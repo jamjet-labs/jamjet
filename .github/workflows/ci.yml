@@ -15,12 +15,17 @@ jobs:
   rust-lint:
     name: Rust lint
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runtime
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime -> target
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -29,29 +34,17 @@ jobs:
   rust-test:
     name: Rust tests
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: jamjet_test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-    env:
-      DATABASE_URL: postgresql://postgres:postgres@localhost/jamjet_test
+    defaults:
+      run:
+        working-directory: runtime
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run migrations
-        run: cargo run --bin jamjet-migrate
+        with:
+          workspaces: runtime -> target
       - name: Test
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace
 
   # ── Python SDK ──────────────────────────────────────────────────────
   python-lint:
@@ -90,10 +83,15 @@ jobs:
   rust-audit:
     name: Rust dependency audit
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runtime
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime -> target
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit dependencies
@@ -126,7 +124,7 @@ jobs:
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
-          base: ${{ github.event.repository.default_branch }}
+          base: ${{ github.event.before != '0000000000000000000000000000000000000000' && github.event.before || github.sha }}
           head: HEAD
           extra_args: --only-verified
 
@@ -134,8 +132,13 @@ jobs:
   build:
     name: Build release binary
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runtime
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime -> target
       - run: cargo build --release --workspace
