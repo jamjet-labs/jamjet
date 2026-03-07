@@ -49,7 +49,10 @@ pub mod metrics {
             .u64_histogram("jamjet.node.duration_ms")
             .with_description("Node execution duration in milliseconds")
             .init()
-            .record(duration_ms, &[KeyValue::new("node_kind", node_kind.to_string())]);
+            .record(
+                duration_ms,
+                &[KeyValue::new("node_kind", node_kind.to_string())],
+            );
     }
 
     /// Record input/output token counts for a model call.
@@ -304,8 +307,7 @@ pub mod capture {
             "bearer [token]",
         );
         // Credit card: 4 groups of 4 digits optionally separated by space/dash
-        let s = regex_replace(&s, r"\b(?:\d{4}[\s\-]?){3}\d{4}\b", "[cc]");
-        s
+        regex_replace(&s, r"\b(?:\d{4}[\s\-]?){3}\d{4}\b", "[cc]")
     }
 
     fn regex_replace(input: &str, pattern: &str, replacement: &str) -> String {

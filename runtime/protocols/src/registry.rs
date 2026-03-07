@@ -104,9 +104,7 @@ impl std::fmt::Debug for ProtocolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        RemoteCapabilities, TaskHandle, TaskRequest, TaskStatus, TaskStream,
-    };
+    use crate::{RemoteCapabilities, TaskHandle, TaskRequest, TaskStatus, TaskStream};
     use async_trait::async_trait;
 
     struct FakeAdapter(String);
@@ -138,7 +136,11 @@ mod tests {
     #[test]
     fn test_register_and_lookup_by_name() {
         let mut reg = ProtocolRegistry::new();
-        reg.register("mcp", Arc::new(FakeAdapter("mcp".into())), vec!["http://mcp/"]);
+        reg.register(
+            "mcp",
+            Arc::new(FakeAdapter("mcp".into())),
+            vec!["http://mcp/"],
+        );
         assert!(reg.adapter("mcp").is_some());
         assert!(reg.adapter("a2a").is_none());
     }
@@ -147,17 +149,27 @@ mod tests {
     fn test_adapter_for_url_matches_prefix() {
         let mut reg = ProtocolRegistry::new();
         reg.register("anp", Arc::new(FakeAdapter("anp".into())), vec!["did:"]);
-        reg.register("mcp", Arc::new(FakeAdapter("mcp".into())), vec!["http://mcp."]);
+        reg.register(
+            "mcp",
+            Arc::new(FakeAdapter("mcp".into())),
+            vec!["http://mcp."],
+        );
 
         assert!(reg.adapter_for_url("did:web:example.com").is_some());
-        assert!(reg.adapter_for_url("http://mcp.example.com/tools").is_some());
+        assert!(reg
+            .adapter_for_url("http://mcp.example.com/tools")
+            .is_some());
         assert!(reg.adapter_for_url("https://unknown.com").is_none());
     }
 
     #[test]
     fn test_longest_prefix_wins() {
         let mut reg = ProtocolRegistry::new();
-        reg.register("generic-http", Arc::new(FakeAdapter("generic".into())), vec!["http://"]);
+        reg.register(
+            "generic-http",
+            Arc::new(FakeAdapter("generic".into())),
+            vec!["http://"],
+        );
         reg.register(
             "specific-mcp",
             Arc::new(FakeAdapter("specific".into())),
@@ -177,8 +189,16 @@ mod tests {
     #[test]
     fn test_protocols_list() {
         let mut reg = ProtocolRegistry::new();
-        reg.register("mcp", Arc::new(FakeAdapter("mcp".into())), vec![] as Vec<String>);
-        reg.register("a2a", Arc::new(FakeAdapter("a2a".into())), vec![] as Vec<String>);
+        reg.register(
+            "mcp",
+            Arc::new(FakeAdapter("mcp".into())),
+            vec![] as Vec<String>,
+        );
+        reg.register(
+            "a2a",
+            Arc::new(FakeAdapter("a2a".into())),
+            vec![] as Vec<String>,
+        );
         let mut protos = reg.protocols();
         protos.sort();
         assert_eq!(protos, vec!["a2a", "mcp"]);

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# pre-commit hook — auto-format and lint before every commit.
+# Install: just hooks  (or: git config core.hooksPath .githooks)
+#
+# What this does:
+#   1. cargo fmt --all              — format Rust code (auto-fix)
+#   2. ruff format + ruff check     — format + auto-fix Python code
+#   3. cargo clippy                 — Rust lint (fail on warnings)
+#   4. Re-stage any files that were auto-fixed
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# ── Colours ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'; NC='\033[0m'
+info()    { echo -e "${GREEN}[hook]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[hook]${NC} $*"; }
+fail()    { echo -e "${RED}[hook]${NC} $*"; exit 1; }
+
+# ── 1. Rust formatting ───────────────────────────────────────────────────────
+if git diff --cached --name-only | grep -qE '\.rs$'; then
+    info "Running cargo fmt..."
+    (cd runtime && cargo fmt --all)
+    # Re-stage any Rust files that cargo fmt touched
+    git diff --name-only | grep '\.rs$' | xargs -r git add
+fi
+
+# ── 2. Python formatting ─────────────────────────────────────────────────────
+if git diff --cached --name-only | grep -qE '\.py$'; then
+    info "Running ruff format + check --fix..."
+    (cd sdk/python && uv run ruff format . && uv run ruff check --fix .)
+    # Re-stage any Python files that ruff touched
+    git diff --name-only | grep '\.py$' | xargs -r git add
+fi
+
+# ── 3. Rust clippy (staged Rust files only) ──────────────────────────────────
+if git diff --cached --name-only | grep -qE '\.rs$'; then
+    info "Running cargo clippy..."
+    (cd runtime && cargo clippy --workspace --all-features -- -D warnings) \
+        || fail "clippy found warnings — fix them before committing."
+fi
+
+info "Pre-commit checks passed."

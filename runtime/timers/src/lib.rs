@@ -108,7 +108,7 @@ impl TimerStore {
         .await
         .map_err(|e| format!("list due timers: {e}"))?;
 
-        rows.iter().map(|r| row_to_timer(r)).collect()
+        rows.iter().map(row_to_timer).collect()
     }
 
     /// Mark a timer as fired.
@@ -267,7 +267,7 @@ impl CronStore {
         .await
         .map_err(|e| format!("list due cron jobs: {e}"))?;
 
-        rows.iter().map(|r| row_to_cron(r)).collect()
+        rows.iter().map(row_to_cron).collect()
     }
 
     /// Advance a cron job's next_run_at after it has fired.
@@ -421,15 +421,15 @@ pub fn cron_next(expr: &str, from: DateTime<Utc>) -> Result<DateTime<Utc>, Strin
         .with_second(0)
         .and_then(|t| t.with_nanosecond(0))
         .unwrap_or(from);
-    candidate = candidate + chrono::Duration::minutes(1);
+    candidate += chrono::Duration::minutes(1);
 
     // Scan up to 366 days forward.
     for _ in 0..(366 * 24 * 60) {
-        let m = candidate.minute() as u32;
-        let h = candidate.hour() as u32;
-        let dom = candidate.day() as u32;
-        let mon = candidate.month() as u32;
-        let dow = candidate.weekday().num_days_from_sunday() as u32;
+        let m = candidate.minute();
+        let h = candidate.hour();
+        let dom = candidate.day();
+        let mon = candidate.month();
+        let dow = candidate.weekday().num_days_from_sunday();
 
         if months.contains(&mon)
             && doms.contains(&dom)
@@ -439,7 +439,7 @@ pub fn cron_next(expr: &str, from: DateTime<Utc>) -> Result<DateTime<Utc>, Strin
         {
             return Ok(candidate);
         }
-        candidate = candidate + chrono::Duration::minutes(1);
+        candidate += chrono::Duration::minutes(1);
     }
     Err(format!("cron: no next time found in 366 days for: {expr}"))
 }

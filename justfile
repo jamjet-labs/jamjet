@@ -6,11 +6,17 @@ default:
     @just --list
 
 # ── Setup ───────────────────────────────────────────────────────────────
-# Bootstrap dev environment
+# Bootstrap dev environment (installs git hooks automatically)
 setup:
     rustup show
     cd sdk/python && uv sync --all-extras
+    just hooks
     @echo "Setup complete. Run 'just dev' to start the local runtime."
+
+# Install git hooks (auto-fmt + clippy on commit)
+hooks:
+    git config core.hooksPath .githooks
+    @echo "Git hooks installed from .githooks/ (pre-commit: cargo fmt + ruff + clippy)"
 
 # ── Development ─────────────────────────────────────────────────────────
 # Start local runtime (SQLite mode)

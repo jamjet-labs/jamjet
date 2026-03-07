@@ -191,7 +191,7 @@ impl ModelAdapter for OpenAiAdapter {
             .as_deref()
             .unwrap_or(&self.default_model)
             .to_string();
-        tracing::Span::current().record("gen_ai.request.model", &model.as_str());
+        tracing::Span::current().record("gen_ai.request.model", model.as_str());
 
         debug!(model = %model, "Calling OpenAI Chat Completions API");
 
@@ -220,7 +220,7 @@ impl ModelAdapter for OpenAiAdapter {
             .as_deref()
             .unwrap_or(&self.default_model)
             .to_string();
-        tracing::Span::current().record("gen_ai.request.model", &model.as_str());
+        tracing::Span::current().record("gen_ai.request.model", model.as_str());
 
         // Use OpenAI's native JSON mode (response_format: json_object).
         // For models that support json_schema, we pass the schema directly.

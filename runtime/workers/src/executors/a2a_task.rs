@@ -170,13 +170,14 @@ fn extract_output(artifacts: &[jamjet_a2a::A2aArtifact]) -> Value {
         .map(|a| {
             a.parts
                 .iter()
-                .find_map(|p| match p {
-                    A2aPart::Data { data } => Some(data.clone()),
-                    A2aPart::Text { text } => Some(json!({ "text": text })),
+                .map(|p| match p {
+                    A2aPart::Data { data } => data.clone(),
+                    A2aPart::Text { text } => json!({ "text": text }),
                     A2aPart::File { file } => {
-                        Some(json!({ "uri": file.uri, "mime_type": file.mime_type }))
+                        json!({ "uri": file.uri, "mime_type": file.mime_type })
                     }
                 })
+                .next()
                 .unwrap_or(json!({}))
         })
         .unwrap_or(json!({}))

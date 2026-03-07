@@ -269,7 +269,10 @@ async fn test_request_ids_increment() {
     let transport = CapturingTransport {
         responses: Mutex::new(vec![
             ok_response(2, json!({ "tools": [] })),
-            ok_response(1, json!({ "protocolVersion": "2024-11-05", "serverInfo": {}, "capabilities": {} })),
+            ok_response(
+                1,
+                json!({ "protocolVersion": "2024-11-05", "serverInfo": {}, "capabilities": {} }),
+            ),
         ]),
         seen_ids: Arc::clone(&seen_ids),
     };
@@ -278,7 +281,10 @@ async fn test_request_ids_increment() {
     client.list_tools().await.expect("list_tools");
     let ids = seen_ids.lock().await.clone();
     assert_eq!(ids.len(), 2, "expected 2 requests");
-    assert!(ids[0] < ids[1], "request IDs must be strictly increasing: {ids:?}");
+    assert!(
+        ids[0] < ids[1],
+        "request IDs must be strictly increasing: {ids:?}"
+    );
 }
 
 // ── McpClientPool ─────────────────────────────────────────────────────────────
@@ -315,11 +321,17 @@ async fn test_pool_on_demand_refresh() {
     // First call: initial discovery (1 tool).
     // Second call (on-demand refresh): 2 tools.
     let transport = MockTransport::new(vec![
-        ok_response(1, json!({ "tools": [{ "name": "tool_a", "description": null, "inputSchema": {} }] })),
-        ok_response(2, json!({ "tools": [
-            { "name": "tool_a", "description": null, "inputSchema": {} },
-            { "name": "tool_b", "description": null, "inputSchema": {} }
-        ]})),
+        ok_response(
+            1,
+            json!({ "tools": [{ "name": "tool_a", "description": null, "inputSchema": {} }] }),
+        ),
+        ok_response(
+            2,
+            json!({ "tools": [
+                { "name": "tool_a", "description": null, "inputSchema": {} },
+                { "name": "tool_b", "description": null, "inputSchema": {} }
+            ]}),
+        ),
     ]);
     let pool = McpClientPool::new(Duration::ZERO);
     pool.add_client(
