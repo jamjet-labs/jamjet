@@ -33,10 +33,12 @@ app = typer.Typer(
 agents_app = typer.Typer(help="Manage agents", no_args_is_help=True)
 mcp_app = typer.Typer(help="MCP server tools", no_args_is_help=True)
 a2a_app = typer.Typer(help="A2A agent tools", no_args_is_help=True)
+eval_app = typer.Typer(help="Eval harness — batch scoring and CI regression", no_args_is_help=True)
 
 app.add_typer(agents_app, name="agents")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(a2a_app, name="a2a")
+app.add_typer(eval_app, name="eval")
 
 console = Console()
 
@@ -197,6 +199,7 @@ def _download_server_binary(cache_dir: str) -> str:
         req = urllib.request.Request(api_url, headers=gh_headers)  # noqa: S310
         with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
             import json as _json
+
             release = _json.loads(resp.read())
         tag = release["tag_name"]
     except Exception as exc:
@@ -411,7 +414,7 @@ def run(
             else:
                 console.print(f"[red]Execution ended:[/red] {final_status}")
 
-    async def _stream_execution(c: "JamjetClient", exec_id: str) -> None:
+    async def _stream_execution(c: JamjetClient, exec_id: str) -> None:
         """
         Poll events and render structured stream chunks progressively (I2.7).
 
@@ -419,7 +422,6 @@ def run(
         events as typed stream chunks with Rich formatting.
         """
         from rich.live import Live
-        from rich.text import Text
 
         terminal = {"completed", "failed", "cancelled", "limit_exceeded"}
         seen_seq: int = -1
@@ -433,10 +435,7 @@ def run(
                 status = state.get("status", "unknown")
 
                 events_data = await c.get_events(exec_id)
-                new_events = [
-                    e for e in events_data.get("events", [])
-                    if e.get("sequence", 0) > seen_seq
-                ]
+                new_events = [e for e in events_data.get("events", []) if e.get("sequence", 0) > seen_seq]
 
                 for evt in sorted(new_events, key=lambda e: e.get("sequence", 0)):
                     seq = evt.get("sequence", 0)
@@ -458,9 +457,8 @@ def run(
                         live.console.print(f"[red]✗ {status}[/red]")
                     break
 
-    def _event_to_stream_chunk(etype: str, kind: dict) -> "str | None":
+    def _event_to_stream_chunk(etype: str, kind: dict) -> str | None:
         """Map an event kind to a human-readable stream chunk line."""
-        from rich.text import Text
 
         if etype == "node_started":
             node_id = kind.get("node_id", "?")
@@ -688,7 +686,7 @@ def mcp_connect(
 
         if url.startswith("stdio:"):
             # stdio:<command> — spawn subprocess, speak JSON-RPC over stdin/stdout
-            command = url[len("stdio:"):].strip()
+            command = url[len("stdio:") :].strip()
             args = shlex.split(command)
             proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -699,6 +697,7 @@ def mcp_connect(
 
             async def _rpc(method: str, params: dict | None = None) -> dict:
                 import json as _json
+
                 msg = _json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}) + "\n"
                 assert proc.stdin and proc.stdout  # noqa: S101
                 proc.stdin.write(msg.encode())
@@ -720,6 +719,7 @@ def mcp_connect(
         else:
             # HTTP + SSE — POST JSON-RPC to the MCP endpoint
             async with httpx.AsyncClient(timeout=timeout) as client:
+
                 async def _rpc(method: str, params: dict | None = None) -> dict:  # type: ignore[misc]
                     endpoint = url.rstrip("/") + "/mcp"
                     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
@@ -894,6 +894,106 @@ def workers(
             console.print_json(r.text)
 
     asyncio.run(_workers())
+
+
+# ── eval ──────────────────────────────────────────────────────────────────────
+
+
+@eval_app.command("run")
+def eval_run(
+    dataset: str = typer.Argument(..., help="Path to .jsonl or .json dataset file"),
+    workflow: str = typer.Option(..., "--workflow", "-w", help="Workflow ID to evaluate"),
+    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+    rubric: str | None = typer.Option(None, "--rubric", help="LLM-judge rubric (enables LLM scoring)"),
+    model: str = typer.Option("claude-haiku-4-5-20251001", "--model", help="Model for LLM judge"),
+    min_score: int = typer.Option(3, "--min-score", help="Minimum passing score for LLM judge (1-5)"),
+    assertions: list[str] = typer.Option([], "--assert", "-a", help="Python assertion expression (repeatable)"),
+    latency_ms: float | None = typer.Option(None, "--latency-ms", help="Maximum allowed latency in ms"),
+    cost_usd: float | None = typer.Option(None, "--cost-usd", help="Maximum allowed cost in USD"),
+    concurrency: int = typer.Option(4, "--concurrency", "-c", help="Parallel executions"),
+    output_json: str | None = typer.Option(None, "--output", "-o", help="Write full results to JSON file"),
+    fail_below: float | None = typer.Option(None, "--fail-below", help="Exit 1 if pass rate below this % (e.g. 80)"),
+    timeout_s: float = typer.Option(120.0, "--timeout", help="Per-row execution timeout in seconds"),
+) -> None:
+    """Run batch evaluation of a workflow against a dataset.
+
+    \b
+    Examples:
+      jamjet eval run qa_pairs.jsonl --workflow my_workflow --rubric "Rate accuracy 1-5"
+      jamjet eval run dataset.jsonl -w summarizer --assert "'summary' in output" --latency-ms 5000
+      jamjet eval run evals.jsonl -w rag --fail-below 80 --output results.json
+    """
+    from jamjet.eval.dataset import EvalDataset
+    from jamjet.eval.runner import EvalRunner
+    from jamjet.eval.scorers import AssertionScorer, CostScorer, LatencyScorer, LlmJudgeScorer
+
+    scorers = []
+
+    if rubric:
+        scorers.append(LlmJudgeScorer(rubric=rubric, model=model, min_score=min_score))
+
+    if assertions:
+        scorers.append(AssertionScorer(checks=list(assertions)))
+
+    if latency_ms is not None:
+        scorers.append(LatencyScorer(threshold_ms=latency_ms))
+
+    if cost_usd is not None:
+        scorers.append(CostScorer(threshold_usd=cost_usd))
+
+    if not scorers:
+        console.print(
+            "[yellow]Warning:[/yellow] No scorers configured. Add --rubric, --assert, --latency-ms, or --cost-usd."
+        )
+
+    try:
+        ds = EvalDataset.from_file(dataset)
+    except (FileNotFoundError, ValueError) as e:
+        console.print(f"[red]Error loading dataset:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print(f"Running eval: [bold]{len(ds)}[/bold] rows × [bold]{workflow}[/bold] with {len(scorers)} scorer(s)")
+
+    runner = EvalRunner(
+        workflow_id=workflow,
+        scorers=scorers,
+        runtime=runtime,
+        concurrency=concurrency,
+        timeout_s=timeout_s,
+    )
+
+    results = asyncio.run(runner.run(ds))
+    EvalRunner.print_summary(results, console=console)
+
+    if output_json:
+        import dataclasses
+
+        out_data = [
+            {
+                "row_id": r.row_id,
+                "passed": r.passed,
+                "overall_score": r.overall_score,
+                "duration_ms": r.duration_ms,
+                "cost_usd": r.cost_usd,
+                "error": r.error,
+                "scorers": [dataclasses.asdict(s) for s in r.scorers],
+                "output": r.output,
+                "input": r.input,
+                "expected": r.expected,
+            }
+            for r in results
+        ]
+        with open(output_json, "w") as f:
+            json.dump(out_data, f, indent=2, default=str)
+        console.print(f"[dim]Results written to {output_json}[/dim]")
+
+    if fail_below is not None:
+        total = len(results)
+        passed = sum(1 for r in results if r.passed)
+        pass_rate = passed / total * 100 if total else 0
+        if pass_rate < fail_below:
+            console.print(f"[red]FAIL:[/red] pass rate {pass_rate:.1f}% < {fail_below:.1f}% threshold")
+            raise typer.Exit(1)
 
 
 if __name__ == "__main__":

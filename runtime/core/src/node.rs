@@ -137,6 +137,22 @@ pub enum NodeKind {
         protocol: Option<String>,
         output_binding: String,
     },
+
+    /// Evaluates the preceding node's output using configurable scorers.
+    ///
+    /// Supports LLM-judge, deterministic assertions, latency/cost thresholds,
+    /// and custom Python scorer plugins.
+    Eval {
+        /// Ordered list of scorer configurations.
+        scorers: Vec<EvalScorer>,
+        /// Action on overall failure (any scorer below threshold).
+        on_fail: EvalOnFail,
+        /// Maximum retry attempts before propagating failure.
+        #[serde(default)]
+        max_retries: u32,
+        /// Input expression — which state field to evaluate (default: last node output).
+        input_expr: Option<String>,
+    },
 }
 
 impl NodeKind {
@@ -150,6 +166,7 @@ impl NodeKind {
             Self::McpTool { .. } | Self::A2aTask { .. } => QueueType::Tool,
             Self::Agent { .. } => QueueType::General,
             Self::HumanApproval { .. } | Self::Wait { .. } => QueueType::General,
+            Self::Eval { .. } => QueueType::General,
             _ => QueueType::General,
         }
     }
@@ -211,6 +228,64 @@ pub enum FinalizerTrigger {
     Success,
     Failure,
     Always,
+}
+
+// ── Eval node types ──────────────────────────────────────────────────────────
+
+/// A scorer within an `Eval` node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EvalScorer {
+    /// LLM-as-judge: sends output to a model with a rubric, expects a score 1-5.
+    LlmJudge {
+        model: String,
+        rubric: String,
+        /// Minimum acceptable score (1-5). Scores below this fail.
+        #[serde(default = "default_min_score")]
+        min_score: u8,
+    },
+    /// Deterministic Python expressions evaluated against the output.
+    Assertion {
+        /// Each check is a Python expression that must evaluate to truthy.
+        checks: Vec<String>,
+    },
+    /// Ensures node execution completed within a latency threshold.
+    Latency {
+        /// Maximum allowed duration in milliseconds.
+        threshold_ms: u64,
+    },
+    /// Ensures the execution cost is within budget.
+    Cost {
+        /// Maximum allowed cost in USD.
+        threshold_usd: f64,
+    },
+    /// Custom Python scorer loaded via entry point or module path.
+    Custom {
+        /// Python dotted path: "my_package.scorers:MyScorer"
+        module: String,
+        /// Optional keyword arguments passed to the scorer.
+        #[serde(default)]
+        kwargs: serde_json::Value,
+    },
+}
+
+fn default_min_score() -> u8 {
+    3
+}
+
+/// What the eval node does when one or more scorers fail.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalOnFail {
+    /// Feed scorer feedback back to the previous node and retry.
+    RetryWithFeedback,
+    /// Escalate to human (triggers HumanApproval fallback node).
+    Escalate,
+    /// Fail the workflow immediately.
+    #[default]
+    Halt,
+    /// Record the failure but continue the workflow.
+    LogAndContinue,
 }
 
 #[cfg(test)]
