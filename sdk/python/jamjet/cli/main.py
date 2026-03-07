@@ -26,16 +26,25 @@ from rich.table import Table
 
 from jamjet.client import JamjetClient
 
-# ── Pixel art logo (24×7 grid, rendered as Unicode full-block pairs) ──────────
+# ── Pixel art logo — J-shaped vertical jet ready to launch ────────────────────
+# 7×15 grid: body IS the letter J. Nose up, swept wings, J-hook nozzle, flames.
 # 0=bg  1=yellow#f5c518  2=orange#ea580c  3=red#dc2626  4=white(cockpit)
 _LOGO_PIXELS = [
-    "001100000000000000000000",
-    "300001111111111111111000",
-    "033211111111111111111110",
-    "332211111111111111441111",
-    "033211111111111111111110",
-    "300001111111111111111000",
-    "001100000000000000000000",
+    "0001000",  # nose tip
+    "0011100",  # nose cone
+    "0014100",  # cockpit window
+    "0011100",  # upper body
+    "1011101",  # swept wings
+    "0011100",  # body
+    "0011100",  # body
+    "0011100",  # lower body
+    "0011100",  # engine
+    "0111000",  # J nozzle — curves left
+    "1110000",  # J base
+    "2220000",  # exhaust orange
+    "0330000",  # flame core
+    "0232000",  # flame mid
+    "0030000",  # flame tip
 ]
 _LC = {
     "1": "\033[38;2;245;197;24m",
