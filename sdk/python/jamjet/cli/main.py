@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 import typer
 from rich.console import Console
@@ -25,11 +26,71 @@ from rich.table import Table
 
 from jamjet.client import JamjetClient
 
+# ── Pixel art logo (24×7 grid, rendered as Unicode full-block pairs) ──────────
+# 0=bg  1=yellow#f5c518  2=orange#ea580c  3=red#dc2626  4=white(cockpit)
+_LOGO_PIXELS = [
+    "001100000000000000000000",
+    "300001111111111111111000",
+    "033211111111111111111110",
+    "332211111111111111441111",
+    "033211111111111111111110",
+    "300001111111111111111000",
+    "001100000000000000000000",
+]
+_LC = {
+    "1": "\033[38;2;245;197;24m",
+    "2": "\033[38;2;234;88;12m",
+    "3": "\033[38;2;220;38;38m",
+    "4": "\033[38;2;255;255;255m",
+}
+_LR = "\033[0m"
+
+
+def _render_logo() -> str:
+    lines = []
+    for row in _LOGO_PIXELS:
+        line = ""
+        for ch in row:
+            if ch == "0":
+                line += "  "
+            else:
+                line += _LC[ch] + "██" + _LR
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _print_logo() -> None:
+    if sys.stdout.isatty():
+        sys.stdout.write(_render_logo() + "\n")
+        sys.stdout.flush()
+
+
+# ── Version callback ──────────────────────────────────────────────────────────
+
+def _version_callback(value: bool) -> None:
+    if value:
+        _print_logo()
+        typer.echo("\nJamJet v0.1.0  —  agent-native workflow runtime")
+        raise typer.Exit()
+
+
 app = typer.Typer(
     name="jamjet",
     help="JamJet — agent-native workflow runtime CLI",
     no_args_is_help=True,
 )
+
+
+@app.callback()
+def _main(
+    version: bool = typer.Option(  # noqa: FBT001
+        False, "--version", "-V",
+        callback=_version_callback,
+        is_eager=True,
+        help="Print version and exit.",
+    ),
+) -> None:
+    pass
 agents_app = typer.Typer(help="Manage agents", no_args_is_help=True)
 mcp_app = typer.Typer(help="MCP server tools", no_args_is_help=True)
 a2a_app = typer.Typer(help="A2A agent tools", no_args_is_help=True)
@@ -287,6 +348,7 @@ def dev(
     if db_url:
         env["DATABASE_URL"] = db_url
 
+    _print_logo()
     console.rule("[bold green]JamJet Dev Runtime[/bold green]")
     console.print(f"  [bold]Binary:[/bold] {binary}")
     console.print(f"  [bold]Port:[/bold]   {port}")
