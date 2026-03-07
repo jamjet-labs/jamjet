@@ -1,0 +1,68 @@
+# examples/plan-and-execute-agent/agent.yaml
+#
+# Plan-and-Execute Agent — generates a multi-step plan upfront, then executes
+# each step sequentially with optional verification.
+#
+# The strategy compiles to a DAG:
+#   __plan__  →  __step_0__  →  __verify_0__?  →  __step_1__  → ... → __finalize__
+#                          ↘ cost_guard ↙
+#
+# Best for: tasks with clear sub-steps, longer horizons, where you want
+#           the plan visible in `jamjet inspect` before steps run.
+#
+# Prerequisites:
+#   export ANTHROPIC_API_KEY="sk-ant-..."
+#
+# Run:
+#   jamjet dev
+#   jamjet run agent.yaml \
+#     --input '{"task": "Write a blog post about the history of programming languages"}'
+#
+# Inspect the generated plan:
+#   jamjet inspect <exec_id>    # shows plan steps, cost per step, iteration count
+
+agent:
+  id: plan_execute_writer
+  version: 0.1.0
+  description: "Plan-and-execute writing agent — plan outline, execute each section, assemble"
+
+  strategy: plan-and-execute
+  strategy_config:
+    # Number of parallel plan steps to generate and execute.
+    max_steps: 5
+    # After each step, a verifier model checks quality before proceeding.
+    verifier: true
+    verifier_model: claude-haiku-4-5-20251001
+
+  model: claude-sonnet-4-6
+
+  goal: |
+    Complete the following writing task step by step:
+
+    {{ task }}
+
+    First, produce a numbered outline. Then write each section.
+    Finally, assemble and polish the full piece.
+
+  tools:
+    - name: web_search
+      description: "Research background information"
+      input_schema:
+        type: object
+        properties:
+          query: { type: string }
+        required: [query]
+
+    - name: save_draft
+      description: "Save a draft section to the document"
+      input_schema:
+        type: object
+        properties:
+          section: { type: string, description: "Section heading" }
+          content: { type: string, description: "Section content in markdown" }
+        required: [section, content]
+
+  limits:
+    max_iterations: 5
+    max_cost_usd: 1.00
+    timeout_seconds: 300

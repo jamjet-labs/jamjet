@@ -1,0 +1,106 @@
+# examples/multi-agent-review/workflow.yaml
+#
+# Multi-Agent Review — a coordinator agent fans out to specialist reviewers via A2A,
+# then synthesises their findings into a final report.
+#
+# Architecture:
+#   Coordinator (this workflow)
+#     → Security Reviewer   (external A2A agent)
+#     → Performance Reviewer (external A2A agent)
+#     → Compliance Reviewer  (external A2A agent)
+#   → Synthesiser (model node)
+#
+# Prerequisites:
+#   export SECURITY_AGENT_URL="https://security-agent.example.com"
+#   export PERF_AGENT_URL="https://perf-agent.example.com"
+#   export COMPLIANCE_AGENT_URL="https://compliance-agent.example.com"
+#   export ANTHROPIC_API_KEY="sk-ant-..."
+#
+# Run:
+#   jamjet dev
+#   jamjet run workflow.yaml --input '{"artifact_url": "https://github.com/acme/pr/42"}'
+
+workflow:
+  id: multi_agent_review
+  version: 0.1.0
+  description: "Fan out to specialist A2A reviewer agents, synthesise results"
+
+  start_node: security_review
+
+  state_schema:
+    type: object
+    properties:
+      artifact_url:        { type: string }
+      security_findings:   { type: string }
+      perf_findings:       { type: string }
+      compliance_findings: { type: string }
+      final_report:        { type: string }
+    required: [artifact_url]
+
+  nodes:
+    # Parallel reviewer legs — each delegates to a specialist A2A agent.
+
+    - id: security_review
+      kind: a2a_task
+      label: "Delegate to Security Reviewer agent"
+      config:
+        agent_url: "${SECURITY_AGENT_URL}"
+        skill: review_security
+        input:
+          artifact_url: "{{ artifact_url }}"
+        output_to_state:
+          result: security_findings
+      edges:
+        - to: perf_review
+
+    - id: perf_review
+      kind: a2a_task
+      label: "Delegate to Performance Reviewer agent"
+      config:
+        agent_url: "${PERF_AGENT_URL}"
+        skill: review_performance
+        input:
+          artifact_url: "{{ artifact_url }}"
+        output_to_state:
+          result: perf_findings
+      edges:
+        - to: compliance_review
+
+    - id: compliance_review
+      kind: a2a_task
+      label: "Delegate to Compliance Reviewer agent"
+      config:
+        agent_url: "${COMPLIANCE_AGENT_URL}"
+        skill: review_compliance
+        input:
+          artifact_url: "{{ artifact_url }}"
+        output_to_state:
+          result: compliance_findings
+      edges:
+        - to: synthesise
+
+    # Coordinator synthesises findings into a final report.
+    - id: synthesise
+      kind: model
+      label: "Synthesise all review findings"
+      config:
+        model: claude-sonnet-4-6
+        system: |
+          You are a senior engineering lead. Given findings from three specialist
+          reviewers, synthesise them into a concise, prioritised final report
+          (executive summary + action items).
+        prompt_template: |
+          Artifact: {{ artifact_url }}
+
+          Security findings:
+          {{ security_findings }}
+
+          Performance findings:
+          {{ perf_findings }}
+
+          Compliance findings:
+          {{ compliance_findings }}
+        output_to_state:
+          result: final_report
+      edges:
+        - to: end

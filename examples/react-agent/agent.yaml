@@ -1,0 +1,77 @@
+# examples/react-agent/agent.yaml
+#
+# ReAct Agent — Reasoning + Acting loop compiled to a durable JamJet DAG.
+#
+# The agent follows the ReAct pattern (Yao et al. 2022):
+#   Thought → Tool Call → Observation → Thought → ... → Final Answer
+#
+# JamJet compiles this to a static DAG with:
+#   - One think/observe pair per iteration (up to max_iterations)
+#   - Cost guards after every iteration (max_cost_usd)
+#   - Workflow-level timeout (timeout_seconds)
+#   - LIMIT_EXCEEDED terminal state if any limit is hit
+#
+# Prerequisites:
+#   export ANTHROPIC_API_KEY="sk-ant-..."
+#   # Optional MCP server for tools:
+#   export MCP_TOOLS_SERVER="http://localhost:9000/mcp"
+#
+# Run:
+#   jamjet dev
+#   jamjet run agent.yaml \
+#     --input '{"goal": "Find the 3 most-starred Python ML repos on GitHub this week"}'
+#   jamjet run agent.yaml --stream   # live iteration output
+
+agent:
+  id: react_researcher
+  version: 0.1.0
+  description: "ReAct research agent — iteratively searches and reasons until the goal is met"
+
+  strategy: react
+  strategy_config:
+    # Each iteration = one Thought + one Tool Call + one Observation.
+    max_steps: 6
+
+  model: claude-sonnet-4-6
+
+  goal: |
+    {{ goal }}
+
+    Use the available tools to gather information. Think step by step.
+    When you have enough information to answer fully, call the `finish` tool.
+
+  # Tools available to the agent in each iteration.
+  tools:
+    - name: web_search
+      description: "Search the web for current information"
+      input_schema:
+        type: object
+        properties:
+          query: { type: string, description: "Search query" }
+        required: [query]
+
+    - name: fetch_url
+      description: "Fetch the content of a URL"
+      input_schema:
+        type: object
+        properties:
+          url: { type: string, description: "URL to fetch" }
+        required: [url]
+
+    - name: finish
+      description: "Submit the final answer when research is complete"
+      input_schema:
+        type: object
+        properties:
+          answer: { type: string, description: "The complete final answer" }
+          sources: { type: array, items: { type: string }, description: "Sources used" }
+        required: [answer]
+
+  # Hard limits — enforced by compiled cost-guard nodes in the DAG.
+  limits:
+    max_iterations: 6
+    max_cost_usd: 0.50
+    timeout_seconds: 120
+
+  # Override behaviour when a limit is hit (default: fail with LIMIT_EXCEEDED).
+  on_limit_exceeded: return_partial   # return whatever the agent found so far

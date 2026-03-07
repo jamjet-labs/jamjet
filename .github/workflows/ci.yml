@@ -142,3 +142,27 @@ jobs:
         with:
           workspaces: runtime -> target
       - run: cargo build --release --workspace
+
+  # ── Wheel build check (task 3.28) ─────────────────────────────────
+  wheel-check:
+    name: Wheel build check (maturin)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build wheel (debug, Linux x86_64)
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: >
+            --manifest-path runtime/api/Cargo.toml
+            --out dist
+          manylinux: auto
+          working-directory: sdk/python
+      - name: Smoke-test wheel installs
+        run: |
+          pip install sdk/python/dist/*.whl
+          jamjet --help
+          jamjet-server --help || true   # may exit non-zero without DB, that's OK

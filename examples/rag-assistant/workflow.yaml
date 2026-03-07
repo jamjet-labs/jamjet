@@ -1,0 +1,82 @@
+# examples/rag-assistant/workflow.yaml
+#
+# RAG Assistant — Retrieval-Augmented Generation pipeline.
+#
+# Pattern: fetch documents via MCP → retrieve relevant chunks → answer with Claude.
+#
+# Prerequisites:
+#   export MCP_DOCS_SERVER="http://localhost:8080"   # any MCP docs server
+#   export ANTHROPIC_API_KEY="sk-ant-..."
+#
+# Run:
+#   jamjet dev
+#   jamjet run workflow.yaml --input '{"question": "What is JamJet?"}'
+
+workflow:
+  id: rag_assistant
+  version: 0.1.0
+  description: "Retrieval-Augmented Generation — fetch docs, retrieve chunks, answer with an LLM"
+
+  start_node: fetch_docs
+
+  state_schema:
+    type: object
+    properties:
+      question:      { type: string }
+      raw_docs:      { type: array, items: { type: string } }
+      chunks:        { type: array, items: { type: string } }
+      answer:        { type: string }
+    required: [question]
+
+  nodes:
+    # Step 1: Fetch documents from an MCP docs server.
+    - id: fetch_docs
+      kind: mcp_tool
+      label: "Fetch documents from MCP docs server"
+      config:
+        server_url: "${MCP_DOCS_SERVER}"
+        tool: search_documents
+        input_from_state:
+          query: question
+        output_to_state:
+          documents: raw_docs
+      timeout: { node_seconds: 30 }
+      retry: { max_attempts: 2, backoff: exponential }
+      edges:
+        - to: retrieve_chunks
+
+    # Step 2: Retrieve the most relevant chunks (local Python tool).
+    - id: retrieve_chunks
+      kind: tool
+      label: "Retrieve top-k relevant chunks"
+      config:
+        fn: retrieve_top_chunks
+        input_from_state:
+          docs: raw_docs
+          query: question
+        output_to_state:
+          chunks: chunks
+      edges:
+        - to: answer_question
+
+    # Step 3: Answer using Claude with retrieved context.
+    - id: answer_question
+      kind: model
+      label: "Answer question with retrieved context"
+      config:
+        model: claude-sonnet-4-6
+        system: |
+          You are a helpful assistant. Answer the user's question using ONLY
+          the provided context. If the context does not contain the answer,
+          say "I don't have enough information to answer that."
+        prompt_template: |
+          Context:
+          {% for chunk in chunks %}
+          - {{ chunk }}
+          {% endfor %}
+
+          Question: {{ question }}
+        output_to_state:
+          answer: answer
+      edges:
+        - to: end
