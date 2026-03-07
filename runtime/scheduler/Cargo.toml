@@ -1,0 +1,19 @@
+[package]
+name = "jamjet-scheduler"
+description = "JamJet scheduler — runnable node detection, queue dispatch, lease management"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jamjet-core = { path = "../core" }
+jamjet-ir = { path = "../ir" }
+jamjet-state = { path = "../state" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

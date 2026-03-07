@@ -1,0 +1,81 @@
+# Rust
+/target/
+runtime/target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+sdk/python/.venv/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# JamJet local runtime
+.jamjet/
+*.db
+*.db-shm
+*.db-wal
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmarks / profiling
+flamegraph.svg
+perf.data*
+
+# Internal planning docs (not for public repo)
+progress-tracker.md
+REQUIREMENTS.md
+
+# Local AI/editor agent config
+.claude/*.local.*
+.claude/settings.local.json
+.cursor/
+.copilot/
+
+# Secrets and credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*.service-account.json
+credentials*.json
+.envrc
+.secrets*
+
+# Infrastructure state and local cloud env
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.pulumi/
+.azd/
+
+# Coverage, logs, temp artifacts
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+*.log
+logs/
+tmp/
+.tmp/
+*.pid
+*.sqlite
+*.sqlite3

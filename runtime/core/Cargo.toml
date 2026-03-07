@@ -1,0 +1,16 @@
+[package]
+name = "jamjet-core"
+description = "JamJet core execution model — workflow states, node types, retry/timeout policies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

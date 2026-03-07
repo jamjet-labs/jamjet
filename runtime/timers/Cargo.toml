@@ -1,0 +1,20 @@
+[package]
+name = "jamjet-timers"
+description = "JamJet durable timers — Postgres-backed timer store and cron scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jamjet-core = { path = "../core" }
+jamjet-state = { path = "../state" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
+reqwest = { workspace = true }

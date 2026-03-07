@@ -1,0 +1,15 @@
+[package]
+name = "jamjet-telemetry"
+description = "JamJet telemetry — tracing, metrics, OpenTelemetry exporters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+serde = { workspace = true }

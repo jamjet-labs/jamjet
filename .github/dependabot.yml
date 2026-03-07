@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # Rust / Cargo
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      patch-updates:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # Python SDK
+  - package-ecosystem: pip
+    directory: /sdk/python
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+
+  # GitHub Actions
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10

@@ -1,0 +1,12 @@
+[package]
+name = "jamjet-policy"
+description = "JamJet policy engine — tool blocking, approval requirements, model allowlists"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jamjet-core = { path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
