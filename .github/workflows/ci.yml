@@ -176,7 +176,6 @@ jobs:
         with:
           command: build
           args: >
-            --manifest-path runtime/api/Cargo.toml
             --out dist
           manylinux: auto
           working-directory: sdk/python
