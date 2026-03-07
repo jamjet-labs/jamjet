@@ -42,6 +42,7 @@ perf.data*
 # Internal planning docs (not for public repo)
 progress-tracker.md
 REQUIREMENTS.md
+launch-plan.md
 
 # Local AI/editor agent config
 .claude/*.local.*
