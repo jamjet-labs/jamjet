@@ -1,0 +1,101 @@
+# examples/hitl-approval/workflow.yaml
+#
+# Human-in-the-Loop Approval — AI drafts a decision, a human approves or rejects it.
+#
+# Pattern: generate recommendation → pause for human review → act on decision.
+#
+# Prerequisites:
+#   export ANTHROPIC_API_KEY="sk-ant-..."
+#
+# Run:
+#   jamjet dev
+#   jamjet run workflow.yaml --input '{"request": "Approve $50k budget for Q3 infra."}'
+#
+# Approve:
+#   jamjet run approval exec_<id> --approve --comment "Looks good"
+# Reject:
+#   jamjet run approval exec_<id> --reject  --comment "Needs CFO sign-off first"
+
+workflow:
+  id: hitl_approval
+  version: 0.1.0
+  description: "AI generates a risk assessment, a human approves or rejects before action is taken"
+
+  start_node: assess_risk
+
+  state_schema:
+    type: object
+    properties:
+      request:         { type: string }
+      risk_assessment: { type: string }
+      risk_level:      { type: string, enum: [low, medium, high] }
+      decision:        { type: string }
+      action_result:   { type: string }
+    required: [request]
+
+  nodes:
+    # Step 1: AI analyses the request and produces a risk assessment.
+    - id: assess_risk
+      kind: model
+      label: "Assess risk of the request"
+      config:
+        model: claude-sonnet-4-6
+        system: |
+          You are a risk assessment assistant. Given a business request, produce:
+          1. A brief risk assessment (2-3 sentences).
+          2. A risk level: low, medium, or high.
+
+          Respond in JSON: {"risk_assessment": "...", "risk_level": "low|medium|high"}
+        prompt_template: "Request: {{ request }}"
+        output_to_state:
+          risk_assessment: risk_assessment
+          risk_level: risk_level
+        structured_output: true
+      edges:
+        - to: await_approval
+
+    # Step 2: Pause and wait for a human to approve or reject.
+    - id: await_approval
+      kind: human_approval
+      label: "Wait for human review and decision"
+      config:
+        prompt_template: |
+          Please review the following request:
+
+          Request: {{ request }}
+          Risk assessment: {{ risk_assessment }}
+          Risk level: {{ risk_level }}
+
+          Approve to proceed. Reject to halt.
+        timeout: { node_seconds: 86400 }   # 24h timeout
+        on_timeout: reject
+      edges:
+        - condition: "decision == 'approved'"
+          to: take_action
+        - condition: "decision == 'rejected'"
+          to: notify_rejected
+
+    # Step 3a: Human approved — take the action.
+    - id: take_action
+      kind: tool
+      label: "Execute approved action"
+      config:
+        fn: execute_request
+        input_from_state:
+          request: request
+        output_to_state:
+          result: action_result
+      edges:
+        - to: end
+
+    # Step 3b: Human rejected — record and exit.
+    - id: notify_rejected
+      kind: tool
+      label: "Record rejection"
+      config:
+        fn: record_rejection
+        input_from_state:
+          request: request
+          decision: decision
+      edges:
+        - to: end
