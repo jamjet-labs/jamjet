@@ -1,210 +1,192 @@
+<div align="center">
+
+<!-- Pixel art lightning bolt logo -->
+<svg width="80" height="96" viewBox="0 0 30 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="10" y="0"  width="5" height="4" fill="#f5c518"/>
+  <rect x="15" y="0"  width="5" height="4" fill="#f5c518"/>
+  <rect x="5"  y="4"  width="5" height="4" fill="#f5c518"/>
+  <rect x="10" y="4"  width="5" height="4" fill="#f5c518"/>
+  <rect x="15" y="4"  width="5" height="4" fill="#f5c518"/>
+  <rect x="20" y="4"  width="5" height="4" fill="#f5c518"/>
+  <rect x="10" y="8"  width="5" height="4" fill="#f5c518"/>
+  <rect x="15" y="8"  width="5" height="4" fill="#f5c518"/>
+  <rect x="0"  y="12" width="5" height="4" fill="#f5c518"/>
+  <rect x="5"  y="12" width="5" height="4" fill="#f5c518"/>
+  <rect x="10" y="12" width="5" height="4" fill="#f5c518"/>
+  <rect x="15" y="12" width="5" height="4" fill="#f5c518"/>
+  <rect x="5"  y="16" width="5" height="4" fill="#f5c518"/>
+  <rect x="10" y="16" width="5" height="4" fill="#f5c518"/>
+  <rect x="15" y="16" width="5" height="4" fill="#f5c518"/>
+  <rect x="20" y="16" width="5" height="4" fill="#f5c518"/>
+  <rect x="25" y="16" width="5" height="4" fill="#f5c518"/>
+  <rect x="10" y="20" width="5" height="4" fill="#f5c518"/>
+  <rect x="15" y="20" width="5" height="4" fill="#f5c518"/>
+  <rect x="10" y="24" width="5" height="4" fill="#f5c518"/>
+  <rect x="15" y="24" width="5" height="4" fill="#f5c518"/>
+</svg>
+
 # JamJet
 
-> **The agent-native runtime — built for performance, designed for interoperability, reliable enough for production.**
+**The agent-native runtime — durable, composable, built for production.**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/jamjet/jamjet/ci.yml?label=CI&style=flat-square)](https://github.com/jamjet-labs/jamjet/actions)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/jamjet-labs/jamjet/ci.yml?label=CI&style=flat-square)](https://github.com/jamjet-labs/jamjet/actions)
+[![PyPI](https://img.shields.io/pypi/v/jamjet?style=flat-square&color=f5c518)](https://pypi.org/project/jamjet)
+[![License](https://img.shields.io/badge/license-Apache%202.0-f5c518?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square)](https://rustup.rs)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)](https://python.org)
-[![Docs](https://img.shields.io/badge/docs-jamjet.dev-green?style=flat-square)](https://jamjet.dev/docs)
+[![Docs](https://img.shields.io/badge/docs-jamjet.dev-f5c518?style=flat-square)](https://jamjet.dev/docs/quickstart)
 
-JamJet is a **performance-first, agent-native runtime and framework** for building reliable, interoperable AI agent systems. It is not another prompt wrapper or thin agent SDK — it is a **production-grade orchestration substrate** for agents that need to work, not just demo.
+[jamjet.dev](https://jamjet.dev) · [Quickstart](https://jamjet.dev/docs/quickstart) · [Docs](https://jamjet.dev/docs/concepts) · [Examples](https://jamjet.dev/examples) · [Blog](https://jamjet.dev/blog)
+
+</div>
 
 ---
+
+JamJet is a **performance-first, agent-native runtime** for AI agents. It is not another prompt wrapper or thin agent SDK — it is a **production-grade orchestration substrate** for agents that need to work, not just demo.
+
+The runtime core is **Rust + Tokio** for scheduling, state, and concurrency. The authoring surface is **Python** (or YAML). Both compile to the same IR graph and run on the same engine.
 
 ## Why JamJet?
 
 | Problem | JamJet's answer |
 |---------|----------------|
-| Fragile agent runs that lose state on crash | **Durable graph execution** with event sourcing and crash recovery |
+| Agent runs lose state on crash | **Durable graph execution** — event-sourced, crash-safe resume |
 | No way to pause for human approval | **Human-in-the-loop** as a first-class workflow primitive |
 | Agents siloed in their own framework | **Native MCP + A2A** — interoperate with any agent, any framework |
-| Slow Python orchestration at scale | **Rust core** for scheduling, state, concurrency; Python for authoring |
-| Weak observability, no replay | **Full event timeline**, replay from any checkpoint |
-| No standard agent identity | **Agent Cards** — every agent is addressable, discoverable, composable |
-| Inconsistent tool contracts | **Typed schemas everywhere** — Pydantic, TypedDict, JSON Schema |
+| Slow Python orchestration at scale | **Rust core** — no GIL, real async parallelism |
+| Weak observability, no replay | **Full event timeline**, OTel GenAI traces, replay from any checkpoint |
+| No standard agent identity | **Agent Cards** — every agent is addressable and discoverable |
 
 ---
 
-## How JamJet compares
-
-> As of March 2026. All frameworks evolve quickly — check their docs for the latest.
-
-| Capability | JamJet | LangChain | AutoGen | CrewAI | BeeAI |
-|------------|--------|-----------|---------|--------|-------|
-| **Default model** | Agent-first + strategy | Chain / LCEL | Conversational agents | Role-based crew | Agent loop |
-| **Durable execution** | ✅ event-sourced; crash-safe resume | ❌ ephemeral | ❌ ephemeral | ❌ ephemeral | ❌ ephemeral |
-| **Human-in-the-loop** | ✅ first-class primitive | 🟡 callback hooks | 🟡 first-class for conversational flows | 🟡 manual | ❌ |
-| **MCP support** | ✅ client + server | 🟡 client only | 🟡 client only | 🟡 client only | 🟡 client only |
-| **A2A protocol** | ✅ client + server | ❌ | ❌ | ❌ | ❌ |
-| **Pluggable reasoning strategies** | ✅ react, plan-and-execute, critic, reflection, consensus, debate | ❌ manual wiring | 🟡 user-built | 🟡 role-based tasks | 🟡 user-built |
-| **Enforced cost/iteration limits** | ✅ compile-time guards | ❌ | 🟡 partial | 🟡 partial | ❌ |
-| **Typed state schemas** | ✅ Pydantic / TypedDict / JSON Schema | 🟡 optional | 🟡 optional | 🟡 partial | 🟡 partial |
-| **Built-in observability** | ✅ OTel GenAI, full event timeline, replay | 🟡 LangSmith (external) | ❌ | ❌ | ❌ |
-| **Agent identity + discovery** | ✅ Agent Cards, A2A discovery | ❌ | ❌ | ❌ | 🟡 framework-level discovery |
-| **Runtime language** | Rust core + Python authoring | Python | Python | Python | TypeScript |
-| **Scheduler / throughput** | ✅ Rust async scheduler; low-overhead worker pool | 🟡 Python asyncio; GIL-bound | 🟡 Python asyncio; message-passing overhead | 🟡 Python; sequential by default | 🟡 Node.js event loop |
-| **Deployment model** | Long-running server (local or cloud) | Library (in-process) | Library (in-process) | Library (in-process) | Library (in-process) |
-| **Best for** | Production multi-agent systems needing durability and interop | Rapid prototyping, LLM chains | Conversational multi-agent apps | Role-based collab agents | TypeScript agentic apps |
-
----
-
-## Key Features
-
-**Durable graph workflows** — every step is checkpointed; crash the runtime and execution resumes exactly where it left off.
-
-**Native MCP + A2A** — connect to any MCP server, expose your tools as an MCP server, delegate to or serve external agents via A2A.
-
-**Agent-native identity** — every agent has a URI, an Agent Card describing its capabilities, and a managed lifecycle.
-
-**Human-in-the-loop** — pause any workflow for human approval or input as a first-class primitive.
-
-**Configurable autonomy** — from strict deterministic graph execution to bounded autonomous agents operating within defined budgets.
-
-**Typed schemas everywhere** — Pydantic, TypedDict, JSON Schema. No stringly-typed state.
-
-**Distributed workers** — horizontal scale with lease semantics, retry policies, and queue isolation by workload type.
-
-**Python-friendly authoring** — define workflows with Python decorators or YAML; both compile to the same runtime graph.
-
----
-
-## Quick Start
+## Quickstart
 
 **Requirements:** Python 3.11+
 
 ```bash
-# Install the CLI (runtime binary included)
 pip install jamjet
-
-# Option A — scaffold a new project
-jamjet init my-agent-project
-cd my-agent-project
-
-# Option B — add JamJet to an existing project (works like git init)
-cd my-existing-project
-jamjet init
-
-# Start local dev runtime (SQLite, embedded — no server setup needed)
+jamjet init my-first-agent
+cd my-first-agent
 jamjet dev
 ```
 
 In another terminal:
 
 ```bash
-# Run the example workflow
-jamjet run examples/basic_tool_flow
+jamjet run workflow.yaml --input '{"query": "What is JamJet?"}'
 ```
 
-### Hello World — Python
+→ **[Full quickstart guide](https://jamjet.dev/docs/quickstart)**
 
-```python
-from jamjet import Workflow, tool
-from pydantic import BaseModel
+---
 
-class SearchResult(BaseModel):
-    summary: str
-    sources: list[str]
+## Hello World
 
-@tool
-async def web_search(query: str) -> SearchResult:
-    # your implementation here
-    ...
-
-workflow = Workflow("research")
-
-@workflow.state
-class ResearchState(BaseModel):
-    question: str
-    result: SearchResult | None = None
-
-@workflow.step
-async def search(state: ResearchState) -> ResearchState:
-    result = await web_search(query=state.question)
-    return state.model_copy(update={"result": result})
-
-@workflow.step
-async def summarize(state: ResearchState) -> ResearchState:
-    # model call here
-    ...
-```
-
-### Hello World — YAML
+### YAML
 
 ```yaml
 # workflow.yaml
 workflow:
-  id: research
+  id: hello-agent
   version: 0.1.0
-  state_schema: schemas.ResearchState
-  start: search
+  state_schema:
+    query: str
+    answer: str
+  start: think
 
 nodes:
-  search:
-    type: tool
-    tool_ref: tools.web_search
-    input:
-      query: "{{ state.question }}"
-    output_schema: schemas.SearchResult
-    next: summarize
-
-  summarize:
+  think:
     type: model
-    model: default_chat
-    prompt: prompts/summarize.md
-    output_schema: schemas.Summary
+    model: claude-haiku-4-5-20251001
+    prompt: "Answer clearly and concisely: {{ state.query }}"
+    output_key: answer
     next: end
+
+  end:
+    type: end
 ```
 
 ```bash
 jamjet validate workflow.yaml
-jamjet run workflow.yaml --input '{"question": "What is JamJet?"}'
+jamjet run workflow.yaml --input '{"query": "What is JamJet?"}'
 ```
 
-### Connecting to an MCP Server
+### Python SDK
 
-```yaml
-# agents.yaml
-agents:
-  researcher:
-    model: default_chat
-    mcp:
-      servers:
-        github:
-          transport: http_sse
-          url: https://mcp.github.com/v1
-          auth:
-            type: bearer
-            token_env: GITHUB_TOKEN
+```python
+from jamjet import workflow, node, State
+
+@workflow(id="hello-agent", version="0.1.0")
+class HelloAgent:
+    @node(start=True)
+    async def think(self, state: State) -> State:
+        response = await self.model(
+            model="claude-haiku-4-5-20251001",
+            prompt=f"Answer clearly: {state['query']}",
+        )
+        return {"answer": response.text}
 ```
 
-```yaml
-# workflow.yaml (node using MCP tool)
-nodes:
-  search_github:
-    type: mcp_tool
-    server: github
-    tool: search_code
-    input:
-      query: "{{ state.search_query }}"
-    output_schema: schemas.SearchResults
-    retry_policy: io_default
-```
-
-### Delegating to an External Agent via A2A
+### MCP tool call
 
 ```yaml
 nodes:
-  code_review:
+  search:
+    type: tool
+    server: brave-search        # configured in jamjet.toml
+    tool: web_search
+    arguments:
+      query: "{{ state.query }}"
+      count: 10
+    output_key: results
+    next: summarize
+```
+
+### A2A delegation
+
+```yaml
+nodes:
+  delegate:
     type: a2a_task
-    remote_agent: partner_reviewer   # defined in agents.yaml
-    skill: security_review
+    agent_url: "https://agents.example.com/research-agent"
     input:
-      code: "{{ state.generated_code }}"
-    stream: true
-    timeout: 300s
-    on_input_required: human_review
+      query: "{{ state.query }}"
+    output_key: research
+    next: end
 ```
+
+### Eval with self-improvement
+
+```yaml
+nodes:
+  check:
+    type: eval
+    scorers:
+      - type: llm_judge
+        rubric: "Is the answer accurate and complete?"
+        min_score: 4
+    on_fail: retry_with_feedback   # injects feedback into next model call
+    max_retries: 2
+    next: end
+```
+
+---
+
+## How JamJet compares
+
+> As of March 2026. All frameworks evolve — check their docs for the latest.
+
+| Capability | JamJet | LangChain | AutoGen | CrewAI |
+|------------|--------|-----------|---------|--------|
+| **Durable execution** | ✅ event-sourced, crash-safe | ❌ ephemeral | ❌ ephemeral | ❌ ephemeral |
+| **Human-in-the-loop** | ✅ first-class primitive | 🟡 callbacks | 🟡 conversational | 🟡 manual |
+| **MCP support** | ✅ client + server | 🟡 client only | 🟡 client only | 🟡 client only |
+| **A2A protocol** | ✅ client + server | ❌ | ❌ | ❌ |
+| **Built-in eval** | ✅ LLM judge, assertions | ❌ | ❌ | ❌ |
+| **Built-in observability** | ✅ OTel GenAI, event replay | 🟡 LangSmith (external) | ❌ | ❌ |
+| **Agent identity** | ✅ Agent Cards, A2A discovery | ❌ | ❌ | ❌ |
+| **Runtime language** | Rust core + Python authoring | Python | Python | Python |
+| **Best for** | Production multi-agent systems | Rapid prototyping | Conversational agents | Role-based crews |
 
 ---
 
@@ -216,108 +198,102 @@ nodes:
 │              Python SDK  |  YAML  |  CLI                  │
 ├──────────────────────────────────────────────────────────┤
 │                 Compilation / Validation                   │
-│         Graph IR  |  Schema  |  Policy lint               │
+│           Graph IR  |  Schema  |  Policy lint             │
 ├────────────────────────────┬─────────────────────────────┤
 │      Rust Runtime Core     │      Protocol Layer          │
 │  Scheduler  |  State SM    │  MCP Client  |  MCP Server   │
 │  Event log  |  Snapshots   │  A2A Client  |  A2A Server   │
-│  Workers    |  Timers      │  Protocol Adapter Framework  │
+│  Workers    |  Timers      │                              │
 ├────────────────────────────┴─────────────────────────────┤
 │                      Runtime Services                      │
-│  Model Adapters  |  Tool Execution  |  Memory/Retrieval   │
-│  Policy Engine   |  Observability   |  Secret Management  │
-├──────────────────────────────────────────────────────────┤
-│                    Control Plane / APIs                    │
-│        REST / gRPC  |  Agent Registry  |  Admin           │
+│  Model Adapters  |  Tool Execution  |  Observability      │
 ├──────────────────────────────────────────────────────────┤
 │                         Storage                           │
 │           Postgres (production)  |  SQLite (local)        │
 └──────────────────────────────────────────────────────────┘
 ```
 
-Read more: [Architecture Overview](docs/architecture/overview.md)
+## Roadmap
+
+| Phase | Status | Goal |
+|-------|--------|------|
+| 0 — Architecture & RFCs | ✅ Complete | Design docs, RFCs, repo scaffolding |
+| 1 — Minimal Viable Runtime | ✅ Complete | Local durable execution, MCP client, agent cards, Python CLI |
+| 2 — Production Core | ✅ Complete | Distributed workers, MCP server, full A2A client + server |
+| 3 — Developer Delight | 🔄 In Progress | Eval harness, trace debugging, templates |
+| 4 — Enterprise | 📋 Planned | Policy engine, tenant isolation, mTLS federation |
+| 5 — Scale & Ecosystem | 📋 Planned | TypeScript SDK, hosted plane, agent marketplace |
 
 ---
 
 ## Documentation
 
-### Start here
+Full documentation at **[jamjet.dev/docs](https://jamjet.dev/docs/quickstart)**
 
-| Guide | Description |
-|-------|-------------|
-| [Quickstart](docs/guides/quickstart.md) | Get a workflow running in 10 minutes |
-| [Core Concepts](docs/guides/concepts.md) | Agents, workflows, nodes, state, durability |
-| [Workflow Authoring](docs/guides/workflow-authoring.md) | YAML and Python authoring guide |
-| [Python SDK](docs/guides/python-sdk.md) | Full SDK reference |
-| [YAML Reference](docs/guides/yaml-reference.md) | Complete YAML spec |
-
-### Connect to other systems
-
-| Guide | Description |
-|-------|-------------|
-| [MCP Integration](docs/guides/mcp-guide.md) | Connect to MCP servers, expose tools |
-| [A2A Integration](docs/guides/a2a-guide.md) | Delegate to and serve external agents |
-| [Agent Model](docs/guides/agent-model-guide.md) | Agent Cards, lifecycle, autonomy levels |
-| [Human-in-the-Loop](docs/guides/hitl.md) | Approval nodes, state editing, audit |
-| [Observability](docs/guides/observability.md) | Traces, replay, cost attribution, OTel GenAI |
-| [Deployment](docs/guides/deployment.md) | Production deployment guide |
-
-### Advanced & enterprise
-
-| Guide | Description |
-|-------|-------------|
-| [Security](docs/guides/security.md) | Auth, secrets, RBAC, OAuth delegated agent auth |
-| [WASI Sandboxing](docs/guides/wasi-sandboxing.md) | Sandboxed tool execution via Wasmtime |
-| [Eval Node](docs/guides/eval.md) | Evaluation as a workflow primitive |
-| [ANP Discovery](docs/guides/anp.md) | Decentralized agent discovery via DID |
-
-### Architecture deep-dives
-
-| Document | Description |
-|----------|-------------|
-| [Architecture Overview](docs/architecture/overview.md) | Full system architecture |
-| [Execution Model](docs/architecture/execution-model.md) | State machine, node types, IR |
-| [State & Durability](docs/architecture/state-and-durability.md) | Event sourcing, snapshotting, recovery |
-| [Agent Model](docs/architecture/agent-model.md) | Agent-native runtime design |
-| [MCP Architecture](docs/architecture/mcp-integration.md) | MCP client/server internals |
-| [A2A Architecture](docs/architecture/a2a-integration.md) | A2A protocol internals |
-| [Protocol Adapters](docs/architecture/protocol-adapters.md) | Extensible protocol layer |
+| | |
+|--|--|
+| [Quickstart](https://jamjet.dev/docs/quickstart) | Get running in 10 minutes |
+| [Core Concepts](https://jamjet.dev/docs/concepts) | Agents, workflows, nodes, state, durability |
+| [YAML Workflows](https://jamjet.dev/docs/yaml-workflows) | All node types, retry policies, conditions |
+| [Python SDK](https://jamjet.dev/docs/python-sdk) | Full SDK reference |
+| [MCP Integration](https://jamjet.dev/docs/mcp) | Connect to MCP servers, expose tools |
+| [A2A Integration](https://jamjet.dev/docs/a2a) | Delegate to and serve external agents |
+| [Eval Harness](https://jamjet.dev/docs/eval) | Score quality, run regression suites, gate CI |
+| [Observability](https://jamjet.dev/docs/observability) | OTel traces, metrics, Prometheus |
+| [Deployment](https://jamjet.dev/docs/deployment) | Docker, Kubernetes, PostgreSQL |
+| [CLI Reference](https://jamjet.dev/docs/cli) | Full CLI reference |
 
 ---
 
-## Roadmap
+## Repository structure
 
-| Phase | Status | Goal |
-|-------|--------|------|
-| 0 — Architecture & RFCs | In progress | Design docs, RFCs, scaffolding |
-| 1 — Minimal Viable Runtime | Planned | Local durable execution, MCP client, agent cards |
-| 2 — Production Core | Planned | Distributed workers, MCP server, full A2A |
-| 3 — Developer Delight | Planned | Templates, eval harness, trace debugging |
-| 4 — Enterprise | Planned | Policy engine, tenant isolation, federation security |
-| 5 — Scale & Ecosystem | Planned | TypeScript SDK, hosted plane, agent marketplace |
-
-Track milestone progress in [GitHub Issues](https://github.com/jamjet-labs/jamjet/issues) and the project board.
+```
+jamjet/
+├── runtime/
+│   ├── core/           # Graph IR, node types, state machine
+│   ├── scheduler/      # Durable task scheduler (Rust)
+│   ├── workers/        # Node executors (model, tool, http, eval, …)
+│   ├── api/            # REST API server
+│   ├── agents/         # Agent Cards, registry, lifecycle
+│   ├── protocols/
+│   │   ├── mcp/        # MCP client + server
+│   │   └── a2a/        # A2A client + server
+│   └── telemetry/      # OTel instrumentation
+├── sdk/
+│   └── python/
+│       └── jamjet/
+│           ├── cli/    # jamjet CLI (Typer)
+│           ├── eval/   # Eval dataset, runner, scorers
+│           └── workflows/  # Python workflow builder
+└── tests/              # Integration tests
+```
 
 ---
 
 ## Contributing
 
-We welcome contributions of all kinds — bug reports, feature requests, documentation, and code.
+Contributions are welcome — bugs, features, docs, and code.
 
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) to get started
-- Check open issues for `good first issue` tags
-- RFCs for major changes: see [docs/rfcs/](docs/rfcs/)
-- Architecture decisions: see [docs/adr/](docs/adr/)
+- Open an issue for bugs or feature requests
+- Check issues tagged `good first issue` for easy entry points
+- For large changes, open an issue first to discuss the approach
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions
 
 ---
 
 ## Community
 
 - **GitHub Discussions:** [github.com/jamjet-labs/jamjet/discussions](https://github.com/jamjet-labs/jamjet/discussions)
-
+- **GitHub Issues:** [github.com/jamjet-labs/jamjet/issues](https://github.com/jamjet-labs/jamjet/issues)
 
 ---
 
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
+
+---
+
+<div align="center">
+  <sub>© 2026 JamJet — <a href="https://jamjet.dev">jamjet.dev</a></sub>
+</div>
