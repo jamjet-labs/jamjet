@@ -50,9 +50,15 @@ def _client(runtime: str = "http://localhost:7700") -> JamjetClient:
 
 @app.command()
 def init(
-    project_name: str | None = typer.Argument(None, help="Name of the new project (omit to initialise in the current directory)"),
+    project_name: str | None = typer.Argument(
+        None,
+        help="Name of the new project (omit to initialise in the current directory)",
+    ),
 ) -> None:
-    """Initialise a JamJet project. Pass a name to create a new directory, or omit to set up in the current directory."""
+    """Initialise a JamJet project.
+
+    Pass a name to create a new directory, or omit to set up in the current directory.
+    """
     import os
 
     if project_name:
@@ -181,25 +187,66 @@ def _download_server_binary(cache_dir: str) -> str:
     ext = ".exe" if system == "windows" else ""
     filename = f"jamjet-server-{system}-{arch}{ext}"
 
-    # TODO: replace with real release tag when publishing to PyPI
-    version = "latest"
-    url = f"https://github.com/jamjet/jamjet/releases/download/{version}/{filename}"
+    # Resolve the latest release tag from GitHub API.
+    api_url = "https://api.github.com/repos/jamjet-labs/jamjet/releases/latest"
+    try:
+        gh_headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        req = urllib.request.Request(api_url, headers=gh_headers)  # noqa: S310
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+            import json as _json
+            release = _json.loads(resp.read())
+        tag = release["tag_name"]
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"Could not fetch latest release info from GitHub ({exc}).\n"
+            "Build from source: cd runtime && cargo build -p jamjet-api\n"
+            "Or set JAMJET_SERVER_PATH to the binary path."
+        ) from exc
 
+    url = f"https://github.com/jamjet-labs/jamjet/releases/download/{tag}/{filename}"
     os.makedirs(cache_dir, exist_ok=True)
     dest = os.path.join(cache_dir, f"jamjet-server{ext}")
+    dest_tmp = dest + ".tmp"
 
-    console.print(f"[dim]Downloading runtime binary for {system}/{arch}...[/dim]")
+    console.print(f"[dim]Downloading jamjet-server {tag} for {system}/{arch}...[/dim]")
+
+    # Stream download with a Rich progress bar.
+    from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TransferSpeedColumn
+
     try:
-        urllib.request.urlretrieve(url, dest)
+        with urllib.request.urlopen(url, timeout=60) as response:  # noqa: S310
+            total = int(response.headers.get("Content-Length", 0)) or None
+            with Progress(
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                DownloadColumn(),
+                TransferSpeedColumn(),
+                console=console,
+                transient=True,
+            ) as progress:
+                task = progress.add_task(filename, total=total)
+                with open(dest_tmp, "wb") as out:
+                    while True:
+                        chunk = response.read(65536)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        progress.advance(task, len(chunk))
     except Exception as exc:
+        if os.path.exists(dest_tmp):
+            os.remove(dest_tmp)
         raise FileNotFoundError(
             f"Auto-download failed ({exc}).\n"
             "Build from source: cd runtime && cargo build -p jamjet-api\n"
             "Or set JAMJET_SERVER_PATH to the binary path."
         ) from exc
 
+    os.replace(dest_tmp, dest)
     os.chmod(dest, os.stat(dest).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    console.print(f"[green]✓[/green] Runtime cached at {dest}")
+    console.print(f"[green]✓[/green] Runtime binary cached at {dest}")
     return dest
 
 
@@ -328,6 +375,7 @@ def run(
     input: str | None = typer.Option(None, "--input", "-i", help="JSON input"),
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
     follow: bool = typer.Option(True, "--follow/--no-follow", help="Follow execution progress"),
+    stream: bool = typer.Option(False, "--stream", help="Stream structured output chunks progressively"),
 ) -> None:
     """Submit and run a workflow execution."""
     input_data = json.loads(input) if input else {}
@@ -338,10 +386,15 @@ def run(
             exec_id = result.get("execution_id", "unknown")
             console.print(f"[green]Execution started:[/green] {exec_id}")
 
+            if stream:
+                await _stream_execution(c, exec_id)
+                return
+
             if not follow:
                 return
 
-            terminal = {"completed", "failed", "cancelled"}
+            terminal = {"completed", "failed", "cancelled", "limit_exceeded"}
+            state: dict = {}
             while True:
                 await asyncio.sleep(1)
                 state = await c.get_execution(exec_id)
@@ -350,10 +403,114 @@ def run(
                 if status in terminal:
                     break
 
-            if state.get("status") == "completed":
+            final_status = state.get("status")
+            if final_status == "completed":
                 console.print("[green]Execution completed.[/green]")
+            elif final_status == "limit_exceeded":
+                console.print("[yellow]Execution halted: strategy limit exceeded.[/yellow]")
             else:
-                console.print(f"[red]Execution ended:[/red] {state.get('status')}")
+                console.print(f"[red]Execution ended:[/red] {final_status}")
+
+    async def _stream_execution(c: "JamjetClient", exec_id: str) -> None:
+        """
+        Poll events and render structured stream chunks progressively (I2.7).
+
+        Polls ``GET /executions/{id}/events`` every 500ms and renders new
+        events as typed stream chunks with Rich formatting.
+        """
+        from rich.live import Live
+        from rich.text import Text
+
+        terminal = {"completed", "failed", "cancelled", "limit_exceeded"}
+        seen_seq: int = -1
+        console.print(f"[dim]Streaming chunks for[/dim] {exec_id}\n")
+
+        with Live(console=console, refresh_per_second=4) as live:
+            while True:
+                await asyncio.sleep(0.5)
+
+                state = await c.get_execution(exec_id)
+                status = state.get("status", "unknown")
+
+                events_data = await c.get_events(exec_id)
+                new_events = [
+                    e for e in events_data.get("events", [])
+                    if e.get("sequence", 0) > seen_seq
+                ]
+
+                for evt in sorted(new_events, key=lambda e: e.get("sequence", 0)):
+                    seq = evt.get("sequence", 0)
+                    seen_seq = max(seen_seq, seq)
+                    kind = evt.get("kind", {})
+                    etype = kind.get("type", "")
+
+                    chunk = _event_to_stream_chunk(etype, kind)
+                    if chunk:
+                        live.console.print(chunk)
+
+                if status in terminal:
+                    live.console.print()
+                    if status == "completed":
+                        live.console.print("[green]✓ Stream complete[/green]")
+                    elif status == "limit_exceeded":
+                        live.console.print("[yellow]⚠ Strategy limit exceeded[/yellow]")
+                    else:
+                        live.console.print(f"[red]✗ {status}[/red]")
+                    break
+
+    def _event_to_stream_chunk(etype: str, kind: dict) -> "str | None":
+        """Map an event kind to a human-readable stream chunk line."""
+        from rich.text import Text
+
+        if etype == "node_started":
+            node_id = kind.get("node_id", "?")
+            return f"[dim cyan]→ node_started[/dim cyan]  [cyan]{node_id}[/cyan]"
+        if etype == "node_completed":
+            node_id = kind.get("node_id", "?")
+            dur = kind.get("duration_ms", 0)
+            model = kind.get("gen_ai_model")
+            tokens = ""
+            if kind.get("input_tokens") or kind.get("output_tokens"):
+                inp = kind.get("input_tokens", 0)
+                out = kind.get("output_tokens", 0)
+                tokens = f" [dim]({inp}→{out} tokens)[/dim]"
+            model_tag = f" [dim]{model}[/dim]" if model else ""
+            return f"[green]✓ node_completed[/green]  [bold]{node_id}[/bold]{model_tag}  [dim]{dur}ms{tokens}[/dim]"
+        if etype == "node_failed":
+            node_id = kind.get("node_id", "?")
+            err = kind.get("error", "")
+            return f"[red]✗ node_failed[/red]    [bold]{node_id}[/bold]  [dim red]{err}[/dim red]"
+        if etype == "strategy_started":
+            strategy = kind.get("strategy", "?")
+            return f"[magenta]⚡ strategy_started[/magenta]  [bold]{strategy}[/bold]"
+        if etype == "plan_generated":
+            steps = kind.get("steps", [])
+            return f"[blue]📋 plan_generated[/blue]  {len(steps)} steps"
+        if etype == "iteration_started":
+            it = kind.get("iteration", "?")
+            return f"[blue]↻ iteration_started[/blue]  #{it}"
+        if etype == "iteration_completed":
+            it = kind.get("iteration", "?")
+            cost = kind.get("cost_delta_usd")
+            cost_str = f"  [dim]cost=${cost:.4f}[/dim]" if cost else ""
+            return f"[blue]✓ iteration_done[/blue]   #{it}{cost_str}"
+        if etype == "critic_verdict":
+            score = kind.get("score", 0.0)
+            passed = kind.get("passed", False)
+            icon = "✓" if passed else "✗"
+            color = "green" if passed else "yellow"
+            return f"[{color}]{icon} critic_verdict[/{color}]  score={score:.2f}"
+        if etype == "strategy_limit_hit":
+            limit_type = kind.get("limit_type", "?")
+            limit_val = kind.get("limit_value", "?")
+            actual = kind.get("actual_value", "?")
+            return f"[yellow]⚠ limit_hit[/yellow]  {limit_type}: {actual} ≥ {limit_val}"
+        if etype == "strategy_completed":
+            iters = kind.get("iterations", "?")
+            cost = kind.get("total_cost_usd")
+            cost_str = f"  total=${cost:.4f}" if cost else ""
+            return f"[green]✓ strategy_done[/green]  {iters} iterations{cost_str}"
+        return None
 
     asyncio.run(_run())
 
@@ -517,12 +674,102 @@ def agents_activate(
 
 @mcp_app.command("connect")
 def mcp_connect(
-    url: str = typer.Argument(..., help="MCP server URL or 'stdio:<command>'"),
+    url: str = typer.Argument(..., help="MCP server URL (http/https) or 'stdio:<command>'"),
+    timeout: float = typer.Option(10.0, "--timeout", help="Connection timeout in seconds"),
 ) -> None:
     """Test MCP server connectivity and list available tools."""
-    console.print(f"Connecting to MCP server: {url}")
-    # TODO: initialize MCP client, list tools
-    console.print("[yellow]MCP client not yet implemented (Phase 1 in progress)[/yellow]")
+
+    async def _connect() -> None:
+        import shlex
+
+        import httpx
+
+        console.print(f"Connecting to MCP server: [cyan]{url}[/cyan]\n")
+
+        if url.startswith("stdio:"):
+            # stdio:<command> — spawn subprocess, speak JSON-RPC over stdin/stdout
+            command = url[len("stdio:"):].strip()
+            args = shlex.split(command)
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+
+            async def _rpc(method: str, params: dict | None = None) -> dict:
+                import json as _json
+                msg = _json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}) + "\n"
+                assert proc.stdin and proc.stdout  # noqa: S101
+                proc.stdin.write(msg.encode())
+                await proc.stdin.drain()
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
+                return _json.loads(line)["result"]
+
+            try:
+                init_params = {
+                    "protocolVersion": "2024-11-05",
+                    "clientInfo": {"name": "jamjet-cli", "version": "0.1.0"},
+                    "capabilities": {},
+                }
+                info = await _rpc("initialize", init_params)
+                tools_resp = await _rpc("tools/list")
+            finally:
+                proc.terminate()
+                await proc.wait()
+        else:
+            # HTTP + SSE — POST JSON-RPC to the MCP endpoint
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async def _rpc(method: str, params: dict | None = None) -> dict:  # type: ignore[misc]
+                    endpoint = url.rstrip("/") + "/mcp"
+                    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
+                    try:
+                        resp = await client.post(endpoint, json=payload)
+                        resp.raise_for_status()
+                    except httpx.HTTPStatusError as e:
+                        console.print(f"[red]HTTP {e.response.status_code}: {e.response.text}[/red]")
+                        raise typer.Exit(1)
+                    except httpx.RequestError as e:
+                        console.print(f"[red]Connection error: {e}[/red]")
+                        raise typer.Exit(1)
+                    body = resp.json()
+                    if "error" in body:
+                        console.print(f"[red]MCP error: {body['error']}[/red]")
+                        raise typer.Exit(1)
+                    return body["result"]
+
+                init_params = {
+                    "protocolVersion": "2024-11-05",
+                    "clientInfo": {"name": "jamjet-cli", "version": "0.1.0"},
+                    "capabilities": {},
+                }
+                info = await _rpc("initialize", init_params)
+                tools_resp = await _rpc("tools/list")
+
+        # Server info
+        server_info = info.get("serverInfo", {})
+        name = server_info.get("name", "MCP server")
+        ver = server_info.get("version", "?")
+        console.print(f"[green]✓[/green] Connected to [bold]{name}[/bold] v{ver}")
+        console.print(f"  Protocol: {info.get('protocolVersion', '?')}\n")
+
+        # Tools table
+        tools = tools_resp.get("tools", [])
+        if not tools:
+            console.print("[dim]No tools exposed by this server.[/dim]")
+            return
+
+        t = Table(title=f"{len(tools)} tool(s) available", show_header=True)
+        t.add_column("Name", style="bold")
+        t.add_column("Description")
+        t.add_column("Input schema")
+        for tool in tools:
+            schema = tool.get("inputSchema", {})
+            props = ", ".join(schema.get("properties", {}).keys()) if schema else "—"
+            t.add_row(tool.get("name", "?"), tool.get("description", "—"), props or "—")
+        console.print(t)
+
+    asyncio.run(_connect())
 
 
 # ── a2a ───────────────────────────────────────────────────────────────────────

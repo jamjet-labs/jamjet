@@ -85,6 +85,9 @@ pub fn apply_events(
             EventKind::WorkflowCancelled { .. } => {
                 status = WorkflowStatus::Cancelled;
             }
+            EventKind::StrategyLimitHit { .. } => {
+                status = WorkflowStatus::LimitExceeded;
+            }
             EventKind::NodeScheduled { node_id, .. } | EventKind::NodeStarted { node_id, .. } => {
                 active_nodes.insert(node_id.clone());
             }

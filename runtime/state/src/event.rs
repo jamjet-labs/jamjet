@@ -162,6 +162,52 @@ pub enum EventKind {
         limit: u64,
         current: u64,
     },
+
+    // ── Reasoning strategy lifecycle (§14.5) ─────────────────────────────
+    /// Emitted when a reasoning strategy begins execution.
+    StrategyStarted {
+        strategy: String,
+        config: serde_json::Value,
+    },
+    /// Emitted by plan-and-execute when the plan is generated.
+    PlanGenerated {
+        steps: Vec<String>,
+    },
+    /// Emitted at the start of each reasoning loop iteration.
+    IterationStarted {
+        iteration: u32,
+    },
+    /// Emitted each time a tool is invoked within a strategy loop.
+    ToolCalled {
+        node_id: NodeId,
+        tool: String,
+    },
+    /// Emitted by critic/verifier nodes with a quality score.
+    CriticVerdict {
+        node_id: NodeId,
+        score: f64,
+        passed: bool,
+        feedback: Option<String>,
+    },
+    /// Emitted at the end of each iteration with cost/token delta.
+    IterationCompleted {
+        iteration: u32,
+        cost_delta_usd: Option<f64>,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    /// Emitted when a strategy limit (max_iterations, max_cost_usd, timeout) is hit.
+    /// Workflow transitions to `LimitExceeded` after this event.
+    StrategyLimitHit {
+        limit_type: String,
+        limit_value: serde_json::Value,
+        actual_value: serde_json::Value,
+    },
+    /// Emitted when strategy execution completes successfully.
+    StrategyCompleted {
+        iterations: u32,
+        total_cost_usd: Option<f64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

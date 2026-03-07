@@ -9,4 +9,4 @@
 
 pub mod runner;
 
-pub use runner::Scheduler;
+pub use runner::{Scheduler, SchedulerConfig};

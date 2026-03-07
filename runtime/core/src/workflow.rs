@@ -43,12 +43,18 @@ pub enum WorkflowStatus {
     Failed,
     /// Explicitly cancelled.
     Cancelled,
+    /// A strategy limit (max_iterations, max_cost_usd, timeout_seconds) was
+    /// exceeded. Terminal — does not transition to any other state.
+    LimitExceeded,
 }
 
 impl WorkflowStatus {
     /// Returns true if this is a terminal status (no further transitions possible).
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::LimitExceeded
+        )
     }
 
     /// Returns true if this execution can still accept work.
@@ -64,6 +70,7 @@ impl WorkflowStatus {
             (Self::Running, Self::Completed) => true,
             (Self::Running, Self::Failed) => true,
             (Self::Running, Self::Cancelled) => true,
+            (Self::Running, Self::LimitExceeded) => true,
             (Self::Paused, Self::Running) => true,
             (Self::Paused, Self::Cancelled) => true,
             _ => false,
@@ -125,8 +132,17 @@ mod tests {
         assert!(WorkflowStatus::Completed.is_terminal());
         assert!(WorkflowStatus::Failed.is_terminal());
         assert!(WorkflowStatus::Cancelled.is_terminal());
+        assert!(WorkflowStatus::LimitExceeded.is_terminal());
         assert!(!WorkflowStatus::Running.is_terminal());
         assert!(!WorkflowStatus::Paused.is_terminal());
+    }
+
+    #[test]
+    fn limit_exceeded_transition() {
+        let s = WorkflowStatus::Running;
+        assert!(s.validate_transition(&WorkflowStatus::LimitExceeded).is_ok());
+        let s = WorkflowStatus::LimitExceeded;
+        assert!(s.validate_transition(&WorkflowStatus::Running).is_err());
     }
 
     #[test]
