@@ -14,6 +14,8 @@ pub mod pool;
 pub mod worker;
 
 pub use executor::{ExecutionResult, NodeExecutor};
-pub use executors::{A2aTaskExecutor, AgentDiscoveryExecutor, McpToolExecutor, ModelNodeExecutor};
+pub use executors::{
+    A2aTaskExecutor, AgentDiscoveryExecutor, EvalExecutor, McpToolExecutor, ModelNodeExecutor,
+};
 pub use pool::{default_pool, WorkerGroupConfig, WorkerPool};
 pub use worker::Worker;

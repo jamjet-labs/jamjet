@@ -1,0 +1,6 @@
+# Q&A evaluation dataset for jamjet eval run
+# Format: {"input": {...}, "expected": "...", "metadata": {...}}
+{"id": "q1", "input": {"query": "What is the capital of France?"}, "expected": "Paris", "metadata": {"category": "geography"}}
+{"id": "q2", "input": {"query": "What is 2 + 2?"}, "expected": "4", "metadata": {"category": "math"}}
+{"id": "q3", "input": {"query": "Who wrote Hamlet?"}, "expected": "Shakespeare", "metadata": {"category": "literature"}}
+{"id": "q4", "input": {"query": "What is the speed of light in m/s?"}, "expected": "299792458", "metadata": {"category": "physics"}}
