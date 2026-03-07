@@ -30,9 +30,9 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - os: macos-14          # Apple Silicon runner
+          - os: macos-14          # Apple Silicon runner (arm64)
             target: aarch64
-          - os: macos-13          # Intel runner
+          - os: macos-14          # Cross-compile Intel x86_64 from arm64 runner
             target: x86_64
           - os: ubuntu-latest
             target: x86_64
