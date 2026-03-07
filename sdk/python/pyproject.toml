@@ -1,16 +1,15 @@
 [build-system]
-# maturin bundles the jamjet-server Rust binary into the wheel (task 3.28).
-# The binary is placed in PATH on `pip install`, so `jamjet dev` works with
-# zero Rust toolchain required on the user's machine.
+# Pure Python wheel — no Rust extension.
+# The jamjet-server binary is distributed as a GitHub Release asset and
+# auto-downloaded on first `jamjet dev` via _find_server_binary() in cli/main.py.
 #
-# Local development (no binary bundling):
+# Local development:
 #   pip install -e ".[dev]"
 #
-# Wheel with bundled binary (CI / release):
-#   maturin build --release -m ../../runtime/api/Cargo.toml
-#   pip install dist/jamjet-*.whl
-requires = ["maturin>=1.5,<2.0"]
-build-backend = "maturin"
+# Build wheel:
+#   python -m build --wheel
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "jamjet"
@@ -39,21 +38,6 @@ dev = [
 [project.scripts]
 jamjet = "jamjet.cli.main:app"
 
-# ── Maturin configuration (task 3.28) ─────────────────────────────────────────
-# bindings = "bin"  →  bundle a Rust binary (not a Python extension module)
-# manifest-path     →  the Cargo.toml of the crate that contains [[bin]] jamjet-server
-# python-source     →  where the Python package lives (relative to this pyproject.toml)
-#
-# After `maturin build --release`, the wheel contains:
-#   scripts/jamjet-server       (auto-added to PATH by pip)
-#   jamjet/                     (the Python package)
-#
-# The CLI's _find_server_binary() checks shutil.which("jamjet-server") first,
-# so the bundled binary is picked up automatically — no extra code needed.
-[tool.maturin]
-bindings = "bin"
-manifest-path = "../../runtime/api/Cargo.toml"
-python-source = "."
 
 [tool.ruff]
 line-length = 120
