@@ -55,7 +55,6 @@ jobs:
           args: >
             --release
             --out dist
-            --manifest-path runtime/api/Cargo.toml
             --interpreter python3.11
           target: ${{ matrix.platform.target }}
           manylinux: auto        # uses manylinux2014 on Linux for broad compat
