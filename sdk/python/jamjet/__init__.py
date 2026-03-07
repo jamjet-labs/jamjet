@@ -26,9 +26,11 @@ Quick start:
         return state.model_copy(update={"result": r})
 """
 
+from jamjet.agents.agent import Agent, AgentResult
+from jamjet.agents.task import task
 from jamjet.client import JamjetClient
 from jamjet.tools.decorators import tool
 from jamjet.workflow.workflow import Workflow
 
-__all__ = ["Workflow", "tool", "JamjetClient"]
+__all__ = ["Agent", "AgentResult", "task", "Workflow", "tool", "JamjetClient"]
 __version__ = "0.1.0"

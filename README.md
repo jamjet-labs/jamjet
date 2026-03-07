@@ -56,12 +56,38 @@ The runtime core is **Rust + Tokio** for scheduling, state, and concurrency. The
 | Slow Python orchestration at scale | **Rust core** — no GIL, real async parallelism |
 | Weak observability, no replay | **Full event timeline**, OTel GenAI traces, replay from any checkpoint |
 | No standard agent identity | **Agent Cards** — every agent is addressable and discoverable |
+| Can't run without a server | **In-process execution** — `pip install jamjet` and run immediately |
 
 ---
 
 ## Quickstart
 
 **Requirements:** Python 3.11+
+
+### Fastest path — pure Python, no server
+
+```bash
+pip install jamjet
+```
+
+```python
+from jamjet import task, tool
+
+@tool
+async def web_search(query: str) -> str:
+    return f"Search results for: {query}"
+
+@task(model="claude-haiku-4-5-20251001", tools=[web_search])
+async def research(question: str) -> str:
+    """You are a research assistant. Search first, then summarize clearly."""
+
+result = await research("What is JamJet?")
+print(result)
+```
+
+No server. No config. No YAML. Just `pip install` and run.
+
+### Full runtime path — durable execution
 
 ```bash
 pip install jamjet
@@ -111,21 +137,79 @@ jamjet validate workflow.yaml
 jamjet run workflow.yaml --input '{"query": "What is JamJet?"}'
 ```
 
-### Python SDK
+### Python — `@task` (simplest)
 
 ```python
-from jamjet import workflow, node, State
+from jamjet import task, tool
 
-@workflow(id="hello-agent", version="0.1.0")
-class HelloAgent:
-    @node(start=True)
-    async def think(self, state: State) -> State:
-        response = await self.model(
-            model="claude-haiku-4-5-20251001",
-            prompt=f"Answer clearly: {state['query']}",
-        )
-        return {"answer": response.text}
+@tool
+async def web_search(query: str) -> str:
+    return f"Search results for: {query}"
+
+@task(model="claude-haiku-4-5-20251001", tools=[web_search])
+async def research(question: str) -> str:
+    """You are a research assistant. Search first, then summarize clearly."""
+
+result = await research("What is JamJet?")
 ```
+
+The docstring becomes the instruction. The function signature is the contract. That's it.
+
+### Python — `Agent`
+
+```python
+from jamjet import Agent, tool
+
+@tool
+async def web_search(query: str) -> str:
+    return f"Search results for: {query}"
+
+agent = Agent(
+    "researcher",
+    model="claude-haiku-4-5-20251001",
+    tools=[web_search],
+    instructions="You are a research assistant. Search first, then summarize.",
+)
+
+result = await agent.run("What is JamJet?")
+print(result)
+```
+
+### Python — `Workflow` (full control)
+
+```python
+from jamjet import Workflow, tool
+from pydantic import BaseModel
+
+@tool
+async def web_search(query: str) -> str:
+    return f"Search results for: {query}"
+
+workflow = Workflow("research")
+
+@workflow.state
+class State(BaseModel):
+    query: str
+    answer: str | None = None
+
+@workflow.step
+async def search(state: State) -> State:
+    result = await web_search(query=state.query)
+    return state.model_copy(update={"answer": result})
+```
+
+All three levels compile to the same IR and run on the same durable Rust runtime.
+
+### Performance
+
+JamJet's IR compilation is **88× faster** than LangGraph's graph compilation:
+
+| Operation | JamJet | LangGraph |
+|-----------|--------|-----------|
+| Compile / graph build | **~0.006 ms** | ~0.529 ms |
+| In-process invocation | **~0.015 ms** | ~1.458 ms |
+
+Measured with Python 3.11, single-tool workflows. JamJet compiles a lightweight IR dict; LangGraph builds a NetworkX graph.
 
 ### MCP tool call
 
@@ -178,6 +262,8 @@ nodes:
 
 | Capability | JamJet | LangChain | AutoGen | CrewAI |
 |------------|--------|-----------|---------|--------|
+| **Simple agent setup** | ✅ 3 lines (`@task`) | 6+ lines | 10+ lines | 8+ lines |
+| **In-process execution** | ✅ `pip install` + run | ✅ native | ✅ native | ✅ native |
 | **Durable execution** | ✅ event-sourced, crash-safe | ❌ ephemeral | ❌ ephemeral | ❌ ephemeral |
 | **Human-in-the-loop** | ✅ first-class primitive | 🟡 callbacks | 🟡 conversational | 🟡 manual |
 | **MCP support** | ✅ client + server | 🟡 client only | 🟡 client only | 🟡 client only |
@@ -185,6 +271,7 @@ nodes:
 | **Built-in eval** | ✅ LLM judge, assertions | ❌ | ❌ | ❌ |
 | **Built-in observability** | ✅ OTel GenAI, event replay | 🟡 LangSmith (external) | ❌ | ❌ |
 | **Agent identity** | ✅ Agent Cards, A2A discovery | ❌ | ❌ | ❌ |
+| **Progressive complexity** | ✅ `@task` → `Agent` → `Workflow` | ❌ single API | ❌ | ❌ |
 | **Runtime language** | Rust core + Python authoring | Python | Python | Python |
 | **Best for** | Production multi-agent systems | Rapid prototyping | Conversational agents | Role-based crews |
 

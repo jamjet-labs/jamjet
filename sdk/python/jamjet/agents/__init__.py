@@ -1,1 +1,5 @@
-# Agent management Python API (stub — Phase 1)
+# Agent management Python API
+from jamjet.agents.agent import Agent, AgentResult
+from jamjet.agents.task import task
+
+__all__ = ["Agent", "AgentResult", "task"]

@@ -21,11 +21,13 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+from jamjet.workflow.executor import ExecutionResult, execute_workflow
 from jamjet.workflow.ir_compiler import compile_to_ir
 from jamjet.workflow.types import StepDef, WorkflowDef
 
@@ -129,6 +131,31 @@ class Workflow:
             steps=self._steps,
         )
         return compile_to_ir(defn)
+
+    async def run(self, initial_state: BaseModel, *, max_steps: int = 100) -> ExecutionResult:
+        """
+        Execute this workflow in-process. No runtime server needed.
+
+        Walks the step chain sequentially, calling each step function with the
+        current state and collecting the result. Supports conditional routing.
+
+        For production deployments, use :meth:`compile` and submit to the
+        JamJet runtime instead.
+
+        Example::
+
+            result = await workflow.run(State(query="What is JamJet?"))
+            print(result.state.answer)
+        """
+        if self._state_class is None:
+            raise ValueError(f"Workflow '{self.workflow_id}' has no @workflow.state defined")
+        if not self._steps:
+            raise ValueError(f"Workflow '{self.workflow_id}' has no @workflow.step definitions")
+        return await execute_workflow(self._steps, initial_state, max_steps)
+
+    def run_sync(self, initial_state: BaseModel, *, max_steps: int = 100) -> ExecutionResult:
+        """Synchronous wrapper around :meth:`run` for scripts and notebooks."""
+        return asyncio.run(self.run(initial_state, max_steps=max_steps))
 
     def __repr__(self) -> str:
         return f"Workflow(id={self.workflow_id!r}, steps={[s.name for s in self._steps]})"
