@@ -37,19 +37,14 @@ pub struct Skill {
     pub output_schema: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutonomyLevel {
     Deterministic,
+    #[default]
     Guided,
     BoundedAutonomous,
     FullyAutonomous,
-}
-
-impl Default for AutonomyLevel {
-    fn default() -> Self {
-        Self::Guided
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

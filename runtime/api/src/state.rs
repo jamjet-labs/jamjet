@@ -1,6 +1,6 @@
+use jamjet_a2a::A2aAdapter;
 use jamjet_agents::AgentRegistry;
 use jamjet_mcp::McpAdapter;
-use jamjet_a2a::A2aAdapter;
 use jamjet_protocols::{anp::AnpAdapter, ProtocolRegistry};
 use jamjet_state::backend::StateBackend;
 use std::sync::Arc;
@@ -37,11 +37,7 @@ pub fn default_protocol_registry() -> ProtocolRegistry {
         // A2A agents typically live at paths containing /a2a or /.well-known/agent.json
         vec![] as Vec<String>,
     );
-    reg.register(
-        "anp",
-        Arc::new(AnpAdapter::new()),
-        vec!["did:"],
-    );
+    reg.register("anp", Arc::new(AnpAdapter::new()), vec!["did:"]);
 
     reg
 }

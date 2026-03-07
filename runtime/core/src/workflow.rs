@@ -64,17 +64,17 @@ impl WorkflowStatus {
 
     /// Validate a state transition. Returns Ok(()) if the transition is valid.
     pub fn validate_transition(&self, next: &WorkflowStatus) -> crate::error::Result<()> {
-        let valid = match (self, next) {
-            (Self::Pending, Self::Running) => true,
-            (Self::Running, Self::Paused) => true,
-            (Self::Running, Self::Completed) => true,
-            (Self::Running, Self::Failed) => true,
-            (Self::Running, Self::Cancelled) => true,
-            (Self::Running, Self::LimitExceeded) => true,
-            (Self::Paused, Self::Running) => true,
-            (Self::Paused, Self::Cancelled) => true,
-            _ => false,
-        };
+        let valid = matches!(
+            (self, next),
+            (Self::Pending, Self::Running)
+                | (Self::Running, Self::Paused)
+                | (Self::Running, Self::Completed)
+                | (Self::Running, Self::Failed)
+                | (Self::Running, Self::Cancelled)
+                | (Self::Running, Self::LimitExceeded)
+                | (Self::Paused, Self::Running)
+                | (Self::Paused, Self::Cancelled)
+        );
         if valid {
             Ok(())
         } else {
@@ -140,7 +140,9 @@ mod tests {
     #[test]
     fn limit_exceeded_transition() {
         let s = WorkflowStatus::Running;
-        assert!(s.validate_transition(&WorkflowStatus::LimitExceeded).is_ok());
+        assert!(s
+            .validate_transition(&WorkflowStatus::LimitExceeded)
+            .is_ok());
         let s = WorkflowStatus::LimitExceeded;
         assert!(s.validate_transition(&WorkflowStatus::Running).is_err());
     }

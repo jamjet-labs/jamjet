@@ -1,6 +1,6 @@
 use crate::error::{IrError, IrResult};
 use crate::workflow::WorkflowIr;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 /// Validate a WorkflowIr. Returns Ok(()) if valid, Err with the first
 /// violation found otherwise.

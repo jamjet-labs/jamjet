@@ -686,8 +686,8 @@ impl StateBackend for SqliteBackend {
                 .bind(serde_json::to_string(&item.payload)?)
                 .bind(new_attempt as i64)
                 .bind("lease expired: worker dead")
-                .bind(&item.created_at.to_rfc3339())
-                .bind(&dead_lettered_at)
+                .bind(item.created_at.to_rfc3339())
+                .bind(dead_lettered_at)
                 .execute(&self.pool)
                 .await
                 .map_err(map_db_err)?;
@@ -761,8 +761,8 @@ impl StateBackend for SqliteBackend {
         .bind(serde_json::to_string(&item.payload)?)
         .bind(item.attempt as i64)
         .bind(last_error)
-        .bind(&item.created_at.to_rfc3339())
-        .bind(&dead_lettered_at)
+        .bind(item.created_at.to_rfc3339())
+        .bind(dead_lettered_at)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;

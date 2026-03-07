@@ -28,7 +28,6 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, instrument};
-use uuid::Uuid;
 
 // ── DID types ─────────────────────────────────────────────────────────────────
 
@@ -37,7 +36,9 @@ struct DidDocument {
     id: String,
     #[serde(default)]
     service: Vec<DidService>,
+    // Retained for forward-compat deserialization of full DID documents.
     #[serde(default, rename = "verificationMethod")]
+    #[allow(dead_code)]
     verification_method: Vec<Value>,
 }
 
@@ -54,6 +55,8 @@ struct DidService {
 #[serde(untagged)]
 enum ServiceEndpoint {
     String(String),
+    // Object endpoints (maps with `uri` key) — retained for spec compliance.
+    #[allow(dead_code)]
     Object(Value),
 }
 

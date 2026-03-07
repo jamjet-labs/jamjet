@@ -178,7 +178,7 @@ impl ModelAdapter for AnthropicAdapter {
             .as_deref()
             .unwrap_or(&self.default_model)
             .to_string();
-        tracing::Span::current().record("gen_ai.request.model", &model.as_str());
+        tracing::Span::current().record("gen_ai.request.model", model.as_str());
 
         debug!(model = %model, "Calling Anthropic Messages API");
 
@@ -207,7 +207,7 @@ impl ModelAdapter for AnthropicAdapter {
             .as_deref()
             .unwrap_or(&self.default_model)
             .to_string();
-        tracing::Span::current().record("gen_ai.request.model", &model.as_str());
+        tracing::Span::current().record("gen_ai.request.model", model.as_str());
 
         // Append schema instruction to system prompt.
         let schema_str = serde_json::to_string_pretty(&request.output_schema)

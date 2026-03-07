@@ -11,7 +11,6 @@ use jamjet_protocols::{
     TaskStatus, TaskStream,
 };
 use serde_json::json;
-use std::time::Duration;
 use tracing::instrument;
 use uuid::Uuid;
 

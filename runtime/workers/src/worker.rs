@@ -145,10 +145,10 @@ impl Worker {
 
         // Load workflow IR to get the node definition.
         let (workflow_id, workflow_version) = parse_payload(&item.payload);
-        node_span.record(gen_ai_attrs::JAMJET_WORKFLOW_ID, &workflow_id.as_str());
+        node_span.record(gen_ai_attrs::JAMJET_WORKFLOW_ID, workflow_id.as_str());
         node_span.record(
             gen_ai_attrs::JAMJET_WORKFLOW_VERSION,
-            &workflow_version.as_str(),
+            workflow_version.as_str(),
         );
         let node_kind = self
             .load_node_kind(&workflow_id, &workflow_version, &node_id)
@@ -158,7 +158,7 @@ impl Worker {
         let result = match node_kind {
             Ok(kind) => {
                 let kind_tag = node_kind_tag(&kind);
-                node_span.record(gen_ai_attrs::JAMJET_NODE_KIND, &kind_tag.as_str());
+                node_span.record(gen_ai_attrs::JAMJET_NODE_KIND, kind_tag.as_str());
                 match self.executors.get(&kind_tag) {
                     Some(executor) => executor.execute(&item).await,
                     None => {

@@ -81,6 +81,7 @@ impl TaskStore {
         }
     }
 
+    #[allow(dead_code)]
     async fn add_artifact(&self, task_id: &str, artifact: A2aArtifact) {
         let event = A2aStreamEvent::ArtifactUpdate {
             id: task_id.to_string(),

@@ -8,8 +8,6 @@
 //! `redact_value()` replaces resolved secret values with `[REDACTED]` before
 //! they appear in logs or traces.
 
-use std::collections::HashMap;
-
 // ── Secret backend trait ──────────────────────────────────────────────────────
 
 pub trait SecretBackend: Send + Sync {

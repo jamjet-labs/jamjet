@@ -38,7 +38,7 @@ pub enum Role {
 }
 
 impl Role {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_role(s: &str) -> Self {
         match s {
             "operator" => Self::Operator,
             "developer" => Self::Developer,
@@ -118,7 +118,7 @@ pub async fn require_write_role(req: Request<Body>, next: Next) -> Response {
         let role = req
             .extensions()
             .get::<ApiToken>()
-            .map(|t| Role::from_str(&t.role))
+            .map(|t| Role::parse_role(&t.role))
             .unwrap_or(Role::Viewer);
 
         if !role.can_write() {
@@ -142,7 +142,7 @@ pub async fn require_operator_role(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if !Role::from_str(&token.role).can_admin() {
+    if !Role::parse_role(&token.role).can_admin() {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({

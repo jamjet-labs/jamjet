@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use jamjet_agents::{AgentCard, AgentFilter, AgentRegistry, AgentStatus};
+use jamjet_agents::{AgentCard, AgentFilter, AgentStatus};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::{WorkItem, WorkflowDefinition};
 use serde::Deserialize;
@@ -370,7 +370,7 @@ async fn register_agent(
         .agents
         .register(body)
         .await
-        .map_err(|e| ApiError::Internal(e))?;
+        .map_err(ApiError::Internal)?;
     Ok((StatusCode::CREATED, Json(json!({ "agent_id": agent_id }))))
 }
 
@@ -401,7 +401,7 @@ async fn list_agents(
         .agents
         .find(filter)
         .await
-        .map_err(|e| ApiError::Internal(e))?;
+        .map_err(ApiError::Internal)?;
     Ok(Json(json!({ "agents": agents })))
 }
 
@@ -415,7 +415,7 @@ async fn get_agent(
         .agents
         .get(uuid)
         .await
-        .map_err(|e| ApiError::Internal(e))?
+        .map_err(ApiError::Internal)?
         .ok_or_else(|| ApiError::NotFound(format!("agent {id}")))?;
     Ok(Json(serde_json::to_value(agent).unwrap()))
 }
@@ -430,7 +430,7 @@ async fn activate_agent(
         .agents
         .update_status(uuid, AgentStatus::Active)
         .await
-        .map_err(|e| ApiError::Internal(e))?;
+        .map_err(ApiError::Internal)?;
     Ok(Json(json!({ "agent_id": id, "status": "active" })))
 }
 
@@ -444,7 +444,7 @@ async fn deactivate_agent(
         .agents
         .update_status(uuid, AgentStatus::Deactivated)
         .await
-        .map_err(|e| ApiError::Internal(e))?;
+        .map_err(ApiError::Internal)?;
     Ok(Json(json!({ "agent_id": id, "status": "deactivated" })))
 }
 
@@ -470,7 +470,7 @@ async fn discover_agent(
         .agents
         .discover_remote(&body.url)
         .await
-        .map_err(|e| ApiError::Internal(e))?;
+        .map_err(ApiError::Internal)?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::to_value(&agent).unwrap()),
@@ -488,7 +488,7 @@ async fn agent_heartbeat(
         .agents
         .heartbeat(uuid)
         .await
-        .map_err(|e| ApiError::Internal(e))?;
+        .map_err(ApiError::Internal)?;
     Ok(Json(json!({ "agent_id": id, "ok": true })))
 }
 
@@ -508,7 +508,7 @@ async fn serve_did_document(State(state): State<AppState>) -> Result<Json<Value>
             protocol: None,
         })
         .await
-        .map_err(|e| ApiError::Internal(e))?;
+        .map_err(ApiError::Internal)?;
 
     let public_url = std::env::var("JAMJET_PUBLIC_URL").unwrap_or_else(|_| {
         let bind = std::env::var("JAMJET_BIND").unwrap_or_else(|_| "localhost".into());
