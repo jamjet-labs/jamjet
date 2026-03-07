@@ -50,17 +50,20 @@ def _client(runtime: str = "http://localhost:7700") -> JamjetClient:
 
 @app.command()
 def init(
-    project_name: str = typer.Argument(..., help="Name of the new project"),
+    project_name: str | None = typer.Argument(None, help="Name of the new project (omit to initialise in the current directory)"),
 ) -> None:
-    """Create a new JamJet project."""
+    """Initialise a JamJet project. Pass a name to create a new directory, or omit to set up in the current directory."""
     import os
 
-    project_dir = os.path.join(os.getcwd(), project_name)
-    if os.path.exists(project_dir):
-        console.print(f"[red]Error:[/red] directory '{project_name}' already exists")
-        raise typer.Exit(1)
-
-    os.makedirs(project_dir)
+    if project_name:
+        project_dir = os.path.join(os.getcwd(), project_name)
+        if os.path.exists(project_dir):
+            console.print(f"[red]Error:[/red] directory '{project_name}' already exists")
+            raise typer.Exit(1)
+        os.makedirs(project_dir)
+    else:
+        project_name = os.path.basename(os.getcwd())
+        project_dir = os.getcwd()
 
     workflow_yaml = f"""# {project_name}/workflow.yaml
 # Edit this file, then run: jamjet dev  (in another terminal: jamjet run workflow.yaml)
@@ -106,12 +109,13 @@ Open `workflow.yaml` to change the workflow. See the [JamJet docs](https://jamje
     with open(os.path.join(project_dir, "README.md"), "w") as f:
         f.write(readme)
 
-    console.print(f"[green]✓[/green] Created [bold]{project_name}/[/bold]")
+    console.print(f"[green]✓[/green] Initialised [bold]{project_name}[/bold]")
     console.print("  [dim]workflow.yaml[/dim]   ← your workflow (edit this)")
     console.print("  [dim]README.md[/dim]")
     console.print()
     console.print("[bold]Next steps:[/bold]")
-    console.print(f"  cd {project_name}")
+    if project_name != os.path.basename(os.getcwd()):
+        console.print(f"  cd {project_name}")
     console.print("  jamjet dev              [dim]# start the runtime[/dim]")
     console.print("  jamjet run workflow.yaml [dim]# run in another terminal[/dim]")
 

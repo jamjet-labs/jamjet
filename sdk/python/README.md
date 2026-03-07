@@ -77,9 +77,13 @@ JamJet is a **performance-first, agent-native runtime and framework** for buildi
 # Install the CLI (runtime binary included)
 pip install jamjet
 
-# Create a new project
+# Option A — scaffold a new project
 jamjet init my-agent-project
 cd my-agent-project
+
+# Option B — add JamJet to an existing project (works like git init)
+cd my-existing-project
+jamjet init
 
 # Start local dev runtime (SQLite, embedded — no server setup needed)
 jamjet dev
