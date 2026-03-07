@@ -9,36 +9,71 @@ use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
+/// Configuration for the scheduler.
+#[derive(Debug, Clone)]
+pub struct SchedulerConfig {
+    /// How often the scheduler polls for runnable nodes.
+    pub poll_interval: Duration,
+    /// Maximum number of nodes that may be simultaneously active (scheduled or
+    /// running) per execution. Prevents a single large workflow from
+    /// monopolising all workers. Default: 16.
+    pub max_concurrent_nodes_per_execution: usize,
+    /// Maximum number of new nodes dispatched per execution per scheduler tick.
+    /// Provides backpressure so a burst of runnable nodes doesn't saturate the
+    /// queue all at once. Default: 8.
+    pub max_dispatch_per_tick: usize,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_millis(500),
+            max_concurrent_nodes_per_execution: 16,
+            max_dispatch_per_tick: 8,
+        }
+    }
+}
+
 /// The JamJet scheduler drives workflow execution.
 ///
 /// It runs as a Tokio async loop, detecting runnable nodes and dispatching
 /// them to the worker queue.
 pub struct Scheduler {
     backend: Arc<dyn StateBackend>,
-    poll_interval: Duration,
+    config: SchedulerConfig,
 }
 
 impl Scheduler {
     pub fn new(backend: Arc<dyn StateBackend>) -> Self {
         Self {
             backend,
-            poll_interval: Duration::from_millis(500),
+            config: SchedulerConfig::default(),
         }
     }
 
+    pub fn with_config(mut self, config: SchedulerConfig) -> Self {
+        self.config = config;
+        self
+    }
+
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
-        self.poll_interval = interval;
+        self.config.poll_interval = interval;
         self
     }
 
     /// Run the scheduler loop. This runs indefinitely until the future is cancelled.
     pub async fn run(&self) {
-        info!("Scheduler started (poll_interval={:?})", self.poll_interval);
+        info!(
+            "Scheduler started (poll_interval={:?}, max_concurrent={}, max_dispatch_per_tick={})",
+            self.config.poll_interval,
+            self.config.max_concurrent_nodes_per_execution,
+            self.config.max_dispatch_per_tick,
+        );
         loop {
             if let Err(e) = self.tick().await {
                 warn!("Scheduler tick error: {e}");
             }
-            tokio::time::sleep(self.poll_interval).await;
+            tokio::time::sleep(self.config.poll_interval).await;
         }
     }
 
@@ -212,9 +247,33 @@ impl Scheduler {
             "Checking for runnable nodes"
         );
 
+        // Concurrency limit: if this execution is already at the cap, skip dispatch.
+        if scheduled.len() >= self.config.max_concurrent_nodes_per_execution {
+            debug!(
+                execution_id = %execution_id,
+                active = scheduled.len(),
+                limit = self.config.max_concurrent_nodes_per_execution,
+                "Concurrency limit reached — skipping dispatch"
+            );
+            return Ok(());
+        }
+
         // Find nodes that are runnable and enqueue them.
         let mut enqueued = 0usize;
         for (node_id, node) in &ir.nodes {
+            // Backpressure: stop dispatching if we've hit the per-tick cap or the
+            // concurrency limit (accounting for nodes dispatched this tick).
+            if enqueued >= self.config.max_dispatch_per_tick {
+                debug!(
+                    execution_id = %execution_id,
+                    dispatched = enqueued,
+                    "Per-tick dispatch limit reached — deferring remaining nodes"
+                );
+                break;
+            }
+            if scheduled.len() + enqueued >= self.config.max_concurrent_nodes_per_execution {
+                break;
+            }
             if terminal_failed.contains(node_id.as_str()) {
                 continue; // permanently failed
             }

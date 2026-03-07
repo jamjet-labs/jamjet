@@ -26,7 +26,22 @@ impl NodeExecutor for AgentDiscoveryExecutor {
 
         debug!(agent_url = %agent_url, "Discovering agent");
 
-        let card_url = format!("{}/.well-known/agent.json", agent_url.trim_end_matches('/'));
+        // Handle did: URLs: resolve did:web to HTTPS URL first (I2.4).
+        let resolved_base = if agent_url.starts_with("did:web:") {
+            let rest = agent_url.trim_start_matches("did:web:");
+            let parts: Vec<&str> = rest.splitn(2, ':').collect();
+            let host = parts[0];
+            let path = if parts.len() > 1 {
+                format!("/{}", parts[1].replace(':', "/"))
+            } else {
+                String::new()
+            };
+            format!("https://{host}{path}")
+        } else {
+            agent_url.trim_end_matches('/').to_string()
+        };
+
+        let card_url = format!("{resolved_base}/.well-known/agent.json");
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()

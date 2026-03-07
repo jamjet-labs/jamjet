@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         backend: Arc::new(backend),
         agents: Arc::new(agents),
+        protocols: jamjet_api::state::default_protocol_registry(),
     };
 
     let router = build_router(state);

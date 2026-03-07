@@ -6,6 +6,9 @@
 //! the runtime core.
 
 pub mod anp;
+pub mod registry;
+
+pub use registry::ProtocolRegistry;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -130,6 +133,7 @@ pub trait ProtocolAdapter: Send + Sync {
 
     /// Stream task with structured typed chunks (I2.6).
     /// Default: wraps `stream()` and maps `TaskEvent` to `StreamChunk`.
+    /// Each chunk is also emitted as a `tracing` span event (I2.8).
     async fn stream_structured(
         &self,
         url: &str,
@@ -137,24 +141,58 @@ pub trait ProtocolAdapter: Send + Sync {
     ) -> Result<StructuredStream, String> {
         use tokio_stream::StreamExt;
         let event_stream = self.stream(url, task).await?;
-        let chunk_stream = event_stream.map(|event| match event {
-            TaskEvent::Progress { message, progress } => StreamChunk::Progress {
-                message,
-                fraction: progress,
-            },
-            TaskEvent::Artifact { name, data } => StreamChunk::Artifact {
-                name,
-                data,
-                mime_type: None,
-            },
-            TaskEvent::Completed { output } => StreamChunk::Final { output },
-            TaskEvent::Failed { error } => StreamChunk::Error { message: error },
-            TaskEvent::InputRequired { prompt } => StreamChunk::Progress {
-                message: format!("input required: {prompt}"),
-                fraction: None,
-            },
+        let chunk_stream = event_stream.map(|event| {
+            let chunk = match event {
+                TaskEvent::Progress { message, progress } => StreamChunk::Progress {
+                    message,
+                    fraction: progress,
+                },
+                TaskEvent::Artifact { name, data } => StreamChunk::Artifact {
+                    name,
+                    data,
+                    mime_type: None,
+                },
+                TaskEvent::Completed { output } => StreamChunk::Final { output },
+                TaskEvent::Failed { error } => StreamChunk::Error { message: error },
+                TaskEvent::InputRequired { prompt } => StreamChunk::Progress {
+                    message: format!("input required: {prompt}"),
+                    fraction: None,
+                },
+            };
+            // I2.8: emit span event for each structured stream chunk.
+            let chunk_type = match &chunk {
+                StreamChunk::TextDelta { .. } => "text_delta",
+                StreamChunk::ToolCall { .. } => "tool_call",
+                StreamChunk::Progress { .. } => "progress",
+                StreamChunk::Artifact { .. } => "artifact",
+                StreamChunk::Final { .. } => "final",
+                StreamChunk::Error { .. } => "error",
+            };
+            tracing::debug!(stream_chunk = chunk_type, "stream_chunk_emitted");
+            chunk
         });
         Ok(Box::pin(chunk_stream))
+    }
+
+    /// Stream with backpressure: bounded channel buffers at most `buffer_size` chunks
+    /// before applying flow control to the producer (I2.9).
+    async fn stream_with_backpressure(
+        &self,
+        url: &str,
+        task: TaskRequest,
+        buffer_size: usize,
+    ) -> Result<StructuredStream, String> {
+        use tokio_stream::StreamExt;
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(buffer_size);
+        let mut source = self.stream_structured(url, task).await?;
+        tokio::spawn(async move {
+            while let Some(chunk) = source.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break; // receiver dropped
+                }
+            }
+        });
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     /// Poll task status by task_id.

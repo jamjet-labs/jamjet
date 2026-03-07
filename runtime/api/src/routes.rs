@@ -49,6 +49,7 @@ pub fn build_router(state: AppState) -> Router {
     // Public routes — no auth required.
     Router::new()
         .route("/health", get(health))
+        .route("/.well-known/did.json", get(serve_did_document))
         .merge(protected)
         .with_state(state)
 }
@@ -489,6 +490,57 @@ async fn agent_heartbeat(
         .await
         .map_err(|e| ApiError::Internal(e))?;
     Ok(Json(json!({ "agent_id": id, "ok": true })))
+}
+
+// ── DID Document publishing (I2.2) ───────────────────────────────────────────
+
+/// `GET /.well-known/did.json` — serve the runtime's W3C DID Document.
+///
+/// Builds a `did:web` document from all active registered agents. Each active
+/// agent is listed as an A2A service endpoint. The DID host is derived from
+/// `JAMJET_PUBLIC_URL` (preferred) or `JAMJET_BIND`:`JAMJET_PORT`.
+async fn serve_did_document(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let agents = state
+        .agents
+        .find(AgentFilter {
+            status: Some(AgentStatus::Active),
+            skill: None,
+            protocol: None,
+        })
+        .await
+        .map_err(|e| ApiError::Internal(e))?;
+
+    let public_url = std::env::var("JAMJET_PUBLIC_URL").unwrap_or_else(|_| {
+        let bind = std::env::var("JAMJET_BIND").unwrap_or_else(|_| "localhost".into());
+        let port = std::env::var("JAMJET_PORT").unwrap_or_else(|_| "7700".into());
+        format!("http://{}:{}", bind, port)
+    });
+
+    // did:web:<host> or did:web:<host>:<path>
+    let did_host = public_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .replace('/', ":");
+    let did_id = format!("did:web:{did_host}");
+
+    let services: Vec<Value> = agents
+        .iter()
+        .map(|agent| {
+            let agent_name = &agent.card.name;
+            json!({
+                "id": format!("#{}", agent.id),
+                "type": "A2AService",
+                "serviceEndpoint": format!("{}/agents/{}", public_url, agent.id),
+                "name": agent_name,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": did_id,
+        "service": services,
+    })))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

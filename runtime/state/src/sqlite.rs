@@ -74,6 +74,7 @@ fn status_to_str(s: &WorkflowStatus) -> &'static str {
         WorkflowStatus::Completed => "completed",
         WorkflowStatus::Failed => "failed",
         WorkflowStatus::Cancelled => "cancelled",
+        WorkflowStatus::LimitExceeded => "limit_exceeded",
     }
 }
 
@@ -85,6 +86,7 @@ fn str_to_status(s: &str) -> BackendResult<WorkflowStatus> {
         "completed" => Ok(WorkflowStatus::Completed),
         "failed" => Ok(WorkflowStatus::Failed),
         "cancelled" => Ok(WorkflowStatus::Cancelled),
+        "limit_exceeded" => Ok(WorkflowStatus::LimitExceeded),
         other => Err(StateBackendError::Database(format!(
             "unknown status: {other}"
         ))),

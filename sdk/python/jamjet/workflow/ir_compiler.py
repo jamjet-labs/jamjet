@@ -2,6 +2,22 @@
 Compile Python workflow definitions and YAML files to the canonical JamJet IR.
 
 Both paths produce the same IR dict, which is then submitted to the runtime API.
+
+Agent-first YAML
+----------------
+A top-level ``agent:`` block triggers the strategy compiler instead of the
+manual ``nodes:`` + ``edges:`` path::
+
+    agent:
+      id: my-agent
+      strategy: plan-and-execute
+      goal: "Research the given company and write an investment memo"
+      tools: [search_web, read_document]
+      model: gpt-4o
+      limits:
+        max_iterations: 6
+        max_cost_usd: 0.50
+        timeout_seconds: 120
 """
 
 from __future__ import annotations
@@ -70,19 +86,36 @@ def compile_yaml(yaml_content: str) -> dict[str, Any]:
     """
     Compile a workflow.yaml string to the canonical IR dict.
 
-    The YAML schema is:
+    Supports two top-level schemas:
+
+    **Graph/workflow mode** (manual nodes + edges)::
+
         workflow:
           id: ...
-          version: ...
-          state_schema: ...
-          start: ...
         nodes:
           <node_id>:
             type: model|tool|condition|human_approval|...
-            ...
-        edges (or inline next: in each node)
+
+    **Agent-first mode** (strategy compiler)::
+
+        agent:
+          id: my-agent
+          strategy: plan-and-execute
+          goal: "..."
+          tools: [search_web]
+          model: gpt-4o
+          limits:
+            max_iterations: 6
+            max_cost_usd: 0.50
+            timeout_seconds: 120
     """
     data = yaml.safe_load(yaml_content)
+
+    # ── Agent-first mode ──────────────────────────────────────────────────────
+    if "agent" in data:
+        return _compile_agent_yaml(data)
+
+    # ── Graph/workflow mode ───────────────────────────────────────────────────
     wf = data.get("workflow", {})
     raw_nodes = data.get("nodes", {})
 
@@ -136,6 +169,114 @@ def compile_yaml(yaml_content: str) -> dict[str, Any]:
         "mcp_servers": data.get("mcp", {}).get("servers", {}),
         "remote_agents": data.get("a2a", {}).get("remote_agents", {}),
         "labels": wf.get("labels", {}),
+    }
+
+
+def _compile_agent_yaml(data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Compile an agent-first YAML document to IR (§14.2).
+
+    Required fields inside the ``agent:`` block:
+        id, strategy, goal, model, limits.max_iterations,
+        limits.max_cost_usd, limits.timeout_seconds
+
+    Raises ``ValueError`` with an actionable message if required fields are
+    missing (§14.5 / J2.10).
+    """
+    from jamjet.compiler.strategies import StrategyLimits, compile_strategy
+
+    agent = data["agent"]
+
+    # ── Validate required fields ──────────────────────────────────────────────
+    missing = [f for f in ("id", "strategy", "goal", "model") if not agent.get(f)]
+    if missing:
+        raise ValueError(
+            f"agent-first workflow is missing required fields: {', '.join(missing)}"
+        )
+
+    limits_raw = agent.get("limits")
+    if not limits_raw:
+        raise ValueError(
+            "agent-first workflows require a 'limits' block (§14.5).\n"
+            "Add:\n"
+            "  limits:\n"
+            "    max_iterations: 10\n"
+            "    max_cost_usd: 0.50\n"
+            "    timeout_seconds: 120"
+        )
+
+    for lf in ("max_iterations", "max_cost_usd", "timeout_seconds"):
+        if lf not in limits_raw:
+            raise ValueError(
+                f"agent-first workflow limits block is missing '{lf}' (§14.5).\n"
+                "All three limits are required: max_iterations, max_cost_usd, timeout_seconds."
+            )
+
+    limits = StrategyLimits(
+        max_iterations=int(limits_raw["max_iterations"]),
+        max_cost_usd=float(limits_raw["max_cost_usd"]),
+        timeout_seconds=int(limits_raw["timeout_seconds"]),
+    )
+
+    agent_id = agent["id"]
+    strategy_name = agent["strategy"]
+    strategy_config = agent.get("strategy_config", {})
+    tools = agent.get("tools", [])
+    model = agent["model"]
+    goal = agent["goal"]
+    version = agent.get("version", "0.1.0")
+
+    # ── Compile strategy → IR sub-DAG ─────────────────────────────────────────
+    compiled = compile_strategy(
+        strategy_name=strategy_name,
+        strategy_config=strategy_config,
+        tools=tools,
+        model=model,
+        limits=limits,
+        goal=goal,
+        agent_id=agent_id,
+    )
+
+    raw_nodes = compiled["nodes"]
+    raw_edges = compiled["edges"]
+    start_node = compiled["start_node"]
+    strategy_meta = compiled["strategy_metadata"]
+
+    # Normalise nodes into IR format
+    nodes: dict[str, Any] = {}
+    for node_id, node_def in raw_nodes.items():
+        nodes[node_id] = {
+            "id": node_id,
+            "kind": node_def["kind"],
+            "retry_policy": node_def.get("retry_policy"),
+            "node_timeout_secs": node_def.get("node_timeout_secs"),
+            "description": node_def.get("description"),
+            "labels": node_def.get("labels", {}),
+        }
+
+    return {
+        "workflow_id": agent_id,
+        "version": version,
+        "name": agent.get("name", agent_id),
+        "description": goal,
+        "state_schema": agent.get("state_schema", ""),
+        "start_node": start_node,
+        "nodes": nodes,
+        "edges": raw_edges,
+        "retry_policies": {},
+        "timeouts": {
+            "workflow_timeout": limits.timeout_seconds,
+            "heartbeat_interval": 30,
+        },
+        "models": {},
+        "tools": {},
+        "mcp_servers": {},
+        "remote_agents": {},
+        "labels": {
+            "jamjet.strategy": strategy_name,
+            "jamjet.agent.id": agent_id,
+        },
+        "strategy_metadata": strategy_meta,
     }
 
 

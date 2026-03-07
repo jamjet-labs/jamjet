@@ -8,6 +8,9 @@ use serde_json::Value;
 pub struct McpTool {
     pub name: String,
     pub description: Option<String>,
+    /// JSON Schema describing the tool's inputs.
+    /// The MCP protocol sends this as `inputSchema` (camelCase).
+    #[serde(rename = "inputSchema")]
     pub input_schema: Value,
 }
 
@@ -22,6 +25,9 @@ pub struct McpToolCallRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolCallResponse {
     pub content: Vec<McpContent>,
+    /// Whether the tool execution resulted in an error.
+    /// The MCP protocol sends this as `isError` (camelCase).
+    #[serde(rename = "isError")]
     pub is_error: Option<bool>,
 }
 
