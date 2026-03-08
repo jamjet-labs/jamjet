@@ -73,6 +73,8 @@ impl PolicyEvaluator {
                         ),
                     };
                 }
+                // Model matched this layer's allowlist — stop checking less-specific layers.
+                return PolicyDecision::Allow;
             }
 
             // 2. Blocked tools check.
