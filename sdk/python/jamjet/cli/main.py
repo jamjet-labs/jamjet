@@ -76,6 +76,7 @@ def _print_logo() -> None:
 
 # ── Version callback ──────────────────────────────────────────────────────────
 
+
 def _version_callback(value: bool) -> None:
     if value:
         _print_logo()
@@ -93,13 +94,17 @@ app = typer.Typer(
 @app.callback()
 def _main(
     version: bool = typer.Option(  # noqa: FBT001
-        False, "--version", "-V",
+        False,
+        "--version",
+        "-V",
         callback=_version_callback,
         is_eager=True,
         help="Print version and exit.",
     ),
 ) -> None:
     pass
+
+
 agents_app = typer.Typer(help="Manage agents", no_args_is_help=True)
 mcp_app = typer.Typer(help="MCP server tools", no_args_is_help=True)
 a2a_app = typer.Typer(help="A2A agent tools", no_args_is_help=True)

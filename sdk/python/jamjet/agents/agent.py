@@ -69,10 +69,7 @@ class Agent:
         for t in tools:
             defn = getattr(t, "_jamjet_tool", None)
             if defn is None:
-                raise TypeError(
-                    f"{t!r} is not a @tool-decorated function. "
-                    "Wrap it with @jamjet.tool first."
-                )
+                raise TypeError(f"{t!r} is not a @tool-decorated function. Wrap it with @jamjet.tool first.")
             self._tools.append(defn)
 
     @property
@@ -126,12 +123,14 @@ class Agent:
                 duration_us = (time.perf_counter_ns() - t_call) / 1000
                 output_str = str(result)
                 tool_outputs.append({"tool": td.name, "output": output_str})
-                tool_calls.append({
-                    "tool": td.name,
-                    "input": prompt,
-                    "output": output_str,
-                    "duration_us": duration_us,
-                })
+                tool_calls.append(
+                    {
+                        "tool": td.name,
+                        "input": prompt,
+                        "output": output_str,
+                        "duration_us": duration_us,
+                    }
+                )
 
             parts = [to["output"] for to in tool_outputs]
             final_output = "\n\n".join(parts)
@@ -150,10 +149,7 @@ class Agent:
         return asyncio.run(self.run(prompt))
 
     def __repr__(self) -> str:
-        return (
-            f"Agent(name={self.name!r}, model={self.model!r}, "
-            f"tools={self.tool_names}, strategy={self.strategy!r})"
-        )
+        return f"Agent(name={self.name!r}, model={self.model!r}, tools={self.tool_names}, strategy={self.strategy!r})"
 
 
 class AgentResult:

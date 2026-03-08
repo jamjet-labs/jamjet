@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -50,10 +49,7 @@ class ExecutionResult:
         return str(self.state)
 
     def __repr__(self) -> str:
-        return (
-            f"ExecutionResult(steps={self.steps_executed}, "
-            f"duration={self.total_duration_us:.1f}µs)"
-        )
+        return f"ExecutionResult(steps={self.steps_executed}, duration={self.total_duration_us:.1f}µs)"
 
 
 async def execute_workflow(

@@ -4,9 +4,8 @@ import asyncio
 
 import pytest
 
-from jamjet import Agent, tool, task
+from jamjet import Agent, task, tool
 from jamjet.agents.agent import AgentResult
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -18,7 +17,7 @@ async def search(query: str) -> str:
 
 @tool
 async def calculator(query: str) -> str:
-    return f"42"
+    return "42"
 
 
 # ── Agent tests ───────────────────────────────────────────────────────────────

@@ -215,10 +215,7 @@ impl NodeExecutor for EvalExecutor {
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
 
-        debug!(
-            scorers = scorers.len(),
-            "Running eval node"
-        );
+        debug!(scorers = scorers.len(), "Running eval node");
 
         // Run all scorers.
         let mut results: Vec<ScorerResult> = Vec::new();
@@ -239,9 +236,7 @@ impl NodeExecutor for EvalExecutor {
                 EvalScorer::Cost { threshold_usd } => {
                     self.run_cost(*threshold_usd, preceding_cost_usd)
                 }
-                EvalScorer::Custom { module, kwargs } => {
-                    self.run_custom(module, kwargs, &subject)
-                }
+                EvalScorer::Custom { module, kwargs } => self.run_custom(module, kwargs, &subject),
             };
             results.push(result);
         }
@@ -355,11 +350,11 @@ fn eval_assertion(check: &str, subject: &Value) -> bool {
     if let Some(rest) = check.strip_prefix("output.") {
         if let Some(eq_pos) = rest.find(" == ") {
             let field = rest[..eq_pos].trim();
-            let expected = rest[eq_pos + 4..].trim().trim_matches('\'').trim_matches('"');
-            let actual = subject
-                .get(field)
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let expected = rest[eq_pos + 4..]
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"');
+            let actual = subject.get(field).and_then(|v| v.as_str()).unwrap_or("");
             return actual == expected;
         }
         if let Some(ne_pos) = rest.find(" != ") {
