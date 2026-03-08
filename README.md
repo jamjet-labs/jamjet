@@ -11,9 +11,9 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square)](https://rustup.rs)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)](https://python.org)
 [![Java](https://img.shields.io/badge/java-21%2B-red?style=flat-square)](https://openjdk.org)
-[![Docs](https://img.shields.io/badge/docs-jamjet.dev-f5c518?style=flat-square)](https://jamjet.dev/docs/quickstart)
+[![Docs](https://img.shields.io/badge/docs-jamjet.dev-f5c518?style=flat-square)](https://jamjet.dev/quickstart)
 
-[jamjet.dev](https://jamjet.dev) · [Quickstart](https://jamjet.dev/docs/quickstart) · [Docs](https://jamjet.dev/docs/concepts) · [Examples](https://jamjet.dev/examples) · [Blog](https://jamjet.dev/blog)
+[jamjet.dev](https://jamjet.dev) · [Quickstart](https://jamjet.dev/quickstart) · [Concepts](https://jamjet.dev/concepts) · [Examples](https://jamjet.dev/examples) · [Blog](https://jamjet.dev/blog)
 
 </div>
 
@@ -87,7 +87,7 @@ In another terminal:
 jamjet run workflow.yaml --input '{"query": "What is JamJet?"}'
 ```
 
-→ **[Full quickstart guide](https://jamjet.dev/docs/quickstart)**
+→ **[Full quickstart guide](https://jamjet.dev/quickstart)**
 
 ---
 
@@ -304,21 +304,20 @@ nodes:
 
 ## Documentation
 
-Full documentation at **[jamjet.dev/docs](https://jamjet.dev/docs/quickstart)**
+Full documentation at **[jamjet.dev](https://jamjet.dev/quickstart)**
 
 | | |
 |--|--|
-| [Quickstart](https://jamjet.dev/docs/quickstart) | Get running in 10 minutes |
-| [Core Concepts](https://jamjet.dev/docs/concepts) | Agents, workflows, nodes, state, durability |
-| [YAML Workflows](https://jamjet.dev/docs/yaml-workflows) | All node types, retry policies, conditions |
-| [Python SDK](https://jamjet.dev/docs/python-sdk) | Full Python SDK reference |
-| [Java SDK](https://jamjet.dev/docs/java-sdk) | JDK 21, virtual threads, records |
-| [MCP Integration](https://jamjet.dev/docs/mcp) | Connect to MCP servers, expose tools |
-| [A2A Integration](https://jamjet.dev/docs/a2a) | Delegate to and serve external agents |
-| [Eval Harness](https://jamjet.dev/docs/eval) | Score quality, run regression suites, gate CI |
-| [Observability](https://jamjet.dev/docs/observability) | OTel traces, metrics, Prometheus |
-| [Deployment](https://jamjet.dev/docs/deployment) | Docker, Kubernetes, PostgreSQL |
-| [CLI Reference](https://jamjet.dev/docs/cli) | Full CLI reference |
+| [Quickstart](https://jamjet.dev/quickstart) | Get running in 10 minutes |
+| [Core Concepts](https://jamjet.dev/concepts) | Agents, workflows, nodes, state, durability |
+| [YAML Workflows](https://jamjet.dev/yaml-workflows) | All node types, retry policies, conditions |
+| [Python SDK](https://jamjet.dev/python-sdk) | Full Python SDK reference |
+| [MCP Integration](https://jamjet.dev/mcp) | Connect to MCP servers, expose tools |
+| [A2A Integration](https://jamjet.dev/a2a) | Delegate to and serve external agents |
+| [Eval Harness](https://jamjet.dev/eval) | Score quality, run regression suites, gate CI |
+| [Observability](https://jamjet.dev/observability) | OTel traces, metrics, Prometheus |
+| [Deployment](https://jamjet.dev/deployment) | Docker, Kubernetes, PostgreSQL |
+| [CLI Reference](https://jamjet.dev/cli) | Full CLI reference |
 
 ---
 
