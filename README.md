@@ -388,5 +388,5 @@ Apache 2.0 — see [LICENSE](LICENSE).
 ---
 
 <div align="center">
-  <sub>© 2026 JamJet — <a href="https://jamjet.dev">jamjet.dev</a></sub>
+  <sub>Built by <a href="https://github.com/sunilp">Sunil Prakash</a> · © 2026 JamJet · <a href="https://jamjet.dev">jamjet.dev</a> · Apache 2.0</sub>
 </div>
