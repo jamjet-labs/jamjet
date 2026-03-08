@@ -7,6 +7,9 @@ license.workspace = true
 
 [dependencies]
 jamjet-core = { path = "../core" }
+jamjet-ir = { path = "../ir" }
+jamjet-agents = { path = "../agents" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }

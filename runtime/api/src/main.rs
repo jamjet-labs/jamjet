@@ -1,5 +1,6 @@
 use jamjet_agents::SqliteAgentRegistry;
 use jamjet_api::{config::ApiConfig, routes::build_router, state::AppState};
+use jamjet_audit::{AuditEnricher, SqliteAuditBackend};
 use jamjet_state::SqliteBackend;
 use std::sync::Arc;
 use tracing::info;
@@ -45,9 +46,22 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("failed to open agent registry: {e}"))?;
 
+    // Audit log uses the same SQLite file as the state backend.
+    let audit_backend = SqliteAuditBackend::open(&database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to open audit backend: {e}"))?;
+    audit_backend
+        .migrate()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to migrate audit log: {e}"))?;
+    let audit: Arc<dyn jamjet_audit::AuditBackend> = Arc::new(audit_backend);
+    let enricher = Arc::new(AuditEnricher::new(Arc::clone(&audit)));
+
     let state = AppState {
         backend: Arc::new(backend),
         agents: Arc::new(agents),
+        audit,
+        enricher,
         protocols: jamjet_api::state::default_protocol_registry(),
     };
 

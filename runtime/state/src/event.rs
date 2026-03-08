@@ -162,6 +162,57 @@ pub enum EventKind {
         limit: u64,
         current: u64,
     },
+    TokenBudgetExceeded {
+        node_id: NodeId,
+        /// "input_tokens" | "output_tokens" | "total_tokens"
+        kind: String,
+        limit: u64,
+        current: u64,
+    },
+    CostBudgetExceeded {
+        node_id: NodeId,
+        limit_usd: f64,
+        current_usd: f64,
+    },
+    AutonomyLimitReached {
+        node_id: NodeId,
+        agent_ref: String,
+        /// "max_iterations" | "cost_budget" | "token_budget" | "max_tool_calls"
+        limit_type: String,
+        limit_value: serde_json::Value,
+        actual_value: serde_json::Value,
+    },
+    CircuitBreakerTripped {
+        node_id: NodeId,
+        agent_ref: String,
+        consecutive_errors: u32,
+        threshold: u32,
+    },
+    EscalationRequired {
+        node_id: NodeId,
+        agent_ref: String,
+        /// "circuit_breaker" | "autonomy_limit" | "budget_exceeded"
+        reason: String,
+        /// "supervisor_agent:<id>" | "human_approval"
+        escalation_target: String,
+    },
+
+    // ── Policy ────────────────────────────────────────────────────────────
+    PolicyViolation {
+        node_id: NodeId,
+        /// Which rule triggered (e.g. "block_tool:payments.*")
+        rule: String,
+        /// "blocked" | "require_approval"
+        decision: String,
+        /// "global" | "tenant" | "workflow" | "node"
+        policy_scope: String,
+    },
+    ToolApprovalRequired {
+        node_id: NodeId,
+        tool_name: String,
+        approver: String,
+        context: serde_json::Value,
+    },
 
     // ── Reasoning strategy lifecycle (§14.5) ─────────────────────────────
     /// Emitted when a reasoning strategy begins execution.
@@ -233,6 +284,13 @@ impl EventKind {
             | Self::TimerCreated { node_id, .. }
             | Self::TimerFired { node_id, .. }
             | Self::BudgetExceeded { node_id, .. }
+            | Self::TokenBudgetExceeded { node_id, .. }
+            | Self::CostBudgetExceeded { node_id, .. }
+            | Self::AutonomyLimitReached { node_id, .. }
+            | Self::CircuitBreakerTripped { node_id, .. }
+            | Self::EscalationRequired { node_id, .. }
+            | Self::PolicyViolation { node_id, .. }
+            | Self::ToolApprovalRequired { node_id, .. }
             | Self::ChildWorkflowStarted { node_id, .. }
             | Self::ChildWorkflowCompleted { node_id, .. }
             | Self::ChildWorkflowFailed { node_id, .. } => Some(node_id.as_str()),

@@ -42,6 +42,19 @@ pub struct WorkflowIr {
     /// Observability labels attached to all spans from this workflow.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Workflow-level policy set (overrides global; node-level overrides this).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicySetIr>,
+    /// Per-execution token budget enforcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<TokenBudgetIr>,
+    /// Per-execution cost cap in USD. Execution fails / branches when exceeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_budget_usd: Option<f64>,
+    /// Node to route to when any budget is exceeded (optional).
+    /// If absent, the execution fails with `WorkflowFailed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_budget_exceeded: Option<String>,
 }
 
 impl WorkflowIr {
@@ -93,6 +106,9 @@ pub struct NodeDef {
     /// Extra observability labels for this node's spans.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Node-level policy override (most specific — overrides workflow + global).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicySetIr>,
 }
 
 /// A directed edge between two nodes.
@@ -166,6 +182,38 @@ pub struct RemoteAgentConfig {
     pub auth: Option<AuthConfig>,
 }
 
+/// Policy rules embedded in the workflow IR.
+///
+/// This is the serializable form of `PolicySet` — it lives in the IR so that
+/// workflow YAML/JSON can declare policy inline. The policy engine converts
+/// `PolicySetIr` → internal `PolicySet` at evaluation time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PolicySetIr {
+    /// Exact tool names or glob patterns to block (e.g. `"payments.*"`).
+    #[serde(default)]
+    pub blocked_tools: Vec<String>,
+    /// Tool names/patterns that require human approval before execution.
+    #[serde(default)]
+    pub require_approval_for: Vec<String>,
+    /// If non-empty, only models in this list are allowed for model nodes.
+    #[serde(default)]
+    pub model_allowlist: Vec<String>,
+}
+
+/// Per-execution token budget configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenBudgetIr {
+    /// Maximum input tokens allowed for the full execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
+    /// Maximum output tokens allowed for the full execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    /// Maximum combined input + output tokens for the full execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u32>,
+}
+
 /// Authentication configuration for external connections.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -194,6 +242,10 @@ mod tests {
             version: "0.1.0".into(),
             name: None,
             description: None,
+            policy: None,
+            token_budget: None,
+            cost_budget_usd: None,
+            on_budget_exceeded: None,
             state_schema: "schemas.TestState".into(),
             start_node: "start".into(),
             nodes: HashMap::new(),

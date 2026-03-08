@@ -10,6 +10,7 @@ use axum::{
 };
 use chrono::Utc;
 use jamjet_agents::{AgentCard, AgentFilter, AgentStatus};
+use jamjet_audit::backend::AuditQuery;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::{WorkItem, WorkflowDefinition};
 use serde::Deserialize;
@@ -42,6 +43,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/agents/:id/heartbeat", post(agent_heartbeat))
         // Admin
         .route("/workers", get(list_workers))
+        // Audit log — immutable, append-only
+        .route("/audit", get(list_audit_log))
         .layer(middleware::from_fn(require_write_role))
         .layer(middleware::from_fn_with_state(auth_state, require_auth))
         .with_state(state.clone());
@@ -540,6 +543,57 @@ async fn serve_did_document(State(state): State<AppState>) -> Result<Json<Value>
         "@context": ["https://www.w3.org/ns/did/v1"],
         "id": did_id,
         "service": services,
+    })))
+}
+
+// ── Audit log ────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AuditQueryParams {
+    execution_id: Option<String>,
+    actor_id: Option<String>,
+    event_type: Option<String>,
+    #[serde(default = "default_audit_limit")]
+    limit: u32,
+    #[serde(default)]
+    offset: u32,
+}
+
+fn default_audit_limit() -> u32 {
+    50
+}
+
+async fn list_audit_log(
+    State(state): State<AppState>,
+    Query(params): Query<AuditQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let q = AuditQuery {
+        execution_id: params.execution_id,
+        actor_id: params.actor_id,
+        event_type: params.event_type,
+        limit: params.limit.min(200),
+        offset: params.offset,
+        from: None,
+        to: None,
+    };
+
+    let total = state
+        .audit
+        .count(&q)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let entries = state
+        .audit
+        .query(&q)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(json!({
+        "items": entries,
+        "total": total,
+        "limit": q.limit,
+        "offset": q.offset,
     })))
 }
 

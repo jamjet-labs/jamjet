@@ -14,6 +14,7 @@ jamjet-core = { path = "../core" }
 jamjet-ir = { path = "../ir" }
 jamjet-state = { path = "../state" }
 jamjet-agents = { path = "../agents" }
+jamjet-audit = { path = "../audit" }
 jamjet-scheduler = { path = "../scheduler" }
 jamjet-protocols = { path = "../protocols" }
 jamjet-mcp = { path = "../protocols/mcp" }

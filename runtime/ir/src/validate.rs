@@ -151,6 +151,7 @@ mod tests {
                         node_timeout_secs: None,
                         description: None,
                         labels: HashMap::new(),
+                        policy: None,
                     },
                 )
             })
@@ -181,6 +182,10 @@ mod tests {
             mcp_servers: HashMap::new(),
             remote_agents: HashMap::new(),
             labels: HashMap::new(),
+            policy: None,
+            token_budget: None,
+            cost_budget_usd: None,
+            on_budget_exceeded: None,
         }
     }
 
@@ -224,6 +229,7 @@ mod tests {
                 node_timeout_secs: None,
                 description: None,
                 labels: HashMap::new(),
+                policy: None,
             },
         );
         ir.edges.push(EdgeDef {

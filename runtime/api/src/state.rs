@@ -1,5 +1,6 @@
 use jamjet_a2a::A2aAdapter;
 use jamjet_agents::AgentRegistry;
+use jamjet_audit::{AuditBackend, AuditEnricher};
 use jamjet_mcp::McpAdapter;
 use jamjet_protocols::{anp::AnpAdapter, ProtocolRegistry};
 use jamjet_state::backend::StateBackend;
@@ -10,6 +11,10 @@ use std::sync::Arc;
 pub struct AppState {
     pub backend: Arc<dyn StateBackend>,
     pub agents: Arc<dyn AgentRegistry>,
+    /// Audit log backend — append-only, immutable.
+    pub audit: Arc<dyn AuditBackend>,
+    /// Audit enricher — wraps all `append_event` calls with audit metadata.
+    pub enricher: Arc<AuditEnricher>,
     /// Protocol adapter registry — pre-loaded with MCP, A2A, and ANP adapters.
     pub protocols: ProtocolRegistry,
 }

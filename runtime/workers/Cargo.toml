@@ -10,6 +10,8 @@ jamjet-core = { path = "../core" }
 jamjet-ir = { path = "../ir" }
 jamjet-models = { path = "../models" }
 jamjet-state = { path = "../state" }
+jamjet-policy = { path = "../policy" }
+jamjet-agents = { path = "../agents" }
 jamjet-mcp = { path = "../protocols/mcp" }
 jamjet-a2a = { path = "../protocols/a2a" }
 jamjet-telemetry = { path = "../telemetry" }

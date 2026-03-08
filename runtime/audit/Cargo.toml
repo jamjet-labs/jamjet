@@ -1,0 +1,19 @@
+[package]
+name = "jamjet-audit"
+description = "JamJet audit log — immutable, append-only record of all security-relevant events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jamjet-core = { path = "../core" }
+jamjet-state = { path = "../state" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }

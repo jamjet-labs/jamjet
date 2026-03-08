@@ -12,6 +12,7 @@ members = [
     "timers",
     "policy",
     "agents",
+    "audit",
     "protocols",
     "protocols/mcp",
     "protocols/a2a",
