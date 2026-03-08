@@ -120,12 +120,42 @@ def init(
         None,
         help="Name of the new project (omit to initialise in the current directory)",
     ),
+    template: str = typer.Option(
+        "hello-agent",
+        "--template",
+        "-t",
+        help="Starter template to use. Run `jamjet init --list-templates` to see all options.",
+    ),
+    list_templates: bool = typer.Option(  # noqa: FBT001
+        False,
+        "--list-templates",
+        is_eager=True,
+        help="List available templates and exit.",
+    ),
 ) -> None:
-    """Initialise a JamJet project.
+    """Initialise a JamJet project from a template.
 
     Pass a name to create a new directory, or omit to set up in the current directory.
+
+    Available templates: hello-agent (default), research-agent, code-reviewer, approval-workflow
     """
     import os
+
+    from jamjet.templates import AVAILABLE_TEMPLATES, render_template
+
+    if list_templates:
+        console.print("[bold]Available templates:[/bold]")
+        for t in AVAILABLE_TEMPLATES:
+            marker = "  [green]●[/green]" if t == "hello-agent" else "  [dim]●[/dim]"
+            console.print(f"{marker} {t}")
+        raise typer.Exit()
+
+    if template not in AVAILABLE_TEMPLATES:
+        console.print(
+            f"[red]Error:[/red] unknown template '{template}'. "
+            f"Run [bold]jamjet init --list-templates[/bold] to see options."
+        )
+        raise typer.Exit(1)
 
     if project_name:
         project_dir = os.path.join(os.getcwd(), project_name)
@@ -137,59 +167,24 @@ def init(
         project_name = os.path.basename(os.getcwd())
         project_dir = os.getcwd()
 
-    workflow_yaml = f"""# {project_name}/workflow.yaml
-# Edit this file, then run: jamjet dev  (in another terminal: jamjet run workflow.yaml)
-name: {project_name}
-version: 0.1.0
+    files = render_template(template, project_name)
+    written: list[str] = []
+    for rel_path, content in files.items():
+        abs_path = os.path.join(project_dir, rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, "w") as fh:
+            fh.write(content)
+        written.append(rel_path)
 
-state_schema:
-  query: str
-  result: str
-
-nodes:
-  start:
-    type: model
-    model: default_chat
-    prompt: "Answer this question clearly: {{{{ state.query }}}}"
-    output_key: result
-    next: end
-
-  end:
-    type: end
-"""
-
-    readme = f"""# {project_name}
-
-A JamJet agent workflow.
-
-## Run
-
-```bash
-# Terminal 1 — start runtime
-jamjet dev
-
-# Terminal 2 — run the workflow
-jamjet run workflow.yaml --input '{{"query": "What is JamJet?"}}'\n```
-
-## Edit
-
-Open `workflow.yaml` to change the workflow. See the [JamJet docs](https://jamjet.dev/docs) for all node types.
-"""
-
-    with open(os.path.join(project_dir, "workflow.yaml"), "w") as f:
-        f.write(workflow_yaml)
-    with open(os.path.join(project_dir, "README.md"), "w") as f:
-        f.write(readme)
-
-    console.print(f"[green]✓[/green] Initialised [bold]{project_name}[/bold]")
-    console.print("  [dim]workflow.yaml[/dim]   ← your workflow (edit this)")
-    console.print("  [dim]README.md[/dim]")
+    console.print(f"[green]✓[/green] Initialised [bold]{project_name}[/bold] from template [bold]{template}[/bold]")
+    for rel_path in written:
+        console.print(f"  [dim]{rel_path}[/dim]")
     console.print()
     console.print("[bold]Next steps:[/bold]")
     if project_name != os.path.basename(os.getcwd()):
         console.print(f"  cd {project_name}")
-    console.print("  jamjet dev              [dim]# start the runtime[/dim]")
-    console.print("  jamjet run workflow.yaml [dim]# run in another terminal[/dim]")
+    console.print("  jamjet dev               [dim]# start the runtime[/dim]")
+    console.print("  jamjet run workflow.yaml  [dim]# run in another terminal[/dim]")
 
 
 # ── dev ──────────────────────────────────────────────────────────────────────
