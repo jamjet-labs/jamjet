@@ -230,6 +230,317 @@ args = ["-y", "@modelcontextprotocol/server-github"]
 env = {{ GITHUB_TOKEN = "${{GITHUB_TOKEN}}" }}
 """,
     },
+    # ── single-agent-tool-flow ────────────────────────────────────────────────
+    "single-agent-tool-flow": {
+        "workflow.yaml": """\
+# {name}/workflow.yaml
+# Single agent that calls one tool then generates a response.
+# The simplest useful pattern: tool → model → done.
+#
+# Usage:
+#   jamjet run workflow.yaml --input '{{"path": "README.md", "question": "What does this project do?"}}'
+
+workflow:
+  id: {name}
+  version: 0.1.0
+  state_schema:
+    path: str
+    question: str
+    file_content: str
+    answer: str
+  start: read-file
+
+nodes:
+  read-file:
+    type: tool
+    server: filesystem
+    tool: read_file
+    arguments:
+      path: "{{{{ state.path }}}}"
+    output_key: file_content
+    retry:
+      max_attempts: 2
+      backoff: constant
+      delay_ms: 500
+    next: answer
+
+  answer:
+    type: model
+    model: claude-haiku-4-5-20251001
+    system: |
+      You are a helpful assistant. Answer questions about files clearly and concisely.
+    prompt: |
+      File: {{{{ state.path }}}}
+
+      Content:
+      {{{{ state.file_content }}}}
+
+      Question: {{{{ state.question }}}}
+    output_key: answer
+    next: end
+
+  end:
+    type: end
+""",
+        "jamjet.toml": """\
+[project]
+name = "{name}"
+version = "0.1.0"
+
+[[mcp_servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+""",
+        "evals/dataset.jsonl": """\
+{{"id": "q1", "input": {{"path": "README.md", "question": "What does this project do?"}}, "expected": {{}}}}
+{{"id": "q2", "input": {{"path": "jamjet.toml", "question": "What MCP servers are configured?"}}, "expected": {{}}}}
+""",
+    },
+    # ── hitl-approval ─────────────────────────────────────────────────────────
+    "hitl-approval": {
+        "workflow.yaml": """\
+# {name}/workflow.yaml
+# Human-in-the-loop review workflow.
+# Agent drafts a response, waits for human review, then executes or revises.
+#
+# Usage:
+#   jamjet run workflow.yaml --input '{{"request": "Refund order #1234 for $99"}}'
+#
+# Resume after human review:
+#   jamjet resume <exec-id> --event reviewed --data '{{"approved": true}}'
+#   jamjet resume <exec-id> --event reviewed --data '{{"approved": false, "feedback": "Too large, check policy first"}}'
+
+workflow:
+  id: {name}
+  version: 0.1.0
+  state_schema:
+    request: str
+    draft_response: str
+    approved: bool
+    feedback: str
+    final_response: str
+  start: draft
+
+nodes:
+  draft:
+    type: model
+    model: claude-sonnet-4-6
+    system: |
+      You are a support agent. Draft a clear, professional response to customer requests.
+      Be specific about what action will be taken.
+    prompt: |
+      Customer request: {{{{ state.request }}}}
+
+      Draft a response that explains what action you will take and why.
+    output_key: draft_response
+    next: await-review
+
+  await-review:
+    type: wait
+    event: reviewed
+    timeout_hours: 8
+    on_timeout: auto-approve
+    next: route
+
+  route:
+    type: branch
+    conditions:
+      - if: "state.approved == true"
+        next: execute
+      - if: "state.approved == false"
+        next: revise
+    default: execute
+
+  execute:
+    type: model
+    model: claude-sonnet-4-6
+    prompt: |
+      The following response was approved. Finalize and confirm action taken:
+
+      Request: {{{{ state.request }}}}
+      Approved response: {{{{ state.draft_response }}}}
+    output_key: final_response
+    next: end
+
+  revise:
+    type: model
+    model: claude-sonnet-4-6
+    prompt: |
+      Your draft was not approved. Revise based on this feedback:
+
+      Original request: {{{{ state.request }}}}
+      Draft: {{{{ state.draft_response }}}}
+      Feedback: {{{{ state.feedback }}}}
+
+      Write a revised response addressing the feedback.
+    output_key: final_response
+    next: end
+
+  auto-approve:
+    type: model
+    model: claude-haiku-4-5-20251001
+    prompt: |
+      Review timed out after 8 hours. Auto-processing:
+      Request: {{{{ state.request }}}}
+      Draft: {{{{ state.draft_response }}}}
+      Confirm the action taken.
+    output_key: final_response
+    next: end
+
+  end:
+    type: end
+""",
+    },
+    # ── multi-agent-review ────────────────────────────────────────────────────
+    "multi-agent-review": {
+        "workflow.yaml": """\
+# {name}/workflow.yaml
+# Two-agent review loop: writer drafts, critic reviews, writer revises.
+# Repeats until the critic scores the output above the threshold.
+#
+# Usage:
+#   jamjet run workflow.yaml --input '{{"topic": "Write a product announcement for JamJet 1.0"}}'
+
+workflow:
+  id: {name}
+  version: 0.1.0
+  state_schema:
+    topic: str
+    draft: str
+    critique: str
+    score: int
+    attempts: int
+    final: str
+  start: write
+
+nodes:
+  write:
+    type: model
+    model: claude-sonnet-4-6
+    system: |
+      You are an expert writer. Produce clear, engaging, well-structured content.
+      If you have received critique, incorporate it fully in this revision.
+    prompt: |
+      Topic: {{{{ state.topic }}}}
+      {%- if state.critique %}
+
+      Previous critique (score {{{{ state.score }}}}/5):
+      {{{{ state.critique }}}}
+
+      Revise your draft to address all points raised.
+      {%- endif %}
+    output_key: draft
+    next: critique
+
+  critique:
+    type: model
+    model: claude-sonnet-4-6
+    system: |
+      You are a strict editor. Evaluate content quality honestly.
+      Reply in this exact format:
+      SCORE: <1-5>
+      CRITIQUE: <one paragraph of specific, actionable feedback>
+    prompt: |
+      Topic: {{{{ state.topic }}}}
+
+      Draft to review:
+      {{{{ state.draft }}}}
+    output_key: critique
+    next: route
+
+  route:
+    type: branch
+    conditions:
+      - if: "int(state.critique.split('SCORE:')[1].split()[0]) >= 4"
+        next: accept
+      - if: "state.attempts >= 3"
+        next: accept
+    default: write
+
+  accept:
+    type: model
+    model: claude-haiku-4-5-20251001
+    prompt: |
+      Format this final approved draft cleanly:
+      {{{{ state.draft }}}}
+    output_key: final
+    next: end
+
+  end:
+    type: end
+""",
+        "evals/dataset.jsonl": """\
+{{"id": "t1", "input": {{"topic": "Write a product announcement for JamJet 1.0"}}, "expected": {{}}}}
+{{"id": "t2", "input": {{"topic": "Explain event sourcing to a junior developer"}}, "expected": {{}}}}
+""",
+    },
+    # ── a2a-server ────────────────────────────────────────────────────────────
+    "a2a-server": {
+        "workflow.yaml": """\
+# {name}/workflow.yaml
+# A JamJet agent that serves A2A protocol requests.
+# External agents can discover this agent via /.well-known/agent.json
+# and delegate tasks to it using the A2A standard.
+#
+# Usage:
+#   jamjet dev                     # starts runtime + A2A server
+#   curl http://localhost:7700/.well-known/agent.json   # view Agent Card
+#
+# From another JamJet agent:
+#   type: a2a_task
+#   agent_uri: "http://localhost:7700"
+#   skill: summarize
+
+workflow:
+  id: {name}
+  version: 0.1.0
+  state_schema:
+    message: str
+    result: str
+  start: handle
+
+nodes:
+  handle:
+    type: model
+    model: claude-haiku-4-5-20251001
+    system: |
+      You are a helpful agent that processes delegated tasks.
+      Complete the task clearly and concisely.
+    prompt: "{{{{ state.message }}}}"
+    output_key: result
+    next: end
+
+  end:
+    type: end
+""",
+        "jamjet.toml": """\
+[project]
+name = "{name}"
+version = "0.1.0"
+
+[agent]
+id = "{name}"
+name = "{name}"
+version = "0.1.0"
+description = "A JamJet agent that accepts A2A task delegations"
+url = "http://localhost:7700"
+
+[[agent.skills]]
+id = "default"
+name = "Default task handler"
+description = "Handles general delegated tasks"
+input_schema = {{ message = "str" }}
+output_schema = {{ result = "str" }}
+
+[[agent.skills]]
+id = "summarize"
+name = "Summarizer"
+description = "Summarizes provided text"
+input_schema = {{ message = "str" }}
+output_schema = {{ result = "str" }}
+""",
+    },
     # ── rag-assistant ─────────────────────────────────────────────────────────
     "rag-assistant": {
         "workflow.yaml": """\
