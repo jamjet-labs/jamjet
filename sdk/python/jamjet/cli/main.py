@@ -727,6 +727,109 @@ def agents_activate(
     asyncio.run(_activate())
 
 
+@agents_app.command("discover")
+def agents_discover(
+    url: str = typer.Argument(..., help="Base URL of the remote agent (e.g. https://agent.example.com)"),
+    register: bool = typer.Option(False, "--register", "-r", help="Register the agent after discovery"),
+    runtime: str = typer.Option("http://localhost:7700", "--runtime"),
+) -> None:
+    """Fetch and display an Agent Card from a remote A2A endpoint."""
+    import httpx
+    from rich.table import Table
+
+    well_known = url.rstrip("/") + "/.well-known/agent.json"
+
+    async def _discover() -> None:
+        try:
+            async with httpx.AsyncClient(timeout=10) as http:
+                resp = await http.get(well_known)
+                resp.raise_for_status()
+                card = resp.json()
+        except Exception as exc:
+            console.print(f"[red]Failed to fetch Agent Card:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+        t = Table(title=f"Agent Card — {url}", show_header=False, box=None)
+        t.add_column("Field", style="bold cyan", width=18)
+        t.add_column("Value")
+        for key in ("id", "name", "version", "description", "url"):
+            if key in card:
+                t.add_row(key, str(card[key]))
+        console.print(t)
+
+        skills = card.get("capabilities", {}).get("skills", [])
+        if skills:
+            console.print("\n[bold]Skills:[/bold]")
+            for sk in skills:
+                console.print(f"  · [yellow]{sk.get('id', '?')}[/yellow] — {sk.get('description', '')}")
+
+        if register:
+            async with _client(runtime) as c:
+                result = await c.post("/agents/discover", json={"url": url})
+                console.print(f"\n[green]Registered:[/green] {result.get('id', card.get('id'))}")
+
+    asyncio.run(_discover())
+
+
+@agents_app.command("connect")
+def agents_connect(
+    url: str = typer.Argument(..., help="Base URL of the remote agent to register"),
+    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+) -> None:
+    """Discover and register a remote agent with the local registry."""
+
+    async def _connect() -> None:
+        async with _client(runtime) as c:
+            result = await c.post("/agents/discover", json={"url": url})
+            agent_id = result.get("id", "?")
+            name = result.get("name", agent_id)
+            console.print(f"[green]Connected:[/green] [bold]{name}[/bold] ({agent_id})")
+            console.print(f"  URL: {url}")
+            skills = result.get("capabilities", {}).get("skills", [])
+            if skills:
+                console.print(f"  Skills: {', '.join(s.get('id', '?') for s in skills)}")
+
+    asyncio.run(_connect())
+
+
+@agents_app.command("trace")
+def agents_trace(
+    agent_id: str = typer.Argument(..., help="Agent ID to show communication trace for"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Number of recent events to show"),
+    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+) -> None:
+    """Show recent A2A communication events for an agent."""
+    from rich.table import Table
+
+    async def _trace() -> None:
+        async with _client(runtime) as c:
+            data = await c.get(f"/agents/{agent_id}/trace?limit={limit}")
+            events = data.get("events", [])
+
+        if not events:
+            console.print(f"[dim]No trace events found for agent {agent_id}[/dim]")
+            return
+
+        t = Table(title=f"Agent trace — {agent_id}", show_lines=False)
+        t.add_column("Time", style="dim", width=20)
+        t.add_column("Direction", width=10)
+        t.add_column("Type", style="cyan", width=18)
+        t.add_column("Details")
+
+        for evt in events:
+            direction = "[green]→ OUT[/green]" if evt.get("direction") == "outbound" else "[blue]← IN[/blue]"
+            t.add_row(
+                evt.get("timestamp", "")[:19],
+                direction,
+                evt.get("event_type", ""),
+                evt.get("summary", ""),
+            )
+
+        console.print(t)
+
+    asyncio.run(_trace())
+
+
 # ── mcp ───────────────────────────────────────────────────────────────────────
 
 
