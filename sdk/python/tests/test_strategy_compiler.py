@@ -92,8 +92,13 @@ def test_unknown_strategy_error_lists_known():
 
 def test_plan_and_execute_compiles():
     result = compile_strategy(
-        "plan-and-execute", {}, ["search_web", "read_file"], "gpt-4o",
-        DEFAULT_LIMITS, "Research and write a report", "agent-1"
+        "plan-and-execute",
+        {},
+        ["search_web", "read_file"],
+        "gpt-4o",
+        DEFAULT_LIMITS,
+        "Research and write a report",
+        "agent-1",
     )
     nodes = result["nodes"]
 
@@ -154,8 +159,7 @@ def test_plan_and_execute_respects_max_iterations():
 
 def test_react_compiles():
     result = compile_strategy(
-        "react", {}, ["calculator", "search"], "gpt-4o",
-        DEFAULT_LIMITS, "Solve the problem step by step", "agent-react"
+        "react", {}, ["calculator", "search"], "gpt-4o", DEFAULT_LIMITS, "Solve the problem step by step", "agent-react"
     )
     nodes = result["nodes"]
 
@@ -189,8 +193,13 @@ def test_react_cost_guards():
 
 def test_critic_compiles():
     result = compile_strategy(
-        "critic", {"critic_model": "claude-sonnet-4-6", "max_rounds": 2, "pass_threshold": 0.85},
-        [], "gpt-4o", DEFAULT_LIMITS, "Write a report", "agent-critic"
+        "critic",
+        {"critic_model": "claude-sonnet-4-6", "max_rounds": 2, "pass_threshold": 0.85},
+        [],
+        "gpt-4o",
+        DEFAULT_LIMITS,
+        "Write a report",
+        "agent-critic",
     )
     nodes = result["nodes"]
 

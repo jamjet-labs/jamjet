@@ -96,10 +96,10 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit dependencies
         run: |
-          # --deny vulnerabilities: fail on CVEs (not on unmaintained-crate warnings)
+          # --deny unsound: fail on CVEs/unsound advisories (not on unmaintained warnings)
           # --ignore RUSTSEC-2023-0071: rsa Marvin Attack — no upstream fix available yet;
           #   we use rsa only as a transitive dep of tonic, not for key operations.
-          cargo audit --deny vulnerabilities \
+          cargo audit --deny unsound \
             --ignore RUSTSEC-2023-0071
 
   python-audit:

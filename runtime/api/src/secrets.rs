@@ -128,6 +128,8 @@ impl Redactor {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     struct MapBackend(HashMap<String, String>);

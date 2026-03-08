@@ -90,9 +90,7 @@ def compile_strategy(
     compiler_fn = compilers.get(strategy_name)
     if compiler_fn is None:
         known = ", ".join(sorted(compilers))
-        raise ValueError(
-            f"Unknown strategy '{strategy_name}'. Known strategies: {known}"
-        )
+        raise ValueError(f"Unknown strategy '{strategy_name}'. Known strategies: {known}")
 
     result = compiler_fn(strategy_config, tools, model, limits, goal, agent_id)
     result["strategy_metadata"] = {
@@ -210,7 +208,7 @@ def _compile_plan_and_execute(
             f"You are an AI agent working on: {goal}\n"
             f"Available tools: {tools_list}\n"
             f"Generate a structured plan with up to {n} concrete steps. "
-            "Output JSON: {\"steps\": [\"step 1\", \"step 2\", ...]}"
+            'Output JSON: {"steps": ["step 1", "step 2", ...]}'
         ),
         "__plan__",
         system_prompt="You are a planning AI. Output valid JSON only.",
@@ -260,7 +258,7 @@ def _compile_plan_and_execute(
                 verifier_model,
                 (
                     f"Verify step {i + 1} output against the goal: {goal}\n"
-                    "Output JSON: {\"passed\": true/false, \"score\": 0.0-1.0, \"feedback\": \"...\"}"
+                    'Output JSON: {"passed": true/false, "score": 0.0-1.0, "feedback": "..."}'
                 ),
                 f"__verify_{i}_result__",
                 labels={"jamjet.strategy.node": "verifier", "jamjet.strategy.event": "critic_verdict"},
@@ -345,7 +343,7 @@ def _compile_react(
                 f"Iteration {i + 1} of {n}. "
                 "Think about what to do next. If you have enough information to answer, say FINISH. "
                 "Otherwise choose a tool and describe what input to pass. "
-                "Output JSON: {\"thought\": \"...\", \"action\": \"tool_name or FINISH\", \"input\": {...}}"
+                'Output JSON: {"thought": "...", "action": "tool_name or FINISH", "input": {...}}'
             ),
             f"__think_{i}_output__",
             labels={
@@ -375,7 +373,7 @@ def _compile_react(
                     f"Goal: {goal}\n"
                     f"Previous thought: {{{{ state.__think_{i}_output__ }}}}\n"
                     "Process the tool result and update your understanding. "
-                    "Output JSON: {\"observation\": \"...\", \"progress\": \"...\"}"
+                    'Output JSON: {"observation": "...", "progress": "..."}'
                 ),
                 f"__observe_{i}_output__",
                 labels={
@@ -389,10 +387,7 @@ def _compile_react(
     # Finalizer
     nodes["__finalize__"] = _model_node(
         model,
-        (
-            f"Goal: {goal}\n"
-            "Based on all thoughts and observations, produce a final answer."
-        ),
+        (f"Goal: {goal}\nBased on all thoughts and observations, produce a final answer."),
         "result",
         labels={"jamjet.strategy.node": "finalizer", "jamjet.strategy.event": "strategy_completed"},
     )
@@ -457,7 +452,7 @@ def _compile_critic(
                 f"Goal: {goal}\n"
                 f"Draft to evaluate: {{{{ state.{draft_ref} }}}}\n"
                 f"Evaluate this draft against the goal. Pass threshold: {pass_threshold}.\n"
-                "Output JSON: {\"score\": 0.0-1.0, \"passed\": true/false, \"feedback\": \"...\"}"
+                'Output JSON: {"score": 0.0-1.0, "passed": true/false, "feedback": "..."}'
             ),
             f"__critic_{i}_verdict__",
             labels={
@@ -506,10 +501,7 @@ def _compile_critic(
     # Finalizer
     nodes["__finalize__"] = _model_node(
         model,
-        (
-            f"Goal: {goal}\n"
-            "Format the final, polished response based on all revisions."
-        ),
+        (f"Goal: {goal}\nFormat the final, polished response based on all revisions."),
         "result",
         labels={"jamjet.strategy.node": "finalizer", "jamjet.strategy.event": "strategy_completed"},
     )

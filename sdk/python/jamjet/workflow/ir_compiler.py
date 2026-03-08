@@ -190,9 +190,7 @@ def _compile_agent_yaml(data: dict[str, Any]) -> dict[str, Any]:
     # ── Validate required fields ──────────────────────────────────────────────
     missing = [f for f in ("id", "strategy", "goal", "model") if not agent.get(f)]
     if missing:
-        raise ValueError(
-            f"agent-first workflow is missing required fields: {', '.join(missing)}"
-        )
+        raise ValueError(f"agent-first workflow is missing required fields: {', '.join(missing)}")
 
     limits_raw = agent.get("limits")
     if not limits_raw:

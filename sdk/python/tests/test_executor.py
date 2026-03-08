@@ -8,7 +8,6 @@ from pydantic import BaseModel
 from jamjet import Agent, Workflow, tool
 from jamjet.workflow.executor import ExecutionResult
 
-
 # ── Shared fixtures ──────────────────────────────────────────────────────────
 
 
