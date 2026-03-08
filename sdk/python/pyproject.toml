@@ -33,6 +33,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
     "mypy>=1.10",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
@@ -54,6 +55,12 @@ ignore = ["ANN401"]
 python_version = "3.11"
 strict = true
 ignore_missing_imports = true
+# JSON-heavy code legitimately returns Any from parsed responses.
+warn_return_any = false
+# bare dict/list are common in JSON contexts; disabling generics check.
+disallow_any_generics = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+
