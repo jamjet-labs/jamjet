@@ -26,31 +26,20 @@ from rich.table import Table
 
 from jamjet.client import JamjetClient
 
-# ── Pixel art logo — J-shaped vertical jet ready to launch ────────────────────
-# 7×15 grid: body IS the letter J. Nose up, swept wings, J-hook nozzle, flames.
-# 0=bg  1=yellow#f5c518  2=orange#ea580c  3=red#dc2626  4=white(cockpit)
+# ── Logo — block letter J  (0=bg  1=yellow#f5c518  2=orange#ea580c) ──────────
+# 6×7 grid: clean J — top bar + vertical stem + orange hook at base.
 _LOGO_PIXELS = [
-    "0001000",  # nose tip
-    "0011100",  # nose cone
-    "0014100",  # cockpit window
-    "0011100",  # upper body
-    "1011101",  # swept wings
-    "0011100",  # body
-    "0011100",  # body
-    "0011100",  # lower body
-    "0011100",  # engine
-    "0111000",  # J nozzle — curves left
-    "1110000",  # J base
-    "2220000",  # exhaust orange
-    "0330000",  # flame core
-    "0232000",  # flame mid
-    "0030000",  # flame tip
+    "011111",  # top bar
+    "000001",  # stem
+    "000001",  # stem
+    "000001",  # stem
+    "000001",  # stem
+    "020001",  # foot — orange accent + stem
+    "002220",  # base curve — orange
 ]
 _LC = {
-    "1": "\033[38;2;245;197;24m",
-    "2": "\033[38;2;234;88;12m",
-    "3": "\033[38;2;220;38;38m",
-    "4": "\033[38;2;255;255;255m",
+    "1": "\033[38;2;245;197;24m",  # yellow/gold
+    "2": "\033[38;2;234;88;12m",  # orange
 }
 _LR = "\033[0m"
 
