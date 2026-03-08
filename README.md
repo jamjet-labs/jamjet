@@ -1,3 +1,7 @@
+![GitHub issues](https://img.shields.io/github/issues/jamjet)
+![GitHub stars](https://img.shields.io/github/stars/jamjet)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+
 <div align="center">
 
 <!-- Pixel art lightning bolt logo -->
