@@ -3,6 +3,9 @@
 runtime/target/
 Cargo.lock
 
+# Java / Maven
+sdk/java/**/target/
+
 # Python
 __pycache__/
 *.py[cod]
