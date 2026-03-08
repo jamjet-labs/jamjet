@@ -151,6 +151,28 @@ class JamjetClient:
         r.raise_for_status()
         return r.json()
 
+    async def discover_agent(self, url: str) -> dict[str, Any]:
+        r = await self._client.post("/agents/discover", json={"url": url})
+        r.raise_for_status()
+        return r.json()
+
+    async def get_agent_trace(self, agent_id: str, limit: int = 20) -> dict[str, Any]:
+        r = await self._client.get(f"/agents/{agent_id}/trace", params={"limit": limit})
+        r.raise_for_status()
+        return r.json()
+
+    # ── Generic helpers (for one-off API paths not covered above) ─────────
+
+    async def post(self, path: str, **kwargs: Any) -> dict[str, Any]:
+        r = await self._client.post(path, **kwargs)
+        r.raise_for_status()
+        return r.json()
+
+    async def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
+        r = await self._client.get(path, **kwargs)
+        r.raise_for_status()
+        return r.json()
+
     async def __aenter__(self) -> JamjetClient:
         return self
 
