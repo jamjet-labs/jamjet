@@ -2,11 +2,13 @@
 
 > **The agent-native runtime — built for performance, designed for interoperability, reliable enough for production.**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/jamjet/jamjet/ci.yml?label=CI&style=flat-square)](https://github.com/jamjet-labs/jamjet/actions)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square)](https://rustup.rs)
+[![CI](https://img.shields.io/github/actions/workflow/status/jamjet-labs/jamjet/ci.yml?label=CI&style=flat-square)](https://github.com/jamjet-labs/jamjet/actions)
+[![PyPI](https://img.shields.io/pypi/v/jamjet?style=flat-square&color=f5c518)](https://pypi.org/project/jamjet)
+[![License](https://img.shields.io/badge/license-Apache%202.0-f5c518?style=flat-square)](https://github.com/jamjet-labs/jamjet/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)](https://python.org)
-[![Docs](https://img.shields.io/badge/docs-jamjet.dev-green?style=flat-square)](https://jamjet.dev/docs)
+[![Docs](https://img.shields.io/badge/docs-jamjet.dev-f5c518?style=flat-square)](https://jamjet.dev)
+
+![JamJet demo](https://raw.githubusercontent.com/jamjet-labs/jamjet/main/demo.gif)
 
 JamJet is a **performance-first, agent-native runtime and framework** for building reliable, interoperable AI agent systems. It is not another prompt wrapper or thin agent SDK — it is a **production-grade orchestration substrate** for agents that need to work, not just demo.
 
