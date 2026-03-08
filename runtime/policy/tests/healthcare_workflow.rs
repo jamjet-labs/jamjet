@@ -30,12 +30,12 @@ fn hospital_global_policy() -> PolicySetIr {
     PolicySetIr {
         blocked_tools: vec![
             "delete_patient_record".to_string(),
-            "delete_*".to_string(),      // block ALL deletion tools
+            "delete_*".to_string(),        // block ALL deletion tools
             "export_phi_bulk".to_string(), // block bulk PHI export
         ],
         require_approval_for: vec![
             "prescribe_medication".to_string(),
-            "order_lab_*".to_string(),   // all lab orders need approval
+            "order_lab_*".to_string(), // all lab orders need approval
             "discharge_patient".to_string(),
         ],
         model_allowlist: vec![
@@ -174,7 +174,11 @@ fn lab_orders_all_require_approval() {
     let evaluator = PolicyEvaluator;
     let global = hospital_global_policy();
 
-    for tool in &["order_lab_cbc", "order_lab_metabolic_panel", "order_lab_urinalysis"] {
+    for tool in &[
+        "order_lab_cbc",
+        "order_lab_metabolic_panel",
+        "order_lab_urinalysis",
+    ] {
         let ctx = EvaluationContext {
             node_id: "lab_agent".to_string(),
             node_kind_tag: "tool".to_string(),
@@ -328,7 +332,11 @@ fn safe_tools_pass_through_all_policy_layers() {
     let global = hospital_global_policy();
     let workflow = intake_workflow_policy();
 
-    for tool in &["lookup_patient", "check_insurance_status", "schedule_appointment"] {
+    for tool in &[
+        "lookup_patient",
+        "check_insurance_status",
+        "schedule_appointment",
+    ] {
         let ctx = EvaluationContext {
             node_id: "intake_agent".to_string(),
             node_kind_tag: "tool".to_string(),

@@ -231,12 +231,18 @@ fn circuit_breaker_trips_after_consecutive_errors() {
 
     // After 1 error: proceed
     let ctx1 = execution_agent_context(1);
-    assert!(matches!(enforcer.check(&ctx1, None), AutonomyDecision::Proceed));
+    assert!(matches!(
+        enforcer.check(&ctx1, None),
+        AutonomyDecision::Proceed
+    ));
     println!("Error 1/3: Proceed (might be transient)");
 
     // After 2 errors: proceed
     let ctx2 = execution_agent_context(2);
-    assert!(matches!(enforcer.check(&ctx2, None), AutonomyDecision::Proceed));
+    assert!(matches!(
+        enforcer.check(&ctx2, None),
+        AutonomyDecision::Proceed
+    ));
     println!("Error 2/3: Proceed (still within threshold)");
 
     // After 3 errors: TRIP
@@ -304,9 +310,9 @@ fn fully_autonomous_agent_only_has_circuit_breaker() {
             require_approval_for: vec![],
             time_budget_secs: None,
         }),
-        current_iterations: 500,  // Way past what bounded would allow
+        current_iterations: 500, // Way past what bounded would allow
         current_tool_calls: 5000,
-        current_cost_usd: 50.0,   // Way past typical budgets
+        current_cost_usd: 50.0, // Way past typical budgets
         current_tokens: 500_000,
         consecutive_errors: 0,
         circuit_breaker_threshold: 3,

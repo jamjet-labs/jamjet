@@ -34,9 +34,7 @@
 //! - A single unlogged policy violation could mean regulatory action
 
 use chrono::Utc;
-use jamjet_audit::{
-    ActorType, AuditBackend, AuditLogEntry, AuditQuery, SqliteAuditBackend,
-};
+use jamjet_audit::{ActorType, AuditBackend, AuditLogEntry, AuditQuery, SqliteAuditBackend};
 use uuid::Uuid;
 
 /// Helper: create an in-memory SQLite audit backend for testing.
@@ -82,12 +80,22 @@ async fn audit_entries_are_immutably_persisted() {
     let exec_id = "LOAN-2024-00847";
 
     // Step 1: Agent starts
-    let mut e1 = make_entry(exec_id, "node_started", "credit-analysis-agent-v2", ActorType::System);
+    let mut e1 = make_entry(
+        exec_id,
+        "node_started",
+        "credit-analysis-agent-v2",
+        ActorType::System,
+    );
     e1.sequence = 1;
     backend.append(e1).await.expect("append e1");
 
     // Step 2: Policy violation
-    let mut e2 = make_entry(exec_id, "policy_violation", "credit-analysis-agent-v2", ActorType::System);
+    let mut e2 = make_entry(
+        exec_id,
+        "policy_violation",
+        "credit-analysis-agent-v2",
+        ActorType::System,
+    );
     e2.sequence = 2;
     e2.policy_decision = Some("blocked".to_string());
     e2.raw_event = serde_json::json!({
@@ -100,7 +108,12 @@ async fn audit_entries_are_immutably_persisted() {
     backend.append(e2).await.expect("append e2");
 
     // Step 3: Human approval
-    let mut e3 = make_entry(exec_id, "approval_received", "loan-officer-jsmith", ActorType::Human);
+    let mut e3 = make_entry(
+        exec_id,
+        "approval_received",
+        "loan-officer-jsmith",
+        ActorType::Human,
+    );
     e3.sequence = 3;
     backend.append(e3).await.expect("append e3");
 
@@ -133,14 +146,22 @@ async fn idempotent_append_prevents_duplicates() {
 
     let backend = test_backend().await;
 
-    let entry = make_entry("LOAN-2024-00848", "node_completed", "system", ActorType::System);
+    let entry = make_entry(
+        "LOAN-2024-00848",
+        "node_completed",
+        "system",
+        ActorType::System,
+    );
     let entry_id = entry.id;
 
     // First append
     backend.append(entry.clone()).await.expect("first append");
 
     // Duplicate append (crash replay) — same ID
-    backend.append(entry).await.expect("duplicate append should succeed silently");
+    backend
+        .append(entry)
+        .await
+        .expect("duplicate append should succeed silently");
 
     // Verify: only 1 entry
     let q = AuditQuery {
@@ -149,7 +170,11 @@ async fn idempotent_append_prevents_duplicates() {
         ..AuditQuery::default()
     };
     let entries = backend.query(&q).await.expect("query");
-    assert_eq!(entries.len(), 1, "Duplicate append must not create a second entry");
+    assert_eq!(
+        entries.len(),
+        1,
+        "Duplicate append must not create a second entry"
+    );
     assert_eq!(entries[0].id, entry_id);
 
     println!("IDEMPOTENT: Duplicate append ignored (crash replay scenario)");
@@ -169,15 +194,30 @@ async fn actor_attribution_distinguishes_humans_agents_system() {
     let exec_id = "LOAN-2024-00849";
 
     // Human: loan officer reviews application
-    let e1 = make_entry(exec_id, "approval_received", "loan-officer-jsmith", ActorType::Human);
+    let e1 = make_entry(
+        exec_id,
+        "approval_received",
+        "loan-officer-jsmith",
+        ActorType::Human,
+    );
     backend.append(e1).await.unwrap();
 
     // Agent: credit analysis agent processes documents
-    let e2 = make_entry(exec_id, "node_completed", "credit-analysis-agent-v2", ActorType::Agent);
+    let e2 = make_entry(
+        exec_id,
+        "node_completed",
+        "credit-analysis-agent-v2",
+        ActorType::Agent,
+    );
     backend.append(e2).await.unwrap();
 
     // System: scheduler assigns work
-    let e3 = make_entry(exec_id, "node_scheduled", "scheduler-main", ActorType::System);
+    let e3 = make_entry(
+        exec_id,
+        "node_scheduled",
+        "scheduler-main",
+        ActorType::System,
+    );
     backend.append(e3).await.unwrap();
 
     // Query all for this execution
@@ -190,9 +230,18 @@ async fn actor_attribution_distinguishes_humans_agents_system() {
     assert_eq!(entries.len(), 3);
 
     // Verify actor types (entries returned in reverse chronological order)
-    let human_entries: Vec<_> = entries.iter().filter(|e| e.actor_type == ActorType::Human).collect();
-    let agent_entries: Vec<_> = entries.iter().filter(|e| e.actor_type == ActorType::Agent).collect();
-    let system_entries: Vec<_> = entries.iter().filter(|e| e.actor_type == ActorType::System).collect();
+    let human_entries: Vec<_> = entries
+        .iter()
+        .filter(|e| e.actor_type == ActorType::Human)
+        .collect();
+    let agent_entries: Vec<_> = entries
+        .iter()
+        .filter(|e| e.actor_type == ActorType::Agent)
+        .collect();
+    let system_entries: Vec<_> = entries
+        .iter()
+        .filter(|e| e.actor_type == ActorType::System)
+        .collect();
 
     assert_eq!(human_entries.len(), 1, "One human action");
     assert_eq!(agent_entries.len(), 1, "One agent action");
@@ -221,7 +270,11 @@ async fn query_policy_violations_for_compliance_report() {
     let violations = vec![
         ("LOAN-001", "block_tool:delete_applicant_data", "blocked"),
         ("LOAN-002", "block_tool:export_ssn_bulk", "blocked"),
-        ("LOAN-003", "require_approval:approve_loan_over_500k", "require_approval"),
+        (
+            "LOAN-003",
+            "require_approval:approve_loan_over_500k",
+            "require_approval",
+        ),
     ];
 
     for (exec_id, rule, decision) in &violations {
@@ -258,7 +311,10 @@ async fn query_policy_violations_for_compliance_report() {
 
     // All results should have policy_decision set
     for entry in &results {
-        assert!(entry.policy_decision.is_some(), "All violations must have a policy_decision");
+        assert!(
+            entry.policy_decision.is_some(),
+            "All violations must have a policy_decision"
+        );
         println!(
             "VIOLATION: {} — {} ({})",
             entry.execution_id,
@@ -320,17 +376,37 @@ async fn http_context_enables_forensic_correlation() {
     let incident = &results[0];
     assert_eq!(incident.actor_id, "api-key-intern-account");
     assert_eq!(incident.http_method.as_deref(), Some("POST"));
-    assert!(incident.http_path.as_deref().unwrap().contains("export_ssn_bulk"));
+    assert!(incident
+        .http_path
+        .as_deref()
+        .unwrap()
+        .contains("export_ssn_bulk"));
     assert_eq!(incident.ip_address.as_deref(), Some("10.0.3.47"));
-    assert_eq!(incident.http_request_id.as_deref(), Some("req-abc123-def456"));
+    assert_eq!(
+        incident.http_request_id.as_deref(),
+        Some("req-abc123-def456")
+    );
     assert_eq!(incident.policy_decision.as_deref(), Some("blocked"));
 
     println!("FORENSIC TRACE: Unauthorized SSN export attempt");
-    println!("  Actor:      {} (type: {:?})", incident.actor_id, incident.actor_type);
-    println!("  Request:    {} {}", incident.http_method.as_deref().unwrap(), incident.http_path.as_deref().unwrap());
+    println!(
+        "  Actor:      {} (type: {:?})",
+        incident.actor_id, incident.actor_type
+    );
+    println!(
+        "  Request:    {} {}",
+        incident.http_method.as_deref().unwrap(),
+        incident.http_path.as_deref().unwrap()
+    );
     println!("  Source IP:  {}", incident.ip_address.as_deref().unwrap());
-    println!("  Request ID: {}", incident.http_request_id.as_deref().unwrap());
-    println!("  Decision:   {}", incident.policy_decision.as_deref().unwrap());
+    println!(
+        "  Request ID: {}",
+        incident.http_request_id.as_deref().unwrap()
+    );
+    println!(
+        "  Decision:   {}",
+        incident.policy_decision.as_deref().unwrap()
+    );
     println!("  -> Cross-reference with API gateway logs using request ID.");
     println!("  -> Intern's API key was immediately revoked.");
 }
@@ -346,7 +422,12 @@ async fn pagination_works_for_large_audit_trails() {
     let exec_id = "PORTFOLIO-2024-Q1";
 
     for i in 0..150 {
-        let mut entry = make_entry(exec_id, "node_completed", "portfolio-agent", ActorType::Agent);
+        let mut entry = make_entry(
+            exec_id,
+            "node_completed",
+            "portfolio-agent",
+            ActorType::Agent,
+        );
         entry.sequence = i + 1;
         backend.append(entry).await.unwrap();
     }
@@ -389,7 +470,11 @@ async fn pagination_works_for_large_audit_trails() {
         ..AuditQuery::default()
     };
     let last_page = backend.query(&q_last).await.unwrap();
-    assert_eq!(last_page.len(), 10, "Last page should have 10 entries (150 % 20)");
+    assert_eq!(
+        last_page.len(),
+        10,
+        "Last page should have 10 entries (150 % 20)"
+    );
 
     println!("PAGINATION: 150 entries across 8 pages (20/page)");
     println!("  Page 1: 20 entries, Page 8: 10 entries");
@@ -460,12 +545,22 @@ async fn tool_call_hash_detects_duplicate_operations() {
     let hash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
 
     // First call — legitimate
-    let mut e1 = make_entry("LOAN-001", "tool_approval_required", "system", ActorType::System);
+    let mut e1 = make_entry(
+        "LOAN-001",
+        "tool_approval_required",
+        "system",
+        ActorType::System,
+    );
     e1.tool_call_hash = Some(hash.to_string());
     backend.append(e1).await.unwrap();
 
     // Second call with same hash — potential replay
-    let mut e2 = make_entry("LOAN-001", "tool_approval_required", "system", ActorType::System);
+    let mut e2 = make_entry(
+        "LOAN-001",
+        "tool_approval_required",
+        "system",
+        ActorType::System,
+    );
     e2.tool_call_hash = Some(hash.to_string());
     backend.append(e2).await.unwrap();
 
@@ -479,9 +574,15 @@ async fn tool_call_hash_detects_duplicate_operations() {
 
     // Both entries exist (different IDs, but same hash)
     assert_eq!(results.len(), 2);
-    let hashes: Vec<_> = results.iter().filter_map(|e| e.tool_call_hash.as_deref()).collect();
+    let hashes: Vec<_> = results
+        .iter()
+        .filter_map(|e| e.tool_call_hash.as_deref())
+        .collect();
     assert_eq!(hashes.len(), 2);
-    assert_eq!(hashes[0], hashes[1], "Same tool call hash = potential replay");
+    assert_eq!(
+        hashes[0], hashes[1],
+        "Same tool call hash = potential replay"
+    );
 
     println!("REPLAY DETECTION: 2 tool calls with identical hash");
     println!("  Hash: {hash}");

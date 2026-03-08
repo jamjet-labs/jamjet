@@ -46,6 +46,7 @@ perf.data*
 progress-tracker.md
 REQUIREMENTS.md
 launch-plan.md
+CLAUDE.md
 
 # Local AI/editor agent config
 .claude/*.local.*

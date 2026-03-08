@@ -41,11 +41,11 @@ fn budget_accumulates_across_multiple_model_calls() {
     let mut budget = BudgetState::default();
 
     let calls = vec![
-        (2_000u64, 1_000u64, 0.003),    // summarize
-        (5_000, 3_000, 0.008),           // find precedents
-        (8_000, 4_000, 0.012),           // analyze case 1
-        (12_000, 6_000, 0.018),          // analyze case 2
-        (15_000, 8_000, 0.023),          // draft memo
+        (2_000u64, 1_000u64, 0.003), // summarize
+        (5_000, 3_000, 0.008),       // find precedents
+        (8_000, 4_000, 0.012),       // analyze case 1
+        (12_000, 6_000, 0.018),      // analyze case 2
+        (15_000, 8_000, 0.023),      // draft memo
     ];
 
     for (i, (input, output, cost)) in calls.iter().enumerate() {
@@ -87,12 +87,20 @@ fn detect_token_budget_exceeded() {
     for _ in 0..30 {
         budget.accumulate(Some(10_000), Some(6_000), Some(0.016));
     }
-    println!("After 30 patents: {} tokens, ${:.2}", budget.total_tokens(), budget.total_cost_usd);
+    println!(
+        "After 30 patents: {} tokens, ${:.2}",
+        budget.total_tokens(),
+        budget.total_cost_usd
+    );
     assert_eq!(budget.total_tokens(), 480_000);
 
     // The 31st patent pushes over the 500k limit
     budget.accumulate(Some(15_000), Some(10_000), Some(0.025));
-    println!("After 31 patents: {} tokens, ${:.2}", budget.total_tokens(), budget.total_cost_usd);
+    println!(
+        "After 31 patents: {} tokens, ${:.2}",
+        budget.total_tokens(),
+        budget.total_cost_usd
+    );
 
     let token_limit = 500_000u64;
     let exceeded = budget.total_tokens() > token_limit;
@@ -219,11 +227,20 @@ fn error_tracking_integrates_with_circuit_breaker() {
 
     // Westlaw goes down — 3 consecutive errors
     budget.record_error();
-    println!("Error 1: consecutive_errors = {}", budget.consecutive_error_count);
+    println!(
+        "Error 1: consecutive_errors = {}",
+        budget.consecutive_error_count
+    );
     budget.record_error();
-    println!("Error 2: consecutive_errors = {}", budget.consecutive_error_count);
+    println!(
+        "Error 2: consecutive_errors = {}",
+        budget.consecutive_error_count
+    );
     budget.record_error();
-    println!("Error 3: consecutive_errors = {}", budget.consecutive_error_count);
+    println!(
+        "Error 3: consecutive_errors = {}",
+        budget.consecutive_error_count
+    );
 
     assert_eq!(budget.consecutive_error_count, 3);
     println!("\nCircuit breaker threshold reached.");
@@ -268,10 +285,30 @@ fn multiple_budget_dimensions_checked_simultaneously() {
     let cost_ok = budget.total_cost_usd <= cost_limit;
 
     println!("\nBudget checks:");
-    println!("  Input  ({} / {}): {}", budget.total_input_tokens, input_limit, if input_ok { "OK" } else { "EXCEEDED" });
-    println!("  Output ({} / {}): {}", budget.total_output_tokens, output_limit, if output_ok { "OK" } else { "EXCEEDED" });
-    println!("  Total  ({} / {}): {}", budget.total_tokens(), total_limit, if total_ok { "OK" } else { "EXCEEDED" });
-    println!("  Cost   (${:.2} / ${:.2}): {}", budget.total_cost_usd, cost_limit, if cost_ok { "OK" } else { "EXCEEDED" });
+    println!(
+        "  Input  ({} / {}): {}",
+        budget.total_input_tokens,
+        input_limit,
+        if input_ok { "OK" } else { "EXCEEDED" }
+    );
+    println!(
+        "  Output ({} / {}): {}",
+        budget.total_output_tokens,
+        output_limit,
+        if output_ok { "OK" } else { "EXCEEDED" }
+    );
+    println!(
+        "  Total  ({} / {}): {}",
+        budget.total_tokens(),
+        total_limit,
+        if total_ok { "OK" } else { "EXCEEDED" }
+    );
+    println!(
+        "  Cost   (${:.2} / ${:.2}): {}",
+        budget.total_cost_usd,
+        cost_limit,
+        if cost_ok { "OK" } else { "EXCEEDED" }
+    );
 
     // Output tokens exceed first (400k > 300k limit)
     assert!(!output_ok, "Output tokens should exceed the 300k limit");
