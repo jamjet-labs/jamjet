@@ -35,7 +35,7 @@ def task(
     *,
     model: str = "default",
     tools: list[Callable[..., Any]] | None = None,
-    strategy: str = "react",
+    strategy: str = "plan-and-execute",
     max_iterations: int = 10,
     max_cost_usd: float = 1.0,
     timeout_seconds: int = 300,
