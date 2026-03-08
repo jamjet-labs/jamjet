@@ -92,54 +92,101 @@ class Agent:
         """
         Run the agent on a single prompt in-process. No runtime server needed.
 
-        Compiles the agent to IR, then executes the tool loop locally —
-        each tool is called with the prompt and results are collected.
-        For production, submit the compiled IR to the JamJet runtime.
+        Executes a ReAct loop: call the model → execute any tool calls →
+        feed results back → repeat until the model stops calling tools or
+        max_iterations is reached.
         """
+        import json
+        import os
+
+        try:
+            from openai import AsyncOpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "openai package is required for Agent.run(). Run: pip install openai"
+            ) from exc
+
         t_start = time.perf_counter_ns()
         ir = self.compile()
 
-        messages: list[dict[str, str]] = []
+        client = AsyncOpenAI(
+            api_key=os.environ.get("OPENAI_API_KEY", ""),
+            base_url=os.environ.get("OPENAI_BASE_URL"),
+        )
+
+        # Build OpenAI-compatible tool schemas
+        openai_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": td.name,
+                    "description": td.description,
+                    "parameters": td.input_schema,
+                },
+            }
+            for td in self._tools
+        ]
+
+        messages: list[dict[str, Any]] = []
         if self.instructions:
             messages.append({"role": "system", "content": self.instructions})
         messages.append({"role": "user", "content": prompt})
 
-        tool_calls: list[dict[str, Any]] = []
+        tool_calls_log: list[dict[str, Any]] = []
         final_output: str = ""
+        tool_map = {td.name: td for td in self._tools}
 
         for _iteration in range(self.limits.max_iterations):
-            tool_outputs: list[dict[str, Any]] = []
-            for td in self._tools:
-                t_call = time.perf_counter_ns()
-                # Call the tool — support both keyword and positional styles
-                sig = inspect.signature(td.fn)
-                params = list(sig.parameters.keys())
-                if params:
-                    result = td.fn(**{params[0]: prompt})
-                else:
-                    result = td.fn()
-                if inspect.isawaitable(result):
-                    result = await result
-                duration_us = (time.perf_counter_ns() - t_call) / 1000
-                output_str = str(result)
-                tool_outputs.append({"tool": td.name, "output": output_str})
-                tool_calls.append(
-                    {
-                        "tool": td.name,
-                        "input": prompt,
-                        "output": output_str,
-                        "duration_us": duration_us,
-                    }
-                )
+            kwargs: dict[str, Any] = {"model": self.model, "messages": messages}
+            if openai_tools:
+                kwargs["tools"] = openai_tools
 
-            parts = [to["output"] for to in tool_outputs]
-            final_output = "\n\n".join(parts)
-            break  # single-pass for local execution without a live model
+            response = await client.chat.completions.create(**kwargs)
+            msg = response.choices[0].message
+
+            # No tool calls — model is done
+            if not msg.tool_calls:
+                final_output = msg.content or ""
+                break
+
+            # Execute each tool call and feed results back
+            messages.append(msg)
+            for tc in msg.tool_calls:
+                td = tool_map.get(tc.function.name)
+                if td is None:
+                    result_str = f"Error: unknown tool {tc.function.name!r}"
+                else:
+                    t_call = time.perf_counter_ns()
+                    args = json.loads(tc.function.arguments or "{}")
+                    result = td.fn(**args)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    duration_us = (time.perf_counter_ns() - t_call) / 1000
+                    result_str = str(result)
+                    tool_calls_log.append({
+                        "tool": td.name,
+                        "input": args,
+                        "output": result_str,
+                        "duration_us": duration_us,
+                    })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result_str,
+                })
+        else:
+            # Hit max_iterations — return last assistant content
+            for m in reversed(messages):
+                content = m.content if hasattr(m, "content") else m.get("content")
+                role = m.role if hasattr(m, "role") else m.get("role")
+                if role == "assistant" and content:
+                    final_output = content
+                    break
 
         total_us = (time.perf_counter_ns() - t_start) / 1000
         return AgentResult(
             output=final_output,
-            tool_calls=tool_calls,
+            tool_calls=tool_calls_log,
             ir=ir,
             duration_us=total_us,
         )
