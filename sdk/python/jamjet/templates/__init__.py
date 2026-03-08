@@ -230,6 +230,291 @@ args = ["-y", "@modelcontextprotocol/server-github"]
 env = {{ GITHUB_TOKEN = "${{GITHUB_TOKEN}}" }}
 """,
     },
+    # ── rag-assistant ─────────────────────────────────────────────────────────
+    "rag-assistant": {
+        "workflow.yaml": """\
+# {name}/workflow.yaml
+# RAG (Retrieval-Augmented Generation) assistant.
+# Reads local files via MCP filesystem, retrieves relevant context, answers questions.
+#
+# Usage:
+#   jamjet run workflow.yaml --input '{{"question": "What does the README say about setup?"}}'
+
+workflow:
+  id: {name}
+  version: 0.1.0
+  state_schema:
+    question: str
+    context: str
+    answer: str
+  start: retrieve
+
+nodes:
+  retrieve:
+    type: tool
+    server: filesystem
+    tool: read_file
+    arguments:
+      path: "{{{{ state.question | extract_path }}}}"
+    output_key: context
+    retry:
+      max_attempts: 2
+      backoff: constant
+      delay_ms: 500
+    next: answer
+
+  answer:
+    type: model
+    model: claude-sonnet-4-6
+    system: |
+      You are a helpful assistant that answers questions using the provided context.
+      Always ground your answer in the context. If the context does not contain
+      enough information, say so clearly.
+    prompt: |
+      Context:
+      {{{{ state.context }}}}
+
+      Question: {{{{ state.question }}}}
+
+      Answer based only on the context above.
+    output_key: answer
+    next: end
+
+  end:
+    type: end
+""",
+        "jamjet.toml": """\
+[project]
+name = "{name}"
+version = "0.1.0"
+
+[[mcp_servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+""",
+        "evals/dataset.jsonl": """\
+{{"id": "q1", "input": {{"question": "Summarise the project README"}}, "expected": {{}}}}
+{{"id": "q2", "input": {{"question": "What are the setup steps?"}}, "expected": {{}}}}
+""",
+    },
+    # ── mcp-tool-consumer ─────────────────────────────────────────────────────
+    "mcp-tool-consumer": {
+        "workflow.yaml": """\
+# {name}/workflow.yaml
+# Connects to an MCP server and uses its tools inside a workflow.
+# Shows how JamJet integrates with any MCP-compatible tool server.
+#
+# Usage:
+#   jamjet run workflow.yaml --input '{{"query": "Search for JamJet on GitHub"}}'
+
+workflow:
+  id: {name}
+  version: 0.1.0
+  state_schema:
+    query: str
+    tool_result: str
+    summary: str
+  start: call-tool
+
+nodes:
+  call-tool:
+    type: tool
+    server: brave-search
+    tool: web_search
+    arguments:
+      query: "{{{{ state.query }}}}"
+      count: 5
+    output_key: tool_result
+    retry:
+      max_attempts: 3
+      backoff: exponential
+      delay_ms: 1000
+    next: summarize
+
+  summarize:
+    type: model
+    model: claude-haiku-4-5-20251001
+    system: You are a concise summarizer. Summarize search results in 3-5 sentences.
+    prompt: |
+      Search results for "{{{{ state.query }}}}":
+
+      {{{{ state.tool_result }}}}
+
+      Write a clear summary.
+    output_key: summary
+    next: end
+
+  end:
+    type: end
+""",
+        "jamjet.toml": """\
+[project]
+name = "{name}"
+version = "0.1.0"
+
+# Connect any MCP server here — brave-search, github, postgres, filesystem, etc.
+[[mcp_servers]]
+name = "brave-search"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-brave-search"]
+env = {{ BRAVE_API_KEY = "${{BRAVE_API_KEY}}" }}
+""",
+        "evals/dataset.jsonl": """\
+{{"id": "q1", "input": {{"query": "JamJet AI workflow runtime"}}, "expected": {{}}}}
+{{"id": "q2", "input": {{"query": "Model Context Protocol MCP spec"}}, "expected": {{}}}}
+""",
+    },
+    # ── mcp-tool-provider ─────────────────────────────────────────────────────
+    "mcp-tool-provider": {
+        "server.py": """\
+# {name}/server.py
+# Expose Python functions as MCP tools — any MCP client can call them.
+#
+# Usage:
+#   python server.py          # starts the MCP server on stdio
+#
+# Then configure in jamjet.toml:
+#   [[mcp_servers]]
+#   name = "{name}"
+#   command = "python"
+#   args = ["server.py"]
+
+from jamjet.protocols.mcp import MCPServer, tool
+
+server = MCPServer("{name}")
+
+
+@tool(description="Add two numbers together")
+def add(a: float, b: float) -> float:
+    \"\"\"Add two numbers.\"\"\"
+    return a + b
+
+
+@tool(description="Convert text to uppercase")
+def to_upper(text: str) -> str:
+    \"\"\"Convert text to uppercase.\"\"\"
+    return text.upper()
+
+
+@tool(description="Get the current UTC timestamp")
+def now() -> str:
+    \"\"\"Return current UTC time as ISO 8601 string.\"\"\"
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+if __name__ == "__main__":
+    server.run_stdio()
+""",
+        "workflow.yaml": """\
+# {name}/workflow.yaml
+# Uses the local MCP server defined in server.py.
+
+workflow:
+  id: {name}
+  version: 0.1.0
+  state_schema:
+    a: float
+    b: float
+    result: float
+    message: str
+  start: calculate
+
+nodes:
+  calculate:
+    type: tool
+    server: {name}
+    tool: add
+    arguments:
+      a: "{{{{ state.a }}}}"
+      b: "{{{{ state.b }}}}"
+    output_key: result
+    next: respond
+
+  respond:
+    type: model
+    model: claude-haiku-4-5-20251001
+    prompt: |
+      {{{{ state.a }}}} + {{{{ state.b }}}} = {{{{ state.result }}}}
+      Write one sentence confirming this calculation.
+    output_key: message
+    next: end
+
+  end:
+    type: end
+""",
+        "jamjet.toml": """\
+[project]
+name = "{name}"
+version = "0.1.0"
+
+[[mcp_servers]]
+name = "{name}"
+command = "python"
+args = ["server.py"]
+""",
+    },
+    # ── a2a-delegator ─────────────────────────────────────────────────────────
+    "a2a-delegator": {
+        "workflow.yaml": """\
+# {name}/workflow.yaml
+# Delegates a task to a remote agent via the A2A protocol.
+# The remote agent does the work; this workflow collects and presents the result.
+#
+# Usage:
+#   jamjet run workflow.yaml --input '{{"task": "Summarise Q3 sales report", "agent_url": "https://agent.example.com"}}'
+
+workflow:
+  id: {name}
+  version: 0.1.0
+  state_schema:
+    task: str
+    agent_url: str
+    agent_result: str
+    final_summary: str
+  start: delegate
+
+nodes:
+  delegate:
+    type: a2a_task
+    agent_uri: "{{{{ state.agent_url }}}}"
+    skill: default
+    input:
+      message: "{{{{ state.task }}}}"
+    output_key: agent_result
+    timeout_seconds: 120
+    next: summarize
+
+  summarize:
+    type: model
+    model: claude-haiku-4-5-20251001
+    system: You are a coordinator agent. Present the delegated result clearly.
+    prompt: |
+      Task delegated: {{{{ state.task }}}}
+      Remote agent result: {{{{ state.agent_result }}}}
+
+      Write a one-paragraph summary of what was accomplished.
+    output_key: final_summary
+    next: end
+
+  end:
+    type: end
+""",
+        "jamjet.toml": """\
+[project]
+name = "{name}"
+version = "0.1.0"
+
+[agent]
+id = "{name}-coordinator"
+name = "{name} Coordinator"
+version = "0.1.0"
+""",
+        "evals/dataset.jsonl": """\
+{{"id": "t1", "input": {{"task": "Summarise this document", "agent_url": "http://localhost:8080"}}, "expected": {{}}}}
+""",
+    },
     # ── approval-workflow ─────────────────────────────────────────────────────
     "approval-workflow": {
         "workflow.yaml": """\
