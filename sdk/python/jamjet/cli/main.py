@@ -80,7 +80,7 @@ def _print_logo() -> None:
 def _version_callback(value: bool) -> None:
     if value:
         _print_logo()
-        typer.echo("\nJamJet v0.1.0  —  agent-native workflow runtime")
+        typer.echo("\nJamJet v0.1.1  —  agent-native workflow runtime")
         raise typer.Exit()
 
 
@@ -784,7 +784,7 @@ def mcp_connect(
             try:
                 init_params = {
                     "protocolVersion": "2024-11-05",
-                    "clientInfo": {"name": "jamjet-cli", "version": "0.1.0"},
+                    "clientInfo": {"name": "jamjet-cli", "version": "0.1.1"},
                     "capabilities": {},
                 }
                 info = await _rpc("initialize", init_params)
@@ -816,7 +816,7 @@ def mcp_connect(
 
                 init_params = {
                     "protocolVersion": "2024-11-05",
-                    "clientInfo": {"name": "jamjet-cli", "version": "0.1.0"},
+                    "clientInfo": {"name": "jamjet-cli", "version": "0.1.1"},
                     "capabilities": {},
                 }
                 info = await _rpc("initialize", init_params)
