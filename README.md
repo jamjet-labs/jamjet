@@ -40,6 +40,12 @@
 
 </div>
 
+<div align="center">
+
+![JamJet demo](https://raw.githubusercontent.com/jamjet-labs/jamjet/main/demo.gif)
+
+</div>
+
 ---
 
 JamJet is a **performance-first, agent-native runtime** for AI agents. It is not another prompt wrapper or thin agent SDK — it is a **production-grade orchestration substrate** for agents that need to work, not just demo.
