@@ -18,6 +18,27 @@ description = "JamJet Python SDK — agent-native workflow authoring and CLI"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
+keywords = ["ai", "agents", "workflow", "mcp", "a2a", "llm", "rust", "durable", "orchestration"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://jamjet.dev"
+Documentation = "https://jamjet.dev"
+Repository = "https://github.com/jamjet-labs/jamjet"
+Changelog = "https://github.com/jamjet-labs/jamjet/blob/main/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/jamjet-labs/jamjet/issues"
+
 dependencies = [
     "pydantic>=2.0",
     "httpx>=0.27",
