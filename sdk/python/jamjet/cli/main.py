@@ -796,7 +796,7 @@ def mcp_connect(
             # HTTP + SSE — POST JSON-RPC to the MCP endpoint
             async with httpx.AsyncClient(timeout=timeout) as client:
 
-                async def _rpc(method: str, params: dict | None = None) -> dict:  # type: ignore[misc]
+                async def _rpc(method: str, params: dict | None = None) -> dict:
                     endpoint = url.rstrip("/") + "/mcp"
                     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
                     try:
@@ -1001,9 +1001,9 @@ def eval_run(
     """
     from jamjet.eval.dataset import EvalDataset
     from jamjet.eval.runner import EvalRunner
-    from jamjet.eval.scorers import AssertionScorer, CostScorer, LatencyScorer, LlmJudgeScorer
+    from jamjet.eval.scorers import AssertionScorer, BaseScorer, CostScorer, LatencyScorer, LlmJudgeScorer
 
-    scorers = []
+    scorers: list[BaseScorer] = []
 
     if rubric:
         scorers.append(LlmJudgeScorer(rubric=rubric, model=model, min_score=min_score))
