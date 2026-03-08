@@ -78,9 +78,7 @@ class Agent:
         for t in tools:
             defn = getattr(t, "_jamjet_tool", None)
             if defn is None:
-                raise TypeError(
-                    f"{t!r} is not a @tool-decorated function. Wrap it with @jamjet.tool first."
-                )
+                raise TypeError(f"{t!r} is not a @tool-decorated function. Wrap it with @jamjet.tool first.")
             self._tools.append(defn)
 
     @property
@@ -146,17 +144,21 @@ class Agent:
                     result = await result
                 duration_us = (time.perf_counter_ns() - t_call) / 1000
                 result_str = str(result)
-                tool_calls_log.append({
-                    "tool": td.name,
-                    "input": args,
-                    "output": result_str,
-                    "duration_us": duration_us,
-                })
-            results.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result_str,
-            })
+                tool_calls_log.append(
+                    {
+                        "tool": td.name,
+                        "input": args,
+                        "output": result_str,
+                        "duration_us": duration_us,
+                    }
+                )
+            results.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result_str,
+                }
+            )
         return results
 
     # ── Strategy executors ─────────────────────────────────────────────────
@@ -195,11 +197,7 @@ class Agent:
         plan_text = plan_msg.content or ""
 
         # Parse steps — each numbered line is one step
-        steps = [
-            line.strip()
-            for line in plan_text.splitlines()
-            if line.strip() and line.strip()[0].isdigit()
-        ]
+        steps = [line.strip() for line in plan_text.splitlines() if line.strip() and line.strip()[0].isdigit()]
         if not steps:
             steps = [plan_text]
 
@@ -239,9 +237,7 @@ class Agent:
                     f"Goal: {prompt}\n\n"
                     f"Plan executed:\n{plan_text}\n\n"
                     "Step results:\n"
-                    + "\n\n".join(
-                        f"Step {i+1}: {r}" for i, r in enumerate(step_results)
-                    )
+                    + "\n\n".join(f"Step {i + 1}: {r}" for i, r in enumerate(step_results))
                     + "\n\nSynthesize these results into a final, well-structured answer."
                 ),
             },
@@ -360,9 +356,7 @@ class Agent:
         try:
             from openai import AsyncOpenAI
         except ImportError as exc:
-            raise ImportError(
-                "openai package is required for Agent.run(). Run: pip install openai"
-            ) from exc
+            raise ImportError("openai package is required for Agent.run(). Run: pip install openai") from exc
 
         t_start = time.perf_counter_ns()
         ir = self.compile()
@@ -382,8 +376,7 @@ class Agent:
             final_output = await self._run_critic(client, prompt, tool_calls_log)
         else:
             raise ValueError(
-                f"Unknown strategy {self.strategy!r}. "
-                "Valid options: 'plan-and-execute', 'react', 'critic'."
+                f"Unknown strategy {self.strategy!r}. Valid options: 'plan-and-execute', 'react', 'critic'."
             )
 
         total_us = (time.perf_counter_ns() - t_start) / 1000
@@ -399,10 +392,7 @@ class Agent:
         return asyncio.run(self.run(prompt))
 
     def __repr__(self) -> str:
-        return (
-            f"Agent(name={self.name!r}, model={self.model!r}, "
-            f"tools={self.tool_names}, strategy={self.strategy!r})"
-        )
+        return f"Agent(name={self.name!r}, model={self.model!r}, tools={self.tool_names}, strategy={self.strategy!r})"
 
 
 class AgentResult:
