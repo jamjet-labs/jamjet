@@ -13,7 +13,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jamjet"
-version = "0.1.1"
+version = "0.1.2"
 description = "JamJet Python SDK — agent-native workflow authoring and CLI"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -31,14 +31,6 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Typing :: Typed",
 ]
-
-[project.urls]
-Homepage = "https://jamjet.dev"
-Documentation = "https://jamjet.dev"
-Repository = "https://github.com/jamjet-labs/jamjet"
-Changelog = "https://github.com/jamjet-labs/jamjet/blob/main/CHANGELOG.md"
-"Bug Tracker" = "https://github.com/jamjet-labs/jamjet/issues"
-
 dependencies = [
     "pydantic>=2.0",
     "httpx>=0.27",
@@ -47,6 +39,13 @@ dependencies = [
     "anyio>=4.0",
     "pyyaml>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://jamjet.dev"
+Documentation = "https://jamjet.dev"
+Repository = "https://github.com/jamjet-labs/jamjet"
+Changelog = "https://github.com/jamjet-labs/jamjet/blob/main/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/jamjet-labs/jamjet/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -83,5 +82,3 @@ disallow_any_generics = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-
-
