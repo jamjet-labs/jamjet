@@ -1,31 +1,7 @@
 <div align="center">
 
-<!-- Pixel art lightning bolt logo -->
-<svg width="80" height="96" viewBox="0 0 30 36" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <rect x="10" y="0"  width="5" height="4" fill="#f5c518"/>
-  <rect x="15" y="0"  width="5" height="4" fill="#f5c518"/>
-  <rect x="5"  y="4"  width="5" height="4" fill="#f5c518"/>
-  <rect x="10" y="4"  width="5" height="4" fill="#f5c518"/>
-  <rect x="15" y="4"  width="5" height="4" fill="#f5c518"/>
-  <rect x="20" y="4"  width="5" height="4" fill="#f5c518"/>
-  <rect x="10" y="8"  width="5" height="4" fill="#f5c518"/>
-  <rect x="15" y="8"  width="5" height="4" fill="#f5c518"/>
-  <rect x="0"  y="12" width="5" height="4" fill="#f5c518"/>
-  <rect x="5"  y="12" width="5" height="4" fill="#f5c518"/>
-  <rect x="10" y="12" width="5" height="4" fill="#f5c518"/>
-  <rect x="15" y="12" width="5" height="4" fill="#f5c518"/>
-  <rect x="5"  y="16" width="5" height="4" fill="#f5c518"/>
-  <rect x="10" y="16" width="5" height="4" fill="#f5c518"/>
-  <rect x="15" y="16" width="5" height="4" fill="#f5c518"/>
-  <rect x="20" y="16" width="5" height="4" fill="#f5c518"/>
-  <rect x="25" y="16" width="5" height="4" fill="#f5c518"/>
-  <rect x="10" y="20" width="5" height="4" fill="#f5c518"/>
-  <rect x="15" y="20" width="5" height="4" fill="#f5c518"/>
-  <rect x="10" y="24" width="5" height="4" fill="#f5c518"/>
-  <rect x="15" y="24" width="5" height="4" fill="#f5c518"/>
-</svg>
-
-# JamJet
+<!-- Lightning bolt logo — ⚡ fallback since GitHub strips inline SVG -->
+<h1>⚡ JamJet</h1>
 
 **The agent-native runtime — durable, composable, built for production.**
 
@@ -34,6 +10,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-f5c518?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square)](https://rustup.rs)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)](https://python.org)
+[![Java](https://img.shields.io/badge/java-21%2B-red?style=flat-square)](https://openjdk.org)
 [![Docs](https://img.shields.io/badge/docs-jamjet.dev-f5c518?style=flat-square)](https://jamjet.dev/docs/quickstart)
 
 [jamjet.dev](https://jamjet.dev) · [Quickstart](https://jamjet.dev/docs/quickstart) · [Docs](https://jamjet.dev/docs/concepts) · [Examples](https://jamjet.dev/examples) · [Blog](https://jamjet.dev/blog)
@@ -50,7 +27,7 @@
 
 JamJet is a **performance-first, agent-native runtime** for AI agents. It is not another prompt wrapper or thin agent SDK — it is a **production-grade orchestration substrate** for agents that need to work, not just demo.
 
-The runtime core is **Rust + Tokio** for scheduling, state, and concurrency. The authoring surface is **Python** (or YAML). Both compile to the same IR graph and run on the same engine.
+The runtime core is **Rust + Tokio** for scheduling, state, and concurrency. The authoring surface is **Python**, **Java**, or **YAML**. All compile to the same IR graph and run on the same engine.
 
 ## Why JamJet?
 
@@ -62,6 +39,8 @@ The runtime core is **Rust + Tokio** for scheduling, state, and concurrency. The
 | Slow Python orchestration at scale | **Rust core** — no GIL, real async parallelism |
 | Weak observability, no replay | **Full event timeline**, OTel GenAI traces, replay from any checkpoint |
 | No standard agent identity | **Agent Cards** — every agent is addressable and discoverable |
+| No governance or guardrails | **Policy engine** — tool blocking, approvals, autonomy enforcement, audit log |
+| Locked into one language | **Polyglot SDKs** — Python, Java (JDK 21), YAML — same IR, same runtime |
 | Can't run without a server | **In-process execution** — `pip install jamjet` and run immediately |
 
 ---
@@ -277,8 +256,9 @@ nodes:
 | **Built-in eval** | ✅ LLM judge, assertions | ❌ | ❌ | ❌ |
 | **Built-in observability** | ✅ OTel GenAI, event replay | 🟡 LangSmith (external) | ❌ | ❌ |
 | **Agent identity** | ✅ Agent Cards, A2A discovery | ❌ | ❌ | ❌ |
+| **Policy & governance** | ✅ policy engine, audit log | ❌ | ❌ | ❌ |
 | **Progressive complexity** | ✅ `@task` → `Agent` → `Workflow` | ❌ single API | ❌ | ❌ |
-| **Runtime language** | Rust core + Python authoring | Python | Python | Python |
+| **Runtime language** | Rust core + Python/Java authoring | Python | Python | Python |
 | **Best for** | Production multi-agent systems | Rapid prototyping | Conversational agents | Role-based crews |
 
 ---
@@ -288,7 +268,7 @@ nodes:
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                     Authoring Layer                       │
-│              Python SDK  |  YAML  |  CLI                  │
+│         Python SDK  |  Java SDK  |  YAML  |  CLI          │
 ├──────────────────────────────────────────────────────────┤
 │                 Compilation / Validation                   │
 │           Graph IR  |  Schema  |  Policy lint             │
@@ -298,6 +278,9 @@ nodes:
 │  Event log  |  Snapshots   │  A2A Client  |  A2A Server   │
 │  Workers    |  Timers      │                              │
 ├────────────────────────────┴─────────────────────────────┤
+│                    Enterprise Services                     │
+│  Policy Engine  |  Audit Log  |  Autonomy Enforcement     │
+├──────────────────────────────────────────────────────────┤
 │                      Runtime Services                      │
 │  Model Adapters  |  Tool Execution  |  Observability      │
 ├──────────────────────────────────────────────────────────┤
@@ -313,8 +296,8 @@ nodes:
 | 0 — Architecture & RFCs | ✅ Complete | Design docs, RFCs, repo scaffolding |
 | 1 — Minimal Viable Runtime | ✅ Complete | Local durable execution, MCP client, agent cards, Python CLI |
 | 2 — Production Core | ✅ Complete | Distributed workers, MCP server, full A2A client + server |
-| 3 — Developer Delight | 🔄 In Progress | Eval harness, trace debugging, templates |
-| 4 — Enterprise | 📋 Planned | Policy engine, tenant isolation, mTLS federation |
+| 3 — Developer Delight | ✅ Complete | Eval harness, trace debugging, templates, Java SDK |
+| 4 — Enterprise | 🔄 In Progress | Policy engine, autonomy enforcement, audit log, budgets |
 | 5 — Scale & Ecosystem | 📋 Planned | TypeScript SDK, hosted plane, agent marketplace |
 
 ---
@@ -328,7 +311,8 @@ Full documentation at **[jamjet.dev/docs](https://jamjet.dev/docs/quickstart)**
 | [Quickstart](https://jamjet.dev/docs/quickstart) | Get running in 10 minutes |
 | [Core Concepts](https://jamjet.dev/docs/concepts) | Agents, workflows, nodes, state, durability |
 | [YAML Workflows](https://jamjet.dev/docs/yaml-workflows) | All node types, retry policies, conditions |
-| [Python SDK](https://jamjet.dev/docs/python-sdk) | Full SDK reference |
+| [Python SDK](https://jamjet.dev/docs/python-sdk) | Full Python SDK reference |
+| [Java SDK](https://jamjet.dev/docs/java-sdk) | JDK 21, virtual threads, records |
 | [MCP Integration](https://jamjet.dev/docs/mcp) | Connect to MCP servers, expose tools |
 | [A2A Integration](https://jamjet.dev/docs/a2a) | Delegate to and serve external agents |
 | [Eval Harness](https://jamjet.dev/docs/eval) | Score quality, run regression suites, gate CI |
@@ -342,23 +326,33 @@ Full documentation at **[jamjet.dev/docs](https://jamjet.dev/docs/quickstart)**
 
 ```
 jamjet/
-├── runtime/
-│   ├── core/           # Graph IR, node types, state machine
-│   ├── scheduler/      # Durable task scheduler (Rust)
-│   ├── workers/        # Node executors (model, tool, http, eval, …)
-│   ├── api/            # REST API server
-│   ├── agents/         # Agent Cards, registry, lifecycle
+├── runtime/                # Rust workspace (15 crates)
+│   ├── core/               # Graph IR, node types, state machine
+│   ├── ir/                 # Canonical Intermediate Representation
+│   ├── scheduler/          # Durable task scheduler
+│   ├── state/              # Event-sourced state, snapshots
+│   ├── workers/            # Node executors (model, tool, http, eval, …)
+│   ├── api/                # REST API control plane
+│   ├── agents/             # Agent Cards, registry, lifecycle
+│   ├── models/             # LLM provider adapter layer
+│   ├── timers/             # Durable timers, Postgres-backed cron
+│   ├── policy/             # Policy engine (tool blocking, approvals)
+│   ├── audit/              # Immutable audit log
 │   ├── protocols/
-│   │   ├── mcp/        # MCP client + server
-│   │   └── a2a/        # A2A client + server
-│   └── telemetry/      # OTel instrumentation
+│   │   ├── mcp/            # MCP client + server
+│   │   └── a2a/            # A2A client + server
+│   └── telemetry/          # OTel instrumentation
 ├── sdk/
-│   └── python/
-│       └── jamjet/
-│           ├── cli/    # jamjet CLI (Typer)
-│           ├── eval/   # Eval dataset, runner, scorers
-│           └── workflows/  # Python workflow builder
-└── tests/              # Integration tests
+│   ├── python/             # Python SDK + CLI
+│   │   └── jamjet/
+│   │       ├── cli/        # jamjet CLI (Typer)
+│   │       ├── eval/       # Eval dataset, runner, scorers
+│   │       ├── agents/     # Agent definitions + strategies
+│   │       ├── templates/  # Project scaffolding templates
+│   │       └── workflow/   # Python workflow builder
+│   └── java/               # Java SDK (JDK 21, virtual threads, records)
+│       ├── jamjet-sdk/     # Core SDK module
+│       └── jamjet-cli/     # CLI module
 ```
 
 ---
