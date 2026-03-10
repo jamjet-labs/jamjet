@@ -152,7 +152,17 @@ class LlmJudgeScorer(BaseScorer):
         if self._model_fn is not None:
             return await self._model_fn(prompt)
 
-        # Auto-detect available SDK.
+        # Auto-detect available SDK / provider.
+
+        # Ollama — free local inference, no API key needed.
+        if self.model.startswith(("llama", "qwen", "gemma", "phi", "mistral")):
+            return await self._call_ollama(prompt)
+
+        # Google Gemini — cheap cloud.
+        if self.model.startswith("gemini"):
+            return await self._call_google(prompt)
+
+        # Anthropic Claude.
         try:
             import anthropic
 
@@ -163,9 +173,10 @@ class LlmJudgeScorer(BaseScorer):
                 messages=[{"role": "user", "content": prompt}],
             )
             return msg.content[0].text
-        except ImportError:
+        except (ImportError, Exception):
             pass
 
+        # OpenAI.
         try:
             from openai import OpenAI
 
@@ -176,12 +187,64 @@ class LlmJudgeScorer(BaseScorer):
                 max_tokens=256,
             )
             return resp.choices[0].message.content or ""
-        except ImportError:
+        except (ImportError, Exception):
             pass
 
         raise RuntimeError(
-            "No model SDK available. Install 'anthropic' or 'openai', or pass a custom model_fn to LlmJudgeScorer."
+            "No model SDK available. Install 'anthropic', 'openai', or 'httpx', "
+            "or pass a custom model_fn to LlmJudgeScorer."
         )
+
+    async def _call_ollama(self, prompt: str) -> str:
+        """Call Ollama local server."""
+        import os
+
+        import httpx
+
+        host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                f"{host}/api/chat",
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "options": {"num_predict": 256},
+                },
+            )
+            resp.raise_for_status()
+            return resp.json().get("message", {}).get("content", "")
+
+    async def _call_google(self, prompt: str) -> str:
+        """Call Google Gemini via REST API."""
+        import os
+
+        import httpx
+
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GOOGLE_API_KEY or GEMINI_API_KEY not set")
+
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta"
+            f"/models/{self.model}:generateContent?key={api_key}"
+        )
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                url,
+                json={
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {"maxOutputTokens": 256},
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    return parts[0].get("text", "")
+            return ""
 
 
 class LatencyScorer(BaseScorer):

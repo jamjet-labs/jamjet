@@ -98,16 +98,37 @@ impl Default for ModelRegistry {
 
 /// Build a `ModelRegistry` from environment variables.
 ///
-/// Registers Anthropic if `ANTHROPIC_API_KEY` is set, OpenAI if `OPENAI_API_KEY` is set.
-/// Sets up standard prefix routing (claude-* → anthropic, gpt-* / o1-* / o3-* → openai).
+/// Registers adapters based on available API keys / services:
+/// - Anthropic if `ANTHROPIC_API_KEY` is set
+/// - OpenAI if `OPENAI_API_KEY` is set
+/// - Google if `GOOGLE_API_KEY` or `GEMINI_API_KEY` is set
+/// - Ollama if `OLLAMA_HOST` is set or defaults to localhost:11434
+///
+/// Sets up standard prefix routing:
+///   claude-* → anthropic, gpt-*/o1-*/o3-* → openai,
+///   gemini-* → google, ollama model names → ollama.
 pub fn registry_from_env() -> ModelRegistry {
-    use crate::{anthropic::AnthropicAdapter, openai::OpenAiAdapter};
+    use crate::{
+        anthropic::AnthropicAdapter, google::GoogleAdapter, ollama::OllamaAdapter,
+        openai::OpenAiAdapter,
+    };
 
     let mut registry = ModelRegistry::new()
         .route_prefix("claude-", "anthropic")
         .route_prefix("gpt-", "openai")
         .route_prefix("o1-", "openai")
-        .route_prefix("o3-", "openai");
+        .route_prefix("o3-", "openai")
+        .route_prefix("gemini-", "google")
+        .route_prefix("google/", "google")
+        // Common Ollama model name patterns.
+        .route_prefix("llama", "ollama")
+        .route_prefix("qwen", "ollama")
+        .route_prefix("gemma", "ollama")
+        .route_prefix("phi", "ollama")
+        .route_prefix("mistral", "ollama")
+        .route_prefix("codellama", "ollama")
+        .route_prefix("deepseek", "ollama")
+        .route_prefix("nomic-", "ollama");
 
     if let Ok(adapter) = AnthropicAdapter::from_env() {
         registry = registry.register(Arc::new(adapter));
@@ -118,6 +139,22 @@ pub fn registry_from_env() -> ModelRegistry {
         registry = registry.register(Arc::new(adapter));
         if registry.default.is_none() {
             registry = registry.with_default("openai");
+        }
+    }
+
+    if let Ok(adapter) = GoogleAdapter::from_env() {
+        registry = registry.register(Arc::new(adapter));
+        if registry.default.is_none() {
+            registry = registry.with_default("google");
+        }
+    }
+
+    // Ollama is always available if the server is running (no API key needed).
+    // Register it but don't set as default — cloud providers take priority.
+    if let Ok(adapter) = OllamaAdapter::from_env() {
+        registry = registry.register(Arc::new(adapter));
+        if registry.default.is_none() {
+            registry = registry.with_default("ollama");
         }
     }
 
