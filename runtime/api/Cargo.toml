@@ -32,3 +32,4 @@ chrono = { workspace = true }
 config = { workspace = true }
 dotenvy = { workspace = true }
 anyhow = { workspace = true }
+reqwest = { workspace = true }
