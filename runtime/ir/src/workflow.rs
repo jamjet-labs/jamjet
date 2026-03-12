@@ -55,6 +55,9 @@ pub struct WorkflowIr {
     /// If absent, the execution fails with `WorkflowFailed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_budget_exceeded: Option<String>,
+    /// Data handling policy (PII redaction + retention controls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_policy: Option<DataPolicyIr>,
 }
 
 impl WorkflowIr {
@@ -109,6 +112,9 @@ pub struct NodeDef {
     /// Node-level policy override (most specific — overrides workflow + global).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicySetIr>,
+    /// Node-level data policy override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_policy: Option<DataPolicyIr>,
 }
 
 /// A directed edge between two nodes.
@@ -214,6 +220,60 @@ pub struct TokenBudgetIr {
     pub total_tokens: Option<u32>,
 }
 
+/// Data handling policy — controls PII redaction and prompt/output retention.
+///
+/// Applied at workflow level and overridable per-node (same layering as `PolicySetIr`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataPolicyIr {
+    /// JSON path patterns that contain PII and must be redacted.
+    /// Examples: `"$.patient.ssn"`, `"$.user.email"`
+    #[serde(default)]
+    pub pii_fields: Vec<String>,
+
+    /// Built-in PII pattern detectors to enable.
+    /// Values: `"email"`, `"ssn"`, `"credit_card"`, `"phone"`, `"ip_address"`
+    #[serde(default)]
+    pub pii_detectors: Vec<String>,
+
+    /// How to redact PII values. Default: `"mask"`.
+    /// Options: `"mask"` (`[REDACTED]`), `"hash"` (SHA-256), `"remove"` (delete key).
+    #[serde(default = "default_redaction_mode")]
+    pub redaction_mode: String,
+
+    /// Whether to store prompts in the event/audit log. Default: false.
+    #[serde(default)]
+    pub retain_prompts: bool,
+
+    /// Whether to store model outputs/completions. Default: true.
+    #[serde(default = "default_true")]
+    pub retain_outputs: bool,
+
+    /// Retention duration for audit entries in days. None = indefinite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u32>,
+}
+
+fn default_redaction_mode() -> String {
+    "mask".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for DataPolicyIr {
+    fn default() -> Self {
+        Self {
+            pii_fields: Vec::new(),
+            pii_detectors: Vec::new(),
+            redaction_mode: default_redaction_mode(),
+            retain_prompts: false,
+            retain_outputs: true,
+            retention_days: None,
+        }
+    }
+}
+
 /// Authentication configuration for external connections.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -246,6 +306,7 @@ mod tests {
             token_budget: None,
             cost_budget_usd: None,
             on_budget_exceeded: None,
+            data_policy: None,
             state_schema: "schemas.TestState".into(),
             start_node: "start".into(),
             nodes: HashMap::new(),

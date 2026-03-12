@@ -45,6 +45,12 @@ pub struct AuditLogEntry {
     /// Tenant that this audit entry belongs to.
     #[serde(default = "default_tenant")]
     pub tenant_id: String,
+    /// When this entry expires for retention purposes. None = keep indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Whether PII redaction was applied to raw_event.
+    #[serde(default)]
+    pub redacted: bool,
 }
 
 fn default_tenant() -> String {
@@ -78,6 +84,8 @@ impl AuditLogEntry {
             created_at: Utc::now(),
             raw_event,
             tenant_id: "default".to_string(),
+            expires_at: None,
+            redacted: false,
         }
     }
 }

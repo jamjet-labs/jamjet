@@ -30,13 +30,16 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ip_address      TEXT,
     created_at      TEXT NOT NULL,
     raw_event       TEXT NOT NULL,
-    tenant_id       TEXT NOT NULL DEFAULT 'default'
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
+    expires_at      TEXT,
+    redacted        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_audit_execution_id ON audit_log (execution_id);
 CREATE INDEX IF NOT EXISTS idx_audit_actor_id     ON audit_log (actor_id);
 CREATE INDEX IF NOT EXISTS idx_audit_event_type   ON audit_log (event_type);
 CREATE INDEX IF NOT EXISTS idx_audit_created_at   ON audit_log (created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_tenant_id    ON audit_log (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_audit_expires_at   ON audit_log (expires_at);
 "#;
 
 pub struct SqliteAuditBackend {
@@ -52,6 +55,21 @@ impl SqliteAuditBackend {
     pub async fn open(database_url: &str) -> Result<Self, sqlx::Error> {
         let pool = SqlitePool::connect(database_url).await?;
         Ok(Self { pool })
+    }
+
+    /// Purge audit entries whose retention period has expired.
+    ///
+    /// Returns the number of entries removed.
+    pub async fn purge_expired(&self) -> Result<u64, AuditError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result =
+            sqlx::query("DELETE FROM audit_log WHERE expires_at IS NOT NULL AND expires_at < ?")
+                .bind(&now)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| AuditError::Database(e.to_string()))?;
+
+        Ok(result.rows_affected())
     }
 
     /// Apply the audit log DDL. Call once at server startup.
@@ -73,14 +91,16 @@ impl AuditBackend for SqliteAuditBackend {
         let raw = serde_json::to_string(&entry.raw_event)
             .map_err(|e| AuditError::Serialization(e.to_string()))?;
 
+        let expires_at = entry.expires_at.map(|dt| dt.to_rfc3339());
+
         sqlx::query(
             r#"
             INSERT OR IGNORE INTO audit_log
                 (id, event_id, execution_id, sequence, event_type,
                  actor_id, actor_type, tool_call_hash, policy_decision,
                  http_request_id, http_method, http_path, ip_address,
-                 created_at, raw_event, tenant_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 created_at, raw_event, tenant_id, expires_at, redacted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(entry.id.to_string())
@@ -99,6 +119,8 @@ impl AuditBackend for SqliteAuditBackend {
         .bind(entry.created_at.to_rfc3339())
         .bind(raw)
         .bind(&entry.tenant_id)
+        .bind(expires_at.as_deref())
+        .bind(entry.redacted as i32)
         .execute(&self.pool)
         .await
         .map_err(|e| AuditError::Database(e.to_string()))?;
@@ -199,6 +221,8 @@ struct AuditRow {
     created_at: String,
     raw_event: String,
     tenant_id: String,
+    expires_at: Option<String>,
+    redacted: i32,
 }
 
 fn row_to_entry(row: AuditRow) -> Result<AuditLogEntry, AuditError> {
@@ -227,6 +251,11 @@ fn row_to_entry(row: AuditRow) -> Result<AuditLogEntry, AuditError> {
         created_at,
         raw_event,
         tenant_id: row.tenant_id,
+        expires_at: row
+            .expires_at
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc)),
+        redacted: row.redacted != 0,
     })
 }
 

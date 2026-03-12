@@ -11,6 +11,7 @@
 
 pub mod autonomy;
 pub mod engine;
+pub mod redaction;
 
 use jamjet_ir::workflow::PolicySetIr;
 use serde::{Deserialize, Serialize};

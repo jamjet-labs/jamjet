@@ -2,6 +2,9 @@
 
 use crate::backend::AuditBackend;
 use crate::entry::{ActorType, AuditLogEntry};
+use chrono::Duration;
+use jamjet_ir::workflow::DataPolicyIr;
+use jamjet_policy::redaction::PiiRedactor;
 use jamjet_state::event::{Event, EventKind};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -22,6 +25,8 @@ pub struct RequestContext {
     pub actor_type: ActorType,
     /// Tenant context for this request.
     pub tenant_id: String,
+    /// Data handling policy for PII redaction and retention.
+    pub data_policy: Option<DataPolicyIr>,
 }
 
 impl RequestContext {
@@ -104,9 +109,49 @@ impl AuditEnricher {
         // Set tenant_id from request context.
         entry.tenant_id = ctx.tenant_id.clone();
 
+        // Apply data policy: PII redaction + retention.
+        if let Some(data_policy) = &ctx.data_policy {
+            let redactor = PiiRedactor::from_policy(data_policy);
+            if redactor.is_active() {
+                entry.raw_event = redactor.redact_json(&entry.raw_event);
+                entry.redacted = true;
+            }
+
+            // Retention: set expires_at based on policy.
+            if let Some(days) = data_policy.retention_days {
+                entry.expires_at = Some(entry.created_at + Duration::days(i64::from(days)));
+            }
+
+            // Prompt/output retention controls.
+            if !data_policy.retain_prompts {
+                strip_prompts(&mut entry.raw_event);
+            }
+            if !data_policy.retain_outputs {
+                strip_outputs(&mut entry.raw_event);
+            }
+        }
+
         if let Err(e) = self.backend.append(entry).await {
             warn!("Failed to write audit log entry: {e}");
         }
+    }
+}
+
+/// Remove prompt data from the raw event JSON.
+fn strip_prompts(raw: &mut serde_json::Value) {
+    if let Some(obj) = raw.as_object_mut() {
+        obj.remove("prompt");
+        obj.remove("system_prompt");
+        obj.remove("input_messages");
+    }
+}
+
+/// Remove output/completion data from the raw event JSON.
+fn strip_outputs(raw: &mut serde_json::Value) {
+    if let Some(obj) = raw.as_object_mut() {
+        obj.remove("output");
+        obj.remove("completion");
+        obj.remove("response");
     }
 }
 
