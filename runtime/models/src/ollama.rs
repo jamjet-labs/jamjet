@@ -38,8 +38,7 @@ impl OllamaAdapter {
 
     /// Create adapter from `OLLAMA_HOST` env var (defaults to localhost:11434).
     pub fn from_env() -> Result<Self, ModelError> {
-        let host =
-            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| OLLAMA_DEFAULT_HOST.to_string());
+        let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| OLLAMA_DEFAULT_HOST.to_string());
 
         // Quick check: if Ollama is not reachable, fail fast.
         // We skip the actual health check here to keep construction sync;
@@ -141,10 +140,7 @@ impl OllamaAdapter {
         let output_tokens = resp["eval_count"].as_u64().unwrap_or(0);
 
         // Ollama uses "done_reason" (not "finish_reason").
-        let finish_reason = resp["done_reason"]
-            .as_str()
-            .unwrap_or("stop")
-            .to_string();
+        let finish_reason = resp["done_reason"].as_str().unwrap_or("stop").to_string();
 
         Ok(ModelResponse {
             content,

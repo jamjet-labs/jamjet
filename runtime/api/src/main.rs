@@ -57,8 +57,10 @@ async fn main() -> anyhow::Result<()> {
     let audit: Arc<dyn jamjet_audit::AuditBackend> = Arc::new(audit_backend);
     let enricher = Arc::new(AuditEnricher::new(Arc::clone(&audit)));
 
+    let sqlite = Arc::new(backend);
     let state = AppState {
-        backend: Arc::new(backend),
+        backend: sqlite.clone() as Arc<dyn jamjet_state::StateBackend>,
+        sqlite,
         agents: Arc::new(agents),
         audit,
         enricher,

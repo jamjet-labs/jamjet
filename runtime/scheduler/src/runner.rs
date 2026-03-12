@@ -320,6 +320,7 @@ impl Scheduler {
                     created_at: chrono::Utc::now(),
                     lease_expires_at: None,
                     worker_id: None,
+                    tenant_id: jamjet_state::DEFAULT_TENANT.to_string(),
                 };
                 self.backend.enqueue_work_item(item).await?;
                 enqueued += 1;

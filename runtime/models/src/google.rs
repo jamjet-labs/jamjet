@@ -48,11 +48,7 @@ impl GoogleAdapter {
         self
     }
 
-    async fn call_api(
-        &self,
-        model: &str,
-        body: Value,
-    ) -> Result<Value, ModelError> {
+    async fn call_api(&self, model: &str, body: Value) -> Result<Value, ModelError> {
         // Gemini API URL: /v1beta/models/{model}:generateContent?key={key}
         let url = format!(
             "{}/models/{}:generateContent?key={}",
@@ -133,15 +129,12 @@ impl GoogleAdapter {
         });
 
         // System instruction (separate from contents in Gemini API).
-        let system_text = config
-            .system_prompt
-            .as_deref()
-            .or_else(|| {
-                messages
-                    .iter()
-                    .find(|m| matches!(m.role, ChatRole::System))
-                    .map(|m| m.content.as_str())
-            });
+        let system_text = config.system_prompt.as_deref().or_else(|| {
+            messages
+                .iter()
+                .find(|m| matches!(m.role, ChatRole::System))
+                .map(|m| m.content.as_str())
+        });
 
         if let Some(sys) = system_text {
             body["systemInstruction"] = json!({
@@ -260,8 +253,7 @@ impl ModelAdapter for GoogleAdapter {
             "\n\nRespond ONLY with a valid JSON object matching this schema:\n{schema_str}"
         ));
 
-        let body =
-            self.build_request_body(&request.messages, &config, Some("application/json"));
+        let body = self.build_request_body(&request.messages, &config, Some("application/json"));
         let resp_json = self.call_api(&model, body).await?;
         let mut response = self.parse_response(resp_json)?;
 

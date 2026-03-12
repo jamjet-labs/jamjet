@@ -1,5 +1,6 @@
 use crate::event::{Event, EventSequence};
 use crate::snapshot::Snapshot;
+use crate::tenant::{Tenant, TenantId, DEFAULT_TENANT};
 use async_trait::async_trait;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use thiserror::Error;
@@ -12,6 +13,13 @@ pub struct WorkflowDefinition {
     /// The canonical IR JSON value.
     pub ir: serde_json::Value,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Tenant that owns this workflow definition.
+    #[serde(default = "default_tenant_string")]
+    pub tenant_id: String,
+}
+
+fn default_tenant_string() -> String {
+    DEFAULT_TENANT.to_string()
 }
 
 #[derive(Debug, Error)]
@@ -143,6 +151,32 @@ pub trait StateBackend: Send + Sync {
 
     /// Validate a plaintext API token. Returns the token info if valid and not revoked.
     async fn validate_token(&self, token: &str) -> BackendResult<Option<ApiToken>>;
+
+    // ── Tenant management ───────────────────────────────────────────────
+
+    /// Create a new tenant.
+    async fn create_tenant(&self, _tenant: Tenant) -> BackendResult<()> {
+        Err(StateBackendError::Database(
+            "tenant management not supported".into(),
+        ))
+    }
+
+    /// Get a tenant by ID.
+    async fn get_tenant(&self, _id: &TenantId) -> BackendResult<Option<Tenant>> {
+        Ok(None)
+    }
+
+    /// List all tenants.
+    async fn list_tenants(&self) -> BackendResult<Vec<Tenant>> {
+        Ok(vec![])
+    }
+
+    /// Update tenant metadata (name, status, policy, limits).
+    async fn update_tenant(&self, _tenant: Tenant) -> BackendResult<()> {
+        Err(StateBackendError::Database(
+            "tenant management not supported".into(),
+        ))
+    }
 }
 
 /// Metadata for an API token (does not contain the plaintext token).
@@ -153,6 +187,9 @@ pub struct ApiToken {
     pub role: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Tenant this token belongs to.
+    #[serde(default = "default_tenant_string")]
+    pub tenant_id: String,
 }
 
 pub type WorkItemId = uuid::Uuid;
@@ -171,6 +208,9 @@ pub struct WorkItem {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub worker_id: Option<String>,
+    /// Tenant that owns this work item.
+    #[serde(default = "default_tenant_string")]
+    pub tenant_id: String,
 }
 
 /// Result of reclaiming expired work item leases.

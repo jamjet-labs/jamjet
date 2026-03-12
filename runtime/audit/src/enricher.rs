@@ -20,6 +20,8 @@ pub struct RequestContext {
     /// `actor_id` comes from the API token's name field, or "system" for internal events.
     pub actor_id: String,
     pub actor_type: ActorType,
+    /// Tenant context for this request.
+    pub tenant_id: String,
 }
 
 impl RequestContext {
@@ -27,6 +29,16 @@ impl RequestContext {
         Self {
             actor_id: worker_id.into(),
             actor_type: ActorType::System,
+            tenant_id: "default".to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub fn system_for_tenant(worker_id: impl Into<String>, tenant_id: impl Into<String>) -> Self {
+        Self {
+            actor_id: worker_id.into(),
+            actor_type: ActorType::System,
+            tenant_id: tenant_id.into(),
             ..Default::default()
         }
     }
@@ -50,6 +62,7 @@ impl AuditEnricher {
         let default_ctx = RequestContext {
             actor_id: "system".to_string(),
             actor_type: ActorType::System,
+            tenant_id: "default".to_string(),
             ..Default::default()
         };
         let ctx = ctx.unwrap_or(&default_ctx);
@@ -87,6 +100,9 @@ impl AuditEnricher {
 
         // Derive policy_decision for policy events.
         entry.policy_decision = extract_policy_decision(&event.kind);
+
+        // Set tenant_id from request context.
+        entry.tenant_id = ctx.tenant_id.clone();
 
         if let Err(e) = self.backend.append(entry).await {
             warn!("Failed to write audit log entry: {e}");

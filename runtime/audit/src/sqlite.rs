@@ -29,12 +29,14 @@ CREATE TABLE IF NOT EXISTS audit_log (
     http_path       TEXT,
     ip_address      TEXT,
     created_at      TEXT NOT NULL,
-    raw_event       TEXT NOT NULL
+    raw_event       TEXT NOT NULL,
+    tenant_id       TEXT NOT NULL DEFAULT 'default'
 );
 CREATE INDEX IF NOT EXISTS idx_audit_execution_id ON audit_log (execution_id);
 CREATE INDEX IF NOT EXISTS idx_audit_actor_id     ON audit_log (actor_id);
 CREATE INDEX IF NOT EXISTS idx_audit_event_type   ON audit_log (event_type);
 CREATE INDEX IF NOT EXISTS idx_audit_created_at   ON audit_log (created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_tenant_id    ON audit_log (tenant_id);
 "#;
 
 pub struct SqliteAuditBackend {
@@ -77,8 +79,8 @@ impl AuditBackend for SqliteAuditBackend {
                 (id, event_id, execution_id, sequence, event_type,
                  actor_id, actor_type, tool_call_hash, policy_decision,
                  http_request_id, http_method, http_path, ip_address,
-                 created_at, raw_event)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 created_at, raw_event, tenant_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(entry.id.to_string())
@@ -96,6 +98,7 @@ impl AuditBackend for SqliteAuditBackend {
         .bind(&entry.ip_address)
         .bind(entry.created_at.to_rfc3339())
         .bind(raw)
+        .bind(&entry.tenant_id)
         .execute(&self.pool)
         .await
         .map_err(|e| AuditError::Database(e.to_string()))?;
@@ -104,12 +107,6 @@ impl AuditBackend for SqliteAuditBackend {
     }
 
     async fn query(&self, q: &AuditQuery) -> Result<Vec<AuditLogEntry>, AuditError> {
-        // Build a dynamic WHERE clause.
-        let conditions: Vec<&str> = vec!["1=1"];
-        // Note: SQLite doesn't support true dynamic binding like diesel/sea-orm,
-        // so we use a simple approach: pre-filter with the fields we have.
-        // Full dynamic query building would require a query builder; here we keep
-        // it simple with optional clauses materialized in the WHERE string.
         let from_str;
         let to_str;
 
@@ -131,8 +128,10 @@ impl AuditBackend for SqliteAuditBackend {
         if let Some(exec_id) = &q.execution_id {
             wheres.push(format!("execution_id = '{exec_id}'"));
         }
+        if let Some(tid) = &q.tenant_id {
+            wheres.push(format!("tenant_id = '{tid}'"));
+        }
 
-        let _ = conditions; // suppress unused warning
         let where_clause = wheres.join(" AND ");
         let sql = format!(
             "SELECT * FROM audit_log WHERE {where_clause} ORDER BY created_at DESC LIMIT {} OFFSET {}",
@@ -163,6 +162,9 @@ impl AuditBackend for SqliteAuditBackend {
         }
         if let Some(exec_id) = &q.execution_id {
             wheres.push(format!("execution_id = '{exec_id}'"));
+        }
+        if let Some(tid) = &q.tenant_id {
+            wheres.push(format!("tenant_id = '{tid}'"));
         }
 
         let where_clause = wheres.join(" AND ");
@@ -196,6 +198,7 @@ struct AuditRow {
     ip_address: Option<String>,
     created_at: String,
     raw_event: String,
+    tenant_id: String,
 }
 
 fn row_to_entry(row: AuditRow) -> Result<AuditLogEntry, AuditError> {
@@ -223,6 +226,7 @@ fn row_to_entry(row: AuditRow) -> Result<AuditLogEntry, AuditError> {
         ip_address: row.ip_address,
         created_at,
         raw_event,
+        tenant_id: row.tenant_id,
     })
 }
 

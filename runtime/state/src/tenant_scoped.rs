@@ -1,86 +1,45 @@
+//! Tenant-scoped SQLite backend — wraps a shared `SqlitePool` and transparently
+//! filters all queries by `tenant_id`.
+//!
+//! Workers serve all tenants: they claim any pending work item, then read the
+//! `tenant_id` from the claimed item and use a scoped backend for the rest of
+//! that item's execution.
+
 use crate::backend::{
     ApiToken, BackendResult, ReclaimResult, StateBackend, StateBackendError, WorkItem, WorkItemId,
     WorkflowDefinition,
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
+use crate::sqlite::{map_db_err, parse_datetime, parse_execution_id};
+use crate::tenant::{Tenant, TenantId, TenantLimits, TenantStatus, DEFAULT_TENANT};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
-use sqlx::{sqlite::SqliteConnectOptions, Row, SqlitePool};
-use std::str::FromStr;
+use sqlx::{Row, SqlitePool};
 use tracing::instrument;
 use uuid::Uuid;
 
-/// SQLite-backed state store for local development.
+/// A tenant-scoped view over a shared `SqlitePool`.
 ///
-/// Run migrations with [`SqliteBackend::migrate`] before first use.
-pub struct SqliteBackend {
-    pool: SqlitePool,
+/// Every read/write operation is filtered by `tenant_id`, ensuring
+/// complete data isolation between tenants.
+pub struct TenantScopedSqliteBackend {
+    pub(crate) pool: SqlitePool,
+    pub(crate) tenant_id: TenantId,
 }
 
-impl SqliteBackend {
-    /// Connect to the SQLite database at `database_url` and return a backend.
-    /// `database_url` is a SQLx-compatible URL, e.g. `sqlite:///path/to/db.sqlite3`.
-    /// The database file is created automatically if it does not exist.
-    pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
-        let opts = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
-        let pool = SqlitePool::connect_with(opts).await?;
-        Ok(Self { pool })
+impl TenantScopedSqliteBackend {
+    pub fn new(pool: SqlitePool, tenant_id: TenantId) -> Self {
+        Self { pool, tenant_id }
     }
 
-    /// Run embedded migrations against the connected database.
-    pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
-        sqlx::migrate!("./migrations").run(&self.pool).await
-    }
-
-    /// Convenience: connect and immediately run migrations.
-    pub async fn open(
-        database_url: &str,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let backend = Self::connect(database_url).await?;
-        backend.migrate().await?;
-        Ok(backend)
-    }
-
-    /// Create a tenant-scoped view of this backend.
-    ///
-    /// All operations on the returned backend are filtered by `tenant_id`,
-    /// ensuring complete data isolation between tenants.
-    pub fn for_tenant(
-        &self,
-        tenant_id: crate::tenant::TenantId,
-    ) -> crate::tenant_scoped::TenantScopedSqliteBackend {
-        crate::tenant_scoped::TenantScopedSqliteBackend::new(self.pool.clone(), tenant_id)
-    }
-
-    /// Get a clone of the underlying connection pool.
-    pub fn pool(&self) -> SqlitePool {
-        self.pool.clone()
+    pub fn tenant_id(&self) -> &TenantId {
+        &self.tenant_id
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-pub(crate) fn map_db_err(e: sqlx::Error) -> StateBackendError {
-    StateBackendError::Database(e.to_string())
-}
-
-fn execution_id_str(id: &ExecutionId) -> String {
-    id.0.to_string()
-}
-
-pub(crate) fn parse_execution_id(s: &str) -> BackendResult<ExecutionId> {
-    let uuid = Uuid::parse_str(s)
-        .map_err(|e| StateBackendError::Database(format!("invalid execution_id: {e}")))?;
-    Ok(ExecutionId(uuid))
-}
-
-pub(crate) fn parse_datetime(s: &str) -> BackendResult<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| StateBackendError::Database(format!("invalid datetime: {e}")))
-}
+// ── Helpers (re-use sqlite.rs parsers) ────────────────────────────────────────
 
 fn status_to_str(s: &WorkflowStatus) -> &'static str {
     match s {
@@ -107,6 +66,10 @@ fn str_to_status(s: &str) -> BackendResult<WorkflowStatus> {
             "unknown status: {other}"
         ))),
     }
+}
+
+fn execution_id_str(id: &ExecutionId) -> String {
+    id.0.to_string()
 }
 
 fn row_to_execution(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkflowExecution> {
@@ -183,12 +146,10 @@ fn row_to_work_item(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkItem> {
         .transpose()?;
     let created_at = parse_datetime(row.try_get::<&str, _>("created_at").map_err(map_db_err)?)?;
     let attempt: i64 = row.try_get("attempt").map_err(map_db_err)?;
-
     let max_attempts: i64 = row.try_get("max_attempts").unwrap_or(3);
-
     let tenant_id: String = row
         .try_get("tenant_id")
-        .unwrap_or_else(|_| crate::tenant::DEFAULT_TENANT.to_string());
+        .unwrap_or_else(|_| DEFAULT_TENANT.to_string());
 
     Ok(WorkItem {
         id,
@@ -210,11 +171,12 @@ fn row_to_work_item(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkItem> {
 // ── StateBackend impl ─────────────────────────────────────────────────────────
 
 #[async_trait]
-impl StateBackend for SqliteBackend {
+impl StateBackend for TenantScopedSqliteBackend {
     // ── Workflow definitions ──────────────────────────────────────────────
 
-    #[instrument(skip(self, def), fields(workflow_id = %def.workflow_id, version = %def.version))]
-    async fn store_workflow(&self, def: WorkflowDefinition) -> BackendResult<()> {
+    #[instrument(skip(self, def), fields(tenant = %self.tenant_id, workflow_id = %def.workflow_id))]
+    async fn store_workflow(&self, mut def: WorkflowDefinition) -> BackendResult<()> {
+        def.tenant_id = self.tenant_id.0.clone();
         let ir_json = serde_json::to_string(&def.ir)?;
         let created_at = def.created_at.to_rfc3339();
 
@@ -226,7 +188,7 @@ impl StateBackend for SqliteBackend {
         .bind(&def.version)
         .bind(&ir_json)
         .bind(&created_at)
-        .bind(&def.tenant_id)
+        .bind(&self.tenant_id.0)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -234,19 +196,21 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(workflow_id = workflow_id, version = version))]
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, workflow_id = workflow_id))]
     async fn get_workflow(
         &self,
         workflow_id: &str,
         version: &str,
     ) -> BackendResult<Option<WorkflowDefinition>> {
-        let row =
-            sqlx::query("SELECT * FROM workflow_definitions WHERE workflow_id = ? AND version = ?")
-                .bind(workflow_id)
-                .bind(version)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(map_db_err)?;
+        let row = sqlx::query(
+            "SELECT * FROM workflow_definitions WHERE workflow_id = ? AND version = ? AND tenant_id = ?",
+        )
+        .bind(workflow_id)
+        .bind(version)
+        .bind(&self.tenant_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_db_err)?;
 
         let Some(row) = row else { return Ok(None) };
 
@@ -255,10 +219,6 @@ impl StateBackend for SqliteBackend {
                 .map_err(StateBackendError::Serialization)?;
         let created_at = parse_datetime(row.try_get::<&str, _>("created_at").map_err(map_db_err)?)?;
 
-        let tenant_id: String = row
-            .try_get("tenant_id")
-            .unwrap_or_else(|_| crate::tenant::DEFAULT_TENANT.to_string());
-
         Ok(Some(WorkflowDefinition {
             workflow_id: row
                 .try_get::<String, _>("workflow_id")
@@ -266,13 +226,13 @@ impl StateBackend for SqliteBackend {
             version: row.try_get::<String, _>("version").map_err(map_db_err)?,
             ir,
             created_at,
-            tenant_id,
+            tenant_id: self.tenant_id.0.clone(),
         }))
     }
 
     // ── Executions ────────────────────────────────────────────────────────
 
-    #[instrument(skip(self, execution), fields(execution_id = %execution.execution_id))]
+    #[instrument(skip(self, execution), fields(tenant = %self.tenant_id, execution_id = %execution.execution_id))]
     async fn create_execution(&self, execution: WorkflowExecution) -> BackendResult<()> {
         let id = execution_id_str(&execution.execution_id);
         let status = status_to_str(&execution.status);
@@ -285,8 +245,8 @@ impl StateBackend for SqliteBackend {
         sqlx::query(
             r#"INSERT INTO workflow_executions
                (execution_id, workflow_id, workflow_version, status, initial_input, current_state,
-                started_at, updated_at, completed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                started_at, updated_at, completed_at, tenant_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id)
         .bind(&execution.workflow_id)
@@ -297,6 +257,7 @@ impl StateBackend for SqliteBackend {
         .bind(&started_at)
         .bind(&updated_at)
         .bind(completed_at.as_deref())
+        .bind(&self.tenant_id.0)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -304,19 +265,22 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(execution_id = %id))]
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %id))]
     async fn get_execution(&self, id: &ExecutionId) -> BackendResult<Option<WorkflowExecution>> {
         let id_str = execution_id_str(id);
-        let row = sqlx::query("SELECT * FROM workflow_executions WHERE execution_id = ?")
-            .bind(&id_str)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_db_err)?;
+        let row = sqlx::query(
+            "SELECT * FROM workflow_executions WHERE execution_id = ? AND tenant_id = ?",
+        )
+        .bind(&id_str)
+        .bind(&self.tenant_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_db_err)?;
 
         row.map(|r| row_to_execution(&r)).transpose()
     }
 
-    #[instrument(skip(self), fields(execution_id = %id, status = ?status))]
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %id))]
     async fn update_execution_status(
         &self,
         id: &ExecutionId,
@@ -332,12 +296,13 @@ impl StateBackend for SqliteBackend {
         };
 
         let rows_affected = sqlx::query(
-            "UPDATE workflow_executions SET status = ?, updated_at = ?, completed_at = COALESCE(?, completed_at) WHERE execution_id = ?",
+            "UPDATE workflow_executions SET status = ?, updated_at = ?, completed_at = COALESCE(?, completed_at) WHERE execution_id = ? AND tenant_id = ?",
         )
         .bind(status_str)
         .bind(&now)
         .bind(completed_at.as_deref())
         .bind(&id_str)
+        .bind(&self.tenant_id.0)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?
@@ -349,7 +314,7 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), fields(tenant = %self.tenant_id))]
     async fn list_executions(
         &self,
         status: Option<WorkflowStatus>,
@@ -360,9 +325,10 @@ impl StateBackend for SqliteBackend {
             Some(s) => {
                 let status_str = status_to_str(&s);
                 sqlx::query(
-                    "SELECT * FROM workflow_executions WHERE status = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    "SELECT * FROM workflow_executions WHERE status = ? AND tenant_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?",
                 )
                 .bind(status_str)
+                .bind(&self.tenant_id.0)
                 .bind(limit as i64)
                 .bind(offset as i64)
                 .fetch_all(&self.pool)
@@ -370,8 +336,9 @@ impl StateBackend for SqliteBackend {
                 .map_err(map_db_err)?
             }
             None => sqlx::query(
-                "SELECT * FROM workflow_executions ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                "SELECT * FROM workflow_executions WHERE tenant_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?",
             )
+            .bind(&self.tenant_id.0)
             .bind(limit as i64)
             .bind(offset as i64)
             .fetch_all(&self.pool)
@@ -384,7 +351,7 @@ impl StateBackend for SqliteBackend {
 
     // ── Event log ─────────────────────────────────────────────────────────
 
-    #[instrument(skip(self, event), fields(execution_id = %event.execution_id, seq = event.sequence))]
+    #[instrument(skip(self, event), fields(tenant = %self.tenant_id, execution_id = %event.execution_id))]
     async fn append_event(&self, event: Event) -> BackendResult<EventSequence> {
         let id = event.id.to_string();
         let execution_id = execution_id_str(&event.execution_id);
@@ -392,14 +359,15 @@ impl StateBackend for SqliteBackend {
         let created_at = event.created_at.to_rfc3339();
 
         sqlx::query(
-            r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at)
-               VALUES (?, ?, ?, ?, ?)"#,
+            r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at, tenant_id)
+               VALUES (?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id)
         .bind(&execution_id)
         .bind(event.sequence)
         .bind(&kind_json)
         .bind(&created_at)
+        .bind(&self.tenant_id.0)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -407,19 +375,22 @@ impl StateBackend for SqliteBackend {
         Ok(event.sequence)
     }
 
-    #[instrument(skip(self), fields(execution_id = %execution_id))]
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %execution_id))]
     async fn get_events(&self, execution_id: &ExecutionId) -> BackendResult<Vec<Event>> {
         let id_str = execution_id_str(execution_id);
-        let rows = sqlx::query("SELECT * FROM events WHERE execution_id = ? ORDER BY sequence ASC")
-            .bind(&id_str)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(map_db_err)?;
+        let rows = sqlx::query(
+            "SELECT * FROM events WHERE execution_id = ? AND tenant_id = ? ORDER BY sequence ASC",
+        )
+        .bind(&id_str)
+        .bind(&self.tenant_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_db_err)?;
 
         rows.iter().map(row_to_event).collect()
     }
 
-    #[instrument(skip(self), fields(execution_id = %execution_id, since = since_sequence))]
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %execution_id))]
     async fn get_events_since(
         &self,
         execution_id: &ExecutionId,
@@ -427,9 +398,10 @@ impl StateBackend for SqliteBackend {
     ) -> BackendResult<Vec<Event>> {
         let id_str = execution_id_str(execution_id);
         let rows = sqlx::query(
-            "SELECT * FROM events WHERE execution_id = ? AND sequence > ? ORDER BY sequence ASC",
+            "SELECT * FROM events WHERE execution_id = ? AND tenant_id = ? AND sequence > ? ORDER BY sequence ASC",
         )
         .bind(&id_str)
+        .bind(&self.tenant_id.0)
         .bind(since_sequence)
         .fetch_all(&self.pool)
         .await
@@ -438,13 +410,14 @@ impl StateBackend for SqliteBackend {
         rows.iter().map(row_to_event).collect()
     }
 
-    #[instrument(skip(self), fields(execution_id = %execution_id))]
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %execution_id))]
     async fn latest_sequence(&self, execution_id: &ExecutionId) -> BackendResult<EventSequence> {
         let id_str = execution_id_str(execution_id);
         let row = sqlx::query(
-            "SELECT COALESCE(MAX(sequence), 0) as seq FROM events WHERE execution_id = ?",
+            "SELECT COALESCE(MAX(sequence), 0) as seq FROM events WHERE execution_id = ? AND tenant_id = ?",
         )
         .bind(&id_str)
+        .bind(&self.tenant_id.0)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -454,7 +427,7 @@ impl StateBackend for SqliteBackend {
 
     // ── Snapshots ─────────────────────────────────────────────────────────
 
-    #[instrument(skip(self, snapshot), fields(execution_id = %snapshot.execution_id, at_seq = snapshot.at_sequence))]
+    #[instrument(skip(self, snapshot), fields(tenant = %self.tenant_id, execution_id = %snapshot.execution_id))]
     async fn write_snapshot(&self, snapshot: Snapshot) -> BackendResult<()> {
         let id = snapshot.id.to_string();
         let execution_id = execution_id_str(&snapshot.execution_id);
@@ -462,14 +435,15 @@ impl StateBackend for SqliteBackend {
         let created_at = snapshot.created_at.to_rfc3339();
 
         sqlx::query(
-            r#"INSERT OR REPLACE INTO snapshots (id, execution_id, at_sequence, state_json, created_at)
-               VALUES (?, ?, ?, ?, ?)"#,
+            r#"INSERT OR REPLACE INTO snapshots (id, execution_id, at_sequence, state_json, created_at, tenant_id)
+               VALUES (?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id)
         .bind(&execution_id)
         .bind(snapshot.at_sequence)
         .bind(&state_json)
         .bind(&created_at)
+        .bind(&self.tenant_id.0)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -477,13 +451,14 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(execution_id = %execution_id))]
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %execution_id))]
     async fn latest_snapshot(&self, execution_id: &ExecutionId) -> BackendResult<Option<Snapshot>> {
         let id_str = execution_id_str(execution_id);
         let row = sqlx::query(
-            "SELECT * FROM snapshots WHERE execution_id = ? ORDER BY at_sequence DESC LIMIT 1",
+            "SELECT * FROM snapshots WHERE execution_id = ? AND tenant_id = ? ORDER BY at_sequence DESC LIMIT 1",
         )
         .bind(&id_str)
+        .bind(&self.tenant_id.0)
         .fetch_optional(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -511,8 +486,9 @@ impl StateBackend for SqliteBackend {
 
     // ── Work item queue ───────────────────────────────────────────────────
 
-    #[instrument(skip(self, item), fields(execution_id = %item.execution_id, node_id = %item.node_id))]
-    async fn enqueue_work_item(&self, item: WorkItem) -> BackendResult<WorkItemId> {
+    #[instrument(skip(self, item), fields(tenant = %self.tenant_id, execution_id = %item.execution_id))]
+    async fn enqueue_work_item(&self, mut item: WorkItem) -> BackendResult<WorkItemId> {
+        item.tenant_id = self.tenant_id.0.clone();
         let id = item.id.to_string();
         let execution_id = execution_id_str(&item.execution_id);
         let payload_json = serde_json::to_string(&item.payload)?;
@@ -520,8 +496,8 @@ impl StateBackend for SqliteBackend {
 
         sqlx::query(
             r#"INSERT INTO work_items
-               (id, execution_id, node_id, queue_type, payload_json, attempt, max_attempts, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)"#,
+               (id, execution_id, node_id, queue_type, payload_json, attempt, max_attempts, status, created_at, tenant_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)"#,
         )
         .bind(&id)
         .bind(&execution_id)
@@ -531,6 +507,7 @@ impl StateBackend for SqliteBackend {
         .bind(item.attempt as i64)
         .bind(item.max_attempts as i64)
         .bind(&created_at)
+        .bind(&self.tenant_id.0)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -538,7 +515,7 @@ impl StateBackend for SqliteBackend {
         Ok(item.id)
     }
 
-    #[instrument(skip(self), fields(worker_id = worker_id))]
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, worker_id = worker_id))]
     async fn claim_work_item(
         &self,
         worker_id: &str,
@@ -548,22 +525,20 @@ impl StateBackend for SqliteBackend {
             return Ok(None);
         }
 
-        // Expire stale leases first
         let now = Utc::now().to_rfc3339();
+        // Expire stale leases for this tenant.
         sqlx::query(
             "UPDATE work_items SET status = 'pending', worker_id = NULL, lease_expires_at = NULL \
-             WHERE status = 'claimed' AND lease_expires_at < ?",
+             WHERE status = 'claimed' AND lease_expires_at < ? AND tenant_id = ?",
         )
         .bind(&now)
+        .bind(&self.tenant_id.0)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
 
-        // SQLite doesn't support UPDATE ... RETURNING with a subquery easily, so
-        // we use a transaction: SELECT FOR UPDATE equivalent via exclusive transaction.
         let mut tx = self.pool.begin().await.map_err(map_db_err)?;
 
-        // Build placeholders for queue_types IN clause
         let placeholders = queue_types
             .iter()
             .map(|_| "?")
@@ -571,14 +546,15 @@ impl StateBackend for SqliteBackend {
             .join(",");
         let query_str = format!(
             "SELECT * FROM work_items WHERE status = 'pending' AND queue_type IN ({}) \
-             AND (retry_after IS NULL OR retry_after <= ?) ORDER BY created_at ASC LIMIT 1",
+             AND tenant_id = ? AND (retry_after IS NULL OR retry_after <= ?) ORDER BY created_at ASC LIMIT 1",
             placeholders
         );
         let mut q = sqlx::query(&query_str);
         for qt in queue_types {
             q = q.bind(*qt);
         }
-        q = q.bind(&now); // for retry_after <= now check
+        q = q.bind(&self.tenant_id.0);
+        q = q.bind(&now);
         let row = q.fetch_optional(&mut *tx).await.map_err(map_db_err)?;
 
         let Some(row) = row else {
@@ -604,7 +580,6 @@ impl StateBackend for SqliteBackend {
 
         tx.commit().await.map_err(map_db_err)?;
 
-        // Return item with updated fields
         let mut claimed = item;
         claimed.worker_id = Some(worker_id.to_string());
         claimed.lease_expires_at = Some(
@@ -615,17 +590,18 @@ impl StateBackend for SqliteBackend {
         Ok(Some(claimed))
     }
 
-    #[instrument(skip(self), fields(item_id = %item_id, worker_id = worker_id))]
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, item_id = %item_id))]
     async fn renew_lease(&self, item_id: WorkItemId, worker_id: &str) -> BackendResult<()> {
         let lease_expires_at = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
         let id_str = item_id.to_string();
 
         let rows_affected = sqlx::query(
-            "UPDATE work_items SET lease_expires_at = ? WHERE id = ? AND worker_id = ? AND status = 'claimed'",
+            "UPDATE work_items SET lease_expires_at = ? WHERE id = ? AND worker_id = ? AND status = 'claimed' AND tenant_id = ?",
         )
         .bind(&lease_expires_at)
         .bind(&id_str)
         .bind(worker_id)
+        .bind(&self.tenant_id.0)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?
@@ -637,16 +613,17 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(item_id = %item_id))]
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, item_id = %item_id))]
     async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
         let id_str = item_id.to_string();
         let completed_at = Utc::now().to_rfc3339();
 
         let rows_affected = sqlx::query(
-            "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL WHERE id = ?",
+            "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL WHERE id = ? AND tenant_id = ?",
         )
         .bind(&completed_at)
         .bind(&id_str)
+        .bind(&self.tenant_id.0)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?
@@ -658,15 +635,16 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
-    #[instrument(skip(self, error), fields(item_id = %item_id))]
+    #[instrument(skip(self, error), fields(tenant = %self.tenant_id, item_id = %item_id))]
     async fn fail_work_item(&self, item_id: WorkItemId, error: &str) -> BackendResult<()> {
         let id_str = item_id.to_string();
-        let _ = error; // logged by caller; stored in event log not here
+        let _ = error;
 
         let rows_affected = sqlx::query(
-            "UPDATE work_items SET status = 'failed', lease_expires_at = NULL, worker_id = NULL WHERE id = ?",
+            "UPDATE work_items SET status = 'failed', lease_expires_at = NULL, worker_id = NULL WHERE id = ? AND tenant_id = ?",
         )
         .bind(&id_str)
+        .bind(&self.tenant_id.0)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?
@@ -678,15 +656,15 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), fields(tenant = %self.tenant_id))]
     async fn reclaim_expired_leases(&self) -> BackendResult<ReclaimResult> {
         let now = Utc::now().to_rfc3339();
 
-        // Find all claimed items whose lease has expired.
         let rows = sqlx::query(
-            "SELECT * FROM work_items WHERE status = 'claimed' AND lease_expires_at < ? ORDER BY created_at ASC",
+            "SELECT * FROM work_items WHERE status = 'claimed' AND lease_expires_at < ? AND tenant_id = ? ORDER BY created_at ASC",
         )
         .bind(&now)
+        .bind(&self.tenant_id.0)
         .fetch_all(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -699,12 +677,11 @@ impl StateBackend for SqliteBackend {
             let id_str = item.id.to_string();
 
             if new_attempt >= item.max_attempts {
-                // Exhausted — move to dead-letter (caller emits the event)
                 let dead_lettered_at = Utc::now().to_rfc3339();
                 sqlx::query(
                     r#"INSERT OR IGNORE INTO dead_letter_items
-                       (id, execution_id, node_id, queue_type, payload_json, attempt, last_error, created_at, dead_lettered_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                       (id, execution_id, node_id, queue_type, payload_json, attempt, last_error, created_at, dead_lettered_at, tenant_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
                 )
                 .bind(&id_str)
                 .bind(execution_id_str(&item.execution_id))
@@ -715,6 +692,7 @@ impl StateBackend for SqliteBackend {
                 .bind("lease expired: worker dead")
                 .bind(item.created_at.to_rfc3339())
                 .bind(dead_lettered_at)
+                .bind(&self.tenant_id.0)
                 .execute(&self.pool)
                 .await
                 .map_err(map_db_err)?;
@@ -730,9 +708,7 @@ impl StateBackend for SqliteBackend {
                 exhausted_item.attempt = new_attempt;
                 result.exhausted.push(exhausted_item);
             } else {
-                // Retryable — reset to pending with incremented attempt.
-                // Apply exponential backoff: 2^attempt seconds.
-                let backoff_secs = 1u64 << new_attempt.min(6); // max 64s
+                let backoff_secs = 1u64 << new_attempt.min(6);
                 let retry_after =
                     (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
 
@@ -755,7 +731,7 @@ impl StateBackend for SqliteBackend {
         Ok(result)
     }
 
-    #[instrument(skip(self, last_error), fields(item_id = %item_id))]
+    #[instrument(skip(self, last_error), fields(tenant = %self.tenant_id, item_id = %item_id))]
     async fn move_to_dead_letter(
         &self,
         item_id: WorkItemId,
@@ -763,9 +739,9 @@ impl StateBackend for SqliteBackend {
     ) -> BackendResult<()> {
         let id_str = item_id.to_string();
 
-        // Load the item first to copy fields.
-        let row = sqlx::query("SELECT * FROM work_items WHERE id = ?")
+        let row = sqlx::query("SELECT * FROM work_items WHERE id = ? AND tenant_id = ?")
             .bind(&id_str)
+            .bind(&self.tenant_id.0)
             .fetch_optional(&self.pool)
             .await
             .map_err(map_db_err)?;
@@ -778,8 +754,8 @@ impl StateBackend for SqliteBackend {
 
         sqlx::query(
             r#"INSERT OR REPLACE INTO dead_letter_items
-               (id, execution_id, node_id, queue_type, payload_json, attempt, last_error, created_at, dead_lettered_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               (id, execution_id, node_id, queue_type, payload_json, attempt, last_error, created_at, dead_lettered_at, tenant_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id_str)
         .bind(execution_id_str(&item.execution_id))
@@ -790,12 +766,14 @@ impl StateBackend for SqliteBackend {
         .bind(last_error)
         .bind(item.created_at.to_rfc3339())
         .bind(dead_lettered_at)
+        .bind(&self.tenant_id.0)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
 
-        sqlx::query("UPDATE work_items SET status = 'dead_lettered', lease_expires_at = NULL, worker_id = NULL WHERE id = ?")
+        sqlx::query("UPDATE work_items SET status = 'dead_lettered', lease_expires_at = NULL, worker_id = NULL WHERE id = ? AND tenant_id = ?")
             .bind(&id_str)
+            .bind(&self.tenant_id.0)
             .execute(&self.pool)
             .await
             .map_err(map_db_err)?;
@@ -803,11 +781,12 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
+    // ── API tokens ────────────────────────────────────────────────────────
+
     async fn create_token(&self, name: &str, role: &str) -> BackendResult<(String, ApiToken)> {
         use rand::Rng;
         use sha2::{Digest, Sha256};
 
-        // Generate a random 32-byte token, hex-encoded with a prefix.
         let random_bytes: [u8; 32] = rand::thread_rng().gen();
         let token = format!(
             "jj_{}",
@@ -817,19 +796,19 @@ impl StateBackend for SqliteBackend {
                 .collect::<String>()
         );
         let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
-
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
         sqlx::query(
-            r#"INSERT INTO api_tokens (id, token_hash, name, role, created_at)
-               VALUES (?, ?, ?, ?, ?)"#,
+            r#"INSERT INTO api_tokens (id, token_hash, name, role, created_at, tenant_id)
+               VALUES (?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id)
         .bind(&token_hash)
         .bind(name)
         .bind(role)
         .bind(&now)
+        .bind(&self.tenant_id.0)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -840,7 +819,7 @@ impl StateBackend for SqliteBackend {
             role: role.to_string(),
             created_at: Utc::now(),
             expires_at: None,
-            tenant_id: crate::tenant::DEFAULT_TENANT.to_string(),
+            tenant_id: self.tenant_id.0.clone(),
         };
         Ok((token, info))
     }
@@ -852,7 +831,7 @@ impl StateBackend for SqliteBackend {
         let now = Utc::now().to_rfc3339();
 
         let row = sqlx::query(
-            r#"SELECT id, name, role, created_at, expires_at
+            r#"SELECT id, name, role, created_at, expires_at, tenant_id
                FROM api_tokens
                WHERE token_hash = ?
                  AND revoked_at IS NULL
@@ -866,7 +845,6 @@ impl StateBackend for SqliteBackend {
 
         let Some(row) = row else { return Ok(None) };
 
-        // Update last_used_at.
         let id: String = row.get("id");
         sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE id = ?")
             .bind(&now)
@@ -878,7 +856,8 @@ impl StateBackend for SqliteBackend {
         let expires_at: Option<String> = row.get("expires_at");
         let tenant_id: String = row
             .try_get("tenant_id")
-            .unwrap_or_else(|_| crate::tenant::DEFAULT_TENANT.to_string());
+            .unwrap_or_else(|_| DEFAULT_TENANT.to_string());
+
         let info = ApiToken {
             id,
             name: row.get("name"),
@@ -892,170 +871,137 @@ impl StateBackend for SqliteBackend {
         };
         Ok(Some(info))
     }
+
+    // ── Tenant management ─────────────────────────────────────────────────
+
+    async fn create_tenant(&self, tenant: Tenant) -> BackendResult<()> {
+        let policy_json = tenant
+            .policy
+            .as_ref()
+            .map(|p| serde_json::to_string(p))
+            .transpose()?;
+        let limits_json = tenant
+            .limits
+            .as_ref()
+            .map(|l| serde_json::to_string(l))
+            .transpose()
+            .map_err(StateBackendError::Serialization)?;
+
+        sqlx::query(
+            r#"INSERT INTO tenants (id, name, status, policy_json, limits_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&tenant.id.0)
+        .bind(&tenant.name)
+        .bind(tenant.status.as_str())
+        .bind(policy_json.as_deref())
+        .bind(limits_json.as_deref())
+        .bind(tenant.created_at.to_rfc3339())
+        .bind(tenant.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+
+        Ok(())
+    }
+
+    async fn get_tenant(&self, id: &TenantId) -> BackendResult<Option<Tenant>> {
+        let row = sqlx::query("SELECT * FROM tenants WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+
+        let Some(row) = row else { return Ok(None) };
+        row_to_tenant(&row).map(Some)
+    }
+
+    async fn list_tenants(&self) -> BackendResult<Vec<Tenant>> {
+        let rows = sqlx::query("SELECT * FROM tenants ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+
+        rows.iter().map(row_to_tenant).collect()
+    }
+
+    async fn update_tenant(&self, tenant: Tenant) -> BackendResult<()> {
+        let policy_json = tenant
+            .policy
+            .as_ref()
+            .map(|p| serde_json::to_string(p))
+            .transpose()?;
+        let limits_json = tenant
+            .limits
+            .as_ref()
+            .map(|l| serde_json::to_string(l))
+            .transpose()
+            .map_err(StateBackendError::Serialization)?;
+
+        let rows_affected = sqlx::query(
+            r#"UPDATE tenants SET name = ?, status = ?, policy_json = ?, limits_json = ?, updated_at = ?
+               WHERE id = ?"#,
+        )
+        .bind(&tenant.name)
+        .bind(tenant.status.as_str())
+        .bind(policy_json.as_deref())
+        .bind(limits_json.as_deref())
+        .bind(tenant.updated_at.to_rfc3339())
+        .bind(&tenant.id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(StateBackendError::NotFound(tenant.id.0));
+        }
+        Ok(())
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Utc;
-    use jamjet_core::workflow::{WorkflowExecution, WorkflowStatus};
-    use serde_json::json;
-
-    async fn open_test_db() -> SqliteBackend {
-        let backend = SqliteBackend::open("sqlite::memory:")
-            .await
-            .expect("failed to open in-memory SQLite");
-        backend
+/// Parse a datetime that might be either RFC 3339 or SQLite's `datetime('now')` format.
+fn parse_datetime_flexible(s: &str) -> BackendResult<DateTime<Utc>> {
+    // Try RFC 3339 first (e.g. "2026-03-12T00:00:00+00:00")
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
     }
-
-    fn sample_execution() -> WorkflowExecution {
-        let now = Utc::now();
-        WorkflowExecution {
-            execution_id: ExecutionId::new(),
-            workflow_id: "test-wf".to_string(),
-            workflow_version: "1.0.0".to_string(),
-            status: WorkflowStatus::Pending,
-            initial_input: json!({"x": 1}),
-            current_state: json!({}),
-            started_at: now,
-            updated_at: now,
-            completed_at: None,
-        }
+    // Fallback: SQLite datetime format "YYYY-MM-DD HH:MM:SS"
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Ok(naive.and_utc());
     }
+    Err(StateBackendError::Database(format!(
+        "invalid datetime: {s}"
+    )))
+}
 
-    #[tokio::test]
-    async fn test_create_and_get_execution() {
-        let db = open_test_db().await;
-        let exec = sample_execution();
-        let id = exec.execution_id.clone();
-        db.create_execution(exec).await.unwrap();
-        let fetched = db.get_execution(&id).await.unwrap().unwrap();
-        assert_eq!(fetched.workflow_id, "test-wf");
-        assert_eq!(fetched.status, WorkflowStatus::Pending);
-    }
+fn row_to_tenant(row: &sqlx::sqlite::SqliteRow) -> BackendResult<Tenant> {
+    let policy: Option<serde_json::Value> = row
+        .try_get::<Option<&str>, _>("policy_json")
+        .map_err(map_db_err)?
+        .map(|s| serde_json::from_str(s))
+        .transpose()
+        .map_err(StateBackendError::Serialization)?;
 
-    #[tokio::test]
-    async fn test_update_status() {
-        let db = open_test_db().await;
-        let exec = sample_execution();
-        let id = exec.execution_id.clone();
-        db.create_execution(exec).await.unwrap();
-        db.update_execution_status(&id, WorkflowStatus::Running)
-            .await
-            .unwrap();
-        let fetched = db.get_execution(&id).await.unwrap().unwrap();
-        assert_eq!(fetched.status, WorkflowStatus::Running);
-    }
+    let limits: Option<TenantLimits> = row
+        .try_get::<Option<&str>, _>("limits_json")
+        .map_err(map_db_err)?
+        .map(|s| serde_json::from_str(s))
+        .transpose()
+        .map_err(StateBackendError::Serialization)?;
 
-    #[tokio::test]
-    async fn test_list_executions() {
-        let db = open_test_db().await;
-        db.create_execution(sample_execution()).await.unwrap();
-        db.create_execution(sample_execution()).await.unwrap();
-        let all = db.list_executions(None, 10, 0).await.unwrap();
-        assert_eq!(all.len(), 2);
-    }
+    let created_at =
+        parse_datetime_flexible(row.try_get::<&str, _>("created_at").map_err(map_db_err)?)?;
+    let updated_at =
+        parse_datetime_flexible(row.try_get::<&str, _>("updated_at").map_err(map_db_err)?)?;
 
-    #[tokio::test]
-    async fn test_event_log() {
-        use crate::event::{Event, EventKind};
-        let db = open_test_db().await;
-        let exec = sample_execution();
-        let exec_id = exec.execution_id.clone();
-        db.create_execution(exec).await.unwrap();
-
-        let event = Event::new(
-            exec_id.clone(),
-            1,
-            EventKind::WorkflowStarted {
-                workflow_id: "test-wf".to_string(),
-                workflow_version: "1.0.0".to_string(),
-                initial_input: json!({"x": 1}),
-            },
-        );
-        db.append_event(event).await.unwrap();
-
-        let events = db.get_events(&exec_id).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].sequence, 1);
-
-        let seq = db.latest_sequence(&exec_id).await.unwrap();
-        assert_eq!(seq, 1);
-    }
-
-    #[tokio::test]
-    async fn test_snapshot() {
-        use crate::snapshot::Snapshot;
-        let db = open_test_db().await;
-        let exec = sample_execution();
-        let exec_id = exec.execution_id.clone();
-        db.create_execution(exec).await.unwrap();
-
-        let snap = Snapshot::new(exec_id.clone(), 5, json!({"nodes_completed": ["a", "b"]}));
-        db.write_snapshot(snap).await.unwrap();
-
-        let loaded = db.latest_snapshot(&exec_id).await.unwrap().unwrap();
-        assert_eq!(loaded.at_sequence, 5);
-    }
-
-    #[tokio::test]
-    async fn test_workflow_definition() {
-        use crate::backend::WorkflowDefinition;
-        let db = open_test_db().await;
-
-        let def = WorkflowDefinition {
-            workflow_id: "my-wf".to_string(),
-            version: "1.0.0".to_string(),
-            ir: json!({"workflow_id": "my-wf", "version": "1.0.0", "nodes": {}}),
-            created_at: Utc::now(),
-            tenant_id: crate::tenant::DEFAULT_TENANT.to_string(),
-        };
-        db.store_workflow(def).await.unwrap();
-
-        let loaded = db.get_workflow("my-wf", "1.0.0").await.unwrap().unwrap();
-        assert_eq!(loaded.workflow_id, "my-wf");
-        assert_eq!(loaded.version, "1.0.0");
-
-        // Non-existent version returns None
-        let missing = db.get_workflow("my-wf", "2.0.0").await.unwrap();
-        assert!(missing.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_work_item_queue() {
-        let db = open_test_db().await;
-        let exec = sample_execution();
-        let exec_id = exec.execution_id.clone();
-        db.create_execution(exec).await.unwrap();
-
-        let item = WorkItem {
-            id: Uuid::new_v4(),
-            execution_id: exec_id.clone(),
-            node_id: "node-1".to_string(),
-            queue_type: "default".to_string(),
-            payload: json!({}),
-            attempt: 0,
-            max_attempts: 3,
-            created_at: Utc::now(),
-            lease_expires_at: None,
-            worker_id: None,
-            tenant_id: crate::tenant::DEFAULT_TENANT.to_string(),
-        };
-        let item_id = item.id;
-        db.enqueue_work_item(item).await.unwrap();
-
-        let claimed = db
-            .claim_work_item("worker-1", &["default"])
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(claimed.node_id, "node-1");
-        assert_eq!(claimed.worker_id.as_deref(), Some("worker-1"));
-
-        db.complete_work_item(item_id).await.unwrap();
-
-        // No more items
-        let none = db.claim_work_item("worker-1", &["default"]).await.unwrap();
-        assert!(none.is_none());
-    }
+    Ok(Tenant {
+        id: TenantId(row.try_get::<String, _>("id").map_err(map_db_err)?),
+        name: row.try_get::<String, _>("name").map_err(map_db_err)?,
+        status: TenantStatus::parse(row.try_get::<&str, _>("status").map_err(map_db_err)?),
+        policy,
+        limits,
+        created_at,
+        updated_at,
+    })
 }

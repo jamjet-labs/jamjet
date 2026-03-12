@@ -4,12 +4,16 @@ use jamjet_audit::{AuditBackend, AuditEnricher};
 use jamjet_mcp::McpAdapter;
 use jamjet_protocols::{anp::AnpAdapter, ProtocolRegistry};
 use jamjet_state::backend::StateBackend;
+use jamjet_state::{SqliteBackend, TenantId};
 use std::sync::Arc;
 
 /// Shared application state injected into Axum route handlers.
 #[derive(Clone)]
 pub struct AppState {
+    /// The raw, unscoped backend. Used by scheduler/worker (cross-tenant).
     pub backend: Arc<dyn StateBackend>,
+    /// The underlying SqliteBackend pool, for creating tenant-scoped backends.
+    pub sqlite: Arc<SqliteBackend>,
     pub agents: Arc<dyn AgentRegistry>,
     /// Audit log backend — append-only, immutable.
     pub audit: Arc<dyn AuditBackend>,
@@ -17,6 +21,13 @@ pub struct AppState {
     pub enricher: Arc<AuditEnricher>,
     /// Protocol adapter registry — pre-loaded with MCP, A2A, and ANP adapters.
     pub protocols: ProtocolRegistry,
+}
+
+impl AppState {
+    /// Get a tenant-scoped backend for the given tenant.
+    pub fn backend_for(&self, tenant_id: &TenantId) -> Arc<dyn StateBackend> {
+        Arc::new(self.sqlite.for_tenant(tenant_id.clone()))
+    }
 }
 
 /// Build a `ProtocolRegistry` pre-loaded with the built-in adapters.

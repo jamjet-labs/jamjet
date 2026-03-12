@@ -2,7 +2,7 @@ use crate::auth::{require_auth, require_write_role, AuthState};
 use crate::error::ApiError;
 use crate::state::AppState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     middleware,
     routing::{get, post},
@@ -12,7 +12,7 @@ use chrono::Utc;
 use jamjet_agents::{AgentCard, AgentFilter, AgentStatus};
 use jamjet_audit::backend::AuditQuery;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
-use jamjet_state::{WorkItem, WorkflowDefinition};
+use jamjet_state::{Tenant, TenantId, TenantStatus, WorkItem, WorkflowDefinition};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -43,6 +43,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/agents/:id/heartbeat", post(agent_heartbeat))
         // Admin
         .route("/workers", get(list_workers))
+        // Tenant management (operator-only)
+        .route("/tenants", post(create_tenant).get(list_tenants))
+        .route("/tenants/:id", get(get_tenant).put(update_tenant))
         // Audit log — immutable, append-only
         .route("/audit", get(list_audit_log))
         .layer(middleware::from_fn(require_write_role))
@@ -72,6 +75,7 @@ struct CreateWorkflowRequest {
 
 async fn create_workflow(
     State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
     Json(body): Json<CreateWorkflowRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let workflow_id = body
@@ -87,13 +91,15 @@ async fn create_workflow(
         .ok_or_else(|| ApiError::BadRequest("ir.version is required".into()))?
         .to_string();
 
+    let backend = state.backend_for(&tenant_id);
     let def = WorkflowDefinition {
         workflow_id: workflow_id.clone(),
         version: version.clone(),
         ir: body.ir,
         created_at: Utc::now(),
+        tenant_id: tenant_id.0.clone(),
     };
-    state.backend.store_workflow(def).await?;
+    backend.store_workflow(def).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -115,13 +121,14 @@ struct StartExecutionRequest {
 
 async fn start_execution(
     State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
     Json(body): Json<StartExecutionRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let backend = state.backend_for(&tenant_id);
     let version = body.workflow_version.unwrap_or_else(|| "1.0.0".into());
 
-    // Verify the workflow definition exists.
-    let def = state
-        .backend
+    // Verify the workflow definition exists (within this tenant).
+    let def = backend
         .get_workflow(&body.workflow_id, &version)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("workflow {} v{}", body.workflow_id, version)))?;
@@ -148,7 +155,7 @@ async fn start_execution(
         completed_at: None,
     };
     let execution_id = execution.execution_id.clone();
-    state.backend.create_execution(execution).await?;
+    backend.create_execution(execution).await?;
 
     // Append WorkflowStarted event.
     let event = jamjet_state::Event::new(
@@ -160,7 +167,7 @@ async fn start_execution(
             initial_input: input.clone(),
         },
     );
-    state.backend.append_event(event).await?;
+    backend.append_event(event).await?;
 
     // Immediately enqueue the start node as a work item.
     let queue_type = "general".to_string();
@@ -172,7 +179,7 @@ async fn start_execution(
             queue_type: queue_type.clone(),
         },
     );
-    state.backend.append_event(sched_event).await?;
+    backend.append_event(sched_event).await?;
 
     let work_item = WorkItem {
         id: Uuid::new_v4(),
@@ -188,8 +195,9 @@ async fn start_execution(
         created_at: now,
         lease_expires_at: None,
         worker_id: None,
+        tenant_id: tenant_id.0.clone(),
     };
-    state.backend.enqueue_work_item(work_item).await?;
+    backend.enqueue_work_item(work_item).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -206,8 +214,10 @@ struct ListExecutionsQuery {
 
 async fn list_executions(
     State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
     Query(params): Query<ListExecutionsQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&tenant_id);
     let status = params.status.as_deref().and_then(|s| match s {
         "running" => Some(WorkflowStatus::Running),
         "paused" => Some(WorkflowStatus::Paused),
@@ -215,8 +225,7 @@ async fn list_executions(
         "failed" => Some(WorkflowStatus::Failed),
         _ => None,
     });
-    let executions = state
-        .backend
+    let executions = backend
         .list_executions(
             status,
             params.limit.unwrap_or(50),
@@ -228,12 +237,12 @@ async fn list_executions(
 
 async fn get_execution(
     State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    // Parse the execution id from the URL (format: exec_<uuid_simple>)
+    let backend = state.backend_for(&tenant_id);
     let execution_id = parse_execution_id(&id)?;
-    let execution = state
-        .backend
+    let execution = backend
         .get_execution(&execution_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("execution {id}")))?;
@@ -242,13 +251,13 @@ async fn get_execution(
 
 async fn cancel_execution(
     State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&tenant_id);
     let execution_id = parse_execution_id(&id)?;
 
-    // Verify execution exists and is not already terminal.
-    let execution = state
-        .backend
+    let execution = backend
         .get_execution(&execution_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("execution {id}")))?;
@@ -260,8 +269,7 @@ async fn cancel_execution(
         )));
     }
 
-    // Emit WorkflowCancelled event.
-    let seq = state.backend.latest_sequence(&execution_id).await? + 1;
+    let seq = backend.latest_sequence(&execution_id).await? + 1;
     let event = jamjet_state::Event::new(
         execution_id.clone(),
         seq,
@@ -269,9 +277,8 @@ async fn cancel_execution(
             reason: Some("user request".into()),
         },
     );
-    state.backend.append_event(event).await?;
-    state
-        .backend
+    backend.append_event(event).await?;
+    backend
         .update_execution_status(&execution_id, WorkflowStatus::Cancelled)
         .await?;
 
@@ -280,10 +287,12 @@ async fn cancel_execution(
 
 async fn list_events(
     State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&tenant_id);
     let execution_id = parse_execution_id(&id)?;
-    let events = state.backend.get_events(&execution_id).await?;
+    let events = backend.get_events(&execution_id).await?;
     Ok(Json(json!({ "events": events })))
 }
 
@@ -298,9 +307,11 @@ struct ApproveRequest {
 
 async fn approve_execution(
     State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
     Json(body): Json<ApproveRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&tenant_id);
     let execution_id = parse_execution_id(&id)?;
 
     let decision = match body.decision.as_str() {
@@ -309,7 +320,7 @@ async fn approve_execution(
         other => return Err(ApiError::BadRequest(format!("unknown decision: {other}"))),
     };
 
-    let seq = state.backend.latest_sequence(&execution_id).await? + 1;
+    let seq = backend.latest_sequence(&execution_id).await? + 1;
     let event = jamjet_state::Event::new(
         execution_id.clone(),
         seq,
@@ -321,13 +332,11 @@ async fn approve_execution(
             state_patch: body.state_patch,
         },
     );
-    state.backend.append_event(event).await?;
+    backend.append_event(event).await?;
 
-    // Resume paused execution.
-    if let Ok(Some(exec)) = state.backend.get_execution(&execution_id).await {
+    if let Ok(Some(exec)) = backend.get_execution(&execution_id).await {
         if exec.status == WorkflowStatus::Paused {
-            state
-                .backend
+            backend
                 .update_execution_status(&execution_id, WorkflowStatus::Running)
                 .await?;
         }
@@ -344,12 +353,14 @@ struct ExternalEventRequest {
 
 async fn send_external_event(
     State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
     Json(body): Json<ExternalEventRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&tenant_id);
     let execution_id = parse_execution_id(&id)?;
 
-    let seq = state.backend.latest_sequence(&execution_id).await? + 1;
+    let seq = backend.latest_sequence(&execution_id).await? + 1;
     let event = jamjet_state::Event::new(
         execution_id.clone(),
         seq,
@@ -358,7 +369,7 @@ async fn send_external_event(
             payload: body.payload,
         },
     );
-    state.backend.append_event(event).await?;
+    backend.append_event(event).await?;
 
     Ok(Json(json!({ "execution_id": id, "accepted": true })))
 }
@@ -565,12 +576,14 @@ fn default_audit_limit() -> u32 {
 
 async fn list_audit_log(
     State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
     Query(params): Query<AuditQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
     let q = AuditQuery {
         execution_id: params.execution_id,
         actor_id: params.actor_id,
         event_type: params.event_type,
+        tenant_id: Some(tenant_id.0),
         limit: params.limit.min(200),
         offset: params.offset,
         from: None,
@@ -595,6 +608,95 @@ async fn list_audit_log(
         "limit": q.limit,
         "offset": q.offset,
     })))
+}
+
+// ── Tenant management ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateTenantRequest {
+    id: String,
+    name: String,
+}
+
+async fn create_tenant(
+    State(state): State<AppState>,
+    Json(body): Json<CreateTenantRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let now = Utc::now();
+    let tenant = Tenant {
+        id: TenantId::from(body.id.clone()),
+        name: body.name,
+        status: TenantStatus::Active,
+        policy: None,
+        limits: None,
+        created_at: now,
+        updated_at: now,
+    };
+    // Use any scoped backend (tenant CRUD is cross-tenant).
+    let backend = state.backend_for(&TenantId::default());
+    backend.create_tenant(tenant).await?;
+    Ok((StatusCode::CREATED, Json(json!({ "tenant_id": body.id }))))
+}
+
+async fn list_tenants(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&TenantId::default());
+    let tenants = backend.list_tenants().await?;
+    Ok(Json(json!({ "tenants": tenants })))
+}
+
+async fn get_tenant(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&TenantId::default());
+    let tenant = backend
+        .get_tenant(&TenantId::from(id.as_str()))
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("tenant {id}")))?;
+    Ok(Json(serde_json::to_value(tenant).unwrap()))
+}
+
+#[derive(Deserialize)]
+struct UpdateTenantRequest {
+    name: Option<String>,
+    status: Option<String>,
+    policy: Option<Value>,
+    limits: Option<Value>,
+}
+
+async fn update_tenant(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateTenantRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&TenantId::default());
+    let tid = TenantId::from(id.as_str());
+    let existing = backend
+        .get_tenant(&tid)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("tenant {id}")))?;
+
+    let limits = body
+        .limits
+        .map(|v| serde_json::from_value(v))
+        .transpose()
+        .map_err(|e| ApiError::BadRequest(format!("invalid limits: {e}")))?;
+
+    let updated = Tenant {
+        id: tid.clone(),
+        name: body.name.unwrap_or(existing.name),
+        status: body
+            .status
+            .as_deref()
+            .map(TenantStatus::parse)
+            .unwrap_or(existing.status),
+        policy: body.policy.or(existing.policy),
+        limits: limits.or(existing.limits),
+        created_at: existing.created_at,
+        updated_at: Utc::now(),
+    };
+    backend.update_tenant(updated).await?;
+    Ok(Json(json!({ "tenant_id": id, "updated": true })))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

@@ -42,6 +42,13 @@ pub struct AuditLogEntry {
     pub created_at: DateTime<Utc>,
     /// The full serialized `EventKind` JSON for immutable archival.
     pub raw_event: serde_json::Value,
+    /// Tenant that this audit entry belongs to.
+    #[serde(default = "default_tenant")]
+    pub tenant_id: String,
+}
+
+fn default_tenant() -> String {
+    "default".to_string()
 }
 
 impl AuditLogEntry {
@@ -70,6 +77,7 @@ impl AuditLogEntry {
             ip_address: None,
             created_at: Utc::now(),
             raw_event,
+            tenant_id: "default".to_string(),
         }
     }
 }

@@ -22,7 +22,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
-use jamjet_state::{ApiToken, StateBackend};
+use jamjet_state::{ApiToken, StateBackend, TenantId};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -86,6 +86,9 @@ pub async fn require_auth(
 
     match auth.backend.validate_token(&token).await {
         Ok(Some(info)) => {
+            // Inject tenant context from the token.
+            let tenant_id = TenantId::from(info.tenant_id.clone());
+            req.extensions_mut().insert(tenant_id);
             req.extensions_mut().insert(info);
             next.run(req).await
         }

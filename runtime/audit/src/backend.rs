@@ -24,6 +24,8 @@ pub struct AuditQuery {
     pub event_type: Option<String>,
     /// Filter by execution_id.
     pub execution_id: Option<String>,
+    /// Filter by tenant_id for multi-tenant isolation.
+    pub tenant_id: Option<String>,
     pub limit: u32,
     pub offset: u32,
 }
