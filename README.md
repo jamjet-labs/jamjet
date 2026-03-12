@@ -40,6 +40,9 @@ The runtime core is **Rust + Tokio** for scheduling, state, and concurrency. The
 | Weak observability, no replay | **Full event timeline**, OTel GenAI traces, replay from any checkpoint |
 | No standard agent identity | **Agent Cards** — every agent is addressable and discoverable |
 | No governance or guardrails | **Policy engine** — tool blocking, approvals, autonomy enforcement, audit log |
+| Agents with unchecked access | **OAuth delegation** — RFC 8693 token exchange, scope narrowing, per-step scoping |
+| PII leaking into logs | **Data governance** — PII redaction (mask/hash/remove), retention policies, auto-purge |
+| No tenant isolation | **Multi-tenant** — row-level partitioning, tenant-scoped state, isolated audit logs |
 | Locked into one language | **Polyglot SDKs** — Python, Java (JDK 21), YAML — same IR, same runtime |
 | Can't run without a server | **In-process execution** — `pip install jamjet` and run immediately |
 
@@ -257,6 +260,10 @@ nodes:
 | **Built-in observability** | ✅ OTel GenAI, event replay | 🟡 LangSmith (external) | ❌ | ❌ |
 | **Agent identity** | ✅ Agent Cards, A2A discovery | ❌ | ❌ | ❌ |
 | **Policy & governance** | ✅ policy engine, audit log | ❌ | ❌ | ❌ |
+| **Multi-tenant isolation** | ✅ row-level partitioning | ❌ | ❌ | ❌ |
+| **PII redaction** | ✅ mask/hash/remove, retention | ❌ | ❌ | ❌ |
+| **OAuth delegation** | ✅ RFC 8693, scope narrowing | ❌ | ❌ | ❌ |
+| **A2A federation auth** | ✅ mTLS, capability-scoped | ❌ | ❌ | ❌ |
 | **Progressive complexity** | ✅ `@task` → `Agent` → `Workflow` | ❌ single API | ❌ | ❌ |
 | **Runtime language** | Rust core + Python/Java authoring | Python | Python | Python |
 | **Best for** | Production multi-agent systems | Rapid prototyping | Conversational agents | Role-based crews |
@@ -279,7 +286,7 @@ nodes:
 │  Workers    |  Timers      │                              │
 ├────────────────────────────┴─────────────────────────────┤
 │                    Enterprise Services                     │
-│  Policy Engine  |  Audit Log  |  Autonomy Enforcement     │
+│  Policy  |  Audit  |  PII Redaction  |  OAuth  |  mTLS     │
 ├──────────────────────────────────────────────────────────┤
 │                      Runtime Services                      │
 │  Model Adapters  |  Tool Execution  |  Observability      │
@@ -297,7 +304,7 @@ nodes:
 | 1 — Minimal Viable Runtime | ✅ Complete | Local durable execution, MCP client, agent cards, Python CLI |
 | 2 — Production Core | ✅ Complete | Distributed workers, MCP server, full A2A client + server |
 | 3 — Developer Delight | ✅ Complete | Eval harness, trace debugging, templates, Java SDK |
-| 4 — Enterprise | 🔄 In Progress | Policy engine, autonomy enforcement, audit log, budgets |
+| 4 — Enterprise | 🔄 In Progress | Policy engine, tenant isolation, PII redaction, OAuth delegation, A2A federation auth, mTLS |
 | 5 — Scale & Ecosystem | 📋 Planned | TypeScript SDK, hosted plane, agent marketplace |
 
 ---
@@ -331,15 +338,15 @@ jamjet/
 │   ├── scheduler/          # Durable task scheduler
 │   ├── state/              # Event-sourced state, snapshots
 │   ├── workers/            # Node executors (model, tool, http, eval, …)
-│   ├── api/                # REST API control plane
+│   ├── api/                # REST API, OAuth delegation, secrets backends
 │   ├── agents/             # Agent Cards, registry, lifecycle
 │   ├── models/             # LLM provider adapter layer
 │   ├── timers/             # Durable timers, Postgres-backed cron
-│   ├── policy/             # Policy engine (tool blocking, approvals)
+│   ├── policy/             # Policy engine, PII redaction
 │   ├── audit/              # Immutable audit log
 │   ├── protocols/
 │   │   ├── mcp/            # MCP client + server
-│   │   └── a2a/            # A2A client + server
+│   │   └── a2a/            # A2A client + server + federation auth + mTLS
 │   └── telemetry/          # OTel instrumentation
 ├── sdk/
 │   ├── python/             # Python SDK + CLI
