@@ -13,7 +13,7 @@
 [![Java](https://img.shields.io/badge/java-21%2B-red?style=flat-square)](https://openjdk.org)
 [![Docs](https://img.shields.io/badge/docs-jamjet.dev-f5c518?style=flat-square)](https://jamjet.dev/quickstart)
 
-[jamjet.dev](https://jamjet.dev) · [Quickstart](https://jamjet.dev/quickstart) · [Concepts](https://jamjet.dev/concepts) · [Examples](https://jamjet.dev/examples) · [Blog](https://jamjet.dev/blog)
+[jamjet.dev](https://jamjet.dev) · [Quickstart](https://jamjet.dev/quickstart) · [Concepts](https://jamjet.dev/concepts) · [API Reference](https://jamjet.dev/api-reference) · [Examples](https://jamjet.dev/examples) · [Blog](https://jamjet.dev/blog)
 
 </div>
 
@@ -319,6 +319,9 @@ Full documentation at **[jamjet.dev](https://jamjet.dev/quickstart)**
 | [Core Concepts](https://jamjet.dev/concepts) | Agents, workflows, nodes, state, durability |
 | [YAML Workflows](https://jamjet.dev/yaml-workflows) | All node types, retry policies, conditions |
 | [Python SDK](https://jamjet.dev/python-sdk) | Full Python SDK reference |
+| [Java SDK](https://jamjet.dev/java-sdk) | Builders, records, @Tool annotation, agents |
+| [REST API](https://jamjet.dev/api-reference) | All endpoints, auth, request/response schemas |
+| [Enterprise Security](https://jamjet.dev/enterprise) | Tenants, PII redaction, OAuth, mTLS federation |
 | [MCP Integration](https://jamjet.dev/mcp) | Connect to MCP servers, expose tools |
 | [A2A Integration](https://jamjet.dev/a2a) | Delegate to and serve external agents |
 | [Eval Harness](https://jamjet.dev/eval) | Score quality, run regression suites, gate CI |
