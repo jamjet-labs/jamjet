@@ -311,6 +311,7 @@ pub struct A2aServer {
     card: AgentCard,
     port: u16,
     handler: Option<Box<dyn TaskHandler>>,
+    federation_policy: Option<crate::federation::FederationPolicy>,
 }
 
 impl A2aServer {
@@ -319,11 +320,18 @@ impl A2aServer {
             card,
             port,
             handler: None,
+            federation_policy: None,
         }
     }
 
     pub fn with_handler(mut self, handler: impl TaskHandler + 'static) -> Self {
         self.handler = Some(Box::new(handler));
+        self
+    }
+
+    /// Enable federation auth on incoming A2A requests.
+    pub fn with_federation_policy(mut self, policy: crate::federation::FederationPolicy) -> Self {
+        self.federation_policy = Some(policy);
         self
     }
 
@@ -335,7 +343,15 @@ impl A2aServer {
             handler: Arc::new(self.handler),
         };
 
-        let router = build_router(state);
+        let mut router = build_router(state);
+
+        // Apply federation auth middleware if configured.
+        if let Some(policy) = self.federation_policy {
+            router = router.layer(axum::middleware::from_fn_with_state(
+                policy,
+                crate::federation::federation_auth_layer,
+            ));
+        }
         let addr = format!("0.0.0.0:{}", self.port);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await

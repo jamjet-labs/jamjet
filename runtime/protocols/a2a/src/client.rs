@@ -24,6 +24,15 @@ impl A2aClient {
         self
     }
 
+    /// Build a client with mTLS for cross-org federation.
+    pub fn with_tls(tls: &crate::federation::TlsConfig) -> Result<Self, String> {
+        let http = crate::federation::build_mtls_client(tls)?;
+        Ok(Self {
+            http,
+            bearer_token: std::env::var("JAMJET_A2A_TOKEN").ok(),
+        })
+    }
+
     fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
         let mut builder = self.http.request(method, url);
         if let Some(token) = &self.bearer_token {

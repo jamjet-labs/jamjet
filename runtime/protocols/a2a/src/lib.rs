@@ -7,10 +7,12 @@
 
 pub mod adapter;
 pub mod client;
+pub mod federation;
 pub mod server;
 pub mod types;
 
 pub use adapter::A2aAdapter;
 pub use client::A2aClient;
+pub use federation::{FederationPolicy, FederationToken, TlsConfig};
 pub use server::{A2aServer, TaskHandler, TaskStore};
 pub use types::*;
