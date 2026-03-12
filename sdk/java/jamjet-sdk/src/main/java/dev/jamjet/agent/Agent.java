@@ -11,7 +11,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.lang.reflect.Constructor;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -330,25 +329,26 @@ public final class Agent {
     @SuppressWarnings({"unchecked", "rawtypes"})
     private Object invokeTool(ToolDefinition td, Map<String, Object> args) throws Exception {
         var cls = td.cls();
-        // Find the canonical constructor (record constructor)
-        Constructor<?>[] constructors = cls.getDeclaredConstructors();
-        if (constructors.length == 0) {
-            throw new IllegalStateException("No constructor found for tool " + cls.getName());
+        if (!ToolCall.class.isAssignableFrom(cls)) {
+            throw new IllegalStateException(cls.getName() + " does not implement ToolCall");
         }
-        var ctor = constructors[0];
-        ctor.setAccessible(true);
-        var params = ctor.getParameters();
-        var ctorArgs = new Object[params.length];
-        for (int i = 0; i < params.length; i++) {
-            var p = params[i];
-            var val = args.get(p.getName());
-            ctorArgs[i] = coerce(val, p.getType());
+        if (!cls.isRecord()) {
+            throw new IllegalStateException(cls.getName() + " must be a record class");
         }
-        var instance = ctor.newInstance(ctorArgs);
-        if (instance instanceof ToolCall tc) {
-            return tc.execute();
+        // Use the canonical constructor (record constructor)
+        var components = cls.getRecordComponents();
+        var paramTypes = new Class<?>[components.length];
+        for (int i = 0; i < components.length; i++) {
+            paramTypes[i] = components[i].getType();
         }
-        throw new IllegalStateException(cls.getName() + " does not implement ToolCall");
+        var ctor = cls.getDeclaredConstructor(paramTypes);
+        var ctorArgs = new Object[components.length];
+        for (int i = 0; i < components.length; i++) {
+            var val = args.get(components[i].getName());
+            ctorArgs[i] = coerce(val, components[i].getType());
+        }
+        var instance = (ToolCall) ctor.newInstance(ctorArgs);
+        return instance.execute();
     }
 
     private Object coerce(Object val, Class<?> type) {
@@ -386,7 +386,8 @@ public final class Agent {
 
             var resp = client.send(req, HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() >= 400) {
-                throw new RuntimeException("Model API error " + resp.statusCode() + ": " + resp.body());
+                throw new RuntimeException("Model API error " + resp.statusCode()
+                        + " from " + baseUrl + "/chat/completions");
             }
 
             var parsed = MAPPER.readValue(resp.body(), new TypeReference<Map<String, Object>>() {});

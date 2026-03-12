@@ -1,6 +1,7 @@
 package dev.jamjet;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.jamjet.client.ClientConfig;
 import dev.jamjet.client.JamjetApiException;
@@ -42,7 +43,9 @@ public final class JamjetClient implements AutoCloseable {
 
     public JamjetClient(ClientConfig config) {
         this.config = config;
-        this.mapper = new ObjectMapper();
+        this.mapper = new ObjectMapper()
+                .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
         this.http = HttpClient.newBuilder()
                 .executor(Executors.newVirtualThreadPerTaskExecutor())
                 .connectTimeout(Duration.ofSeconds(config.timeoutSeconds()))

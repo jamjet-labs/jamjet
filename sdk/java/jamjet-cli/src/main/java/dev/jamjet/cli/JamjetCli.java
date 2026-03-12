@@ -137,35 +137,19 @@ public class JamjetCli implements Callable<Integer> {
         public Integer call() {
             try {
                 var content = Files.readString(workflowFile);
-                var parsed = MAPPER.readTree(content);
-
-                // Basic structural validation
-                var errors = new java.util.ArrayList<String>();
-                if (!parsed.has("workflow_id") && !parsed.has("id")) {
-                    errors.add("Missing 'workflow_id' field");
-                }
-                if (!parsed.has("start_node")) {
-                    errors.add("Missing 'start_node' field");
-                }
-                if (!parsed.has("nodes")) {
-                    errors.add("Missing 'nodes' field");
-                }
-                if (!parsed.has("edges")) {
-                    errors.add("Missing 'edges' field");
-                }
+                var ir = dev.jamjet.ir.WorkflowIr.fromJson(content);
+                var errors = dev.jamjet.ir.IrValidator.validate(ir);
 
                 if (errors.isEmpty()) {
                     System.out.println("✓ Workflow IR is valid");
-                    var workflowId = parsed.has("workflow_id")
-                            ? parsed.get("workflow_id").asText()
-                            : parsed.get("id").asText();
-                    System.out.println("  id:         " + workflowId);
-                    System.out.println("  nodes:      " + parsed.get("nodes").size());
-                    System.out.println("  edges:      " + parsed.get("edges").size());
-                    System.out.println("  start_node: " + parsed.get("start_node").asText());
+                    System.out.println("  id:         " + ir.id());
+                    System.out.println("  version:    " + ir.version());
+                    System.out.println("  start_node: " + ir.startNode());
+                    System.out.println("  nodes:      " + (ir.nodes() != null ? ir.nodes().size() : 0));
+                    System.out.println("  edges:      " + (ir.edges() != null ? ir.edges().size() : 0));
                     return 0;
                 } else {
-                    System.err.println("✗ Validation errors:");
+                    System.err.println("✗ Validation failed (" + errors.size() + " error(s)):");
                     for (var err : errors) {
                         System.err.println("  - " + err);
                     }

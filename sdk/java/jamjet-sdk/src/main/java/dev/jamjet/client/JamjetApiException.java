@@ -10,7 +10,7 @@ public final class JamjetApiException extends RuntimeException {
     private final String path;
 
     public JamjetApiException(int statusCode, String body, String path) {
-        super("JamJet API error " + statusCode + " on " + path + ": " + body);
+        super("JamJet API error " + statusCode + " on " + path);
         this.statusCode = statusCode;
         this.body = body;
         this.path = path;
