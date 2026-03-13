@@ -52,12 +52,16 @@ pub fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(auth_state, require_auth))
         .with_state(state.clone());
 
+    // MCP bridge — unauthenticated, local-only.
+    let mcp_bridge = crate::mcp_bridge::build_mcp_bridge(state.clone());
+
     // Public routes — no auth required.
     Router::new()
         .route("/health", get(health))
         .route("/.well-known/did.json", get(serve_did_document))
         .merge(protected)
         .with_state(state)
+        .merge(mcp_bridge)
 }
 
 // ── Health ───────────────────────────────────────────────────────────────────

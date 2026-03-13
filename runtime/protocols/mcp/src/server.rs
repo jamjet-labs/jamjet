@@ -269,6 +269,22 @@ impl McpServer {
         self
     }
 
+    /// Convert into an Axum `Router` suitable for merging into another app.
+    ///
+    /// Unlike [`start`], this does not bind a TCP listener — the caller mounts
+    /// the returned router into their own server.
+    pub fn into_router(self) -> Router {
+        let (sse_tx, _) = broadcast::channel(64);
+        let state = McpServerState {
+            server_name: self.server_name,
+            server_version: self.server_version,
+            tools: Arc::new(self.tools),
+            resources: Arc::new(self.resources),
+            sse_tx,
+        };
+        build_router(state)
+    }
+
     /// Start the MCP server (binds on `0.0.0.0:{port}`).
     pub async fn start(self) -> Result<(), String> {
         let (sse_tx, _) = broadcast::channel(64);
