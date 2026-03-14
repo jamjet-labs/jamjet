@@ -878,12 +878,12 @@ impl StateBackend for TenantScopedSqliteBackend {
         let policy_json = tenant
             .policy
             .as_ref()
-            .map(|p| serde_json::to_string(p))
+            .map(serde_json::to_string)
             .transpose()?;
         let limits_json = tenant
             .limits
             .as_ref()
-            .map(|l| serde_json::to_string(l))
+            .map(serde_json::to_string)
             .transpose()
             .map_err(StateBackendError::Serialization)?;
 
@@ -929,12 +929,12 @@ impl StateBackend for TenantScopedSqliteBackend {
         let policy_json = tenant
             .policy
             .as_ref()
-            .map(|p| serde_json::to_string(p))
+            .map(serde_json::to_string)
             .transpose()?;
         let limits_json = tenant
             .limits
             .as_ref()
-            .map(|l| serde_json::to_string(l))
+            .map(serde_json::to_string)
             .transpose()
             .map_err(StateBackendError::Serialization)?;
 
@@ -979,14 +979,14 @@ fn row_to_tenant(row: &sqlx::sqlite::SqliteRow) -> BackendResult<Tenant> {
     let policy: Option<serde_json::Value> = row
         .try_get::<Option<&str>, _>("policy_json")
         .map_err(map_db_err)?
-        .map(|s| serde_json::from_str(s))
+        .map(serde_json::from_str)
         .transpose()
         .map_err(StateBackendError::Serialization)?;
 
     let limits: Option<TenantLimits> = row
         .try_get::<Option<&str>, _>("limits_json")
         .map_err(map_db_err)?
-        .map(|s| serde_json::from_str(s))
+        .map(serde_json::from_str)
         .transpose()
         .map_err(StateBackendError::Serialization)?;
 

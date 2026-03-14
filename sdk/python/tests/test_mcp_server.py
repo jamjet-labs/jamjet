@@ -10,7 +10,6 @@ import pytest
 from jamjet import tool
 from jamjet.protocols.mcp_server import serve_tools
 
-
 # ── Test tools ────────────────────────────────────────────────────────────────
 
 
