@@ -29,8 +29,19 @@ Quick start:
 from jamjet.agents.agent import Agent, AgentResult
 from jamjet.agents.task import task
 from jamjet.client import JamjetClient
+from jamjet.protocols.adapter import ProtocolAdapter
+from jamjet.protocols.registry import ProtocolRegistry
 from jamjet.tools.decorators import tool
 from jamjet.workflow.workflow import Workflow
 
-__all__ = ["Agent", "AgentResult", "task", "Workflow", "tool", "JamjetClient"]
+__all__ = [
+    "Agent",
+    "AgentResult",
+    "task",
+    "Workflow",
+    "tool",
+    "JamjetClient",
+    "ProtocolAdapter",
+    "ProtocolRegistry",
+]
 __version__ = "0.1.0"
