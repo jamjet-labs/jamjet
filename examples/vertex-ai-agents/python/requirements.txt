@@ -1,0 +1,2 @@
+jamjet-sdk
+openai>=1.0
