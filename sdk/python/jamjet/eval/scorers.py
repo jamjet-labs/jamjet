@@ -225,10 +225,7 @@ class LlmJudgeScorer(BaseScorer):
         if not api_key:
             raise RuntimeError("GOOGLE_API_KEY or GEMINI_API_KEY not set")
 
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta"
-            f"/models/{self.model}:generateContent?key={api_key}"
-        )
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={api_key}"
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 url,

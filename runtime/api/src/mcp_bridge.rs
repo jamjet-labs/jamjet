@@ -5,6 +5,7 @@
 
 use crate::state::AppState;
 use axum::Router;
+use chrono::Utc;
 use jamjet_agents::{AgentFilter, AgentStatus};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_mcp::server::McpServer;
@@ -12,7 +13,6 @@ use jamjet_mcp::types::{McpContent, McpTool};
 use jamjet_state::{Event, EventKind, TenantId, WorkItem};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use chrono::Utc;
 use uuid::Uuid;
 
 /// Build the MCP bridge router with all JamJet runtime tools.
@@ -199,26 +199,51 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
         move |args: Value| {
             let s = s.clone();
             async move {
-                let id_str = args.get("execution_id").and_then(|v| v.as_str()).unwrap_or("");
+                let id_str = args
+                    .get("execution_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let tenant_id = TenantId::from(
-                    args.get("tenant_id").and_then(|v| v.as_str()).unwrap_or("default"),
+                    args.get("tenant_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default"),
                 );
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
 
-                let exec = backend.get_execution(&eid).await.map_err(|e| format!("{e}"))?
+                let exec = backend
+                    .get_execution(&eid)
+                    .await
+                    .map_err(|e| format!("{e}"))?
                     .ok_or_else(|| format!("execution {id_str} not found"))?;
 
                 if exec.status.is_terminal() {
-                    return Err(format!("execution {id_str} is already terminal: {:?}", exec.status));
+                    return Err(format!(
+                        "execution {id_str} is already terminal: {:?}",
+                        exec.status
+                    ));
                 }
 
-                let seq = backend.latest_sequence(&eid).await.map_err(|e| format!("{e}"))? + 1;
-                let event = Event::new(eid.clone(), seq, EventKind::WorkflowCancelled {
-                    reason: Some("cancelled via MCP".into()),
-                });
-                backend.append_event(event).await.map_err(|e| format!("{e}"))?;
-                backend.update_execution_status(&eid, WorkflowStatus::Cancelled).await.map_err(|e| format!("{e}"))?;
+                let seq = backend
+                    .latest_sequence(&eid)
+                    .await
+                    .map_err(|e| format!("{e}"))?
+                    + 1;
+                let event = Event::new(
+                    eid.clone(),
+                    seq,
+                    EventKind::WorkflowCancelled {
+                        reason: Some("cancelled via MCP".into()),
+                    },
+                );
+                backend
+                    .append_event(event)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                backend
+                    .update_execution_status(&eid, WorkflowStatus::Cancelled)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
 
                 Ok(vec![McpContent::Text {
                     text: json!({"execution_id": id_str, "status": "cancelled"}).to_string(),
@@ -245,14 +270,20 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
         move |args: Value| {
             let s = s.clone();
             async move {
-                let id_str = args.get("execution_id").and_then(|v| v.as_str()).unwrap_or("");
+                let id_str = args
+                    .get("execution_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let tenant_id = TenantId::from(
-                    args.get("tenant_id").and_then(|v| v.as_str()).unwrap_or("default"),
+                    args.get("tenant_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default"),
                 );
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
                 let events = backend.get_events(&eid).await.map_err(|e| format!("{e}"))?;
-                let text = serde_json::to_string(&json!({"events": events})).map_err(|e| format!("{e}"))?;
+                let text = serde_json::to_string(&json!({"events": events}))
+                    .map_err(|e| format!("{e}"))?;
                 Ok(vec![McpContent::Text { text }])
             }
         },
@@ -279,12 +310,24 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
         move |args: Value| {
             let s = s.clone();
             async move {
-                let id_str = args.get("execution_id").and_then(|v| v.as_str()).unwrap_or("");
+                let id_str = args
+                    .get("execution_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let decision_str = args.get("decision").and_then(|v| v.as_str()).unwrap_or("");
-                let node_id = args.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let comment = args.get("comment").and_then(|v| v.as_str()).map(String::from);
+                let node_id = args
+                    .get("node_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let comment = args
+                    .get("comment")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let tenant_id = TenantId::from(
-                    args.get("tenant_id").and_then(|v| v.as_str()).unwrap_or("default"),
+                    args.get("tenant_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default"),
                 );
 
                 let decision = match decision_str {
@@ -296,20 +339,33 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
 
-                let seq = backend.latest_sequence(&eid).await.map_err(|e| format!("{e}"))? + 1;
-                let event = Event::new(eid.clone(), seq, EventKind::ApprovalReceived {
-                    node_id,
-                    user_id: "mcp-client".into(),
-                    decision,
-                    comment,
-                    state_patch: None,
-                });
-                backend.append_event(event).await.map_err(|e| format!("{e}"))?;
+                let seq = backend
+                    .latest_sequence(&eid)
+                    .await
+                    .map_err(|e| format!("{e}"))?
+                    + 1;
+                let event = Event::new(
+                    eid.clone(),
+                    seq,
+                    EventKind::ApprovalReceived {
+                        node_id,
+                        user_id: "mcp-client".into(),
+                        decision,
+                        comment,
+                        state_patch: None,
+                    },
+                );
+                backend
+                    .append_event(event)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
 
                 if let Ok(Some(exec)) = backend.get_execution(&eid).await {
                     if exec.status == WorkflowStatus::Paused {
-                        backend.update_execution_status(&eid, WorkflowStatus::Running)
-                            .await.map_err(|e| format!("{e}"))?;
+                        backend
+                            .update_execution_status(&eid, WorkflowStatus::Running)
+                            .await
+                            .map_err(|e| format!("{e}"))?;
                     }
                 }
 

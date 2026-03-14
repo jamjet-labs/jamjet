@@ -202,7 +202,8 @@ class McpAsgiApp:
     async def run(self, host: str = "0.0.0.0", port: int = 9000) -> None:
         """Run a minimal HTTP server (for local dev / MCP integration)."""
         listener = await anyio.create_tcp_listener(
-            local_host=host, local_port=port,
+            local_host=host,
+            local_port=port,
         )
         async with listener:
             await listener.serve(self._handle_connection)
