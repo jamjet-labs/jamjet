@@ -42,5 +42,5 @@ Cons: JVM startup overhead, GC pause variability, memory overhead.
 
 - Python remains the primary **authoring** and **SDK** language — the clean service boundary means Python engineers don't need to write Rust
 - Rust engineers needed for runtime contributions — higher bar than Go or Python
-- Future TypeScript/Go SDKs are easy: they talk to the REST/gRPC API, no Rust knowledge required
+- Future TypeScript/Go SDKs are easy: they talk to the REST/gRPC API, no Rust knowledge required (Java SDK shipped; Go SDK planned for Phase 5)
 - Build times will be longer than Go/Python; mitigated by incremental compilation and CI caching

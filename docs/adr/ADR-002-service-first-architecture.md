@@ -17,7 +17,7 @@ Should the Rust runtime be an embeddable library (like SQLite), a standalone ser
 
 ## Rationale
 
-- **Polyglot-ready** — TypeScript and Go SDKs can be built with no additional work; they just talk to the same API
+- **Polyglot-ready** — TypeScript, Go, and future SDKs can be built with no additional work; they just talk to the same API. Java and Go SDKs are planned for Phase 5 (Java shipped early in Phase K)
 - **Clean separation of concerns** — Python authors don't need to know about Rust; Rust engineers don't need to know Python
 - **Deployment flexibility** — runtime can be deployed separately, scaled independently, operated as infrastructure
 - **Debuggability** — a separate process is easier to inspect, restart, and monitor than an embedded library

@@ -85,6 +85,7 @@ First public release. JamJet is a performance-first, agent-native runtime for AI
 
 ## [0.2.0] — Planned
 
+- Go SDK
 - TypeScript SDK
 - Hosted runtime plane (zero-ops deployment)
 - Enhanced policy engine with multi-tenant isolation

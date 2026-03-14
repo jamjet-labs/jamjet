@@ -49,7 +49,7 @@ Parsed by `YamlCompiler` → same IR as Python path.
 Both Python and YAML paths compile to identical canonical IR. The compiler validates the graph and schemas before submitting to the runtime API.
 
 ### Communication with Runtime
-The Python SDK talks to the Rust runtime via REST API (no direct bindings in v1). This keeps the architecture clean and polyglot-ready.
+The Python SDK talks to the Rust runtime via REST API (no direct bindings in v1). This keeps the architecture clean and polyglot-ready. Java SDK uses the same pattern; Go and TypeScript SDKs will follow.
 
 ### CLI
 Built with Typer. Commands: `init`, `dev`, `run`, `validate`, `inspect`, `events`, `agents`, `mcp`, `a2a`.

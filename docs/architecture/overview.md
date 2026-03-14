@@ -9,7 +9,7 @@ JamJet is built as six cooperating layers. This document describes each layer, t
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  1. Authoring Layer                                           │
-│     Python SDK  ·  YAML project files  ·  CLI templates      │
+│     Python SDK  ·  Java SDK  ·  Go SDK (planned)  ·  YAML    │
 └─────────────────────────┬────────────────────────────────────┘
                           │  compile / validate
 ┌─────────────────────────▼────────────────────────────────────┐
@@ -60,11 +60,11 @@ JamJet has a deliberate language split:
 | Layer | Language | Rationale |
 |-------|----------|-----------|
 | Runtime core, scheduler, state engine, worker coordination | **Rust** | Performance, memory safety, async concurrency via Tokio |
-| Python SDK, CLI, tool definitions, schema authoring | **Python** | Developer adoption, AI ecosystem compatibility |
+| SDKs, CLI, tool definitions, schema authoring | **Python, Java, Go (planned)** | Developer adoption, AI ecosystem compatibility, enterprise reach |
 | Wire protocol (internal services) | **Protobuf over gRPC** | Strongly typed, polyglot-ready |
 | Control plane API | **REST (JSON) + gRPC** | REST for broad compatibility; gRPC for high-perf internal |
 
-The Python SDK communicates with the Rust runtime via the REST/gRPC control plane API. There are no direct Python↔Rust bindings in v1 — the clean service boundary keeps the architecture polyglot-ready for a future TypeScript SDK.
+The Python SDK communicates with the Rust runtime via the REST/gRPC control plane API. There are no direct Python↔Rust bindings in v1 — the clean service boundary keeps the architecture polyglot-ready. Java SDK is shipped; Go and TypeScript SDKs are planned for Phase 5.
 
 ---
 

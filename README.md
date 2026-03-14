@@ -11,6 +11,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square)](https://rustup.rs)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)](https://python.org)
 [![Java](https://img.shields.io/badge/java-21%2B-red?style=flat-square)](https://openjdk.org)
+[![Go](https://img.shields.io/badge/go-planned-lightgrey?style=flat-square)](https://go.dev)
 [![Docs](https://img.shields.io/badge/docs-jamjet.dev-f5c518?style=flat-square)](https://jamjet.dev/quickstart)
 
 [jamjet.dev](https://jamjet.dev) · [Quickstart](https://jamjet.dev/quickstart) · [Concepts](https://jamjet.dev/concepts) · [API Reference](https://jamjet.dev/api-reference) · [Examples](https://jamjet.dev/examples) · [Blog](https://jamjet.dev/blog)
@@ -27,7 +28,7 @@
 
 JamJet is a **performance-first, agent-native runtime** for AI agents. It is not another prompt wrapper or thin agent SDK — it is a **production-grade orchestration substrate** for agents that need to work, not just demo.
 
-The runtime core is **Rust + Tokio** for scheduling, state, and concurrency. The authoring surface is **Python**, **Java**, or **YAML**. All compile to the same IR graph and run on the same engine.
+The runtime core is **Rust + Tokio** for scheduling, state, and concurrency. The authoring surface is **Python**, **Java**, **Go** (planned), or **YAML**. All compile to the same IR graph and run on the same engine.
 
 ## Why JamJet?
 
@@ -43,7 +44,7 @@ The runtime core is **Rust + Tokio** for scheduling, state, and concurrency. The
 | Agents with unchecked access | **OAuth delegation** — RFC 8693 token exchange, scope narrowing, per-step scoping |
 | PII leaking into logs | **Data governance** — PII redaction (mask/hash/remove), retention policies, auto-purge |
 | No tenant isolation | **Multi-tenant** — row-level partitioning, tenant-scoped state, isolated audit logs |
-| Locked into one language | **Polyglot SDKs** — Python, Java (JDK 21), YAML — same IR, same runtime |
+| Locked into one language | **Polyglot SDKs** — Python, Java (JDK 21), Go (planned), YAML — same IR, same runtime |
 | Can't run without a server | **In-process execution** — `pip install jamjet` and run immediately |
 
 ---
@@ -265,7 +266,7 @@ nodes:
 | **OAuth delegation** | ✅ RFC 8693, scope narrowing | ❌ | ❌ | ❌ |
 | **A2A federation auth** | ✅ mTLS, capability-scoped | ❌ | ❌ | ❌ |
 | **Progressive complexity** | ✅ `@task` → `Agent` → `Workflow` | ❌ single API | ❌ | ❌ |
-| **Runtime language** | Rust core + Python/Java authoring | Python | Python | Python |
+| **Runtime language** | Rust core + Python/Java/Go authoring | Python | Python | Python |
 | **Best for** | Production multi-agent systems | Rapid prototyping | Conversational agents | Role-based crews |
 
 ---
@@ -275,7 +276,7 @@ nodes:
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                     Authoring Layer                       │
-│         Python SDK  |  Java SDK  |  YAML  |  CLI          │
+│     Python SDK  |  Java SDK  |  Go SDK (planned)  |  YAML  │
 ├──────────────────────────────────────────────────────────┤
 │                 Compilation / Validation                   │
 │           Graph IR  |  Schema  |  Policy lint             │
@@ -305,7 +306,7 @@ nodes:
 | 2 — Production Core | ✅ Complete | Distributed workers, MCP server, full A2A client + server |
 | 3 — Developer Delight | ✅ Complete | Eval harness, trace debugging, templates, Java SDK |
 | 4 — Enterprise | 🔄 In Progress | Policy engine, tenant isolation, PII redaction, OAuth delegation, A2A federation auth, mTLS |
-| 5 — Scale & Ecosystem | 📋 Planned | TypeScript SDK, hosted plane, agent marketplace |
+| 5 — Scale & Ecosystem | 📋 Planned | Go SDK, TypeScript SDK, hosted plane, agent marketplace |
 
 ---
 
@@ -359,9 +360,10 @@ jamjet/
 │   │       ├── agents/     # Agent definitions + strategies
 │   │       ├── templates/  # Project scaffolding templates
 │   │       └── workflow/   # Python workflow builder
-│   └── java/               # Java SDK (JDK 21, virtual threads, records)
-│       ├── jamjet-sdk/     # Core SDK module
-│       └── jamjet-cli/     # CLI module
+│   ├── java/               # Java SDK (JDK 21, virtual threads, records)
+│   │   ├── jamjet-sdk/     # Core SDK module
+│   │   └── jamjet-cli/     # CLI module
+│   └── go/                 # Go SDK (planned — Phase 5)
 ```
 
 ---

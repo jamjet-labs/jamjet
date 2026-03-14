@@ -296,7 +296,7 @@ Read more: [Architecture Overview](docs/architecture/overview.md)
 | 2 — Production Core | Planned | Distributed workers, MCP server, full A2A |
 | 3 — Developer Delight | Planned | Templates, eval harness, trace debugging |
 | 4 — Enterprise | Planned | Policy engine, tenant isolation, federation security |
-| 5 — Scale & Ecosystem | Planned | TypeScript SDK, hosted plane, agent marketplace |
+| 5 — Scale & Ecosystem | Planned | Go SDK, TypeScript SDK, hosted plane, agent marketplace |
 
 Track milestone progress in [GitHub Issues](https://github.com/jamjet-labs/jamjet/issues) and the project board.
 
