@@ -47,6 +47,9 @@ progress-tracker.md
 REQUIREMENTS.md
 launch-plan.md
 CLAUDE.md
+strategy/
+docs/superpowers/
+paper/
 
 # Local AI/editor agent config
 .claude/*.local.*
