@@ -16,6 +16,9 @@
 
 [jamjet.dev](https://jamjet.dev) · [Quickstart](https://jamjet.dev/quickstart) · [Concepts](https://jamjet.dev/concepts) · [API Reference](https://jamjet.dev/api-reference) · [Examples](https://jamjet.dev/examples) · [Blog](https://jamjet.dev/blog)
 
+[![Open in GitHub Codespaces](https://img.shields.io/badge/Open%20in-Codespaces-blue?style=flat-square&logo=github)](https://codespaces.new/jamjet-labs/jamjet?quickstart=1)
+[![Open in Gitpod](https://img.shields.io/badge/Open%20in-Gitpod-orange?style=flat-square&logo=gitpod)](https://gitpod.io/#https://github.com/jamjet-labs/jamjet)
+
 </div>
 
 <div align="center">

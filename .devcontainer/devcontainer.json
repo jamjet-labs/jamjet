@@ -1,0 +1,35 @@
+{
+  "name": "JamJet Dev",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "stable",
+      "profile": "default"
+    }
+  },
+  "postCreateCommand": "pip install -e sdk/python[dev] && cd runtime && cargo build",
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": {
+      "label": "JamJet Server",
+      "onAutoForward": "notify"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "ms-python.python",
+        "redhat.vscode-yaml"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  },
+  "containerEnv": {
+    "JAMJET_ENV": "development",
+    "RUST_LOG": "info"
+  }
+}
