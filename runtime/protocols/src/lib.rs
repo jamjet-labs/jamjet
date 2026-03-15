@@ -6,8 +6,10 @@
 //! the runtime core.
 
 pub mod anp;
+pub mod failure;
 pub mod registry;
 
+pub use failure::{DelegationFailure, DelegationFailureInfo, FailureSeverity};
 pub use registry::ProtocolRegistry;
 
 use async_trait::async_trait;
