@@ -342,16 +342,182 @@ class Agent:
 
         return draft
 
+    async def _run_reflection(
+        self,
+        client: Any,
+        prompt: str,
+        tool_calls_log: list[dict[str, Any]],
+    ) -> str:
+        """reflection (§3.29): Execute → self-reflect → revise loop."""
+        openai_tools = self._openai_tools()
+        tool_map = {td.name: td for td in self._tools}
+        system = self.instructions or "You are a helpful assistant."
+
+        output = ""
+        reflection = ""
+        for round_i in range(self.limits.max_iterations):
+            # Execute: produce or revise the answer
+            if round_i == 0:
+                exec_prompt = prompt
+            else:
+                exec_prompt = (
+                    f"Original task: {prompt}\n\n"
+                    f"Your previous answer:\n{output}\n\n"
+                    f"Your self-reflection:\n{reflection}\n\n"
+                    "Revise your answer based on the reflection. Return only the improved answer."
+                )
+            exec_msgs: list[dict[str, Any]] = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": exec_prompt},
+            ]
+            for _ in range(self.limits.max_iterations):
+                msg = await self._call_model(client, exec_msgs, openai_tools or None)
+                if not msg.tool_calls:
+                    output = msg.content or ""
+                    break
+                exec_msgs.append(msg)
+                exec_msgs.extend(await self._execute_tool_calls(msg, tool_map, tool_calls_log))
+
+            # Self-reflect
+            reflect_msgs: list[dict[str, Any]] = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a careful self-evaluator. Reflect on the answer below. "
+                        "Identify any errors, gaps, or improvements. "
+                        "Reply SATISFIED if the answer is good, or describe specific issues."
+                    ),
+                },
+                {"role": "user", "content": f"Task: {prompt}\n\nAnswer:\n{output}"},
+            ]
+            reflect_msg = await self._call_model(client, reflect_msgs)
+            reflection = (reflect_msg.content or "").strip()
+            if "SATISFIED" in reflection.upper():
+                break
+
+        return output
+
+    async def _run_consensus(
+        self,
+        client: Any,
+        prompt: str,
+        tool_calls_log: list[dict[str, Any]],
+    ) -> str:
+        """consensus (§3.30): Multiple independent responses → vote → judge."""
+        openai_tools = self._openai_tools()
+        tool_map = {td.name: td for td in self._tools}
+        system = self.instructions or "You are a helpful assistant."
+        n_agents = min(3, self.limits.max_iterations)
+
+        # Phase 1: Generate independent responses
+        responses: list[str] = []
+        for i in range(n_agents):
+            msgs: list[dict[str, Any]] = [
+                {"role": "system", "content": f"{system}\nYou are agent {i + 1} of {n_agents}. Think independently."},
+                {"role": "user", "content": prompt},
+            ]
+            for _ in range(self.limits.max_iterations):
+                msg = await self._call_model(client, msgs, openai_tools or None)
+                if not msg.tool_calls:
+                    responses.append(msg.content or "")
+                    break
+                msgs.append(msg)
+                msgs.extend(await self._execute_tool_calls(msg, tool_map, tool_calls_log))
+
+        # Phase 2: Judge selects the best response
+        candidates = "\n\n".join(f"--- Response {i + 1} ---\n{r}" for i, r in enumerate(responses))
+        judge_msgs: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a judge. Review the candidate responses below and synthesize "
+                    "the best answer. Take the strongest elements from each."
+                ),
+            },
+            {"role": "user", "content": f"Task: {prompt}\n\n{candidates}"},
+        ]
+        judge_msg = await self._call_model(client, judge_msgs)
+        return judge_msg.content or responses[0] if responses else ""
+
+    async def _run_debate(
+        self,
+        client: Any,
+        prompt: str,
+        tool_calls_log: list[dict[str, Any]],
+    ) -> str:
+        """debate (§3.31): Propose → counter → judge loop."""
+        openai_tools = self._openai_tools()
+        tool_map = {td.name: td for td in self._tools}
+        system = self.instructions or "You are a helpful assistant."
+
+        # Phase 1: Initial proposal
+        prop_msgs: list[dict[str, Any]] = [
+            {"role": "system", "content": f"{system}\nYou are the proposer. Give your best answer."},
+            {"role": "user", "content": prompt},
+        ]
+        for _ in range(self.limits.max_iterations):
+            msg = await self._call_model(client, prop_msgs, openai_tools or None)
+            if not msg.tool_calls:
+                proposal = msg.content or ""
+                break
+            prop_msgs.append(msg)
+            prop_msgs.extend(await self._execute_tool_calls(msg, tool_map, tool_calls_log))
+        else:
+            proposal = ""
+
+        # Phase 2: Counter-argument rounds
+        counter = proposal
+        for round_i in range(min(2, self.limits.max_iterations)):
+            counter_msgs: list[dict[str, Any]] = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a devil's advocate. Challenge the answer below. "
+                        "Point out flaws, missing perspectives, or errors. Be constructive."
+                    ),
+                },
+                {"role": "user", "content": f"Task: {prompt}\n\nProposed answer:\n{counter}"},
+            ]
+            counter_msg = await self._call_model(client, counter_msgs)
+            critique = counter_msg.content or ""
+
+            # Proposer responds to critique
+            revise_msgs: list[dict[str, Any]] = [
+                {"role": "system", "content": f"{system}\nRevise your answer addressing the critique."},
+                {
+                    "role": "user",
+                    "content": f"Task: {prompt}\n\nYour answer:\n{counter}\n\nCritique:\n{critique}",
+                },
+            ]
+            for _ in range(self.limits.max_iterations):
+                msg = await self._call_model(client, revise_msgs, openai_tools or None)
+                if not msg.tool_calls:
+                    counter = msg.content or ""
+                    break
+                revise_msgs.append(msg)
+                revise_msgs.extend(await self._execute_tool_calls(msg, tool_map, tool_calls_log))
+
+        # Phase 3: Judge renders final verdict
+        judge_msgs: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": "You are the judge. Synthesize the best final answer from the debate.",
+            },
+            {
+                "role": "user",
+                "content": f"Task: {prompt}\n\nFinal proposal after debate:\n{counter}",
+            },
+        ]
+        judge_msg = await self._call_model(client, judge_msgs)
+        return judge_msg.content or counter
+
     # ── Public run interface ───────────────────────────────────────────────
 
     async def run(self, prompt: str) -> AgentResult:
         """
         Run the agent on a single prompt in-process. No runtime server needed.
 
-        Dispatches to the appropriate strategy executor:
-          - ``plan-and-execute`` (default): plan → execute steps → synthesize
-          - ``react``: reason + act tool loop
-          - ``critic``: draft → critique → revise
+        Dispatches to the appropriate strategy executor.
         """
         try:
             from openai import AsyncOpenAI
@@ -368,16 +534,20 @@ class Agent:
 
         tool_calls_log: list[dict[str, Any]] = []
 
-        if self.strategy == "plan-and-execute":
-            final_output = await self._run_plan_and_execute(client, prompt, tool_calls_log)
-        elif self.strategy == "react":
-            final_output = await self._run_react(client, prompt, tool_calls_log)
-        elif self.strategy == "critic":
-            final_output = await self._run_critic(client, prompt, tool_calls_log)
-        else:
-            raise ValueError(
-                f"Unknown strategy {self.strategy!r}. Valid options: 'plan-and-execute', 'react', 'critic'."
-            )
+        strategy_runners = {
+            "plan-and-execute": self._run_plan_and_execute,
+            "react": self._run_react,
+            "critic": self._run_critic,
+            "reflection": self._run_reflection,
+            "consensus": self._run_consensus,
+            "debate": self._run_debate,
+        }
+
+        runner_fn = strategy_runners.get(self.strategy)
+        if runner_fn is None:
+            raise ValueError(f"Unknown strategy {self.strategy!r}. Valid options: {list(strategy_runners.keys())}")
+
+        final_output = await runner_fn(client, prompt, tool_calls_log)
 
         total_us = (time.perf_counter_ns() - t_start) / 1000
         return AgentResult(
