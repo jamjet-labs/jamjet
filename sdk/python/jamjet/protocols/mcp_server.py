@@ -265,8 +265,8 @@ class McpAsgiApp:
             # Build HTTP response
             status_text = {200: "OK", 400: "Bad Request", 404: "Not Found"}.get(response_status, "OK")
             resp_lines = [f"HTTP/1.1 {response_status} {status_text}"]
-            for k, v in response_headers:
-                resp_lines.append(f"{k.decode()}: {v.decode()}")
+            for hk, hv in response_headers:
+                resp_lines.append(f"{hk.decode()}: {hv.decode()}")
             resp_lines.append(f"Content-Length: {len(response_body)}")
             resp_lines.append("")
             resp_lines.append("")

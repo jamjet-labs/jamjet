@@ -295,7 +295,7 @@ class ProtocolAdapter(ABC):
 
     async def stream_structured(self, url: str, task: TaskRequest) -> AsyncIterator[StreamChunk]:
         """Stream with typed chunks.  Default: wraps ``stream()``."""
-        async for event in self.stream(url, task):
+        async for event in await self.stream(url, task):
             yield _event_to_chunk(event)
 
     async def stream_with_backpressure(

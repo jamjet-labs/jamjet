@@ -22,8 +22,14 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import sys
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from jamjet.eval.grid import ComparisonResult
 
 import typer
 from rich.console import Console
@@ -1633,7 +1639,7 @@ def eval_compare(
         _print_comparison_table(result, alpha=alpha)
 
 
-def _resolve_condition(name: str, agg: dict[str, object]) -> str | None:
+def _resolve_condition(name: str, agg: Mapping[str, object]) -> str | None:
     """Resolve a short condition name to a full condition key from the aggregation."""
     # Exact match first.
     if name in agg:
@@ -1650,7 +1656,7 @@ def _resolve_condition(name: str, agg: dict[str, object]) -> str | None:
     return None
 
 
-def _print_comparison_table(result: object, *, alpha: float = 0.05) -> None:
+def _print_comparison_table(result: ComparisonResult, *, alpha: float = 0.05) -> None:
     """Print a Rich table summarizing a ComparisonResult."""
     table = Table(title="Statistical Comparison", show_header=True, header_style="bold")
     table.add_column("Metric", style="cyan")

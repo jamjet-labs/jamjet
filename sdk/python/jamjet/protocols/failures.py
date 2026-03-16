@@ -56,7 +56,7 @@ class DelegationFailure:
 
     # ── Variant field mappings (type -> set of field names) ──────────────
     _VARIANT_FIELDS: dict[str, tuple[str, ...]] = field(
-        default=None,  # type: ignore[assignment]
+        default_factory=dict,
         init=False,
         repr=False,
         compare=False,

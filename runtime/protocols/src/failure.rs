@@ -15,24 +15,16 @@ use serde_json::Value;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DelegationFailure {
     /// The delegated agent could not be reached.
-    DelegateUnreachable {
-        url: String,
-        message: String,
-    },
+    DelegateUnreachable { url: String, message: String },
     /// The requested capability is not among those the delegate advertises.
     CapabilityMismatch {
         requested: String,
         available: Vec<String>,
     },
     /// A governance policy denied the delegation.
-    PolicyDenied {
-        policy_id: String,
-        reason: String,
-    },
+    PolicyDenied { policy_id: String, reason: String },
     /// The delegation requires human approval before it can proceed.
-    ApprovalRequired {
-        prompt: String,
-    },
+    ApprovalRequired { prompt: String },
     /// The delegation would exceed an allocated budget.
     BudgetExceeded {
         limit: f64,
@@ -45,15 +37,9 @@ pub enum DelegationFailure {
         to_domain: String,
     },
     /// A verification check (signature, hash, attestation) failed.
-    VerificationFailed {
-        check: String,
-        message: String,
-    },
+    VerificationFailed { check: String, message: String },
     /// A tool dependency required by the delegate failed.
-    ToolDependencyFailed {
-        tool: String,
-        error: String,
-    },
+    ToolDependencyFailed { tool: String, error: String },
     /// The delegation partially completed before failing.
     PartialCompletion {
         completed_steps: usize,
