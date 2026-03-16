@@ -85,7 +85,8 @@ async fn inject_dev_tenant(
     mut req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    req.extensions_mut().insert(TenantId::from("default".to_string()));
+    req.extensions_mut()
+        .insert(TenantId::from("default".to_string()));
     next.run(req).await
 }
 
