@@ -19,12 +19,17 @@ use uuid::Uuid;
 
 /// Build the Axum router with all API routes.
 pub fn build_router(state: AppState) -> Router {
+    build_router_with_opts(state, false)
+}
+
+/// Build the Axum router, optionally skipping auth for dev mode.
+pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
     let auth_state = AuthState {
         backend: state.backend.clone(),
     };
 
-    // Protected routes — require valid Bearer token.
-    let protected = Router::new()
+    // Core API routes.
+    let api_routes = Router::new()
         // Workflow definitions
         .route("/workflows", post(create_workflow))
         // Executions
@@ -47,10 +52,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/tenants", post(create_tenant).get(list_tenants))
         .route("/tenants/:id", get(get_tenant).put(update_tenant))
         // Audit log — immutable, append-only
-        .route("/audit", get(list_audit_log))
-        .layer(middleware::from_fn(require_write_role))
-        .layer(middleware::from_fn_with_state(auth_state, require_auth))
-        .with_state(state.clone());
+        .route("/audit", get(list_audit_log));
+
+    // In dev mode, skip auth and inject a default tenant. In production, require Bearer token.
+    let protected = if dev_mode {
+        api_routes
+            .layer(middleware::from_fn(inject_dev_tenant))
+            .with_state(state.clone())
+    } else {
+        api_routes
+            .layer(middleware::from_fn(require_write_role))
+            .layer(middleware::from_fn_with_state(auth_state, require_auth))
+            .with_state(state.clone())
+    };
 
     // MCP bridge — unauthenticated, local-only.
     let mcp_bridge = crate::mcp_bridge::build_mcp_bridge(state.clone());
@@ -62,6 +76,17 @@ pub fn build_router(state: AppState) -> Router {
         .merge(protected)
         .with_state(state)
         .merge(mcp_bridge)
+}
+
+// ── Dev-mode middleware ──────────────────────────────────────────────────────
+
+/// Injects a default tenant extension for dev mode (no auth required).
+async fn inject_dev_tenant(
+    mut req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    req.extensions_mut().insert(TenantId::from("default".to_string()));
+    next.run(req).await
 }
 
 // ── Health ───────────────────────────────────────────────────────────────────

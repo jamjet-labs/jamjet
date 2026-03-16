@@ -25,7 +25,9 @@ impl Default for ApiConfig {
                 .unwrap_or(7700),
             database_url: None,
             log_level: "info".into(),
-            dev_mode: false,
+            dev_mode: std::env::var("JAMJET_DEV_MODE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 }

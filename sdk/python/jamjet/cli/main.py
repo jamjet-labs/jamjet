@@ -352,6 +352,8 @@ def dev(
     db_url = f"sqlite://{db}" if db else None
     env = os.environ.copy()
     env["PORT"] = str(port)
+    env["JAMJET_PORT"] = str(port)
+    env["JAMJET_DEV_MODE"] = "1"
     env["RUST_LOG"] = env.get("RUST_LOG", "info")
     if db_url:
         env["DATABASE_URL"] = db_url

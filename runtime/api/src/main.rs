@@ -1,5 +1,5 @@
 use jamjet_agents::SqliteAgentRegistry;
-use jamjet_api::{config::ApiConfig, routes::build_router, state::AppState};
+use jamjet_api::{config::ApiConfig, routes::build_router_with_opts, state::AppState};
 use jamjet_audit::{AuditEnricher, SqliteAuditBackend};
 use jamjet_state::SqliteBackend;
 use std::sync::Arc;
@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         protocols: jamjet_api::state::default_protocol_registry(),
     };
 
-    let router = build_router(state);
+    let router = build_router_with_opts(state, config.dev_mode);
     let addr = format!("{}:{}", config.bind, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
