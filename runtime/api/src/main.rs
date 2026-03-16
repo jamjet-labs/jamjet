@@ -67,6 +67,11 @@ async fn main() -> anyhow::Result<()> {
         protocols: jamjet_api::state::default_protocol_registry(),
     };
 
+    // Spawn the scheduler as a background task — auto-chains nodes after completion.
+    let scheduler = jamjet_scheduler::Scheduler::new(state.backend.clone());
+    tokio::spawn(async move { scheduler.run().await });
+    info!("Scheduler started");
+
     let router = build_router_with_opts(state, config.dev_mode);
     let addr = format!("{}:{}", config.bind, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

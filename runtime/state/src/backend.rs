@@ -72,6 +72,13 @@ pub trait StateBackend: Send + Sync {
         status: WorkflowStatus,
     ) -> BackendResult<()>;
 
+    /// Update the current_state of a workflow execution (apply state patches).
+    async fn update_execution_current_state(
+        &self,
+        id: &ExecutionId,
+        current_state: &serde_json::Value,
+    ) -> BackendResult<()>;
+
     /// List executions, optionally filtered by status.
     async fn list_executions(
         &self,

@@ -315,6 +315,28 @@ impl StateBackend for TenantScopedSqliteBackend {
         Ok(())
     }
 
+    async fn update_execution_current_state(
+        &self,
+        id: &ExecutionId,
+        current_state: &serde_json::Value,
+    ) -> BackendResult<()> {
+        let id_str = execution_id_str(id);
+        let state_str =
+            serde_json::to_string(current_state).map_err(StateBackendError::Serialization)?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE workflow_executions SET current_state = ?, updated_at = ? WHERE execution_id = ? AND tenant_id = ?",
+        )
+        .bind(&state_str)
+        .bind(&now)
+        .bind(&id_str)
+        .bind(&self.tenant_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        Ok(())
+    }
+
     #[instrument(skip(self), fields(tenant = %self.tenant_id))]
     async fn list_executions(
         &self,

@@ -47,6 +47,7 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         .route("/agents/:id/deactivate", post(deactivate_agent))
         .route("/agents/:id/heartbeat", post(agent_heartbeat))
         // Work items (worker protocol)
+        .route("/work-items", post(enqueue_work_item))
         .route("/work-items/claim", post(claim_work_item))
         .route("/work-items/:id/complete", post(complete_work_item))
         .route("/work-items/:id/fail", post(fail_work_item))
@@ -771,26 +772,127 @@ async fn claim_work_item(
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct CompleteWorkItemRequest {
+    /// Execution ID for event emission (optional for backwards compat).
+    execution_id: Option<String>,
+    /// Node ID for event emission.
+    node_id: Option<String>,
     output: Value,
     state_patch: Value,
     #[serde(default)]
     duration_ms: u64,
 }
 
-/// `POST /work-items/:id/complete` — mark a work item as completed.
+/// `POST /work-items/:id/complete` — mark a work item as completed and emit NodeCompleted event.
 async fn complete_work_item(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
-    Json(_body): Json<CompleteWorkItemRequest>,
+    Json(body): Json<CompleteWorkItemRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let item_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
+
+    // Mark the work item as completed.
     backend.complete_work_item(item_id).await?;
+
+    // Emit NodeCompleted event if execution_id and node_id are provided.
+    if let (Some(exec_id_str), Some(node_id)) = (&body.execution_id, &body.node_id) {
+        let execution_id = parse_execution_id(exec_id_str)?;
+        let seq = backend.latest_sequence(&execution_id).await? + 1;
+        let event = jamjet_state::Event::new(
+            execution_id.clone(),
+            seq,
+            jamjet_state::EventKind::NodeCompleted {
+                node_id: node_id.clone(),
+                output: body.output.clone(),
+                state_patch: body.state_patch.clone(),
+                duration_ms: body.duration_ms,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+            },
+        );
+        backend.append_event(event).await?;
+
+        // Apply state_patch to the execution's current_state.
+        if let Ok(Some(mut exec)) = backend.get_execution(&execution_id).await {
+            if let Some(state_obj) = exec.current_state.as_object_mut() {
+                if let Some(patch_obj) = body.state_patch.as_object() {
+                    for (k, v) in patch_obj {
+                        state_obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            let _ = backend
+                .update_execution_current_state(&execution_id, &exec.current_state)
+                .await;
+        }
+    }
+
     Ok(Json(json!({ "completed": true, "work_item_id": id })))
+}
+
+#[derive(Deserialize)]
+struct EnqueueWorkItemRequest {
+    execution_id: String,
+    node_id: String,
+    #[serde(default = "default_queue_type")]
+    queue_type: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+fn default_queue_type() -> String {
+    "general".to_string()
+}
+
+/// `POST /work-items` — enqueue a new work item for a node.
+async fn enqueue_work_item(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Json(body): Json<EnqueueWorkItemRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let execution_id = parse_execution_id(&body.execution_id)?;
+    let backend = state.backend_for(&tenant_id);
+
+    // Emit NodeScheduled event.
+    let seq = backend.latest_sequence(&execution_id).await? + 1;
+    backend
+        .append_event(jamjet_state::Event::new(
+            execution_id.clone(),
+            seq,
+            jamjet_state::EventKind::NodeScheduled {
+                node_id: body.node_id.clone(),
+                queue_type: body.queue_type.clone(),
+            },
+        ))
+        .await?;
+
+    // Enqueue the work item.
+    let item = WorkItem {
+        id: Uuid::new_v4(),
+        execution_id,
+        node_id: body.node_id,
+        queue_type: body.queue_type,
+        payload: body.payload,
+        attempt: 0,
+        max_attempts: 3,
+        created_at: Utc::now(),
+        lease_expires_at: None,
+        worker_id: None,
+        tenant_id: tenant_id.0.clone(),
+    };
+    let item_id = backend.enqueue_work_item(item).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "work_item_id": item_id.to_string() })),
+    ))
 }
 
 #[derive(Deserialize)]

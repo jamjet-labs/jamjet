@@ -181,10 +181,21 @@ class JamjetClient:
         output: dict[str, Any],
         state_patch: dict[str, Any],
         duration_ms: int = 0,
+        execution_id: str | None = None,
+        node_id: str | None = None,
     ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "output": output,
+            "state_patch": state_patch,
+            "duration_ms": duration_ms,
+        }
+        if execution_id:
+            body["execution_id"] = execution_id
+        if node_id:
+            body["node_id"] = node_id
         r = await self._client.post(
             f"/work-items/{item_id}/complete",
-            json={"output": output, "state_patch": state_patch, "duration_ms": duration_ms},
+            json=body,
         )
         r.raise_for_status()
         return r.json()

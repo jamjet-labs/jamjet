@@ -1453,6 +1453,8 @@ def worker(
                             output=new_state,
                             state_patch=state_patch,
                             duration_ms=duration_ms,
+                            execution_id=exec_id,
+                            node_id=node_id,
                         )
                         console.print(
                             f"[green]Completed[/green] node=[bold]{node_id}[/bold] "
