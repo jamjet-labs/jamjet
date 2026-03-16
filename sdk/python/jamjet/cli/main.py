@@ -1350,6 +1350,131 @@ def workers(
     asyncio.run(_workers())
 
 
+@app.command()
+def worker(
+    module: str = typer.Argument(..., help="Python module path containing the workflow (e.g., my_app.workflow)"),
+    workflow_name: str = typer.Option("workflow", "--name", "-n", help="Name of the Workflow variable in the module"),
+    queue: str = typer.Option("general", "--queue", "-q", help="Queue type(s) to consume, comma-separated"),
+    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r", help="Runtime URL"),
+    poll_interval: float = typer.Option(0.5, "--poll-interval", help="Seconds between poll attempts"),
+    worker_id: str | None = typer.Option(None, "--worker-id", help="Worker ID (auto-generated if omitted)"),
+) -> None:
+    """Start a Python worker that executes workflow steps.
+
+    The worker polls the runtime for work items, executes the matching
+    step function from the loaded workflow, and reports results back.
+
+    Example:
+        jamjet worker my_app.benchmark_workflow --name workflow --queue general
+    """
+    import importlib
+    import time
+    import uuid
+
+    from jamjet.client import JamjetClient
+    from jamjet.workflow import Workflow
+
+    wid = worker_id or f"py-worker-{uuid.uuid4().hex[:8]}"
+    queues = [q.strip() for q in queue.split(",")]
+
+    # Load the workflow module and find the Workflow object
+    try:
+        mod = importlib.import_module(module)
+    except ImportError as e:
+        console.print(f"[red]Error importing module:[/red] {e}")
+        raise typer.Exit(1)
+
+    wf = getattr(mod, workflow_name, None)
+    if wf is None or not isinstance(wf, Workflow):
+        console.print(f"[red]Error:[/red] {module}.{workflow_name} is not a Workflow instance")
+        raise typer.Exit(1)
+
+    # Build step lookup: node_id -> async step function
+    step_map: dict = {}
+    for step in wf._steps:
+        step_map[step.name] = step
+
+    console.print("[bold]JamJet Python Worker[/bold]")
+    console.print(f"  Worker ID: {wid}")
+    console.print(f"  Queues:    {queues}")
+    console.print(f"  Workflow:  {wf.workflow_id} ({len(step_map)} steps: {list(step_map.keys())})")
+    console.print(f"  Runtime:   {runtime}")
+    console.print()
+
+    async def _run_worker() -> None:
+        async with JamjetClient(base_url=runtime) as client:
+            console.print("[dim]Polling for work items... (Ctrl+C to stop)[/dim]")
+            while True:
+                try:
+                    resp = await client.claim_work_item(wid, queues)
+                    if not resp.get("claimed"):
+                        await asyncio.sleep(poll_interval)
+                        continue
+
+                    wi = resp["work_item"]
+                    item_id = wi["id"]
+                    node_id = wi["node_id"]
+                    exec_id = wi["execution_id"]
+                    attempt = wi.get("attempt", 0)
+
+                    console.print(f"[cyan]Claimed[/cyan] node=[bold]{node_id}[/bold] exec={exec_id} attempt={attempt}")
+
+                    step = step_map.get(node_id)
+                    if step is None:
+                        error_msg = f"unknown node_id: {node_id}"
+                        console.print(f"[red]Failed:[/red] {error_msg}")
+                        await client.fail_work_item(item_id, error_msg)
+                        continue
+
+                    # Get current execution state
+                    exec_data = await client.get_execution(exec_id)
+                    current_state = exec_data.get("current_state", {})
+
+                    # Instantiate the state model and run the step
+                    t_start = time.monotonic()
+                    try:
+                        state_cls = wf._state_class
+                        state_obj = state_cls(**current_state) if state_cls else current_state
+                        result = step.fn(state_obj)
+                        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                            result = await result
+                        duration_ms = int((time.monotonic() - t_start) * 1000)
+
+                        # Compute state patch (diff between old and new state)
+                        if hasattr(result, "model_dump"):
+                            new_state = result.model_dump()
+                        else:
+                            new_state = dict(result) if isinstance(result, dict) else {}
+
+                        state_patch = {k: v for k, v in new_state.items() if current_state.get(k) != v}
+
+                        await client.complete_work_item(
+                            item_id,
+                            output=new_state,
+                            state_patch=state_patch,
+                            duration_ms=duration_ms,
+                        )
+                        console.print(
+                            f"[green]Completed[/green] node=[bold]{node_id}[/bold] "
+                            f"{duration_ms}ms patch={list(state_patch.keys())}"
+                        )
+                    except Exception as e:
+                        duration_ms = int((time.monotonic() - t_start) * 1000)
+                        console.print(f"[red]Failed[/red] node={node_id}: {e}")
+                        await client.fail_work_item(item_id, str(e))
+
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    console.print(f"[yellow]Poll error:[/yellow] {e}")
+                    await asyncio.sleep(poll_interval)
+
+    try:
+        asyncio.run(_run_worker())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Worker stopped.[/yellow]")
+
+
 # ── eval ──────────────────────────────────────────────────────────────────────
 
 

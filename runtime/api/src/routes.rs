@@ -46,6 +46,11 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         .route("/agents/:id/activate", post(activate_agent))
         .route("/agents/:id/deactivate", post(deactivate_agent))
         .route("/agents/:id/heartbeat", post(agent_heartbeat))
+        // Work items (worker protocol)
+        .route("/work-items/claim", post(claim_work_item))
+        .route("/work-items/:id/complete", post(complete_work_item))
+        .route("/work-items/:id/fail", post(fail_work_item))
+        .route("/work-items/:id/heartbeat", post(heartbeat_work_item))
         // Admin
         .route("/workers", get(list_workers))
         // Tenant management (operator-only)
@@ -728,6 +733,102 @@ async fn update_tenant(
     };
     backend.update_tenant(updated).await?;
     Ok(Json(json!({ "tenant_id": id, "updated": true })))
+}
+
+// ── Work items (worker protocol) ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ClaimWorkItemRequest {
+    worker_id: String,
+    queue_types: Vec<String>,
+}
+
+/// `POST /work-items/claim` — claim the next available work item.
+async fn claim_work_item(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Json(body): Json<ClaimWorkItemRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&tenant_id);
+    let queue_refs: Vec<&str> = body.queue_types.iter().map(|s| s.as_str()).collect();
+    let item = backend
+        .claim_work_item(&body.worker_id, &queue_refs)
+        .await?;
+    match item {
+        Some(wi) => Ok(Json(json!({
+            "claimed": true,
+            "work_item": {
+                "id": wi.id.to_string(),
+                "execution_id": wi.execution_id.to_string(),
+                "node_id": wi.node_id,
+                "queue_type": wi.queue_type,
+                "payload": wi.payload,
+                "attempt": wi.attempt,
+            }
+        }))),
+        None => Ok(Json(json!({ "claimed": false }))),
+    }
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct CompleteWorkItemRequest {
+    output: Value,
+    state_patch: Value,
+    #[serde(default)]
+    duration_ms: u64,
+}
+
+/// `POST /work-items/:id/complete` — mark a work item as completed.
+async fn complete_work_item(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(id): Path<String>,
+    Json(_body): Json<CompleteWorkItemRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let item_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
+    let backend = state.backend_for(&tenant_id);
+    backend.complete_work_item(item_id).await?;
+    Ok(Json(json!({ "completed": true, "work_item_id": id })))
+}
+
+#[derive(Deserialize)]
+struct FailWorkItemRequest {
+    error: String,
+}
+
+/// `POST /work-items/:id/fail` — mark a work item as failed.
+async fn fail_work_item(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(id): Path<String>,
+    Json(body): Json<FailWorkItemRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let item_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
+    let backend = state.backend_for(&tenant_id);
+    backend.fail_work_item(item_id, &body.error).await?;
+    Ok(Json(json!({ "failed": true, "work_item_id": id })))
+}
+
+#[derive(Deserialize)]
+struct HeartbeatRequest {
+    worker_id: String,
+}
+
+/// `POST /work-items/:id/heartbeat` — renew the lease on a claimed work item.
+async fn heartbeat_work_item(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(id): Path<String>,
+    Json(body): Json<HeartbeatRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let item_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
+    let backend = state.backend_for(&tenant_id);
+    backend.renew_lease(item_id, &body.worker_id).await?;
+    Ok(Json(json!({ "renewed": true, "work_item_id": id })))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

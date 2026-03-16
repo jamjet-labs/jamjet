@@ -161,6 +161,50 @@ class JamjetClient:
         r.raise_for_status()
         return r.json()
 
+    # ── Work items (worker protocol) ────────────────────────────────────
+
+    async def claim_work_item(
+        self,
+        worker_id: str,
+        queue_types: list[str],
+    ) -> dict[str, Any]:
+        r = await self._client.post(
+            "/work-items/claim",
+            json={"worker_id": worker_id, "queue_types": queue_types},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def complete_work_item(
+        self,
+        item_id: str,
+        output: dict[str, Any],
+        state_patch: dict[str, Any],
+        duration_ms: int = 0,
+    ) -> dict[str, Any]:
+        r = await self._client.post(
+            f"/work-items/{item_id}/complete",
+            json={"output": output, "state_patch": state_patch, "duration_ms": duration_ms},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def fail_work_item(self, item_id: str, error: str) -> dict[str, Any]:
+        r = await self._client.post(
+            f"/work-items/{item_id}/fail",
+            json={"error": error},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def heartbeat_work_item(self, item_id: str, worker_id: str) -> dict[str, Any]:
+        r = await self._client.post(
+            f"/work-items/{item_id}/heartbeat",
+            json={"worker_id": worker_id},
+        )
+        r.raise_for_status()
+        return r.json()
+
     # ── Generic helpers (for one-off API paths not covered above) ─────────
 
     async def post(self, path: str, **kwargs: Any) -> dict[str, Any]:
