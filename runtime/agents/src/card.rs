@@ -14,8 +14,45 @@ pub struct AgentCard {
     pub autonomy: AutonomyLevel,
     pub constraints: Option<AutonomyConstraints>,
     pub auth: AuthSpec,
+    /// Latency classification for routing decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_class: Option<LatencyClass>,
+    /// Cost tier for delegation decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_class: Option<CostClass>,
+    /// Reasoning modes this agent supports (e.g. react, plan-and-execute, critic).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_modes: Vec<String>,
     #[serde(default)]
     pub labels: HashMap<String, String>,
+}
+
+/// Latency classification for agent routing and SLA matching.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LatencyClass {
+    /// Sub-second responses (caches, deterministic tools).
+    Realtime,
+    /// Seconds (fast model inference, simple tool calls).
+    Fast,
+    /// Tens of seconds (complex reasoning, multi-step).
+    Medium,
+    /// Minutes+ (research tasks, multi-agent delegation).
+    Slow,
+}
+
+/// Cost tier for delegation budget planning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CostClass {
+    /// Free or negligible cost (local tools, cached responses).
+    Free,
+    /// Low cost per invocation (small models, simple APIs).
+    Low,
+    /// Moderate cost (frontier models, paid APIs).
+    Medium,
+    /// High cost (long-running agents, expensive external services).
+    High,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

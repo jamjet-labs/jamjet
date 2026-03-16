@@ -75,6 +75,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                     started_at: now,
                     updated_at: now,
                     completed_at: None,
+                    session_type: None,
                 };
                 let eid = execution.execution_id.clone();
                 backend.create_execution(execution).await.map_err(|e| format!("{e}"))?;

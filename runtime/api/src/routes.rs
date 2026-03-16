@@ -157,6 +157,7 @@ async fn start_execution(
         started_at: now,
         updated_at: now,
         completed_at: None,
+        session_type: None,
     };
     let execution_id = execution.execution_id.clone();
     backend.create_execution(execution).await?;

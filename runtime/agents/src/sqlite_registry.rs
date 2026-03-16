@@ -267,6 +267,9 @@ mod tests {
             autonomy: AutonomyLevel::Guided,
             constraints: None,
             auth: AuthSpec::None,
+            latency_class: None,
+            cost_class: None,
+            reasoning_modes: vec![],
             labels: Default::default(),
         }
     }

@@ -8,4 +8,4 @@ pub use error::Error;
 pub use node::{NodeId, NodeKind, NodeStatus};
 pub use retry::{BackoffStrategy, RetryPolicy};
 pub use timeout::TimeoutConfig;
-pub use workflow::{WorkflowId, WorkflowMetadata, WorkflowStatus};
+pub use workflow::{SessionType, WorkflowId, WorkflowMetadata, WorkflowStatus};

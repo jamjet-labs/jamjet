@@ -86,6 +86,23 @@ impl WorkflowStatus {
     }
 }
 
+/// Session type label for execution metadata.
+/// Describes the governance and durability model of an execution session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionType {
+    /// Fire-and-forget, no state persisted beyond completion.
+    Stateless,
+    /// Checkpointed execution that can resume after interruption.
+    Resumable,
+    /// Long-lived session with audit trail and governance policies.
+    PersistentGoverned,
+    /// Short-lived session discarded after use (e.g. preview, dry-run).
+    Ephemeral,
+    /// Session that requires human approval at one or more gates.
+    ApprovalGated,
+}
+
 /// Metadata for a workflow definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowMetadata {
@@ -109,6 +126,9 @@ pub struct WorkflowExecution {
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Session type label for governance and durability classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_type: Option<SessionType>,
 }
 
 #[cfg(test)]

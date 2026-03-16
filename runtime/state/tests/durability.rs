@@ -43,6 +43,7 @@ fn sample_execution(id: &ExecutionId) -> WorkflowExecution {
         started_at: now,
         updated_at: now,
         completed_at: None,
+        session_type: None,
     }
 }
 

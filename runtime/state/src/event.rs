@@ -43,6 +43,11 @@ pub struct ProvenanceMetadata {
     pub verified: bool,
     /// Source identifier (e.g., "mcp:brave-search", "a2a:research-agent")
     pub source: Option<String>,
+    /// Trust domain this output belongs to (e.g., "internal", "external:partner-org").
+    pub trust_domain: Option<String>,
+    /// References to supporting evidence (URIs, document IDs, event sequences).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
 }
 
 impl Default for ProvenanceMetadata {
@@ -53,6 +58,8 @@ impl Default for ProvenanceMetadata {
             confidence: None,
             verified: false,
             source: None,
+            trust_domain: None,
+            evidence_refs: Vec::new(),
         }
     }
 }

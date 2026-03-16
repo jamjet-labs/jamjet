@@ -145,6 +145,7 @@ fn row_to_execution(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkflowExec
         started_at,
         updated_at,
         completed_at,
+        session_type: None,
     })
 }
 
@@ -920,6 +921,7 @@ mod tests {
             started_at: now,
             updated_at: now,
             completed_at: None,
+            session_type: None,
         }
     }
 
