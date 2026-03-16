@@ -1,0 +1,16 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en
+reviews:
+  profile: chill
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!docs/**"
+    - "!*.md"
+    - "!LICENSE"
+  tools:
+    clippy:
+      enabled: true
+chat:
+  auto_reply: true
