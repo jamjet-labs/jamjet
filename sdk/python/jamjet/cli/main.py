@@ -1417,7 +1417,7 @@ def eval_run(
     )
 
     results = asyncio.run(runner.run(ds))
-    EvalRunner.print_summary(results, console=console)
+    runner.print_summary(results, console=console)
 
     if output_json:
         import dataclasses

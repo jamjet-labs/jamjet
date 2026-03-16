@@ -169,6 +169,52 @@ class EvalRunner:
             error=error,
         )
 
+    @staticmethod
+    def print_summary(results: list[EvalResult], *, console: Any = None) -> None:
+        """Print a Rich summary table of eval results."""
+        from rich.console import Console
+        from rich.table import Table
+
+        if console is None:
+            console = Console()
+
+        total = len(results)
+        passed = sum(1 for r in results if r.passed)
+        failed = total - passed
+        pass_rate = passed / total * 100 if total else 0
+
+        console.rule(f"[bold]Eval Results — {passed}/{total} passed ({pass_rate:.1f}%)[/bold]")
+
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Row", style="dim")
+        table.add_column("Passed")
+        table.add_column("Score")
+        table.add_column("Duration (ms)", justify="right")
+        table.add_column("Cost (USD)", justify="right")
+        table.add_column("Scorer Details")
+
+        for r in results:
+            passed_icon = "[green]✓[/green]" if r.passed else "[red]✗[/red]"
+            score_str = f"{r.overall_score:.2f}" if r.overall_score is not None else "—"
+            cost_str = f"${r.cost_usd:.6f}" if r.cost_usd is not None else "—"
+            details = "; ".join(f"{s.scorer}={'✓' if s.passed else '✗'}({s.message})" for s in r.scorers)
+            if r.error:
+                details = f"[red]{r.error}[/red]"
+
+            table.add_row(
+                r.row_id,
+                passed_icon,
+                score_str,
+                f"{r.duration_ms:.0f}",
+                cost_str,
+                details,
+            )
+
+        console.print(table)
+        console.print(
+            f"[bold]Pass rate:[/bold] {pass_rate:.1f}%  [bold]Passed:[/bold] {passed}  [bold]Failed:[/bold] {failed}"
+        )
+
 
 class AgentEvalRunner:
     """Runs an eval dataset using in-process Agent execution. No runtime server needed.
@@ -238,11 +284,11 @@ class AgentEvalRunner:
                 max_cost_usd=1.0,
                 timeout_seconds=int(self.timeout_s),
             )
-            result = await asyncio.wait_for(
+            agent_result = await asyncio.wait_for(
                 agent.run(task_text),
                 timeout=self.timeout_s,
             )
-            output = result.output
+            output = agent_result.output
         except TimeoutError:
             error = f"timeout after {self.timeout_s}s"
         except Exception as e:
@@ -252,20 +298,20 @@ class AgentEvalRunner:
 
         scorer_results: list[ScorerResult] = []
         if output is not None:
-            for scorer in self.scorers:
+            for s in self.scorers:
                 try:
-                    result = await scorer.score(
+                    sr = await s.score(
                         output,
                         expected=row.expected,
                         duration_ms=duration_ms,
                         cost_usd=cost_usd,
                         input_data=row.input,
                     )
-                    scorer_results.append(result)
+                    scorer_results.append(sr)
                 except Exception as e:
                     scorer_results.append(
                         ScorerResult(
-                            scorer=scorer.name,
+                            scorer=s.name,
                             passed=False,
                             score=None,
                             message=f"scorer error: {e}",

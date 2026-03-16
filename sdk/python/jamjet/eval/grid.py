@@ -441,7 +441,7 @@ class ExperimentGrid:
     async def run(self) -> GridResults:
         """Run the full experiment grid and return aggregated results."""
         combinations = self._condition_combinations()
-        seeds: list[int | None] = self.seeds if self.seeds is not None else [None]
+        seeds: list[int | None] = list(self.seeds) if self.seeds is not None else [None]
 
         semaphore = asyncio.Semaphore(self.concurrency)
         all_results: list[ConditionResult] = []
