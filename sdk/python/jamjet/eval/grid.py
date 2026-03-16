@@ -408,6 +408,9 @@ class ExperimentGrid:
         concurrency: int = 4,
         poll_interval_s: float = 1.0,
         timeout_s: float = 120.0,
+        mode: str = "runtime",
+        agent_instructions: str = "",
+        agent_tools: list | None = None,
     ) -> None:
         self.workflow_id = workflow_id
         self.conditions = conditions
@@ -417,6 +420,9 @@ class ExperimentGrid:
         self.concurrency = concurrency
         self.poll_interval_s = poll_interval_s
         self.timeout_s = timeout_s
+        self.mode = mode
+        self.agent_instructions = agent_instructions
+        self.agent_tools = agent_tools or []
 
         if isinstance(dataset, str):
             self._dataset = EvalDataset.from_file(dataset)
@@ -442,14 +448,25 @@ class ExperimentGrid:
 
         async def _run_condition(condition: dict[str, str], seed: int | None) -> ConditionResult:
             async with semaphore:
-                runner = EvalRunner(
-                    workflow_id=self.workflow_id,
-                    scorers=self.scorers,
-                    runtime=self.runtime,
-                    concurrency=1,  # inner concurrency is 1; outer semaphore controls parallelism
-                    poll_interval_s=self.poll_interval_s,
-                    timeout_s=self.timeout_s,
-                )
+                if self.mode == "agent":
+                    from jamjet.eval.runner import AgentEvalRunner
+
+                    runner: EvalRunner | AgentEvalRunner = AgentEvalRunner(
+                        scorers=self.scorers,
+                        instructions=self.agent_instructions,
+                        tools=self.agent_tools,
+                        concurrency=1,
+                        timeout_s=self.timeout_s,
+                    )
+                else:
+                    runner = EvalRunner(
+                        workflow_id=self.workflow_id,
+                        scorers=self.scorers,
+                        runtime=self.runtime,
+                        concurrency=1,
+                        poll_interval_s=self.poll_interval_s,
+                        timeout_s=self.timeout_s,
+                    )
 
                 # Build a modified dataset that injects condition + seed metadata
                 # into each row's input.

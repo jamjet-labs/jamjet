@@ -23,7 +23,7 @@ from jamjet.eval.registry import (
 from jamjet.eval.registry import (
     ScorerResult as CustomScorerResult,
 )
-from jamjet.eval.runner import EvalResult, EvalRunner
+from jamjet.eval.runner import AgentEvalRunner, EvalResult, EvalRunner
 from jamjet.eval.scorers import (
     AssertionScorer,
     BaseScorer,
@@ -34,6 +34,7 @@ from jamjet.eval.scorers import (
 )
 
 __all__ = [
+    "AgentEvalRunner",
     "AssertionScorer",
     "BaseScorer",
     "ComparisonResult",

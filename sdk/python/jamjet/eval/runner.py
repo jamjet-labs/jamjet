@@ -169,6 +169,120 @@ class EvalRunner:
             error=error,
         )
 
+
+class AgentEvalRunner:
+    """Runs an eval dataset using in-process Agent execution. No runtime server needed.
+
+    Each eval row's input is expected to contain ``_condition`` metadata with
+    ``strategy`` and ``model`` keys. A fresh Agent is built per row, so each
+    row can test a different strategy/model combination.
+
+    Usage::
+
+        runner = AgentEvalRunner(
+            scorers=[LlmJudgeScorer(rubric="...", min_score=3)],
+            instructions="You are a helpful assistant.",
+            tools=[my_tool],
+            concurrency=2,
+        )
+        results = await runner.run(dataset)
+    """
+
+    def __init__(
+        self,
+        scorers: list[BaseScorer],
+        *,
+        instructions: str = "",
+        tools: list[Any] | None = None,
+        concurrency: int = 4,
+        timeout_s: float = 120.0,
+    ) -> None:
+        self.scorers = scorers
+        self.instructions = instructions
+        self.tools = tools or []
+        self.concurrency = concurrency
+        self.timeout_s = timeout_s
+
+    async def run(self, dataset: EvalDataset) -> list[EvalResult]:
+        """Run all dataset rows, applying scorers to each output."""
+        semaphore = asyncio.Semaphore(self.concurrency)
+
+        async def _run_row(row: EvalRow) -> EvalResult:
+            async with semaphore:
+                return await self._run_one(row)
+
+        tasks = [_run_row(row) for row in dataset]
+        return await asyncio.gather(*tasks)
+
+    async def _run_one(self, row: EvalRow) -> EvalResult:
+        from jamjet.agents.agent import Agent
+
+        start = time.monotonic()
+        output = None
+        cost_usd = None
+        error = None
+
+        condition = row.input.get("_condition", {})
+        strategy = condition.get("strategy", "plan-and-execute")
+        model = condition.get("model", "")
+        task_text = row.input.get("task", str(row.input))
+
+        try:
+            agent = Agent(
+                name="eval-agent",
+                model=model,
+                tools=self.tools,
+                instructions=self.instructions,
+                strategy=strategy,
+                max_iterations=10,
+                max_cost_usd=1.0,
+                timeout_seconds=int(self.timeout_s),
+            )
+            result = await asyncio.wait_for(
+                agent.run(task_text),
+                timeout=self.timeout_s,
+            )
+            output = result.output
+        except TimeoutError:
+            error = f"timeout after {self.timeout_s}s"
+        except Exception as e:
+            error = str(e)
+
+        duration_ms = (time.monotonic() - start) * 1000.0
+
+        scorer_results: list[ScorerResult] = []
+        if output is not None:
+            for scorer in self.scorers:
+                try:
+                    result = await scorer.score(
+                        output,
+                        expected=row.expected,
+                        duration_ms=duration_ms,
+                        cost_usd=cost_usd,
+                        input_data=row.input,
+                    )
+                    scorer_results.append(result)
+                except Exception as e:
+                    scorer_results.append(
+                        ScorerResult(
+                            scorer=scorer.name,
+                            passed=False,
+                            score=None,
+                            message=f"scorer error: {e}",
+                        )
+                    )
+
+        return EvalResult(
+            row_id=row.id,
+            input=row.input,
+            expected=row.expected,
+            output=output,
+            scorers=scorer_results,
+            duration_ms=duration_ms,
+            cost_usd=cost_usd,
+            error=error,
+        )
+
     @staticmethod
     def print_summary(results: list[EvalResult], *, console: Any = None) -> None:
         """Print a Rich summary table of eval results."""
