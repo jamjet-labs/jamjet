@@ -55,6 +55,7 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML>=6.0",
     "openai>=1.0",
+    "scipy>=1.11",
 ]
 
 [project.scripts]
