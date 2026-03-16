@@ -670,11 +670,7 @@ def _compile_consensus(
         # Agent node
         nodes[agent_id_node] = _model_node(
             model,
-            (
-                f"Goal: {goal}. "
-                f"You are agent {i + 1} of {num_agents}. "
-                "Independently produce your best answer."
-            ),
+            (f"Goal: {goal}. You are agent {i + 1} of {num_agents}. Independently produce your best answer."),
             f"__agent_{i}_output__",
             labels={
                 "jamjet.strategy.node": "parallel_agent",

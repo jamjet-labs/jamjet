@@ -407,7 +407,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                     skill: args.get("skill").and_then(|v| v.as_str()).map(String::from),
                     protocol: args.get("protocol").and_then(|v| v.as_str()).map(String::from),
                 };
-                let agents = s.agents.find(filter).await.map_err(|e| format!("{e}"))?;
+                let agents = s.agents.find(filter).await.map_err(|e| e.to_string())?;
                 let text = serde_json::to_string(&json!({"agents": agents})).map_err(|e| format!("{e}"))?;
                 Ok(vec![McpContent::Text { text }])
             }
@@ -432,7 +432,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
             let s = s.clone();
             async move {
                 let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                let agent = s.agents.discover_remote(url).await.map_err(|e| format!("{e}"))?;
+                let agent = s.agents.discover_remote(url).await.map_err(|e| e.to_string())?;
                 let text = serde_json::to_string(&agent).map_err(|e| format!("{e}"))?;
                 Ok(vec![McpContent::Text { text }])
             }

@@ -683,7 +683,7 @@ async fn update_tenant(
 
     let limits = body
         .limits
-        .map(|v| serde_json::from_value(v))
+        .map(serde_json::from_value)
         .transpose()
         .map_err(|e| ApiError::BadRequest(format!("invalid limits: {e}")))?;
 

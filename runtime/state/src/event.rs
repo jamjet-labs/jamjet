@@ -31,7 +31,7 @@ impl Event {
 }
 
 /// Provenance metadata attached to node completions for research traceability.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProvenanceMetadata {
     /// Model identifier used for this node (e.g., "claude-haiku-4-5-20251001")
     pub model_id: Option<String>,
@@ -40,6 +40,7 @@ pub struct ProvenanceMetadata {
     /// Confidence score (0.0-1.0) if available
     pub confidence: Option<f64>,
     /// Whether the output was verified by another model/check
+    #[serde(default)]
     pub verified: bool,
     /// Source identifier (e.g., "mcp:brave-search", "a2a:research-agent")
     pub source: Option<String>,
@@ -48,20 +49,6 @@ pub struct ProvenanceMetadata {
     /// References to supporting evidence (URIs, document IDs, event sequences).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_refs: Vec<String>,
-}
-
-impl Default for ProvenanceMetadata {
-    fn default() -> Self {
-        Self {
-            model_id: None,
-            model_version: None,
-            confidence: None,
-            verified: false,
-            source: None,
-            trust_domain: None,
-            evidence_refs: Vec::new(),
-        }
-    }
 }
 
 /// All possible event kinds in the JamJet event log.
@@ -121,7 +108,7 @@ pub enum EventKind {
         cost_usd: Option<f64>,
         /// Provenance metadata for research traceability.
         #[serde(skip_serializing_if = "Option::is_none")]
-        provenance: Option<ProvenanceMetadata>,
+        provenance: Option<Box<ProvenanceMetadata>>,
     },
     NodeFailed {
         node_id: NodeId,

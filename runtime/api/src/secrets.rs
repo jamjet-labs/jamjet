@@ -45,7 +45,7 @@ impl FileSecretBackend {
     pub fn from_env() -> Option<Self> {
         std::env::var("JAMJET_SECRETS_DIR")
             .ok()
-            .map(|d| Self::new(d))
+            .map(Self::new)
     }
 }
 
