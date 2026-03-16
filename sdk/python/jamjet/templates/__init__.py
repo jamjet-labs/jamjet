@@ -826,6 +826,315 @@ version = "0.1.0"
 {{"id": "t1", "input": {{"task": "Summarise this document", "agent_url": "http://localhost:8080"}}, "expected": {{}}}}
 """,
     },
+    # ── research ───────────────────────────────────────────────────────────────
+    "research": {
+        "agents/researcher.py": """\
+# {name}/agents/researcher.py
+# Research agent with tools for paper search and data analysis.
+#
+# Usage:
+#   from agents.researcher import researcher
+#   result = await researcher.run("Find papers on transformer architectures")
+
+from jamjet import Agent, tool
+
+
+@tool
+async def search_papers(query: str) -> str:
+    \"\"\"Search academic papers by keyword.\"\"\"
+    # Replace with a real API (Semantic Scholar, arXiv, etc.)
+    return f"Found papers about: {{query}}"
+
+
+@tool
+async def analyze_data(dataset: str) -> str:
+    \"\"\"Analyze a dataset and return key findings.\"\"\"
+    # Replace with real analysis logic
+    return f"Analysis of {{dataset}}: significant results found"
+
+
+researcher = Agent(
+    name="{name}-researcher",
+    model="claude-haiku-4-5-20251001",
+    tools=[search_papers, analyze_data],
+    instructions=(
+        "You are a research assistant. Search for papers, analyze data, "
+        "and provide clear, well-cited summaries."
+    ),
+    strategy="react",
+    max_iterations=6,
+)
+""",
+        "baselines/baseline.py": """\
+# {name}/baselines/baseline.py
+# Abstract baseline class and a simple single-agent baseline for comparison.
+#
+# Usage:
+#   from baselines.baseline import SingleAgentBaseline
+#   result = await SingleAgentBaseline().run("Summarise recent LLM research")
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+
+
+@dataclass
+class BaselineResult:
+    \"\"\"Container for baseline run outputs.\"\"\"
+    output: str
+    tokens: int = 0
+    latency_ms: float = 0.0
+
+
+class Baseline(ABC):
+    \"\"\"Override `run` to implement a new baseline.\"\"\"
+
+    @abstractmethod
+    async def run(self, task: str) -> BaselineResult:
+        ...
+
+
+class SingleAgentBaseline(Baseline):
+    \"\"\"Simple single-prompt baseline — no tools, no iteration.\"\"\"
+
+    async def run(self, task: str) -> BaselineResult:
+        # Replace with a real model call to measure baseline quality
+        return BaselineResult(
+            output=f"Baseline response for: {{task}}",
+            tokens=0,
+            latency_ms=0.0,
+        )
+""",
+        "experiments/config.yaml": """\
+# {name}/experiments/config.yaml
+# Experiment configuration — models, seeds, and evaluation settings.
+#
+# Usage:
+#   python experiments/runner.py              # run all conditions
+#   python experiments/runner.py --seed 42    # run a single seed
+
+experiment:
+  name: {name}
+  seeds: [42, 123, 456]
+
+  conditions:
+    - name: react
+      strategy: react
+      model: claude-haiku-4-5-20251001
+    - name: plan-and-execute
+      strategy: plan-and-execute
+      model: claude-haiku-4-5-20251001
+
+  eval:
+    judge_model: claude-haiku-4-5-20251001
+    rubric: "Rate the research quality 1-5: depth, accuracy, clarity"
+    min_score: 3
+
+  output_dir: results/
+""",
+        "experiments/runner.py": """\
+# {name}/experiments/runner.py
+# Run experiments across conditions and seeds, collect eval results.
+#
+# Usage:
+#   python experiments/runner.py
+#   python experiments/runner.py --seed 42
+
+import json
+import pathlib
+
+import yaml
+
+from jamjet.eval import EvalRunner
+
+
+def load_config(path: str = "experiments/config.yaml") -> dict:
+    \"\"\"Load experiment configuration from YAML.\"\"\"
+    with open(path) as f:
+        return yaml.safe_load(f)["experiment"]
+
+
+async def run_experiments() -> None:
+    config = load_config()
+    results_dir = pathlib.Path(config["output_dir"])
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    runner = EvalRunner(
+        dataset="evals/dataset.jsonl",
+        scorers_module="evals.scorers",
+        judge_model=config["eval"]["judge_model"],
+    )
+
+    all_results = []
+
+    for condition in config["conditions"]:
+        for seed in config["seeds"]:
+            print(f"Running condition={{condition['name']}} seed={{seed}}")
+            result = await runner.run(
+                workflow="workflow.yaml",
+                strategy=condition["strategy"],
+                model=condition["model"],
+                seed=seed,
+            )
+            entry = {{
+                "condition": condition["name"],
+                "seed": seed,
+                "scores": result.scores,
+                "pass_rate": result.pass_rate,
+            }}
+            all_results.append(entry)
+
+    output_path = results_dir / "experiment_results.json"
+    output_path.write_text(json.dumps(all_results, indent=2))
+    print(f"Results saved to {{output_path}}")
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(run_experiments())
+""",
+        "evals/dataset.jsonl": """\
+{{"id": "r1", "input": {{"query": "What are the latest advances in transformer architectures?"}}, "expected": {{}}}}
+{{"id": "r2", "input": {{"query": "Compare retrieval-augmented generation approaches"}}, "expected": {{}}}}
+{{"id": "r3", "input": {{"query": "Summarise key findings on chain-of-thought prompting"}}, "expected": {{}}}}
+{{"id": "r4", "input": {{"query": "What are effective evaluation methods for LLM agents?"}}, "expected": {{}}}}
+{{"id": "r5", "input": {{"query": "How does RLHF improve language model alignment?"}}, "expected": {{}}}}
+""",
+        "evals/scorers.py": """\
+# {name}/evals/scorers.py
+# Custom scorer for research quality evaluation.
+#
+# Scorers are auto-discovered by EvalRunner when pointed at this module.
+
+from jamjet.eval import Scorer, Score
+
+
+class ResearchDepthScorer(Scorer):
+    \"\"\"Score whether the research output demonstrates sufficient depth.\"\"\"
+
+    name = "research_depth"
+
+    async def score(self, output: str, expected: dict | None = None) -> Score:
+        # Simple heuristic — replace with model-graded or custom logic
+        word_count = len(output.split())
+        if word_count >= 200:
+            return Score(value=5, reason=f"Thorough ({{word_count}} words)")
+        if word_count >= 100:
+            return Score(value=3, reason=f"Adequate ({{word_count}} words)")
+        return Score(value=1, reason=f"Too brief ({{word_count}} words)")
+""",
+        "results/.gitkeep": "",
+        "workflow.yaml": """\
+# {name}/workflow.yaml
+# Multi-step research workflow: search, analyse, evaluate quality.
+#
+# Usage:
+#   jamjet dev
+#   jamjet run workflow.yaml --input '{{"query": "Latest advances in LLM agents"}}'
+
+workflow:
+  id: {name}
+  version: 0.1.0
+  state_schema:
+    query: str
+    search_results: str
+    analysis: str
+    report: str
+  start: research
+
+nodes:
+  research:
+    type: model
+    model: claude-haiku-4-5-20251001
+    system: |
+      You are a research assistant. Search for relevant papers and information,
+      then provide a detailed, well-cited summary.
+    prompt: |
+      Research the following topic thoroughly:
+
+      {{{{ state.query }}}}
+
+      Provide:
+      1. Key findings from recent literature
+      2. Different perspectives or approaches
+      3. Open questions and future directions
+    output_key: report
+    next: evaluate
+
+  evaluate:
+    type: eval
+    scorers:
+      - type: llm_judge
+        rubric: "Is the research thorough and accurate? Rate depth, accuracy, and clarity 1-5."
+        min_score: 3
+        model: claude-haiku-4-5-20251001
+    on_fail: retry_with_feedback
+    max_retries: 2
+    next: end
+
+  end:
+    type: end
+""",
+        "README.md": """\
+# {name}
+
+A research workflow built with [JamJet](https://jamjet.dev).
+
+## Quick start
+
+```bash
+# Start the JamJet runtime
+jamjet dev
+
+# Run the research workflow
+jamjet run workflow.yaml --input '{{"query": "Latest advances in LLM agents"}}'
+```
+
+## Run experiments
+
+```bash
+# Execute all experiment conditions and seeds
+python experiments/runner.py
+
+# Results are saved to results/experiment_results.json
+```
+
+## Project structure
+
+```
+agents/researcher.py      # Research agent with tools
+baselines/baseline.py     # Baseline for comparison
+experiments/config.yaml   # Experiment configuration
+experiments/runner.py     # Experiment runner
+evals/dataset.jsonl       # Sample evaluation dataset
+evals/scorers.py          # Custom scorers
+workflow.yaml             # Research workflow (YAML)
+results/                  # Experiment output
+```
+
+## Adding a new condition
+
+Edit `experiments/config.yaml` and add an entry under `conditions`:
+
+```yaml
+conditions:
+  - name: my-condition
+    strategy: react
+    model: claude-sonnet-4-6
+```
+
+Then re-run `python experiments/runner.py`.
+
+## Exporting results
+
+Results are written as JSON to `results/experiment_results.json`. Load them
+in a notebook or script for further analysis:
+
+```python
+import json, pathlib
+results = json.loads(pathlib.Path("results/experiment_results.json").read_text())
+```
+""",
+    },
     # ── approval-workflow ─────────────────────────────────────────────────────
     "approval-workflow": {
         "workflow.yaml": """\

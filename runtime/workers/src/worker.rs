@@ -271,6 +271,7 @@ impl Worker {
                             output_tokens: exec_result.output_tokens,
                             finish_reason: exec_result.finish_reason,
                             cost_usd: None,
+                            provenance: None,
                         },
                     ))
                     .await?;

@@ -2,7 +2,7 @@
 Strategy compiler tests (J2.11).
 
 Tests cover:
-- All three strategies compile to valid IR DAGs
+- All six strategies compile to valid IR DAGs
 - Limits block validation (missing → clear error)
 - Agent-first YAML parsing round-trips through ir_compiler
 - Node/edge structure invariants (start_node reachable, __finalize__ present, etc.)
@@ -83,8 +83,13 @@ def test_unknown_strategy_raises():
 
 
 def test_unknown_strategy_error_lists_known():
-    with pytest.raises(ValueError, match="plan-and-execute"):
+    try:
         compile_strategy("bad", {}, [], "gpt-4o", DEFAULT_LIMITS, "goal", "agent-1")
+        assert False, "Expected ValueError"  # noqa: B011
+    except ValueError as exc:
+        msg = str(exc)
+        for name in ("plan-and-execute", "react", "critic", "reflection", "consensus", "debate"):
+            assert name in msg, f"expected '{name}' in error message, got: {msg}"
 
 
 # ── plan-and-execute ──────────────────────────────────────────────────────────
@@ -355,3 +360,236 @@ nodes:
     assert "start" in ir["nodes"]
     # Should NOT have strategy_metadata
     assert "strategy_metadata" not in ir
+
+
+# ── reflection ─────────────────────────────────────────────────────────────
+
+
+def test_reflection_compiles():
+    result = compile_strategy(
+        "reflection",
+        {"pass_threshold": 0.75, "max_rounds": 2},
+        ["search"],
+        "gpt-4o",
+        DEFAULT_LIMITS,
+        "Write a thorough analysis",
+        "agent-reflect",
+    )
+    nodes = result["nodes"]
+
+    assert "__execute__" in nodes
+    assert "__reflect_0__" in nodes
+    assert "__reflect_gate_0__" in nodes
+    assert "__revise_0__" in nodes
+    assert "__finalize__" in nodes
+    assert "__limit_exceeded__" in nodes
+
+    _assert_ir_invariants(result, "reflection")
+
+
+def test_reflection_start_node():
+    result = compile_strategy("reflection", {}, [], "gpt-4o", DEFAULT_LIMITS, "goal", "a")
+    assert result["start_node"] == "__execute__"
+
+
+def test_reflection_max_rounds_capped():
+    # max_rounds=10 but max_iterations=3 → only 3 reflect rounds
+    limits = StrategyLimits(max_iterations=3, max_cost_usd=1.0, timeout_seconds=120)
+    config = {"max_rounds": 10}
+    result = compile_strategy("reflection", config, [], "gpt-4o", limits, "goal", "a")
+    nodes = result["nodes"]
+    assert "__reflect_2__" in nodes
+    assert "__reflect_3__" not in nodes
+
+
+def test_reflection_default_threshold():
+    # config={} uses default pass_threshold (0.8 in the implementation)
+    result = compile_strategy("reflection", {}, [], "gpt-4o", DEFAULT_LIMITS, "goal", "a")
+    # Verify reflection nodes still compile correctly with defaults
+    nodes = result["nodes"]
+    assert "__reflect_0__" in nodes
+    assert "__execute__" in nodes
+
+
+def test_reflection_invariants():
+    result = compile_strategy("reflection", {}, [], "gpt-4o", DEFAULT_LIMITS, "goal", "a")
+    _assert_ir_invariants(result, "reflection")
+
+
+# ── consensus ──────────────────────────────────────────────────────────────
+
+
+def test_consensus_compiles():
+    result = compile_strategy(
+        "consensus",
+        {"num_agents": 3},
+        [],
+        "gpt-4o",
+        DEFAULT_LIMITS,
+        "Answer this question",
+        "agent-consensus",
+    )
+    nodes = result["nodes"]
+
+    assert "__agent_0__" in nodes
+    assert "__agent_1__" in nodes
+    assert "__agent_2__" in nodes
+    assert "__vote__" in nodes
+    assert "__judge__" in nodes
+    assert "__finalize__" in nodes
+    assert "__limit_exceeded__" in nodes
+
+    _assert_ir_invariants(result, "consensus")
+
+
+def test_consensus_start_node():
+    result = compile_strategy("consensus", {}, [], "gpt-4o", DEFAULT_LIMITS, "goal", "a")
+    assert result["start_node"] == "__agent_0__"
+
+
+def test_consensus_num_agents_config():
+    config = {"num_agents": 5}
+    result = compile_strategy("consensus", config, [], "gpt-4o", DEFAULT_LIMITS, "goal", "a")
+    nodes = result["nodes"]
+    assert "__agent_4__" in nodes
+    assert "__agent_5__" not in nodes
+
+
+def test_consensus_custom_judge_model():
+    config = {"judge_model": "gpt-4o"}
+    result = compile_strategy("consensus", config, [], "claude-sonnet-4-6", DEFAULT_LIMITS, "goal", "a")
+    judge_node = result["nodes"]["__judge__"]
+    assert judge_node["kind"]["model_ref"] == "gpt-4o"
+
+
+def test_consensus_invariants():
+    result = compile_strategy("consensus", {}, [], "gpt-4o", DEFAULT_LIMITS, "goal", "a")
+    _assert_ir_invariants(result, "consensus")
+
+
+# ── debate ─────────────────────────────────────────────────────────────────
+
+
+def test_debate_compiles():
+    result = compile_strategy(
+        "debate",
+        {"max_rounds": 2},
+        [],
+        "gpt-4o",
+        DEFAULT_LIMITS,
+        "Determine the best approach",
+        "agent-debate",
+    )
+    nodes = result["nodes"]
+
+    assert "__propose__" in nodes
+    assert "__counter_0__" in nodes
+    assert "__judge_0__" in nodes
+    assert "__respond_0__" in nodes
+    assert "__finalize__" in nodes
+    assert "__limit_exceeded__" in nodes
+
+    _assert_ir_invariants(result, "debate")
+
+
+def test_debate_start_node():
+    result = compile_strategy("debate", {}, [], "gpt-4o", DEFAULT_LIMITS, "goal", "a")
+    assert result["start_node"] == "__propose__"
+
+
+def test_debate_max_rounds_capped():
+    # max_rounds=10 but max_iterations=3 → only 3 judge rounds
+    limits = StrategyLimits(max_iterations=3, max_cost_usd=1.0, timeout_seconds=120)
+    config = {"max_rounds": 10}
+    result = compile_strategy("debate", config, [], "gpt-4o", limits, "goal", "a")
+    nodes = result["nodes"]
+    assert "__judge_2__" in nodes
+    assert "__judge_3__" not in nodes
+
+
+def test_debate_custom_judge_model():
+    config = {"judge_model": "claude-opus-4-6"}
+    result = compile_strategy("debate", config, [], "gpt-4o", DEFAULT_LIMITS, "goal", "a")
+    judge_node = result["nodes"]["__judge_0__"]
+    assert judge_node["kind"]["model_ref"] == "claude-opus-4-6"
+
+
+def test_debate_invariants():
+    result = compile_strategy("debate", {}, [], "gpt-4o", DEFAULT_LIMITS, "goal", "a")
+    _assert_ir_invariants(result, "debate")
+
+
+# ── Agent-first YAML round-trip (new strategies) ─────────────────────────
+
+
+REFLECTION_YAML = """
+agent:
+  id: reflect-agent
+  strategy: reflection
+  goal: Write a thorough code review
+  model: gpt-4o
+  limits:
+    max_iterations: 3
+    max_cost_usd: 0.50
+    timeout_seconds: 120
+"""
+
+
+def test_agent_yaml_reflection():
+    ir = compile_yaml(REFLECTION_YAML)
+    assert ir["workflow_id"] == "reflect-agent"
+    assert ir["start_node"] == "__execute__"
+    assert "__execute__" in ir["nodes"]
+    assert "__reflect_0__" in ir["nodes"]
+    assert ir["strategy_metadata"]["strategy_name"] == "reflection"
+    assert ir["labels"]["jamjet.strategy"] == "reflection"
+
+
+CONSENSUS_YAML = """
+agent:
+  id: consensus-agent
+  strategy: consensus
+  goal: Answer a disputed question
+  model: gpt-4o
+  strategy_config:
+    num_agents: 4
+  limits:
+    max_iterations: 5
+    max_cost_usd: 1.00
+    timeout_seconds: 300
+"""
+
+
+def test_agent_yaml_consensus():
+    ir = compile_yaml(CONSENSUS_YAML)
+    assert ir["workflow_id"] == "consensus-agent"
+    assert ir["start_node"] == "__agent_0__"
+    assert "__agent_0__" in ir["nodes"]
+    assert "__vote__" in ir["nodes"]
+    assert "__judge__" in ir["nodes"]
+    assert ir["strategy_metadata"]["strategy_name"] == "consensus"
+    assert ir["labels"]["jamjet.strategy"] == "consensus"
+
+
+DEBATE_YAML = """
+agent:
+  id: debate-agent
+  strategy: debate
+  goal: Determine the best programming language for AI
+  model: gpt-4o
+  limits:
+    max_iterations: 4
+    max_cost_usd: 0.80
+    timeout_seconds: 240
+"""
+
+
+def test_agent_yaml_debate():
+    ir = compile_yaml(DEBATE_YAML)
+    assert ir["workflow_id"] == "debate-agent"
+    assert ir["start_node"] == "__propose__"
+    assert "__propose__" in ir["nodes"]
+    assert "__counter_0__" in ir["nodes"]
+    assert "__judge_0__" in ir["nodes"]
+    assert ir["strategy_metadata"]["strategy_name"] == "debate"
+    assert ir["labels"]["jamjet.strategy"] == "debate"

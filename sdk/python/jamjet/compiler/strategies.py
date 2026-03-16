@@ -9,6 +9,9 @@ Supported strategies
 - ``react``            — Reason + Act loop (thought → tool → observation)
 - ``plan-and-execute`` — Generate plan, execute steps sequentially (default)
 - ``critic``           — Draft → critic evaluation → revise loop
+- ``reflection``       — Execute → self-reflect → revise loop (§3.29)
+- ``consensus``        — Multiple agents → vote → judge (§3.30)
+- ``debate``           — Propose → counter → judge loop (§3.31)
 
 Compiled IR contract (§14.4)
 -----------------------------
@@ -85,6 +88,9 @@ def compile_strategy(
         "react": _compile_react,
         "plan-and-execute": _compile_plan_and_execute,
         "critic": _compile_critic,
+        "reflection": _compile_reflection,
+        "consensus": _compile_consensus,
+        "debate": _compile_debate,
     }
 
     compiler_fn = compilers.get(strategy_name)
@@ -514,4 +520,376 @@ def _compile_critic(
         "nodes": nodes,
         "edges": edges,
         "start_node": "__draft__",
+    }
+
+
+# ── reflection ─────────────────────────────────────────────────────────────────
+
+
+def _compile_reflection(
+    config: dict[str, Any],
+    tools: list[str],
+    model: str,
+    limits: StrategyLimits,
+    goal: str,
+    agent_id: str,
+) -> dict[str, Any]:
+    """
+    Compiled structure (§3.29):
+
+        __execute__ → __reflect_0__ → __reflect_gate_0__ → [pass → __finalize__]
+                                                          → [fail → __revise_0__]
+        __revise_0__ → __reflect_1__ → __reflect_gate_1__ → ...
+        __reflect_{N-1}__ → __finalize__ (forced after max rounds)
+    """
+    pass_threshold = config.get("pass_threshold", 0.8)
+    max_rounds = min(config.get("max_rounds", 3), limits.max_iterations)
+
+    nodes: dict[str, Any] = {}
+    edges: list[dict[str, Any]] = []
+
+    # Initial execution
+    nodes["__execute__"] = _model_node(
+        model,
+        f"Goal: {goal}. Produce your best response.",
+        "__execute_output__",
+        labels={"jamjet.strategy.node": "initial_execution", "jamjet.strategy.event": "iteration_started"},
+    )
+    edges.append(_edge("__execute__", "__reflect_0__"))
+
+    for i in range(max_rounds):
+        reflect_id = f"__reflect_{i}__"
+        revise_id = f"__revise_{i}__"
+        gate_id = f"__reflect_gate_{i}__"
+        next_reflect_id = f"__reflect_{i + 1}__"
+
+        output_ref = "__execute_output__" if i == 0 else f"__revise_{i - 1}_output__"
+
+        # Reflection node
+        nodes[reflect_id] = _model_node(
+            model,
+            (
+                f"Goal: {goal}. "
+                f"Current output: {{{{ state.{output_ref} }}}}. "
+                "Reflect: does this fully achieve the goal? "
+                f"Score 0-1. Pass threshold: {pass_threshold}. "
+                'Output JSON: {"score": 0.0-1.0, "passed": true/false, "gaps": "...", "suggestions": "..."}'
+            ),
+            f"__reflect_{i}_verdict__",
+            labels={
+                "jamjet.strategy.node": "reflection",
+                "jamjet.strategy.event": "critic_verdict",
+                "jamjet.strategy.iteration": str(i),
+            },
+        )
+
+        # After last round: always finalize
+        if i == max_rounds - 1:
+            edges.append(_edge(reflect_id, "__finalize__"))
+        else:
+            # Condition: passed? → finalize, else → revise
+            nodes[gate_id] = _condition_node(
+                f"state.__reflect_{i}_verdict__.passed == true",
+                [
+                    {"condition": f"state.__reflect_{i}_verdict__.passed == true", "target": "__finalize__"},
+                    {"condition": None, "target": revise_id},
+                ],
+                labels={"jamjet.strategy.node": "reflect_gate", "jamjet.strategy.iteration": str(i)},
+            )
+            edges.append(_edge(reflect_id, gate_id))
+            edges.append(_edge(gate_id, "__finalize__", f"state.__reflect_{i}_verdict__.passed == true"))
+            edges.append(_edge(gate_id, revise_id, None))
+
+            # Revise node
+            nodes[revise_id] = _model_node(
+                model,
+                (
+                    f"Goal: {goal}. "
+                    f"Previous: {{{{ state.{output_ref} }}}}. "
+                    f"Reflection feedback: {{{{ state.__reflect_{i}_verdict__ }}}}. "
+                    "Improve the response."
+                ),
+                f"__revise_{i}_output__",
+                labels={
+                    "jamjet.strategy.node": "revision",
+                    "jamjet.strategy.event": "iteration_started",
+                    "jamjet.strategy.iteration": str(i + 1),
+                },
+            )
+            edges.append(_edge(revise_id, next_reflect_id))
+
+    # Finalizer
+    nodes["__finalize__"] = _model_node(
+        model,
+        (f"Goal: {goal}\nFormat the final, polished response based on all reflections and revisions."),
+        "result",
+        labels={"jamjet.strategy.node": "finalizer", "jamjet.strategy.event": "strategy_completed"},
+    )
+    edges.append(_edge("__finalize__", "end"))
+
+    nodes["__limit_exceeded__"] = _limit_exceeded_node()
+    edges.append(_edge("__limit_exceeded__", "end"))
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "start_node": "__execute__",
+    }
+
+
+# ── consensus ──────────────────────────────────────────────────────────────────
+
+
+def _compile_consensus(
+    config: dict[str, Any],
+    tools: list[str],
+    model: str,
+    limits: StrategyLimits,
+    goal: str,
+    agent_id: str,
+) -> dict[str, Any]:
+    """
+    Compiled structure (§3.30):
+
+        __agent_0__ → __cost_guard_0__ → __agent_1__ → __cost_guard_1__ → ...
+        __agent_{N-1}__ → __vote__ → __judge__ → __finalize__
+
+    Agents run sequentially (IR has no native parallel node) with cost guards
+    between each agent.  No cost guard on vote/judge (cheap nodes).
+    """
+    num_agents = config.get("num_agents", 3)
+    judge_model = config.get("judge_model", model)
+
+    nodes: dict[str, Any] = {}
+    edges: list[dict[str, Any]] = []
+
+    for i in range(num_agents):
+        agent_id_node = f"__agent_{i}__"
+        guard_id = f"__cost_guard_{i}__"
+
+        # Agent node
+        nodes[agent_id_node] = _model_node(
+            model,
+            (
+                f"Goal: {goal}. "
+                f"You are agent {i + 1} of {num_agents}. "
+                "Independently produce your best answer."
+            ),
+            f"__agent_{i}_output__",
+            labels={
+                "jamjet.strategy.node": "parallel_agent",
+                "jamjet.strategy.event": "iteration_started",
+                "jamjet.strategy.iteration": str(i),
+            },
+        )
+
+        # Cost guard after each agent (except last → goes straight to vote)
+        if i < num_agents - 1:
+            next_agent_id = f"__agent_{i + 1}__"
+            nodes[guard_id] = _condition_node(
+                "state.__cost_exceeded__ == true",
+                _cost_guard_branches(next_agent_id),
+                labels={"jamjet.strategy.node": "cost_guard", "jamjet.strategy.iteration": str(i)},
+            )
+            edges.append(_edge(agent_id_node, guard_id))
+            edges.append(_edge(guard_id, "__limit_exceeded__", "state.__cost_exceeded__ == true"))
+            edges.append(_edge(guard_id, next_agent_id, None))
+        else:
+            # Last agent → vote
+            edges.append(_edge(agent_id_node, "__vote__"))
+
+    # Build state refs for all agent outputs
+    agent_refs = ", ".join(f"{{{{ state.__agent_{i}_output__ }}}}" for i in range(num_agents))
+
+    # Vote node
+    nodes["__vote__"] = _model_node(
+        model,
+        (
+            f"Goal: {goal}. "
+            f"You have {num_agents} candidate answers: {agent_refs}. "
+            "Analyze each answer. Vote for the best one. "
+            'Output JSON: {"votes": [{"agent": i, "score": 0.0-1.0, "reason": "..."}], "winner": i}'
+        ),
+        "__vote_result__",
+        labels={"jamjet.strategy.node": "voting", "jamjet.strategy.event": "critic_verdict"},
+    )
+    edges.append(_edge("__vote__", "__judge__"))
+
+    # Judge node
+    nodes["__judge__"] = _model_node(
+        judge_model,
+        (
+            f"Goal: {goal}. "
+            "The voting result: {{ state.__vote_result__ }}. "
+            "The winning answer: {{ state.__vote_result__.winner }}. "
+            "Verify this is the best choice and produce the final refined answer."
+        ),
+        "__judge_output__",
+        labels={"jamjet.strategy.node": "judge", "jamjet.strategy.event": "strategy_completed"},
+    )
+    edges.append(_edge("__judge__", "__finalize__"))
+
+    # Finalizer
+    nodes["__finalize__"] = _model_node(
+        model,
+        (f"Goal: {goal}\nFormat the final consensus answer based on the judge's output."),
+        "result",
+        labels={"jamjet.strategy.node": "finalizer", "jamjet.strategy.event": "strategy_completed"},
+    )
+    edges.append(_edge("__finalize__", "end"))
+
+    nodes["__limit_exceeded__"] = _limit_exceeded_node()
+    edges.append(_edge("__limit_exceeded__", "end"))
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "start_node": "__agent_0__",
+    }
+
+
+# ── debate ─────────────────────────────────────────────────────────────────────
+
+
+def _compile_debate(
+    config: dict[str, Any],
+    tools: list[str],
+    model: str,
+    limits: StrategyLimits,
+    goal: str,
+    agent_id: str,
+) -> dict[str, Any]:
+    """
+    Compiled structure (§3.31):
+
+        __propose__ → __counter_0__ → __judge_0__ → __judge_gate_0__
+            → [settled → __finalize__]
+            → [continue → __cost_guard_0__ → __respond_0__]
+        __respond_0__ → __counter_1__ → __judge_1__ → __judge_gate_1__ → ...
+        __judge_{N-1}__ → __finalize__ (forced after max rounds)
+    """
+    judge_model = config.get("judge_model", model)
+    max_rounds = min(config.get("max_rounds", 3), limits.max_iterations)
+
+    nodes: dict[str, Any] = {}
+    edges: list[dict[str, Any]] = []
+
+    # Initial proposal
+    nodes["__propose__"] = _model_node(
+        model,
+        f"Goal: {goal}. Present your initial position with reasoning and evidence.",
+        "__propose_output__",
+        labels={"jamjet.strategy.node": "proposer", "jamjet.strategy.event": "iteration_started"},
+    )
+    edges.append(_edge("__propose__", "__counter_0__"))
+
+    for i in range(max_rounds):
+        counter_id = f"__counter_{i}__"
+        judge_id = f"__judge_{i}__"
+        gate_id = f"__judge_gate_{i}__"
+        respond_id = f"__respond_{i}__"
+        guard_id = f"__cost_guard_{i}__"
+        next_counter_id = f"__counter_{i + 1}__"
+
+        # Determine the argument reference for this round
+        if i == 0:
+            argument_ref = "__propose_output__"
+        else:
+            argument_ref = f"__respond_{i - 1}_output__"
+
+        # Counter-argument node
+        nodes[counter_id] = _model_node(
+            model,
+            (
+                f"Goal: {goal}. "
+                f"Previous argument: {{{{ state.{argument_ref} }}}}. "
+                "Challenge this argument. Identify weaknesses, present counter-arguments."
+            ),
+            f"__counter_{i}_output__",
+            labels={
+                "jamjet.strategy.node": "challenger",
+                "jamjet.strategy.event": "tool_called",
+                "jamjet.strategy.iteration": str(i),
+            },
+        )
+        edges.append(_edge(counter_id, judge_id))
+
+        # Judge node
+        nodes[judge_id] = _model_node(
+            judge_model,
+            (
+                f"Goal: {goal}. "
+                f"Proposition: {{{{ state.{argument_ref} }}}}. "
+                f"Counter-argument: {{{{ state.__counter_{i}_output__ }}}}. "
+                "Judge: has the debate reached a well-supported conclusion? "
+                'Output JSON: {"settled": true/false, "score": 0.0-1.0, "ruling": "..."}'
+            ),
+            f"__judge_{i}_ruling__",
+            labels={
+                "jamjet.strategy.node": "judge",
+                "jamjet.strategy.event": "critic_verdict",
+                "jamjet.strategy.iteration": str(i),
+            },
+        )
+
+        # After last round: always finalize
+        if i == max_rounds - 1:
+            edges.append(_edge(judge_id, "__finalize__"))
+        else:
+            # Condition: settled? → finalize, else → cost_guard → respond
+            nodes[gate_id] = _condition_node(
+                f"state.__judge_{i}_ruling__.settled == true",
+                [
+                    {"condition": f"state.__judge_{i}_ruling__.settled == true", "target": "__finalize__"},
+                    {"condition": None, "target": guard_id},
+                ],
+                labels={"jamjet.strategy.node": "judge_gate", "jamjet.strategy.iteration": str(i)},
+            )
+            edges.append(_edge(judge_id, gate_id))
+            edges.append(_edge(gate_id, "__finalize__", f"state.__judge_{i}_ruling__.settled == true"))
+            edges.append(_edge(gate_id, guard_id, None))
+
+            # Cost guard between rounds
+            nodes[guard_id] = _condition_node(
+                "state.__cost_exceeded__ == true",
+                _cost_guard_branches(respond_id),
+                labels={"jamjet.strategy.node": "cost_guard", "jamjet.strategy.iteration": str(i)},
+            )
+            edges.append(_edge(guard_id, "__limit_exceeded__", "state.__cost_exceeded__ == true"))
+            edges.append(_edge(guard_id, respond_id, None))
+
+            # Respond node
+            nodes[respond_id] = _model_node(
+                model,
+                (
+                    f"Goal: {goal}. "
+                    f"Counter-argument: {{{{ state.__counter_{i}_output__ }}}}. "
+                    f"Judge feedback: {{{{ state.__judge_{i}_ruling__ }}}}. "
+                    "Respond to the counter-argument, strengthening your position."
+                ),
+                f"__respond_{i}_output__",
+                labels={
+                    "jamjet.strategy.node": "responder",
+                    "jamjet.strategy.event": "iteration_started",
+                    "jamjet.strategy.iteration": str(i + 1),
+                },
+            )
+            edges.append(_edge(respond_id, next_counter_id))
+
+    # Finalizer
+    nodes["__finalize__"] = _model_node(
+        model,
+        (f"Goal: {goal}\nSynthesize the debate into a final, well-supported answer."),
+        "result",
+        labels={"jamjet.strategy.node": "finalizer", "jamjet.strategy.event": "strategy_completed"},
+    )
+    edges.append(_edge("__finalize__", "end"))
+
+    nodes["__limit_exceeded__"] = _limit_exceeded_node()
+    edges.append(_edge("__limit_exceeded__", "end"))
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "start_node": "__propose__",
     }

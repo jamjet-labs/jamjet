@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from jamjet.workflow.nodes import ConditionNode, HumanApprovalNode, ModelNode, ToolNode
+from jamjet.workflow.nodes import ConditionNode, EvalNode, HumanApprovalNode, ModelNode, ToolNode
 
-AnyNode = ModelNode | ToolNode | ConditionNode | HumanApprovalNode
+AnyNode = ModelNode | ToolNode | ConditionNode | HumanApprovalNode | EvalNode
 
 
 class WorkflowGraph:

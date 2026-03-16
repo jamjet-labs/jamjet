@@ -30,6 +30,33 @@ impl Event {
     }
 }
 
+/// Provenance metadata attached to node completions for research traceability.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProvenanceMetadata {
+    /// Model identifier used for this node (e.g., "claude-haiku-4-5-20251001")
+    pub model_id: Option<String>,
+    /// Model version or checkpoint (e.g., "20251001")
+    pub model_version: Option<String>,
+    /// Confidence score (0.0-1.0) if available
+    pub confidence: Option<f64>,
+    /// Whether the output was verified by another model/check
+    pub verified: bool,
+    /// Source identifier (e.g., "mcp:brave-search", "a2a:research-agent")
+    pub source: Option<String>,
+}
+
+impl Default for ProvenanceMetadata {
+    fn default() -> Self {
+        Self {
+            model_id: None,
+            model_version: None,
+            confidence: None,
+            verified: false,
+            source: None,
+        }
+    }
+}
+
 /// All possible event kinds in the JamJet event log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -85,6 +112,9 @@ pub enum EventKind {
         /// Estimated USD cost for this node.
         #[serde(skip_serializing_if = "Option::is_none")]
         cost_usd: Option<f64>,
+        /// Provenance metadata for research traceability.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provenance: Option<ProvenanceMetadata>,
     },
     NodeFailed {
         node_id: NodeId,

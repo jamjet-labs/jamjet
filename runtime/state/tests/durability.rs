@@ -137,6 +137,7 @@ async fn test_crash_recovery_from_event_log() {
                     output_tokens: None,
                     finish_reason: None,
                     cost_usd: None,
+                    provenance: None,
                 },
             ),
             Event::new(
@@ -210,6 +211,7 @@ async fn test_recovery_with_snapshot() {
                     output_tokens: None,
                     finish_reason: None,
                     cost_usd: None,
+                    provenance: None,
                 },
             );
             db.append_event(event).await.unwrap();
@@ -238,6 +240,7 @@ async fn test_recovery_with_snapshot() {
                 output_tokens: None,
                 finish_reason: None,
                 cost_usd: None,
+                provenance: None,
             },
         ))
         .await

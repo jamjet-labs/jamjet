@@ -12,7 +12,7 @@ pub use backend::{
     WorkflowDefinition,
 };
 pub use budget::BudgetState;
-pub use event::{Event, EventKind, EventSequence};
+pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};
 pub use materializer::{apply_events, materialize, should_snapshot, MaterializedState};
 pub use snapshot::Snapshot;
 pub use sqlite::SqliteBackend;

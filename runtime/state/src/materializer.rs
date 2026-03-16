@@ -191,6 +191,7 @@ mod tests {
                 output_tokens: None,
                 finish_reason: None,
                 cost_usd: None,
+                provenance: None,
             },
         )];
         let mat = apply_events(base, &events, &WorkflowStatus::Running);
@@ -215,6 +216,7 @@ mod tests {
                 output_tokens: None,
                 finish_reason: None,
                 cost_usd: None,
+                provenance: None,
             },
         )];
         let mat = apply_events(base, &events, &WorkflowStatus::Running);
@@ -253,6 +255,7 @@ mod tests {
                     output_tokens: None,
                     finish_reason: None,
                     cost_usd: None,
+                    provenance: None,
                 },
             ),
             make_event(

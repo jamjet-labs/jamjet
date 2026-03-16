@@ -358,8 +358,64 @@ def _yaml_node_to_kind(node_id: str, node_type: str, data: dict[str, Any]) -> di
         }
     if node_type == "condition":
         return {"type": "condition", "branches": []}
+    if node_type == "eval":
+        return {
+            "type": "eval",
+            "scorers": _compile_yaml_scorers(data.get("scorers", [])),
+            "on_fail": data.get("on_fail", "halt"),
+            "max_retries": data.get("max_retries", 0),
+            "input_expr": data.get("input_expr"),
+        }
     # Default fallback
     return {"type": node_type}
+
+
+def _compile_yaml_scorers(scorers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert YAML scorer definitions to the IR format expected by the Rust executor."""
+    compiled = []
+    for s in scorers:
+        scorer_type = s.get("type", "")
+        if scorer_type == "llm_judge":
+            compiled.append(
+                {
+                    "type": "llm_judge",
+                    "model": s.get("model", "default_chat"),
+                    "rubric": s.get("rubric", ""),
+                    "min_score": s.get("min_score", 3),
+                }
+            )
+        elif scorer_type == "assertion":
+            compiled.append(
+                {
+                    "type": "assertion",
+                    "checks": s.get("checks", []),
+                }
+            )
+        elif scorer_type == "latency":
+            compiled.append(
+                {
+                    "type": "latency",
+                    "threshold_ms": s.get("threshold_ms", 5000),
+                }
+            )
+        elif scorer_type == "cost":
+            compiled.append(
+                {
+                    "type": "cost",
+                    "threshold_usd": s.get("threshold_usd", 1.0),
+                }
+            )
+        elif scorer_type == "custom":
+            compiled.append(
+                {
+                    "type": "custom",
+                    "module": s.get("module", ""),
+                    "kwargs": s.get("kwargs", {}),
+                }
+            )
+        else:
+            compiled.append(s)
+    return compiled
 
 
 def _parse_timeout(timeout: str | int | None) -> int | None:
