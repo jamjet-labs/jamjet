@@ -5,6 +5,8 @@
 //! - Streaming:      POST `{agent_uri}/tasks/sendSubscribe`  — NDJSON stream with budget guard
 //! - Conversational: POST `{agent_uri}/tasks/send` in a loop — multi-turn exchange
 
+#![allow(clippy::too_many_arguments)]
+
 use crate::executor::{ExecutionResult, NodeExecutor};
 use async_trait::async_trait;
 use jamjet_state::backend::WorkItem;

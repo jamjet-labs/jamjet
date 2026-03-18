@@ -131,8 +131,8 @@ class AgentToolNode:
     budget: dict | None = None
 
     def to_ir_kind(self) -> dict[str, Any]:
-        agent_target = {"auto": True} if self.agent == "auto" else {"explicit": self.agent}
-        ir = {
+        agent_target: dict[str, Any] = {"auto": True} if self.agent == "auto" else {"explicit": self.agent}
+        ir: dict[str, Any] = {
             "type": "agent_tool",
             "agent": agent_target,
             "mode": self.mode,

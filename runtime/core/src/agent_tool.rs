@@ -11,10 +11,11 @@ pub enum AgentTarget {
 }
 
 /// Invocation mode for an agent tool call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentToolMode {
     /// Single request/response (default).
+    #[default]
     Sync,
     /// Streamed output with support for early termination.
     Streaming,
@@ -23,12 +24,6 @@ pub enum AgentToolMode {
         max_turns: u32,
         max_tokens_per_turn: Option<u32>,
     },
-}
-
-impl Default for AgentToolMode {
-    fn default() -> Self {
-        AgentToolMode::Sync
-    }
 }
 
 /// Spending / token budget constraints for an agent tool invocation.
