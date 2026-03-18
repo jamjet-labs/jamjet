@@ -1,12 +1,11 @@
+import { Shell } from '@/components/layout/Shell'
+
 export default function App() {
   return (
-    <div className="h-screen flex flex-col bg-zinc-950 text-zinc-100">
-      <header className="h-12 border-b border-zinc-800 flex items-center px-4 shrink-0">
-        <span className="font-semibold text-sm tracking-wide">JamJet Inspector</span>
-      </header>
-      <main className="flex-1 flex items-center justify-center text-zinc-500">
-        Select an execution to inspect
-      </main>
-    </div>
+    <Shell
+      graph={<div className="flex items-center justify-center h-full text-zinc-600">Graph view</div>}
+      detail={<div className="p-4 text-zinc-600 text-sm">Select a node</div>}
+      timeline={<div className="p-4 text-zinc-600 text-sm">Event timeline</div>}
+    />
   )
 }
