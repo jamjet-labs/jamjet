@@ -87,6 +87,7 @@ class EvalNode:
 @dataclass
 class CoordinatorNode:
     """Dynamic agent routing with structured scoring + LLM tiebreaker."""
+
     task: str = ""
     required_skills: list[str] = field(default_factory=list)
     output_key: str = "result"
@@ -121,6 +122,7 @@ class CoordinatorNode:
 @dataclass
 class AgentToolNode:
     """Invoke a registered agent as a callable tool."""
+
     agent: str = ""
     output_key: str = "result"
     mode: str = "sync"
@@ -129,10 +131,7 @@ class AgentToolNode:
     budget: dict | None = None
 
     def to_ir_kind(self) -> dict[str, Any]:
-        agent_target = (
-            {"auto": True} if self.agent == "auto"
-            else {"explicit": self.agent}
-        )
+        agent_target = {"auto": True} if self.agent == "auto" else {"explicit": self.agent}
         ir = {
             "type": "agent_tool",
             "agent": agent_target,

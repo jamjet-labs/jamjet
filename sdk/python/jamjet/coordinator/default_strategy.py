@@ -37,27 +37,33 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
             required = set(required_skills)
 
             if not required.issubset(agent_skills):
-                filtered.append({
-                    "uri": agent["uri"],
-                    "reason": f"missing skills: {required - agent_skills}",
-                })
+                filtered.append(
+                    {
+                        "uri": agent["uri"],
+                        "reason": f"missing skills: {required - agent_skills}",
+                    }
+                )
                 continue
 
             if trust_domain and agent.get("trust_domain") != trust_domain:
-                filtered.append({
-                    "uri": agent["uri"],
-                    "reason": f"trust domain mismatch: {agent.get('trust_domain')} != {trust_domain}",
-                })
+                filtered.append(
+                    {
+                        "uri": agent["uri"],
+                        "reason": f"trust domain mismatch: {agent.get('trust_domain')} != {trust_domain}",
+                    }
+                )
                 continue
 
-            candidates.append(AgentCandidate(
-                uri=agent["uri"],
-                agent_card=agent.get("agent_card", {}),
-                skills=list(agent_skills),
-                latency_class=agent.get("latency_class"),
-                cost_class=agent.get("cost_class"),
-                trust_domain=agent.get("trust_domain"),
-            ))
+            candidates.append(
+                AgentCandidate(
+                    uri=agent["uri"],
+                    agent_card=agent.get("agent_card", {}),
+                    skills=list(agent_skills),
+                    latency_class=agent.get("latency_class"),
+                    cost_class=agent.get("cost_class"),
+                    trust_domain=agent.get("trust_domain"),
+                )
+            )
 
         return candidates, filtered
 
@@ -78,11 +84,13 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
                 historical_performance=0.5,
             )
             composite = scores.composite(weights if weights else None)
-            results.append(ScoringResult(
-                agent_uri=c.uri,
-                scores=scores,
-                composite=composite,
-            ))
+            results.append(
+                ScoringResult(
+                    agent_uri=c.uri,
+                    scores=scores,
+                    composite=composite,
+                )
+            )
 
         results.sort(key=lambda r: r.composite, reverse=True)
         spread = (results[0].composite - results[1].composite) if len(results) >= 2 else 1.0
@@ -101,10 +109,7 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
             selected_uri=selected.agent_uri if selected else None,
             method="structured",
             confidence=selected.composite if selected else 0.0,
-            rejected=[
-                {"uri": c.agent_uri, "reason": "lower score"}
-                for c in top_candidates[1:]
-            ],
+            rejected=[{"uri": c.agent_uri, "reason": "lower score"} for c in top_candidates[1:]],
         )
 
     def _score_capability(self, task: str, candidate: AgentCandidate) -> float:

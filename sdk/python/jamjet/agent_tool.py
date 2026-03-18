@@ -7,6 +7,7 @@ from typing import Any
 @dataclass
 class AgentToolDef:
     """A wrapped agent that can be used as a tool by other agents."""
+
     agent_uri: str
     mode: str
     description: str
@@ -16,10 +17,7 @@ class AgentToolDef:
 
     def to_ir_kind(self) -> dict[str, Any]:
         """Compile to IR node kind definition."""
-        agent_target = (
-            {"auto": True} if self.agent_uri == "auto"
-            else {"explicit": self.agent_uri}
-        )
+        agent_target = {"auto": True} if self.agent_uri == "auto" else {"explicit": self.agent_uri}
         ir: dict[str, Any] = {
             "type": "agent_tool",
             "agent": agent_target,

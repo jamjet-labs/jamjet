@@ -21,12 +21,14 @@ class StrategyServer:
         self._strategies: dict[str, CoordinatorStrategy] = {
             "default": DefaultCoordinatorStrategy(registry=None),
         }
-        self._app = Starlette(routes=[
-            Route("/coordinator/discover", self._handle_discover, methods=["POST"]),
-            Route("/coordinator/score", self._handle_score, methods=["POST"]),
-            Route("/coordinator/decide", self._handle_decide, methods=["POST"]),
-            Route("/health", self._handle_health, methods=["GET"]),
-        ])
+        self._app = Starlette(
+            routes=[
+                Route("/coordinator/discover", self._handle_discover, methods=["POST"]),
+                Route("/coordinator/score", self._handle_score, methods=["POST"]),
+                Route("/coordinator/decide", self._handle_decide, methods=["POST"]),
+                Route("/health", self._handle_health, methods=["GET"]),
+            ]
+        )
 
     def register_strategy(self, name: str, strategy: CoordinatorStrategy) -> None:
         self._strategies[name] = strategy
@@ -55,10 +57,12 @@ class StrategyServer:
             trust_domain=data.get("trust_domain"),
             context=data.get("context", {}),
         )
-        return JSONResponse({
-            "candidates": [_candidate_to_dict(c) for c in candidates],
-            "filtered_out": filtered,
-        })
+        return JSONResponse(
+            {
+                "candidates": [_candidate_to_dict(c) for c in candidates],
+                "filtered_out": filtered,
+            }
+        )
 
     async def _handle_score(self, request: Request) -> JSONResponse:
         data = await request.json()
@@ -70,13 +74,15 @@ class StrategyServer:
             weights=data.get("weights", {}),
             context=data.get("context", {}),
         )
-        return JSONResponse({
-            "rankings": [
-                {"uri": r.agent_uri, "scores": _scores_to_dict(r.scores), "composite": r.composite}
-                for r in rankings
-            ],
-            "spread": spread,
-        })
+        return JSONResponse(
+            {
+                "rankings": [
+                    {"uri": r.agent_uri, "scores": _scores_to_dict(r.scores), "composite": r.composite}
+                    for r in rankings
+                ],
+                "spread": spread,
+            }
+        )
 
     async def _handle_decide(self, request: Request) -> JSONResponse:
         data = await request.json()
@@ -99,21 +105,24 @@ class StrategyServer:
             tiebreaker_model=data.get("tiebreaker_model", ""),
             context=data.get("context", {}),
         )
-        return JSONResponse({
-            "selected_uri": decision.selected_uri,
-            "method": decision.method,
-            "reasoning": decision.reasoning,
-            "confidence": decision.confidence,
-            "rejected": decision.rejected,
-            "tiebreaker_tokens": decision.tiebreaker_tokens,
-            "tiebreaker_cost": decision.tiebreaker_cost,
-        })
+        return JSONResponse(
+            {
+                "selected_uri": decision.selected_uri,
+                "method": decision.method,
+                "reasoning": decision.reasoning,
+                "confidence": decision.confidence,
+                "rejected": decision.rejected,
+                "tiebreaker_tokens": decision.tiebreaker_tokens,
+                "tiebreaker_cost": decision.tiebreaker_cost,
+            }
+        )
 
     async def _handle_health(self, request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "strategies": list(self._strategies.keys())})
 
     def run(self) -> None:
         import uvicorn
+
         uvicorn.run(self._app, host=self.host, port=self.port)
 
 

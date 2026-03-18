@@ -8,6 +8,7 @@ from typing import Any
 @dataclass
 class AgentCandidate:
     """An agent discovered during the discovery phase."""
+
     uri: str
     agent_card: dict[str, Any]
     skills: list[str] = field(default_factory=list)
@@ -19,6 +20,7 @@ class AgentCandidate:
 @dataclass
 class DimensionScores:
     """Per-dimension scoring for a single candidate."""
+
     capability_fit: float = 0.5
     cost_fit: float = 0.5
     latency_fit: float = 0.5
@@ -36,18 +38,25 @@ class DimensionScores:
         total_weight = sum(w.values())
         if total_weight == 0:
             return 0.0
-        return sum(
-            getattr(self, dim) * w.get(dim, 1.0)
-            for dim in [
-                "capability_fit", "cost_fit", "latency_fit",
-                "trust_compatibility", "historical_performance",
-            ]
-        ) / total_weight
+        return (
+            sum(
+                getattr(self, dim) * w.get(dim, 1.0)
+                for dim in [
+                    "capability_fit",
+                    "cost_fit",
+                    "latency_fit",
+                    "trust_compatibility",
+                    "historical_performance",
+                ]
+            )
+            / total_weight
+        )
 
 
 @dataclass
 class ScoringResult:
     """Scoring result for a single candidate."""
+
     agent_uri: str
     scores: DimensionScores
     composite: float = 0.0
@@ -56,6 +65,7 @@ class ScoringResult:
 @dataclass
 class Decision:
     """The coordinator's final routing decision."""
+
     selected_uri: str | None
     method: str
     reasoning: str | None = None

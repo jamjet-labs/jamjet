@@ -47,16 +47,28 @@ class TestDimensionScores:
 
     def test_composite_custom_weights(self):
         scores = DimensionScores(capability_fit=1.0, cost_fit=0.0)
-        result = scores.composite({"capability_fit": 2.0, "cost_fit": 0.0,
-                                    "latency_fit": 0.0, "trust_compatibility": 0.0,
-                                    "historical_performance": 0.0})
+        result = scores.composite(
+            {
+                "capability_fit": 2.0,
+                "cost_fit": 0.0,
+                "latency_fit": 0.0,
+                "trust_compatibility": 0.0,
+                "historical_performance": 0.0,
+            }
+        )
         assert result == pytest.approx(1.0)
 
     def test_composite_zero_weights(self):
         scores = DimensionScores()
-        result = scores.composite({"capability_fit": 0.0, "cost_fit": 0.0,
-                                    "latency_fit": 0.0, "trust_compatibility": 0.0,
-                                    "historical_performance": 0.0})
+        result = scores.composite(
+            {
+                "capability_fit": 0.0,
+                "cost_fit": 0.0,
+                "latency_fit": 0.0,
+                "trust_compatibility": 0.0,
+                "historical_performance": 0.0,
+            }
+        )
         assert result == 0.0
 
 

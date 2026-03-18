@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from jamjet.workflow.nodes import AgentToolNode, ConditionNode, CoordinatorNode, EvalNode, HumanApprovalNode, ModelNode, ToolNode
+from jamjet.workflow.nodes import (
+    AgentToolNode,
+    ConditionNode,
+    CoordinatorNode,
+    EvalNode,
+    HumanApprovalNode,
+    ModelNode,
+    ToolNode,
+)
 
 AnyNode = ModelNode | ToolNode | ConditionNode | HumanApprovalNode | EvalNode | CoordinatorNode | AgentToolNode
 
@@ -45,11 +53,13 @@ class WorkflowGraph:
 
     def add_coordinator(self, name: str, **kwargs) -> "WorkflowGraph":
         from .nodes import CoordinatorNode
+
         node = CoordinatorNode(**kwargs)
         return self.add_node(name, node)
 
     def add_agent_tool(self, name: str, **kwargs) -> "WorkflowGraph":
         from .nodes import AgentToolNode
+
         node = AgentToolNode(**kwargs)
         return self.add_node(name, node)
 
@@ -65,8 +75,7 @@ class WorkflowGraph:
         from .nodes import AgentToolNode, CoordinatorNode
 
         auto_nodes = [
-            (nid, node) for nid, node in self._nodes.items()
-            if isinstance(node, AgentToolNode) and node.agent == "auto"
+            (nid, node) for nid, node in self._nodes.items() if isinstance(node, AgentToolNode) and node.agent == "auto"
         ]
 
         for agent_node_id, agent_node in auto_nodes:

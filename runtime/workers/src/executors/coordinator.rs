@@ -239,7 +239,11 @@ impl NodeExecutor for CoordinatorExecutor {
                 .and_then(|t| t.get("max_candidates"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(3) as usize;
-            let top_n: Vec<_> = score_resp.rankings.into_iter().take(max_candidates).collect();
+            let top_n: Vec<_> = score_resp
+                .rankings
+                .into_iter()
+                .take(max_candidates)
+                .collect();
 
             match self
                 .bridge

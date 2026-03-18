@@ -28,11 +28,7 @@ impl AgentToolExecutor {
     /// Resolve the base agent URI to an `https://` URL, returning an error for unsupported schemes.
     fn resolve_url(agent_uri: &str, endpoint: &str) -> Result<String, String> {
         if agent_uri.starts_with("https://") {
-            Ok(format!(
-                "{}/{}",
-                agent_uri.trim_end_matches('/'),
-                endpoint
-            ))
+            Ok(format!("{}/{}", agent_uri.trim_end_matches('/'), endpoint))
         } else {
             Err(format!(
                 "Cannot resolve '{}' to HTTP endpoint. \
@@ -174,8 +170,8 @@ impl AgentToolExecutor {
                 continue;
             }
 
-            let chunk: Value = serde_json::from_str(trimmed)
-                .unwrap_or_else(|_| json!({ "raw": trimmed }));
+            let chunk: Value =
+                serde_json::from_str(trimmed).unwrap_or_else(|_| json!({ "raw": trimmed }));
 
             // Extract cost from chunk if present
             if let Some(cost) = chunk.get("cost_usd").and_then(|v| v.as_f64()) {
@@ -310,7 +306,9 @@ impl AgentToolExecutor {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                return Err(format!("Agent returned error {status} on turn {turn}: {body}"));
+                return Err(format!(
+                    "Agent returned error {status} on turn {turn}: {body}"
+                ));
             }
 
             let response: Value = resp
@@ -330,7 +328,10 @@ impl AgentToolExecutor {
             final_output = response.clone();
 
             // Check if the agent signals completion
-            let status = response.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let status = response
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if status == "completed" {
                 debug!(
                     node_id = %item.node_id,
@@ -380,7 +381,11 @@ impl NodeExecutor for AgentToolExecutor {
         // Extract agent target — handle both { "explicit": "uri" } and plain string
         let agent_uri = p
             .get("agent")
-            .and_then(|a| a.get("explicit").and_then(|v| v.as_str()).or_else(|| a.as_str()))
+            .and_then(|a| {
+                a.get("explicit")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| a.as_str())
+            })
             .ok_or("AgentTool: missing 'agent' URI in payload")?;
 
         // Extract mode — handle both string and object forms
@@ -398,8 +403,14 @@ impl NodeExecutor for AgentToolExecutor {
         } else {
             "sync".to_string()
         };
-        let output_key = p.get("output_key").and_then(|v| v.as_str()).unwrap_or("result");
-        let timeout_ms = p.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
+        let output_key = p
+            .get("output_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("result");
+        let timeout_ms = p
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30_000);
         let input = p.get("input").cloned().unwrap_or(json!({}));
         // Budget lookup: check nested {"budget": {"max_cost_usd": …}} first, then flat "max_cost_usd"
         let max_cost_usd = p
