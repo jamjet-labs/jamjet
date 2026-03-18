@@ -1,36 +1,6 @@
-// NOTE: useInspectorStore and useExecutions are stubbed inline here.
-// When Task 2 commits web/src/store/inspector.ts and web/src/hooks/useExecutions.ts,
-// replace the stub sections below with:
-//   import { useInspectorStore } from '@/store/inspector'
-//   import { useExecutions } from '@/hooks/useExecutions'
-
 import type { Execution } from '@/api/types'
-
-// ─── Inline stubs (remove once Task 2 lands) ─────────────────────────────────
-
-interface InspectorState {
-  selectedExecutionId: string | null
-  setSelectedExecutionId: (id: string | null) => void
-}
-
-function useInspectorStore(): InspectorState {
-  // Minimal stub — replace with real zustand store import from @/store/inspector
-  const [selectedExecutionId, setSelectedExecutionId] =
-    (window as unknown as { __inspectorState?: InspectorState }).__inspectorState
-      ? [
-          (window as unknown as { __inspectorState: InspectorState }).__inspectorState
-            .selectedExecutionId,
-          (window as unknown as { __inspectorState: InspectorState }).__inspectorState
-            .setSelectedExecutionId,
-        ]
-      : [null as string | null, (_id: string | null) => {}]
-  return { selectedExecutionId, setSelectedExecutionId }
-}
-
-function useExecutions(): { executions: Execution[]; isLoading: boolean } {
-  // Minimal stub — replace with real hook import from @/hooks/useExecutions
-  return { executions: [], isLoading: false }
-}
+import { useExecutions } from '@/hooks/useExecution'
+import { useInspectorStore } from '@/store/inspector'
 
 // ─── Status config ────────────────────────────────────────────────────────────
 
@@ -53,8 +23,9 @@ const STATUS_LABEL: Record<Execution['status'], string> = {
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function ExecutionList() {
-  const { executions, isLoading } = useExecutions()
-  const { selectedExecutionId, setSelectedExecutionId } = useInspectorStore()
+  const { data, isLoading } = useExecutions()
+  const executions: Execution[] = (data as any)?.executions ?? []
+  const { selectedExecutionId, setExecution } = useInspectorStore()
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -78,7 +49,7 @@ export function ExecutionList() {
           return (
             <button
               key={ex.id}
-              onClick={() => setSelectedExecutionId(ex.id)}
+              onClick={() => setExecution(ex.id)}
               className={[
                 'w-full text-left px-3 py-2 flex flex-col gap-0.5 hover:bg-zinc-800/60 transition-colors',
                 isSelected ? 'bg-zinc-800' : '',
