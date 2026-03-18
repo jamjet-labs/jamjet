@@ -23,7 +23,5 @@ and routes each ticket to the best match.
 ## Run
 
 ```bash
-jamjet run examples/coordinator-routing/workflow.yaml
-# or
 python examples/coordinator-routing/main.py
 ```

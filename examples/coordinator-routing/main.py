@@ -1,30 +1,26 @@
 """
-Coordinator Routing — Dynamic agent selection for customer support.
+Coordinator Routing -- Dynamic agent selection for customer support.
 
 Demonstrates:
-- CoordinatorNode for capability-based agent discovery and scoring
+- DefaultCoordinatorStrategy for capability-based agent discovery and scoring
 - Structured scoring with dimension weights
 - Automatic fallback when no candidates match
+- CoordinatorNode in a workflow graph
 """
 from __future__ import annotations
 
-from jamjet.coordinator import (
-    AgentCandidate,
-    DefaultCoordinatorStrategy,
-    DimensionScores,
-    ScoringResult,
-)
+import asyncio
+
+from jamjet.coordinator import DefaultCoordinatorStrategy
 from jamjet.workflow.graph import WorkflowGraph
 from jamjet.workflow.nodes import CoordinatorNode, ModelNode
 
 
-# --- Define specialized agents (in production, these would be in the registry) ---
-
-MOCK_AGENTS = [
+SUPPORT_AGENTS = [
     {
         "uri": "jamjet://support/billing-agent",
         "skills": ["billing", "payments", "refunds", "subscriptions"],
-        "agent_card": {"name": "Billing Agent", "description": "Handles payment and billing issues"},
+        "agent_card": {"name": "Billing Agent"},
         "latency_class": "low",
         "cost_class": "low",
         "trust_domain": "internal",
@@ -32,7 +28,7 @@ MOCK_AGENTS = [
     {
         "uri": "jamjet://support/technical-agent",
         "skills": ["debugging", "api-errors", "integrations", "technical-support"],
-        "agent_card": {"name": "Technical Agent", "description": "Handles bugs and technical issues"},
+        "agent_card": {"name": "Technical Agent"},
         "latency_class": "medium",
         "cost_class": "medium",
         "trust_domain": "internal",
@@ -40,7 +36,7 @@ MOCK_AGENTS = [
     {
         "uri": "jamjet://support/general-agent",
         "skills": ["faq", "account", "general-support", "onboarding"],
-        "agent_card": {"name": "General Agent", "description": "Handles general inquiries"},
+        "agent_card": {"name": "General Agent"},
         "latency_class": "low",
         "cost_class": "low",
         "trust_domain": "internal",
@@ -49,31 +45,28 @@ MOCK_AGENTS = [
 
 
 class MockRegistry:
-    """Simulates an agent registry for this example."""
-
     async def list_agents(self):
-        return MOCK_AGENTS
+        return SUPPORT_AGENTS
 
 
 async def demo_coordinator_scoring():
     """Show how the coordinator scores and selects agents."""
     print("=" * 60)
-    print("Coordinator Routing — Structured Scoring Demo")
+    print("Coordinator Routing -- Structured Scoring Demo")
     print("=" * 60)
 
     strategy = DefaultCoordinatorStrategy(registry=MockRegistry())
 
-    # Simulate routing a billing ticket
     tickets = [
         {"task": "Customer wants a refund for duplicate charge", "skills": ["billing", "refunds"]},
         {"task": "API returning 500 errors on /v2/tasks endpoint", "skills": ["debugging", "api-errors"]},
         {"task": "How do I reset my password?", "skills": ["faq", "account"]},
+        {"task": "Need help with quantum computing", "skills": ["quantum"]},
     ]
 
     for ticket in tickets:
         print(f"\n--- Ticket: {ticket['task'][:60]} ---")
 
-        # Phase 1: Discovery
         candidates, filtered = await strategy.discover(
             task=ticket["task"],
             required_skills=ticket["skills"],
@@ -81,60 +74,48 @@ async def demo_coordinator_scoring():
             trust_domain="internal",
             context={},
         )
-        print(f"  Discovered: {len(candidates)} candidates, {len(filtered)} filtered out")
+        print(f"  Discovered: {len(candidates)} candidates, {len(filtered)} filtered")
 
         if not candidates:
-            print("  No matching agents found!")
+            print("  No matching agents! Would escalate to human.")
             continue
 
-        # Phase 2: Scoring
         rankings, spread = await strategy.score(
-            task=ticket["task"],
-            candidates=candidates,
-            weights={},
-            context={},
+            task=ticket["task"], candidates=candidates, weights={}, context={},
         )
         print(f"  Rankings (spread={spread:.3f}):")
         for r in rankings:
             print(f"    {r.agent_uri}: {r.composite:.3f}")
 
-        # Phase 3: Decision
         decision = await strategy.decide(
-            task=ticket["task"],
-            top_candidates=rankings,
-            threshold=0.1,
-            tiebreaker_model="claude-sonnet-4-6",
-            context={},
+            task=ticket["task"], top_candidates=rankings,
+            threshold=0.1, tiebreaker_model="claude-sonnet-4-6", context={},
         )
-        print(f"  Selected: {decision.selected_uri} (method={decision.method})")
+        print(f"  -> Selected: {decision.selected_uri} (method={decision.method})")
 
 
 def demo_workflow_graph():
-    """Show how to build a workflow with a Coordinator node."""
+    """Build a workflow with a Coordinator node."""
     print("\n" + "=" * 60)
-    print("Coordinator Routing — Workflow Graph Demo")
+    print("Coordinator Routing -- Workflow Graph")
     print("=" * 60)
 
     graph = WorkflowGraph("support-routing")
-    graph.add_node("classify", ModelNode(
-        model="claude-haiku-4-5-20251001",
-        prompt="Classify this support ticket by domain",
-    ))
+    graph.add_node("classify", ModelNode(model="claude-haiku-4-5-20251001"))
     graph.add_coordinator("route",
-        task="Route ticket to appropriate support agent",
+        task="Route ticket to support agent",
         required_skills=["support"],
-        preferred_skills=["billing", "technical"],
         output_key="selected_agent",
         strategy="default",
-        budget={"max_cost_usd": 0.10},
         tiebreaker={"model": "claude-sonnet-4-6", "threshold": 0.1},
     )
     graph.add_edge("classify", "route")
 
     ir = graph.compile()
-    print(f"  Compiled workflow: {len(ir['nodes'])} nodes, {len(ir['edges'])} edges")
-    for node_id, node in ir["nodes"].items():
-        print(f"    {node_id}: {node['kind']['type']}")
+    print(f"\n  Compiled: {len(ir['nodes'])} nodes, {len(ir['edges'])} edges")
+    for nid, node in ir["nodes"].items():
+        kind = node["kind"]
+        print(f"    {nid}: {kind['type']}")
 
 
 async def main():
@@ -143,5 +124,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())

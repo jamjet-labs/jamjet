@@ -1,13 +1,13 @@
 # Custom Coordinator Strategy Example
 
-Demonstrates writing a custom `CoordinatorStrategy` for domain-specific agent routing.
+Write a custom `CoordinatorStrategy` for domain-specific agent routing.
 
 ## Use Case
 
-A healthcare platform routes medical queries to specialized agents. The custom strategy:
+A healthcare platform routes medical queries to specialized agents:
 - Weights medical certification 3x higher than other dimensions
-- Requires agents to be in the "healthcare" trust domain
-- Uses a medical-specific LLM for tiebreaking
+- Requires "healthcare" trust domain
+- No LLM tiebreaker (predictability over flexibility in medical contexts)
 
 ## Run
 
