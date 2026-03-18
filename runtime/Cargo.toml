@@ -83,3 +83,7 @@ pin-project = "1"
 # Crypto
 sha2 = "0.10"
 rand = "0.8"
+
+# Static file embedding
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2"
