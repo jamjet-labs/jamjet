@@ -1,0 +1,41 @@
+# Pre-commit hooks — mirrors CI lint checks exactly.
+# Install: pip install pre-commit && pre-commit install
+repos:
+  # Rust formatting
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: bash -c 'cd runtime && cargo fmt --all -- --check'
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: bash -c 'cd runtime && cargo clippy --workspace --all-features -- -D warnings'
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+  # Python formatting and linting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.10
+    hooks:
+      - id: ruff-format
+        args: [--check]
+        files: ^sdk/python/
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ^sdk/python/
+
+  # Python type checking
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: bash -c 'cd sdk/python && python -m mypy jamjet --ignore-missing-imports'
+        language: system
+        types: [python]
+        pass_filenames: false
+        files: ^sdk/python/
