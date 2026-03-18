@@ -30,8 +30,8 @@ class AgentToolDef:
             ir["budget"] = self.budget
         if self.timeout_ms:
             ir["timeout_ms"] = self.timeout_ms
-        if self.mode == "conversational" and self.max_turns:
-            ir["mode"] = {"conversational": {"max_turns": self.max_turns}}
+        if self.mode == "conversational":
+            ir["mode"] = {"conversational": {"max_turns": self.max_turns or 5}}
         return ir
 
 

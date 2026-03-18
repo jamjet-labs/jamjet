@@ -172,6 +172,40 @@ impl NodeExecutor for CoordinatorExecutor {
             .await
             .map_err(|e| format!("Scoring failed: {e}"))?;
 
+        // Guard: empty rankings means scoring produced nothing
+        if score_resp.rankings.is_empty() {
+            let decision_event = json!({
+                "type": "coordinator_decision",
+                "node_id": &item.node_id,
+                "selected": null,
+                "method": "no_candidates",
+                "confidence": 0.0,
+                "rejected": [],
+            });
+            let duration_ms = start.elapsed().as_millis() as u64;
+            return Ok(ExecutionResult {
+                output: json!(null),
+                state_patch: json!({
+                    "coordinator_events": [
+                        json!({
+                            "type": "coordinator_scoring",
+                            "node_id": &item.node_id,
+                            "rankings": [],
+                            "spread": score_resp.spread,
+                            "weights": &weights,
+                        }),
+                        decision_event,
+                    ]
+                }),
+                duration_ms,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+            });
+        }
+
         let scoring_event = json!({
             "type": "coordinator_scoring",
             "node_id": item.node_id,
@@ -240,15 +274,27 @@ impl NodeExecutor for CoordinatorExecutor {
                 Err(e) => {
                     warn!("LLM tiebreaker failed, falling back to top scorer: {e}");
                     used_tiebreaker_model = None;
-                    json!({
-                        "type": "coordinator_decision",
-                        "node_id": item.node_id,
-                        "selected": top_n[0].uri,
-                        "method": "tiebreaker_failed",
-                        "reasoning": format!("Tiebreaker error: {e}"),
-                        "confidence": top_n[0].composite,
-                        "rejected": [],
-                    })
+                    if let Some(first) = top_n.first() {
+                        json!({
+                            "type": "coordinator_decision",
+                            "node_id": item.node_id,
+                            "selected": first.uri,
+                            "method": "tiebreaker_failed",
+                            "reasoning": format!("Tiebreaker error: {e}"),
+                            "confidence": first.composite,
+                            "rejected": [],
+                        })
+                    } else {
+                        json!({
+                            "type": "coordinator_decision",
+                            "node_id": item.node_id,
+                            "selected": null,
+                            "method": "tiebreaker_failed",
+                            "reasoning": format!("Tiebreaker error: {e}"),
+                            "confidence": 0.0,
+                            "rejected": [],
+                        })
+                    }
                 }
             }
         };

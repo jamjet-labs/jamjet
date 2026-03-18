@@ -1,5 +1,5 @@
 from jamjet.workflow.graph import WorkflowGraph
-from jamjet.workflow.nodes import AgentToolNode, ModelNode
+from jamjet.workflow.nodes import ModelNode
 
 
 class TestAutoExpansion:

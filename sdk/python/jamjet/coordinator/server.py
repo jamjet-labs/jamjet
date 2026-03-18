@@ -17,6 +17,7 @@ class StrategyServer:
     def __init__(self, host: str = "127.0.0.1", port: int = 4270):
         self.host = host
         self.port = port
+        self._registry = None
         self._strategies: dict[str, CoordinatorStrategy] = {
             "default": DefaultCoordinatorStrategy(registry=None),
         }
@@ -29,8 +30,11 @@ class StrategyServer:
 
     def register_strategy(self, name: str, strategy: CoordinatorStrategy) -> None:
         self._strategies[name] = strategy
+        if self._registry is not None and hasattr(strategy, "_registry"):
+            strategy._registry = self._registry
 
     def set_registry(self, registry: Any) -> None:
+        self._registry = registry
         for strategy in self._strategies.values():
             if hasattr(strategy, "_registry"):
                 strategy._registry = registry
@@ -77,10 +81,17 @@ class StrategyServer:
     async def _handle_decide(self, request: Request) -> JSONResponse:
         data = await request.json()
         strategy = self._get_strategy(data)
-        top = [
-            ScoringResult(agent_uri=c["uri"], scores=DimensionScores(), composite=c.get("composite", 0))
-            for c in data.get("top_candidates", [])
-        ]
+        top = []
+        for c in data.get("top_candidates", []):
+            scores_data = c.get("scores", {})
+            scores = DimensionScores(
+                capability_fit=scores_data.get("capability_fit", 0.5),
+                cost_fit=scores_data.get("cost_fit", 0.5),
+                latency_fit=scores_data.get("latency_fit", 0.5),
+                trust_compatibility=scores_data.get("trust_compatibility", 0.5),
+                historical_performance=scores_data.get("historical_performance", 0.5),
+            )
+            top.append(ScoringResult(agent_uri=c["uri"], scores=scores, composite=c.get("composite", 0)))
         decision = await strategy.decide(
             task=data["task"],
             top_candidates=top,

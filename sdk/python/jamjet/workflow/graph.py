@@ -40,6 +40,7 @@ class WorkflowGraph:
         if not self._nodes:
             self._start = node_id
         self._nodes[node_id] = node
+        self._already_expanded = False
         return self
 
     def add_coordinator(self, name: str, **kwargs) -> "WorkflowGraph":
@@ -54,6 +55,7 @@ class WorkflowGraph:
 
     def add_edge(self, from_id: str, to_id: str, condition: str | None = None) -> WorkflowGraph:
         self._edges.append({"from": from_id, "to": to_id, "condition": condition})
+        self._already_expanded = False
         return self
 
     def _expand_auto_agents(self) -> None:

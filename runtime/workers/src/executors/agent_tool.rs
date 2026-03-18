@@ -383,11 +383,30 @@ impl NodeExecutor for AgentToolExecutor {
             .and_then(|a| a.get("explicit").and_then(|v| v.as_str()).or_else(|| a.as_str()))
             .ok_or("AgentTool: missing 'agent' URI in payload")?;
 
-        let mode = p.get("mode").and_then(|v| v.as_str()).unwrap_or("sync");
+        // Extract mode — handle both string and object forms
+        // e.g. "sync" or {"conversational": {"max_turns": 5}}
+        let mode = if let Some(mode_val) = p.get("mode") {
+            if let Some(s) = mode_val.as_str() {
+                s.to_string()
+            } else if mode_val.get("conversational").is_some() {
+                "conversational".to_string()
+            } else if mode_val.get("streaming").is_some() {
+                "streaming".to_string()
+            } else {
+                "sync".to_string()
+            }
+        } else {
+            "sync".to_string()
+        };
         let output_key = p.get("output_key").and_then(|v| v.as_str()).unwrap_or("result");
         let timeout_ms = p.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
         let input = p.get("input").cloned().unwrap_or(json!({}));
-        let max_cost_usd = p.get("max_cost_usd").and_then(|v| v.as_f64());
+        // Budget lookup: check nested {"budget": {"max_cost_usd": …}} first, then flat "max_cost_usd"
+        let max_cost_usd = p
+            .get("budget")
+            .and_then(|b| b.get("max_cost_usd"))
+            .and_then(|v| v.as_f64())
+            .or_else(|| p.get("max_cost_usd").and_then(|v| v.as_f64()));
 
         // Check for unresolved auto target
         if p.get("agent").and_then(|a| a.get("auto")).is_some() {
@@ -414,7 +433,7 @@ impl NodeExecutor for AgentToolExecutor {
 
         debug!(agent_uri = %agent_uri, mode = %mode, protocol = %protocol, "AgentTool: invoking");
 
-        match mode {
+        match mode.as_str() {
             "sync" => {
                 self.execute_sync(
                     item,
