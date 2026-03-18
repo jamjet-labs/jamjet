@@ -131,11 +131,43 @@ pub enum NodeKind {
         timeout_secs: Option<u64>,
     },
 
+    #[deprecated(note = "Use Coordinator node instead")]
     /// Dynamically discovers and selects an agent at runtime.
     AgentDiscovery {
         skill: String,
         protocol: Option<String>,
         output_binding: String,
+    },
+
+    /// Dynamic agent routing with structured scoring + LLM tiebreaker.
+    /// Supersedes AgentDiscovery.
+    Coordinator {
+        task: String,
+        required_skills: Vec<String>,
+        #[serde(default)]
+        preferred_skills: Vec<String>,
+        trust_domain: Option<String>,
+        budget: Option<crate::coordinator::CoordinatorBudget>,
+        tiebreaker: Option<crate::coordinator::TiebreakerConfig>,
+        #[serde(default = "default_strategy")]
+        strategy: String,
+        #[serde(default)]
+        weights: crate::coordinator::DimensionWeights,
+        #[serde(default)]
+        input_mapping: HashMap<String, String>,
+        output_key: String,
+    },
+
+    /// Invoke a registered agent as a callable tool.
+    AgentTool {
+        agent: crate::agent_tool::AgentTarget,
+        #[serde(default)]
+        mode: crate::agent_tool::AgentToolMode,
+        #[serde(default)]
+        input_mapping: HashMap<String, String>,
+        output_key: String,
+        timeout_ms: Option<u64>,
+        budget: Option<crate::agent_tool::AgentToolBudget>,
     },
 
     /// Evaluates the preceding node's output using configurable scorers.
@@ -167,13 +199,17 @@ impl NodeKind {
             Self::Agent { .. } => QueueType::General,
             Self::HumanApproval { .. } | Self::Wait { .. } => QueueType::General,
             Self::Eval { .. } => QueueType::General,
+            Self::Coordinator { .. } => QueueType::General,
+            Self::AgentTool { .. } => QueueType::General,
             _ => QueueType::General,
         }
     }
 
     /// Returns true if this node requires durable tracking across crashes.
     pub fn is_durable(&self) -> bool {
-        !matches!(self, Self::Condition { .. } | Self::AgentDiscovery { .. })
+        #[allow(deprecated)]
+        let is_agent_discovery = matches!(self, Self::AgentDiscovery { .. });
+        !matches!(self, Self::Condition { .. }) && !is_agent_discovery
     }
 }
 
@@ -273,6 +309,10 @@ fn default_min_score() -> u8 {
     3
 }
 
+fn default_strategy() -> String {
+    "default".to_string()
+}
+
 /// What the eval node does when one or more scorers fail.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -308,5 +348,55 @@ mod tests {
     fn condition_node_is_not_durable() {
         let node = NodeKind::Condition { branches: vec![] };
         assert!(!node.is_durable());
+    }
+
+    #[test]
+    fn coordinator_node_round_trip() {
+        let node = NodeKind::Coordinator {
+            task: "Analyze data".into(),
+            required_skills: vec!["data-analysis".into()],
+            preferred_skills: vec![],
+            trust_domain: Some("internal".into()),
+            budget: None,
+            tiebreaker: None,
+            strategy: "default".into(),
+            weights: Default::default(),
+            input_mapping: Default::default(),
+            output_key: "result".into(),
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        let deserialized: NodeKind = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, NodeKind::Coordinator { .. }));
+        assert_eq!(node.queue_type(), QueueType::General);
+        assert!(node.is_durable());
+    }
+
+    #[test]
+    fn agent_tool_node_round_trip() {
+        let node = NodeKind::AgentTool {
+            agent: crate::agent_tool::AgentTarget::Explicit("jamjet://org/test".into()),
+            mode: crate::agent_tool::AgentToolMode::Sync,
+            input_mapping: Default::default(),
+            output_key: "result".into(),
+            timeout_ms: Some(5000),
+            budget: None,
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        let deserialized: NodeKind = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, NodeKind::AgentTool { .. }));
+        assert_eq!(node.queue_type(), QueueType::General);
+        assert!(node.is_durable());
+    }
+
+    #[test]
+    fn agent_discovery_is_deprecated_but_functional() {
+        #[allow(deprecated)]
+        let node = NodeKind::AgentDiscovery {
+            skill: "data-analysis".into(),
+            protocol: None,
+            output_binding: "selected_agent".into(),
+        };
+        #[allow(deprecated)]
+        let _ = node.queue_type();
     }
 }

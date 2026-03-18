@@ -283,6 +283,74 @@ pub enum EventKind {
         iterations: u32,
         total_cost_usd: Option<f64>,
     },
+
+    // ── Coordinator events ────────────────────────────────────────────────
+    CoordinatorDiscovery {
+        node_id: NodeId,
+        query_skills: Vec<String>,
+        query_trust_domain: Option<String>,
+        candidates: Vec<serde_json::Value>,
+        filtered_out: Vec<serde_json::Value>,
+    },
+    CoordinatorScoring {
+        node_id: NodeId,
+        rankings: Vec<serde_json::Value>,
+        spread: f64,
+        weights: serde_json::Value,
+    },
+    CoordinatorDecision {
+        node_id: NodeId,
+        selected: Option<String>,
+        method: String,
+        reasoning: Option<String>,
+        confidence: f64,
+        rejected: Vec<serde_json::Value>,
+        tiebreaker_tokens: Option<serde_json::Value>,
+        tiebreaker_cost: Option<f64>,
+    },
+
+    // ── Agent-as-Tool events ──────────────────────────────────────────────
+    AgentToolInvoked {
+        node_id: NodeId,
+        agent_uri: String,
+        mode: String,
+        protocol: String,
+        input_hash: String,
+    },
+    AgentToolProgress {
+        node_id: NodeId,
+        chunk_index: u32,
+        partial_output_summary: String,
+    },
+    AgentToolTurn {
+        node_id: NodeId,
+        turn_number: u32,
+        direction: String,
+        content_summary: String,
+        tokens: u32,
+        cost: f64,
+    },
+    AgentToolCompleted {
+        node_id: NodeId,
+        output: serde_json::Value,
+        provenance: Option<serde_json::Value>,
+        total_cost: f64,
+        latency_ms: u64,
+        total_turns: Option<u32>,
+    },
+    AgentToolTerminated {
+        node_id: NodeId,
+        reason: String,
+        chunks_received: u32,
+        partial_output: Option<serde_json::Value>,
+        cost: f64,
+    },
+    AgentToolFailed {
+        node_id: NodeId,
+        failure_type: String,
+        message: String,
+        retryable: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,7 +385,16 @@ impl EventKind {
             | Self::ToolApprovalRequired { node_id, .. }
             | Self::ChildWorkflowStarted { node_id, .. }
             | Self::ChildWorkflowCompleted { node_id, .. }
-            | Self::ChildWorkflowFailed { node_id, .. } => Some(node_id.as_str()),
+            | Self::ChildWorkflowFailed { node_id, .. }
+            | Self::CoordinatorDiscovery { node_id, .. }
+            | Self::CoordinatorScoring { node_id, .. }
+            | Self::CoordinatorDecision { node_id, .. }
+            | Self::AgentToolInvoked { node_id, .. }
+            | Self::AgentToolProgress { node_id, .. }
+            | Self::AgentToolTurn { node_id, .. }
+            | Self::AgentToolCompleted { node_id, .. }
+            | Self::AgentToolTerminated { node_id, .. }
+            | Self::AgentToolFailed { node_id, .. } => Some(node_id.as_str()),
             _ => None,
         }
     }

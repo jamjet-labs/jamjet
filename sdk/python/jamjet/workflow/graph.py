@@ -4,9 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from jamjet.workflow.nodes import ConditionNode, EvalNode, HumanApprovalNode, ModelNode, ToolNode
+from jamjet.workflow.nodes import (
+    AgentToolNode,
+    ConditionNode,
+    CoordinatorNode,
+    EvalNode,
+    HumanApprovalNode,
+    ModelNode,
+    ToolNode,
+)
 
-AnyNode = ModelNode | ToolNode | ConditionNode | HumanApprovalNode | EvalNode
+AnyNode = ModelNode | ToolNode | ConditionNode | HumanApprovalNode | EvalNode | CoordinatorNode | AgentToolNode
 
 
 class WorkflowGraph:
@@ -30,6 +38,7 @@ class WorkflowGraph:
         self._edges: list[dict[str, Any]] = []
         self._start: str | None = None
         self._state_schema: str = ""
+        self._already_expanded = False
 
     def set_state(self, schema: str) -> WorkflowGraph:
         self._state_schema = schema
@@ -39,13 +48,67 @@ class WorkflowGraph:
         if not self._nodes:
             self._start = node_id
         self._nodes[node_id] = node
+        self._already_expanded = False
         return self
+
+    def add_coordinator(self, name: str, **kwargs: Any) -> WorkflowGraph:
+        from .nodes import CoordinatorNode
+
+        node = CoordinatorNode(**kwargs)
+        return self.add_node(name, node)
+
+    def add_agent_tool(self, name: str, **kwargs: Any) -> WorkflowGraph:
+        from .nodes import AgentToolNode
+
+        node = AgentToolNode(**kwargs)
+        return self.add_node(name, node)
 
     def add_edge(self, from_id: str, to_id: str, condition: str | None = None) -> WorkflowGraph:
         self._edges.append({"from": from_id, "to": to_id, "condition": condition})
+        self._already_expanded = False
         return self
 
+    def _expand_auto_agents(self) -> None:
+        if self._already_expanded:
+            return
+
+        from .nodes import AgentToolNode, CoordinatorNode
+
+        auto_nodes = [
+            (nid, node) for nid, node in self._nodes.items() if isinstance(node, AgentToolNode) and node.agent == "auto"
+        ]
+
+        for agent_node_id, agent_node in auto_nodes:
+            coord_id = f"_coordinator_{agent_node_id}"
+
+            if coord_id in self._nodes:
+                raise ValueError(
+                    f"Auto-expansion would overwrite existing node '{coord_id}'. "
+                    "Reserve the '_coordinator_' prefix for generated nodes."
+                )
+
+            coord_node = CoordinatorNode(
+                task=f"Route to agent for: {agent_node_id}",
+                output_key=f"_selected_agent_{agent_node_id}",
+                strategy="default",
+            )
+            self._nodes[coord_id] = coord_node
+
+            agent_node.agent = f"state._selected_agent_{agent_node_id}"
+
+            for edge in self._edges:
+                if edge["to"] == agent_node_id:
+                    edge["to"] = coord_id
+
+            self._edges.append({"from": coord_id, "to": agent_node_id, "condition": None})
+
+            if self._start == agent_node_id:
+                self._start = coord_id
+
+        self._already_expanded = True
+
     def compile(self) -> dict[str, Any]:
+        self._expand_auto_agents()
         nodes: dict[str, Any] = {}
         for node_id, node in self._nodes.items():
             nodes[node_id] = {

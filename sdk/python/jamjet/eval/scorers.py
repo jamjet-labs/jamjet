@@ -166,13 +166,16 @@ class LlmJudgeScorer(BaseScorer):
         try:
             import anthropic
 
-            client = anthropic.Anthropic()
-            msg = client.messages.create(
+            anthropic_client = anthropic.Anthropic()
+            msg = anthropic_client.messages.create(
                 model=self.model,
                 max_tokens=256,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return msg.content[0].text
+            text_blocks = [b for b in msg.content if hasattr(b, "text")]
+            if text_blocks:
+                return text_blocks[0].text
+            return ""
         except (ImportError, Exception):
             pass
 
@@ -180,8 +183,8 @@ class LlmJudgeScorer(BaseScorer):
         try:
             from openai import OpenAI
 
-            client = OpenAI()
-            resp = client.chat.completions.create(
+            openai_client = OpenAI()
+            resp = openai_client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=256,

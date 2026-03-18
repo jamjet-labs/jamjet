@@ -43,6 +43,8 @@ The runtime core is **Rust + Tokio** for scheduling, state, and concurrency. The
 | Slow Python orchestration at scale | **Rust core** — no GIL, real async parallelism |
 | Weak observability, no replay | **Full event timeline**, OTel GenAI traces, replay from any checkpoint |
 | No standard agent identity | **Agent Cards** — every agent is addressable and discoverable |
+| Hard-coded agent routing | **Coordinator Node** — dynamic routing with structured scoring + LLM tiebreaker |
+| Can't use agents as tools | **Agent-as-Tool** — wrap any agent as a callable tool (sync, streaming, conversational) |
 | No governance or guardrails | **Policy engine** — tool blocking, approvals, autonomy enforcement, audit log |
 | Agents with unchecked access | **OAuth delegation** — RFC 8693 token exchange, scope narrowing, per-step scoping |
 | PII leaking into logs | **Data governance** — PII redaction (mask/hash/remove), retention policies, auto-purge |
@@ -246,31 +248,128 @@ nodes:
     next: end
 ```
 
+### Coordinator — dynamic agent routing
+
+```python
+from jamjet.coordinator import DefaultCoordinatorStrategy
+
+strategy = DefaultCoordinatorStrategy(registry=my_registry)
+
+# Discover agents by skill, score them, route to the best fit
+candidates, _ = await strategy.discover(
+    task="Analyze quarterly revenue data",
+    required_skills=["data-analysis", "finance"],
+    trust_domain="internal",
+)
+rankings, spread = await strategy.score(task, candidates, weights={})
+decision = await strategy.decide(task, rankings, threshold=0.1)
+# decision.selected_uri → "jamjet://org/finance-analyst"
+```
+
+### Agent-as-Tool — wrap agents as callable tools
+
+```python
+from jamjet.agent_tool import agent_tool
+
+# Sync: quick, stateless
+classifier = agent_tool(agent="jamjet://org/classifier", mode="sync",
+                        description="Classifies documents by topic")
+
+# Streaming: long-running with early termination on budget
+researcher = agent_tool(agent="jamjet://org/researcher", mode="streaming",
+                        description="Deep research with progress", budget={"max_cost_usd": 2.00})
+
+# Conversational: multi-turn iterative refinement
+reviewer = agent_tool(agent="jamjet://org/reviewer", mode="conversational",
+                      description="Peer review with feedback", max_turns=5)
+```
+
+### Auto-routing — compiler inserts Coordinator automatically
+
+```python
+from jamjet.workflow.graph import WorkflowGraph
+
+graph = WorkflowGraph("pipeline")
+graph.add_agent_tool("process", agent="auto", mode="sync", output_key="result")
+# ↑ "auto" expands at compile time into: Coordinator → AgentTool
+ir = graph.compile()
+# IR now has 2 nodes: _coordinator_process → process
+```
+
+---
+
+## Agentic design patterns
+
+JamJet supports the six major multi-agent orchestration patterns. Here's when to use each:
+
+| Pattern | JamJet primitive | When to use | Example |
+|---------|-----------------|-------------|---------|
+| **Single Agent** | `Agent` with `@task` | Simple prototypes, single-purpose tasks | Chatbot, classifier |
+| **Sequential Pipeline** | `WorkflowGraph` with edges | Ordered steps where each depends on the previous | ETL, document processing |
+| **Parallel Fan-Out** | `ParallelNode` | Independent tasks that can run concurrently | Multi-source research, batch classification |
+| **Loop & Critic** | `LoopNode` + `EvalNode` | Quality-critical tasks needing iterative refinement | Code review, content generation |
+| **Coordinator (Dynamic Routing)** | `CoordinatorNode` | Route to the best agent at runtime based on capability, cost, latency | Support ticket routing, task delegation |
+| **Agent-as-Tool** | `agent_tool()` wrapper | One agent needs to call another as a function | Orchestrator invoking specialists |
+
+### Choosing the right pattern
+
+```
+Is it a single task?
+  → Single Agent
+
+Does order matter?
+  → Sequential Pipeline
+
+Can tasks run independently?
+  → Parallel Fan-Out
+
+Does output need quality checks?
+  → Loop & Critic
+
+Do you need to pick the best agent at runtime?
+  → Coordinator
+
+Does one agent need to invoke another?
+  → Agent-as-Tool
+```
+
+### Coordinator vs static routing
+
+| | Static (`ConditionalNode`) | Dynamic (`CoordinatorNode`) |
+|---|---|---|
+| **Candidates** | Declared in YAML | Discovered from registry at runtime |
+| **Selection** | Expression-based rules | Structured scoring + optional LLM tiebreaker |
+| **When agents change** | Redeploy workflow | Automatic — new agents discovered |
+| **Observability** | Branch taken logged | Full scoring breakdown + reasoning in event log |
+| **Best for** | Fixed, known routes | Dynamic environments, multi-tenant, research |
+
 ---
 
 ## How JamJet compares
 
 > As of March 2026. All frameworks evolve — check their docs for the latest.
 
-| Capability | JamJet | LangChain | AutoGen | CrewAI |
-|------------|--------|-----------|---------|--------|
-| **Simple agent setup** | ✅ 3 lines (`@task`) | 6+ lines | 10+ lines | 8+ lines |
-| **In-process execution** | ✅ `pip install` + run | ✅ native | ✅ native | ✅ native |
-| **Durable execution** | ✅ event-sourced, crash-safe | ❌ ephemeral | ❌ ephemeral | ❌ ephemeral |
-| **Human-in-the-loop** | ✅ first-class primitive | 🟡 callbacks | 🟡 conversational | 🟡 manual |
-| **MCP support** | ✅ client + server | 🟡 client only | 🟡 client only | 🟡 client only |
-| **A2A protocol** | ✅ client + server | ❌ | ❌ | ❌ |
-| **Built-in eval** | ✅ LLM judge, assertions | ❌ | ❌ | ❌ |
-| **Built-in observability** | ✅ OTel GenAI, event replay | 🟡 LangSmith (external) | ❌ | ❌ |
-| **Agent identity** | ✅ Agent Cards, A2A discovery | ❌ | ❌ | ❌ |
-| **Policy & governance** | ✅ policy engine, audit log | ❌ | ❌ | ❌ |
-| **Multi-tenant isolation** | ✅ row-level partitioning | ❌ | ❌ | ❌ |
-| **PII redaction** | ✅ mask/hash/remove, retention | ❌ | ❌ | ❌ |
-| **OAuth delegation** | ✅ RFC 8693, scope narrowing | ❌ | ❌ | ❌ |
-| **A2A federation auth** | ✅ mTLS, capability-scoped | ❌ | ❌ | ❌ |
-| **Progressive complexity** | ✅ `@task` → `Agent` → `Workflow` | ❌ single API | ❌ | ❌ |
-| **Runtime language** | Rust core + Python/Java/Go authoring | Python | Python | Python |
-| **Best for** | Production multi-agent systems | Rapid prototyping | Conversational agents | Role-based crews |
+| Capability | JamJet | Google ADK | LangChain | AutoGen | CrewAI |
+|------------|--------|------------|-----------|---------|--------|
+| **Simple agent setup** | ✅ 3 lines (`@task`) | ✅ 5 lines | 6+ lines | 10+ lines | 8+ lines |
+| **In-process execution** | ✅ `pip install` + run | ✅ native | ✅ native | ✅ native | ✅ native |
+| **Durable execution** | ✅ event-sourced, crash-safe | ❌ ephemeral | ❌ ephemeral | ❌ ephemeral | ❌ ephemeral |
+| **Dynamic agent routing** | ✅ Coordinator with scoring + LLM tiebreaker | ✅ `transfer_to_agent()` | ❌ | ❌ | ❌ |
+| **Agent-as-Tool** | ✅ sync, streaming, conversational | ✅ `AgentTool` (sync only) | ❌ | ❌ | ❌ |
+| **Human-in-the-loop** | ✅ first-class primitive | 🟡 callbacks | 🟡 callbacks | 🟡 conversational | 🟡 manual |
+| **MCP support** | ✅ client + server | ✅ client + server | 🟡 client only | 🟡 client only | 🟡 client only |
+| **A2A protocol** | ✅ client + server | 🟡 client only | ❌ | ❌ | ❌ |
+| **Built-in eval** | ✅ LLM judge, assertions, cost | ✅ 8 built-in criteria | ❌ | ❌ | ❌ |
+| **Built-in observability** | ✅ OTel GenAI, event replay | ✅ Cloud Trace | 🟡 LangSmith (external) | ❌ | ❌ |
+| **Agent identity** | ✅ Agent Cards, A2A discovery | ✅ Agent Cards | ❌ | ❌ | ❌ |
+| **Policy & governance** | ✅ policy engine, audit log | 🟡 Model Armor plugin | ❌ | ❌ | ❌ |
+| **Multi-tenant isolation** | ✅ row-level partitioning | ❌ | ❌ | ❌ | ❌ |
+| **PII redaction** | ✅ mask/hash/remove, retention | 🟡 plugin | ❌ | ❌ | ❌ |
+| **Model independence** | ✅ any model provider | 🟡 Gemini-first (LiteLLM escape) | ✅ any | ✅ any | ✅ any |
+| **Progressive complexity** | ✅ `@task` → `Agent` → `Workflow` | 🟡 code or YAML | ❌ single API | ❌ | ❌ |
+| **Managed deployment** | 📋 Planned | ✅ Vertex AI Agent Engine | ❌ | ❌ | ❌ |
+| **Runtime language** | Rust core + Python/Java/Go | Python/TS/Go/Java | Python | Python | Python |
+| **Best for** | Production multi-agent systems | Google Cloud AI agents | Rapid prototyping | Conversational agents | Role-based crews |
 
 ---
 

@@ -15,6 +15,7 @@ jamjet-agents = { path = "../agents" }
 jamjet-mcp = { path = "../protocols/mcp" }
 jamjet-a2a = { path = "../protocols/a2a" }
 jamjet-telemetry = { path = "../telemetry" }
+jamjet-scheduler = { path = "../scheduler" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

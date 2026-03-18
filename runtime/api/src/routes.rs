@@ -58,7 +58,21 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         .route("/tenants", post(create_tenant).get(list_tenants))
         .route("/tenants/:id", get(get_tenant).put(update_tenant))
         // Audit log — immutable, append-only
-        .route("/audit", get(list_audit_log));
+        .route("/audit", get(list_audit_log))
+        // Coordinator decisions and agent search
+        .route(
+            "/executions/:id/coordinator-decisions",
+            get(list_coordinator_decisions),
+        )
+        .route(
+            "/executions/:id/nodes/:node_id/scoring",
+            get(get_node_scoring),
+        )
+        .route(
+            "/executions/:id/nodes/:node_id/reasoning",
+            get(get_node_reasoning),
+        )
+        .route("/agents/search", get(search_agents));
 
     // In dev mode, skip auth and inject a default tenant. In production, require Bearer token.
     let protected = if dev_mode {
@@ -931,6 +945,179 @@ async fn heartbeat_work_item(
     let backend = state.backend_for(&tenant_id);
     backend.renew_lease(item_id, &body.worker_id).await?;
     Ok(Json(json!({ "renewed": true, "work_item_id": id })))
+}
+
+// ── Coordinator decisions ────────────────────────────────────────────────────
+
+/// `GET /executions/:id/coordinator-decisions`
+///
+/// Returns all coordinator events (discovery, scoring, decision) for an execution,
+/// in sequence order.
+async fn list_coordinator_decisions(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&tenant_id);
+    let execution_id = parse_execution_id(&id)?;
+    let events = backend.get_events(&execution_id).await?;
+
+    let coordinator_events: Vec<&jamjet_state::Event> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                jamjet_state::EventKind::CoordinatorDiscovery { .. }
+                    | jamjet_state::EventKind::CoordinatorScoring { .. }
+                    | jamjet_state::EventKind::CoordinatorDecision { .. }
+            )
+        })
+        .collect();
+
+    Ok(Json(json!({ "events": coordinator_events })))
+}
+
+/// `GET /executions/:id/nodes/:node_id/scoring`
+///
+/// Returns the coordinator scoring breakdown for a specific node.
+async fn get_node_scoring(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path((id, node_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&tenant_id);
+    let execution_id = parse_execution_id(&id)?;
+    let events = backend.get_events(&execution_id).await?;
+
+    let scoring: Vec<&jamjet_state::Event> = events
+        .iter()
+        .filter(|e| {
+            if let jamjet_state::EventKind::CoordinatorScoring {
+                node_id: ref nid, ..
+            } = e.kind
+            {
+                nid.as_str() == node_id
+            } else {
+                false
+            }
+        })
+        .collect();
+
+    if scoring.is_empty() {
+        return Err(ApiError::NotFound(format!(
+            "no scoring events for node {node_id} in execution {id}"
+        )));
+    }
+
+    Ok(Json(json!({ "node_id": node_id, "scoring": scoring })))
+}
+
+/// `GET /executions/:id/nodes/:node_id/reasoning`
+///
+/// Returns the coordinator decision/reasoning for a specific node.
+async fn get_node_reasoning(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path((id, node_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&tenant_id);
+    let execution_id = parse_execution_id(&id)?;
+    let events = backend.get_events(&execution_id).await?;
+
+    let decisions: Vec<&jamjet_state::Event> = events
+        .iter()
+        .filter(|e| {
+            if let jamjet_state::EventKind::CoordinatorDecision {
+                node_id: ref nid, ..
+            } = e.kind
+            {
+                nid.as_str() == node_id
+            } else {
+                false
+            }
+        })
+        .collect();
+
+    if decisions.is_empty() {
+        return Err(ApiError::NotFound(format!(
+            "no decision events for node {node_id} in execution {id}"
+        )));
+    }
+
+    Ok(Json(json!({ "node_id": node_id, "decisions": decisions })))
+}
+
+// ── Agent search ──────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SearchAgentsQuery {
+    /// Comma-separated list of required skill names.
+    skills: Option<String>,
+    /// Trust domain label to filter by (matches `labels["trust_domain"]`).
+    trust_domain: Option<String>,
+}
+
+/// `GET /agents/search`
+///
+/// Search agents by skills and/or trust domain. `skills` is a comma-separated
+/// list; an agent must possess all listed skills to be included. `trust_domain`
+/// is matched against the agent's `labels["trust_domain"]` label.
+async fn search_agents(
+    State(state): State<AppState>,
+    Query(params): Query<SearchAgentsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    // Start with all active agents (no status filter means all statuses).
+    let all_agents = state
+        .agents
+        .find(AgentFilter {
+            status: None,
+            skill: None,
+            protocol: None,
+        })
+        .await
+        .map_err(ApiError::Internal)?;
+
+    let required_skills: Vec<String> = params
+        .skills
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let agents: Vec<_> = all_agents
+        .into_iter()
+        .filter(|agent| {
+            // Filter by skills: agent must have all required skills.
+            if !required_skills.is_empty() {
+                let agent_skills: Vec<&str> = agent
+                    .card
+                    .capabilities
+                    .skills
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect();
+                if !required_skills
+                    .iter()
+                    .all(|req| agent_skills.contains(&req.as_str()))
+                {
+                    return false;
+                }
+            }
+
+            // Filter by trust_domain label.
+            if let Some(ref td) = params.trust_domain {
+                if agent.card.labels.get("trust_domain").map(|v| v.as_str()) != Some(td.as_str()) {
+                    return false;
+                }
+            }
+
+            true
+        })
+        .collect();
+
+    Ok(Json(json!({ "agents": agents })))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
