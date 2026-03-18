@@ -90,13 +90,19 @@ impl StrategyBridge {
         Self { client, base_url }
     }
 
-    pub async fn discover(&self, req: DiscoverRequest) -> Result<DiscoverResponse, StrategyBridgeError> {
+    pub async fn discover(
+        &self,
+        req: DiscoverRequest,
+    ) -> Result<DiscoverResponse, StrategyBridgeError> {
         let url = format!("{}/coordinator/discover", self.base_url);
         let resp = self.client.post(&url).json(&req).send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(StrategyBridgeError::StrategyError { status: status.as_u16(), body });
+            return Err(StrategyBridgeError::StrategyError {
+                status: status.as_u16(),
+                body,
+            });
         }
         Ok(resp.json().await?)
     }
@@ -107,7 +113,10 @@ impl StrategyBridge {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(StrategyBridgeError::StrategyError { status: status.as_u16(), body });
+            return Err(StrategyBridgeError::StrategyError {
+                status: status.as_u16(),
+                body,
+            });
         }
         Ok(resp.json().await?)
     }
@@ -118,7 +127,10 @@ impl StrategyBridge {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(StrategyBridgeError::StrategyError { status: status.as_u16(), body });
+            return Err(StrategyBridgeError::StrategyError {
+                status: status.as_u16(),
+                body,
+            });
         }
         Ok(resp.json().await?)
     }
