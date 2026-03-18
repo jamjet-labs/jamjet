@@ -8,5 +8,6 @@
 //! 5. Wake suspended executions on timer/external-event
 
 pub mod runner;
+pub mod strategy_bridge;
 
 pub use runner::{Scheduler, SchedulerConfig};
