@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from jamjet.workflow.nodes import ConditionNode, EvalNode, HumanApprovalNode, ModelNode, ToolNode
+from jamjet.workflow.nodes import AgentToolNode, ConditionNode, CoordinatorNode, EvalNode, HumanApprovalNode, ModelNode, ToolNode
 
-AnyNode = ModelNode | ToolNode | ConditionNode | HumanApprovalNode | EvalNode
+AnyNode = ModelNode | ToolNode | ConditionNode | HumanApprovalNode | EvalNode | CoordinatorNode | AgentToolNode
 
 
 class WorkflowGraph:
@@ -40,6 +40,16 @@ class WorkflowGraph:
             self._start = node_id
         self._nodes[node_id] = node
         return self
+
+    def add_coordinator(self, name: str, **kwargs) -> "WorkflowGraph":
+        from .nodes import CoordinatorNode
+        node = CoordinatorNode(**kwargs)
+        return self.add_node(name, node)
+
+    def add_agent_tool(self, name: str, **kwargs) -> "WorkflowGraph":
+        from .nodes import AgentToolNode
+        node = AgentToolNode(**kwargs)
+        return self.add_node(name, node)
 
     def add_edge(self, from_id: str, to_id: str, condition: str | None = None) -> WorkflowGraph:
         self._edges.append({"from": from_id, "to": to_id, "condition": condition})

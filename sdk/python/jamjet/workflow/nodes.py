@@ -84,6 +84,69 @@ class EvalNode:
         }
 
 
+@dataclass
+class CoordinatorNode:
+    """Dynamic agent routing with structured scoring + LLM tiebreaker."""
+    task: str = ""
+    required_skills: list[str] = field(default_factory=list)
+    output_key: str = "result"
+    preferred_skills: list[str] = field(default_factory=list)
+    trust_domain: str | None = None
+    budget: dict | None = None
+    tiebreaker: dict | None = None
+    strategy: str = "default"
+    weights: dict | None = None
+    input_mapping: dict | None = None
+
+    def to_ir_kind(self) -> dict[str, Any]:
+        ir = {
+            "type": "coordinator",
+            "task": self.task,
+            "required_skills": self.required_skills,
+            "preferred_skills": self.preferred_skills,
+            "output_key": self.output_key,
+            "strategy": self.strategy,
+            "weights": self.weights or {},
+            "input_mapping": self.input_mapping or {},
+        }
+        if self.trust_domain:
+            ir["trust_domain"] = self.trust_domain
+        if self.budget:
+            ir["budget"] = self.budget
+        if self.tiebreaker:
+            ir["tiebreaker"] = self.tiebreaker
+        return ir
+
+
+@dataclass
+class AgentToolNode:
+    """Invoke a registered agent as a callable tool."""
+    agent: str = ""
+    output_key: str = "result"
+    mode: str = "sync"
+    input_mapping: dict | None = None
+    timeout_ms: int | None = None
+    budget: dict | None = None
+
+    def to_ir_kind(self) -> dict[str, Any]:
+        agent_target = (
+            {"auto": True} if self.agent == "auto"
+            else {"explicit": self.agent}
+        )
+        ir = {
+            "type": "agent_tool",
+            "agent": agent_target,
+            "mode": self.mode,
+            "output_key": self.output_key,
+            "input_mapping": self.input_mapping or {},
+        }
+        if self.timeout_ms:
+            ir["timeout_ms"] = self.timeout_ms
+        if self.budget:
+            ir["budget"] = self.budget
+        return ir
+
+
 def _compile_scorers(scorers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Convert SDK scorer dicts to the IR format expected by the Rust executor.
 
