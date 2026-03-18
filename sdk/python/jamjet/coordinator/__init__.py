@@ -5,6 +5,7 @@ from .strategy import (
     AgentCandidate,
     DimensionScores,
 )
+from .default_strategy import DefaultCoordinatorStrategy
 
 __all__ = [
     "CoordinatorStrategy",
@@ -12,4 +13,5 @@ __all__ = [
     "Decision",
     "AgentCandidate",
     "DimensionScores",
+    "DefaultCoordinatorStrategy",
 ]
