@@ -8,13 +8,13 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from .default_strategy import DefaultCoordinatorStrategy
-from .strategy import CoordinatorStrategy, AgentCandidate, ScoringResult, DimensionScores
+from .strategy import AgentCandidate, CoordinatorStrategy, DimensionScores, ScoringResult
 
 
 class StrategyServer:
     """REST server that serves coordinator strategies to the Rust runtime."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 4270):
+    def __init__(self, host: str = "127.0.0.1", port: int = 4270) -> None:
         self.host = host
         self.port = port
         self._registry = None
@@ -148,7 +148,7 @@ def _dict_to_candidate(d: dict) -> AgentCandidate:
     )
 
 
-def _scores_to_dict(s) -> dict:
+def _scores_to_dict(s: DimensionScores) -> dict:
     return {
         "capability_fit": s.capability_fit,
         "cost_fit": s.cost_fit,

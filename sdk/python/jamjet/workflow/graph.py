@@ -51,13 +51,13 @@ class WorkflowGraph:
         self._already_expanded = False
         return self
 
-    def add_coordinator(self, name: str, **kwargs) -> "WorkflowGraph":
+    def add_coordinator(self, name: str, **kwargs: Any) -> WorkflowGraph:
         from .nodes import CoordinatorNode
 
         node = CoordinatorNode(**kwargs)
         return self.add_node(name, node)
 
-    def add_agent_tool(self, name: str, **kwargs) -> "WorkflowGraph":
+    def add_agent_tool(self, name: str, **kwargs: Any) -> WorkflowGraph:
         from .nodes import AgentToolNode
 
         node = AgentToolNode(**kwargs)

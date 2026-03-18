@@ -14,7 +14,7 @@ from .strategy import (
 class DefaultCoordinatorStrategy(CoordinatorStrategy):
     """Built-in coordinator strategy: structured scoring with optional LLM tiebreaker."""
 
-    def __init__(self, registry=None):
+    def __init__(self, registry: Any = None) -> None:
         self._registry = registry
 
     async def discover(

@@ -6,12 +6,19 @@ fn coordinator_discovery_round_trip() {
         node_id: "route_to_analyst".into(),
         query_skills: vec!["data-analysis".into(), "statistics".into()],
         query_trust_domain: Some("internal".into()),
-        candidates: vec![serde_json::json!({"uri": "jamjet://org/agent-a", "skills": ["data-analysis"]})],
-        filtered_out: vec![serde_json::json!({"uri": "jamjet://org/agent-c", "reason": "trust mismatch"})],
+        candidates: vec![
+            serde_json::json!({"uri": "jamjet://org/agent-a", "skills": ["data-analysis"]}),
+        ],
+        filtered_out: vec![
+            serde_json::json!({"uri": "jamjet://org/agent-c", "reason": "trust mismatch"}),
+        ],
     };
     let json = serde_json::to_string(&event).unwrap();
     let deserialized: EventKind = serde_json::from_str(&json).unwrap();
-    assert!(matches!(deserialized, EventKind::CoordinatorDiscovery { .. }));
+    assert!(matches!(
+        deserialized,
+        EventKind::CoordinatorDiscovery { .. }
+    ));
     assert_eq!(event.node_id(), Some("route_to_analyst"));
 }
 
@@ -45,7 +52,10 @@ fn coordinator_decision_structured_round_trip() {
     };
     let json = serde_json::to_string(&event).unwrap();
     let deserialized: EventKind = serde_json::from_str(&json).unwrap();
-    assert!(matches!(deserialized, EventKind::CoordinatorDecision { .. }));
+    assert!(matches!(
+        deserialized,
+        EventKind::CoordinatorDecision { .. }
+    ));
 }
 
 #[test]
@@ -63,7 +73,9 @@ fn coordinator_decision_no_candidates() {
     let json = serde_json::to_string(&event).unwrap();
     let deserialized: EventKind = serde_json::from_str(&json).unwrap();
     match deserialized {
-        EventKind::CoordinatorDecision { selected, method, .. } => {
+        EventKind::CoordinatorDecision {
+            selected, method, ..
+        } => {
             assert!(selected.is_none());
             assert_eq!(method, "no_candidates");
         }

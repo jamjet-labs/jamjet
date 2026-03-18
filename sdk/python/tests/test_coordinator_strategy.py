@@ -1,4 +1,5 @@
 import pytest
+
 from jamjet.coordinator import (
     AgentCandidate,
     DimensionScores,
