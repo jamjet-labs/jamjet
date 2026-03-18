@@ -49,73 +49,82 @@ class StrategyServer:
 
     async def _handle_discover(self, request: Request) -> JSONResponse:
         data = await request.json()
-        strategy = self._get_strategy(data)
-        candidates, filtered = await strategy.discover(
-            task=data["task"],
-            required_skills=data.get("required_skills", []),
-            preferred_skills=data.get("preferred_skills", []),
-            trust_domain=data.get("trust_domain"),
-            context=data.get("context", {}),
-        )
-        return JSONResponse(
-            {
-                "candidates": [_candidate_to_dict(c) for c in candidates],
-                "filtered_out": filtered,
-            }
-        )
+        try:
+            strategy = self._get_strategy(data)
+            candidates, filtered = await strategy.discover(
+                task=data["task"],
+                required_skills=data.get("required_skills", []),
+                preferred_skills=data.get("preferred_skills", []),
+                trust_domain=data.get("trust_domain"),
+                context=data.get("context", {}),
+            )
+            return JSONResponse(
+                {
+                    "candidates": [_candidate_to_dict(c) for c in candidates],
+                    "filtered_out": filtered,
+                }
+            )
+        except (ValueError, KeyError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
 
     async def _handle_score(self, request: Request) -> JSONResponse:
         data = await request.json()
-        strategy = self._get_strategy(data)
-        candidates = [_dict_to_candidate(c) for c in data.get("candidates", [])]
-        rankings, spread = await strategy.score(
-            task=data["task"],
-            candidates=candidates,
-            weights=data.get("weights", {}),
-            context=data.get("context", {}),
-        )
-        return JSONResponse(
-            {
-                "rankings": [
-                    {"uri": r.agent_uri, "scores": _scores_to_dict(r.scores), "composite": r.composite}
-                    for r in rankings
-                ],
-                "spread": spread,
-            }
-        )
+        try:
+            strategy = self._get_strategy(data)
+            candidates = [_dict_to_candidate(c) for c in data.get("candidates", [])]
+            rankings, spread = await strategy.score(
+                task=data["task"],
+                candidates=candidates,
+                weights=data.get("weights", {}),
+                context=data.get("context", {}),
+            )
+            return JSONResponse(
+                {
+                    "rankings": [
+                        {"uri": r.agent_uri, "scores": _scores_to_dict(r.scores), "composite": r.composite}
+                        for r in rankings
+                    ],
+                    "spread": spread,
+                }
+            )
+        except (ValueError, KeyError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
 
     async def _handle_decide(self, request: Request) -> JSONResponse:
         data = await request.json()
-        strategy = self._get_strategy(data)
-        top = []
-        for c in data.get("top_candidates", []):
-            scores_data = c.get("scores", {})
-            scores = DimensionScores(
-                capability_fit=scores_data.get("capability_fit", 0.5),
-                cost_fit=scores_data.get("cost_fit", 0.5),
-                latency_fit=scores_data.get("latency_fit", 0.5),
-                trust_compatibility=scores_data.get("trust_compatibility", 0.5),
-                historical_performance=scores_data.get("historical_performance", 0.5),
+        try:
+            strategy = self._get_strategy(data)
+            top = []
+            for c in data.get("top_candidates", []):
+                scores_data = c.get("scores", {})
+                scores = DimensionScores(
+                    capability_fit=scores_data.get("capability_fit", 0.5),
+                    cost_fit=scores_data.get("cost_fit", 0.5),
+                    latency_fit=scores_data.get("latency_fit", 0.5),
+                    trust_compatibility=scores_data.get("trust_compatibility", 0.5),
+                    historical_performance=scores_data.get("historical_performance", 0.5),
+                )
+                top.append(ScoringResult(agent_uri=c["uri"], scores=scores, composite=c.get("composite", 0)))
+            decision = await strategy.decide(
+                task=data["task"],
+                top_candidates=top,
+                threshold=data.get("threshold", 0.1),
+                tiebreaker_model=data.get("tiebreaker_model", ""),
+                context=data.get("context", {}),
             )
-            top.append(ScoringResult(agent_uri=c["uri"], scores=scores, composite=c.get("composite", 0)))
-        decision = await strategy.decide(
-            task=data["task"],
-            top_candidates=top,
-            threshold=data.get("threshold", 0.1),
-            tiebreaker_model=data.get("tiebreaker_model", ""),
-            context=data.get("context", {}),
-        )
-        return JSONResponse(
-            {
-                "selected_uri": decision.selected_uri,
-                "method": decision.method,
-                "reasoning": decision.reasoning,
-                "confidence": decision.confidence,
-                "rejected": decision.rejected,
-                "tiebreaker_tokens": decision.tiebreaker_tokens,
-                "tiebreaker_cost": decision.tiebreaker_cost,
-            }
-        )
+            return JSONResponse(
+                {
+                    "selected_uri": decision.selected_uri,
+                    "method": decision.method,
+                    "reasoning": decision.reasoning,
+                    "confidence": decision.confidence,
+                    "rejected": decision.rejected,
+                    "tiebreaker_tokens": decision.tiebreaker_tokens,
+                    "tiebreaker_cost": decision.tiebreaker_cost,
+                }
+            )
+        except (ValueError, KeyError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
 
     async def _handle_health(self, request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "strategies": list(self._strategies.keys())})

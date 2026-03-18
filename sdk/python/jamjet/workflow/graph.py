@@ -81,6 +81,12 @@ class WorkflowGraph:
         for agent_node_id, agent_node in auto_nodes:
             coord_id = f"_coordinator_{agent_node_id}"
 
+            if coord_id in self._nodes:
+                raise ValueError(
+                    f"Auto-expansion would overwrite existing node '{coord_id}'. "
+                    "Reserve the '_coordinator_' prefix for generated nodes."
+                )
+
             coord_node = CoordinatorNode(
                 task=f"Route to agent for: {agent_node_id}",
                 output_key=f"_selected_agent_{agent_node_id}",
