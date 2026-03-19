@@ -1,3 +1,4 @@
+import { Fragment } from 'react'
 import { useInspectorStore } from '@/store/inspector'
 import { useEvents } from '@/hooks/useExecution'
 import type { Event, NodeStartedEvent, NodeCompletedEvent, NodeFailedEvent, Provenance } from '@/api/types'
@@ -92,12 +93,12 @@ function ProvenanceSection({ provenance }: { provenance: Provenance }) {
       <div className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Provenance</div>
       <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
         {entries.map(([key, val]) => (
-          <>
-            <span key={`k-${key}`} className="text-zinc-500 capitalize">{key.replace(/_/g, ' ')}</span>
-            <span key={`v-${key}`} className="font-mono text-zinc-300 break-all">
+          <Fragment key={key}>
+            <span className="text-zinc-500 capitalize">{key.replace(/_/g, ' ')}</span>
+            <span className="font-mono text-zinc-300 break-all">
               {typeof val === 'number' ? val.toFixed(4) : String(val)}
             </span>
-          </>
+          </Fragment>
         ))}
       </div>
     </div>

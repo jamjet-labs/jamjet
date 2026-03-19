@@ -116,15 +116,21 @@ export function ReplayControls() {
     setLoading(true)
     setResult(null)
 
+    // Capture the node we're replaying for, so we can discard stale responses.
+    const replayNodeId = selectedNodeId
+
     try {
-      const res = await fetch(`/api/executions/${selectedExecutionId}/replay`, {
+      const res = await fetch(`/api/executions/${encodeURIComponent(selectedExecutionId)}/replay`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          from_node: selectedNodeId,
+          from_node: replayNodeId,
           ...(parsedInput !== undefined ? { input: parsedInput } : {}),
         }),
       })
+
+      // Discard if the user selected a different node while we were waiting.
+      if (useInspectorStore.getState().selectedNodeId !== replayNodeId) return
 
       if (res.status === 404 || res.status === 501) {
         setResult({ output: null, unavailable: true })
@@ -140,6 +146,9 @@ export function ReplayControls() {
       const data = await res.json()
       setResult({ output: data })
     } catch (err) {
+      // Discard if stale.
+      if (useInspectorStore.getState().selectedNodeId !== replayNodeId) return
+
       // Network error — treat as unavailable if we can't reach the server.
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.toLowerCase().includes('fetch') || msg.toLowerCase().includes('network')) {

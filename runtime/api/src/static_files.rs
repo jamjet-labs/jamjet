@@ -23,12 +23,21 @@ pub async fn serve_spa(uri: Uri) -> Response {
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, mime.as_ref().to_string()),
-                    (header::CACHE_CONTROL, "public, max-age=31536000, immutable".to_string()),
+                    (
+                        header::CACHE_CONTROL,
+                        "public, max-age=31536000, immutable".to_string(),
+                    ),
                 ],
                 asset.data.to_vec(),
             )
                 .into_response();
         }
+    }
+
+    // If the path looks like a file request (has an extension), return 404
+    // instead of falling back to index.html (which would cause confusing 200 OK).
+    if !path.is_empty() && path.contains('.') {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
     }
 
     // Fallback to index.html for SPA client-side routing
@@ -42,7 +51,10 @@ pub async fn serve_spa(uri: Uri) -> Response {
             asset.data.to_vec(),
         )
             .into_response(),
-        None => (StatusCode::NOT_FOUND, "Web companion not built. Run: cd web && npm run build")
+        None => (
+            StatusCode::NOT_FOUND,
+            "Web companion not built. Run: cd web && npm run build",
+        )
             .into_response(),
     }
 }

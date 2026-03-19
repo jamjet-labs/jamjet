@@ -178,7 +178,13 @@ export function AgentToolDetail({ nodeId, events }: AgentToolDetailProps) {
     ].includes(e.kind.type) || nodeEvents.some((ne) => ne.id === e.id)
   )
 
-  const relevantEvents = nodeEvents.length > 0 ? nodeEvents : allToolEvents
+  // Merge: start with nodeEvents (scoped by node_id), then add any tool events
+  // not already included (they may be keyed by `tool` rather than node_id).
+  const seen = new Set(nodeEvents.map((e) => e.id))
+  const relevantEvents = [
+    ...nodeEvents,
+    ...allToolEvents.filter((e) => !seen.has(e.id)),
+  ]
 
   const mode = detectMode(relevantEvents)
   const protocol = detectProtocol(relevantEvents)

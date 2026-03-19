@@ -24,7 +24,7 @@ const STATUS_LABEL: Record<Execution['status'], string> = {
 
 export function ExecutionList() {
   const { data, isLoading } = useExecutions()
-  const executions: Execution[] = (data as any)?.executions ?? []
+  const executions: Execution[] = data?.executions ?? []
   const { selectedExecutionId, setExecution } = useInspectorStore()
 
   return (

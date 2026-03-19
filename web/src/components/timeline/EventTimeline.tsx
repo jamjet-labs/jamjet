@@ -197,8 +197,17 @@ function EventRow({
     >
       {/* Summary row */}
       <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
         className="flex items-center gap-3 px-3 py-1.5 cursor-pointer hover:bg-zinc-900/60 transition-colors select-none"
         onClick={() => setExpanded((v) => !v)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            setExpanded((v) => !v)
+          }
+        }}
       >
         {/* Sequence */}
         <span className="font-mono text-[11px] text-zinc-600 w-8 shrink-0 text-right">

@@ -27,27 +27,6 @@ const NODE_HEIGHT = 72
 // React Flow requires the custom node map to be typed as NodeTypes
 const nodeTypes: NodeTypes = { custom: NodeRenderer }
 
-// ─── Mock IR (used when the API execution has no workflow_ir field) ────────────
-
-const MOCK_IR: WorkflowIr = {
-  workflow_id: 'mock',
-  start_node: 'start',
-  nodes: [
-    { id: 'start', kind: 'start' },
-    { id: 'model_1', kind: 'model' },
-    { id: 'tool_1', kind: 'tool' },
-    { id: 'coordinator_1', kind: 'coordinator' },
-    { id: 'end', kind: 'end' },
-  ],
-  edges: [
-    { from: 'start', to: 'model_1' },
-    { from: 'model_1', to: 'tool_1' },
-    { from: 'model_1', to: 'coordinator_1' },
-    { from: 'tool_1', to: 'end' },
-    { from: 'coordinator_1', to: 'end' },
-  ],
-}
-
 // ─── Dagre layout ─────────────────────────────────────────────────────────────
 
 type FlowNode = Node<NodeData>
@@ -162,7 +141,7 @@ export function WorkflowGraph() {
     if (!selectedExecutionId) return null
     // Server may extend the Execution payload with workflow_ir
     const ext = execution as (typeof execution & { workflow_ir?: WorkflowIr }) | undefined
-    return ext?.workflow_ir ?? MOCK_IR
+    return ext?.workflow_ir ?? null
   }, [selectedExecutionId, execution])
 
   // Build React Flow nodes/edges
@@ -188,6 +167,15 @@ export function WorkflowGraph() {
     return (
       <div className="flex items-center justify-center h-full text-zinc-500 text-sm select-none">
         Select an execution to view the workflow graph
+      </div>
+    )
+  }
+
+  // ── No workflow IR available ────────────────────────────────────────────
+  if (!ir) {
+    return (
+      <div className="flex items-center justify-center h-full text-zinc-500 text-sm select-none">
+        Workflow graph not available for this execution
       </div>
     )
   }
