@@ -6,6 +6,7 @@ pub mod oauth;
 pub mod routes;
 pub mod secrets;
 pub mod state;
+pub mod static_files;
 
 pub use auth::{require_auth, require_write_role, AuthState, Role};
 pub use config::ApiConfig;

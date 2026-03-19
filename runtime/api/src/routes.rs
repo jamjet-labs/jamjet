@@ -96,6 +96,7 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         .merge(protected)
         .with_state(state)
         .merge(mcp_bridge)
+        .fallback(crate::static_files::serve_spa)
 }
 
 // ── Dev-mode middleware ──────────────────────────────────────────────────────

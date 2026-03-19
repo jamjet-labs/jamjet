@@ -33,3 +33,5 @@ config = { workspace = true }
 dotenvy = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
