@@ -26,6 +26,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: runtime -> target
+      - name: Create web/dist placeholder for rust-embed
+        run: mkdir -p ../web/dist && echo '<!DOCTYPE html><html><body></body></html>' > ../web/dist/index.html
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -43,6 +45,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: runtime -> target
+      - name: Create web/dist placeholder for rust-embed
+        run: mkdir -p ../web/dist && echo '<!DOCTYPE html><html><body></body></html>' > ../web/dist/index.html
       - name: Test
         run: cargo test --workspace
 
@@ -163,6 +167,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: runtime -> target
+      - name: Create web/dist placeholder for rust-embed
+        run: mkdir -p ../web/dist && echo '<!DOCTYPE html><html><body></body></html>' > ../web/dist/index.html
       - run: cargo build --release --workspace
 
   # ── Wheel build check ───────────────────────────────────────────────

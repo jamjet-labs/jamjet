@@ -184,6 +184,8 @@ function EventRow({
   onNodeClick: (nodeId: string) => void
 }) {
   const [expanded, setExpanded] = useState(false)
+  const payloadId = `event-payload-${event.id}`
+  const toggleExpanded = () => setExpanded((v) => !v)
   const type = event.kind.type
   const nodeId = extractNodeId(event.kind)
   const isCoordinator = isCoordinatorEvent(type)
@@ -200,12 +202,14 @@ function EventRow({
         role="button"
         tabIndex={0}
         aria-expanded={expanded}
+        aria-controls={payloadId}
         className="flex items-center gap-3 px-3 py-1.5 cursor-pointer hover:bg-zinc-900/60 transition-colors select-none"
-        onClick={() => setExpanded((v) => !v)}
+        onClick={toggleExpanded}
         onKeyDown={(e) => {
+          if (e.target !== e.currentTarget) return
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault()
-            setExpanded((v) => !v)
+            toggleExpanded()
           }
         }}
       >
@@ -262,7 +266,7 @@ function EventRow({
 
       {/* Expanded JSON payload */}
       {expanded && (
-        <div className="px-3 pb-2 pt-1">
+        <div id={payloadId} className="px-3 pb-2 pt-1">
           <pre className="text-[11px] font-mono bg-zinc-950 border border-zinc-800 p-2 rounded overflow-auto max-h-48 text-zinc-300">
             {JSON.stringify(event.kind, null, 2)}
           </pre>
@@ -280,7 +284,7 @@ export function EventTimeline() {
   const setEventTypeFilter = useInspectorStore((s) => s.setEventTypeFilter)
   const setNode = useInspectorStore((s) => s.setNode)
 
-  const { data: events = [], isLoading } = useEvents(selectedExecutionId)
+  const { data: events = [], isLoading, isError, refetch } = useEvents(selectedExecutionId)
 
   const filtered =
     eventTypeFilter.length === 0
@@ -319,7 +323,19 @@ export function EventTimeline() {
           </div>
         )}
 
-        {selectedExecutionId && !isLoading && filtered.length === 0 && (
+        {selectedExecutionId && isError && (
+          <div className="flex flex-col items-center justify-center h-full gap-2">
+            <p className="text-red-400 text-xs">Failed to load events</p>
+            <button
+              className="text-xs px-2 py-1 rounded border border-zinc-700 hover:border-zinc-500 text-zinc-400"
+              onClick={() => void refetch()}
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {selectedExecutionId && !isLoading && !isError && filtered.length === 0 && (
           <div className="flex items-center justify-center h-full">
             <p className="text-zinc-600 text-xs">
               {eventTypeFilter.length > 0 ? 'No events match the current filter' : 'No events'}

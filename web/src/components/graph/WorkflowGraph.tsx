@@ -60,8 +60,9 @@ type NodeStatus = 'pending' | 'scheduled' | 'running' | 'completed' | 'failed' |
 // Helper: the EventKind union includes UnknownEvent with `[key:string]:unknown`,
 // which prevents TypeScript from narrowing `node_id` to string after a type check.
 // We extract node_id explicitly and assert it.
-function nodeIdOf(kind: { type: string; [key: string]: unknown }): string {
-  return kind['node_id'] as string
+function nodeIdOf(kind: { type: string; [key: string]: unknown }): string | null {
+  const id = kind['node_id']
+  return typeof id === 'string' && id.length > 0 ? id : null
 }
 
 function computeNodeStatuses(events: Event[]): Record<string, NodeStatus> {
@@ -70,17 +71,21 @@ function computeNodeStatuses(events: Event[]): Record<string, NodeStatus> {
   for (const event of events) {
     const kind = event.kind as { type: string; [key: string]: unknown }
     if (kind.type === 'node_completed') {
-      statuses[nodeIdOf(kind)] = 'completed'
+      const id = nodeIdOf(kind)
+      if (id) statuses[id] = 'completed'
     } else if (kind.type === 'node_failed') {
-      statuses[nodeIdOf(kind)] = 'failed'
+      const id = nodeIdOf(kind)
+      if (id) statuses[id] = 'failed'
     } else if (kind.type === 'node_started') {
       const id = nodeIdOf(kind)
+      if (!id) continue
       const current = statuses[id]
       if (current !== 'completed' && current !== 'failed') {
         statuses[id] = 'running'
       }
     } else if (kind.type === 'node_scheduled') {
       const id = nodeIdOf(kind)
+      if (!id) continue
       if (!statuses[id]) {
         statuses[id] = 'scheduled'
       }
@@ -127,7 +132,7 @@ function irToFlow(
 export function WorkflowGraph() {
   const { selectedExecutionId, selectedNodeId, setNode } = useInspectorStore()
 
-  const { data: execution } = useExecution(selectedExecutionId)
+  const { data: execution, isLoading: isExecutionLoading } = useExecution(selectedExecutionId)
   const { data: events } = useEvents(selectedExecutionId)
 
   // Compute statuses from events
@@ -167,6 +172,15 @@ export function WorkflowGraph() {
     return (
       <div className="flex items-center justify-center h-full text-zinc-500 text-sm select-none">
         Select an execution to view the workflow graph
+      </div>
+    )
+  }
+
+  // ── Loading ──────────────────────────────────────────────────────────────
+  if (isExecutionLoading) {
+    return (
+      <div className="flex items-center justify-center h-full text-zinc-500 text-sm select-none">
+        Loading workflow graph…
       </div>
     )
   }

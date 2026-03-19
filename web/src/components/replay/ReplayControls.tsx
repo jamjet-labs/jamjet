@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useInspectorStore } from '@/store/inspector'
 import { useExecution, useEvents } from '@/hooks/useExecution'
 import { cn } from '@/lib/utils'
-import type { NodeStartedEvent, NodeCompletedEvent } from '@/api/types'
+import type { NodeStartedEvent, NodeCompletedEvent, NodeFailedEvent } from '@/api/types'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -35,7 +35,7 @@ function isNodeCompleted(
   return events.some(
     (ev) =>
       (ev.kind.type === 'node_completed' || ev.kind.type === 'node_failed') &&
-      (ev.kind as NodeCompletedEvent).node_id === nodeId,
+      (ev.kind as NodeCompletedEvent | NodeFailedEvent).node_id === nodeId,
   )
 }
 
