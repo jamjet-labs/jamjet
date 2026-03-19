@@ -13,7 +13,7 @@ jamjet-state = { path = "../state" }
 jamjet-policy = { path = "../policy" }
 jamjet-agents = { path = "../agents" }
 jamjet-mcp = { path = "../protocols/mcp" }
-jamjet-a2a = { path = "../protocols/a2a" }
+jamjet-a2a-proto = { path = "../protocols/a2a" }
 jamjet-telemetry = { path = "../telemetry" }
 jamjet-scheduler = { path = "../scheduler" }
 tokio = { workspace = true }

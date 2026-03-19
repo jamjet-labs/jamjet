@@ -1,4 +1,4 @@
-use jamjet_a2a::A2aAdapter;
+use jamjet_a2a_proto::A2aAdapter;
 use jamjet_agents::AgentRegistry;
 use jamjet_audit::{AuditBackend, AuditEnricher};
 use jamjet_mcp::McpAdapter;

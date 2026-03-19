@@ -18,7 +18,7 @@ jamjet-audit = { path = "../audit" }
 jamjet-scheduler = { path = "../scheduler" }
 jamjet-protocols = { path = "../protocols" }
 jamjet-mcp = { path = "../protocols/mcp" }
-jamjet-a2a = { path = "../protocols/a2a" }
+jamjet-a2a-proto = { path = "../protocols/a2a" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }

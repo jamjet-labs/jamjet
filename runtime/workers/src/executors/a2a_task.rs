@@ -11,9 +11,15 @@
 
 use crate::executor::{ExecutionResult, NodeExecutor};
 use async_trait::async_trait;
-use jamjet_a2a::{A2aClient, A2aMessage, A2aPart, A2aTaskState, SendTaskRequest};
+use jamjet_a2a_proto::{
+    A2aClient, A2aTaskState, A2aArtifact, PartContent, SendMessageRequest,
+    SendMessageResponse, Role,
+};
+use jamjet_a2a_proto::A2aMessage as Message;
+use jamjet_a2a_proto::A2aPart as Part;
 use jamjet_state::backend::WorkItem;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
@@ -90,33 +96,53 @@ impl NodeExecutor for A2aTaskExecutor {
         );
         let _a2a_guard = a2a_span.enter();
 
-        // Submit the task.
-        let message = A2aMessage {
-            role: "user".into(),
-            parts: vec![A2aPart::Data { data: input }],
-            metadata: Some(json!({ "skill": skill })),
+        // Build the message using the published crate's types.
+        let mut metadata_map = HashMap::new();
+        metadata_map.insert("skill".to_string(), json!(skill));
+
+        let message = Message {
+            message_id: Uuid::new_v4().to_string(),
+            context_id: None,
+            task_id: Some(task_id.clone()),
+            role: Role::User,
+            parts: vec![Part {
+                content: PartContent::Data(input),
+                metadata: None,
+                filename: None,
+                media_type: None,
+            }],
+            metadata: Some(metadata_map),
+            extensions: vec![],
+            reference_task_ids: vec![],
         };
 
-        let request = SendTaskRequest {
-            id: task_id.clone(),
-            session_id: None,
+        let request = SendMessageRequest {
+            tenant: None,
             message,
-            history_length: None,
+            configuration: None,
             metadata: None,
         };
 
         let submitted = self
             .client
-            .send_task(agent_uri, request)
+            .send_message(agent_uri, request)
             .await
             .map_err(|e| format!("A2A task submission failed: {e}"))?;
 
-        debug!(task_id = %submitted.id, state = ?submitted.status.state, "A2A task submitted");
+        // Extract the task ID from the response (may differ from our generated one).
+        let response_task_id = match &submitted {
+            SendMessageResponse::Task(t) => t.id.clone(),
+            SendMessageResponse::Message(m) => {
+                m.task_id.clone().unwrap_or(task_id.clone())
+            }
+        };
+
+        debug!(task_id = %response_task_id, "A2A task submitted");
 
         // Poll until completion.
         let final_task = self
             .client
-            .wait_for_completion(agent_uri, &task_id, self.poll_interval)
+            .wait_for_completion(agent_uri, &response_task_id, self.poll_interval, None)
             .await
             .map_err(|e| format!("A2A task polling failed: {e}"))?;
 
@@ -141,10 +167,11 @@ impl NodeExecutor for A2aTaskExecutor {
                 let error = final_task
                     .status
                     .message
+                    .as_ref()
                     .and_then(|m| {
-                        m.parts.into_iter().find_map(|p| {
-                            if let A2aPart::Text { text } = p {
-                                Some(text)
+                        m.parts.iter().find_map(|p| {
+                            if let PartContent::Text(ref text) = p.content {
+                                Some(text.clone())
                             } else {
                                 None
                             }
@@ -156,7 +183,7 @@ impl NodeExecutor for A2aTaskExecutor {
             A2aTaskState::InputRequired => {
                 // The workflow should be paused for user input — return error
                 // so the retry mechanism handles re-submission.
-                warn!(task_id = %task_id, "A2A task requires input — not yet handled");
+                warn!(task_id = %response_task_id, "A2A task requires input — not yet handled");
                 Err("A2A task requires input — multi-turn not yet supported in this node".into())
             }
             other => Err(format!("A2A task ended in unexpected state: {other:?}")),
@@ -164,18 +191,18 @@ impl NodeExecutor for A2aTaskExecutor {
     }
 }
 
-fn extract_output(artifacts: &[jamjet_a2a::A2aArtifact]) -> Value {
+fn extract_output(artifacts: &[A2aArtifact]) -> Value {
     artifacts
         .first()
         .map(|a| {
             a.parts
                 .iter()
-                .map(|p| match p {
-                    A2aPart::Data { data } => data.clone(),
-                    A2aPart::Text { text } => json!({ "text": text }),
-                    A2aPart::File { file } => {
-                        json!({ "uri": file.uri, "mime_type": file.mime_type })
-                    }
+                .map(|p| match &p.content {
+                    PartContent::Data(data) => data.clone(),
+                    PartContent::Text(text) => json!({ "text": text }),
+                    PartContent::Url(url) => json!({ "uri": url }),
+                    PartContent::Raw(_) => json!({ "type": "raw_binary" }),
+                    _ => json!({}),
                 })
                 .next()
                 .unwrap_or(json!({}))

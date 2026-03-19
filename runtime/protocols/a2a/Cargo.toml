@@ -1,22 +1,24 @@
 [package]
-name = "jamjet-a2a"
-description = "JamJet A2A client and server — Agent-to-Agent protocol support"
+name = "jamjet-a2a-proto"
+description = "JamJet A2A protocol bridge — re-exports from jamjet-a2a crate + ProtocolAdapter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Published A2A crate (crates.io)
+jamjet-a2a = { version = "0.1", features = ["client", "server", "federation"] }
+jamjet-a2a-types = "0.1"
+
+# Internal workspace crates
 jamjet-protocols = { path = ".." }
 jamjet-agents = { path = "../../agents" }
+
+# Only deps needed by adapter.rs
 tokio = { workspace = true }
-tokio-stream = { version = "0.1", features = ["sync"] }
-axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 async-trait = { workspace = true }
-reqwest = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-chrono = { workspace = true }
 uuid = { workspace = true }
