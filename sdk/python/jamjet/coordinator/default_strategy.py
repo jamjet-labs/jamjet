@@ -82,8 +82,9 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
     ) -> tuple[list[ScoringResult], float]:
         results = []
         for c in candidates:
+            reasoning_bonus = self._score_reasoning_modes(c, context)
             scores = DimensionScores(
-                capability_fit=self._score_capability(task, c),
+                capability_fit=min(self._score_capability(task, c) + reasoning_bonus, 1.0),
                 cost_fit=self._score_cost(c),
                 latency_fit=self._score_latency(c),
                 trust_compatibility=1.0 if c.trust_domain else 0.5,
@@ -231,3 +232,12 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
     def _score_latency(self, candidate: AgentCandidate) -> float:
         mapping = {"low": 1.0, "medium": 0.7, "high": 0.4}
         return mapping.get(candidate.latency_class or "", 0.5)
+
+    def _score_reasoning_modes(
+        self, candidate: AgentCandidate, context: dict[str, Any]
+    ) -> float:
+        preferred = context.get("preferred_reasoning_modes", [])
+        if not preferred or not candidate.reasoning_modes:
+            return 0.0
+        overlap = set(preferred) & set(candidate.reasoning_modes)
+        return 0.2 * len(overlap) / len(preferred)

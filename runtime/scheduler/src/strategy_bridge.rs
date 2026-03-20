@@ -32,6 +32,8 @@ pub struct AgentCandidate {
     pub latency_class: Option<String>,
     pub cost_class: Option<String>,
     pub trust_domain: Option<String>,
+    #[serde(default)]
+    pub reasoning_modes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

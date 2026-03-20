@@ -15,6 +15,7 @@ class AgentCandidate:
     latency_class: str | None = None
     cost_class: str | None = None
     trust_domain: str | None = None
+    reasoning_modes: list[str] = field(default_factory=list)
 
 
 @dataclass

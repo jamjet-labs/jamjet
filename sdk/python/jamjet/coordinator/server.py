@@ -143,6 +143,7 @@ def _candidate_to_dict(c: AgentCandidate) -> dict:
         "latency_class": c.latency_class,
         "cost_class": c.cost_class,
         "trust_domain": c.trust_domain,
+        "reasoning_modes": c.reasoning_modes,
     }
 
 
@@ -154,6 +155,7 @@ def _dict_to_candidate(d: dict) -> AgentCandidate:
         latency_class=d.get("latency_class"),
         cost_class=d.get("cost_class"),
         trust_domain=d.get("trust_domain"),
+        reasoning_modes=d.get("reasoning_modes", []),
     )
 
 

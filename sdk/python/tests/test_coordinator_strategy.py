@@ -103,6 +103,48 @@ class TestDefaultStrategy:
         assert rankings[0].scores.cost_fit == pytest.approx(0.5)
 
     @pytest.mark.asyncio
+    async def test_reasoning_modes_boost_capability(self, strategy):
+        candidates = [
+            AgentCandidate(
+                uri="agent-a",
+                agent_card={},
+                skills=["analysis"],
+                reasoning_modes=["react", "plan-and-execute"],
+            ),
+            AgentCandidate(
+                uri="agent-b",
+                agent_card={},
+                skills=["analysis"],
+                reasoning_modes=[],
+            ),
+        ]
+        context = {"preferred_reasoning_modes": ["react"]}
+        rankings, _ = await strategy.score("task", candidates, {}, context)
+        # Agent A should score higher due to reasoning mode match
+        assert rankings[0].agent_uri == "agent-a"
+        assert rankings[0].composite > rankings[1].composite
+
+    @pytest.mark.asyncio
+    async def test_reasoning_modes_neutral_without_preference(self, strategy):
+        candidates = [
+            AgentCandidate(
+                uri="agent-a",
+                agent_card={},
+                skills=["analysis"],
+                reasoning_modes=["react"],
+            ),
+            AgentCandidate(
+                uri="agent-b",
+                agent_card={},
+                skills=["analysis"],
+                reasoning_modes=[],
+            ),
+        ]
+        # No preferred_reasoning_modes in context — should be neutral
+        rankings, _ = await strategy.score("task", candidates, {}, {})
+        assert rankings[0].composite == pytest.approx(rankings[1].composite)
+
+    @pytest.mark.asyncio
     async def test_decide_selects_top_candidate(self, strategy):
         top = [
             ScoringResult(agent_uri="agent-a", scores=DimensionScores(), composite=0.9),
