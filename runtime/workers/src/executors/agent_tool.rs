@@ -33,8 +33,8 @@ impl AgentToolExecutor {
     /// Resolve the base agent URI to an `https://` URL, returning an error for unsupported schemes.
     /// In test builds, `http://` is also accepted (for wiremock).
     fn resolve_url(agent_uri: &str, endpoint: &str) -> Result<String, String> {
-        let is_http = agent_uri.starts_with("https://")
-            || (cfg!(test) && agent_uri.starts_with("http://"));
+        let is_http =
+            agent_uri.starts_with("https://") || (cfg!(test) && agent_uri.starts_with("http://"));
         if is_http {
             Ok(format!("{}/{}", agent_uri.trim_end_matches('/'), endpoint))
         } else {
@@ -561,7 +561,9 @@ impl NodeExecutor for AgentToolExecutor {
             .unwrap_or(60);
 
         // Resolve protocol
-        let protocol = if agent_uri.starts_with("https://") || (cfg!(test) && agent_uri.starts_with("http://")) {
+        let protocol = if agent_uri.starts_with("https://")
+            || (cfg!(test) && agent_uri.starts_with("http://"))
+        {
             "a2a"
         } else if agent_uri.starts_with("jamjet://") {
             "local"
@@ -637,14 +639,16 @@ impl NodeExecutor for AgentToolExecutor {
                         idle_timeout_secs,
                         "AgentTool streaming: idle timeout, terminating"
                     );
-                    let _ = tx.send(json!({
-                        "type": "agent_tool_terminated",
-                        "node_id": &item.node_id,
-                        "reason": "idle_timeout",
-                        "accumulated_cost_usd": accumulated_cost,
-                        "latency_ms": start.elapsed().as_millis() as u64,
-                        "timestamp_ms": now_ms()
-                    })).await;
+                    let _ = tx
+                        .send(json!({
+                            "type": "agent_tool_terminated",
+                            "node_id": &item.node_id,
+                            "reason": "idle_timeout",
+                            "accumulated_cost_usd": accumulated_cost,
+                            "latency_ms": start.elapsed().as_millis() as u64,
+                            "timestamp_ms": now_ms()
+                        }))
+                        .await;
                     Self::send_a2a_cancel(&client, agent_uri, &task_id).await;
                     terminated_early = true;
                     break;
@@ -660,12 +664,14 @@ impl NodeExecutor for AgentToolExecutor {
                         error = %e,
                         "AgentTool streaming: network error"
                     );
-                    let _ = tx.send(json!({
-                        "type": "agent_tool_error",
-                        "node_id": &item.node_id,
-                        "error": e.to_string(),
-                        "timestamp_ms": now_ms()
-                    })).await;
+                    let _ = tx
+                        .send(json!({
+                            "type": "agent_tool_error",
+                            "node_id": &item.node_id,
+                            "error": e.to_string(),
+                            "timestamp_ms": now_ms()
+                        }))
+                        .await;
                     terminated_early = true;
                     break;
                 }
@@ -737,14 +743,16 @@ impl NodeExecutor for AgentToolExecutor {
                                     budget,
                                     "AgentTool streaming: budget exceeded, terminating"
                                 );
-                                let _ = tx.send(json!({
-                                    "type": "agent_tool_terminated",
-                                    "node_id": &item.node_id,
-                                    "reason": "budget_exceeded",
-                                    "accumulated_cost_usd": accumulated_cost,
-                                    "latency_ms": start.elapsed().as_millis() as u64,
-                                    "timestamp_ms": now_ms()
-                                })).await;
+                                let _ = tx
+                                    .send(json!({
+                                        "type": "agent_tool_terminated",
+                                        "node_id": &item.node_id,
+                                        "reason": "budget_exceeded",
+                                        "accumulated_cost_usd": accumulated_cost,
+                                        "latency_ms": start.elapsed().as_millis() as u64,
+                                        "timestamp_ms": now_ms()
+                                    }))
+                                    .await;
                                 Self::send_a2a_cancel(&client, agent_uri, &task_id).await;
                                 terminated_early = true;
                                 break;
@@ -765,21 +773,23 @@ impl NodeExecutor for AgentToolExecutor {
             if let Ok(remaining) = std::str::from_utf8(&line_buf) {
                 let trimmed = remaining.trim();
                 if !trimmed.is_empty() {
-                    let chunk: Value = serde_json::from_str(trimmed)
-                        .unwrap_or_else(|_| json!({ "raw": trimmed }));
+                    let chunk: Value =
+                        serde_json::from_str(trimmed).unwrap_or_else(|_| json!({ "raw": trimmed }));
 
                     if let Some(cost) = chunk.get("cost_usd").and_then(|v| v.as_f64()) {
                         accumulated_cost += cost;
                     }
 
-                    let _ = tx.send(json!({
-                        "type": "agent_tool_progress",
-                        "node_id": &item.node_id,
-                        "chunk_index": chunk_index,
-                        "chunk": &chunk,
-                        "accumulated_cost_usd": accumulated_cost,
-                        "timestamp_ms": now_ms()
-                    })).await;
+                    let _ = tx
+                        .send(json!({
+                            "type": "agent_tool_progress",
+                            "node_id": &item.node_id,
+                            "chunk_index": chunk_index,
+                            "chunk": &chunk,
+                            "accumulated_cost_usd": accumulated_cost,
+                            "timestamp_ms": now_ms()
+                        }))
+                        .await;
                 }
             }
         }
@@ -787,13 +797,15 @@ impl NodeExecutor for AgentToolExecutor {
         // ── Emit completed (if not terminated early) ────────────────────
         let duration_ms = start.elapsed().as_millis() as u64;
         if !terminated_early {
-            let _ = tx.send(json!({
-                "type": "agent_tool_completed",
-                "node_id": &item.node_id,
-                "total_cost": accumulated_cost,
-                "latency_ms": duration_ms,
-                "timestamp_ms": now_ms()
-            })).await;
+            let _ = tx
+                .send(json!({
+                    "type": "agent_tool_completed",
+                    "node_id": &item.node_id,
+                    "total_cost": accumulated_cost,
+                    "latency_ms": duration_ms,
+                    "timestamp_ms": now_ms()
+                }))
+                .await;
         }
 
         Ok(ExecutionResult {
@@ -806,5 +818,217 @@ impl NodeExecutor for AgentToolExecutor {
             output_tokens: None,
             finish_reason: None,
         })
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::NodeExecutor;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Build a WorkItem that targets the given agent URI with streaming mode.
+    fn make_test_work_item(
+        agent_uri: &str,
+        idle_timeout: Option<u64>,
+        max_cost: Option<f64>,
+    ) -> WorkItem {
+        let mut payload = serde_json::json!({
+            "agent": agent_uri,
+            "mode": "streaming",
+            "input": {"query": "test"},
+            "workflow_id": "wf1",
+            "workflow_version": "1.0.0",
+        });
+        if let Some(t) = idle_timeout {
+            payload["idle_timeout_secs"] = serde_json::json!(t);
+        }
+        if let Some(c) = max_cost {
+            payload["budget"] = serde_json::json!({"max_cost_usd": c});
+        }
+        WorkItem {
+            id: uuid::Uuid::new_v4(),
+            execution_id: jamjet_core::workflow::ExecutionId::new(),
+            node_id: "n1".into(),
+            queue_type: "agent_tool".into(),
+            payload,
+            attempt: 1,
+            max_attempts: 3,
+            created_at: chrono::Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            tenant_id: "default".into(),
+        }
+    }
+
+    /// Join NDJSON lines into a single body terminated by a newline.
+    fn ndjson_body(lines: &[&str]) -> String {
+        lines.join("\n") + "\n"
+    }
+
+    /// Drain all events from the receiver (non-blocking).
+    fn collect_events(
+        rx: &mut tokio::sync::mpsc::Receiver<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        events
+    }
+
+    // ── Test 1: streams NDJSON chunks in order ──────────────────────────
+
+    #[tokio::test]
+    async fn streams_ndjson_chunks_in_order() {
+        let server = MockServer::start().await;
+
+        let body = ndjson_body(&[r#"{"text":"hello"}"#, r#"{"text":"world"}"#]);
+
+        Mock::given(method("POST"))
+            .and(path("/tasks/sendSubscribe"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let item = make_test_work_item(&server.uri(), Some(5), None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+
+        let executor = AgentToolExecutor;
+        let result = executor.execute_streaming(&item, tx).await;
+        assert!(
+            result.is_ok(),
+            "execute_streaming failed: {:?}",
+            result.err()
+        );
+
+        let events = collect_events(&mut rx);
+
+        // Expect: invoked, progress(0), progress(1), completed
+        assert!(
+            events.len() >= 4,
+            "Expected at least 4 events, got {}: {:#?}",
+            events.len(),
+            events
+        );
+
+        assert_eq!(events[0]["type"], "agent_tool_invoked");
+        assert_eq!(events[0]["mode"], "streaming");
+
+        assert_eq!(events[1]["type"], "agent_tool_progress");
+        assert_eq!(events[1]["chunk_index"], 0);
+        assert_eq!(events[1]["chunk"]["text"], "hello");
+
+        assert_eq!(events[2]["type"], "agent_tool_progress");
+        assert_eq!(events[2]["chunk_index"], 1);
+        assert_eq!(events[2]["chunk"]["text"], "world");
+
+        assert_eq!(events[3]["type"], "agent_tool_completed");
+    }
+
+    // ── Test 2: budget exceeded terminates stream ───────────────────────
+
+    #[tokio::test]
+    async fn budget_exceeded_terminates_stream() {
+        let server = MockServer::start().await;
+
+        // 3 chunks each costing 0.3; budget is 0.5 → should terminate after chunk 1
+        let body = ndjson_body(&[
+            r#"{"text":"a","cost_usd":0.3}"#,
+            r#"{"text":"b","cost_usd":0.3}"#,
+            r#"{"text":"c","cost_usd":0.3}"#,
+        ]);
+
+        Mock::given(method("POST"))
+            .and(path("/tasks/sendSubscribe"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        // Also mock /tasks/cancel so the A2A cancel doesn't fail
+        Mock::given(method("POST"))
+            .and(path("/tasks/cancel"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let item = make_test_work_item(&server.uri(), Some(5), Some(0.5));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+
+        let executor = AgentToolExecutor;
+        let result = executor.execute_streaming(&item, tx).await;
+        assert!(result.is_ok());
+
+        let events = collect_events(&mut rx);
+
+        // Find a terminated event with reason "budget_exceeded"
+        let terminated = events.iter().find(|e| e["type"] == "agent_tool_terminated");
+        assert!(
+            terminated.is_some(),
+            "Expected an agent_tool_terminated event, got: {:#?}",
+            events
+        );
+        assert_eq!(terminated.unwrap()["reason"], "budget_exceeded");
+
+        // Should NOT have a completed event
+        let completed = events.iter().any(|e| e["type"] == "agent_tool_completed");
+        assert!(
+            !completed,
+            "Should not have agent_tool_completed when budget exceeded"
+        );
+    }
+
+    // ── Test 3: malformed JSON becomes raw ──────────────────────────────
+
+    #[tokio::test]
+    async fn malformed_json_becomes_raw() {
+        let server = MockServer::start().await;
+
+        let body = ndjson_body(&[
+            r#"{"text":"first"}"#,
+            "not json at all",
+            r#"{"text":"third"}"#,
+        ]);
+
+        Mock::given(method("POST"))
+            .and(path("/tasks/sendSubscribe"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let item = make_test_work_item(&server.uri(), Some(5), None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+
+        let executor = AgentToolExecutor;
+        let result = executor.execute_streaming(&item, tx).await;
+        assert!(result.is_ok());
+
+        let events = collect_events(&mut rx);
+
+        // events[0] = invoked, events[1] = progress(0), events[2] = progress(1), events[3] = progress(2), events[4] = completed
+        let progress_events: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["type"] == "agent_tool_progress")
+            .collect();
+
+        assert_eq!(
+            progress_events.len(),
+            3,
+            "Expected 3 progress events, got {}: {:#?}",
+            progress_events.len(),
+            progress_events
+        );
+
+        // First chunk: valid JSON
+        assert_eq!(progress_events[0]["chunk"]["text"], "first");
+
+        // Second chunk: malformed → wrapped in {"raw": "not json at all"}
+        assert_eq!(progress_events[1]["chunk"]["raw"], "not json at all");
+
+        // Third chunk: valid JSON
+        assert_eq!(progress_events[2]["chunk"]["text"], "third");
     }
 }
