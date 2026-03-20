@@ -1,4 +1,4 @@
-"""Shared LLM client — tries Anthropic, then OpenAI, then raises."""
+"""Shared LLM client — tries Anthropic (async), then OpenAI (async), then raises."""
 
 from __future__ import annotations
 
@@ -14,13 +14,14 @@ class LlmResponse:
 
 async def call_llm(model: str, prompt: str, max_tokens: int = 512) -> LlmResponse:
     """Call an LLM with auto-detected SDK. Tries Anthropic first, then OpenAI."""
+    errors: list[str] = []
 
-    # Anthropic Claude
+    # Anthropic Claude (async)
     try:
-        import anthropic
+        from anthropic import AsyncAnthropic
 
-        client = anthropic.Anthropic()
-        msg = client.messages.create(
+        client = AsyncAnthropic()
+        msg = await client.messages.create(
             model=model,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
@@ -32,14 +33,16 @@ async def call_llm(model: str, prompt: str, max_tokens: int = 512) -> LlmRespons
             output_tokens=getattr(msg.usage, "output_tokens", 0),
         )
     except ImportError:
-        pass
+        errors.append("anthropic SDK not installed")
+    except Exception as e:
+        errors.append(f"anthropic: {e}")
 
-    # OpenAI
+    # OpenAI (async)
     try:
-        from openai import OpenAI
+        from openai import AsyncOpenAI
 
-        client = OpenAI()  # type: ignore[assignment]
-        resp = client.chat.completions.create(
+        client = AsyncOpenAI()  # type: ignore[assignment]
+        resp = await client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
@@ -51,8 +54,8 @@ async def call_llm(model: str, prompt: str, max_tokens: int = 512) -> LlmRespons
             output_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
         )
     except ImportError:
-        pass
+        errors.append("openai SDK not installed")
+    except Exception as e:
+        errors.append(f"openai: {e}")
 
-    raise RuntimeError(
-        "No LLM SDK available. Install 'anthropic' or 'openai'."
-    )
+    raise RuntimeError(f"LLM call failed: {'; '.join(errors)}")

@@ -148,12 +148,16 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
         """Call an LLM to break a tie between closely-scored candidates."""
         tied = candidates[:max_candidates]
 
-        # Build prompt
+        # Build prompt with Agent Card summaries
+        card_summaries = context.get("agent_card_summaries", {})
         candidate_summaries = []
         for i, c in enumerate(tied, 1):
             s = c.scores
+            card_info = card_summaries.get(c.agent_uri, "")
+            card_line = f"   Description: {card_info}\n" if card_info else ""
             candidate_summaries.append(
                 f"{i}. URI: {c.agent_uri}\n"
+                f"{card_line}"
                 f"   Composite: {c.composite:.3f}\n"
                 f"   Scores: capability={s.capability_fit:.2f}, "
                 f"cost={s.cost_fit:.2f}, latency={s.latency_fit:.2f}, "
@@ -182,11 +186,14 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
                 selected_uri = tied[0].agent_uri
                 reasoning = f"LLM returned invalid URI, falling back. Original: {reasoning}"
 
+            selected_candidate = next(
+                (c for c in tied if c.agent_uri == selected_uri), tied[0]
+            )
             return Decision(
                 selected_uri=selected_uri,
                 method="llm_tiebreaker",
                 reasoning=reasoning,
-                confidence=tied[0].composite,
+                confidence=selected_candidate.composite,
                 rejected=[
                     {"uri": c.agent_uri, "reason": "not selected by tiebreaker"}
                     for c in tied
