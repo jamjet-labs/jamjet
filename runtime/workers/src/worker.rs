@@ -189,6 +189,29 @@ impl Worker {
 
                     // Execute.
                     let exec_result = match self.executors.get(&kind_tag) {
+                        Some(executor) if kind_tag == "agent_tool" => {
+                            let (tx, mut rx) =
+                                tokio::sync::mpsc::channel::<serde_json::Value>(64);
+                            let backend = Arc::clone(&self.backend);
+                            let eid = execution_id.clone();
+                            let receiver_handle = tokio::spawn(async move {
+                                while let Some(event) = rx.recv().await {
+                                    if let Err(e) = backend
+                                        .patch_append_array(
+                                            &eid,
+                                            "agent_tool_events",
+                                            event,
+                                        )
+                                        .await
+                                    {
+                                        warn!("patch_append_array failed: {e}");
+                                    }
+                                }
+                            });
+                            let result = executor.execute_streaming(&item, tx).await;
+                            let _ = receiver_handle.await;
+                            result
+                        }
                         Some(executor) => executor.execute(&item).await,
                         None => {
                             info!(node_id = %node_id, kind = %kind_tag, "No executor; using stub");
