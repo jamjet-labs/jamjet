@@ -39,7 +39,7 @@ jobs:
         working-directory: sdk/python
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-dist
           path: sdk/python/dist/
@@ -104,7 +104,7 @@ jobs:
         run: cp runtime/target/${{ matrix.target }}/release/jamjet-server.exe ${{ matrix.artifact }}
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
