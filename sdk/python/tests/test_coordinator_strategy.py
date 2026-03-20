@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 from jamjet.coordinator import (
@@ -6,6 +8,7 @@ from jamjet.coordinator import (
     ScoringResult,
 )
 from jamjet.coordinator.default_strategy import DefaultCoordinatorStrategy
+from jamjet.llm.client import LlmResponse
 
 
 @pytest.fixture
@@ -115,3 +118,45 @@ class TestDefaultStrategy:
         candidates, filtered = await strategy.discover("task", ["skill"], [], None, {})
         assert candidates == []
         assert filtered == []
+
+    @pytest.mark.asyncio
+    async def test_decide_skips_tiebreaker_when_spread_above_threshold(self, strategy):
+        top = [
+            ScoringResult(agent_uri="agent-a", scores=DimensionScores(), composite=0.9),
+            ScoringResult(agent_uri="agent-b", scores=DimensionScores(), composite=0.7),
+        ]
+        decision = await strategy.decide("task", top, 0.1, "some-model", {})
+        assert decision.method == "structured"
+        assert decision.selected_uri == "agent-a"
+
+    @pytest.mark.asyncio
+    @patch("jamjet.coordinator.default_strategy.call_llm", new_callable=AsyncMock)
+    async def test_decide_calls_tiebreaker_when_tied(self, mock_llm, strategy):
+        mock_llm.return_value = LlmResponse(
+            text='{"selected_uri": "agent-b", "reasoning": "better fit"}',
+            input_tokens=50,
+            output_tokens=20,
+        )
+        top = [
+            ScoringResult(agent_uri="agent-a", scores=DimensionScores(), composite=0.80),
+            ScoringResult(agent_uri="agent-b", scores=DimensionScores(), composite=0.78),
+        ]
+        decision = await strategy.decide("task", top, 0.05, "claude-haiku", {})
+        assert decision.method == "llm_tiebreaker"
+        assert decision.selected_uri == "agent-b"
+        assert decision.reasoning == "better fit"
+        assert decision.tiebreaker_tokens == {"input": 50, "output": 20}
+        mock_llm.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("jamjet.coordinator.default_strategy.call_llm", new_callable=AsyncMock)
+    async def test_decide_falls_back_on_tiebreaker_failure(self, mock_llm, strategy):
+        mock_llm.side_effect = RuntimeError("No SDK available")
+        top = [
+            ScoringResult(agent_uri="agent-a", scores=DimensionScores(), composite=0.80),
+            ScoringResult(agent_uri="agent-b", scores=DimensionScores(), composite=0.78),
+        ]
+        decision = await strategy.decide("task", top, 0.05, "claude-haiku", {})
+        assert decision.method == "tiebreaker_failed"
+        assert decision.selected_uri == "agent-a"
+        assert "failed" in decision.reasoning.lower()

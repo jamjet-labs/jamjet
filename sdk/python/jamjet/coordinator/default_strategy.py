@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
+
+from jamjet.llm import call_llm
 
 from .strategy import (
     AgentCandidate,
@@ -9,6 +13,8 @@ from .strategy import (
     DimensionScores,
     ScoringResult,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class DefaultCoordinatorStrategy(CoordinatorStrategy):
@@ -104,13 +110,114 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
         tiebreaker_model: str,
         context: dict[str, Any],
     ) -> Decision:
-        selected = top_candidates[0] if top_candidates else None
-        return Decision(
-            selected_uri=selected.agent_uri if selected else None,
-            method="structured",
-            confidence=selected.composite if selected else 0.0,
-            rejected=[{"uri": c.agent_uri, "reason": "lower score"} for c in top_candidates[1:]],
+        if not top_candidates:
+            return Decision(selected_uri=None, method="no_candidates", confidence=0.0)
+
+        selected = top_candidates[0]
+
+        # Check if scores are close enough to warrant a tiebreaker
+        spread = (
+            (top_candidates[0].composite - top_candidates[1].composite)
+            if len(top_candidates) >= 2
+            else 1.0
         )
+
+        if spread <= threshold and tiebreaker_model and len(top_candidates) >= 2:
+            return await self._llm_tiebreaker(
+                task, top_candidates, tiebreaker_model, context
+            )
+
+        return Decision(
+            selected_uri=selected.agent_uri,
+            method="structured",
+            confidence=selected.composite,
+            rejected=[
+                {"uri": c.agent_uri, "reason": "lower score"}
+                for c in top_candidates[1:]
+            ],
+        )
+
+    async def _llm_tiebreaker(
+        self,
+        task: str,
+        candidates: list[ScoringResult],
+        model: str,
+        context: dict[str, Any],
+        max_candidates: int = 3,
+    ) -> Decision:
+        """Call an LLM to break a tie between closely-scored candidates."""
+        tied = candidates[:max_candidates]
+
+        # Build prompt with Agent Card summaries
+        card_summaries = context.get("agent_card_summaries", {})
+        candidate_summaries = []
+        for i, c in enumerate(tied, 1):
+            s = c.scores
+            card_info = card_summaries.get(c.agent_uri, "")
+            card_line = f"   Description: {card_info}\n" if card_info else ""
+            candidate_summaries.append(
+                f"{i}. URI: {c.agent_uri}\n"
+                f"{card_line}"
+                f"   Composite: {c.composite:.3f}\n"
+                f"   Scores: capability={s.capability_fit:.2f}, "
+                f"cost={s.cost_fit:.2f}, latency={s.latency_fit:.2f}, "
+                f"trust={s.trust_compatibility:.2f}"
+            )
+
+        prompt = (
+            f"You are selecting the best AI agent for a task.\n\n"
+            f"Task: {task}\n\n"
+            f"Candidates (scores are very close):\n"
+            f"{''.join(candidate_summaries)}\n\n"
+            f"Return ONLY valid JSON:\n"
+            f'{{"selected_uri": "<uri of best agent>", '
+            f'"reasoning": "<one sentence why>"}}'
+        )
+
+        try:
+            resp = await call_llm(model=model, prompt=prompt, max_tokens=256)
+            parsed = json.loads(resp.text.strip())
+            selected_uri = parsed.get("selected_uri", "")
+            reasoning = parsed.get("reasoning", "")
+
+            # Validate that selected_uri is actually one of the candidates
+            valid_uris = {c.agent_uri for c in tied}
+            if selected_uri not in valid_uris:
+                selected_uri = tied[0].agent_uri
+                reasoning = f"LLM returned invalid URI, falling back. Original: {reasoning}"
+
+            selected_candidate = next(
+                (c for c in tied if c.agent_uri == selected_uri), tied[0]
+            )
+            return Decision(
+                selected_uri=selected_uri,
+                method="llm_tiebreaker",
+                reasoning=reasoning,
+                confidence=selected_candidate.composite,
+                rejected=[
+                    {"uri": c.agent_uri, "reason": "not selected by tiebreaker"}
+                    for c in tied
+                    if c.agent_uri != selected_uri
+                ],
+                tiebreaker_tokens={
+                    "input": resp.input_tokens,
+                    "output": resp.output_tokens,
+                },
+                tiebreaker_cost=None,
+            )
+        except Exception as e:
+            logger.warning("LLM tiebreaker failed: %s", e)
+            # Fall back to structured selection
+            return Decision(
+                selected_uri=tied[0].agent_uri,
+                method="tiebreaker_failed",
+                reasoning=f"LLM tiebreaker failed: {e}",
+                confidence=tied[0].composite,
+                rejected=[
+                    {"uri": c.agent_uri, "reason": "lower score"}
+                    for c in candidates[1:]
+                ],
+            )
 
     def _score_capability(self, task: str, candidate: AgentCandidate) -> float:
         if not candidate.skills:
