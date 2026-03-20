@@ -25,3 +25,9 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.5"
+tokio = { workspace = true, features = ["test-util"] }
