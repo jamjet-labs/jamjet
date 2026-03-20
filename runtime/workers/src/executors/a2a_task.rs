@@ -11,12 +11,12 @@
 
 use crate::executor::{ExecutionResult, NodeExecutor};
 use async_trait::async_trait;
-use jamjet_a2a_proto::{
-    A2aClient, A2aTaskState, A2aArtifact, PartContent, SendMessageRequest,
-    SendMessageResponse, Role,
-};
 use jamjet_a2a_proto::A2aMessage as Message;
 use jamjet_a2a_proto::A2aPart as Part;
+use jamjet_a2a_proto::{
+    A2aArtifact, A2aClient, A2aTaskState, PartContent, Role, SendMessageRequest,
+    SendMessageResponse,
+};
 use jamjet_state::backend::WorkItem;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -132,8 +132,12 @@ impl NodeExecutor for A2aTaskExecutor {
         // Extract the task ID from the response (may differ from our generated one).
         let response_task_id = match &submitted {
             SendMessageResponse::Task(t) => t.id.clone(),
+            SendMessageResponse::WrappedTask(w) => w.task.id.clone(),
             SendMessageResponse::Message(m) => {
                 m.task_id.clone().unwrap_or(task_id.clone())
+            }
+            SendMessageResponse::WrappedMessage(w) => {
+                w.message.task_id.clone().unwrap_or(task_id.clone())
             }
         };
 
