@@ -7,14 +7,17 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::executor::{ExecutionResult, NodeExecutor};
+use crate::executor::{ExecutionResult, NodeExecutor, StreamEventSender};
 use async_trait::async_trait;
+use bytes::BytesMut;
+use futures::StreamExt;
 use jamjet_state::backend::WorkItem;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use tracing::{debug, instrument};
+use std::time::Duration;
+use tracing::{debug, instrument, warn};
 
 pub struct AgentToolExecutor;
 
@@ -28,8 +31,11 @@ impl AgentToolExecutor {
     }
 
     /// Resolve the base agent URI to an `https://` URL, returning an error for unsupported schemes.
+    /// In test builds, `http://` is also accepted (for wiremock).
     fn resolve_url(agent_uri: &str, endpoint: &str) -> Result<String, String> {
-        if agent_uri.starts_with("https://") {
+        let is_http = agent_uri.starts_with("https://")
+            || (cfg!(test) && agent_uri.starts_with("http://"));
+        if is_http {
             Ok(format!("{}/{}", agent_uri.trim_end_matches('/'), endpoint))
         } else {
             Err(format!(
@@ -109,12 +115,15 @@ impl AgentToolExecutor {
         })
     }
 
-    /// Execute in streaming mode: POST to `/tasks/sendSubscribe`, read NDJSON stream.
+    /// Legacy streaming mode: POST to `/tasks/sendSubscribe`, buffer full body, parse NDJSON.
     ///
     /// Emits `agent_tool_progress` events per chunk, with optional early termination
     /// when `max_cost_usd` budget is exceeded. Final event is `agent_tool_completed`
     /// or `agent_tool_terminated` on budget breach.
-    async fn execute_streaming(
+    ///
+    /// Kept as fallback when invoked through `execute()` (no channel available).
+    /// The incremental path is `execute_streaming` on the trait.
+    async fn stream_ndjson(
         &self,
         item: &WorkItem,
         agent_uri: &str,
@@ -236,6 +245,20 @@ impl AgentToolExecutor {
             output_tokens: None,
             finish_reason: None,
         })
+    }
+
+    /// Best-effort A2A cancel. Fire-and-forget with 5s timeout.
+    async fn send_a2a_cancel(client: &Client, agent_uri: &str, task_id: &Option<String>) {
+        if let Some(ref id) = task_id {
+            if let Ok(cancel_url) = Self::resolve_url(agent_uri, "tasks/cancel") {
+                let _ = client
+                    .post(&cancel_url)
+                    .json(&serde_json::json!({ "id": id }))
+                    .timeout(Duration::from_secs(5))
+                    .send()
+                    .await;
+            }
+        }
     }
 
     /// Execute in conversational mode: multi-turn loop sending to `/tasks/send`.
@@ -461,7 +484,7 @@ impl NodeExecutor for AgentToolExecutor {
                 .await
             }
             "streaming" => {
-                self.execute_streaming(
+                self.stream_ndjson(
                     item,
                     agent_uri,
                     protocol,
@@ -489,5 +512,299 @@ impl NodeExecutor for AgentToolExecutor {
             }
             other => Err(format!("Unknown agent_tool mode: '{other}'")),
         }
+    }
+
+    /// Incremental NDJSON streaming with per-chunk idle timeout, budget guard,
+    /// and A2A cancel on early termination. Events are sent via `tx` in real time.
+    #[instrument(skip(self, item, tx), fields(node_id = %item.node_id))]
+    async fn execute_streaming(
+        &self,
+        item: &WorkItem,
+        tx: StreamEventSender,
+    ) -> Result<ExecutionResult, String> {
+        let start = std::time::Instant::now();
+        let p = &item.payload;
+
+        // ── Extract params ──────────────────────────────────────────────
+        let agent_uri = p
+            .get("agent")
+            .and_then(|a| {
+                a.get("explicit")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| a.as_str())
+            })
+            .ok_or("AgentTool: missing 'agent' URI in payload")?;
+
+        let mode = if let Some(mode_val) = p.get("mode") {
+            if let Some(s) = mode_val.as_str() {
+                s.to_string()
+            } else if mode_val.get("streaming").is_some() {
+                "streaming".to_string()
+            } else {
+                "sync".to_string()
+            }
+        } else {
+            "sync".to_string()
+        };
+
+        let input = p.get("input").cloned().unwrap_or(json!({}));
+
+        let max_cost_usd = p
+            .get("budget")
+            .and_then(|b| b.get("max_cost_usd"))
+            .and_then(|v| v.as_f64())
+            .or_else(|| p.get("max_cost_usd").and_then(|v| v.as_f64()));
+
+        let idle_timeout_secs = p
+            .get("idle_timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60);
+
+        // Resolve protocol
+        let protocol = if agent_uri.starts_with("https://") || (cfg!(test) && agent_uri.starts_with("http://")) {
+            "a2a"
+        } else if agent_uri.starts_with("jamjet://") {
+            "local"
+        } else {
+            "mcp"
+        };
+
+        // Compute input hash
+        let mut hasher = DefaultHasher::new();
+        input.to_string().hash(&mut hasher);
+        let input_hash = format!("{:016x}", hasher.finish());
+
+        // ── Build client WITHOUT overall timeout (streaming uses per-chunk idle) ──
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("HTTP client: {e}"))?;
+
+        // ── Emit invoked event ──────────────────────────────────────────
+        let now_ms = || -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        };
+
+        let invoked_event = json!({
+            "type": "agent_tool_invoked",
+            "node_id": &item.node_id,
+            "agent_uri": agent_uri,
+            "mode": &mode,
+            "protocol": protocol,
+            "input_hash": &input_hash,
+            "timestamp_ms": now_ms()
+        });
+        if tx.send(invoked_event).await.is_err() {
+            return Err("Streaming receiver dropped before invocation event".into());
+        }
+
+        // ── POST to /tasks/sendSubscribe ────────────────────────────────
+        let task_url = Self::resolve_url(agent_uri, "tasks/sendSubscribe")?;
+        let resp = client
+            .post(&task_url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "method": "tasks/sendSubscribe",
+                "params": { "message": { "parts": [{ "text": input.to_string() }] } }
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("AgentTool streaming invocation failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Agent returned error {status}: {body}"));
+        }
+
+        // ── Incremental NDJSON read loop ────────────────────────────────
+        let mut stream = resp.bytes_stream();
+        let mut line_buf = BytesMut::new();
+        let mut chunk_index: u64 = 0;
+        let mut accumulated_cost: f64 = 0.0;
+        let mut task_id: Option<String> = None;
+        let mut terminated_early = false;
+        let idle_dur = Duration::from_secs(idle_timeout_secs);
+
+        loop {
+            match tokio::time::timeout(idle_dur, stream.next()).await {
+                // Timeout — no data within idle window
+                Err(_elapsed) => {
+                    warn!(
+                        node_id = %item.node_id,
+                        idle_timeout_secs,
+                        "AgentTool streaming: idle timeout, terminating"
+                    );
+                    let _ = tx.send(json!({
+                        "type": "agent_tool_terminated",
+                        "node_id": &item.node_id,
+                        "reason": "idle_timeout",
+                        "accumulated_cost_usd": accumulated_cost,
+                        "latency_ms": start.elapsed().as_millis() as u64,
+                        "timestamp_ms": now_ms()
+                    })).await;
+                    Self::send_a2a_cancel(&client, agent_uri, &task_id).await;
+                    terminated_early = true;
+                    break;
+                }
+                // Stream ended normally
+                Ok(None) => {
+                    break;
+                }
+                // Network error
+                Ok(Some(Err(e))) => {
+                    warn!(
+                        node_id = %item.node_id,
+                        error = %e,
+                        "AgentTool streaming: network error"
+                    );
+                    let _ = tx.send(json!({
+                        "type": "agent_tool_error",
+                        "node_id": &item.node_id,
+                        "error": e.to_string(),
+                        "timestamp_ms": now_ms()
+                    })).await;
+                    terminated_early = true;
+                    break;
+                }
+                // Got a chunk of bytes
+                Ok(Some(Ok(bytes))) => {
+                    line_buf.extend_from_slice(&bytes);
+
+                    // Process all complete lines in the buffer
+                    while let Some(newline_pos) = line_buf.iter().position(|&b| b == b'\n') {
+                        let line_bytes = line_buf.split_to(newline_pos + 1);
+                        let line_str = match std::str::from_utf8(&line_bytes) {
+                            Ok(s) => s.trim().to_string(),
+                            Err(e) => {
+                                warn!(
+                                    node_id = %item.node_id,
+                                    error = %e,
+                                    "AgentTool streaming: non-UTF8 chunk, skipping"
+                                );
+                                continue;
+                            }
+                        };
+                        if line_str.is_empty() {
+                            continue;
+                        }
+
+                        let chunk: Value = serde_json::from_str(&line_str)
+                            .unwrap_or_else(|_| json!({ "raw": &line_str }));
+
+                        // Extract task_id from first chunk
+                        if task_id.is_none() {
+                            if let Some(id) = chunk.get("id").and_then(|v| v.as_str()) {
+                                task_id = Some(id.to_string());
+                            }
+                        }
+
+                        // Accumulate cost
+                        if let Some(cost) = chunk.get("cost_usd").and_then(|v| v.as_f64()) {
+                            accumulated_cost += cost;
+                        }
+
+                        // Emit progress event
+                        let progress = json!({
+                            "type": "agent_tool_progress",
+                            "node_id": &item.node_id,
+                            "chunk_index": chunk_index,
+                            "chunk": &chunk,
+                            "accumulated_cost_usd": accumulated_cost,
+                            "timestamp_ms": now_ms()
+                        });
+                        chunk_index += 1;
+
+                        if tx.send(progress).await.is_err() {
+                            // Receiver dropped — treat as cancellation
+                            debug!(
+                                node_id = %item.node_id,
+                                "AgentTool streaming: receiver dropped, cancelling"
+                            );
+                            Self::send_a2a_cancel(&client, agent_uri, &task_id).await;
+                            terminated_early = true;
+                            break;
+                        }
+
+                        // Budget guard
+                        if let Some(budget) = max_cost_usd {
+                            if accumulated_cost > budget {
+                                debug!(
+                                    node_id = %item.node_id,
+                                    accumulated_cost,
+                                    budget,
+                                    "AgentTool streaming: budget exceeded, terminating"
+                                );
+                                let _ = tx.send(json!({
+                                    "type": "agent_tool_terminated",
+                                    "node_id": &item.node_id,
+                                    "reason": "budget_exceeded",
+                                    "accumulated_cost_usd": accumulated_cost,
+                                    "latency_ms": start.elapsed().as_millis() as u64,
+                                    "timestamp_ms": now_ms()
+                                })).await;
+                                Self::send_a2a_cancel(&client, agent_uri, &task_id).await;
+                                terminated_early = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // If inner loop broke due to termination, break outer loop too
+                    if terminated_early {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ── Drain remaining bytes in line_buf ───────────────────────────
+        if !terminated_early && !line_buf.is_empty() {
+            if let Ok(remaining) = std::str::from_utf8(&line_buf) {
+                let trimmed = remaining.trim();
+                if !trimmed.is_empty() {
+                    let chunk: Value = serde_json::from_str(trimmed)
+                        .unwrap_or_else(|_| json!({ "raw": trimmed }));
+
+                    if let Some(cost) = chunk.get("cost_usd").and_then(|v| v.as_f64()) {
+                        accumulated_cost += cost;
+                    }
+
+                    let _ = tx.send(json!({
+                        "type": "agent_tool_progress",
+                        "node_id": &item.node_id,
+                        "chunk_index": chunk_index,
+                        "chunk": &chunk,
+                        "accumulated_cost_usd": accumulated_cost,
+                        "timestamp_ms": now_ms()
+                    })).await;
+                }
+            }
+        }
+
+        // ── Emit completed (if not terminated early) ────────────────────
+        let duration_ms = start.elapsed().as_millis() as u64;
+        if !terminated_early {
+            let _ = tx.send(json!({
+                "type": "agent_tool_completed",
+                "node_id": &item.node_id,
+                "total_cost": accumulated_cost,
+                "latency_ms": duration_ms,
+                "timestamp_ms": now_ms()
+            })).await;
+        }
+
+        Ok(ExecutionResult {
+            output: json!({}),
+            state_patch: json!({}),
+            duration_ms,
+            gen_ai_system: None,
+            gen_ai_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            finish_reason: None,
+        })
     }
 }
