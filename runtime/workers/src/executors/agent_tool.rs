@@ -547,6 +547,11 @@ impl NodeExecutor for AgentToolExecutor {
             "sync".to_string()
         };
 
+        // Short-circuit non-streaming modes back to execute()
+        if mode != "streaming" {
+            return self.execute(item).await;
+        }
+
         let input = p.get("input").cloned().unwrap_or(json!({}));
 
         let max_cost_usd = p
@@ -558,7 +563,7 @@ impl NodeExecutor for AgentToolExecutor {
         let idle_timeout_secs = p
             .get("idle_timeout_secs")
             .and_then(|v| v.as_u64())
-            .unwrap_or(60);
+            .unwrap_or(30);
 
         // Resolve protocol
         let protocol = if agent_uri.starts_with("https://")
@@ -627,7 +632,13 @@ impl NodeExecutor for AgentToolExecutor {
         let mut chunk_index: u64 = 0;
         let mut accumulated_cost: f64 = 0.0;
         let mut task_id: Option<String> = None;
+        let mut last_chunk: Value = json!(null);
+        let output_key = p
+            .get("output_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("result");
         let mut terminated_early = false;
+        let mut terminal_error: Option<String> = None;
         let idle_dur = Duration::from_secs(idle_timeout_secs);
 
         loop {
@@ -651,6 +662,9 @@ impl NodeExecutor for AgentToolExecutor {
                         .await;
                     Self::send_a2a_cancel(&client, agent_uri, &task_id).await;
                     terminated_early = true;
+                    terminal_error = Some(format!(
+                        "AgentTool idle timeout after {idle_timeout_secs}s"
+                    ));
                     break;
                 }
                 // Stream ended normally
@@ -673,6 +687,7 @@ impl NodeExecutor for AgentToolExecutor {
                         }))
                         .await;
                     terminated_early = true;
+                    terminal_error = Some(format!("AgentTool stream error: {e}"));
                     break;
                 }
                 // Got a chunk of bytes
@@ -699,6 +714,7 @@ impl NodeExecutor for AgentToolExecutor {
 
                         let chunk: Value = serde_json::from_str(&line_str)
                             .unwrap_or_else(|_| json!({ "raw": &line_str }));
+                        last_chunk = chunk.clone();
 
                         // Extract task_id from first chunk
                         if task_id.is_none() {
@@ -731,6 +747,8 @@ impl NodeExecutor for AgentToolExecutor {
                             );
                             Self::send_a2a_cancel(&client, agent_uri, &task_id).await;
                             terminated_early = true;
+                            terminal_error =
+                                Some("AgentTool stream receiver dropped".into());
                             break;
                         }
 
@@ -775,6 +793,7 @@ impl NodeExecutor for AgentToolExecutor {
                 if !trimmed.is_empty() {
                     let chunk: Value =
                         serde_json::from_str(trimmed).unwrap_or_else(|_| json!({ "raw": trimmed }));
+                    last_chunk = chunk.clone();
 
                     if let Some(cost) = chunk.get("cost_usd").and_then(|v| v.as_f64()) {
                         accumulated_cost += cost;
@@ -794,6 +813,11 @@ impl NodeExecutor for AgentToolExecutor {
             }
         }
 
+        // ── Return error for hard failures ───────────────────────────────
+        if let Some(error) = terminal_error {
+            return Err(error);
+        }
+
         // ── Emit completed (if not terminated early) ────────────────────
         let duration_ms = start.elapsed().as_millis() as u64;
         if !terminated_early {
@@ -801,6 +825,7 @@ impl NodeExecutor for AgentToolExecutor {
                 .send(json!({
                     "type": "agent_tool_completed",
                     "node_id": &item.node_id,
+                    "output": &last_chunk,
                     "total_cost": accumulated_cost,
                     "latency_ms": duration_ms,
                     "timestamp_ms": now_ms()
@@ -809,7 +834,7 @@ impl NodeExecutor for AgentToolExecutor {
         }
 
         Ok(ExecutionResult {
-            output: json!({}),
+            output: json!({ output_key: last_chunk }),
             state_patch: json!({}),
             duration_ms,
             gen_ai_system: None,
