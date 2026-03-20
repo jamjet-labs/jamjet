@@ -79,6 +79,15 @@ pub trait StateBackend: Send + Sync {
         current_state: &serde_json::Value,
     ) -> BackendResult<()>;
 
+    /// Append a value to an array field in the execution's current_state.
+    /// Creates the array if it doesn't exist.
+    async fn patch_append_array(
+        &self,
+        execution_id: &ExecutionId,
+        key: &str,
+        value: serde_json::Value,
+    ) -> BackendResult<()>;
+
     /// List executions, optionally filtered by status.
     async fn list_executions(
         &self,

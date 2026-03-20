@@ -4,6 +4,9 @@
 use jamjet_state::backend::WorkItem;
 use serde_json::Value;
 
+/// Channel sender for real-time streaming events from executors.
+pub type StreamEventSender = tokio::sync::mpsc::Sender<Value>;
+
 pub struct ExecutionResult {
     pub output: Value,
     pub state_patch: Value,
@@ -24,4 +27,13 @@ pub struct ExecutionResult {
 #[async_trait::async_trait]
 pub trait NodeExecutor: Send + Sync {
     async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, String>;
+
+    /// Execute with streaming event emission. Default delegates to `execute()`.
+    async fn execute_streaming(
+        &self,
+        item: &WorkItem,
+        _tx: StreamEventSender,
+    ) -> Result<ExecutionResult, String> {
+        self.execute(item).await
+    }
 }
