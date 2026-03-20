@@ -371,6 +371,31 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
+    async fn patch_append_array(
+        &self,
+        execution_id: &ExecutionId,
+        key: &str,
+        value: serde_json::Value,
+    ) -> BackendResult<()> {
+        let exec = self
+            .get_execution(execution_id)
+            .await?
+            .ok_or_else(|| StateBackendError::NotFound(format!("execution {execution_id}")))?;
+        let mut state = exec.current_state.clone();
+        let arr = state
+            .as_object_mut()
+            .ok_or_else(|| StateBackendError::Database("state is not a JSON object".into()))?
+            .entry(key)
+            .or_insert_with(|| serde_json::json!([]));
+        arr.as_array_mut()
+            .ok_or_else(|| {
+                StateBackendError::Database(format!("{key} is not an array"))
+            })?
+            .push(value);
+        self.update_execution_current_state(execution_id, &state)
+            .await
+    }
+
     #[instrument(skip(self))]
     async fn list_executions(
         &self,
@@ -1080,5 +1105,28 @@ mod tests {
         // No more items
         let none = db.claim_work_item("worker-1", &["default"]).await.unwrap();
         assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_patch_append_array() {
+        let db = open_test_db().await;
+        let exec = sample_execution();
+        let id = exec.execution_id.clone();
+        db.create_execution(exec).await.unwrap();
+
+        db.patch_append_array(&id, "agent_tool_events", json!({"type": "progress", "chunk": 0}))
+            .await
+            .unwrap();
+        db.patch_append_array(&id, "agent_tool_events", json!({"type": "progress", "chunk": 1}))
+            .await
+            .unwrap();
+
+        let fetched = db.get_execution(&id).await.unwrap().unwrap();
+        let events = fetched.current_state["agent_tool_events"]
+            .as_array()
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["chunk"], 0);
+        assert_eq!(events[1]["chunk"], 1);
     }
 }
