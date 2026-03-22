@@ -1,0 +1,90 @@
+name: Publish Crates
+
+# Publishes all workspace crates to crates.io in dependency order.
+# Triggered by version tags (same as release-wheels.yml) or manual dispatch.
+#
+# Prerequisites:
+#   - CARGO_REGISTRY_TOKEN secret with a crates.io API token
+#   - Token must have publish scope for all jamjet-* crates
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runtime
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: cargo-registry-${{ hashFiles('runtime/Cargo.lock') }}
+
+      - name: Publish Tier 0 (no internal deps)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p jamjet-core --no-verify
+          cargo publish -p jamjet-telemetry --no-verify
+          cargo publish -p jamjet-protocols --no-verify
+
+      - name: Wait for Tier 0 index propagation
+        run: sleep 30
+
+      - name: Publish Tier 1
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p jamjet-ir --no-verify
+          cargo publish -p jamjet-models --no-verify
+
+      - name: Wait for Tier 1 index propagation
+        run: sleep 30
+
+      - name: Publish Tier 2
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p jamjet-state --no-verify
+          cargo publish -p jamjet-agents --no-verify
+          cargo publish -p jamjet-timers --no-verify
+          cargo publish -p jamjet-mcp --no-verify
+
+      - name: Wait for Tier 2 index propagation
+        run: sleep 30
+
+      - name: Publish Tier 3
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p jamjet-scheduler --no-verify
+          cargo publish -p jamjet-policy --no-verify
+          cargo publish -p jamjet-audit --no-verify
+
+      - name: Wait for Tier 3 index propagation
+        run: sleep 30
+
+      - name: Publish Tier 4
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p jamjet-a2a-proto --no-verify
+          cargo publish -p jamjet-worker --no-verify
+          cargo publish -p jamjet-api --no-verify
