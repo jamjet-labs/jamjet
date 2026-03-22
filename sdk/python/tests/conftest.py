@@ -137,3 +137,20 @@ def mock_openai_client(monkeypatch: pytest.MonkeyPatch) -> None:
         sys.modules["openai"] = mock_module
     else:
         monkeypatch.setattr("openai.AsyncOpenAI", _SmartMockClient)
+
+
+# ── Test-harness fixtures ────────────────────────────────────────────────────
+
+from jamjet.testing import FakeEventBus, FakeJamjetClient  # noqa: E402
+
+
+@pytest.fixture
+def fake_event_bus() -> FakeEventBus:
+    """Provide a fresh :class:`FakeEventBus` for each test."""
+    return FakeEventBus()
+
+
+@pytest.fixture
+def fake_client(fake_event_bus: FakeEventBus) -> FakeJamjetClient:
+    """Provide a :class:`FakeJamjetClient` wired to the ``fake_event_bus``."""
+    return FakeJamjetClient(event_bus=fake_event_bus)
