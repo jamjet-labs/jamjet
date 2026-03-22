@@ -62,11 +62,13 @@ class Agent:
         max_iterations: int = 10,
         max_cost_usd: float = 1.0,
         timeout_seconds: int = 300,
+        on_limit_exceeded: Callable[[str | None, str, Any, Any], str | None] | None = None,
     ) -> None:
         self.name = name
         self.model = model
         self.instructions = instructions
         self.strategy = strategy
+        self._on_limit_exceeded = on_limit_exceeded
         self.limits = StrategyLimits(
             max_iterations=max_iterations,
             max_cost_usd=max_cost_usd,
@@ -96,6 +98,17 @@ class Agent:
             goal=self.instructions,
             agent_id=self.name,
         )
+
+    # ── Limit handler ─────────────────────────────────────────────────────
+
+    def _invoke_limit_handler(
+        self, partial_output: str | None, limit_type: str, limit_value: Any, actual_value: Any
+    ) -> str | None:
+        """Invoke the on_limit_exceeded callback if set; otherwise pass through."""
+        if self._on_limit_exceeded is None:
+            return partial_output
+        result = self._on_limit_exceeded(partial_output, limit_type, limit_value, actual_value)
+        return result if result is not None else partial_output
 
     # ── Internal helpers ───────────────────────────────────────────────────
 
@@ -226,7 +239,10 @@ class Agent:
                 tool_result_msgs = await self._execute_tool_calls(msg, tool_map, tool_calls_log)
                 step_messages.extend(tool_result_msgs)
             else:
-                step_results.append("")
+                partial = self._invoke_limit_handler(
+                    "", "max_iterations", self.limits.max_iterations, self.limits.max_iterations
+                ) or ""
+                step_results.append(partial)
 
         # Step 3 — synthesize
         synthesis_messages: list[dict[str, Any]] = [
@@ -271,13 +287,21 @@ class Agent:
             tool_result_msgs = await self._execute_tool_calls(msg, tool_map, tool_calls_log)
             messages.extend(tool_result_msgs)
 
-        # Max iterations — return last assistant content
+        # Max iterations exhausted — invoke limit handler on partial output
+        last_content: str | None = None
         for m in reversed(messages):
             content = m.content if hasattr(m, "content") else m.get("content")
             role = m.role if hasattr(m, "role") else m.get("role")
             if role == "assistant" and content:
-                return content
-        return ""
+                last_content = content
+                break
+        if last_content is not None:
+            return self._invoke_limit_handler(
+                last_content, "max_iterations", self.limits.max_iterations, self.limits.max_iterations
+            ) or ""
+        return self._invoke_limit_handler(
+            "", "max_iterations", self.limits.max_iterations, self.limits.max_iterations
+        ) or ""
 
     async def _run_critic(
         self,
@@ -339,6 +363,11 @@ class Agent:
                 break
             # Append critic feedback for next round
             draft = f"{draft}\n\n[Critic feedback]: {verdict}"
+        else:
+            # Loop exhausted without PASS — invoke limit handler
+            draft = self._invoke_limit_handler(
+                draft, "max_iterations", self.limits.max_iterations, self.limits.max_iterations
+            ) or ""
 
         return draft
 
@@ -394,6 +423,11 @@ class Agent:
             reflection = (reflect_msg.content or "").strip()
             if "SATISFIED" in reflection.upper():
                 break
+        else:
+            # Loop exhausted without SATISFIED — invoke limit handler
+            output = self._invoke_limit_handler(
+                output, "max_iterations", self.limits.max_iterations, self.limits.max_iterations
+            ) or ""
 
         return output
 
@@ -463,7 +497,9 @@ class Agent:
             prop_msgs.append(msg)
             prop_msgs.extend(await self._execute_tool_calls(msg, tool_map, tool_calls_log))
         else:
-            proposal = ""
+            proposal = self._invoke_limit_handler(
+                "", "max_iterations", self.limits.max_iterations, self.limits.max_iterations
+            ) or ""
 
         # Phase 2: Counter-argument rounds
         counter = proposal
@@ -496,6 +532,10 @@ class Agent:
                     break
                 revise_msgs.append(msg)
                 revise_msgs.extend(await self._execute_tool_calls(msg, tool_map, tool_calls_log))
+            else:
+                counter = self._invoke_limit_handler(
+                    counter, "max_iterations", self.limits.max_iterations, self.limits.max_iterations
+                ) or ""
 
         # Phase 3: Judge renders final verdict
         judge_msgs: list[dict[str, Any]] = [
