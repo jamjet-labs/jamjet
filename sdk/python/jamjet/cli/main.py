@@ -25,7 +25,7 @@ import asyncio
 import json
 import sys
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from jamjet.eval.grid import ComparisonResult
@@ -119,6 +119,34 @@ console = Console()
 
 def _client(runtime: str = "http://localhost:7700") -> JamjetClient:
     return JamjetClient(base_url=runtime)
+
+
+# ── Protocol trace helpers ───────────────────────────────────────────────────
+
+
+def _filter_events(
+    events: list[dict[str, Any]],
+    *,
+    protocol: str | None = None,
+    node: str | None = None,
+) -> list[dict[str, Any]]:
+    """Filter events by protocol type and/or node ID."""
+    result = events
+    if protocol:
+        result = [e for e in result if e.get("protocol") == protocol]
+    if node:
+        result = [e for e in result if e.get("node_id") == node]
+    return result
+
+
+def _build_protocol_tree(events: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Group protocol events by node_id for tree display."""
+    tree: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        node_id = event.get("node_id")
+        if node_id:
+            tree.setdefault(node_id, []).append(event)
+    return tree
 
 
 # ── init ─────────────────────────────────────────────────────────────────────
@@ -657,6 +685,22 @@ def inspect(
                     f"output={total_out} tokens" + (f", cost=${total_cost:.6f}" if total_cost else "")
                 )
 
+            # ── Protocol Activity section ─────────────────────────────────
+            protocol_events = [e for e in evts if e.get("kind", "").startswith("AgentTool")]
+            if protocol_events:
+                console.print("\n[bold]Protocol Activity[/bold]")
+                tree = _build_protocol_tree(protocol_events)
+                for nid, node_events in tree.items():
+                    invoked = next((e for e in node_events if e["kind"] == "AgentToolInvoked"), {})
+                    completed = next((e for e in node_events if e["kind"] == "AgentToolCompleted"), {})
+                    proto = invoked.get("protocol", "unknown")
+                    latency = completed.get("latency_ms", "?")
+                    turns = sum(1 for e in node_events if e["kind"] == "AgentToolTurn")
+                    console.print(
+                        f"  {nid} [{proto}] — {len(node_events)} events, "
+                        f"{turns} turns, {latency}ms"
+                    )
+
             # ── Strategy section ─────────────────────────────────────────
             _print_strategy_section(console, data, evts)
 
@@ -803,6 +847,8 @@ def _print_strategy_section(console: Console, execution: dict, events: list) -> 
 def events(
     execution_id: str = typer.Argument(...),
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+    protocol: str | None = typer.Option(None, "--protocol", "-p", help="Filter by protocol: mcp, a2a"),
+    node: str | None = typer.Option(None, "--node", "-n", help="Filter by node ID"),
 ) -> None:
     """Show the event timeline for a workflow execution."""
 
@@ -810,6 +856,7 @@ def events(
         async with _client(runtime) as c:
             data = await c.get_events(execution_id)
             evts = data.get("events", [])
+            evts = _filter_events(evts, protocol=protocol, node=node)
             table = Table(title=f"Events: {execution_id}")
             table.add_column("Seq", style="dim")
             table.add_column("Type")
