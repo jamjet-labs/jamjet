@@ -115,3 +115,26 @@ example-rag:
 # Run the full CI suite locally (what CI runs)
 ci: lint test build
     @echo "All CI checks passed."
+
+# ── Publishing ─────────────────────────────────────────────────────────
+# Publish all workspace crates to crates.io in dependency order (requires CARGO_REGISTRY_TOKEN)
+publish-crates:
+    cd runtime && cargo publish -p jamjet-core --no-verify
+    cd runtime && cargo publish -p jamjet-telemetry --no-verify
+    cd runtime && cargo publish -p jamjet-protocols --no-verify
+    sleep 30
+    cd runtime && cargo publish -p jamjet-ir --no-verify
+    cd runtime && cargo publish -p jamjet-models --no-verify
+    sleep 30
+    cd runtime && cargo publish -p jamjet-state --no-verify
+    cd runtime && cargo publish -p jamjet-agents --no-verify
+    cd runtime && cargo publish -p jamjet-timers --no-verify
+    cd runtime && cargo publish -p jamjet-mcp --no-verify
+    sleep 30
+    cd runtime && cargo publish -p jamjet-scheduler --no-verify
+    cd runtime && cargo publish -p jamjet-policy --no-verify
+    cd runtime && cargo publish -p jamjet-audit --no-verify
+    sleep 30
+    cd runtime && cargo publish -p jamjet-a2a-proto --no-verify
+    cd runtime && cargo publish -p jamjet-worker --no-verify
+    cd runtime && cargo publish -p jamjet-api --no-verify
