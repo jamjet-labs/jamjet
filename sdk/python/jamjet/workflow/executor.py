@@ -35,6 +35,16 @@ class ExecutionEvent:
     status: str  # "completed" | "skipped" | "error"
     error: str | None = None
 
+    def to_dict(self, *, include_timing: bool = False) -> dict[str, Any]:
+        """Serialize for snapshot comparison. Excludes timing by default for determinism."""
+        d: dict[str, Any] = {"step": self.step, "status": self.status}
+        if self.error:
+            d["error"] = self.error
+        if include_timing:
+            d["timestamp_ns"] = self.timestamp_ns
+            d["duration_us"] = self.duration_us
+        return d
+
 
 @dataclass
 class ExecutionResult:
@@ -44,6 +54,14 @@ class ExecutionResult:
     events: list[ExecutionEvent] = field(default_factory=list)
     steps_executed: int = 0
     total_duration_us: float = 0.0
+
+    def to_snapshot(self, *, include_timing: bool = False) -> dict[str, Any]:
+        """Serialize execution trace for snapshot comparison."""
+        return {
+            "state": self.state.model_dump() if hasattr(self.state, "model_dump") else str(self.state),
+            "steps_executed": self.steps_executed,
+            "events": [e.to_dict(include_timing=include_timing) for e in self.events],
+        }
 
     def __str__(self) -> str:
         return str(self.state)

@@ -51,6 +51,7 @@ Changelog = "https://github.com/jamjet-labs/jamjet/blob/main/CHANGELOG.md"
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "syrupy>=4.0",
     "ruff>=0.4",
     "mypy>=1.10",
     "types-PyYAML>=6.0",

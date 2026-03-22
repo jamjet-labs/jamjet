@@ -1,0 +1,38 @@
+# serializer version: 1
+# name: test_linear_workflow_events_structure
+  list([
+    dict({
+      'status': 'completed',
+      'step': 'add_step',
+    }),
+    dict({
+      'status': 'completed',
+      'step': 'double_step',
+    }),
+  ])
+# ---
+# name: test_linear_workflow_state
+  dict({
+    'doubled': 14,
+    'value': 7,
+  })
+# ---
+# name: test_linear_workflow_trace
+  dict({
+    'events': list([
+      dict({
+        'status': 'completed',
+        'step': 'add_step',
+      }),
+      dict({
+        'status': 'completed',
+        'step': 'double_step',
+      }),
+    ]),
+    'state': dict({
+      'doubled': 14,
+      'value': 7,
+    }),
+    'steps_executed': 2,
+  })
+# ---
