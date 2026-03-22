@@ -10,15 +10,15 @@ name = "jamjet-server"
 path = "src/main.rs"
 
 [dependencies]
-jamjet-core = { path = "../core" }
-jamjet-ir = { path = "../ir" }
-jamjet-state = { path = "../state" }
-jamjet-agents = { path = "../agents" }
-jamjet-audit = { path = "../audit" }
-jamjet-scheduler = { path = "../scheduler" }
-jamjet-protocols = { path = "../protocols" }
-jamjet-mcp = { path = "../protocols/mcp" }
-jamjet-a2a-proto = { path = "../protocols/a2a" }
+jamjet-core = { path = "../core", version = "=0.3.0" }
+jamjet-ir = { path = "../ir", version = "=0.3.0" }
+jamjet-state = { path = "../state", version = "=0.3.0" }
+jamjet-agents = { path = "../agents", version = "=0.3.0" }
+jamjet-audit = { path = "../audit", version = "=0.3.0" }
+jamjet-scheduler = { path = "../scheduler", version = "=0.3.0" }
+jamjet-protocols = { path = "../protocols", version = "=0.3.0" }
+jamjet-mcp = { path = "../protocols/mcp", version = "=0.3.0" }
+jamjet-a2a-proto = { path = "../protocols/a2a", version = "=0.3.0" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }

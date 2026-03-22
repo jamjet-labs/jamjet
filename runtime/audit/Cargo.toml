@@ -6,10 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-jamjet-core = { path = "../core" }
-jamjet-ir = { path = "../ir" }
-jamjet-policy = { path = "../policy" }
-jamjet-state = { path = "../state" }
+jamjet-core = { path = "../core", version = "=0.3.0" }
+jamjet-ir = { path = "../ir", version = "=0.3.0" }
+jamjet-policy = { path = "../policy", version = "=0.3.0" }
+jamjet-state = { path = "../state", version = "=0.3.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
