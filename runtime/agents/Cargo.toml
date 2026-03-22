@@ -4,6 +4,11 @@ description = "JamJet agent registry, lifecycle, and Agent Card management"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 jamjet-core = { path = "../core", version = "=0.3.0" }

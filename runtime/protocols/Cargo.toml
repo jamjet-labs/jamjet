@@ -4,6 +4,11 @@ description = "JamJet protocol adapter trait — extensible inter-agent communic
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }

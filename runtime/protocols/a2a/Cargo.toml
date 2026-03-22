@@ -4,6 +4,11 @@ description = "JamJet A2A protocol bridge — re-exports from jamjet-a2a crate +
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # Published A2A crate (crates.io)
