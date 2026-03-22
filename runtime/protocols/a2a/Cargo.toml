@@ -16,8 +16,8 @@ jamjet-a2a = { version = "0.1", features = ["client", "server", "federation"] }
 jamjet-a2a-types = "0.1"
 
 # Internal workspace crates
-jamjet-protocols = { path = "..", version = "=0.3.0" }
-jamjet-agents = { path = "../../agents", version = "=0.3.0" }
+jamjet-protocols = { path = "..", version = "=0.3.1" }
+jamjet-agents = { path = "../../agents", version = "=0.3.1" }
 
 # Only deps needed by adapter.rs
 tokio = { workspace = true }

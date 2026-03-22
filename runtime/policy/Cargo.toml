@@ -11,9 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-jamjet-core = { path = "../core", version = "=0.3.0" }
-jamjet-ir = { path = "../ir", version = "=0.3.0" }
-jamjet-agents = { path = "../agents", version = "=0.3.0" }
+jamjet-core = { path = "../core", version = "=0.3.1" }
+jamjet-ir = { path = "../ir", version = "=0.3.1" }
+jamjet-agents = { path = "../agents", version = "=0.3.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

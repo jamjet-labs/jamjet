@@ -11,9 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-jamjet-core = { path = "../core", version = "=0.3.0" }
-jamjet-ir = { path = "../ir", version = "=0.3.0" }
-jamjet-state = { path = "../state", version = "=0.3.0" }
+jamjet-core = { path = "../core", version = "=0.3.1" }
+jamjet-ir = { path = "../ir", version = "=0.3.1" }
+jamjet-state = { path = "../state", version = "=0.3.1" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
