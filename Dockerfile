@@ -1,14 +1,24 @@
-# ── Stage 1: Build Rust binary ──────────────────────────────────────
+# ── Stage 1: Build web frontend ─────────────────────────────────────
+FROM node:20-bookworm-slim AS web-builder
+
+WORKDIR /build/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ .
+RUN npm run build
+
+# ── Stage 2: Build Rust binary ──────────────────────────────────────
 FROM rust:1-bookworm AS builder
 
 WORKDIR /build
 COPY runtime/ runtime/
 COPY rust-toolchain.toml .
+COPY --from=web-builder /build/web/dist web/dist
 
 WORKDIR /build/runtime
 RUN cargo build --release --bin jamjet-server
 
-# ── Stage 2: Final image ────────────────────────────────────────────
+# ── Stage 3: Final image ────────────────────────────────────────────
 FROM python:3.11-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
