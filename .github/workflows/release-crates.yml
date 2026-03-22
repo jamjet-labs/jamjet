@@ -3,6 +3,9 @@ name: Publish Crates
 # Publishes all workspace crates to crates.io in dependency order.
 # Triggered by version tags (same as release-wheels.yml) or manual dispatch.
 #
+# Handles crates.io rate limits (429) with retry + backoff.
+# Skips crates that are already published (e.g., on re-run after partial failure).
+#
 # Prerequisites:
 #   - CARGO_REGISTRY_TOKEN secret with a crates.io API token
 #   - Token must have publish scope for all jamjet-* crates
@@ -37,54 +40,69 @@ jobs:
             ~/.cargo/registry/cache
           key: cargo-registry-${{ hashFiles('runtime/Cargo.lock') }}
 
-      - name: Publish Tier 0 (no internal deps)
+      - name: Publish all crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          cargo publish -p jamjet-core --no-verify
-          cargo publish -p jamjet-telemetry --no-verify
-          cargo publish -p jamjet-protocols --no-verify
+          publish() {
+            local crate=$1
+            local max_retries=3
+            local retry=0
+            while [ $retry -lt $max_retries ]; do
+              echo "Publishing $crate (attempt $((retry+1))/$max_retries)..."
+              if cargo publish -p "$crate" --no-verify 2>&1 | tee /tmp/publish.log; then
+                echo "✅ $crate published successfully"
+                return 0
+              fi
+              if grep -q "already uploaded" /tmp/publish.log; then
+                echo "⏭️  $crate already published, skipping"
+                return 0
+              fi
+              if grep -q "429" /tmp/publish.log; then
+                retry=$((retry+1))
+                echo "⏳ Rate limited, waiting 120s before retry..."
+                sleep 120
+              else
+                echo "❌ $crate failed with non-retryable error"
+                cat /tmp/publish.log
+                return 1
+              fi
+            done
+            echo "❌ $crate failed after $max_retries retries"
+            return 1
+          }
 
-      - name: Wait for Tier 0 index propagation
-        run: sleep 30
+          # Tier 0 — no internal deps
+          publish jamjet-core
+          publish jamjet-telemetry
+          publish jamjet-protocols
+          echo "Waiting 60s for index propagation..."
+          sleep 60
 
-      - name: Publish Tier 1
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          cargo publish -p jamjet-ir --no-verify
-          cargo publish -p jamjet-models --no-verify
+          # Tier 1
+          publish jamjet-ir
+          publish jamjet-models
+          echo "Waiting 60s for index propagation..."
+          sleep 60
 
-      - name: Wait for Tier 1 index propagation
-        run: sleep 30
+          # Tier 2
+          publish jamjet-state
+          publish jamjet-agents
+          publish jamjet-timers
+          publish jamjet-mcp
+          echo "Waiting 60s for index propagation..."
+          sleep 60
 
-      - name: Publish Tier 2
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          cargo publish -p jamjet-state --no-verify
-          cargo publish -p jamjet-agents --no-verify
-          cargo publish -p jamjet-timers --no-verify
-          cargo publish -p jamjet-mcp --no-verify
+          # Tier 3
+          publish jamjet-scheduler
+          publish jamjet-policy
+          publish jamjet-audit
+          echo "Waiting 60s for index propagation..."
+          sleep 60
 
-      - name: Wait for Tier 2 index propagation
-        run: sleep 30
+          # Tier 4
+          publish jamjet-a2a-proto
+          publish jamjet-worker
+          publish jamjet-api
 
-      - name: Publish Tier 3
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          cargo publish -p jamjet-scheduler --no-verify
-          cargo publish -p jamjet-policy --no-verify
-          cargo publish -p jamjet-audit --no-verify
-
-      - name: Wait for Tier 3 index propagation
-        run: sleep 30
-
-      - name: Publish Tier 4
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          cargo publish -p jamjet-a2a-proto --no-verify
-          cargo publish -p jamjet-worker --no-verify
-          cargo publish -p jamjet-api --no-verify
+          echo "🎉 All crates published!"
