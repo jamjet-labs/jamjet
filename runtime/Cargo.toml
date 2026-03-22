@@ -24,6 +24,10 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/jamjet-labs/jamjet"
 rust-version = "1.75"
+homepage = "https://jamjet.dev"
+documentation = "https://docs.jamjet.dev"
+keywords = ["agent", "workflow", "mcp", "a2a", "llm"]
+categories = ["development-tools", "asynchronous", "web-programming"]
 
 [workspace.dependencies]
 # Async runtime
