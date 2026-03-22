@@ -104,6 +104,7 @@ impl Worker {
         let start = std::time::Instant::now();
         let execution_id = item.execution_id.clone();
         let node_id = item.node_id.clone();
+        let tenant_id = item.tenant_id.clone();
         let attempt = item.attempt;
         let item_id = item.id;
 
@@ -171,7 +172,7 @@ impl Worker {
 
                     // Policy check.
                     if let Some(r) = self
-                        .check_policy(&execution_id, &node_id, kind, node_def, &ir)
+                        .check_policy(&execution_id, &node_id, &tenant_id, kind, node_def, &ir)
                         .await
                     {
                         heartbeat.abort();
@@ -325,12 +326,28 @@ impl Worker {
         &self,
         execution_id: &ExecutionId,
         node_id: &str,
+        tenant_id: &str,
         kind: &NodeKind,
         node_def: &NodeDef,
         ir: &WorkflowIr,
     ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
         let ctx = EvaluationContext::from_node_kind(node_id, kind);
+
+        // Load tenant policy (sits between global and workflow in the chain).
+        let tenant_policy_set = self
+            .backend
+            .get_tenant(&jamjet_state::TenantId::from(tenant_id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|t| t.policy_set());
+
+        // Build policy chain: tenant -> workflow -> node (least-specific to most-specific).
+        // The evaluator iterates in reverse, so node rules take priority.
         let mut sets: Vec<&jamjet_ir::workflow::PolicySetIr> = Vec::new();
+        if let Some(ref tp) = tenant_policy_set {
+            sets.push(tp);
+        }
         if let Some(p) = &ir.policy {
             sets.push(p);
         }
@@ -347,7 +364,13 @@ impl Worker {
             PolicyDecision::Allow => None,
 
             PolicyDecision::Block { reason } => {
-                warn!(execution_id = %execution_id, node_id, %reason, "Policy blocked node");
+                let policy_scope = self.identify_policy_scope(
+                    &ctx,
+                    tenant_policy_set.as_ref(),
+                    ir.policy.as_ref(),
+                    node_def.policy.as_ref(),
+                );
+                warn!(execution_id = %execution_id, node_id, %reason, %policy_scope, "Policy blocked node");
                 let seq = self.backend.latest_sequence(execution_id).await.ok()? + 1;
                 let _ = self
                     .backend
@@ -358,7 +381,7 @@ impl Worker {
                             node_id: node_id.to_string(),
                             rule: reason.clone(),
                             decision: "blocked".to_string(),
-                            policy_scope: "workflow".to_string(),
+                            policy_scope,
                         },
                     ))
                     .await;
@@ -385,6 +408,37 @@ impl Worker {
                 Some(Ok(()))
             }
         }
+    }
+
+    /// Determine which policy scope triggered a non-Allow decision.
+    ///
+    /// Checks each scope individually from most-specific (node) to least-specific
+    /// (tenant), returning the name of the first scope that produces a non-Allow
+    /// decision.
+    fn identify_policy_scope(
+        &self,
+        ctx: &EvaluationContext,
+        tenant_policy: Option<&jamjet_ir::workflow::PolicySetIr>,
+        workflow_policy: Option<&jamjet_ir::workflow::PolicySetIr>,
+        node_policy: Option<&jamjet_ir::workflow::PolicySetIr>,
+    ) -> String {
+        // Check most-specific first (same order as evaluator's reverse iteration).
+        if let Some(p) = node_policy {
+            if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
+                return "node".to_string();
+            }
+        }
+        if let Some(p) = workflow_policy {
+            if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
+                return "workflow".to_string();
+            }
+        }
+        if let Some(p) = tenant_policy {
+            if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
+                return "tenant".to_string();
+            }
+        }
+        "unknown".to_string()
     }
 
     // ── Autonomy check ────────────────────────────────────────────────────────

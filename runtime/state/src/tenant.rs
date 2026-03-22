@@ -90,6 +90,17 @@ impl TenantStatus {
     }
 }
 
+impl Tenant {
+    /// Deserialize the JSON policy field into a `PolicySetIr`.
+    ///
+    /// Returns `None` if no policy is set or if deserialization fails.
+    pub fn policy_set(&self) -> Option<jamjet_ir::workflow::PolicySetIr> {
+        self.policy
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+}
+
 /// Per-tenant resource and cost limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantLimits {
