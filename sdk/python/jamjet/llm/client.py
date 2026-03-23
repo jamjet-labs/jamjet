@@ -41,7 +41,7 @@ async def call_llm(model: str, prompt: str, max_tokens: int = 512) -> LlmRespons
     try:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI()  # type: ignore[assignment]
+        client = AsyncOpenAI()
         resp = await client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
