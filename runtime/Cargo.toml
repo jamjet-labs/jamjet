@@ -50,7 +50,7 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 
 # HTTP client
-reqwest = { version = "0.11", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 # Tracing / telemetry
 tracing = "0.1"
