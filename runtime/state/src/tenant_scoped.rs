@@ -354,9 +354,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             .entry(key)
             .or_insert_with(|| serde_json::json!([]));
         arr.as_array_mut()
-            .ok_or_else(|| {
-                StateBackendError::Database(format!("{key} is not an array"))
-            })?
+            .ok_or_else(|| StateBackendError::Database(format!("{key} is not an array")))?
             .push(value);
         self.update_execution_current_state(execution_id, &state)
             .await

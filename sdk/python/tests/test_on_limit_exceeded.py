@@ -59,6 +59,7 @@ class TestOnLimitExceeded:
 
     def test_on_limit_exceeded_none_returns_partial(self):
         """Handler returning None preserves the partial output unchanged."""
+
         def handler(
             partial_output: str | None,
             limit_type: str,

@@ -662,9 +662,8 @@ impl NodeExecutor for AgentToolExecutor {
                         .await;
                     Self::send_a2a_cancel(&client, agent_uri, &task_id).await;
                     terminated_early = true;
-                    terminal_error = Some(format!(
-                        "AgentTool idle timeout after {idle_timeout_secs}s"
-                    ));
+                    terminal_error =
+                        Some(format!("AgentTool idle timeout after {idle_timeout_secs}s"));
                     break;
                 }
                 // Stream ended normally
@@ -747,8 +746,7 @@ impl NodeExecutor for AgentToolExecutor {
                             );
                             Self::send_a2a_cancel(&client, agent_uri, &task_id).await;
                             terminated_early = true;
-                            terminal_error =
-                                Some("AgentTool stream receiver dropped".into());
+                            terminal_error = Some("AgentTool stream receiver dropped".into());
                             break;
                         }
 

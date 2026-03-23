@@ -388,9 +388,7 @@ impl StateBackend for SqliteBackend {
             .entry(key)
             .or_insert_with(|| serde_json::json!([]));
         arr.as_array_mut()
-            .ok_or_else(|| {
-                StateBackendError::Database(format!("{key} is not an array"))
-            })?
+            .ok_or_else(|| StateBackendError::Database(format!("{key} is not an array")))?
             .push(value);
         self.update_execution_current_state(execution_id, &state)
             .await
@@ -1114,12 +1112,20 @@ mod tests {
         let id = exec.execution_id.clone();
         db.create_execution(exec).await.unwrap();
 
-        db.patch_append_array(&id, "agent_tool_events", json!({"type": "progress", "chunk": 0}))
-            .await
-            .unwrap();
-        db.patch_append_array(&id, "agent_tool_events", json!({"type": "progress", "chunk": 1}))
-            .await
-            .unwrap();
+        db.patch_append_array(
+            &id,
+            "agent_tool_events",
+            json!({"type": "progress", "chunk": 0}),
+        )
+        .await
+        .unwrap();
+        db.patch_append_array(
+            &id,
+            "agent_tool_events",
+            json!({"type": "progress", "chunk": 1}),
+        )
+        .await
+        .unwrap();
 
         let fetched = db.get_execution(&id).await.unwrap().unwrap();
         let events = fetched.current_state["agent_tool_events"]

@@ -115,7 +115,11 @@ impl ProtocolAdapter for A2aAdapter {
         let metadata = if task.metadata.is_object() {
             let map: HashMap<String, serde_json::Value> =
                 serde_json::from_value(task.metadata).unwrap_or_default();
-            if map.is_empty() { None } else { Some(map) }
+            if map.is_empty() {
+                None
+            } else {
+                Some(map)
+            }
         } else {
             None
         };

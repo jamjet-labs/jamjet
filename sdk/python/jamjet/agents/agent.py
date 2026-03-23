@@ -239,9 +239,12 @@ class Agent:
                 tool_result_msgs = await self._execute_tool_calls(msg, tool_map, tool_calls_log)
                 step_messages.extend(tool_result_msgs)
             else:
-                partial = self._invoke_limit_handler(
-                    "", "max_iterations", self.limits.max_iterations, self.limits.max_iterations
-                ) or ""
+                partial = (
+                    self._invoke_limit_handler(
+                        "", "max_iterations", self.limits.max_iterations, self.limits.max_iterations
+                    )
+                    or ""
+                )
                 step_results.append(partial)
 
         # Step 3 — synthesize
@@ -296,12 +299,16 @@ class Agent:
                 last_content = content
                 break
         if last_content is not None:
-            return self._invoke_limit_handler(
-                last_content, "max_iterations", self.limits.max_iterations, self.limits.max_iterations
-            ) or ""
-        return self._invoke_limit_handler(
-            "", "max_iterations", self.limits.max_iterations, self.limits.max_iterations
-        ) or ""
+            return (
+                self._invoke_limit_handler(
+                    last_content, "max_iterations", self.limits.max_iterations, self.limits.max_iterations
+                )
+                or ""
+            )
+        return (
+            self._invoke_limit_handler("", "max_iterations", self.limits.max_iterations, self.limits.max_iterations)
+            or ""
+        )
 
     async def _run_critic(
         self,
@@ -365,9 +372,12 @@ class Agent:
             draft = f"{draft}\n\n[Critic feedback]: {verdict}"
         else:
             # Loop exhausted without PASS — invoke limit handler
-            draft = self._invoke_limit_handler(
-                draft, "max_iterations", self.limits.max_iterations, self.limits.max_iterations
-            ) or ""
+            draft = (
+                self._invoke_limit_handler(
+                    draft, "max_iterations", self.limits.max_iterations, self.limits.max_iterations
+                )
+                or ""
+            )
 
         return draft
 
@@ -425,9 +435,12 @@ class Agent:
                 break
         else:
             # Loop exhausted without SATISFIED — invoke limit handler
-            output = self._invoke_limit_handler(
-                output, "max_iterations", self.limits.max_iterations, self.limits.max_iterations
-            ) or ""
+            output = (
+                self._invoke_limit_handler(
+                    output, "max_iterations", self.limits.max_iterations, self.limits.max_iterations
+                )
+                or ""
+            )
 
         return output
 
@@ -497,9 +510,10 @@ class Agent:
             prop_msgs.append(msg)
             prop_msgs.extend(await self._execute_tool_calls(msg, tool_map, tool_calls_log))
         else:
-            proposal = self._invoke_limit_handler(
-                "", "max_iterations", self.limits.max_iterations, self.limits.max_iterations
-            ) or ""
+            proposal = (
+                self._invoke_limit_handler("", "max_iterations", self.limits.max_iterations, self.limits.max_iterations)
+                or ""
+            )
 
         # Phase 2: Counter-argument rounds
         counter = proposal
@@ -533,9 +547,12 @@ class Agent:
                 revise_msgs.append(msg)
                 revise_msgs.extend(await self._execute_tool_calls(msg, tool_map, tool_calls_log))
             else:
-                counter = self._invoke_limit_handler(
-                    counter, "max_iterations", self.limits.max_iterations, self.limits.max_iterations
-                ) or ""
+                counter = (
+                    self._invoke_limit_handler(
+                        counter, "max_iterations", self.limits.max_iterations, self.limits.max_iterations
+                    )
+                    or ""
+                )
 
         # Phase 3: Judge renders final verdict
         judge_msgs: list[dict[str, Any]] = [

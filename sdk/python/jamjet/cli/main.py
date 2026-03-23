@@ -696,10 +696,7 @@ def inspect(
                     proto = invoked.get("protocol", "unknown")
                     latency = completed.get("latency_ms", "?")
                     turns = sum(1 for e in node_events if e["kind"] == "AgentToolTurn")
-                    console.print(
-                        f"  {nid} [{proto}] — {len(node_events)} events, "
-                        f"{turns} turns, {latency}ms"
-                    )
+                    console.print(f"  {nid} [{proto}] — {len(node_events)} events, {turns} turns, {latency}ms")
 
             # ── Strategy section ─────────────────────────────────────────
             _print_strategy_section(console, data, evts)

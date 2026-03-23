@@ -33,9 +33,7 @@ class FakeEventBus:
         """Record an event for the given execution."""
         self._events.setdefault(execution_id, []).append(event)
 
-    def events_for(
-        self, execution_id: str, *, kind: str | None = None
-    ) -> list[dict[str, Any]]:
+    def events_for(self, execution_id: str, *, kind: str | None = None) -> list[dict[str, Any]]:
         """Return events for *execution_id*, optionally filtered by *kind*."""
         events = self._events.get(execution_id, [])
         if kind is not None:
@@ -80,12 +78,8 @@ class FakeJamjetClient:
             "input": input_data,
             "output": input_data,
         }
-        self._event_bus.emit(
-            exec_id, {"kind": "ExecutionStarted", "workflow_id": workflow_id}
-        )
-        self._event_bus.emit(
-            exec_id, {"kind": "ExecutionCompleted", "workflow_id": workflow_id}
-        )
+        self._event_bus.emit(exec_id, {"kind": "ExecutionStarted", "workflow_id": workflow_id})
+        self._event_bus.emit(exec_id, {"kind": "ExecutionCompleted", "workflow_id": workflow_id})
         return {"execution_id": exec_id}
 
     def get_execution(self, execution_id: str) -> dict[str, Any]:

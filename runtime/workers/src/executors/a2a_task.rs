@@ -133,9 +133,7 @@ impl NodeExecutor for A2aTaskExecutor {
         let response_task_id = match &submitted {
             SendMessageResponse::Task(t) => t.id.clone(),
             SendMessageResponse::WrappedTask(w) => w.task.id.clone(),
-            SendMessageResponse::Message(m) => {
-                m.task_id.clone().unwrap_or(task_id.clone())
-            }
+            SendMessageResponse::Message(m) => m.task_id.clone().unwrap_or(task_id.clone()),
             SendMessageResponse::WrappedMessage(w) => {
                 w.message.task_id.clone().unwrap_or(task_id.clone())
             }

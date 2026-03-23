@@ -117,25 +117,16 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
         selected = top_candidates[0]
 
         # Check if scores are close enough to warrant a tiebreaker
-        spread = (
-            (top_candidates[0].composite - top_candidates[1].composite)
-            if len(top_candidates) >= 2
-            else 1.0
-        )
+        spread = (top_candidates[0].composite - top_candidates[1].composite) if len(top_candidates) >= 2 else 1.0
 
         if spread <= threshold and tiebreaker_model and len(top_candidates) >= 2:
-            return await self._llm_tiebreaker(
-                task, top_candidates, tiebreaker_model, context
-            )
+            return await self._llm_tiebreaker(task, top_candidates, tiebreaker_model, context)
 
         return Decision(
             selected_uri=selected.agent_uri,
             method="structured",
             confidence=selected.composite,
-            rejected=[
-                {"uri": c.agent_uri, "reason": "lower score"}
-                for c in top_candidates[1:]
-            ],
+            rejected=[{"uri": c.agent_uri, "reason": "lower score"} for c in top_candidates[1:]],
         )
 
     async def _llm_tiebreaker(
@@ -187,9 +178,7 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
                 selected_uri = tied[0].agent_uri
                 reasoning = f"LLM returned invalid URI, falling back. Original: {reasoning}"
 
-            selected_candidate = next(
-                (c for c in tied if c.agent_uri == selected_uri), tied[0]
-            )
+            selected_candidate = next((c for c in tied if c.agent_uri == selected_uri), tied[0])
             return Decision(
                 selected_uri=selected_uri,
                 method="llm_tiebreaker",
@@ -214,10 +203,7 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
                 method="tiebreaker_failed",
                 reasoning=f"LLM tiebreaker failed: {e}",
                 confidence=tied[0].composite,
-                rejected=[
-                    {"uri": c.agent_uri, "reason": "lower score"}
-                    for c in candidates[1:]
-                ],
+                rejected=[{"uri": c.agent_uri, "reason": "lower score"} for c in candidates[1:]],
             )
 
     def _score_capability(self, task: str, candidate: AgentCandidate) -> float:
@@ -233,9 +219,7 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
         mapping = {"low": 1.0, "medium": 0.7, "high": 0.4}
         return mapping.get(candidate.latency_class or "", 0.5)
 
-    def _score_reasoning_modes(
-        self, candidate: AgentCandidate, context: dict[str, Any]
-    ) -> float:
+    def _score_reasoning_modes(self, candidate: AgentCandidate, context: dict[str, Any]) -> float:
         preferred = context.get("preferred_reasoning_modes", [])
         if not preferred or not candidate.reasoning_modes:
             return 0.0
