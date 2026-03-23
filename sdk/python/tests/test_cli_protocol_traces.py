@@ -1,6 +1,6 @@
 """Tests for protocol-level trace CLI views."""
 
-from jamjet.cli.main import _filter_events, _build_protocol_tree
+from jamjet.cli.main import _build_protocol_tree, _filter_events
 
 
 def test_filter_events_by_protocol_mcp():

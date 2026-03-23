@@ -1,12 +1,7 @@
 """Tests for the on_limit_exceeded handler on Agent (task 3.34)."""
 
-import asyncio
-
-import pytest
-
 from jamjet import Agent, tool
 from jamjet.agents.agent import AgentResult
-
 
 # ── Tools ────────────────────────────────────────────────────────────────────
 
@@ -129,7 +124,7 @@ class TestOnLimitExceeded:
             max_iterations=1,
             on_limit_exceeded=handler,
         )
-        result = agent.run_sync("hello")
+        agent.run_sync("hello")
         # The handler should have received the partial output
         assert len(received_partials) == 1
         # Partial output should be a string (possibly empty, but not None in typical case)

@@ -25,7 +25,7 @@ import asyncio
 import json
 import sys
 from collections.abc import Mapping
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from jamjet.eval.grid import ComparisonResult

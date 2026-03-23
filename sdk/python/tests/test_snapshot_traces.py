@@ -1,8 +1,8 @@
 """Snapshot tests for execution traces. Run with --snapshot-update to regenerate."""
 
 from pydantic import BaseModel
-from jamjet import Workflow
 
+from jamjet import Workflow
 
 wf = Workflow("snapshot-test", version="1.0.0")
 
