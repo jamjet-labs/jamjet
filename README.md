@@ -21,6 +21,8 @@
 [![Open in GitHub Codespaces](https://img.shields.io/badge/Open%20in-Codespaces-blue?style=flat-square&logo=github)](https://codespaces.new/jamjet-labs/jamjet?quickstart=1)
 [![Open in Gitpod](https://img.shields.io/badge/Open%20in-Gitpod-orange?style=flat-square&logo=gitpod)](https://gitpod.io/#https://github.com/jamjet-labs/jamjet)
 
+[![jamjet MCP server](https://glama.ai/mcp/servers/jamjet-labs/jamjet/badges/card.svg)](https://glama.ai/mcp/servers/jamjet-labs/jamjet)
+
 </div>
 
 <div align="center">
