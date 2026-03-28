@@ -137,7 +137,7 @@ jobs:
       - run: pip install uv pip-audit
       - run: uv sync --all-extras
       - name: Audit dependencies
-        run: pip-audit --desc
+        run: pip-audit --desc --ignore-vuln CVE-2026-4539  # pygments AdlLexer regex DoS — no fix released yet
 
   secret-scan:
     name: Secret scanning

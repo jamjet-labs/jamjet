@@ -81,6 +81,9 @@ jobs:
           workspaces: runtime -> target
           key: ${{ matrix.target }}
 
+      - name: Create web/dist placeholder for rust-embed
+        run: mkdir -p web/dist && echo '<!DOCTYPE html><html><body></body></html>' > web/dist/index.html
+
       - name: Install cross (Linux aarch64)
         if: matrix.cross
         run: cargo install cross --locked
