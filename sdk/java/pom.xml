@@ -39,6 +39,7 @@
     <modules>
         <module>jamjet-sdk</module>
         <module>jamjet-cli</module>
+        <module>jamjet-skillsjars</module>
     </modules>
 
     <properties>
