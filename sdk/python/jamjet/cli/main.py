@@ -479,21 +479,39 @@ def run(
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
     follow: bool = typer.Option(True, "--follow/--no-follow", help="Follow execution progress"),
     stream: bool = typer.Option(False, "--stream", help="Stream structured output chunks progressively"),
+    output: str = typer.Option(
+        "text",
+        "--output",
+        "-o",
+        help="Output format: 'text' (human-readable, default) or 'json' (machine-readable)",
+    ),
 ) -> None:
     """Submit and run a workflow execution."""
+    import time
+
+    if output not in ("text", "json"):
+        console.print(f"[red]Error:[/red] invalid --output value '{output}'. Must be 'text' or 'json'.")
+        raise typer.Exit(1)
+
     input_data = json.loads(input) if input else {}
+    json_output = output == "json"
 
     async def _run() -> None:
+        start_time_us = time.monotonic_ns() // 1000
+
         async with _client(runtime) as c:
             result = await c.start_execution(workflow_id=workflow, input=input_data)
             exec_id = result.get("execution_id", "unknown")
-            console.print(f"[green]Execution started:[/green] {exec_id}")
 
-            if stream:
+            if not json_output:
+                console.print(f"[green]Execution started:[/green] {exec_id}")
+
+            if stream and not json_output:
                 await _stream_execution(c, exec_id)
                 return
 
-            if not follow:
+            # For JSON output, always follow to completion
+            if not follow and not json_output:
                 return
 
             terminal = {"completed", "failed", "cancelled", "limit_exceeded"}
@@ -502,9 +520,34 @@ def run(
                 await asyncio.sleep(1)
                 state = await c.get_execution(exec_id)
                 status = state.get("status", "unknown")
-                console.print(f"  [dim]Status:[/dim] {status}")
+                if not json_output:
+                    console.print(f"  [dim]Status:[/dim] {status}")
                 if status in terminal:
                     break
+
+            end_time_us = time.monotonic_ns() // 1000
+            total_duration_us = end_time_us - start_time_us
+
+            if json_output:
+                # Fetch events for per-step details
+                events_data = await c.get_events(exec_id)
+                events = events_data.get("events", [])
+
+                # Count steps (node_started events)
+                steps_executed = sum(
+                    1 for e in events if e.get("kind", {}).get("type") == "node_started"
+                )
+
+                json_result = {
+                    "execution_id": exec_id,
+                    "final_state": state,
+                    "steps_executed": steps_executed,
+                    "total_duration_us": total_duration_us,
+                    "events": events,
+                }
+                # Output raw JSON to stdout (not through Rich to avoid formatting)
+                print(json.dumps(json_result, indent=2))
+                return
 
             final_status = state.get("status")
             if final_status == "completed":
