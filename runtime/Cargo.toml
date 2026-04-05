@@ -13,6 +13,7 @@ members = [
     "policy",
     "agents",
     "audit",
+    "engram",
     "protocols",
     "protocols/mcp",
     "protocols/a2a",
