@@ -1,18 +1,19 @@
-# jamjet-memory — Design Specification
+# Engram — Design Specification
 
 **Date:** 2026-04-05
 **Status:** Draft
 **Author:** Sunil Prakash
+**Product Name:** Engram (by JamJet)
 
 ## 1. Overview
 
-jamjet-memory is a durable, open-source memory layer for AI agents. It works as a fully independent alternative to Mem0 (zero JamJet dependency) or as a runtime-integrated module that gains crash safety, audit trails, and compliance for free.
+Engram is a durable, open-source memory layer for AI agents. It works as a fully independent alternative to Mem0 (zero JamJet dependency) or as a runtime-integrated module that gains crash safety, audit trails, and compliance for free.
 
 **Tagline:** *"Memory that survives crashes, understands time, and speaks MCP."*
 
 ### Goals
 
-- **Standalone-first:** `pip install jamjet-memory` works with zero infrastructure — local SQLite, embedded vector index, ONNX embeddings. No API keys required.
+- **Standalone-first:** `pip install engram` works with zero infrastructure — local SQLite, embedded vector index, ONNX embeddings. No API keys required.
 - **MCP-native:** Primary interface is MCP tools. Any MCP client (Claude Code, Cursor, Windsurf, JamJet agents) gets persistent memory by connecting to the server.
 - **Beyond Mem0:** Temporal knowledge graph, three-tier memory hierarchy, context assembly, background consolidation, conflict resolution — things Mem0 doesn't offer.
 - **Runtime superpowers:** When used inside JamJet, memory operations become durable workflow nodes with event sourcing, PII redaction, audit trails, and crash recovery.
@@ -25,7 +26,7 @@ jamjet-memory is a durable, open-source memory layer for AI agents. It works as 
 
 ## 2. Competitive Analysis
 
-| Capability | Mem0 | Zep | Letta | jamjet-memory |
+| Capability | Mem0 | Zep | Letta | engram |
 |---|---|---|---|---|
 | Zero-config local mode | Needs OpenAI key | Cloud only | Needs API key | **Works offline (ONNX + SQLite)** |
 | Extraction | LLM facts | Graph builder | Self-editing | **3-stage pipeline + conflict resolution** |
@@ -70,7 +71,7 @@ Two modes from the same Rust codebase:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      jamjet-memory                               │
+│                      engram                               │
 │                                                                   │
 │  ┌─────────────┐  ┌─────────────┐  ┌──────────────────────────┐ │
 │  │  Extraction  │  │  Temporal    │  │  Context                 │ │
@@ -108,9 +109,9 @@ Two modes from the same Rust codebase:
 
 ### Dependency Rules
 
-- `jamjet-memory` crate has **zero dependency** on `jamjet-state`, `jamjet-ir`, or any runtime crate. Fully standalone.
-- `jamjet-memory` depends on `jamjet-models` (for LLM extraction via `ModelAdapter` — already a standalone crate with Anthropic, OpenAI, Google, Ollama adapters).
-- `jamjet-memory-nodes` is a thin bridge crate that wires jamjet-memory into the runtime. Depends on `jamjet-memory` + `jamjet-state` + `jamjet-audit`.
+- `engram` crate has **zero dependency** on `jamjet-state`, `jamjet-ir`, or any runtime crate. Fully standalone.
+- `engram` depends on `jamjet-models` (for LLM extraction via `ModelAdapter` — already a standalone crate with Anthropic, OpenAI, Google, Ollama adapters).
+- `engram-nodes` is a thin bridge crate that wires engram into the runtime. Depends on `engram` + `jamjet-state` + `jamjet-audit`.
 
 ## 4. Memory Model
 
@@ -282,7 +283,7 @@ If user later says "I moved to Denver":
 ### Configuration
 
 ```python
-from jamjet_memory import MemoryConfig, ExtractionRule
+from engram import MemoryConfig, ExtractionRule
 
 config = MemoryConfig(
     extraction_rules=[
@@ -377,7 +378,7 @@ If the budget is tight, lower-priority facts are summarized or dropped. The asse
 
 ### MCP Tools (primary interface)
 
-When `jamjet-memory serve` runs, it exposes an MCP server. Any MCP client connects and gets these tools:
+When `engram serve` runs, it exposes an MCP server. Any MCP client connects and gets these tools:
 
 | Tool | Purpose |
 |---|---|
@@ -437,7 +438,7 @@ memory_inspect:
 {
   "mcpServers": {
     "memory": {
-      "command": "jamjet-memory",
+      "command": "engram",
       "args": ["serve", "--mcp"]
     }
   }
@@ -469,10 +470,10 @@ Auth via API key header (`Authorization: Bearer jm_...`).
 ### Mem0 Migration
 
 ```bash
-jamjet-memory migrate --from mem0 --mem0-api-key=... --org=default
+engram migrate --from mem0 --mem0-api-key=... --org=default
 ```
 
-Pulls all memories from Mem0 API, converts to jamjet-memory fact format, re-indexes in vector + graph stores.
+Pulls all memories from Mem0 API, converts to engram fact format, re-indexes in vector + graph stores.
 
 ## 8. Consolidation Engine
 
@@ -522,7 +523,7 @@ Below 0.3 confidence → archived
 ### Configuration
 
 ```python
-from jamjet_memory import ConsolidationConfig
+from engram import ConsolidationConfig
 
 config = ConsolidationConfig(
     interval="6h",
@@ -582,7 +583,7 @@ trait GraphStore: Send + Sync {
 | `VectorStore` | Embedded HNSW | In-process vector index (`usearch` or `hnsw_rs`). Persisted to disk. Handles 100K+ facts. |
 | `GraphStore` | SQLite triple store | Entities + relationships tables with temporal columns. BFS/DFS traversal in Rust. |
 
-All three share one SQLite file by default: `~/.jamjet-memory/memory.db`
+All three share one SQLite file by default: `~/.engram/memory.db`
 
 ### Pluggable Backends (production scale)
 
@@ -613,10 +614,10 @@ trait EmbeddingProvider: Send + Sync {
 ### Configuration
 
 ```toml
-# ~/.jamjet-memory/config.toml
+# ~/.engram/config.toml
 
 [storage]
-path = "~/.jamjet-memory/memory.db"
+path = "~/.engram/memory.db"
 
 [storage.vector]
 backend = "embedded"                  # or "qdrant", "pinecone"
@@ -633,7 +634,7 @@ provider = "auto"                     # same ModelAdapter resolution
 
 ## 10. Runtime Integration Mode
 
-When jamjet-memory is used inside JamJet runtime, memory operations become durable workflow nodes.
+When engram is used inside JamJet runtime, memory operations become durable workflow nodes.
 
 ### Memory Workflow Nodes
 
@@ -720,7 +721,7 @@ nodes:
 
 ```
 runtime/
-├── memory/                          # jamjet-memory (standalone)
+├── memory/                          # engram (standalone)
 │   ├── Cargo.toml
 │   ├── src/
 │   │   ├── lib.rs                   # Public API: Memory, MemoryConfig
@@ -751,7 +752,7 @@ runtime/
 │   └── tests/
 │
 ├── memory-nodes/                    # Runtime integration (thin glue)
-│   ├── Cargo.toml                   # depends on jamjet-memory + jamjet-state + jamjet-audit
+│   ├── Cargo.toml                   # depends on engram + jamjet-state + jamjet-audit
 │   └── src/
 │       ├── lib.rs
 │       ├── extract_node.rs          # MemoryExtractNode executor
@@ -779,7 +780,7 @@ postgres = ["sqlx/postgres"]         # Postgres fact store
 ### Python SDK
 
 ```
-sdk/python/jamjet_memory/            # Standalone Python package
+sdk/python/engram/            # Standalone Python package
 ├── __init__.py                      # Memory class (main API)
 ├── client.py                        # HTTP/MCP client to server
 ├── config.py                        # MemoryConfig, Pydantic models
@@ -787,44 +788,44 @@ sdk/python/jamjet_memory/            # Standalone Python package
 ├── local.py                         # In-process mode (PyO3 or subprocess)
 └── testing.py                       # MockMemory, assertion helpers
 
-# Published as: pip install jamjet-memory
+# Published as: pip install engram
 ```
 
 ### Java SDK
 
 ```
-sdk/java/jamjet-memory/              # Maven module
+sdk/java/engram/              # Maven module
 ├── pom.xml
-└── src/main/java/dev/jamjet/memory/
-    ├── JamjetMemory.java            # Main API
-    ├── MemoryClient.java            # HTTP client
+└── src/main/java/dev/engram/
+    ├── Engram.java                  # Main API
+    ├── EngramClient.java            # HTTP client
     ├── Fact.java
     ├── Scope.java
     ├── ContextBlock.java
-    ├── MemoryConfig.java
+    ├── EngramConfig.java
     ├── spring/
-    │   └── JamjetMemoryAutoConfiguration.java
+    │   └── EngramAutoConfiguration.java
     └── langchain4j/
-        └── JamjetMemoryStore.java
+        └── EngramMemoryStore.java
 
-# Published as: dev.jamjet:jamjet-memory on Maven Central
+# Published as: dev.jamjet:engram on Maven Central
 ```
 
 ### Standalone Binary
 
 ```bash
 # Install
-cargo install jamjet-memory
-pip install jamjet-memory
-brew install jamjet-labs/tap/jamjet-memory
+cargo install engram
+pip install engram
+brew install jamjet-labs/tap/engram
 
 # Run
-jamjet-memory serve                  # REST API + MCP server on :9090
-jamjet-memory serve --mcp-only       # MCP stdio mode (Claude Code, Cursor)
-jamjet-memory migrate --from mem0    # import from Mem0
-jamjet-memory inspect --user user_123
-jamjet-memory stats
-jamjet-memory export --user user_123 --format json
+engram serve                  # REST API + MCP server on :9090
+engram serve --mcp-only       # MCP stdio mode (Claude Code, Cursor)
+engram migrate --from mem0    # import from Mem0
+engram inspect --user user_123
+engram stats
+engram export --user user_123 --format json
 ```
 
 ## 12. Developer Experience — Quick Start
@@ -832,7 +833,7 @@ jamjet-memory export --user user_123 --format json
 ### Python (standalone, zero infra)
 
 ```python
-from jamjet_memory import Memory
+from engram import Memory
 
 # One line. Uses local SQLite + ONNX embeddings. No API keys needed.
 memory = Memory()
@@ -867,7 +868,7 @@ response = anthropic.messages.create(
 ### Java (standalone)
 
 ```java
-var memory = JamjetMemory.create();
+var memory = Engram.create();
 
 memory.add(
     Messages.of("I'm allergic to peanuts and I live in Austin"),
@@ -886,7 +887,7 @@ var context = memory.context("recommend a restaurant",
 {
   "mcpServers": {
     "memory": {
-      "command": "jamjet-memory",
+      "command": "engram",
       "args": ["serve", "--mcp"]
     }
   }
@@ -898,7 +899,7 @@ var context = memory.context("recommend a restaurant",
 ```xml
 <dependency>
     <groupId>dev.jamjet</groupId>
-    <artifactId>jamjet-memory-spring-boot-starter</artifactId>
+    <artifactId>engram-spring-boot-starter</artifactId>
 </dependency>
 ```
 
@@ -918,7 +919,7 @@ jamjet:
 | **M4: Context Assembly** | Token counting per model, priority-ranked assembly, budget enforcement, output formats (system_prompt, messages, markdown, raw), `memory.context()` API | M1, M3 |
 | **M5: Interfaces** | MCP server (6 tools), REST API (Axum), CLI commands (serve, inspect, stats, export, migrate), API key auth | M1-M4 |
 | **M6: Consolidation** | 5-op background engine (summarize, dedup, promote, reflect, decay), configurable scheduling, cost controls | M2, M3 |
-| **M7: SDKs** | Python SDK (`jamjet_memory` package), Java SDK (`dev.jamjet:jamjet-memory`), Spring Boot auto-configuration | M5 |
-| **M8: Runtime Integration** | `jamjet-memory-nodes` crate, MemoryExtract/Recall/Consolidate node executors, auto-injection mode, PII redaction integration, audit trail wiring | M1-M6 |
+| **M7: SDKs** | Python SDK (`engram` package), Java SDK (`dev.jamjet:engram`), Spring Boot auto-configuration | M5 |
+| **M8: Runtime Integration** | `engram-nodes` crate, MemoryExtract/Recall/Consolidate node executors, auto-injection mode, PII redaction integration, audit trail wiring | M1-M6 |
 | **M9: Pluggable Backends** | Qdrant adapter, Neo4j adapter, Postgres adapter, Pinecone adapter (all feature-gated) | M1 |
 | **M10: Migration + Polish** | Mem0 import tool, Zep import tool, benchmarks vs. Mem0, documentation, examples | M5 |
