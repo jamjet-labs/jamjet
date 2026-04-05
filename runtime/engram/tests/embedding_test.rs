@@ -29,14 +29,8 @@ async fn mock_is_deterministic() {
     let provider = MockEmbeddingProvider::new(32);
     let text = "the quick brown fox jumps over the lazy dog";
 
-    let first = provider
-        .embed(&[text])
-        .await
-        .expect("embed should succeed");
-    let second = provider
-        .embed(&[text])
-        .await
-        .expect("embed should succeed");
+    let first = provider.embed(&[text]).await.expect("embed should succeed");
+    let second = provider.embed(&[text]).await.expect("embed should succeed");
 
     assert_eq!(
         first, second,

@@ -38,7 +38,9 @@ async fn upsert_and_search_returns_matches() {
     let base = random_embedding(128);
     let similar = similar_embedding(&base, 0.01);
     // Build a clearly different vector by reversing and scaling
-    let different: Vec<f32> = (0..128).map(|i| ((i * 3 + 97) % 100) as f32 / 100.0).collect();
+    let different: Vec<f32> = (0..128)
+        .map(|i| ((i * 3 + 97) % 100) as f32 / 100.0)
+        .collect();
 
     let id_base = Uuid::new_v4();
     let id_similar = Uuid::new_v4();
@@ -49,11 +51,7 @@ async fn upsert_and_search_returns_matches() {
         .await
         .expect("upsert base");
     store
-        .upsert(
-            id_similar,
-            similar,
-            serde_json::json!({"label": "similar"}),
-        )
+        .upsert(id_similar, similar, serde_json::json!({"label": "similar"}))
         .await
         .expect("upsert similar");
     store
@@ -65,18 +63,12 @@ async fn upsert_and_search_returns_matches() {
         .await
         .expect("upsert different");
 
-    let results = store
-        .search(&base, &filter, 3)
-        .await
-        .expect("search");
+    let results = store.search(&base, &filter, 3).await.expect("search");
 
     assert_eq!(results.len(), 3, "should return 3 results");
 
     // The exact-match vector must be the top result.
-    assert_eq!(
-        results[0].id, id_base,
-        "exact match should be ranked first"
-    );
+    assert_eq!(results[0].id, id_base, "exact match should be ranked first");
     // The similar vector should be ranked before the different one.
     assert_eq!(
         results[1].id, id_similar,
@@ -157,10 +149,7 @@ async fn search_respects_top_k() {
             .expect("upsert");
     }
 
-    let results = store
-        .search(&query, &filter, 3)
-        .await
-        .expect("search");
+    let results = store.search(&query, &filter, 3).await.expect("search");
 
     assert!(
         results.len() <= 3,

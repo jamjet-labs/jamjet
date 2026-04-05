@@ -75,9 +75,7 @@ impl Memory {
     ///
     /// Schema migration is applied automatically. Suitable for testing and
     /// short-lived agent invocations.
-    pub async fn in_memory(
-        embedding: Box<dyn EmbeddingProvider>,
-    ) -> Result<Self, MemoryError> {
+    pub async fn in_memory(embedding: Box<dyn EmbeddingProvider>) -> Result<Self, MemoryError> {
         let dims = embedding.dimensions();
         let embedding = Arc::from(embedding);
 
@@ -156,9 +154,9 @@ impl Memory {
     pub async fn add_fact(&self, text: &str, scope: Scope) -> Result<FactId, MemoryError> {
         // Embed text.
         let mut embeddings = self.embedding.embed(&[text]).await?;
-        let embedding = embeddings
-            .pop()
-            .ok_or_else(|| MemoryError::Embedding("provider returned empty embeddings".to_string()))?;
+        let embedding = embeddings.pop().ok_or_else(|| {
+            MemoryError::Embedding("provider returned empty embeddings".to_string())
+        })?;
 
         // Build and persist the fact.
         let mut fact = Fact::new(text, scope);
@@ -186,9 +184,9 @@ impl Memory {
 
         // Embed the query.
         let mut embeddings = self.embedding.embed(&[query.query.as_str()]).await?;
-        let query_vec = embeddings
-            .pop()
-            .ok_or_else(|| MemoryError::Embedding("provider returned empty embeddings".to_string()))?;
+        let query_vec = embeddings.pop().ok_or_else(|| {
+            MemoryError::Embedding("provider returned empty embeddings".to_string())
+        })?;
 
         // Vector search.
         let filter = VectorFilter {
@@ -306,7 +304,9 @@ impl Memory {
             self.fact_store.insert_fact(fact).await?;
 
             let metadata = serde_json::json!({ "fact_id": fact_id.to_string() });
-            self.vector_store.upsert(fact_id, embedding, metadata).await?;
+            self.vector_store
+                .upsert(fact_id, embedding, metadata)
+                .await?;
             imported += 1;
         }
         Ok(imported)

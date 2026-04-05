@@ -126,13 +126,22 @@ async fn delete_user_removes_all_data() {
     let u1 = user_scope("acme", "user-1");
     let u2 = user_scope("acme", "user-2");
 
-    mem.add_fact("User 1 fact A", u1.clone()).await.expect("u1 a");
-    mem.add_fact("User 1 fact B", u1.clone()).await.expect("u1 b");
-    mem.add_fact("User 2 fact A", u2.clone()).await.expect("u2 a");
+    mem.add_fact("User 1 fact A", u1.clone())
+        .await
+        .expect("u1 a");
+    mem.add_fact("User 1 fact B", u1.clone())
+        .await
+        .expect("u1 b");
+    mem.add_fact("User 2 fact A", u2.clone())
+        .await
+        .expect("u2 a");
 
     // Delete user 1 data.
     let deleted = mem.delete_user_data(u1.clone()).await.expect("delete u1");
-    assert_eq!(deleted, 2, "two facts belonging to user-1 should be deleted");
+    assert_eq!(
+        deleted, 2,
+        "two facts belonging to user-1 should be deleted"
+    );
 
     // User 2 data should remain.
     let u2_facts = mem

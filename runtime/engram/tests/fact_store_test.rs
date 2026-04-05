@@ -172,10 +172,7 @@ async fn delete_scope_data_removes_all_facts() {
         .await
         .unwrap();
 
-    let deleted = store
-        .delete_scope_data(&scope_alice)
-        .await
-        .expect("delete");
+    let deleted = store.delete_scope_data(&scope_alice).await.expect("delete");
     assert_eq!(deleted, 2);
 
     // Bob's fact should still be there
@@ -247,7 +244,9 @@ async fn list_facts_filters_by_tier() {
 
     let scope = Scope::org("acme");
     store
-        .insert_fact(Fact::new("conversation fact", scope.clone()).with_tier(MemoryTier::Conversation))
+        .insert_fact(
+            Fact::new("conversation fact", scope.clone()).with_tier(MemoryTier::Conversation),
+        )
         .await
         .unwrap();
     store

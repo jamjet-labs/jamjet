@@ -334,10 +334,7 @@ impl FactStore for SqliteFactStore {
                 wheres.push(format!("agent_id = '{}'", agent_id.replace('\'', "''")));
             }
             if let Some(ref session_id) = scope.session_id {
-                wheres.push(format!(
-                    "session_id = '{}'",
-                    session_id.replace('\'', "''")
-                ));
+                wheres.push(format!("session_id = '{}'", session_id.replace('\'', "''")));
             }
         }
 
@@ -397,10 +394,7 @@ impl FactStore for SqliteFactStore {
             wheres.push(format!("agent_id = '{}'", agent_id.replace('\'', "''")));
         }
         if let Some(ref session_id) = scope.session_id {
-            wheres.push(format!(
-                "session_id = '{}'",
-                session_id.replace('\'', "''")
-            ));
+            wheres.push(format!("session_id = '{}'", session_id.replace('\'', "''")));
         }
 
         let where_clause = wheres.join(" AND ");
@@ -446,8 +440,7 @@ impl FactStore for SqliteFactStore {
             .bind(fact.invalid_at.map(|dt| dt.to_rfc3339()))
             .bind(fact.created_at.to_rfc3339())
             .bind({
-                let strs: Vec<String> =
-                    fact.entity_refs.iter().map(|u| u.to_string()).collect();
+                let strs: Vec<String> = fact.entity_refs.iter().map(|u| u.to_string()).collect();
                 serde_json::to_string(&strs)
                     .map_err(|e| MemoryError::Serialization(e.to_string()))?
             })

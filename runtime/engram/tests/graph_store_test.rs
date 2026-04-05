@@ -86,10 +86,7 @@ async fn upsert_and_query_relationship() {
     let rel = Relationship::new(src.id, "located_in", tgt.id, org_scope());
     store.upsert_relationship(&rel).await.expect("upsert rel");
 
-    let subgraph = store
-        .neighbors(src.id, 1, None)
-        .await
-        .expect("neighbors");
+    let subgraph = store.neighbors(src.id, 1, None).await.expect("neighbors");
 
     assert_eq!(subgraph.relationships.len(), 1);
     assert_eq!(subgraph.entities.len(), 1);
@@ -149,7 +146,7 @@ async fn temporal_query_returns_valid_at_time() {
     let t0 = Utc::now() - Duration::seconds(10);
     let t1 = Utc::now() - Duration::seconds(5); // query point
     let t2 = Utc::now() - Duration::seconds(2); // rel_ab invalidated at
-    let t3 = Utc::now();                         // rel_ac starts at
+    let t3 = Utc::now(); // rel_ac starts at
 
     // Rel A→B: valid from t0, invalidated at t2.
     let mut rel_ab = Relationship::new(a.id, "rel_ab", b.id, org_scope());
@@ -207,10 +204,7 @@ async fn search_entities_by_name() {
         .await
         .unwrap();
 
-    let results = store
-        .search_entities("Austin", 10)
-        .await
-        .expect("search");
+    let results = store.search_entities("Austin", 10).await.expect("search");
 
     assert_eq!(results.len(), 2, "should find 'Austin' and 'Austin Powers'");
     let names: Vec<&str> = results.iter().map(|e| e.name.as_str()).collect();
@@ -248,10 +242,17 @@ async fn delete_by_scope_clears_entities_and_relationships() {
         .expect("delete_by_scope");
 
     // 2 entities + 1 relationship = 3 rows deleted.
-    assert_eq!(deleted, 3, "should have deleted 2 entities + 1 relationship");
+    assert_eq!(
+        deleted, 3,
+        "should have deleted 2 entities + 1 relationship"
+    );
 
     // u2's entity should still exist.
-    let e3_retrieved = store.get_entity(e3.id).await.expect("get e3").expect("e3 should exist");
+    let e3_retrieved = store
+        .get_entity(e3.id)
+        .await
+        .expect("get e3")
+        .expect("e3 should exist");
     assert_eq!(e3_retrieved.name, "E3");
 
     // u1 entities should be gone.
