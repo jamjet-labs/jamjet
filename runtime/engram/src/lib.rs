@@ -7,6 +7,7 @@
 pub mod fact;
 pub mod scope;
 pub mod store;
+pub mod store_sqlite;
 
 pub use fact::{
     Entity, EntityId, Fact, FactFilter, FactId, FactPatch, MemoryTier, Relationship,
@@ -14,3 +15,4 @@ pub use fact::{
 };
 pub use scope::Scope;
 pub use store::{FactStore, MemoryError, StoreStats};
+pub use store_sqlite::SqliteFactStore;
