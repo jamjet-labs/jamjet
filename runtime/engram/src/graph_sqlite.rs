@@ -294,9 +294,7 @@ impl GraphStore for SqliteGraphStore {
         let validity_clause = match as_of {
             Some(t) => {
                 let s = t.to_rfc3339();
-                format!(
-                    "valid_from <= '{s}' AND (invalid_at IS NULL OR invalid_at > '{s}')"
-                )
+                format!("valid_from <= '{s}' AND (invalid_at IS NULL OR invalid_at > '{s}')")
             }
             None => "invalid_at IS NULL".to_string(),
         };
@@ -361,9 +359,7 @@ impl GraphStore for SqliteGraphStore {
 
     async fn search_entities(&self, query: &str, top_k: usize) -> Result<Vec<Entity>, MemoryError> {
         let escaped = query.replace('\'', "''");
-        let sql = format!(
-            "SELECT * FROM entities WHERE name LIKE '%{escaped}%' LIMIT {top_k}"
-        );
+        let sql = format!("SELECT * FROM entities WHERE name LIKE '%{escaped}%' LIMIT {top_k}");
 
         let rows = sqlx::query_as::<_, EntityRow>(&sql)
             .fetch_all(&self.pool)
@@ -384,10 +380,7 @@ impl GraphStore for SqliteGraphStore {
             wheres.push(format!("agent_id = '{}'", agent_id.replace('\'', "''")));
         }
         if let Some(ref session_id) = scope.session_id {
-            wheres.push(format!(
-                "session_id = '{}'",
-                session_id.replace('\'', "''")
-            ));
+            wheres.push(format!("session_id = '{}'", session_id.replace('\'', "''")));
         }
 
         let where_clause = wheres.join(" AND ");
