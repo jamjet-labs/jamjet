@@ -19,7 +19,7 @@ name = "engram_server"
 path = "src/lib.rs"
 
 [dependencies]
-engram = { path = "../engram", package = "jamjet-engram" }
+engram = { path = "../engram", package = "jamjet-engram", version = "0.3.1" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
