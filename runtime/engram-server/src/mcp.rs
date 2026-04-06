@@ -54,9 +54,7 @@ pub struct McpToolDef {
 // ---------------------------------------------------------------------------
 
 pub type ToolHandler = Box<
-    dyn Fn(Value) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(Value) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync,
 >;
 
 // ---------------------------------------------------------------------------

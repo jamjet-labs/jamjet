@@ -29,12 +29,10 @@ async fn stats_returns_counts() {
 #[tokio::test]
 async fn recall_with_empty_store() {
     let memory = test_memory().await;
-    let result = engram_server::handlers::handle_recall(
-        memory,
-        json!({"query": "test", "user_id": "u1"}),
-    )
-    .await
-    .unwrap();
+    let result =
+        engram_server::handlers::handle_recall(memory, json!({"query": "test", "user_id": "u1"}))
+            .await
+            .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["total"], 0);
 }
@@ -48,12 +46,10 @@ async fn context_returns_block() {
         .await
         .unwrap();
 
-    let result = engram_server::handlers::handle_context(
-        memory,
-        json!({"query": "pizza", "user_id": "u1"}),
-    )
-    .await
-    .unwrap();
+    let result =
+        engram_server::handlers::handle_context(memory, json!({"query": "pizza", "user_id": "u1"}))
+            .await
+            .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
     assert!(parsed["facts_included"].as_u64().unwrap() > 0);
     assert!(parsed["text"].as_str().unwrap().contains("<memory>"));
@@ -82,27 +78,20 @@ async fn search_finds_keyword_match() {
 async fn forget_and_verify() {
     let memory = test_memory().await;
 
-    let id = memory
-        .add_fact("Temp fact", user_scope())
-        .await
-        .unwrap();
+    let id = memory.add_fact("Temp fact", user_scope()).await.unwrap();
 
-    let result = engram_server::handlers::handle_forget(
-        memory.clone(),
-        json!({"fact_id": id.to_string()}),
-    )
-    .await
-    .unwrap();
+    let result =
+        engram_server::handlers::handle_forget(memory.clone(), json!({"fact_id": id.to_string()}))
+            .await
+            .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["success"], true);
 
     // Verify fact is gone from keyword search
-    let search = engram_server::handlers::handle_search(
-        memory,
-        json!({"query": "Temp", "user_id": "u1"}),
-    )
-    .await
-    .unwrap();
+    let search =
+        engram_server::handlers::handle_search(memory, json!({"query": "Temp", "user_id": "u1"}))
+            .await
+            .unwrap();
     let parsed: Value = serde_json::from_str(&search).unwrap();
     assert_eq!(parsed["total"], 0);
 }
@@ -110,7 +99,6 @@ async fn forget_and_verify() {
 #[tokio::test]
 async fn add_with_empty_messages_errors() {
     let memory = test_memory().await;
-    let result =
-        engram_server::handlers::handle_add(memory, json!({"messages": []})).await;
+    let result = engram_server::handlers::handle_add(memory, json!({"messages": []})).await;
     assert!(result.is_err());
 }
