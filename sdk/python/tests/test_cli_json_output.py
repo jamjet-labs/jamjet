@@ -12,6 +12,33 @@ from jamjet.cli.main import OutputFormat, app
 runner = CliRunner()
 
 
+@pytest.fixture()
+def fake_client(monkeypatch: pytest.MonkeyPatch):
+    """Shared mock client that avoids needing a running runtime."""
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def start_execution(self, **kw):
+            return {"execution_id": "exec_test123"}
+
+        async def get_execution(self, eid):
+            return {"status": "completed", "output": {"result": "ok"}}
+
+        async def get_events(self, eid):
+            return {"events": []}
+
+    monkeypatch.setattr("jamjet.cli.main._client", lambda runtime: FakeClient())
+    return FakeClient
+
+
 class TestOutputFormatEnum:
     """OutputFormat enum validates allowed values."""
 
@@ -26,38 +53,18 @@ class TestOutputFormatEnum:
     def test_enum_members(self) -> None:
         assert set(OutputFormat.__members__) == {"text", "json"}
 
+    def test_invalid_output_format_via_cli(self) -> None:
+        result = runner.invoke(app, ["run", "test-wf", "--output", "xml"])
+        assert result.exit_code != 0
+        output = result.stdout + (result.stderr or "")
+        assert "xml" in output or "Invalid value" in output or result.exit_code == 2
+
 
 class TestJsonOutput:
     """JSON output mode produces valid, compact JSON with expected keys."""
 
-    def test_json_output_is_valid_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_json_output_is_valid_json(self, fake_client) -> None:
         """Smoke test: --output json should produce parseable JSON (mocked)."""
-        import asyncio
-
-        captured: dict = {}
-
-        # Mock the async client to avoid needing a running runtime
-        class FakeClient:
-            def __init__(self, *a, **kw):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *a):
-                pass
-
-            async def start_execution(self, **kw):
-                return {"execution_id": "exec_test123"}
-
-            async def get_execution(self, eid):
-                return {"status": "completed", "output": {"result": "ok"}}
-
-            async def get_events(self, eid):
-                return {"events": []}
-
-        monkeypatch.setattr("jamjet.cli.main._client", lambda runtime: FakeClient())
-
         result = runner.invoke(app, ["run", "test-wf", "--output", "json", "--runtime", "http://fake:7700"])
 
         # The output should be valid JSON
@@ -70,30 +77,8 @@ class TestJsonOutput:
         assert "total_duration_us" in parsed
         assert "events" in parsed
 
-    def test_json_output_is_compact(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_json_output_is_compact(self, fake_client) -> None:
         """JSON output should be compact (no indentation)."""
-
-        class FakeClient:
-            def __init__(self, *a, **kw):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *a):
-                pass
-
-            async def start_execution(self, **kw):
-                return {"execution_id": "exec_test456"}
-
-            async def get_execution(self, eid):
-                return {"status": "completed"}
-
-            async def get_events(self, eid):
-                return {"events": []}
-
-        monkeypatch.setattr("jamjet.cli.main._client", lambda runtime: FakeClient())
-
         result = runner.invoke(app, ["run", "test-wf", "--output", "json", "--runtime", "http://fake:7700"])
         stdout = result.stdout.strip()
         # Compact JSON should be a single line
@@ -103,28 +88,7 @@ class TestJsonOutput:
 class TestJsonOutputSuppressesRich:
     """JSON mode should not emit Rich/ANSI formatting."""
 
-    def test_no_ansi_in_json_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        class FakeClient:
-            def __init__(self, *a, **kw):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *a):
-                pass
-
-            async def start_execution(self, **kw):
-                return {"execution_id": "exec_test789"}
-
-            async def get_execution(self, eid):
-                return {"status": "completed"}
-
-            async def get_events(self, eid):
-                return {"events": []}
-
-        monkeypatch.setattr("jamjet.cli.main._client", lambda runtime: FakeClient())
-
+    def test_no_ansi_in_json_mode(self, fake_client) -> None:
         result = runner.invoke(app, ["run", "test-wf", "-o", "json", "--runtime", "http://fake:7700"])
         stdout = result.stdout.strip()
         # No ANSI escape codes
