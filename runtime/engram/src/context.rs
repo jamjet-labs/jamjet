@@ -33,7 +33,7 @@ pub struct CharTokenEstimator;
 impl TokenEstimator for CharTokenEstimator {
     fn estimate(&self, text: &str) -> usize {
         // ~4 characters per token is a widely-used heuristic
-        (text.len() + 3) / 4
+        text.len().div_ceil(4)
     }
 }
 
@@ -394,9 +394,7 @@ mod tests {
     fn format_system_prompt_omits_empty_tiers() {
         use crate::scope::Scope;
         let scope = Scope::org("test");
-        let facts = vec![
-            Fact::new("just a convo fact", scope).with_tier(MemoryTier::Conversation),
-        ];
+        let facts = vec![Fact::new("just a convo fact", scope).with_tier(MemoryTier::Conversation)];
         let output = format_system_prompt(&facts);
         assert!(!output.contains("<working>"));
         assert!(output.contains("<conversation>"));

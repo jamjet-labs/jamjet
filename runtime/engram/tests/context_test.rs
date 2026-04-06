@@ -41,7 +41,10 @@ async fn build_returns_context_block_with_facts() {
         ContextConfig::default(),
     );
 
-    let block = builder.build("peanut allergy", &user_scope()).await.unwrap();
+    let block = builder
+        .build("peanut allergy", &user_scope())
+        .await
+        .unwrap();
 
     assert!(block.facts_included > 0);
     assert!(block.token_count > 0);
