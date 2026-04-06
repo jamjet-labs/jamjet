@@ -4,6 +4,7 @@
 //! `EmbeddingProvider` into a single high-level interface. Callers interact
 //! with `Memory` rather than the lower-level trait objects directly.
 
+use crate::context::{ContextBlock, ContextBuilder, ContextConfig};
 use crate::embedding::EmbeddingProvider;
 use crate::extract::{ExtractionConfig, Message};
 use crate::fact::{Entity, Fact, FactFilter, FactId, Relationship};
@@ -314,6 +315,31 @@ impl Memory {
             imported += 1;
         }
         Ok(imported)
+    }
+
+    // -----------------------------------------------------------------------
+    // Context assembly
+    // -----------------------------------------------------------------------
+
+    /// Assemble a token-budgeted context block for LLM prompt injection.
+    ///
+    /// Retrieves relevant facts via hybrid search (vector + keyword + graph),
+    /// ranks by tier priority (Working > Conversation > Knowledge), fills the
+    /// token budget greedily, and formats the output.
+    pub async fn context(
+        &self,
+        query: &str,
+        scope: &Scope,
+        config: ContextConfig,
+    ) -> Result<ContextBlock, MemoryError> {
+        let builder = ContextBuilder::new(
+            self.fact_store.clone(),
+            self.vector_store.clone(),
+            self.graph_store.clone(),
+            self.embedding.clone(),
+            config,
+        );
+        builder.build(query, scope).await
     }
 
     // -----------------------------------------------------------------------
