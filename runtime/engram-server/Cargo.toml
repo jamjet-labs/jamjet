@@ -1,9 +1,14 @@
 [package]
-name = "engram-server"
-description = "Engram MCP server — memory layer for AI agents"
+name = "jamjet-engram-server"
+description = "Engram MCP server — memory layer for AI agents. MCP stdio + REST API."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["agent", "memory", "mcp", "llm", "rest-api"]
+categories = ["development-tools", "web-programming"]
 
 [[bin]]
 name = "engram"
@@ -14,7 +19,7 @@ name = "engram_server"
 path = "src/lib.rs"
 
 [dependencies]
-engram = { path = "../engram" }
+engram = { path = "../engram", package = "jamjet-engram" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
