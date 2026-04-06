@@ -5,6 +5,7 @@
 //! queryable across time — enabling agents to reason over what they knew, when.
 
 pub mod conflict;
+pub mod context;
 pub mod embedding;
 pub mod embedding_ollama;
 pub mod extract;
@@ -22,6 +23,9 @@ pub mod store_sqlite;
 pub mod vector;
 pub mod vector_embedded;
 
+pub use context::{
+    CharTokenEstimator, ContextBlock, ContextBuilder, ContextConfig, OutputFormat, TokenEstimator,
+};
 pub use embedding::EmbeddingProvider;
 pub use embedding_ollama::OllamaEmbeddingProvider;
 pub use extract::{ExtractedFact, ExtractionConfig, ExtractionResult, Message};
