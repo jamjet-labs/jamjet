@@ -6,6 +6,7 @@
 
 pub mod embedding;
 pub mod embedding_ollama;
+pub mod conflict;
 pub mod extract;
 pub mod fact;
 pub mod graph;
