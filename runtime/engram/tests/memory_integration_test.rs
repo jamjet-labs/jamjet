@@ -75,9 +75,7 @@ async fn add_messages_creates_entities_and_relationships() {
         .await
         .unwrap();
 
-    let messages = vec![Message::user(
-        "I'm allergic to peanuts and live in Austin",
-    )];
+    let messages = vec![Message::user("I'm allergic to peanuts and live in Austin")];
 
     let llm = mock_extraction_llm();
     memory

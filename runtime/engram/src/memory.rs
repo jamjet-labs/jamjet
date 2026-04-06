@@ -339,9 +339,9 @@ impl Memory {
         for extracted in extraction.facts {
             // Create and embed the fact
             let mut embeddings = self.embedding.embed(&[extracted.text.as_str()]).await?;
-            let embedding = embeddings.pop().ok_or_else(|| {
-                MemoryError::Embedding("empty embedding".to_string())
-            })?;
+            let embedding = embeddings
+                .pop()
+                .ok_or_else(|| MemoryError::Embedding("empty embedding".to_string()))?;
 
             let mut fact = Fact::new(&extracted.text, scope.clone());
             fact.confidence = Some(extracted.confidence as f32);
@@ -368,8 +368,7 @@ impl Memory {
                     entity_map.get(&ext_rel.source),
                     entity_map.get(&ext_rel.target),
                 ) {
-                    let rel =
-                        Relationship::new(src_id, &ext_rel.relation, tgt_id, scope.clone());
+                    let rel = Relationship::new(src_id, &ext_rel.relation, tgt_id, scope.clone());
                     self.graph_store.upsert_relationship(&rel).await?;
                 }
             }

@@ -62,9 +62,10 @@ impl ConflictDetector {
     ) -> Result<ConflictResult, MemoryError> {
         // Embed the new fact
         let embeddings = self.embedding.embed(&[new_text]).await?;
-        let new_embedding = embeddings.into_iter().next().ok_or_else(|| {
-            MemoryError::Embedding("empty embedding result".to_string())
-        })?;
+        let new_embedding = embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| MemoryError::Embedding("empty embedding result".to_string()))?;
 
         // Search for similar existing facts
         let filter = VectorFilter {

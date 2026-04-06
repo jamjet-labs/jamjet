@@ -43,9 +43,9 @@ impl LlmClient for MockLlmClient {
             .responses
             .lock()
             .map_err(|e| MemoryError::Database(format!("mock lock error: {e}")))?;
-        let val = queue.pop().ok_or_else(|| {
-            MemoryError::Database("mock LLM: no more responses".to_string())
-        })?;
+        let val = queue
+            .pop()
+            .ok_or_else(|| MemoryError::Database("mock LLM: no more responses".to_string()))?;
         Ok(val.as_str().unwrap_or(&val.to_string()).to_string())
     }
 
@@ -58,8 +58,8 @@ impl LlmClient for MockLlmClient {
             .responses
             .lock()
             .map_err(|e| MemoryError::Database(format!("mock lock error: {e}")))?;
-        queue.pop().ok_or_else(|| {
-            MemoryError::Database("mock LLM: no more responses".to_string())
-        })
+        queue
+            .pop()
+            .ok_or_else(|| MemoryError::Database("mock LLM: no more responses".to_string()))
     }
 }

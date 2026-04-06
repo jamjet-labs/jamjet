@@ -77,9 +77,10 @@ impl HybridRetriever {
 
         // 1. Vector search
         let embeddings = self.embedding.embed(&[query]).await?;
-        let query_vec = embeddings.into_iter().next().ok_or_else(|| {
-            MemoryError::Embedding("empty embedding".to_string())
-        })?;
+        let query_vec = embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| MemoryError::Embedding("empty embedding".to_string()))?;
         let vector_filter = VectorFilter {
             scope: Some(scope.clone()),
             min_score: None,

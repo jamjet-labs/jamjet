@@ -24,13 +24,7 @@ async fn no_conflict_for_new_fact() {
     let vector_store: Arc<dyn VectorStore> = Arc::new(EmbeddedVectorStore::new(64));
     let llm = MockLlmClient::new(vec![]);
 
-    let detector = ConflictDetector::new(
-        fact_store,
-        vector_store,
-        embedding,
-        Box::new(llm),
-        0.85,
-    );
+    let detector = ConflictDetector::new(fact_store, vector_store, embedding, Box::new(llm), 0.85);
 
     let verdict = detector
         .check("User likes pizza", &user_scope())
@@ -61,13 +55,7 @@ async fn detects_duplicate_by_high_similarity() {
 
     // LLM not needed for exact duplicate (sim > 0.99)
     let llm = MockLlmClient::new(vec![]);
-    let detector = ConflictDetector::new(
-        fact_store,
-        vector_store,
-        embedding,
-        Box::new(llm),
-        0.85,
-    );
+    let detector = ConflictDetector::new(fact_store, vector_store, embedding, Box::new(llm), 0.85);
 
     // Same text = exact same embedding = similarity 1.0
     let verdict = detector

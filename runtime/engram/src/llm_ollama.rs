@@ -11,6 +11,12 @@ pub struct OllamaLlmClient {
     client: reqwest::Client,
 }
 
+impl Default for OllamaLlmClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OllamaLlmClient {
     pub fn new() -> Self {
         Self {
