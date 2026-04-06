@@ -22,8 +22,10 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import sys
+import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -81,6 +83,13 @@ def _version_callback(value: bool) -> None:
         _print_logo()
         typer.echo("\nJamJet v0.1.1  —  agent-native workflow runtime")
         raise typer.Exit()
+
+
+class OutputFormat(str, enum.Enum):
+    """Supported output formats for CLI commands."""
+
+    text = "text"
+    json = "json"
 
 
 app = typer.Typer(
@@ -479,22 +488,21 @@ def run(
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
     follow: bool = typer.Option(True, "--follow/--no-follow", help="Follow execution progress"),
     stream: bool = typer.Option(False, "--stream", help="Stream structured output chunks progressively"),
-    output: str = typer.Option(
-        "text",
+    output: OutputFormat = typer.Option(
+        OutputFormat.text,
         "--output",
         "-o",
         help="Output format: 'text' (human-readable, default) or 'json' (machine-readable)",
     ),
+    timeout: int = typer.Option(
+        300,
+        "--timeout",
+        help="Maximum seconds to wait for a terminal state (default: 300)",
+    ),
 ) -> None:
     """Submit and run a workflow execution."""
-    import time
-
-    if output not in ("text", "json"):
-        console.print(f"[red]Error:[/red] invalid --output value '{output}'. Must be 'text' or 'json'.")
-        raise typer.Exit(1)
-
     input_data = json.loads(input) if input else {}
-    json_output = output == "json"
+    json_output = output == OutputFormat.json
 
     async def _run() -> None:
         start_time_us = time.monotonic_ns() // 1000
@@ -516,13 +524,19 @@ def run(
 
             terminal = {"completed", "failed", "cancelled", "limit_exceeded"}
             state: dict = {}
+            max_wait = timeout
+            elapsed = 0
             while True:
                 await asyncio.sleep(1)
+                elapsed += 1
                 state = await c.get_execution(exec_id)
                 status = state.get("status", "unknown")
                 if not json_output:
                     console.print(f"  [dim]Status:[/dim] {status}")
                 if status in terminal:
+                    break
+                if elapsed >= max_wait:
+                    state = {"status": "timeout", "detail": f"No terminal state after {max_wait}s"}
                     break
 
             end_time_us = time.monotonic_ns() // 1000
@@ -530,8 +544,11 @@ def run(
 
             if json_output:
                 # Fetch events for per-step details
-                events_data = await c.get_events(exec_id)
-                events = events_data.get("events", [])
+                try:
+                    events_data = await c.get_events(exec_id)
+                    events = events_data.get("events", [])
+                except Exception:
+                    events = []
 
                 # Count steps (node_started events)
                 steps_executed = sum(
@@ -545,8 +562,9 @@ def run(
                     "total_duration_us": total_duration_us,
                     "events": events,
                 }
-                # Output raw JSON to stdout (not through Rich to avoid formatting)
-                print(json.dumps(json_result, indent=2))
+                # Output compact JSON to stdout (not through Rich to avoid formatting).
+                # Note: total_duration_us includes connection setup time.
+                print(json.dumps(json_result))
                 return
 
             final_status = state.get("status")
