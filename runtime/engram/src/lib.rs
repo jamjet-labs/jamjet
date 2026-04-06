@@ -15,6 +15,7 @@ pub mod llm;
 pub mod llm_ollama;
 pub mod memory;
 pub mod pipeline;
+pub mod retrieve;
 pub mod scope;
 pub mod store;
 pub mod store_sqlite;
