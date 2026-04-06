@@ -14,6 +14,7 @@ members = [
     "agents",
     "audit",
     "engram",
+    "engram-server",
     "protocols",
     "protocols/mcp",
     "protocols/a2a",

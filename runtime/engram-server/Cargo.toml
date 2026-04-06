@@ -1,0 +1,27 @@
+[package]
+name = "engram-server"
+description = "Engram MCP server — memory layer for AI agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "engram"
+path = "src/main.rs"
+
+[lib]
+name = "engram_server"
+path = "src/lib.rs"
+
+[dependencies]
+engram = { path = "../engram" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
