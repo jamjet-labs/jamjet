@@ -3,13 +3,14 @@ use engram::embedding::MockEmbeddingProvider;
 use engram::memory::Memory;
 use engram_server::handlers;
 use engram_server::mcp::{McpServer, McpToolDef};
+use engram_server::rest::{self, AppState};
 use serde_json::json;
 use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "engram", about = "Engram — memory layer for AI agents")]
 enum Cli {
-    /// Start the MCP stdio server
+    /// Start the server (MCP stdio or REST HTTP)
     Serve {
         /// Path to SQLite database file
         #[arg(long, default_value = "engram.db")]
@@ -18,6 +19,14 @@ enum Cli {
         /// Embedding dimensions (for mock provider)
         #[arg(long, default_value = "64")]
         dims: usize,
+
+        /// Server mode: "mcp" (stdio, default) or "rest" (HTTP)
+        #[arg(long, default_value = "mcp")]
+        mode: String,
+
+        /// HTTP port for REST mode
+        #[arg(long, default_value = "9090")]
+        port: u16,
     },
 }
 
@@ -134,7 +143,12 @@ async fn main() {
 
     let cli = Cli::parse();
     match cli {
-        Cli::Serve { db, dims } => {
+        Cli::Serve {
+            db,
+            dims,
+            mode,
+            port,
+        } => {
             // Ensure parent directory exists
             if let Some(parent) = std::path::Path::new(&db).parent() {
                 if !parent.as_os_str().is_empty() {
@@ -150,64 +164,80 @@ async fn main() {
                 .expect("failed to open memory database");
             let memory = Arc::new(memory);
 
-            eprintln!("engram: MCP server ready (db={db})");
+            match mode.as_str() {
+                "rest" => {
+                    let state = AppState {
+                        memory: memory.clone(),
+                    };
+                    let app = rest::build_router(state);
+                    let addr = format!("0.0.0.0:{port}");
+                    eprintln!("engram: REST server listening on {addr} (db={db})");
+                    let listener = tokio::net::TcpListener::bind(&addr)
+                        .await
+                        .expect("failed to bind");
+                    axum::serve(listener, app).await.expect("server error");
+                }
+                _ => {
+                    eprintln!("engram: MCP server ready (db={db})");
 
-            let defs = tool_defs();
-            let m = memory.clone();
-            let server = McpServer::new()
-                .tool(defs[0].clone(), {
-                    let m = m.clone();
-                    move |args| {
-                        let m = m.clone();
-                        async move { handlers::handle_add(m, args).await }
-                    }
-                })
-                .tool(defs[1].clone(), {
-                    let m = m.clone();
-                    move |args| {
-                        let m = m.clone();
-                        async move { handlers::handle_recall(m, args).await }
-                    }
-                })
-                .tool(defs[2].clone(), {
-                    let m = m.clone();
-                    move |args| {
-                        let m = m.clone();
-                        async move { handlers::handle_context(m, args).await }
-                    }
-                })
-                .tool(defs[3].clone(), {
-                    let m = m.clone();
-                    move |args| {
-                        let m = m.clone();
-                        async move { handlers::handle_forget(m, args).await }
-                    }
-                })
-                .tool(defs[4].clone(), {
-                    let m = m.clone();
-                    move |args| {
-                        let m = m.clone();
-                        async move { handlers::handle_search(m, args).await }
-                    }
-                })
-                .tool(defs[5].clone(), {
-                    let m = m.clone();
-                    move |args| {
-                        let m = m.clone();
-                        async move { handlers::handle_stats(m, args).await }
-                    }
-                })
-                .tool(defs[6].clone(), {
-                    let m = m.clone();
-                    move |args| {
-                        let m = m.clone();
-                        async move { handlers::handle_consolidate(m, args).await }
-                    }
-                });
+                    let defs = tool_defs();
+                    let m = memory.clone();
+                    let server = McpServer::new()
+                        .tool(defs[0].clone(), {
+                            let m = m.clone();
+                            move |args| {
+                                let m = m.clone();
+                                async move { handlers::handle_add(m, args).await }
+                            }
+                        })
+                        .tool(defs[1].clone(), {
+                            let m = m.clone();
+                            move |args| {
+                                let m = m.clone();
+                                async move { handlers::handle_recall(m, args).await }
+                            }
+                        })
+                        .tool(defs[2].clone(), {
+                            let m = m.clone();
+                            move |args| {
+                                let m = m.clone();
+                                async move { handlers::handle_context(m, args).await }
+                            }
+                        })
+                        .tool(defs[3].clone(), {
+                            let m = m.clone();
+                            move |args| {
+                                let m = m.clone();
+                                async move { handlers::handle_forget(m, args).await }
+                            }
+                        })
+                        .tool(defs[4].clone(), {
+                            let m = m.clone();
+                            move |args| {
+                                let m = m.clone();
+                                async move { handlers::handle_search(m, args).await }
+                            }
+                        })
+                        .tool(defs[5].clone(), {
+                            let m = m.clone();
+                            move |args| {
+                                let m = m.clone();
+                                async move { handlers::handle_stats(m, args).await }
+                            }
+                        })
+                        .tool(defs[6].clone(), {
+                            let m = m.clone();
+                            move |args| {
+                                let m = m.clone();
+                                async move { handlers::handle_consolidate(m, args).await }
+                            }
+                        });
 
-            if let Err(e) = server.run().await {
-                eprintln!("engram: server error: {e}");
-                std::process::exit(1);
+                    if let Err(e) = server.run().await {
+                        eprintln!("engram: server error: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
         }
     }
