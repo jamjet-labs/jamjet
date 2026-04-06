@@ -48,6 +48,16 @@ CREATE INDEX IF NOT EXISTS idx_facts_valid_from ON facts (valid_from);
 CREATE INDEX IF NOT EXISTS idx_facts_invalid_at ON facts (invalid_at);
 "#;
 
+/// FTS5 virtual table for keyword search. Separate from FACT_STORE_DDL because
+/// triggers contain `;` inside their bodies, which breaks the `split(';')` DDL
+/// execution approach. Uses a standalone FTS5 table (no content= directive) to
+/// avoid column-name mismatches.
+const FTS5_DDL: &[&str] = &[
+    "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(fact_id UNINDEXED, text)",
+    "CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN INSERT INTO facts_fts(fact_id, text) VALUES (new.id, new.text); END",
+    "CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN DELETE FROM facts_fts WHERE fact_id = old.id; END",
+];
+
 // ---------------------------------------------------------------------------
 // SqliteFactStore
 // ---------------------------------------------------------------------------
@@ -74,6 +84,10 @@ impl SqliteFactStore {
             if stmt.is_empty() {
                 continue;
             }
+            sqlx::query(stmt).execute(&self.pool).await?;
+        }
+        // FTS5 DDL is handled separately because triggers contain `;` inside
+        for stmt in FTS5_DDL {
             sqlx::query(stmt).execute(&self.pool).await?;
         }
         Ok(())
@@ -501,5 +515,36 @@ impl FactStore for SqliteFactStore {
         .await
         .map_err(|e| MemoryError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    async fn keyword_search(
+        &self,
+        query: &str,
+        scope: &Scope,
+        top_k: usize,
+    ) -> Result<Vec<Fact>, MemoryError> {
+        let sql = r#"
+            SELECT f.*
+            FROM facts_fts fts
+            INNER JOIN facts f ON f.id = fts.fact_id
+            WHERE facts_fts MATCH ?
+              AND f.org_id = ?
+              AND (? IS NULL OR f.user_id = ?)
+              AND f.invalid_at IS NULL
+            ORDER BY fts.rank
+            LIMIT ?
+        "#;
+
+        let rows = sqlx::query_as::<_, FactRow>(sql)
+            .bind(query)
+            .bind(&scope.org_id)
+            .bind(scope.user_id.as_deref())
+            .bind(scope.user_id.as_deref())
+            .bind(top_k as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| MemoryError::Database(e.to_string()))?;
+
+        rows.into_iter().map(row_to_fact).collect()
     }
 }

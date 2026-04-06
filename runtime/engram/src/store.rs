@@ -99,4 +99,12 @@ pub trait FactStore: Send + Sync {
     /// asynchronously / fire-and-forget; callers SHOULD NOT depend on
     /// the update being immediately visible.
     async fn record_access(&self, id: FactId) -> Result<(), MemoryError>;
+
+    /// Full-text keyword search over fact text (BM25 ranking).
+    async fn keyword_search(
+        &self,
+        query: &str,
+        scope: &Scope,
+        top_k: usize,
+    ) -> Result<Vec<Fact>, MemoryError>;
 }
