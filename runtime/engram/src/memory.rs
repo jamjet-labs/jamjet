@@ -5,15 +5,19 @@
 //! with `Memory` rather than the lower-level trait objects directly.
 
 use crate::embedding::EmbeddingProvider;
-use crate::fact::{Fact, FactFilter, FactId};
+use crate::extract::{ExtractionConfig, Message};
+use crate::fact::{Entity, Fact, FactFilter, FactId, Relationship};
 use crate::graph::GraphStore;
 use crate::graph_sqlite::SqliteGraphStore;
+use crate::llm::LlmClient;
+use crate::pipeline::ExtractionPipeline;
 use crate::scope::Scope;
 use crate::store::{FactStore, MemoryError, StoreStats};
 use crate::store_sqlite::SqliteFactStore;
 use crate::vector::{VectorFilter, VectorStore};
 use crate::vector_embedded::EmbeddedVectorStore;
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -310,6 +314,70 @@ impl Memory {
             imported += 1;
         }
         Ok(imported)
+    }
+
+    // -----------------------------------------------------------------------
+    // Extraction pipeline
+    // -----------------------------------------------------------------------
+
+    /// Ingest conversation messages: extract facts via LLM, detect conflicts,
+    /// store facts + entities + relationships.
+    ///
+    /// Returns the IDs of newly created facts.
+    pub async fn add_messages(
+        &self,
+        messages: &[Message],
+        scope: Scope,
+        llm: Box<dyn LlmClient>,
+        config: ExtractionConfig,
+    ) -> Result<Vec<FactId>, MemoryError> {
+        let pipeline = ExtractionPipeline::new(llm, config);
+        let extraction = pipeline.extract(messages).await?;
+
+        let mut fact_ids = Vec::new();
+
+        for extracted in extraction.facts {
+            // Create and embed the fact
+            let mut embeddings = self.embedding.embed(&[extracted.text.as_str()]).await?;
+            let embedding = embeddings.pop().ok_or_else(|| {
+                MemoryError::Embedding("empty embedding".to_string())
+            })?;
+
+            let mut fact = Fact::new(&extracted.text, scope.clone());
+            fact.confidence = Some(extracted.confidence as f32);
+            fact.category = extracted.category;
+            fact.embedding = embedding.clone();
+
+            let id = self.fact_store.insert_fact(fact).await?;
+            self.vector_store
+                .upsert(id, embedding, serde_json::json!({}))
+                .await?;
+
+            // Store entities in graph
+            let mut entity_map: HashMap<String, uuid::Uuid> = HashMap::new();
+            for ext_entity in &extracted.entities {
+                let entity = Entity::new(&ext_entity.name, scope.clone())
+                    .with_type(ext_entity.entity_type.as_deref().unwrap_or("unknown"));
+                entity_map.insert(ext_entity.name.clone(), entity.id);
+                self.graph_store.upsert_entity(&entity).await?;
+            }
+
+            // Store relationships in graph
+            for ext_rel in &extracted.relationships {
+                if let (Some(&src_id), Some(&tgt_id)) = (
+                    entity_map.get(&ext_rel.source),
+                    entity_map.get(&ext_rel.target),
+                ) {
+                    let rel =
+                        Relationship::new(src_id, &ext_rel.relation, tgt_id, scope.clone());
+                    self.graph_store.upsert_relationship(&rel).await?;
+                }
+            }
+
+            fact_ids.push(id);
+        }
+
+        Ok(fact_ids)
     }
 
     // -----------------------------------------------------------------------
