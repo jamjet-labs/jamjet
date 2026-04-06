@@ -7,24 +7,12 @@
     <parent>
         <groupId>dev.jamjet</groupId>
         <artifactId>jamjet-parent</artifactId>
-        <version>0.4.1</version>
+        <version>0.4.2</version>
     </parent>
 
     <artifactId>jamjet-skillsjars</artifactId>
     <name>JamJet SkillsJars</name>
     <description>JamJet durability patterns for AI coding assistants — discoverable via SkillsJars</description>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-javadoc-plugin</artifactId>
-                <configuration>
-                    <skip>true</skip>
-                </configuration>
-            </plugin>
-        </plugins>
-    </build>
 
     <dependencies>
         <dependency>
