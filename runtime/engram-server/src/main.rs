@@ -111,6 +111,17 @@ fn tool_defs() -> Vec<McpToolDef> {
                 "properties": {}
             }),
         },
+        McpToolDef {
+            name: "memory_consolidate".into(),
+            description: "Run a memory consolidation cycle (decay, promote, dedup)".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "user_id": { "type": "string" },
+                    "org_id": { "type": "string" }
+                }
+            }),
+        },
     ]
 }
 
@@ -184,6 +195,13 @@ async fn main() {
                     move |args| {
                         let m = m.clone();
                         async move { handlers::handle_stats(m, args).await }
+                    }
+                })
+                .tool(defs[6].clone(), {
+                    let m = m.clone();
+                    move |args| {
+                        let m = m.clone();
+                        async move { handlers::handle_consolidate(m, args).await }
                     }
                 });
 

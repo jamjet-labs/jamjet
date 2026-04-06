@@ -102,3 +102,15 @@ async fn add_with_empty_messages_errors() {
     let result = engram_server::handlers::handle_add(memory, json!({"messages": []})).await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn consolidate_runs_without_error() {
+    let memory = test_memory().await;
+    memory.add_fact("A fact", user_scope()).await.unwrap();
+
+    let result = engram_server::handlers::handle_consolidate(memory, json!({"user_id": "u1"}))
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["llm_calls_used"], 0);
+}

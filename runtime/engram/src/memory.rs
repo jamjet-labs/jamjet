@@ -4,6 +4,7 @@
 //! `EmbeddingProvider` into a single high-level interface. Callers interact
 //! with `Memory` rather than the lower-level trait objects directly.
 
+use crate::consolidation::{ConsolidationConfig, ConsolidationEngine, ConsolidationResult};
 use crate::context::{ContextBlock, ContextBuilder, ContextConfig};
 use crate::embedding::EmbeddingProvider;
 use crate::extract::{ExtractionConfig, Message};
@@ -315,6 +316,30 @@ impl Memory {
             imported += 1;
         }
         Ok(imported)
+    }
+
+    // -----------------------------------------------------------------------
+    // Consolidation
+    // -----------------------------------------------------------------------
+
+    /// Run a consolidation cycle over the given scope.
+    ///
+    /// Operations (decay, promote, dedup, summarize, reflect) are controlled
+    /// by `config.enabled_ops`. LLM-dependent operations (summarize, reflect)
+    /// are skipped when `llm` is `None`.
+    pub async fn consolidate(
+        &self,
+        scope: &Scope,
+        llm: Option<&dyn LlmClient>,
+        config: ConsolidationConfig,
+    ) -> Result<ConsolidationResult, MemoryError> {
+        let engine = ConsolidationEngine::new(
+            self.fact_store.clone(),
+            self.vector_store.clone(),
+            self.embedding.clone(),
+            config,
+        );
+        engine.run(scope, llm).await
     }
 
     // -----------------------------------------------------------------------

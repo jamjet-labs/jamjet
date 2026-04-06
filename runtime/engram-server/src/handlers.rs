@@ -203,3 +203,16 @@ pub async fn handle_stats(memory: Arc<Memory>, _args: Value) -> Result<String, S
     });
     serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
 }
+
+/// memory_consolidate — run a consolidation cycle.
+pub async fn handle_consolidate(memory: Arc<Memory>, args: Value) -> Result<String, String> {
+    let scope = parse_scope(&args);
+
+    let config = engram::consolidation::ConsolidationConfig::default();
+    let result = memory
+        .consolidate(&scope, None, config)
+        .await
+        .map_err(|e| format!("consolidate failed: {e}"))?;
+
+    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+}

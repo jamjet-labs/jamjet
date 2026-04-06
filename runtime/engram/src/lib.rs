@@ -5,6 +5,7 @@
 //! queryable across time — enabling agents to reason over what they knew, when.
 
 pub mod conflict;
+pub mod consolidation;
 pub mod context;
 pub mod embedding;
 pub mod embedding_ollama;
@@ -23,6 +24,9 @@ pub mod store_sqlite;
 pub mod vector;
 pub mod vector_embedded;
 
+pub use consolidation::{
+    ConsolidationConfig, ConsolidationEngine, ConsolidationOp, ConsolidationResult,
+};
 pub use context::{
     CharTokenEstimator, ContextBlock, ContextBuilder, ContextConfig, OutputFormat, TokenEstimator,
 };
