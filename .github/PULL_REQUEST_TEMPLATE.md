@@ -26,3 +26,4 @@ How was this tested? What new tests were added?
 - [ ] Relevant docs updated
 - [ ] `CHANGELOG.md` updated (for user-visible changes)
 - [ ] RFC linked (for significant design changes)
+- [ ] AI assistance disclosed if applicable (see [CONTRIBUTING.md](../CONTRIBUTING.md#ai-assisted-contributions))

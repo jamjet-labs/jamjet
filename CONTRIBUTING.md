@@ -12,6 +12,7 @@ Thank you for your interest in contributing to JamJet. This document covers how 
 - [Repository Structure](#repository-structure)
 - [Running Tests](#running-tests)
 - [Submitting Changes](#submitting-changes)
+- [AI-Assisted Contributions](#ai-assisted-contributions)
 - [RFC Process](#rfc-process)
 - [Architecture Decision Records](#architecture-decision-records)
 - [Code Style](#code-style)
@@ -224,6 +225,36 @@ fix(mcp): handle reconnect on stdio transport disconnect
 docs(guides): add MCP tool discovery example
 test(a2a): add conformance test for input-required state
 ```
+
+---
+
+## AI-Assisted Contributions
+
+JamJet is an AI agent runtime — it would be strange to ban AI-assisted contributions. We welcome them, with one rule:
+
+**Disclose AI assistance in the PR description.** A single line is enough:
+
+> *Disclosure: This contribution was developed with AI assistance (Claude / Cursor / Copilot / etc.).*
+
+The bar for accepting a contribution is the same regardless of how it was produced:
+
+1. The change solves a real problem clearly stated in the issue or PR description
+2. The code follows existing patterns in the affected module
+3. Tests are included for any non-trivial change
+4. The contributor responds to review feedback and iterates as needed
+5. CI passes
+
+What we will NOT accept, regardless of authorship:
+
+- High-volume drive-by PRs with no engagement after submission
+- PRs that don't run tests locally before pushing
+- PRs that ignore review feedback
+- PRs that introduce dependencies, license changes, or design shifts without discussion in an issue first
+- PRs that add features, refactor unrelated code, or "improve" beyond what was asked
+
+In short: be a good collaborator. Use AI to ship faster, not to ship lower-quality contributions. We will treat your PR exactly the same whether you wrote every line by hand or generated it with an agent — the code is what we're reviewing.
+
+If you're unsure whether a change is in scope, open an issue first.
 
 ---
 
