@@ -69,7 +69,8 @@ class TestJsonOutput:
 
         # The output should be valid JSON
         stdout = result.stdout.strip()
-        assert stdout, f"Expected JSON output, got empty stdout. stderr: {result.stderr if hasattr(result, 'stderr') else 'N/A'}"
+        stderr = result.stderr if hasattr(result, "stderr") else "N/A"
+        assert stdout, f"Expected JSON output, got empty stdout. stderr: {stderr}"
         parsed = json.loads(stdout)
         assert "execution_id" in parsed
         assert "final_state" in parsed

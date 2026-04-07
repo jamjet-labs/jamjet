@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import pytest
-
 from jamjet.engram import EngramClient
-from jamjet.engram.client import ContextBlock, ConsolidationResult
+from jamjet.engram.client import ConsolidationResult, ContextBlock
 
 
 def test_client_defaults():

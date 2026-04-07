@@ -165,14 +165,17 @@ class EngramClient:
 
     # ── Forget ────────────────────────────────────────────────────────────
 
-    async def forget(
-        self, fact_id: str, *, reason: str | None = None
-    ) -> dict[str, Any]:
+    async def forget(self, fact_id: str, *, reason: str | None = None) -> dict[str, Any]:
         """Soft-delete a fact by ID."""
+        # httpx doesn't support a body on .delete(); use .request() instead.
         body: dict[str, Any] = {}
         if reason:
             body["reason"] = reason
-        r = await self._client.delete(f"/v1/memory/facts/{fact_id}", json=body or None)
+        r = await self._client.request(
+            "DELETE",
+            f"/v1/memory/facts/{fact_id}",
+            json=body if body else None,
+        )
         r.raise_for_status()
         return r.json()
 

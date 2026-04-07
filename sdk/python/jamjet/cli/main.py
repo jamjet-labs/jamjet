@@ -85,7 +85,7 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-class OutputFormat(str, enum.Enum):
+class OutputFormat(enum.StrEnum):
     """Supported output formats for CLI commands."""
 
     text = "text"
@@ -551,9 +551,7 @@ def run(
                     events = []
 
                 # Count steps (node_started events)
-                steps_executed = sum(
-                    1 for e in events if e.get("kind", {}).get("type") == "node_started"
-                )
+                steps_executed = sum(1 for e in events if e.get("kind", {}).get("type") == "node_started")
 
                 json_result = {
                     "execution_id": exec_id,
