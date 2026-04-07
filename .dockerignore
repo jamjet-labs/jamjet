@@ -1,0 +1,50 @@
+# Build artifacts
+runtime/target/
+runtime/**/target/
+sdk/python/.venv/
+sdk/python/dist/
+sdk/python/build/
+sdk/python/*.egg-info/
+sdk/java/**/target/
+sdk/java-cli/**/target/
+target/
+
+# Node
+node_modules/
+**/node_modules/
+
+# Web build outputs
+web/dist/
+web/.next/
+web/build/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.log
+
+# Git
+.git/
+.github/
+.gitignore
+
+# Tests / cache
+.pytest_cache/
+__pycache__/
+*.pyc
+.cache/
+.mypy_cache/
+.ruff_cache/
+
+# Docs / examples (not needed in image)
+docs/
+strategy/
+.claude/
+.claude-meta/
+.coderabbit.yaml
+
+# Temp
+*.tmp
+*.bak
