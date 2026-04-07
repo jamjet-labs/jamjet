@@ -20,6 +20,9 @@ LABEL org.opencontainers.image.documentation="https://docs.jamjet.dev"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.vendor="JamJet Labs"
 
+# MCP Registry name annotation (required by registry.modelcontextprotocol.io)
+LABEL io.modelcontextprotocol.server.name="io.github.jamjet-labs/engram-server"
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

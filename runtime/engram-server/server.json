@@ -12,9 +12,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "registryBaseUrl": "https://ghcr.io",
-      "identifier": "ghcr.io/jamjet-labs/engram-server",
-      "version": "0.3.1",
+      "identifier": "ghcr.io/jamjet-labs/engram-server:0.3.1",
       "transport": {
         "type": "stdio"
       }
