@@ -22,8 +22,10 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import sys
+import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -81,6 +83,13 @@ def _version_callback(value: bool) -> None:
         _print_logo()
         typer.echo("\nJamJet v0.1.1  —  agent-native workflow runtime")
         raise typer.Exit()
+
+
+class OutputFormat(str, enum.Enum):
+    """Supported output formats for CLI commands."""
+
+    text = "text"
+    json = "json"
 
 
 app = typer.Typer(
@@ -479,32 +488,84 @@ def run(
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
     follow: bool = typer.Option(True, "--follow/--no-follow", help="Follow execution progress"),
     stream: bool = typer.Option(False, "--stream", help="Stream structured output chunks progressively"),
+    output: OutputFormat = typer.Option(
+        OutputFormat.text,
+        "--output",
+        "-o",
+        help="Output format: 'text' (human-readable, default) or 'json' (machine-readable)",
+    ),
+    timeout: int = typer.Option(
+        300,
+        "--timeout",
+        help="Maximum seconds to wait for a terminal state (default: 300)",
+    ),
 ) -> None:
     """Submit and run a workflow execution."""
     input_data = json.loads(input) if input else {}
+    json_output = output == OutputFormat.json
 
     async def _run() -> None:
+        start_time_us = time.monotonic_ns() // 1000
+
         async with _client(runtime) as c:
             result = await c.start_execution(workflow_id=workflow, input=input_data)
             exec_id = result.get("execution_id", "unknown")
-            console.print(f"[green]Execution started:[/green] {exec_id}")
 
-            if stream:
+            if not json_output:
+                console.print(f"[green]Execution started:[/green] {exec_id}")
+
+            if stream and not json_output:
                 await _stream_execution(c, exec_id)
                 return
 
-            if not follow:
+            # For JSON output, always follow to completion
+            if not follow and not json_output:
                 return
 
             terminal = {"completed", "failed", "cancelled", "limit_exceeded"}
             state: dict = {}
+            max_wait = timeout
+            elapsed = 0
             while True:
                 await asyncio.sleep(1)
+                elapsed += 1
                 state = await c.get_execution(exec_id)
                 status = state.get("status", "unknown")
-                console.print(f"  [dim]Status:[/dim] {status}")
+                if not json_output:
+                    console.print(f"  [dim]Status:[/dim] {status}")
                 if status in terminal:
                     break
+                if elapsed >= max_wait:
+                    state = {"status": "timeout", "detail": f"No terminal state after {max_wait}s"}
+                    break
+
+            end_time_us = time.monotonic_ns() // 1000
+            total_duration_us = end_time_us - start_time_us
+
+            if json_output:
+                # Fetch events for per-step details
+                try:
+                    events_data = await c.get_events(exec_id)
+                    events = events_data.get("events", [])
+                except Exception:
+                    events = []
+
+                # Count steps (node_started events)
+                steps_executed = sum(
+                    1 for e in events if e.get("kind", {}).get("type") == "node_started"
+                )
+
+                json_result = {
+                    "execution_id": exec_id,
+                    "final_state": state,
+                    "steps_executed": steps_executed,
+                    "total_duration_us": total_duration_us,
+                    "events": events,
+                }
+                # Output compact JSON to stdout (not through Rich to avoid formatting).
+                # Note: total_duration_us includes connection setup time.
+                print(json.dumps(json_result))
+                return
 
             final_status = state.get("status")
             if final_status == "completed":
