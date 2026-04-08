@@ -33,5 +33,5 @@ spring.jamjet.durability-enabled=true
 ## Runtime requirement
 
 ```bash
-docker run -p 7700:7700 ghcr.io/jamjet-labs/jamjet:latest
+docker run -p 7700:8080 ghcr.io/jamjet-labs/jamjet:latest
 ```

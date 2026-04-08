@@ -174,7 +174,7 @@ public class JamjetCli implements Callable<Integer> {
                       cargo run --bin jamjet-server
 
                     Or with Docker:
-                      docker run -p 7700:7700 jamjet/runtime:latest
+                      docker run -p 7700:8080 jamjet/runtime:latest
 
                     Environment variables:
                       JAMJET_TOKEN      — API authentication token

@@ -33,9 +33,9 @@ COPY sdk/python /tmp/sdk
 RUN pip install --no-cache-dir /tmp/sdk && rm -rf /tmp/sdk
 
 ENV JAMJET_BIND=0.0.0.0
-ENV JAMJET_PORT=7700
+ENV JAMJET_PORT=8080
 ENV RUST_LOG=info
 
-EXPOSE 7700
+EXPOSE 8080
 
 ENTRYPOINT ["jamjet-server"]

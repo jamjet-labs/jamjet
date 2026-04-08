@@ -13,7 +13,7 @@
 ## Step 2: Start the JamJet runtime
 
 ```bash
-docker run -p 7700:7700 ghcr.io/jamjet-labs/jamjet:latest
+docker run -p 7700:8080 ghcr.io/jamjet-labs/jamjet:latest
 ```
 
 ## Step 3: Configure
