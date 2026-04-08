@@ -7,21 +7,49 @@ use std::sync::Arc;
 
 const EXTRACTION_SYSTEM_PROMPT: &str = r#"You are a memory extraction engine. Given a conversation, extract discrete facts about the user or topic.
 
-For each fact, extract:
-- "text": a concise, standalone statement of the fact
-- "entities": named entities mentioned (name + entity_type: person/place/thing/concept/pet/org)
-- "relationships": directed relationships between entities (source, relation, target)
-- "confidence": how certain you are (0.0-1.0)
-- "category": one of: preferences, personal_info, intent, health, work, location, relationships, general
+Respond with a JSON object in EXACTLY this shape — no other fields, no extra nesting:
+
+{
+  "facts": [
+    {
+      "text": "The user is allergic to peanuts",
+      "entities": [
+        { "name": "user", "entity_type": "person" },
+        { "name": "peanuts", "entity_type": "thing" }
+      ],
+      "relationships": [
+        { "source": "user", "relation": "allergic_to", "target": "peanuts" }
+      ],
+      "confidence": 0.98,
+      "category": "health"
+    },
+    {
+      "text": "The user lives in Bangalore",
+      "entities": [
+        { "name": "user", "entity_type": "person" },
+        { "name": "Bangalore", "entity_type": "place" }
+      ],
+      "relationships": [
+        { "source": "user", "relation": "lives_in", "target": "Bangalore" }
+      ],
+      "confidence": 0.95,
+      "category": "location"
+    }
+  ]
+}
+
+Every entity MUST be an object with a "name" string, never a bare string. Every relationship MUST be an object with "source", "relation", and "target" strings.
+
+Allowed entity_type values: person, place, thing, concept, pet, org.
+Allowed category values: preferences, personal_info, intent, health, work, location, relationships, general.
 
 Rules:
-- Extract facts that would be useful to remember for future conversations
-- Each fact should be a single, atomic statement
-- Do NOT extract greetings, acknowledgments, or small talk
-- Do NOT repeat facts that are already implied by other facts
-- Confidence should reflect how explicitly the fact was stated (explicit=0.95+, inferred=0.7-0.9)
-
-Respond with JSON: {"facts": [...]}"#;
+- Extract facts that would be useful to remember for future conversations.
+- Each fact should be a single, atomic statement.
+- Do NOT extract greetings, acknowledgments, or small talk.
+- Do NOT repeat facts that are already implied by other facts.
+- Confidence should reflect how explicitly the fact was stated (explicit ≥ 0.95, inferred 0.7–0.9).
+- If there are no useful facts, respond with {"facts": []}."#;
 
 pub struct ExtractionPipeline {
     llm: Arc<dyn LlmClient>,

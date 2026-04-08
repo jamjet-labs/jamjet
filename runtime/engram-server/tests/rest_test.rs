@@ -3,6 +3,7 @@ use axum::http::{Request, StatusCode};
 use engram::embedding::MockEmbeddingProvider;
 use engram::memory::Memory;
 use engram::scope::Scope;
+use engram_server::config::LlmBackend;
 use engram_server::rest::{build_router, AppState};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -20,6 +21,7 @@ async fn test_app() -> (axum::Router, Arc<Memory>) {
     let memory = Arc::new(memory);
     let state = AppState {
         memory: memory.clone(),
+        llm_backend: LlmBackend::Mock,
     };
     (build_router(state), memory)
 }
@@ -142,7 +144,7 @@ async fn forget_and_verify() {
 
     let resp = app
         .oneshot(
-            Request::delete(&format!("/v1/memory/facts/{id}"))
+            Request::delete(format!("/v1/memory/facts/{id}"))
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -7,12 +7,12 @@
     "source": "github",
     "subfolder": "runtime/engram-server"
   },
-  "version": "0.3.1",
+  "version": "0.3.2",
   "websiteUrl": "https://java-ai-memory.dev",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/jamjet-labs/engram-server:0.3.1",
+      "identifier": "ghcr.io/jamjet-labs/engram-server:0.3.2",
       "transport": {
         "type": "stdio"
       }

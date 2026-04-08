@@ -1,8 +1,8 @@
 //! MCP tool handlers — one function per tool, each calling Memory methods.
 
+use crate::config::LlmBackend;
 use engram::context::{ContextConfig, OutputFormat};
 use engram::extract::{ExtractionConfig, Message};
-use engram::llm::MockLlmClient;
 use engram::memory::{Memory, RecallQuery};
 use engram::scope::Scope;
 use serde_json::Value;
@@ -20,7 +20,16 @@ fn parse_scope(args: &Value) -> Scope {
 }
 
 /// memory_add — extract facts from conversation messages.
-pub async fn handle_add(memory: Arc<Memory>, args: Value) -> Result<String, String> {
+///
+/// The LLM used for extraction is chosen by the server's `LlmBackend`
+/// (configured at startup via CLI flags or env vars — see `config.rs`).
+/// A fresh boxed client is built per call because `Memory::add_messages`
+/// takes ownership of `Box<dyn LlmClient>`.
+pub async fn handle_add(
+    memory: Arc<Memory>,
+    llm_backend: LlmBackend,
+    args: Value,
+) -> Result<String, String> {
     let messages: Vec<Message> = args["messages"]
         .as_array()
         .unwrap_or(&vec![])
@@ -41,11 +50,13 @@ pub async fn handle_add(memory: Arc<Memory>, args: Value) -> Result<String, Stri
 
     let scope = parse_scope(&args);
 
-    // MockLlmClient returns empty facts — in a real deployment, configure Ollama or API LLM.
-    let llm = MockLlmClient::new(vec![serde_json::json!({"facts": []})]);
-
     let ids = memory
-        .add_messages(&messages, scope, Box::new(llm), ExtractionConfig::default())
+        .add_messages(
+            &messages,
+            scope,
+            llm_backend.build(),
+            ExtractionConfig::default(),
+        )
         .await
         .map_err(|e| format!("add_messages failed: {e}"))?;
 

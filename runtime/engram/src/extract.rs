@@ -52,13 +52,47 @@ fn default_confidence() -> f64 {
 }
 
 /// An entity extracted by the LLM (before storage — no UUID yet).
+///
+/// Deserialization is lenient: the LLM may return either a bare string
+/// `"alice"` (which becomes `{ name: "alice", entity_type: None }`) or a
+/// full object `{ "name": "alice", "entity_type": "person" }`. This makes
+/// the pipeline robust against smaller open models that sometimes drop
+/// structured fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "ExtractedEntityInput")]
 pub struct ExtractedEntity {
     /// Canonical name (e.g., "Austin", "Max").
     pub name: String,
     /// Entity type (e.g., "person", "place", "pet").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity_type: Option<String>,
+}
+
+/// Internal — lenient deserialization target. Accepts either a bare string
+/// or a struct, then converts into `ExtractedEntity`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ExtractedEntityInput {
+    /// Bare string form — `"alice"`.
+    Name(String),
+    /// Full struct form — `{ "name": "alice", "entity_type": "person" }`.
+    Full {
+        name: String,
+        #[serde(default)]
+        entity_type: Option<String>,
+    },
+}
+
+impl From<ExtractedEntityInput> for ExtractedEntity {
+    fn from(input: ExtractedEntityInput) -> Self {
+        match input {
+            ExtractedEntityInput::Name(name) => Self {
+                name,
+                entity_type: None,
+            },
+            ExtractedEntityInput::Full { name, entity_type } => Self { name, entity_type },
+        }
+    }
 }
 
 /// A relationship extracted by the LLM (before storage).
@@ -164,5 +198,39 @@ mod tests {
         let fact: ExtractedFact = serde_json::from_str(json).unwrap();
         assert_eq!(fact.confidence, 1.0);
         assert!(fact.entities.is_empty());
+    }
+
+    #[test]
+    fn extracted_entity_accepts_bare_string() {
+        let json = r#""alice""#;
+        let entity: ExtractedEntity = serde_json::from_str(json).unwrap();
+        assert_eq!(entity.name, "alice");
+        assert!(entity.entity_type.is_none());
+    }
+
+    #[test]
+    fn extracted_entity_accepts_full_struct() {
+        let json = r#"{"name": "Bangalore", "entity_type": "place"}"#;
+        let entity: ExtractedEntity = serde_json::from_str(json).unwrap();
+        assert_eq!(entity.name, "Bangalore");
+        assert_eq!(entity.entity_type.as_deref(), Some("place"));
+    }
+
+    #[test]
+    fn extracted_fact_accepts_mixed_entity_shapes() {
+        // A real failure case: llama3.2:3b often returns entities as a
+        // mix of bare strings and partial objects in the same list.
+        let json = r#"{
+            "text": "The user is allergic to peanuts",
+            "entities": ["user", {"name": "peanuts", "entity_type": "thing"}],
+            "confidence": 0.95,
+            "category": "health"
+        }"#;
+        let fact: ExtractedFact = serde_json::from_str(json).unwrap();
+        assert_eq!(fact.entities.len(), 2);
+        assert_eq!(fact.entities[0].name, "user");
+        assert!(fact.entities[0].entity_type.is_none());
+        assert_eq!(fact.entities[1].name, "peanuts");
+        assert_eq!(fact.entities[1].entity_type.as_deref(), Some("thing"));
     }
 }

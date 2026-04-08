@@ -377,6 +377,39 @@ Does one agent need to invoke another?
 
 ---
 
+## Memory — Engram
+
+JamJet ships with **Engram**, a durable memory layer for agents — temporal knowledge graph, hybrid retrieval, consolidation engine, all backed by a single SQLite file. Engram runs as an embedded Rust library or as a standalone MCP/REST server, and is consumable from Python, Java, and Spring Boot.
+
+**Provider-agnostic.** The same Engram binary speaks to Ollama (local, free), any OpenAI-compatible endpoint (OpenAI, Azure, Groq, Together, Mistral, DeepSeek, Perplexity, OpenRouter, vLLM, LM Studio, …), Anthropic Claude, Google Gemini, or a `command` shell-out for anything else — pick one with `ENGRAM_LLM_PROVIDER=…`, no recompile.
+
+| Shape | Package | When to use |
+|---|---|---|
+| Rust library | `jamjet-engram` (crates.io) | Embedding memory directly in a Rust application |
+| Standalone binary | `jamjet-engram-server` (crates.io), `ghcr.io/jamjet-labs/engram-server` (Docker), [Official MCP Registry](https://registry.modelcontextprotocol.io/servers/io.github.jamjet-labs/engram-server) | MCP clients (Claude Desktop, Cursor), language-agnostic REST clients, zero-code setups |
+| Python client | `jamjet` (PyPI) | Python agents talking to `engram-server` over REST |
+| Java client | `dev.jamjet:jamjet-sdk` (Maven Central) | JVM agents talking to `engram-server` over REST |
+| Spring Boot starter | `dev.jamjet:engram-spring-boot-starter` (Maven Central) | Drop-in `@Bean EngramMemory` for Spring AI applications |
+
+```bash
+# Try it with Claude Desktop in 30 seconds (uses local Ollama by default)
+docker run --rm -i \
+  -v engram-data:/data \
+  ghcr.io/jamjet-labs/engram-server:0.3.2
+
+# Or point at Groq instead — same binary, no rebuild
+docker run --rm -i \
+  -e ENGRAM_LLM_PROVIDER=openai-compatible \
+  -e ENGRAM_OPENAI_BASE_URL=https://api.groq.com/openai/v1 \
+  -e OPENAI_API_KEY=gsk_... \
+  -v engram-data:/data \
+  ghcr.io/jamjet-labs/engram-server:0.3.2
+```
+
+Seven MCP tools exposed by the server: `memory_add`, `memory_recall`, `memory_context`, `memory_search`, `memory_forget`, `memory_stats`, `memory_consolidate`. Full docs at [**runtime/engram-server/README.md**](runtime/engram-server/README.md). For how Engram compares to Mem0, Zep, Spring AI ChatMemory, LangChain4j, Koog, Google ADK Memory Bank, and Embabel, see [java-ai-memory.dev](https://java-ai-memory.dev).
+
+---
+
 ## Architecture
 
 ```
@@ -442,7 +475,7 @@ Full documentation at **[jamjet.dev](https://jamjet.dev/quickstart)**
 
 ```
 jamjet/
-├── runtime/                # Rust workspace (15 crates)
+├── runtime/                # Rust workspace
 │   ├── core/               # Graph IR, node types, state machine
 │   ├── ir/                 # Canonical Intermediate Representation
 │   ├── scheduler/          # Durable task scheduler
@@ -454,6 +487,8 @@ jamjet/
 │   ├── timers/             # Durable timers, Postgres-backed cron
 │   ├── policy/             # Policy engine, PII redaction
 │   ├── audit/              # Immutable audit log
+│   ├── engram/             # Durable memory library (jamjet-engram crate)
+│   ├── engram-server/      # MCP + REST server binary (jamjet-engram-server)
 │   ├── protocols/
 │   │   ├── mcp/            # MCP client + server
 │   │   └── a2a/            # A2A client + server + federation auth + mTLS

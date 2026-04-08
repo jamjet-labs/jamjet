@@ -1,6 +1,7 @@
 use engram::embedding::MockEmbeddingProvider;
 use engram::memory::Memory;
 use engram::scope::Scope;
+use engram_server::config::LlmBackend;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -99,7 +100,9 @@ async fn forget_and_verify() {
 #[tokio::test]
 async fn add_with_empty_messages_errors() {
     let memory = test_memory().await;
-    let result = engram_server::handlers::handle_add(memory, json!({"messages": []})).await;
+    let result =
+        engram_server::handlers::handle_add(memory, LlmBackend::Mock, json!({"messages": []}))
+            .await;
     assert!(result.is_err());
 }
 

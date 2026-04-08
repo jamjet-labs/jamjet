@@ -1,5 +1,6 @@
 //! Axum REST API for Engram memory operations.
 
+use crate::config::LlmBackend;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -7,7 +8,6 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use engram::context::{ContextConfig, OutputFormat};
 use engram::extract::{ExtractionConfig, Message};
-use engram::llm::MockLlmClient;
 use engram::memory::{Memory, RecallQuery};
 use engram::scope::Scope;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AppState {
     pub memory: Arc<Memory>,
+    pub llm_backend: LlmBackend,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,11 +129,14 @@ async fn add_handler(
         body.session_id.as_deref(),
     );
 
-    let llm = MockLlmClient::new(vec![serde_json::json!({"facts": []})]);
-
     match state
         .memory
-        .add_messages(&messages, scope, Box::new(llm), ExtractionConfig::default())
+        .add_messages(
+            &messages,
+            scope,
+            state.llm_backend.build(),
+            ExtractionConfig::default(),
+        )
         .await
     {
         Ok(ids) => {

@@ -39,6 +39,16 @@ WORKDIR /home/engram
 ENV ENGRAM_DB_PATH=/data/engram.db
 VOLUME ["/data"]
 
+# Default Ollama URL points at the Docker host gateway, so users running
+# Ollama on their host machine can `docker run` with no extra flags on
+# Docker Desktop. Linux users need `--add-host=host.docker.internal:host-gateway`.
+# Override with `-e ENGRAM_OLLAMA_URL=http://...` to point at a remote Ollama.
+ENV ENGRAM_OLLAMA_URL=http://host.docker.internal:11434
+ENV ENGRAM_BACKEND=ollama
+ENV ENGRAM_LLM_MODEL=llama3.2
+ENV ENGRAM_EMBEDDING_MODEL=nomic-embed-text
+ENV ENGRAM_EMBEDDING_DIMS=768
+
 # Default to MCP stdio mode (most common use case for AI agents)
 ENTRYPOINT ["engram"]
-CMD ["serve", "--db", "/data/engram.db"]
+CMD ["serve"]

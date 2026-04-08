@@ -1,12 +1,13 @@
 [package]
 name = "jamjet-engram"
 description = "Engram — durable memory layer for AI agents. Temporal knowledge graph, semantic search, and MCP-native tools."
-version.workspace = true
+version = "0.3.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
+readme = "README.md"
 keywords = ["agent", "memory", "knowledge-graph", "mcp", "llm"]
 categories = ["development-tools", "asynchronous"]
 
@@ -23,6 +24,8 @@ chrono = { workspace = true }
 sqlx = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
+# `tokio::process` + async I/O are needed by CommandLlmClient.
+tokio = { version = "1", features = ["process", "io-util", "time", "macros"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

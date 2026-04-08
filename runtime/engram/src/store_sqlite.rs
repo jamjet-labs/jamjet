@@ -535,8 +535,13 @@ impl FactStore for SqliteFactStore {
             LIMIT ?
         "#;
 
+        let normalized = normalize_fts_query(query);
+        if normalized.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let rows = sqlx::query_as::<_, FactRow>(sql)
-            .bind(query)
+            .bind(&normalized)
             .bind(&scope.org_id)
             .bind(scope.user_id.as_deref())
             .bind(scope.user_id.as_deref())
@@ -546,5 +551,71 @@ impl FactStore for SqliteFactStore {
             .map_err(|e| MemoryError::Database(e.to_string()))?;
 
         rows.into_iter().map(row_to_fact).collect()
+    }
+}
+
+/// Normalize a raw keyword query into an FTS5 MATCH expression.
+///
+/// FTS5 requires `peanut*` for prefix matching — plain `peanut` only matches
+/// the exact token `peanut` and would miss `peanuts`. This helper strips
+/// punctuation, lowercases, splits on whitespace, and appends `*` to each
+/// token so that reasonable user input like `"peanut"` or `"food allergies"`
+/// matches what they expect. Queries that already contain FTS5 operators
+/// (quoted phrases, column filters) are passed through unchanged.
+fn normalize_fts_query(query: &str) -> String {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Pass through advanced FTS5 syntax so power users aren't blocked.
+    if trimmed.contains('"') || trimmed.contains(':') || trimmed.contains('(') {
+        return trimmed.to_string();
+    }
+
+    trimmed
+        .split_whitespace()
+        .filter_map(|token| {
+            let cleaned: String = token
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(format!("{cleaned}*"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_fts_query;
+
+    #[test]
+    fn single_token_gets_prefix_star() {
+        assert_eq!(normalize_fts_query("peanut"), "peanut*");
+    }
+
+    #[test]
+    fn multi_token_each_gets_prefix_star() {
+        assert_eq!(normalize_fts_query("food allergies"), "food* allergies*");
+    }
+
+    #[test]
+    fn punctuation_stripped() {
+        assert_eq!(normalize_fts_query("what's up?"), "whats* up*");
+    }
+
+    #[test]
+    fn empty_query_returns_empty() {
+        assert_eq!(normalize_fts_query("   "), "");
+    }
+
+    #[test]
+    fn quoted_phrase_passes_through() {
+        let q = "\"exact phrase\"";
+        assert_eq!(normalize_fts_query(q), q);
     }
 }

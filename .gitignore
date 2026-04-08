@@ -66,6 +66,8 @@ paper/
 credentials*.json
 .envrc
 .secrets*
+.mcpregistry_*token
+runtime/engram-server/.mcpregistry_*
 
 # Infrastructure state and local cloud env
 .terraform/
