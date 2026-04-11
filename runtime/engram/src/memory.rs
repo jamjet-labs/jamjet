@@ -10,13 +10,16 @@ use crate::embedding::EmbeddingProvider;
 use crate::extract::{ExtractionConfig, Message};
 use crate::fact::{Entity, Fact, FactFilter, FactId, Relationship};
 use crate::graph::GraphStore;
+use crate::graph_postgres::PostgresGraphStore;
 use crate::graph_sqlite::SqliteGraphStore;
 use crate::llm::LlmClient;
 use crate::message::{ChatMessage, MessageId, MessageStore};
+use crate::message_postgres::PostgresMessageStore;
 use crate::message_sqlite::SqliteMessageStore;
 use crate::pipeline::ExtractionPipeline;
 use crate::scope::Scope;
 use crate::store::{FactStore, MemoryError, StoreStats};
+use crate::store_postgres::PostgresFactStore;
 use crate::store_sqlite::SqliteFactStore;
 use crate::vector::{VectorFilter, VectorStore};
 use crate::vector_embedded::EmbeddedVectorStore;
@@ -163,6 +166,55 @@ impl Memory {
         let message_store = SqliteMessageStore::open(database_url).await.map_err(|e| {
             MemoryError::Database(format!("failed to open message store SQLite: {e}"))
         })?;
+        message_store
+            .migrate()
+            .await
+            .map_err(|e| MemoryError::Database(format!("message store migration failed: {e}")))?;
+
+        let vector_store = EmbeddedVectorStore::new(dims);
+
+        Ok(Self {
+            fact_store: Arc::new(fact_store),
+            vector_store: Arc::new(vector_store),
+            graph_store: Arc::new(graph_store),
+            embedding,
+            message_store: Some(Arc::new(message_store)),
+        })
+    }
+
+    /// Open a PostgreSQL-backed `Memory` instance at `database_url`.
+    ///
+    /// Uses Postgres for facts, graph, and message data, with an in-process
+    /// `EmbeddedVectorStore` for semantic search. Schema migration is applied
+    /// automatically.
+    pub async fn open_postgres(
+        database_url: &str,
+        embedding: Box<dyn EmbeddingProvider>,
+    ) -> Result<Self, MemoryError> {
+        let dims = embedding.dimensions();
+        let embedding = Arc::from(embedding);
+
+        let fact_store = PostgresFactStore::open(database_url)
+            .await
+            .map_err(|e| MemoryError::Database(format!("failed to open Postgres: {e}")))?;
+        fact_store
+            .migrate()
+            .await
+            .map_err(|e| MemoryError::Database(format!("fact store migration failed: {e}")))?;
+
+        let graph_store = PostgresGraphStore::open(database_url)
+            .await
+            .map_err(|e| MemoryError::Database(format!("failed to open graph Postgres: {e}")))?;
+        graph_store
+            .migrate()
+            .await
+            .map_err(|e| MemoryError::Database(format!("graph store migration failed: {e}")))?;
+
+        let message_store = PostgresMessageStore::open(database_url)
+            .await
+            .map_err(|e| {
+                MemoryError::Database(format!("failed to open message store Postgres: {e}"))
+            })?;
         message_store
             .migrate()
             .await

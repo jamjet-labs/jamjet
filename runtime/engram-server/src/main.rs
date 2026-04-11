@@ -41,7 +41,8 @@ enum EmbeddingProvider {
 enum Cli {
     /// Start the server (MCP stdio or REST HTTP)
     Serve {
-        /// Path to SQLite database file
+        /// Database path or URL. Use a file path for SQLite (e.g. `engram.db`)
+        /// or a Postgres connection URL (`postgres://…` / `postgresql://…`).
         #[arg(long, env = "ENGRAM_DB_PATH", default_value = "engram.db")]
         db: String,
 
@@ -469,11 +470,18 @@ async fn main() {
             }
             eprintln!("engram: extract_on_save = {extract_on_save}");
 
-            let db_url = format!("sqlite:{db}?mode=rwc");
-
-            let memory = Memory::open(&db_url, config.embedding.build())
-                .await
-                .expect("failed to open memory database");
+            let memory = if db.starts_with("postgres://") || db.starts_with("postgresql://") {
+                tracing::info!("  backend: PostgreSQL");
+                Memory::open_postgres(&db, config.embedding.build())
+                    .await
+                    .expect("failed to open Postgres memory database")
+            } else {
+                let db_url = format!("sqlite:{db}?mode=rwc");
+                tracing::info!("  backend: SQLite ({db})");
+                Memory::open(&db_url, config.embedding.build())
+                    .await
+                    .expect("failed to open SQLite memory database")
+            };
             let memory = Arc::new(memory);
 
             match mode.as_str() {
