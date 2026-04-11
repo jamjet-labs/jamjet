@@ -2,7 +2,7 @@
 
 <h1>⚡ Engram</h1>
 
-**Durable memory for AI agents — temporal knowledge graph, hybrid retrieval, SQLite-backed.**
+**Durable memory for AI agents — temporal knowledge graph, hybrid retrieval, SQLite or PostgreSQL.**
 
 [![crates.io (lib)](https://img.shields.io/crates/v/jamjet-engram?label=jamjet-engram&style=flat-square&color=f5c518)](https://crates.io/crates/jamjet-engram)
 [![crates.io (server)](https://img.shields.io/crates/v/jamjet-engram-server?label=jamjet-engram-server&style=flat-square&color=f5c518)](https://crates.io/crates/jamjet-engram-server)
@@ -16,7 +16,7 @@
 
 ---
 
-Engram is a **durable memory layer for AI agents**. It extracts facts from conversations, stores them in a temporal knowledge graph, and retrieves them with hybrid semantic + keyword search — all backed by a single SQLite file.
+Engram is a **durable memory layer for AI agents**. It extracts facts from conversations, stores them in a temporal knowledge graph, and retrieves them with hybrid semantic + keyword search — backed by a single SQLite file or a PostgreSQL database.
 
 It ships in two shapes:
 
@@ -43,11 +43,11 @@ Pick one with `ENGRAM_LLM_PROVIDER=…` — the same binary handles all of them.
 | Problem | Engram's answer |
 |---------|-----------------|
 | Every agent memory library is Python-first | **Rust core** with native Python, Java, and MCP clients — no sidecar required |
-| Needs Postgres + Qdrant + Neo4j just to try | **Single SQLite file**, zero infra |
+| Needs Postgres + Qdrant + Neo4j just to try | **Single SQLite file** (zero infra) or **Postgres** when you need it |
 | Conversation history is not knowledge memory | **Fact extraction pipeline** — pulls structured facts out of messages |
 | Old facts drift and contradict each other | **Conflict detection + consolidation** — decay, promote, dedup, summarize, reflect |
 | Memory recall is either semantic OR keyword | **Hybrid retrieval** — vector search + SQLite FTS5 in one query |
-| Agents lose memory across processes | **Durable by default** — one SQLite file, crash-safe, portable |
+| Agents lose memory across processes | **Durable by default** — SQLite or Postgres, crash-safe, portable |
 | MCP support is an afterthought | **MCP-native** — 7 tools exposed by a single binary |
 | No time-travel over what the agent knew | **Temporal knowledge graph** — every fact is scoped and timestamped |
 | Can't isolate memory per user or tenant | **First-class scopes** — org / user / session built into every query |
@@ -244,29 +244,40 @@ No server. No config. No Python sidecar. One binary.
 
 ### Cursor / any MCP-aware IDE
 
-Point it at the same `docker run` command, or at a locally-installed `engram serve` binary. After restart, seven `memory_*` tools are available to the model.
+Point it at the same `docker run` command, or at a locally-installed `engram serve` binary. After restart, eleven tools are available to the model (seven `memory_*` + four `messages_*`).
 
 ---
 
-## The seven MCP tools
+## MCP tools
+
+### Memory tools (7)
 
 | Tool | What it does |
 |------|--------------|
 | `memory_add` | Extract and store facts from conversation messages (calls the LLM for extraction) |
 | `memory_recall` | Semantic search over stored facts, scoped by `user_id` / `org_id` |
 | `memory_context` | Assemble a token-budgeted context block for an LLM prompt, with tier-aware selection |
-| `memory_search` | Keyword search over facts (SQLite FTS5) |
+| `memory_search` | Keyword search over facts (SQLite FTS5 / Postgres full-text) |
 | `memory_forget` | Soft-delete a fact by ID with an optional reason |
 | `memory_stats` | Aggregate counts: total facts, valid facts, entities, relationships |
 | `memory_consolidate` | Run a consolidation cycle — decay stale facts, promote high-value ones, dedup near-duplicates |
 
 All scoped by `(org_id, user_id, session_id)` — org is the coarsest, session the finest.
 
+### Message store tools (4)
+
+| Tool | What it does |
+|------|--------------|
+| `messages_save` | Save chat messages for a conversation (optionally triggers fact extraction) |
+| `messages_get` | Get all messages for a conversation by ID |
+| `messages_list` | List all conversation IDs |
+| `messages_delete` | Delete all messages for a conversation |
+
 ---
 
 ## REST API
 
-Nine endpoints, rooted at `/v1/memory`. Full OpenAPI-style surface:
+Thirteen endpoints, rooted at `/v1/memory`. Full OpenAPI-style surface:
 
 | Method | Path | Handler |
 |--------|------|---------|
@@ -279,6 +290,10 @@ Nine endpoints, rooted at `/v1/memory`. Full OpenAPI-style surface:
 | POST | `/v1/memory/consolidate` | Trigger consolidation |
 | DELETE | `/v1/memory/facts/:id` | Forget a fact |
 | DELETE | `/v1/memory/users/:id` | GDPR user-data delete |
+| POST | `/v1/memory/messages` | Save messages for a conversation |
+| GET | `/v1/memory/messages` | List conversation IDs |
+| GET | `/v1/memory/messages/:id` | Get messages for a conversation |
+| DELETE | `/v1/memory/messages/:id` | Delete a conversation |
 
 ---
 
@@ -290,7 +305,8 @@ All settings flow through CLI flags or environment variables. Env vars are the r
 
 | CLI flag | Env var | Default | Notes |
 |----------|---------|---------|-------|
-| `--db` | `ENGRAM_DB_PATH` | `engram.db` | SQLite file path |
+| `--db` | `ENGRAM_DB_PATH` | `engram.db` | SQLite file path or `postgres://…` connection URL |
+| `--extract-on-save` | `ENGRAM_EXTRACT_ON_SAVE` | `true` | Enable fact extraction when saving chat messages |
 | `--mode` | `ENGRAM_MODE` | `mcp` | `mcp` (stdio) or `rest` (HTTP) |
 | `--port` | `ENGRAM_PORT` | `9090` | HTTP port in REST mode |
 | `--llm-provider` | `ENGRAM_LLM_PROVIDER` | `ollama` | `ollama`, `openai-compatible` (alias `openai`), `anthropic`, `google`, `command`, `mock` |
@@ -337,6 +353,41 @@ All settings flow through CLI flags or environment variables. Env vars are the r
 | `--llm-command-timeout` | `ENGRAM_LLM_COMMAND_TIMEOUT` | `120` — seconds before the child is killed |
 
 > The `mock` backend returns empty facts and deterministic byte-cycled vectors. It exists for tests and CI. The server prints a clear warning on startup if it detects mock mode in use. API keys and command contents are never echoed to stdout or logs — the server only describes `provider model at base_url` or `command \`<first 60 chars>\``.
+
+---
+
+## Database Backend
+
+Engram supports SQLite (default) and PostgreSQL backends. The backend is selected by the `--db` URL:
+
+```bash
+# SQLite (default)
+engram serve --mode rest --db engram.db
+
+# PostgreSQL
+engram serve --mode rest --db postgres://user:pass@localhost:5432/engram
+```
+
+When using PostgreSQL, tables are created automatically on first startup.
+
+---
+
+## Chat Message Store
+
+Engram can store raw chat messages alongside extracted facts. This enables Spring AI `ChatMemoryRepository` integration.
+
+**REST Endpoints:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/v1/memory/messages` | Save messages for a conversation |
+| GET | `/v1/memory/messages` | List conversation IDs |
+| GET | `/v1/memory/messages/{id}` | Get messages for a conversation |
+| DELETE | `/v1/memory/messages/{id}` | Delete a conversation |
+
+**MCP Tools:** `messages_save`, `messages_get`, `messages_list`, `messages_delete`
+
+Fact extraction on message save is controlled by `--extract-on-save` (default: `true`).
 
 ---
 
@@ -413,7 +464,7 @@ See [java-ai-memory.dev](https://java-ai-memory.dev) for how Engram compares to 
 │    Ollama · Mock          │    Ollama · Mock              │
 ├──────────────────────────────────────────────────────────┤
 │                       Storage                             │
-│       SQLite (facts, entities, FTS5, vectors)            │
+│   SQLite or PostgreSQL (facts, entities, FTS, vectors)   │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -421,7 +472,7 @@ See [java-ai-memory.dev](https://java-ai-memory.dev) for how Engram compares to 
 
 ## What Engram is **not**
 
-- **Not a chat-history store.** If all you need is the last N messages of a conversation, use LangChain4j `ChatMemory`, Spring AI `ChatMemory`, or any framework's built-in window.
+- **Not _just_ a chat-history store.** Engram now includes a message store (see [Chat Message Store](#chat-message-store)), but its primary value is the fact extraction and knowledge graph layer on top. If all you need is the last N messages of a conversation, a framework's built-in window may be simpler.
 - **Not a state checkpointer.** If you need to snapshot agent execution state for resume and replay, that's what LangGraph, Koog persistence, or JamJet's own durable runtime does. Pair them with Engram — they solve different problems.
 - **Not a managed service.** No hosted plane, no auth layer beyond scopes, no SLA. Bring your own process manager.
 - **Not benchmarked yet.** LongMemEval and DMR numbers are on the roadmap. Until they exist, treat comparative claims with the skepticism they deserve.
@@ -440,8 +491,8 @@ See [java-ai-memory.dev](https://java-ai-memory.dev) for how Engram compares to 
 | ✅ | Multi-provider LLM backends: Ollama, OpenAI-compatible (OpenAI/Azure/Groq/Together/Mistral/vLLM/LM Studio/…), Anthropic, Google, `command` shell-out |
 | ✅ | Python, Java, Spring Boot clients |
 | ✅ | Docker image, MCP Registry publish |
-| 🔄 | Postgres backend (in parallel to SQLite) |
-| 🔄 | Spring AI `ChatMemoryRepository` implementation |
+| ✅ | Postgres backend (in parallel to SQLite) |
+| ✅ | Chat message store + Spring AI `ChatMemoryRepository` integration |
 | 📋 | LongMemEval + DMR benchmark scores |
 | 📋 | Quarkus extension |
 | 📋 | Cloud embedding providers (OpenAI `text-embedding-3`, Google `text-embedding-004`) |
