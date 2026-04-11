@@ -152,6 +152,53 @@ public final class EngramClient implements AutoCloseable {
         return delete("/v1/memory/users/" + userId, null);
     }
 
+    // ── Messages ─────────────────────────────────────────────────────────────
+
+    /** Save chat messages for a conversation. */
+    public Map<String, Object> saveMessages(String conversationId, List<Map<String, String>> messages,
+                                             String userId, String orgId) {
+        var body = new HashMap<String, Object>();
+        body.put("conversation_id", conversationId);
+        body.put("messages", messages);
+        if (userId != null) body.put("user_id", userId);
+        if (orgId != null) body.put("org_id", orgId);
+        return post("/v1/memory/messages", body);
+    }
+
+    /** Get chat messages for a conversation. */
+    @SuppressWarnings("unchecked")
+    public List<Map<String, Object>> getMessages(String conversationId, Integer lastN,
+                                                  String userId, String orgId) {
+        var path = new StringBuilder("/v1/memory/messages/")
+                .append(encode(conversationId)).append("?");
+        if (lastN != null) path.append("last_n=").append(lastN).append("&");
+        if (userId != null) path.append("user_id=").append(encode(userId)).append("&");
+        if (orgId != null) path.append("org_id=").append(encode(orgId)).append("&");
+        var response = get(path.toString());
+        Object msgs = response.get("messages");
+        return msgs instanceof List ? (List<Map<String, Object>>) msgs : List.of();
+    }
+
+    /** List all conversation IDs. */
+    @SuppressWarnings("unchecked")
+    public List<String> listConversations(String userId, String orgId) {
+        var path = new StringBuilder("/v1/memory/messages?");
+        if (userId != null) path.append("user_id=").append(encode(userId)).append("&");
+        if (orgId != null) path.append("org_id=").append(encode(orgId)).append("&");
+        var response = get(path.toString());
+        Object ids = response.get("conversation_ids");
+        return ids instanceof List ? (List<String>) ids : List.of();
+    }
+
+    /** Delete all messages for a conversation. */
+    public Map<String, Object> deleteMessages(String conversationId, String userId, String orgId) {
+        var path = new StringBuilder("/v1/memory/messages/")
+                .append(encode(conversationId)).append("?");
+        if (userId != null) path.append("user_id=").append(encode(userId)).append("&");
+        if (orgId != null) path.append("org_id=").append(encode(orgId)).append("&");
+        return delete(path.toString(), null);
+    }
+
     // ── Internal HTTP helpers ─────────────────────────────────────────────────
 
     @SuppressWarnings("unchecked")
