@@ -6,7 +6,7 @@
 
     <groupId>dev.jamjet</groupId>
     <artifactId>jamjet-parent</artifactId>
-    <version>0.4.3</version>
+    <version>0.5.0</version>
     <packaging>pom</packaging>
 
     <name>JamJet Java SDK — Parent</name>
