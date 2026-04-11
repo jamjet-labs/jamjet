@@ -4,6 +4,7 @@ use crate::config::LlmBackend;
 use engram::context::{ContextConfig, OutputFormat};
 use engram::extract::{ExtractionConfig, Message};
 use engram::memory::{Memory, RecallQuery};
+use engram::message::ChatMessage;
 use engram::scope::Scope;
 use serde_json::Value;
 use std::sync::Arc;
@@ -225,5 +226,167 @@ pub async fn handle_consolidate(memory: Arc<Memory>, args: Value) -> Result<Stri
         .await
         .map_err(|e| format!("consolidate failed: {e}"))?;
 
+    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+}
+
+/// messages_save — save chat messages to a conversation, optionally extracting facts.
+pub async fn handle_messages_save(
+    memory: Arc<Memory>,
+    llm_backend: LlmBackend,
+    extract_on_save: bool,
+    args: Value,
+) -> Result<String, String> {
+    let conversation_id = args["conversation_id"]
+        .as_str()
+        .ok_or("conversation_id is required")?
+        .to_string();
+
+    let raw_messages = args["messages"]
+        .as_array()
+        .ok_or("messages array is required")?;
+
+    if raw_messages.is_empty() {
+        return Err("messages must not be empty".to_string());
+    }
+
+    let scope = parse_scope(&args);
+
+    let chat_messages: Vec<ChatMessage> = raw_messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            let role = m["role"].as_str()?;
+            let content = m["content"].as_str()?;
+            let mut msg =
+                ChatMessage::new(&conversation_id, role, content, scope.clone(), i as i32);
+            if let Some(meta) = m["metadata"].as_object() {
+                msg.metadata = meta.clone();
+            }
+            Some(msg)
+        })
+        .collect();
+
+    if chat_messages.is_empty() {
+        return Err("messages must contain valid {role, content} objects".to_string());
+    }
+
+    let message_ids = memory
+        .save_chat_messages(&conversation_id, &chat_messages, &scope)
+        .await
+        .map_err(|e| format!("save_chat_messages failed: {e}"))?;
+
+    let message_id_strs: Vec<String> = message_ids.iter().map(|id| id.to_string()).collect();
+
+    let fact_ids = if extract_on_save {
+        let extract_messages: Vec<Message> = raw_messages
+            .iter()
+            .filter_map(|m| {
+                let role = m["role"].as_str()?;
+                let content = m["content"].as_str()?;
+                Some(Message {
+                    role: role.to_string(),
+                    content: content.to_string(),
+                })
+            })
+            .collect();
+
+        match memory
+            .add_messages(
+                &extract_messages,
+                scope,
+                llm_backend.build(),
+                ExtractionConfig::default(),
+            )
+            .await
+        {
+            Ok(ids) => Some(ids.iter().map(|id| id.to_string()).collect::<Vec<_>>()),
+            Err(e) => {
+                tracing::warn!("fact extraction failed (messages saved): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let result = serde_json::json!({
+        "success": true,
+        "message_ids": message_id_strs,
+        "fact_ids": fact_ids,
+    });
+    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+}
+
+/// messages_get — retrieve messages from a conversation.
+pub async fn handle_messages_get(memory: Arc<Memory>, args: Value) -> Result<String, String> {
+    let conversation_id = args["conversation_id"]
+        .as_str()
+        .ok_or("conversation_id is required")?
+        .to_string();
+
+    let scope = parse_scope(&args);
+    let last_n = args["last_n"].as_u64().map(|n| n as usize);
+
+    let messages = memory
+        .get_chat_messages(&conversation_id, last_n, &scope)
+        .await
+        .map_err(|e| format!("get_chat_messages failed: {e}"))?;
+
+    let results: Vec<Value> = messages
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id.to_string(),
+                "conversation_id": m.conversation_id,
+                "role": m.role,
+                "content": m.content,
+                "seq": m.seq,
+                "created_at": m.created_at.to_rfc3339(),
+                "metadata": m.metadata,
+            })
+        })
+        .collect();
+
+    let result = serde_json::json!({
+        "messages": results,
+        "total": results.len(),
+    });
+    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+}
+
+/// messages_list — list all conversation IDs visible to the given scope.
+pub async fn handle_messages_list(memory: Arc<Memory>, args: Value) -> Result<String, String> {
+    let scope = parse_scope(&args);
+
+    let ids = memory
+        .list_conversations(&scope)
+        .await
+        .map_err(|e| format!("list_conversations failed: {e}"))?;
+
+    let result = serde_json::json!({
+        "conversation_ids": ids,
+        "total": ids.len(),
+    });
+    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+}
+
+/// messages_delete — delete all messages in a conversation.
+pub async fn handle_messages_delete(memory: Arc<Memory>, args: Value) -> Result<String, String> {
+    let conversation_id = args["conversation_id"]
+        .as_str()
+        .ok_or("conversation_id is required")?
+        .to_string();
+
+    let scope = parse_scope(&args);
+
+    let count = memory
+        .delete_chat_messages(&conversation_id, &scope)
+        .await
+        .map_err(|e| format!("delete_chat_messages failed: {e}"))?;
+
+    let result = serde_json::json!({
+        "success": true,
+        "deleted_count": count,
+    });
     serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
 }
