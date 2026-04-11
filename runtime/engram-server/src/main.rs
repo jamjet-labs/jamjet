@@ -148,6 +148,12 @@ enum Cli {
         /// `nomic-embed-text` is 768. Mock backend accepts any value.
         #[arg(long, env = "ENGRAM_EMBEDDING_DIMS", default_value = "768")]
         embedding_dims: usize,
+
+        /// Enable fact extraction when saving chat messages via the message store.
+        /// When true, POST /v1/memory/messages and the messages_save MCP tool
+        /// will also run the LLM extraction pipeline to extract facts.
+        #[arg(long, env = "ENGRAM_EXTRACT_ON_SAVE", default_value = "true")]
+        extract_on_save: bool,
     },
 }
 
@@ -252,6 +258,70 @@ fn tool_defs() -> Vec<McpToolDef> {
                 }
             }),
         },
+        McpToolDef {
+            name: "messages_save".into(),
+            description: "Save chat messages to a conversation, optionally extracting facts".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "conversation_id": { "type": "string", "description": "Conversation identifier" },
+                    "messages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "role": { "type": "string" },
+                                "content": { "type": "string" },
+                                "metadata": { "type": "object" }
+                            },
+                            "required": ["role", "content"]
+                        },
+                        "description": "Chat messages to save"
+                    },
+                    "user_id": { "type": "string", "description": "User identifier" },
+                    "org_id": { "type": "string", "description": "Organization identifier" }
+                },
+                "required": ["conversation_id", "messages"]
+            }),
+        },
+        McpToolDef {
+            name: "messages_get".into(),
+            description: "Retrieve chat messages from a conversation".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "conversation_id": { "type": "string", "description": "Conversation identifier" },
+                    "last_n": { "type": "integer", "description": "Only return the last N messages" },
+                    "user_id": { "type": "string" },
+                    "org_id": { "type": "string" }
+                },
+                "required": ["conversation_id"]
+            }),
+        },
+        McpToolDef {
+            name: "messages_list".into(),
+            description: "List all conversation IDs visible to the given scope".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "user_id": { "type": "string" },
+                    "org_id": { "type": "string" }
+                }
+            }),
+        },
+        McpToolDef {
+            name: "messages_delete".into(),
+            description: "Delete all messages in a conversation".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "conversation_id": { "type": "string", "description": "Conversation identifier" },
+                    "user_id": { "type": "string" },
+                    "org_id": { "type": "string" }
+                },
+                "required": ["conversation_id"]
+            }),
+        },
     ]
 }
 
@@ -351,6 +421,7 @@ async fn main() {
             embedding_provider,
             embedding_model,
             embedding_dims,
+            extract_on_save,
         } => {
             // Ensure parent directory exists
             if let Some(parent) = std::path::Path::new(&db).parent() {
@@ -396,6 +467,7 @@ async fn main() {
                     "engram: WARNING — set ENGRAM_LLM_PROVIDER=ollama|openai|anthropic|google for real extraction."
                 );
             }
+            eprintln!("engram: extract_on_save = {extract_on_save}");
 
             let db_url = format!("sqlite:{db}?mode=rwc");
 
@@ -409,6 +481,7 @@ async fn main() {
                     let state = AppState {
                         memory: memory.clone(),
                         llm_backend: config.llm.clone(),
+                        extract_on_save,
                     };
                     let app = rest::build_router(state);
                     let addr = format!("0.0.0.0:{port}");
@@ -474,6 +547,39 @@ async fn main() {
                             move |args| {
                                 let m = m.clone();
                                 async move { handlers::handle_consolidate(m, args).await }
+                            }
+                        })
+                        .tool(defs[7].clone(), {
+                            let m = m.clone();
+                            let lb = llm_backend.clone();
+                            let eos = extract_on_save;
+                            move |args| {
+                                let m = m.clone();
+                                let lb = lb.clone();
+                                async move {
+                                    handlers::handle_messages_save(m, lb, eos, args).await
+                                }
+                            }
+                        })
+                        .tool(defs[8].clone(), {
+                            let m = m.clone();
+                            move |args| {
+                                let m = m.clone();
+                                async move { handlers::handle_messages_get(m, args).await }
+                            }
+                        })
+                        .tool(defs[9].clone(), {
+                            let m = m.clone();
+                            move |args| {
+                                let m = m.clone();
+                                async move { handlers::handle_messages_list(m, args).await }
+                            }
+                        })
+                        .tool(defs[10].clone(), {
+                            let m = m.clone();
+                            move |args| {
+                                let m = m.clone();
+                                async move { handlers::handle_messages_delete(m, args).await }
                             }
                         });
 
