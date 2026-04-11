@@ -22,6 +22,7 @@ async fn test_app() -> (axum::Router, Arc<Memory>) {
     let state = AppState {
         memory: memory.clone(),
         llm_backend: LlmBackend::Mock,
+        extract_on_save: false,
     };
     (build_router(state), memory)
 }
