@@ -12,6 +12,8 @@ use crate::fact::{Entity, Fact, FactFilter, FactId, Relationship};
 use crate::graph::GraphStore;
 use crate::graph_sqlite::SqliteGraphStore;
 use crate::llm::LlmClient;
+use crate::message::{ChatMessage, MessageId, MessageStore};
+use crate::message_sqlite::SqliteMessageStore;
 use crate::pipeline::ExtractionPipeline;
 use crate::scope::Scope;
 use crate::store::{FactStore, MemoryError, StoreStats};
@@ -55,6 +57,7 @@ pub struct Memory {
     vector_store: Arc<dyn VectorStore>,
     graph_store: Arc<dyn GraphStore>,
     embedding: Arc<dyn EmbeddingProvider>,
+    message_store: Option<Arc<dyn MessageStore>>,
 }
 
 impl Memory {
@@ -74,7 +77,14 @@ impl Memory {
             vector_store,
             graph_store,
             embedding,
+            message_store: None,
         }
+    }
+
+    /// Builder method — attach a `MessageStore` to this `Memory` instance.
+    pub fn with_message_store(mut self, store: Arc<dyn MessageStore>) -> Self {
+        self.message_store = Some(store);
+        self
     }
 
     /// Create a fully in-memory `Memory` instance backed by SQLite `:memory:`.
@@ -101,6 +111,16 @@ impl Memory {
             .await
             .map_err(|e| MemoryError::Database(format!("graph store migration failed: {e}")))?;
 
+        let message_store = SqliteMessageStore::open("sqlite::memory:")
+            .await
+            .map_err(|e| {
+                MemoryError::Database(format!("failed to open in-memory message store: {e}"))
+            })?;
+        message_store
+            .migrate()
+            .await
+            .map_err(|e| MemoryError::Database(format!("message store migration failed: {e}")))?;
+
         let vector_store = EmbeddedVectorStore::new(dims);
 
         Ok(Self {
@@ -108,6 +128,7 @@ impl Memory {
             vector_store: Arc::new(vector_store),
             graph_store: Arc::new(graph_store),
             embedding,
+            message_store: Some(Arc::new(message_store)),
         })
     }
 
@@ -139,6 +160,14 @@ impl Memory {
             .await
             .map_err(|e| MemoryError::Database(format!("graph store migration failed: {e}")))?;
 
+        let message_store = SqliteMessageStore::open(database_url).await.map_err(|e| {
+            MemoryError::Database(format!("failed to open message store SQLite: {e}"))
+        })?;
+        message_store
+            .migrate()
+            .await
+            .map_err(|e| MemoryError::Database(format!("message store migration failed: {e}")))?;
+
         let vector_store = EmbeddedVectorStore::new(dims);
 
         Ok(Self {
@@ -146,6 +175,7 @@ impl Memory {
             vector_store: Arc::new(vector_store),
             graph_store: Arc::new(graph_store),
             embedding,
+            message_store: Some(Arc::new(message_store)),
         })
     }
 
@@ -447,5 +477,64 @@ impl Memory {
     /// Access the underlying `GraphStore`.
     pub fn graph_store(&self) -> &Arc<dyn GraphStore> {
         &self.graph_store
+    }
+
+    /// Access the underlying `MessageStore`, if configured.
+    pub fn message_store(&self) -> Option<&Arc<dyn MessageStore>> {
+        self.message_store.as_ref()
+    }
+
+    // -----------------------------------------------------------------------
+    // Chat message operations
+    // -----------------------------------------------------------------------
+
+    /// Save chat messages to a conversation.
+    pub async fn save_chat_messages(
+        &self,
+        conversation_id: &str,
+        messages: &[ChatMessage],
+        scope: &Scope,
+    ) -> Result<Vec<MessageId>, MemoryError> {
+        let store = self
+            .message_store
+            .as_ref()
+            .ok_or_else(|| MemoryError::Database("message store not configured".to_string()))?;
+        store.save_messages(conversation_id, messages, scope).await
+    }
+
+    /// Retrieve chat messages from a conversation.
+    pub async fn get_chat_messages(
+        &self,
+        conversation_id: &str,
+        last_n: Option<usize>,
+        scope: &Scope,
+    ) -> Result<Vec<ChatMessage>, MemoryError> {
+        let store = self
+            .message_store
+            .as_ref()
+            .ok_or_else(|| MemoryError::Database("message store not configured".to_string()))?;
+        store.get_messages(conversation_id, last_n, scope).await
+    }
+
+    /// List all conversations visible to the given scope.
+    pub async fn list_conversations(&self, scope: &Scope) -> Result<Vec<String>, MemoryError> {
+        let store = self
+            .message_store
+            .as_ref()
+            .ok_or_else(|| MemoryError::Database("message store not configured".to_string()))?;
+        store.list_conversations(scope).await
+    }
+
+    /// Delete all messages in a conversation.
+    pub async fn delete_chat_messages(
+        &self,
+        conversation_id: &str,
+        scope: &Scope,
+    ) -> Result<u64, MemoryError> {
+        let store = self
+            .message_store
+            .as_ref()
+            .ok_or_else(|| MemoryError::Database("message store not configured".to_string()))?;
+        store.delete_messages(conversation_id, scope).await
     }
 }
