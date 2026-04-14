@@ -1,0 +1,130 @@
+id: claims-processor
+version: "0.1.0"
+
+nodes:
+  intake:
+    type: model
+    model: claude-sonnet-4-6
+    prompt: |
+      You are an insurance claims intake specialist. Extract structured
+      claim details from this submission.
+
+      Claim ID: {{ state.claim_id }}
+      Customer: {{ state.customer_id }}
+      Description: {{ state.submission }}
+      Photos: {{ state.photo_urls }}
+
+      Extract: damage type, severity estimate (1-10), affected areas,
+      and any red flags.
+    output_key: claim_analysis
+    next: parallel_lookup
+
+  parallel_lookup:
+    type: parallel
+    branches:
+      - photo_analysis
+      - policy_lookup
+    next: assessment
+
+  photo_analysis:
+    type: model
+    model: claude-sonnet-4-6
+    prompt: |
+      Analyze these damage photos for an insurance claim.
+      Photo URLs: {{ state.photo_urls }}
+      Initial analysis: {{ state.claim_analysis }}
+
+      Provide: damage description, estimated repair scope,
+      consistency with the claim description.
+    output_key: damage_report
+
+  policy_lookup:
+    type: tool
+    server: insurance-db
+    tool: get_policy
+    arguments:
+      customer_id: "{{ state.customer_id }}"
+    output_key: policy
+    retry:
+      max_attempts: 3
+      backoff: exponential
+      delay_ms: 1000
+
+  assessment:
+    type: model
+    model: claude-sonnet-4-6
+    prompt: |
+      You are a claims assessor. Based on the following, estimate the
+      repair cost and determine coverage.
+
+      Damage report: {{ state.damage_report }}
+      Policy details: {{ state.policy }}
+      Claim analysis: {{ state.claim_analysis }}
+
+      Output: estimated_cost (number), covered (boolean),
+      coverage_details, reasoning.
+    output_key: assessment
+    next: fraud_check
+
+  fraud_check:
+    type: tool
+    server: fraud-detection
+    tool: check_claim_history
+    arguments:
+      claim_id: "{{ state.claim_id }}"
+      customer_id: "{{ state.customer_id }}"
+      estimated_cost: "{{ state.assessment.estimated_cost }}"
+    output_key: fraud_result
+    retry:
+      max_attempts: 2
+      backoff: exponential
+    next: approval_gate
+
+  approval_gate:
+    type: condition
+    expression: "state.assessment.estimated_cost > 10000"
+    if_true: human_review
+    if_false: resolution
+
+  human_review:
+    type: wait
+    prompt: |
+      Claim {{ state.claim_id }} requires manual review.
+      Estimated cost: ${{ state.assessment.estimated_cost }}
+      Fraud score: {{ state.fraud_result.risk_score }}
+      Coverage: {{ state.assessment.coverage_details }}
+    next: resolution
+
+  resolution:
+    type: model
+    model: claude-sonnet-4-6
+    prompt: |
+      Generate a professional decision letter for insurance claim {{ state.claim_id }}.
+
+      Assessment: {{ state.assessment }}
+      Fraud check: {{ state.fraud_result }}
+      {% if state.human_review %}
+      Adjuster decision: {{ state.human_review.decision }}
+      {% endif %}
+
+      The letter should include: decision (approved/denied/partial),
+      amount authorized, conditions, next steps for the policyholder.
+    output_key: decision
+    next: evaluate
+
+  evaluate:
+    type: eval
+    scorers:
+      - type: assertion
+        check: "len(state.decision) > 200"
+      - type: assertion
+        check: "'claim_id' in state.decision.lower() or '{{ state.claim_id }}' in state.decision"
+      - type: llm_judge
+        model: claude-haiku-4-5-20251001
+        rubric: |
+          Rate this insurance decision letter on:
+          1. Professional tone and clarity
+          2. Completeness (decision, amount, conditions, next steps)
+          3. Consistency with the assessment data
+          4. Legal/compliance appropriateness
+    fail_under: 4.0
