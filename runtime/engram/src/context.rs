@@ -66,7 +66,7 @@ pub struct ContextConfig {
     /// Output format. Default: SystemPrompt.
     pub format: OutputFormat,
     /// Maximum number of candidate facts to retrieve before budget filtering.
-    /// Default: 50.
+    /// Default: 100.
     pub max_candidates: usize,
 }
 
@@ -75,7 +75,7 @@ impl Default for ContextConfig {
         Self {
             token_budget: 2000,
             format: OutputFormat::SystemPrompt,
-            max_candidates: 50,
+            max_candidates: 100,
         }
     }
 }
@@ -346,7 +346,7 @@ mod tests {
         let cfg = ContextConfig::default();
         assert_eq!(cfg.token_budget, 2000);
         assert_eq!(cfg.format, OutputFormat::SystemPrompt);
-        assert_eq!(cfg.max_candidates, 50);
+        assert_eq!(cfg.max_candidates, 100);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::llm::LlmClient;
 use crate::store::MemoryError;
 use std::sync::Arc;
 
-const EXTRACTION_SYSTEM_PROMPT: &str = r#"You are a memory extraction engine. Given a conversation, extract discrete facts about the user or topic.
+const EXTRACTION_SYSTEM_PROMPT: &str = r#"You are a memory extraction engine. Given a conversation, extract ALL discrete facts about the user. Be thorough — extract every specific detail, even if it seems minor.
 
 Respond with a JSON object in EXACTLY this shape — no other fields, no extra nesting:
 
@@ -44,10 +44,14 @@ Allowed entity_type values: person, place, thing, concept, pet, org.
 Allowed category values: preferences, personal_info, intent, health, work, location, relationships, general.
 
 Rules:
-- Extract facts that would be useful to remember for future conversations.
+- Extract EVERY fact the user reveals about themselves, their life, activities, and preferences.
+- Pay special attention to specific details: proper names (people, places, brands, stores, apps), exact numbers (prices, durations, distances, quantities, ages), dates and times, job titles, relationships (spouse, friend, colleague names).
+- Always include the specific value: "The user's commute is 45 minutes each way" NOT "The user has a commute."
+- Always include proper nouns: "The user redeemed a coupon at Target" NOT "The user redeemed a coupon at a store."
 - Each fact should be a single, atomic statement.
+- Prefer MORE facts over fewer — when in doubt, extract it.
 - Do NOT extract greetings, acknowledgments, or small talk.
-- Do NOT repeat facts that are already implied by other facts.
+- Do NOT extract facts about the assistant or general knowledge unrelated to the user.
 - Confidence should reflect how explicitly the fact was stated (explicit ≥ 0.95, inferred 0.7–0.9).
 - If there are no useful facts, respond with {"facts": []}."#;
 

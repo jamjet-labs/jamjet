@@ -34,7 +34,7 @@ impl OpenAiLlmClient {
             api_key: api_key.into(),
             model: model.into(),
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
+                .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .expect("reqwest client build"),
         }
