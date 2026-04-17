@@ -29,14 +29,36 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
     let server = server.register_tool(
         McpTool {
             name: "jamjet_run_workflow".into(),
-            description: Some("Start a workflow execution".into()),
+            description: Some(concat!(
+                "Start a new durable workflow execution. ",
+                "Use this to kick off a workflow that has already been registered with the runtime. ",
+                "Side effects: creates a new execution record, appends WorkflowStarted and NodeScheduled events to the event log, ",
+                "and enqueues a work item for the first node — the workflow begins processing immediately. ",
+                "Returns a JSON object with the execution_id (format: exec_<uuid>) that you can pass to ",
+                "jamjet_get_execution, jamjet_get_events, jamjet_cancel_execution, or jamjet_approve. ",
+                "This operation is not reversible — use jamjet_cancel_execution to stop a running workflow. ",
+                "Fails if the workflow_id + version combination is not registered. ",
+                "No authentication required (local-only server)."
+            ).into()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "workflow_id": { "type": "string", "description": "ID of the workflow to run" },
-                    "input": { "type": "object", "description": "Input data for the workflow" },
-                    "workflow_version": { "type": "string", "description": "Workflow version (default: 1.0.0)" },
-                    "tenant_id": { "type": "string", "description": "Tenant ID (default: default)" }
+                    "workflow_id": {
+                        "type": "string",
+                        "description": "ID of a registered workflow to execute. Must match a workflow previously loaded into the runtime."
+                    },
+                    "input": {
+                        "type": "object",
+                        "description": "Initial state data passed to the workflow's first node. Shape must match the workflow's state_schema."
+                    },
+                    "workflow_version": {
+                        "type": "string",
+                        "description": "Semantic version of the workflow to run. Defaults to '1.0.0' if omitted. Use when multiple versions are registered."
+                    },
+                    "tenant_id": {
+                        "type": "string",
+                        "description": "Tenant partition for multi-tenant isolation. Defaults to 'default'. Execution and events are scoped to this tenant."
+                    }
                 },
                 "required": ["workflow_id", "input"]
             }),
@@ -121,12 +143,25 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
     let server = server.register_tool(
         McpTool {
             name: "jamjet_get_execution".into(),
-            description: Some("Get details of a workflow execution".into()),
+            description: Some(concat!(
+                "Retrieve the full details of a single workflow execution. Read-only, no side effects. ",
+                "Use this to check an execution's current status, inspect its state, or confirm completion after running jamjet_run_workflow. ",
+                "Returns a JSON object with: execution_id, workflow_id, workflow_version, status (one of: running, paused, completed, failed, cancelled), ",
+                "initial_input, current_state, started_at, updated_at, and completed_at (null if still running). ",
+                "Fails with 'execution not found' if the ID does not exist in the specified tenant. ",
+                "For the full event history, use jamjet_get_events instead."
+            ).into()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "execution_id": { "type": "string", "description": "Execution ID (exec_<uuid> or bare UUID)" },
-                    "tenant_id": { "type": "string", "description": "Tenant ID (default: default)" }
+                    "execution_id": {
+                        "type": "string",
+                        "description": "Execution ID returned by jamjet_run_workflow. Accepts either 'exec_<uuid>' or bare UUID format."
+                    },
+                    "tenant_id": {
+                        "type": "string",
+                        "description": "Tenant partition to query. Defaults to 'default'. Must match the tenant used when the execution was created."
+                    }
                 },
                 "required": ["execution_id"]
             }),
@@ -153,14 +188,34 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
     let server = server.register_tool(
         McpTool {
             name: "jamjet_list_executions".into(),
-            description: Some("List workflow executions with optional filters".into()),
+            description: Some(concat!(
+                "List workflow executions with optional status filtering and pagination. Read-only, no side effects. ",
+                "Use this to find executions that need attention — for example, filter by 'paused' to find executions awaiting approval via jamjet_approve, ",
+                "or filter by 'running' to monitor active workflows. ",
+                "Returns a JSON object with an 'executions' array, where each entry has the same fields as jamjet_get_execution. ",
+                "Results are ordered by creation time (newest first). Supports offset-based pagination via limit and offset parameters. ",
+                "All parameters are optional — calling with no arguments returns the 50 most recent executions across all statuses."
+            ).into()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "status": { "type": "string", "description": "Filter by status: running, paused, completed, failed" },
-                    "limit": { "type": "integer", "description": "Max results (default 50)" },
-                    "offset": { "type": "integer", "description": "Offset for pagination" },
-                    "tenant_id": { "type": "string", "description": "Tenant ID (default: default)" }
+                    "status": {
+                        "type": "string",
+                        "description": "Filter to a specific status. Allowed values: 'running', 'paused', 'completed', 'failed'. Omit to return all statuses.",
+                        "enum": ["running", "paused", "completed", "failed"]
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of executions to return. Defaults to 50. Use with offset for pagination through large result sets."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Number of executions to skip before returning results. Defaults to 0. Combine with limit for pagination (e.g., offset=50, limit=50 for page 2)."
+                    },
+                    "tenant_id": {
+                        "type": "string",
+                        "description": "Tenant partition to query. Defaults to 'default'. Only executions in this tenant are returned."
+                    }
                 }
             }),
         },
@@ -187,12 +242,25 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
     let server = server.register_tool(
         McpTool {
             name: "jamjet_cancel_execution".into(),
-            description: Some("Cancel a running workflow execution".into()),
+            description: Some(concat!(
+                "Cancel a running or paused workflow execution. This is an irreversible, destructive operation. ",
+                "Side effects: appends a WorkflowCancelled event to the execution's event log and sets the status to 'cancelled'. ",
+                "The execution cannot be resumed after cancellation — start a new execution with jamjet_run_workflow if needed. ",
+                "Use this when a workflow is stuck, no longer needed, or was started with incorrect input. ",
+                "Returns a JSON object with execution_id and status 'cancelled'. ",
+                "Fails if the execution is already in a terminal state (completed, failed, or cancelled) or if the execution_id is not found."
+            ).into()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "execution_id": { "type": "string", "description": "Execution ID" },
-                    "tenant_id": { "type": "string", "description": "Tenant ID (default: default)" }
+                    "execution_id": {
+                        "type": "string",
+                        "description": "Execution ID to cancel. Accepts 'exec_<uuid>' or bare UUID format. The execution must be in 'running' or 'paused' state."
+                    },
+                    "tenant_id": {
+                        "type": "string",
+                        "description": "Tenant partition. Defaults to 'default'. Must match the tenant used when the execution was created."
+                    }
                 },
                 "required": ["execution_id"]
             }),
@@ -258,12 +326,26 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
     let server = server.register_tool(
         McpTool {
             name: "jamjet_get_events".into(),
-            description: Some("Get the event log for an execution".into()),
+            description: Some(concat!(
+                "Retrieve the full, ordered event log for a workflow execution. Read-only, no side effects. ",
+                "Use this to debug execution behavior, understand which nodes ran and in what order, or inspect approval decisions. ",
+                "Returns a JSON object with an 'events' array. Each event has: execution_id, sequence (monotonic counter), ",
+                "timestamp, and kind (one of: WorkflowStarted, NodeScheduled, NodeStarted, NodeCompleted, NodeFailed, ",
+                "ApprovalRequested, ApprovalReceived, WorkflowCompleted, WorkflowCancelled, WorkflowFailed). ",
+                "Events are returned in sequence order (oldest first) and represent the complete, immutable audit trail. ",
+                "For a high-level status summary, use jamjet_get_execution instead."
+            ).into()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "execution_id": { "type": "string", "description": "Execution ID" },
-                    "tenant_id": { "type": "string", "description": "Tenant ID (default: default)" }
+                    "execution_id": {
+                        "type": "string",
+                        "description": "Execution ID to retrieve events for. Accepts 'exec_<uuid>' or bare UUID format."
+                    },
+                    "tenant_id": {
+                        "type": "string",
+                        "description": "Tenant partition to query. Defaults to 'default'. Must match the tenant used when the execution was created."
+                    }
                 },
                 "required": ["execution_id"]
             }),
@@ -295,15 +377,39 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
     let server = server.register_tool(
         McpTool {
             name: "jamjet_approve".into(),
-            description: Some("Approve or reject a paused execution".into()),
+            description: Some(concat!(
+                "Submit an approval or rejection decision for a workflow execution that is paused and waiting for human review. ",
+                "Use this when jamjet_list_executions shows a 'paused' execution or jamjet_get_events shows an ApprovalRequested event. ",
+                "Side effects: appends an ApprovalReceived event to the event log (with user_id 'mcp-client') and, if the execution is paused, ",
+                "resumes it to 'running' status so the next node can proceed. The decision is recorded in the immutable audit trail. ",
+                "Returns a JSON object with execution_id and accepted: true. ",
+                "Fails if execution_id is not found or if decision is not exactly 'approved' or 'rejected'. ",
+                "Related: use jamjet_get_events to see the ApprovalRequested event details before deciding."
+            ).into()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "execution_id": { "type": "string", "description": "Execution ID" },
-                    "decision": { "type": "string", "description": "approved or rejected" },
-                    "node_id": { "type": "string", "description": "Node that requested approval" },
-                    "comment": { "type": "string", "description": "Optional comment" },
-                    "tenant_id": { "type": "string", "description": "Tenant ID (default: default)" }
+                    "execution_id": {
+                        "type": "string",
+                        "description": "Execution ID of the paused workflow awaiting approval. Accepts 'exec_<uuid>' or bare UUID format."
+                    },
+                    "decision": {
+                        "type": "string",
+                        "description": "The approval decision. Must be exactly 'approved' or 'rejected'. 'approved' resumes the workflow; 'rejected' records the rejection.",
+                        "enum": ["approved", "rejected"]
+                    },
+                    "node_id": {
+                        "type": "string",
+                        "description": "ID of the node that requested approval. Helps correlate the decision with the correct approval gate when a workflow has multiple."
+                    },
+                    "comment": {
+                        "type": "string",
+                        "description": "Optional free-text comment explaining the decision. Recorded in the audit trail alongside the approval event."
+                    },
+                    "tenant_id": {
+                        "type": "string",
+                        "description": "Tenant partition. Defaults to 'default'. Must match the tenant used when the execution was created."
+                    }
                 },
                 "required": ["execution_id", "decision"]
             }),
@@ -382,13 +488,30 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
     let server = server.register_tool(
         McpTool {
             name: "jamjet_list_agents".into(),
-            description: Some("List registered agents with optional filters".into()),
+            description: Some(concat!(
+                "List all agents registered in the runtime, with optional filters by status, skill, or protocol. Read-only, no side effects. ",
+                "Use this to discover which agents are available before routing work, or to check the health/status of registered agents. ",
+                "Returns a JSON object with an 'agents' array. Each entry includes the agent's ID, name, description, skills, protocol, status, and Agent Card metadata. ",
+                "All filter parameters are optional and can be combined — omit all to list every registered agent. ",
+                "Returns an empty array if no agents match the filters. ",
+                "Related: use jamjet_discover_agent to register a new remote agent before listing."
+            ).into()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "status": { "type": "string", "description": "Filter by status: registered, active, paused, deactivated" },
-                    "skill": { "type": "string", "description": "Filter by skill" },
-                    "protocol": { "type": "string", "description": "Filter by protocol" }
+                    "status": {
+                        "type": "string",
+                        "description": "Filter agents by lifecycle status. Allowed values: 'registered' (known but not started), 'active' (running and available), 'paused' (temporarily offline), 'deactivated' (permanently removed). Omit to return all statuses.",
+                        "enum": ["registered", "active", "paused", "deactivated"]
+                    },
+                    "skill": {
+                        "type": "string",
+                        "description": "Filter to agents that declare this skill (e.g., 'data-analysis', 'translation'). Matches against the agent's skills list."
+                    },
+                    "protocol": {
+                        "type": "string",
+                        "description": "Filter to agents using this protocol (e.g., 'a2a', 'mcp', 'rest'). Useful for finding agents reachable via a specific communication method."
+                    }
                 }
             }),
         },
@@ -419,11 +542,22 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
     let server = server.register_tool(
         McpTool {
             name: "jamjet_discover_agent".into(),
-            description: Some("Discover and register a remote agent by URL".into()),
+            description: Some(concat!(
+                "Discover and register a remote agent by fetching its Agent Card from the given URL. ",
+                "Side effects: makes an outbound HTTP request to the URL to retrieve the agent's metadata (Agent Card), ",
+                "then registers the agent in the local runtime registry so it becomes available for routing and invocation. ",
+                "Use this to onboard external agents (A2A, MCP, or REST) before they can appear in jamjet_list_agents or be routed to by a Coordinator. ",
+                "Returns the full JSON Agent Card of the newly registered agent, including its ID, name, skills, protocol, and endpoint. ",
+                "Fails if the URL is unreachable, does not serve a valid Agent Card, or if a network error occurs. ",
+                "This operation is idempotent — discovering the same URL again updates the existing registration."
+            ).into()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string", "description": "URL of the remote agent to discover" }
+                    "url": {
+                        "type": "string",
+                        "description": "HTTPS URL of the remote agent to discover. The agent must serve an Agent Card (A2A/.well-known/agent.json or equivalent metadata endpoint). Example: 'https://agents.example.com/research-agent'."
+                    }
                 },
                 "required": ["url"]
             }),
