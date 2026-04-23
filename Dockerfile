@@ -35,6 +35,7 @@ RUN pip install --no-cache-dir /tmp/sdk && rm -rf /tmp/sdk
 ENV JAMJET_BIND=0.0.0.0
 ENV JAMJET_PORT=8080
 ENV RUST_LOG=info
+ENV STORAGE_BACKEND=memory
 
 EXPOSE 8080
 
