@@ -470,7 +470,12 @@ async fn main() {
             }
             eprintln!("engram: extract_on_save = {extract_on_save}");
 
-            let memory = if db.starts_with("postgres://") || db.starts_with("postgresql://") {
+            let memory = if db == ":memory:" {
+                tracing::info!("  backend: in-memory (ephemeral)");
+                Memory::in_memory(config.embedding.build())
+                    .await
+                    .expect("failed to open in-memory database")
+            } else if db.starts_with("postgres://") || db.starts_with("postgresql://") {
                 tracing::info!("  backend: PostgreSQL");
                 Memory::open_postgres(&db, config.embedding.build())
                     .await
