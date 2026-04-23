@@ -11,9 +11,11 @@
 pub mod backend;
 pub mod enricher;
 pub mod entry;
+pub mod noop;
 pub mod sqlite;
 
 pub use backend::{AuditBackend, AuditError, AuditQuery};
 pub use enricher::{AuditEnricher, RequestContext};
 pub use entry::{ActorType, AuditLogEntry};
+pub use noop::NoopAuditBackend;
 pub use sqlite::SqliteAuditBackend;
