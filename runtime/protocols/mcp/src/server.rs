@@ -99,7 +99,7 @@ async fn rpc_handler(
             })
         }
 
-        "initialized" => json!({}),
+        "initialized" | "notifications/initialized" => json!({}),
 
         "tools/list" => {
             let tools: Vec<Value> = state
@@ -174,6 +174,9 @@ async fn rpc_handler(
         "prompts/list" => json!({ "prompts": [] }),
 
         "ping" => json!({}),
+
+        // MCP notifications are fire-and-forget — accept silently.
+        other if other.starts_with("notifications/") => json!({}),
 
         other => {
             warn!(method = %other, "Unknown MCP method");
