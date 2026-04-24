@@ -348,7 +348,8 @@ async fn consolidate_handler(
     let scope = parse_scope(body.org_id.as_deref(), body.user_id.as_deref(), None);
     let config = engram::consolidation::ConsolidationConfig::default();
 
-    match state.memory.consolidate(&scope, None, config).await {
+    let llm = state.llm_backend.build();
+    match state.memory.consolidate(&scope, Some(llm.as_ref()), config).await {
         Ok(result) => Json(serde_json::json!(result)).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
