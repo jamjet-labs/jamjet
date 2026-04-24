@@ -463,6 +463,7 @@ impl Memory {
         scope: Scope,
         llm: Box<dyn LlmClient>,
         config: ExtractionConfig,
+        timestamp: Option<DateTime<Utc>>,
     ) -> Result<Vec<FactId>, MemoryError> {
         let pipeline = ExtractionPipeline::new(llm, config);
         let extraction = pipeline.extract(messages).await?;
@@ -479,6 +480,20 @@ impl Memory {
             let mut fact = Fact::new(&extracted.text, scope.clone());
             fact.confidence = Some(extracted.confidence as f32);
             fact.category = extracted.category;
+
+            // Temporal grounding: use session timestamp or extracted event_date
+            if let Some(ts) = timestamp {
+                fact.valid_from = ts;
+            }
+            if let Some(ref date_str) = extracted.event_date {
+                fact.metadata
+                    .insert("event_date".to_string(), serde_json::json!(date_str));
+                if timestamp.is_none() {
+                    if let Ok(dt) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                        fact.valid_from = dt.and_hms_opt(0, 0, 0).unwrap().and_utc();
+                    }
+                }
+            }
             fact.embedding = embedding.clone();
 
             let id = self.fact_store.insert_fact(fact).await?;

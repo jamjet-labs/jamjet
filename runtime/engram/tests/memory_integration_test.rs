@@ -58,6 +58,7 @@ async fn add_messages_extracts_and_stores_facts() {
             user_scope(),
             Box::new(llm),
             ExtractionConfig::default(),
+            None,
         )
         .await
         .unwrap();
@@ -84,6 +85,7 @@ async fn add_messages_creates_entities_and_relationships() {
             user_scope(),
             Box::new(llm),
             ExtractionConfig::default(),
+            None,
         )
         .await
         .unwrap();

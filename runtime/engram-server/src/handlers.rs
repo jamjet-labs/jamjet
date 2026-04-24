@@ -57,6 +57,7 @@ pub async fn handle_add(
             scope,
             llm_backend.build(),
             ExtractionConfig::default(),
+            None,
         )
         .await
         .map_err(|e| format!("add_messages failed: {e}"))?;
@@ -296,6 +297,7 @@ pub async fn handle_messages_save(
                 scope,
                 llm_backend.build(),
                 ExtractionConfig::default(),
+                None,
             )
             .await
         {

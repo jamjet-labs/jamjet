@@ -2,6 +2,7 @@
 
 use crate::config::LlmBackend;
 use axum::extract::{Path, Query, State};
+use chrono::{DateTime, Utc};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -35,6 +36,7 @@ pub struct AddRequest {
     pub user_id: Option<String>,
     pub org_id: Option<String>,
     pub session_id: Option<String>,
+    pub timestamp: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +168,12 @@ async fn add_handler(
         body.session_id.as_deref(),
     );
 
+    let parsed_ts: Option<DateTime<Utc>> = body.timestamp.as_deref().and_then(|ts| {
+        DateTime::parse_from_rfc3339(ts)
+            .map(|dt| dt.with_timezone(&Utc))
+            .ok()
+    });
+
     match state
         .memory
         .add_messages(
@@ -173,6 +181,7 @@ async fn add_handler(
             scope,
             state.llm_backend.build(),
             ExtractionConfig::default(),
+            parsed_ts,
         )
         .await
     {
@@ -421,6 +430,7 @@ async fn save_messages_handler(
                 scope,
                 state.llm_backend.build(),
                 ExtractionConfig::default(),
+                None,
             )
             .await
         {
