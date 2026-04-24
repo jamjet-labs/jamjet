@@ -26,6 +26,7 @@ pub mod message;
 pub mod message_postgres;
 pub mod message_sqlite;
 pub mod pipeline;
+pub mod rerank;
 pub mod retrieve;
 pub mod scope;
 pub mod store;
