@@ -122,6 +122,19 @@ pub fn sort_by_tier_priority(facts: &mut [Fact]) {
 // Formatters
 // ---------------------------------------------------------------------------
 
+/// Format a fact as a bullet point, optionally prefixed with its date.
+fn format_fact_line(fact: &Fact) -> String {
+    // Check for event_date in metadata first
+    if let Some(event_date) = fact.metadata.get("event_date").and_then(|v| v.as_str()) {
+        return format!("- [{event_date}] {}", fact.text);
+    }
+    // Fall back to valid_from if it's not today (i.e., has a meaningful timestamp)
+    if fact.valid_from.date_naive() != chrono::Utc::now().date_naive() {
+        return format!("- [{}] {}", fact.valid_from.format("%Y-%m-%d"), fact.text);
+    }
+    format!("- {}", fact.text)
+}
+
 /// Format facts as an XML-tagged block for system prompt injection.
 pub fn format_system_prompt(facts: &[Fact]) -> String {
     let mut working = Vec::new();
@@ -129,7 +142,7 @@ pub fn format_system_prompt(facts: &[Fact]) -> String {
     let mut knowledge = Vec::new();
 
     for fact in facts {
-        let line = format!("- {}", fact.text);
+        let line = format_fact_line(fact);
         match fact.tier {
             MemoryTier::Working => working.push(line),
             MemoryTier::Conversation => conversation.push(line),
@@ -183,7 +196,8 @@ pub fn format_markdown(facts: &[Fact]) -> String {
             out.push_str(&format!("### {label}\n\n"));
             current_tier = Some(&fact.tier);
         }
-        out.push_str(&format!("- {}\n", fact.text));
+        out.push_str(&format_fact_line(fact));
+        out.push('\n');
     }
 
     out
@@ -425,5 +439,38 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["text"], "test fact");
         assert_eq!(parsed[0]["tier"], "conversation");
+    }
+
+    #[test]
+    fn format_system_prompt_includes_date_prefix() {
+        use crate::scope::Scope;
+        let scope = Scope::org("test");
+        let mut fact = Fact::new("User went to dentist", scope).with_tier(MemoryTier::Conversation);
+        fact.valid_from = chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let output = format_system_prompt(&[fact]);
+        assert!(output.contains("[2024-03-15] User went to dentist"), "got: {output}");
+    }
+
+    #[test]
+    fn format_fact_line_uses_event_date_metadata() {
+        use crate::scope::Scope;
+        let scope = Scope::org("test");
+        let mut fact = Fact::new("User ran a 5K", scope).with_tier(MemoryTier::Conversation);
+        fact.metadata.insert("event_date".to_string(), serde_json::json!("2024-06-01"));
+        let line = format_fact_line(&fact);
+        assert_eq!(line, "- [2024-06-01] User ran a 5K");
+    }
+
+    #[test]
+    fn format_fact_line_no_date_for_today() {
+        use crate::scope::Scope;
+        let scope = Scope::org("test");
+        let fact = Fact::new("User likes pizza", scope).with_tier(MemoryTier::Conversation);
+        let line = format_fact_line(&fact);
+        assert_eq!(line, "- User likes pizza");
     }
 }
