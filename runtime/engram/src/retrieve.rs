@@ -5,7 +5,7 @@ use crate::fact::{Fact, FactId};
 use crate::graph::GraphStore;
 use crate::scope::Scope;
 use crate::store::{FactStore, MemoryError};
-use crate::temporal_parser::detect_temporal_intent;
+use crate::temporal_parser::{detect_category_intent, detect_temporal_intent};
 use crate::vector::{VectorFilter, VectorStore};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -161,8 +161,9 @@ impl HybridRetriever {
             }
         }
 
-        // Detect temporal intent
+        // Detect query intent for scoring adjustments
         let temporal_intent = detect_temporal_intent(query);
+        let category_intent = detect_category_intent(query);
         let anchor = Utc::now();
 
         // Merge scores
@@ -201,7 +202,7 @@ impl HybridRetriever {
                 let cs =
                     calibrated_confidence(&fact, self.config.confidence_half_life_days);
 
-                let final_score = if temporal_intent.is_some() {
+                let mut final_score = if temporal_intent.is_some() {
                     vs * self.config.vector_weight
                         + ks * self.config.keyword_weight
                         + gs * self.config.graph_weight
@@ -212,6 +213,13 @@ impl HybridRetriever {
                     let (vw, kw, gw, iw, cw) = self.config.non_temporal_weights();
                     vs * vw + ks * kw + gs * gw + is * iw + cs * cw
                 };
+
+                // Category-aware boost: if query intent matches fact category, boost score
+                if let Some(target_cat) = category_intent {
+                    if fact.category.as_deref() == Some(target_cat) {
+                        final_score += 0.3;
+                    }
+                }
 
                 results.push(ScoredFact {
                     fact,

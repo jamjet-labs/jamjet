@@ -52,6 +52,36 @@ pub fn detect_temporal_intent(query: &str) -> Option<TemporalQuery> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Category intent detection
+// ---------------------------------------------------------------------------
+
+static PREFERENCE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Matches requests for personalized suggestions/recommendations — NOT factual recall
+    Regex::new(r"(?i)\b(can\s+you\s+(recommend|suggest)|recommend\s+(some|me)|suggest\s+(some|me|a\b)|tips?\s+for|advice\s+for|ideas?\s+for|activities?\s+for|recipes?\s+for|ways?\s+to|what\s+should\s+i)\b").unwrap()
+});
+
+static ASSISTANT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Matches questions about what the assistant previously said/recommended
+    // Past-tense or "did you" — references to what the assistant *already* said/did
+    Regex::new(r"(?i)(you\s+(said|told|recommended|suggested|mentioned|provided|gave|listed|explained)|what\s+did\s+you\s+(recommend|suggest|say|tell)|what\s+was\s+the\s+.+?\s+you\s+(recommend|suggest)(ed)?|the\s+.+?\s+you\s+(recommend|suggest)(ed)?|your\s+recommendation|did\s+you\s+(recommend|suggest|say|mention))").unwrap()
+});
+
+/// Detect which fact category is most relevant to the query.
+///
+/// Returns the category name to boost during retrieval, or `None` if
+/// no specific category is indicated.
+pub fn detect_category_intent(query: &str) -> Option<&'static str> {
+    // Assistant-referencing queries take priority (more specific)
+    if ASSISTANT_RE.is_match(query) {
+        return Some("assistant_recommendation");
+    }
+    if PREFERENCE_RE.is_match(query) {
+        return Some("preference");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,5 +111,26 @@ mod tests {
     fn returns_none_for_non_temporal() {
         assert!(detect_temporal_intent("What is my favorite color?").is_none());
         assert!(detect_temporal_intent("Where do I live?").is_none());
+    }
+
+    #[test]
+    fn detects_preference_intent() {
+        assert_eq!(detect_category_intent("Can you recommend some evening activities for me?"), Some("preference"));
+        assert_eq!(detect_category_intent("What are some tips for meal prep?"), Some("preference"));
+        assert_eq!(detect_category_intent("Suggest recipes for dinner"), Some("preference"));
+    }
+
+    #[test]
+    fn detects_assistant_intent() {
+        assert_eq!(detect_category_intent("What sealant did you recommend?"), Some("assistant_recommendation"));
+        assert_eq!(detect_category_intent("What was the dish you suggested?"), Some("assistant_recommendation"));
+        assert_eq!(detect_category_intent("You told me about a restaurant, what was it?"), Some("assistant_recommendation"));
+    }
+
+    #[test]
+    fn category_none_for_factual() {
+        assert!(detect_category_intent("What is my favorite color?").is_none());
+        assert!(detect_category_intent("Where do I live?").is_none());
+        assert!(detect_category_intent("How much did I spend on the handbag?").is_none());
     }
 }
