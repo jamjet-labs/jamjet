@@ -26,6 +26,7 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 # `tokio::process` + async I/O are needed by CommandLlmClient.
 tokio = { version = "1", features = ["process", "io-util", "time", "macros"] }
+regex = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
