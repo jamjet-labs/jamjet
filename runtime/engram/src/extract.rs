@@ -4,7 +4,17 @@
 //! facts, entities, and relationships.
 
 use crate::fact::MemoryTier;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize a JSON `null` (or missing field) as an empty `String`.
+/// Some models (e.g. Gemini Flash-Lite) occasionally emit `null` for
+/// string fields in structured output.
+fn null_as_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+}
 
 /// A single message in a conversation (role + content).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +42,7 @@ impl Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedFact {
     /// The human-readable fact text.
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub text: String,
     /// Extracted entities mentioned in this fact.
     #[serde(default)]
@@ -45,6 +56,9 @@ pub struct ExtractedFact {
     /// Optional category.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// Optional event date in ISO-8601 format (e.g. "2024-03-15").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_date: Option<String>,
 }
 
 fn default_confidence() -> f64 {
@@ -99,10 +113,13 @@ impl From<ExtractedEntityInput> for ExtractedEntity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedRelationship {
     /// Source entity name.
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub source: String,
     /// Relationship type (e.g., "lives_in", "owns_pet").
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub relation: String,
     /// Target entity name.
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub target: String,
 }
 
@@ -214,6 +231,27 @@ mod tests {
         let entity: ExtractedEntity = serde_json::from_str(json).unwrap();
         assert_eq!(entity.name, "Bangalore");
         assert_eq!(entity.entity_type.as_deref(), Some("place"));
+    }
+
+    #[test]
+    fn extracted_fact_deserializes_event_date() {
+        let json = r#"{"text": "User went to dentist", "event_date": "2024-03-15"}"#;
+        let fact: ExtractedFact = serde_json::from_str(json).unwrap();
+        assert_eq!(fact.event_date.as_deref(), Some("2024-03-15"));
+    }
+
+    #[test]
+    fn extracted_fact_event_date_defaults_to_none() {
+        let json = r#"{"text": "User likes pizza"}"#;
+        let fact: ExtractedFact = serde_json::from_str(json).unwrap();
+        assert!(fact.event_date.is_none());
+    }
+
+    #[test]
+    fn extracted_fact_event_date_null_becomes_none() {
+        let json = r#"{"text": "User likes pizza", "event_date": null}"#;
+        let fact: ExtractedFact = serde_json::from_str(json).unwrap();
+        assert!(fact.event_date.is_none());
     }
 
     #[test]
