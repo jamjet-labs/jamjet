@@ -30,7 +30,9 @@ pub mod retrieve;
 pub mod scope;
 pub mod store;
 pub mod store_postgres;
+pub mod spreading;
 pub mod store_sqlite;
+pub mod temporal_parser;
 pub mod vector;
 pub mod vector_embedded;
 
