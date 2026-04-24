@@ -1,11 +1,14 @@
 //! Consolidation engine — background memory maintenance.
 //!
-//! Five operations keep long-term memory healthy:
+//! Eight operations keep long-term memory healthy:
 //! 1. **Decay** — exponential confidence reduction for stale facts
 //! 2. **Promote** — move frequently-accessed conversation facts to knowledge tier
 //! 3. **Dedup** — batch vector similarity scan to merge near-duplicates
 //! 4. **Summarize** — LLM-condense conversation clusters into knowledge facts
 //! 5. **Reflect** — LLM-generate higher-order insights from multiple facts
+//! 6. **EntitySummary** — wiki-style per-entity summary from grouped facts
+//! 7. **PreferenceRollup** — consolidate preference-category facts into a single profile
+//! 8. **TimelineBuilder** — chronologically order facts with event dates
 
 use crate::embedding::EmbeddingProvider;
 use crate::fact::{Fact, FactFilter, FactId, FactPatch, MemoryTier};
@@ -15,7 +18,9 @@ use crate::store::{FactStore, MemoryError};
 use crate::vector::{VectorFilter, VectorStore};
 use chrono::Utc;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // ConsolidationConfig
@@ -24,7 +29,7 @@ use std::sync::Arc;
 /// Configuration for the consolidation engine.
 #[derive(Debug, Clone)]
 pub struct ConsolidationConfig {
-    /// Operations to run. Default: all five.
+    /// Operations to run. Default: all eight.
     pub enabled_ops: Vec<ConsolidationOp>,
     /// Decay factor per half-life period. Default: 0.95.
     pub decay_factor: f64,
@@ -53,6 +58,9 @@ impl Default for ConsolidationConfig {
                 ConsolidationOp::Dedup,
                 ConsolidationOp::Summarize,
                 ConsolidationOp::Reflect,
+                ConsolidationOp::EntitySummary,
+                ConsolidationOp::PreferenceRollup,
+                ConsolidationOp::TimelineBuilder,
             ],
             decay_factor: 0.95,
             half_life_days: 30.0,
@@ -75,6 +83,9 @@ pub enum ConsolidationOp {
     Dedup,
     Summarize,
     Reflect,
+    EntitySummary,
+    PreferenceRollup,
+    TimelineBuilder,
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +101,9 @@ pub struct ConsolidationResult {
     pub facts_deduped: usize,
     pub facts_summarized: usize,
     pub insights_generated: usize,
+    pub entity_summaries_generated: usize,
+    pub preferences_rolled_up: usize,
+    pub timeline_events_ordered: usize,
     pub llm_calls_used: usize,
 }
 
@@ -169,6 +183,40 @@ impl ConsolidationEngine {
                             result.llm_calls_used += calls;
                         }
                     }
+                }
+                ConsolidationOp::EntitySummary => {
+                    if let Some(llm) = llm {
+                        if result.llm_calls_used < self.config.max_llm_calls {
+                            let (summaries, calls) = self
+                                .op_entity_summary(
+                                    scope,
+                                    llm,
+                                    self.config.max_llm_calls - result.llm_calls_used,
+                                )
+                                .await?;
+                            result.entity_summaries_generated = summaries;
+                            result.llm_calls_used += calls;
+                        }
+                    }
+                }
+                ConsolidationOp::PreferenceRollup => {
+                    if let Some(llm) = llm {
+                        if result.llm_calls_used < self.config.max_llm_calls {
+                            let (rolled_up, calls) = self
+                                .op_preference_rollup(
+                                    scope,
+                                    llm,
+                                    self.config.max_llm_calls - result.llm_calls_used,
+                                )
+                                .await?;
+                            result.preferences_rolled_up = rolled_up;
+                            result.llm_calls_used += calls;
+                        }
+                    }
+                }
+                ConsolidationOp::TimelineBuilder => {
+                    result.timeline_events_ordered =
+                        self.op_timeline_builder(scope).await?;
                 }
             }
         }
@@ -453,6 +501,205 @@ impl ConsolidationEngine {
 
         Ok((generated, 1))
     }
+
+    // -----------------------------------------------------------------------
+    // Operation 6: EntitySummary
+    // -----------------------------------------------------------------------
+
+    /// Generate wiki-style per-entity summaries from facts grouped by entity.
+    /// Only entities with 3+ facts are summarized.
+    /// Returns (entity_summaries_generated, llm_calls_used).
+    async fn op_entity_summary(
+        &self,
+        scope: &Scope,
+        llm: &dyn LlmClient,
+        max_calls: usize,
+    ) -> Result<(usize, usize), MemoryError> {
+        if max_calls == 0 {
+            return Ok((0, 0));
+        }
+
+        let filter = FactFilter::new().with_scope(scope.clone());
+        let facts = self.fact_store.list_facts(&filter).await?;
+
+        // Group facts by entity ref — a fact can reference multiple entities.
+        let mut entity_facts: HashMap<crate::fact::EntityId, Vec<&Fact>> = HashMap::new();
+        for fact in &facts {
+            for entity_id in &fact.entity_refs {
+                entity_facts.entry(*entity_id).or_default().push(fact);
+            }
+        }
+
+        let mut generated = 0;
+        let mut calls_used = 0;
+
+        for (entity_id, group) in &entity_facts {
+            if group.len() < 3 || calls_used >= max_calls {
+                continue;
+            }
+
+            let fact_texts: Vec<&str> = group.iter().map(|f| f.text.as_str()).collect();
+            let prompt = fact_texts.join("\n- ");
+
+            info!(
+                entity_id = %entity_id,
+                fact_count = group.len(),
+                "entity_summary: generating summary for entity"
+            );
+
+            let system = "You are a memory consolidation engine. Given a list of facts about a single entity, produce one concise wiki-style summary paragraph. Respond with JSON: {\"summary\": \"...\"}";
+            let user_msg = format!(
+                "Summarize these facts about entity {entity_id} into a single paragraph:\n- {prompt}"
+            );
+
+            let response = llm.structured_output(system, &user_msg).await?;
+            calls_used += 1;
+
+            if let Some(summary_text) = response["summary"].as_str() {
+                let mut embeddings = self.embedding.embed(&[summary_text]).await?;
+                let embedding = embeddings.pop().unwrap_or_default();
+
+                let mut fact = Fact::new(summary_text, scope.clone());
+                fact.tier = MemoryTier::Knowledge;
+                fact.source = Some("consolidation:entity_summary".to_string());
+                fact.confidence = Some(0.85);
+                fact.entity_refs = vec![*entity_id];
+                fact.embedding = embedding.clone();
+
+                let id = self.fact_store.insert_fact(fact).await?;
+                self.vector_store
+                    .upsert(id, embedding, serde_json::json!({}))
+                    .await?;
+                generated += 1;
+            }
+        }
+
+        Ok((generated, calls_used))
+    }
+
+    // -----------------------------------------------------------------------
+    // Operation 7: PreferenceRollup
+    // -----------------------------------------------------------------------
+
+    /// Consolidate preference-category facts into a rolled-up profile fact.
+    /// Returns (preferences_rolled_up, llm_calls_used).
+    async fn op_preference_rollup(
+        &self,
+        scope: &Scope,
+        llm: &dyn LlmClient,
+        max_calls: usize,
+    ) -> Result<(usize, usize), MemoryError> {
+        if max_calls == 0 {
+            return Ok((0, 0));
+        }
+
+        let mut filter = FactFilter::new().with_scope(scope.clone());
+        filter.category = Some("preference".to_string());
+        let facts = self.fact_store.list_facts(&filter).await?;
+
+        if facts.is_empty() {
+            return Ok((0, 0));
+        }
+
+        info!(
+            preference_count = facts.len(),
+            "preference_rollup: consolidating preference facts"
+        );
+
+        let fact_texts: Vec<&str> = facts.iter().map(|f| f.text.as_str()).collect();
+        let prompt = fact_texts.join("\n- ");
+
+        let system = "You are a memory consolidation engine. Given a list of user preference facts, produce a single consolidated preference profile as a concise paragraph. Respond with JSON: {\"profile\": \"...\"}";
+        let user_msg = format!("Roll up these user preferences into a profile:\n- {prompt}");
+
+        let response = llm.structured_output(system, &user_msg).await?;
+
+        if let Some(profile_text) = response["profile"].as_str() {
+            let mut embeddings = self.embedding.embed(&[profile_text]).await?;
+            let embedding = embeddings.pop().unwrap_or_default();
+
+            let mut fact = Fact::new(profile_text, scope.clone());
+            fact.tier = MemoryTier::Knowledge;
+            fact.category = Some("preference".to_string());
+            fact.source = Some("consolidation:preference_rollup".to_string());
+            fact.confidence = Some(0.9);
+            fact.embedding = embedding.clone();
+
+            let id = self.fact_store.insert_fact(fact).await?;
+            self.vector_store
+                .upsert(id, embedding, serde_json::json!({}))
+                .await?;
+
+            // Mark originals as rolled up
+            for fact in &facts {
+                let mut metadata = serde_json::Map::new();
+                metadata.insert("rolled_up".to_string(), serde_json::Value::Bool(true));
+                let patch = FactPatch {
+                    metadata,
+                    ..Default::default()
+                };
+                let _ = self.fact_store.update_fact(fact.id, patch).await;
+            }
+
+            return Ok((facts.len(), 1));
+        }
+
+        Ok((0, 1))
+    }
+
+    // -----------------------------------------------------------------------
+    // Operation 8: TimelineBuilder
+    // -----------------------------------------------------------------------
+
+    /// Sort facts with `event_date` metadata chronologically and tag them
+    /// with their ordinal position. No LLM needed.
+    /// Returns the number of timeline events ordered.
+    async fn op_timeline_builder(
+        &self,
+        scope: &Scope,
+    ) -> Result<usize, MemoryError> {
+        let filter = FactFilter::new().with_scope(scope.clone());
+        let facts = self.fact_store.list_facts(&filter).await?;
+
+        // Collect facts that carry an event_date in metadata.
+        let mut dated: Vec<(&Fact, String)> = facts
+            .iter()
+            .filter_map(|f| {
+                f.metadata
+                    .get("event_date")
+                    .and_then(|v| v.as_str())
+                    .map(|d| (f, d.to_string()))
+            })
+            .collect();
+
+        if dated.is_empty() {
+            return Ok(0);
+        }
+
+        // Sort by the event_date string (ISO-8601 sorts lexicographically).
+        dated.sort_by(|a, b| a.1.cmp(&b.1));
+
+        info!(
+            event_count = dated.len(),
+            "timeline_builder: ordering facts chronologically"
+        );
+
+        // Tag each fact with its position in the timeline.
+        for (position, (fact, _date)) in dated.iter().enumerate() {
+            let mut metadata = serde_json::Map::new();
+            metadata.insert(
+                "timeline_position".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(position)),
+            );
+            let patch = FactPatch {
+                metadata,
+                ..Default::default()
+            };
+            let _ = self.fact_store.update_fact(fact.id, patch).await;
+        }
+
+        Ok(dated.len())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +713,7 @@ mod tests {
     #[test]
     fn config_defaults() {
         let cfg = ConsolidationConfig::default();
-        assert_eq!(cfg.enabled_ops.len(), 5);
+        assert_eq!(cfg.enabled_ops.len(), 8);
         assert!((cfg.decay_factor - 0.95).abs() < f64::EPSILON);
         assert_eq!(cfg.promote_access_count, 3);
         assert_eq!(cfg.max_llm_calls, 10);
