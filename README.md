@@ -158,7 +158,7 @@ Full docs → [runtime/engram-server/README.md](runtime/engram-server/README.md)
 | **Policy & governance** | ✅ policy engine, audit log | 🟡 plugin | ❌ | ❌ | ❌ |
 | **Multi-tenant isolation** | ✅ row-level partitioning | ❌ | ❌ | ❌ | ❌ |
 | **Model independence** | ✅ any provider | 🟡 Gemini-first | ✅ any | ✅ any | ✅ any |
-| **Runtime language** | Rust + Python/Java | Python/TS/Go/Java | Python | Python | Python |
+| **Runtime language** | Rust + **[Java runtime](https://github.com/jamjet-labs/jamjet-runtime-java)** + Python | Python/TS/Go/Java | Python | Python | Python |
 
 ## Architecture
 
@@ -185,6 +185,32 @@ Full docs → [runtime/engram-server/README.md](runtime/engram-server/README.md)
 │           Postgres (production)  |  SQLite (local)        │
 └──────────────────────────────────────────────────────────┘
 ```
+
+## Java Runtime — No Sidecar
+
+> **NEW** — The [JamJet Java Runtime](https://github.com/jamjet-labs/jamjet-runtime-java) embeds durable execution directly in your JVM. No Docker, no sidecar, no REST overhead.
+
+```java
+@DurableAgent
+@Service
+public class MyAgent {
+    @Checkpoint("search")
+    public String search(String topic) {
+        return chatClient.prompt("Research: " + topic).call().content();
+    }
+}
+// Kill the process. Restart. It resumes from the last checkpoint.
+```
+
+```xml
+<dependency>
+    <groupId>dev.jamjet</groupId>
+    <artifactId>jamjet-runtime-spring-boot-starter</artifactId>
+    <version>0.1.1</version>
+</dependency>
+```
+
+**8.9x faster** than the REST sidecar path. Virtual threads, MCP native, plugin hot-reload. Works with Spring AI, LangChain4j, Google ADK. [Read the launch post](https://jamjet.dev/blog/zero-sidecar-durable-agents-java/).
 
 ## Examples
 
@@ -219,7 +245,7 @@ Full docs → [runtime/engram-server/README.md](runtime/engram-server/README.md)
 | 0 — Architecture & RFCs | ✅ Complete | Design docs, RFCs, repo scaffolding |
 | 1 — Minimal Viable Runtime | ✅ Complete | Local durable execution, MCP client, agent cards |
 | 2 — Production Core | ✅ Complete | Distributed workers, MCP server, A2A client + server |
-| 3 — Developer Delight | 🔄 In Progress | Eval harness, Java SDK, trace debugging, templates |
+| 3 — Developer Delight | 🔄 In Progress | Eval harness, ~~Java SDK~~ ✅, **[Java Runtime](https://github.com/jamjet-labs/jamjet-runtime-java)** ✅, trace debugging, templates |
 | 4 — Enterprise | 🔄 In Progress | Policy engine, tenant isolation, PII redaction, OAuth, mTLS |
 | 5 — Scale & Ecosystem | 📋 Planned | Go SDK, TypeScript SDK, hosted plane, marketplace |
 
