@@ -124,13 +124,17 @@ pub fn sort_by_tier_priority(facts: &mut [Fact]) {
 
 /// Format a fact as a bullet point, optionally prefixed with its date.
 fn format_fact_line(fact: &Fact) -> String {
-    // Check for event_date in metadata first
-    if let Some(event_date) = fact.metadata.get("event_date").and_then(|v| v.as_str()) {
-        return format!("- [{event_date}] {}", fact.text);
-    }
-    // Fall back to valid_from if it's not today (i.e., has a meaningful timestamp)
+    // Prefer valid_from when it has a meaningful timestamp (not today).
+    // This is more reliable than event_date metadata which may contain
+    // relative words like "today" or "last week" that weren't resolved.
     if fact.valid_from.date_naive() != chrono::Utc::now().date_naive() {
         return format!("- [{}] {}", fact.valid_from.format("%Y-%m-%d"), fact.text);
+    }
+    // Fall back to event_date metadata only if it looks like an ISO date (starts with digit)
+    if let Some(event_date) = fact.metadata.get("event_date").and_then(|v| v.as_str()) {
+        if event_date.starts_with(|c: char| c.is_ascii_digit()) {
+            return format!("- [{event_date}] {}", fact.text);
+        }
     }
     format!("- {}", fact.text)
 }
