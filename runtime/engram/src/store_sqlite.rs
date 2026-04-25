@@ -568,7 +568,9 @@ fn normalize_fts_query(query: &str) -> String {
         return String::new();
     }
     // Pass through advanced FTS5 syntax so power users aren't blocked.
-    if trimmed.contains('"') || trimmed.contains(':') || trimmed.contains('(') {
+    // Only double-quote phrases are true FTS5 syntax — colons and parens
+    // in entity names (e.g., "Museum of Modern Art (MoMA)") must be cleaned.
+    if trimmed.contains('"') {
         return trimmed.to_string();
     }
 
