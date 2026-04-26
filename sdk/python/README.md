@@ -247,7 +247,7 @@ pip install jamjet[anthropic]   # or Anthropic
 pip install jamjet[cloud-all]   # both
 ```
 
-Full guide: [Cloud Quickstart](https://docs.jamjet.dev/docs/en/cloud-quickstart) · [Sign up free](https://app.jamjet.dev)
+Full guide: [Cloud Quickstart](https://docs.jamjet.dev/en/docs/cloud-quickstart) · [Sign up free](https://app.jamjet.dev)
 
 ---
 

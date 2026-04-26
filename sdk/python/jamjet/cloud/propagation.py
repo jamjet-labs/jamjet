@@ -6,7 +6,7 @@ directly — the auto-patched transports (httpx, A2A, MCP) wire it up
 transparently. Helpers exist for custom transports.
 
 Header spec lives in `docs/propagation.md` (jamjet-cloud private repo,
-mirrored at https://docs.jamjet.dev/docs/en/cloud-quickstart#propagation
+mirrored at https://docs.jamjet.dev/en/docs/cloud-quickstart#propagation
 once it's published).
 """
 
