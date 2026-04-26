@@ -1,3 +1,10 @@
+// Clippy 1.95+ flags `match X { Variant => { if cond { ... } } }` patterns as
+// collapsible. These are intentional in the materializer and memory backend
+// where the if-condition is semantically distinct from the variant match
+// (status checks, filter predicates). Collapsing into match-guards would
+// require explicit catch-all arms and duplicate destructuring.
+#![allow(clippy::collapsible_match, clippy::collapsible_if)]
+
 pub mod backend;
 pub mod budget;
 pub mod event;
