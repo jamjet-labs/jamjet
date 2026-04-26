@@ -2,13 +2,14 @@
 
 <h1>⚡ JamJet</h1>
 
-**The agent-native runtime — durable, composable, built for production.**
+**The open-source runtime for AI agents that need to reach production.**
 
 [![jamjet MCP server](https://glama.ai/mcp/servers/jamjet-labs/jamjet/badges/score.svg)](https://glama.ai/mcp/servers/jamjet-labs/jamjet)
 [![CI](https://img.shields.io/github/actions/workflow/status/jamjet-labs/jamjet/ci.yml?label=CI&style=flat-square)](https://github.com/jamjet-labs/jamjet/actions)
 [![PyPI](https://img.shields.io/pypi/v/jamjet?style=flat-square&color=f5c518)](https://pypi.org/project/jamjet)
 [![crates.io](https://img.shields.io/crates/v/jamjet-engram?style=flat-square&color=f5c518)](https://crates.io/crates/jamjet-engram)
 [![License](https://img.shields.io/badge/license-Apache%202.0-f5c518?style=flat-square)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/jamjet-labs/jamjet?style=flat-square&color=f5c518)](https://github.com/jamjet-labs/jamjet/stargazers)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square)](https://rustup.rs)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)](https://python.org)
 [![Java](https://img.shields.io/badge/java-21%2B-red?style=flat-square)](https://openjdk.org)
@@ -25,6 +26,8 @@
 ---
 
 JamJet is a **performance-first, agent-native runtime** for AI agents. Not another prompt wrapper — a **production-grade orchestration substrate**. Rust + Tokio core for scheduling, state, and concurrency. Author in **Python**, **Java**, or **YAML** — all compile to the same IR graph and run on the same durable engine.
+
+> **For developers who:** ship agents to production · can't lose state on crash · need audit trails for compliance · want first-class human-in-the-loop · don't want to lock into one cloud or framework. *89% of enterprise agents never reach production. JamJet exists to fix that.*
 
 ## Quickstart
 
@@ -48,6 +51,32 @@ result = await research("What is JamJet?")
 
 No server. No config. No YAML. Just `pip install` and run. → **[Full quickstart](https://jamjet.dev/quickstart)**
 
+## Java Runtime — No Sidecar
+
+> **NEW** — The [JamJet Java Runtime](https://github.com/jamjet-labs/jamjet-runtime-java) embeds durable execution directly in your JVM. No Docker, no sidecar, no REST overhead.
+
+```java
+@DurableAgent
+@Service
+public class MyAgent {
+    @Checkpoint("search")
+    public String search(String topic) {
+        return chatClient.prompt("Research: " + topic).call().content();
+    }
+}
+// Kill the process. Restart. It resumes from the last checkpoint.
+```
+
+```xml
+<dependency>
+    <groupId>dev.jamjet</groupId>
+    <artifactId>jamjet-runtime-spring-boot-starter</artifactId>
+    <version>0.1.1</version>
+</dependency>
+```
+
+**8.9x faster** than the REST sidecar path. Virtual threads, MCP native, plugin hot-reload. Works with Spring AI, LangChain4j, Google ADK. [Read the launch post](https://jamjet.dev/blog/zero-sidecar-durable-agents-java/).
+
 ## Why JamJet?
 
 | Problem | JamJet's answer |
@@ -60,7 +89,7 @@ No server. No config. No YAML. Just `pip install` and run. → **[Full quickstar
 | Can't use agents as tools | **Agent-as-Tool** — sync, streaming, or conversational invocation modes |
 | No governance or guardrails | **Policy engine** — tool blocking, approvals, audit log, PII redaction, OAuth delegation |
 | Locked into one language | **Polyglot SDKs** — Python, Java (JDK 21), Go (planned) — same IR, same runtime |
-| Need a hosted dashboard, not just local | **JamJet Cloud** — drop-in two-line SDK adds traces, policies, approvals, hosted memory, audit retention. See [Cloud Quickstart](https://docs.jamjet.dev/docs/en/cloud-quickstart). |
+| Need a hosted dashboard, not just local | **JamJet Cloud** — drop-in two-line SDK adds traces, policies, approvals, hosted memory, audit retention. See [Cloud Quickstart](https://docs.jamjet.dev/en/docs/cloud-quickstart). |
 
 ## Progressive Complexity
 
@@ -142,30 +171,13 @@ docker run --rm -i -v engram-data:/data ghcr.io/jamjet-labs/engram-server:0.5.0
 
 Full docs → [runtime/engram-server/README.md](runtime/engram-server/README.md) · Comparison with Mem0, Zep, and others → [java-ai-memory.dev](https://java-ai-memory.dev)
 
-## Cloud — Hosted Control Plane
+## Cloud — When You Need Shared Visibility
 
-**JamJet Cloud** is the hosted, paid product that complements the open-source runtime + Engram. It adds the dashboard, multi-tenant audit retention, hosted memory, policy enforcement, and approval queue.
+**Free OSS forever.** This runtime, Engram local, and both SDKs are Apache-2.0 — no usage limits, no telemetry.
 
-```python
-import jamjet.cloud as jamjet
-from openai import OpenAI
+When you outgrow local: **JamJet Cloud** adds the dashboard, multi-tenant audit retention, hosted memory, policy enforcement, and an approval queue — wired in via two lines of SDK config. Multi-agent network graph + Java cloud SDK ship Q3 2026.
 
-jamjet.configure(api_key="jj_xxxxxxxxxxxx", project="my-agent")
-
-# Every OpenAI / Anthropic call is now captured automatically.
-OpenAI().chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "hello"}],
-)
-```
-
-Open `app.jamjet.dev/dashboard/traces` — the call appears within ~5 seconds with model, tokens, cost, and duration.
-
-Optional: `jamjet.policy("block", "payments.*")`, `jamjet.budget(max_cost_usd=5.00)`, `jamjet.require_approval(...)`, `@jamjet.trace`.
-
-Open-source JamJet (this runtime, Engram local, the Python and Java SDKs) stays free forever. Cloud is the paid layer for teams that need shared visibility, hosted memory, and retained audit. **Multi-agent network graph + Java cloud SDK shipping Q3 2026** — see the [roadmap](https://jamjet.dev/cloud).
-
-→ [**Cloud Quickstart**](https://docs.jamjet.dev/docs/en/cloud-quickstart) · [**Sign up**](https://app.jamjet.dev)
+→ [**Cloud Quickstart**](https://docs.jamjet.dev/en/docs/cloud-quickstart) · [**Sign up**](https://app.jamjet.dev)
 
 ## How JamJet Compares
 
@@ -211,32 +223,6 @@ Open-source JamJet (this runtime, Engram local, the Python and Java SDKs) stays 
 │           Postgres (production)  |  SQLite (local)        │
 └──────────────────────────────────────────────────────────┘
 ```
-
-## Java Runtime — No Sidecar
-
-> **NEW** — The [JamJet Java Runtime](https://github.com/jamjet-labs/jamjet-runtime-java) embeds durable execution directly in your JVM. No Docker, no sidecar, no REST overhead.
-
-```java
-@DurableAgent
-@Service
-public class MyAgent {
-    @Checkpoint("search")
-    public String search(String topic) {
-        return chatClient.prompt("Research: " + topic).call().content();
-    }
-}
-// Kill the process. Restart. It resumes from the last checkpoint.
-```
-
-```xml
-<dependency>
-    <groupId>dev.jamjet</groupId>
-    <artifactId>jamjet-runtime-spring-boot-starter</artifactId>
-    <version>0.1.1</version>
-</dependency>
-```
-
-**8.9x faster** than the REST sidecar path. Virtual threads, MCP native, plugin hot-reload. Works with Spring AI, LangChain4j, Google ADK. [Read the launch post](https://jamjet.dev/blog/zero-sidecar-durable-agents-java/).
 
 ## Community Integrations
 
