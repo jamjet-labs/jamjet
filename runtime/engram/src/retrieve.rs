@@ -135,10 +135,8 @@ impl HybridRetriever {
 
         // 3. Graph spreading activation
         let graph_entity_ids = self.graph_store.search_entities(query, 5).await?;
-        let seeds: Vec<(crate::fact::EntityId, f32)> = graph_entity_ids
-            .iter()
-            .map(|e| (e.id, 1.0_f32))
-            .collect();
+        let seeds: Vec<(crate::fact::EntityId, f32)> =
+            graph_entity_ids.iter().map(|e| (e.id, 1.0_f32)).collect();
 
         let activations = crate::spreading::spread(
             &self.graph_store,
@@ -199,8 +197,7 @@ impl HybridRetriever {
                     0.0
                 };
                 let is = node_importance(&fact);
-                let cs =
-                    calibrated_confidence(&fact, self.config.confidence_half_life_days);
+                let cs = calibrated_confidence(&fact, self.config.confidence_half_life_days);
 
                 let mut final_score = if temporal_intent.is_some() {
                     vs * self.config.vector_weight

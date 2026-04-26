@@ -19,7 +19,11 @@ async fn main() -> anyhow::Result<()> {
 
     let config = ApiConfig::default();
     let storage_backend = std::env::var("STORAGE_BACKEND").unwrap_or_default();
-    let storage_label = if storage_backend == "memory" { "memory" } else { "sqlite" };
+    let storage_label = if storage_backend == "memory" {
+        "memory"
+    } else {
+        "sqlite"
+    };
 
     info!(
         port = config.port,

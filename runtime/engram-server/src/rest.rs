@@ -2,11 +2,11 @@
 
 use crate::config::LlmBackend;
 use axum::extract::{Path, Query, State};
-use chrono::{DateTime, Utc};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use engram::context::{ContextConfig, OutputFormat};
 use engram::extract::{ExtractionConfig, Message};
 use engram::memory::{Memory, RecallQuery};
@@ -349,7 +349,11 @@ async fn consolidate_handler(
     let config = engram::consolidation::ConsolidationConfig::default();
 
     let llm = state.llm_backend.build();
-    match state.memory.consolidate(&scope, Some(llm.as_ref()), config).await {
+    match state
+        .memory
+        .consolidate(&scope, Some(llm.as_ref()), config)
+        .await
+    {
         Ok(result) => Json(serde_json::json!(result)).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

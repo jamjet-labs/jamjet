@@ -41,14 +41,21 @@ async fn test_workflow_crud() {
     let loaded = backend.get_workflow("wf-1", "1.0.0").await.unwrap();
     assert!(loaded.is_some());
     assert_eq!(loaded.unwrap().workflow_id, "wf-1");
-    assert!(backend.get_workflow("wf-1", "2.0.0").await.unwrap().is_none());
+    assert!(backend
+        .get_workflow("wf-1", "2.0.0")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
 async fn test_execution_lifecycle() {
     let backend = InMemoryBackend::new();
     let id = ExecutionId::new();
-    backend.create_execution(sample_execution(&id)).await.unwrap();
+    backend
+        .create_execution(sample_execution(&id))
+        .await
+        .unwrap();
     let exec = backend.get_execution(&id).await.unwrap().unwrap();
     assert_eq!(exec.status, WorkflowStatus::Running);
     backend
@@ -174,7 +181,10 @@ async fn test_work_queue() {
 async fn test_patch_append_array() {
     let backend = InMemoryBackend::new();
     let id = ExecutionId::new();
-    backend.create_execution(sample_execution(&id)).await.unwrap();
+    backend
+        .create_execution(sample_execution(&id))
+        .await
+        .unwrap();
     backend
         .patch_append_array(&id, "results", json!("first"))
         .await

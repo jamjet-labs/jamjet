@@ -38,16 +38,28 @@ static POINT_IN_TIME_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Detect temporal intent in a query string. Returns `None` for non-temporal queries.
 pub fn detect_temporal_intent(query: &str) -> Option<TemporalQuery> {
     if DURATION_RE.is_match(query) {
-        return Some(TemporalQuery { intent: TemporalIntent::Duration, confidence: 0.9 });
+        return Some(TemporalQuery {
+            intent: TemporalIntent::Duration,
+            confidence: 0.9,
+        });
     }
     if POINT_IN_TIME_RE.is_match(query) {
-        return Some(TemporalQuery { intent: TemporalIntent::PointInTime, confidence: 0.85 });
+        return Some(TemporalQuery {
+            intent: TemporalIntent::PointInTime,
+            confidence: 0.85,
+        });
     }
     if ORDERING_RE.is_match(query) {
-        return Some(TemporalQuery { intent: TemporalIntent::Ordering, confidence: 0.8 });
+        return Some(TemporalQuery {
+            intent: TemporalIntent::Ordering,
+            confidence: 0.8,
+        });
     }
     if RECENCY_RE.is_match(query) {
-        return Some(TemporalQuery { intent: TemporalIntent::Recency, confidence: 0.75 });
+        return Some(TemporalQuery {
+            intent: TemporalIntent::Recency,
+            confidence: 0.75,
+        });
     }
     None
 }
@@ -88,23 +100,48 @@ mod tests {
 
     #[test]
     fn detects_duration() {
-        assert_eq!(detect_temporal_intent("How many days between my dentist visit and the concert?").unwrap().intent, TemporalIntent::Duration);
-        assert_eq!(detect_temporal_intent("How long did the renovation take?").unwrap().intent, TemporalIntent::Duration);
+        assert_eq!(
+            detect_temporal_intent("How many days between my dentist visit and the concert?")
+                .unwrap()
+                .intent,
+            TemporalIntent::Duration
+        );
+        assert_eq!(
+            detect_temporal_intent("How long did the renovation take?")
+                .unwrap()
+                .intent,
+            TemporalIntent::Duration
+        );
     }
 
     #[test]
     fn detects_recency() {
-        assert_eq!(detect_temporal_intent("What did I do most recently?").unwrap().intent, TemporalIntent::Recency);
+        assert_eq!(
+            detect_temporal_intent("What did I do most recently?")
+                .unwrap()
+                .intent,
+            TemporalIntent::Recency
+        );
     }
 
     #[test]
     fn detects_ordering() {
-        assert_eq!(detect_temporal_intent("Did I go to the gym before or after the meeting?").unwrap().intent, TemporalIntent::Ordering);
+        assert_eq!(
+            detect_temporal_intent("Did I go to the gym before or after the meeting?")
+                .unwrap()
+                .intent,
+            TemporalIntent::Ordering
+        );
     }
 
     #[test]
     fn detects_point_in_time() {
-        assert_eq!(detect_temporal_intent("When did I start my new job?").unwrap().intent, TemporalIntent::PointInTime);
+        assert_eq!(
+            detect_temporal_intent("When did I start my new job?")
+                .unwrap()
+                .intent,
+            TemporalIntent::PointInTime
+        );
     }
 
     #[test]
@@ -115,16 +152,34 @@ mod tests {
 
     #[test]
     fn detects_preference_intent() {
-        assert_eq!(detect_category_intent("Can you recommend some evening activities for me?"), Some("preference"));
-        assert_eq!(detect_category_intent("What are some tips for meal prep?"), Some("preference"));
-        assert_eq!(detect_category_intent("Suggest recipes for dinner"), Some("preference"));
+        assert_eq!(
+            detect_category_intent("Can you recommend some evening activities for me?"),
+            Some("preference")
+        );
+        assert_eq!(
+            detect_category_intent("What are some tips for meal prep?"),
+            Some("preference")
+        );
+        assert_eq!(
+            detect_category_intent("Suggest recipes for dinner"),
+            Some("preference")
+        );
     }
 
     #[test]
     fn detects_assistant_intent() {
-        assert_eq!(detect_category_intent("What sealant did you recommend?"), Some("assistant_recommendation"));
-        assert_eq!(detect_category_intent("What was the dish you suggested?"), Some("assistant_recommendation"));
-        assert_eq!(detect_category_intent("You told me about a restaurant, what was it?"), Some("assistant_recommendation"));
+        assert_eq!(
+            detect_category_intent("What sealant did you recommend?"),
+            Some("assistant_recommendation")
+        );
+        assert_eq!(
+            detect_category_intent("What was the dish you suggested?"),
+            Some("assistant_recommendation")
+        );
+        assert_eq!(
+            detect_category_intent("You told me about a restaurant, what was it?"),
+            Some("assistant_recommendation")
+        );
     }
 
     #[test]

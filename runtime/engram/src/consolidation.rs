@@ -215,8 +215,7 @@ impl ConsolidationEngine {
                     }
                 }
                 ConsolidationOp::TimelineBuilder => {
-                    result.timeline_events_ordered =
-                        self.op_timeline_builder(scope).await?;
+                    result.timeline_events_ordered = self.op_timeline_builder(scope).await?;
                 }
             }
         }
@@ -654,10 +653,7 @@ impl ConsolidationEngine {
     /// Sort facts with `event_date` metadata chronologically and tag them
     /// with their ordinal position. No LLM needed.
     /// Returns the number of timeline events ordered.
-    async fn op_timeline_builder(
-        &self,
-        scope: &Scope,
-    ) -> Result<usize, MemoryError> {
+    async fn op_timeline_builder(&self, scope: &Scope) -> Result<usize, MemoryError> {
         let filter = FactFilter::new().with_scope(scope.clone());
         let facts = self.fact_store.list_facts(&filter).await?;
 

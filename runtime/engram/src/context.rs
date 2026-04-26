@@ -456,7 +456,10 @@ mod tests {
             .unwrap()
             .and_utc();
         let output = format_system_prompt(&[fact]);
-        assert!(output.contains("[2024-03-15] User went to dentist"), "got: {output}");
+        assert!(
+            output.contains("[2024-03-15] User went to dentist"),
+            "got: {output}"
+        );
     }
 
     #[test]
@@ -464,7 +467,8 @@ mod tests {
         use crate::scope::Scope;
         let scope = Scope::org("test");
         let mut fact = Fact::new("User ran a 5K", scope).with_tier(MemoryTier::Conversation);
-        fact.metadata.insert("event_date".to_string(), serde_json::json!("2024-06-01"));
+        fact.metadata
+            .insert("event_date".to_string(), serde_json::json!("2024-06-01"));
         let line = format_fact_line(&fact);
         assert_eq!(line, "- [2024-06-01] User ran a 5K");
     }

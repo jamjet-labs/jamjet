@@ -134,10 +134,19 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      - run: pip install --upgrade pip
       - run: pip install uv pip-audit
       - run: uv sync --all-extras
       - name: Audit dependencies
-        run: pip-audit --desc --ignore-vuln CVE-2026-4539  # pygments AdlLexer regex DoS — no fix released yet
+        run: |
+          # Ignored vulns (re-evaluate periodically):
+          #   CVE-2026-4539 — pygments AdlLexer regex DoS, no upstream fix.
+          #   CVE-2026-3219 — pip tar/zip handling; pip is a build-time tool, not
+          #     a runtime dep. We upgrade pip above to mitigate, and ignore here so
+          #     the audit doesn't fail on pip-audit's own venv pinning.
+          pip-audit --desc \
+            --ignore-vuln CVE-2026-4539 \
+            --ignore-vuln CVE-2026-3219
 
   secret-scan:
     name: Secret scanning

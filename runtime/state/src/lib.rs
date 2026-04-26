@@ -15,8 +15,8 @@ pub use backend::{
 pub use budget::BudgetState;
 pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};
 pub use materializer::{apply_events, materialize, should_snapshot, MaterializedState};
-pub use snapshot::Snapshot;
 pub use memory::InMemoryBackend;
+pub use snapshot::Snapshot;
 pub use sqlite::SqliteBackend;
 pub use tenant::{Tenant, TenantId, TenantLimits, TenantStatus, DEFAULT_TENANT};
 pub use tenant_scoped::TenantScopedSqliteBackend;

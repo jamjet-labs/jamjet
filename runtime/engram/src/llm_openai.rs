@@ -77,7 +77,17 @@ struct ResponseMessage {
 }
 
 impl OpenAiLlmClient {
+    /// Returns true for reasoning models (GPT-5, o1, o3) that do not support
+    /// `response_format: json_object` or `temperature`.
+    fn is_reasoning_model(&self) -> bool {
+        self.model.contains("gpt-5") || self.model.starts_with("o1") || self.model.starts_with("o3")
+    }
+
     async fn call(&self, system: &str, user: &str, json_mode: bool) -> Result<String, MemoryError> {
+        // Reasoning models (GPT-5, o1, o3) reject the legacy json_object
+        // response_format — rely on the prompt + extract_json_payload() instead.
+        let use_json_format = json_mode && !self.is_reasoning_model();
+
         let body = ChatRequest {
             model: &self.model,
             messages: vec![
@@ -90,7 +100,7 @@ impl OpenAiLlmClient {
                     content: user,
                 },
             ],
-            response_format: if json_mode {
+            response_format: if use_json_format {
                 Some(ResponseFormat {
                     kind: "json_object",
                 })
