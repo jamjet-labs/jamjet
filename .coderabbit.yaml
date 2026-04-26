@@ -12,5 +12,15 @@ reviews:
   tools:
     clippy:
       enabled: true
+    ruff:
+      enabled: true
+    hadolint:
+      enabled: true
+    actionlint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    yamllint:
+      enabled: true
 chat:
   auto_reply: true
