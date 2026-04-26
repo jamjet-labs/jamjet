@@ -23,7 +23,7 @@ impl CrossEncoderReranker {
         #[cfg(feature = "rerank")]
         {
             let session = ort::session::Session::builder()
-                .and_then(|b| b.commit_from_file(model_path))
+                .and_then(|mut b| b.commit_from_file(model_path))
                 .map_err(|e| MemoryError::Database(format!("ONNX load error: {e}")))?;
             Ok(Self { _session: session })
         }
