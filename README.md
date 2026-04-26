@@ -238,6 +238,16 @@ public class MyAgent {
 
 **8.9x faster** than the REST sidecar path. Virtual threads, MCP native, plugin hot-reload. Works with Spring AI, LangChain4j, Google ADK. [Read the launch post](https://jamjet.dev/blog/zero-sidecar-durable-agents-java/).
 
+## Community Integrations
+
+JamJet works with your existing AI framework. Browse community-built
+integrations for LangChain, LlamaIndex, CrewAI, AutoGen, Pydantic-AI, DSPy,
+Spring AI, and LangChain4j → [`jamjet-labs/jamjet-examples/integrations`](https://github.com/jamjet-labs/jamjet-examples/tree/main/integrations).
+
+**Want to build the official integration for *your* framework?**
+[Claim a slot](https://github.com/jamjet-labs/jamjet-examples/issues?q=is%3Aissue+is%3Aopen+label%3Awanted-integration)
+— first 10 merged contributors get JamJet swag.
+
 ## Examples
 
 | Example | Description |
