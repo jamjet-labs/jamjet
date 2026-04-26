@@ -44,6 +44,10 @@ class Span:
     end_user_id: str | None = None
     end_user_email: str | None = None
     tags: tuple[str, ...] = ()
+    # Typed failure category (Plan 5 Phase 4). Set when the span ends with an
+    # error/blocked status. The dashboard renders these as a pie chart and
+    # uses them for per-agent error-rate analytics.
+    failure_mode: str | None = None
     _start_time: float = field(default_factory=time.monotonic, repr=False)
 
     def finish(self, status: str = "ok", duration_ms: float | None = None) -> None:
@@ -53,6 +57,17 @@ class Span:
             self.duration_ms = duration_ms
         else:
             self.duration_ms = (time.monotonic() - self._start_time) * 1000
+
+    def fail(self, mode: str, *, status: str = "error") -> None:
+        """Mark span as failed with a typed failure mode (Plan 5 Phase 4).
+
+        Valid modes (CHECK constraint server-side): model_timeout,
+        model_refusal, model_rate_limited, model_invalid_request, tool_error,
+        policy_block, budget_exceeded, approval_rejected, downstream_failure,
+        network_error, validation_error, custom.
+        """
+        self.failure_mode = mode
+        self.finish(status=status)
 
     def to_event_dict(self) -> dict[str, Any]:
         """Convert span to a dict suitable for the event ingest API."""
@@ -104,6 +119,8 @@ class Span:
             # Tags ride in the payload jsonb under the reserved 'tags' key —
             # avoids a column for low-cardinality free-form labels.
             d.setdefault("payload", {})["tags"] = list(self.tags)
+        if self.failure_mode is not None:
+            d["failure_mode"] = self.failure_mode
         return d
 
 

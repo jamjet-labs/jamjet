@@ -29,6 +29,43 @@ _COST_PER_TOKEN: dict[str, tuple[float, float]] = {
 _originals: dict[str, Any] = {}
 
 
+def _classify_exception(exc: BaseException) -> str:
+    """Map a raised exception to a failure_mode enum value (Plan 5 Phase 4).
+
+    Recognizes common openai/anthropic/httpx errors plus our own exceptions
+    (BudgetExceeded, JamJetPolicyBlocked). Falls back to ``custom`` for
+    anything unrecognized — never raises from this function.
+    """
+    name = type(exc).__name__
+    # Our own exceptions, named explicitly
+    if name == "JamJetBudgetExceeded":
+        return "budget_exceeded"
+    if name == "JamJetPolicyBlocked":
+        return "policy_block"
+    if name in ("JamJetApprovalRejected",):
+        return "approval_rejected"
+    if name == "JamJetApprovalTimeout":
+        return "downstream_failure"
+    # Provider rate limits
+    if name in ("RateLimitError", "TooManyRequestsError"):
+        return "model_rate_limited"
+    # Provider timeouts
+    if name in ("APITimeoutError", "TimeoutException", "ReadTimeout", "WriteTimeout", "ConnectTimeout"):
+        return "model_timeout" if "API" in name else "network_error"
+    # Network-level
+    if name in ("ConnectError", "NetworkError", "ConnectionError", "RemoteProtocolError"):
+        return "network_error"
+    # Provider-side bad request / refusal
+    if name in ("BadRequestError", "UnprocessableEntityError"):
+        return "model_invalid_request"
+    if name in ("ContentPolicyViolationError",):
+        return "model_refusal"
+    # Validation errors from pydantic / similar
+    if name in ("ValidationError", "ValueError", "TypeError"):
+        return "validation_error"
+    return "custom"
+
+
 def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """Estimate cost in USD for a given model and token counts."""
     rates = _COST_PER_TOKEN.get(model)
@@ -80,7 +117,12 @@ def patch_openai() -> None:
         budget.check_or_raise(_estimate_cost(model, 500, 1000))
 
         span = ctx.new_span(kind="llm_call", name=f"openai.{model}")
-        result = original(self_inner, *args, **kwargs)
+        try:
+            result = original(self_inner, *args, **kwargs)
+        except BaseException as exc:
+            span.fail(mode=_classify_exception(exc))
+            emit(span.to_event_dict())
+            raise
 
         usage = getattr(result, "usage", None)
         input_tokens = getattr(usage, "prompt_tokens", 0) or 0
@@ -141,7 +183,12 @@ def patch_anthropic() -> None:
         budget.check_or_raise(_estimate_cost(model, 500, 1000))
 
         span = ctx.new_span(kind="llm_call", name=f"anthropic.{model}")
-        result = original(self_inner, *args, **kwargs)
+        try:
+            result = original(self_inner, *args, **kwargs)
+        except BaseException as exc:
+            span.fail(mode=_classify_exception(exc))
+            emit(span.to_event_dict())
+            raise
 
         # Anthropic response has .usage with input_tokens / output_tokens
         usage = getattr(result, "usage", None)

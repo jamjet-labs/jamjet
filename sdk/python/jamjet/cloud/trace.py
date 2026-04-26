@@ -88,7 +88,12 @@ def set_context(ctx: TraceContext | None = None) -> TraceContext:
 
 
 def trace(fn: F) -> F:
-    """Decorator that wraps a function in a span and emits an event on completion."""
+    """Decorator that wraps a function in a span and emits an event on completion.
+
+    On exception, classifies via the same heuristic the LLM patchers use so
+    @trace-decorated wrappers around custom code show up in the failure-mode
+    pie chart with a sensible category.
+    """
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -98,8 +103,11 @@ def trace(fn: F) -> F:
             result = fn(*args, **kwargs)
             span.finish(status="ok")
             return result
-        except Exception:
-            span.finish(status="error")
+        except Exception as exc:
+            # Lazy import to avoid pulling patcher into trace.py's import graph.
+            from .patcher import _classify_exception
+
+            span.fail(mode=_classify_exception(exc))
             raise
         finally:
             emit(span.to_event_dict())
