@@ -76,6 +76,26 @@ _state_lock = threading.Lock()
 _keypair: AipKeypair | None = None
 
 
+@dataclass(frozen=True)
+class _EmitterCfg:
+    """Tells the event emitter to attach a freshly-minted AIP token to each
+    outgoing event so the cloud can stamp ``events.aip_verified=true``.
+
+    Populated by :func:`register_with_cloud` (since registration is what gives
+    us a verifiable identity in the first place). Cleared by
+    :func:`disable_emitter_attach` if the caller wants to stop attaching
+    without unloading the keypair.
+    """
+
+    agent_name: str
+    project_id: str
+    ttl_seconds: int = 300
+
+
+_emitter: _EmitterCfg | None = None
+_emitter_attach_enabled: bool = True
+
+
 def generate_keypair() -> AipKeypair:
     """Generate a fresh Ed25519 keypair. Use during dev / on first boot.
 
@@ -166,6 +186,37 @@ def mint_token(
     return f"{h}.{p}.{_b64url(sig)}"
 
 
+def mint_for_event() -> str | None:
+    """Mint a fresh AIP token for the configured emitter agent, or return None
+    if AIP auto-attach is not enabled in this process. Called from the event
+    queue's send path; kept lightweight (Ed25519 sign is microseconds)."""
+    cfg = _emitter
+    if cfg is None or not _emitter_attach_enabled or _keypair is None:
+        return None
+    try:
+        return mint_token(
+            issuer=cfg.agent_name,
+            project_id=cfg.project_id,
+            ttl_seconds=cfg.ttl_seconds,
+        )
+    except Exception:
+        # Never let an AIP minting bug break event ingest.
+        return None
+
+
+def disable_emitter_attach() -> None:
+    """Stop attaching AIP tokens to outgoing events. The keypair stays loaded
+    so :func:`mint_token` keeps working for explicit delegation flows."""
+    global _emitter_attach_enabled
+    _emitter_attach_enabled = False
+
+
+def enable_emitter_attach() -> None:
+    """Resume attaching AIP tokens to outgoing events (default state)."""
+    global _emitter_attach_enabled
+    _emitter_attach_enabled = True
+
+
 def peek_claims(token: str) -> dict:
     """Decode a token's claims without verifying. Useful for client-side display
     of who delegated what (the cloud still verifies on receipt)."""
@@ -213,4 +264,12 @@ def register_with_cloud(
         timeout=10,
     )
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+
+    # Wire the emitter so subsequent events get an AIP token attached.
+    project_id = data.get("project_id")
+    if project_id:
+        global _emitter
+        _emitter = _EmitterCfg(agent_name=agent_name, project_id=project_id)
+
+    return data

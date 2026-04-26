@@ -10,6 +10,16 @@ import httpx
 from .config import get_config
 
 
+def _maybe_mint_aip_token() -> str | None:
+    """Return a freshly-minted AIP token, or None if AIP isn't configured.
+    Lazy import keeps the cryptography dep optional — no AIP, no overhead."""
+    try:
+        from .aip import mint_for_event
+    except ImportError:
+        return None
+    return mint_for_event()
+
+
 class EventQueue:
     """Thread-safe event queue with background batch flushing."""
 
@@ -78,6 +88,14 @@ class EventQueue:
             "Authorization": f"Bearer {cfg.api_key}",
             "Content-Type": "application/json",
         }
+        # Attach a freshly-minted AIP token (Plan 5 Phase 1.6) when the
+        # caller has registered an agent identity. One token is sufficient
+        # for the whole batch — its TTL covers the network round-trip and
+        # all events in the batch were emitted by the same process agent.
+        token = _maybe_mint_aip_token()
+        if token is not None:
+            for event in batch:
+                event.setdefault("aip_token", token)
         payload = {"project": cfg.project, "events": batch}
         try:
             resp = httpx.post(url, json=payload, headers=headers, timeout=10)
