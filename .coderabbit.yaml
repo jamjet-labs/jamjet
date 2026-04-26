@@ -7,7 +7,6 @@ reviews:
     drafts: false
   path_filters:
     - "!docs/**"
-    - "!*.md"
     - "!LICENSE"
   tools:
     clippy:
