@@ -29,6 +29,21 @@ class Span:
     # when present, lets the dashboard link out to a public Agent Card spec.
     agent_name: str | None = None
     agent_card_uri: str | None = None
+    # Cross-trace lineage (Plan 5 Phase 2). When this trace was started by an
+    # incoming request from another agent, these point to the upstream span.
+    # The dashboard uses them to render this trace as a child sub-tree.
+    originating_trace_id: str | None = None
+    originating_span_id: str | None = None
+    originating_agent_name: str | None = None
+    # Session + end-user + environment attribution (Phase 2 + 0009 schema).
+    # All opt-in; the SDK never auto-sniffs. end_user_email is PII and lives
+    # in a separate cloud-side table; the SDK passes it through opportunistically.
+    session_id: str | None = None
+    environment: str | None = None
+    release_version: str | None = None
+    end_user_id: str | None = None
+    end_user_email: str | None = None
+    tags: tuple[str, ...] = ()
     _start_time: float = field(default_factory=time.monotonic, repr=False)
 
     def finish(self, status: str = "ok", duration_ms: float | None = None) -> None:
@@ -69,6 +84,26 @@ class Span:
             d["agent_name"] = self.agent_name
         if self.agent_card_uri is not None:
             d["agent_card_uri"] = self.agent_card_uri
+        if self.originating_trace_id is not None:
+            d["originating_trace_id"] = self.originating_trace_id
+        if self.originating_span_id is not None:
+            d["originating_span_id"] = self.originating_span_id
+        if self.originating_agent_name is not None:
+            d["originating_agent_name"] = self.originating_agent_name
+        if self.session_id is not None:
+            d["session_id"] = self.session_id
+        if self.environment is not None:
+            d["environment"] = self.environment
+        if self.release_version is not None:
+            d["release_version"] = self.release_version
+        if self.end_user_id is not None:
+            d["end_user_id"] = self.end_user_id
+        if self.end_user_email is not None:
+            d["end_user_email"] = self.end_user_email
+        if self.tags:
+            # Tags ride in the payload jsonb under the reserved 'tags' key —
+            # avoids a column for low-cardinality free-form labels.
+            d.setdefault("payload", {})["tags"] = list(self.tags)
         return d
 
 

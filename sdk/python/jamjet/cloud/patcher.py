@@ -176,13 +176,70 @@ def unpatch_anthropic() -> None:
 # ---------------------------------------------------------------------------
 
 
+def patch_httpx() -> None:
+    """Inject traceparent + tracestate into outbound httpx requests.
+
+    OpenAI's and Anthropic's Python SDKs both speak HTTP through httpx, so
+    patching here covers most cross-agent calls without touching the LLM
+    SDK auto-patches above (which capture spans, not propagation). Both
+    sync ``Client.send`` and async ``AsyncClient.send`` are wrapped.
+
+    Idempotent. Skipped silently if httpx isn't installed.
+    """
+    try:
+        import httpx
+    except ImportError:
+        return
+
+    if "httpx" in _originals:
+        return
+
+    from .propagation import inject_headers
+
+    sync_original = httpx.Client.send
+    async_original = httpx.AsyncClient.send
+    _originals["httpx"] = (sync_original, async_original)
+
+    def patched_sync_send(self_inner: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            inject_headers(request.headers)
+        except Exception:  # noqa: BLE001  fail-open — never block the user's HTTP call
+            pass
+        return sync_original(self_inner, request, *args, **kwargs)
+
+    async def patched_async_send(self_inner: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            inject_headers(request.headers)
+        except Exception:  # noqa: BLE001
+            pass
+        return await async_original(self_inner, request, *args, **kwargs)
+
+    httpx.Client.send = patched_sync_send  # type: ignore[method-assign]
+    httpx.AsyncClient.send = patched_async_send  # type: ignore[method-assign]
+
+
+def unpatch_httpx() -> None:
+    entry = _originals.pop("httpx", None)
+    if entry is None:
+        return
+    try:
+        import httpx
+    except ImportError:
+        return
+    sync_original, async_original = entry
+    httpx.Client.send = sync_original  # type: ignore[method-assign]
+    httpx.AsyncClient.send = async_original  # type: ignore[method-assign]
+
+
 def patch_all() -> None:
-    """Patch both OpenAI and Anthropic SDKs."""
+    """Patch all supported integrations: OpenAI, Anthropic, httpx propagation."""
     patch_openai()
     patch_anthropic()
+    patch_httpx()
 
 
 def unpatch_all() -> None:
-    """Unpatch both SDKs."""
+    """Unpatch all integrations."""
     unpatch_openai()
     unpatch_anthropic()
+    unpatch_httpx()

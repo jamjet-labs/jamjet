@@ -12,18 +12,24 @@ from .config import get_config, set_config
 from .events import init_queue
 from .patcher import patch_all, unpatch_all
 from .policy import get_evaluator
+from .propagation import extract_headers, inject_headers
 from .trace import trace
+from .user_context import set_process_context, set_user_context, user_context
 
 __all__ = [
     "Agent",
     "agent",
     "budget",
     "configure",
+    "extract_headers",
+    "inject_headers",
     "patch_all",
     "policy",
     "require_approval",
+    "set_user_context",
     "trace",
     "unpatch_all",
+    "user_context",
 ]
 
 
@@ -31,6 +37,8 @@ def configure(
     api_key: str,
     project: str = "default",
     agent: str | None = None,
+    environment: str | None = None,
+    release_version: str | None = None,
     capture_io: bool = False,
     auto_patch: bool = True,
     flush_interval: float = 5.0,
@@ -69,6 +77,9 @@ def configure(
     # name or the literal "default" agent.
     default_name = agent if agent and agent.strip() else "default"
     set_default_agent(Agent(name=default_name))
+
+    # Process-wide context (environment, release_version) for every span.
+    set_process_context(environment=environment, release_version=release_version)
 
     if auto_patch:
         patch_all()
