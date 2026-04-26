@@ -130,7 +130,7 @@ def patch_anthropic() -> None:
     # anthropic SDK to assign create at the class level, so silence the
     # attr-defined errors here and at the assignment below.
     messages_cls = anthropic.Anthropic.messages.__class__
-    original = messages_cls.create  # type: ignore[attr-defined]
+    original = messages_cls.create
     _originals["anthropic"] = (messages_cls, original)
 
     def patched_create(self_inner: Any, *args: Any, **kwargs: Any) -> Any:
@@ -160,7 +160,7 @@ def patch_anthropic() -> None:
         emit(span.to_event_dict())
         return result
 
-    messages_cls.create = patched_create  # type: ignore[attr-defined]
+    messages_cls.create = patched_create
 
 
 def unpatch_anthropic() -> None:
@@ -214,8 +214,8 @@ def patch_httpx() -> None:
             pass
         return await async_original(self_inner, request, *args, **kwargs)
 
-    httpx.Client.send = patched_sync_send  # type: ignore[method-assign]
-    httpx.AsyncClient.send = patched_async_send  # type: ignore[method-assign]
+    httpx.Client.send = patched_sync_send  # type: ignore[method-assign,assignment]
+    httpx.AsyncClient.send = patched_async_send  # type: ignore[method-assign,assignment]
 
 
 def unpatch_httpx() -> None:
