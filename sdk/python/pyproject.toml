@@ -13,8 +13,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jamjet"
-version = "0.5.0"
-description = "JamJet Python SDK — agent-native workflow authoring and CLI"
+version = "0.6.0"
+description = "JamJet Python SDK — agent-native workflow authoring, CLI, and JamJet Cloud governance (jamjet.cloud submodule)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
@@ -58,6 +58,12 @@ dev = [
     "openai>=1.0",
     "scipy>=1.11",
 ]
+# Optional extras for the `jamjet.cloud` governance submodule (introduced in 0.6.0).
+# `pip install jamjet[openai]` enables auto-instrumentation of OpenAI calls;
+# `pip install jamjet[anthropic]` for Anthropic; `pip install jamjet[cloud-all]` for both.
+openai = ["openai>=2"]
+anthropic = ["anthropic>=0.40"]
+cloud-all = ["openai>=2", "anthropic>=0.40"]
 
 [project.scripts]
 jamjet = "jamjet.cli.main:app"
