@@ -3,8 +3,9 @@ from __future__ import annotations
 import functools
 import threading
 import uuid
+from collections.abc import Callable
 from contextvars import ContextVar
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 from .events import emit
 from .models import Span
@@ -75,7 +76,7 @@ def trace(fn: F) -> F:
             result = fn(*args, **kwargs)
             span.finish(status="ok")
             return result
-        except Exception as exc:
+        except Exception:
             span.finish(status="error")
             raise
         finally:

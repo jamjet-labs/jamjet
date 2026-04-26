@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import time
-import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -17,7 +16,7 @@ class Span:
     name: str
     parent_span_id: str | None = None
     sequence: int = 0
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     duration_ms: float | None = None
     model: str | None = None
     input_tokens: int | None = None
