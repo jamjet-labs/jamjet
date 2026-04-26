@@ -34,9 +34,10 @@ from __future__ import annotations
 
 import functools
 import threading
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -54,7 +55,7 @@ class Agent:
     card_uri: str | None = None
     description: str | None = None
 
-    def __enter__(self) -> "Agent":
+    def __enter__(self) -> Agent:
         _push_current(self)
         return self
 

@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import re
 import threading
+from collections.abc import Mapping, MutableMapping
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Mapping, MutableMapping
 from urllib.parse import quote, unquote
 
 # ---------------------------------------------------------------------------

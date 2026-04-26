@@ -61,7 +61,7 @@ def get_user_context() -> UserContext | None:
     return _user_var.get()
 
 
-class user_context:
+class user_context:  # noqa: N801 — public context-manager API uses lowercase by convention
     """Context manager that scopes session/user attribution to a block.
 
     Example::

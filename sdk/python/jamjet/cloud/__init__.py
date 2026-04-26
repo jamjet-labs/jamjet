@@ -22,6 +22,7 @@ __all__ = [
     "budget",
     "configure",
     "extract_headers",
+    "get_current_agent",
     "inject_headers",
     "patch_all",
     "policy",
