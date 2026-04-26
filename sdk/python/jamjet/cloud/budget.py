@@ -24,9 +24,7 @@ class BudgetManager:
             return
         with self._lock:
             if self._spent + estimated_cost > self._max_cost_usd:
-                raise JamJetBudgetExceeded(
-                    spent=self._spent, limit=self._max_cost_usd
-                )
+                raise JamJetBudgetExceeded(spent=self._spent, limit=self._max_cost_usd)
 
     @property
     def spent(self) -> float:

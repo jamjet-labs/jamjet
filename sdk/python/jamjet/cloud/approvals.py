@@ -55,8 +55,6 @@ def request_approval(
         if status == "approved":
             return approval_id
         if status == "rejected":
-            raise JamJetApprovalRejected(
-                approval_id, reason=status_data.get("reason")
-            )
+            raise JamJetApprovalRejected(approval_id, reason=status_data.get("reason"))
 
     raise JamJetApprovalTimeout(approval_id, timeout_seconds)

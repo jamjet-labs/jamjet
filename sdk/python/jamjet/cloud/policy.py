@@ -30,9 +30,7 @@ class PolicyEvaluator:
                 matched_action = action
                 matched_pattern = pattern
         if matched_action is None:
-            return PolicyDecision(
-                blocked=False, policy_kind="allow", pattern=None, tool_name=tool_name
-            )
+            return PolicyDecision(blocked=False, policy_kind="allow", pattern=None, tool_name=tool_name)
         if matched_action == "block":
             return PolicyDecision(
                 blocked=True,
@@ -48,9 +46,7 @@ class PolicyEvaluator:
             tool_name=tool_name,
         )
 
-    def filter_tools(
-        self, tools: list[dict[str, Any]]
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def filter_tools(self, tools: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Split an OpenAI-format tool list into (allowed, blocked).
 
         Each tool dict is expected to have a ``function`` key with a ``name`` field.

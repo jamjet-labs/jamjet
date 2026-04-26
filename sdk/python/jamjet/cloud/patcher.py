@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
 from .budget import get_budget
 from .events import emit
@@ -52,8 +52,7 @@ def patch_openai() -> None:
     the *class* level — every client instance picks the patch up automatically.
     """
     try:
-        import openai  # type: ignore[import-untyped]
-        from openai.resources.chat.completions import Completions  # type: ignore[import-untyped]
+        from openai.resources.chat.completions import Completions
     except ImportError:
         return
 
@@ -99,7 +98,7 @@ def patch_openai() -> None:
         emit(span.to_event_dict())
         return result
 
-    Completions.create = patched_create  # type: ignore[method-assign]
+    Completions.create = patched_create  # type: ignore[assignment,method-assign]
 
 
 def unpatch_openai() -> None:
@@ -119,7 +118,7 @@ def unpatch_openai() -> None:
 def patch_anthropic() -> None:
     """Monkey-patch ``anthropic.Anthropic.messages.create`` (sync)."""
     try:
-        import anthropic  # type: ignore[import-untyped]
+        import anthropic
     except ImportError:
         return
 
@@ -127,7 +126,7 @@ def patch_anthropic() -> None:
         return
 
     # anthropic.Anthropic().messages is a Messages resource; we patch the class method
-    messages_cls = anthropic.Anthropic.messages.__class__  # type: ignore[attr-defined]
+    messages_cls = anthropic.Anthropic.messages.__class__
     original = messages_cls.create
     _originals["anthropic"] = (messages_cls, original)
 

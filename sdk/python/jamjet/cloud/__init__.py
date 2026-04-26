@@ -14,11 +14,13 @@ from .policy import get_evaluator
 from .trace import trace
 
 __all__ = [
-    "configure",
-    "policy",
     "budget",
+    "configure",
+    "patch_all",
+    "policy",
     "require_approval",
     "trace",
+    "unpatch_all",
 ]
 
 

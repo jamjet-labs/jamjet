@@ -96,6 +96,10 @@ fn validate_reachability(ir: &WorkflowIr) -> IrResult<()> {
     Ok(())
 }
 
+// `if !map.contains_key(...)` inside each match arm is intentional here —
+// reads more naturally than collapsing into match guards (which would require
+// an explicit success arm per variant and duplicate the destructuring).
+#[allow(clippy::collapsible_match, clippy::collapsible_if)]
 fn validate_refs(ir: &WorkflowIr) -> IrResult<()> {
     use jamjet_core::node::NodeKind;
 

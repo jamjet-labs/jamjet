@@ -1,3 +1,8 @@
+# Exception class names follow the JamJet* prefix convention rather than the
+# *Error suffix convention. These names are part of the public SDK surface; the
+# convention is established and renaming would be a breaking API change.
+# ruff: noqa: N818
+
 from __future__ import annotations
 
 
@@ -7,9 +12,7 @@ class JamJetBudgetExceeded(Exception):
     def __init__(self, spent: float, limit: float) -> None:
         self.spent = spent
         self.limit = limit
-        super().__init__(
-            f"Budget exceeded: spent ${spent:.4f} of ${limit:.4f} limit"
-        )
+        super().__init__(f"Budget exceeded: spent ${spent:.4f} of ${limit:.4f} limit")
 
 
 class JamJetPolicyBlocked(Exception):
@@ -39,6 +42,4 @@ class JamJetApprovalTimeout(Exception):
     def __init__(self, approval_id: str, timeout_seconds: float) -> None:
         self.approval_id = approval_id
         self.timeout_seconds = timeout_seconds
-        super().__init__(
-            f"Approval {approval_id} timed out after {timeout_seconds}s"
-        )
+        super().__init__(f"Approval {approval_id} timed out after {timeout_seconds}s")
