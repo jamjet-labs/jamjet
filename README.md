@@ -60,6 +60,7 @@ No server. No config. No YAML. Just `pip install` and run. → **[Full quickstar
 | Can't use agents as tools | **Agent-as-Tool** — sync, streaming, or conversational invocation modes |
 | No governance or guardrails | **Policy engine** — tool blocking, approvals, audit log, PII redaction, OAuth delegation |
 | Locked into one language | **Polyglot SDKs** — Python, Java (JDK 21), Go (planned) — same IR, same runtime |
+| Need a hosted dashboard, not just local | **JamJet Cloud** — drop-in two-line SDK adds traces, policies, approvals, hosted memory, audit retention. See [Cloud Quickstart](https://docs.jamjet.dev/docs/en/cloud-quickstart). |
 
 ## Progressive Complexity
 
@@ -140,6 +141,31 @@ docker run --rm -i -v engram-data:/data ghcr.io/jamjet-labs/engram-server:0.5.0
 11 MCP tools: `memory_add`, `memory_recall`, `memory_context`, `memory_search`, `memory_forget`, `memory_stats`, `memory_consolidate`, `messages_save`, `messages_get`, `messages_list`, `messages_delete`.
 
 Full docs → [runtime/engram-server/README.md](runtime/engram-server/README.md) · Comparison with Mem0, Zep, and others → [java-ai-memory.dev](https://java-ai-memory.dev)
+
+## Cloud — Hosted Control Plane
+
+**JamJet Cloud** is the hosted, paid product that complements the open-source runtime + Engram. It adds the dashboard, multi-tenant audit retention, hosted memory, policy enforcement, and approval queue.
+
+```python
+import jamjet.cloud as jamjet
+from openai import OpenAI
+
+jamjet.configure(api_key="jj_xxxxxxxxxxxx", project="my-agent")
+
+# Every OpenAI / Anthropic call is now captured automatically.
+OpenAI().chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "hello"}],
+)
+```
+
+Open `app.jamjet.dev/dashboard/traces` — the call appears within ~5 seconds with model, tokens, cost, and duration.
+
+Optional: `jamjet.policy("block", "payments.*")`, `jamjet.budget(max_cost_usd=5.00)`, `jamjet.require_approval(...)`, `@jamjet.trace`.
+
+Open-source JamJet (this runtime, Engram local, the Python and Java SDKs) stays free forever. Cloud is the paid layer for teams that need shared visibility, hosted memory, and retained audit. **Multi-agent network graph + Java cloud SDK shipping Q3 2026** — see the [roadmap](https://jamjet.dev/cloud).
+
+→ [**Cloud Quickstart**](https://docs.jamjet.dev/docs/en/cloud-quickstart) · [**Sign up**](https://app.jamjet.dev)
 
 ## How JamJet Compares
 

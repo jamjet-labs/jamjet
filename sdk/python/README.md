@@ -210,6 +210,47 @@ nodes:
 
 ---
 
+## JamJet Cloud — Hosted Governance (`jamjet.cloud`)
+
+Starting in **0.6.0**, the `jamjet` package includes a `jamjet.cloud` submodule for the hosted control plane. Two-line install:
+
+```python
+import jamjet.cloud as jamjet
+from openai import OpenAI
+
+jamjet.configure(api_key="jj_xxxxxxxxxxxx", project="my-agent")
+
+# Every OpenAI / Anthropic call is now captured automatically.
+resp = OpenAI().chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "hello"}],
+)
+```
+
+Open [app.jamjet.dev/dashboard/traces](https://app.jamjet.dev/dashboard/traces) — the call appears within ~5 seconds with model, tokens, cost, and duration.
+
+Optional governance primitives:
+
+```python
+jamjet.policy("block", "payments.*")              # filter tools by name
+jamjet.budget(max_cost_usd=5.00)                   # cap spend; raises BudgetExceeded
+approval = jamjet.require_approval(action="charge_card", context={...})
+@jamjet.trace                                       # decorate any function
+def lookup_customer(...): ...
+```
+
+Install with the LLM SDK you use:
+
+```bash
+pip install jamjet[openai]      # auto-instrument OpenAI
+pip install jamjet[anthropic]   # or Anthropic
+pip install jamjet[cloud-all]   # both
+```
+
+Full guide: [Cloud Quickstart](https://docs.jamjet.dev/docs/en/cloud-quickstart) · [Sign up free](https://app.jamjet.dev)
+
+---
+
 ## Architecture
 
 ```
