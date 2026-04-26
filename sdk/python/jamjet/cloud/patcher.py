@@ -130,7 +130,7 @@ def patch_anthropic() -> None:
     # anthropic SDK to assign create at the class level, so silence the
     # attr-defined errors here and at the assignment below.
     messages_cls = anthropic.Anthropic.messages.__class__
-    original = messages_cls.create
+    original = messages_cls.create  # type: ignore[attr-defined,unused-ignore]
     _originals["anthropic"] = (messages_cls, original)
 
     def patched_create(self_inner: Any, *args: Any, **kwargs: Any) -> Any:
@@ -160,7 +160,7 @@ def patch_anthropic() -> None:
         emit(span.to_event_dict())
         return result
 
-    messages_cls.create = patched_create
+    messages_cls.create = patched_create  # type: ignore[attr-defined,unused-ignore]
 
 
 def unpatch_anthropic() -> None:
