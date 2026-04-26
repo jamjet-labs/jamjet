@@ -63,7 +63,9 @@ dev = [
 # `pip install jamjet[anthropic]` for Anthropic; `pip install jamjet[cloud-all]` for both.
 openai = ["openai>=2"]
 anthropic = ["anthropic>=0.40"]
-cloud-all = ["openai>=2", "anthropic>=0.40"]
+# Enables jamjet.cloud.aip (Ed25519 signing for AIP delegation tokens).
+aip = ["cryptography>=42"]
+cloud-all = ["openai>=2", "anthropic>=0.40", "cryptography>=42"]
 
 [project.scripts]
 jamjet = "jamjet.cli.main:app"
