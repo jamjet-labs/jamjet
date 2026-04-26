@@ -28,9 +28,7 @@ TRACESTATE_HEADER = "tracestate"
 JJ_TRACESTATE_KEY = "jj"
 
 # ``00-<32hex>-<16hex>-<2hex>``
-_TRACEPARENT_RE = re.compile(
-    r"^00-(?P<trace>[0-9a-f]{32})-(?P<parent>[0-9a-f]{16})-(?P<flags>[0-9a-f]{2})$"
-)
+_TRACEPARENT_RE = re.compile(r"^00-(?P<trace>[0-9a-f]{32})-(?P<parent>[0-9a-f]{16})-(?P<flags>[0-9a-f]{2})$")
 
 
 # ---------------------------------------------------------------------------
@@ -52,9 +50,7 @@ class OriginatingContext:
     agent_name: str | None = None
 
 
-_originating_var: ContextVar[OriginatingContext | None] = ContextVar(
-    "jamjet_originating", default=None
-)
+_originating_var: ContextVar[OriginatingContext | None] = ContextVar("jamjet_originating", default=None)
 
 
 def get_originating() -> OriginatingContext | None:

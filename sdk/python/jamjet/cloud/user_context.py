@@ -40,9 +40,7 @@ class UserContext:
 
 
 _process_context: ProcessContext = ProcessContext()
-_user_var: ContextVar[UserContext | None] = ContextVar(
-    "jamjet_user_context", default=None
-)
+_user_var: ContextVar[UserContext | None] = ContextVar("jamjet_user_context", default=None)
 
 
 def get_process_context() -> ProcessContext:

@@ -86,9 +86,7 @@ def configure(
 
     # Sync policies from server in background
     cfg = get_config()
-    t = threading.Thread(
-        target=_sync_policies, args=(cfg.api_key, cfg.api_url, project), daemon=True
-    )
+    t = threading.Thread(target=_sync_policies, args=(cfg.api_key, cfg.api_url, project), daemon=True)
     t.start()
 
 
