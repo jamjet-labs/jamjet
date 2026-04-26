@@ -89,7 +89,7 @@ public class MyAgent {
 | Can't use agents as tools | **Agent-as-Tool** — sync, streaming, or conversational invocation modes |
 | No governance or guardrails | **Policy engine** — tool blocking, approvals, audit log, PII redaction, OAuth delegation |
 | Locked into one language | **Polyglot SDKs** — Python, Java (JDK 21), Go (planned) — same IR, same runtime |
-| Need a hosted dashboard, not just local | **JamJet Cloud** — drop-in two-line SDK adds traces, policies, approvals, hosted memory, audit retention. See [Cloud Quickstart](https://docs.jamjet.dev/docs/en/cloud-quickstart). |
+| Need a hosted dashboard, not just local | **JamJet Cloud** — drop-in two-line SDK adds traces, policies, approvals, hosted memory, audit retention. See [Cloud Quickstart](https://docs.jamjet.dev/en/docs/cloud-quickstart). |
 
 ## Progressive Complexity
 
@@ -177,7 +177,7 @@ Full docs → [runtime/engram-server/README.md](runtime/engram-server/README.md)
 
 When you outgrow local: **JamJet Cloud** adds the dashboard, multi-tenant audit retention, hosted memory, policy enforcement, and an approval queue — wired in via two lines of SDK config. Multi-agent network graph + Java cloud SDK ship Q3 2026.
 
-→ [**Cloud Quickstart**](https://docs.jamjet.dev/docs/en/cloud-quickstart) · [**Sign up**](https://app.jamjet.dev)
+→ [**Cloud Quickstart**](https://docs.jamjet.dev/en/docs/cloud-quickstart) · [**Sign up**](https://app.jamjet.dev)
 
 ## How JamJet Compares
 
