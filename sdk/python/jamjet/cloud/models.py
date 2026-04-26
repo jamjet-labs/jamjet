@@ -24,6 +24,11 @@ class Span:
     cost_usd: float | None = None
     status: str = "pending"
     payload: dict[str, Any] = field(default_factory=dict)
+    # Multi-agent attribution (Plan 5 Phase 1). agent_name is the human-readable
+    # identifier; the cloud API resolves it to a UUID on ingest. agent_card_uri,
+    # when present, lets the dashboard link out to a public Agent Card spec.
+    agent_name: str | None = None
+    agent_card_uri: str | None = None
     _start_time: float = field(default_factory=time.monotonic, repr=False)
 
     def finish(self, status: str = "ok", duration_ms: float | None = None) -> None:
@@ -60,6 +65,10 @@ class Span:
             d["cost_usd"] = self.cost_usd
         if self.payload:
             d["payload"] = self.payload
+        if self.agent_name is not None:
+            d["agent_name"] = self.agent_name
+        if self.agent_card_uri is not None:
+            d["agent_card_uri"] = self.agent_card_uri
         return d
 
 

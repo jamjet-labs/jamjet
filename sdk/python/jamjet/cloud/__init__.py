@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+from .agent import Agent, agent, get_current_agent, set_default_agent
 from .approvals import request_approval as _request_approval
 from .budget import set_budget as _set_budget
 from .config import get_config, set_config
@@ -14,6 +15,8 @@ from .policy import get_evaluator
 from .trace import trace
 
 __all__ = [
+    "Agent",
+    "agent",
     "budget",
     "configure",
     "patch_all",
@@ -27,6 +30,7 @@ __all__ = [
 def configure(
     api_key: str,
     project: str = "default",
+    agent: str | None = None,
     capture_io: bool = False,
     auto_patch: bool = True,
     flush_interval: float = 5.0,
@@ -35,8 +39,18 @@ def configure(
 ) -> None:
     """Initialize the JamJet Cloud SDK.
 
-    Sets global config, starts the event queue, and optionally monkey-patches
-    OpenAI and Anthropic SDKs for automatic capture.
+    Sets global config, starts the event queue, optionally monkey-patches the
+    OpenAI / Anthropic SDKs, and seeds the default agent identity.
+
+    Args:
+        api_key: ``jj_...`` key from ``app.jamjet.dev``.
+        project: logical grouping of traces. One project per service is typical.
+        agent: optional default agent name for every span this process emits.
+            If omitted, spans are tagged ``default`` until an explicit
+            ``with jamjet.agent("name"):`` scope or ``@jamjet.agent("name")``
+            decorator overrides.
+        capture_io: when True, captures full prompt/response payloads (off by
+            default for privacy).
     """
     set_config(
         api_key=api_key,
@@ -50,12 +64,20 @@ def configure(
     )
     init_queue(flush_interval=flush_interval, flush_size=flush_size)
 
+    # Seed the default agent. Even users who don't call jamjet.agent() get
+    # named attribution — every span belongs to either the configured default
+    # name or the literal "default" agent.
+    default_name = agent if agent and agent.strip() else "default"
+    set_default_agent(Agent(name=default_name))
+
     if auto_patch:
         patch_all()
 
     # Sync policies from server in background
     cfg = get_config()
-    t = threading.Thread(target=_sync_policies, args=(cfg.api_key, cfg.api_url, project), daemon=True)
+    t = threading.Thread(
+        target=_sync_policies, args=(cfg.api_key, cfg.api_url, project), daemon=True
+    )
     t.start()
 
 

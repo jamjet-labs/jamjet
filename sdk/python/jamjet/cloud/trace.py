@@ -7,6 +7,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from typing import Any, TypeVar
 
+from .agent import get_current_agent
 from .events import emit
 from .models import Span
 
@@ -22,17 +23,23 @@ class TraceContext:
         self._lock = threading.Lock()
 
     def new_span(self, kind: str, name: str) -> Span:
-        """Create a new Span belonging to this trace."""
+        """Create a new Span belonging to this trace, tagged with the current agent."""
         with self._lock:
             self._seq += 1
             seq = self._seq
         span_id = "sp_" + uuid.uuid4().hex
+        # Pull current agent from context. None is permitted (the API will
+        # accept untagged events) but configure() seeds a "default" so this
+        # is rarely None in practice.
+        current_agent = get_current_agent()
         return Span(
             trace_id=self.trace_id,
             span_id=span_id,
             kind=kind,
             name=name,
             sequence=seq,
+            agent_name=current_agent.name if current_agent else None,
+            agent_card_uri=current_agent.card_uri if current_agent else None,
         )
 
 
