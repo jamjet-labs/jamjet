@@ -2,7 +2,7 @@
 
 <h1>⚡ JamJet</h1>
 
-**Production-safe AI agents, without cloud or framework lock-in.**
+**The safety layer behind your AI agents.**
 
 [![jamjet MCP server](https://glama.ai/mcp/servers/jamjet-labs/jamjet/badges/score.svg)](https://glama.ai/mcp/servers/jamjet-labs/jamjet)
 [![CI](https://img.shields.io/github/actions/workflow/status/jamjet-labs/jamjet/ci.yml?label=CI&style=flat-square)](https://github.com/jamjet-labs/jamjet/actions)
@@ -25,9 +25,13 @@
 
 ---
 
-JamJet is an **open-source governance runtime for AI agents**. It gives agent systems policy enforcement, audit trails, human approval, crash recovery, cost governance, durable memory, and MCP/A2A interoperability — built into the runtime, not bolted on later.
+AI agents fail in predictable ways: they lose state on crash, call tools they shouldn't, skip human approval, run past budget, forget context, or leave no useful audit trail.
 
-> **For developers who:** ship agents to production · can't lose state on crash · need audit trails for compliance · want first-class human-in-the-loop · don't want to lock into one cloud or framework. *89% of enterprise agents never reach production. JamJet exists to fix that.*
+JamJet is an open-source runtime that handles those failure modes directly: policy checks, audit trails, human approval, crash recovery, cost limits, durable memory, and MCP/A2A interoperability.
+
+**Keep your framework. Add JamJet when an agent needs to be replayable, auditable, and controlled.**
+
+> *89% of enterprise agents never reach production. JamJet exists to fix that.* — for developers shipping agents that need to survive crashes, unsafe tool calls, runaway costs, missed approvals, and audit gaps.
 
 ![JamJet demo](./demo.gif)
 
@@ -65,7 +69,7 @@ result = await research("What is JamJet?")
 
 No server. No config. No YAML. Just `pip install` and run. → **[Full quickstart](https://jamjet.dev/quickstart)**
 
-## Production-safety primitives
+## Add the safety layer
 
 Add JamJet Cloud's two-line config and the same code gains policy enforcement, cost budgets, human approval, and an audit trail:
 
@@ -350,7 +354,7 @@ Apache 2.0 — see [LICENSE](LICENSE).
 
 <div align="center">
 
-### ⭐ Star JamJet if you believe AI agents need to be production-safe
+### ⭐ Star JamJet if you believe agents need a safety layer
 
 <sub>Built by <a href="https://github.com/sunilp">Sunil Prakash</a> · © 2026 JamJet Labs · <a href="https://jamjet.dev">jamjet.dev</a> · Apache 2.0</sub>
 
