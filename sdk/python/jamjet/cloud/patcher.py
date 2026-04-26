@@ -168,7 +168,7 @@ def unpatch_anthropic() -> None:
     if "anthropic" not in _originals:
         return
     messages_cls, original = _originals.pop("anthropic")
-    messages_cls.create = original  # type: ignore[attr-defined]
+    messages_cls.create = original
 
 
 # ---------------------------------------------------------------------------

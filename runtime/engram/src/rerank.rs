@@ -12,7 +12,7 @@ use std::path::Path;
 /// Cross-encoder reranker backed by an ONNX model.
 pub struct CrossEncoderReranker {
     #[cfg(feature = "rerank")]
-    _session: ort::Session,
+    _session: ort::session::Session,
     #[cfg(not(feature = "rerank"))]
     _phantom: (),
 }
@@ -22,7 +22,7 @@ impl CrossEncoderReranker {
     pub fn load(model_path: &Path) -> Result<Self, MemoryError> {
         #[cfg(feature = "rerank")]
         {
-            let session = ort::Session::builder()
+            let session = ort::session::Session::builder()
                 .and_then(|b| b.commit_from_file(model_path))
                 .map_err(|e| MemoryError::Database(format!("ONNX load error: {e}")))?;
             Ok(Self { _session: session })
