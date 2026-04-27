@@ -10,7 +10,7 @@
 
 ![JamJet demo](https://raw.githubusercontent.com/jamjet-labs/jamjet/main/demo.gif)
 
-JamJet is a **performance-first, agent-native runtime and framework** for building reliable, interoperable AI agent systems. It is not another prompt wrapper or thin agent SDK — it is a **production-grade orchestration substrate** for agents that need to work, not just demo.
+JamJet is a **performance-first, agent-native runtime and framework** for building reliable, interoperable AI agent systems. It is not another prompt wrapper or thin agent SDK — it is an **orchestration substrate** built to prevent the failure modes that hurt real agents: lost state on crash, skipped approvals, runaway cost, and siloed observability.
 
 ---
 

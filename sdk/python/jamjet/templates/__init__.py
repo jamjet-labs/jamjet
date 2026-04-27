@@ -1135,6 +1135,201 @@ results = json.loads(pathlib.Path("results/experiment_results.json").read_text()
 ```
 """,
     },
+    # ── cloud-agent ───────────────────────────────────────────────────────────
+    "cloud-agent": {
+        "agent.py": """\
+# {name}/agent.py
+# A JamJet agent with cloud governance — policy enforcement, approval gates,
+# cost tracking, and full trace visibility in the JamJet Cloud dashboard.
+#
+# Prerequisites:
+#   pip install jamjet[openai]        # or jamjet[anthropic]
+#   export JAMJET_API_KEY=jj_...      # from https://jamjet.cloud/dashboard/settings
+#
+# Usage:
+#   python agent.py
+
+import os
+
+import jamjet.cloud as cloud
+from jamjet import tool
+
+# ── 1. Connect to JamJet Cloud ────────────────────────────────────────────────
+cloud.init(
+    api_key=os.environ["JAMJET_API_KEY"],
+    agent_name="{name}",          # appears in the dashboard agent list
+    environment="dev",            # dev | staging | prod
+)
+
+# Block any tool whose name matches these patterns — enforced server-side.
+# Violations appear on the Audit page in the dashboard.
+cloud.policy("block", "payments.*")
+cloud.policy("block", "*.delete")
+
+# ── 2. Define tools ───────────────────────────────────────────────────────────
+
+@tool
+async def summarize_text(text: str) -> str:
+    \\"\\"\\"Summarize the provided text in one paragraph.\\"\\"\\"
+    # Replace with real logic — e.g. call an LLM or a library
+    return f"Summary of {{len(text)}} chars: {{text[:120]}}..."
+
+
+@tool
+async def send_notification(message: str, channel: str = "general") -> str:
+    \\"\\"\\"Send a notification to the specified channel.\\"\\"\\"
+    # Replace with a real integration (Slack, email, etc.)
+    print(f"[notification -> #{{channel}}] {{message}}")
+    return "sent"
+
+
+# ── 3. Run the agent ──────────────────────────────────────────────────────────
+
+async def main() -> None:
+    from openai import AsyncOpenAI
+    import json
+
+    client = AsyncOpenAI()
+
+    messages = [
+        {{
+            "role": "system",
+            "content": (
+                "You are a helpful assistant with access to tools. "
+                "Use tools to complete tasks. Never call blocked tools."
+            ),
+        }},
+        {{
+            "role": "user",
+            "content": "Summarize this paragraph and send it to the #updates channel: "
+                       "JamJet is a governance layer for AI agents that enforces policies, "
+                       "tracks costs, and gives teams full visibility into what their agents are doing.",
+        }},
+    ]
+
+    tools_schema = [
+        {{
+            "type": "function",
+            "function": {{
+                "name": "summarize_text",
+                "description": "Summarize text in one paragraph",
+                "parameters": {{
+                    "type": "object",
+                    "properties": {{"text": {{"type": "string"}}}},
+                    "required": ["text"],
+                }},
+            }},
+        }},
+        {{
+            "type": "function",
+            "function": {{
+                "name": "send_notification",
+                "description": "Send a notification to a channel",
+                "parameters": {{
+                    "type": "object",
+                    "properties": {{
+                        "message": {{"type": "string"}},
+                        "channel": {{"type": "string", "default": "general"}},
+                    }},
+                    "required": ["message"],
+                }},
+            }},
+        }},
+    ]
+
+    # Agentic loop
+    while True:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=tools_schema,
+            tool_choice="auto",
+        )
+        msg = response.choices[0].message
+        messages.append(msg)
+
+        if not msg.tool_calls:
+            print("Agent:", msg.content)
+            break
+
+        for call in msg.tool_calls:
+            name = call.function.name
+            args = json.loads(call.function.arguments)
+
+            if name == "summarize_text":
+                result = await summarize_text(**args)
+            elif name == "send_notification":
+                result = await send_notification(**args)
+            else:
+                result = f"Unknown tool: {{name}}"
+
+            messages.append({{
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": str(result),
+            }})
+
+    # View the trace in your dashboard:
+    # https://jamjet.cloud/dashboard/traces
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+""",
+        "README.md": """\
+# {name}
+
+A governed AI agent built with [JamJet Cloud](https://jamjet.cloud).
+
+## Setup
+
+```bash
+pip install jamjet[openai]
+export JAMJET_API_KEY=jj_...   # https://jamjet.cloud/dashboard/settings
+```
+
+## Run
+
+```bash
+python agent.py
+```
+
+Then open the [JamJet Cloud dashboard](https://jamjet.cloud/dashboard) to see:
+
+- **Traces** — full event timeline for every run
+- **Audit** — any policy violations (e.g. blocked tool calls)
+- **Costs** — per-model spend with recommendations
+- **Approvals** — human-in-the-loop gates for sensitive actions
+
+## What's wired up
+
+| Feature | How |
+|---|---|
+| Policy enforcement | `cloud.policy("block", "payments.*")` — server-side, no bypass |
+| Trace visibility | Every LLM call and tool call appears in the dashboard |
+| Cost tracking | Automatic per-model attribution |
+| Agent identity | `agent_name="{name}"` — shows in the Agents view |
+| Environment | `environment="dev"` — filter traces by env in the dashboard |
+
+## Add an approval gate
+
+Wrap any sensitive action in a cloud approval:
+
+```python
+from jamjet.cloud import require_approval
+
+approval = await require_approval(
+    action="send_notification",
+    context={{"message": message, "channel": channel}},
+)
+if approval.approved:
+    await send_notification(message, channel)
+```
+
+Approvals surface in `/dashboard/approvals` for your team to review.
+""",
+    },
     # ── approval-workflow ─────────────────────────────────────────────────────
     "approval-workflow": {
         "workflow.yaml": """\
