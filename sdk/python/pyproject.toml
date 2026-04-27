@@ -67,6 +67,7 @@ cloud-all = ["openai>=2", "anthropic>=0.40"]
 
 [project.scripts]
 jamjet = "jamjet.cli.main:app"
+jamjet-cloud = "jamjet.cloud.cli:main"
 
 
 [tool.ruff]

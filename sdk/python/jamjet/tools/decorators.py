@@ -118,6 +118,25 @@ def tool(
         # called directly (useful in tests and local dev).
         @functools.wraps(fn)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # Replay intercept (Phase 6.1): when a replay bundle is active,
+            # return the recorded output instead of calling the real tool.
+            # Import is local to avoid a hard dep cycle at module load.
+            try:
+                from jamjet.cloud.replay import get_active as _get_replay  # noqa: PLC0415
+                _replay = _get_replay()
+            except Exception:  # noqa: BLE001
+                _replay = None
+            if _replay is not None:
+                sig_params = list(inspect.signature(fn).parameters.keys())
+                tool_input = dict(zip(sig_params, args))
+                tool_input.update(kwargs)
+                try:
+                    return _replay.lookup_tool_output(tool_name, tool_input)
+                except (KeyError, TypeError):
+                    # KeyError: no recording for this input.
+                    # TypeError: input contains non-JSON-serializable values
+                    #   (Pydantic model, datetime, bytes, etc.) — treat as cache miss.
+                    pass  # Fall through to live execution.
             return await fn(*args, **kwargs)
 
         wrapper._jamjet_tool = defn  # type: ignore[attr-defined]
