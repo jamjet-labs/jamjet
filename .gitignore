@@ -89,3 +89,4 @@ tmp/
 *.pid
 *.sqlite
 *.sqlite3
+.worktrees/
