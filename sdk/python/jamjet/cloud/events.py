@@ -138,3 +138,38 @@ def emit(event: dict[str, Any]) -> None:
     q = _queue
     if q is not None:
         q.push(event)
+    _capture_local(event)
+
+
+# ---------------------------------------------------------------------------
+# Local capture (Phase 6.1 — capture_io=True)
+# ---------------------------------------------------------------------------
+
+import json as _json  # noqa: E402 — placed after class defs to avoid circular import
+
+_capture_lock = threading.Lock()
+_capture_path: str | None = None
+
+
+def set_capture_path(path: str) -> None:
+    """Override the local capture file path (default: .jamjet-replay.jsonl)."""
+    global _capture_path
+    with _capture_lock:
+        _capture_path = path
+
+
+def _capture_local(event: dict[str, Any]) -> None:
+    """Append event to .jamjet-replay.jsonl when capture_io=True."""
+    cfg = get_config()
+    if not cfg.capture_io:
+        return
+    line = _json.dumps(event, ensure_ascii=False) + "\n"
+    # Hold lock across both path read and write so concurrent emit() calls
+    # never interleave partial lines in the cassette file.
+    try:
+        with _capture_lock:
+            path = _capture_path or ".jamjet-replay.jsonl"
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+    except OSError:
+        pass  # Never crash user code over local capture failures.
