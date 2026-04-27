@@ -196,7 +196,7 @@ def _auto_activate() -> None:
         import warnings
         warnings.warn(
             f"JAMJET_REPLAY_BUNDLE={bundle_path!r} could not be loaded: {exc}",
-            stacklevel=1,
+            stacklevel=2,
         )
 
 

@@ -163,11 +163,13 @@ def _capture_local(event: dict[str, Any]) -> None:
     cfg = get_config()
     if not cfg.capture_io:
         return
-    with _capture_lock:
-        path = _capture_path or ".jamjet-replay.jsonl"
     line = _json.dumps(event, ensure_ascii=False) + "\n"
+    # Hold lock across both path read and write so concurrent emit() calls
+    # never interleave partial lines in the cassette file.
     try:
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line)
+        with _capture_lock:
+            path = _capture_path or ".jamjet-replay.jsonl"
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line)
     except OSError:
         pass  # Never crash user code over local capture failures.

@@ -132,8 +132,11 @@ def tool(
                 tool_input.update(kwargs)
                 try:
                     return _replay.lookup_tool_output(tool_name, tool_input)
-                except KeyError:
-                    pass  # Not in recording; fall through to live execution.
+                except (KeyError, TypeError):
+                    # KeyError: no recording for this input.
+                    # TypeError: input contains non-JSON-serializable values
+                    #   (Pydantic model, datetime, bytes, etc.) — treat as cache miss.
+                    pass  # Fall through to live execution.
             return await fn(*args, **kwargs)
 
         wrapper._jamjet_tool = defn  # type: ignore[attr-defined]

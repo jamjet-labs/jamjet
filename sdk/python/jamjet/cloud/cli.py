@@ -168,9 +168,9 @@ def _display_bundle(bundle: ReplayBundle, *, stub_models: bool) -> None:
         style = _STATUS_STYLE.get(status, "")
         icon = _KIND_ICON.get(ev.get("kind", ""), "  ")
         cost = ev.get("cost_usd")
-        cost_str = f"${float(cost):.4f}" if cost else ""
+        cost_str = f"${float(cost):.4f}" if cost is not None else ""
         dur = ev.get("duration_ms")
-        dur_str = str(int(dur)) if dur else ""
+        dur_str = str(int(dur)) if dur is not None else ""
         tbl.add_row(
             str(ev.get("sequence", "")),
             f"{icon} {ev.get('kind', '')}",
@@ -193,16 +193,28 @@ def _display_bundle(bundle: ReplayBundle, *, stub_models: bool) -> None:
 
 
 def _extract_bundle(data: bytes, dest: Path) -> None:
-    """Extract tar.gz bundle into dest, stripping the top-level directory prefix."""
+    """Extract tar.gz bundle into dest, stripping the top-level directory prefix.
+
+    Only regular files are written; symlinks and hardlinks are skipped.
+    Each resolved output path is checked to remain inside dest to prevent
+    path-traversal via crafted tar entries.
+    """
+    dest_resolved = dest.resolve()
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
         for member in tar.getmembers():
+            # Skip non-regular-file entries (symlinks, hardlinks, devices).
+            if not member.isfile():
+                continue
             stripped = member.name.split("/", 1)
             if len(stripped) < 2 or not stripped[1]:
                 continue
             f = tar.extractfile(member)
             if f is None:
                 continue
-            out_path = dest / stripped[1]
+            out_path = (dest / stripped[1]).resolve()
+            # Guard against path traversal (e.g. ../../etc/passwd in entry name).
+            if not str(out_path).startswith(str(dest_resolved)):
+                continue
             out_path.write_bytes(f.read())
 
 
