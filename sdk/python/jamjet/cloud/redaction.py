@@ -6,6 +6,7 @@ Falls back to compiled regex patterns otherwise.
 from __future__ import annotations
 
 import re
+import threading
 from typing import Any
 
 try:
@@ -20,6 +21,8 @@ except ImportError:
     _presidio_available = False
     _analyzer = None
     _anonymizer = None
+
+_presidio_lock = threading.Lock()
 
 
 _REGEX_PATTERNS: dict[str, re.Pattern[str]] = {
@@ -48,10 +51,19 @@ _config: dict[str, Any] = {
 
 
 def _setup_presidio() -> None:
-    global _analyzer, _anonymizer
-    if _presidio_available and _analyzer is None:
-        _analyzer = AnalyzerEngine()
-        _anonymizer = AnonymizerEngine()
+    global _analyzer, _anonymizer, _presidio_available
+    if not _presidio_available or _analyzer is not None:
+        return
+    with _presidio_lock:
+        if not _presidio_available or _analyzer is not None:
+            return
+        try:
+            _analyzer = AnalyzerEngine()
+            _anonymizer = AnonymizerEngine()
+        except Exception:
+            _presidio_available = False
+            _analyzer = None
+            _anonymizer = None
 
 
 def _make_replacement(pii_type: str) -> str:
@@ -86,8 +98,12 @@ def _redact_presidio(text: str, pii_types: list[str]) -> str:
 
 
 def redact(text: str, *, pii_types: list[str] | None = None) -> str:
-    """Redact PII from text. Uses Presidio if available, else regex."""
-    types = pii_types or _config["pii_types"]
+    """Redact PII from text. Uses Presidio if available, else regex.
+
+    Pass ``pii_types=[]`` to disable redaction for this call (returns text
+    unchanged). Pass ``pii_types=None`` (default) to use the configured set.
+    """
+    types = _config["pii_types"] if pii_types is None else pii_types
     if _presidio_available:
         return _redact_presidio(text, types)
     return _redact_regex(text, types)
@@ -110,9 +126,12 @@ def configure(
     pii_types: list[str] | None = None,
     replacement_format: str | None = None,
 ) -> None:
-    """Configure auto-mode. Called by jamjet.configure(redact=True)."""
+    """Configure auto-mode. Called by jamjet.configure(redact=True).
+
+    Each call resets ``pii_types`` and ``replacement_format`` to either the
+    explicit value or the module defaults — earlier customization does not
+    bleed into later calls.
+    """
     _config["enabled"] = enabled
-    if pii_types is not None:
-        _config["pii_types"] = pii_types
-    if replacement_format is not None:
-        _config["replacement_format"] = replacement_format
+    _config["pii_types"] = list(DEFAULT_PII_TYPES) if pii_types is None else list(pii_types)
+    _config["replacement_format"] = "[{type}]" if replacement_format is None else replacement_format

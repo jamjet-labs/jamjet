@@ -117,9 +117,10 @@ def _scrub_event(event: dict[str, Any], redact_dict: Any) -> dict[str, Any]:
     result = dict(event)
     if result.get("payload") is not None:
         result["payload"] = redact_dict(result["payload"])
-    if result.get("end_user_email"):
+    email = result.get("end_user_email")
+    if isinstance(email, str) and email:
         from .redaction import redact as _redact
-        result["end_user_email"] = _redact(result["end_user_email"])
+        result["end_user_email"] = _redact(email)
     return result
 
 

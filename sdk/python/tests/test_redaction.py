@@ -64,6 +64,45 @@ def test_replacement_format_static():
         r._config["replacement_format"] = original_fmt
 
 
+def test_pii_types_empty_list_disables_for_call():
+    """pii_types=[] means 'disable all detectors for this call' (not 'use defaults')."""
+    from jamjet.cloud import redaction
+    text = "email a@b.com phone 415-555-1234"
+    assert redaction.redact(text, pii_types=[]) == text
+
+
+def test_configure_resets_to_defaults():
+    """A second configure() call without pii_types resets to module defaults."""
+    from jamjet.cloud import redaction as r
+    r.configure(enabled=True, pii_types=["EMAIL_ADDRESS"])
+    assert r._config["pii_types"] == ["EMAIL_ADDRESS"]
+    r.configure(enabled=True)
+    assert r._config["pii_types"] == r.DEFAULT_PII_TYPES
+    assert r._config["replacement_format"] == "[{type}]"
+    r._config["enabled"] = False  # reset
+
+
+def test_scrub_event_handles_non_string_email():
+    """Non-string end_user_email is left unchanged (no crash)."""
+    from jamjet.cloud.events import _scrub_event
+    from jamjet.cloud.redaction import _redact_dict
+    out = _scrub_event(
+        {"payload": {"x": "y"}, "end_user_email": 12345},
+        _redact_dict,
+    )
+    assert out["end_user_email"] == 12345
+
+
+def test_configure_redact_false_disables_in_top_level():
+    """jamjet.configure(redact=False) actually turns off auto-mode."""
+    import jamjet.cloud as jj
+    from jamjet.cloud import redaction as r
+    r.configure(enabled=True)
+    assert r._config["enabled"] is True
+    jj.configure(api_key="test", redact=False, auto_patch=False)
+    assert r._config["enabled"] is False
+
+
 def test_auto_mode_scrubs_payload():
     """Auto-mode redacts email in event payload before POST hits the network."""
     from jamjet.cloud import redaction as r
