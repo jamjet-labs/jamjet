@@ -13,13 +13,15 @@ def test_no_context_returns_none():
 
 
 def test_set_execution_context_returns_token():
+    from jamjet.durable.context import _execution_id
+
     token = set_execution_context("run-1")
     try:
         assert get_execution_context() == "run-1"
     finally:
-        # context.reset_token would be ideal; for now we rely on durable_run
-        # in normal usage. Manual set is for advanced use only.
-        pass
+        # Reset to avoid leaking state into subsequent tests.
+        # In application code, prefer durable_run() which handles cleanup.
+        _execution_id.reset(token)
 
 
 def test_durable_run_sets_and_clears():
