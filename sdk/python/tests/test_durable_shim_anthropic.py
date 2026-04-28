@@ -32,3 +32,17 @@ def test_durable_run_clears_after_block():
     with durable_run(r):
         pass
     assert get_execution_context() is None
+
+
+class _FakeRunIdOnly:
+    """Stand-in run handle exposing only `.id`, not `.run_id` — exercises the fallback chain."""
+
+    def __init__(self, id_: str):
+        self.id = id_
+
+
+def test_durable_run_falls_back_to_id_when_run_id_missing():
+    r = _FakeRunIdOnly(id_="anthropic-id-only")
+    with durable_run(r) as eid:
+        assert eid == "anthropic-id-only"
+        assert get_execution_context() == "anthropic-id-only"

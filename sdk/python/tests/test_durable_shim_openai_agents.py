@@ -30,3 +30,17 @@ def test_durable_run_clears_after_block():
     with durable_run(r):
         pass
     assert get_execution_context() is None
+
+
+class _FakeRunnerIdOnly:
+    """Stand-in runner exposing only `.id`, not `.run_id` — exercises the fallback chain."""
+
+    def __init__(self, id_: str):
+        self.id = id_
+
+
+def test_durable_run_falls_back_to_id_when_run_id_missing():
+    r = _FakeRunnerIdOnly(id_="oa-id-only")
+    with durable_run(r) as eid:
+        assert eid == "oa-id-only"
+        assert get_execution_context() == "oa-id-only"
