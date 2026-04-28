@@ -52,6 +52,10 @@ def durable(
     the same execution context with the same args, returns the cached value
     without re-executing `fn`.
 
+    Note: functions that return `None` are treated as cache misses and will
+    re-execute on every call. To cache nullable results, return a sentinel
+    (e.g. `{"value": None}`) instead.
+
     Usage:
         @durable
         def charge_card(amount: float) -> dict: ...

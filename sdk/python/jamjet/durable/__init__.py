@@ -22,6 +22,7 @@ from jamjet.durable.cache import Cache, SqliteCache
 from jamjet.durable.context import (
     durable_run,
     get_execution_context,
+    reset_execution_context,
     set_execution_context,
 )
 from jamjet.durable.decorator import durable
@@ -30,6 +31,7 @@ __all__ = [
     "durable",
     "durable_run",
     "set_execution_context",
+    "reset_execution_context",
     "get_execution_context",
     "Cache",
     "SqliteCache",

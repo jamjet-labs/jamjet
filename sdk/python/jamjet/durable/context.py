@@ -36,6 +36,16 @@ def set_execution_context(execution_id: str) -> Token:
     return _execution_id.set(execution_id)
 
 
+def reset_execution_context(token: Token) -> None:
+    """
+    Restore the execution_id to its prior value, given a Token returned
+    from `set_execution_context()`.
+
+    Prefer `durable_run()` for normal use — it pairs set + reset automatically.
+    """
+    _execution_id.reset(token)
+
+
 @contextmanager
 def durable_run(execution_id: str) -> Iterator[str]:
     """

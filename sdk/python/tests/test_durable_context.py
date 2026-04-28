@@ -65,3 +65,16 @@ def test_durable_run_requires_str():
     with pytest.raises(TypeError):
         with durable_run(123):  # type: ignore[arg-type]
             pass
+
+
+def test_reset_execution_context_restores_prior_value():
+    """set + reset round-trips correctly — symmetric public API."""
+    from jamjet.durable.context import reset_execution_context, set_execution_context
+
+    assert get_execution_context() is None
+    token = set_execution_context("explicit-run")
+    try:
+        assert get_execution_context() == "explicit-run"
+    finally:
+        reset_execution_context(token)
+    assert get_execution_context() is None
