@@ -13,6 +13,7 @@ from .events import init_queue
 from .patcher import patch_all, unpatch_all
 from .policy import get_evaluator
 from .propagation import extract_headers, inject_headers
+from .redaction import redact
 from .trace import trace
 from .user_context import set_process_context, set_user_context, user_context
 
@@ -26,6 +27,7 @@ __all__ = [
     "inject_headers",
     "patch_all",
     "policy",
+    "redact",
     "require_approval",
     "set_user_context",
     "trace",
@@ -45,6 +47,8 @@ def configure(
     flush_interval: float = 5.0,
     flush_size: int = 50,
     api_url: str = "https://api.jamjet.dev",
+    redact: bool = False,
+    redact_types: list[str] | None = None,
 ) -> None:
     """Initialize the JamJet Cloud SDK.
 
@@ -81,6 +85,10 @@ def configure(
 
     # Process-wide context (environment, release_version) for every span.
     set_process_context(environment=environment, release_version=release_version)
+
+    if redact:
+        from .redaction import configure as _redact_cfg
+        _redact_cfg(enabled=True, pii_types=redact_types)
 
     if auto_patch:
         patch_all()

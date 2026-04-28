@@ -65,35 +65,43 @@ def test_replacement_format_static():
 
 
 def test_auto_mode_scrubs_payload():
-    """Auto-mode redacts email in event payload before POST."""
+    """Auto-mode redacts email in event payload before POST hits the network."""
     from jamjet.cloud import redaction as r
+    from jamjet.cloud.config import set_config
+    from jamjet.cloud.events import EventQueue
 
+    set_config(api_key="test-key", project="test", api_url="http://x", enabled=True)
     r.configure(enabled=True)
 
-    captured: list[dict] = []
+    captured_payloads: list[dict] = []
 
-    def fake_send(self, batch):
-        captured.extend(batch)
+    class FakeResp:
+        status_code = 200
 
-    with mock.patch(
-        "jamjet.cloud.events.EventQueue._send",
-        new=fake_send,
-    ):
-        from jamjet.cloud.events import EventQueue
-        q = EventQueue(flush_size=1)
-        q.push({
-            "trace_id": "t1",
-            "span_id": "s1",
-            "sequence": 0,
-            "kind": "llm",
-            "timestamp": "2026-04-28T00:00:00Z",
-            "payload": {"content": "email me at secret@example.com"},
-        })
-        q._flush()
+        def raise_for_status(self):
+            pass
 
-    assert captured, "No events captured"
-    content = captured[0]["payload"]["content"]
-    assert "secret@example.com" not in content
-    assert "[EMAIL_ADDRESS]" in content
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured_payloads.append(json)
+        return FakeResp()
 
-    r._config["enabled"] = False  # reset
+    try:
+        with mock.patch("jamjet.cloud.events.httpx.post", side_effect=fake_post):
+            q = EventQueue()
+            q.push({
+                "trace_id": "t1",
+                "span_id": "s1",
+                "sequence": 0,
+                "kind": "llm",
+                "timestamp": "2026-04-28T00:00:00Z",
+                "payload": {"content": "email me at secret@example.com"},
+            })
+            q._flush()
+
+        assert captured_payloads, "No HTTP POST captured"
+        events = captured_payloads[0]["events"]
+        content = events[0]["payload"]["content"]
+        assert "secret@example.com" not in content
+        assert "[EMAIL_ADDRESS]" in content
+    finally:
+        r._config["enabled"] = False
