@@ -56,3 +56,28 @@ def test_verify_rejects_short_signature():
     result = verify_package(b"x", b"\x00" * 10, pk_bytes)
     assert result.ok is False
     assert "signature" in result.reason.lower()
+
+
+def test_verify_from_files_handles_invalid_json_bundle(tmp_path):
+    """Bundle that isn't JSON returns ok=False, doesn't raise."""
+    from jamjet.cloud.audit_verify import verify_from_files
+    bundle_path = tmp_path / "bad.json"
+    bundle_path.write_bytes(b"not valid json{{")
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text('{"signature_b64":"x","signing_key_id":"y"}')
+    result = verify_from_files(bundle_path, metadata_path)
+    assert result.ok is False
+    assert "not valid JSON" in result.reason
+
+
+def test_verify_from_files_handles_unreachable_well_known(tmp_path):
+    """Failed HTTP call to well-known endpoint returns ok=False, doesn't raise."""
+    from jamjet.cloud.audit_verify import verify_from_files
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_bytes(b'{"project":{"id":"abc"}}')
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text('{"signature_b64":"AAAA","signing_key_id":"y"}')
+    # Use an unroutable URL so httpx fails to connect.
+    result = verify_from_files(bundle_path, metadata_path, api_url="http://127.0.0.1:1")
+    assert result.ok is False
+    assert "could not fetch public key" in result.reason or "fetch" in result.reason.lower()

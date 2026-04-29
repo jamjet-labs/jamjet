@@ -84,15 +84,28 @@ def verify_from_files(
         return VerifyResult(False, digest_hex,
                             f"bundle digest {digest_hex} does not match metadata.sha256_digest {meta['sha256_digest']}")
 
-    project_id = json.loads(bundle).get("project", {}).get("id")
+    try:
+        bundle_json = json.loads(bundle)
+    except json.JSONDecodeError as e:
+        return VerifyResult(False, digest_hex, f"bundle is not valid JSON: {e}")
+    project_id = bundle_json.get("project", {}).get("id")
     if not project_id:
         return VerifyResult(False, digest_hex, "bundle missing project.id")
 
-    keys = httpx.get(
-        f"{api_url}/.well-known/jamjet-audit-key.json",
-        params={"project_id": project_id},
-        timeout=10,
-    ).json()
+    try:
+        keys_resp = httpx.get(
+            f"{api_url}/.well-known/jamjet-audit-key.json",
+            params={"project_id": project_id},
+            timeout=10,
+        )
+        keys_resp.raise_for_status()
+        keys = keys_resp.json()
+        if not isinstance(keys, list):
+            return VerifyResult(False, digest_hex, f"well-known endpoint returned unexpected shape: {type(keys).__name__}")
+    except httpx.HTTPError as e:
+        return VerifyResult(False, digest_hex, f"could not fetch public key: {e}")
+    except json.JSONDecodeError as e:
+        return VerifyResult(False, digest_hex, f"well-known response not JSON: {e}")
     matching = [k for k in keys if k["key_id"] == key_id]
     if not matching:
         return VerifyResult(False, digest_hex, f"key_id {key_id} not in published keys")
