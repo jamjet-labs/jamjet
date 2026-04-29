@@ -238,20 +238,27 @@ Example with LangChain:
 
 ```python
 from langchain.agents import AgentExecutor
-from jamjet.langchain import durable_run
-from jamjet import durable
+from jamjet import durable, durable_run
 
 @durable
 def charge_card(amount): ...  # your real tool
 
 executor = AgentExecutor(...)
-with durable_run(executor):
+
+# Use a stable execution_id that survives process restarts.
+# (Persist this id in your job queue / DB / wherever you start agent runs.)
+AGENT_RUN_ID = "booking-agent-run-abc123"
+
+with durable_run(AGENT_RUN_ID):
     executor.invoke({"input": "book a flight to Tokyo"})
-    # If the process crashes mid-`charge_card` and restarts, the cached
-    # result is returned on replay — Stripe is never called twice.
+    # If the process crashes mid-`charge_card` and restarts under the same
+    # AGENT_RUN_ID, the cached result is returned on replay — Stripe is
+    # never called twice.
 ```
 
-See [docs/durable.md](https://jamjet.dev/concepts/durable) for the full guide.
+For framework-native run-identity (where you'd otherwise want `with durable_run(executor):`), see the per-shim docs in `jamjet/<framework>/__init__.py` — note that most frameworks expose `run_id` only per-invocation via callbacks, so threading a stable identity across crash boundaries is the user's responsibility.
+
+See the per-module guide at [`jamjet/durable/README.md`](./jamjet/durable/README.md).
 
 ---
 
