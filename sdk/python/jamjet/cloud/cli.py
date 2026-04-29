@@ -222,5 +222,24 @@ def _sanitize(s: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in s)
 
 
+@app.command("audit-verify")
+def audit_verify(
+    package: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True,
+                                   help="Path to the .json audit package."),
+    metadata: Path = typer.Option(..., "--metadata", "-m", exists=True, dir_okay=False, readable=True,
+                                   help="Path to the metadata JSON saved from POST /v1/audit/export."),
+    api_url: str = typer.Option(_DEFAULT_API_URL, "--api-url",
+                                help="Cloud base URL (override for self-hosted or local dev)."),
+) -> None:
+    """Verify the Ed25519 signature on an audit export package."""
+    from .audit_verify import verify_from_files
+    res = verify_from_files(package, metadata, api_url=api_url)
+    if res.ok:
+        console.print(f"[green]OK[/green] · sha256={res.digest} · key_id={res.key_id}")
+        raise typer.Exit(code=0)
+    console.print(f"[red]FAIL[/red] · {res.reason} · sha256={res.digest}")
+    raise typer.Exit(code=2)
+
+
 def main() -> None:
     app()
