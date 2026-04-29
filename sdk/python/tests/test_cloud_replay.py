@@ -27,6 +27,7 @@ from jamjet.tools.decorators import tool
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_bundle_bytes(
     manifest: dict[str, Any] | None = None,
     events: list[dict[str, Any]] | None = None,
@@ -64,12 +65,21 @@ def _make_bundle_bytes(
 # Bundle parsing
 # ---------------------------------------------------------------------------
 
+
 def test_load_bundle_from_bytes_parses_all_sections() -> None:
     events = [
-        {"kind": "tool_call", "sequence": 0, "name": "send_email",
-         "payload": {"tool": "send_email", "tool_input": {"to": "a@b.com"}, "tool_output": {"status": "sent"}}},
-        {"kind": "llm_call", "sequence": 1, "name": "openai.gpt-4o",
-         "payload": {"model": "gpt-4o", "response": "Hello from recording"}},
+        {
+            "kind": "tool_call",
+            "sequence": 0,
+            "name": "send_email",
+            "payload": {"tool": "send_email", "tool_input": {"to": "a@b.com"}, "tool_output": {"status": "sent"}},
+        },
+        {
+            "kind": "llm_call",
+            "sequence": 1,
+            "name": "openai.gpt-4o",
+            "payload": {"model": "gpt-4o", "response": "Hello from recording"},
+        },
     ]
     audit = [{"action": "tool_blocked", "detail": {"tool": "send_email"}}]
     agents = [{"id": "uuid1", "name": "worker"}]
@@ -93,12 +103,18 @@ def test_total_cost_sums_event_costs() -> None:
 
 
 def test_load_bundle_from_directory() -> None:
-    events = [{"kind": "tool_call", "sequence": 0, "payload": {
-        "tool": "greet", "tool_input": {"name": "world"}, "tool_output": "hi world"
-    }}]
+    events = [
+        {
+            "kind": "tool_call",
+            "sequence": 0,
+            "payload": {"tool": "greet", "tool_input": {"name": "world"}, "tool_output": "hi world"},
+        }
+    ]
     with tempfile.TemporaryDirectory() as tmpdir:
         d = Path(tmpdir)
-        (d / "manifest.json").write_text(json.dumps({"trace_id": "tr_dir", "schema_version": "replay-1.0", "event_count": 1}))
+        (d / "manifest.json").write_text(
+            json.dumps({"trace_id": "tr_dir", "schema_version": "replay-1.0", "event_count": 1})
+        )
         (d / "events.jsonl").write_text(json.dumps(events[0]))
         (d / "audit.jsonl").write_text("")
         (d / "agents.json").write_text("[]")
@@ -111,10 +127,9 @@ def test_load_bundle_from_directory() -> None:
 # Tool output lookup
 # ---------------------------------------------------------------------------
 
+
 def test_lookup_tool_output_returns_recorded_value() -> None:
-    events = [{"kind": "tool_call", "payload": {
-        "tool": "add", "tool_input": {"a": 1, "b": 2}, "tool_output": 3
-    }}]
+    events = [{"kind": "tool_call", "payload": {"tool": "add", "tool_input": {"a": 1, "b": 2}, "tool_output": 3}}]
     bundle = load_bundle_from_bytes(_make_bundle_bytes(events=events))
     assert bundle.lookup_tool_output("add", {"a": 1, "b": 2}) == 3
 
@@ -138,6 +153,7 @@ def test_lookup_tool_output_first_occurrence_wins() -> None:
 # LLM stub
 # ---------------------------------------------------------------------------
 
+
 def test_next_llm_stub_returns_recorded_responses_in_order() -> None:
     events = [
         {"kind": "llm_call", "payload": {"model": "gpt-4o", "response": "first"}},
@@ -158,6 +174,7 @@ def test_next_llm_stub_falls_back_when_exhausted() -> None:
 # Active session + auto-activation
 # ---------------------------------------------------------------------------
 
+
 def test_activate_deactivate_lifecycle() -> None:
     bundle = load_bundle_from_bytes(_make_bundle_bytes())
     activate(bundle, stub_models=True)
@@ -169,12 +186,12 @@ def test_activate_deactivate_lifecycle() -> None:
 
 
 def test_auto_activate_from_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    events = [{"kind": "tool_call", "payload": {
-        "tool": "ping", "tool_input": {}, "tool_output": "pong"
-    }}]
+    events = [{"kind": "tool_call", "payload": {"tool": "ping", "tool_input": {}, "tool_output": "pong"}}]
     bundle_bytes = _make_bundle_bytes(events=events)
     # Write extracted dir
-    (tmp_path / "manifest.json").write_text(json.dumps({"trace_id": "tr_env", "schema_version": "replay-1.0", "event_count": 1}))
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"trace_id": "tr_env", "schema_version": "replay-1.0", "event_count": 1})
+    )
     (tmp_path / "events.jsonl").write_text(json.dumps(events[0]))
     (tmp_path / "audit.jsonl").write_text("")
     (tmp_path / "agents.json").write_text("[]")
@@ -184,6 +201,7 @@ def test_auto_activate_from_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
     # Re-run auto-activation manually (module was already imported)
     import jamjet.cloud.replay as _replay_mod
+
     _replay_mod.deactivate()
     _replay_mod._auto_activate()
 
@@ -197,6 +215,7 @@ def test_auto_activate_from_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 # @tool replay intercept integration
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_tool_decorator_uses_replay_when_bundle_active() -> None:
     call_count = 0
@@ -207,9 +226,7 @@ async def test_tool_decorator_uses_replay_when_bundle_active() -> None:
         call_count += 1
         return x * 2
 
-    events = [{"kind": "tool_call", "payload": {
-        "tool": "double", "tool_input": {"x": 5}, "tool_output": 99
-    }}]
+    events = [{"kind": "tool_call", "payload": {"tool": "double", "tool_input": {"x": 5}, "tool_output": 99}}]
     bundle = load_bundle_from_bytes(_make_bundle_bytes(events=events))
     activate(bundle)
     try:
@@ -250,6 +267,7 @@ async def test_tool_decorator_calls_real_fn_when_no_bundle() -> None:
 # ---------------------------------------------------------------------------
 # Local capture (capture_io=True)
 # ---------------------------------------------------------------------------
+
 
 def test_local_capture_writes_jsonl_when_enabled(tmp_path: Path) -> None:
     from jamjet.cloud.events import emit, set_capture_path

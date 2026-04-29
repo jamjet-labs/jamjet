@@ -9,6 +9,7 @@ Usage:
     with durable_run(agent):
         agent.run("book a flight")
 """
+
 from __future__ import annotations
 
 import uuid

@@ -1,4 +1,5 @@
 """Tests for jamjet.durable.cache.SqliteCache."""
+
 import pytest
 
 from jamjet.durable.cache import SqliteCache

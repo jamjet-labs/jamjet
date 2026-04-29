@@ -71,6 +71,7 @@ class EventQueue:
     def _send(self, batch: list[dict[str, Any]]) -> None:
         """POST a batch of events to the ingest endpoint."""
         from .redaction import _config as _r_cfg, _redact_dict
+
         if _r_cfg.get("enabled"):
             batch = [_scrub_event(event, _redact_dict) for event in batch]
 
@@ -120,6 +121,7 @@ def _scrub_event(event: dict[str, Any], redact_dict: Any) -> dict[str, Any]:
     email = result.get("end_user_email")
     if isinstance(email, str) and email:
         from .redaction import redact as _redact
+
         result["end_user_email"] = _redact(email)
     return result
 

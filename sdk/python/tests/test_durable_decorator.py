@@ -1,4 +1,5 @@
 """Tests for the @durable decorator — sync, async, cache hit/miss, error paths."""
+
 import asyncio
 
 import pytest
@@ -151,6 +152,7 @@ def test_cache_persists_across_decorator_instances(cache):
         def my_tool(x: int) -> int:
             calls.append(x)
             return x + 1
+
         return my_tool
 
     with durable_run("run-1"):

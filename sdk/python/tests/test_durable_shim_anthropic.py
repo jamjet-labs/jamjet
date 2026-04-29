@@ -1,4 +1,5 @@
 """Anthropic Agent SDK shim contract test."""
+
 import pytest
 
 pytest.importorskip("anthropic")

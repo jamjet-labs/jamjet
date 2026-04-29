@@ -2,6 +2,7 @@
 The @durable decorator — auto-detects sync vs. async, wraps to consult an
 idempotency cache before executing the wrapped function.
 """
+
 from __future__ import annotations
 
 import functools

@@ -1,4 +1,5 @@
 """LangChain shim contract test — durable_run sets execution context from executor.run_id."""
+
 import pytest
 
 pytest.importorskip("langchain")

@@ -10,6 +10,7 @@ by clearing the in-memory function-call counter while reusing the same
 SQLite cache file, and assert the side effect (counter increment) only
 happens once across the simulated crash boundary.
 """
+
 import pytest
 
 from jamjet.durable import durable

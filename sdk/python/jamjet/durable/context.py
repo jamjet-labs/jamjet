@@ -8,15 +8,14 @@ execution_id, so that cache hits work across crash/restart boundaries.
 Implemented with contextvars so context propagates correctly across asyncio
 tasks (each task has its own logical context).
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 
-_execution_id: ContextVar[str | None] = ContextVar(
-    "jamjet_durable_execution_id", default=None
-)
+_execution_id: ContextVar[str | None] = ContextVar("jamjet_durable_execution_id", default=None)
 
 
 def get_execution_context() -> str | None:

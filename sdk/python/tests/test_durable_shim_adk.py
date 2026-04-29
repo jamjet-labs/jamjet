@@ -1,4 +1,5 @@
 """Google ADK shim contract test."""
+
 import pytest
 
 pytest.importorskip("google.adk")

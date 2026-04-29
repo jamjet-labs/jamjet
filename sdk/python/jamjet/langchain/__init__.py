@@ -17,6 +17,7 @@ Usage:
     with durable_run(executor):
         executor.invoke({"input": "book a flight"})
 """
+
 from __future__ import annotations
 
 import uuid

@@ -1,4 +1,5 @@
 """Tests for jamjet.durable.keys — deterministic idempotency keys."""
+
 import pytest
 
 from jamjet.durable.keys import args_fingerprint, generate_key

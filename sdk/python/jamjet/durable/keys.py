@@ -11,6 +11,7 @@ A key is a SHA-256 hex string of the canonicalized triple
 Args that are pydantic models are dumped via `.model_dump()`.
 Other args must be JSON-serializable.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -48,8 +49,7 @@ def args_fingerprint(args: tuple, kwargs: dict) -> str:
         encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     except TypeError as e:
         raise TypeError(
-            f"@durable arguments are not JSON-serializable: {e}. "
-            "Use primitive types, dicts, lists, or pydantic models."
+            f"@durable arguments are not JSON-serializable: {e}. Use primitive types, dicts, lists, or pydantic models."
         ) from e
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 

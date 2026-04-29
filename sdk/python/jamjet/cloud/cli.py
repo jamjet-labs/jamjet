@@ -39,6 +39,7 @@ app = typer.Typer(
 def _root() -> None:
     """JamJet Cloud CLI."""
 
+
 _DEFAULT_API_URL = "https://api.jamjet.dev"
 
 # Status colour mapping
@@ -60,10 +61,21 @@ _KIND_ICON = {
 @app.command("replay")
 def replay(
     trace_id: Annotated[str, typer.Argument(help="Cloud trace ID to replay (e.g. tr_abc123)")],
-    stub_models: Annotated[bool, typer.Option("--stub-models", help="Return recorded LLM responses instead of re-issuing API calls")] = False,
-    api_key: Annotated[str | None, typer.Option("--api-key", envvar="JAMJET_API_KEY", help="JamJet Cloud API key")] = None,
-    api_url: Annotated[str, typer.Option("--api-url", envvar="JAMJET_API_URL", help="Cloud API base URL")] = _DEFAULT_API_URL,
-    extract_to: Annotated[Path | None, typer.Option("--extract-to", help="Directory to extract the bundle into (default: ~/.jamjet/replays/<trace_id>)")] = None,
+    stub_models: Annotated[
+        bool, typer.Option("--stub-models", help="Return recorded LLM responses instead of re-issuing API calls")
+    ] = False,
+    api_key: Annotated[
+        str | None, typer.Option("--api-key", envvar="JAMJET_API_KEY", help="JamJet Cloud API key")
+    ] = None,
+    api_url: Annotated[
+        str, typer.Option("--api-url", envvar="JAMJET_API_URL", help="Cloud API base URL")
+    ] = _DEFAULT_API_URL,
+    extract_to: Annotated[
+        Path | None,
+        typer.Option(
+            "--extract-to", help="Directory to extract the bundle into (default: ~/.jamjet/replays/<trace_id>)"
+        ),
+    ] = None,
 ) -> None:
     """Download a cloud trace bundle, display the timeline, and print re-run instructions.
 
@@ -115,16 +127,18 @@ def replay(
     console.print()
     console.rule("[bold]Re-run instructions[/bold]")
     stub_line = f"export JAMJET_STUB_MODELS=1\n" if stub_models else ""
-    console.print(Padding(
-        f"[dim]# Set these environment variables, then run your agent as normal:[/dim]\n"
-        f"[bold]export JAMJET_REPLAY_BUNDLE={dest}[/bold]\n"
-        f"{stub_line}"
-        f"[bold]python your_agent.py[/bold]\n\n"
-        f"[dim]Tool calls will replay from the recording.\n"
-        f"{'LLM calls will return recorded responses (stub mode).' if stub_models else 'LLM calls will re-issue against real APIs (costs money).'}"
-        f"[/dim]",
-        pad=(0, 0, 0, 2),
-    ))
+    console.print(
+        Padding(
+            f"[dim]# Set these environment variables, then run your agent as normal:[/dim]\n"
+            f"[bold]export JAMJET_REPLAY_BUNDLE={dest}[/bold]\n"
+            f"{stub_line}"
+            f"[bold]python your_agent.py[/bold]\n\n"
+            f"[dim]Tool calls will replay from the recording.\n"
+            f"{'LLM calls will return recorded responses (stub mode).' if stub_models else 'LLM calls will re-issue against real APIs (costs money).'}"
+            f"[/dim]",
+            pad=(0, 0, 0, 2),
+        )
+    )
 
 
 def _display_bundle(bundle: ReplayBundle, *, stub_models: bool) -> None:

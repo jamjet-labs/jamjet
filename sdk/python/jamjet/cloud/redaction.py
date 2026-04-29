@@ -3,6 +3,7 @@
 Uses Presidio (presidio-analyzer + spacy en_core_web_lg) when installed.
 Falls back to compiled regex patterns otherwise.
 """
+
 from __future__ import annotations
 
 import re
@@ -26,17 +27,11 @@ _presidio_lock = threading.Lock()
 
 
 _REGEX_PATTERNS: dict[str, re.Pattern[str]] = {
-    "EMAIL_ADDRESS": re.compile(
-        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
-    ),
+    "EMAIL_ADDRESS": re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"),
     "CREDIT_CARD": re.compile(r"\b(?:\d[\s\-]?){13,15}\d\b"),
     "US_SSN": re.compile(r"\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b"),
-    "PHONE_NUMBER": re.compile(
-        r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"
-    ),
-    "IP_ADDRESS": re.compile(
-        r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
-    ),
+    "PHONE_NUMBER": re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
+    "IP_ADDRESS": re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"),
     "IBAN_CODE": re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"),
 }
 
@@ -87,14 +82,9 @@ def _redact_presidio(text: str, pii_types: list[str]) -> str:
     if not results:
         return text
     operators = {
-        r.entity_type: OperatorConfig(
-            "replace", {"new_value": _make_replacement(r.entity_type)}
-        )
-        for r in results
+        r.entity_type: OperatorConfig("replace", {"new_value": _make_replacement(r.entity_type)}) for r in results
     }
-    return _anonymizer.anonymize(
-        text=text, analyzer_results=results, operators=operators
-    ).text
+    return _anonymizer.anonymize(text=text, analyzer_results=results, operators=operators).text
 
 
 def redact(text: str, *, pii_types: list[str] | None = None) -> str:

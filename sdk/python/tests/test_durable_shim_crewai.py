@@ -1,4 +1,5 @@
 """CrewAI shim contract test."""
+
 import pytest
 
 pytest.importorskip("crewai")

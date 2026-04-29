@@ -6,6 +6,7 @@ SQLite in WAL mode for safe concurrent reads. The interface is intentionally
 small: get(key) and put(key, value). Future backends (Engram-native, Redis,
 Postgres) implement the same Protocol.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -52,9 +53,7 @@ class SqliteCache:
 
     def get(self, key: str) -> Any | None:
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT value FROM durable_cache WHERE key = ?", (key,)
-            ).fetchone()
+            row = conn.execute("SELECT value FROM durable_cache WHERE key = ?", (key,)).fetchone()
         if row is None:
             return None
         return loads(row[0])

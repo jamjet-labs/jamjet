@@ -1,4 +1,5 @@
 """OpenAI Agents SDK shim contract test."""
+
 import pytest
 
 pytest.importorskip("agents")  # OpenAI Agents SDK package import name

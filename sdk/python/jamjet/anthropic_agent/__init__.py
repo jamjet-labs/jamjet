@@ -15,6 +15,7 @@ Usage:
         # tools called within this run share an idempotency namespace
         ...
 """
+
 from __future__ import annotations
 
 import uuid
@@ -28,11 +29,7 @@ from jamjet.durable.context import durable_run as _durable_run
 @contextmanager
 def durable_run(run: Any) -> Iterator[str]:
     """Set jamjet's execution context from an Anthropic Agent SDK run handle."""
-    eid = (
-        getattr(run, "run_id", None)
-        or getattr(run, "id", None)
-        or f"anthropic-{uuid.uuid4()}"
-    )
+    eid = getattr(run, "run_id", None) or getattr(run, "id", None) or f"anthropic-{uuid.uuid4()}"
     if not isinstance(eid, str):
         eid = str(eid)
     with _durable_run(eid) as resolved:

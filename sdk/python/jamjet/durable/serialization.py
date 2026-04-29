@@ -6,6 +6,7 @@ because it round-trips arbitrary Python objects, but we wrap it so that
 unpicklable values fail loudly at @durable call time (not silently when the
 cache is later read).
 """
+
 from __future__ import annotations
 
 import pickle
