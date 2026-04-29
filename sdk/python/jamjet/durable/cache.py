@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol
 
 from jamjet.durable.serialization import dumps, loads
 
@@ -19,7 +19,7 @@ from jamjet.durable.serialization import dumps, loads
 class Cache(Protocol):
     """A keyed cache for @durable function results."""
 
-    def get(self, key: str) -> Optional[Any]:
+    def get(self, key: str) -> Any | None:
         """Return the cached value for `key`, or None if missing."""
         ...
 
@@ -39,7 +39,7 @@ class SqliteCache:
     );
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -50,7 +50,7 @@ class SqliteCache:
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, isolation_level=None, timeout=5.0)
 
-    def get(self, key: str) -> Optional[Any]:
+    def get(self, key: str) -> Any | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT value FROM durable_cache WHERE key = ?", (key,)

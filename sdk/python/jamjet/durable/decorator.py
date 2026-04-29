@@ -7,8 +7,9 @@ from __future__ import annotations
 import functools
 import inspect
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Optional, TypeVar, overload
+from typing import Any, TypeVar, overload
 
 from jamjet.durable.cache import Cache, SqliteCache
 from jamjet.durable.context import get_execution_context
@@ -25,7 +26,7 @@ def _default_cache_path() -> Path:
     return Path.home() / ".jamjet" / "durable" / "cache.db"
 
 
-_default_cache: Optional[Cache] = None
+_default_cache: Cache | None = None
 
 
 def _get_default_cache() -> Cache:
@@ -38,13 +39,13 @@ def _get_default_cache() -> Cache:
 @overload
 def durable(fn: F) -> F: ...
 @overload
-def durable(*, cache: Optional[Cache] = None) -> Callable[[F], F]: ...
+def durable(*, cache: Cache | None = None) -> Callable[[F], F]: ...
 
 
 def durable(
-    fn: Optional[Callable[..., Any]] = None,
+    fn: Callable[..., Any] | None = None,
     *,
-    cache: Optional[Cache] = None,
+    cache: Cache | None = None,
 ) -> Any:
     """
     Decorator: cache the result of `fn` against an idempotency key derived

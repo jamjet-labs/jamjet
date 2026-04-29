@@ -3,8 +3,8 @@ import pytest
 
 pytest.importorskip("anthropic")
 
-from jamjet.durable.context import get_execution_context
 from jamjet.anthropic_agent import durable_run
+from jamjet.durable.context import get_execution_context
 
 
 class _FakeRun:

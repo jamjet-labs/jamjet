@@ -3,8 +3,8 @@ import pytest
 
 pytest.importorskip("google.adk")
 
-from jamjet.durable.context import get_execution_context
 from jamjet.adk import durable_run
+from jamjet.durable.context import get_execution_context
 
 
 class _FakeAdkAgent:

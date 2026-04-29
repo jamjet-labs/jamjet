@@ -12,7 +12,8 @@ happens once across the simulated crash boundary.
 """
 import pytest
 
-from jamjet.durable import durable, durable_run as core_durable_run
+from jamjet.durable import durable
+from jamjet.durable import durable_run as core_durable_run
 from jamjet.durable.cache import SqliteCache
 
 

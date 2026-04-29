@@ -3,8 +3,8 @@ import pytest
 
 pytest.importorskip("crewai")
 
-from jamjet.durable.context import get_execution_context
 from jamjet.crewai import durable_run
+from jamjet.durable.context import get_execution_context
 
 
 class _FakeCrew:

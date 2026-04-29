@@ -10,16 +10,16 @@ tasks (each task has its own logical context).
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from typing import Iterator, Optional
 
-_execution_id: ContextVar[Optional[str]] = ContextVar(
+_execution_id: ContextVar[str | None] = ContextVar(
     "jamjet_durable_execution_id", default=None
 )
 
 
-def get_execution_context() -> Optional[str]:
+def get_execution_context() -> str | None:
     """Return the current execution_id, or None if not in a durable_run."""
     return _execution_id.get()
 
