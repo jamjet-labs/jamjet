@@ -86,9 +86,7 @@ class SqliteCache:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                row = conn.execute(
-                    "SELECT value FROM durable_cache WHERE key = ?", (key,)
-                ).fetchone()
+                row = conn.execute("SELECT value FROM durable_cache WHERE key = ?", (key,)).fetchone()
                 if row is not None:
                     return loads(row[0])
                 value = compute()
