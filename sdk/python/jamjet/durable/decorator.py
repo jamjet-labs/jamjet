@@ -8,6 +8,7 @@ from __future__ import annotations
 import functools
 import inspect
 import os
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar, overload
@@ -28,12 +29,15 @@ def _default_cache_path() -> Path:
 
 
 _default_cache: Cache | None = None
+_default_cache_lock = threading.Lock()
 
 
 def _get_default_cache() -> Cache:
     global _default_cache
     if _default_cache is None:
-        _default_cache = SqliteCache(_default_cache_path())
+        with _default_cache_lock:
+            if _default_cache is None:
+                _default_cache = SqliteCache(_default_cache_path())
     return _default_cache
 
 
@@ -67,14 +71,30 @@ def durable(
 
     Must be called within a `durable_run(execution_id)` block; raises
     RuntimeError otherwise to prevent accidental no-op caching.
+
+    Concurrency:
+        Sync `@durable` functions are safe under concurrent calls: the
+        underlying cache uses an atomic `get_or_compute` (SQLite
+        `BEGIN IMMEDIATE` transaction) so two callers racing on the same
+        (execution_id, fn, args) key serialize and `fn` runs at most once.
+
+        Async `@durable` does NOT serialize concurrent callers on the same
+        key — holding a SQLite write lock across an `await` (typically an
+        LLM/tool call) is not viable. Applications are responsible for
+        ensuring no two coroutines share the same `execution_id` + key
+        combination simultaneously. In practice every realistic
+        `durable_run(...)` block is single-task, so this constraint is
+        invisible to users.
     """
     if fn is not None and callable(fn):
         # @durable form (no parens).
-        return _wrap(fn, cache=cache or _get_default_cache())
+        return _wrap(fn, cache=cache if cache is not None else _get_default_cache())
 
     # @durable(...) form (with parens).
     def deco(f: F) -> F:
-        return _wrap(f, cache=cache or _get_default_cache())  # type: ignore[return-value]
+        return _wrap(  # type: ignore[return-value]
+            f, cache=cache if cache is not None else _get_default_cache()
+        )
 
     return deco
 
@@ -111,11 +131,8 @@ def _wrap(fn: Callable[..., Any], *, cache: Cache) -> Callable[..., Any]:
                 "called inside a `with durable_run(...):` block."
             )
         key = generate_key(eid, qualname, args, kwargs)
-        cached = cache.get(key)
-        if cached is not None:
-            return cached
-        result = fn(*args, **kwargs)
-        cache.put(key, result)
-        return result
+        # Atomic get-or-compute closes the TOCTOU race that get/put would
+        # otherwise expose to concurrent callers within the same execution_id.
+        return cache.get_or_compute(key, lambda: fn(*args, **kwargs))
 
     return sync_wrapper

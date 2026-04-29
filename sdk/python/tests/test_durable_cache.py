@@ -50,3 +50,32 @@ def test_concurrent_open_safe(tmp_path):
     b = SqliteCache(db)
     a.put("k", "val-a")
     assert b.get("k") == "val-a"
+
+
+def test_get_or_compute_returns_cached_without_calling_compute(tmp_path):
+    cache = SqliteCache(tmp_path / "cache.db")
+    cache.put("key1", "stored")
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return "computed"
+
+    result = cache.get_or_compute("key1", compute)
+    assert result == "stored"
+    assert calls == []  # compute was not called
+
+
+def test_get_or_compute_calls_compute_on_miss_and_caches(tmp_path):
+    cache = SqliteCache(tmp_path / "cache.db")
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return {"new": "value"}
+
+    r1 = cache.get_or_compute("missing", compute)
+    r2 = cache.get_or_compute("missing", compute)
+
+    assert r1 == r2 == {"new": "value"}
+    assert calls == [1]  # compute called exactly once

@@ -24,6 +24,7 @@ def test_durable_run_generates_id_when_none():
     a = _FakeAdkAgent(session_id=None)
     with durable_run(a) as eid:
         assert isinstance(eid, str) and len(eid) > 0
+        assert get_execution_context() == eid
 
 
 def test_durable_run_clears_after_block():

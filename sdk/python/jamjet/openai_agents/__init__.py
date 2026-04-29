@@ -5,10 +5,11 @@ Usage:
     from agents import Runner, Agent
     from jamjet.openai_agents import durable_run
 
-    runner = Runner.run_sync(agent, "book a flight")
-    with durable_run(runner):
-        # tools called within this run share an idempotency namespace
-        ...
+    agent = Agent(...)
+    # Enter durable_run BEFORE invoking the runner so any tools called
+    # during the run share the idempotency namespace.
+    with durable_run(agent) as eid:
+        result = Runner.run_sync(agent, "book a flight")
 """
 
 from __future__ import annotations

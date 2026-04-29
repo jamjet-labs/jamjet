@@ -5,6 +5,7 @@ import pytest
 from jamjet.durable.context import (
     durable_run,
     get_execution_context,
+    reset_execution_context,
     set_execution_context,
 )
 
@@ -14,15 +15,13 @@ def test_no_context_returns_none():
 
 
 def test_set_execution_context_returns_token():
-    from jamjet.durable.context import _execution_id
-
     token = set_execution_context("run-1")
     try:
         assert get_execution_context() == "run-1"
     finally:
         # Reset to avoid leaking state into subsequent tests.
         # In application code, prefer durable_run() which handles cleanup.
-        _execution_id.reset(token)
+        reset_execution_context(token)
 
 
 def test_durable_run_sets_and_clears():
@@ -70,8 +69,6 @@ def test_durable_run_requires_str():
 
 def test_reset_execution_context_restores_prior_value():
     """set + reset round-trips correctly — symmetric public API."""
-    from jamjet.durable.context import reset_execution_context, set_execution_context
-
     assert get_execution_context() is None
     token = set_execution_context("explicit-run")
     try:

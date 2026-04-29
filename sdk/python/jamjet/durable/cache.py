@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -26,6 +27,15 @@ class Cache(Protocol):
 
     def put(self, key: str, value: Any) -> None:
         """Store `value` under `key`. Overwrites any prior value."""
+        ...
+
+    def get_or_compute(self, key: str, compute: Callable[[], Any]) -> Any:
+        """
+        Atomic get-or-set: if `key` is cached, return it; otherwise call
+        `compute()`, store the result under `key`, and return it. Concurrent
+        callers requesting the same key must serialize so that `compute()` is
+        invoked at most once per key.
+        """
         ...
 
 
@@ -66,3 +76,28 @@ class SqliteCache:
                 "INSERT OR REPLACE INTO durable_cache (key, value) VALUES (?, ?)",
                 (key, blob),
             )
+
+    def get_or_compute(self, key: str, compute: Callable[[], Any]) -> Any:
+        """
+        Atomic get-or-set: if key is cached, return it; otherwise call compute(),
+        store the result under key, and return it. Uses a SQLite transaction so
+        concurrent callers within the same execution_id serialize on the same key.
+        """
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT value FROM durable_cache WHERE key = ?", (key,)
+                ).fetchone()
+                if row is not None:
+                    return loads(row[0])
+                value = compute()
+                blob = dumps(value)
+                conn.execute(
+                    "INSERT OR REPLACE INTO durable_cache (key, value) VALUES (?, ?)",
+                    (key, blob),
+                )
+                return value
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise

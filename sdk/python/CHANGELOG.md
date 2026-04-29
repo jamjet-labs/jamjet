@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 — 2026-04-XX
+## 0.7.0 — 2026-04-29
 
 ### Added
 - `jamjet.durable` — `@durable` decorator for exactly-once tool execution.
