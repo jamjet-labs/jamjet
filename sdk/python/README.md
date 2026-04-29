@@ -210,6 +210,51 @@ nodes:
 
 ---
 
+## Durability across frameworks
+
+Wrap any side-effecting tool with `@durable` to get exactly-once execution
+across crashes, restarts, and replays — regardless of which agent framework
+you're using.
+
+```python
+from jamjet import durable
+
+@durable
+def charge_card(amount: float) -> dict:
+    return stripe.charges.create(amount=amount)
+```
+
+Pair it with a `durable_run()` context manager — one shim per framework:
+
+| Framework | Import |
+|---|---|
+| LangChain | `from jamjet.langchain import durable_run` |
+| CrewAI | `from jamjet.crewai import durable_run` |
+| Google ADK | `from jamjet.adk import durable_run` |
+| Anthropic Agent SDK | `from jamjet.anthropic_agent import durable_run` |
+| OpenAI Agents SDK | `from jamjet.openai_agents import durable_run` |
+
+Example with LangChain:
+
+```python
+from langchain.agents import AgentExecutor
+from jamjet.langchain import durable_run
+from jamjet import durable
+
+@durable
+def charge_card(amount): ...  # your real tool
+
+executor = AgentExecutor(...)
+with durable_run(executor):
+    executor.invoke({"input": "book a flight to Tokyo"})
+    # If the process crashes mid-`charge_card` and restarts, the cached
+    # result is returned on replay — Stripe is never called twice.
+```
+
+See [docs/durable.md](https://jamjet.dev/concepts/durable) for the full guide.
+
+---
+
 ## JamJet Cloud — Hosted Governance (`jamjet.cloud`)
 
 Starting in **0.6.0**, the `jamjet` package includes a `jamjet.cloud` submodule for the hosted control plane. Two-line install:
