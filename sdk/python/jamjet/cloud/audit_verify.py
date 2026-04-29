@@ -6,6 +6,7 @@ Used both as a library (``verify_package(...)``) and via the
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 from dataclasses import dataclass
@@ -67,7 +68,10 @@ def verify_from_files(
           "download_urls": {...}
         }
     """
-    bundle = package_path.read_bytes()
+    try:
+        bundle = package_path.read_bytes()
+    except OSError as e:
+        return VerifyResult(False, "", f"could not read package: {e}")
     digest_hex = hashlib.sha256(bundle).hexdigest()
 
     try:
@@ -86,8 +90,10 @@ def verify_from_files(
 
     try:
         bundle_json = json.loads(bundle)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         return VerifyResult(False, digest_hex, f"bundle is not valid JSON: {e}")
+    if not isinstance(bundle_json, dict):
+        return VerifyResult(False, digest_hex, "bundle must be a JSON object")
     project_id = bundle_json.get("project", {}).get("id")
     if not project_id:
         return VerifyResult(False, digest_hex, "bundle missing project.id")
@@ -106,11 +112,17 @@ def verify_from_files(
         return VerifyResult(False, digest_hex, f"could not fetch public key: {e}")
     except json.JSONDecodeError as e:
         return VerifyResult(False, digest_hex, f"well-known response not JSON: {e}")
-    matching = [k for k in keys if k["key_id"] == key_id]
+    matching = [k for k in keys if isinstance(k, dict) and k.get("key_id") == key_id]
     if not matching:
         return VerifyResult(False, digest_hex, f"key_id {key_id} not in published keys")
-    pk_bytes = base64.b64decode(matching[0]["public_key_b64"])
-    sig = base64.b64decode(sig_b64)
+    public_key_b64 = matching[0].get("public_key_b64")
+    if not public_key_b64:
+        return VerifyResult(False, digest_hex, f"key_id {key_id} missing public_key_b64")
+    try:
+        pk_bytes = base64.b64decode(public_key_b64, validate=True)
+        sig = base64.b64decode(sig_b64, validate=True)
+    except (binascii.Error, ValueError, TypeError) as e:
+        return VerifyResult(False, digest_hex, f"invalid base64 encoding: {e}")
     result = verify_package(bundle, sig, pk_bytes)
     result.key_id = key_id
     return result

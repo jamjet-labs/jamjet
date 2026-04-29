@@ -81,3 +81,49 @@ def test_verify_from_files_handles_unreachable_well_known(tmp_path):
     result = verify_from_files(bundle_path, metadata_path, api_url="http://127.0.0.1:1")
     assert result.ok is False
     assert "could not fetch public key" in result.reason or "fetch" in result.reason.lower()
+
+
+def test_verify_from_files_handles_missing_package_file(tmp_path):
+    """Nonexistent package path returns ok=False, doesn't raise."""
+    from jamjet.cloud.audit_verify import verify_from_files
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text('{"signature_b64":"x","signing_key_id":"y"}')
+    result = verify_from_files(tmp_path / "no-such-file.json", metadata_path)
+    assert result.ok is False
+    assert "could not read package" in result.reason
+
+
+def test_verify_from_files_handles_invalid_base64_signature(tmp_path, monkeypatch):
+    """Invalid base64 in metadata signature returns ok=False, doesn't raise."""
+    import jamjet.cloud.audit_verify as av
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_bytes(b'{"project":{"id":"abc"}}')
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text('{"signature_b64":"!!!not-valid!!!","signing_key_id":"y"}')
+
+    # Stub the well-known fetch so we get past the network step.
+    import httpx
+    def fake_get(url, params=None, timeout=None):
+        class R:
+            status_code = 200
+            def raise_for_status(self): pass
+            def json(self): return [{"key_id": "y", "public_key_b64": "AAAA"}]
+        return R()
+    monkeypatch.setattr(av.httpx, "get", fake_get)
+
+    result = av.verify_from_files(bundle_path, metadata_path)
+    assert result.ok is False
+    assert "base64" in result.reason.lower() or "invalid" in result.reason.lower()
+
+
+def test_verify_from_files_handles_non_dict_bundle(tmp_path):
+    """Bundle that's a JSON array (not object) returns ok=False, doesn't raise."""
+    from jamjet.cloud.audit_verify import verify_from_files
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_bytes(b'["not", "an", "object"]')
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text('{"signature_b64":"AAAA","signing_key_id":"y"}')
+    result = verify_from_files(bundle_path, metadata_path)
+    assert result.ok is False
+    assert "JSON object" in result.reason
