@@ -89,15 +89,6 @@ def test_exactly_once_under_simulated_crash(tmp_path, shim_durable_run):
     side_effect_count["calls"] = 0
     cache2 = SqliteCache(tmp_path / "cache.db")
 
-    @durable(cache=cache2)
-    def charge_card_after_restart(amount: float) -> dict:
-        # Function name change is intentional — the cache key is determined
-        # by qualname, so changing the function name should produce a NEW key.
-        # But we want the SAME qualname to still hit the cache from the prior
-        # run, so we reuse the original name pattern.
-        side_effect_count["calls"] += 1
-        return {"id": f"ch_after_{side_effect_count['calls']}", "amount": amount}
-
     # Re-bind the same name to test cache hit behavior:
     @durable(cache=cache2)
     def charge_card(amount: float) -> dict:  # noqa: F811
