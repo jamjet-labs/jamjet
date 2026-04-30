@@ -385,6 +385,13 @@ impl Memory {
         // Batch-embed all fact texts in one provider call.
         let texts: Vec<&str> = facts.iter().map(|f| f.text.as_str()).collect();
         let embeddings = self.embedding.embed(&texts).await?;
+        if embeddings.len() != texts.len() {
+            return Err(MemoryError::Embedding(format!(
+                "provider returned {} embeddings for {} texts (cardinality mismatch)",
+                embeddings.len(),
+                texts.len(),
+            )));
+        }
 
         let mut imported: u64 = 0;
         for (mut fact, embedding) in facts.into_iter().zip(embeddings) {
@@ -481,6 +488,13 @@ impl Memory {
         } else {
             self.embedding.embed(&fact_texts).await?
         };
+        if batch_embeddings.len() != fact_texts.len() {
+            return Err(MemoryError::Embedding(format!(
+                "provider returned {} embeddings for {} texts (cardinality mismatch)",
+                batch_embeddings.len(),
+                fact_texts.len(),
+            )));
+        }
 
         for (extracted, embedding) in extraction.facts.into_iter().zip(batch_embeddings) {
             let mut fact = Fact::new(&extracted.text, scope.clone());
