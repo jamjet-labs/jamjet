@@ -186,7 +186,9 @@ def cross_check_otlp(otlp_path: Path, expected_bundle_sha256: str) -> str | None
         return f"otlp: could not read: {e}"
     if not isinstance(doc, dict):
         return "otlp: file is not a JSON object"
-    audit = doc.get("_jamjet_audit", {})
+    audit = doc.get("_jamjet_audit")
+    if not isinstance(audit, dict):
+        return "otlp: _jamjet_audit field missing or not an object"
     actual = audit.get("bundle_sha256")
     if actual != expected_bundle_sha256:
         return (f"otlp: _jamjet_audit.bundle_sha256 = {actual!r} "
@@ -199,7 +201,7 @@ def cross_check_siem_jsonl(siem_path: Path, expected_bundle_sha256: str, *, splu
     try:
         raw = siem_path.read_text()
     except OSError as e:
-        return f"could not read {flavor}: {e}"
+        return f"{flavor}: could not read: {e}"
     field_name = "jj_audit_bundle_sha256"
     seen = 0
     for i, line in enumerate(ln for ln in raw.splitlines() if ln.strip()):
@@ -207,14 +209,19 @@ def cross_check_siem_jsonl(siem_path: Path, expected_bundle_sha256: str, *, splu
         try:
             rec = json.loads(line)
         except json.JSONDecodeError as e:
-            return f"{flavor} line {i} not valid JSON: {e}"
+            return f"{flavor}: line {i} not valid JSON: {e}"
+        if not isinstance(rec, dict):
+            return f"{flavor}: line {i} is not a JSON object"
         if splunk:
-            actual = rec.get("fields", {}).get(field_name)
+            fields = rec.get("fields")
+            if not isinstance(fields, dict):
+                return f"{flavor}: line {i} missing or non-object fields container"
+            actual = fields.get(field_name)
         else:
             actual = rec.get(field_name)
         if actual != expected_bundle_sha256:
-            return (f"{flavor} line {i} {field_name} = {actual!r} "
+            return (f"{flavor}: line {i} {field_name} = {actual!r} "
                     f"does not match canonical bundle digest {expected_bundle_sha256!r}")
     if seen == 0:
-        return f"{flavor} file contains no records — possible tampering"
+        return f"{flavor}: file contains no records — possible tampering"
     return None

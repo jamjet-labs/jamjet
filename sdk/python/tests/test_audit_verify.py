@@ -299,3 +299,56 @@ def test_verify_pdf_flatedecode_match(tmp_path, monkeypatch):
 
     result = verify_from_files(bundle_path, metadata_path, pdf_path=pdf_path)
     assert result.ok, result.reason
+
+
+def test_verify_otlp_jamjet_audit_not_object_fails(tmp_path, monkeypatch):
+    """A non-object _jamjet_audit value must fail with a clear message, not raise."""
+    bundle_path, metadata_path, pk_bytes, _digest_hex = _make_signed_bundle(tmp_path)
+    _patch_well_known(monkeypatch, pk_bytes)
+
+    otlp_path = tmp_path / "report.otlp.json"
+    otlp_path.write_text(json.dumps({
+        "resourceSpans": [],
+        "_jamjet_audit": "not an object — should fail loudly, not crash",
+    }))
+
+    result = verify_from_files(bundle_path, metadata_path, otlp_path=otlp_path)
+    assert not result.ok
+    assert "_jamjet_audit" in result.reason, result.reason
+    assert "not an object" in result.reason, result.reason
+
+
+def test_verify_siem_record_not_object_fails(tmp_path, monkeypatch):
+    """A SIEM JSONL line that is a non-object JSON value must fail with a clear message."""
+    bundle_path, metadata_path, pk_bytes, _digest_hex = _make_signed_bundle(tmp_path)
+    _patch_well_known(monkeypatch, pk_bytes)
+
+    siem_path = tmp_path / "report.datadog.jsonl"
+    # Each line is valid JSON but a non-object value
+    siem_path.write_text("[1, 2, 3]\n\"a string\"\n")
+
+    result = verify_from_files(bundle_path, metadata_path, siem_datadog_path=siem_path)
+    assert not result.ok
+    assert "siem_datadog" in result.reason, result.reason
+    assert "not a JSON object" in result.reason, result.reason
+
+
+def test_verify_siem_splunk_missing_fields_container_fails(tmp_path, monkeypatch):
+    """A Splunk JSONL line without a `fields` object must fail with a clear message."""
+    bundle_path, metadata_path, pk_bytes, _digest_hex = _make_signed_bundle(tmp_path)
+    _patch_well_known(monkeypatch, pk_bytes)
+
+    siem_path = tmp_path / "report.splunk.jsonl"
+    line1 = json.dumps({
+        "time": 1730000000,
+        "host": "h",
+        "sourcetype": "jamjet:event",
+        "event": {"trace_id": "t1"},
+        # missing `fields` container entirely
+    })
+    siem_path.write_text(line1 + "\n")
+
+    result = verify_from_files(bundle_path, metadata_path, siem_splunk_path=siem_path)
+    assert not result.ok
+    assert "siem_splunk" in result.reason, result.reason
+    assert "fields container" in result.reason, result.reason
