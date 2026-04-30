@@ -192,7 +192,7 @@ def test_verify_pdf_bundle_sha256_mismatch_fails(tmp_path, monkeypatch):
 
     result = verify_from_files(bundle_path, metadata_path, pdf_path=pdf_path)
     assert not result.ok
-    assert "pdf metadata sha256" in result.reason.lower(), result.reason
+    assert "metadata sha256" in result.reason.lower(), result.reason
 
 
 def test_verify_otlp_resource_attribute_match(tmp_path, monkeypatch):
@@ -207,4 +207,95 @@ def test_verify_otlp_resource_attribute_match(tmp_path, monkeypatch):
     }))
 
     result = verify_from_files(bundle_path, metadata_path, otlp_path=otlp_path)
+    assert result.ok, result.reason
+
+
+def test_verify_siem_splunk_match(tmp_path, monkeypatch):
+    """Splunk JSONL with matching fields.jj_audit_bundle_sha256 verifies OK."""
+    bundle_path, metadata_path, pk_bytes, digest_hex = _make_signed_bundle(tmp_path)
+    _patch_well_known(monkeypatch, pk_bytes)
+
+    siem_path = tmp_path / "report.splunk.jsonl"
+    line1 = json.dumps({
+        "time": 1730000000,
+        "host": "h",
+        "sourcetype": "jamjet:event",
+        "event": {"trace_id": "t1"},
+        "fields": {"jj_audit_bundle_sha256": digest_hex, "jj_project_id": "p1"},
+    })
+    siem_path.write_text(line1 + "\n")
+
+    result = verify_from_files(bundle_path, metadata_path, siem_splunk_path=siem_path)
+    assert result.ok, result.reason
+
+
+def test_verify_siem_datadog_match(tmp_path, monkeypatch):
+    """Datadog JSONL with matching top-level jj_audit_bundle_sha256 verifies OK."""
+    bundle_path, metadata_path, pk_bytes, digest_hex = _make_signed_bundle(tmp_path)
+    _patch_well_known(monkeypatch, pk_bytes)
+
+    siem_path = tmp_path / "report.datadog.jsonl"
+    line1 = json.dumps({
+        "ddsource": "jamjet",
+        "service": "agent",
+        "message": "x",
+        "jj_audit_bundle_sha256": digest_hex,
+    })
+    siem_path.write_text(line1 + "\n")
+
+    result = verify_from_files(bundle_path, metadata_path, siem_datadog_path=siem_path)
+    assert result.ok, result.reason
+
+
+def test_verify_siem_empty_file_fails(tmp_path, monkeypatch):
+    """Empty SIEM file must fail — guards against attacker swapping in /dev/null."""
+    bundle_path, metadata_path, pk_bytes, _digest_hex = _make_signed_bundle(tmp_path)
+    _patch_well_known(monkeypatch, pk_bytes)
+
+    empty = tmp_path / "report.splunk.jsonl"
+    empty.write_text("")
+
+    result = verify_from_files(bundle_path, metadata_path, siem_splunk_path=empty)
+    assert not result.ok
+    assert "no records" in result.reason.lower(), result.reason
+
+
+def test_verify_siem_mismatch_includes_flavor(tmp_path, monkeypatch):
+    """Mismatch error message must name the SIEM flavor for triage."""
+    bundle_path, metadata_path, pk_bytes, _digest_hex = _make_signed_bundle(tmp_path)
+    _patch_well_known(monkeypatch, pk_bytes)
+
+    siem_path = tmp_path / "report.datadog.jsonl"
+    line1 = json.dumps({
+        "ddsource": "jamjet",
+        "service": "agent",
+        "message": "x",
+        "jj_audit_bundle_sha256": "wrong" * 16,  # 80 chars, won't match real digest
+    })
+    siem_path.write_text(line1 + "\n")
+
+    result = verify_from_files(bundle_path, metadata_path, siem_datadog_path=siem_path)
+    assert not result.ok
+    assert "siem_datadog" in result.reason, result.reason
+
+
+def test_verify_pdf_flatedecode_match(tmp_path, monkeypatch):
+    """PDF with the digest hex inside a FlateDecode-compressed stream verifies OK."""
+    import zlib
+    bundle_path, metadata_path, pk_bytes, digest_hex = _make_signed_bundle(tmp_path)
+    _patch_well_known(monkeypatch, pk_bytes)
+
+    compressed = zlib.compress(digest_hex.encode())
+    # Minimal hand-rolled PDF with one FlateDecoded content stream containing the digest.
+    pdf = (
+        b"%PDF-1.4\n"
+        b"1 0 obj\n"
+        b"<< /Length " + str(len(compressed)).encode() + b" /Filter /FlateDecode >>\n"
+        b"stream\n" + compressed + b"\nendstream\nendobj\n"
+        b"%%EOF\n"
+    )
+    pdf_path = tmp_path / "report.pdf"
+    pdf_path.write_bytes(pdf)
+
+    result = verify_from_files(bundle_path, metadata_path, pdf_path=pdf_path)
     assert result.ok, result.reason

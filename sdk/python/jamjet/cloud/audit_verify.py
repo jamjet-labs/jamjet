@@ -9,6 +9,8 @@ import base64
 import binascii
 import hashlib
 import json
+import re
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -152,25 +154,19 @@ def verify_from_files(
     return result
 
 
-import re
-
-
 def cross_check_pdf(pdf_path: Path, expected_bundle_sha256: str) -> str | None:
-    """If `pdf_path` is given, extract the embedded bundle_sha256 from the
-    PDF cover page (which prints it as text) and assert equality.
-    Returns None if OK, or a failure-reason string."""
+    """Best-effort PDF cross-check. Heuristic: scans raw bytes for the
+    expected digest hex; on miss, also tries decompressing FlateDecode
+    streams. Not a full PDF parser — false negatives are possible if
+    typst-pdf's stream framing diverges from the regex used here."""
     try:
         raw = pdf_path.read_bytes()
     except OSError as e:
-        return f"could not read pdf: {e}"
+        return f"pdf: could not read: {e}"
     if not raw.startswith(b"%PDF-"):
-        return f"{pdf_path} does not look like a PDF (missing %PDF- magic)"
-    # The sha256 (64 hex chars) appears in a content stream. typst-pdf
-    # may compress streams; decompress to find it.
+        return f"pdf: {pdf_path.name} does not look like a PDF (missing %PDF- magic)"
     if expected_bundle_sha256.encode() in raw:
         return None
-    # Try zlib-decompressing each /FlateDecode object naively.
-    import zlib
     for chunk in re.findall(rb"stream\r?\n(.*?)\r?\nendstream", raw, re.DOTALL):
         try:
             decompressed = zlib.decompress(chunk)
@@ -178,8 +174,8 @@ def cross_check_pdf(pdf_path: Path, expected_bundle_sha256: str) -> str | None:
             continue
         if expected_bundle_sha256.encode() in decompressed:
             return None
-    return (f"pdf metadata sha256 not found in {pdf_path.name} "
-            f"(expected {expected_bundle_sha256[:16]}…); "
+    return (f"pdf: metadata sha256 not found in {pdf_path.name} "
+            f"(expected {expected_bundle_sha256[:16]}...); "
             f"pdf may have been re-rendered or tampered")
 
 
@@ -187,33 +183,38 @@ def cross_check_otlp(otlp_path: Path, expected_bundle_sha256: str) -> str | None
     try:
         doc = json.loads(otlp_path.read_text())
     except (OSError, json.JSONDecodeError) as e:
-        return f"could not read otlp: {e}"
+        return f"otlp: could not read: {e}"
     if not isinstance(doc, dict):
-        return "otlp file is not a JSON object"
+        return "otlp: file is not a JSON object"
     audit = doc.get("_jamjet_audit", {})
     actual = audit.get("bundle_sha256")
     if actual != expected_bundle_sha256:
-        return (f"otlp _jamjet_audit.bundle_sha256 = {actual!r} "
+        return (f"otlp: _jamjet_audit.bundle_sha256 = {actual!r} "
                 f"does not match canonical bundle digest {expected_bundle_sha256!r}")
     return None
 
 
 def cross_check_siem_jsonl(siem_path: Path, expected_bundle_sha256: str, *, splunk: bool) -> str | None:
+    flavor = "siem_splunk" if splunk else "siem_datadog"
     try:
         raw = siem_path.read_text()
     except OSError as e:
-        return f"could not read siem jsonl: {e}"
+        return f"could not read {flavor}: {e}"
     field_name = "jj_audit_bundle_sha256"
-    for i, line in enumerate(l for l in raw.splitlines() if l.strip()):
+    seen = 0
+    for i, line in enumerate(ln for ln in raw.splitlines() if ln.strip()):
+        seen += 1
         try:
             rec = json.loads(line)
         except json.JSONDecodeError as e:
-            return f"siem line {i} not valid JSON: {e}"
+            return f"{flavor} line {i} not valid JSON: {e}"
         if splunk:
             actual = rec.get("fields", {}).get(field_name)
         else:
             actual = rec.get(field_name)
         if actual != expected_bundle_sha256:
-            return (f"siem line {i} {field_name} = {actual!r} "
+            return (f"{flavor} line {i} {field_name} = {actual!r} "
                     f"does not match canonical bundle digest {expected_bundle_sha256!r}")
+    if seen == 0:
+        return f"{flavor} file contains no records — possible tampering"
     return None
