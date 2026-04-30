@@ -244,10 +244,26 @@ def audit_verify(
                                    help="Path to the metadata JSON saved from POST /v1/audit/export."),
     api_url: str = typer.Option(_DEFAULT_API_URL, "--api-url",
                                 help="Cloud base URL (override for self-hosted or local dev)."),
+    pdf: Path | None = typer.Option(None, "--pdf", exists=True, dir_okay=False, readable=True,
+                                    help="Optional PDF report — cross-check that its embedded bundle_sha256 matches."),
+    otlp: Path | None = typer.Option(None, "--otlp", exists=True, dir_okay=False, readable=True,
+                                     help="Optional OTLP JSON file — cross-check _jamjet_audit.bundle_sha256."),
+    siem_splunk: Path | None = typer.Option(None, "--siem-splunk", exists=True, dir_okay=False, readable=True,
+                                            help="Optional Splunk JSONL — cross-check fields.jj_audit_bundle_sha256."),
+    siem_datadog: Path | None = typer.Option(None, "--siem-datadog", exists=True, dir_okay=False, readable=True,
+                                             help="Optional Datadog JSONL — cross-check jj_audit_bundle_sha256."),
 ) -> None:
     """Verify the Ed25519 signature on an audit export package."""
     from .audit_verify import verify_from_files
-    res = verify_from_files(package, metadata, api_url=api_url)
+    res = verify_from_files(
+        package,
+        metadata,
+        api_url=api_url,
+        pdf_path=pdf,
+        otlp_path=otlp,
+        siem_splunk_path=siem_splunk,
+        siem_datadog_path=siem_datadog,
+    )
     if res.ok:
         console.print(f"[green]OK[/green] · sha256={res.digest} · key_id={res.key_id}")
         raise typer.Exit(code=0)

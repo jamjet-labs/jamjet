@@ -9,6 +9,8 @@ import base64
 import binascii
 import hashlib
 import json
+import re
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,6 +56,10 @@ def verify_from_files(
     metadata_path: Path,
     *,
     api_url: str = "https://api.jamjet.dev",
+    pdf_path: Path | None = None,
+    otlp_path: Path | None = None,
+    siem_splunk_path: Path | None = None,
+    siem_datadog_path: Path | None = None,
 ) -> VerifyResult:
     """Read a package + its POST-response metadata, fetch the published
     public key, and verify.
@@ -125,4 +131,97 @@ def verify_from_files(
         return VerifyResult(False, digest_hex, f"invalid base64 encoding: {e}")
     result = verify_package(bundle, sig, pk_bytes)
     result.key_id = key_id
+
+    if not result.ok:
+        return result
+
+    expected_digest = digest_hex
+    for path, kind, fn in (
+        (pdf_path, "pdf",
+         lambda p: cross_check_pdf(p, expected_digest)),
+        (otlp_path, "otlp",
+         lambda p: cross_check_otlp(p, expected_digest)),
+        (siem_splunk_path, "siem_splunk",
+         lambda p: cross_check_siem_jsonl(p, expected_digest, splunk=True)),
+        (siem_datadog_path, "siem_datadog",
+         lambda p: cross_check_siem_jsonl(p, expected_digest, splunk=False)),
+    ):
+        if path is not None:
+            err = fn(path)
+            if err is not None:
+                return VerifyResult(False, expected_digest, err, key_id)
+
     return result
+
+
+def cross_check_pdf(pdf_path: Path, expected_bundle_sha256: str) -> str | None:
+    """Best-effort PDF cross-check. Heuristic: scans raw bytes for the
+    expected digest hex; on miss, also tries decompressing FlateDecode
+    streams. Not a full PDF parser — false negatives are possible if
+    typst-pdf's stream framing diverges from the regex used here."""
+    try:
+        raw = pdf_path.read_bytes()
+    except OSError as e:
+        return f"pdf: could not read: {e}"
+    if not raw.startswith(b"%PDF-"):
+        return f"pdf: {pdf_path.name} does not look like a PDF (missing %PDF- magic)"
+    if expected_bundle_sha256.encode() in raw:
+        return None
+    for chunk in re.findall(rb"stream\r?\n(.*?)\r?\nendstream", raw, re.DOTALL):
+        try:
+            decompressed = zlib.decompress(chunk)
+        except zlib.error:
+            continue
+        if expected_bundle_sha256.encode() in decompressed:
+            return None
+    return (f"pdf: metadata sha256 not found in {pdf_path.name} "
+            f"(expected {expected_bundle_sha256[:16]}...); "
+            f"pdf may have been re-rendered or tampered")
+
+
+def cross_check_otlp(otlp_path: Path, expected_bundle_sha256: str) -> str | None:
+    try:
+        doc = json.loads(otlp_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        return f"otlp: could not read: {e}"
+    if not isinstance(doc, dict):
+        return "otlp: file is not a JSON object"
+    audit = doc.get("_jamjet_audit")
+    if not isinstance(audit, dict):
+        return "otlp: _jamjet_audit field missing or not an object"
+    actual = audit.get("bundle_sha256")
+    if actual != expected_bundle_sha256:
+        return (f"otlp: _jamjet_audit.bundle_sha256 = {actual!r} "
+                f"does not match canonical bundle digest {expected_bundle_sha256!r}")
+    return None
+
+
+def cross_check_siem_jsonl(siem_path: Path, expected_bundle_sha256: str, *, splunk: bool) -> str | None:
+    flavor = "siem_splunk" if splunk else "siem_datadog"
+    try:
+        raw = siem_path.read_text()
+    except OSError as e:
+        return f"{flavor}: could not read: {e}"
+    field_name = "jj_audit_bundle_sha256"
+    seen = 0
+    for i, line in enumerate(ln for ln in raw.splitlines() if ln.strip()):
+        seen += 1
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError as e:
+            return f"{flavor}: line {i} not valid JSON: {e}"
+        if not isinstance(rec, dict):
+            return f"{flavor}: line {i} is not a JSON object"
+        if splunk:
+            fields = rec.get("fields")
+            if not isinstance(fields, dict):
+                return f"{flavor}: line {i} missing or non-object fields container"
+            actual = fields.get(field_name)
+        else:
+            actual = rec.get(field_name)
+        if actual != expected_bundle_sha256:
+            return (f"{flavor}: line {i} {field_name} = {actual!r} "
+                    f"does not match canonical bundle digest {expected_bundle_sha256!r}")
+    if seen == 0:
+        return f"{flavor}: file contains no records — possible tampering"
+    return None
