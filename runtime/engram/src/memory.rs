@@ -379,13 +379,22 @@ impl Memory {
     ///
     /// Returns the number of facts successfully imported (skips duplicates by id).
     pub async fn import(&self, facts: Vec<Fact>) -> Result<u64, MemoryError> {
+        if facts.is_empty() {
+            return Ok(0);
+        }
+        // Batch-embed all fact texts in one provider call.
+        let texts: Vec<&str> = facts.iter().map(|f| f.text.as_str()).collect();
+        let embeddings = self.embedding.embed(&texts).await?;
+        if embeddings.len() != texts.len() {
+            return Err(MemoryError::Embedding(format!(
+                "provider returned {} embeddings for {} texts (cardinality mismatch)",
+                embeddings.len(),
+                texts.len(),
+            )));
+        }
+
         let mut imported: u64 = 0;
-        for mut fact in facts {
-            // Re-embed the fact text.
-            let mut embeddings = self.embedding.embed(&[fact.text.as_str()]).await?;
-            let embedding = embeddings.pop().ok_or_else(|| {
-                MemoryError::Embedding("provider returned empty embeddings".to_string())
-            })?;
+        for (mut fact, embedding) in facts.into_iter().zip(embeddings) {
             fact.embedding = embedding.clone();
 
             let fact_id = fact.id;
@@ -470,13 +479,24 @@ impl Memory {
 
         let mut fact_ids = Vec::new();
 
-        for extracted in extraction.facts {
-            // Create and embed the fact
-            let mut embeddings = self.embedding.embed(&[extracted.text.as_str()]).await?;
-            let embedding = embeddings
-                .pop()
-                .ok_or_else(|| MemoryError::Embedding("empty embedding".to_string()))?;
+        // Batch-embed all extracted facts in one provider call instead of N individual
+        // calls. This cuts N HTTP round trips to ollama down to 1, which is the main
+        // throughput bottleneck when ingesting large conversation batches.
+        let fact_texts: Vec<&str> = extraction.facts.iter().map(|f| f.text.as_str()).collect();
+        let batch_embeddings = if fact_texts.is_empty() {
+            vec![]
+        } else {
+            self.embedding.embed(&fact_texts).await?
+        };
+        if batch_embeddings.len() != fact_texts.len() {
+            return Err(MemoryError::Embedding(format!(
+                "provider returned {} embeddings for {} texts (cardinality mismatch)",
+                batch_embeddings.len(),
+                fact_texts.len(),
+            )));
+        }
 
+        for (extracted, embedding) in extraction.facts.into_iter().zip(batch_embeddings) {
             let mut fact = Fact::new(&extracted.text, scope.clone());
             fact.confidence = Some(extracted.confidence as f32);
             fact.category = extracted.category;
