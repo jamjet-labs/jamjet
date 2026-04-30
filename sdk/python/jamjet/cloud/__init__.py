@@ -87,6 +87,7 @@ def configure(
     set_process_context(environment=environment, release_version=release_version)
 
     from .redaction import configure as _redact_cfg
+
     _redact_cfg(enabled=redact, pii_types=redact_types)
 
     if auto_patch:

@@ -29,6 +29,12 @@ Quick start:
 from jamjet.agents.agent import Agent, AgentResult
 from jamjet.agents.task import task
 from jamjet.client import JamjetClient
+from jamjet.durable import (
+    durable,
+    durable_run,
+    reset_execution_context,
+    set_execution_context,
+)
 from jamjet.eval.registry import scorer
 from jamjet.protocols.adapter import ProtocolAdapter
 from jamjet.protocols.registry import ProtocolRegistry
@@ -42,8 +48,12 @@ __all__ = [
     "ProtocolAdapter",
     "ProtocolRegistry",
     "Workflow",
+    "durable",
+    "durable_run",
+    "reset_execution_context",
     "scorer",
+    "set_execution_context",
     "task",
     "tool",
 ]
-__version__ = "0.6.0"
+__version__ = "0.7.0"

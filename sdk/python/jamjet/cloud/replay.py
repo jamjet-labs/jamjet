@@ -29,6 +29,7 @@ from typing import Any
 # Bundle data model
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ReplayBundle:
     """Parsed replay bundle (replay-1.0 schema)."""
@@ -104,6 +105,7 @@ def _input_hash(tool_input: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Bundle loading
 # ---------------------------------------------------------------------------
+
 
 def load_bundle(path: str | Path) -> ReplayBundle:
     """Load a replay bundle from a tar.gz file or extracted directory."""
@@ -183,6 +185,7 @@ def is_stub_models() -> bool:
 # Auto-activation from env vars (Phase 6.1)
 # ---------------------------------------------------------------------------
 
+
 def _auto_activate() -> None:
     """Called at module import. Activates replay if JAMJET_REPLAY_BUNDLE is set."""
     bundle_path = os.environ.get("JAMJET_REPLAY_BUNDLE")
@@ -194,6 +197,7 @@ def _auto_activate() -> None:
         activate(bundle, stub_models=stub)
     except Exception as exc:  # noqa: BLE001
         import warnings
+
         warnings.warn(
             f"JAMJET_REPLAY_BUNDLE={bundle_path!r} could not be loaded: {exc}",
             stacklevel=2,

@@ -123,6 +123,7 @@ def tool(
             # Import is local to avoid a hard dep cycle at module load.
             try:
                 from jamjet.cloud.replay import get_active as _get_replay  # noqa: PLC0415
+
                 _replay = _get_replay()
             except Exception:  # noqa: BLE001
                 _replay = None
