@@ -51,9 +51,10 @@ strategy/
 docs/superpowers/
 paper/
 
-# Local AI/editor agent config
-.claude/*.local.*
-.claude/settings.local.json
+# Local AI/editor agent config — never commit Claude/skill artifacts
+.claude/
+.superpowers/
+.playwright-mcp/
 .cursor/
 .copilot/
 
