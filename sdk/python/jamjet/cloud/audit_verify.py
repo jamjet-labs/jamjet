@@ -54,6 +54,10 @@ def verify_from_files(
     metadata_path: Path,
     *,
     api_url: str = "https://api.jamjet.dev",
+    pdf_path: Path | None = None,
+    otlp_path: Path | None = None,
+    siem_splunk_path: Path | None = None,
+    siem_datadog_path: Path | None = None,
 ) -> VerifyResult:
     """Read a package + its POST-response metadata, fetch the published
     public key, and verify.
@@ -125,4 +129,91 @@ def verify_from_files(
         return VerifyResult(False, digest_hex, f"invalid base64 encoding: {e}")
     result = verify_package(bundle, sig, pk_bytes)
     result.key_id = key_id
+
+    if not result.ok:
+        return result
+
+    expected_digest = digest_hex
+    for path, kind, fn in (
+        (pdf_path, "pdf",
+         lambda p: cross_check_pdf(p, expected_digest)),
+        (otlp_path, "otlp",
+         lambda p: cross_check_otlp(p, expected_digest)),
+        (siem_splunk_path, "siem_splunk",
+         lambda p: cross_check_siem_jsonl(p, expected_digest, splunk=True)),
+        (siem_datadog_path, "siem_datadog",
+         lambda p: cross_check_siem_jsonl(p, expected_digest, splunk=False)),
+    ):
+        if path is not None:
+            err = fn(path)
+            if err is not None:
+                return VerifyResult(False, expected_digest, err, key_id)
+
     return result
+
+
+import re
+
+
+def cross_check_pdf(pdf_path: Path, expected_bundle_sha256: str) -> str | None:
+    """If `pdf_path` is given, extract the embedded bundle_sha256 from the
+    PDF cover page (which prints it as text) and assert equality.
+    Returns None if OK, or a failure-reason string."""
+    try:
+        raw = pdf_path.read_bytes()
+    except OSError as e:
+        return f"could not read pdf: {e}"
+    if not raw.startswith(b"%PDF-"):
+        return f"{pdf_path} does not look like a PDF (missing %PDF- magic)"
+    # The sha256 (64 hex chars) appears in a content stream. typst-pdf
+    # may compress streams; decompress to find it.
+    if expected_bundle_sha256.encode() in raw:
+        return None
+    # Try zlib-decompressing each /FlateDecode object naively.
+    import zlib
+    for chunk in re.findall(rb"stream\r?\n(.*?)\r?\nendstream", raw, re.DOTALL):
+        try:
+            decompressed = zlib.decompress(chunk)
+        except zlib.error:
+            continue
+        if expected_bundle_sha256.encode() in decompressed:
+            return None
+    return (f"pdf metadata sha256 not found in {pdf_path.name} "
+            f"(expected {expected_bundle_sha256[:16]}…); "
+            f"pdf may have been re-rendered or tampered")
+
+
+def cross_check_otlp(otlp_path: Path, expected_bundle_sha256: str) -> str | None:
+    try:
+        doc = json.loads(otlp_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        return f"could not read otlp: {e}"
+    if not isinstance(doc, dict):
+        return "otlp file is not a JSON object"
+    audit = doc.get("_jamjet_audit", {})
+    actual = audit.get("bundle_sha256")
+    if actual != expected_bundle_sha256:
+        return (f"otlp _jamjet_audit.bundle_sha256 = {actual!r} "
+                f"does not match canonical bundle digest {expected_bundle_sha256!r}")
+    return None
+
+
+def cross_check_siem_jsonl(siem_path: Path, expected_bundle_sha256: str, *, splunk: bool) -> str | None:
+    try:
+        raw = siem_path.read_text()
+    except OSError as e:
+        return f"could not read siem jsonl: {e}"
+    field_name = "jj_audit_bundle_sha256"
+    for i, line in enumerate(l for l in raw.splitlines() if l.strip()):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError as e:
+            return f"siem line {i} not valid JSON: {e}"
+        if splunk:
+            actual = rec.get("fields", {}).get(field_name)
+        else:
+            actual = rec.get(field_name)
+        if actual != expected_bundle_sha256:
+            return (f"siem line {i} {field_name} = {actual!r} "
+                    f"does not match canonical bundle digest {expected_bundle_sha256!r}")
+    return None

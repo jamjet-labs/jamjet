@@ -1,7 +1,9 @@
 """Unit tests for jamjet.cloud.audit_verify."""
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 
 import pytest
 
@@ -127,3 +129,82 @@ def test_verify_from_files_handles_non_dict_bundle(tmp_path):
     result = verify_from_files(bundle_path, metadata_path)
     assert result.ok is False
     assert "JSON object" in result.reason
+
+
+# --- 4.E.β cross-check tests ---------------------------------------------
+from jamjet.cloud.audit_verify import verify_from_files  # noqa: E402
+
+
+def _make_signed_bundle(tmp_path):
+    """Helper: build a signed bundle + metadata + return (paths, public-key-bytes, digest_hex)."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    bundle = b'{"project":{"id":"p1","name":"t"},"warnings":[]}\n'
+    sk = Ed25519PrivateKey.generate()
+    pk = sk.public_key()
+    digest = hashlib.sha256(bundle).digest()
+    digest_hex = digest.hex()
+    sig = sk.sign(digest)
+
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_bytes(bundle)
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(json.dumps({
+        "id": "x",
+        "sha256_digest": digest_hex,
+        "signature_b64": base64.b64encode(sig).decode(),
+        "signing_key_id": "k1",
+    }))
+    pk_bytes = (pk.public_bytes_raw() if hasattr(pk, "public_bytes_raw")
+                else pk.public_bytes(encoding=Encoding.Raw, format=PublicFormat.Raw))
+    return bundle_path, metadata_path, pk_bytes, digest_hex
+
+
+def _patch_well_known(monkeypatch, pk_bytes):
+    def fake_get(url, *a, **kw):
+        class R:
+            status_code = 200
+            def raise_for_status(self_): pass
+            def json(self_): return [{"key_id": "k1", "public_key_b64": base64.b64encode(pk_bytes).decode()}]
+        return R()
+    monkeypatch.setattr("httpx.get", fake_get)
+
+
+def test_verify_with_pdf_metadata_match(tmp_path, monkeypatch):
+    """End-to-end: signed bundle + matching PDF -> OK."""
+    bundle_path, metadata_path, pk_bytes, digest_hex = _make_signed_bundle(tmp_path)
+    _patch_well_known(monkeypatch, pk_bytes)
+
+    pdf_path = tmp_path / "report.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n" + digest_hex.encode() + b"\n%%EOF\n")
+
+    result = verify_from_files(bundle_path, metadata_path, pdf_path=pdf_path)
+    assert result.ok, result.reason
+
+
+def test_verify_pdf_bundle_sha256_mismatch_fails(tmp_path, monkeypatch):
+    """PDF whose embedded digest does not match the canonical bundle should fail."""
+    bundle_path, metadata_path, pk_bytes, _digest_hex = _make_signed_bundle(tmp_path)
+    _patch_well_known(monkeypatch, pk_bytes)
+
+    pdf_path = tmp_path / "report.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n" + (b"0" * 64) + b"\n%%EOF\n")
+
+    result = verify_from_files(bundle_path, metadata_path, pdf_path=pdf_path)
+    assert not result.ok
+    assert "pdf metadata sha256" in result.reason.lower(), result.reason
+
+
+def test_verify_otlp_resource_attribute_match(tmp_path, monkeypatch):
+    """OTLP file with matching _jamjet_audit.bundle_sha256 should verify OK."""
+    bundle_path, metadata_path, pk_bytes, digest_hex = _make_signed_bundle(tmp_path)
+    _patch_well_known(monkeypatch, pk_bytes)
+
+    otlp_path = tmp_path / "report.otlp.json"
+    otlp_path.write_text(json.dumps({
+        "resourceSpans": [],
+        "_jamjet_audit": {"bundle_sha256": digest_hex, "scope_type": "trace", "scope_ref": "x", "generated_at": "now"},
+    }))
+
+    result = verify_from_files(bundle_path, metadata_path, otlp_path=otlp_path)
+    assert result.ok, result.reason
