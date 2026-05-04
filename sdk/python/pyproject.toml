@@ -68,7 +68,7 @@ cloud-all = ["openai>=2", "anthropic>=0.40"]
 # Optional extras for the `jamjet.durable` framework shims (introduced in 0.7.0).
 # Each enables a thin durable_run() context manager that bridges the framework's
 # native run identity to JamJet's @durable idempotency cache.
-langchain = ["langchain>=0.3,<1.0"]
+langchain = ["langchain>=0.3,<2.0"]
 crewai = ["crewai>=0.70"]
 adk = ["google-adk>=0.1"]
 anthropic-agent = ["anthropic>=0.40"]
