@@ -3,6 +3,7 @@
 Used both as a library (``verify_package(...)``) and via the
 ``jamjet-cloud audit-verify`` CLI subcommand.
 """
+
 from __future__ import annotations
 
 import base64
@@ -91,8 +92,11 @@ def verify_from_files(
         return VerifyResult(False, digest_hex, "metadata missing signature_b64 or signing_key_id")
 
     if meta.get("sha256_digest") and meta["sha256_digest"] != digest_hex:
-        return VerifyResult(False, digest_hex,
-                            f"bundle digest {digest_hex} does not match metadata.sha256_digest {meta['sha256_digest']}")
+        return VerifyResult(
+            False,
+            digest_hex,
+            f"bundle digest {digest_hex} does not match metadata.sha256_digest {meta['sha256_digest']}",
+        )
 
     try:
         bundle_json = json.loads(bundle)
@@ -113,7 +117,9 @@ def verify_from_files(
         keys_resp.raise_for_status()
         keys = keys_resp.json()
         if not isinstance(keys, list):
-            return VerifyResult(False, digest_hex, f"well-known endpoint returned unexpected shape: {type(keys).__name__}")
+            return VerifyResult(
+                False, digest_hex, f"well-known endpoint returned unexpected shape: {type(keys).__name__}"
+            )
     except httpx.HTTPError as e:
         return VerifyResult(False, digest_hex, f"could not fetch public key: {e}")
     except json.JSONDecodeError as e:
@@ -137,14 +143,10 @@ def verify_from_files(
 
     expected_digest = digest_hex
     for path, kind, fn in (
-        (pdf_path, "pdf",
-         lambda p: cross_check_pdf(p, expected_digest)),
-        (otlp_path, "otlp",
-         lambda p: cross_check_otlp(p, expected_digest)),
-        (siem_splunk_path, "siem_splunk",
-         lambda p: cross_check_siem_jsonl(p, expected_digest, splunk=True)),
-        (siem_datadog_path, "siem_datadog",
-         lambda p: cross_check_siem_jsonl(p, expected_digest, splunk=False)),
+        (pdf_path, "pdf", lambda p: cross_check_pdf(p, expected_digest)),
+        (otlp_path, "otlp", lambda p: cross_check_otlp(p, expected_digest)),
+        (siem_splunk_path, "siem_splunk", lambda p: cross_check_siem_jsonl(p, expected_digest, splunk=True)),
+        (siem_datadog_path, "siem_datadog", lambda p: cross_check_siem_jsonl(p, expected_digest, splunk=False)),
     ):
         if path is not None:
             err = fn(path)
@@ -174,9 +176,11 @@ def cross_check_pdf(pdf_path: Path, expected_bundle_sha256: str) -> str | None:
             continue
         if expected_bundle_sha256.encode() in decompressed:
             return None
-    return (f"pdf: metadata sha256 not found in {pdf_path.name} "
-            f"(expected {expected_bundle_sha256[:16]}...); "
-            f"pdf may have been re-rendered or tampered")
+    return (
+        f"pdf: metadata sha256 not found in {pdf_path.name} "
+        f"(expected {expected_bundle_sha256[:16]}...); "
+        f"pdf may have been re-rendered or tampered"
+    )
 
 
 def cross_check_otlp(otlp_path: Path, expected_bundle_sha256: str) -> str | None:
@@ -191,8 +195,10 @@ def cross_check_otlp(otlp_path: Path, expected_bundle_sha256: str) -> str | None
         return "otlp: _jamjet_audit field missing or not an object"
     actual = audit.get("bundle_sha256")
     if actual != expected_bundle_sha256:
-        return (f"otlp: _jamjet_audit.bundle_sha256 = {actual!r} "
-                f"does not match canonical bundle digest {expected_bundle_sha256!r}")
+        return (
+            f"otlp: _jamjet_audit.bundle_sha256 = {actual!r} "
+            f"does not match canonical bundle digest {expected_bundle_sha256!r}"
+        )
     return None
 
 
@@ -220,8 +226,10 @@ def cross_check_siem_jsonl(siem_path: Path, expected_bundle_sha256: str, *, splu
         else:
             actual = rec.get(field_name)
         if actual != expected_bundle_sha256:
-            return (f"{flavor}: line {i} {field_name} = {actual!r} "
-                    f"does not match canonical bundle digest {expected_bundle_sha256!r}")
+            return (
+                f"{flavor}: line {i} {field_name} = {actual!r} "
+                f"does not match canonical bundle digest {expected_bundle_sha256!r}"
+            )
     if seen == 0:
         return f"{flavor}: file contains no records — possible tampering"
     return None

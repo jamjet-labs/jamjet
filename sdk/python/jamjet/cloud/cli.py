@@ -238,23 +238,57 @@ def _sanitize(s: str) -> str:
 
 @app.command("audit-verify")
 def audit_verify(
-    package: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True,
-                                   help="Path to the .json audit package."),
-    metadata: Path = typer.Option(..., "--metadata", "-m", exists=True, dir_okay=False, readable=True,
-                                   help="Path to the metadata JSON saved from POST /v1/audit/export."),
-    api_url: str = typer.Option(_DEFAULT_API_URL, "--api-url",
-                                help="Cloud base URL (override for self-hosted or local dev)."),
-    pdf: Path | None = typer.Option(None, "--pdf", exists=True, dir_okay=False, readable=True,
-                                    help="Optional PDF report — cross-check that its embedded bundle_sha256 matches."),
-    otlp: Path | None = typer.Option(None, "--otlp", exists=True, dir_okay=False, readable=True,
-                                     help="Optional OTLP JSON file — cross-check _jamjet_audit.bundle_sha256."),
-    siem_splunk: Path | None = typer.Option(None, "--siem-splunk", exists=True, dir_okay=False, readable=True,
-                                            help="Optional Splunk JSONL — cross-check fields.jj_audit_bundle_sha256."),
-    siem_datadog: Path | None = typer.Option(None, "--siem-datadog", exists=True, dir_okay=False, readable=True,
-                                             help="Optional Datadog JSONL — cross-check jj_audit_bundle_sha256."),
+    package: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, readable=True, help="Path to the .json audit package."
+    ),
+    metadata: Path = typer.Option(
+        ...,
+        "--metadata",
+        "-m",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="Path to the metadata JSON saved from POST /v1/audit/export.",
+    ),
+    api_url: str = typer.Option(
+        _DEFAULT_API_URL, "--api-url", help="Cloud base URL (override for self-hosted or local dev)."
+    ),
+    pdf: Path | None = typer.Option(
+        None,
+        "--pdf",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="Optional PDF report — cross-check that its embedded bundle_sha256 matches.",
+    ),
+    otlp: Path | None = typer.Option(
+        None,
+        "--otlp",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="Optional OTLP JSON file — cross-check _jamjet_audit.bundle_sha256.",
+    ),
+    siem_splunk: Path | None = typer.Option(
+        None,
+        "--siem-splunk",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="Optional Splunk JSONL — cross-check fields.jj_audit_bundle_sha256.",
+    ),
+    siem_datadog: Path | None = typer.Option(
+        None,
+        "--siem-datadog",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="Optional Datadog JSONL — cross-check jj_audit_bundle_sha256.",
+    ),
 ) -> None:
     """Verify the Ed25519 signature on an audit export package."""
     from .audit_verify import verify_from_files
+
     res = verify_from_files(
         package,
         metadata,

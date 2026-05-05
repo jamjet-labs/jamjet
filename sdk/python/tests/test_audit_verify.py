@@ -1,4 +1,5 @@
 """Unit tests for jamjet.cloud.audit_verify."""
+
 from __future__ import annotations
 
 import base64
@@ -27,6 +28,7 @@ def _sign_fixture(bundle: bytes) -> tuple[bytes, bytes]:
 
 def test_verify_ok_round_trip():
     from jamjet.cloud.audit_verify import verify_package
+
     bundle = b'{"schema_version":"1.0","payload":"x"}\n'
     pk_bytes, sig = _sign_fixture(bundle)
     result = verify_package(bundle, sig, pk_bytes)
@@ -36,6 +38,7 @@ def test_verify_ok_round_trip():
 
 def test_verify_fails_on_tampered_bundle():
     from jamjet.cloud.audit_verify import verify_package
+
     bundle = b'{"schema_version":"1.0","payload":"x"}\n'
     pk_bytes, sig = _sign_fixture(bundle)
     tampered = bundle.replace(b'"x"', b'"y"')
@@ -45,7 +48,8 @@ def test_verify_fails_on_tampered_bundle():
 
 def test_verify_fails_on_wrong_key():
     from jamjet.cloud.audit_verify import verify_package
-    bundle = b'{}\n'
+
+    bundle = b"{}\n"
     _, sig = _sign_fixture(bundle)
     other_pk_bytes, _ = _sign_fixture(b"other")
     result = verify_package(bundle, sig, other_pk_bytes)
@@ -54,6 +58,7 @@ def test_verify_fails_on_wrong_key():
 
 def test_verify_rejects_short_signature():
     from jamjet.cloud.audit_verify import verify_package
+
     pk_bytes, _ = _sign_fixture(b"x")
     result = verify_package(b"x", b"\x00" * 10, pk_bytes)
     assert result.ok is False
@@ -63,6 +68,7 @@ def test_verify_rejects_short_signature():
 def test_verify_from_files_handles_invalid_json_bundle(tmp_path):
     """Bundle that isn't JSON returns ok=False, doesn't raise."""
     from jamjet.cloud.audit_verify import verify_from_files
+
     bundle_path = tmp_path / "bad.json"
     bundle_path.write_bytes(b"not valid json{{")
     metadata_path = tmp_path / "metadata.json"
@@ -75,6 +81,7 @@ def test_verify_from_files_handles_invalid_json_bundle(tmp_path):
 def test_verify_from_files_handles_unreachable_well_known(tmp_path):
     """Failed HTTP call to well-known endpoint returns ok=False, doesn't raise."""
     from jamjet.cloud.audit_verify import verify_from_files
+
     bundle_path = tmp_path / "bundle.json"
     bundle_path.write_bytes(b'{"project":{"id":"abc"}}')
     metadata_path = tmp_path / "metadata.json"
@@ -88,6 +95,7 @@ def test_verify_from_files_handles_unreachable_well_known(tmp_path):
 def test_verify_from_files_handles_missing_package_file(tmp_path):
     """Nonexistent package path returns ok=False, doesn't raise."""
     from jamjet.cloud.audit_verify import verify_from_files
+
     metadata_path = tmp_path / "metadata.json"
     metadata_path.write_text('{"signature_b64":"x","signing_key_id":"y"}')
     result = verify_from_files(tmp_path / "no-such-file.json", metadata_path)
@@ -106,12 +114,19 @@ def test_verify_from_files_handles_invalid_base64_signature(tmp_path, monkeypatc
 
     # Stub the well-known fetch so we get past the network step.
     import httpx
+
     def fake_get(url, params=None, timeout=None):
         class R:
             status_code = 200
-            def raise_for_status(self): pass
-            def json(self): return [{"key_id": "y", "public_key_b64": "AAAA"}]
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return [{"key_id": "y", "public_key_b64": "AAAA"}]
+
         return R()
+
     monkeypatch.setattr(av.httpx, "get", fake_get)
 
     result = av.verify_from_files(bundle_path, metadata_path)
@@ -122,6 +137,7 @@ def test_verify_from_files_handles_invalid_base64_signature(tmp_path, monkeypatc
 def test_verify_from_files_handles_non_dict_bundle(tmp_path):
     """Bundle that's a JSON array (not object) returns ok=False, doesn't raise."""
     from jamjet.cloud.audit_verify import verify_from_files
+
     bundle_path = tmp_path / "bundle.json"
     bundle_path.write_bytes(b'["not", "an", "object"]')
     metadata_path = tmp_path / "metadata.json"
@@ -139,6 +155,7 @@ def _make_signed_bundle(tmp_path):
     """Helper: build a signed bundle + metadata + return (paths, public-key-bytes, digest_hex)."""
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
     bundle = b'{"project":{"id":"p1","name":"t"},"warnings":[]}\n'
     sk = Ed25519PrivateKey.generate()
     pk = sk.public_key()
@@ -149,14 +166,21 @@ def _make_signed_bundle(tmp_path):
     bundle_path = tmp_path / "bundle.json"
     bundle_path.write_bytes(bundle)
     metadata_path = tmp_path / "metadata.json"
-    metadata_path.write_text(json.dumps({
-        "id": "x",
-        "sha256_digest": digest_hex,
-        "signature_b64": base64.b64encode(sig).decode(),
-        "signing_key_id": "k1",
-    }))
-    pk_bytes = (pk.public_bytes_raw() if hasattr(pk, "public_bytes_raw")
-                else pk.public_bytes(encoding=Encoding.Raw, format=PublicFormat.Raw))
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "id": "x",
+                "sha256_digest": digest_hex,
+                "signature_b64": base64.b64encode(sig).decode(),
+                "signing_key_id": "k1",
+            }
+        )
+    )
+    pk_bytes = (
+        pk.public_bytes_raw()
+        if hasattr(pk, "public_bytes_raw")
+        else pk.public_bytes(encoding=Encoding.Raw, format=PublicFormat.Raw)
+    )
     return bundle_path, metadata_path, pk_bytes, digest_hex
 
 
@@ -164,9 +188,15 @@ def _patch_well_known(monkeypatch, pk_bytes):
     def fake_get(url, *a, **kw):
         class R:
             status_code = 200
-            def raise_for_status(self_): pass
-            def json(self_): return [{"key_id": "k1", "public_key_b64": base64.b64encode(pk_bytes).decode()}]
+
+            def raise_for_status(self_):
+                pass
+
+            def json(self_):
+                return [{"key_id": "k1", "public_key_b64": base64.b64encode(pk_bytes).decode()}]
+
         return R()
+
     monkeypatch.setattr("httpx.get", fake_get)
 
 
@@ -201,10 +231,19 @@ def test_verify_otlp_resource_attribute_match(tmp_path, monkeypatch):
     _patch_well_known(monkeypatch, pk_bytes)
 
     otlp_path = tmp_path / "report.otlp.json"
-    otlp_path.write_text(json.dumps({
-        "resourceSpans": [],
-        "_jamjet_audit": {"bundle_sha256": digest_hex, "scope_type": "trace", "scope_ref": "x", "generated_at": "now"},
-    }))
+    otlp_path.write_text(
+        json.dumps(
+            {
+                "resourceSpans": [],
+                "_jamjet_audit": {
+                    "bundle_sha256": digest_hex,
+                    "scope_type": "trace",
+                    "scope_ref": "x",
+                    "generated_at": "now",
+                },
+            }
+        )
+    )
 
     result = verify_from_files(bundle_path, metadata_path, otlp_path=otlp_path)
     assert result.ok, result.reason
@@ -216,13 +255,15 @@ def test_verify_siem_splunk_match(tmp_path, monkeypatch):
     _patch_well_known(monkeypatch, pk_bytes)
 
     siem_path = tmp_path / "report.splunk.jsonl"
-    line1 = json.dumps({
-        "time": 1730000000,
-        "host": "h",
-        "sourcetype": "jamjet:event",
-        "event": {"trace_id": "t1"},
-        "fields": {"jj_audit_bundle_sha256": digest_hex, "jj_project_id": "p1"},
-    })
+    line1 = json.dumps(
+        {
+            "time": 1730000000,
+            "host": "h",
+            "sourcetype": "jamjet:event",
+            "event": {"trace_id": "t1"},
+            "fields": {"jj_audit_bundle_sha256": digest_hex, "jj_project_id": "p1"},
+        }
+    )
     siem_path.write_text(line1 + "\n")
 
     result = verify_from_files(bundle_path, metadata_path, siem_splunk_path=siem_path)
@@ -235,12 +276,14 @@ def test_verify_siem_datadog_match(tmp_path, monkeypatch):
     _patch_well_known(monkeypatch, pk_bytes)
 
     siem_path = tmp_path / "report.datadog.jsonl"
-    line1 = json.dumps({
-        "ddsource": "jamjet",
-        "service": "agent",
-        "message": "x",
-        "jj_audit_bundle_sha256": digest_hex,
-    })
+    line1 = json.dumps(
+        {
+            "ddsource": "jamjet",
+            "service": "agent",
+            "message": "x",
+            "jj_audit_bundle_sha256": digest_hex,
+        }
+    )
     siem_path.write_text(line1 + "\n")
 
     result = verify_from_files(bundle_path, metadata_path, siem_datadog_path=siem_path)
@@ -266,12 +309,14 @@ def test_verify_siem_mismatch_includes_flavor(tmp_path, monkeypatch):
     _patch_well_known(monkeypatch, pk_bytes)
 
     siem_path = tmp_path / "report.datadog.jsonl"
-    line1 = json.dumps({
-        "ddsource": "jamjet",
-        "service": "agent",
-        "message": "x",
-        "jj_audit_bundle_sha256": "wrong" * 16,  # 80 chars, won't match real digest
-    })
+    line1 = json.dumps(
+        {
+            "ddsource": "jamjet",
+            "service": "agent",
+            "message": "x",
+            "jj_audit_bundle_sha256": "wrong" * 16,  # 80 chars, won't match real digest
+        }
+    )
     siem_path.write_text(line1 + "\n")
 
     result = verify_from_files(bundle_path, metadata_path, siem_datadog_path=siem_path)
@@ -282,6 +327,7 @@ def test_verify_siem_mismatch_includes_flavor(tmp_path, monkeypatch):
 def test_verify_pdf_flatedecode_match(tmp_path, monkeypatch):
     """PDF with the digest hex inside a FlateDecode-compressed stream verifies OK."""
     import zlib
+
     bundle_path, metadata_path, pk_bytes, digest_hex = _make_signed_bundle(tmp_path)
     _patch_well_known(monkeypatch, pk_bytes)
 
@@ -307,10 +353,14 @@ def test_verify_otlp_jamjet_audit_not_object_fails(tmp_path, monkeypatch):
     _patch_well_known(monkeypatch, pk_bytes)
 
     otlp_path = tmp_path / "report.otlp.json"
-    otlp_path.write_text(json.dumps({
-        "resourceSpans": [],
-        "_jamjet_audit": "not an object — should fail loudly, not crash",
-    }))
+    otlp_path.write_text(
+        json.dumps(
+            {
+                "resourceSpans": [],
+                "_jamjet_audit": "not an object — should fail loudly, not crash",
+            }
+        )
+    )
 
     result = verify_from_files(bundle_path, metadata_path, otlp_path=otlp_path)
     assert not result.ok
@@ -325,7 +375,7 @@ def test_verify_siem_record_not_object_fails(tmp_path, monkeypatch):
 
     siem_path = tmp_path / "report.datadog.jsonl"
     # Each line is valid JSON but a non-object value
-    siem_path.write_text("[1, 2, 3]\n\"a string\"\n")
+    siem_path.write_text('[1, 2, 3]\n"a string"\n')
 
     result = verify_from_files(bundle_path, metadata_path, siem_datadog_path=siem_path)
     assert not result.ok
@@ -339,13 +389,15 @@ def test_verify_siem_splunk_missing_fields_container_fails(tmp_path, monkeypatch
     _patch_well_known(monkeypatch, pk_bytes)
 
     siem_path = tmp_path / "report.splunk.jsonl"
-    line1 = json.dumps({
-        "time": 1730000000,
-        "host": "h",
-        "sourcetype": "jamjet:event",
-        "event": {"trace_id": "t1"},
-        # missing `fields` container entirely
-    })
+    line1 = json.dumps(
+        {
+            "time": 1730000000,
+            "host": "h",
+            "sourcetype": "jamjet:event",
+            "event": {"trace_id": "t1"},
+            # missing `fields` container entirely
+        }
+    )
     siem_path.write_text(line1 + "\n")
 
     result = verify_from_files(bundle_path, metadata_path, siem_splunk_path=siem_path)
