@@ -55,31 +55,13 @@ JamJet sits underneath your agent — LangChain, CrewAI, ADK, MCP servers, custo
 
 ![JamJet demo](./demo.gif)
 
-## Quickstart
+## 60-second safety demo
 
 ```bash
 pip install jamjet
 ```
 
-```python
-from jamjet import task, tool
-
-@tool
-async def web_search(query: str) -> str:
-    return f"Search results for: {query}"
-
-@task(model="claude-haiku-4-5-20251001", tools=[web_search])
-async def research(question: str) -> str:
-    """You are a research assistant. Search first, then summarize clearly."""
-
-result = await research("What is JamJet?")
-```
-
-No server. No config. No YAML. Just `pip install` and run.
-
-## Add the safety layer
-
-Declare a runtime policy. Destructive tool calls get blocked or routed for human approval before they leave the agent's process:
+Drop a policy beside your agent code. The runtime intercepts any matching tool call *before* it leaves the agent's process — `blocked_tools` are refused outright, `require_approval_for` pauses execution durably and waits for an out-of-band decision (crashes don't lose the approval; execution resumes when it arrives).
 
 ```yaml
 # workflow.yaml
@@ -93,9 +75,28 @@ policy:
     - "user.suspend"
 ```
 
-Now the runtime intercepts any matching tool call, persists the execution state, and waits for an out-of-band approval decision. Crashes during the wait don't lose the approval — execution resumes when the decision arrives.
+**Python, with the hosted control plane:**
 
-→ See **[`examples/hitl-approval`](examples/hitl-approval)** for a runnable approval workflow.
+```python
+import jamjet
+jamjet.cloud.configure(api_key="jj_...", project="my-agent")
+jamjet.cloud.policy("block", "*delete*")
+jamjet.cloud.policy("require_approval", "database.*")
+# Every OpenAI / Anthropic call in this process is now policy-gated.
+```
+
+→ Runnable approval workflow in **[`examples/hitl-approval`](examples/hitl-approval)** · [Cloud Quickstart](https://docs.jamjet.dev/en/docs/cloud-quickstart)
+
+## Use JamJet when your agent can…
+
+- call MCP servers or arbitrary tools
+- write to a database
+- send emails or Slack messages
+- trigger payments or external API calls
+- access customer data or PII
+- run for minutes/hours and needs to survive crashes
+- spend real model budget at scale
+- delegate to other agents
 
 ## What JamJet adds
 
@@ -109,9 +110,9 @@ Now the runtime intercepts any matching tool call, persists the execution state,
 | Memory is framework-specific | Engram works via MCP, REST, Python, Java |
 | Frameworks stay siloed | MCP + A2A connect tools and agents |
 
-## Works with your stack
+## Works with your stack — not a replacement
 
-JamJet is the runtime safety layer underneath whatever framework you already use.
+JamJet does not replace LangChain, LangGraph, CrewAI, Google ADK, Spring AI, or your custom agent code. Use those to build agent behavior. Use JamJet to control what happens at runtime.
 
 | You're using | Keep it for | JamJet adds |
 |---|---|---|
@@ -134,41 +135,11 @@ Community-built integrations for **LangChain, LlamaIndex, CrewAI, AutoGen, Pydan
 
 → [All 19 examples](examples/) · [Community integrations](https://github.com/jamjet-labs/jamjet-examples/tree/main/integrations) · [Build your own](https://github.com/jamjet-labs/jamjet-examples/issues?q=is%3Aissue+is%3Aopen+label%3Awanted-integration)
 
-## Memory — Engram
+## Sub-products
 
-**Engram** is JamJet's durable memory layer — temporal knowledge graph, hybrid retrieval, fact extraction, conflict detection. Backed by SQLite (zero-infra) or Postgres (production). Provider-agnostic (Ollama, OpenAI-compatible, Claude, Gemini).
+**[Engram](runtime/engram-server/README.md)** — JamJet's durable memory layer for agents (temporal knowledge graph, hybrid retrieval, conflict detection). Available as a [Rust crate](https://crates.io/crates/jamjet-engram), an [MCP server](https://registry.modelcontextprotocol.io/servers/io.github.jamjet-labs/engram-server) (Docker · GHCR), a [Python client](https://pypi.org/project/jamjet), and a [Spring AI `ChatMemoryRepository`](https://central.sonatype.com/artifact/dev.jamjet/engram-spring-boot-starter). Comparison with Mem0/Zep → [java-ai-memory.dev](https://java-ai-memory.dev).
 
-| Package | Install | Use case |
-|---|---|---|
-| `jamjet-engram` | [crates.io](https://crates.io/crates/jamjet-engram) | Embed in Rust apps |
-| `jamjet-engram-server` | [crates.io](https://crates.io/crates/jamjet-engram-server) · [Docker](https://ghcr.io/jamjet-labs/engram-server) · [MCP Registry](https://registry.modelcontextprotocol.io/servers/io.github.jamjet-labs/engram-server) | MCP + REST server |
-| `jamjet` | [PyPI](https://pypi.org/project/jamjet) | Python client |
-| `dev.jamjet:jamjet-sdk` | [Maven Central](https://central.sonatype.com/artifact/dev.jamjet/jamjet-sdk) | Java client |
-| `dev.jamjet:engram-spring-boot-starter` | [Maven Central](https://central.sonatype.com/artifact/dev.jamjet/engram-spring-boot-starter) | Spring AI `ChatMemoryRepository` |
-
-```bash
-docker run --rm -i -v engram-data:/data ghcr.io/jamjet-labs/engram-server:0.5.0
-```
-
-Full docs → [`runtime/engram-server/README.md`](runtime/engram-server/README.md) · Comparison with Mem0, Zep, others → [java-ai-memory.dev](https://java-ai-memory.dev)
-
-## Java Runtime
-
-The [JamJet Java Runtime](https://github.com/jamjet-labs/jamjet-runtime-java) embeds durable execution directly in your JVM. No Docker, no sidecar, no REST overhead — and **8.9× faster** than calling out to one.
-
-```java
-@DurableAgent
-@Service
-public class MyAgent {
-    @Checkpoint("search")
-    public String search(String topic) {
-        return chatClient.prompt("Research: " + topic).call().content();
-    }
-}
-// Kill the process. Restart. It resumes from the last checkpoint.
-```
-
-Virtual threads, MCP native, plugin hot-reload. Works with Spring AI, LangChain4j, and Google ADK. → [Read the launch post](https://jamjet.dev/blog/zero-sidecar-durable-agents-java/) · [Quickstart](https://github.com/jamjet-labs/jamjet-runtime-java)
+**[JamJet Java Runtime](https://github.com/jamjet-labs/jamjet-runtime-java)** — embeds durable execution directly in your JVM, no Docker or sidecar, **8.9× faster** than calling out to one. Works with Spring AI, LangChain4j, and Google ADK. → [Launch post](https://jamjet.dev/blog/zero-sidecar-durable-agents-java/).
 
 ## Architecture
 
