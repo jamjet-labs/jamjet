@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import unittest.mock as mock
 
-import pytest
-
 
 def test_redact_email():
     from jamjet.cloud import redaction

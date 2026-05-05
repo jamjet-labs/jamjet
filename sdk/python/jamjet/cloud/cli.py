@@ -13,16 +13,15 @@ import io
 import json
 import os
 import tarfile
-import tempfile
 from pathlib import Path
 from typing import Annotated
 
 import httpx
 import typer
+from rich import box
 from rich.console import Console
 from rich.padding import Padding
 from rich.table import Table
-from rich import box
 
 from .replay import ReplayBundle, load_bundle_from_bytes
 
@@ -126,7 +125,12 @@ def replay(
     # --- Re-run instructions ---
     console.print()
     console.rule("[bold]Re-run instructions[/bold]")
-    stub_line = f"export JAMJET_STUB_MODELS=1\n" if stub_models else ""
+    stub_line = "export JAMJET_STUB_MODELS=1\n" if stub_models else ""
+    llm_msg = (
+        "LLM calls will return recorded responses (stub mode)."
+        if stub_models
+        else "LLM calls will re-issue against real APIs (costs money)."
+    )
     console.print(
         Padding(
             f"[dim]# Set these environment variables, then run your agent as normal:[/dim]\n"
@@ -134,7 +138,7 @@ def replay(
             f"{stub_line}"
             f"[bold]python your_agent.py[/bold]\n\n"
             f"[dim]Tool calls will replay from the recording.\n"
-            f"{'LLM calls will return recorded responses (stub mode).' if stub_models else 'LLM calls will re-issue against real APIs (costs money).'}"
+            f"{llm_msg}"
             f"[/dim]",
             pad=(0, 0, 0, 2),
         )

@@ -70,7 +70,8 @@ class EventQueue:
 
     def _send(self, batch: list[dict[str, Any]]) -> None:
         """POST a batch of events to the ingest endpoint."""
-        from .redaction import _config as _r_cfg, _redact_dict
+        from .redaction import _config as _r_cfg
+        from .redaction import _redact_dict
 
         if _r_cfg.get("enabled"):
             batch = [_scrub_event(event, _redact_dict) for event in batch]

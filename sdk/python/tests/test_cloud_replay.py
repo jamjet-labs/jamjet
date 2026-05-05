@@ -12,7 +12,6 @@ from typing import Any
 import pytest
 
 from jamjet.cloud.replay import (
-    ReplayBundle,
     activate,
     deactivate,
     get_active,
@@ -21,7 +20,6 @@ from jamjet.cloud.replay import (
     load_bundle_from_bytes,
 )
 from jamjet.tools.decorators import tool
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -187,7 +185,6 @@ def test_activate_deactivate_lifecycle() -> None:
 
 def test_auto_activate_from_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     events = [{"kind": "tool_call", "payload": {"tool": "ping", "tool_input": {}, "tool_output": "pong"}}]
-    bundle_bytes = _make_bundle_bytes(events=events)
     # Write extracted dir
     (tmp_path / "manifest.json").write_text(
         json.dumps({"trace_id": "tr_env", "schema_version": "replay-1.0", "event_count": 1})
@@ -270,8 +267,8 @@ async def test_tool_decorator_calls_real_fn_when_no_bundle() -> None:
 
 
 def test_local_capture_writes_jsonl_when_enabled(tmp_path: Path) -> None:
-    from jamjet.cloud.events import emit, set_capture_path
     from jamjet.cloud.config import set_config
+    from jamjet.cloud.events import emit, set_capture_path
 
     capture_file = tmp_path / "replay.jsonl"
     set_capture_path(str(capture_file))
@@ -289,8 +286,8 @@ def test_local_capture_writes_jsonl_when_enabled(tmp_path: Path) -> None:
 
 
 def test_local_capture_no_op_when_disabled(tmp_path: Path) -> None:
-    from jamjet.cloud.events import emit, set_capture_path
     from jamjet.cloud.config import set_config
+    from jamjet.cloud.events import emit, set_capture_path
 
     capture_file = tmp_path / "replay.jsonl"
     set_capture_path(str(capture_file))

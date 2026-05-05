@@ -24,7 +24,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # Bundle data model
 # ---------------------------------------------------------------------------
@@ -146,9 +145,9 @@ def load_bundle_from_bytes(data: bytes) -> ReplayBundle:
 def _load_from_dir(directory: Path) -> ReplayBundle:
     manifest = json.loads((directory / "manifest.json").read_text())
     events_raw = (directory / "events.jsonl").read_text()
-    events = [json.loads(l) for l in events_raw.splitlines() if l]
+    events = [json.loads(line) for line in events_raw.splitlines() if line]
     audit_raw = (directory / "audit.jsonl").read_text()
-    audit = [json.loads(l) for l in audit_raw.splitlines() if l]
+    audit = [json.loads(line) for line in audit_raw.splitlines() if line]
     agents = json.loads((directory / "agents.json").read_text())
     return ReplayBundle(manifest=manifest, events=events, audit=audit, agents=agents)
 

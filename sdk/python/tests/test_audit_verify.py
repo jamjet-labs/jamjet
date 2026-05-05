@@ -9,8 +9,8 @@ import json
 import pytest
 
 cryptography = pytest.importorskip("cryptography")
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
 
 def _sign_fixture(bundle: bytes) -> tuple[bytes, bytes]:
@@ -113,7 +113,6 @@ def test_verify_from_files_handles_invalid_base64_signature(tmp_path, monkeypatc
     metadata_path.write_text('{"signature_b64":"!!!not-valid!!!","signing_key_id":"y"}')
 
     # Stub the well-known fetch so we get past the network step.
-    import httpx
 
     def fake_get(url, params=None, timeout=None):
         class R:
@@ -189,10 +188,10 @@ def _patch_well_known(monkeypatch, pk_bytes):
         class R:
             status_code = 200
 
-            def raise_for_status(self_):
+            def raise_for_status(self):
                 pass
 
-            def json(self_):
+            def json(self):
                 return [{"key_id": "k1", "public_key_b64": base64.b64encode(pk_bytes).decode()}]
 
         return R()
