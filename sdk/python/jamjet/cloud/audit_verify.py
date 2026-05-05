@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -142,12 +143,13 @@ def verify_from_files(
         return result
 
     expected_digest = digest_hex
-    for path, kind, fn in (
+    checks: list[tuple[Path | None, str, Callable[[Path], str | None]]] = [
         (pdf_path, "pdf", lambda p: cross_check_pdf(p, expected_digest)),
         (otlp_path, "otlp", lambda p: cross_check_otlp(p, expected_digest)),
         (siem_splunk_path, "siem_splunk", lambda p: cross_check_siem_jsonl(p, expected_digest, splunk=True)),
         (siem_datadog_path, "siem_datadog", lambda p: cross_check_siem_jsonl(p, expected_digest, splunk=False)),
-    ):
+    ]
+    for path, kind, fn in checks:
         if path is not None:
             err = fn(path)
             if err is not None:
