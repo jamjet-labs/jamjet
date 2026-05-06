@@ -107,7 +107,7 @@ jamjet.cloud.policy("require_approval", "database.*")
 | Human approval is custom glue | Approval is a durable workflow step |
 | Costs are discovered after the bill | Budgets enforced per agent / per run |
 | Audit evidence is stitched from logs | Append-only event log, signed export |
-| Memory is framework-specific | Engram works via MCP, REST, Python, Java |
+| Memory is framework-specific | Pair with [Engram](#sub-products) for portable memory (MCP · REST · Python · Java) |
 | Frameworks stay siloed | MCP + A2A connect tools and agents |
 
 ## Works with your stack — not a replacement
@@ -137,7 +137,7 @@ Community-built integrations for **LangChain, LlamaIndex, CrewAI, AutoGen, Pydan
 
 ## Sub-products
 
-**[Engram](runtime/engram-server/README.md)** — JamJet's durable memory layer for agents (temporal knowledge graph, hybrid retrieval, conflict detection). Available as a [Rust crate](https://crates.io/crates/jamjet-engram), an [MCP server](https://registry.modelcontextprotocol.io/servers/io.github.jamjet-labs/engram-server) (Docker · GHCR), a [standalone Python library](https://pypi.org/project/jamjet-engram) ([github.com/jamjet-labs/engram](https://github.com/jamjet-labs/engram), 71% on LongMemEval-S), a [Python client](https://pypi.org/project/jamjet) for the MCP server, and a [Spring AI `ChatMemoryRepository`](https://central.sonatype.com/artifact/dev.jamjet/engram-spring-boot-starter). Comparison with Mem0/Zep → [java-ai-memory.dev](https://java-ai-memory.dev).
+**[Engram](runtime/engram-server/README.md)** — the JamJet ecosystem's memory layer for agents. Where JamJet provides durable *execution* (process can crash and resume), Engram provides durable *memory* (facts persist across runs and version cleanly via `supersede()`). Temporal knowledge graph, hybrid retrieval, conflict detection. Ships as a [Rust crate](https://crates.io/crates/jamjet-engram) (also bundled into the Rust runtime above), an [MCP server](https://registry.modelcontextprotocol.io/servers/io.github.jamjet-labs/engram-server) (Docker · GHCR), a [standalone Python library](https://pypi.org/project/jamjet-engram) ([github.com/jamjet-labs/engram](https://github.com/jamjet-labs/engram), 71% on LongMemEval-S), a [Python client](https://pypi.org/project/jamjet) for the MCP server, and a [Spring AI `ChatMemoryRepository`](https://central.sonatype.com/artifact/dev.jamjet/engram-spring-boot-starter). Comparison with Mem0/Zep → [java-ai-memory.dev](https://java-ai-memory.dev).
 
 **[JamJet Java Runtime](https://github.com/jamjet-labs/jamjet-runtime-java)** — embeds durable execution directly in your JVM, no Docker or sidecar, **8.9× faster** than calling out to one. Works with Spring AI, LangChain4j, and Google ADK. → [Launch post](https://jamjet.dev/blog/zero-sidecar-durable-agents-java/).
 
@@ -169,6 +169,8 @@ Community-built integrations for **LangChain, LlamaIndex, CrewAI, AutoGen, Pydan
 │           Postgres (production)  |  SQLite (local)        │
 └──────────────────────────────────────────────────────────┘
 ```
+
+*"Engram Memory" here is the in-process distribution bundled with the Rust runtime. Engram also ships standalone — see [Sub-products](#sub-products).*
 
 </details>
 
