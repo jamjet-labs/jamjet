@@ -8,7 +8,7 @@ Monorepo for JamJet's TypeScript SDK packages.
 | `@jamjet/cloud-vercel` | Planned (Plan 3) |
 | `@jamjet/cli` | Planned (Plan 4) |
 
-See `docs/superpowers/specs/2026-05-07-typescript-sdk-design.md` for design.
+Internal design specs live in `docs/superpowers/` (not committed). Public docs are at [jamjet.dev](https://jamjet.dev).
 
 ## Dev setup
 
