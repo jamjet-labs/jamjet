@@ -54,8 +54,7 @@
     "node": ">=20.0.0"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "keywords": ["jamjet", "ai", "agents", "governance", "observability", "openai", "anthropic"],
   "homepage": "https://jamjet.dev",
