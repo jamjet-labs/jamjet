@@ -1,0 +1,20 @@
+{
+  "type": "span",
+  "trace_id": "fixture-trace-1",
+  "span_id": "fixture-span-1",
+  "kind": "llm_call",
+  "name": "openai.gpt-4o",
+  "sequence": 0,
+  "timestamp": "2026-05-07T12:00:00.000Z",
+  "status": "ok",
+  "duration_ms": 250,
+  "model": "gpt-4o",
+  "input_tokens": 120,
+  "output_tokens": 35,
+  "cost_usd": 0.000656,
+  "agent_name": "research-bot",
+  "environment": "production",
+  "payload": {
+    "tags": ["test", "wire-fixture"]
+  }
+}
