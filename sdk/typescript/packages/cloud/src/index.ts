@@ -1,1 +1,11 @@
 export const VERSION = '0.1.0-alpha.0'
+
+export { init } from './init.js'
+export { wrap } from './wrap.js'
+export { Span } from './span.js'
+export type { SpanEventDict, SpanInit } from './span.js'
+export type { InitOptions, ResolvedConfig } from './config.js'
+export { ConfigError } from './config.js'
+export { redact, redactDict, DEFAULT_PII_TYPES } from './redaction.js'
+export type { PiiType, RedactOptions } from './redaction.js'
+export { TransportError } from './transport.js'
