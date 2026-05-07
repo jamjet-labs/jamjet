@@ -1,5 +1,5 @@
 """JamJet agent IR — Pydantic spec models that runtimes consume."""
-from jamjet.spec.agent import AgentSpec, AgentStrategy
+from jamjet.spec.agent import AgentSpec, AgentStrategy, DurableAgentSpec, MethodSpec
 from jamjet.spec.durability import DurabilityConfig
 from jamjet.spec.llm import LLMConfig
 from jamjet.spec.memory import MemoryConfig
@@ -10,8 +10,10 @@ __all__ = [
     "AgentSpec",
     "AgentStrategy",
     "DurabilityConfig",
+    "DurableAgentSpec",
     "IR_VERSION",
     "LLMConfig",
     "MemoryConfig",
+    "MethodSpec",
     "ToolSpec",
 ]
