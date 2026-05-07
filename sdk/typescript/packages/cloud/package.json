@@ -1,0 +1,67 @@
+{
+  "name": "@jamjet/cloud",
+  "version": "0.1.0-alpha.0",
+  "description": "JamJet Cloud SDK — drop-in governance for TypeScript AI apps",
+  "license": "Apache-2.0",
+  "type": "module",
+  "files": ["dist", "README.md"],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "size": "size-limit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "msw": "^2.4.0",
+    "size-limit": "^11.1.0",
+    "@size-limit/preset-small-lib": "^11.1.0",
+    "tsup": "^8.2.0",
+    "typescript": "^5.4.5",
+    "vitest": "^2.0.0"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sdk": ">=0.27.0",
+    "openai": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "openai": { "optional": true },
+    "@anthropic-ai/sdk": { "optional": true }
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "keywords": ["jamjet", "ai", "agents", "governance", "observability", "openai", "anthropic"],
+  "homepage": "https://jamjet.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jamjet-labs/jamjet.git",
+    "directory": "sdk/typescript/packages/cloud"
+  }
+}

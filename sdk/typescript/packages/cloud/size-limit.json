@@ -1,0 +1,12 @@
+[
+  {
+    "name": "@jamjet/cloud (universal core)",
+    "path": "dist/index.js",
+    "limit": "15 KB"
+  },
+  {
+    "name": "@jamjet/cloud/node (with auto-patcher)",
+    "path": "dist/node.js",
+    "limit": "20 KB"
+  }
+]
