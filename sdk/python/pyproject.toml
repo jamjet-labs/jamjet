@@ -39,6 +39,7 @@ dependencies = [
     "anyio>=4.0",
     "pyyaml>=6.0",
     "cryptography>=42",
+    "aiosqlite>=0.20",
 ]
 
 [project.urls]
