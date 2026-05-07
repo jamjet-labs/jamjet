@@ -35,6 +35,7 @@ from jamjet.durable import (
     reset_execution_context,
     set_execution_context,
 )
+from jamjet.entry import deploy, resume, run
 from jamjet.eval.registry import scorer
 from jamjet.protocols.adapter import ProtocolAdapter
 from jamjet.protocols.registry import ProtocolRegistry
@@ -48,9 +49,12 @@ __all__ = [
     "ProtocolAdapter",
     "ProtocolRegistry",
     "Workflow",
+    "deploy",
     "durable",
     "durable_run",
     "reset_execution_context",
+    "resume",
+    "run",
     "scorer",
     "set_execution_context",
     "task",
