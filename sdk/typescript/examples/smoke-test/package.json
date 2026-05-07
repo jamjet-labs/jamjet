@@ -1,0 +1,16 @@
+{
+  "name": "smoke-test",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --import tsx index.ts"
+  },
+  "dependencies": {
+    "@jamjet/cloud": "workspace:*",
+    "openai": "^5.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.16.0"
+  }
+}
