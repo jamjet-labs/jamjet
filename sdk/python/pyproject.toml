@@ -58,6 +58,7 @@ dev = [
     "types-PyYAML>=6.0",
     "openai>=1.0",
     "scipy>=1.11",
+    "hypothesis>=6.0",
 ]
 # Optional extras for the `jamjet.cloud` governance submodule (introduced in 0.6.0).
 # `pip install jamjet[openai]` enables auto-instrumentation of OpenAI calls;
