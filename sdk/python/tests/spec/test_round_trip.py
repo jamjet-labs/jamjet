@@ -7,9 +7,12 @@ from jamjet.spec import (
     AgentStrategy,
     DurabilityConfig,
     DurableAgentSpec,
+    EdgeSpec,
     LLMConfig,
     MemoryConfig,
     MethodSpec,
+    NodeSpec,
+    WorkflowSpec,
 )
 
 providers = st.sampled_from(["openai", "anthropic", "google", "ollama", "openai_compatible"])
@@ -51,3 +54,14 @@ def test_durable_agent_round_trip(llm, name):
         methods=[MethodSpec(name="run", is_entrypoint=True)],
     )
     assert DurableAgentSpec.model_validate_json(a.model_dump_json()) == a
+
+
+@given(st.text(min_size=1, max_size=20))
+def test_workflow_round_trip(name):
+    w = WorkflowSpec(
+        name=name,
+        nodes=[NodeSpec(id="a", handler_ref="m:f"), NodeSpec(id="b", handler_ref="m:g")],
+        edges=[EdgeSpec(from_node="a", to_node="b")],
+        entry_node="a",
+    )
+    assert WorkflowSpec.model_validate_json(w.model_dump_json()) == w
