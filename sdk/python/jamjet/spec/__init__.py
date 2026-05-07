@@ -1,5 +1,6 @@
 """JamJet agent IR — Pydantic spec models that runtimes consume."""
 from jamjet.spec.llm import LLMConfig
+from jamjet.spec.tool import ToolSpec
 from jamjet.spec.version import IR_VERSION
 
-__all__ = ["IR_VERSION", "LLMConfig"]
+__all__ = ["IR_VERSION", "LLMConfig", "ToolSpec"]
