@@ -1,0 +1,51 @@
+name: TypeScript SDK Release
+
+on:
+  push:
+    tags:
+      - 'ts-sdk-v*'
+
+jobs:
+  publish:
+    name: Publish @jamjet/cloud
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: sdk/typescript/pnpm-lock.yaml
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test
+
+      - name: Size check
+        run: pnpm size
+
+      - name: Publish to npm with provenance
+        working-directory: sdk/typescript/packages/cloud
+        run: pnpm publish --access=public --no-git-checks --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
