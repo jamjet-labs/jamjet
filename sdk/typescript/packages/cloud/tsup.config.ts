@@ -14,5 +14,5 @@ export default defineConfig({
   target: 'es2022',
   platform: 'neutral',
   treeshake: true,
-  external: ['msw', 'msw/node'],
+  external: ['msw', 'msw/node', 'node:async_hooks', 'async_hooks'],
 })
