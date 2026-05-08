@@ -29,6 +29,7 @@ Quick start:
 from jamjet.agents.agent import Agent, AgentResult
 from jamjet.agents.task import task
 from jamjet.client import JamjetClient
+from jamjet.decorators import DurableAgent, workflow  # noqa: F401
 from jamjet.durable import (
     durable,
     durable_run,
@@ -37,18 +38,48 @@ from jamjet.durable import (
 )
 from jamjet.entry import deploy, resume, run
 from jamjet.eval.registry import scorer
+from jamjet.memory import AgentMemory, Scope  # noqa: F401
 from jamjet.protocols.adapter import ProtocolAdapter
 from jamjet.protocols.registry import ProtocolRegistry
+from jamjet.runtime import Runtime, RuntimeEvent, RuntimeResult  # noqa: F401
+from jamjet.runtime.local import LocalRuntime  # noqa: F401
+
+# Phase 1+2 additions
+from jamjet.spec import (  # noqa: F401
+    IR_VERSION,
+    AgentSpec,
+    DurabilityConfig,
+    DurableAgentSpec,
+    LLMConfig,
+    MemoryConfig,
+    ToolSpec,
+    WorkflowSpec,
+)
 from jamjet.tools.decorators import tool
 from jamjet.workflow.workflow import Workflow
 
 __all__ = [
     "Agent",
     "AgentResult",
+    "AgentMemory",
+    "AgentSpec",
+    "DurabilityConfig",
+    "DurableAgent",
+    "DurableAgentSpec",
+    "IR_VERSION",
     "JamjetClient",
+    "LLMConfig",
+    "LocalRuntime",
+    "MemoryConfig",
     "ProtocolAdapter",
     "ProtocolRegistry",
+    "Runtime",
+    "RuntimeEvent",
+    "RuntimeResult",
+    "Scope",
+    "ToolSpec",
     "Workflow",
+    "WorkflowSpec",
     "deploy",
     "durable",
     "durable_run",
@@ -59,5 +90,6 @@ __all__ = [
     "set_execution_context",
     "task",
     "tool",
+    "workflow",
 ]
 __version__ = "0.7.0"
