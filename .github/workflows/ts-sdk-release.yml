@@ -29,6 +29,9 @@ jobs:
           cache-dependency-path: sdk/typescript/pnpm-lock.yaml
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Upgrade npm to a trusted-publisher-capable version
+        run: npm install -g npm@latest
+
       - name: Install
         run: pnpm install --frozen-lockfile
 
@@ -44,8 +47,6 @@ jobs:
       - name: Size check
         run: pnpm size
 
-      - name: Publish to npm with provenance
+      - name: Publish to npm with provenance (trusted publisher OIDC)
         working-directory: sdk/typescript/packages/cloud
-        run: pnpm publish --access=public --no-git-checks --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access=public --provenance
