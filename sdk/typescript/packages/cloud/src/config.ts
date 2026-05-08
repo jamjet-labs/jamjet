@@ -26,7 +26,7 @@ export const InitOptionsSchema = z.object({
 })
 
 export type InitOptions = z.input<typeof InitOptionsSchema>
-export type ResolvedConfig = z.output<typeof InitOptionsSchema> & { apiKey: string; apiUrl: string; maxCostUsd?: number }
+export type ResolvedConfig = z.output<typeof InitOptionsSchema> & { apiKey: string; apiUrl: string; maxCostUsd?: number | undefined }
 
 export class ConfigError extends Error {
   constructor(message: string) {

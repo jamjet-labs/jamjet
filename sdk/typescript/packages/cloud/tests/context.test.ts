@@ -43,8 +43,8 @@ describe('GovernanceContext (ALS)', () => {
         observed = ctx.getCurrentContext()
       })
     })
-    expect(observed?.agent?.name).toBe('b')
-    expect(observed?.user?.userId).toBe('u1')
+    expect((observed as ScopeFrame | null)?.agent?.name).toBe('b')
+    expect((observed as ScopeFrame | null)?.user?.userId).toBe('u1')
   })
 })
 

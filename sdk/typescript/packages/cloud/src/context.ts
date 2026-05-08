@@ -72,9 +72,11 @@ export class GovernanceContext {
 
   private merge(parent: ScopeFrame | null, child: ScopeFrame): ScopeFrame {
     if (!parent) return child
+    const agent = child.agent ?? parent.agent
+    const user = child.user ?? parent.user
     return {
-      agent: child.agent ?? parent.agent,
-      user: child.user ?? parent.user,
+      ...(agent !== undefined ? { agent } : {}),
+      ...(user !== undefined ? { user } : {}),
     }
   }
 }

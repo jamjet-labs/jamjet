@@ -45,9 +45,9 @@ describe('PolicyEvaluator', () => {
     ]
     const { allowed, blocked } = e.filterTools(tools)
     expect(allowed).toHaveLength(1)
-    expect(allowed[0].function.name).toBe('search')
+    expect(allowed[0]!.function.name).toBe('search')
     expect(blocked).toHaveLength(1)
-    expect(blocked[0].function.name).toBe('wire_money')
+    expect(blocked[0]!.function.name).toBe('wire_money')
   })
 
   it('filterTools handles tools without function.name gracefully', () => {
