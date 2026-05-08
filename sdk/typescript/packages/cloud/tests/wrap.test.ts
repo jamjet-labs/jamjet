@@ -1,7 +1,10 @@
-import { afterEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, test, vi } from 'vitest'
 import { wrap } from '../src/wrap.js'
-import { Client, resetActive, setActive } from '../src/client.js'
+import { Client, getActive, resetActive, setActive } from '../src/client.js'
 import type { ResolvedConfig } from '../src/config.js'
+import { resolveConfig } from '../src/config.js'
+import { JamjetBudgetExceeded } from '../src/errors.js'
+import { agent } from '../src/governance.js'
 import type { SpanEventDict } from '../src/span.js'
 import type { Transport } from '../src/transport.js'
 
@@ -119,5 +122,56 @@ describe('wrap(anthropic)', () => {
     expect(span.output_tokens).toBe(100)
     expect(span.cost_usd).toBeCloseTo(50 * 3e-6 + 100 * 15e-6, 8)
     await resetActive()
+  })
+})
+
+describe('wrap Plan 2 enforcement', () => {
+  beforeEach(async () => {
+    await resetActive()
+    setActive(new Client(resolveConfig({ apiKey: 'jj_t', project: 'p', maxCostUsd: 100 })))
+  })
+  afterEach(async () => {
+    await resetActive()
+  })
+
+  it('strips blocked tools before calling original (openai shape)', async () => {
+    getActive()!._policy.add('block', 'wire_*')
+    let received: any
+    const fakeOpenai = {
+      chat: { completions: { create: async (args: any) => {
+        received = args
+        return { usage: { prompt_tokens: 1, completion_tokens: 1 }, model: 'gpt-4o', choices: [{ message: {} }] }
+      } } },
+    }
+    wrap(fakeOpenai)
+    await fakeOpenai.chat.completions.create({
+      model: 'gpt-4o', messages: [],
+      tools: [{ type: 'function', function: { name: 'search' } }, { type: 'function', function: { name: 'wire_money' } }],
+    })
+    expect(received.tools).toHaveLength(1)
+  })
+
+  it('opts.agent overrides context agent', async () => {
+    let recorded: any
+    const c = getActive()!
+    const orig = c.recordSpan.bind(c)
+    c.recordSpan = (e) => { recorded = e; return orig(e) }
+    const fakeOpenai = {
+      chat: { completions: { create: async (..._args: any[]) => ({ usage: { prompt_tokens: 1, completion_tokens: 1 }, model: 'gpt-4o', choices: [{ message: {} }] }) } },
+    }
+    wrap(fakeOpenai, { agent: agent('explicit_agent') })
+    await fakeOpenai.chat.completions.create({ model: 'gpt-4o', messages: [] })
+    expect(recorded.agent_name).toBe('explicit_agent')
+  })
+
+  it('throws JamjetBudgetExceeded on pre-call', async () => {
+    getActive()!._budget.setLimit(0.0001)
+    getActive()!._budget.record(0.0001)
+    const fakeOpenai = {
+      chat: { completions: { create: async (..._args: any[]) => ({ usage: { prompt_tokens: 1, completion_tokens: 1 }, model: 'gpt-4o', choices: [{ message: {} }] }) } },
+    }
+    wrap(fakeOpenai)
+    await expect(fakeOpenai.chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: 'x'.repeat(1_000) }] }))
+      .rejects.toBeInstanceOf(JamjetBudgetExceeded)
   })
 })
