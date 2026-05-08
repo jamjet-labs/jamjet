@@ -1,6 +1,7 @@
 import { type Client, getActive } from './client.js'
 import type { AgentRef, ScopeFrame, UserContext } from './context.js'
 import type { PolicyAction } from './policy.js'
+import { pollUntilResolved } from './approvals.js'
 
 const NOT_INIT = 'JamJet Cloud not initialized. Call init() first.'
 
@@ -64,5 +65,28 @@ export function setProcessContext(opts: {
   Object.assign(client.config, {
     ...(opts.environment !== undefined ? { environment: opts.environment } : {}),
     ...(opts.releaseVersion !== undefined ? { releaseVersion: opts.releaseVersion } : {}),
+  })
+}
+
+export interface RequireApprovalOptions {
+  context?: Record<string, unknown>
+  timeoutMs?: number
+  signal?: AbortSignal
+  pollIntervalMs?: number
+}
+
+export async function requireApproval(
+  action: string,
+  opts: RequireApprovalOptions = {},
+): Promise<string> {
+  const client = activeOrThrow()
+  return pollUntilResolved({
+    apiKey: client.config.apiKey,
+    apiUrl: client.config.apiUrl,
+    action,
+    ...(opts.context !== undefined ? { context: opts.context } : {}),
+    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    ...(opts.pollIntervalMs !== undefined ? { pollIntervalMs: opts.pollIntervalMs } : {}),
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
   })
 }

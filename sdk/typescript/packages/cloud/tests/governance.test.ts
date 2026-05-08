@@ -1,9 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { setupServer } from 'msw/node'
+import { http, HttpResponse } from 'msw'
 import { getActive, resetActive } from '../src/client.js'
 import {
   agent,
   budget,
   policy,
+  requireApproval,
   setProcessContext,
   setUserContext,
   withAgent,
@@ -96,5 +99,33 @@ describe('after init', () => {
     setProcessContext({ environment: 'staging', releaseVersion: '2.0.0' })
     expect(getActive()!.config.environment).toBe('staging')
     expect((getActive()!.config as any).releaseVersion).toBe('2.0.0')
+  })
+})
+
+const apprServer = setupServer()
+beforeAll(() => apprServer.listen({ onUnhandledRequest: 'error' }))
+afterAll(() => apprServer.close())
+afterEach(() => apprServer.resetHandlers())
+
+describe('requireApproval', () => {
+  beforeEach(async () => {
+    await resetActive()
+    await init({ apiKey: 'jj_test', project: 'p', apiUrl: 'https://api.jamjet.test' })
+  })
+
+  it('throws before init', async () => {
+    await resetActive()
+    await expect(requireApproval('x')).rejects.toThrow(/not initialized/)
+  })
+
+  it('returns approval id on approved', async () => {
+    apprServer.use(
+      http.post('https://api.jamjet.test/v1/approvals', () => HttpResponse.json({ id: 'apr_x' })),
+      http.get('https://api.jamjet.test/v1/approvals/apr_x', () =>
+        HttpResponse.json({ status: 'approved' }),
+      ),
+    )
+    const id = await requireApproval('x', { pollIntervalMs: 10, timeoutMs: 1000 })
+    expect(id).toBe('apr_x')
   })
 })
