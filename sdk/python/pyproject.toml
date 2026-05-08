@@ -13,7 +13,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jamjet"
-version = "0.7.0"
+version = "0.8.0"
 description = "JamJet Python SDK — agent-native workflow authoring, CLI, and JamJet Cloud governance (jamjet.cloud submodule)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
