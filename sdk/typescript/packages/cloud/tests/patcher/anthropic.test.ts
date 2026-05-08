@@ -1,6 +1,8 @@
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { patchAnthropic, unpatchAnthropic } from '../../src/patcher/anthropic.js'
 import { Client, getActive, resetActive, setActive } from '../../src/client.js'
+import { resolveConfig } from '../../src/config.js'
+import { JamjetPolicyBlocked } from '../../src/errors.js'
 import type { ResolvedConfig } from '../../src/config.js'
 import type { SpanEventDict } from '../../src/span.js'
 import type { Transport } from '../../src/transport.js'
@@ -56,5 +58,37 @@ describe('patchAnthropic', () => {
     patchAnthropic(fakeModule as any)
     expect(FakeMessages.prototype.create).toBe(afterFirst)
     expect(afterFirst).not.toBe(original)
+  })
+})
+
+describe('patchAnthropic Plan 2 enforcement', () => {
+  beforeEach(async () => {
+    await resetActive()
+    setActive(new Client(resolveConfig({ apiKey: 'jj_t', project: 'p', maxCostUsd: 100 })))
+  })
+  afterEach(async () => {
+    unpatchAnthropic()
+    await resetActive()
+  })
+
+  test('blocks tool_use in post-decision check', async () => {
+    getActive()!._policy.add('block', 'wire_*')
+    const fakeModule = {
+      resources: {
+        messages: {
+          Messages: class {
+            async create() {
+              return {
+                usage: { input_tokens: 1, output_tokens: 1 },
+                content: [{ type: 'tool_use', id: 'tu_1', name: 'wire_money', input: {} }],
+              }
+            }
+          },
+        },
+      },
+    }
+    patchAnthropic(fakeModule as any)
+    const inst = new (fakeModule as any).resources.messages.Messages()
+    await expect(inst.create({ model: 'claude-3', messages: [] })).rejects.toBeInstanceOf(JamjetPolicyBlocked)
   })
 })
