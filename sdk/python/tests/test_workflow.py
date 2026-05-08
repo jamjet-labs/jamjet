@@ -50,14 +50,14 @@ def test_workflow_compile_basic():
     async def step_b(state: State) -> State:
         return state
 
-    ir = wf.compile()
-    assert ir["workflow_id"] == "test_wf"
-    assert ir["version"] == "0.1.0"
-    assert "step_a" in ir["nodes"]
-    assert "step_b" in ir["nodes"]
-    assert ir["start_node"] == "step_a"
+    spec = wf.compile()
+    assert spec.name == "test_wf"
+    node_ids = {n.id for n in spec.nodes}
+    assert "step_a" in node_ids
+    assert "step_b" in node_ids
+    assert spec.entry_node == "step_a"
     # step_a → step_b edge
-    edges = {(e["from"], e["to"]) for e in ir["edges"]}
+    edges = {(e.from_node, e.to_node) for e in spec.edges}
     assert ("step_a", "step_b") in edges
 
 

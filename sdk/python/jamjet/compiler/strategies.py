@@ -31,7 +31,10 @@ user-defined nodes.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from jamjet.spec import AgentSpec
 
 
 @dataclasses.dataclass
@@ -889,3 +892,29 @@ def _compile_debate(
         "edges": edges,
         "start_node": "__propose__",
     }
+
+
+def compile_strategy_to_spec(
+    strategy_name: str,
+    strategy_config: dict[str, Any],
+    tools: list[str],
+    model: str,
+    limits: StrategyLimits,
+    goal: str,
+    agent_id: str,
+) -> AgentSpec:
+    """Compile a strategy to an AgentSpec (Pydantic). Sibling to compile_strategy.
+
+    Use this for the new @DurableAgent / Agent IR path. The dict-returning
+    compile_strategy is preserved for legacy callers.
+    """
+    from jamjet.spec import AgentSpec, AgentStrategy, LLMConfig
+
+    return AgentSpec(
+        name=agent_id,
+        instructions=goal,
+        llm=LLMConfig(provider="openai", model=model),
+        tools=[],
+        strategy=AgentStrategy(name=strategy_name, config=strategy_config),  # type: ignore[arg-type]
+        limits=limits.to_dict(),
+    )

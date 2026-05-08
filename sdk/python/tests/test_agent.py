@@ -51,11 +51,14 @@ class TestAgent:
             Agent("bad", model="gpt-5.2", tools=[plain_fn])
 
     def test_compile_produces_ir(self):
+        from jamjet.spec import AgentSpec
+
         agent = Agent("compile_test", model="gpt-5.2", tools=[search])
-        ir = agent.compile()
-        assert "nodes" in ir
-        assert "edges" in ir
-        assert "start_node" in ir
+        spec = agent.compile()
+        assert isinstance(spec, AgentSpec)
+        assert spec.name == "compile_test"
+        assert spec.llm.model == "gpt-5.2"
+        assert len(spec.tools) == 1
 
     def test_run_returns_result(self):
         agent = Agent(

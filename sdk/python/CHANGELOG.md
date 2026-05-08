@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.8.0 — 2026-05-08
+
+### Added
+- New `jamjet.spec` package: Pydantic IR models (`AgentSpec`, `DurableAgentSpec`, `WorkflowSpec`, `MemoryConfig`, `LLMConfig`, `ToolSpec`, `DurabilityConfig`, `MethodSpec`, `NodeSpec`, `EdgeSpec`, `AgentStrategy`)
+- New `jamjet.runtime` package: `Runtime` Protocol + `LocalRuntime` (in-process executor with SQLite-backed durability, replay, crash recovery)
+- New `jamjet.decorators` package: `@DurableAgent` (class decorator with bare/parameterized/`stateless=True` forms), `@workflow`, `@task`, `@tool` (re-export)
+- `jamjet.memory.AgentMemory` — Engram v2 bridge for `self.memory` inside `@DurableAgent`. Supports `record` / `record_message` / `recall` / `context` / `synthesize` / `ask` (mode-aware)
+- Top-level `run()`, `resume()`, `deploy()` entry points
+- `RuntimeEvent` callback for streaming step lifecycle to consumers (no exporter yet — Phase 6)
+- Stub runtimes for cloud / java / rust (raise `NotImplementedError` until Phase 5)
+- 5 new examples in `examples/python/`
+
+### Changed
+- `Agent.compile()` returns `AgentSpec` instead of a dict (breaking for code that introspected the dict; call `.model_dump()` if you need a dict)
+- `Workflow.compile()` returns `WorkflowSpec` instead of a dict
+- `Agent.run()` now executes via `LocalRuntime` under the hood. Strategy executors moved to `jamjet.runtime.local.strategies.*`. Public behavior unchanged.
+
+### Notes
+- This release combines roadmap Phase 1 (DSL + IR) and Phase 2 (Local runtime + durability)
+- LLM providers other than OpenAI, MCP wiring, multi-agent coordination, OTel exporters, dispatch backends — all land in Phases 3-7
+- Method-level checkpointing inside `@task` methods is partial — only the entrypoint method is checkpointed. Full intra-method interception lands in a Phase 1+2 follow-up.
+
 ## 0.7.0 — 2026-04-29
 
 ### Added

@@ -258,8 +258,9 @@ class TestAgentRun:
     def test_agent_has_ir(self):
         agent = Agent("ir_test", model="test-model", tools=[search_tool])
         result = agent.run_sync("query")
-        assert "nodes" in result.ir
-        assert "edges" in result.ir
+        assert isinstance(result.ir, dict)
+        assert "name" in result.ir
+        assert "llm" in result.ir
 
 
 # ── @task in-process tests ───────────────────────────────────────────────────
