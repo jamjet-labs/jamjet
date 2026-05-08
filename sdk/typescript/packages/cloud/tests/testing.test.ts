@@ -1,5 +1,7 @@
-import { describe, expect, test, vi } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { createTestHarness } from '../src/testing.js'
+import { requireApproval } from '../src/governance.js'
+import { resetActive, setActive } from '../src/client.js'
 import { wrap } from '../src/wrap.js'
 
 const fakeOpenAI = () => ({
@@ -51,5 +53,38 @@ describe('createTestHarness', () => {
     })
     expect(h1.spans).toHaveLength(1)
     expect(h2.spans).toHaveLength(2)
+  })
+})
+
+describe('createTestHarness Plan 2', () => {
+  afterEach(async () => {
+    await resetActive()
+  })
+
+  test('exposes policy and budget on harness', async () => {
+    const h = await createTestHarness()
+    expect(h.policy).toBeDefined()
+    expect(h.budget).toBeDefined()
+    h.policy.add('block', 'x_*')
+    expect(h.policy.evaluate('x_y').blocked).toBe(true)
+    await h.reset()
+  })
+
+  test('mockApproval queues a deterministic approve outcome', async () => {
+    const h = await createTestHarness()
+    setActive(h.client)
+    h.mockApproval('wire_money', 'approve')
+    const id = await requireApproval('wire_money', { pollIntervalMs: 1, timeoutMs: 1000 })
+    expect(id).toMatch(/^apr_/)
+    await h.reset()
+  })
+
+  test('mockApproval reject propagates reason', async () => {
+    const h = await createTestHarness()
+    setActive(h.client)
+    h.mockApproval('wire_money', 'reject', { reason: 'no way' })
+    await expect(requireApproval('wire_money', { pollIntervalMs: 1, timeoutMs: 1000 }))
+      .rejects.toMatchObject({ name: 'JamjetApprovalRejected', reason: 'no way' })
+    await h.reset()
   })
 })
