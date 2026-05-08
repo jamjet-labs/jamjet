@@ -1,15 +1,10 @@
 import { getActive } from '../client.js'
-import { estimateCost } from '../cost.js'
-import { Span } from '../span.js'
+import { runEnforcedCall } from '../enforcement.js'
 
 type OriginalRef = { proto: { create: (...args: any[]) => any }; original: (...args: any[]) => any }
 let originals: OriginalRef[] = []
 
 const PATCH_MARK = Symbol.for('jamjet.openai.patched')
-
-function newId(): string {
-  return Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
-}
 
 export function patchOpenAI(openaiModule: any): void {
   const targets: any[] = []
@@ -24,39 +19,15 @@ export function patchOpenAI(openaiModule: any): void {
     if (typeof original !== 'function') continue
 
     proto.create = async function patchedCreate(this: unknown, ...args: any[]) {
-      const arg0 = args[0] ?? {}
-      const model = typeof arg0.model === 'string' ? arg0.model : 'unknown'
-      const span = new Span({
-        traceId: newId(),
-        spanId: newId(),
-        kind: 'llm_call',
-        name: `openai.${model}`,
-      })
-      span.model = model
       const client = getActive()
-      try {
-        const result = await original.call(this, ...args)
-        const usage = result?.usage ?? {}
-        const inputTokens = Number(usage.prompt_tokens ?? 0) || 0
-        const outputTokens = Number(usage.completion_tokens ?? 0) || 0
-        const actualModel = typeof result?.model === 'string' ? result.model : model
-        span.model = actualModel
-        span.name = `openai.${actualModel}`
-        span.inputTokens = inputTokens
-        span.outputTokens = outputTokens
-        span.costUsd = estimateCost(actualModel, inputTokens, outputTokens)
-        if (client?.config.agent) span.agentName = client.config.agent
-        if (client?.config.environment) span.environment = client.config.environment
-        span.finish('ok')
-        client?.recordSpan(span.toEventDict())
-        return result
-      } catch (err) {
-        span.finish('error')
-        span.payload = { error: (err as Error).message }
-        if (client?.config.agent) span.agentName = client.config.agent
-        client?.recordSpan(span.toEventDict())
-        throw err
-      }
+      if (!client) return original.call(this, ...args)
+      return runEnforcedCall({
+        client,
+        vendor: 'openai',
+        // Pre-bind `this` so runEnforcedCall's apply(null, ...) contract is satisfied
+        original: (...a: any[]) => original.call(this, ...a),
+        args,
+      })
     }
 
     Object.defineProperty(proto, PATCH_MARK, {
