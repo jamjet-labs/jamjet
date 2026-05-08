@@ -22,10 +22,11 @@ export const InitOptionsSchema = z.object({
   redaction: RedactionSchema.optional().default({}),
   debug: z.boolean().default(false),
   ctx: z.unknown().optional(),
+  maxCostUsd: z.number().positive().optional(),
 })
 
 export type InitOptions = z.input<typeof InitOptionsSchema>
-export type ResolvedConfig = z.output<typeof InitOptionsSchema> & { apiKey: string; apiUrl: string }
+export type ResolvedConfig = z.output<typeof InitOptionsSchema> & { apiKey: string; apiUrl: string; maxCostUsd?: number }
 
 export class ConfigError extends Error {
   constructor(message: string) {
