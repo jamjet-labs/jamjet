@@ -83,8 +83,12 @@ export type TestHarness = {
   /** Sum of cost_usd across all captured spans. */
   readonly totalCostUsd: number
   /**
-   * Run `fn` in an isolated Client context, capturing spans in-memory.
-   * Sets the active client for the duration of `fn`.
+   * Run `fn` in an isolated client (separate from `harness.client`).
+   *
+   * Note: policy and budget rules added via `harness.policy.add(...)` /
+   * `harness.budget.setLimit(...)` apply to `harness.client`, not to the
+   * client created for this run. Add rules manually inside `fn` if you
+   * need them in the isolated context.
    */
   run<T>(fn: () => Promise<T>): Promise<T>
 }

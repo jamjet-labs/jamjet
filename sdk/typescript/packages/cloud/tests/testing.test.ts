@@ -62,7 +62,7 @@ describe('createTestHarness Plan 2', () => {
   })
 
   test('exposes policy and budget on harness', async () => {
-    const h = await createTestHarness()
+    const h = createTestHarness()
     expect(h.policy).toBeDefined()
     expect(h.budget).toBeDefined()
     h.policy.add('block', 'x_*')
@@ -71,7 +71,7 @@ describe('createTestHarness Plan 2', () => {
   })
 
   test('mockApproval queues a deterministic approve outcome', async () => {
-    const h = await createTestHarness()
+    const h = createTestHarness()
     setActive(h.client)
     h.mockApproval('wire_money', 'approve')
     const id = await requireApproval('wire_money', { pollIntervalMs: 1, timeoutMs: 1000 })
@@ -80,7 +80,7 @@ describe('createTestHarness Plan 2', () => {
   })
 
   test('mockApproval reject propagates reason', async () => {
-    const h = await createTestHarness()
+    const h = createTestHarness()
     setActive(h.client)
     h.mockApproval('wire_money', 'reject', { reason: 'no way' })
     await expect(requireApproval('wire_money', { pollIntervalMs: 1, timeoutMs: 1000 }))

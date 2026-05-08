@@ -121,6 +121,10 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
 
     if (!isStreaming) {
       // 4. Post-decision policy: re-check tool_calls returned by the model
+      // NOTE (Plan 2 limitation): require_approval matches do not gate the call
+      // here. Tools matched by require_approval rules pass through to the model
+      // and to user code unchanged. Pre-call approval gating is deferred to a
+      // future release; see docs/superpowers/specs/2026-05-08-ts-sdk-plan2.md §6.
       const toolCalls = getToolCalls(vendor, result)
       for (const tc of toolCalls) {
         const d = client._policy.evaluate(tc.name)
