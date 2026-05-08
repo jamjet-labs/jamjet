@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node --import tsx index.ts"
+    "start": "node --import tsx index.ts",
+    "smoke:plan2": "node --import tsx plan2.ts"
   },
   "dependencies": {
     "@jamjet/cloud": "workspace:*",

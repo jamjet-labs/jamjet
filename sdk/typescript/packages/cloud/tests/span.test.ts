@@ -119,3 +119,42 @@ describe('Span', () => {
     expect(dict).toEqual(wireFixture)
   })
 })
+
+describe('Span Plan 2 governance attrs', () => {
+  it('exposes user identity attrs in toEventDict', () => {
+    const span = new Span({ traceId: 'a'.repeat(16), spanId: 'b'.repeat(16), kind: 'llm_call', name: 'test' })
+    span.userId = 'u_42'
+    span.userEmail = 'a@b.co'
+    span.userAttrs = { plan: 'pro' }
+    span.releaseVersion = '1.0.0'
+    span.finish('ok')
+    const dict = span.toEventDict() as Record<string, unknown>
+    expect(dict.user_id).toBe('u_42')
+    expect(dict.user_email).toBe('a@b.co')
+    expect(dict.user_attrs).toEqual({ plan: 'pro' })
+    expect(dict.release_version).toBe('1.0.0')
+  })
+
+  it('exposes governance enforcement attrs', () => {
+    const span = new Span({ traceId: 'a'.repeat(16), spanId: 'b'.repeat(16), kind: 'llm_call', name: 'test' })
+    span.policyDecisions = [{ tool_name: 'wire_money', policy_kind: 'block', pattern: 'wire_*' }]
+    span.policyBlockedToolCalls = [{ id: 'tc_1', name: 'wire_money' }]
+    span.approvalId = 'apr_123'
+    span.budgetCheck = { estimated: 0.05, allowed: true }
+    span.finish('ok')
+    const dict = span.toEventDict() as Record<string, unknown>
+    expect(dict.policy_decisions).toHaveLength(1)
+    expect(dict.policy_blocked_tool_calls).toHaveLength(1)
+    expect(dict.approval_id).toBe('apr_123')
+    expect(dict.budget_check).toEqual({ estimated: 0.05, allowed: true })
+  })
+
+  it('omits Plan 2 attrs when unset', () => {
+    const span = new Span({ traceId: 'a'.repeat(16), spanId: 'b'.repeat(16), kind: 'llm_call', name: 'test' })
+    span.finish('ok')
+    const dict = span.toEventDict() as Record<string, unknown>
+    expect(dict.user_id).toBeUndefined()
+    expect(dict.policy_decisions).toBeUndefined()
+    expect(dict.approval_id).toBeUndefined()
+  })
+})

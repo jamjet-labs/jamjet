@@ -31,6 +31,13 @@ export type SpanEventDict = {
   release_version?: string
   end_user_id?: string
   end_user_email?: string
+  user_id?: string
+  user_email?: string
+  user_attrs?: Record<string, string | number | boolean>
+  policy_decisions?: Array<{ tool_name: string; policy_kind: string; pattern: string | null }>
+  policy_blocked_tool_calls?: Array<{ id?: string; name: string }>
+  approval_id?: string
+  budget_check?: { estimated: number; allowed: boolean }
 }
 
 export class Span {
@@ -58,6 +65,13 @@ export class Span {
   releaseVersion: string | null = null
   endUserId: string | null = null
   endUserEmail: string | null = null
+  userId?: string
+  userEmail?: string
+  userAttrs?: Record<string, string | number | boolean>
+  policyDecisions?: Array<{ tool_name: string; policy_kind: string; pattern: string | null }>
+  policyBlockedToolCalls?: Array<{ id?: string; name: string }>
+  approvalId?: string
+  budgetCheck?: { estimated: number; allowed: boolean }
   tags: string[] = []
   private startTime: number = performance.now()
 
@@ -101,6 +115,13 @@ export class Span {
     if (this.releaseVersion !== null) d.release_version = this.releaseVersion
     if (this.endUserId !== null) d.end_user_id = this.endUserId
     if (this.endUserEmail !== null) d.end_user_email = this.endUserEmail
+    if (this.userId !== undefined) d.user_id = this.userId
+    if (this.userEmail !== undefined) d.user_email = this.userEmail
+    if (this.userAttrs !== undefined) d.user_attrs = this.userAttrs
+    if (this.policyDecisions !== undefined) d.policy_decisions = this.policyDecisions
+    if (this.policyBlockedToolCalls !== undefined) d.policy_blocked_tool_calls = this.policyBlockedToolCalls
+    if (this.approvalId !== undefined) d.approval_id = this.approvalId
+    if (this.budgetCheck !== undefined) d.budget_check = this.budgetCheck
     if (this.tags.length > 0) {
       d.payload = { ...(d.payload ?? {}), tags: [...this.tags] }
     }

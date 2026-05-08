@@ -2,7 +2,7 @@
   {
     "name": "@jamjet/cloud (universal core)",
     "path": "dist/index.js",
-    "limit": "17 KB"
+    "limit": "19 KB"
   },
   {
     "name": "@jamjet/cloud/node (with auto-patcher)",

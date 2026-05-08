@@ -19,6 +19,7 @@ async function readinessCheck(
     const url = `${apiUrl.replace(/\/$/, '')}/v1/projects/${encodeURIComponent(project)}/readiness`
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(3000),
     })
     if (!res.ok) {
       if (debug) {

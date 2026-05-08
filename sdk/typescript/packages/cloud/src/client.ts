@@ -1,5 +1,8 @@
 import { Batcher } from './batcher.js'
+import { BudgetManager } from './budget.js'
 import type { ResolvedConfig } from './config.js'
+import { GovernanceContext } from './context.js'
+import { PolicyEvaluator } from './policy.js'
 import { redactDict } from './redaction.js'
 import type { SpanEventDict } from './span.js'
 import { Transport } from './transport.js'
@@ -8,6 +11,9 @@ export class Client {
   readonly config: ResolvedConfig
   readonly transport: Transport
   readonly batcher: Batcher
+  readonly _policy: PolicyEvaluator
+  readonly _budget: BudgetManager
+  readonly _governanceContext: GovernanceContext
 
   constructor(config: ResolvedConfig, transportOverride?: Transport) {
     this.config = config
@@ -26,6 +32,9 @@ export class Client {
         }
       },
     })
+    this._policy = new PolicyEvaluator()
+    this._budget = new BudgetManager(config.maxCostUsd ?? null)
+    this._governanceContext = new GovernanceContext()
   }
 
   recordSpan(event: SpanEventDict): void {
