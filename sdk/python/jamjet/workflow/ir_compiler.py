@@ -22,11 +22,14 @@ manual ``nodes:`` + ``edges:`` path::
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
 from jamjet.workflow.types import StepDef, WorkflowDef
+
+if TYPE_CHECKING:
+    from jamjet.spec import WorkflowSpec
 
 
 def compile_to_ir(defn: WorkflowDef) -> dict[str, Any]:
@@ -80,6 +83,36 @@ def compile_to_ir(defn: WorkflowDef) -> dict[str, Any]:
         "remote_agents": {},
         "labels": {},
     }
+
+
+def compile_to_workflow_spec(defn: WorkflowDef) -> WorkflowSpec:
+    """Compile a WorkflowDef into a Pydantic WorkflowSpec.
+
+    Wraps the existing dict-IR producer; preserves edge/node structure.
+    """
+    from jamjet.spec import EdgeSpec, NodeSpec, WorkflowSpec
+
+    nodes: list[NodeSpec] = []
+    for step in defn.steps:
+        handler_ref = f"{step.fn.__module__}:{step.fn.__qualname__}"
+        nodes.append(NodeSpec(id=step.name, handler_ref=handler_ref))
+
+    edges: list[EdgeSpec] = []
+    steps = defn.steps
+    for i, step in enumerate(steps):
+        if step.next:
+            for target, _ in step.next.items():
+                edges.append(EdgeSpec(from_node=step.name, to_node=target))
+        else:
+            next_name = steps[i + 1].name if i + 1 < len(steps) else "end"
+            edges.append(EdgeSpec(from_node=step.name, to_node=next_name))
+
+    return WorkflowSpec(
+        name=defn.workflow_id,
+        nodes=nodes,
+        edges=edges,
+        entry_node=defn.start_node,
+    )
 
 
 def compile_yaml(yaml_content: str) -> dict[str, Any]:

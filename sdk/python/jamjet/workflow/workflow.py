@@ -23,13 +23,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel
 
 from jamjet.workflow.executor import ExecutionResult, execute_workflow
-from jamjet.workflow.ir_compiler import compile_to_ir
+from jamjet.workflow.ir_compiler import compile_to_workflow_spec
 from jamjet.workflow.types import StepDef, WorkflowDef
+
+if TYPE_CHECKING:
+    from jamjet.spec import WorkflowSpec
 
 T = TypeVar("T", bound=BaseModel)
 F = TypeVar("F", bound=Callable[..., Any])
@@ -112,12 +115,13 @@ class Workflow:
         # Used as @workflow.step(...) (with arguments)
         return decorator
 
-    def compile(self) -> dict[str, Any]:
+    def compile(self) -> WorkflowSpec:
         """
-        Compile this workflow to the canonical IR (dict).
+        Compile this workflow to a WorkflowSpec (Pydantic IR).
 
         Raises ValueError if the workflow is not valid.
         """
+
         if self._state_class is None:
             raise ValueError(f"Workflow '{self.workflow_id}' has no @workflow.state defined")
         if not self._steps:
@@ -130,7 +134,7 @@ class Workflow:
             start_node=self._start or self._steps[0].name,
             steps=self._steps,
         )
-        return compile_to_ir(defn)
+        return compile_to_workflow_spec(defn)
 
     async def run(self, initial_state: BaseModel, *, max_steps: int = 100) -> ExecutionResult:
         """
