@@ -1,6 +1,6 @@
 import { setupServer } from 'msw/node'
 import { http, HttpResponse } from 'msw'
-import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, test, vi } from 'vitest'
 import { init } from '../src/init.js'
 import { getActive, resetActive } from '../src/client.js'
 
@@ -66,5 +66,23 @@ describe('init()', () => {
     )
     await init({ apiKey: 'k', project: 'p', debug: true })
     expect(getActive()?.config.debug).toBe(true)
+  })
+})
+
+describe('init Plan 2 sugar fields', () => {
+  beforeEach(async () => {
+    await resetActive()
+  })
+
+  it('seeds budget when maxCostUsd given', async () => {
+    await init({ apiKey: 'jj_test', project: 'p', maxCostUsd: 30 })
+    const client = getActive()
+    expect(client?._budget.remaining).toBe(30)
+  })
+
+  it('default agent name flows to client.config.agent', async () => {
+    await init({ apiKey: 'jj_test', project: 'p', agent: 'researcher' })
+    const client = getActive()
+    expect(client?.config.agent).toBe('researcher')
   })
 })
