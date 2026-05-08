@@ -34,10 +34,13 @@ import json
 import os
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from jamjet.compiler.strategies import StrategyLimits, compile_strategy
+from jamjet.compiler.strategies import StrategyLimits
 from jamjet.tools.decorators import ToolDefinition
+
+if TYPE_CHECKING:
+    from jamjet.spec import AgentSpec
 
 
 class Agent:
@@ -87,16 +90,29 @@ class Agent:
     def tool_names(self) -> list[str]:
         return [t.name for t in self._tools]
 
-    def compile(self) -> dict[str, Any]:
-        """Compile this agent to the canonical IR."""
-        return compile_strategy(
-            strategy_name=self.strategy,
-            strategy_config={"goal_template": self.instructions},
-            tools=self.tool_names,
-            model=self.model,
-            limits=self.limits,
-            goal=self.instructions,
-            agent_id=self.name,
+    def compile(self) -> AgentSpec:
+        """Compile this agent to an AgentSpec."""
+        from jamjet.spec import AgentSpec, AgentStrategy, LLMConfig, ToolSpec  # noqa: PLC0415
+
+        return AgentSpec(
+            name=self.name,
+            instructions=self.instructions,
+            llm=LLMConfig(provider="openai", model=self.model),
+            tools=[
+                ToolSpec(
+                    name=td.name,
+                    description=td.description,
+                    input_schema=td.input_schema,
+                    handler_ref=f"{td.fn.__module__}:{td.fn.__qualname__}",
+                )
+                for td in self._tools
+            ],
+            strategy=AgentStrategy(name=self.strategy),
+            limits={
+                "max_iterations": self.limits.max_iterations,
+                "max_cost_usd": self.limits.max_cost_usd,
+                "timeout_seconds": self.limits.timeout_seconds,
+            },
         )
 
     # ── Limit handler ─────────────────────────────────────────────────────
