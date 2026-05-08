@@ -29,7 +29,6 @@ Quick start:
 from jamjet.agents.agent import Agent, AgentResult
 from jamjet.agents.task import task
 from jamjet.client import JamjetClient
-from jamjet.decorators import DurableAgent, workflow  # noqa: F401
 from jamjet.durable import (
     durable,
     durable_run,
@@ -57,6 +56,11 @@ from jamjet.spec import (  # noqa: F401
 )
 from jamjet.tools.decorators import tool
 from jamjet.workflow.workflow import Workflow
+
+# Decorators imported LAST so the `workflow` name binds to the decorator
+# rather than the subpackage module (which Python's import machinery sets
+# on the parent namespace when `jamjet.workflow.workflow` is imported above).
+from jamjet.decorators import DurableAgent, workflow  # noqa: F401, E402
 
 __all__ = [
     "Agent",
@@ -92,4 +96,4 @@ __all__ = [
     "tool",
     "workflow",
 ]
-__version__ = "0.7.0"
+__version__ = "0.8.0"
