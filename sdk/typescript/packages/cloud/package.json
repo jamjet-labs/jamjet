@@ -44,11 +44,13 @@
   },
   "peerDependencies": {
     "@anthropic-ai/sdk": ">=0.27.0",
+    "msw": ">=2 <3",
     "openai": ">=4.0.0"
   },
   "peerDependenciesMeta": {
     "openai": { "optional": true },
-    "@anthropic-ai/sdk": { "optional": true }
+    "@anthropic-ai/sdk": { "optional": true },
+    "msw": { "optional": true }
   },
   "engines": {
     "node": ">=20.0.0"
