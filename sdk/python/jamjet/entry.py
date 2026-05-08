@@ -10,8 +10,12 @@ from jamjet.spec import AgentSpec, WorkflowSpec
 
 
 def _resolve_spec(target: Any) -> AgentSpec | WorkflowSpec:
-    spec = getattr(target, "__jamjet_spec__", None)
+    spec: Any = getattr(target, "__jamjet_spec__", None)
     if spec is not None:
+        if not isinstance(spec, (AgentSpec, WorkflowSpec)):
+            raise TypeError(
+                f"__jamjet_spec__ on {target!r} is not an AgentSpec or WorkflowSpec."
+            )
         return spec
     if isinstance(target, (AgentSpec, WorkflowSpec)):
         return target

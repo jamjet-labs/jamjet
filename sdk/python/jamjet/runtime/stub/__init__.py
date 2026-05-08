@@ -10,7 +10,7 @@ from jamjet.spec import AgentSpec, WorkflowSpec
 
 class _StubBase:
     name: str = ""
-    supported_ir_versions = ("1.0",)
+    supported_ir_versions: tuple[str, ...] = ("1.0",)
 
     async def execute(
         self,

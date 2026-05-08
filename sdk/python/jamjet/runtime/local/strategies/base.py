@@ -74,5 +74,5 @@ def _last_assistant_content(messages: list[Any]) -> str:
         content = getattr(m, "content", None) or (m.get("content") if isinstance(m, dict) else None)
         role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else None)
         if role == "assistant" and content:
-            return content
+            return str(content)
     return ""

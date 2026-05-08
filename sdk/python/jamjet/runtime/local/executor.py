@@ -27,7 +27,7 @@ from jamjet.spec import AgentSpec, DurableAgentSpec, ToolSpec, WorkflowSpec
 
 class LocalRuntime:
     name = "local"
-    supported_ir_versions = ("1.0",)
+    supported_ir_versions: tuple[str, ...] = ("1.0",)
 
     async def execute(
         self,
@@ -120,8 +120,18 @@ class LocalRuntime:
         method = getattr(instance, entry)
 
         step_id = derive_step_id(parent_step_id=None, call_site=f"{spec.name}.{entry}", invocation_index=0)
-        input_hash = compute_input_hash({"input": input})
 
+        # On resume (input is None), check for an already-completed step regardless of input hash.
+        if input is None:
+            existing = await store.get_step(step_id)
+            if existing is not None and existing.status == "completed" and existing.output_json is not None:
+                output = json.loads(existing.output_json)
+                engram = getattr(instance, "_jamjet_engram", None)
+                if engram is not None:
+                    await engram.close()
+                return output, [existing], [], []
+
+        input_hash = compute_input_hash({"input": input})
         existing = await store.get_step_if_match(step_id, input_hash=input_hash)
         if existing is not None and existing.output_json is not None:
             output = json.loads(existing.output_json)
