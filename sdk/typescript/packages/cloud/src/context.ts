@@ -44,7 +44,7 @@ export class GovernanceContext {
   }
 
   getCurrentContext(): ScopeFrame | null {
-    if (this.als) return this.als.getStore() ?? null
+    if (this.als) return this.als.getStore() ?? this.fallbackFrame
     return this.fallbackFrame
   }
 
