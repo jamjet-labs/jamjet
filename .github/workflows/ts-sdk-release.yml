@@ -29,9 +29,6 @@ jobs:
           cache-dependency-path: sdk/typescript/pnpm-lock.yaml
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Upgrade npm to a trusted-publisher-capable version
-        run: npm install -g npm@latest
-
       - name: Install
         run: pnpm install --frozen-lockfile
 
@@ -48,5 +45,7 @@ jobs:
         run: pnpm size
 
       - name: Publish to npm with provenance (trusted publisher OIDC)
+        # Use npx to fetch a fresh npm >= 11.5.1 (trusted-publisher OIDC support)
+        # without overwriting the system npm bundled with Node 22 (which is too old).
         working-directory: sdk/typescript/packages/cloud
-        run: npm publish --access=public --provenance
+        run: npx -y npm@latest publish --access=public --provenance
