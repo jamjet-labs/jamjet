@@ -3,7 +3,25 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal, get_args
+
+# Mirrors the events_kind_check constraint on the cloud side (migration 0008).
+# Sending any other value used to surface as a 500 from the DB; the server
+# now returns 400, and this Literal lets static type checkers catch the same
+# class of bug at write time. ALLOWED_KINDS is the runtime counterpart for
+# `__post_init__` validation and for users who compose `kind` from a variable.
+EventKind = Literal[
+    "llm_call",
+    "tool_call",
+    "policy_decision",
+    "approval",
+    "budget_check",
+    "error",
+    "custom",
+    "mcp_tool_call",
+    "agent_call",
+]
+ALLOWED_KINDS: tuple[str, ...] = get_args(EventKind)
 
 
 @dataclass
@@ -12,7 +30,7 @@ class Span:
 
     trace_id: str
     span_id: str
-    kind: str
+    kind: EventKind
     name: str
     parent_span_id: str | None = None
     sequence: int = 0
@@ -45,6 +63,13 @@ class Span:
     end_user_email: str | None = None
     tags: tuple[str, ...] = ()
     _start_time: float = field(default_factory=time.monotonic, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.kind not in ALLOWED_KINDS:
+            raise ValueError(
+                f"Invalid event kind {self.kind!r}. Must be one of: "
+                f"{', '.join(ALLOWED_KINDS)}"
+            )
 
     def finish(self, status: str = "ok", duration_ms: float | None = None) -> None:
         """Mark span as finished with a status and computed duration."""

@@ -9,7 +9,7 @@ from typing import Any, TypeVar
 
 from .agent import get_current_agent
 from .events import emit
-from .models import Span
+from .models import EventKind, Span
 from .propagation import get_originating
 from .user_context import get_process_context, get_user_context
 
@@ -24,7 +24,7 @@ class TraceContext:
         self._seq: int = 0
         self._lock = threading.Lock()
 
-    def new_span(self, kind: str, name: str) -> Span:
+    def new_span(self, kind: EventKind, name: str) -> Span:
         """Create a new Span belonging to this trace, tagged with the current
         agent and (when applicable) cross-trace lineage from the upstream caller."""
         with self._lock:
