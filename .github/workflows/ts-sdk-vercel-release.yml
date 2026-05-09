@@ -1,0 +1,51 @@
+name: TypeScript SDK Vercel Release
+
+on:
+  push:
+    tags:
+      - 'ts-sdk-vercel-v*'
+
+jobs:
+  publish:
+    name: Publish @jamjet/cloud-vercel
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: sdk/typescript/pnpm-lock.yaml
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm --filter @jamjet/cloud-vercel typecheck
+
+      - name: Build
+        run: pnpm --filter @jamjet/cloud-vercel build
+
+      - name: Test
+        run: pnpm --filter @jamjet/cloud-vercel test
+
+      - name: Size check
+        run: pnpm --filter @jamjet/cloud-vercel size
+
+      - name: Publish to npm with provenance (trusted publisher OIDC)
+        # npx fetches a fresh npm >= 11.5.1 (trusted-publisher OIDC support)
+        # to avoid the self-overwrite breakage that npm install -g npm@latest causes.
+        working-directory: sdk/typescript/packages/cloud-vercel
+        run: npx -y npm@latest publish --access=public --provenance
