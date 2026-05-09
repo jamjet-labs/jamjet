@@ -14,9 +14,18 @@ importers:
 
   examples/smoke-test:
     dependencies:
+      '@ai-sdk/openai':
+        specifier: ^2.0.0
+        version: 2.0.106(zod@3.25.76)
       '@jamjet/cloud':
         specifier: workspace:*
         version: link:../../packages/cloud
+      '@jamjet/cloud-vercel':
+        specifier: workspace:*
+        version: link:../../packages/cloud-vercel
+      ai:
+        specifier: ^5.0.0
+        version: 5.0.186(zod@3.25.76)
       openai:
         specifier: ^5.0.0
         version: 5.23.2(zod@3.25.76)
@@ -93,6 +102,12 @@ packages:
 
   '@ai-sdk/gateway@2.0.88':
     resolution: {integrity: sha512-H62l0gxr4K0rdR2WHbvck2wOKMsocAjdZg41Exsj9Qf5/TyAuHzcNt9jKNv5t2vRFXFZaCpbC5uCCxgUC/GiaA==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+
+  '@ai-sdk/openai@2.0.106':
+    resolution: {integrity: sha512-EFC0rpo1wfe4HIz5KZCE72edP2J7fOeR7wPXzjCDljaTRB1wectKDIKRLowpU4F0mbcJ+XScAsoYNPK/Z20aVQ==}
     engines: {node: '>=18'}
     peerDependencies:
       zod: ^3.25.76 || ^4.1.8
@@ -1452,6 +1467,12 @@ snapshots:
       '@ai-sdk/provider': 2.0.3
       '@ai-sdk/provider-utils': 3.0.25(zod@3.25.76)
       '@vercel/oidc': 3.1.0
+      zod: 3.25.76
+
+  '@ai-sdk/openai@2.0.106(zod@3.25.76)':
+    dependencies:
+      '@ai-sdk/provider': 2.0.3
+      '@ai-sdk/provider-utils': 3.0.25(zod@3.25.76)
       zod: 3.25.76
 
   '@ai-sdk/provider-utils@3.0.25(zod@3.25.76)':
