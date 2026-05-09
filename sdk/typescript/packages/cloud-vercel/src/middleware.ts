@@ -174,11 +174,89 @@ export function jamjetMiddleware(opts?: JamjetMiddlewareOptions): LanguageModelM
         throw err
       }
     },
-    async wrapStream({ doStream }) {
+    async wrapStream({ doStream, params, model }) {
       const client = getActive()
       if (!client) throw new Error(NOT_INIT)
-      // Task 5 will add streaming enforcement. For now, pass-through.
-      return doStream()
+
+      const identity = resolveIdentity(client, opts)
+      const modelId = modelIdOf(model, params)
+
+      // Pre-call: filter tools (mutate in-place)
+      const { allowed, decisions } = filterToolsForAISDK(client, (params as any).tools)
+      if (decisions.length > 0) (params as any).tools = allowed
+
+      // Pre-call: budget
+      const estTokens = estimatePromptTokens(params)
+      const estCost = estimateCost(modelId, estTokens, 0)
+      client._budget.checkOrThrow({ estimatedCost: estCost })
+
+      // Open span (will be finalised inside the stream wrapper on finish/error/blocked)
+      const span = openSpan(client, modelId, 'stream', identity, decisions, estCost)
+      let spanFinalised = false
+
+      const result = await doStream()
+      const blockedToolCalls: Array<{ id?: string; name: string }> = []
+
+      const wrappedStream = (result.stream as ReadableStream<any>).pipeThrough(
+        new TransformStream<any, any>({
+          transform(part, controller) {
+            try {
+              if (part?.type === 'tool-call') {
+                const name = part.toolName ?? ''
+                const d = (client as any)._policy.evaluate(name)
+                if (d.blocked) {
+                  blockedToolCalls.push({ id: part.toolCallId, name })
+                  span.policyBlockedToolCalls = blockedToolCalls
+                  span.finish('error')
+                  client.recordSpan(spanWithSource(span) as any)
+                  spanFinalised = true
+                  controller.error(new JamjetPolicyBlocked(name, d.pattern ?? '*', { cause: part }))
+                  return
+                }
+                if (d.policyKind === 'require_approval') {
+                  ;(span as any).policyApprovalPending = { id: part.toolCallId, name }
+                }
+                controller.enqueue(part)
+                return
+              }
+              if (part?.type === 'finish') {
+                const usage = (part.usage ?? {}) as { inputTokens?: number; outputTokens?: number }
+                const inputTokens = Number(usage.inputTokens ?? 0) || 0
+                const outputTokens = Number(usage.outputTokens ?? 0) || 0
+                span.inputTokens = inputTokens
+                span.outputTokens = outputTokens
+                span.costUsd = estimateCost(modelId, inputTokens, outputTokens)
+                client._budget.record(span.costUsd)
+                span.finish('ok')
+                client.recordSpan(spanWithSource(span) as any)
+                spanFinalised = true
+                controller.enqueue(part)
+                return
+              }
+              if (part?.type === 'error') {
+                span.finish('error')
+                span.payload = { error: String((part as any).error?.message ?? part.error ?? 'stream error') }
+                client.recordSpan(spanWithSource(span) as any)
+                spanFinalised = true
+                controller.enqueue(part)
+                return
+              }
+              // text, tool-call-delta, stream-start, response-metadata, reasoning, etc.: forward unchanged
+              controller.enqueue(part)
+            } catch (err) {
+              if (!spanFinalised) {
+                span.finish('error')
+                span.payload = { error: (err as Error).message }
+                client.recordSpan(spanWithSource(span) as any)
+                spanFinalised = true
+              }
+              controller.error(err)
+            }
+          },
+        }),
+      )
+
+      return { ...result, stream: wrappedStream }
     },
   }
 }
