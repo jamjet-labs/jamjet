@@ -182,3 +182,4 @@ export function createTestHarness(opts: { project?: string; agent?: string } = {
 }
 
 export type { SpanEventDict }
+export { setActive, resetActive } from './client.js'
