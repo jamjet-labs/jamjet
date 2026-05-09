@@ -1,0 +1,8 @@
+[
+  {
+    "name": "@jamjet/cloud-vercel (full)",
+    "path": "dist/index.js",
+    "limit": "10 KB",
+    "ignore": ["@jamjet/cloud", "ai", "@opentelemetry/api", "@opentelemetry/sdk-trace-base"]
+  }
+]

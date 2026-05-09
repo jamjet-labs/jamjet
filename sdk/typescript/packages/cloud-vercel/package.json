@@ -1,0 +1,58 @@
+{
+  "name": "@jamjet/cloud-vercel",
+  "version": "0.1.0",
+  "description": "JamJet Cloud governance middleware for the Vercel AI SDK.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "size": "size-limit"
+  },
+  "peerDependencies": {
+    "@jamjet/cloud": ">=0.2.0 <1",
+    "ai": ">=5 <6",
+    "@opentelemetry/api": ">=1 <2",
+    "@opentelemetry/sdk-trace-base": ">=1 <2"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/api": { "optional": true },
+    "@opentelemetry/sdk-trace-base": { "optional": true }
+  },
+  "devDependencies": {
+    "@jamjet/cloud": "workspace:*",
+    "ai": "^5.0.0",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-trace-base": "^1.30.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.4.0",
+    "vitest": "^2.1.0",
+    "size-limit": "^11.1.6",
+    "@size-limit/preset-small-lib": "^11.1.6"
+  },
+  "publishConfig": {
+    "provenance": true,
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jamjet-labs/jamjet.git",
+    "directory": "sdk/typescript/packages/cloud-vercel"
+  },
+  "homepage": "https://docs.jamjet.dev",
+  "keywords": ["jamjet", "vercel-ai-sdk", "ai", "llm", "governance", "telemetry", "policy", "budget"]
+}
