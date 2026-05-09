@@ -33,16 +33,16 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck
-        run: pnpm typecheck
+        run: pnpm --filter @jamjet/cloud typecheck
 
       - name: Build
-        run: pnpm build
+        run: pnpm --filter @jamjet/cloud build
 
       - name: Test
-        run: pnpm test
+        run: pnpm --filter @jamjet/cloud test
 
       - name: Size check
-        run: pnpm size
+        run: pnpm --filter @jamjet/cloud size
 
       - name: Publish to npm with provenance (trusted publisher OIDC)
         # Use npx to fetch a fresh npm >= 11.5.1 (trusted-publisher OIDC support)
