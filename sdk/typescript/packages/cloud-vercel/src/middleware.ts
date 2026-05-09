@@ -4,6 +4,8 @@ import type { LanguageModelMiddleware } from 'ai'
 
 const NOT_INIT = 'JamJet Cloud not initialized. Call init() first.'
 
+/** Per-call identity overrides for `jamjetMiddleware`. Both fields are optional;
+ *  omit them to fall back to the context set by `withGovernanceContext`. */
 export interface JamjetMiddlewareOptions {
   agent?: AgentRef
   user?: UserContext
@@ -96,12 +98,12 @@ function openSpan(
   })
   span.model = modelId
   if (identity.agent?.name) span.agentName = identity.agent.name
-  else if ((client as any).config?.agent) span.agentName = (client as any).config.agent
+  else if (client.config?.agent) span.agentName = client.config.agent
   if (identity.user?.userId) span.userId = identity.user.userId
   if (identity.user?.email) span.userEmail = identity.user.email
   if (identity.user?.attrs) span.userAttrs = identity.user.attrs
-  if ((client as any).config?.environment) span.environment = (client as any).config.environment
-  if ((client as any).config?.releaseVersion) span.releaseVersion = (client as any).config.releaseVersion
+  if (client.config?.environment) span.environment = client.config.environment
+  if (client.config?.releaseVersion) span.releaseVersion = client.config.releaseVersion
   if (decisions.length > 0) span.policyDecisions = decisions
   span.budgetCheck = { estimated: estimatedCost, allowed: true }
   return span
@@ -113,6 +115,13 @@ function spanWithSource(span: Span): Record<string, unknown> {
   return dict
 }
 
+/**
+ * AI SDK 5.x middleware that enforces JamJet Cloud governance.
+ * Pre-call: filters tools by policy, checks budget. Post-call: re-checks
+ * tool calls, records cost, emits a span. Streaming-aware.
+ *
+ * Requires `init()` from `@jamjet/cloud` to have been called.
+ */
 export function jamjetMiddleware(opts?: JamjetMiddlewareOptions): LanguageModelMiddleware {
   return {
     async wrapGenerate({ doGenerate, params, model }) {

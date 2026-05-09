@@ -46,7 +46,7 @@ export function translateAISDKSpan(otel: OtelSpanLike, client: Client): SpanEven
 
   const ctx = otel.spanContext()
   const span = new Span({
-    traceId: ctx.traceId.slice(0, 16) || ctx.traceId,
+    traceId: ctx.traceId.slice(0, 16),
     spanId: ctx.spanId,
     kind: 'llm_call',
     name: otel.name,

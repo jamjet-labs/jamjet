@@ -21,6 +21,8 @@ const DEFAULT_SPAN_NAMES = [
 
 const REGISTERED_FLAG = Symbol.for('jamjet.cloud-vercel.telemetry-registered')
 
+/** Options for `registerJamjetTelemetry`. Both fields are optional and have
+ *  sensible defaults (built-in AI SDK span names, auto-created span processor). */
 export interface RegisterTelemetryOptions {
   spanProcessor?: SpanProcessor
   spanNames?: string[]
@@ -54,6 +56,14 @@ class JamjetSpanProcessor implements SpanProcessor {
   }
 }
 
+/**
+ * Registers a JamJet Cloud span processor on the global OpenTelemetry
+ * `TracerProvider`. Translates AI SDK spans into JamJet `SpanEventDict` records
+ * and forwards them to the active client's batcher.
+ *
+ * Idempotent — safe to call multiple times; only the first call takes effect.
+ * Requires `init()` from `@jamjet/cloud` to have been called.
+ */
 export function registerJamjetTelemetry(opts: RegisterTelemetryOptions = {}): void {
   const client = getActive()
   if (!client) throw new Error('JamJet Cloud not initialized. Call init() first.')
