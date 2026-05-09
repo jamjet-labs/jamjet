@@ -31,3 +31,10 @@ export {
   JamjetApprovalTimeout,
 } from './errors.js'
 export type { WrapOptions } from './wrap.js'
+
+// Low-level accessor — for ecosystem packages that need to inspect whether a
+// client has been initialised (e.g. @jamjet/cloud-vercel middleware).
+export { getActive } from './client.js'
+
+// Cost utility — exported for ecosystem packages (e.g. @jamjet/cloud-vercel middleware).
+export { estimateCost } from './cost.js'

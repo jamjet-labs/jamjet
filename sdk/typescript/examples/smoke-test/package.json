@@ -5,10 +5,14 @@
   "type": "module",
   "scripts": {
     "start": "node --import tsx index.ts",
-    "smoke:plan2": "node --import tsx plan2.ts"
+    "smoke:plan2": "node --import tsx plan2.ts",
+    "smoke:plan3": "node --import tsx plan3.ts"
   },
   "dependencies": {
+    "@ai-sdk/openai": "^2.0.0",
     "@jamjet/cloud": "workspace:*",
+    "@jamjet/cloud-vercel": "workspace:*",
+    "ai": "^5.0.0",
     "openai": "^5.0.0"
   },
   "devDependencies": {
