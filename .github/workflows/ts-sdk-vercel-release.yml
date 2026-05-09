@@ -32,6 +32,9 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      - name: Build @jamjet/cloud (workspace dep — needed for cloud-vercel typecheck)
+        run: pnpm --filter @jamjet/cloud build
+
       - name: Typecheck
         run: pnpm --filter @jamjet/cloud-vercel typecheck
 
