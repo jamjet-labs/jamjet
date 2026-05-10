@@ -17,6 +17,10 @@ Commands:
   jamjet eval run       Run batch evaluation of a workflow
   jamjet eval export    Export eval results as LaTeX, CSV, or JSON
   jamjet eval compare   Compare two conditions with statistical tests
+  jamjet demo unsafe-tool-call    Show how JamJet blocks destructive tool calls
+  jamjet demo approval            Show pause-for-approval flow
+  jamjet demo budget-cap          Show budget enforcement
+  jamjet demo mcp-tool-policy     Show MCP-shaped policy evaluation
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from jamjet.cli.demo import demo_app
 from jamjet.client import JamjetClient
 
 # ── Logo — block letter J  (0=bg  1=yellow#f5c518  2=orange#ea580c) ──────────
@@ -122,6 +127,7 @@ app.add_typer(agents_app, name="agents")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(a2a_app, name="a2a")
 app.add_typer(eval_app, name="eval")
+app.add_typer(demo_app, name="demo")
 
 console = Console()
 
