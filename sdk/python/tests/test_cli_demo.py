@@ -83,3 +83,32 @@ def test_unsafe_tool_call_json_output(tmp_path, monkeypatch):
     assert payload["decision"] == "BLOCKED"
     assert payload["executed"] is False
     assert payload["tool"] == "database.delete_all_customers"
+
+
+def test_approval_pauses_when_no_approve_flag(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["demo", "approval"])
+    assert result.exit_code == 0
+    assert "WAITING_FOR_APPROVAL" in result.stdout
+    assert "jamjet demo approval --approve" in result.stdout
+    runs = list((tmp_path / ".jamjet-demo" / "runs").glob("approval-*.json"))
+    assert len(runs) == 1
+    state = json.loads(runs[0].read_text())
+    assert state["decision"] == "WAITING_FOR_APPROVAL"
+    assert state["executed"] is False
+
+
+def test_approval_resumes_after_approve_flag(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runner.invoke(app, ["demo", "approval"])
+    runs = list((tmp_path / ".jamjet-demo" / "runs").glob("approval-*.json"))
+    run_id = runs[0].stem
+
+    result = runner.invoke(app, ["demo", "approval", "--approve", run_id])
+    assert result.exit_code == 0
+    assert "Approved" in result.stdout
+    assert "Tool executed" in result.stdout
+
+    state = json.loads(runs[0].read_text())
+    assert state["decision"] == "APPROVED"
+    assert state["executed"] is True

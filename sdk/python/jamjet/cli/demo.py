@@ -71,7 +71,68 @@ def approval(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable audit event."),
 ) -> None:
     """Mock agent attempts a risky action. JamJet pauses for approval; --approve <id> resumes."""
-    raise NotImplementedError
+    import time
+
+    from jamjet.cli._demo_agent import DeterministicDemoAgent
+    from jamjet.cli._demo_audit import DemoAuditEvent, write_audit_event
+
+    runs_dir = Path.cwd() / ".jamjet-demo" / "runs"
+
+    if approve:
+        path = runs_dir / f"{approve}.json"
+        if not path.exists():
+            typer.echo(f"No pending approval found for run id: {approve}", err=True)
+            raise typer.Exit(code=1)
+        state = json.loads(path.read_text())
+        if state["decision"] != "WAITING_FOR_APPROVAL":
+            typer.echo(f"Run {approve} is not waiting for approval (state: {state['decision']}).", err=True)
+            raise typer.Exit(code=1)
+        state["decision"] = "APPROVED"
+        state["executed"] = True
+        path.write_text(json.dumps(state, indent=2, sort_keys=True))
+        if json_output:
+            typer.echo(json.dumps(state, indent=2, sort_keys=True))
+            return
+        typer.echo(f"Approved: {approve}")
+        typer.echo(f"Tool executed: {state['tool']}")
+        typer.echo(f"Audit:    {path}")
+        typer.echo("")
+        typer.echo("  The model is mocked. The enforcement path is real.")
+        return
+
+    agent = DeterministicDemoAgent(scenario="approval")
+    plan = agent.plan_tool_calls()[0]
+    run_id = f"approval-{int(time.time())}"
+
+    event = DemoAuditEvent(
+        run_id=run_id,
+        demo="approval",
+        decision="WAITING_FOR_APPROVAL",
+        tool=plan.tool,
+        rule="payments.* requires approval",
+        executed=False,
+        extra={"arguments": plan.arguments},
+    )
+    audit_path = write_audit_event(event)
+
+    if json_output:
+        typer.echo(json.dumps(event.to_dict(), indent=2, sort_keys=True))
+        return
+
+    typer.echo("JamJet demo: human approval")
+    typer.echo("")
+    typer.echo(f"  Agent:    {agent.name()}")
+    typer.echo(f"  Planned:  {plan.tool}({plan.arguments!r})")
+    typer.echo("")
+    typer.echo("  Policy: payments.* requires approval")
+    typer.echo("")
+    typer.echo("  Decision: WAITING_FOR_APPROVAL")
+    typer.echo(f"  Run ID:   {run_id}")
+    typer.echo("")
+    typer.echo(f"  Approve with:   jamjet demo approval --approve {run_id}")
+    typer.echo(f"  Audit:    {audit_path}")
+    typer.echo("")
+    typer.echo("  The model is mocked. The enforcement path is real.")
 
 
 @demo_app.command("budget-cap")
