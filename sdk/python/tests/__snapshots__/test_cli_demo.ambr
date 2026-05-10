@@ -1,0 +1,20 @@
+# serializer version: 1
+# name: test_unsafe_tool_call_human_output
+  '''
+  JamJet demo: unsafe tool-call blocking
+  
+    Agent:    DeterministicDemoAgent (mocked — no real model)
+    Planned:  database.delete_all_customers({'reason': 'cleanup old records'})
+  
+    Policy:
+      block tools matching '*delete*'
+  
+    Decision: BLOCKED  (rule: *delete*)
+    Executed: false
+  
+    Audit:    <TMP>/.jamjet-demo/runs/unsafe-tool-call-001.json
+  
+    The model is mocked. The enforcement path is real.
+  
+  '''
+# ---

@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -48,3 +49,37 @@ def test_demo_agent_is_explicit_about_being_mocked():
     assert plan, "agent must propose at least one tool call"
     # Honesty: agent identifies as mocked, not as a real model.
     assert "mock" in agent.name().lower() or "deterministic" in agent.name().lower()
+
+
+def _redact_tmp_audit_path(stdout: str, tmp_path: Path) -> str:
+    """Replace per-test tmp paths in audit lines with a stable token.
+
+    On macOS, ``tmp_path`` resolves to ``/var/...`` while ``Path.cwd()`` after
+    ``monkeypatch.chdir`` resolves to ``/private/var/...``. Strip both, plus
+    the pytest-N counter that increments each test run.
+    """
+    redacted = stdout.replace(str(tmp_path), "<TMP>")
+    redacted = redacted.replace("/private" + str(tmp_path), "<TMP>")
+    # Also strip any pytest-N folders that survived the simple replace.
+    redacted = re.sub(r"pytest-of-[^/]+/pytest-\d+/[^/]+", "pytest-tmp", redacted)
+    return redacted
+
+
+def test_unsafe_tool_call_human_output(tmp_path, monkeypatch, snapshot):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["demo", "unsafe-tool-call"])
+    assert result.exit_code == 0
+    # Honesty line MUST appear.
+    assert "The model is mocked. The enforcement path is real." in result.stdout
+    # Snapshot the full output for regression protection.
+    assert _redact_tmp_audit_path(result.stdout, tmp_path) == snapshot
+
+
+def test_unsafe_tool_call_json_output(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["demo", "unsafe-tool-call", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "BLOCKED"
+    assert payload["executed"] is False
+    assert payload["tool"] == "database.delete_all_customers"

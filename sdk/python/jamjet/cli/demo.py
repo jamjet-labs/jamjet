@@ -7,6 +7,9 @@ paths work. The model is mocked. The enforcement path is real.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import typer
 
 demo_app = typer.Typer(
@@ -21,7 +24,45 @@ def unsafe_tool_call(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable audit event."),
 ) -> None:
     """Mock agent attempts a destructive tool call. JamJet blocks it before execution."""
-    raise NotImplementedError
+    from jamjet.cli._demo_agent import DeterministicDemoAgent
+    from jamjet.cli._demo_audit import DemoAuditEvent, write_audit_event
+    from jamjet.cloud.policy import PolicyEvaluator
+
+    evaluator = PolicyEvaluator()
+    evaluator.add("block", "*delete*")
+
+    agent = DeterministicDemoAgent(scenario="unsafe-tool-call")
+    plan = agent.plan_tool_calls()[0]
+    decision = evaluator.evaluate(plan.tool)
+
+    event = DemoAuditEvent(
+        run_id="unsafe-tool-call-001",
+        demo="unsafe-tool-call",
+        decision="BLOCKED" if decision.blocked else "ALLOWED",
+        tool=plan.tool,
+        rule=decision.pattern,
+        executed=False if decision.blocked else True,
+    )
+    audit_path = write_audit_event(event)
+
+    if json_output:
+        typer.echo(json.dumps(event.to_dict(), indent=2, sort_keys=True))
+        return
+
+    typer.echo("JamJet demo: unsafe tool-call blocking")
+    typer.echo("")
+    typer.echo(f"  Agent:    {agent.name()}")
+    typer.echo(f"  Planned:  {plan.tool}({plan.arguments!r})")
+    typer.echo("")
+    typer.echo("  Policy:")
+    typer.echo("    block tools matching '*delete*'")
+    typer.echo("")
+    typer.echo(f"  Decision: {event.decision}  (rule: {event.rule})")
+    typer.echo(f"  Executed: {str(event.executed).lower()}")
+    typer.echo("")
+    typer.echo(f"  Audit:    {audit_path}")
+    typer.echo("")
+    typer.echo("  The model is mocked. The enforcement path is real.")
 
 
 @demo_app.command("approval")
