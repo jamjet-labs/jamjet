@@ -17,7 +17,7 @@ version = "0.8.1"
 description = "JamJet — open-source safety layer for AI agents. Block unsafe tool calls, require approval, enforce budgets, audit, replay."
 readme = "README.md"
 license = { text = "Apache-2.0" }
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 keywords = ["ai", "agents", "workflow", "mcp", "a2a", "llm", "rust", "durable", "orchestration"]
 classifiers = [
     "Development Status :: 4 - Beta",
