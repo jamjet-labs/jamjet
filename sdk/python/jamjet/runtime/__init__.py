@@ -1,4 +1,5 @@
 """JamJet runtime protocol + LocalRuntime implementation."""
+
 from jamjet.runtime.types import (
     LLMCallRecord,
     Runtime,

@@ -1,6 +1,7 @@
 import pytest
+from engram import Engram
+from engram import Scope as EngramScope
 
-from engram import Engram, Scope as EngramScope
 from jamjet.memory.engram_bridge import AgentMemory
 from jamjet.spec import MemoryConfig
 

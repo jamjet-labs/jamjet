@@ -1,4 +1,5 @@
 """JamJet memory — Engram v2 bridge for self.memory inside @DurableAgent."""
+
 from engram import Scope
 
 from jamjet.memory.engram_bridge import AgentMemory

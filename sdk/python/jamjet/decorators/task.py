@@ -1,4 +1,5 @@
 """@task decorator — marks a method as a workflow step (checkpoint boundary)."""
+
 from __future__ import annotations
 
 from collections.abc import Callable

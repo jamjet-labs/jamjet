@@ -1,0 +1,7 @@
+Server: postgres-mcp
+Tool: postgres/database.delete_all_customers
+Policy: block '*delete*'
+Decision: BLOCKED
+This demo uses an MCP-shaped request envelope to show policy evaluation.
+It is not yet an MCP proxy. Full MCP proxy support is planned for JamJet Gateway.
+The model is mocked. The enforcement path is real.

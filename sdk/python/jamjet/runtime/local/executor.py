@@ -1,4 +1,5 @@
 """LocalRuntime executor — dispatches AgentSpec / DurableAgentSpec / WorkflowSpec."""
+
 from __future__ import annotations
 
 import importlib
@@ -43,15 +44,25 @@ class LocalRuntime:
 
         if isinstance(spec, DurableAgentSpec):
             output, steps, tool_calls, llm_calls = await self._run_durable_agent(
-                spec, input, eid, scope, on_event,
+                spec,
+                input,
+                eid,
+                scope,
+                on_event,
             )
         elif isinstance(spec, AgentSpec):
             output, steps, tool_calls, llm_calls = await self._run_agent(
-                spec, input, eid, on_event,
+                spec,
+                input,
+                eid,
+                on_event,
             )
         elif isinstance(spec, WorkflowSpec):
             output, steps, tool_calls, llm_calls = await self._run_workflow(
-                spec, input, eid, on_event,
+                spec,
+                input,
+                eid,
+                on_event,
             )
         else:
             raise TypeError(f"Unsupported spec type: {type(spec).__name__}")
@@ -66,12 +77,18 @@ class LocalRuntime:
         )
 
     async def resume(
-        self, spec: AgentSpec | WorkflowSpec, execution_id: str,
+        self,
+        spec: AgentSpec | WorkflowSpec,
+        execution_id: str,
     ) -> RuntimeResult:
         return await self.execute(spec, input=None, execution_id=execution_id)
 
     async def _run_agent(
-        self, spec: AgentSpec, input: Any, eid: str, on_event: Any,
+        self,
+        spec: AgentSpec,
+        input: Any,
+        eid: str,
+        on_event: Any,
     ) -> tuple[Any, list[StepRecord], list[ToolCallRecord], list[LLMCallRecord]]:
         adapter = get_adapter(spec.llm)
         runner = get_strategy_runner(spec.strategy.name)
@@ -79,12 +96,17 @@ class LocalRuntime:
         openai_tools = [self._tool_to_openai_schema(t) for t in spec.tools]
         prompt = input if isinstance(input, str) else json.dumps(input)
         output = await runner(
-            adapter=adapter, spec=spec, prompt=prompt,
-            tools=openai_tools, tool_calls_log=tool_calls_log,
+            adapter=adapter,
+            spec=spec,
+            prompt=prompt,
+            tools=openai_tools,
+            tool_calls_log=tool_calls_log,
         )
         tool_calls = [
             ToolCallRecord(
-                tool=t["tool"], input=t["input"], output=t["output"],
+                tool=t["tool"],
+                input=t["input"],
+                output=t["output"],
                 duration_us=t["duration_us"],
             )
             for t in tool_calls_log
@@ -92,7 +114,12 @@ class LocalRuntime:
         return output, [], tool_calls, []
 
     async def _run_durable_agent(
-        self, spec: DurableAgentSpec, input: Any, eid: str, scope: Scope | None, on_event: Any,
+        self,
+        spec: DurableAgentSpec,
+        input: Any,
+        eid: str,
+        scope: Scope | None,
+        on_event: Any,
     ) -> tuple[Any, list[StepRecord], list[ToolCallRecord], list[LLMCallRecord]]:
         module_path, cls_name = spec.class_ref.split(":", 1)
         module = importlib.import_module(module_path)
@@ -109,6 +136,7 @@ class LocalRuntime:
 
         instance = cls()
         from engram import Scope as EngramScope
+
         engram_scope: EngramScope | None = None
         if scope is not None:
             engram_scope = EngramScope(user_id=scope.user_id, org_id=scope.org_id)
@@ -162,14 +190,20 @@ class LocalRuntime:
             await engram.close()
 
         record = StepRecord(
-            step_id=step_id, input_hash=input_hash,
-            status="completed", output_json=json.dumps(output, default=str),
+            step_id=step_id,
+            input_hash=input_hash,
+            status="completed",
+            output_json=json.dumps(output, default=str),
             duration_ms=duration_ms,
         )
         return output, [record], [], []
 
     async def _run_workflow(
-        self, spec: WorkflowSpec, input: Any, eid: str, on_event: Any,
+        self,
+        spec: WorkflowSpec,
+        input: Any,
+        eid: str,
+        on_event: Any,
     ) -> tuple[Any, list[StepRecord], list[ToolCallRecord], list[LLMCallRecord]]:
         if len(spec.nodes) == 1:
             node = spec.nodes[0]

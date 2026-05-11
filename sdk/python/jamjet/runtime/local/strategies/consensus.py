@@ -1,4 +1,5 @@
 """Consensus strategy: independent N responses -> judge picks best."""
+
 from __future__ import annotations
 
 from typing import Any

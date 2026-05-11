@@ -1,4 +1,5 @@
 """@workflow function decorator — free-function alternative to @DurableAgent."""
+
 from __future__ import annotations
 
 import functools

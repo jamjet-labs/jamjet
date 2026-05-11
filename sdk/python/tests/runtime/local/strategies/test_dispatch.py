@@ -1,4 +1,5 @@
 """Strategy dispatcher uses a FakeLLMAdapter so we don't hit real APIs."""
+
 from dataclasses import dataclass
 
 import pytest
@@ -24,9 +25,17 @@ class FakeLLMAdapter:
         return _FakeMsg(content=self._responses.pop(0), tool_calls=None)
 
 
-@pytest.mark.parametrize("strategy_name", [
-    "plan-and-execute", "react", "critic", "reflection", "consensus", "debate",
-])
+@pytest.mark.parametrize(
+    "strategy_name",
+    [
+        "plan-and-execute",
+        "react",
+        "critic",
+        "reflection",
+        "consensus",
+        "debate",
+    ],
+)
 async def test_dispatch_returns_str(strategy_name):
     runner = get_strategy_runner(strategy_name)
     adapter = FakeLLMAdapter(["1. step\n2. step", "result", "PASS", "SATISFIED"] * 20)

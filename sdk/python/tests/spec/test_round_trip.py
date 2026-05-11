@@ -1,4 +1,5 @@
 """Property-based round-trip tests across all spec types."""
+
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -16,9 +17,17 @@ from jamjet.spec import (
 )
 
 providers = st.sampled_from(["openai", "anthropic", "google", "ollama", "openai_compatible"])
-strategy_names = st.sampled_from([
-    "plan-and-execute", "react", "critic", "reflection", "consensus", "debate", "custom",
-])
+strategy_names = st.sampled_from(
+    [
+        "plan-and-execute",
+        "react",
+        "critic",
+        "reflection",
+        "consensus",
+        "debate",
+        "custom",
+    ]
+)
 
 
 @st.composite
@@ -50,7 +59,9 @@ def test_agent_round_trip(llm, name, strat_name):
 @given(llm_configs(), st.text(min_size=1, max_size=20))
 def test_durable_agent_round_trip(llm, name):
     a = DurableAgentSpec(
-        name=name, llm=llm, class_ref="m:C",
+        name=name,
+        llm=llm,
+        class_ref="m:C",
         methods=[MethodSpec(name="run", is_entrypoint=True)],
     )
     assert DurableAgentSpec.model_validate_json(a.model_dump_json()) == a

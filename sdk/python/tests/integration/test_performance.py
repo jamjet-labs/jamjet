@@ -3,6 +3,7 @@
 Stricter <2s budget needs intra-method @task checkpointing which is a
 follow-up; for now we measure run() invocation overhead end-to-end.
 """
+
 import time
 
 import pytest

@@ -35,31 +35,31 @@ JamJet sits underneath your agent — LangChain, CrewAI, ADK, MCP servers, custo
 
 **Keep your agent framework. Add JamJet when tool calls need control.**
 
+![JamJet safety demo](./demo.gif)
+
+## See it in 60 seconds
+
+```bash
+pip install jamjet
+jamjet demo unsafe-tool-call
 ```
-            Your Agent / Framework
-   (LangChain · CrewAI · ADK · custom · MCP client)
-                     │
-                     ▼
-  ┌───────────────────────────────────────────────┐
-  │            JamJet Safety Layer                │
-  │   policy · approval · budget · audit · replay  │
-  └───────────────────────────────────────────────┘
-                     │
-                     ▼
-        Tools · MCP servers · APIs · DBs · Agents
+
+No API key. No Docker. No cloud account. The model is mocked; the enforcement path is real. Three more demos run the same way:
+
+```bash
+jamjet demo approval        # pause-for-approval flow
+jamjet demo budget-cap      # $0.05 cost cap
+jamjet demo mcp-tool-policy # MCP-shaped policy (preview of JamJet Gateway)
 ```
+
+Works alongside **LangChain · CrewAI · ADK · OpenAI Agents SDK · MCP tools**.
 
 > Prompts are not a security boundary. The runtime is.
 
 → Read **[When AI Deletes the Database](https://jamjet.dev/blog/when-ai-deletes-the-database/)** for why this is a runtime architecture problem, not a model problem.
+→ See the deeper **[durability demo at jamjet.dev/demo](https://jamjet.dev/demo)** for what happens when an agent crashes mid-tool-call.
 
-![JamJet demo](./demo.gif)
-
-## 60-second safety demo
-
-```bash
-pip install jamjet
-```
+## Policy in your own code
 
 Drop a policy beside your agent code. The runtime intercepts any matching tool call *before* it leaves the agent's process — `blocked_tools` are refused outright, `require_approval_for` pauses execution durably and waits for an out-of-band decision (crashes don't lose the approval; execution resumes when it arrives).
 
@@ -86,6 +86,22 @@ jamjet.cloud.policy("require_approval", "database.*")
 ```
 
 → Runnable approval workflow in **[`examples/hitl-approval`](examples/hitl-approval)** · [Cloud Quickstart](https://docs.jamjet.dev/en/docs/cloud-quickstart)
+
+## Where JamJet sits
+
+```text
+            Your Agent / Framework
+   (LangChain · CrewAI · ADK · custom · MCP client)
+                     │
+                     ▼
+  ┌───────────────────────────────────────────────┐
+  │            JamJet Safety Layer                │
+  │   policy · approval · budget · audit · replay  │
+  └───────────────────────────────────────────────┘
+                     │
+                     ▼
+        Tools · MCP servers · APIs · DBs · Agents
+```
 
 ## Use JamJet when your agent can…
 

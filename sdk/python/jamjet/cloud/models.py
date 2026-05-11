@@ -66,10 +66,7 @@ class Span:
 
     def __post_init__(self) -> None:
         if self.kind not in ALLOWED_KINDS:
-            raise ValueError(
-                f"Invalid event kind {self.kind!r}. Must be one of: "
-                f"{', '.join(ALLOWED_KINDS)}"
-            )
+            raise ValueError(f"Invalid event kind {self.kind!r}. Must be one of: {', '.join(ALLOWED_KINDS)}")
 
     def finish(self, status: str = "ok", duration_ms: float | None = None) -> None:
         """Mark span as finished with a status and computed duration."""

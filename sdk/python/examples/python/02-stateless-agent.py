@@ -1,4 +1,5 @@
 """Two stateless agents side by side: @DurableAgent(stateless=True) and Agent()."""
+
 import asyncio
 
 from jamjet import Agent, DurableAgent, run

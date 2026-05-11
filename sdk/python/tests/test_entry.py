@@ -1,4 +1,5 @@
 """End-to-end run() through entry.py for stateless DurableAgent."""
+
 import pytest
 
 from jamjet import resume, run

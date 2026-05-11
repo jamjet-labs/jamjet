@@ -3,6 +3,7 @@
 These are deterministic across runs given the same execution_id seed. Author code
 that wants replay-faithful non-determinism must use these instead of stdlib calls.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -35,10 +36,7 @@ class SeededClock:
     """
 
     def __init__(self, start_iso: str | None = None) -> None:
-        self._t = (
-            datetime.fromisoformat(start_iso) if start_iso
-            else datetime.now(tz=UTC)
-        )
+        self._t = datetime.fromisoformat(start_iso) if start_iso else datetime.now(tz=UTC)
 
     def now(self) -> datetime:
         out = self._t

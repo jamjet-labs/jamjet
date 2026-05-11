@@ -1,0 +1,5 @@
+Tool: database.delete_all_customers
+Policy: block '*delete*'
+Decision: BLOCKED
+Executed: false
+The model is mocked. The enforcement path is real.

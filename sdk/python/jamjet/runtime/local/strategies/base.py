@@ -1,4 +1,5 @@
 """Strategy runner Protocol + shared helpers (tool resolution, tool-call execution)."""
+
 from __future__ import annotations
 
 import importlib
@@ -59,12 +60,14 @@ async def execute_tool_calls(
             result = await result
         duration_us = (time.perf_counter_ns() - t0) / 1000
         result_str = str(result)
-        tool_calls_log.append({
-            "tool": name,
-            "input": args,
-            "output": result_str,
-            "duration_us": duration_us,
-        })
+        tool_calls_log.append(
+            {
+                "tool": name,
+                "input": args,
+                "output": result_str,
+                "duration_us": duration_us,
+            }
+        )
         results.append({"role": "tool", "tool_call_id": tc.id, "content": result_str})
     return results
 

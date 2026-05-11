@@ -1,0 +1,3 @@
+policy:
+  require_approval_for:
+    - "payments.*"

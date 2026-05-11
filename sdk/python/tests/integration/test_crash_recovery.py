@@ -1,4 +1,5 @@
 """End-to-end durable @DurableAgent — execute, then resume via execution_id short-circuits."""
+
 import pytest
 
 from jamjet import resume, run
@@ -46,9 +47,7 @@ class _Counter:
 def _spec_with_db(base_spec, db_path):
     """Return a copy of the spec with db_path set to the given tmp path."""
     return base_spec.model_copy(
-        update={
-            "durability": DurabilityConfig(db_path=str(db_path), checkpoint_every_step=True)
-        }
+        update={"durability": DurabilityConfig(db_path=str(db_path), checkpoint_every_step=True)}
     )
 
 

@@ -1,4 +1,5 @@
 """AgentMemory — what self.memory IS inside a @DurableAgent. Wraps an Engram instance."""
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -111,8 +112,7 @@ class AgentMemory:
             )
         if self._config.llm.provider != "openai":
             raise NotImplementedError(
-                f"synthesize() with provider={self._config.llm.provider!r} lands in Phase 3. "
-                "Use 'openai' for now."
+                f"synthesize() with provider={self._config.llm.provider!r} lands in Phase 3. Use 'openai' for now."
             )
         llm = OpenAILLM(model=self._config.llm.model)
         ctx = await self.context(query, role_filter=role_filter)

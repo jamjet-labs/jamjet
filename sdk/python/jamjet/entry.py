@@ -1,4 +1,5 @@
 """Top-level entry points: run() / resume() / deploy()."""
+
 from __future__ import annotations
 
 import os
@@ -13,9 +14,7 @@ def _resolve_spec(target: Any) -> AgentSpec | WorkflowSpec:
     spec: Any = getattr(target, "__jamjet_spec__", None)
     if spec is not None:
         if not isinstance(spec, (AgentSpec, WorkflowSpec)):
-            raise TypeError(
-                f"__jamjet_spec__ on {target!r} is not an AgentSpec or WorkflowSpec."
-            )
+            raise TypeError(f"__jamjet_spec__ on {target!r} is not an AgentSpec or WorkflowSpec.")
         return spec
     if isinstance(target, (AgentSpec, WorkflowSpec)):
         return target
@@ -30,6 +29,7 @@ def _select_runtime(target_runtime: str | None = None) -> Runtime:
     if name == "local":
         return LocalRuntime()
     from jamjet.runtime.stub import CloudRuntime, JavaRuntime, RustRuntime
+
     runtimes: dict[str, Runtime] = {
         "cloud": CloudRuntime(),
         "java": JavaRuntime(),

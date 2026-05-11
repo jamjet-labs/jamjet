@@ -1,4 +1,5 @@
 """Runtime protocol + result/event types. Every backend (Local, Cloud, Java, Rust) implements Runtime."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -58,6 +59,7 @@ class RuntimeResult(BaseModel):
 
 class Scope(BaseModel):
     """Scope for memory / agent invocation. Mirrors engram.Scope shape so it bridges directly."""
+
     model_config = ConfigDict(frozen=True, extra="forbid")
     user_id: str = "default"
     org_id: str = "default"

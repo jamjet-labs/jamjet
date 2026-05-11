@@ -1,4 +1,5 @@
 """JamJet agent IR — Pydantic spec models that runtimes consume."""
+
 from jamjet.spec.agent import AgentSpec, AgentStrategy, DurableAgentSpec, MethodSpec
 from jamjet.spec.durability import DurabilityConfig
 from jamjet.spec.llm import LLMConfig
