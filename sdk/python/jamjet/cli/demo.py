@@ -8,9 +8,13 @@ paths work. The model is mocked. The enforcement path is real.
 from __future__ import annotations
 
 import json
+import re
+import uuid
 from pathlib import Path
 
 import typer
+
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 demo_app = typer.Typer(
     name="demo",
@@ -80,15 +84,19 @@ def approval(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable audit event."),
 ) -> None:
     """Mock agent attempts a risky action. JamJet pauses for approval; --approve <id> resumes."""
-    import time
-
     from jamjet.cli._demo_agent import DeterministicDemoAgent
     from jamjet.cli._demo_audit import DemoAuditEvent, write_audit_event
 
     runs_dir = Path.cwd() / ".jamjet-demo" / "runs"
 
     if approve:
-        path = runs_dir / f"{approve}.json"
+        if not _RUN_ID_RE.fullmatch(approve):
+            typer.echo(f"Invalid run id: {approve}", err=True)
+            raise typer.Exit(code=1)
+        path = (runs_dir / f"{approve}.json").resolve()
+        if path.parent != runs_dir.resolve():
+            typer.echo(f"Invalid run id: {approve}", err=True)
+            raise typer.Exit(code=1)
         if not path.exists():
             typer.echo(f"No pending approval found for run id: {approve}", err=True)
             raise typer.Exit(code=1)
@@ -111,7 +119,7 @@ def approval(
 
     agent = DeterministicDemoAgent(scenario="approval")
     plan = agent.plan_tool_calls()[0]
-    run_id = f"approval-{int(time.time())}"
+    run_id = f"approval-{uuid.uuid4().hex[:12]}"
 
     event = DemoAuditEvent(
         run_id=run_id,

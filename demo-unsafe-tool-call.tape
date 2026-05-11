@@ -18,7 +18,7 @@ Set TypingSpeed 50ms
 Set Padding 20
 
 Hide
-Type "source /Users/sunilp/Development/sunil-ws/jamjet/sdk/python/.venv/bin/activate"
+Type "source ${JAMJET_DEMO_VENV:-./sdk/python/.venv/bin/activate}"
 Enter
 Sleep 300ms
 Type "cd /tmp && rm -rf jamjet-demo && mkdir jamjet-demo && cd jamjet-demo"
