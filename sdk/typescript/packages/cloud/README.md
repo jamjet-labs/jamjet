@@ -26,7 +26,7 @@ pnpm --filter @jamjet/example-01-block-unsafe-tool start
 
 Output:
 
-```
+```text
 Tool: database.delete_all_customers
 Policy: block '*delete*'
 Decision: BLOCKED

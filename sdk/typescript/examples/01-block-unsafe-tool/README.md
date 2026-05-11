@@ -11,7 +11,7 @@ pnpm start
 
 ## Expected output
 
-```
+```text
 Tool: database.delete_all_customers
 Policy: block '*delete*'
 Decision: BLOCKED

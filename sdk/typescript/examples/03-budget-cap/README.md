@@ -11,7 +11,7 @@ pnpm start
 
 ## Expected output
 
-```
+```text
 Step 1: search.web $0.02  ALLOWED
 Step 2: search.web $0.02  ALLOWED
 Step 3: search.web $0.02  BUDGET_EXCEEDED

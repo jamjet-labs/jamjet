@@ -16,7 +16,7 @@ pnpm start
 
 ## Expected output
 
-```
+```text
 Server: postgres-mcp
 Tool: postgres/database.delete_all_customers
 Policy: block '*delete*'

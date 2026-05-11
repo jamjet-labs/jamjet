@@ -11,7 +11,7 @@ pnpm start
 
 ## Expected output
 
-```
+```text
 Tool: payments.refund
 Policy: payments.* requires approval
 Decision: WAITING_FOR_APPROVAL
