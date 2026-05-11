@@ -1,0 +1,5 @@
+Tool: payments.refund
+Policy: payments.* requires approval
+Decision: WAITING_FOR_APPROVAL
+Approve via your control plane, then resume.
+The model is mocked. The enforcement path is real.

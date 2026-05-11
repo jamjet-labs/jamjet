@@ -1,0 +1,6 @@
+Step 1: search.web $0.02  ALLOWED
+Step 2: search.web $0.02  ALLOWED
+Step 3: search.web $0.02  BUDGET_EXCEEDED
+Spent: $0.04 of $0.05 cap
+Decision: BUDGET_EXCEEDED
+The model is mocked. The enforcement path is real.
