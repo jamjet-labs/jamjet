@@ -1,4 +1,4 @@
-export type PolicyAction = 'block' | 'allow' | 'require_approval'
+export type PolicyAction = 'block' | 'allow' | 'require_approval' | 'audit'
 
 export interface PolicyDecision {
   blocked: boolean
@@ -31,12 +31,15 @@ export class PolicyEvaluator {
   }
 
   evaluate(toolName: string): PolicyDecision {
+    // First-match-wins per policy spec §5 (rules evaluated top-to-bottom,
+    // first matching rule is returned; later rules cannot override).
     let matchedAction: PolicyAction | null = null
     let matchedPattern: string | null = null
     for (const rule of this.rules) {
       if (rule.regex.test(toolName)) {
         matchedAction = rule.action
         matchedPattern = rule.pattern
+        break
       }
     }
     if (matchedAction === null) {

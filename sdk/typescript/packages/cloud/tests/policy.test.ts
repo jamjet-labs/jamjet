@@ -19,10 +19,10 @@ describe('PolicyEvaluator', () => {
     expect(d.pattern).toBe('payments.*')
   })
 
-  it('last matching rule wins', () => {
+  it('first matching rule wins (specific before catch-all)', () => {
     const e = new PolicyEvaluator()
-    e.add('block', 'payments.*')
     e.add('allow', 'payments.read')
+    e.add('block', 'payments.*')
     expect(e.evaluate('payments.send').blocked).toBe(true)
     expect(e.evaluate('payments.read').blocked).toBe(false)
   })
@@ -57,5 +57,39 @@ describe('PolicyEvaluator', () => {
     const { allowed, blocked } = e.filterTools(tools as any)
     expect(blocked).toHaveLength(1)
     expect(allowed).toHaveLength(0)
+  })
+})
+
+describe('PolicyEvaluator first-match-wins', () => {
+  it('returns the FIRST matching rule when multiple rules match', () => {
+    const ev = new PolicyEvaluator()
+    ev.add('allow', '*')
+    ev.add('block', '*delete*')
+    const decision = ev.evaluate('database.delete_all')
+    // first match is the * rule (allow), so:
+    expect(decision.blocked).toBe(false)
+    expect(decision.pattern).toBe('*')
+    expect(decision.policyKind).toBe('allow')
+  })
+
+  it('returns the FIRST match when reverse-ordered', () => {
+    const ev = new PolicyEvaluator()
+    ev.add('block', '*delete*')
+    ev.add('allow', '*')
+    const decision = ev.evaluate('database.delete_all')
+    // first match is *delete* (block):
+    expect(decision.blocked).toBe(true)
+    expect(decision.pattern).toBe('*delete*')
+  })
+})
+
+describe('PolicyEvaluator audit action', () => {
+  it('treats audit as a recognized action with policyKind="audit"', () => {
+    const ev = new PolicyEvaluator()
+    ev.add('audit', 'slack.send_message')
+    const decision = ev.evaluate('slack.send_message')
+    expect(decision.blocked).toBe(false)
+    expect(decision.policyKind).toBe('audit')
+    expect(decision.pattern).toBe('slack.send_message')
   })
 })
