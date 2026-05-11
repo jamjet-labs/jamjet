@@ -140,7 +140,53 @@ def budget_cap(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable audit event."),
 ) -> None:
     """Mock agent loop hits a $0.05 budget cap. JamJet blocks before further spend."""
-    raise NotImplementedError
+    from jamjet.cli._demo_agent import DeterministicDemoAgent
+    from jamjet.cli._demo_audit import DemoAuditEvent, write_audit_event
+
+    cap_usd = 0.05
+    agent = DeterministicDemoAgent(scenario="budget-cap")
+    plans = agent.plan_tool_calls()
+
+    spent = 0.0
+    log: list[dict[str, object]] = []
+    blocked_at: int | None = None
+    for i, plan in enumerate(plans, start=1):
+        if spent + plan.estimated_cost_usd > cap_usd:
+            log.append({"step": i, "tool": plan.tool, "cost": plan.estimated_cost_usd, "decision": "BUDGET_EXCEEDED"})
+            blocked_at = i
+            break
+        spent += plan.estimated_cost_usd
+        log.append({"step": i, "tool": plan.tool, "cost": plan.estimated_cost_usd, "decision": "ALLOWED"})
+
+    event = DemoAuditEvent(
+        run_id="budget-cap-001",
+        demo="budget-cap",
+        decision="BUDGET_EXCEEDED" if blocked_at else "ALLOWED",
+        tool=plans[blocked_at - 1].tool if blocked_at else "—",
+        rule=f"budget cap ${cap_usd:.2f}",
+        executed=False if blocked_at else True,
+        extra={"spent_usd": round(spent, 2), "cap_usd": cap_usd, "log": log},
+    )
+    audit_path = write_audit_event(event)
+
+    if json_output:
+        typer.echo(json.dumps(event.to_dict(), indent=2, sort_keys=True))
+        return
+
+    typer.echo("JamJet demo: budget cap")
+    typer.echo("")
+    typer.echo(f"  Agent:    {agent.name()}")
+    typer.echo(f"  Budget:   ${cap_usd:.2f}")
+    typer.echo("")
+    for entry in log:
+        marker = "✓" if entry["decision"] == "ALLOWED" else "✗"
+        typer.echo(f"  {marker} Step {entry['step']}  {entry['tool']}  ${entry['cost']:.2f}  {entry['decision']}")
+    typer.echo("")
+    typer.echo(f"  Spent:    ${spent:.2f}")
+    typer.echo(f"  Decision: {event.decision}")
+    typer.echo(f"  Audit:    {audit_path}")
+    typer.echo("")
+    typer.echo("  The model is mocked. The enforcement path is real.")
 
 
 @demo_app.command("mcp-tool-policy")

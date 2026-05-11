@@ -112,3 +112,21 @@ def test_approval_resumes_after_approve_flag(tmp_path, monkeypatch):
     state = json.loads(runs[0].read_text())
     assert state["decision"] == "APPROVED"
     assert state["executed"] is True
+
+
+def test_budget_cap_blocks_third_step(tmp_path, monkeypatch, snapshot):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["demo", "budget-cap"])
+    assert result.exit_code == 0
+    assert "BUDGET_EXCEEDED" in result.stdout
+    assert "$0.04" in result.stdout
+    assert _redact_tmp_audit_path(result.stdout, tmp_path) == snapshot
+
+
+def test_budget_cap_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["demo", "budget-cap", "--json"])
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "BUDGET_EXCEEDED"
+    assert payload["extra"]["spent_usd"] == 0.04
+    assert payload["extra"]["cap_usd"] == 0.05

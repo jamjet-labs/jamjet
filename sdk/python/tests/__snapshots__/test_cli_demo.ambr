@@ -1,4 +1,23 @@
 # serializer version: 1
+# name: test_budget_cap_blocks_third_step
+  '''
+  JamJet demo: budget cap
+  
+    Agent:    DeterministicDemoAgent (mocked — no real model)
+    Budget:   $0.05
+  
+    ✓ Step 1  search.web  $0.02  ALLOWED
+    ✓ Step 2  search.web  $0.02  ALLOWED
+    ✗ Step 3  search.web  $0.02  BUDGET_EXCEEDED
+  
+    Spent:    $0.04
+    Decision: BUDGET_EXCEEDED
+    Audit:    <TMP>/.jamjet-demo/runs/budget-cap-001.json
+  
+    The model is mocked. The enforcement path is real.
+  
+  '''
+# ---
 # name: test_unsafe_tool_call_human_output
   '''
   JamJet demo: unsafe tool-call blocking
