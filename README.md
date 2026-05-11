@@ -89,7 +89,7 @@ jamjet.cloud.policy("require_approval", "database.*")
 
 ## Where JamJet sits
 
-```
+```text
             Your Agent / Framework
    (LangChain · CrewAI · ADK · custom · MCP client)
                      │
