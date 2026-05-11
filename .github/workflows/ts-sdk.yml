@@ -28,8 +28,10 @@ jobs:
           cache: pnpm
           cache-dependency-path: sdk/typescript/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
+      # Build before typecheck so @jamjet/cloud-vercel can resolve
+      # @jamjet/cloud's emitted .d.ts (workspace dep typecheck order).
       - run: pnpm build
+      - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm size
 
