@@ -1,4 +1,4 @@
-export const VERSION = '0.2.2'
+export const VERSION = '0.3.0'
 
 export { init } from './init.js'
 export { wrap } from './wrap.js'
@@ -40,3 +40,27 @@ export { getActive } from './client.js'
 
 // Cost utility — exported for ecosystem packages (e.g. @jamjet/cloud-vercel middleware).
 export { estimateCost } from './cost.js'
+
+// Policy loader (v1 policy.yaml) — used by Phase 2 adapters
+// (claude-code-hook, openai-guardrail, mcp-shim) to load policy from the
+// canonical lookup order (explicit path > env > cwd > ~/.jamjet/).
+export { loadPolicy } from './load-policy.js'
+export type { Policy, PolicyRule, PolicyBudget } from './load-policy.js'
+
+// Audit writer (v1 JSONL schema) — append-only, daily rotation by default
+export { AuditWriter } from './audit-writer.js'
+export type {
+  AdapterName,
+  HostName,
+  Decision,
+  AuditEventInput,
+  AuditWriterOptions,
+} from './audit-writer.js'
+
+// Approval queue — in-memory + filesystem pending dir, 5-min default timeout
+export { ApprovalQueue } from './approval-queue.js'
+export type {
+  PendingApproval,
+  ApprovalResult,
+  ApprovalQueueOptions,
+} from './approval-queue.js'
