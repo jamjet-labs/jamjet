@@ -45,9 +45,11 @@ def unsafe_tool_call(
         decision="BLOCKED" if decision.blocked else "ALLOWED",
         tool=plan.tool,
         rule=decision.pattern,
+        rule_kind="block" if decision.blocked else ("allow" if decision.pattern else None),
         executed=False if decision.blocked else True,
         trace_id="jj_7f21c9",
         decision_id="dec_91ab2",
+        args=dict(plan.arguments),
     )
     audit_path = write_audit_event(event)
 
@@ -127,7 +129,9 @@ def approval(
         decision="WAITING_FOR_APPROVAL",
         tool=plan.tool,
         rule="payments.* requires approval",
+        rule_kind="require_approval",
         executed=False,
+        args=dict(plan.arguments),
         extra={"arguments": plan.arguments},
     )
     audit_path = write_audit_event(event)
@@ -181,7 +185,9 @@ def budget_cap(
         decision="BUDGET_EXCEEDED" if blocked_at else "ALLOWED",
         tool=plans[blocked_at - 1].tool if blocked_at else "—",
         rule=f"budget cap ${cap_usd:.2f}",
+        rule_kind=None,  # budget is a separate concern, not a rule action
         executed=False if blocked_at else True,
+        args=dict(plans[blocked_at - 1].arguments) if blocked_at else {},
         extra={"spent_usd": round(spent, 2), "cap_usd": cap_usd, "log": log},
     )
     audit_path = write_audit_event(event)
@@ -228,7 +234,10 @@ def mcp_tool_policy(
         decision="BLOCKED" if decision.blocked else "ALLOWED",
         tool=plan.tool,
         rule=decision.pattern,
+        rule_kind="block" if decision.blocked else ("allow" if decision.pattern else None),
         executed=False if decision.blocked else True,
+        server="postgres-mcp",
+        args=dict(plan.arguments),
         extra={
             "server": "postgres-mcp",
             "envelope": {"server": "postgres-mcp", "tool": plan.tool, "arguments": plan.arguments},
