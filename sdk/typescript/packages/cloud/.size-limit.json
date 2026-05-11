@@ -5,8 +5,23 @@
     "limit": "19 KB"
   },
   {
-    "name": "@jamjet/cloud/node (with auto-patcher)",
+    "name": "@jamjet/cloud/node (with auto-patcher + loadPolicy + AuditWriter + ApprovalQueue)",
     "path": "dist/node.js",
-    "limit": "20 KB"
+    "limit": "30 KB",
+    "ignore": [
+      "fs",
+      "path",
+      "os",
+      "crypto",
+      "events",
+      "node:fs",
+      "node:path",
+      "node:os",
+      "node:crypto",
+      "node:events",
+      "openai",
+      "@anthropic-ai/sdk",
+      "yaml"
+    ]
   }
 ]

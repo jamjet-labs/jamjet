@@ -30,3 +30,10 @@ async function tryPatchAnthropic(): Promise<void> {
 export { wrap } from './wrap.js'
 export { VERSION } from './index.js'
 export type { InitOptions } from './config.js'
+
+// Phase 2 Node-only utilities — live here (not in the universal entry) because
+// they use node:fs / node:crypto and would break Cloudflare Workers / Vercel
+// Edge / browser bundles if exposed from '@jamjet/cloud'.
+export { loadPolicy } from './load-policy.js'
+export { AuditWriter } from './audit-writer.js'
+export { ApprovalQueue } from './approval-queue.js'
