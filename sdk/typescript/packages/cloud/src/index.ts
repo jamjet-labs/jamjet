@@ -56,3 +56,11 @@ export type {
   AuditEventInput,
   AuditWriterOptions,
 } from './audit-writer.js'
+
+// Approval queue — in-memory + filesystem pending dir, 5-min default timeout
+export { ApprovalQueue } from './approval-queue.js'
+export type {
+  PendingApproval,
+  ApprovalResult,
+  ApprovalQueueOptions,
+} from './approval-queue.js'
