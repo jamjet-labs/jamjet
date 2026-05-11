@@ -13,8 +13,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jamjet"
-version = "0.8.0"
-description = "JamJet Python SDK — agent-native workflow authoring, CLI, and JamJet Cloud governance (jamjet.cloud submodule)"
+version = "0.8.1"
+description = "JamJet — open-source safety layer for AI agents. Block unsafe tool calls, require approval, enforce budgets, audit, replay."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
