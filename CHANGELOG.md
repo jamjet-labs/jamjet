@@ -11,6 +11,17 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## 0.8.3 — 2026-05-11
+
+### Added
+- `jamjet.integrations.openai_guardrail` — JamJet policy as an OpenAI Agents SDK tool guardrail. Same `policy.yaml`, same v1 audit JSONL as `@jamjet/claude-code-hook` / `@jamjet/mcp-shim` / `@jamjet/openai-guardrail` (TS).
+- New exceptions: `JamjetPolicyBlocked`, `JamjetApprovalRequired`.
+
+### Notes
+- Approval flow surfaces as `JamjetApprovalRequired` exception in v0.1. Full approval flow with `jamjet approve <run-id>` integrates with the OpenAI Agents SDK approval API in v0.2.
+
+---
+
 ## 0.8.2 — 2026-05-11
 
 ### Added
