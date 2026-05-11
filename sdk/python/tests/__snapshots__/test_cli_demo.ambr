@@ -44,18 +44,25 @@
   '''
   JamJet demo: unsafe tool-call blocking
   
-    Agent:    DeterministicDemoAgent (mocked — no real model)
-    Planned:  database.delete_all_customers({'reason': 'cleanup old records'})
+  Scenario:
+    An AI agent wants to clean up old customer records.
   
-    Policy:
-      block tools matching '*delete*'
+  Agent (DeterministicDemoAgent (mocked — no real model)) requested tool:
+    database.delete_all_customers({'reason': 'cleanup old records'})
   
-    Decision: BLOCKED  (rule: *delete*)
-    Executed: false
+  Policy check:
+    blocked patterns: '*delete*'
   
-    Audit:    <TMP>/.jamjet-demo/runs/unsafe-tool-call-001.json
+  Decision: BLOCKED
+  Reason:   tool name matches blocked pattern '*delete*'
   
-    The model is mocked. The enforcement path is real.
+  Audit event:
+    trace_id:    jj_7f21c9
+    decision_id: dec_91ab2
+    executed:    false
+    audit_path:  <TMP>/.jamjet-demo/runs/unsafe-tool-call-001.json
+  
+  The model is mocked. The enforcement path is real.
   
   '''
 # ---

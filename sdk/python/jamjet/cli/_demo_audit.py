@@ -17,6 +17,8 @@ class DemoAuditEvent:
     tool: str
     rule: str | None = None
     executed: bool = False
+    trace_id: str | None = None
+    decision_id: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 

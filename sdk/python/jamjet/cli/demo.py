@@ -42,6 +42,8 @@ def unsafe_tool_call(
         tool=plan.tool,
         rule=decision.pattern,
         executed=False if decision.blocked else True,
+        trace_id="jj_7f21c9",
+        decision_id="dec_91ab2",
     )
     audit_path = write_audit_event(event)
 
@@ -51,18 +53,25 @@ def unsafe_tool_call(
 
     typer.echo("JamJet demo: unsafe tool-call blocking")
     typer.echo("")
-    typer.echo(f"  Agent:    {agent.name()}")
-    typer.echo(f"  Planned:  {plan.tool}({plan.arguments!r})")
+    typer.echo("Scenario:")
+    typer.echo("  An AI agent wants to clean up old customer records.")
     typer.echo("")
-    typer.echo("  Policy:")
-    typer.echo("    block tools matching '*delete*'")
+    typer.echo(f"Agent ({agent.name()}) requested tool:")
+    typer.echo(f"  {plan.tool}({plan.arguments!r})")
     typer.echo("")
-    typer.echo(f"  Decision: {event.decision}  (rule: {event.rule})")
-    typer.echo(f"  Executed: {str(event.executed).lower()}")
+    typer.echo("Policy check:")
+    typer.echo("  blocked patterns: '*delete*'")
     typer.echo("")
-    typer.echo(f"  Audit:    {audit_path}")
+    typer.echo(f"Decision: {event.decision}")
+    typer.echo(f"Reason:   tool name matches blocked pattern '{event.rule}'")
     typer.echo("")
-    typer.echo("  The model is mocked. The enforcement path is real.")
+    typer.echo("Audit event:")
+    typer.echo(f"  trace_id:    {event.trace_id}")
+    typer.echo(f"  decision_id: {event.decision_id}")
+    typer.echo(f"  executed:    {str(event.executed).lower()}")
+    typer.echo(f"  audit_path:  {audit_path}")
+    typer.echo("")
+    typer.echo("The model is mocked. The enforcement path is real.")
 
 
 @demo_app.command("approval")

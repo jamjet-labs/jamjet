@@ -1,10 +1,12 @@
-# demo-unsafe-tool-call.tape
+# demo-unsafe-tool-call.tape — README GIF
 # Generate with: vhs demo-unsafe-tool-call.tape
 #
-# The GIF shows only the demo running. The README explains `pip install jamjet`
-# in text right above the GIF, so the GIF stays focused on the safety story.
-# We activate the local editable venv silently before the visible recording starts
-# and override the shell prompt so the visible terminal looks generic ($).
+# README hero GIF. Smaller dimensions (1100x700), 16pt, ~7s. The README
+# explains `pip install jamjet` in text right above this GIF, so the GIF
+# shows only the safety demo running for maximum focus.
+#
+# For the marketing-quality MP4 (1280x720, 18pt, slower paced for narration
+# overlays), see demo-unsafe-tool-call-marketing.tape.
 Output demo.gif
 
 Set Shell "bash"
@@ -19,7 +21,7 @@ Hide
 Type "source /Users/sunilp/Development/sunil-ws/jamjet/sdk/python/.venv/bin/activate"
 Enter
 Sleep 300ms
-Type "cd /tmp && rm -rf jamjet-demo-gif && mkdir jamjet-demo-gif && cd jamjet-demo-gif"
+Type "cd /tmp && rm -rf jamjet-demo && mkdir jamjet-demo && cd jamjet-demo"
 Enter
 Sleep 300ms
 Type "export PS1='$ '"
