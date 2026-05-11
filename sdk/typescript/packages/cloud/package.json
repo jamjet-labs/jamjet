@@ -1,7 +1,7 @@
 {
   "name": "@jamjet/cloud",
-  "version": "0.2.1",
-  "description": "JamJet Cloud SDK — drop-in governance for TypeScript AI apps",
+  "version": "0.2.2",
+  "description": "JamJet — open-source safety layer for AI agents (TypeScript). Block unsafe tool calls, require approval, enforce budgets, audit, replay.",
   "license": "Apache-2.0",
   "type": "module",
   "files": ["dist", "README.md"],
@@ -59,7 +59,19 @@
     "access": "public",
     "provenance": true
   },
-  "keywords": ["jamjet", "ai", "agents", "governance", "observability", "openai", "anthropic"],
+  "keywords": [
+    "jamjet",
+    "ai",
+    "agents",
+    "agent-safety",
+    "governance",
+    "observability",
+    "openai",
+    "anthropic",
+    "mcp",
+    "human-in-the-loop",
+    "audit-log"
+  ],
   "homepage": "https://jamjet.dev",
   "repository": {
     "type": "git",

@@ -2,7 +2,41 @@
 
 [![npm version](https://img.shields.io/npm/v/@jamjet/cloud.svg)](https://www.npmjs.com/package/@jamjet/cloud)
 
-Drop-in governance for TypeScript AI applications. Two-line install gets you spans, cost tracking, and PII redaction in [JamJet Cloud](https://app.jamjet.dev).
+**The open-source safety layer for AI agents — TypeScript edition.**
+
+- **Block** unsafe tool calls at runtime
+- **Pause** for human approval on risky actions
+- **Cap** cost per agent, per run, per project
+- **Audit** every decision the agent made
+- **Replay or resume** a crashed run
+
+Keep your AI framework (Vercel AI SDK, OpenAI SDK, Anthropic SDK, LangChain.js).
+Add `@jamjet/cloud` where tool calls need control.
+
+## See it in 60 seconds
+
+Clone the repo and run the four safety demos — no API keys, no network calls:
+
+```bash
+git clone https://github.com/jamjet-labs/jamjet.git
+cd jamjet/sdk/typescript
+pnpm install
+pnpm --filter @jamjet/example-01-block-unsafe-tool start
+```
+
+Output:
+
+```
+Tool: database.delete_all_customers
+Policy: block '*delete*'
+Decision: BLOCKED
+Executed: false
+The model is mocked. The enforcement path is real.
+```
+
+The other three demos live in `examples/02-human-approval`, `examples/03-budget-cap`,
+and `examples/04-mcp-tool-policy`. Each exercises a different enforcement path
+with the same zero-setup contract.
 
 ## Install
 
@@ -57,6 +91,39 @@ import { init, wrap } from '@jamjet/cloud'
 await init({ apiKey: process.env.JAMJET_API_KEY!, project: 'my-app' })
 const openai = wrap(new OpenAI())
 ```
+
+## Add a policy
+
+```ts
+import { init, policy, budget } from '@jamjet/cloud'
+
+await init({ apiKey: process.env.JAMJET_API_KEY!, project: 'my-app' })
+
+policy('block', 'database.*delete*')
+policy('require_approval', 'payments.*')
+budget(5.00) // hard cap in USD
+```
+
+`policy()` and `budget()` apply to every wrapped LLM client in the process.
+Blocked tools are stripped before the model sees them; budget exhaustion throws
+`JamjetBudgetExceeded` before the next call goes out.
+
+## Standalone primitives (no Cloud account)
+
+The same evaluator that powers the auto-patcher is also exposed directly —
+useful for tests, gateways, or any code that wants policy enforcement without
+spinning up a `Client`:
+
+```ts
+import { PolicyEvaluator, BudgetManager } from '@jamjet/cloud'
+
+const evaluator = new PolicyEvaluator()
+evaluator.add('block', '*delete*')
+const decision = evaluator.evaluate('database.delete_all_customers')
+// decision.blocked === true
+```
+
+This is the path the four `examples/0*` demos take.
 
 ## Testing
 

@@ -12,6 +12,58 @@ importers:
         specifier: ^5.4.5
         version: 5.9.3
 
+  examples/01-block-unsafe-tool:
+    dependencies:
+      '@jamjet/cloud':
+        specifier: workspace:*
+        version: link:../../packages/cloud
+    devDependencies:
+      tsx:
+        specifier: ^4.16.0
+        version: 4.21.0
+      typescript:
+        specifier: ^5.4.5
+        version: 5.9.3
+
+  examples/02-human-approval:
+    dependencies:
+      '@jamjet/cloud':
+        specifier: workspace:*
+        version: link:../../packages/cloud
+    devDependencies:
+      tsx:
+        specifier: ^4.16.0
+        version: 4.21.0
+      typescript:
+        specifier: ^5.4.5
+        version: 5.9.3
+
+  examples/03-budget-cap:
+    dependencies:
+      '@jamjet/cloud':
+        specifier: workspace:*
+        version: link:../../packages/cloud
+    devDependencies:
+      tsx:
+        specifier: ^4.16.0
+        version: 4.21.0
+      typescript:
+        specifier: ^5.4.5
+        version: 5.9.3
+
+  examples/04-mcp-tool-policy:
+    dependencies:
+      '@jamjet/cloud':
+        specifier: workspace:*
+        version: link:../../packages/cloud
+    devDependencies:
+      tsx:
+        specifier: ^4.16.0
+        version: 4.21.0
+      typescript:
+        specifier: ^5.4.5
+        version: 5.9.3
+
   examples/smoke-test:
     dependencies:
       '@ai-sdk/openai':

@@ -1,4 +1,4 @@
-export const VERSION = '0.2.0'
+export const VERSION = '0.2.2'
 
 export { init } from './init.js'
 export { wrap } from './wrap.js'
@@ -24,6 +24,8 @@ export {
 export type { RequireApprovalOptions } from './governance.js'
 export type { AgentRef, UserContext } from './context.js'
 export type { PolicyAction, PolicyDecision } from './policy.js'
+export { PolicyEvaluator } from './policy.js'
+export { BudgetManager } from './budget.js'
 export {
   JamjetBudgetExceeded,
   JamjetPolicyBlocked,
