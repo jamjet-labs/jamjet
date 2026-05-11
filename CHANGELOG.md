@@ -11,6 +11,24 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.8.1] — 2026-05-11
+
+### Added
+- `jamjet demo` CLI: 4 zero-setup safety demos — `unsafe-tool-call`, `approval`, `budget-cap`, `mcp-tool-policy`.
+  All demos run with no API key, no Docker, no cloud. Mock agent named `DeterministicDemoAgent`. Every output ends with "The model is mocked. The enforcement path is real."
+- `--json` flag on every demo emits a machine-readable audit event.
+- Audit events written to `.jamjet-demo/runs/<run-id>.json` for inspection.
+- Examples 01–04 in `examples/` mirror the demo CLI commands.
+
+### Changed
+- PyPI description rewritten from "agent-native runtime and framework" to "safety layer for AI agents".
+- README hero rewritten to lead with the 60-second safety demo.
+
+### Notes
+- This release is SDK-based. **JamJet Gateway** — an MCP proxy applying the same policy to MCP traffic from Claude Desktop, Cursor, and other MCP clients — is the next major milestone. See [jamjet.dev/gateway](https://jamjet.dev/gateway).
+
+---
+
 ## [0.1.0] — 2026-03-08
 
 First public release. JamJet is a performance-first, agent-native runtime for AI agents — built in Rust, authored in Python.
