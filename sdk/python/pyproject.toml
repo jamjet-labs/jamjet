@@ -40,7 +40,7 @@ dependencies = [
     "pyyaml>=6.0",
     "cryptography>=42",
     "aiosqlite>=0.20",
-    "jamjet-engram>=0.1,<0.2",
+    "jamjet-engram>=0.1,<0.3",
 ]
 
 [project.urls]
