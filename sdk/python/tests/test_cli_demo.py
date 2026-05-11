@@ -130,3 +130,22 @@ def test_budget_cap_json(tmp_path, monkeypatch):
     assert payload["decision"] == "BUDGET_EXCEEDED"
     assert payload["extra"]["spent_usd"] == 0.04
     assert payload["extra"]["cap_usd"] == 0.05
+
+
+def test_mcp_tool_policy_blocks_with_gateway_footer(tmp_path, monkeypatch, snapshot):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["demo", "mcp-tool-policy"])
+    assert result.exit_code == 0
+    assert "BLOCKED" in result.stdout
+    assert "Full MCP proxy support is planned for JamJet Gateway" in result.stdout
+    assert "MCP-shaped request envelope" in result.stdout
+    assert _redact_tmp_audit_path(result.stdout, tmp_path) == snapshot
+
+
+def test_mcp_tool_policy_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["demo", "mcp-tool-policy", "--json"])
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "BLOCKED"
+    assert payload["extra"]["server"] == "postgres-mcp"
+    assert payload["executed"] is False

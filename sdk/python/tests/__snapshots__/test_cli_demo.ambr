@@ -18,6 +18,28 @@
   
   '''
 # ---
+# name: test_mcp_tool_policy_blocks_with_gateway_footer
+  '''
+  JamJet demo: MCP tool policy
+  
+    This demo uses an MCP-shaped request envelope to show policy evaluation.
+    It is not yet an MCP proxy. Full MCP proxy support is planned for JamJet Gateway.
+  
+    Agent:    DeterministicDemoAgent (mocked — no real model)
+    MCP request:
+      server: postgres-mcp
+      tool:   postgres/database.delete_all_customers
+  
+    Policy: block tools matching '*delete*'
+  
+    Decision: BLOCKED  (rule: *delete*)
+    Executed: false
+    Audit:    <TMP>/.jamjet-demo/runs/mcp-tool-policy-001.json
+  
+    The model is mocked. The enforcement path is real.
+  
+  '''
+# ---
 # name: test_unsafe_tool_call_human_output
   '''
   JamJet demo: unsafe tool-call blocking

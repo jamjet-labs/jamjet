@@ -194,4 +194,49 @@ def mcp_tool_policy(
     json_output: bool = typer.Option(False, "--json", help="Machine-readable audit event."),
 ) -> None:
     """Mock MCP-shaped tool request. JamJet evaluates policy. Foreshadows JamJet Gateway."""
-    raise NotImplementedError
+    from jamjet.cli._demo_agent import DeterministicDemoAgent
+    from jamjet.cli._demo_audit import DemoAuditEvent, write_audit_event
+    from jamjet.cloud.policy import PolicyEvaluator
+
+    evaluator = PolicyEvaluator()
+    evaluator.add("block", "*delete*")
+
+    agent = DeterministicDemoAgent(scenario="mcp-tool-policy")
+    plan = agent.plan_tool_calls()[0]
+    decision = evaluator.evaluate(plan.tool)
+
+    event = DemoAuditEvent(
+        run_id="mcp-tool-policy-001",
+        demo="mcp-tool-policy",
+        decision="BLOCKED" if decision.blocked else "ALLOWED",
+        tool=plan.tool,
+        rule=decision.pattern,
+        executed=False if decision.blocked else True,
+        extra={
+            "server": "postgres-mcp",
+            "envelope": {"server": "postgres-mcp", "tool": plan.tool, "arguments": plan.arguments},
+        },
+    )
+    audit_path = write_audit_event(event)
+
+    if json_output:
+        typer.echo(json.dumps(event.to_dict(), indent=2, sort_keys=True))
+        return
+
+    typer.echo("JamJet demo: MCP tool policy")
+    typer.echo("")
+    typer.echo("  This demo uses an MCP-shaped request envelope to show policy evaluation.")
+    typer.echo("  It is not yet an MCP proxy. Full MCP proxy support is planned for JamJet Gateway.")
+    typer.echo("")
+    typer.echo(f"  Agent:    {agent.name()}")
+    typer.echo("  MCP request:")
+    typer.echo("    server: postgres-mcp")
+    typer.echo(f"    tool:   {plan.tool}")
+    typer.echo("")
+    typer.echo("  Policy: block tools matching '*delete*'")
+    typer.echo("")
+    typer.echo(f"  Decision: {event.decision}  (rule: {event.rule})")
+    typer.echo(f"  Executed: {str(event.executed).lower()}")
+    typer.echo(f"  Audit:    {audit_path}")
+    typer.echo("")
+    typer.echo("  The model is mocked. The enforcement path is real.")
