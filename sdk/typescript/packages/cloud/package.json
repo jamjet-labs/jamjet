@@ -4,7 +4,10 @@
   "description": "JamJet — open-source safety layer for AI agents (TypeScript). Block unsafe tool calls, require approval, enforce budgets, audit, replay.",
   "license": "Apache-2.0",
   "type": "module",
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -31,13 +34,14 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "yaml": "^2.5.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@size-limit/preset-small-lib": "^11.1.0",
     "@types/node": "^20.14.0",
     "msw": "^2.4.0",
     "size-limit": "^11.1.0",
-    "@size-limit/preset-small-lib": "^11.1.0",
     "tsup": "^8.2.0",
     "typescript": "^5.4.5",
     "vitest": "^2.0.0"
@@ -48,9 +52,15 @@
     "openai": ">=4.0.0"
   },
   "peerDependenciesMeta": {
-    "openai": { "optional": true },
-    "@anthropic-ai/sdk": { "optional": true },
-    "msw": { "optional": true }
+    "openai": {
+      "optional": true
+    },
+    "@anthropic-ai/sdk": {
+      "optional": true
+    },
+    "msw": {
+      "optional": true
+    }
   },
   "engines": {
     "node": ">=20.0.0"

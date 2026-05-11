@@ -40,3 +40,9 @@ export { getActive } from './client.js'
 
 // Cost utility — exported for ecosystem packages (e.g. @jamjet/cloud-vercel middleware).
 export { estimateCost } from './cost.js'
+
+// Policy loader (v1 policy.yaml) — used by Phase 2 adapters
+// (claude-code-hook, openai-guardrail, mcp-shim) to load policy from the
+// canonical lookup order (explicit path > env > cwd > ~/.jamjet/).
+export { loadPolicy } from './load-policy.js'
+export type { Policy, PolicyRule, PolicyBudget } from './load-policy.js'
