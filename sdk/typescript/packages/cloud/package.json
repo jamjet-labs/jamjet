@@ -1,7 +1,7 @@
 {
   "name": "@jamjet/cloud",
-  "version": "0.2.2",
-  "description": "JamJet — open-source safety layer for AI agents (TypeScript). Block unsafe tool calls, require approval, enforce budgets, audit, replay.",
+  "version": "0.3.0",
+  "description": "JamJet engine — policy evaluation, budget enforcement, audit writing, approval queue. The shared brain across all JamJet adapters.",
   "license": "Apache-2.0",
   "type": "module",
   "files": [
