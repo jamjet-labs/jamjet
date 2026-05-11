@@ -126,6 +126,7 @@ def test_budget_cap_blocks_third_step(tmp_path, monkeypatch, snapshot):
 def test_budget_cap_json(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["demo", "budget-cap", "--json"])
+    assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert payload["decision"] == "BUDGET_EXCEEDED"
     assert payload["extra"]["spent_usd"] == 0.04
@@ -145,6 +146,7 @@ def test_mcp_tool_policy_blocks_with_gateway_footer(tmp_path, monkeypatch, snaps
 def test_mcp_tool_policy_json(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["demo", "mcp-tool-policy", "--json"])
+    assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert payload["decision"] == "BLOCKED"
     assert payload["extra"]["server"] == "postgres-mcp"
