@@ -190,17 +190,6 @@ Community-built integrations for **LangChain, LlamaIndex, CrewAI, AutoGen, Pydan
 
 </details>
 
-## Roadmap
-
-| Phase | Status | Goal |
-|-------|--------|------|
-| 0 — Architecture & RFCs | ✅ Complete | Design docs, RFCs, repo scaffolding |
-| 1 — Minimal Viable Runtime | ✅ Complete | Local durable execution, MCP client, agent cards |
-| 2 — Production Core | ✅ Complete | Distributed workers, MCP server, A2A client + server |
-| 3 — Developer Delight | 🔄 In Progress | Eval harness, ~~Java SDK~~ ✅, **[Java Runtime](https://github.com/jamjet-labs/jamjet-runtime-java)** ✅, trace debugging, templates |
-| 4 — Enterprise | 🔄 In Progress | Policy engine, tenant isolation, PII redaction, OAuth, mTLS |
-| 5 — Scale & Ecosystem | 📋 Planned | Go SDK, TypeScript SDK, hosted plane, marketplace |
-
 ## Documentation
 
 Full docs at **[jamjet.dev](https://jamjet.dev/quickstart)**
