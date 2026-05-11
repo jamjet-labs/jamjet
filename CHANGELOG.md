@@ -11,6 +11,20 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## 0.8.2 — 2026-05-11
+
+### Added
+- `jamjet demo` audit events now emit the v1 portable schema: `adapter: "python-sdk"`, `host: "python"`, `schema_version: 1`, `policy_version: "1"`, `rule_kind`. Plus `args`, `server`, and the `ts` field (replaces `timestamp`).
+- Audit events from `jamjet` now share the same JSONL shape as `@jamjet/claude-code-hook`, `@jamjet/mcp-shim`, and `@jamjet/cloud` — `cat ~/.jamjet/audit/<YYYY-MM-DD>/*.jsonl` gives a unified view across every JamJet adapter.
+
+### Changed
+- Internal `DemoAuditEvent.timestamp` field renamed to `ts`. The `timestamp` key is preserved on serialized output as an alias for backward compatibility with anything reading jamjet 0.8.1 audit JSON.
+
+### Notes
+- Foundation for Phase 2's "one policy, one audit trail" claim. Other JamJet adapters (claude-code-hook, mcp-shim, openai-guardrail) live in [`jamjet-labs/jamjet-policy`](https://github.com/jamjet-labs/jamjet-policy).
+
+---
+
 ## [0.8.1] — 2026-05-11
 
 ### Added
