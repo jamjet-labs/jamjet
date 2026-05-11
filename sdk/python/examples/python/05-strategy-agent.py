@@ -1,4 +1,5 @@
 """Existing Agent() class (now backed by LocalRuntime) with strategy='react'."""
+
 import asyncio
 
 from jamjet import Agent

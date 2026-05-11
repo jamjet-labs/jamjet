@@ -31,5 +31,4 @@ def test_example_exits_zero_and_matches_expected(example: str) -> None:
         timeout=30,
     )
     assert proc.returncode == 0, f"{example} exit={proc.returncode}\n{proc.stderr}"
-    assert proc.stdout.strip() == expected_path.read_text().strip(), \
-        f"{example} output drift"
+    assert proc.stdout.strip() == expected_path.read_text().strip(), f"{example} output drift"

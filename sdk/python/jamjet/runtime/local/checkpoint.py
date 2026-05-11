@@ -1,4 +1,5 @@
 """SQLite-backed step checkpoint log. One DB file per execution_id."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -92,8 +93,12 @@ class CheckpointStore:
             if row is None:
                 return None
             return StepRecord(
-                step_id=row[0], input_hash=row[1], output_json=row[2],
-                status=row[3], error=row[4], duration_ms=row[5],
+                step_id=row[0],
+                input_hash=row[1],
+                output_json=row[2],
+                status=row[3],
+                error=row[4],
+                duration_ms=row[5],
             )
 
     async def get_step_if_match(self, step_id: str, *, input_hash: str) -> StepRecord | None:
@@ -111,8 +116,12 @@ class CheckpointStore:
             rows = await cur.fetchall()
             return [
                 StepRecord(
-                    step_id=r[0], input_hash=r[1], output_json=r[2],
-                    status=r[3], error=r[4], duration_ms=r[5],
+                    step_id=r[0],
+                    input_hash=r[1],
+                    output_json=r[2],
+                    status=r[3],
+                    error=r[4],
+                    duration_ms=r[5],
                 )
                 for r in rows
             ]

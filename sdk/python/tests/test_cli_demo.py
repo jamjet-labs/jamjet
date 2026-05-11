@@ -4,6 +4,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from jamjet.cli._demo_agent import DeterministicDemoAgent
 from jamjet.cli._demo_audit import DemoAuditEvent, write_audit_event
 from jamjet.cli.main import app
 
@@ -38,9 +39,6 @@ def test_audit_event_writes_json_under_run_dir(tmp_path, monkeypatch):
     assert written["run_id"] == "demo-run-001"
     assert written["decision"] == "BLOCKED"
     assert written["executed"] is False
-
-
-from jamjet.cli._demo_agent import DeterministicDemoAgent
 
 
 def test_demo_agent_is_explicit_about_being_mocked():

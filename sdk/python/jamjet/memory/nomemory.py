@@ -1,4 +1,5 @@
 """NoMemory stub for MemoryConfig(enabled=False) or backend='none'."""
+
 from __future__ import annotations
 
 from typing import Any

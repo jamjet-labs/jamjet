@@ -1,4 +1,5 @@
 """Deterministic step_id derivation + input hashing for replay."""
+
 from __future__ import annotations
 
 import hashlib

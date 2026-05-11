@@ -14,7 +14,9 @@ async def test_injector_wires_memory(tmp_path):
 
     instance = A()
     await inject_runtime_attributes(
-        instance, spec=A.__jamjet_spec__, execution_id="ex1",
+        instance,
+        spec=A.__jamjet_spec__,
+        execution_id="ex1",
     )
     assert instance.memory is not None
     fact = await instance.memory.record("test")
@@ -34,9 +36,12 @@ async def test_injector_uses_no_memory_when_disabled():
 
     instance = A()
     await inject_runtime_attributes(
-        instance, spec=A.__jamjet_spec__, execution_id="ex1",
+        instance,
+        spec=A.__jamjet_spec__,
+        execution_id="ex1",
     )
     from jamjet.memory import NoMemory
+
     assert isinstance(instance.memory, NoMemory)
 
 
@@ -49,14 +54,18 @@ async def test_injector_sets_seeded_helpers():
 
     instance = A()
     await inject_runtime_attributes(
-        instance, spec=A.__jamjet_spec__, execution_id="ex-seed-test",
+        instance,
+        spec=A.__jamjet_spec__,
+        execution_id="ex-seed-test",
     )
     assert instance.workflow_id == "ex-seed-test"
     # Seeded random produces deterministic output for same execution_id
     a = instance.random.random()
     instance2 = A()
     await inject_runtime_attributes(
-        instance2, spec=A.__jamjet_spec__, execution_id="ex-seed-test",
+        instance2,
+        spec=A.__jamjet_spec__,
+        execution_id="ex-seed-test",
     )
     b = instance2.random.random()
     assert a == b

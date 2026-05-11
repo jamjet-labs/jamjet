@@ -1,4 +1,5 @@
 """OpenAI LLM adapter. Wraps AsyncOpenAI for chat.completions.create."""
+
 from __future__ import annotations
 
 import os
@@ -20,9 +21,7 @@ class OpenAIAdapter:
         try:
             from openai import AsyncOpenAI
         except ImportError as exc:
-            raise ImportError(
-                "openai package required for OpenAI provider. Install: pip install openai"
-            ) from exc
+            raise ImportError("openai package required for OpenAI provider. Install: pip install openai") from exc
 
         client = AsyncOpenAI(
             api_key=os.environ.get(self.config.api_key_env, ""),

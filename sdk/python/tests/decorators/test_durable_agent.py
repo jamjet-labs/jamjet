@@ -43,6 +43,7 @@ def test_stateless_shortcut():
 
 def test_stateless_conflicts_with_explicit_memory():
     with pytest.raises(ValueError, match="stateless"):
+
         @DurableAgent(stateless=True, memory=MemoryConfig())
         class A:
             async def run(self, q: str) -> str:
@@ -96,6 +97,7 @@ def test_class_returned_unmodified_attribute_access_outside_runtime_raises():
 
 def test_runtime_can_inject_attributes():
     """After runtime injection (via instance __dict__), attribute access works."""
+
     @DurableAgent
     class A:
         async def run(self, q: str) -> str:

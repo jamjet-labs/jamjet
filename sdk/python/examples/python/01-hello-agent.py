@@ -3,6 +3,7 @@
 Usage:
     OPENAI_API_KEY=sk-... python examples/python/01-hello-agent.py
 """
+
 import asyncio
 
 from jamjet import DurableAgent, run
@@ -11,10 +12,12 @@ from jamjet import DurableAgent, run
 @DurableAgent(model="gpt-4o", instructions="Greet warmly.")
 class Greeter:
     async def run(self, name: str) -> str:
-        msg = await self.llm.generate([
-            {"role": "system", "content": "Greet warmly."},
-            {"role": "user", "content": f"Say hello to {name}."},
-        ])
+        msg = await self.llm.generate(
+            [
+                {"role": "system", "content": "Greet warmly."},
+                {"role": "user", "content": f"Say hello to {name}."},
+            ]
+        )
         return msg.content or ""
 
 

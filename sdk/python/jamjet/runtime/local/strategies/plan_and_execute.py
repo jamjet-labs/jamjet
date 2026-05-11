@@ -1,4 +1,5 @@
 """Plan-and-execute strategy: numbered plan -> per-step ReAct -> synthesis."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -35,11 +36,7 @@ async def run(
     plan_msg = await adapter.generate(plan_messages)
     plan_text = plan_msg.content or ""
 
-    steps = [
-        line.strip()
-        for line in plan_text.splitlines()
-        if line.strip() and line.strip()[0].isdigit()
-    ]
+    steps = [line.strip() for line in plan_text.splitlines() if line.strip() and line.strip()[0].isdigit()]
     if not steps:
         steps = [plan_text]
 

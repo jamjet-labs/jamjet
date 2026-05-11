@@ -35,4 +35,5 @@ def test_task_preserves_callable():
         return x * 2
 
     import asyncio
+
     assert asyncio.run(m(None, 21)) == 42

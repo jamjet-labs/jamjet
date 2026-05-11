@@ -17,16 +17,23 @@ def test_step_record_minimal():
 
 def test_runtime_event_kinds():
     e = RuntimeEvent(
-        kind="step_start", workflow_id="w1", step_id="s1",
-        timestamp=datetime.now(), payload={},
+        kind="step_start",
+        workflow_id="w1",
+        step_id="s1",
+        timestamp=datetime.now(),
+        payload={},
     )
     assert e.kind == "step_start"
 
 
 def test_runtime_result():
     r = RuntimeResult(
-        output="hi", execution_id="e1", duration_ms=1.0,
-        steps=[], tool_calls=[], llm_calls=[],
+        output="hi",
+        execution_id="e1",
+        duration_ms=1.0,
+        steps=[],
+        tool_calls=[],
+        llm_calls=[],
     )
     assert r.output == "hi"
 
@@ -38,8 +45,11 @@ def test_tool_call_record():
 
 def test_llm_call_record():
     c = LLMCallRecord(
-        provider="openai", model="gpt-4o",
-        prompt_tokens=10, completion_tokens=5, duration_ms=100.0,
+        provider="openai",
+        model="gpt-4o",
+        prompt_tokens=10,
+        completion_tokens=5,
+        duration_ms=100.0,
     )
     assert c.provider == "openai"
 

@@ -1,4 +1,5 @@
 """Inject runtime-managed attributes onto a @DurableAgent instance."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -29,14 +30,14 @@ async def inject_runtime_attributes(
     if spec.memory is None or not spec.memory.enabled or spec.memory.backend == "none":
         instance.memory = NoMemory()  # type: ignore[attr-defined]
     else:
-        db_path = (
-            Path(spec.memory.db_path) if spec.memory.db_path
-            else Path.home() / ".jamjet" / "engram.db"
-        )
+        db_path = Path(spec.memory.db_path) if spec.memory.db_path else Path.home() / ".jamjet" / "engram.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         engram = await Engram.open(path=str(db_path))
         instance.memory = AgentMemory(  # type: ignore[attr-defined]
-            engram, scope=s, config=spec.memory, session_id=execution_id,
+            engram,
+            scope=s,
+            config=spec.memory,
+            session_id=execution_id,
         )
         instance._jamjet_engram = engram  # type: ignore[attr-defined]  # caller must await engram.close()
 

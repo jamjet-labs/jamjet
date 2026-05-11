@@ -15,8 +15,13 @@ class AgentStrategy(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     name: Literal[
-        "plan-and-execute", "react", "critic",
-        "reflection", "consensus", "debate", "custom",
+        "plan-and-execute",
+        "react",
+        "critic",
+        "reflection",
+        "consensus",
+        "debate",
+        "custom",
     ]
     config: dict[str, Any] = Field(default_factory=dict)
 

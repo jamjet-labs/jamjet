@@ -48,7 +48,9 @@ def test_round_trip_json():
 
 def test_kind_discriminator_serialized():
     a = DurableAgentSpec(
-        name="x", llm=_llm(), class_ref="m:C",
+        name="x",
+        llm=_llm(),
+        class_ref="m:C",
         methods=[MethodSpec(name="run", is_entrypoint=True)],
     )
     data = a.model_dump()

@@ -1,4 +1,5 @@
 """@DurableAgent class decorator. Three forms: bare, parameterized, stateless."""
+
 from __future__ import annotations
 
 import inspect
@@ -120,9 +121,7 @@ def DurableAgent(  # noqa: N802
         raise ValueError("stateless=True conflicts with explicit memory= or durability=")
 
     def _decorate(c: type) -> type:
-        resolved_llm = llm or (
-            LLMConfig(provider="openai", model=model) if model else _DEFAULT_LLM
-        )
+        resolved_llm = llm or (LLMConfig(provider="openai", model=model) if model else _DEFAULT_LLM)
         resolved_memory: MemoryConfig | None
         resolved_durability: DurabilityConfig
         if stateless:

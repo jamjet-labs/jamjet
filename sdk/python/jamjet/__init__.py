@@ -26,6 +26,11 @@ Quick start:
         return state.model_copy(update={"result": r})
 """
 
+# isort: off
+# ruff: noqa: I001
+# Import order below is load-bearing: `from jamjet.decorators import workflow`
+# MUST come after `from jamjet.workflow.workflow import Workflow` so the
+# `workflow` name in this namespace binds to the decorator, not the subpackage.
 from jamjet.agents.agent import Agent, AgentResult
 from jamjet.agents.task import task
 from jamjet.client import JamjetClient
@@ -56,11 +61,8 @@ from jamjet.spec import (  # noqa: F401
 )
 from jamjet.tools.decorators import tool
 from jamjet.workflow.workflow import Workflow
-
-# Decorators imported LAST so the `workflow` name binds to the decorator
-# rather than the subpackage module (which Python's import machinery sets
-# on the parent namespace when `jamjet.workflow.workflow` is imported above).
 from jamjet.decorators import DurableAgent, workflow  # noqa: F401, E402
+# isort: on
 
 __all__ = [
     "Agent",

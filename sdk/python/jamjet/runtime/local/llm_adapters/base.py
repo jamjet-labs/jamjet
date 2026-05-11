@@ -1,4 +1,5 @@
 """LLM adapter protocol. One adapter per provider; OpenAI is the only complete one this phase."""
+
 from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable

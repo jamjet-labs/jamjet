@@ -1,4 +1,5 @@
 """Strategy registry. get_strategy_runner(name) -> StrategyRunner."""
+
 from jamjet.runtime.local.strategies import (
     consensus,
     critic,

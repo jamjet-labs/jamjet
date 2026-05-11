@@ -5,6 +5,7 @@ constraint must raise ValueError immediately, not at flush time. The
 server's allowed set lives in ALLOWED_KINDS (single source of truth via
 typing.get_args(EventKind)).
 """
+
 from __future__ import annotations
 
 from typing import get_args
