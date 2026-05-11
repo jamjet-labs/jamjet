@@ -2,7 +2,7 @@
 
 <h1>⚡ JamJet</h1>
 
-**The open-source safety layer for AI agents.**
+**The action-control plane for AI agents.** One policy file. One audit trail. Across hooks, guardrails, MCP gateways, SDKs, and custom runtimes.
 
 [![jamjet MCP server](https://glama.ai/mcp/servers/jamjet-labs/jamjet/badges/score.svg)](https://glama.ai/mcp/servers/jamjet-labs/jamjet)
 [![CI](https://img.shields.io/github/actions/workflow/status/jamjet-labs/jamjet/ci.yml?label=CI&style=flat-square)](https://github.com/jamjet-labs/jamjet/actions)
@@ -25,7 +25,9 @@
 
 ---
 
-JamJet sits underneath your agent — LangChain, CrewAI, ADK, MCP servers, custom code — and enforces what prompts cannot:
+> *Write the safety policy once. Run it everywhere your agents can act.*
+
+JamJet sits underneath your agent — Claude Code, OpenAI Agents SDK, MCP clients, LangChain, CrewAI, ADK, custom code — and enforces what prompts cannot:
 
 - 🛡️ **Block unsafe tool calls** at runtime (database deletes, payments, file writes)
 - ✋ **Pause for human approval** on risky actions, durably
@@ -33,7 +35,7 @@ JamJet sits underneath your agent — LangChain, CrewAI, ADK, MCP servers, custo
 - 📒 **Record an audit trail** that survives a regulator's review
 - ⏪ **Replay or resume** crashed runs from the last checkpoint
 
-**Keep your agent framework. Add JamJet when tool calls need control.**
+**Keep your agent framework. Add JamJet where tool calls need control.**
 
 ![JamJet safety demo](./demo.gif)
 
@@ -52,7 +54,38 @@ jamjet demo budget-cap      # $0.05 cost cap
 jamjet demo mcp-tool-policy # MCP-shaped policy (preview of JamJet Gateway)
 ```
 
-Works alongside **LangChain · CrewAI · ADK · OpenAI Agents SDK · MCP tools**.
+Works alongside **Claude Code · OpenAI Agents SDK · MCP clients · LangChain · CrewAI · ADK · Spring AI · LangChain4j**.
+
+## The same policy, everywhere
+
+Every agent toolchain is inventing its own safety layer. JamJet gives you one policy file and one audit trail across all of them.
+
+| Adapter | Install | Host |
+|---|---|---|
+| [`@jamjet/claude-code-hook`](https://npmjs.com/package/@jamjet/claude-code-hook) | `npm i -g @jamjet/claude-code-hook` | [Claude Code](https://docs.claude.com/en/docs/claude-code/hooks) PreToolUse hook |
+| [`@jamjet/mcp-shim`](https://npmjs.com/package/@jamjet/mcp-shim) | `npx -y @jamjet/mcp-shim ...` | Any [MCP](https://modelcontextprotocol.io) client (Claude Desktop, Cursor, …) |
+| [`@jamjet/openai-guardrail`](https://npmjs.com/package/@jamjet/openai-guardrail) | `npm i @jamjet/openai-guardrail` | [OpenAI Agents SDK](https://github.com/openai/openai-agents-js) tool guardrail (TS) |
+| [`jamjet.integrations.openai_guardrail`](https://pypi.org/project/jamjet/) | `pip install jamjet` | [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) tool guardrail (Python) |
+| [`jamjet`](https://pypi.org/project/jamjet/) | `pip install jamjet` | Python SDK + runtime |
+| [`@jamjet/cloud`](https://npmjs.com/package/@jamjet/cloud) | `npm i @jamjet/cloud` | TypeScript SDK + shared engine |
+| [`@jamjet/cli`](https://npmjs.com/package/@jamjet/cli) | `npm i -g @jamjet/cli` | Unified `jamjet audit show` / `jamjet approve` |
+
+All adapters load the same `policy.yaml`. All emit conformant audit JSONL to `~/.jamjet/audit/`. Run `jamjet audit show` to tail every decision across every adapter in one chronological view.
+
+**Respect the platforms you plug into.** Claude Code gave developers a hook point — JamJet gives that hook point a real policy engine, approval flow, and audit trail, and the same rules carry to OpenAI Agents SDK, MCP, and your own Python/TS code. OpenAI Agents SDK has guardrails — JamJet lets you express the policy once and reuse it elsewhere. If your MCP gateway supports plugins, JamJet can be the policy brain; if not, the `@jamjet/mcp-shim` proxy fills the gap.
+
+### One policy, every adapter
+
+```yaml
+# ~/.jamjet/policy.yaml
+version: 1
+rules:
+  - { match: "*delete*", action: block }
+  - { match: "payments.*", action: require_approval }
+  - { match: "shell.exec", action: block }
+```
+
+Drop this file in `~/.jamjet/`. Every adapter listed above uses it automatically.
 
 > Prompts are not a security boundary. The runtime is.
 
