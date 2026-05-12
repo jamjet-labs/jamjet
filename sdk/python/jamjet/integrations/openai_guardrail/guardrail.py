@@ -37,7 +37,7 @@ import yaml
 from jamjet.cloud.policy import PolicyEvaluator
 
 
-class JamjetPolicyBlockedError(RuntimeError):
+class JamjetPolicyBlocked(RuntimeError):  # noqa: N818
     """Raised when JamJet policy blocks a tool call."""
 
     def __init__(self, tool: str, rule: str | None) -> None:
@@ -46,7 +46,7 @@ class JamjetPolicyBlockedError(RuntimeError):
         self.rule = rule
 
 
-class JamjetApprovalRequiredError(RuntimeError):
+class JamjetApprovalRequired(RuntimeError):  # noqa: N818
     """Raised when JamJet policy requires approval for a tool call.
 
     v0.1 surfaces as an exception; v0.2 will integrate with the OpenAI Agents SDK
@@ -57,11 +57,6 @@ class JamjetApprovalRequiredError(RuntimeError):
         super().__init__(f"JamJet policy: WAITING_FOR_APPROVAL (tool: {tool}, rule: {rule or 'unknown'})")
         self.tool = tool
         self.rule = rule
-
-
-# Backward-compatible aliases.
-JamjetPolicyBlocked = JamjetPolicyBlockedError
-JamjetApprovalRequired = JamjetApprovalRequiredError
 
 
 @dataclass
@@ -166,8 +161,8 @@ def jamjet_guardrail(
         _write_audit(event, audit_destination)
 
         if decision == "BLOCKED":
-            raise JamjetPolicyBlockedError(tool_name, d.pattern)
+            raise JamjetPolicyBlocked(tool_name, d.pattern)
         if decision == "WAITING_FOR_APPROVAL":
-            raise JamjetApprovalRequiredError(tool_name, d.pattern)
+            raise JamjetApprovalRequired(tool_name, d.pattern)
 
     return guardrail
