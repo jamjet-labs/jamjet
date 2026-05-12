@@ -20,7 +20,13 @@ class PolicyEvaluator:
             self._rules.append((action, pattern))
 
     def evaluate(self, tool_name: str) -> PolicyDecision:
-        """Check a tool name against all rules. Last matching rule wins."""
+        """Check a tool name against all rules. First matching rule wins.
+
+        Matches the conformance suite at jamjet-policy/conformance/policy-decisions.yaml
+        and the TS `@jamjet/cloud` evaluator: rules are evaluated top-to-bottom and
+        the first matching rule is returned. Later rules cannot override an earlier
+        match.
+        """
         with self._lock:
             rules = list(self._rules)
         matched_action: str | None = None
@@ -29,6 +35,7 @@ class PolicyEvaluator:
             if fnmatch.fnmatch(tool_name, pattern):
                 matched_action = action
                 matched_pattern = pattern
+                break
         if matched_action is None:
             return PolicyDecision(blocked=False, policy_kind="allow", pattern=None, tool_name=tool_name)
         if matched_action == "block":
