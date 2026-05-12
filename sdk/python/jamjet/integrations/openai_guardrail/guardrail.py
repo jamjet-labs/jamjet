@@ -37,7 +37,7 @@ import yaml
 from jamjet.cloud.policy import PolicyEvaluator
 
 
-class JamjetPolicyBlocked(RuntimeError):
+class JamjetPolicyBlockedError(RuntimeError):
     """Raised when JamJet policy blocks a tool call."""
 
     def __init__(self, tool: str, rule: str | None) -> None:
@@ -46,7 +46,7 @@ class JamjetPolicyBlocked(RuntimeError):
         self.rule = rule
 
 
-class JamjetApprovalRequired(RuntimeError):
+class JamjetApprovalRequiredError(RuntimeError):
     """Raised when JamJet policy requires approval for a tool call.
 
     v0.1 surfaces as an exception; v0.2 will integrate with the OpenAI Agents SDK
@@ -54,11 +54,14 @@ class JamjetApprovalRequired(RuntimeError):
     """
 
     def __init__(self, tool: str, rule: str | None) -> None:
-        super().__init__(
-            f"JamJet policy: WAITING_FOR_APPROVAL (tool: {tool}, rule: {rule or 'unknown'})"
-        )
+        super().__init__(f"JamJet policy: WAITING_FOR_APPROVAL (tool: {tool}, rule: {rule or 'unknown'})")
         self.tool = tool
         self.rule = rule
+
+
+# Backward-compatible aliases.
+JamjetPolicyBlocked = JamjetPolicyBlockedError
+JamjetApprovalRequired = JamjetApprovalRequiredError
 
 
 @dataclass
@@ -92,9 +95,7 @@ def _resolve_policy_path(explicit: str | None) -> Path:
     home_candidate = Path.home() / ".jamjet" / "policy.yaml"
     if home_candidate.exists():
         return home_candidate
-    raise FileNotFoundError(
-        "No policy file found. Set JAMJET_POLICY_FILE, or place policy.yaml in cwd or ~/.jamjet/"
-    )
+    raise FileNotFoundError("No policy file found. Set JAMJET_POLICY_FILE, or place policy.yaml in cwd or ~/.jamjet/")
 
 
 def _load_policy_into_evaluator(path: Path) -> PolicyEvaluator:
@@ -115,11 +116,7 @@ def _load_policy_into_evaluator(path: Path) -> PolicyEvaluator:
 
 
 def _write_audit(event: _AuditEvent, audit_destination: str | None) -> None:
-    base = (
-        Path(os.path.expanduser(audit_destination))
-        if audit_destination
-        else Path.home() / ".jamjet" / "audit"
-    )
+    base = Path(os.path.expanduser(audit_destination)) if audit_destination else Path.home() / ".jamjet" / "audit"
     day_dir = base / event.ts[:10]
     day_dir.mkdir(parents=True, exist_ok=True)
     path = day_dir / "openai-guardrail.jsonl"
@@ -169,8 +166,8 @@ def jamjet_guardrail(
         _write_audit(event, audit_destination)
 
         if decision == "BLOCKED":
-            raise JamjetPolicyBlocked(tool_name, d.pattern)
+            raise JamjetPolicyBlockedError(tool_name, d.pattern)
         if decision == "WAITING_FOR_APPROVAL":
-            raise JamjetApprovalRequired(tool_name, d.pattern)
+            raise JamjetApprovalRequiredError(tool_name, d.pattern)
 
     return guardrail
