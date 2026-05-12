@@ -1,0 +1,4 @@
+jamjet>=0.1.2
+openai>=1.0
+pydantic>=2.0
+mcp>=1.12.4
