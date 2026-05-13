@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 _TRACEPARENT_RE = re.compile(
     r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$",

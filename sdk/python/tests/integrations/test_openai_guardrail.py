@@ -30,9 +30,7 @@ def test_block_destructive_tool(tmp_path: Path) -> None:
 
 
 def test_require_approval(tmp_path: Path) -> None:
-    policy = _write_policy(
-        tmp_path, 'version: 1\nrules:\n  - { match: "payments.*", action: require_approval }\n'
-    )
+    policy = _write_policy(tmp_path, 'version: 1\nrules:\n  - { match: "payments.*", action: require_approval }\n')
     audit_dir = tmp_path / "audit"
     guard = jamjet_guardrail(policy=str(policy), audit_destination=str(audit_dir))
     with pytest.raises(JamjetApprovalRequired):

@@ -13,7 +13,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-
 RuleKind = Literal["allow", "block", "require_approval", "audit"]
 
 

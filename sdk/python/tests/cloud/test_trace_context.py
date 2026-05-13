@@ -10,7 +10,6 @@ from jamjet.cloud.trace_context import (
     read_traceparent,
 )
 
-
 VALID = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
 VALID_TID = "0af7651916cd43dd8448eb211c80319c"
 

@@ -11,7 +11,6 @@ import respx
 
 from jamjet.cloud.cloud_pusher import CloudPusher, detect_path_mode
 
-
 SAMPLE_EVENT: dict[str, Any] = {
     "ts": "2026-05-12T00:00:00.000Z",
     "run_id": "run_a",
