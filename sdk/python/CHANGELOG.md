@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.4 — 2026-05-12
+
+### Fixed
+- `jamjet.cloud.policy.PolicyEvaluator.evaluate()` now correctly returns the
+  **first** matching rule's decision (previously: last match). Aligns Python with
+  the TS `@jamjet/cloud@0.3.0` evaluator and the shared conformance contract at
+  `jamjet-policy/conformance/policy-decisions.yaml`. No production trigger
+  observed today because policies in the wild use single rules; this prevents
+  drift the moment multi-rule policies ship.
+
 ## 0.8.0 — 2026-05-08
 
 ### Added
