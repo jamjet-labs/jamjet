@@ -1,4 +1,4 @@
-export const VERSION = '0.3.0'
+export const VERSION = '0.3.1'
 
 export { init } from './init.js'
 export { wrap } from './wrap.js'
@@ -62,3 +62,12 @@ export type {
   ApprovalResult,
   ApprovalQueueOptions,
 } from './approval-queue.js'
+
+// Cloud Sync v0.1 direct-push (Path B). Universal exports because they're
+// fetch-based + env-var-driven — no node:fs / node:crypto entanglement.
+export { CloudPusher } from './cloud-pusher.js'
+export type { CloudPusherOptions, CloudPusherEvent } from './cloud-pusher.js'
+export { detectPathMode } from './path-mode.js'
+export type { PathMode } from './path-mode.js'
+export { parseTraceparent, readTraceparent } from './trace-context.js'
+export type { Traceparent, TraceContextSource } from './trace-context.js'
