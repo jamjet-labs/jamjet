@@ -2,12 +2,11 @@
 
 Numbered examples in this directory:
 
-- `01-block-unsafe-tool/` blocks a destructive tool call before execution.
-- `02-human-approval/` pauses for approval on a risky action.
-- `03-budget-cap/` stops a runaway loop at a budget cap.
-- `04-mcp-tool-policy/` evaluates policy against an MCP-shaped request.
-- `05_mcp_tool_call/` runs a JamJet workflow step that calls a local MCP tool.
+- `01-block-unsafe-tool/` - JamJet blocks a destructive tool call before execution.
+- `02-human-approval/` - JamJet pauses a risky action until a human approves it.
+- `03-budget-cap/` - JamJet stops a runaway loop at a hard budget cap.
+- `04-mcp-tool-policy/` - JamJet evaluates policy against an MCP-shaped request envelope.
+- `05-mcp-tool-call/` - JamJet enforces policy before an MCP tool call, blocking `delete_history` before execution and allowing the safe `add` tool.
 
 Each example is self-contained. The fifth example includes its own virtual
-environment setup script and uses Ollama locally through an OpenAI-compatible
-endpoint.
+environment setup script and runs without a model API key.
