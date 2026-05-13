@@ -167,8 +167,10 @@ jobs:
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
-          base: ${{ github.event.before != '0000000000000000000000000000000000000000' && github.event.before || github.sha }}
-          head: HEAD
+          # pull_request: compare PR base SHA to PR head SHA
+          # push: compare previous SHA to current SHA (fallback to parent of HEAD)
+          base: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before || format('{0}^', github.sha)) }}
+          head: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           extra_args: --only-verified
 
   # ── Build check ─────────────────────────────────────────────────────
