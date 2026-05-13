@@ -82,7 +82,7 @@ def read_traceparent(
 
     # OpenTelemetry current span (optional dep).
     try:
-        from opentelemetry import trace as _ot_trace  # type: ignore[import-not-found]
+        from opentelemetry import trace as _ot_trace
 
         span = _ot_trace.get_current_span()
         ctx = span.get_span_context() if span is not None else None
