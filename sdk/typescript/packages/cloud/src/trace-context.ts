@@ -25,7 +25,11 @@ export function parseTraceparent(
   if (typeof s !== 'string') return null
   const m = TRACEPARENT_RE.exec(s.trim())
   if (!m) return null
-  const [, version, trace_id, parent_id, flags] = m
+  // Capture groups are required by the regex, so m[1..4] are all defined.
+  const version = m[1] as string
+  const trace_id = m[2] as string
+  const parent_id = m[3] as string
+  const flags = m[4] as string
   if (version === 'ff') return null // W3C: reserved
   if (/^0+$/.test(trace_id)) return null
   if (/^0+$/.test(parent_id)) return null

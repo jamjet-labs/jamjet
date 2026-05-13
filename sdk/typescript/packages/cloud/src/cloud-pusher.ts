@@ -59,20 +59,20 @@ interface ResolvedOptions {
   userAgent: string
 }
 
-const DEFAULT_OPTIONS = {
-  timeoutMs: 500,
-  circuitBreakerThreshold: 5,
-  circuitBreakerResetMs: 60_000,
-  userAgent: '@jamjet/cloud direct-push',
-}
-
 export class CloudPusher {
   consecutiveFailures = 0
-  private circuitOpenedAt?: number
+  private circuitOpenedAt: number | undefined
   private readonly opts: ResolvedOptions
 
   constructor(opts: CloudPusherOptions) {
-    this.opts = { ...DEFAULT_OPTIONS, ...opts }
+    this.opts = {
+      apiBase: opts.apiBase,
+      apiKey: opts.apiKey,
+      timeoutMs: opts.timeoutMs ?? 500,
+      circuitBreakerThreshold: opts.circuitBreakerThreshold ?? 5,
+      circuitBreakerResetMs: opts.circuitBreakerResetMs ?? 60_000,
+      userAgent: opts.userAgent ?? '@jamjet/cloud direct-push',
+    }
   }
 
   isCircuitOpen(): boolean {
