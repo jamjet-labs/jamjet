@@ -28,9 +28,7 @@ SAMPLE_EVENT: dict[str, Any] = {
 
 @respx.mock
 def test_push_returns_true_on_2xx() -> None:
-    respx.post("https://api.example.com/v1/policy-audit/events").respond(
-        status_code=200, json={}
-    )
+    respx.post("https://api.example.com/v1/policy-audit/events").respond(status_code=200, json={})
     p = CloudPusher(api_base="https://api.example.com", api_key="jj_test")
     assert p.push(SAMPLE_EVENT) is True
     assert p.consecutive_failures == 0
@@ -57,9 +55,7 @@ def test_push_returns_false_on_4xx() -> None:
 
 @respx.mock
 def test_push_request_carries_bearer_and_path_direct() -> None:
-    route = respx.post("https://api.example.com/v1/policy-audit/events").respond(
-        status_code=200, json={}
-    )
+    route = respx.post("https://api.example.com/v1/policy-audit/events").respond(status_code=200, json={})
     p = CloudPusher(api_base="https://api.example.com", api_key="jj_secret_key")
     p.push(SAMPLE_EVENT)
     assert route.called
@@ -76,9 +72,7 @@ def test_push_request_carries_bearer_and_path_direct() -> None:
 
 @respx.mock
 def test_trailing_slash_in_api_base_is_normalized() -> None:
-    route = respx.post("https://api.example.com/v1/policy-audit/events").respond(
-        status_code=200, json={}
-    )
+    route = respx.post("https://api.example.com/v1/policy-audit/events").respond(status_code=200, json={})
     p = CloudPusher(api_base="https://api.example.com/", api_key="jj_test")
     p.push(SAMPLE_EVENT)
     assert route.called
@@ -101,9 +95,7 @@ def test_circuit_breaker_opens_after_threshold() -> None:
 
 @respx.mock
 def test_circuit_open_skips_http_call() -> None:
-    route = respx.post("https://api.example.com/v1/policy-audit/events").respond(
-        status_code=503
-    )
+    route = respx.post("https://api.example.com/v1/policy-audit/events").respond(status_code=503)
     p = CloudPusher(
         api_base="https://api.example.com",
         api_key="jj_test",

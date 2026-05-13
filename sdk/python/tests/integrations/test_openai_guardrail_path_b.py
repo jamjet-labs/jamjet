@@ -17,7 +17,7 @@ from jamjet.integrations.openai_guardrail.guardrail import JamjetPolicyBlocked
 def _write_block_policy(tmp_path: Path) -> str:
     policy_path = tmp_path / "policy.yaml"
     policy_path.write_text(
-        "version: 1\nrules:\n  - match: \"payments.refund\"\n    action: block\n",
+        'version: 1\nrules:\n  - match: "payments.refund"\n    action: block\n',
         encoding="utf-8",
     )
     return str(policy_path)
@@ -106,9 +106,7 @@ def test_guardrail_skips_push_when_no_pusher_configured(tmp_path: Path, monkeypa
 
 
 @respx.mock
-def test_guardrail_auto_constructs_pusher_in_path_b(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_guardrail_auto_constructs_pusher_in_path_b(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Setting JAMJET_CLOUD_TOKEN + VERCEL=1 should auto-construct a pusher."""
     monkeypatch.setenv("JAMJET_CLOUD_TOKEN", "jj_auto")
     monkeypatch.setenv("VERCEL", "1")

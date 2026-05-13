@@ -32,9 +32,7 @@ def _stable_stringify(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-def apply_args_redaction(
-    event: dict[str, Any], mode: ArgsRedactionMode
-) -> dict[str, Any]:
+def apply_args_redaction(event: dict[str, Any], mode: ArgsRedactionMode) -> dict[str, Any]:
     """Return a new event dict with args replaced according to mode.
 
     Adds an ``args_redaction`` field so Cloud + dashboards can tell apart
