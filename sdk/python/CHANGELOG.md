@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.5 — 2026-05-14
+
+### Added — Cloud Sync v0.1 Path B (direct-push)
+
+- `jamjet.cloud.cloud_pusher.CloudPusher` — serverless-friendly audit event
+  pusher that POSTs directly to `/v1/policy-audit/events`. Used by short-lived
+  runtimes (Lambda, Cloud Run, Edge) where the on-disk daemon isn't an option.
+- `jamjet.cloud.trace_context` — W3C `traceparent` parser + propagator. Lets
+  the guardrail stamp `trace_id` on every emitted event so they group with the
+  rest of the OTLP span tree in Cloud.
+- `jamjet.cloud.sync_redaction` — `apply_args_redaction()` /
+  `resolve_args_redaction()` helpers (R9 invariant): never push raw tool args
+  to Cloud, only `full` / `hash` / `none` per the policy.
+- `jamjet.integrations.openai_guardrail` — wired for Path B. When
+  `JAMJET_CLOUD_AUDIT_URL` is set, the guardrail uses `CloudPusher` to direct-push
+  redacted decisions in addition to local logging.
+
+### Changed
+
+- `jamjet-engram` requirement bumped (see #57). No public API impact.
+- Python CI lint policy normalized for the guardrail module (no behaviour
+  change).
+
 ## 0.8.4 — 2026-05-12
 
 ### Fixed
