@@ -1,7 +1,7 @@
 name: Release
 
 # Builds and publishes the jamjet Python wheel and platform-specific
-# jamjet-server binaries on version tags (v*.*.*) or manual dispatch.
+# jamjet-server binaries on python-sdk-v*.*.* tags or manual dispatch.
 #
 # Distribution model:
 #   - jamjet wheel  →  pure Python, published to PyPI via Trusted Publishing
@@ -13,7 +13,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "python-sdk-v*.*.*"
   workflow_dispatch:
 
 permissions:

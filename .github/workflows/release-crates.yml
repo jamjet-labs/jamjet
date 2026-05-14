@@ -1,7 +1,7 @@
 name: Publish Crates
 
 # Publishes all workspace crates to crates.io in dependency order.
-# Triggered by version tags (same as release-wheels.yml) or manual dispatch.
+# Triggered by crates-v*.*.* tags (paired with docker-publish.yml) or manual dispatch.
 #
 # Handles crates.io rate limits (429) with retry + backoff.
 # Skips crates that are already published (e.g., on re-run after partial failure).
@@ -13,7 +13,7 @@ name: Publish Crates
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "crates-v*.*.*"
   workflow_dispatch:
 
 env:
