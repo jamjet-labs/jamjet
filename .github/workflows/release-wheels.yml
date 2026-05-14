@@ -80,6 +80,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # macos-14 runners ship a Homebrew `cargo` at /opt/homebrew/bin that's
+      # actually a rustup-init proxy and rejects `cargo build`. Prepend the
+      # rustup-installed bin dir so the real cargo wins on PATH.
+      - name: Prepend ~/.cargo/bin to PATH (macOS workaround)
+        if: runner.os == 'macOS'
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: runtime -> target
