@@ -1,5 +1,8 @@
 import { getActive } from '../client.js'
 import { runEnforcedCall } from '../enforcement.js'
+// Node-only: pulls in `node:crypto` via prefix-hash.ts. Safe here because
+// this patcher is only loaded from `src/node.ts`, never the universal entry.
+import { computePrefixHash } from '../prefix-hash.js'
 
 type OriginalRef = { proto: any; original: (...args: any[]) => any }
 let originals: OriginalRef[] = []
@@ -23,6 +26,7 @@ export function patchAnthropic(anthropicModule: any): void {
       // Pre-bind `this` so runEnforcedCall's apply(null, ...) contract is satisfied
       original: (...a: any[]) => original.call(this, ...a),
       args,
+      computePromptPrefixHash: computePrefixHash,
     })
   }
 

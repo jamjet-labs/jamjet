@@ -21,6 +21,7 @@ export type SpanEventDict = {
   output_tokens?: number
   cost_usd?: number
   payload?: Record<string, unknown>
+  prompt_prefix_hash?: string
   agent_name?: string
   agent_card_uri?: string
   originating_trace_id?: string
@@ -55,6 +56,7 @@ export class Span {
   costUsd: number | null = null
   status = 'pending'
   payload: Record<string, unknown> = {}
+  private promptPrefixHash: string | null = null
   agentName: string | null = null
   agentCardUri: string | null = null
   originatingTraceId: string | null = null
@@ -87,6 +89,10 @@ export class Span {
     this.durationMs = durationMs ?? performance.now() - this.startTime
   }
 
+  setPromptPrefixHash(hash: string | null): void {
+    this.promptPrefixHash = hash
+  }
+
   toEventDict(): SpanEventDict {
     const d: SpanEventDict = {
       type: 'span',
@@ -104,6 +110,7 @@ export class Span {
     if (this.inputTokens !== null) d.input_tokens = this.inputTokens
     if (this.outputTokens !== null) d.output_tokens = this.outputTokens
     if (this.costUsd !== null) d.cost_usd = this.costUsd
+    if (this.promptPrefixHash !== null) d.prompt_prefix_hash = this.promptPrefixHash
     if (Object.keys(this.payload).length > 0) d.payload = { ...this.payload }
     if (this.agentName !== null) d.agent_name = this.agentName
     if (this.agentCardUri !== null) d.agent_card_uri = this.agentCardUri

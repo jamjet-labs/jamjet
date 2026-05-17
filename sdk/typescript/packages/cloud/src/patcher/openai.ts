@@ -21,6 +21,11 @@ export function patchOpenAI(openaiModule: any): void {
     proto.create = async function patchedCreate(this: unknown, ...args: any[]) {
       const client = getActive()
       if (!client) return original.call(this, ...args)
+      // TODO(plan-8 v0.4): wire computePromptPrefixHash for OpenAI shape.
+      // Out of v1 scope — the hash module's MessageParam[] extractor is
+      // Anthropic-specific. OpenAI chat-completions messages have a
+      // different shape (role/content/tool_calls) and need their own
+      // text extractor before this can be wired here.
       return runEnforcedCall({
         client,
         vendor: 'openai',

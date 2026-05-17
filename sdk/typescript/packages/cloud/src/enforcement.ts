@@ -1,3 +1,4 @@
+import type { MessageParam } from '@anthropic-ai/sdk/resources/messages'
 import type { Client } from './client.js'
 import type { AgentRef, UserContext } from './context.js'
 import { estimateCost } from './cost.js'
@@ -12,6 +13,16 @@ export interface EnforcedCallOptions {
   original: (...args: any[]) => any
   args: any[]
   override?: { agent?: AgentRef; user?: UserContext }
+  /**
+   * Optional callback to compute a prefix hash of the prompt for cost-waste
+   * detection. Injected by Node-only patchers (see `src/patcher/anthropic.ts`)
+   * so this module stays runtime-agnostic — universal callers (`src/wrap.ts`)
+   * omit it and the field is simply absent from the recorded span.
+   *
+   * If the callback throws, the LLM call MUST still complete; a hash failure
+   * is recorded as a warning and the span goes out without the field.
+   */
+  computePromptPrefixHash?: (input: string | MessageParam[]) => string
 }
 
 function newId(): string {
@@ -66,10 +77,11 @@ function extractUsage(vendor: Vendor, response: unknown): { input: number; outpu
 }
 
 export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknown> {
-  const { client, vendor, original, args, override } = opts
+  const { client, vendor, original, args, override, computePromptPrefixHash } = opts
   const arg0 = (args[0] ?? {}) as Record<string, unknown>
   const model = typeof arg0['model'] === 'string' ? arg0['model'] : 'unknown'
   const isStreaming = arg0['stream'] === true
+  const messages = Array.isArray(arg0['messages']) ? (arg0['messages'] as MessageParam[]) : []
 
   // Resolve identity from override > context > config default
   const ctx = client._governanceContext.getCurrentContext()
@@ -115,6 +127,20 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
 
   if (policyDecisions.length > 0) span.policyDecisions = policyDecisions
   span.budgetCheck = { estimated: estCost, allowed: true }
+
+  // Compute prompt prefix hash for cost-waste detection. The hash function
+  // lives in a Node-only module (uses node:crypto), so it's injected here by
+  // the patchers rather than imported directly — keeps this file runtime-
+  // agnostic and prevents `node:crypto` from leaking into the universal
+  // bundle via `wrap.ts`. A failing hash MUST NEVER break an LLM call.
+  if (computePromptPrefixHash !== undefined) {
+    try {
+      span.setPromptPrefixHash(computePromptPrefixHash(messages))
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.warn(`[jamjet] prompt prefix hash failed: ${msg}`)
+    }
+  }
 
   try {
     const result = await original.apply(null, mutatedArgs)
