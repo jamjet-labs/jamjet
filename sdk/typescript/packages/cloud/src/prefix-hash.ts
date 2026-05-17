@@ -8,6 +8,12 @@
  *
  * This module is intentionally pure — no I/O, no side effects — so the
  * hash is deterministic across runs and trivially testable.
+ *
+ * @remarks
+ * Node-only — depends on `node:crypto`. When wiring this into the SDK,
+ * route the export through `./node.js` (the Node-specific entrypoint)
+ * rather than `./index.js` (universal), or polyfill `node:crypto` for
+ * edge runtimes (Cloudflare Workers, Vercel Edge).
  */
 
 import { createHash } from 'node:crypto'
@@ -27,7 +33,10 @@ import type { MessageParam } from '@anthropic-ai/sdk/resources/messages'
  *   4. SHA-256 that slice; return the first 16 hex characters.
  *
  * Empty inputs are hashed as the empty string (a sentinel value) and never
- * throw.
+ * throw. Both `""` and `[]` (and any input that normalizes to empty) map
+ * to the SHA-256-of-empty-string sentinel `e3b0c44298fc1c14`; downstream
+ * cost-waste consumers should treat this hash as a "no prompt" marker and
+ * avoid grouping on it.
  */
 export function computePrefixHash(input: string | MessageParam[]): string {
   const text = typeof input === 'string' ? input : extractText(input)
