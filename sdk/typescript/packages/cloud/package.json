@@ -1,6 +1,6 @@
 {
   "name": "@jamjet/cloud",
-  "version": "0.3.1",
+  "version": "0.4.0-alpha.0",
   "description": "JamJet engine — policy evaluation, budget enforcement, audit writing, approval queue. The shared brain across all JamJet adapters.",
   "license": "Apache-2.0",
   "type": "module",
