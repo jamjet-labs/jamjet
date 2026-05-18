@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.4.0-alpha.0 — 2026-05-17 (unreleased)
+## 0.4.0-alpha.1 — 2026-05-18 (unreleased)
+
+### Fixed
+- CI release workflow now passes `--tag=next` for prerelease versions so they do not clobber the stable `latest` dist-tag. The `0.4.0-alpha.0` tag was created but never published; this `.1` bump pairs with the workflow fix.
+
+## 0.4.0-alpha.0 — 2026-05-17 (unreleased — workflow needed --tag fix; never reached npm)
 
 ### Added
 - **Cost-waste detection signal:** every Anthropic-patched span now emits an optional `prompt_prefix_hash` (SHA-256 over the normalized first 80% of the input prompt, truncated to 16 hex chars). The Cloud groups spans by this hash to detect repeated uncached prefixes — the foundation of the Phase 8.1 cost-leak detector.
