@@ -47,5 +47,16 @@ jobs:
       - name: Publish to npm with provenance (trusted publisher OIDC)
         # Use npx to fetch a fresh npm >= 11.5.1 (trusted-publisher OIDC support)
         # without overwriting the system npm bundled with Node 22 (which is too old).
+        # Prerelease versions (containing a hyphen, e.g. 0.4.0-alpha.0) are
+        # tagged "next" so they don't clobber the stable "latest" tag used
+        # by `npm install @jamjet/cloud`.
         working-directory: sdk/typescript/packages/cloud
-        run: npx -y npm@latest publish --access=public --provenance
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [[ "$VERSION" == *-* ]]; then
+            TAG="next"
+          else
+            TAG="latest"
+          fi
+          echo "Publishing $VERSION with --tag=$TAG"
+          npx -y npm@latest publish --access=public --provenance --tag="$TAG"
