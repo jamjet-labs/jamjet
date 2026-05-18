@@ -41,13 +41,20 @@ describe('patchAnthropic', () => {
     const transport = new CapturingTransport()
     setActive(new Client(cfg, transport as unknown as Transport))
 
-    await new FakeMessages().create({ model: 'claude-sonnet-4-6', messages: [] })
+    await new FakeMessages().create({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hello world' }],
+    })
 
     await getActive()?.shutdown()
     expect(transport.events).toHaveLength(1)
     expect(transport.events[0]?.name).toBe('anthropic.claude-sonnet-4-6')
     expect(transport.events[0]?.input_tokens).toBe(50)
     expect(transport.events[0]?.output_tokens).toBe(100)
+    // Hash is computed end-to-end via the patcher's prefix-hash injection.
+    // Locking on the specific 16-hex digest catches accidental rewires of
+    // the normalization/cutoff logic.
+    expect(transport.events[0]?.prompt_prefix_hash).toMatch(/^[0-9a-f]{16}$/)
   })
 
   test('idempotent', () => {

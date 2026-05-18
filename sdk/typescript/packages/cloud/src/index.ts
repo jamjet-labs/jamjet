@@ -1,4 +1,4 @@
-export const VERSION = '0.3.1'
+export const VERSION = '0.4.0-alpha.0'
 
 export { init } from './init.js'
 export { wrap } from './wrap.js'
