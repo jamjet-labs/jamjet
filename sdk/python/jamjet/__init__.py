@@ -62,6 +62,7 @@ from jamjet.spec import (  # noqa: F401
 from jamjet.tools.decorators import tool
 from jamjet.workflow.workflow import Workflow
 from jamjet.decorators import DurableAgent, workflow  # noqa: F401, E402
+from jamjet.gate import PolicyDeniedError, gate, stderr_emitter  # noqa: F401, E402
 # isort: on
 
 __all__ = [
@@ -86,14 +87,17 @@ __all__ = [
     "ToolSpec",
     "Workflow",
     "WorkflowSpec",
+    "PolicyDeniedError",
     "deploy",
     "durable",
     "durable_run",
+    "gate",
     "reset_execution_context",
     "resume",
     "run",
     "scorer",
     "set_execution_context",
+    "stderr_emitter",
     "task",
     "tool",
     "workflow",
