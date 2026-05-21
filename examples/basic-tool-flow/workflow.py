@@ -20,6 +20,7 @@ from jamjet import Workflow, tool
 
 # ── Tools ────────────────────────────────────────────────────────────────────
 
+
 class SearchResult(BaseModel):
     answer: str
     confidence: float
@@ -71,5 +72,6 @@ async def summarize(state: State) -> State:
 
 if __name__ == "__main__":
     import json
+
     ir = workflow.compile()
     print(json.dumps(ir, indent=2))

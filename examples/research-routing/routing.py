@@ -4,6 +4,7 @@ Identity-aware agent routing using JamJet.
 Inspired by LDP (arXiv:2603.08852). Routes tasks to the most
 appropriate agent based on quality scores and cost hints.
 """
+
 from jamjet import Agent, Workflow, tool
 from pydantic import BaseModel
 
@@ -84,12 +85,15 @@ async def main() -> None:
     tasks = [
         ("What is the capital of France?", "simple"),
         ("Compare REST and GraphQL for a real-time dashboard", "moderate"),
-        ("Design a distributed consensus algorithm for Byzantine fault tolerance", "complex"),
+        (
+            "Design a distributed consensus algorithm for Byzantine fault tolerance",
+            "complex",
+        ),
     ]
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Agent Routing Example")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     for task, complexity in tasks:
         print(f"\n--- [{complexity.upper()}] {task} ---")
@@ -97,7 +101,11 @@ async def main() -> None:
         result = await workflow.run(State(task=task, complexity=complexity))
         elapsed = time.monotonic() - start
         print(f"Routed to: {result.state.route}")
-        print(f"Result: {result.state.result[:200]}..." if result.state.result and len(result.state.result) > 200 else f"Result: {result.state.result}")
+        print(
+            f"Result: {result.state.result[:200]}..."
+            if result.state.result and len(result.state.result) > 200
+            else f"Result: {result.state.result}"
+        )
         print(f"({elapsed:.1f}s)")
 
 

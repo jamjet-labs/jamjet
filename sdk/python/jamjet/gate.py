@@ -260,9 +260,7 @@ def gate(
     return _wrap
 
 
-def _bind_args(
-    sig: inspect.Signature, args: tuple[Any, ...], kwargs: Mapping[str, Any]
-) -> dict[str, Any]:
+def _bind_args(sig: inspect.Signature, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> dict[str, Any]:
     bound = sig.bind_partial(*args, **kwargs)
     bound.apply_defaults()
     out: dict[str, Any] = {}
@@ -297,9 +295,7 @@ def _result_ref(result: Any) -> str:
     return repr(result)
 
 
-def _is_blocked(
-    outcome: PolicyOutcome, approval: ApprovalDecision | None
-) -> bool:
+def _is_blocked(outcome: PolicyOutcome, approval: ApprovalDecision | None) -> bool:
     if outcome.decision == "deny":
         return True
     if outcome.decision in ("require-approval", "escalate"):
@@ -307,16 +303,12 @@ def _is_blocked(
     return False
 
 
-def _blocked_execution(
-    outcome: PolicyOutcome, approval: ApprovalDecision | None
-) -> str:
+def _blocked_execution(outcome: PolicyOutcome, approval: ApprovalDecision | None) -> str:
     """Always returns ``"blocked"``; kept separate for clarity at call sites."""
     return "blocked"
 
 
-def _block_message(
-    outcome: PolicyOutcome, approval: ApprovalDecision | None
-) -> str:
+def _block_message(outcome: PolicyOutcome, approval: ApprovalDecision | None) -> str:
     if outcome.decision == "deny":
         return f"policy denied: {outcome.reason or outcome.name}"
     if approval is not None:

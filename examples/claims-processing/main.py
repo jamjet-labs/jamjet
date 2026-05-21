@@ -262,7 +262,9 @@ async def approve_claim(state: ClaimsState) -> ClaimsState:
 @workflow.step
 async def resolve(state: ClaimsState) -> ClaimsState:
     """Step 6: Generate the final decision letter."""
-    human_notes = f"\nHuman reviewer notes:\n{state.human_review}" if state.human_review else ""
+    human_notes = (
+        f"\nHuman reviewer notes:\n{state.human_review}" if state.human_review else ""
+    )
     result = await resolution_writer.run(
         f"Write the decision letter for claim {state.claim_id}:\n\n"
         f"Assessment:\n{state.assessment}\n\n"
@@ -279,9 +281,9 @@ async def resolve(state: ClaimsState) -> ClaimsState:
 
 async def run_local(claim_id: str = "CLM-4821") -> None:
     """Execute the claims workflow locally (in-process)."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  Claims Processing — {claim_id}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     initial_state = ClaimsState(
         claim_id=claim_id,
@@ -302,10 +304,12 @@ async def run_local(claim_id: str = "CLM-4821") -> None:
 
     result = await workflow.run(initial_state, max_steps=20)
 
-    print(f"\n{'─'*60}")
+    print(f"\n{'─' * 60}")
     print(f"  WORKFLOW COMPLETE")
-    print(f"  Steps: {result.steps_executed}  Duration: {result.total_duration_us / 1_000_000:.2f}s")
-    print(f"{'─'*60}")
+    print(
+        f"  Steps: {result.steps_executed}  Duration: {result.total_duration_us / 1_000_000:.2f}s"
+    )
+    print(f"{'─' * 60}")
 
     sections = [
         ("CLAIM ANALYSIS", result.state.claim_analysis),
@@ -315,9 +319,9 @@ async def run_local(claim_id: str = "CLM-4821") -> None:
         ("DECISION LETTER", result.state.decision),
     ]
     for title, content in sections:
-        print(f"\n{'═'*60}")
+        print(f"\n{'═' * 60}")
         print(f"  {title}")
-        print(f"{'═'*60}")
+        print(f"{'═' * 60}")
         print(content or "(not available)")
 
     print(f"\n  Inspect: jamjet inspect <exec_id> --events")

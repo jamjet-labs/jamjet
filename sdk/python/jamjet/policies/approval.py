@@ -122,9 +122,7 @@ class NeverApprove:
         )
 
 
-def callable_approver(
-    fn: Callable[[Mapping[str, Any]], bool], *, approver_id: str
-) -> ApprovalChannel:
+def callable_approver(fn: Callable[[Mapping[str, Any]], bool], *, approver_id: str) -> ApprovalChannel:
     """Wrap a plain function into an :class:`ApprovalChannel`.
 
     Convenient for tests and for custom approval logic that doesn't need the

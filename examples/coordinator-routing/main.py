@@ -7,6 +7,7 @@ Demonstrates:
 - Automatic fallback when no candidates match
 - CoordinatorNode in a workflow graph
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -58,8 +59,14 @@ async def demo_coordinator_scoring():
     strategy = DefaultCoordinatorStrategy(registry=MockRegistry())
 
     tickets = [
-        {"task": "Customer wants a refund for duplicate charge", "skills": ["billing", "refunds"]},
-        {"task": "API returning 500 errors on /v2/tasks endpoint", "skills": ["debugging", "api-errors"]},
+        {
+            "task": "Customer wants a refund for duplicate charge",
+            "skills": ["billing", "refunds"],
+        },
+        {
+            "task": "API returning 500 errors on /v2/tasks endpoint",
+            "skills": ["debugging", "api-errors"],
+        },
         {"task": "How do I reset my password?", "skills": ["faq", "account"]},
         {"task": "Need help with quantum computing", "skills": ["quantum"]},
     ]
@@ -81,15 +88,21 @@ async def demo_coordinator_scoring():
             continue
 
         rankings, spread = await strategy.score(
-            task=ticket["task"], candidates=candidates, weights={}, context={},
+            task=ticket["task"],
+            candidates=candidates,
+            weights={},
+            context={},
         )
         print(f"  Rankings (spread={spread:.3f}):")
         for r in rankings:
             print(f"    {r.agent_uri}: {r.composite:.3f}")
 
         decision = await strategy.decide(
-            task=ticket["task"], top_candidates=rankings,
-            threshold=0.1, tiebreaker_model="claude-sonnet-4-6", context={},
+            task=ticket["task"],
+            top_candidates=rankings,
+            threshold=0.1,
+            tiebreaker_model="claude-sonnet-4-6",
+            context={},
         )
         print(f"  -> Selected: {decision.selected_uri} (method={decision.method})")
 
@@ -102,7 +115,8 @@ def demo_workflow_graph():
 
     graph = WorkflowGraph("support-routing")
     graph.add_node("classify", ModelNode(model="claude-haiku-4-5-20251001"))
-    graph.add_coordinator("route",
+    graph.add_coordinator(
+        "route",
         task="Route ticket to support agent",
         required_skills=["support"],
         output_key="selected_agent",

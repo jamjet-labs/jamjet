@@ -8,6 +8,7 @@ Each agent carries LDP identity fields in its AgentCandidate labels:
 
 These labels are read by LdpCoordinatorStrategy during scoring.
 """
+
 from __future__ import annotations
 
 from jamjet.coordinator import AgentCandidate

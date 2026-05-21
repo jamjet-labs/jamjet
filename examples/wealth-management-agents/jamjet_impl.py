@@ -292,18 +292,18 @@ async def build_recommendation(state: AdvisoryState) -> AdvisoryState:
 
 async def run_local(client_id: str = "C-1001") -> None:
     """Execute the full advisory workflow locally (in-process)."""
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"  JamJet Wealth Management Advisory — Client {client_id}")
-    print(f"{'='*70}\n")
+    print(f"{'=' * 70}\n")
 
     initial_state = AdvisoryState(client_id=client_id)
     result = await workflow.run(initial_state, max_steps=20)
 
-    print(f"\n{'─'*70}")
+    print(f"\n{'─' * 70}")
     print(f"  WORKFLOW COMPLETE")
     print(f"  Steps executed: {result.steps_executed}")
     print(f"  Duration: {result.total_duration_us / 1_000_000:.2f}s")
-    print(f"{'─'*70}\n")
+    print(f"{'─' * 70}\n")
 
     # Print each agent's output
     sections = [
@@ -313,9 +313,9 @@ async def run_local(client_id: str = "C-1001") -> None:
         ("FINAL RECOMMENDATION", result.state.final_recommendation),
     ]
     for title, content in sections:
-        print(f"\n{'═'*70}")
+        print(f"\n{'═' * 70}")
         print(f"  {title}")
-        print(f"{'═'*70}")
+        print(f"{'═' * 70}")
         print(content or "(not available)")
         print()
 

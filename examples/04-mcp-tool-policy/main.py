@@ -19,7 +19,9 @@ def main() -> None:
     print("Policy: block '*delete*'")
     print(f"Decision: {'BLOCKED' if decision.blocked else 'ALLOWED'}")
     print("This demo uses an MCP-shaped request envelope to show policy evaluation.")
-    print("It is not yet an MCP proxy. Full MCP proxy support is planned for JamJet Gateway.")
+    print(
+        "It is not yet an MCP proxy. Full MCP proxy support is planned for JamJet Gateway."
+    )
     print("The model is mocked. The enforcement path is real.")
 
 

@@ -31,6 +31,7 @@ from jamjet import Workflow
 
 # ── Workflow state ────────────────────────────────────────────────────────────
 
+
 class State(BaseModel):
     topic: str
     web_results: list[str] = []
@@ -76,4 +77,5 @@ async def summarise(state: State) -> State:
 
 if __name__ == "__main__":
     import json
+
     print(json.dumps(workflow.compile(), indent=2))

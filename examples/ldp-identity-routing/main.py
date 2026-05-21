@@ -22,6 +22,7 @@ To use real LLMs instead of mock responses:
     export ANTHROPIC_API_KEY=sk-...
     # Then modify the execute_agent() function below -- see "REAL LLM" comments.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -68,7 +69,9 @@ from ldp_strategy import LdpCoordinatorStrategy, classify_difficulty, detect_dom
 
 
 async def execute_agent(
-    agent_uri: str, question: str, question_idx: int,
+    agent_uri: str,
+    question: str,
+    question_idx: int,
 ) -> dict[str, Any]:
     """Run an agent on a question and return output + confidence.
 
@@ -87,7 +90,9 @@ async def execute_agent(
 
 
 def attach_provenance(
-    agent_uri: str, agent_card: dict[str, Any], result: dict[str, Any],
+    agent_uri: str,
+    agent_card: dict[str, Any],
+    result: dict[str, Any],
 ) -> dict[str, Any]:
     """Attach LDP provenance metadata to an agent's result."""
     labels = agent_card.get("labels", {})
@@ -145,15 +150,17 @@ def synthesize(
     ]
     for i, w in enumerate(weighted, 1):
         prov = w["provenance"]
-        lines.extend([
-            f"Source {i} (weight={w['weight']:.3f}):",
-            f"  Agent: {prov['produced_by']}",
-            f"  Reasoning Profile: {prov['reasoning_profile']}",
-            f"  Quality: {prov['quality_score']:.2f}, "
-            f"Confidence: {prov['confidence']:.2f}",
-            f"  Answer: {w['output'][:200]}{'...' if len(w['output']) > 200 else ''}",
-            "",
-        ])
+        lines.extend(
+            [
+                f"Source {i} (weight={w['weight']:.3f}):",
+                f"  Agent: {prov['produced_by']}",
+                f"  Reasoning Profile: {prov['reasoning_profile']}",
+                f"  Quality: {prov['quality_score']:.2f}, "
+                f"Confidence: {prov['confidence']:.2f}",
+                f"  Answer: {w['output'][:200]}{'...' if len(w['output']) > 200 else ''}",
+                "",
+            ]
+        )
 
     prompt = "\n".join(lines)
 
@@ -184,7 +191,10 @@ async def run_question(
 
     # Step 1: Coordinator scores all agents
     rankings, spread = await strategy.score(
-        task=question, candidates=RESEARCH_AGENTS, weights={}, context={},
+        task=question,
+        candidates=RESEARCH_AGENTS,
+        weights={},
+        context={},
     )
     print(f"\nRouting Scores (spread={spread:.3f}):")
     for r in rankings:
@@ -201,8 +211,7 @@ async def run_question(
     # Step 2: Fan-out -- all agents answer in parallel
     print("\nFan-out (all agents answering in parallel)...")
     tasks = [
-        execute_agent(agent.uri, question, question_idx)
-        for agent in RESEARCH_AGENTS
+        execute_agent(agent.uri, question, question_idx) for agent in RESEARCH_AGENTS
     ]
     results = await asyncio.gather(*tasks)
 
@@ -210,11 +219,13 @@ async def run_question(
     opinions = []
     for agent, result in zip(RESEARCH_AGENTS, results):
         provenance = attach_provenance(agent.uri, agent.agent_card, result)
-        opinions.append({
-            "agent_uri": agent.uri,
-            "output": result["output"],
-            "provenance": provenance,
-        })
+        opinions.append(
+            {
+                "agent_uri": agent.uri,
+                "output": result["output"],
+                "provenance": provenance,
+            }
+        )
 
     print("\nAgent Responses with Provenance:")
     for op in opinions:
@@ -222,9 +233,11 @@ async def run_question(
         is_primary = op["agent_uri"] == decision.selected_uri
         marker = " << PRIMARY" if is_primary else ""
         print(f"\n  [{prov['produced_by']}]{marker}")
-        print(f"  Profile: {prov['reasoning_profile']} | "
-              f"Quality: {prov['quality_score']:.2f} | "
-              f"Confidence: {prov['confidence']:.2f}")
+        print(
+            f"  Profile: {prov['reasoning_profile']} | "
+            f"Quality: {prov['quality_score']:.2f} | "
+            f"Confidence: {prov['confidence']:.2f}"
+        )
         preview = op["output"][:150]
         if len(op["output"]) > 150:
             preview += "..."
@@ -242,9 +255,11 @@ async def main():
     for a in RESEARCH_AGENTS:
         labels = a.agent_card.get("labels", {})
         print(f"  {a.uri}")
-        print(f"    reasoning={labels.get('ldp.reasoning_profile')}, "
-              f"cost={labels.get('ldp.cost_profile')}, "
-              f"quality={labels.get('ldp.quality_score')}")
+        print(
+            f"    reasoning={labels.get('ldp.reasoning_profile')}, "
+            f"cost={labels.get('ldp.cost_profile')}, "
+            f"quality={labels.get('ldp.quality_score')}"
+        )
 
     strategy = LdpCoordinatorStrategy(registry=MockRegistry())
 

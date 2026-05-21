@@ -71,28 +71,118 @@ _CLIENT_PROFILES = {
             "vacation home down payment in 5 years",
         ],
         "existing_holdings": [
-            {"asset": "VTSAX", "type": "us_equity_index", "value": 680_000, "account": "taxable"},
-            {"asset": "VBTLX", "type": "us_bond_index", "value": 220_000, "account": "ira"},
-            {"asset": "Company RSUs", "type": "single_stock", "value": 450_000, "account": "taxable"},
-            {"asset": "AAPL", "type": "single_stock", "value": 180_000, "account": "taxable"},
+            {
+                "asset": "VTSAX",
+                "type": "us_equity_index",
+                "value": 680_000,
+                "account": "taxable",
+            },
+            {
+                "asset": "VBTLX",
+                "type": "us_bond_index",
+                "value": 220_000,
+                "account": "ira",
+            },
+            {
+                "asset": "Company RSUs",
+                "type": "single_stock",
+                "value": 450_000,
+                "account": "taxable",
+            },
+            {
+                "asset": "AAPL",
+                "type": "single_stock",
+                "value": 180_000,
+                "account": "taxable",
+            },
             {"asset": "Cash", "type": "cash", "value": 350_000, "account": "savings"},
-            {"asset": "529 Plan", "type": "education", "value": 120_000, "account": "529"},
-            {"asset": "Real Estate", "type": "property", "value": 800_000, "account": "n/a"},
+            {
+                "asset": "529 Plan",
+                "type": "education",
+                "value": 120_000,
+                "account": "529",
+            },
+            {
+                "asset": "Real Estate",
+                "type": "property",
+                "value": 800_000,
+                "account": "n/a",
+            },
         ],
     },
 }
 
 _MARKET_DATA = {
-    "us_large_cap": {"sector": "US Large Cap", "ytd_return_pct": 12.3, "volatility": 15.2, "pe_ratio": 21.5, "outlook": "bullish"},
-    "us_small_cap": {"sector": "US Small Cap", "ytd_return_pct": 8.1, "volatility": 22.8, "pe_ratio": 16.3, "outlook": "neutral"},
-    "international": {"sector": "International Developed", "ytd_return_pct": 6.7, "volatility": 14.1, "pe_ratio": 14.8, "outlook": "neutral"},
-    "emerging_markets": {"sector": "Emerging Markets", "ytd_return_pct": 4.2, "volatility": 20.5, "pe_ratio": 12.1, "outlook": "bullish"},
-    "us_bonds": {"sector": "US Aggregate Bonds", "ytd_return_pct": 3.8, "volatility": 5.2, "pe_ratio": 0, "outlook": "neutral"},
-    "tips": {"sector": "Treasury Inflation-Protected", "ytd_return_pct": 4.1, "volatility": 6.8, "pe_ratio": 0, "outlook": "bullish"},
-    "reits": {"sector": "Real Estate (REITs)", "ytd_return_pct": 5.9, "volatility": 18.3, "pe_ratio": 17.2, "outlook": "neutral"},
-    "technology": {"sector": "Technology", "ytd_return_pct": 18.5, "volatility": 21.0, "pe_ratio": 28.3, "outlook": "bullish"},
-    "healthcare": {"sector": "Healthcare", "ytd_return_pct": 7.2, "volatility": 13.5, "pe_ratio": 18.1, "outlook": "bullish"},
-    "municipal_bonds": {"sector": "Municipal Bonds", "ytd_return_pct": 3.2, "volatility": 4.1, "pe_ratio": 0, "outlook": "neutral"},
+    "us_large_cap": {
+        "sector": "US Large Cap",
+        "ytd_return_pct": 12.3,
+        "volatility": 15.2,
+        "pe_ratio": 21.5,
+        "outlook": "bullish",
+    },
+    "us_small_cap": {
+        "sector": "US Small Cap",
+        "ytd_return_pct": 8.1,
+        "volatility": 22.8,
+        "pe_ratio": 16.3,
+        "outlook": "neutral",
+    },
+    "international": {
+        "sector": "International Developed",
+        "ytd_return_pct": 6.7,
+        "volatility": 14.1,
+        "pe_ratio": 14.8,
+        "outlook": "neutral",
+    },
+    "emerging_markets": {
+        "sector": "Emerging Markets",
+        "ytd_return_pct": 4.2,
+        "volatility": 20.5,
+        "pe_ratio": 12.1,
+        "outlook": "bullish",
+    },
+    "us_bonds": {
+        "sector": "US Aggregate Bonds",
+        "ytd_return_pct": 3.8,
+        "volatility": 5.2,
+        "pe_ratio": 0,
+        "outlook": "neutral",
+    },
+    "tips": {
+        "sector": "Treasury Inflation-Protected",
+        "ytd_return_pct": 4.1,
+        "volatility": 6.8,
+        "pe_ratio": 0,
+        "outlook": "bullish",
+    },
+    "reits": {
+        "sector": "Real Estate (REITs)",
+        "ytd_return_pct": 5.9,
+        "volatility": 18.3,
+        "pe_ratio": 17.2,
+        "outlook": "neutral",
+    },
+    "technology": {
+        "sector": "Technology",
+        "ytd_return_pct": 18.5,
+        "volatility": 21.0,
+        "pe_ratio": 28.3,
+        "outlook": "bullish",
+    },
+    "healthcare": {
+        "sector": "Healthcare",
+        "ytd_return_pct": 7.2,
+        "volatility": 13.5,
+        "pe_ratio": 18.1,
+        "outlook": "bullish",
+    },
+    "municipal_bonds": {
+        "sector": "Municipal Bonds",
+        "ytd_return_pct": 3.2,
+        "volatility": 4.1,
+        "pe_ratio": 0,
+        "outlook": "neutral",
+    },
 }
 
 
@@ -138,9 +228,17 @@ def assess_risk_score(
     tolerance_score = tolerance_map.get(risk_tolerance, 10)
     recovery_score = min(15, (income / max(net_worth, 1)) * 100)
     concentration_penalty = max(0, (concentration_pct - 20) * 0.5)
-    raw_score = age_score + horizon_score + tolerance_score + recovery_score - concentration_penalty
+    raw_score = (
+        age_score
+        + horizon_score
+        + tolerance_score
+        + recovery_score
+        - concentration_penalty
+    )
     score = max(0, min(100, raw_score))
-    category = "aggressive" if score >= 70 else ("moderate" if score >= 40 else "conservative")
+    category = (
+        "aggressive" if score >= 70 else ("moderate" if score >= 40 else "conservative")
+    )
     return {
         "risk_score": round(score, 1),
         "category": category,
@@ -164,7 +262,10 @@ def get_market_data(sectors: str) -> dict:
         Market data including YTD returns, volatility, and outlook for each sector.
     """
     requested = [s.strip().lower().replace(" ", "_") for s in sectors.split(",")]
-    results = [_MARKET_DATA.get(name, {"sector": name, "error": "not found"}) for name in requested]
+    results = [
+        _MARKET_DATA.get(name, {"sector": name, "error": "not found"})
+        for name in requested
+    ]
     return {"market_data": results, "as_of": "2026-03-13T16:00:00Z"}
 
 
@@ -190,14 +291,43 @@ def analyze_tax_implications(
     bracket_pct = float(tax_bracket.replace("%", "")) / 100
     strategies = []
     if bracket_pct >= 0.24:
-        strategies.append({"strategy": "Tax-Loss Harvesting", "estimated_savings": round(income * 0.015, 2), "risk_level": "low"})
+        strategies.append(
+            {
+                "strategy": "Tax-Loss Harvesting",
+                "estimated_savings": round(income * 0.015, 2),
+                "risk_level": "low",
+            }
+        )
     if horizon_years >= 5:
         amt = min(income * 0.15, 50_000)
-        strategies.append({"strategy": "Roth Conversion Ladder", "estimated_savings": round(amt * (bracket_pct - 0.12), 2), "risk_level": "moderate"})
+        strategies.append(
+            {
+                "strategy": "Roth Conversion Ladder",
+                "estimated_savings": round(amt * (bracket_pct - 0.12), 2),
+                "risk_level": "moderate",
+            }
+        )
     if bracket_pct >= 0.32:
-        strategies.append({"strategy": "Municipal Bond Allocation", "estimated_savings": round(income * 0.008, 2), "risk_level": "low"})
-    strategies.append({"strategy": "Asset Location Optimization", "estimated_savings": round(income * 0.01, 2), "risk_level": "low"})
-    return {"strategies": strategies, "total_estimated_annual_savings": sum(s["estimated_savings"] for s in strategies)}
+        strategies.append(
+            {
+                "strategy": "Municipal Bond Allocation",
+                "estimated_savings": round(income * 0.008, 2),
+                "risk_level": "low",
+            }
+        )
+    strategies.append(
+        {
+            "strategy": "Asset Location Optimization",
+            "estimated_savings": round(income * 0.01, 2),
+            "risk_level": "low",
+        }
+    )
+    return {
+        "strategies": strategies,
+        "total_estimated_annual_savings": sum(
+            s["estimated_savings"] for s in strategies
+        ),
+    }
 
 
 def build_portfolio_allocation(
@@ -218,13 +348,46 @@ def build_portfolio_allocation(
         Recommended allocation with percentages and dollar amounts.
     """
     allocations = {
-        "conservative": {"us_large_cap": 20, "us_small_cap": 5, "international": 10, "emerging": 5, "bonds": 30, "tips": 10, "munis": 10, "reits": 5, "cash": 5},
-        "moderate": {"us_large_cap": 30, "us_small_cap": 10, "international": 15, "emerging": 5, "bonds": 15, "tips": 5, "munis": 5, "reits": 10, "cash": 5},
-        "aggressive": {"us_large_cap": 35, "us_small_cap": 15, "international": 15, "emerging": 10, "bonds": 5, "reits": 10, "cash": 5, "alternatives": 5},
+        "conservative": {
+            "us_large_cap": 20,
+            "us_small_cap": 5,
+            "international": 10,
+            "emerging": 5,
+            "bonds": 30,
+            "tips": 10,
+            "munis": 10,
+            "reits": 5,
+            "cash": 5,
+        },
+        "moderate": {
+            "us_large_cap": 30,
+            "us_small_cap": 10,
+            "international": 15,
+            "emerging": 5,
+            "bonds": 15,
+            "tips": 5,
+            "munis": 5,
+            "reits": 10,
+            "cash": 5,
+        },
+        "aggressive": {
+            "us_large_cap": 35,
+            "us_small_cap": 15,
+            "international": 15,
+            "emerging": 10,
+            "bonds": 5,
+            "reits": 10,
+            "cash": 5,
+            "alternatives": 5,
+        },
     }
     alloc = allocations.get(risk_category, allocations["moderate"])
     dollar_alloc = {k: round(net_worth * v / 100, 2) for k, v in alloc.items() if v > 0}
-    return {"allocation_pct": alloc, "allocation_dollars": dollar_alloc, "total_invested": net_worth}
+    return {
+        "allocation_pct": alloc,
+        "allocation_dollars": dollar_alloc,
+        "total_invested": net_worth,
+    }
 
 
 def check_compliance(client_id: str, risk_category: str) -> dict:
@@ -370,9 +533,9 @@ wealth_advisor = SequentialAgent(
 
 async def main(client_id: str = "C-1001") -> None:
     """Run the Google ADK wealth management workflow."""
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"  Google ADK Wealth Management Advisory — Client {client_id}")
-    print(f"{'='*70}\n")
+    print(f"{'=' * 70}\n")
 
     # ADK uses a session service to manage state
     session_service = InMemorySessionService()
@@ -394,12 +557,16 @@ async def main(client_id: str = "C-1001") -> None:
     # Send the initial prompt to kick off the sequential agent
     prompt = types.Content(
         role="user",
-        parts=[types.Part(text=(
-            f"Please produce a comprehensive wealth management recommendation "
-            f"for client {client_id}. Start by assessing their risk profile, "
-            f"then analyze markets, develop a tax strategy, and finally build "
-            f"the portfolio recommendation."
-        ))],
+        parts=[
+            types.Part(
+                text=(
+                    f"Please produce a comprehensive wealth management recommendation "
+                    f"for client {client_id}. Start by assessing their risk profile, "
+                    f"then analyze markets, develop a tax strategy, and finally build "
+                    f"the portfolio recommendation."
+                )
+            )
+        ],
     )
 
     print("Running agents sequentially...\n")
@@ -415,9 +582,9 @@ async def main(client_id: str = "C-1001") -> None:
             agent_name = event.author or "unknown"
             text = event.content.parts[0].text if event.content.parts[0].text else ""
             if text:
-                print(f"\n{'─'*70}")
+                print(f"\n{'─' * 70}")
                 print(f"  Agent: {agent_name}")
-                print(f"{'─'*70}")
+                print(f"{'─' * 70}")
                 print(text[:500] + ("..." if len(text) > 500 else ""))
                 final_response = text
 
@@ -428,19 +595,20 @@ async def main(client_id: str = "C-1001") -> None:
         session_id=session.id,
     )
     if updated_session and updated_session.state:
-        print(f"\n{'='*70}")
+        print(f"\n{'=' * 70}")
         print("  SESSION STATE KEYS")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         for key in updated_session.state:
             print(f"  - {key}")
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print("  WORKFLOW COMPLETE")
-    print(f"{'='*70}\n")
+    print(f"{'=' * 70}\n")
 
 
 if __name__ == "__main__":
     import sys
+
     cid = "C-1001"
     for arg in sys.argv[1:]:
         if arg.startswith("C-"):

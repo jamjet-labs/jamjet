@@ -43,8 +43,13 @@ async def calculate(expression: str) -> dict[str, Any]:
     """
     safe_globals = {
         "__builtins__": {},
-        "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos,
-        "tan": math.tan, "log": math.log, "abs": abs, "pi": math.pi,
+        "sqrt": math.sqrt,
+        "sin": math.sin,
+        "cos": math.cos,
+        "tan": math.tan,
+        "log": math.log,
+        "abs": abs,
+        "pi": math.pi,
     }
     try:
         result = eval(expression, safe_globals)  # noqa: S307 — sandboxed globals

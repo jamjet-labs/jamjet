@@ -4,6 +4,7 @@ Deliberative Collective Intelligence (DCI) pattern using JamJet.
 Inspired by arXiv:2603.11781. Four reasoning archetypes collaborate
 through structured deliberation to solve complex problems.
 """
+
 from jamjet import Agent, Workflow, tool
 from pydantic import BaseModel
 
@@ -107,9 +108,9 @@ async def main() -> None:
         "carbon emissions by 50% while maintaining accessibility for low-income residents?"
     )
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("DCI Deliberation Example")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"\nProblem: {problem}\n")
 
     start = time.monotonic()

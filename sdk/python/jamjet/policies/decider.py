@@ -50,9 +50,7 @@ def static_decider(
     auto-allow behaviour: ``static_decider("allow")``.
     """
 
-    outcome = PolicyOutcome(
-        decision=decision, name=name, version=version, reason=reason
-    )
+    outcome = PolicyOutcome(decision=decision, name=name, version=version, reason=reason)
 
     def _decide(_args: Mapping[str, Any]) -> PolicyOutcome:
         return outcome

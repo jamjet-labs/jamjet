@@ -6,6 +6,7 @@ Demonstrates:
 - Workflow graph with mixed agent-tool modes
 - Auto-routing: compile-time expansion of agent="auto"
 """
+
 from __future__ import annotations
 
 from jamjet.agent_tool import agent_tool
@@ -38,7 +39,9 @@ def demo_agent_tool_definitions():
         timeout_ms=60000,
     )
     print(f"\n  2. Researcher (streaming):")
-    print(f"     URI: {researcher.agent_uri}, budget: ${researcher.budget['max_cost_usd']}")
+    print(
+        f"     URI: {researcher.agent_uri}, budget: ${researcher.budget['max_cost_usd']}"
+    )
     print(f"     Early termination when budget exceeded")
 
     # Conversational: multi-turn
@@ -61,15 +64,26 @@ def demo_mixed_mode_workflow():
     print("=" * 60)
 
     graph = WorkflowGraph("research-pipeline")
-    graph.add_agent_tool("classify",
-        agent="jamjet://research/classifier", mode="sync",
-        output_key="classification", timeout_ms=5000)
-    graph.add_agent_tool("analyze",
-        agent="jamjet://research/deep-analyst", mode="streaming",
-        output_key="analysis", budget={"max_cost_usd": 2.00})
-    graph.add_agent_tool("review",
-        agent="jamjet://research/peer-reviewer", mode="conversational",
-        output_key="review_result")
+    graph.add_agent_tool(
+        "classify",
+        agent="jamjet://research/classifier",
+        mode="sync",
+        output_key="classification",
+        timeout_ms=5000,
+    )
+    graph.add_agent_tool(
+        "analyze",
+        agent="jamjet://research/deep-analyst",
+        mode="streaming",
+        output_key="analysis",
+        budget={"max_cost_usd": 2.00},
+    )
+    graph.add_agent_tool(
+        "review",
+        agent="jamjet://research/peer-reviewer",
+        mode="conversational",
+        output_key="review_result",
+    )
     graph.add_edge("classify", "analyze")
     graph.add_edge("analyze", "review")
 

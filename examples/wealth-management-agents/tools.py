@@ -78,13 +78,48 @@ async def get_client_profile(client_id: str) -> dict[str, Any]:
                 "vacation home down payment in 5 years",
             ],
             "existing_holdings": [
-                {"asset": "VTSAX", "type": "us_equity_index", "value": 680_000, "account": "taxable"},
-                {"asset": "VBTLX", "type": "us_bond_index", "value": 220_000, "account": "ira"},
-                {"asset": "Company RSUs", "type": "single_stock", "value": 450_000, "account": "taxable"},
-                {"asset": "AAPL", "type": "single_stock", "value": 180_000, "account": "taxable"},
-                {"asset": "Cash", "type": "cash", "value": 350_000, "account": "savings"},
-                {"asset": "529 Plan", "type": "education", "value": 120_000, "account": "529"},
-                {"asset": "Real Estate", "type": "property", "value": 800_000, "account": "n/a"},
+                {
+                    "asset": "VTSAX",
+                    "type": "us_equity_index",
+                    "value": 680_000,
+                    "account": "taxable",
+                },
+                {
+                    "asset": "VBTLX",
+                    "type": "us_bond_index",
+                    "value": 220_000,
+                    "account": "ira",
+                },
+                {
+                    "asset": "Company RSUs",
+                    "type": "single_stock",
+                    "value": 450_000,
+                    "account": "taxable",
+                },
+                {
+                    "asset": "AAPL",
+                    "type": "single_stock",
+                    "value": 180_000,
+                    "account": "taxable",
+                },
+                {
+                    "asset": "Cash",
+                    "type": "cash",
+                    "value": 350_000,
+                    "account": "savings",
+                },
+                {
+                    "asset": "529 Plan",
+                    "type": "education",
+                    "value": 120_000,
+                    "account": "529",
+                },
+                {
+                    "asset": "Real Estate",
+                    "type": "property",
+                    "value": 800_000,
+                    "account": "n/a",
+                },
             ],
         },
         "C-1002": {
@@ -103,12 +138,42 @@ async def get_client_profile(client_id: str) -> dict[str, Any]:
                 "leave inheritance for grandchildren",
             ],
             "existing_holdings": [
-                {"asset": "VBTLX", "type": "us_bond_index", "value": 1_200_000, "account": "401k"},
-                {"asset": "VTSAX", "type": "us_equity_index", "value": 800_000, "account": "ira"},
-                {"asset": "Municipal Bonds", "type": "muni_bonds", "value": 400_000, "account": "taxable"},
-                {"asset": "REITs", "type": "reits", "value": 200_000, "account": "taxable"},
-                {"asset": "Cash", "type": "cash", "value": 600_000, "account": "savings"},
-                {"asset": "Rental Property", "type": "property", "value": 1_000_000, "account": "n/a"},
+                {
+                    "asset": "VBTLX",
+                    "type": "us_bond_index",
+                    "value": 1_200_000,
+                    "account": "401k",
+                },
+                {
+                    "asset": "VTSAX",
+                    "type": "us_equity_index",
+                    "value": 800_000,
+                    "account": "ira",
+                },
+                {
+                    "asset": "Municipal Bonds",
+                    "type": "muni_bonds",
+                    "value": 400_000,
+                    "account": "taxable",
+                },
+                {
+                    "asset": "REITs",
+                    "type": "reits",
+                    "value": 200_000,
+                    "account": "taxable",
+                },
+                {
+                    "asset": "Cash",
+                    "type": "cash",
+                    "value": 600_000,
+                    "account": "savings",
+                },
+                {
+                    "asset": "Rental Property",
+                    "type": "property",
+                    "value": 1_000_000,
+                    "account": "n/a",
+                },
             ],
         },
     }
@@ -151,7 +216,13 @@ async def assess_risk_score(
     # Concentration penalty
     concentration_penalty = max(0, (concentration_pct - 20) * 0.5)
 
-    raw_score = age_score + horizon_score + tolerance_score + recovery_score - concentration_penalty
+    raw_score = (
+        age_score
+        + horizon_score
+        + tolerance_score
+        + recovery_score
+        - concentration_penalty
+    )
     score = max(0, min(100, raw_score))
 
     if score >= 70:
@@ -295,65 +366,79 @@ async def analyze_tax_implications(
 
     # Tax-loss harvesting
     if bracket_pct >= 0.24:
-        strategies.append({
-            "strategy": "Tax-Loss Harvesting",
-            "estimated_savings": round(income * 0.015, 2),
-            "description": (
-                "Sell underperforming positions to realize losses, offsetting capital "
-                "gains. Replace with correlated but non-identical funds to maintain exposure."
-            ),
-            "risk_level": "low",
-        })
+        strategies.append(
+            {
+                "strategy": "Tax-Loss Harvesting",
+                "estimated_savings": round(income * 0.015, 2),
+                "description": (
+                    "Sell underperforming positions to realize losses, offsetting capital "
+                    "gains. Replace with correlated but non-identical funds to maintain exposure."
+                ),
+                "risk_level": "low",
+            }
+        )
 
     # Roth conversion ladder
     if horizon_years >= 5:
         conversion_amount = min(income * 0.15, 50_000)
-        strategies.append({
-            "strategy": "Roth Conversion Ladder",
-            "estimated_savings": round(conversion_amount * (bracket_pct - 0.12), 2),
-            "description": (
-                f"Convert ${conversion_amount:,.0f}/year from Traditional IRA to Roth IRA "
-                "over the next 5 years. Pay taxes now at current rate to withdraw tax-free "
-                "in retirement at potentially lower rates."
-            ),
-            "risk_level": "moderate",
-        })
+        strategies.append(
+            {
+                "strategy": "Roth Conversion Ladder",
+                "estimated_savings": round(conversion_amount * (bracket_pct - 0.12), 2),
+                "description": (
+                    f"Convert ${conversion_amount:,.0f}/year from Traditional IRA to Roth IRA "
+                    "over the next 5 years. Pay taxes now at current rate to withdraw tax-free "
+                    "in retirement at potentially lower rates."
+                ),
+                "risk_level": "moderate",
+            }
+        )
 
     # Municipal bond allocation
     if bracket_pct >= 0.32:
-        strategies.append({
-            "strategy": "Municipal Bond Allocation",
-            "estimated_savings": round(income * 0.008, 2),
-            "description": (
-                "Shift taxable bond holdings to municipal bonds. Interest is exempt "
-                "from federal (and often state) income tax, beneficial at your bracket."
-            ),
-            "risk_level": "low",
-        })
+        strategies.append(
+            {
+                "strategy": "Municipal Bond Allocation",
+                "estimated_savings": round(income * 0.008, 2),
+                "description": (
+                    "Shift taxable bond holdings to municipal bonds. Interest is exempt "
+                    "from federal (and often state) income tax, beneficial at your bracket."
+                ),
+                "risk_level": "low",
+            }
+        )
 
     # Asset location optimization
-    strategies.append({
-        "strategy": "Asset Location Optimization",
-        "estimated_savings": round(income * 0.01, 2),
-        "description": (
-            "Place tax-inefficient assets (bonds, REITs) in tax-advantaged accounts "
-            "(IRA, 401k) and tax-efficient assets (index funds, growth stocks) in "
-            "taxable accounts to minimize annual tax drag."
-        ),
-        "risk_level": "low",
-    })
-
-    # 529 maximization
-    if "college" in holdings.lower() or "529" in holdings.lower() or "education" in holdings.lower():
-        strategies.append({
-            "strategy": "529 Plan Maximization",
-            "estimated_savings": round(min(income * 0.005, 16_000), 2),
+    strategies.append(
+        {
+            "strategy": "Asset Location Optimization",
+            "estimated_savings": round(income * 0.01, 2),
             "description": (
-                "Maximize 529 contributions for state tax deduction. Consider "
-                "superfunding (5-year gift tax averaging) if grandparents can contribute."
+                "Place tax-inefficient assets (bonds, REITs) in tax-advantaged accounts "
+                "(IRA, 401k) and tax-efficient assets (index funds, growth stocks) in "
+                "taxable accounts to minimize annual tax drag."
             ),
             "risk_level": "low",
-        })
+        }
+    )
+
+    # 529 maximization
+    if (
+        "college" in holdings.lower()
+        or "529" in holdings.lower()
+        or "education" in holdings.lower()
+    ):
+        strategies.append(
+            {
+                "strategy": "529 Plan Maximization",
+                "estimated_savings": round(min(income * 0.005, 16_000), 2),
+                "description": (
+                    "Maximize 529 contributions for state tax deduction. Consider "
+                    "superfunding (5-year gift tax averaging) if grandparents can contribute."
+                ),
+                "risk_level": "low",
+            }
+        )
 
     total_savings = sum(s["estimated_savings"] for s in strategies)
     return {

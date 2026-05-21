@@ -53,7 +53,9 @@ def run_mcp_server() -> None:
     @server.tool()
     def delete_history() -> str:
         """A dangerous-looking demo tool that should be blocked by policy."""
-        raise RuntimeError("delete_history should be blocked by policy before execution")
+        raise RuntimeError(
+            "delete_history should be blocked by policy before execution"
+        )
 
     server.run(transport="stdio")
 
@@ -159,7 +161,9 @@ def require_tools(tool_names: list[str], *required_tools: str) -> None:
     """Fail early if the MCP server does not advertise the expected tools."""
     missing = [tool for tool in required_tools if tool not in tool_names]
     if missing:
-        raise RuntimeError(f"MCP server did not advertise expected tools: {', '.join(missing)}")
+        raise RuntimeError(
+            f"MCP server did not advertise expected tools: {', '.join(missing)}"
+        )
 
 
 def extract_tool_result(result: Any) -> int:
@@ -230,7 +234,9 @@ def main() -> None:
     print("\nExecution timeline")
     for event in result.events:
         print(f"  {format_event(event)}")
-    print(f"\nTotal: {result.total_duration_us / 1000:.1f}ms ({result.steps_executed} steps)")
+    print(
+        f"\nTotal: {result.total_duration_us / 1000:.1f}ms ({result.steps_executed} steps)"
+    )
     print("The model is mocked. The enforcement path is real.")
     print()
 

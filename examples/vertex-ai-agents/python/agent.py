@@ -107,7 +107,10 @@ async def main() -> None:
         print("  export GOOGLE_API_KEY='your-gemini-api-key'")
         sys.exit(1)
 
-    prompt = " ".join(sys.argv[1:]) or "Research the AI agent platform market and summarize key players."
+    prompt = (
+        " ".join(sys.argv[1:])
+        or "Research the AI agent platform market and summarize key players."
+    )
 
     print(f"Agent:    {research_agent.name}")
     print(f"Model:    {research_agent.model}")

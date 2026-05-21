@@ -7,6 +7,7 @@ Demonstrates:
 - Custom decision logic (no LLM tiebreaker for safety)
 - Registering strategies with the StrategyServer
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -26,8 +27,11 @@ class HealthcareCoordinatorStrategy(DefaultCoordinatorStrategy):
     """Routes medical queries with heavy weight on certification and trust domain."""
 
     async def score(
-        self, task: str, candidates: list[AgentCandidate],
-        weights: dict[str, float], context: dict[str, Any],
+        self,
+        task: str,
+        candidates: list[AgentCandidate],
+        weights: dict[str, float],
+        context: dict[str, Any],
     ) -> tuple[list[ScoringResult], float]:
         results = []
         for c in candidates:
@@ -41,49 +45,73 @@ class HealthcareCoordinatorStrategy(DefaultCoordinatorStrategy):
             has_cert = "medical" in c.agent_card.get("certifications", [])
             cert_bonus = 0.3 if has_cert else 0.0
             custom_weights = {
-                "capability_fit": 1.0, "cost_fit": 0.5, "latency_fit": 0.5,
-                "trust_compatibility": 3.0, "historical_performance": 1.0,
+                "capability_fit": 1.0,
+                "cost_fit": 0.5,
+                "latency_fit": 0.5,
+                "trust_compatibility": 3.0,
+                "historical_performance": 1.0,
             }
             composite = min(scores.composite(custom_weights) + cert_bonus, 1.0)
-            results.append(ScoringResult(agent_uri=c.uri, scores=scores, composite=composite))
+            results.append(
+                ScoringResult(agent_uri=c.uri, scores=scores, composite=composite)
+            )
 
         results.sort(key=lambda r: r.composite, reverse=True)
-        spread = (results[0].composite - results[1].composite) if len(results) >= 2 else 1.0
+        spread = (
+            (results[0].composite - results[1].composite) if len(results) >= 2 else 1.0
+        )
         return results, spread
 
     async def decide(
-        self, task: str, top_candidates: list[ScoringResult],
-        threshold: float, tiebreaker_model: str, context: dict[str, Any],
+        self,
+        task: str,
+        top_candidates: list[ScoringResult],
+        threshold: float,
+        tiebreaker_model: str,
+        context: dict[str, Any],
     ) -> Decision:
         if not top_candidates:
             return Decision(selected_uri=None, method="no_candidates")
         selected = top_candidates[0]
         return Decision(
-            selected_uri=selected.agent_uri, method="structured",
+            selected_uri=selected.agent_uri,
+            method="structured",
             reasoning="Healthcare: highest-scoring certified agent (no tiebreaker)",
             confidence=selected.composite,
-            rejected=[{"uri": c.agent_uri, "reason": "lower score"} for c in top_candidates[1:]],
+            rejected=[
+                {"uri": c.agent_uri, "reason": "lower score"}
+                for c in top_candidates[1:]
+            ],
         )
 
 
 AGENTS = [
     AgentCandidate(
         uri="jamjet://health/cardiology-agent",
-        agent_card={"name": "Cardiology Specialist", "certifications": ["medical", "cardiology"]},
+        agent_card={
+            "name": "Cardiology Specialist",
+            "certifications": ["medical", "cardiology"],
+        },
         skills=["cardiology", "ecg-analysis", "heart-disease"],
-        latency_class="medium", cost_class="high", trust_domain="healthcare",
+        latency_class="medium",
+        cost_class="high",
+        trust_domain="healthcare",
     ),
     AgentCandidate(
         uri="jamjet://health/general-practitioner",
         agent_card={"name": "General Practitioner", "certifications": ["medical"]},
         skills=["general-medicine", "triage", "referrals"],
-        latency_class="low", cost_class="low", trust_domain="healthcare",
+        latency_class="low",
+        cost_class="low",
+        trust_domain="healthcare",
     ),
     AgentCandidate(
         uri="jamjet://support/chatbot",
         agent_card={"name": "Support Chatbot", "certifications": []},
         skills=["faq", "scheduling"],
-        latency_class="low", cost_class="low", trust_domain="internal",
+        latency_class="low",
+        cost_class="low",
+        trust_domain="internal",
     ),
 ]
 
@@ -101,7 +129,9 @@ async def demo():
 
     for query in queries:
         print(f"\n--- {query} ---")
-        rankings, spread = await strategy.score(task=query, candidates=AGENTS, weights={}, context={})
+        rankings, spread = await strategy.score(
+            task=query, candidates=AGENTS, weights={}, context={}
+        )
         print(f"  Rankings (spread={spread:.3f}):")
         for r in rankings:
             agent = next(a for a in AGENTS if a.uri == r.agent_uri)

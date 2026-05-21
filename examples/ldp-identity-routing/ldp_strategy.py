@@ -9,6 +9,7 @@ Scoring mirrors the LDP paper's routing algorithm (arXiv:2603.08852, RQ1):
 - Hard tasks → prefer analytical, high-quality agents
 - Domain-specific tasks → prefer agents with matching domain expertise
 """
+
 from __future__ import annotations
 
 import re
@@ -24,9 +25,20 @@ from jamjet.coordinator import (
 
 # Keywords signaling complex, multi-step analysis
 HARD_SIGNALS = [
-    "analyze", "impact", "implications", "evaluate", "compare",
-    "sustainability", "multi-step", "trade-off", "assess", "critique",
-    "systemic", "structural", "long-term", "comprehensive",
+    "analyze",
+    "impact",
+    "implications",
+    "evaluate",
+    "compare",
+    "sustainability",
+    "multi-step",
+    "trade-off",
+    "assess",
+    "critique",
+    "systemic",
+    "structural",
+    "long-term",
+    "comprehensive",
 ]
 
 # Known domains for domain-matching
@@ -52,7 +64,9 @@ def classify_difficulty(task: str) -> str:
 def detect_domains(task: str) -> list[str]:
     """Detect domain keywords in the task."""
     task_lower = task.lower()
-    return [d for d in KNOWN_DOMAINS if d in task_lower or _domain_synonyms(d, task_lower)]
+    return [
+        d for d in KNOWN_DOMAINS if d in task_lower or _domain_synonyms(d, task_lower)
+    ]
 
 
 def _domain_synonyms(domain: str, text: str) -> bool:
@@ -157,12 +171,18 @@ class LdpCoordinatorStrategy(DefaultCoordinatorStrategy):
             }
 
             composite = min(scores.composite(ldp_weights) + domain_bonus, 1.0)
-            results.append(ScoringResult(
-                agent_uri=c.uri, scores=scores, composite=composite,
-            ))
+            results.append(
+                ScoringResult(
+                    agent_uri=c.uri,
+                    scores=scores,
+                    composite=composite,
+                )
+            )
 
         results.sort(key=lambda r: r.composite, reverse=True)
-        spread = (results[0].composite - results[-1].composite) if len(results) >= 2 else 1.0
+        spread = (
+            (results[0].composite - results[-1].composite) if len(results) >= 2 else 1.0
+        )
         return results, spread
 
     async def decide(
