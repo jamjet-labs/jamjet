@@ -33,7 +33,6 @@ Run:
 from __future__ import annotations
 
 import asyncio
-import json
 
 from google.adk.agents import Agent, SequentialAgent
 from google.adk.runners import InMemoryRunner
@@ -572,7 +571,6 @@ async def main(client_id: str = "C-1001") -> None:
     print("Running agents sequentially...\n")
 
     # Process events from the runner
-    final_response = None
     async for event in runner.run_async(
         session_id=session.id,
         user_id="advisor-1",
@@ -586,7 +584,6 @@ async def main(client_id: str = "C-1001") -> None:
                 print(f"  Agent: {agent_name}")
                 print(f"{'─' * 70}")
                 print(text[:500] + ("..." if len(text) > 500 else ""))
-                final_response = text
 
     # Print final state
     updated_session = await session_service.get_session(

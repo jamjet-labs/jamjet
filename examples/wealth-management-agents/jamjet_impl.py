@@ -29,12 +29,11 @@ Run (on JamJet runtime):
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 
 from pydantic import BaseModel
 
-from jamjet import Agent, Workflow, tool
+from jamjet import Agent, Workflow
 from tools import (
     analyze_tax_implications,
     assess_risk_score,
@@ -300,7 +299,7 @@ async def run_local(client_id: str = "C-1001") -> None:
     result = await workflow.run(initial_state, max_steps=20)
 
     print(f"\n{'─' * 70}")
-    print(f"  WORKFLOW COMPLETE")
+    print("  WORKFLOW COMPLETE")
     print(f"  Steps executed: {result.steps_executed}")
     print(f"  Duration: {result.total_duration_us / 1_000_000:.2f}s")
     print(f"{'─' * 70}\n")

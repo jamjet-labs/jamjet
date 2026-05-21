@@ -27,7 +27,7 @@ def demo_agent_tool_definitions():
         description="Classifies papers by field and methodology",
         timeout_ms=5000,
     )
-    print(f"\n  1. Classifier (sync):")
+    print("\n  1. Classifier (sync):")
     print(f"     URI: {classifier.agent_uri}, timeout: {classifier.timeout_ms}ms")
 
     # Streaming: long-running with early termination
@@ -38,11 +38,11 @@ def demo_agent_tool_definitions():
         budget={"max_cost_usd": 2.00},
         timeout_ms=60000,
     )
-    print(f"\n  2. Researcher (streaming):")
+    print("\n  2. Researcher (streaming):")
     print(
         f"     URI: {researcher.agent_uri}, budget: ${researcher.budget['max_cost_usd']}"
     )
-    print(f"     Early termination when budget exceeded")
+    print("     Early termination when budget exceeded")
 
     # Conversational: multi-turn
     reviewer = agent_tool(
@@ -51,7 +51,7 @@ def demo_agent_tool_definitions():
         description="Iterative peer review with multi-turn feedback",
         max_turns=5,
     )
-    print(f"\n  3. Reviewer (conversational):")
+    print("\n  3. Reviewer (conversational):")
     print(f"     URI: {reviewer.agent_uri}, max_turns: {reviewer.max_turns}")
     ir = reviewer.to_ir_kind()
     print(f"     IR mode: {ir['mode']}")
@@ -109,7 +109,7 @@ def demo_auto_routing():
     graph.add_edge("prepare", "process")
 
     ir = graph.compile()
-    print(f"\n  Wrote: 2 nodes (model + agent_tool with auto)")
+    print("\n  Wrote: 2 nodes (model + agent_tool with auto)")
     print(f"  Compiled: {len(ir['nodes'])} nodes (compiler inserted coordinator)")
     for nid, n in ir["nodes"].items():
         kind = n["kind"]

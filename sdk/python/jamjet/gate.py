@@ -46,9 +46,10 @@ import inspect
 import json
 import sys
 import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Mapping, ParamSpec, TypeVar
+from datetime import UTC, datetime
+from typing import Any, ParamSpec, TypeVar
 
 from agentboundary.hashing import compute_arguments_hash, compute_receipt_hash
 
@@ -70,7 +71,7 @@ R = TypeVar("R")
 class PolicyDeniedError(Exception):
     """Raised when the policy decision (or human approver) blocks the call."""
 
-    def __init__(self, message: str, *, receipt: dict[str, Any]):
+    def __init__(self, message: str, *, receipt: dict[str, Any]) -> None:
         super().__init__(message)
         self.receipt = receipt
 
@@ -338,7 +339,7 @@ def _build_receipt(
     target_environment: str,
     meta: _AgentMeta,
 ) -> dict[str, Any]:
-    issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    issued_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     actor: dict[str, Any] = {"type": actor_type, "id": actor_id}
     if actor_display_name:
         actor["display_name"] = actor_display_name

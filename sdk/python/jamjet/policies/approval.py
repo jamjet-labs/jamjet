@@ -18,8 +18,9 @@ from __future__ import annotations
 import getpass
 import os
 import sys
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Protocol
 
 
 @dataclass(frozen=True)

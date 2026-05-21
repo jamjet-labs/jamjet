@@ -305,7 +305,7 @@ async def run_local(claim_id: str = "CLM-4821") -> None:
     result = await workflow.run(initial_state, max_steps=20)
 
     print(f"\n{'─' * 60}")
-    print(f"  WORKFLOW COMPLETE")
+    print("  WORKFLOW COMPLETE")
     print(
         f"  Steps: {result.steps_executed}  Duration: {result.total_duration_us / 1_000_000:.2f}s"
     )
@@ -324,8 +324,8 @@ async def run_local(claim_id: str = "CLM-4821") -> None:
         print(f"{'═' * 60}")
         print(content or "(not available)")
 
-    print(f"\n  Inspect: jamjet inspect <exec_id> --events")
-    print(f"  Replay:  jamjet replay <exec_id>")
+    print("\n  Inspect: jamjet inspect <exec_id> --events")
+    print("  Replay:  jamjet replay <exec_id>")
 
 
 async def run_on_runtime(claim_id: str = "CLM-4821") -> None:
@@ -347,7 +347,7 @@ async def run_on_runtime(claim_id: str = "CLM-4821") -> None:
         )
         exec_id = result["execution_id"]
         print(f"Execution started: {exec_id}")
-        print(f"The workflow will pause at the approval gate for claims >$10K.")
+        print("The workflow will pause at the approval gate for claims >$10K.")
         print(f"To approve: jamjet approve {exec_id} --decision approved")
 
 

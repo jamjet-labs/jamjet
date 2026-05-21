@@ -14,7 +14,7 @@ import asyncio
 
 from jamjet.coordinator import DefaultCoordinatorStrategy
 from jamjet.workflow.graph import WorkflowGraph
-from jamjet.workflow.nodes import CoordinatorNode, ModelNode
+from jamjet.workflow.nodes import ModelNode
 
 
 SUPPORT_AGENTS = [

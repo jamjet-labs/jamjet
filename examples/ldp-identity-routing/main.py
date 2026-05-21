@@ -162,10 +162,10 @@ def synthesize(
             ]
         )
 
-    prompt = "\n".join(lines)
+    _prompt = "\n".join(lines)  # noqa: F841 — would be sent to an LLM in production
 
     # Return the highest-weighted answer as the "synthesis" for the mock demo.
-    # In production, you'd send `prompt` to an LLM for actual synthesis.
+    # In production, you'd send `_prompt` to an LLM for actual synthesis.
     best = weighted[0]
     return (
         f"[Synthesis based on {len(weighted)} sources, "
