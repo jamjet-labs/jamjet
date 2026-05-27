@@ -66,8 +66,11 @@ class PreCallMiddleware(Protocol):
     ) -> Response: ...
 
 
+from jamjet.cloud.middleware.chain import Chain  # noqa: E402
+
 __all__ = [
     "CallContext",
+    "Chain",
     "MiddlewareOutcome",
     "PreCallMiddleware",
     "Response",
