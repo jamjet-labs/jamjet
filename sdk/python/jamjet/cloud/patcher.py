@@ -4,6 +4,13 @@ from typing import Any
 
 from .budget import get_budget
 from .events import emit
+from .middleware import Chain
+from .middleware.context import (
+    anthropic_kwargs_from_call_context,
+    call_context_from_anthropic_kwargs,
+    call_context_from_openai_kwargs,
+    openai_kwargs_from_call_context,
+)
 from .policy import get_evaluator
 from .trace import get_context
 
@@ -27,6 +34,28 @@ _COST_PER_TOKEN: dict[str, tuple[float, float]] = {
 }
 
 _originals: dict[str, Any] = {}
+
+
+# ---------------------------------------------------------------------------
+# Middleware runtime state
+# ---------------------------------------------------------------------------
+#
+# The middleware chain wraps every patched LLM call. The default is an empty
+# Chain — that path is byte-identical to the pre-middleware behaviour, so the
+# patcher stays no-op when no policy.yaml has been loaded or the feature flag
+# is off. `configure()` in cloud/__init__.py is expected to replace
+# `_STATE.middleware_chain` with a real Chain built from the loaded policy.
+
+
+class _RuntimeState:
+    middleware_chain: Chain = Chain(middlewares=[])
+
+
+_STATE = _RuntimeState()
+
+
+def _runtime_state() -> _RuntimeState:
+    return _STATE
 
 
 def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
@@ -80,7 +109,20 @@ def patch_openai() -> None:
         budget.check_or_raise(_estimate_cost(model, 500, 1000))
 
         span = ctx.new_span(kind="llm_call", name=f"openai.{model}")
-        result = original(self_inner, *args, **kwargs)
+        # Phase 1 middleware: the chain wraps original(). When the chain is
+        # empty (default / flag-off / no middleware rules) the terminal lambda
+        # runs unchanged and behaviour is byte-identical to the pre-Phase-1
+        # path. When a middleware mutates ctx (e.g. PII redact), the rebuilt
+        # vendor kwargs flow into the real SDK call via the kwarg<->ctx
+        # round-trip.
+        call_ctx = call_context_from_openai_kwargs(kwargs)
+        chain: Chain = _runtime_state().middleware_chain
+        result = chain.run(
+            call_ctx,
+            terminal=lambda c: original(
+                self_inner, *args, **openai_kwargs_from_call_context(c)
+            ),
+        )
 
         usage = getattr(result, "usage", None)
         input_tokens = getattr(usage, "prompt_tokens", 0) or 0
@@ -141,7 +183,15 @@ def patch_anthropic() -> None:
         budget.check_or_raise(_estimate_cost(model, 500, 1000))
 
         span = ctx.new_span(kind="llm_call", name=f"anthropic.{model}")
-        result = original(self_inner, *args, **kwargs)
+        # See _patched_create above for the Phase 1 middleware-chain rationale.
+        call_ctx = call_context_from_anthropic_kwargs(kwargs)
+        chain: Chain = _runtime_state().middleware_chain
+        result = chain.run(
+            call_ctx,
+            terminal=lambda c: original(
+                self_inner, *args, **anthropic_kwargs_from_call_context(c)
+            ),
+        )
 
         # Anthropic response has .usage with input_tokens / output_tokens
         usage = getattr(result, "usage", None)
