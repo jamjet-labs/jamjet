@@ -5,9 +5,16 @@ Reuses the same six PII types the existing ingress-side
 pluggable: RegexDetector is always available; PresidioDetector wraps the
 optional `presidio-analyzer` dependency (pip install jamjet[pii])."""
 from __future__ import annotations
+import fnmatch
+import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
+
+from jamjet.cloud.middleware import CallContext, MiddlewareOutcome
+
+_logger = logging.getLogger("jamjet.cloud.middleware.pii")
 
 
 # Patterns intentionally mirror jamjet.cloud.redaction.DEFAULT_PII_TYPES so a
@@ -120,3 +127,123 @@ class PresidioDetector(PIIDetector):
                 end=r.end,
             ))
         return out
+
+
+def _build_detector(types: list[str]) -> PIIDetector:
+    """Prefer Presidio when installed, fall back to regex."""
+    try:
+        return PresidioDetector(types=types)
+    except ImportError:
+        return RegexDetector(types=types)
+
+
+class PIIMiddleware:
+    """Implements the PreCallMiddleware Protocol. Constructed once at
+    chain-build time with the policy's `redact` rules; per call, finds the
+    first rule whose `match` matches `ctx.identifier` and applies its
+    `on_detect` action."""
+
+    def __init__(self, rules: list[dict[str, Any]]) -> None:
+        if not rules:
+            raise ValueError("PIIMiddleware requires at least one redact rule")
+        # Pre-build one detector per rule. Detectors are cheap to hold and
+        # the type-list-per-rule is fixed.
+        self._compiled = [(r, _build_detector(r["types"])) for r in rules]
+
+    def __call__(self, ctx: CallContext, next):  # type: ignore[no-untyped-def]
+        rule, detector = self._match_rule(ctx)
+        if rule is None:
+            return next(ctx)
+
+        scope: list[str] = rule.get("scope", ["messages", "tools"])
+        on_detect: str = rule.get("on_detect", "block")
+
+        try:
+            detections = self._scan_ctx(ctx, detector, scope)
+        except Exception as e:  # pragma: no cover — fail-open per spec
+            _logger.warning("pii detector error: %r — failing open", e)
+            ctx.middleware_fired.append("pii.redact")
+            ctx.middleware_outcome = MiddlewareOutcome.DETECTOR_ERROR
+            return next(ctx)
+
+        if not detections:
+            return next(ctx)
+
+        if on_detect == "block":
+            from jamjet.cloud.exceptions import JamJetPIIBlocked
+            types_detected = sorted({d.type for d in detections})
+            # Sanitized evidence: types + count only; PII VALUE NEVER LOGGED.
+            ctx.middleware_fired.append("pii.redact")
+            ctx.middleware_outcome = MiddlewareOutcome.BLOCKED
+            ctx.middleware_evidence = {
+                "types": types_detected,
+                "count": len(detections),
+                "action": "blocked",
+            }
+            raise JamJetPIIBlocked(
+                rule_pattern=rule["match"],
+                types_detected=types_detected,
+            )
+
+        if on_detect == "replace":
+            types_detected = sorted({d.type for d in detections})
+            self._redact_ctx(ctx, detector, scope)
+            ctx.middleware_fired.append("pii.redact")
+            ctx.middleware_outcome = MiddlewareOutcome.PASSTHROUGH
+            ctx.middleware_evidence = {
+                "types": types_detected,
+                "count": len(detections),
+                "action": "replaced",
+            }
+            return next(ctx)
+
+        # Unknown on_detect (shouldn't reach here — validator catches it) -> fail-open.
+        _logger.warning("pii rule has unknown on_detect: %r — failing open", on_detect)
+        return next(ctx)
+
+    def _match_rule(self, ctx: CallContext):
+        for rule, detector in self._compiled:
+            if fnmatch.fnmatch(ctx.identifier, rule["match"]):
+                return rule, detector
+        return None, None
+
+    def _scan_ctx(self, ctx: CallContext, detector: PIIDetector, scope: list[str]):
+        detections: list[PIIDetection] = []
+        if "messages" in scope:
+            for msg in ctx.messages:
+                content = msg.get("content")
+                if isinstance(content, str):
+                    detections.extend(detector.scan(content))
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            detections.extend(detector.scan(part["text"]))
+        if "tools" in scope:
+            for tool in ctx.tools:
+                fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+                if isinstance(fn.get("description"), str):
+                    detections.extend(detector.scan(fn["description"]))
+                params = fn.get("parameters")
+                if isinstance(params, dict):
+                    # Scan parameter descriptions only (the schema itself is structure, not user content)
+                    for prop in (params.get("properties") or {}).values():
+                        if isinstance(prop, dict) and isinstance(prop.get("description"), str):
+                            detections.extend(detector.scan(prop["description"]))
+        # System prompt deliberately NOT scanned — per spec section 4.
+        return detections
+
+    def _redact_ctx(self, ctx: CallContext, detector: PIIDetector, scope: list[str]) -> None:
+        if "messages" in scope:
+            for msg in ctx.messages:
+                content = msg.get("content")
+                if isinstance(content, str):
+                    msg["content"] = detector.redact(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            part["text"] = detector.redact(part["text"])
+        if "tools" in scope:
+            for tool in ctx.tools:
+                fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+                if isinstance(fn.get("description"), str):
+                    fn["description"] = detector.redact(fn["description"])

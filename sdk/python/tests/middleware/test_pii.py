@@ -64,3 +64,85 @@ def test_presidio_detector_imports_only_when_extras_installed():
         d = PresidioDetector(types=["EMAIL"])
         detections = d.scan("contact alice@example.com")
         assert any(x.type == "EMAIL" for x in detections)
+
+
+from jamjet.cloud.middleware import CallContext
+from jamjet.cloud.middleware.pii import PIIMiddleware
+
+
+def _ctx_with_email() -> CallContext:
+    return CallContext(
+        provider="openai", model="gpt-4o",
+        messages=[{"role": "user", "content": "email alice@example.com"}],
+        tools=[],
+        system="be helpful",
+    )
+
+
+def test_pii_block_raises_jamjet_pii_blocked():
+    from jamjet.cloud.exceptions import JamJetPIIBlocked
+    mw = PIIMiddleware(rules=[{
+        "match": "openai:*", "action": "redact",
+        "types": ["EMAIL"], "on_detect": "block", "scope": ["messages"],
+    }])
+    with pytest.raises(JamJetPIIBlocked) as ei:
+        mw(_ctx_with_email(), next=lambda c: "should-not-call-terminal")
+    assert ei.value.rule_pattern == "openai:*"
+    assert ei.value.types_detected == ["EMAIL"]
+    # Sanitized — TYPES + COUNT only, never the raw PII value.
+    assert "alice@example.com" not in str(ei.value)
+
+
+def test_pii_block_also_caught_by_jamjet_policy_blocked():
+    """Subclass semantics: existing `except JamJetPolicyBlocked` handlers
+    must still catch PII blocks."""
+    from jamjet.cloud.exceptions import JamJetPolicyBlocked
+    mw = PIIMiddleware(rules=[{
+        "match": "openai:*", "action": "redact",
+        "types": ["EMAIL"], "on_detect": "block", "scope": ["messages"],
+    }])
+    with pytest.raises(JamJetPolicyBlocked):
+        mw(_ctx_with_email(), next=lambda c: "should-not-call-terminal")
+
+
+def test_pii_block_ignores_non_matching_rules():
+    """Rule matches `anthropic:*` but call is `openai:*` — pass through."""
+    mw = PIIMiddleware(rules=[{
+        "match": "anthropic:*", "action": "redact",
+        "types": ["EMAIL"], "on_detect": "block", "scope": ["messages"],
+    }])
+    out = mw(_ctx_with_email(), next=lambda c: "passed-through")
+    assert out == "passed-through"
+
+
+def test_pii_block_skips_system_prompts():
+    """Even with a matching rule including scope=[messages], the system
+    prompt must never be scanned."""
+    ctx = CallContext(
+        provider="openai", model="gpt-4o",
+        messages=[{"role": "user", "content": "no pii here"}],
+        system="ops contact: alice@example.com",   # PII in system; must be ignored
+    )
+    mw = PIIMiddleware(rules=[{
+        "match": "openai:*", "action": "redact",
+        "types": ["EMAIL"], "on_detect": "block", "scope": ["messages"],
+    }])
+    out = mw(ctx, next=lambda c: "passed-through")
+    assert out == "passed-through"
+
+
+def test_pii_block_scans_tool_descriptions_when_scope_includes_tools():
+    ctx = CallContext(
+        provider="openai", model="gpt-4o",
+        messages=[{"role": "user", "content": "no pii"}],
+        tools=[{"type": "function", "function": {
+            "name": "lookup", "description": "lookup by email like alice@example.com",
+        }}],
+    )
+    from jamjet.cloud.exceptions import JamJetPIIBlocked
+    mw = PIIMiddleware(rules=[{
+        "match": "openai:*", "action": "redact",
+        "types": ["EMAIL"], "on_detect": "block", "scope": ["tools"],
+    }])
+    with pytest.raises(JamJetPIIBlocked):
+        mw(ctx, next=lambda c: "should-not-pass-through")

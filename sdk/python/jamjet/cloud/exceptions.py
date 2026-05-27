@@ -24,6 +24,22 @@ class JamJetPolicyBlocked(Exception):
         super().__init__(f"Tool '{tool}' blocked by policy pattern '{pattern}'")
 
 
+class JamJetPIIBlocked(JamJetPolicyBlocked):
+    """Raised when a pre-LLM call is blocked because the request contained PII.
+
+    Subclasses JamJetPolicyBlocked so existing `except JamJetPolicyBlocked`
+    handlers still catch this case. Adds sanitized evidence: which rule pattern
+    matched + which PII types were detected (TYPES + COUNT only — the raw PII
+    values are NEVER carried on the exception object)."""
+
+    def __init__(self, rule_pattern: str, types_detected: list[str]) -> None:
+        # Initialize the parent with synthetic tool="llm-call" so the existing
+        # exception message format still works.
+        super().__init__(tool="llm-call", pattern=rule_pattern)
+        self.rule_pattern = rule_pattern
+        self.types_detected = list(types_detected)
+
+
 class JamJetApprovalRejected(Exception):
     """Raised when a human-in-the-loop approval is rejected."""
 
