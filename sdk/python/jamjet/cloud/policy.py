@@ -71,6 +71,56 @@ class PolicyEvaluator:
 
 
 # ---------------------------------------------------------------------------
+# Policy schema validation
+# ---------------------------------------------------------------------------
+
+_PII_TYPES = {"EMAIL", "US_SSN", "CREDIT_CARD", "PHONE_NUMBER", "IBAN_CODE", "IP_ADDRESS"}
+_REDACT_ON_DETECT = {"block", "replace"}
+_REDACT_SCOPE = {"messages", "tools"}
+
+
+def _validate_redact_rule(rule: dict) -> None:
+    types = rule.get("types")
+    if not types or not isinstance(types, list):
+        raise ValueError(f"redact rule requires non-empty `types` list (rule: {rule!r})")
+    for t in types:
+        if t not in _PII_TYPES:
+            raise ValueError(f"redact rule has unknown PII type: {t!r} (allowed: {sorted(_PII_TYPES)})")
+    on_detect = rule.get("on_detect", "block")
+    if on_detect not in _REDACT_ON_DETECT:
+        raise ValueError(f"redact rule `on_detect` must be one of {sorted(_REDACT_ON_DETECT)}, got {on_detect!r}")
+    scope = rule.get("scope", ["messages", "tools"])
+    if not isinstance(scope, list) or any(s not in _REDACT_SCOPE for s in scope):
+        raise ValueError(f"redact rule `scope` items must be in {sorted(_REDACT_SCOPE)}, got {scope!r}")
+
+
+def validate(parsed: dict) -> dict:
+    """Validate a parsed policy dict against the JamJet policy schema.
+
+    Raises ``ValueError`` for any structural or semantic violation.
+    Returns the original ``parsed`` dict unchanged on success (for chaining).
+
+    Recognised actions: ``block``, ``allow``, ``require_approval``, ``audit``,
+    ``redact``, ``cache`` (Phase 2 reserved), ``fallback`` (Phase 3 reserved).
+    """
+    if not isinstance(parsed, dict) or parsed.get("version") != 1:
+        version = parsed.get("version") if isinstance(parsed, dict) else "n/a"
+        raise ValueError(f"unsupported policy version: {version}")
+    rules = parsed.get("rules") or []
+    for i, rule in enumerate(rules):
+        if not isinstance(rule, dict) or "match" not in rule or "action" not in rule:
+            raise ValueError(f"rule[{i}] missing match/action")
+        action = rule["action"]
+        if action == "redact":
+            _validate_redact_rule(rule)
+        elif action in {"cache", "fallback"}:
+            pass  # Phases 2/3 — accepted by schema, instantiated only when those phases ship
+        elif action not in {"block", "allow", "require_approval", "audit"}:
+            raise ValueError(f"unknown rule action: {action!r}")
+    return parsed
+
+
+# ---------------------------------------------------------------------------
 # Module-level singleton
 # ---------------------------------------------------------------------------
 
