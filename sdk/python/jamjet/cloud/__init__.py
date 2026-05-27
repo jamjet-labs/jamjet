@@ -37,7 +37,7 @@ __all__ = [
 
 
 def configure(
-    api_key: str,
+    api_key: str | None = None,
     project: str = "default",
     agent: str | None = None,
     environment: str | None = None,
@@ -49,6 +49,8 @@ def configure(
     api_url: str = "https://api.jamjet.dev",
     redact: bool = False,
     redact_types: list[str] | None = None,
+    policy_path: str | None = None,
+    telemetry: bool = True,
 ) -> None:
     """Initialize the JamJet Cloud SDK.
 
@@ -64,6 +66,14 @@ def configure(
             decorator overrides.
         capture_io: when True, captures full prompt/response payloads (off by
             default for privacy).
+        policy_path: optional path to a ``policy.yaml`` file. When provided the
+            file is loaded and the Phase 1 middleware chain is built from any
+            ``redact`` rules found in the policy. When omitted (or when the
+            ``JAMJET_MIDDLEWARE_ENABLED`` env-var is not set to ``"1"``) the
+            chain remains empty and the patcher is byte-identical to the
+            pre-Phase-1 path.
+        telemetry: set to ``False`` to suppress background policy-sync HTTP
+            requests. Primarily useful in tests.
     """
     set_config(
         api_key=api_key,
@@ -90,13 +100,29 @@ def configure(
 
     _redact_cfg(enabled=redact, pii_types=redact_types)
 
+    # Phase 1: load a local policy.yaml and build the middleware chain from it.
+    # Empty when policy_path is absent, the feature flag is off, or no
+    # middleware-eligible rules exist; in all cases the patcher behaviour is
+    # byte-identical to the pre-Phase-1 path.
+    if policy_path is not None:
+        import yaml  # PyYAML is a dependency of jamjet-engram; safe to import here
+
+        with open(policy_path) as _f:
+            _policy_dict: dict = yaml.safe_load(_f) or {}
+
+        from .middleware import build_chain as _build_chain
+        from .patcher import _runtime_state as _rs
+
+        _rs().middleware_chain = _build_chain(_policy_dict)
+
     if auto_patch:
         patch_all()
 
-    # Sync policies from server in background
-    cfg = get_config()
-    t = threading.Thread(target=_sync_policies, args=(cfg.api_key, cfg.api_url, project), daemon=True)
-    t.start()
+    # Sync policies from server in background (skip when telemetry=False, e.g. tests)
+    if telemetry:
+        cfg = get_config()
+        t = threading.Thread(target=_sync_policies, args=(cfg.api_key, cfg.api_url, project), daemon=True)
+        t.start()
 
 
 def _sync_policies(api_key: str | None, api_url: str, project: str) -> None:

@@ -127,3 +127,43 @@ def test_build_chain_skips_unknown_action(monkeypatch):
     ]}
     chain = build_chain(policy)
     assert len(chain.middlewares) == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 7: configure() builds the chain from a loaded policy.yaml
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402  (pre-existing pattern in this test file)
+
+
+@pytest.mark.xfail(
+    reason="PIIMiddleware (jamjet.cloud.middleware.pii) ships in Task 11; "
+    "until then build_chain raises ImportError for redact rules",
+    strict=False,
+)
+def test_configure_builds_chain_from_loaded_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("JAMJET_MIDDLEWARE_ENABLED", "1")
+    policy_yaml = tmp_path / "policy.yaml"
+    policy_yaml.write_text(
+        "version: 1\n"
+        "rules:\n"
+        '  - { match: "openai:*", action: redact, types: [EMAIL], '
+        'on_detect: block, scope: [messages] }\n'
+    )
+    import jamjet.cloud as cloud
+    cloud.configure(policy_path=str(policy_yaml), telemetry=False, auto_patch=False)
+
+    from jamjet.cloud.patcher import _runtime_state
+    state = _runtime_state()
+    assert len(state.middleware_chain.middlewares) == 1
+
+
+def test_configure_with_no_middleware_rules_yields_empty_chain(monkeypatch, tmp_path):
+    monkeypatch.setenv("JAMJET_MIDDLEWARE_ENABLED", "1")
+    policy_yaml = tmp_path / "policy.yaml"
+    policy_yaml.write_text("version: 1\nrules: []\n")
+    import jamjet.cloud as cloud
+    cloud.configure(policy_path=str(policy_yaml), telemetry=False, auto_patch=False)
+
+    from jamjet.cloud.patcher import _runtime_state
+    assert len(_runtime_state().middleware_chain.middlewares) == 0
