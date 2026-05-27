@@ -11,6 +11,7 @@ from .middleware.context import (
     call_context_from_openai_kwargs,
     openai_kwargs_from_call_context,
 )
+from .middleware.receipts import build_llm_receipt, emit_receipt
 from .policy import get_evaluator
 from .trace import get_context
 
@@ -117,12 +118,42 @@ def patch_openai() -> None:
         # round-trip.
         call_ctx = call_context_from_openai_kwargs(kwargs)
         chain: Chain = _runtime_state().middleware_chain
-        result = chain.run(
-            call_ctx,
-            terminal=lambda c: original(
-                self_inner, *args, **openai_kwargs_from_call_context(c)
-            ),
-        )
+        try:
+            result = chain.run(
+                call_ctx,
+                terminal=lambda c: original(self_inner, *args, **openai_kwargs_from_call_context(c)),
+            )
+        except BaseException:
+            # Middleware short-circuited via raise. Emit a deny-decision
+            # receipt iff middleware actually fired (we have telemetry to
+            # attribute), then re-raise — user code sees the original
+            # exception unchanged. Task 11 will tighten the catch to
+            # JamJetPolicyBlocked once PII middleware lands.
+            if call_ctx.middleware_fired:
+                try:
+                    receipt = build_llm_receipt(
+                        call_ctx,
+                        matched_rule={"match": call_ctx.middleware_fired[0]},
+                        policy_version="1",
+                    )
+                    emit_receipt(receipt)
+                except Exception:  # noqa: BLE001  receipt emission must never mask the user-facing error
+                    pass
+            raise
+
+        # Success path — emit a receipt iff middleware fired (e.g. PII
+        # redact). Happy passthrough leaves the existing span/event path
+        # unchanged and emits no receipt, preserving audit volume.
+        if call_ctx.middleware_fired:
+            try:
+                receipt = build_llm_receipt(
+                    call_ctx,
+                    matched_rule={"match": call_ctx.middleware_fired[0]},
+                    policy_version="1",
+                )
+                emit_receipt(receipt)
+            except Exception:  # noqa: BLE001  receipt emission must never break the LLM call
+                pass
 
         usage = getattr(result, "usage", None)
         input_tokens = getattr(usage, "prompt_tokens", 0) or 0
@@ -186,12 +217,35 @@ def patch_anthropic() -> None:
         # See _patched_create above for the Phase 1 middleware-chain rationale.
         call_ctx = call_context_from_anthropic_kwargs(kwargs)
         chain: Chain = _runtime_state().middleware_chain
-        result = chain.run(
-            call_ctx,
-            terminal=lambda c: original(
-                self_inner, *args, **anthropic_kwargs_from_call_context(c)
-            ),
-        )
+        try:
+            result = chain.run(
+                call_ctx,
+                terminal=lambda c: original(self_inner, *args, **anthropic_kwargs_from_call_context(c)),
+            )
+        except BaseException:
+            # Mirror the OpenAI block path — see the rationale comment above.
+            if call_ctx.middleware_fired:
+                try:
+                    receipt = build_llm_receipt(
+                        call_ctx,
+                        matched_rule={"match": call_ctx.middleware_fired[0]},
+                        policy_version="1",
+                    )
+                    emit_receipt(receipt)
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
+
+        if call_ctx.middleware_fired:
+            try:
+                receipt = build_llm_receipt(
+                    call_ctx,
+                    matched_rule={"match": call_ctx.middleware_fired[0]},
+                    policy_version="1",
+                )
+                emit_receipt(receipt)
+            except Exception:  # noqa: BLE001
+                pass
 
         # Anthropic response has .usage with input_tokens / output_tokens
         usage = getattr(result, "usage", None)
