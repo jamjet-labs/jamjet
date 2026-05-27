@@ -90,3 +90,40 @@ def test_fixed_order_executes_pii_then_cache_then_fallback():
         "pii:enter", "cache:enter", "fallback:enter",
         "fallback:exit", "cache:exit", "pii:exit",
     ]
+
+
+import os
+from jamjet.cloud.middleware import build_chain
+
+
+def test_build_chain_returns_empty_when_flag_disabled(monkeypatch):
+    monkeypatch.delenv("JAMJET_MIDDLEWARE_ENABLED", raising=False)
+    policy = {"version": 1, "rules": [
+        {"match": "openai:*", "action": "redact",
+         "types": ["EMAIL"], "on_detect": "block", "scope": ["messages"]}
+    ]}
+    chain = build_chain(policy)
+    assert len(chain.middlewares) == 0  # flag off -> chain is empty -> no behaviour change
+
+
+def test_build_chain_returns_empty_when_no_middleware_rules(monkeypatch):
+    monkeypatch.setenv("JAMJET_MIDDLEWARE_ENABLED", "1")
+    policy = {"version": 1, "rules": [
+        {"match": "*delete*", "action": "block"},      # tool-call rule, NOT a middleware rule
+    ]}
+    chain = build_chain(policy)
+    assert len(chain.middlewares) == 0
+
+
+def test_build_chain_skips_unknown_action(monkeypatch):
+    """`cache` and `fallback` are reserved for Phases 2/3; build_chain must
+    silently skip them in Phase 1 so a forward-compatible policy.yaml doesn't
+    crash today."""
+    monkeypatch.setenv("JAMJET_MIDDLEWARE_ENABLED", "1")
+    policy = {"version": 1, "rules": [
+        {"match": "openai:*", "action": "cache", "ttl": 60},
+        {"match": "openai:*", "action": "fallback",
+         "on": [{"http_status": [503]}], "chain": ["openai:gpt-4o-mini"]},
+    ]}
+    chain = build_chain(policy)
+    assert len(chain.middlewares) == 0
