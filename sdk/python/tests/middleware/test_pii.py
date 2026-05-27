@@ -41,3 +41,26 @@ def test_redact_in_place_substitutes_tokens():
     assert "123-45-6789" not in out
     assert "[REDACTED:EMAIL]" in out
     assert "[REDACTED:US_SSN]" in out
+
+
+import pytest
+
+
+def test_presidio_detector_imports_only_when_extras_installed():
+    """PresidioDetector should be importable; instantiation should raise a
+    clear error if presidio-analyzer is not installed (instead of an opaque
+    ModuleNotFoundError deep in the call stack)."""
+    from jamjet.cloud.middleware.pii import PresidioDetector
+    try:
+        import presidio_analyzer  # noqa: F401
+        has_presidio = True
+    except ImportError:
+        has_presidio = False
+    if not has_presidio:
+        with pytest.raises(ImportError, match=r"jamjet\[pii\]"):
+            PresidioDetector(types=["EMAIL"])
+    else:
+        # Smoke: instantiate and run one scan
+        d = PresidioDetector(types=["EMAIL"])
+        detections = d.scan("contact alice@example.com")
+        assert any(x.type == "EMAIL" for x in detections)

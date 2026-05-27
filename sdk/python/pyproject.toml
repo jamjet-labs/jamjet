@@ -78,6 +78,7 @@ crewai = ["crewai>=0.70"]
 adk = ["google-adk>=0.1"]
 anthropic-agent = ["anthropic>=0.40"]
 openai-agents = ["openai-agents>=0.1"]
+pii = ["presidio-analyzer>=2.2,<3.0"]
 
 [project.scripts]
 jamjet = "jamjet.cli.main:app"

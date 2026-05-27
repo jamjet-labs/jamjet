@@ -71,3 +71,52 @@ class RegexDetector(PIIDetector):
                 detections.append(PIIDetection(type=t, value=m.group(0),
                                                start=m.start(), end=m.end()))
         return detections
+
+
+_PRESIDIO_TYPE_MAP = {
+    "EMAIL":        "EMAIL_ADDRESS",
+    "US_SSN":       "US_SSN",
+    "CREDIT_CARD":  "CREDIT_CARD",
+    "PHONE_NUMBER": "PHONE_NUMBER",
+    "IP_ADDRESS":   "IP_ADDRESS",
+    "IBAN_CODE":    "IBAN_CODE",
+}
+
+
+class PresidioDetector(PIIDetector):
+    """Higher-precision detector backed by Microsoft Presidio. Activated
+    automatically by the PII middleware when `presidio-analyzer` is on the
+    import path. Falls back to RegexDetector when not installed.
+
+    Install via: pip install jamjet[pii]"""
+
+    def __init__(self, types: list[str]) -> None:
+        try:
+            from presidio_analyzer import AnalyzerEngine
+        except ImportError as e:
+            raise ImportError(
+                "PresidioDetector requires `presidio-analyzer`. Install via: "
+                "pip install jamjet[pii]"
+            ) from e
+        unknown = [t for t in types if t not in _PRESIDIO_TYPE_MAP]
+        if unknown:
+            raise ValueError(f"unknown PII types: {unknown}")
+        self._types = list(types)
+        self._engine = AnalyzerEngine()
+
+    def scan(self, text: str) -> list[PIIDetection]:
+        if not text:
+            return []
+        presidio_types = [_PRESIDIO_TYPE_MAP[t] for t in self._types]
+        results = self._engine.analyze(text=text, entities=presidio_types, language="en")
+        out: list[PIIDetection] = []
+        reverse_map = {v: k for k, v in _PRESIDIO_TYPE_MAP.items()}
+        for r in results:
+            our_type = reverse_map.get(r.entity_type, r.entity_type)
+            out.append(PIIDetection(
+                type=our_type,
+                value=text[r.start : r.end],
+                start=r.start,
+                end=r.end,
+            ))
+        return out
