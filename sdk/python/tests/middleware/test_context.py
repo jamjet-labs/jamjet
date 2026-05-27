@@ -60,3 +60,49 @@ def test_no_system_message_yields_none():
     })
     assert ctx.system is None
     assert len(ctx.messages) == 1
+
+
+from jamjet.cloud.middleware.context import (
+    call_context_from_anthropic_kwargs,
+    anthropic_kwargs_from_call_context,
+)
+
+
+def test_anthropic_kwargs_to_context():
+    kwargs = {
+        "model": "claude-haiku-4-5",
+        "system": "be helpful",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "lookup", "description": "look up"}],
+        "max_tokens": 1024,
+    }
+    ctx = call_context_from_anthropic_kwargs(kwargs)
+    assert ctx.provider == "anthropic"
+    assert ctx.model == "claude-haiku-4-5"
+    assert ctx.system == "be helpful"
+    assert len(ctx.messages) == 1
+    assert ctx.tools[0]["name"] == "lookup"
+    assert ctx.extra_kwargs == {"max_tokens": 1024}
+    assert ctx.identifier == "anthropic:claude-haiku-4-5"
+
+
+def test_anthropic_context_round_trip_preserves_mutation():
+    ctx = call_context_from_anthropic_kwargs({
+        "model": "claude-haiku-4-5",
+        "system": "be helpful",
+        "messages": [{"role": "user", "content": "ssn 123-45-6789"}],
+    })
+    ctx.messages = [{"role": "user", "content": "ssn [REDACTED:US_SSN]"}]
+    rebuilt = anthropic_kwargs_from_call_context(ctx)
+    assert rebuilt["model"] == "claude-haiku-4-5"
+    assert rebuilt["system"] == "be helpful"
+    assert rebuilt["messages"][0]["content"] == "ssn [REDACTED:US_SSN]"
+
+
+def test_anthropic_no_system_omits_key():
+    ctx = call_context_from_anthropic_kwargs({
+        "model": "claude-haiku-4-5",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    rebuilt = anthropic_kwargs_from_call_context(ctx)
+    assert "system" not in rebuilt
