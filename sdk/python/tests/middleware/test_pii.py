@@ -43,7 +43,13 @@ def test_redact_in_place_substitutes_tokens():
     assert "[REDACTED:US_SSN]" in out
 
 
+import logging
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _pii_logs_at_warning(caplog):
+    caplog.set_level(logging.WARNING, logger="jamjet.cloud.middleware.pii")
 
 
 def test_presidio_detector_imports_only_when_extras_installed():
@@ -146,3 +152,67 @@ def test_pii_block_scans_tool_descriptions_when_scope_includes_tools():
     }])
     with pytest.raises(JamJetPIIBlocked):
         mw(ctx, next=lambda c: "should-not-pass-through")
+
+
+def test_pii_replace_substitutes_tokens_and_calls_terminal():
+    seen_messages: list = []
+    def terminal(c):
+        seen_messages.append(c.messages[0]["content"])
+        return "terminal-response"
+
+    ctx = CallContext(
+        provider="openai", model="gpt-4o",
+        messages=[{"role": "user", "content": "email alice@example.com"}],
+    )
+    mw = PIIMiddleware(rules=[{
+        "match": "openai:*", "action": "redact",
+        "types": ["EMAIL"], "on_detect": "replace", "scope": ["messages"],
+    }])
+    out = mw(ctx, next=terminal)
+    assert out == "terminal-response"
+    assert seen_messages == ["email [REDACTED:EMAIL]"]
+    # Original ctx must reflect the mutation (the patcher rebuilds vendor kwargs from ctx).
+    assert ctx.messages[0]["content"] == "email [REDACTED:EMAIL]"
+
+
+def test_pii_replace_handles_multi_part_content():
+    ctx = CallContext(
+        provider="openai", model="gpt-4o",
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": "ssn 123-45-6789"},
+            {"type": "image_url", "image_url": {"url": "http://example.com/img.png"}},
+            {"type": "text", "text": "another email bob@example.com"},
+        ]}],
+    )
+    mw = PIIMiddleware(rules=[{
+        "match": "openai:*", "action": "redact",
+        "types": ["EMAIL", "US_SSN"], "on_detect": "replace", "scope": ["messages"],
+    }])
+    out = mw(ctx, next=lambda c: "ok")
+    assert out == "ok"
+    parts = ctx.messages[0]["content"]
+    assert "[REDACTED:US_SSN]" in parts[0]["text"]
+    assert "[REDACTED:EMAIL]" in parts[2]["text"]
+    # Non-text parts are untouched
+    assert parts[1]["image_url"]["url"] == "http://example.com/img.png"
+
+
+def test_pii_detector_error_fails_open(caplog):
+    """A bug in the detector must NEVER break the user's LLM call."""
+    from jamjet.cloud.middleware.pii import PIIDetector
+
+    class BrokenDetector(PIIDetector):
+        def scan(self, text): raise RuntimeError("detector blew up")
+
+    from jamjet.cloud.middleware import CallContext
+    mw = PIIMiddleware(rules=[{
+        "match": "openai:*", "action": "redact",
+        "types": ["EMAIL"], "on_detect": "block", "scope": ["messages"],
+    }])
+    # Override the compiled detector for this rule
+    mw._compiled = [(mw._compiled[0][0], BrokenDetector())]
+    ctx = CallContext(provider="openai", model="gpt-4o",
+                      messages=[{"role": "user", "content": "hi alice@example.com"}])
+    out = mw(ctx, next=lambda c: "served-anyway")
+    assert out == "served-anyway"
+    assert any("pii detector error" in r.message for r in caplog.records)
