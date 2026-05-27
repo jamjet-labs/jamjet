@@ -1,6 +1,6 @@
 # JamJet
 
-> **The agent-native runtime — built for performance, designed for interoperability, reliable enough for production.**
+> *Write the safety policy once. Run it everywhere your agents can act.*
 
 [![CI](https://img.shields.io/github/actions/workflow/status/jamjet-labs/jamjet/ci.yml?label=CI&style=flat-square)](https://github.com/jamjet-labs/jamjet/actions)
 [![PyPI](https://img.shields.io/pypi/v/jamjet?style=flat-square&color=f5c518)](https://pypi.org/project/jamjet)
@@ -10,64 +10,45 @@
 
 ![JamJet demo](https://raw.githubusercontent.com/jamjet-labs/jamjet/main/demo.gif)
 
-JamJet is a **performance-first, agent-native runtime and framework** for building reliable, interoperable AI agent systems. It is not another prompt wrapper or thin agent SDK — it is an **orchestration substrate** built to prevent the failure modes that hurt real agents: lost state on crash, skipped approvals, runaway cost, and siloed observability.
+JamJet sits underneath your Python agent — Claude Code, OpenAI Agents SDK, MCP clients, LangChain, CrewAI, ADK, custom code — and enforces what prompts cannot:
+
+- 🛡️ **Block unsafe tool calls** at runtime (database deletes, payments, file writes)
+- ✋ **Pause for human approval** on risky actions, durably
+- 💸 **Cap cost** per agent, per run, per project
+- 📒 **Record an audit trail** that survives a regulator's review
+- ⏪ **Replay or resume** crashed runs from the last checkpoint
+
+**Keep your agent framework. Add JamJet where tool calls need control.**
 
 ---
 
-## Why JamJet?
+## See it in 60 seconds
 
-| Problem | JamJet's answer |
-|---------|----------------|
-| Fragile agent runs that lose state on crash | **Durable graph execution** with event sourcing and crash recovery |
-| No way to pause for human approval | **Human-in-the-loop** as a first-class workflow primitive |
-| Agents siloed in their own framework | **Native MCP + A2A** — interoperate with any agent, any framework |
-| Slow Python orchestration at scale | **Rust core** for scheduling, state, concurrency; Python for authoring |
-| Weak observability, no replay | **Full event timeline**, replay from any checkpoint |
-| No standard agent identity | **Agent Cards** — every agent is addressable, discoverable, composable |
-| Inconsistent tool contracts | **Typed schemas everywhere** — Pydantic, TypedDict, JSON Schema |
+```bash
+pip install jamjet
+jamjet demo unsafe-tool-call
+```
 
----
+No API key. No Docker. No cloud account. The model is mocked; the enforcement path is real. Three more demos run the same way:
 
-## How JamJet compares
+```bash
+jamjet demo approval        # pause-for-approval flow
+jamjet demo budget-cap      # $0.05 cost cap
+jamjet demo mcp-tool-policy # MCP-shaped policy
+```
 
-> As of March 2026. All frameworks evolve quickly — check their docs for the latest.
-
-| Capability | JamJet | LangChain | AutoGen | CrewAI | BeeAI |
-|------------|--------|-----------|---------|--------|-------|
-| **Default model** | Agent-first + strategy | Chain / LCEL | Conversational agents | Role-based crew | Agent loop |
-| **Durable execution** | ✅ event-sourced; crash-safe resume | ❌ ephemeral | ❌ ephemeral | ❌ ephemeral | ❌ ephemeral |
-| **Human-in-the-loop** | ✅ first-class primitive | 🟡 callback hooks | 🟡 first-class for conversational flows | 🟡 manual | ❌ |
-| **MCP support** | ✅ client + server | 🟡 client only | 🟡 client only | 🟡 client only | 🟡 client only |
-| **A2A protocol** | ✅ client + server | ❌ | ❌ | ❌ | ❌ |
-| **Pluggable reasoning strategies** | ✅ react, plan-and-execute, critic, reflection, consensus, debate | ❌ manual wiring | 🟡 user-built | 🟡 role-based tasks | 🟡 user-built |
-| **Enforced cost/iteration limits** | ✅ compile-time guards | ❌ | 🟡 partial | 🟡 partial | ❌ |
-| **Typed state schemas** | ✅ Pydantic / TypedDict / JSON Schema | 🟡 optional | 🟡 optional | 🟡 partial | 🟡 partial |
-| **Built-in observability** | ✅ OTel GenAI, full event timeline, replay | 🟡 LangSmith (external) | ❌ | ❌ | ❌ |
-| **Agent identity + discovery** | ✅ Agent Cards, A2A discovery | ❌ | ❌ | ❌ | 🟡 framework-level discovery |
-| **Runtime language** | Rust core + Python authoring | Python | Python | Python | TypeScript |
-| **Scheduler / throughput** | ✅ Rust async scheduler; low-overhead worker pool | 🟡 Python asyncio; GIL-bound | 🟡 Python asyncio; message-passing overhead | 🟡 Python; sequential by default | 🟡 Node.js event loop |
-| **Deployment model** | Long-running server (local or cloud) | Library (in-process) | Library (in-process) | Library (in-process) | Library (in-process) |
-| **Best for** | Production multi-agent systems needing durability and interop | Rapid prototyping, LLM chains | Conversational multi-agent apps | Role-based collab agents | TypeScript agentic apps |
+The rest of this README is the **Python authoring guide** — workflows, durability shims, MCP/A2A integration, and the hosted control plane. For the full positioning + cross-language adapters (Claude Code hook, MCP shim, OpenAI guardrail, TypeScript SDK, CLI), see the [main repo README](https://github.com/jamjet-labs/jamjet#readme).
 
 ---
 
-## Key Features
+## What you get in the Python package
 
-**Durable graph workflows** — every step is checkpointed; crash the runtime and execution resumes exactly where it left off.
-
-**Native MCP + A2A** — connect to any MCP server, expose your tools as an MCP server, delegate to or serve external agents via A2A.
-
-**Agent-native identity** — every agent has a URI, an Agent Card describing its capabilities, and a managed lifecycle.
-
-**Human-in-the-loop** — pause any workflow for human approval or input as a first-class primitive.
-
-**Configurable autonomy** — from strict deterministic graph execution to bounded autonomous agents operating within defined budgets.
-
-**Typed schemas everywhere** — Pydantic, TypedDict, JSON Schema. No stringly-typed state.
-
-**Distributed workers** — horizontal scale with lease semantics, retry policies, and queue isolation by workload type.
-
-**Python-friendly authoring** — define workflows with Python decorators or YAML; both compile to the same runtime graph.
+- **`jamjet demo <scenario>`** — runnable enforcement demos with no setup
+- **Policy as code** — YAML beside your workflow OR `jamjet.cloud.policy(...)` in Python
+- **`@durable`** — exactly-once execution across crashes/restarts for any side-effecting tool, with shims for LangChain, CrewAI, ADK, OpenAI Agents SDK, Anthropic Agent SDK
+- **`jamjet.cloud`** — optional two-line install for the hosted control plane (free tier: 5K traces/mo, single project)
+- **`jamjet.integrations.openai_guardrail`** — drop-in guardrail for the OpenAI Agents SDK that runs the same `policy.yaml`
+- **MCP client + A2A** — connect to MCP servers and delegate to external agents from a workflow; the runtime carries trace context across both protocols
 
 ---
 
@@ -377,21 +358,6 @@ Read more: [Architecture Overview](docs/architecture/overview.md)
 | [MCP Architecture](docs/architecture/mcp-integration.md) | MCP client/server internals |
 | [A2A Architecture](docs/architecture/a2a-integration.md) | A2A protocol internals |
 | [Protocol Adapters](docs/architecture/protocol-adapters.md) | Extensible protocol layer |
-
----
-
-## Roadmap
-
-| Phase | Status | Goal |
-|-------|--------|------|
-| 0 — Architecture & RFCs | In progress | Design docs, RFCs, scaffolding |
-| 1 — Minimal Viable Runtime | Planned | Local durable execution, MCP client, agent cards |
-| 2 — Production Core | Planned | Distributed workers, MCP server, full A2A |
-| 3 — Developer Delight | Planned | Templates, eval harness, trace debugging |
-| 4 — Enterprise | Planned | Policy engine, tenant isolation, federation security |
-| 5 — Scale & Ecosystem | Planned | Go SDK, TypeScript SDK, hosted plane, agent marketplace |
-
-Track milestone progress in [GitHub Issues](https://github.com/jamjet-labs/jamjet/issues) and the project board.
 
 ---
 
