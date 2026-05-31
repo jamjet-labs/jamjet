@@ -59,6 +59,20 @@ describe('applyCacheInject', () => {
   it('no-ops when neither system nor first user message is injectable', () => {
     expect(applyCacheInject({ system: 123 as unknown as string, messages: [] }).injected).toBe(false)
   })
+
+  it('preserves non-text fields of the last block when caching an array message', () => {
+    const { mutated, injected } = applyCacheInject({
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: 'analyze this' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+      ] }],
+    })
+    expect(injected).toBe(true)
+    const blocks = (mutated.messages as any[])[0].content as any[]
+    expect(blocks[1].source).toEqual({ type: 'base64', media_type: 'image/png', data: 'AAAA' })
+    expect(blocks[1].cache_control).toEqual({ type: 'ephemeral' })
+    expect(blocks[0].cache_control).toBeUndefined()
+  })
 })
 
 describe('CacheInjectResolver', () => {

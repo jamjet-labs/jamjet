@@ -12,4 +12,8 @@ describe('fetchCacheInjectHashes', () => {
     const f = vi.fn(async () => { throw new Error('network') }) as any
     expect(await fetchCacheInjectHashes({ apiBase: 'https://api.test', token: 'jj_t', fetchImpl: f })).toEqual([])
   })
+  it('returns [] when the response is not ok', async () => {
+    const f = vi.fn(async () => ({ ok: false, json: async () => ({}) })) as any
+    expect(await fetchCacheInjectHashes({ apiBase: 'https://api.test', token: 'jj_t', fetchImpl: f })).toEqual([])
+  })
 })

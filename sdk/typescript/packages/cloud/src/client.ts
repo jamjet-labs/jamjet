@@ -13,6 +13,7 @@ export class Client {
   readonly transport: Transport
   readonly batcher: Batcher
   readonly _policy: PolicyEvaluator
+  // Mutable (not readonly): replaced by init.ts after the async cloud pull resolves.
   _cacheInject: CacheInjectResolver
   readonly _budget: BudgetManager
   readonly _governanceContext: GovernanceContext

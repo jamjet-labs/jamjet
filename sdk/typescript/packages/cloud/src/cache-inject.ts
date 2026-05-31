@@ -14,21 +14,19 @@ function isInjectable(content: unknown): boolean {
   return typeof content === 'string' || Array.isArray(content)
 }
 
-// Array branch: assumes text blocks; caches the last block per Anthropic's spec.
+// Array branch: caches the last block per Anthropic's spec.
+// We cast to Record<string,unknown> for the spread so that exactOptionalPropertyTypes
+// doesn't complain about the optional `text?` field, while still preserving every
+// field of the original block (image source, document data, tool_result content, etc.).
 function toCachedBlocks(content: unknown): Block[] {
   if (typeof content === 'string') {
     return [{ type: 'text', text: content, cache_control: EPHEMERAL }]
   }
   if (Array.isArray(content)) {
-    const blocks = content.slice() as Block[]
+    const blocks = content.slice() as Array<Record<string, unknown>>
     const last = blocks.length - 1
-    if (last >= 0) {
-      const tail = blocks[last] as Block
-      blocks[last] = tail.text != null
-        ? { type: tail.type, text: tail.text, cache_control: EPHEMERAL }
-        : { type: tail.type, cache_control: EPHEMERAL }
-    }
-    return blocks
+    if (last >= 0) blocks[last] = { ...blocks[last], cache_control: EPHEMERAL }
+    return blocks as unknown as Block[]
   }
   return content as Block[]
 }
