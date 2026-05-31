@@ -10,6 +10,11 @@ function alreadyCached(content: unknown): boolean {
   return Array.isArray(content) && content.some((b) => (b as Block)?.cache_control != null)
 }
 
+function isInjectable(content: unknown): boolean {
+  return typeof content === 'string' || Array.isArray(content)
+}
+
+// Array branch: assumes text blocks; caches the last block per Anthropic's spec.
 function toCachedBlocks(content: unknown): Block[] {
   if (typeof content === 'string') {
     return [{ type: 'text', text: content, cache_control: EPHEMERAL }]
@@ -32,26 +37,29 @@ function toCachedBlocks(content: unknown): Block[] {
  * Returns a shallow-cloned args object with cache_control added to the system
  * block (preferred) or the first user message. `injected` is false when there
  * is nothing to cache or a cache_control is already present (idempotent).
+ * Non-injectable content (neither string nor array) is skipped.
  */
 export function applyCacheInject(
   args0: Record<string, unknown>,
 ): { mutated: Record<string, unknown>; injected: boolean } {
   const out = { ...args0 }
 
-  if (out.system != null) {
-    if (alreadyCached(out.system)) return { mutated: out, injected: false }
-    out.system = toCachedBlocks(out.system)
+  const sys = out.system
+  if (sys != null && isInjectable(sys)) {
+    if (alreadyCached(sys)) return { mutated: out, injected: false }
+    out.system = toCachedBlocks(sys)
     return { mutated: out, injected: true }
   }
 
   const messages = Array.isArray(out.messages) ? (out.messages as Array<Record<string, unknown>>) : []
   const firstUser = messages.findIndex((m) => m.role === 'user')
   if (firstUser === -1) return { mutated: out, injected: false }
-  const userMsg = messages[firstUser] as Record<string, unknown>
-  if (alreadyCached(userMsg.content)) return { mutated: out, injected: false }
+  const firstUserMsg = messages[firstUser] as Record<string, unknown>
+  const content = firstUserMsg.content
+  if (!isInjectable(content) || alreadyCached(content)) return { mutated: out, injected: false }
 
   const newMessages = messages.slice()
-  newMessages[firstUser] = { ...userMsg, content: toCachedBlocks(userMsg.content) }
+  newMessages[firstUser] = { ...firstUserMsg, content: toCachedBlocks(content) }
   out.messages = newMessages
   return { mutated: out, injected: true }
 }

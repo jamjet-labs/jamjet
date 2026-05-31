@@ -43,4 +43,19 @@ describe('applyCacheInject', () => {
     applyCacheInject(input)
     expect(input.system).toBe('x')
   })
+
+  it('caches only the last block of an array system prompt', () => {
+    const { mutated, injected } = applyCacheInject({
+      system: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }],
+      messages: [],
+    })
+    expect(injected).toBe(true)
+    const blocks = mutated.system as any[]
+    expect(blocks[0].cache_control).toBeUndefined()
+    expect(blocks[1].cache_control).toEqual({ type: 'ephemeral' })
+  })
+
+  it('no-ops when neither system nor first user message is injectable', () => {
+    expect(applyCacheInject({ system: 123 as unknown as string, messages: [] }).injected).toBe(false)
+  })
 })
