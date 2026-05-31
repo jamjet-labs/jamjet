@@ -1,4 +1,4 @@
-export const VERSION = '0.4.0-alpha.1'
+export const VERSION = '0.4.0-alpha.2'
 
 export { init } from './init.js'
 export { wrap } from './wrap.js'
@@ -71,3 +71,6 @@ export { detectPathMode } from './path-mode.js'
 export type { PathMode } from './path-mode.js'
 export { parseTraceparent, readTraceparent } from './trace-context.js'
 export type { Traceparent, TraceContextSource } from './trace-context.js'
+
+// Cache-inject enforcement (Phase A Token Intelligence).
+export { applyCacheInject, CacheInjectResolver } from './cache-inject.js'
