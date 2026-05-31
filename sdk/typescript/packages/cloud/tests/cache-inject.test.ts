@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { applyCacheInject } from '../src/cache-inject.js'
+import { CacheInjectResolver } from '../src/cache-inject.js'
 
 describe('applyCacheInject', () => {
   it('wraps a string system prompt into a text block with cache_control', () => {
@@ -57,5 +58,16 @@ describe('applyCacheInject', () => {
 
   it('no-ops when neither system nor first user message is injectable', () => {
     expect(applyCacheInject({ system: 123 as unknown as string, messages: [] }).injected).toBe(false)
+  })
+})
+
+describe('CacheInjectResolver', () => {
+  it('injects only for prefix hashes it was given', () => {
+    const r = new CacheInjectResolver(['aaaa1111', 'bbbb2222'])
+    expect(r.shouldInject('aaaa1111')).toBe(true)
+    expect(r.shouldInject('zzzz9999')).toBe(false)
+  })
+  it('empty resolver never injects', () => {
+    expect(new CacheInjectResolver([]).shouldInject('aaaa1111')).toBe(false)
   })
 })

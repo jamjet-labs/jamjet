@@ -63,3 +63,17 @@ export function applyCacheInject(
   out.messages = newMessages
   return { mutated: out, injected: true }
 }
+
+/** Holds the prompt-prefix hashes for which an active cache_inject policy exists. */
+export class CacheInjectResolver {
+  private readonly hashes: Set<string>
+  constructor(prefixHashes: string[] = []) {
+    this.hashes = new Set(prefixHashes)
+  }
+  shouldInject(prefixHash: string | null | undefined): boolean {
+    return prefixHash != null && this.hashes.has(prefixHash)
+  }
+  get size(): number {
+    return this.hashes.size
+  }
+}
