@@ -2,6 +2,8 @@ import { type Client, getActive } from './client.js'
 import type { AgentRef, ScopeFrame, UserContext } from './context.js'
 import type { PolicyAction } from './policy.js'
 import { pollUntilResolved } from './approvals.js'
+import { recordOutcome as _recordOutcome } from './outcomes.js'
+import type { Outcome, RecordOutcomeOptions } from './outcomes.js'
 
 const NOT_INIT = 'JamJet Cloud not initialized. Call init() first.'
 
@@ -141,4 +143,23 @@ export async function requireApproval(
     ...(opts.pollIntervalMs !== undefined ? { pollIntervalMs: opts.pollIntervalMs } : {}),
     ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
   })
+}
+
+export { type Outcome, type RecordOutcomeOptions }
+
+/**
+ * Record the outcome of a completed trace run. Requires the SDK to be
+ * initialized via `init()`.
+ *
+ * @param traceId  ID of the trace whose outcome is being recorded.
+ * @param outcome  One of `'success' | 'failure' | 'approved' | 'rejected' | 'resolved' | 'unresolved'`.
+ * @param opts     Optional `score` (0–1) and free-form `metadata` object.
+ */
+export async function recordOutcome(
+  traceId: string,
+  outcome: Outcome,
+  opts: RecordOutcomeOptions = {},
+): Promise<void> {
+  const client = activeOrThrow()
+  return _recordOutcome(client.config.apiKey, client.config.apiUrl, traceId, outcome, opts)
 }

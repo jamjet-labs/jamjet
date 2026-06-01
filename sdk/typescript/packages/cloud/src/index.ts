@@ -20,8 +20,9 @@ export {
   setUserContext,
   withUserContext,
   setProcessContext,
+  recordOutcome,
 } from './governance.js'
-export type { RequireApprovalOptions } from './governance.js'
+export type { RequireApprovalOptions, Outcome, RecordOutcomeOptions } from './governance.js'
 export type { AgentRef, UserContext } from './context.js'
 export type { PolicyAction, PolicyDecision } from './policy.js'
 export { PolicyEvaluator } from './policy.js'
