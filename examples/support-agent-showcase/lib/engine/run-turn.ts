@@ -1,10 +1,11 @@
-import { redact, applyCacheInject, estimateCost } from '@jamjet/cloud'
+import { redact, applyCacheInject, estimateCost, CloudPusher } from '@jamjet/cloud'
 import { type Session } from '../session.js'
 import { type FeatureEvent } from './events.js'
 import { SYSTEM_PROMPT } from './knowledge-base.js'
-import { mockModel, type MockModelArgs } from './model-mock.js'
+import { type MockModelArgs } from './model-mock.js'
 import { computePrefixHash } from './prefix-hash.js'
 import { cacheReadSavingsCents } from './savings.js'
+import { selectModel } from './select-model.js'
 
 export interface TurnResult {
   reply: string
@@ -52,8 +53,8 @@ export async function runTurn(
     callArgs = mutated as unknown as MockModelArgs
   }
 
-  // 6. Call the model
-  const res = await mockModel(callArgs)
+  // 6. Call the model (live when ANTHROPIC_API_KEY is set, mock otherwise)
+  const res = await selectModel()(callArgs)
 
   // 7. Record waste
   session.tracker.record(hash, res.usage.input_tokens)
@@ -96,7 +97,37 @@ export async function runTurn(
     })
   }
 
-  // 10. Refund approval gate — detect refund intent in the (already redacted) input
+  // 10. Best-effort dashboard streaming via CloudPusher (JAMJET_API_KEY gated)
+  //     A push failure must NEVER break the turn — wrapped in try/catch, fire-and-forget.
+  if (process.env.JAMJET_API_KEY) {
+    try {
+      const pusher = new CloudPusher({
+        apiBase: process.env.JAMJET_API_BASE ?? 'https://api.jamjet.dev',
+        apiKey: process.env.JAMJET_API_KEY,
+      })
+      void pusher.push({
+        ts: new Date().toISOString(),
+        run_id: crypto.randomUUID(),
+        adapter: 'support-agent-showcase',
+        host: 'showcase',
+        tool: 'model_call',
+        decision: 'allowed',
+        executed: true,
+        schema_version: 1,
+        args: {
+          model: res.model,
+          cents,
+          inTok: res.usage.input_tokens,
+          outTok: res.usage.output_tokens,
+          cacheReadTokens: cacheRead,
+        },
+      })
+    } catch {
+      // intentionally swallowed — dashboard push is non-critical
+    }
+  }
+
+  // 12. Refund approval gate — detect refund intent in the (already redacted) input
   if (/refund/i.test(redacted)) {
     const id = session.openApproval('issue_refund')
     events.push({ kind: 'approval_required', id, tool: 'issue_refund' })
@@ -106,6 +137,6 @@ export async function runTurn(
     }
   }
 
-  // 11. Return result
+  // 13. Return result
   return { reply: res.content[0].text, events }
 }
