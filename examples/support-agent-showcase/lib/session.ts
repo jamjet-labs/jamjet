@@ -5,6 +5,7 @@ export interface Session {
   cacheInjectOn: boolean
   readonly tracker: WasteTracker
   budgetCents: number
+  model: string
   addSpend(cents: number): boolean
   setCacheInject(on: boolean): void
   openApproval(tool: string): string
@@ -23,6 +24,7 @@ export function createSession(opts: { budgetCents: number; model: string }): Ses
     get cacheInjectOn() { return cacheInjectOn },
     get tracker() { return tracker },
     budgetCents: opts.budgetCents,
+    model: opts.model,
 
     addSpend(cents: number): boolean {
       spentCents += cents
