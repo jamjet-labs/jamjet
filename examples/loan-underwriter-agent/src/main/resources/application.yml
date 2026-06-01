@@ -1,0 +1,13 @@
+spring:
+  application:
+    name: loan-underwriter
+  ai:
+    openai:
+      # Optional. The Spring AI receipt path (ChatClientConfig) only activates when loan.llm.enabled=true AND a model starter is on the classpath.
+      api-key: ${OPENAI_API_KEY:disabled}
+loan:
+  checkpoint-dir: ${java.io.tmpdir}/loan-checkpoints
+  approval-dir: ${java.io.tmpdir}/loan-approvals
+  # Disk-backed action receipts. Persisting here is what makes the audit bundle survive a
+  # process crash; a restart re-reads this directory to reconstruct the full bundle.
+  receipts-dir: ${java.io.tmpdir}/loan-receipts

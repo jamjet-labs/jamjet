@@ -10,3 +10,7 @@ Numbered examples in this directory:
 
 Each example is self-contained. The fifth example includes its own virtual
 environment setup script and runs without a model API key.
+
+## Java
+
+- `loan-underwriter-agent/` - A durable, auditable loan-underwriting agent on the JVM, built on Spring Boot, the JamJet Java runtime, and AgentBoundary action receipts. It survives a `kill -9` mid-run and resumes from disk checkpoints without repeating work, gates disbursement on a human officer approval, and produces a verifiable signed receipt bundle. Runs without a model API key. Requires JDK 21. See `loan-underwriter-agent/README.md` and `loan-underwriter-agent/scripts/demo.sh` for the crash demo.
