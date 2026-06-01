@@ -96,6 +96,16 @@ export async function runTurn(
     })
   }
 
-  // 10. Return result
+  // 10. Refund approval gate — detect refund intent in the (already redacted) input
+  if (/refund/i.test(redacted)) {
+    const id = session.openApproval('issue_refund')
+    events.push({ kind: 'approval_required', id, tool: 'issue_refund' })
+    return {
+      reply: 'A refund needs a human approval before I can issue it.',
+      events,
+    }
+  }
+
+  // 11. Return result
   return { reply: res.content[0].text, events }
 }
