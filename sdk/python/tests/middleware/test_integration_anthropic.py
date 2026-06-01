@@ -1,20 +1,24 @@
 """End-to-end: load a real policy YAML, build the middleware chain, invoke
 against a stub terminal mimicking the Anthropic Messages.create() shape.
 Asserts the system-prompt-never-scanned contract and the SSN block path."""
+
 import textwrap
+
 import pytest
 import yaml
+
+from jamjet.cloud.exceptions import JamJetPIIBlocked
 from jamjet.cloud.middleware import build_chain
 from jamjet.cloud.middleware.context import (
-    call_context_from_anthropic_kwargs,
     anthropic_kwargs_from_call_context,
+    call_context_from_anthropic_kwargs,
 )
-from jamjet.cloud.exceptions import JamJetPIIBlocked
 
 
 @pytest.fixture
 def policy_anthropic_block():
-    return yaml.safe_load(textwrap.dedent("""\
+    return yaml.safe_load(
+        textwrap.dedent("""\
         version: 1
         rules:
           - match: "anthropic:*"
@@ -22,7 +26,8 @@ def policy_anthropic_block():
             types: [US_SSN]
             on_detect: block
             scope: [messages]
-    """))
+    """)
+    )
 
 
 def test_anthropic_call_with_ssn_is_blocked(monkeypatch, policy_anthropic_block):
@@ -39,6 +44,7 @@ def test_anthropic_call_with_ssn_is_blocked(monkeypatch, policy_anthropic_block)
     ctx = call_context_from_anthropic_kwargs(kwargs)
 
     terminal_call_count = 0
+
     def stub_terminal(c):
         nonlocal terminal_call_count
         terminal_call_count += 1
@@ -57,7 +63,8 @@ def test_anthropic_system_prompt_pii_is_not_scanned(monkeypatch):
     """The spec is explicit: system prompts are NEVER scanned, even when they
     contain PII. The call must proceed even with PII in the system kwarg."""
     monkeypatch.setenv("JAMJET_MIDDLEWARE_ENABLED", "1")
-    policy = yaml.safe_load(textwrap.dedent("""\
+    policy = yaml.safe_load(
+        textwrap.dedent("""\
         version: 1
         rules:
           - match: "anthropic:*"
@@ -65,7 +72,8 @@ def test_anthropic_system_prompt_pii_is_not_scanned(monkeypatch):
             types: [US_SSN]
             on_detect: block
             scope: [messages]
-    """))
+    """)
+    )
     chain = build_chain(policy)
 
     kwargs = {
@@ -77,6 +85,7 @@ def test_anthropic_system_prompt_pii_is_not_scanned(monkeypatch):
     ctx = call_context_from_anthropic_kwargs(kwargs)
 
     seen: list = []
+
     def stub_terminal(c):
         seen.append(anthropic_kwargs_from_call_context(c))
         return "stub-response"
@@ -90,7 +99,8 @@ def test_anthropic_system_prompt_pii_is_not_scanned(monkeypatch):
 
 def test_anthropic_call_with_replace_redacts_messages(monkeypatch):
     monkeypatch.setenv("JAMJET_MIDDLEWARE_ENABLED", "1")
-    policy = yaml.safe_load(textwrap.dedent("""\
+    policy = yaml.safe_load(
+        textwrap.dedent("""\
         version: 1
         rules:
           - match: "anthropic:claude-haiku-*"
@@ -98,7 +108,8 @@ def test_anthropic_call_with_replace_redacts_messages(monkeypatch):
             types: [EMAIL]
             on_detect: replace
             scope: [messages]
-    """))
+    """)
+    )
     chain = build_chain(policy)
 
     kwargs = {
@@ -110,6 +121,7 @@ def test_anthropic_call_with_replace_redacts_messages(monkeypatch):
     ctx = call_context_from_anthropic_kwargs(kwargs)
 
     seen: list = []
+
     def stub_terminal(c):
         seen.append(anthropic_kwargs_from_call_context(c))
         return "stub-response"

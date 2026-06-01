@@ -11,12 +11,14 @@ def test_no_op_when_flag_off_and_no_rules(monkeypatch):
         call_context_from_openai_kwargs,
         openai_kwargs_from_call_context,
     )
+
     chain = build_chain({"version": 1, "rules": []})
     kwargs = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
     ctx = call_context_from_openai_kwargs(kwargs)
 
     sentinel = object()
     rebuilt: dict = {}
+
     def terminal(c):
         rebuilt.update(openai_kwargs_from_call_context(c))
         return sentinel
@@ -32,8 +34,14 @@ def test_no_op_when_flag_on_but_only_tool_call_rules(monkeypatch):
     actions (block/require_approval/audit) must not change LLM-call behaviour."""
     monkeypatch.setenv("JAMJET_MIDDLEWARE_ENABLED", "1")
     from jamjet.cloud.middleware import build_chain
-    chain = build_chain({"version": 1, "rules": [
-        {"match": "*delete*", "action": "block"},
-        {"match": "payments.*", "action": "require_approval"},
-    ]})
+
+    chain = build_chain(
+        {
+            "version": 1,
+            "rules": [
+                {"match": "*delete*", "action": "block"},
+                {"match": "payments.*", "action": "require_approval"},
+            ],
+        }
+    )
     assert len(chain.middlewares) == 0

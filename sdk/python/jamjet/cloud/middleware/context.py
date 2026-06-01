@@ -2,10 +2,12 @@
 The patcher uses these to convert vendor SDK call args into a portable shape
 the middleware chain can operate on, then back into vendor shape for the
 terminal call."""
-from __future__ import annotations
-from typing import Any
-from jamjet.cloud.middleware import CallContext
 
+from __future__ import annotations
+
+from typing import Any
+
+from jamjet.cloud.middleware import CallContext
 
 _OPENAI_TOP_LEVEL = {"model", "messages", "tools"}
 _ANTHROPIC_TOP_LEVEL = {"model", "messages", "tools", "system"}
