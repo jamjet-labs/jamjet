@@ -10,6 +10,7 @@ from .approvals import request_approval as _request_approval
 from .budget import set_budget as _set_budget
 from .config import get_config, set_config
 from .events import init_queue
+from .outcomes import record_outcome as _record_outcome
 from .patcher import patch_all, unpatch_all
 from .policy import get_evaluator
 from .propagation import extract_headers, inject_headers
@@ -27,6 +28,7 @@ __all__ = [
     "inject_headers",
     "patch_all",
     "policy",
+    "record_outcome",
     "redact",
     "require_approval",
     "set_user_context",
@@ -179,4 +181,39 @@ def require_approval(
         action=action,
         context=context,
         timeout_seconds=timeout_seconds,
+    )
+
+
+def record_outcome(
+    trace_id: str,
+    outcome: str,
+    score: float | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Record the outcome of a completed trace run.
+
+    Requires the SDK to be configured via :func:`configure`.
+
+    Args:
+        trace_id: ID of the trace whose outcome is being recorded.
+        outcome:  One of ``'success'``, ``'failure'``, ``'approved'``,
+                  ``'rejected'``, ``'resolved'``, or ``'unresolved'``.
+        score:    Optional float in [0, 1] representing a quality score.
+        metadata: Optional free-form dict attached to the record.
+
+    Raises:
+        RuntimeError: When the SDK has not been configured.
+        ValueError: When *outcome* is invalid or *score* is out of range.
+        httpx.HTTPStatusError: When the API returns a non-2xx response.
+    """
+    cfg = get_config()
+    if not cfg.api_key:
+        raise RuntimeError("JamJet Cloud not configured. Call jamjet.configure() first.")
+    _record_outcome(
+        api_key=cfg.api_key,
+        api_url=cfg.api_url,
+        trace_id=trace_id,
+        outcome=outcome,
+        score=score,
+        metadata=metadata,
     )

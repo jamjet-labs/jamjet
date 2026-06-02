@@ -1,4 +1,6 @@
 import { Client, resetActive, setActive } from './client.js'
+import { fetchCacheInjectHashes } from './cache-inject-fetch.js'
+import { CacheInjectResolver } from './cache-inject.js'
 import { resolveConfig, type InitOptions } from './config.js'
 
 export async function init(opts: InitOptions): Promise<void> {
@@ -6,6 +8,8 @@ export async function init(opts: InitOptions): Promise<void> {
   await resetActive()
   const client = new Client(config)
   setActive(client)
+  void fetchCacheInjectHashes({ apiBase: config.apiUrl, token: config.apiKey })
+    .then((hashes) => { client._cacheInject = new CacheInjectResolver(hashes) })
   await readinessCheck(config.apiUrl, config.project, config.apiKey, config.debug)
 }
 

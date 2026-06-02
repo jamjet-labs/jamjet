@@ -1,5 +1,6 @@
 import { Batcher } from './batcher.js'
 import { BudgetManager } from './budget.js'
+import { CacheInjectResolver } from './cache-inject.js'
 import type { ResolvedConfig } from './config.js'
 import { GovernanceContext } from './context.js'
 import { PolicyEvaluator } from './policy.js'
@@ -12,6 +13,8 @@ export class Client {
   readonly transport: Transport
   readonly batcher: Batcher
   readonly _policy: PolicyEvaluator
+  // Mutable (not readonly): replaced by init.ts after the async cloud pull resolves.
+  _cacheInject: CacheInjectResolver
   readonly _budget: BudgetManager
   readonly _governanceContext: GovernanceContext
 
@@ -33,6 +36,7 @@ export class Client {
       },
     })
     this._policy = new PolicyEvaluator()
+    this._cacheInject = new CacheInjectResolver()
     this._budget = new BudgetManager(config.maxCostUsd ?? null)
     this._governanceContext = new GovernanceContext()
   }

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0-alpha.2 — 2026-05-31
+
+### Added
+- `cache_inject` enforcement: safe-identical prompt-cache injection driven by
+  active cache_inject policies pulled from Cloud. Records `saved_cents` per call.
+
 ## 0.4.0-alpha.1 — 2026-05-18 (unreleased)
 
 ### Fixed

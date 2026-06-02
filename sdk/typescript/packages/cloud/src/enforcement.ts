@@ -1,6 +1,7 @@
 import type { MessageParam } from '@anthropic-ai/sdk/resources/messages'
 import type { Client } from './client.js'
 import type { AgentRef, UserContext } from './context.js'
+import { applyCacheInject } from './cache-inject.js'
 import { estimateCost } from './cost.js'
 import { JamjetPolicyBlocked } from './errors.js'
 import { Span } from './span.js'
@@ -76,6 +77,24 @@ function extractUsage(vendor: Vendor, response: unknown): { input: number; outpu
   return { input: Number(usage['input_tokens']) || 0, output: Number(usage['output_tokens']) || 0 }
 }
 
+function extractCacheRead(_vendor: Vendor, response: unknown): number {
+  const usage = ((response as Record<string, any>)?.usage ?? {}) as Record<string, unknown>
+  return Number(usage['cache_read_input_tokens'] ?? 0) || 0
+}
+
+// Per-MTok savings = input price − cache_read price; mirrors pricing.rs v_2026_05_17.
+const CACHE_SAVING_PER_MTOK: Record<string, number> = {
+  'claude-opus-4-7': 15.0 - 1.5,
+  'claude-sonnet-4-6': 3.0 - 0.3,
+  'claude-haiku-4-5': 1.0 - 0.1,
+  'claude-haiku-4-5-20251001': 1.0 - 0.1,
+}
+
+function cacheReadSavingsUsd(model: string, cacheReadTokens: number): number {
+  const per = CACHE_SAVING_PER_MTOK[model] ?? 0
+  return (cacheReadTokens / 1_000_000) * per
+}
+
 export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknown> {
   const { client, vendor, original, args, override, computePromptPrefixHash } = opts
   const arg0 = (args[0] ?? {}) as Record<string, unknown>
@@ -133,12 +152,26 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
   // the patchers rather than imported directly — keeps this file runtime-
   // agnostic and prevents `node:crypto` from leaking into the universal
   // bundle via `wrap.ts`. A failing hash MUST NEVER break an LLM call.
+  let prefixHash: string | undefined
   if (computePromptPrefixHash !== undefined) {
     try {
-      span.setPromptPrefixHash(computePromptPrefixHash(messages))
+      prefixHash = computePromptPrefixHash(messages)
+      span.setPromptPrefixHash(prefixHash)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       console.warn(`[jamjet] prompt prefix hash failed: ${msg}`)
+    }
+  }
+
+  // Cache injection: add cache_control to stable prompt prefix when policy matches.
+  // Safe-identical: Anthropic caches are content-addressed — price changes, output does not.
+  let cacheInjected = false
+  if (vendor === 'anthropic' && client._cacheInject.shouldInject(prefixHash)) {
+    const arg0obj = mutatedArgs[0] as Record<string, unknown>
+    const { mutated, injected } = applyCacheInject(arg0obj)
+    if (injected) {
+      mutatedArgs = [mutated, ...mutatedArgs.slice(1)]
+      cacheInjected = true
     }
   }
 
@@ -174,6 +207,19 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
       span.outputTokens = usage.output
       span.costUsd = estimateCost(actualModel, usage.input, usage.output)
       client._budget.record(span.costUsd)
+
+      if (cacheInjected) {
+        const cacheRead = extractCacheRead(vendor, result)
+        const savedUsd = cacheReadSavingsUsd(actualModel, cacheRead)
+        span.payload = {
+          ...span.payload,
+          // Fractional cents intentional — Math.round would zero sub-cent per-call
+          // savings. Authoritative totals are recomputed server-side from
+          // cache_read_input_tokens; this is a secondary per-call annotation.
+          saved_cents: savedUsd * 100,
+          cache_injected: true,
+        }
+      }
     }
 
     span.finish('ok')
