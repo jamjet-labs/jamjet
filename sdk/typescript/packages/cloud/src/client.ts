@@ -1,6 +1,7 @@
 import { Batcher } from './batcher.js'
 import { BudgetManager } from './budget.js'
 import { CacheInjectResolver } from './cache-inject.js'
+import { CompactionResolver } from './compaction.js'
 import type { ResolvedConfig } from './config.js'
 import { GovernanceContext } from './context.js'
 import { PolicyEvaluator } from './policy.js'
@@ -15,6 +16,8 @@ export class Client {
   readonly _policy: PolicyEvaluator
   // Mutable (not readonly): replaced by init.ts after the async cloud pull resolves.
   _cacheInject: CacheInjectResolver
+  // Mutable: empty until init.ts swaps in the pulled tool_compaction rules.
+  _compaction: CompactionResolver
   readonly _budget: BudgetManager
   readonly _governanceContext: GovernanceContext
 
@@ -37,6 +40,7 @@ export class Client {
     })
     this._policy = new PolicyEvaluator()
     this._cacheInject = new CacheInjectResolver()
+    this._compaction = new CompactionResolver([])
     this._budget = new BudgetManager(config.maxCostUsd ?? null)
     this._governanceContext = new GovernanceContext()
   }
