@@ -12,6 +12,7 @@ export async function init(opts: InitOptions): Promise<void> {
   setActive(client)
   void fetchCacheInjectHashes({ apiBase: config.apiUrl, token: config.apiKey })
     .then((hashes) => { client._cacheInject = new CacheInjectResolver(hashes) })
+    .catch(() => {})
   void fetchCompactionRules({ apiBase: config.apiUrl, token: config.apiKey })
     .then((rules) => { client._compaction = new CompactionResolver(rules) })
     .catch(() => {})
