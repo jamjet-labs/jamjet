@@ -2,6 +2,7 @@ import type { MessageParam } from '@anthropic-ai/sdk/resources/messages'
 import type { Client } from './client.js'
 import type { AgentRef, UserContext } from './context.js'
 import { applyCacheInject } from './cache-inject.js'
+import { applyCompaction } from './compaction.js'
 import { estimateCost } from './cost.js'
 import { JamjetPolicyBlocked } from './errors.js'
 import { Span } from './span.js'
@@ -163,6 +164,20 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
     }
   }
 
+  // Tool-result compaction: truncate oversized tool_result messages before the model call.
+  // Opt-in per tool via tool_compaction policy. Fail-open: if no rules, stage is skipped.
+  let compactionSaved = 0
+  if (client._compaction.hasRules()) {
+    const { mutated, tokensSaved } = applyCompaction(
+      mutatedArgs[0] as Record<string, unknown>,
+      client._compaction,
+    )
+    if (tokensSaved > 0) {
+      mutatedArgs = [mutated, ...mutatedArgs.slice(1)]
+      compactionSaved = tokensSaved
+    }
+  }
+
   // Cache injection: add cache_control to stable prompt prefix when policy matches.
   // Safe-identical: Anthropic caches are content-addressed — price changes, output does not.
   let cacheInjected = false
@@ -219,6 +234,10 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
           saved_cents: savedUsd * 100,
           cache_injected: true,
         }
+      }
+
+      if (compactionSaved > 0) {
+        span.payload = { ...span.payload, tokens_saved: compactionSaved, compacted: true }
       }
     }
 
