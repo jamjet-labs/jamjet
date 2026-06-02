@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import httpx
 import pytest
 import respx
-import httpx
 
-from jamjet.cloud.outcomes import record_outcome, VALID_OUTCOMES
+from jamjet.cloud.outcomes import VALID_OUTCOMES, record_outcome
 
 API_URL = "https://api.example.com"
 API_KEY = "jj_test_key"

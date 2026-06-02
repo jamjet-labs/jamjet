@@ -8,9 +8,9 @@ from typing import Any
 from .agent import Agent, agent, get_current_agent, set_default_agent
 from .approvals import request_approval as _request_approval
 from .budget import set_budget as _set_budget
-from .outcomes import record_outcome as _record_outcome
 from .config import get_config, set_config
 from .events import init_queue
+from .outcomes import record_outcome as _record_outcome
 from .patcher import patch_all, unpatch_all
 from .policy import get_evaluator
 from .propagation import extract_headers, inject_headers
