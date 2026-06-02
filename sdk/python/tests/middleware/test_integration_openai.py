@@ -6,16 +6,18 @@ the patcher's closure-captured `original` reference.
 
 The chain is what every production OpenAI call flows through after Task 6,
 so testing the chain directly proves the safety contract end-to-end."""
-import os
+
 import textwrap
+
 import pytest
 import yaml
+
+from jamjet.cloud.exceptions import JamJetPIIBlocked, JamJetPolicyBlocked
 from jamjet.cloud.middleware import build_chain
 from jamjet.cloud.middleware.context import (
     call_context_from_openai_kwargs,
     openai_kwargs_from_call_context,
 )
-from jamjet.cloud.exceptions import JamJetPIIBlocked, JamJetPolicyBlocked
 
 
 def _load_policy_yaml(yaml_text: str) -> dict:
@@ -24,7 +26,8 @@ def _load_policy_yaml(yaml_text: str) -> dict:
 
 @pytest.fixture
 def policy_with_pii_block():
-    return _load_policy_yaml(textwrap.dedent("""\
+    return _load_policy_yaml(
+        textwrap.dedent("""\
         version: 1
         rules:
           - match: "openai:*"
@@ -32,12 +35,14 @@ def policy_with_pii_block():
             types: [EMAIL, US_SSN]
             on_detect: block
             scope: [messages]
-    """))
+    """)
+    )
 
 
 @pytest.fixture
 def policy_with_pii_replace():
-    return _load_policy_yaml(textwrap.dedent("""\
+    return _load_policy_yaml(
+        textwrap.dedent("""\
         version: 1
         rules:
           - match: "openai:*"
@@ -45,7 +50,8 @@ def policy_with_pii_replace():
             types: [EMAIL]
             on_detect: replace
             scope: [messages]
-    """))
+    """)
+    )
 
 
 def test_openai_call_with_pii_is_blocked(monkeypatch, policy_with_pii_block):
@@ -61,6 +67,7 @@ def test_openai_call_with_pii_is_blocked(monkeypatch, policy_with_pii_block):
     ctx = call_context_from_openai_kwargs(kwargs)
 
     terminal_call_count = 0
+
     def stub_terminal(c):
         nonlocal terminal_call_count
         terminal_call_count += 1
@@ -68,8 +75,7 @@ def test_openai_call_with_pii_is_blocked(monkeypatch, policy_with_pii_block):
         rebuilt = openai_kwargs_from_call_context(c)
         # If we ever get here with PII intact, the safety contract is broken.
         for m in rebuilt["messages"]:
-            assert "alice@example.com" not in str(m.get("content", "")), \
-                "PII leaked through chain to terminal!"
+            assert "alice@example.com" not in str(m.get("content", "")), "PII leaked through chain to terminal!"
         return "stub-response"
 
     with pytest.raises(JamJetPIIBlocked):
@@ -96,6 +102,7 @@ def test_openai_call_with_pii_replaces(monkeypatch, policy_with_pii_replace):
     ctx = call_context_from_openai_kwargs(kwargs)
 
     seen_kwargs: list = []
+
     def stub_terminal(c):
         seen_kwargs.append(openai_kwargs_from_call_context(c))
         return "stub-response"
@@ -121,6 +128,7 @@ def test_openai_call_without_pii_passes_through_unchanged(monkeypatch, policy_wi
     ctx = call_context_from_openai_kwargs(kwargs)
 
     seen_kwargs: list = []
+
     def stub_terminal(c):
         seen_kwargs.append(openai_kwargs_from_call_context(c))
         return "ok"
@@ -144,6 +152,7 @@ def test_flag_off_yields_empty_chain_for_redact_rules(monkeypatch, policy_with_p
     ctx = call_context_from_openai_kwargs(kwargs)
 
     seen_kwargs: list = []
+
     def stub_terminal(c):
         seen_kwargs.append(openai_kwargs_from_call_context(c))
         return "ok"

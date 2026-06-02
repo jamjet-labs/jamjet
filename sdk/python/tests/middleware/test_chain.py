@@ -1,7 +1,7 @@
 from jamjet.cloud.middleware import (
-    PreCallMiddleware,
     CallContext,
     MiddlewareOutcome,
+    PreCallMiddleware,
 )
 
 
@@ -14,7 +14,7 @@ def test_protocol_and_outcome_types_importable():
     assert MiddlewareOutcome.FALLBACK.value == "fallback"
 
 
-from jamjet.cloud.middleware import Chain, CallContext
+from jamjet.cloud.middleware import Chain  # noqa: E402
 
 
 def _ctx() -> CallContext:
@@ -30,11 +30,13 @@ def test_empty_chain_invokes_terminal_unchanged():
 
 def test_passthrough_middleware_does_not_short_circuit():
     seen: list[str] = []
+
     def m(ctx, nxt):
         seen.append("before")
         result = nxt(ctx)
         seen.append("after")
         return result
+
     chain = Chain(middlewares=[m])
     out = chain.run(_ctx(), terminal=lambda c: "terminal_called")
     assert out == "terminal_called"
@@ -43,25 +45,31 @@ def test_passthrough_middleware_does_not_short_circuit():
 
 def test_short_circuit_skips_terminal():
     terminal_was_called = False
+
     def terminal(c):
         nonlocal terminal_was_called
         terminal_was_called = True
         return "should-not-see-this"
+
     def short_circuit(ctx, nxt):
         return "synthesized"
+
     chain = Chain(middlewares=[short_circuit])
     assert chain.run(_ctx(), terminal=terminal) == "synthesized"
     assert terminal_was_called is False
 
 
 def test_raise_propagates_through_chain():
-    class CustomBlocked(Exception):
+    class CustomBlockedError(Exception):
         pass
+
     def blocker(ctx, nxt):
-        raise CustomBlocked("block reason")
+        raise CustomBlockedError("block reason")
+
     chain = Chain(middlewares=[blocker])
     import pytest
-    with pytest.raises(CustomBlocked, match="block reason"):
+
+    with pytest.raises(CustomBlockedError, match="block reason"):
         chain.run(_ctx(), terminal=lambda c: "never")
 
 
@@ -69,6 +77,7 @@ def test_mutation_propagates_to_terminal():
     def redactor(ctx, nxt):
         ctx.messages = [{"role": "user", "content": "[REDACTED]"}]
         return nxt(ctx)
+
     chain = Chain(middlewares=[redactor])
     out = chain.run(_ctx(), terminal=lambda c: c.messages[-1]["content"])
     assert out == "[REDACTED]"
@@ -76,6 +85,7 @@ def test_mutation_propagates_to_terminal():
 
 def test_fixed_order_executes_pii_then_cache_then_fallback():
     order: list[str] = []
+
     def m(name):
         def _inner(ctx, nxt):
             order.append(f"{name}:enter")
@@ -83,34 +93,44 @@ def test_fixed_order_executes_pii_then_cache_then_fallback():
                 return nxt(ctx)
             finally:
                 order.append(f"{name}:exit")
+
         return _inner
+
     chain = Chain(middlewares=[m("pii"), m("cache"), m("fallback")])
     chain.run(_ctx(), terminal=lambda c: None)
     assert order == [
-        "pii:enter", "cache:enter", "fallback:enter",
-        "fallback:exit", "cache:exit", "pii:exit",
+        "pii:enter",
+        "cache:enter",
+        "fallback:enter",
+        "fallback:exit",
+        "cache:exit",
+        "pii:exit",
     ]
 
 
-import os
-from jamjet.cloud.middleware import build_chain
+from jamjet.cloud.middleware import build_chain  # noqa: E402
 
 
 def test_build_chain_returns_empty_when_flag_disabled(monkeypatch):
     monkeypatch.delenv("JAMJET_MIDDLEWARE_ENABLED", raising=False)
-    policy = {"version": 1, "rules": [
-        {"match": "openai:*", "action": "redact",
-         "types": ["EMAIL"], "on_detect": "block", "scope": ["messages"]}
-    ]}
+    policy = {
+        "version": 1,
+        "rules": [
+            {"match": "openai:*", "action": "redact", "types": ["EMAIL"], "on_detect": "block", "scope": ["messages"]}
+        ],
+    }
     chain = build_chain(policy)
     assert len(chain.middlewares) == 0  # flag off -> chain is empty -> no behaviour change
 
 
 def test_build_chain_returns_empty_when_no_middleware_rules(monkeypatch):
     monkeypatch.setenv("JAMJET_MIDDLEWARE_ENABLED", "1")
-    policy = {"version": 1, "rules": [
-        {"match": "*delete*", "action": "block"},      # tool-call rule, NOT a middleware rule
-    ]}
+    policy = {
+        "version": 1,
+        "rules": [
+            {"match": "*delete*", "action": "block"},  # tool-call rule, NOT a middleware rule
+        ],
+    }
     chain = build_chain(policy)
     assert len(chain.middlewares) == 0
 
@@ -120,11 +140,18 @@ def test_build_chain_skips_unknown_action(monkeypatch):
     silently skip them in Phase 1 so a forward-compatible policy.yaml doesn't
     crash today."""
     monkeypatch.setenv("JAMJET_MIDDLEWARE_ENABLED", "1")
-    policy = {"version": 1, "rules": [
-        {"match": "openai:*", "action": "cache", "ttl": 60},
-        {"match": "openai:*", "action": "fallback",
-         "on": [{"http_status": [503]}], "chain": ["openai:gpt-4o-mini"]},
-    ]}
+    policy = {
+        "version": 1,
+        "rules": [
+            {"match": "openai:*", "action": "cache", "ttl": 60},
+            {
+                "match": "openai:*",
+                "action": "fallback",
+                "on": [{"http_status": [503]}],
+                "chain": ["openai:gpt-4o-mini"],
+            },
+        ],
+    }
     chain = build_chain(policy)
     assert len(chain.middlewares) == 0
 
@@ -148,12 +175,14 @@ def test_configure_builds_chain_from_loaded_policy(monkeypatch, tmp_path):
         "version: 1\n"
         "rules:\n"
         '  - { match: "openai:*", action: redact, types: [EMAIL], '
-        'on_detect: block, scope: [messages] }\n'
+        "on_detect: block, scope: [messages] }\n"
     )
     import jamjet.cloud as cloud
+
     cloud.configure(policy_path=str(policy_yaml), telemetry=False, auto_patch=False)
 
     from jamjet.cloud.patcher import _runtime_state
+
     state = _runtime_state()
     assert len(state.middleware_chain.middlewares) == 1
 
@@ -163,7 +192,9 @@ def test_configure_with_no_middleware_rules_yields_empty_chain(monkeypatch, tmp_
     policy_yaml = tmp_path / "policy.yaml"
     policy_yaml.write_text("version: 1\nrules: []\n")
     import jamjet.cloud as cloud
+
     cloud.configure(policy_path=str(policy_yaml), telemetry=False, auto_patch=False)
 
     from jamjet.cloud.patcher import _runtime_state
+
     assert len(_runtime_state().middleware_chain.middlewares) == 0
