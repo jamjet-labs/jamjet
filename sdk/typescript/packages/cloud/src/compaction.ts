@@ -101,15 +101,18 @@ export function applyCompaction(
             const [txt, saved] = truncateText(c, cap, name!);
             if (saved > 0) { tokensSaved += saved; blockChanged = true; return { ...block, content: txt }; }
           } else if (Array.isArray(c)) {
-            // content is an array of {type:'text', text} blocks
+            // content is an array of {type:'text', text} blocks. Use a flag
+            // scoped to THIS block so an earlier truncated block in the same
+            // message doesn't cause an unchanged block here to be cloned.
+            let innerChanged = false;
             const nb = (c as Array<Record<string, unknown>>).map((cb) => {
               if (cb && cb["type"] === "text" && typeof cb["text"] === "string") {
                 const [txt, saved] = truncateText(cb["text"] as string, cap, name!);
-                if (saved > 0) { tokensSaved += saved; blockChanged = true; return { ...cb, text: txt }; }
+                if (saved > 0) { tokensSaved += saved; innerChanged = true; return { ...cb, text: txt }; }
               }
               return cb;
             });
-            if (blockChanged) return { ...block, content: nb };
+            if (innerChanged) { blockChanged = true; return { ...block, content: nb }; }
           }
         }
         return block;

@@ -70,6 +70,27 @@ describe("applyCompaction", () => {
     applyCompaction(req, resolver);
     expect(JSON.stringify(req)).toBe(before);
   });
+
+  it("truncates array-of-text-blocks tool_result content and leaves an under-cap sibling block untouched", () => {
+    const small = { type: "tool_result", tool_use_id: "tu_1", content: [{ type: "text", text: "short" }] };
+    const big = { type: "tool_result", tool_use_id: "tu_1", content: [{ type: "text", text: BIG }] };
+    const req = {
+      model: "claude-3-5-sonnet",
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "tu_1", name: "search.web", input: {} }] },
+        { role: "user", content: [small, big] },
+      ],
+    };
+    const { mutated, tokensSaved } = applyCompaction(req, resolver);
+    const blocks = (mutated as any).messages[1].content;
+    // the under-cap block is returned by identity (no spurious clone)
+    expect(blocks[0]).toBe(small);
+    // the oversized array-content block is truncated in place
+    const txt = blocks[1].content[0].text as string;
+    expect(txt.length).toBeLessThan(BIG.length);
+    expect(txt).toContain("truncated by JamJet");
+    expect(tokensSaved).toBeGreaterThan(0);
+  });
 });
 
 describe("CompactionResolver", () => {
