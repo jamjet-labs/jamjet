@@ -1,0 +1,513 @@
+/* globals.css — JamJet Cost Intelligence Showcase */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --color-bg: #0f1117;
+  --color-surface: #1a1d27;
+  --color-border: #2a2d3a;
+  --color-text: #e2e4ed;
+  --color-muted: #7b7f96;
+  --color-accent: #b45309; /* amber-700 for savings */
+  --color-accent-light: #fbbf24; /* amber-400 */
+  --color-red: #dc2626;
+  --color-red-bg: #2d1313;
+  --color-green: #16a34a;
+  --color-green-bg: #0d2016;
+  --color-blue: #3b82f6;
+  --color-blue-bg: #101d35;
+  --color-yellow-bg: #2a1f00;
+  --radius: 6px;
+  --font-mono: ui-monospace, 'SFMono-Regular', 'Fira Code', monospace;
+}
+
+html, body {
+  height: 100%;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ── App shell ── */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ── Header ── */
+.app-header {
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  padding: 12px 20px 10px;
+  flex-shrink: 0;
+}
+
+.app-header-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.app-title {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--color-text);
+}
+
+/* ── Mode badge ── */
+.mode-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mode-badge--mock {
+  background: #2a2d3a;
+  color: var(--color-muted);
+}
+
+.mode-badge--live {
+  background: var(--color-blue-bg);
+  color: var(--color-blue);
+}
+
+.mode-badge--live-dashboard {
+  background: var(--color-green-bg);
+  color: var(--color-green);
+}
+
+.mode-badge-link {
+  color: var(--color-accent-light);
+  text-decoration: none;
+  font-size: 11px;
+}
+
+.mode-badge-link:hover {
+  text-decoration: underline;
+}
+
+/* ── Spend bar ── */
+.spend-bar-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.spend-bar-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--color-muted);
+}
+
+.spend-bar-exceeded-label {
+  color: var(--color-red);
+  font-weight: 600;
+}
+
+.spend-bar-track {
+  height: 6px;
+  background: #2a2d3a;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.spend-bar-fill {
+  height: 100%;
+  background: var(--color-blue);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.spend-bar-fill--exceeded {
+  background: var(--color-red);
+}
+
+.spend-bar-track--exceeded {
+  background: var(--color-red-bg);
+}
+
+/* ── Main layout ── */
+.app-main {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  gap: 0;
+}
+
+.app-chat {
+  flex: 0 0 60%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid var(--color-border);
+}
+
+.app-cost {
+  flex: 0 0 40%;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+/* ── Chat panel ── */
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0;
+}
+
+.chat-transcript {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chat-empty {
+  color: var(--color-muted);
+  font-size: 13px;
+  text-align: center;
+  margin-top: 40px;
+}
+
+.chat-bubble {
+  display: flex;
+  flex-direction: column;
+  max-width: 80%;
+  gap: 2px;
+}
+
+.chat-bubble--user {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+
+.chat-bubble--assistant {
+  align-self: flex-start;
+  align-items: flex-start;
+}
+
+.chat-bubble-role {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-muted);
+}
+
+.chat-bubble-text {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-bubble--user .chat-bubble-text {
+  background: #1a2a4a;
+  border-color: #2a3a6a;
+}
+
+.chat-input-row {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.chat-input {
+  flex: 1;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  color: var(--color-text);
+  font-size: 13px;
+  padding: 8px 12px;
+  outline: none;
+}
+
+.chat-input:focus {
+  border-color: var(--color-blue);
+}
+
+.chat-send-btn {
+  background: var(--color-blue);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius);
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-send-btn:hover {
+  background: #2563eb;
+}
+
+.chat-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg);
+}
+
+.preset-btn {
+  background: var(--color-surface);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.preset-btn:hover {
+  border-color: var(--color-accent-light);
+  color: var(--color-accent-light);
+}
+
+/* ── Cost panel ── */
+.cost-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ── Savings ticker ── */
+.savings-ticker {
+  background: #1a1500;
+  border: 1px solid #3d2e00;
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.savings-ticker-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-accent);
+}
+
+.savings-ticker-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--color-accent-light);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Generic cost section card ── */
+.cost-section {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cost-section-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-muted);
+  margin-bottom: 2px;
+}
+
+.cost-section-empty {
+  font-size: 12px;
+  color: var(--color-muted);
+}
+
+/* ── Waste alerts ── */
+.waste-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.waste-alert {
+  background: var(--color-yellow-bg);
+  border: 1px solid #5c3d00;
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.waste-hash {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-accent-light);
+}
+
+.waste-cost {
+  color: var(--color-red);
+  font-weight: 600;
+}
+
+/* ── Savings panel ── */
+.savings-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.savings-entry {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  padding: 5px 8px;
+  background: var(--color-green-bg);
+  border: 1px solid #1a4020;
+  border-radius: var(--radius);
+}
+
+.savings-amount {
+  color: var(--color-accent-light);
+  font-weight: 600;
+}
+
+.savings-tokens {
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.savings-total {
+  font-size: 12px;
+  color: var(--color-text);
+  padding-top: 4px;
+  border-top: 1px solid var(--color-border);
+}
+
+.savings-pct {
+  color: var(--color-accent-light);
+}
+
+/* ── Governance strip ── */
+.gov-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.gov-entry {
+  font-size: 12px;
+  padding: 7px 10px;
+  border-radius: var(--radius);
+  line-height: 1.5;
+}
+
+.gov-entry--redaction {
+  background: #1a1030;
+  border: 1px solid #3d2a6a;
+  color: #a78bfa;
+}
+
+.gov-entry--blocked {
+  background: var(--color-red-bg);
+  border: 1px solid #5c1a1a;
+  color: #f87171;
+}
+
+.gov-entry--approval {
+  background: var(--color-yellow-bg);
+  border: 1px solid #5c3d00;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gov-entry--resolved {
+  background: var(--color-green-bg);
+  border: 1px solid #1a4020;
+  color: #4ade80;
+}
+
+.gov-entry--audit {
+  background: var(--color-blue-bg);
+  border: 1px solid #1a3060;
+  color: #93c5fd;
+}
+
+.gov-approval-btns {
+  display: flex;
+  gap: 8px;
+}
+
+.gov-btn {
+  padding: 5px 12px;
+  border-radius: var(--radius);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+}
+
+.gov-btn--approve {
+  background: var(--color-green);
+  color: #fff;
+}
+
+.gov-btn--approve:hover {
+  background: #15803d;
+}
+
+.gov-btn--reject {
+  background: var(--color-red);
+  color: #fff;
+}
+
+.gov-btn--reject:hover {
+  background: #b91c1c;
+}
+
+/* ── Scrollbar styling ── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
