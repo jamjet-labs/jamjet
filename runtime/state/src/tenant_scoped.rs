@@ -404,21 +404,36 @@ impl StateBackend for TenantScopedSqliteBackend {
         let kind_json = serde_json::to_string(&event.kind)?;
         let created_at = event.created_at.to_rfc3339();
 
+        // Assign the sequence atomically (see SqliteBackend::append_event). The
+        // MAX is scoped to the execution only (not the tenant), so it agrees with
+        // the base backend's sequence even when an execution's events carry mixed
+        // tenant_id rows (scheduler/worker run on the base backend in dev).
+        let mut tx = self.pool.begin().await.map_err(map_db_err)?;
+        let seq_row = sqlx::query(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
+        )
+        .bind(&execution_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+
         sqlx::query(
             r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at, tenant_id)
                VALUES (?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id)
         .bind(&execution_id)
-        .bind(event.sequence)
+        .bind(sequence)
         .bind(&kind_json)
         .bind(&created_at)
         .bind(&self.tenant_id.0)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        tx.commit().await.map_err(map_db_err)?;
 
-        Ok(event.sequence)
+        Ok(sequence)
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %execution_id))]

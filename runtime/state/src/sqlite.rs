@@ -442,20 +442,35 @@ impl StateBackend for SqliteBackend {
         let kind_json = serde_json::to_string(&event.kind)?;
         let created_at = event.created_at.to_rfc3339();
 
+        // Assign the sequence atomically inside a transaction so concurrent
+        // appends to the same execution cannot compute the same number and
+        // collide on UNIQUE(execution_id, sequence). The caller-supplied
+        // sequence is advisory; the database is the source of truth.
+        let mut tx = self.pool.begin().await.map_err(map_db_err)?;
+        let seq_row = sqlx::query(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
+        )
+        .bind(&execution_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+
         sqlx::query(
             r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at)
                VALUES (?, ?, ?, ?, ?)"#,
         )
         .bind(&id)
         .bind(&execution_id)
-        .bind(event.sequence)
+        .bind(sequence)
         .bind(&kind_json)
         .bind(&created_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        tx.commit().await.map_err(map_db_err)?;
 
-        Ok(event.sequence)
+        Ok(sequence)
     }
 
     #[instrument(skip(self), fields(execution_id = %execution_id))]
