@@ -1,0 +1,38 @@
+{
+  "workflow_id": "demo",
+  "version": "0.1.0",
+  "name": null,
+  "description": null,
+  "state_schema": "{\"query\": \"str\", \"answer\": \"str\"}",
+  "start_node": "think",
+  "nodes": {
+    "think": {
+      "id": "think",
+      "kind": {
+        "type": "model",
+        "model_ref": "claude-haiku-4-5-20251001",
+        "prompt_ref": "Answer this question clearly and concisely:\n\n{{ state.query }}\n",
+        "output_schema": "",
+        "system_prompt": null
+      },
+      "retry_policy": null,
+      "node_timeout_secs": null,
+      "description": null,
+      "labels": {}
+    }
+  },
+  "edges": [
+    {
+      "from": "think",
+      "to": "end",
+      "condition": null
+    }
+  ],
+  "retry_policies": {},
+  "timeouts": {},
+  "models": {},
+  "tools": {},
+  "mcp_servers": {},
+  "remote_agents": {},
+  "labels": {}
+}
