@@ -24,7 +24,13 @@ impl SqliteBackend {
     /// `database_url` is a SQLx-compatible URL, e.g. `sqlite:///path/to/db.sqlite3`.
     /// The database file is created automatically if it does not exist.
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
-        let opts = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+        let opts = SqliteConnectOptions::from_str(database_url)?
+            .create_if_missing(true)
+            // WAL + a busy timeout let the scheduler, worker pool, API, and audit
+            // log share one SQLite file without spurious SQLITE_BUSY errors under
+            // concurrency. (Ignored for in-memory databases.)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePool::connect_with(opts).await?;
         Ok(Self { pool })
     }

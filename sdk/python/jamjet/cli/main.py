@@ -487,6 +487,28 @@ def validate(
 # ── run ───────────────────────────────────────────────────────────────────────
 
 
+def _load_workflow_ir(path: str) -> dict[str, Any]:
+    """Compile a workflow file (.yaml/.yml/.py) to its IR dict."""
+    from jamjet.workflow.ir_compiler import compile_yaml
+
+    if path.endswith((".yaml", ".yml")):
+        with open(path) as fh:
+            return compile_yaml(fh.read())
+    if path.endswith(".py"):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("_wf_module", path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        from jamjet.workflow.workflow import Workflow
+
+        wf = next((v for v in vars(mod).values() if isinstance(v, Workflow)), None)
+        if wf is None:
+            raise ValueError("No Workflow instance found in module.")
+        return wf.compile()
+    raise ValueError("Unsupported workflow file type. Use .yaml, .yml, or .py")
+
+
 @app.command()
 def run(
     workflow: str = typer.Argument(..., help="Workflow id or path to workflow.yaml"),
@@ -511,10 +533,27 @@ def run(
     json_output = output == OutputFormat.json
 
     async def _run() -> None:
+        import os
+
         start_time_us = time.monotonic_ns() // 1000
 
         async with _client(runtime) as c:
-            result = await c.start_execution(workflow_id=workflow, input=input_data)
+            workflow_ref = workflow
+            workflow_version: str | None = None
+            # If given a workflow file, compile and register it first, then run by its id.
+            if os.path.isfile(workflow) and workflow.endswith((".yaml", ".yml", ".py")):
+                ir = _load_workflow_ir(workflow)
+                await c.create_workflow(ir)
+                workflow_ref = str(ir.get("workflow_id") or workflow)
+                workflow_version = ir.get("version")
+                if not json_output:
+                    console.print(
+                        f"[dim]Registered[/dim] [bold]{workflow_ref}[/bold] [dim]v{workflow_version or '?'}[/dim]"
+                    )
+
+            result = await c.start_execution(
+                workflow_id=workflow_ref, input=input_data, workflow_version=workflow_version
+            )
             exec_id = result.get("execution_id", "unknown")
 
             if not json_output:

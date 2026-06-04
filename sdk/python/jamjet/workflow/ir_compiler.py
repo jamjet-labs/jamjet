@@ -155,9 +155,18 @@ def compile_yaml(yaml_content: str) -> dict[str, Any]:
     nodes: dict[str, Any] = {}
     edges: list[dict[str, Any]] = []
 
+    # `end`-type nodes are not runtime node kinds; the runtime terminates an
+    # execution when a node's edge points at the literal target "end". Collect
+    # the end nodes so we can drop them and rewrite any edge or branch that
+    # targets one to the "end" sentinel (this also collapses named end nodes
+    # such as success/failure to the terminal target).
+    end_ids = frozenset(nid for nid, nd in raw_nodes.items() if isinstance(nd, dict) and nd.get("type") == "end")
+
     for node_id, node_data in raw_nodes.items():
         node_type = node_data.get("type", "tool")
-        kind = _yaml_node_to_kind(node_id, node_type, node_data)
+        if node_type == "end":
+            continue
+        kind = _yaml_node_to_kind(node_id, node_type, node_data, end_ids)
         nodes[node_id] = {
             "id": node_id,
             "kind": kind,
@@ -170,14 +179,14 @@ def compile_yaml(yaml_content: str) -> dict[str, Any]:
         # Extract edges from "next" field
         next_val = node_data.get("next")
         if isinstance(next_val, str):
-            edges.append({"from": node_id, "to": next_val, "condition": None})
+            edges.append({"from": node_id, "to": _term(next_val, end_ids), "condition": None})
         elif isinstance(next_val, list):
             for edge in next_val:
                 if isinstance(edge, dict):
                     edges.append(
                         {
                             "from": node_id,
-                            "to": edge.get("to", "end"),
+                            "to": _term(edge.get("to", "end"), end_ids),
                             "condition": edge.get("when"),
                         }
                     )
@@ -191,7 +200,7 @@ def compile_yaml(yaml_content: str) -> dict[str, Any]:
         "version": wf.get("version", "0.1.0"),
         "name": wf.get("name"),
         "description": wf.get("description"),
-        "state_schema": wf.get("state_schema", ""),
+        "state_schema": _state_schema_str(wf.get("state_schema", "")),
         "start_node": wf.get("start", next(iter(raw_nodes)) if raw_nodes else ""),
         "nodes": nodes,
         "edges": edges,
@@ -339,7 +348,25 @@ def _step_to_node_kind(step: StepDef) -> dict[str, Any]:
     }
 
 
-def _yaml_node_to_kind(node_id: str, node_type: str, data: dict[str, Any]) -> dict[str, Any]:
+def _term(target: Any, end_ids: frozenset) -> Any:
+    """Rewrite an edge/branch target that names an `end`-type node to the terminal sentinel."""
+    return "end" if target in end_ids else target
+
+
+def _state_schema_str(value: Any) -> str:
+    """The runtime IR ``state_schema`` is an opaque String; serialize an inline map to JSON."""
+    if isinstance(value, str):
+        return value
+    if value:
+        import json as _json
+
+        return _json.dumps(value)
+    return ""
+
+
+def _yaml_node_to_kind(
+    node_id: str, node_type: str, data: dict[str, Any], end_ids: frozenset = frozenset()
+) -> dict[str, Any]:
     """Convert a YAML node definition to a NodeKind dict."""
     if node_type == "model":
         return {
@@ -389,8 +416,15 @@ def _yaml_node_to_kind(node_id: str, node_type: str, data: dict[str, Any]) -> di
             "input_mapping": data.get("input", {}),
             "output_schema": data.get("output_schema", ""),
         }
-    if node_type == "condition":
-        return {"type": "condition", "branches": []}
+    if node_type in ("condition", "branch"):
+        branches: list[dict[str, Any]] = []
+        for cond in data.get("conditions", []) or []:
+            target = cond.get("next") or cond.get("to") or "end"
+            branches.append({"condition": cond.get("if") or cond.get("when"), "target": _term(target, end_ids)})
+        default = data.get("default")
+        if default is not None:
+            branches.append({"condition": None, "target": _term(default, end_ids)})
+        return {"type": "condition", "branches": branches}
     if node_type == "eval":
         return {
             "type": "eval",

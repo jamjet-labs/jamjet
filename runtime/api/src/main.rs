@@ -104,6 +104,29 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move { scheduler.run().await });
     info!("Scheduler started");
 
+    // In dev mode (or when JAMJET_EMBED_WORKERS is set), run an in-process worker
+    // pool so submitted workflows actually execute. In production, run dedicated
+    // worker processes against the same state backend instead. The base backend
+    // claims across all tenants, so workers drain every execution's queue.
+    if config.dev_mode || std::env::var("JAMJET_EMBED_WORKERS").is_ok() {
+        let model_registry = Arc::new(jamjet_models::registry::registry_from_env());
+        let pool = jamjet_worker::default_pool(state.backend.clone())
+            .with_executor(
+                "model",
+                Arc::new(jamjet_worker::ModelNodeExecutor::new(
+                    model_registry.clone(),
+                )),
+            )
+            .with_executor(
+                "eval",
+                Arc::new(jamjet_worker::EvalExecutor::new(model_registry.clone())),
+            );
+        // Detaching the handles lets the workers run for the lifetime of the process
+        // (same pattern as the scheduler above).
+        let _worker_handles = pool.spawn();
+        info!("Embedded worker pool started (dev mode)");
+    }
+
     let router = build_router_with_opts(state, config.dev_mode);
     let addr = format!("{}:{}", config.bind, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
