@@ -541,8 +541,17 @@ def run(
             workflow_ref = workflow
             workflow_version: str | None = None
             # If given a workflow file, compile and register it first, then run by its id.
-            if os.path.isfile(workflow) and workflow.endswith((".yaml", ".yml", ".py")):
+            if os.path.isfile(workflow):
+                if not workflow.endswith((".yaml", ".yml", ".py")):
+                    console.print("[red]Unsupported workflow file. Use .yaml, .yml, or .py[/red]")
+                    raise typer.Exit(1)
                 ir = _load_workflow_ir(workflow)
+                # The runtime requires string workflow_id/version; a YAML value
+                # like `version: 1.0` parses as a number, which fails registration.
+                if ir.get("workflow_id") is not None:
+                    ir["workflow_id"] = str(ir["workflow_id"])
+                if ir.get("version") is not None:
+                    ir["version"] = str(ir["version"])
                 await c.create_workflow(ir)
                 workflow_ref = str(ir.get("workflow_id") or workflow)
                 workflow_version = ir.get("version")

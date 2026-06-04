@@ -201,7 +201,7 @@ def compile_yaml(yaml_content: str) -> dict[str, Any]:
         "name": wf.get("name"),
         "description": wf.get("description"),
         "state_schema": _state_schema_str(wf.get("state_schema", "")),
-        "start_node": wf.get("start", next(iter(raw_nodes)) if raw_nodes else ""),
+        "start_node": wf.get("start", next(iter(nodes)) if nodes else ""),
         "nodes": nodes,
         "edges": edges,
         "retry_policies": data.get("retry_policies", {}),
