@@ -45,6 +45,11 @@ pub struct Scheduler {
     /// Registered IR is immutable per version, so this avoids re-fetching and
     /// re-deserializing it on every tick for every running execution.
     ir_cache: Mutex<HashMap<(String, String), Arc<WorkflowIr>>>,
+    /// Per-execution scheduling progress, folded incrementally from the event
+    /// log. Each tick reads only events appended since the last tick instead of
+    /// replaying the whole log. The entry is dropped when the execution reaches
+    /// a terminal state.
+    progress: Mutex<HashMap<ExecutionId, ExecProgress>>,
 }
 
 impl Scheduler {
@@ -53,6 +58,7 @@ impl Scheduler {
             backend,
             config: SchedulerConfig::default(),
             ir_cache: Mutex::new(HashMap::new()),
+            progress: Mutex::new(HashMap::new()),
         }
     }
 
@@ -212,51 +218,38 @@ impl Scheduler {
             }
         };
 
-        // Load events to build the set of completed/scheduled/failed nodes.
-        let events = self.backend.get_events(execution_id).await?;
+        // Fold only the events appended since the last tick into the cached
+        // progress for this execution. Completed/failed nodes never revert and
+        // the IR is immutable, so replaying the whole event log every tick is
+        // pure overhead that grows with execution length — we apply just the
+        // delta instead, keeping a tick's cost bounded by the graph size.
+        let mut progress = self
+            .progress
+            .lock()
+            .unwrap()
+            .get(execution_id)
+            .cloned()
+            .unwrap_or_default();
 
-        let mut completed: HashSet<NodeId> = HashSet::new();
-        let mut scheduled: HashSet<NodeId> = HashSet::new();
-        let mut terminal_failed: HashSet<NodeId> = HashSet::new();
-
-        for event in &events {
-            match &event.kind {
-                EventKind::NodeCompleted { node_id, .. }
-                | EventKind::NodeSkipped { node_id, .. } => {
-                    completed.insert(node_id.clone());
-                    scheduled.remove(node_id);
-                }
-                EventKind::NodeScheduled { node_id, .. }
-                | EventKind::NodeStarted { node_id, .. } => {
-                    scheduled.insert(node_id.clone());
-                }
-                EventKind::NodeCancelled { node_id } => {
-                    completed.insert(node_id.clone());
-                    scheduled.remove(node_id);
-                }
-                EventKind::NodeFailed {
-                    node_id,
-                    retryable: false,
-                    ..
-                } => {
-                    terminal_failed.insert(node_id.clone());
-                    scheduled.remove(node_id);
-                }
-                EventKind::NodeFailed {
-                    node_id,
-                    retryable: true,
-                    ..
-                } => {
-                    // Will be re-queued by RetryScheduled event; remove from scheduled.
-                    scheduled.remove(node_id);
-                }
-                EventKind::RetryScheduled { node_id, .. } => {
-                    // Node will be re-queued; treat as scheduled.
-                    scheduled.insert(node_id.clone());
-                }
-                _ => {}
-            }
+        let new_events = self
+            .backend
+            .get_events_since(execution_id, progress.last_sequence)
+            .await?;
+        for event in &new_events {
+            progress.apply(event);
         }
+
+        // Write the advanced progress back before any early return below, so a
+        // tick that bails out (e.g. at the concurrency cap) doesn't have to
+        // re-read the same delta next time.
+        self.progress
+            .lock()
+            .unwrap()
+            .insert(execution_id.clone(), progress.clone());
+
+        let completed = &progress.completed;
+        let scheduled = &progress.scheduled;
+        let terminal_failed = &progress.terminal_failed;
 
         debug!(
             execution_id = %execution_id,
@@ -296,7 +289,7 @@ impl Scheduler {
             if terminal_failed.contains(node_id.as_str()) {
                 continue; // permanently failed
             }
-            if is_runnable(node_id, &ir, &completed, &scheduled) {
+            if is_runnable(node_id, &ir, completed, scheduled) {
                 // Serialize the QueueType variant name to snake_case string.
                 let queue_type = serde_json::to_value(node.kind.queue_type())
                     .ok()
@@ -365,7 +358,7 @@ impl Scheduler {
                 (
                     jamjet_core::workflow::WorkflowStatus::Completed,
                     EventKind::WorkflowCompleted {
-                        final_state: build_final_state(&events),
+                        final_state: serde_json::Value::Object(progress.final_state.clone()),
                     },
                 )
             } else {
@@ -392,26 +385,84 @@ impl Scheduler {
             self.backend
                 .update_execution_status(execution_id, status)
                 .await?;
+            // Execution is terminal; drop its progress so the cache doesn't grow
+            // without bound as executions complete.
+            self.progress.lock().unwrap().remove(execution_id);
         }
 
         Ok(())
     }
 }
 
-/// Merge the `state_patch`es from all `NodeCompleted` events into the final
-/// state object reported on `WorkflowCompleted`.
-fn build_final_state(events: &[jamjet_state::Event]) -> serde_json::Value {
-    let mut state = serde_json::Map::new();
-    for event in events {
-        if let EventKind::NodeCompleted { state_patch, .. } = &event.kind {
-            if let serde_json::Value::Object(patch) = state_patch {
-                for (k, v) in patch {
-                    state.insert(k.clone(), v.clone());
+/// Incrementally-folded scheduling state for a single execution.
+///
+/// Rebuilt lazily from the event log: each scheduler tick reads only events with
+/// a sequence greater than `last_sequence` and folds them in via [`ExecProgress::apply`].
+/// This makes a tick's cost a function of the workflow's graph size rather than
+/// the ever-growing length of its event log.
+#[derive(Default, Clone)]
+struct ExecProgress {
+    completed: HashSet<NodeId>,
+    scheduled: HashSet<NodeId>,
+    terminal_failed: HashSet<NodeId>,
+    /// `state_patch`es from completed nodes, merged in sequence order. This is
+    /// the `final_state` reported on `WorkflowCompleted`.
+    final_state: serde_json::Map<String, serde_json::Value>,
+    /// Highest event sequence already folded in.
+    last_sequence: jamjet_state::EventSequence,
+}
+
+impl ExecProgress {
+    /// Fold one event into the running state. Must be applied in sequence order.
+    fn apply(&mut self, event: &jamjet_state::Event) {
+        match &event.kind {
+            EventKind::NodeCompleted {
+                node_id,
+                state_patch,
+                ..
+            } => {
+                self.completed.insert(node_id.clone());
+                self.scheduled.remove(node_id);
+                if let serde_json::Value::Object(patch) = state_patch {
+                    for (k, v) in patch {
+                        self.final_state.insert(k.clone(), v.clone());
+                    }
                 }
             }
+            EventKind::NodeSkipped { node_id, .. } => {
+                self.completed.insert(node_id.clone());
+                self.scheduled.remove(node_id);
+            }
+            EventKind::NodeScheduled { node_id, .. } | EventKind::NodeStarted { node_id, .. } => {
+                self.scheduled.insert(node_id.clone());
+            }
+            EventKind::NodeCancelled { node_id } => {
+                self.completed.insert(node_id.clone());
+                self.scheduled.remove(node_id);
+            }
+            EventKind::NodeFailed {
+                node_id,
+                retryable: false,
+                ..
+            } => {
+                self.terminal_failed.insert(node_id.clone());
+                self.scheduled.remove(node_id);
+            }
+            EventKind::NodeFailed {
+                node_id,
+                retryable: true,
+                ..
+            } => {
+                // Re-queued by the subsequent RetryScheduled event.
+                self.scheduled.remove(node_id);
+            }
+            EventKind::RetryScheduled { node_id, .. } => {
+                self.scheduled.insert(node_id.clone());
+            }
+            _ => {}
         }
+        self.last_sequence = self.last_sequence.max(event.sequence);
     }
-    serde_json::Value::Object(state)
 }
 
 /// Check if a node is runnable: all its predecessors are completed and
@@ -575,11 +626,19 @@ mod tests {
             "b should be scheduled once a completes"
         );
         assert_eq!(status(&b, &e).await, WorkflowStatus::Running);
+        assert!(
+            s.progress.lock().unwrap().contains_key(&e),
+            "progress should be cached while the execution is running"
+        );
 
         // Worker finishes `b`; tick 3 detects completion.
         append(&b, &e, node_completed("b", serde_json::json!({ "y": 2 }))).await;
         tick(&s, &e).await;
         assert_eq!(status(&b, &e).await, WorkflowStatus::Completed);
+        assert!(
+            !s.progress.lock().unwrap().contains_key(&e),
+            "progress should be dropped once the execution is terminal"
+        );
 
         // Final state merges both nodes' patches in sequence order.
         let evs = b.get_events(&e).await.unwrap();
