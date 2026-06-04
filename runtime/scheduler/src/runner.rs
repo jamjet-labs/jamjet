@@ -337,8 +337,62 @@ impl Scheduler {
             debug!(execution_id = %execution_id, enqueued, "Dispatch complete");
         }
 
+        // Completion detection: if nothing is in flight (no scheduled/running nodes)
+        // and nothing new was dispatched this tick, the execution has reached a
+        // terminal state. Emit the terminal event and flip the stored status so the
+        // execution drops out of the running set on the next tick (fires once).
+        if enqueued == 0 && scheduled.is_empty() {
+            let (status, event_kind) = if terminal_failed.is_empty() {
+                (
+                    jamjet_core::workflow::WorkflowStatus::Completed,
+                    EventKind::WorkflowCompleted {
+                        final_state: build_final_state(&events),
+                    },
+                )
+            } else {
+                let mut failed: Vec<String> =
+                    terminal_failed.iter().map(|n| n.to_string()).collect();
+                failed.sort();
+                (
+                    jamjet_core::workflow::WorkflowStatus::Failed,
+                    EventKind::WorkflowFailed {
+                        error: format!("node(s) failed terminally: {}", failed.join(", ")),
+                    },
+                )
+            };
+
+            let seq = self.backend.latest_sequence(execution_id).await? + 1;
+            self.backend
+                .append_event(jamjet_state::Event::new(
+                    execution_id.clone(),
+                    seq,
+                    event_kind,
+                ))
+                .await?;
+            info!(execution_id = %execution_id, ?status, "Execution reached terminal state");
+            self.backend
+                .update_execution_status(execution_id, status)
+                .await?;
+        }
+
         Ok(())
     }
+}
+
+/// Merge the `state_patch`es from all `NodeCompleted` events into the final
+/// state object reported on `WorkflowCompleted`.
+fn build_final_state(events: &[jamjet_state::Event]) -> serde_json::Value {
+    let mut state = serde_json::Map::new();
+    for event in events {
+        if let EventKind::NodeCompleted { state_patch, .. } = &event.kind {
+            if let serde_json::Value::Object(patch) = state_patch {
+                for (k, v) in patch {
+                    state.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    serde_json::Value::Object(state)
 }
 
 /// Check if a node is runnable: all its predecessors are completed and

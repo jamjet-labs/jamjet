@@ -371,27 +371,40 @@ impl Worker {
                     node_def.policy.as_ref(),
                 );
                 warn!(execution_id = %execution_id, node_id, %reason, %policy_scope, "Policy blocked node");
-                let seq = self.backend.latest_sequence(execution_id).await.ok()? + 1;
-                let _ = self
-                    .backend
-                    .append_event(jamjet_state::Event::new(
-                        execution_id.clone(),
-                        seq,
-                        EventKind::PolicyViolation {
-                            node_id: node_id.to_string(),
-                            rule: reason.clone(),
-                            decision: "blocked".to_string(),
-                            policy_scope,
-                        },
-                    ))
-                    .await;
+                // Best-effort audit. The block is enforced regardless of whether
+                // recording the violation succeeds: fail closed, never open.
+                if let Ok(latest) = self.backend.latest_sequence(execution_id).await {
+                    let _ = self
+                        .backend
+                        .append_event(jamjet_state::Event::new(
+                            execution_id.clone(),
+                            latest + 1,
+                            EventKind::PolicyViolation {
+                                node_id: node_id.to_string(),
+                                rule: reason.clone(),
+                                decision: "blocked".to_string(),
+                                policy_scope,
+                            },
+                        ))
+                        .await;
+                }
                 Some(Err(format!("policy blocked: {reason}").into()))
             }
 
             PolicyDecision::RequireApproval { approver } => {
                 info!(execution_id = %execution_id, node_id, %approver, "Node requires approval");
                 let tool_name = ctx.tool_name.unwrap_or_else(|| node_id.to_string());
-                let seq = self.backend.latest_sequence(execution_id).await.ok()? + 1;
+                // If we cannot record the approval requirement, fail closed rather
+                // than letting the node run unapproved.
+                let seq = match self.backend.latest_sequence(execution_id).await {
+                    Ok(s) => s + 1,
+                    Err(e) => {
+                        return Some(Err(format!(
+                            "approval required but could not be recorded: {e}"
+                        )
+                        .into()))
+                    }
+                };
                 let _ = self
                     .backend
                     .append_event(jamjet_state::Event::new(

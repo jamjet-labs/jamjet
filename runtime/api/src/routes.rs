@@ -221,8 +221,18 @@ async fn start_execution(
     );
     backend.append_event(event).await?;
 
-    // Immediately enqueue the start node as a work item.
-    let queue_type = "general".to_string();
+    // Immediately enqueue the start node as a work item, routed to the queue its
+    // kind requires (e.g. a Model start node -> the "model" queue), mirroring the
+    // scheduler's logic for chained nodes.
+    let queue_type = def
+        .ir
+        .get("nodes")
+        .and_then(|nodes| nodes.get(&start_node))
+        .and_then(|node| node.get("kind"))
+        .and_then(|kind| serde_json::from_value::<jamjet_core::node::NodeKind>(kind.clone()).ok())
+        .and_then(|k| serde_json::to_value(k.queue_type()).ok())
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "general".to_string());
     let sched_event = jamjet_state::Event::new(
         execution_id.clone(),
         2,
