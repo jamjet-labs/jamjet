@@ -142,6 +142,15 @@ async fn create_workflow(
         .ok_or_else(|| ApiError::BadRequest("ir.version is required".into()))?
         .to_string();
 
+    // Reject IR the runtime can't load. Without this, a structurally-broken
+    // definition is stored happily and only fails later when the scheduler tries
+    // to deserialize it — at which point the execution silently never schedules.
+    // (Reference resolution is deliberately left to the runtime: models/tools are
+    // resolved against the worker registry, not the IR maps, so we validate the
+    // shape here, not `validate_workflow`'s ref rules.)
+    serde_json::from_value::<jamjet_ir::WorkflowIr>(body.ir.clone())
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+
     let backend = state.backend_for(&tenant_id);
     let def = WorkflowDefinition {
         workflow_id: workflow_id.clone(),
@@ -308,7 +317,9 @@ async fn get_execution(
         .get_execution(&execution_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("execution {id}")))?;
-    Ok(Json(serde_json::to_value(execution).unwrap()))
+    Ok(Json(serde_json::to_value(execution).map_err(|e| {
+        ApiError::Internal(format!("serialize execution: {e}"))
+    })?))
 }
 
 async fn cancel_execution(
@@ -493,7 +504,9 @@ async fn get_agent(
         .await
         .map_err(ApiError::Internal)?
         .ok_or_else(|| ApiError::NotFound(format!("agent {id}")))?;
-    Ok(Json(serde_json::to_value(agent).unwrap()))
+    Ok(Json(serde_json::to_value(agent).map_err(|e| {
+        ApiError::Internal(format!("serialize agent: {e}"))
+    })?))
 }
 
 async fn activate_agent(
@@ -549,7 +562,10 @@ async fn discover_agent(
         .map_err(ApiError::Internal)?;
     Ok((
         StatusCode::CREATED,
-        Json(serde_json::to_value(&agent).unwrap()),
+        Json(
+            serde_json::to_value(&agent)
+                .map_err(|e| ApiError::Internal(format!("serialize agent: {e}")))?,
+        ),
     ))
 }
 
@@ -715,7 +731,9 @@ async fn get_tenant(
         .get_tenant(&TenantId::from(id.as_str()))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("tenant {id}")))?;
-    Ok(Json(serde_json::to_value(tenant).unwrap()))
+    Ok(Json(serde_json::to_value(tenant).map_err(|e| {
+        ApiError::Internal(format!("serialize tenant: {e}"))
+    })?))
 }
 
 #[derive(Deserialize)]
