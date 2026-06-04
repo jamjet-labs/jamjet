@@ -3,8 +3,8 @@ use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::WorkflowIr;
 use jamjet_state::backend::{StateBackend, WorkItem};
 use jamjet_state::event::EventKind;
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
@@ -41,6 +41,10 @@ impl Default for SchedulerConfig {
 pub struct Scheduler {
     backend: Arc<dyn StateBackend>,
     config: SchedulerConfig,
+    /// Cache of deserialized workflow IR, keyed by (workflow_id, version).
+    /// Registered IR is immutable per version, so this avoids re-fetching and
+    /// re-deserializing it on every tick for every running execution.
+    ir_cache: Mutex<HashMap<(String, String), Arc<WorkflowIr>>>,
 }
 
 impl Scheduler {
@@ -48,6 +52,7 @@ impl Scheduler {
         Self {
             backend,
             config: SchedulerConfig::default(),
+            ir_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -182,16 +187,30 @@ impl Scheduler {
         workflow_id: &str,
         workflow_version: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Load the workflow IR from the registry.
-        let def = self
-            .backend
-            .get_workflow(workflow_id, workflow_version)
-            .await?;
-        let Some(def) = def else {
-            warn!(%workflow_id, %workflow_version, "Workflow definition not found; cannot schedule");
-            return Ok(());
+        // Load the workflow IR, using a cache keyed by (workflow_id, version).
+        // Registered IR is immutable per version, so we deserialize it once
+        // rather than on every tick for every running execution.
+        let cache_key = (workflow_id.to_string(), workflow_version.to_string());
+        let cached = self.ir_cache.lock().unwrap().get(&cache_key).cloned();
+        let ir: Arc<WorkflowIr> = match cached {
+            Some(ir) => ir,
+            None => {
+                let def = self
+                    .backend
+                    .get_workflow(workflow_id, workflow_version)
+                    .await?;
+                let Some(def) = def else {
+                    warn!(%workflow_id, %workflow_version, "Workflow definition not found; cannot schedule");
+                    return Ok(());
+                };
+                let ir = Arc::new(serde_json::from_value::<WorkflowIr>(def.ir)?);
+                self.ir_cache
+                    .lock()
+                    .unwrap()
+                    .insert(cache_key, Arc::clone(&ir));
+                ir
+            }
         };
-        let ir: WorkflowIr = serde_json::from_value(def.ir)?;
 
         // Load events to build the set of completed/scheduled/failed nodes.
         let events = self.backend.get_events(execution_id).await?;
