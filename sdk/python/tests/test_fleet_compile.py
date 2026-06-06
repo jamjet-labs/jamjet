@@ -100,7 +100,7 @@ def test_resolve_uses_bad_prefix_errors():
         _resolve_uses("a", ["banana:x"], [], {}, {}, {"a"})
 
 
-def test_compile_agent_unit_builds_ir_and_populates_mcp():
+def test_compile_agent_unit_builds_registration_safe_ir():
     tool_catalog = {"web_search": {"description": "s", "input_schema": {}}}
     mcp_catalog = {"github": {"url": "u", "transport": "streamable-http"}}
     from jamjet.workflow.bundle import _compile_agent_unit
@@ -118,10 +118,12 @@ def test_compile_agent_unit_builds_ir_and_populates_mcp():
         mcp_catalog=mcp_catalog,
         unit_ids={"researcher"},
     )
+    # IR tools/mcp_servers stay empty: the runtime resolves tools/models itself
+    # and these maps expect typed configs, not catalog defs. uses: refs are
+    # validated and surfaced to the strategy prompt by name.
+    assert ir["tools"] == {}
+    assert ir["mcp_servers"] == {}
     assert ir["workflow_id"] == "researcher"
-    assert ir["version"] == "0.1.0"
-    assert ir["mcp_servers"] == {"github": mcp_catalog["github"]}
-    assert "web_search" in ir["tools"]
     assert ir["labels"]["jamjet.agent.id"] == "researcher"
     assert ir["nodes"]  # strategy produced nodes
 

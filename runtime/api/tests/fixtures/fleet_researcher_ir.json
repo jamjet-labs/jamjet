@@ -1,0 +1,325 @@
+{
+  "workflow_id": "researcher",
+  "version": "0.1.0",
+  "name": "researcher",
+  "description": "Summarize the most important overnight AI news into a short brief",
+  "state_schema": "",
+  "start_node": "__plan__",
+  "nodes": {
+    "__plan__": {
+      "id": "__plan__",
+      "kind": {
+        "type": "model",
+        "model_ref": "claude-sonnet-4-6",
+        "prompt_ref": "You are an AI agent working on: Summarize the most important overnight AI news into a short brief\nAvailable tools: web_search\nGenerate a structured plan with up to 4 concrete steps. Output JSON: {\"steps\": [\"step 1\", \"step 2\", ...]}",
+        "output_schema": "__plan__",
+        "system_prompt": "You are a planning AI. Output valid JSON only."
+      },
+      "retry_policy": "llm_default",
+      "node_timeout_secs": null,
+      "description": "You are an AI agent working on: Summarize the most important overnight AI news into a short brief\nAvailable tools: web_search\nGenerate a structured plan with up to 4 concrete steps. Output JSON: {\"steps\": [\"step 1\", \"step 2\", ...]}",
+      "labels": {
+        "jamjet.strategy.node": "plan_generation",
+        "jamjet.strategy.event": "plan_generated"
+      }
+    },
+    "__cost_guard_0__": {
+      "id": "__cost_guard_0__",
+      "kind": {
+        "type": "condition",
+        "branches": [
+          {
+            "condition": "state.__cost_exceeded__",
+            "target": "__limit_exceeded__"
+          },
+          {
+            "condition": null,
+            "target": "__step_0__"
+          }
+        ],
+        "expression": "state.__cost_exceeded__ == true"
+      },
+      "retry_policy": null,
+      "node_timeout_secs": null,
+      "description": "state.__cost_exceeded__ == true",
+      "labels": {
+        "jamjet.strategy.node": "cost_guard",
+        "jamjet.strategy.iteration": "0"
+      }
+    },
+    "__step_0__": {
+      "id": "__step_0__",
+      "kind": {
+        "type": "model",
+        "model_ref": "claude-sonnet-4-6",
+        "prompt_ref": "You are executing step 1 of 4 for the goal: Summarize the most important overnight AI news into a short brief\nThe plan is: {{ state.__plan__ }}\nExecute step 1 using the available tools. Record your result.",
+        "output_schema": "__step_0_output__",
+        "system_prompt": null
+      },
+      "retry_policy": "llm_default",
+      "node_timeout_secs": null,
+      "description": "You are executing step 1 of 4 for the goal: Summarize the most important overnight AI news into a short brief\nThe plan is: {{ state.__plan__ }}\nExecute step 1 using the available tools. Record your result.",
+      "labels": {
+        "jamjet.strategy.node": "step_executor",
+        "jamjet.strategy.event": "iteration_started",
+        "jamjet.strategy.iteration": "0"
+      }
+    },
+    "__cost_guard_1__": {
+      "id": "__cost_guard_1__",
+      "kind": {
+        "type": "condition",
+        "branches": [
+          {
+            "condition": "state.__cost_exceeded__",
+            "target": "__limit_exceeded__"
+          },
+          {
+            "condition": null,
+            "target": "__step_1__"
+          }
+        ],
+        "expression": "state.__cost_exceeded__ == true"
+      },
+      "retry_policy": null,
+      "node_timeout_secs": null,
+      "description": "state.__cost_exceeded__ == true",
+      "labels": {
+        "jamjet.strategy.node": "cost_guard",
+        "jamjet.strategy.iteration": "1"
+      }
+    },
+    "__step_1__": {
+      "id": "__step_1__",
+      "kind": {
+        "type": "model",
+        "model_ref": "claude-sonnet-4-6",
+        "prompt_ref": "You are executing step 2 of 4 for the goal: Summarize the most important overnight AI news into a short brief\nThe plan is: {{ state.__plan__ }}\nExecute step 2 using the available tools. Record your result.",
+        "output_schema": "__step_1_output__",
+        "system_prompt": null
+      },
+      "retry_policy": "llm_default",
+      "node_timeout_secs": null,
+      "description": "You are executing step 2 of 4 for the goal: Summarize the most important overnight AI news into a short brief\nThe plan is: {{ state.__plan__ }}\nExecute step 2 using the available tools. Record your result.",
+      "labels": {
+        "jamjet.strategy.node": "step_executor",
+        "jamjet.strategy.event": "iteration_started",
+        "jamjet.strategy.iteration": "1"
+      }
+    },
+    "__cost_guard_2__": {
+      "id": "__cost_guard_2__",
+      "kind": {
+        "type": "condition",
+        "branches": [
+          {
+            "condition": "state.__cost_exceeded__",
+            "target": "__limit_exceeded__"
+          },
+          {
+            "condition": null,
+            "target": "__step_2__"
+          }
+        ],
+        "expression": "state.__cost_exceeded__ == true"
+      },
+      "retry_policy": null,
+      "node_timeout_secs": null,
+      "description": "state.__cost_exceeded__ == true",
+      "labels": {
+        "jamjet.strategy.node": "cost_guard",
+        "jamjet.strategy.iteration": "2"
+      }
+    },
+    "__step_2__": {
+      "id": "__step_2__",
+      "kind": {
+        "type": "model",
+        "model_ref": "claude-sonnet-4-6",
+        "prompt_ref": "You are executing step 3 of 4 for the goal: Summarize the most important overnight AI news into a short brief\nThe plan is: {{ state.__plan__ }}\nExecute step 3 using the available tools. Record your result.",
+        "output_schema": "__step_2_output__",
+        "system_prompt": null
+      },
+      "retry_policy": "llm_default",
+      "node_timeout_secs": null,
+      "description": "You are executing step 3 of 4 for the goal: Summarize the most important overnight AI news into a short brief\nThe plan is: {{ state.__plan__ }}\nExecute step 3 using the available tools. Record your result.",
+      "labels": {
+        "jamjet.strategy.node": "step_executor",
+        "jamjet.strategy.event": "iteration_started",
+        "jamjet.strategy.iteration": "2"
+      }
+    },
+    "__cost_guard_3__": {
+      "id": "__cost_guard_3__",
+      "kind": {
+        "type": "condition",
+        "branches": [
+          {
+            "condition": "state.__cost_exceeded__",
+            "target": "__limit_exceeded__"
+          },
+          {
+            "condition": null,
+            "target": "__step_3__"
+          }
+        ],
+        "expression": "state.__cost_exceeded__ == true"
+      },
+      "retry_policy": null,
+      "node_timeout_secs": null,
+      "description": "state.__cost_exceeded__ == true",
+      "labels": {
+        "jamjet.strategy.node": "cost_guard",
+        "jamjet.strategy.iteration": "3"
+      }
+    },
+    "__step_3__": {
+      "id": "__step_3__",
+      "kind": {
+        "type": "model",
+        "model_ref": "claude-sonnet-4-6",
+        "prompt_ref": "You are executing step 4 of 4 for the goal: Summarize the most important overnight AI news into a short brief\nThe plan is: {{ state.__plan__ }}\nExecute step 4 using the available tools. Record your result.",
+        "output_schema": "__step_3_output__",
+        "system_prompt": null
+      },
+      "retry_policy": "llm_default",
+      "node_timeout_secs": null,
+      "description": "You are executing step 4 of 4 for the goal: Summarize the most important overnight AI news into a short brief\nThe plan is: {{ state.__plan__ }}\nExecute step 4 using the available tools. Record your result.",
+      "labels": {
+        "jamjet.strategy.node": "step_executor",
+        "jamjet.strategy.event": "iteration_started",
+        "jamjet.strategy.iteration": "3"
+      }
+    },
+    "__finalize__": {
+      "id": "__finalize__",
+      "kind": {
+        "type": "model",
+        "model_ref": "claude-sonnet-4-6",
+        "prompt_ref": "You completed all steps for the goal: Summarize the most important overnight AI news into a short brief\nSynthesize the results from all steps into a final, well-structured response.",
+        "output_schema": "result",
+        "system_prompt": null
+      },
+      "retry_policy": "llm_default",
+      "node_timeout_secs": null,
+      "description": "You completed all steps for the goal: Summarize the most important overnight AI news into a short brief\nSynthesize the results from all steps into a final, well-structured response.",
+      "labels": {
+        "jamjet.strategy.node": "finalizer",
+        "jamjet.strategy.event": "strategy_completed"
+      }
+    },
+    "__limit_exceeded__": {
+      "id": "__limit_exceeded__",
+      "kind": {
+        "type": "limit_exceeded",
+        "description": "Strategy limit reached"
+      },
+      "retry_policy": null,
+      "node_timeout_secs": null,
+      "description": "Strategy limit exceeded \u2014 execution halted",
+      "labels": {
+        "jamjet.strategy.limit": "true"
+      }
+    }
+  },
+  "edges": [
+    {
+      "from": "__plan__",
+      "to": "__cost_guard_0__",
+      "condition": null
+    },
+    {
+      "from": "__step_0__",
+      "to": "__cost_guard_1__",
+      "condition": null
+    },
+    {
+      "from": "__cost_guard_0__",
+      "to": "__limit_exceeded__",
+      "condition": "state.__cost_exceeded__ == true"
+    },
+    {
+      "from": "__cost_guard_0__",
+      "to": "__step_0__",
+      "condition": null
+    },
+    {
+      "from": "__step_1__",
+      "to": "__cost_guard_2__",
+      "condition": null
+    },
+    {
+      "from": "__cost_guard_1__",
+      "to": "__limit_exceeded__",
+      "condition": "state.__cost_exceeded__ == true"
+    },
+    {
+      "from": "__cost_guard_1__",
+      "to": "__step_1__",
+      "condition": null
+    },
+    {
+      "from": "__step_2__",
+      "to": "__cost_guard_3__",
+      "condition": null
+    },
+    {
+      "from": "__cost_guard_2__",
+      "to": "__limit_exceeded__",
+      "condition": "state.__cost_exceeded__ == true"
+    },
+    {
+      "from": "__cost_guard_2__",
+      "to": "__step_2__",
+      "condition": null
+    },
+    {
+      "from": "__step_3__",
+      "to": "__finalize__",
+      "condition": null
+    },
+    {
+      "from": "__cost_guard_3__",
+      "to": "__limit_exceeded__",
+      "condition": "state.__cost_exceeded__ == true"
+    },
+    {
+      "from": "__cost_guard_3__",
+      "to": "__step_3__",
+      "condition": null
+    },
+    {
+      "from": "__finalize__",
+      "to": "end",
+      "condition": null
+    },
+    {
+      "from": "__limit_exceeded__",
+      "to": "end",
+      "condition": null
+    }
+  ],
+  "retry_policies": {},
+  "timeouts": {
+    "workflow_timeout": 120,
+    "heartbeat_interval": 30
+  },
+  "models": {},
+  "tools": {},
+  "mcp_servers": {},
+  "remote_agents": {},
+  "labels": {
+    "jamjet.strategy": "plan-and-execute",
+    "jamjet.agent.id": "researcher"
+  },
+  "strategy_metadata": {
+    "strategy_name": "plan-and-execute",
+    "strategy_config": {},
+    "limits": {
+      "max_iterations": 4,
+      "max_cost_usd": 0.5,
+      "timeout_seconds": 120
+    },
+    "agent_id": "researcher"
+  }
+}

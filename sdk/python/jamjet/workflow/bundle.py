@@ -188,8 +188,14 @@ def _compile_agent_unit(
         "retry_policies": {},
         "timeouts": {"workflow_timeout": limits.timeout_seconds, "heartbeat_interval": 30},
         "models": {},
-        "tools": resolved.ir_tools,
-        "mcp_servers": resolved.mcp_servers,
+        # The runtime IR `tools`/`mcp_servers` maps expect typed configs
+        # (ToolConfig with `kind`/`reference`, McpServerConfig with a typed
+        # `transport` enum) that differ from the catalog's human-authored
+        # shapes. Strategy agents convey tool names via the compiled prompt
+        # (`resolved.tool_names` → `compile_strategy`); deep tool/MCP IR
+        # wiring is deferred. Emit empty maps so POST /workflows succeeds.
+        "tools": {},
+        "mcp_servers": {},
         "remote_agents": {},
         "labels": {
             "jamjet.strategy": strategy_name,
