@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
             audit,
             enricher,
             protocols: jamjet_api::state::default_protocol_registry(),
+            cron_store: None,
         }
     } else {
         // Determine database URL: env > config > SQLite dev default
@@ -96,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
             audit,
             enricher,
             protocols: jamjet_api::state::default_protocol_registry(),
+            cron_store: Some(Arc::new(jamjet_timers::CronStore::new(sqlite.pool()))),
         }
     };
 

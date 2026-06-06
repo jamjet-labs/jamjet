@@ -24,6 +24,8 @@ pub struct AppState {
     pub enricher: Arc<AuditEnricher>,
     /// Protocol adapter registry — pre-loaded with MCP, A2A, and ANP adapters.
     pub protocols: ProtocolRegistry,
+    /// Cron job store — present only on the SQLite backend (local scheduling).
+    pub cron_store: Option<std::sync::Arc<jamjet_timers::CronStore>>,
 }
 
 impl AppState {
