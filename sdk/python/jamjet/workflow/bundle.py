@@ -205,7 +205,89 @@ def _compile_agent_unit(
     }
 
 
+def _detect_cycle(graph: dict[str, list[str]]) -> list[str] | None:
+    WHITE, GREY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in graph}
+    stack: list[str] = []
+
+    def visit(n: str) -> list[str] | None:
+        color[n] = GREY
+        stack.append(n)
+        for m in graph.get(n, []):
+            if color.get(m, BLACK) == GREY:
+                return stack[stack.index(m):] + [m]
+            if color.get(m, BLACK) == WHITE:
+                found = visit(m)
+                if found:
+                    return found
+        stack.pop()
+        color[n] = BLACK
+        return None
+
+    for n in graph:
+        if color[n] == WHITE:
+            found = visit(n)
+            if found:
+                return found
+    return None
+
+
 def compile_bundle(data: dict[str, Any]) -> CompiledBundle:
     """Compile a fleet document into a CompiledBundle."""
+    defaults = data.get("defaults", {})
+    tool_catalog = data.get("tools", {})
+    mcp_catalog = data.get("mcp", {}).get("servers", {})
+    agents = data.get("agents", {}) or {}
+    workflows = data.get("workflows", {}) or {}
+
+    # Unique ids across both maps.
+    unit_ids: set[str] = set()
+    for uid in list(agents) + list(workflows):
+        if uid in unit_ids:
+            raise ValueError(f"duplicate unit id '{uid}' (ids must be unique across agents: and workflows:)")
+        unit_ids.add(uid)
+
     bundle = CompiledBundle()
+    sibling_graph: dict[str, list[str]] = {uid: [] for uid in unit_ids}
+
+    # Agent units.
+    for uid, agent in agents.items():
+        resolved = _resolve_uses(
+            uid, agent.get("uses", []), agent.get("tools", []),
+            tool_catalog, mcp_catalog, unit_ids,
+        )
+        sibling_graph[uid] = resolved.sibling_refs
+        ir = _compile_agent_unit(uid, agent, defaults, tool_catalog, mcp_catalog, unit_ids)
+        bundle.workflows.append(ir)
+        if "schedule" in agent:
+            bundle.cron_jobs.append(_schedule_to_spec(uid, ir["version"], agent["schedule"]))
+
+    # Workflow units (explicit graphs) reuse the graph compiler with catalog access.
+    for uid, wf in workflows.items():
+        header = {"id": uid, "version": wf.get("version", defaults.get("version", "0.1.0"))}
+        for key in ("name", "description", "start", "state_schema", "labels"):
+            if key in wf:
+                header[key] = wf[key]
+        doc = {
+            "workflow": header,
+            "nodes": wf.get("nodes", {}),
+            "retry_policies": wf.get("retry_policies", {}),
+            "timeouts": wf.get("timeouts", {}),
+            "models": wf.get("models", {}),
+            "tools": tool_catalog,
+            "mcp": {"servers": mcp_catalog},
+            "a2a": {"remote_agents": wf.get("remote_agents", {})},
+        }
+        from jamjet.workflow.ir_compiler import _compile_graph_yaml
+        ir = _compile_graph_yaml(doc)
+        ir["workflow_id"] = uid
+        ir["version"] = str(ir["version"])
+        bundle.workflows.append(ir)
+        if "schedule" in wf:
+            bundle.cron_jobs.append(_schedule_to_spec(uid, ir["version"], wf["schedule"]))
+
+    cycle = _detect_cycle(sibling_graph)
+    if cycle:
+        raise ValueError(f"cycle in agent references: {' -> '.join(cycle)}")
+
     return bundle

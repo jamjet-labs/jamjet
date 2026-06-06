@@ -128,3 +128,49 @@ def test_compile_agent_unit_requires_goal():
         _compile_agent_unit("x", {"strategy": "react", "limits": {
             "max_iterations": 1, "max_cost_usd": 0.1, "timeout_seconds": 10}},
             {"model": "m"}, {}, {}, {"x"})
+
+
+def _fleet():
+    return {
+        "version": 1,
+        "defaults": {"model": "claude-sonnet-4-6",
+                     "limits": {"max_iterations": 3, "max_cost_usd": 0.5, "timeout_seconds": 60}},
+        "tools": {"web_search": {"description": "s", "input_schema": {}}},
+        "mcp": {"servers": {"github": {"url": "u", "transport": "streamable-http"}}},
+        "agents": {
+            "researcher": {"strategy": "plan-and-execute", "goal": "brief",
+                           "uses": ["tool:web_search", "mcp:github"],
+                           "schedule": {"cron": "0 9 * * *"}},
+            "reconciler": {"strategy": "react", "goal": "reconcile",
+                           "uses": ["agent:researcher"]},
+        },
+        "workflows": {
+            "nightly_etl": {
+                "start": "extract",
+                "nodes": {"extract": {"type": "tool", "tool_ref": "pull", "next": "end"}},
+                "schedule": {"cron": "0 2 * * *"},
+            },
+        },
+    }
+
+
+def test_compile_bundle_full():
+    bundle = compile_bundle(_fleet())
+    ids = {ir["workflow_id"] for ir in bundle.workflows}
+    assert ids == {"researcher", "reconciler", "nightly_etl"}
+    names = {c.name for c in bundle.cron_jobs}
+    assert names == {"researcher", "nightly_etl"}
+
+
+def test_compile_bundle_duplicate_id_across_maps_errors():
+    data = _fleet()
+    data["workflows"]["researcher"] = {"start": "x", "nodes": {"x": {"type": "tool", "next": "end"}}}
+    with pytest.raises(ValueError, match="duplicate unit id 'researcher'"):
+        compile_bundle(data)
+
+
+def test_compile_bundle_cycle_errors():
+    data = _fleet()
+    data["agents"]["researcher"]["uses"] = ["agent:reconciler"]  # researcher<->reconciler
+    with pytest.raises(ValueError, match="cycle"):
+        compile_bundle(data)
