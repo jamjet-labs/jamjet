@@ -11,16 +11,16 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-jamjet-core = { path = "../core", version = "=0.3.1" }
-jamjet-ir = { path = "../ir", version = "=0.3.1" }
-jamjet-models = { path = "../models", version = "=0.3.1" }
-jamjet-state = { path = "../state", version = "=0.3.1" }
-jamjet-policy = { path = "../policy", version = "=0.3.1" }
-jamjet-agents = { path = "../agents", version = "=0.3.1" }
-jamjet-mcp = { path = "../protocols/mcp", version = "=0.3.1" }
-jamjet-a2a-proto = { path = "../protocols/a2a", version = "=0.3.1" }
-jamjet-telemetry = { path = "../telemetry", version = "=0.3.1" }
-jamjet-scheduler = { path = "../scheduler", version = "=0.3.1" }
+jamjet-core = { path = "../core", version = "=0.3.2" }
+jamjet-ir = { path = "../ir", version = "=0.3.2" }
+jamjet-models = { path = "../models", version = "=0.3.2" }
+jamjet-state = { path = "../state", version = "=0.3.2" }
+jamjet-policy = { path = "../policy", version = "=0.3.2" }
+jamjet-agents = { path = "../agents", version = "=0.3.2" }
+jamjet-mcp = { path = "../protocols/mcp", version = "=0.3.2" }
+jamjet-a2a-proto = { path = "../protocols/a2a", version = "=0.3.2" }
+jamjet-telemetry = { path = "../telemetry", version = "=0.3.2" }
+jamjet-scheduler = { path = "../scheduler", version = "=0.3.2" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

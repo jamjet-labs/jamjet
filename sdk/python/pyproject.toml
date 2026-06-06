@@ -13,7 +13,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jamjet"
-version = "0.8.7"
+version = "0.9.0"
 description = "JamJet — open-source safety layer for AI agents. Block unsafe tool calls, require approval, enforce budgets, audit, replay."
 readme = "README.md"
 license = { text = "Apache-2.0" }
