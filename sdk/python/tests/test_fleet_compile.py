@@ -174,3 +174,30 @@ def test_compile_bundle_cycle_errors():
     data["agents"]["researcher"]["uses"] = ["agent:reconciler"]  # researcher<->reconciler
     with pytest.raises(ValueError, match="cycle"):
         compile_bundle(data)
+
+
+import respx
+import httpx
+from jamjet.client import JamjetClient
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_client_create_cron_job_posts_body():
+    route = respx.post("http://localhost:7700/cron").mock(
+        return_value=httpx.Response(201, json={"name": "researcher", "next_run_at": "2026-06-06T09:00:00Z"})
+    )
+    async with JamjetClient("http://localhost:7700") as c:
+        res = await c.create_cron_job(
+            name="researcher", cron_expression="0 9 * * *",
+            workflow_id="researcher", workflow_version="0.1.0", input={"x": 1},
+        )
+    assert res["name"] == "researcher"
+    sent = route.calls[0].request
+    import json as _j
+    body = _j.loads(sent.content)
+    assert body == {
+        "name": "researcher", "cron_expression": "0 9 * * *",
+        "workflow_id": "researcher", "enabled": True,
+        "workflow_version": "0.1.0", "input": {"x": 1},
+    }
