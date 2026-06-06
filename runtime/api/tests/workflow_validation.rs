@@ -36,3 +36,19 @@ fn structurally_broken_ir_is_rejected() {
         "incomplete IR must not deserialize into WorkflowIr"
     );
 }
+
+#[test]
+fn fleet_agent_ir_registers() {
+    // A fleet agent that uses a catalog tool must still produce an IR the API
+    // can store (POST /workflows deserializes into WorkflowIr). Regression for
+    // the bug where catalog tool defs were embedded into the IR `tools` map
+    // with a shape ToolConfig can't deserialize.
+    let json = include_str!("fixtures/fleet_researcher_ir.json");
+    let value: serde_json::Value = serde_json::from_str(json).expect("parse fixture json");
+    let parsed = serde_json::from_value::<jamjet_ir::WorkflowIr>(value);
+    assert!(
+        parsed.is_ok(),
+        "fleet researcher IR must deserialize into WorkflowIr, got: {:?}",
+        parsed.err()
+    );
+}

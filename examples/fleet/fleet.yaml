@@ -1,0 +1,46 @@
+# A fleet: two strategy agents and one explicit workflow, all schedulable.
+#
+#   jamjet dev                       # start the local runtime (embeds cron in dev)
+#   jamjet deploy fleet.yaml         # register all units + install schedules
+#   jamjet run fleet.yaml researcher # run one unit on demand
+#
+# Fully local: SQLite state + in-process worker + in-process cron. Point models
+# at Ollama (no API key) for a fully offline run.
+version: 1
+
+defaults:
+  model: claude-sonnet-4-6
+  limits: { max_iterations: 4, max_cost_usd: 0.50, timeout_seconds: 120 }
+
+tools:
+  web_search:
+    description: "Search the web for recent information"
+    input_schema:
+      type: object
+      properties: { query: { type: string } }
+      required: [query]
+
+agents:
+  researcher:
+    strategy: plan-and-execute
+    goal: "Summarize the most important overnight AI news into a short brief"
+    uses:
+      - tool:web_search
+    schedule:
+      cron: "0 9 * * *"      # daily 09:00 UTC
+
+  reconciler:
+    strategy: react
+    goal: "Check yesterday's report for inconsistencies and list any found"
+    uses:
+      - agent:researcher     # may call the researcher as a tool
+    schedule:
+      cron: "30 14 * * 1-5"  # weekdays 14:30 UTC
+
+workflows:
+  heartbeat:
+    start: ping
+    nodes:
+      ping: { type: model, model: claude-haiku-4-5-20251001, next: end }
+    schedule:
+      cron: "*/15 * * * *"   # every 15 minutes

@@ -185,6 +185,13 @@ pub enum NodeKind {
         /// Input expression — which state field to evaluate (default: last node output).
         input_expr: Option<String>,
     },
+
+    /// Terminal node emitted by strategy compilers when an iteration or cost
+    /// limit is reached. The runtime records the workflow as `LimitExceeded`
+    /// and stops further execution. No fields are required — it is purely a
+    /// marker that carries optional descriptive metadata in the node's
+    /// `description` / `labels`.
+    LimitExceeded,
 }
 
 impl NodeKind {

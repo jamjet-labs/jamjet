@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
             audit,
             enricher,
             protocols: jamjet_api::state::default_protocol_registry(),
+            cron_store: None,
         }
     } else {
         // Determine database URL: env > config > SQLite dev default
@@ -96,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
             audit,
             enricher,
             protocols: jamjet_api::state::default_protocol_registry(),
+            cron_store: Some(Arc::new(jamjet_timers::CronStore::new(sqlite.pool()))),
         }
     };
 
@@ -125,6 +127,39 @@ async fn main() -> anyhow::Result<()> {
         // (same pattern as the scheduler above).
         let _worker_handles = pool.spawn();
         info!("Embedded worker pool started (dev mode)");
+    }
+
+    // In dev mode (or when JAMJET_EMBED_CRON is set), run the cron scheduler in
+    // process so YAML-declared schedules fire. It POSTs to this server's own
+    // /executions endpoint. Production should run a dedicated cron process.
+    if (config.dev_mode || std::env::var("JAMJET_EMBED_CRON").is_ok())
+        && storage_backend != "memory"
+    {
+        let host = if config.bind == "0.0.0.0" {
+            "127.0.0.1".to_string()
+        } else {
+            config.bind.clone()
+        };
+        let self_url = format!("http://{}:{}", host, config.port);
+        let database_url = std::env::var("DATABASE_URL")
+            .ok()
+            .or_else(|| config.database_url.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "sqlite://{}",
+                    std::path::PathBuf::from(".jamjet")
+                        .join("runtime.db")
+                        .display()
+                )
+            });
+        match jamjet_state::SqliteBackend::open(&database_url).await {
+            Ok(b) => {
+                let cron = jamjet_timers::CronScheduler::new(b.pool(), self_url);
+                tokio::spawn(cron.run());
+                info!("Cron scheduler started (dev mode)");
+            }
+            Err(e) => tracing::warn!(error = %e, "cron scheduler: failed to open pool; skipping"),
+        }
     }
 
     let router = build_router_with_opts(state, config.dev_mode);

@@ -52,6 +52,36 @@ class JamjetClient:
         r.raise_for_status()
         return r.json()
 
+    # ── Cron schedules ────────────────────────────────────────────────────
+
+    async def create_cron_job(
+        self,
+        name: str,
+        cron_expression: str,
+        workflow_id: str,
+        workflow_version: str | None = None,
+        input: dict[str, Any] | None = None,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "name": name,
+            "cron_expression": cron_expression,
+            "workflow_id": workflow_id,
+            "enabled": enabled,
+        }
+        if workflow_version:
+            body["workflow_version"] = workflow_version
+        if input is not None:
+            body["input"] = input
+        r = await self._client.post("/cron", json=body)
+        r.raise_for_status()
+        return r.json()
+
+    async def list_cron_jobs(self) -> dict[str, Any]:
+        r = await self._client.get("/cron")
+        r.raise_for_status()
+        return r.json()
+
     # ── Executions ────────────────────────────────────────────────────────
 
     async def start_execution(
