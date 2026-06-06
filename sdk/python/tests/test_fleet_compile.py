@@ -31,3 +31,30 @@ def test_empty_bundle_returns_empty_lists():
     assert isinstance(bundle, CompiledBundle)
     assert bundle.workflows == []
     assert bundle.cron_jobs == []
+
+
+import pytest
+from jamjet.workflow.bundle import _validate_cron, _schedule_to_spec
+
+
+def test_validate_cron_accepts_five_fields():
+    _validate_cron("0 9 * * *")  # no raise
+
+
+def test_validate_cron_rejects_wrong_field_count():
+    with pytest.raises(ValueError, match="5 fields"):
+        _validate_cron("* * * *")
+
+
+def test_schedule_to_spec_defaults_and_utc():
+    spec = _schedule_to_spec("researcher", "0.1.0", {"cron": "0 9 * * *"})
+    assert spec.name == "researcher"
+    assert spec.workflow_id == "researcher"
+    assert spec.workflow_version == "0.1.0"
+    assert spec.enabled is True
+    assert spec.input == {}
+
+
+def test_schedule_to_spec_rejects_non_utc():
+    with pytest.raises(ValueError, match="UTC"):
+        _schedule_to_spec("x", "0.1.0", {"cron": "0 9 * * *", "timezone": "America/New_York"})
