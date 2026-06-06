@@ -42,7 +42,6 @@ from jamjet.durable import (
 )
 from jamjet.entry import deploy, resume, run
 from jamjet.eval.registry import scorer
-from jamjet.memory import AgentMemory, Scope  # noqa: F401
 from jamjet.protocols.adapter import ProtocolAdapter
 from jamjet.protocols.registry import ProtocolRegistry
 from jamjet.runtime import Runtime, RuntimeEvent, RuntimeResult  # noqa: F401
@@ -102,4 +101,18 @@ __all__ = [
     "tool",
     "workflow",
 ]
-__version__ = "0.9.0"
+
+
+def __getattr__(name: str):  # noqa: ANN001, ANN202
+    if name in ("AgentMemory", "Scope"):
+        from jamjet import memory
+
+        return getattr(memory, name)  # raises a clear ImportError if engram missing
+    raise AttributeError(f"module 'jamjet' has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:  # noqa: ANN201
+    return list(set(globals()) | set(__all__))
+
+
+__version__ = "0.9.1"

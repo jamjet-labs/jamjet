@@ -135,7 +135,12 @@ class LocalRuntime:
         await store.init()
 
         instance = cls()
-        from engram import Scope as EngramScope
+        try:
+            from engram import Scope as EngramScope
+        except ImportError as e:
+            raise ImportError(
+                "Agent execution with memory requires the 'memory' extra. Install with: pip install 'jamjet[memory]'"
+            ) from e
 
         engram_scope: EngramScope | None = None
         if scope is not None:

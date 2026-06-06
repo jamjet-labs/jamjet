@@ -107,7 +107,7 @@ def configure(
     # middleware-eligible rules exist; in all cases the patcher behaviour is
     # byte-identical to the pre-Phase-1 path.
     if policy_path is not None:
-        import yaml  # PyYAML is a dependency of jamjet-engram; safe to import here
+        import yaml  # PyYAML is a direct dependency of jamjet; safe to import here
 
         with open(policy_path) as _f:
             _policy_dict: dict = yaml.safe_load(_f) or {}
