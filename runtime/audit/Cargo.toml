@@ -11,10 +11,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-jamjet-core = { path = "../core", version = "=0.3.1" }
-jamjet-ir = { path = "../ir", version = "=0.3.1" }
-jamjet-policy = { path = "../policy", version = "=0.3.1" }
-jamjet-state = { path = "../state", version = "=0.3.1" }
+jamjet-core = { path = "../core", version = "=0.3.2" }
+jamjet-ir = { path = "../ir", version = "=0.3.2" }
+jamjet-policy = { path = "../policy", version = "=0.3.2" }
+jamjet-state = { path = "../state", version = "=0.3.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

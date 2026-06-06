@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.0 — 2026-06-06
+
+### Added — Multi-agent YAML fleets + scheduling
+
+- One YAML file can declare a fleet: an `agents:` map (strategy agents) and a
+  `workflows:` map (explicit node graphs) sharing a top-level `tools:`/`mcp:`
+  catalog. Agents reference tools via a typed `uses:` list with `tool:`, `mcp:`,
+  `agent:`, and `workflow:` prefixes, plus inline `tools:`.
+- `jamjet deploy <file>` registers every unit in a fleet and installs its cron
+  schedules. `jamjet run <file> [unit]` runs one unit on demand; single-unit
+  files need no selector.
+- Per-unit `schedule: { cron: "..." }` installs a cron job through the runtime's
+  new `/cron` API; the bundled `jamjet-server` runs due jobs locally via a
+  dev-embedded scheduler. UTC only in this release.
+- `jamjet.workflow.bundle.compile_bundle` validates unknown refs, duplicate unit
+  ids, cyclic sibling refs, and cron expressions. Singular `agent:` and graph
+  `workflow:`/`nodes:` files continue to compile unchanged.
+- `JamjetClient.create_cron_job` and `list_cron_jobs`.
+- Example fleet at `examples/fleet/fleet.yaml`.
+
 ## 0.8.5 — 2026-05-14
 
 ### Added — Cloud Sync v0.1 Path B (direct-push)
