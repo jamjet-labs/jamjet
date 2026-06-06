@@ -30,10 +30,11 @@ import enum
 import json
 import sys
 import time
-import yaml
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+import yaml
 
 if TYPE_CHECKING:
     from jamjet.eval.grid import ComparisonResult
@@ -517,8 +518,7 @@ def deploy(
                     enabled=job.enabled,
                 )
                 console.print(
-                    f"[green]scheduled[/green] {job.name} "
-                    f"[{job.cron_expression}] next={res.get('next_run_at', '?')}"
+                    f"[green]scheduled[/green] {job.name} [{job.cron_expression}] next={res.get('next_run_at', '?')}"
                 )
 
     asyncio.run(_deploy())
@@ -552,9 +552,7 @@ def _load_workflow_ir(path: str) -> dict[str, Any]:
 @app.command()
 def run(
     workflow: str = typer.Argument(..., help="Workflow id or path to workflow.yaml"),
-    unit: str | None = typer.Argument(
-        None, help="For a fleet file, the unit (agent/workflow) to run"
-    ),
+    unit: str | None = typer.Argument(None, help="For a fleet file, the unit (agent/workflow) to run"),
     input: str | None = typer.Option(None, "--input", "-i", help="JSON input"),
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
     follow: bool = typer.Option(True, "--follow/--no-follow", help="Follow execution progress"),
@@ -604,15 +602,11 @@ def run(
                             target = next(iter(by_id))
                         else:
                             console.print(
-                                "[red]This file declares multiple units. "
-                                f"Pick one:[/red] {', '.join(sorted(by_id))}"
+                                f"[red]This file declares multiple units. Pick one:[/red] {', '.join(sorted(by_id))}"
                             )
                             raise typer.Exit(1)
                     if target not in by_id:
-                        console.print(
-                            f"[red]Unknown unit '{target}'.[/red] "
-                            f"Available: {', '.join(sorted(by_id))}"
-                        )
+                        console.print(f"[red]Unknown unit '{target}'.[/red] Available: {', '.join(sorted(by_id))}")
                         raise typer.Exit(1)
                     for ir in bundle.workflows:
                         ir["workflow_id"] = str(ir["workflow_id"])
@@ -635,8 +629,7 @@ def run(
                     workflow_version = ir.get("version")
                     if not json_output:
                         console.print(
-                            f"[dim]Registered[/dim] [bold]{workflow_ref}[/bold] "
-                            f"[dim]v{workflow_version or '?'}[/dim]"
+                            f"[dim]Registered[/dim] [bold]{workflow_ref}[/bold] [dim]v{workflow_version or '?'}[/dim]"
                         )
 
             result = await c.start_execution(

@@ -1,3 +1,16 @@
+import httpx
+import pytest
+import respx
+
+from jamjet.client import JamjetClient
+from jamjet.workflow.bundle import (
+    CompiledBundle,
+    _resolve_uses,
+    _schedule_to_spec,
+    _validate_cron,
+    compile_bundle,
+    is_bundle,
+)
 from jamjet.workflow.ir_compiler import _compile_graph_yaml
 
 
@@ -16,9 +29,6 @@ def test_compile_graph_yaml_builds_ir_from_a_graph_doc():
     assert {"from": "extract", "to": "end", "condition": None} in ir["edges"]
 
 
-from jamjet.workflow.bundle import CompiledBundle, CronSpec, compile_bundle, is_bundle
-
-
 def test_is_bundle_detects_plural_maps():
     assert is_bundle({"agents": {}}) is True
     assert is_bundle({"workflows": {}}) is True
@@ -31,10 +41,6 @@ def test_empty_bundle_returns_empty_lists():
     assert isinstance(bundle, CompiledBundle)
     assert bundle.workflows == []
     assert bundle.cron_jobs == []
-
-
-import pytest
-from jamjet.workflow.bundle import _validate_cron, _schedule_to_spec
 
 
 def test_validate_cron_accepts_five_fields():
@@ -58,9 +64,6 @@ def test_schedule_to_spec_defaults_and_utc():
 def test_schedule_to_spec_rejects_non_utc():
     with pytest.raises(ValueError, match="UTC"):
         _schedule_to_spec("x", "0.1.0", {"cron": "0 9 * * *", "timezone": "America/New_York"})
-
-
-from jamjet.workflow.bundle import _resolve_uses
 
 
 def test_resolve_uses_splits_tools_mcp_and_siblings():
@@ -101,6 +104,7 @@ def test_compile_agent_unit_builds_ir_and_populates_mcp():
     tool_catalog = {"web_search": {"description": "s", "input_schema": {}}}
     mcp_catalog = {"github": {"url": "u", "transport": "streamable-http"}}
     from jamjet.workflow.bundle import _compile_agent_unit
+
     ir = _compile_agent_unit(
         unit_id="researcher",
         agent={
@@ -124,25 +128,35 @@ def test_compile_agent_unit_builds_ir_and_populates_mcp():
 
 def test_compile_agent_unit_requires_goal():
     from jamjet.workflow.bundle import _compile_agent_unit
+
     with pytest.raises(ValueError, match="goal"):
-        _compile_agent_unit("x", {"strategy": "react", "limits": {
-            "max_iterations": 1, "max_cost_usd": 0.1, "timeout_seconds": 10}},
-            {"model": "m"}, {}, {}, {"x"})
+        _compile_agent_unit(
+            "x",
+            {"strategy": "react", "limits": {"max_iterations": 1, "max_cost_usd": 0.1, "timeout_seconds": 10}},
+            {"model": "m"},
+            {},
+            {},
+            {"x"},
+        )
 
 
 def _fleet():
     return {
         "version": 1,
-        "defaults": {"model": "claude-sonnet-4-6",
-                     "limits": {"max_iterations": 3, "max_cost_usd": 0.5, "timeout_seconds": 60}},
+        "defaults": {
+            "model": "claude-sonnet-4-6",
+            "limits": {"max_iterations": 3, "max_cost_usd": 0.5, "timeout_seconds": 60},
+        },
         "tools": {"web_search": {"description": "s", "input_schema": {}}},
         "mcp": {"servers": {"github": {"url": "u", "transport": "streamable-http"}}},
         "agents": {
-            "researcher": {"strategy": "plan-and-execute", "goal": "brief",
-                           "uses": ["tool:web_search", "mcp:github"],
-                           "schedule": {"cron": "0 9 * * *"}},
-            "reconciler": {"strategy": "react", "goal": "reconcile",
-                           "uses": ["agent:researcher"]},
+            "researcher": {
+                "strategy": "plan-and-execute",
+                "goal": "brief",
+                "uses": ["tool:web_search", "mcp:github"],
+                "schedule": {"cron": "0 9 * * *"},
+            },
+            "reconciler": {"strategy": "react", "goal": "reconcile", "uses": ["agent:researcher"]},
         },
         "workflows": {
             "nightly_etl": {
@@ -176,11 +190,6 @@ def test_compile_bundle_cycle_errors():
         compile_bundle(data)
 
 
-import respx
-import httpx
-from jamjet.client import JamjetClient
-
-
 @respx.mock
 @pytest.mark.asyncio
 async def test_client_create_cron_job_posts_body():
@@ -189,15 +198,22 @@ async def test_client_create_cron_job_posts_body():
     )
     async with JamjetClient("http://localhost:7700") as c:
         res = await c.create_cron_job(
-            name="researcher", cron_expression="0 9 * * *",
-            workflow_id="researcher", workflow_version="0.1.0", input={"x": 1},
+            name="researcher",
+            cron_expression="0 9 * * *",
+            workflow_id="researcher",
+            workflow_version="0.1.0",
+            input={"x": 1},
         )
     assert res["name"] == "researcher"
     sent = route.calls[0].request
     import json as _j
+
     body = _j.loads(sent.content)
     assert body == {
-        "name": "researcher", "cron_expression": "0 9 * * *",
-        "workflow_id": "researcher", "enabled": True,
-        "workflow_version": "0.1.0", "input": {"x": 1},
+        "name": "researcher",
+        "cron_expression": "0 9 * * *",
+        "workflow_id": "researcher",
+        "enabled": True,
+        "workflow_version": "0.1.0",
+        "input": {"x": 1},
     }

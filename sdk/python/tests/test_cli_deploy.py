@@ -1,5 +1,7 @@
 from unittest.mock import AsyncMock, patch
+
 from typer.testing import CliRunner
+
 from jamjet.cli.main import app
 
 runner = CliRunner()
@@ -36,11 +38,14 @@ def test_deploy_registers_workflows_and_cron(tmp_path):
     assert fake.create_cron_job.await_args.kwargs["name"] == "researcher"
 
 
-MULTI = FLEET + """
+MULTI = (
+    FLEET
+    + """
   reconciler:
     strategy: react
     goal: reconcile
 """
+)
 
 
 def test_run_multi_unit_requires_selector(tmp_path):

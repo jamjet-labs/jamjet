@@ -160,10 +160,7 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
     nodes: dict[str, Any] = {}
     edges: list[dict[str, Any]] = []
 
-    end_ids = frozenset(
-        nid for nid, nd in raw_nodes.items()
-        if isinstance(nd, dict) and nd.get("type") == "end"
-    )
+    end_ids = frozenset(nid for nid, nd in raw_nodes.items() if isinstance(nd, dict) and nd.get("type") == "end")
 
     for node_id, node_data in raw_nodes.items():
         node_type = node_data.get("type", "tool")
@@ -185,11 +182,13 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(next_val, list):
             for edge in next_val:
                 if isinstance(edge, dict):
-                    edges.append({
-                        "from": node_id,
-                        "to": _term(edge.get("to", "end"), end_ids),
-                        "condition": edge.get("when"),
-                    })
+                    edges.append(
+                        {
+                            "from": node_id,
+                            "to": _term(edge.get("to", "end"), end_ids),
+                            "condition": edge.get("when"),
+                        }
+                    )
                 elif edge == "end":
                     edges.append({"from": node_id, "to": "end", "condition": None})
         elif next_val == "end" or next_val is None:

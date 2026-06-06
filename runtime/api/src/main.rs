@@ -147,7 +147,9 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| {
                 format!(
                     "sqlite://{}",
-                    std::path::PathBuf::from(".jamjet").join("runtime.db").display()
+                    std::path::PathBuf::from(".jamjet")
+                        .join("runtime.db")
+                        .display()
                 )
             });
         match jamjet_state::SqliteBackend::open(&database_url).await {

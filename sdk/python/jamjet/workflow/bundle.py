@@ -38,8 +38,7 @@ def _validate_cron(expr: str) -> None:
     """Light client-side check; the runtime's cron_next is authoritative."""
     if not isinstance(expr, str) or len(expr.split()) != 5:
         raise ValueError(
-            f"cron expression must have 5 fields "
-            f"(minute hour day-of-month month day-of-week), got: {expr!r}"
+            f"cron expression must have 5 fields (minute hour day-of-month month day-of-week), got: {expr!r}"
         )
 
 
@@ -50,10 +49,7 @@ def _schedule_to_spec(unit_id: str, version: str, schedule: dict[str, Any]) -> C
     _validate_cron(cron)
     tz = schedule.get("timezone", "UTC")
     if tz != "UTC":
-        raise ValueError(
-            f"unit '{unit_id}': only timezone 'UTC' is supported in this version "
-            f"(got {tz!r})"
-        )
+        raise ValueError(f"unit '{unit_id}': only timezone 'UTC' is supported in this version (got {tz!r})")
     return CronSpec(
         name=unit_id,
         cron_expression=cron,
@@ -100,10 +96,7 @@ def _resolve_uses(
 
     for ref in uses or []:
         if not isinstance(ref, str) or ":" not in ref:
-            raise ValueError(
-                f"unit '{unit_id}': unknown ref {ref!r} "
-                f"(expected tool:/mcp:/agent:/workflow: prefix)"
-            )
+            raise ValueError(f"unit '{unit_id}': unknown ref {ref!r} (expected tool:/mcp:/agent:/workflow: prefix)")
         kind, _, name = ref.partition(":")
         if kind == "tool":
             if name not in tool_catalog:
@@ -120,10 +113,7 @@ def _resolve_uses(
             r.tool_names.append(name)
             r.sibling_refs.append(name)
         else:
-            raise ValueError(
-                f"unit '{unit_id}': unknown ref {ref!r} "
-                f"(expected tool:/mcp:/agent:/workflow: prefix)"
-            )
+            raise ValueError(f"unit '{unit_id}': unknown ref {ref!r} (expected tool:/mcp:/agent:/workflow: prefix)")
 
     return r
 
@@ -156,8 +146,12 @@ def _compile_agent_unit(
     )
 
     resolved = _resolve_uses(
-        unit_id, agent.get("uses", []), agent.get("tools", []),
-        tool_catalog, mcp_catalog, unit_ids,
+        unit_id,
+        agent.get("uses", []),
+        agent.get("tools", []),
+        tool_catalog,
+        mcp_catalog,
+        unit_ids,
     )
 
     compiled = compile_strategy(
@@ -206,26 +200,26 @@ def _compile_agent_unit(
 
 
 def _detect_cycle(graph: dict[str, list[str]]) -> list[str] | None:
-    WHITE, GREY, BLACK = 0, 1, 2
-    color = {n: WHITE for n in graph}
+    white, grey, black = 0, 1, 2
+    color = {n: white for n in graph}
     stack: list[str] = []
 
     def visit(n: str) -> list[str] | None:
-        color[n] = GREY
+        color[n] = grey
         stack.append(n)
         for m in graph.get(n, []):
-            if color.get(m, BLACK) == GREY:
-                return stack[stack.index(m):] + [m]
-            if color.get(m, BLACK) == WHITE:
+            if color.get(m, black) == grey:
+                return stack[stack.index(m) :] + [m]
+            if color.get(m, black) == white:
                 found = visit(m)
                 if found:
                     return found
         stack.pop()
-        color[n] = BLACK
+        color[n] = black
         return None
 
     for n in graph:
-        if color[n] == WHITE:
+        if color[n] == white:
             found = visit(n)
             if found:
                 return found
@@ -253,8 +247,12 @@ def compile_bundle(data: dict[str, Any]) -> CompiledBundle:
     # Agent units.
     for uid, agent in agents.items():
         resolved = _resolve_uses(
-            uid, agent.get("uses", []), agent.get("tools", []),
-            tool_catalog, mcp_catalog, unit_ids,
+            uid,
+            agent.get("uses", []),
+            agent.get("tools", []),
+            tool_catalog,
+            mcp_catalog,
+            unit_ids,
         )
         sibling_graph[uid] = resolved.sibling_refs
         ir = _compile_agent_unit(uid, agent, defaults, tool_catalog, mcp_catalog, unit_ids)
@@ -279,6 +277,7 @@ def compile_bundle(data: dict[str, Any]) -> CompiledBundle:
             "a2a": {"remote_agents": wf.get("remote_agents", {})},
         }
         from jamjet.workflow.ir_compiler import _compile_graph_yaml
+
         ir = _compile_graph_yaml(doc)
         ir["workflow_id"] = uid
         ir["version"] = str(ir["version"])
