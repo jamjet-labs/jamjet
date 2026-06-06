@@ -1,11 +1,12 @@
 use crate::auth::{require_auth, require_write_role, AuthState};
+use crate::cron::{create_cron, delete_cron, list_cron};
 use crate::error::ApiError;
 use crate::state::AppState;
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
     middleware,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::Utc;
@@ -32,6 +33,9 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
     let api_routes = Router::new()
         // Workflow definitions
         .route("/workflows", post(create_workflow))
+        // Cron schedules (local scheduling)
+        .route("/cron", post(create_cron).get(list_cron))
+        .route("/cron/:name", delete(delete_cron))
         // Executions
         .route("/executions", post(start_execution).get(list_executions))
         .route("/executions/:id", get(get_execution))
