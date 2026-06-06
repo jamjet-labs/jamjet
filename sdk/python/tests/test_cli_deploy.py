@@ -69,3 +69,32 @@ def test_run_multi_unit_with_selector_starts_one(tmp_path):
     assert result.exit_code == 0, result.output
     assert fake.create_workflow.await_count == 2  # both units registered
     assert fake.start_execution.await_args.kwargs["workflow_id"] == "reconciler"
+
+
+def test_run_single_unit_no_selector_auto_runs(tmp_path):
+    f = tmp_path / "solo.yaml"
+    f.write_text(FLEET)  # FLEET has exactly one unit: researcher
+    fake = AsyncMock()
+    fake.create_workflow = AsyncMock(return_value={})
+    fake.start_execution = AsyncMock(return_value={"execution_id": "exec_solo"})
+    fake.get_execution = AsyncMock(return_value={"status": "completed", "current_state": {}})
+    fake.__aenter__ = AsyncMock(return_value=fake)
+    fake.__aexit__ = AsyncMock(return_value=None)
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["run", str(f), "--no-follow"])
+    assert result.exit_code == 0, result.output
+    assert fake.start_execution.await_args.kwargs["workflow_id"] == "researcher"
+
+
+def test_run_unknown_unit_errors(tmp_path):
+    f = tmp_path / "fleet.yaml"
+    f.write_text(MULTI)
+    fake = AsyncMock()
+    fake.create_workflow = AsyncMock(return_value={})
+    fake.__aenter__ = AsyncMock(return_value=fake)
+    fake.__aexit__ = AsyncMock(return_value=None)
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["run", str(f), "ghost"])
+    assert result.exit_code != 0
+    assert "ghost" in result.output
+    assert "researcher" in result.output and "reconciler" in result.output
