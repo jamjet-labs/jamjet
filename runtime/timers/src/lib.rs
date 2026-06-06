@@ -292,6 +292,25 @@ impl CronStore {
             .map_err(|e| format!("disable cron: {e}"))?;
         Ok(())
     }
+
+    /// List all cron jobs regardless of enabled/due state.
+    pub async fn list_all(&self) -> Result<Vec<CronJob>, String> {
+        let rows = sqlx::query("SELECT * FROM cron_jobs ORDER BY name ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("list all cron jobs: {e}"))?;
+        rows.iter().map(row_to_cron).collect()
+    }
+
+    /// Permanently remove a cron job by name.
+    pub async fn delete(&self, name: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM cron_jobs WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("delete cron: {e}"))?;
+        Ok(())
+    }
 }
 
 fn row_to_cron(row: &sqlx::sqlite::SqliteRow) -> Result<CronJob, String> {
@@ -532,5 +551,49 @@ mod tests {
     #[test]
     fn test_cron_bad_field_count() {
         assert!(cron_next("* * * *", Utc::now()).is_err());
+    }
+
+    async fn temp_store() -> (CronStore, std::path::PathBuf) {
+        let db = std::env::temp_dir().join(format!("jjcron-{}.db", Uuid::new_v4()));
+        let url = format!("sqlite://{}", db.display());
+        let backend = jamjet_state::SqliteBackend::open(&url)
+            .await
+            .expect("open sqlite");
+        (CronStore::new(backend.pool()), db)
+    }
+
+    fn sample_job(name: &str) -> CronJob {
+        CronJob {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            cron_expression: "* * * * *".into(),
+            workflow_id: "wf".into(),
+            workflow_version: "0.1.0".into(),
+            input: serde_json::json!({}),
+            enabled: true,
+            last_run_at: None,
+            next_run_at: Utc::now() - chrono::Duration::minutes(1),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_list_all_and_delete() {
+        let (store, db) = temp_store().await;
+        store.upsert(&sample_job("a")).await.unwrap();
+        store.upsert(&sample_job("b")).await.unwrap();
+
+        let all = store.list_all().await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        let due = store.list_due().await.unwrap();
+        assert_eq!(due.len(), 2); // both are past-due
+
+        store.delete("a").await.unwrap();
+        let all = store.list_all().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "b");
+
+        let _ = std::fs::remove_file(&db);
     }
 }
