@@ -19,7 +19,7 @@ WORKDIR /build/runtime
 RUN cargo build --release --bin jamjet-server
 
 # ── Stage 3: Final image ────────────────────────────────────────────
-FROM python:3.11-slim-bookworm
+FROM python:3.12-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
