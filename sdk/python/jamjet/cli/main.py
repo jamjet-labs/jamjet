@@ -30,7 +30,9 @@ import enum
 import json
 import sys
 import time
+import yaml
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -482,6 +484,44 @@ def validate(
     except Exception as e:
         console.print(f"[red]Validation error:[/red] {e}")
         raise typer.Exit(1)
+
+
+# ── deploy ────────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def deploy(
+    file: str = typer.Argument(..., help="Path to a fleet YAML (agents:/workflows:)"),
+    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+) -> None:
+    """Register every unit in a fleet file and install its cron schedules."""
+    from jamjet.workflow.bundle import compile_bundle
+
+    data = yaml.safe_load(Path(file).read_text())
+    bundle = compile_bundle(data)
+
+    async def _deploy() -> None:
+        async with _client(runtime) as c:
+            for ir in bundle.workflows:
+                ir["workflow_id"] = str(ir["workflow_id"])
+                ir["version"] = str(ir["version"])
+                await c.create_workflow(ir)
+                console.print(f"[green]registered[/green] {ir['workflow_id']} v{ir['version']}")
+            for job in bundle.cron_jobs:
+                res = await c.create_cron_job(
+                    name=job.name,
+                    cron_expression=job.cron_expression,
+                    workflow_id=job.workflow_id,
+                    workflow_version=job.workflow_version,
+                    input=job.input,
+                    enabled=job.enabled,
+                )
+                console.print(
+                    f"[green]scheduled[/green] {job.name} "
+                    f"[{job.cron_expression}] next={res.get('next_run_at', '?')}"
+                )
+
+    asyncio.run(_deploy())
 
 
 # ── run ───────────────────────────────────────────────────────────────────────
