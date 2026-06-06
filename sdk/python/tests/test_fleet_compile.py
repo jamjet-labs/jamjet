@@ -95,3 +95,36 @@ def test_resolve_uses_unknown_sibling_errors():
 def test_resolve_uses_bad_prefix_errors():
     with pytest.raises(ValueError, match="unknown ref"):
         _resolve_uses("a", ["banana:x"], [], {}, {}, {"a"})
+
+
+def test_compile_agent_unit_builds_ir_and_populates_mcp():
+    tool_catalog = {"web_search": {"description": "s", "input_schema": {}}}
+    mcp_catalog = {"github": {"url": "u", "transport": "streamable-http"}}
+    from jamjet.workflow.bundle import _compile_agent_unit
+    ir = _compile_agent_unit(
+        unit_id="researcher",
+        agent={
+            "strategy": "plan-and-execute",
+            "goal": "summarize",
+            "uses": ["tool:web_search", "mcp:github"],
+            "limits": {"max_iterations": 3, "max_cost_usd": 0.5, "timeout_seconds": 60},
+        },
+        defaults={"model": "claude-sonnet-4-6"},
+        tool_catalog=tool_catalog,
+        mcp_catalog=mcp_catalog,
+        unit_ids={"researcher"},
+    )
+    assert ir["workflow_id"] == "researcher"
+    assert ir["version"] == "0.1.0"
+    assert ir["mcp_servers"] == {"github": mcp_catalog["github"]}
+    assert "web_search" in ir["tools"]
+    assert ir["labels"]["jamjet.agent.id"] == "researcher"
+    assert ir["nodes"]  # strategy produced nodes
+
+
+def test_compile_agent_unit_requires_goal():
+    from jamjet.workflow.bundle import _compile_agent_unit
+    with pytest.raises(ValueError, match="goal"):
+        _compile_agent_unit("x", {"strategy": "react", "limits": {
+            "max_iterations": 1, "max_cost_usd": 0.1, "timeout_seconds": 10}},
+            {"model": "m"}, {}, {}, {"x"})

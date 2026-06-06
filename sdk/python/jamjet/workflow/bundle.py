@@ -128,6 +128,83 @@ def _resolve_uses(
     return r
 
 
+def _compile_agent_unit(
+    unit_id: str,
+    agent: dict[str, Any],
+    defaults: dict[str, Any],
+    tool_catalog: dict[str, Any],
+    mcp_catalog: dict[str, Any],
+    unit_ids: set[str],
+) -> dict[str, Any]:
+    from jamjet.compiler.strategies import StrategyLimits, compile_strategy
+
+    strategy_name = agent.get("strategy")
+    goal = agent.get("goal")
+    model = agent.get("model") or defaults.get("model")
+    missing = [n for n, v in (("strategy", strategy_name), ("goal", goal), ("model", model)) if not v]
+    if missing:
+        raise ValueError(f"agent unit '{unit_id}' is missing required fields: {', '.join(missing)}")
+
+    limits_raw = {**defaults.get("limits", {}), **agent.get("limits", {})}
+    for lf in ("max_iterations", "max_cost_usd", "timeout_seconds"):
+        if lf not in limits_raw:
+            raise ValueError(f"agent unit '{unit_id}' limits is missing '{lf}'")
+    limits = StrategyLimits(
+        max_iterations=int(limits_raw["max_iterations"]),
+        max_cost_usd=float(limits_raw["max_cost_usd"]),
+        timeout_seconds=int(limits_raw["timeout_seconds"]),
+    )
+
+    resolved = _resolve_uses(
+        unit_id, agent.get("uses", []), agent.get("tools", []),
+        tool_catalog, mcp_catalog, unit_ids,
+    )
+
+    compiled = compile_strategy(
+        strategy_name=strategy_name,
+        strategy_config=agent.get("strategy_config", {}),
+        tools=resolved.tool_names,
+        model=model,
+        limits=limits,
+        goal=goal,
+        agent_id=unit_id,
+    )
+
+    nodes: dict[str, Any] = {}
+    for node_id, node_def in compiled["nodes"].items():
+        nodes[node_id] = {
+            "id": node_id,
+            "kind": node_def["kind"],
+            "retry_policy": node_def.get("retry_policy"),
+            "node_timeout_secs": node_def.get("node_timeout_secs"),
+            "description": node_def.get("description"),
+            "labels": node_def.get("labels", {}),
+        }
+
+    version = str(agent.get("version") or defaults.get("version") or "0.1.0")
+    return {
+        "workflow_id": unit_id,
+        "version": version,
+        "name": agent.get("name", unit_id),
+        "description": goal,
+        "state_schema": agent.get("state_schema", ""),
+        "start_node": compiled["start_node"],
+        "nodes": nodes,
+        "edges": compiled["edges"],
+        "retry_policies": {},
+        "timeouts": {"workflow_timeout": limits.timeout_seconds, "heartbeat_interval": 30},
+        "models": {},
+        "tools": resolved.ir_tools,
+        "mcp_servers": resolved.mcp_servers,
+        "remote_agents": {},
+        "labels": {
+            "jamjet.strategy": strategy_name,
+            "jamjet.agent.id": unit_id,
+        },
+        "strategy_metadata": compiled["strategy_metadata"],
+    }
+
+
 def compile_bundle(data: dict[str, Any]) -> CompiledBundle:
     """Compile a fleet document into a CompiledBundle."""
     bundle = CompiledBundle()
