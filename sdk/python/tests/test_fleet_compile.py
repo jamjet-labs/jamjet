@@ -14,3 +14,20 @@ def test_compile_graph_yaml_builds_ir_from_a_graph_doc():
     assert ir["start_node"] == "extract"
     assert "extract" in ir["nodes"]
     assert {"from": "extract", "to": "end", "condition": None} in ir["edges"]
+
+
+from jamjet.workflow.bundle import CompiledBundle, CronSpec, compile_bundle, is_bundle
+
+
+def test_is_bundle_detects_plural_maps():
+    assert is_bundle({"agents": {}}) is True
+    assert is_bundle({"workflows": {}}) is True
+    assert is_bundle({"agent": {"id": "x"}}) is False
+    assert is_bundle({"workflow": {"id": "x"}, "nodes": {}}) is False
+
+
+def test_empty_bundle_returns_empty_lists():
+    bundle = compile_bundle({"agents": {}})
+    assert isinstance(bundle, CompiledBundle)
+    assert bundle.workflows == []
+    assert bundle.cron_jobs == []
