@@ -36,6 +36,11 @@ pub async fn create_cron(
     Json(body): Json<CreateCronRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let store = store(&state)?;
+    // Defaults to the SDK compiler's default workflow version ("0.1.0"), which is
+    // what `jamjet deploy` registers. This intentionally differs from
+    // start_execution's "1.0.0" fallback; reconciling one canonical default across
+    // the API is tracked as separate runtime work. The deploy flow always sends the
+    // version explicitly, so this default only applies to raw POST /cron callers.
     let version = body.workflow_version.unwrap_or_else(|| "0.1.0".into());
 
     // The target workflow must be registered (deploy registers first).
@@ -75,6 +80,13 @@ pub async fn create_cron(
 }
 
 /// `GET /cron` — list all cron jobs.
+///
+/// NOTE: cron jobs are GLOBAL, not tenant-scoped, in this version. The embedded
+/// cron scheduler is dev-only (a single `default` tenant) and the `cron_jobs`
+/// table has no tenant column, so listing returns all jobs. Tenant-scoped cron
+/// (a `tenant_id` column, filtered listing, and tenant context threaded through
+/// the scheduler to `/executions`) is part of the deferred runtime
+/// tenant-threading work.
 pub async fn list_cron(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let store = store(&state)?;
     let jobs = store.list_all().await.map_err(ApiError::Internal)?;

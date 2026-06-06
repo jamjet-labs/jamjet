@@ -15,6 +15,8 @@ from typing import Any
 
 @dataclass
 class CronSpec:
+    """Cron registration payload for a single scheduled workflow unit."""
+
     name: str
     cron_expression: str
     workflow_id: str
@@ -25,6 +27,8 @@ class CronSpec:
 
 @dataclass
 class CompiledBundle:
+    """Output of compile_bundle: compiled workflow IRs and their associated cron jobs."""
+
     workflows: list[dict[str, Any]] = field(default_factory=list)
     cron_jobs: list[CronSpec] = field(default_factory=list)
 
@@ -43,6 +47,7 @@ def _validate_cron(expr: str) -> None:
 
 
 def _schedule_to_spec(unit_id: str, version: str, schedule: dict[str, Any]) -> CronSpec:
+    """Convert a unit's ``schedule:`` block to a CronSpec, validating the expression and timezone."""
     cron = schedule.get("cron")
     if not cron:
         raise ValueError(f"unit '{unit_id}' has a schedule with no 'cron' field")
@@ -62,6 +67,8 @@ def _schedule_to_spec(unit_id: str, version: str, schedule: dict[str, Any]) -> C
 
 @dataclass
 class _ResolvedUses:
+    """Resolved tool and MCP references for a single agent unit."""
+
     tool_names: list[str] = field(default_factory=list)
     ir_tools: dict[str, Any] = field(default_factory=dict)
     mcp_servers: dict[str, Any] = field(default_factory=dict)
@@ -86,6 +93,7 @@ def _resolve_uses(
     mcp_catalog: dict[str, Any],
     unit_ids: set[str],
 ) -> _ResolvedUses:
+    """Resolve a unit's ``uses:`` refs and inline ``tools:`` against the top-level catalogs."""
     r = _ResolvedUses()
 
     for t in inline_tools or []:
@@ -126,6 +134,7 @@ def _compile_agent_unit(
     mcp_catalog: dict[str, Any],
     unit_ids: set[str],
 ) -> dict[str, Any]:
+    """Compile a single strategy-based agent unit into a workflow IR dict."""
     from jamjet.compiler.strategies import StrategyLimits, compile_strategy
 
     strategy_name = agent.get("strategy")
@@ -206,11 +215,13 @@ def _compile_agent_unit(
 
 
 def _detect_cycle(graph: dict[str, list[str]]) -> list[str] | None:
+    """Return the first cycle found in the sibling-reference graph, or None if acyclic."""
     white, grey, black = 0, 1, 2
     color = {n: white for n in graph}
     stack: list[str] = []
 
     def visit(n: str) -> list[str] | None:
+        """DFS visitor; returns the cycle path if one is found starting from node n."""
         color[n] = grey
         stack.append(n)
         for m in graph.get(n, []):
