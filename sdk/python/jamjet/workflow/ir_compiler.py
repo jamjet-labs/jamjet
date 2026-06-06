@@ -149,18 +149,21 @@ def compile_yaml(yaml_content: str) -> dict[str, Any]:
         return _compile_agent_yaml(data)
 
     # ── Graph/workflow mode ───────────────────────────────────────────────────
+    return _compile_graph_yaml(data)
+
+
+def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
+    """Compile a graph-mode document (``workflow:`` header + ``nodes:``) to IR."""
     wf = data.get("workflow", {})
     raw_nodes = data.get("nodes", {})
 
     nodes: dict[str, Any] = {}
     edges: list[dict[str, Any]] = []
 
-    # `end`-type nodes are not runtime node kinds; the runtime terminates an
-    # execution when a node's edge points at the literal target "end". Collect
-    # the end nodes so we can drop them and rewrite any edge or branch that
-    # targets one to the "end" sentinel (this also collapses named end nodes
-    # such as success/failure to the terminal target).
-    end_ids = frozenset(nid for nid, nd in raw_nodes.items() if isinstance(nd, dict) and nd.get("type") == "end")
+    end_ids = frozenset(
+        nid for nid, nd in raw_nodes.items()
+        if isinstance(nd, dict) and nd.get("type") == "end"
+    )
 
     for node_id, node_data in raw_nodes.items():
         node_type = node_data.get("type", "tool")
@@ -176,20 +179,17 @@ def compile_yaml(yaml_content: str) -> dict[str, Any]:
             "labels": node_data.get("labels", {}),
         }
 
-        # Extract edges from "next" field
         next_val = node_data.get("next")
         if isinstance(next_val, str):
             edges.append({"from": node_id, "to": _term(next_val, end_ids), "condition": None})
         elif isinstance(next_val, list):
             for edge in next_val:
                 if isinstance(edge, dict):
-                    edges.append(
-                        {
-                            "from": node_id,
-                            "to": _term(edge.get("to", "end"), end_ids),
-                            "condition": edge.get("when"),
-                        }
-                    )
+                    edges.append({
+                        "from": node_id,
+                        "to": _term(edge.get("to", "end"), end_ids),
+                        "condition": edge.get("when"),
+                    })
                 elif edge == "end":
                     edges.append({"from": node_id, "to": "end", "condition": None})
         elif next_val == "end" or next_val is None:
