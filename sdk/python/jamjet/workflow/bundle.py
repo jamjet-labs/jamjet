@@ -64,6 +64,70 @@ def _schedule_to_spec(unit_id: str, version: str, schedule: dict[str, Any]) -> C
     )
 
 
+@dataclass
+class _ResolvedUses:
+    tool_names: list[str] = field(default_factory=list)
+    ir_tools: dict[str, Any] = field(default_factory=dict)
+    mcp_servers: dict[str, Any] = field(default_factory=dict)
+    sibling_refs: list[str] = field(default_factory=list)
+
+
+def _tool_name(t: Any) -> str:
+    """Inline tools may be a {name,...} dict or a bare string name."""
+    if isinstance(t, dict):
+        name = t.get("name")
+        if not name:
+            raise ValueError(f"inline tool is missing a 'name': {t!r}")
+        return str(name)
+    return str(t)
+
+
+def _resolve_uses(
+    unit_id: str,
+    uses: list[str],
+    inline_tools: list[Any],
+    tool_catalog: dict[str, Any],
+    mcp_catalog: dict[str, Any],
+    unit_ids: set[str],
+) -> _ResolvedUses:
+    r = _ResolvedUses()
+
+    for t in inline_tools or []:
+        name = _tool_name(t)
+        r.tool_names.append(name)
+        if isinstance(t, dict):
+            r.ir_tools[name] = {k: v for k, v in t.items() if k != "name"}
+
+    for ref in uses or []:
+        if not isinstance(ref, str) or ":" not in ref:
+            raise ValueError(
+                f"unit '{unit_id}': unknown ref {ref!r} "
+                f"(expected tool:/mcp:/agent:/workflow: prefix)"
+            )
+        kind, _, name = ref.partition(":")
+        if kind == "tool":
+            if name not in tool_catalog:
+                raise ValueError(f"unit '{unit_id}': unknown tool '{name}' (not in top-level tools:)")
+            r.tool_names.append(name)
+            r.ir_tools[name] = tool_catalog[name]
+        elif kind == "mcp":
+            if name not in mcp_catalog:
+                raise ValueError(f"unit '{unit_id}': unknown mcp server '{name}' (not in top-level mcp.servers:)")
+            r.mcp_servers[name] = mcp_catalog[name]
+        elif kind in ("agent", "workflow"):
+            if name not in unit_ids:
+                raise ValueError(f"unit '{unit_id}': unknown unit '{name}' referenced via {ref!r}")
+            r.tool_names.append(name)
+            r.sibling_refs.append(name)
+        else:
+            raise ValueError(
+                f"unit '{unit_id}': unknown ref {ref!r} "
+                f"(expected tool:/mcp:/agent:/workflow: prefix)"
+            )
+
+    return r
+
+
 def compile_bundle(data: dict[str, Any]) -> CompiledBundle:
     """Compile a fleet document into a CompiledBundle."""
     bundle = CompiledBundle()

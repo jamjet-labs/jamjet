@@ -58,3 +58,40 @@ def test_schedule_to_spec_defaults_and_utc():
 def test_schedule_to_spec_rejects_non_utc():
     with pytest.raises(ValueError, match="UTC"):
         _schedule_to_spec("x", "0.1.0", {"cron": "0 9 * * *", "timezone": "America/New_York"})
+
+
+from jamjet.workflow.bundle import _resolve_uses
+
+
+def test_resolve_uses_splits_tools_mcp_and_siblings():
+    tool_catalog = {"web_search": {"description": "search", "input_schema": {}}}
+    mcp_catalog = {"github": {"url": "x", "transport": "streamable-http"}}
+    unit_ids = {"researcher", "reconciler"}
+    resolved = _resolve_uses(
+        unit_id="reconciler",
+        uses=["tool:web_search", "mcp:github", "agent:researcher"],
+        inline_tools=[{"name": "post", "description": "post", "input_schema": {}}],
+        tool_catalog=tool_catalog,
+        mcp_catalog=mcp_catalog,
+        unit_ids=unit_ids,
+    )
+    assert set(resolved.tool_names) == {"web_search", "post", "researcher"}
+    assert "github" in resolved.mcp_servers
+    assert "web_search" in resolved.ir_tools
+    assert "post" in resolved.ir_tools
+    assert resolved.sibling_refs == ["researcher"]
+
+
+def test_resolve_uses_unknown_tool_errors():
+    with pytest.raises(ValueError, match="unknown tool 'nope'"):
+        _resolve_uses("a", ["tool:nope"], [], {}, {}, {"a"})
+
+
+def test_resolve_uses_unknown_sibling_errors():
+    with pytest.raises(ValueError, match="unknown unit 'ghost'"):
+        _resolve_uses("a", ["agent:ghost"], [], {}, {}, {"a"})
+
+
+def test_resolve_uses_bad_prefix_errors():
+    with pytest.raises(ValueError, match="unknown ref"):
+        _resolve_uses("a", ["banana:x"], [], {}, {}, {"a"})
