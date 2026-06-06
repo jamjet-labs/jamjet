@@ -34,3 +34,38 @@ def test_deploy_registers_workflows_and_cron(tmp_path):
     fake.create_workflow.assert_awaited_once()
     fake.create_cron_job.assert_awaited_once()
     assert fake.create_cron_job.await_args.kwargs["name"] == "researcher"
+
+
+MULTI = FLEET + """
+  reconciler:
+    strategy: react
+    goal: reconcile
+"""
+
+
+def test_run_multi_unit_requires_selector(tmp_path):
+    f = tmp_path / "fleet.yaml"
+    f.write_text(MULTI)
+    fake = AsyncMock()
+    fake.__aenter__ = AsyncMock(return_value=fake)
+    fake.__aexit__ = AsyncMock(return_value=None)
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["run", str(f)])
+    assert result.exit_code != 0
+    assert "researcher" in result.output and "reconciler" in result.output
+
+
+def test_run_multi_unit_with_selector_starts_one(tmp_path):
+    f = tmp_path / "fleet.yaml"
+    f.write_text(MULTI)
+    fake = AsyncMock()
+    fake.create_workflow = AsyncMock(return_value={})
+    fake.start_execution = AsyncMock(return_value={"execution_id": "exec_abc"})
+    fake.get_execution = AsyncMock(return_value={"status": "completed", "current_state": {}})
+    fake.__aenter__ = AsyncMock(return_value=fake)
+    fake.__aexit__ = AsyncMock(return_value=None)
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["run", str(f), "reconciler", "--no-follow"])
+    assert result.exit_code == 0, result.output
+    assert fake.create_workflow.await_count == 2  # both units registered
+    assert fake.start_execution.await_args.kwargs["workflow_id"] == "reconciler"
