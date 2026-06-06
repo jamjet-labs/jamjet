@@ -1,17 +1,21 @@
-# A fleet: two strategy agents and one explicit workflow, all schedulable.
+# An ops/monitoring fleet: one YAML file, three scheduled units.
 #
-#   jamjet dev                       # start the local runtime (embeds cron in dev)
-#   jamjet deploy fleet.yaml         # register all units + install schedules
-#   jamjet run fleet.yaml researcher # run one unit on demand
+# Two strategy agents and one explicit workflow, each on its own cron schedule,
+# sharing a tools catalog. Runs on the local runtime (SQLite + in-process worker
+# + dev-embedded cron). Point models at Ollama for a fully offline run.
 #
-# Fully local: SQLite state + in-process worker + in-process cron. Point models
-# at Ollama (no API key) for a fully offline run.
+#   jamjet dev                                  # start the runtime (cron embedded in dev)
+#   jamjet deploy fleet.yaml                    # register all units + install schedules
+#   jamjet run fleet.yaml morning_briefing      # run one unit on demand
+#
+# See README.md for the full walkthrough and what runs today vs what is deferred.
 version: 1
 
 defaults:
   model: claude-sonnet-4-6
   limits: { max_iterations: 4, max_cost_usd: 0.50, timeout_seconds: 120 }
 
+# Shared tool catalog — referenced by agents via `uses: [tool:<name>]`.
 tools:
   web_search:
     description: "Search the web for recent information"
@@ -19,28 +23,42 @@ tools:
       type: object
       properties: { query: { type: string } }
       required: [query]
+  ledger_query:
+    description: "Query yesterday's ledger entries"
+    input_schema:
+      type: object
+      properties: { date: { type: string } }
+      required: [date]
 
 agents:
-  researcher:
+  # Daily 08:00 UTC: a short operational brief.
+  morning_briefing:
     strategy: plan-and-execute
-    goal: "Summarize the most important overnight AI news into a short brief"
+    goal: "Summarize the most important overnight events into a short brief."
     uses:
       - tool:web_search
     schedule:
-      cron: "0 9 * * *"      # daily 09:00 UTC
+      cron: "0 8 * * *"        # daily 08:00 UTC
 
+  # Weekdays 14:30 UTC: reconcile, and may call the briefing agent for context.
   reconciler:
     strategy: react
-    goal: "Check yesterday's report for inconsistencies and list any found"
+    goal: "Reconcile yesterday's ledger and list any inconsistencies found."
     uses:
-      - agent:researcher     # may call the researcher as a tool
+      - tool:ledger_query
+      - agent:morning_briefing   # sibling reference (validated at compile time)
     schedule:
-      cron: "30 14 * * 1-5"  # weekdays 14:30 UTC
+      cron: "30 14 * * 1-5"      # weekdays 14:30 UTC
 
 workflows:
-  heartbeat:
+  # Every 15 minutes: a tiny liveness check (explicit single-node graph).
+  healthcheck:
     start: ping
     nodes:
-      ping: { type: model, model: claude-haiku-4-5-20251001, next: end }
+      ping:
+        type: model
+        model: claude-haiku-4-5-20251001
+        prompt: "Reply with the single word: ok"
+        next: end
     schedule:
-      cron: "*/15 * * * *"   # every 15 minutes
+      cron: "*/15 * * * *"       # every 15 minutes
