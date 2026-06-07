@@ -14,8 +14,8 @@
 /// the OTLP metrics pipeline (when `otel_endpoint` is set). Metrics are
 /// no-ops if the global meter provider is not initialised.
 pub mod metrics {
-    use opentelemetry::{global, KeyValue};
     use crate::gen_ai_attrs;
+    use opentelemetry::{global, KeyValue};
 
     /// Build the attribute set for a GenAI token-usage data point.
     /// Pure + deterministic so it can be unit-tested without a meter provider.
