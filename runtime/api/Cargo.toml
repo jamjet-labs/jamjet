@@ -27,6 +27,7 @@ jamjet-a2a-proto = { path = "../protocols/a2a", version = "=0.3.2" }
 jamjet-worker = { path = "../workers", version = "=0.3.2" }
 jamjet-models = { path = "../models", version = "=0.3.2" }
 jamjet-timers = { path = "../timers", version = "=0.3.2" }
+jamjet-telemetry = { path = "../telemetry", version = "=0.3.2" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
