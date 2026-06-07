@@ -10,7 +10,7 @@ use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
 use jamjet_state::backend::{StateBackend, WorkItem};
 use jamjet_state::budget::BudgetState;
 use jamjet_state::event::EventKind;
-use jamjet_telemetry::{gen_ai_attrs, record_gen_ai_usage};
+use jamjet_telemetry::{gen_ai_attrs, metrics, record_gen_ai_usage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -119,6 +119,8 @@ impl Worker {
             "jamjet.node.kind" = tracing::field::Empty,
             "gen_ai.system" = tracing::field::Empty,
             "gen_ai.request.model" = tracing::field::Empty,
+            "gen_ai.response.model" = tracing::field::Empty,
+            "gen_ai.operation.name" = tracing::field::Empty,
             "gen_ai.usage.input_tokens" = tracing::field::Empty,
             "gen_ai.usage.output_tokens" = tracing::field::Empty,
             "gen_ai.response.finish_reasons" = tracing::field::Empty,
@@ -266,6 +268,11 @@ impl Worker {
                     exec_result.output_tokens,
                 ) {
                     record_gen_ai_usage(&node_span, system, model, input, output);
+                    node_span.record(gen_ai_attrs::OPERATION_NAME, "chat");
+                    // The executor surfaces the requested model; record it as the
+                    // response model too until a distinct response model is exposed.
+                    node_span.record(gen_ai_attrs::RESPONSE_MODEL, model.as_str());
+                    metrics::gen_ai_token_usage(system, model, "chat", input, output);
                 }
                 if let Some(finish_reason) = &exec_result.finish_reason {
                     node_span.record(
