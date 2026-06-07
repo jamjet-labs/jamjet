@@ -14,7 +14,51 @@
 /// the OTLP metrics pipeline (when `otel_endpoint` is set). Metrics are
 /// no-ops if the global meter provider is not initialised.
 pub mod metrics {
+    use crate::gen_ai_attrs;
     use opentelemetry::{global, KeyValue};
+
+    /// Build the attribute set for a GenAI token-usage data point.
+    /// Pure + deterministic so it can be unit-tested without a meter provider.
+    pub fn gen_ai_metric_attrs(
+        system: &str,
+        request_model: &str,
+        operation: &str,
+        token_type: &str,
+    ) -> [KeyValue; 4] {
+        [
+            KeyValue::new(gen_ai_attrs::SYSTEM, system.to_string()),
+            KeyValue::new(gen_ai_attrs::REQUEST_MODEL, request_model.to_string()),
+            KeyValue::new(gen_ai_attrs::OPERATION_NAME, operation.to_string()),
+            KeyValue::new(gen_ai_attrs::TOKEN_TYPE, token_type.to_string()),
+        ]
+    }
+
+    /// Record the OTel-standard `gen_ai.client.token.usage` histogram.
+    ///
+    /// Records two data points (input and output) distinguished by the
+    /// `gen_ai.token.type` attribute, matching the OpenTelemetry GenAI metrics
+    /// spec. No-op unless a global meter provider is installed (via `init`).
+    pub fn gen_ai_token_usage(
+        system: &str,
+        request_model: &str,
+        operation: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) {
+        let meter = global::meter("jamjet");
+        let histogram = meter
+            .u64_histogram("gen_ai.client.token.usage")
+            .with_description("Number of tokens used by a model call")
+            .init();
+        histogram.record(
+            input_tokens,
+            &gen_ai_metric_attrs(system, request_model, operation, "input"),
+        );
+        histogram.record(
+            output_tokens,
+            &gen_ai_metric_attrs(system, request_model, operation, "output"),
+        );
+    }
 
     /// Record that a workflow execution was started.
     pub fn execution_started(workflow_id: &str) {
@@ -204,6 +248,10 @@ pub mod gen_ai_attrs {
     pub const SYSTEM: &str = "gen_ai.system";
     /// The model name requested (e.g. "claude-sonnet-4-6", "gpt-4o").
     pub const REQUEST_MODEL: &str = "gen_ai.request.model";
+    /// The GenAI operation name (e.g. "chat"). OTel GenAI semconv.
+    pub const OPERATION_NAME: &str = "gen_ai.operation.name";
+    /// The GenAI token type tag for the token-usage metric ("input" | "output").
+    pub const TOKEN_TYPE: &str = "gen_ai.token.type";
     /// The maximum tokens requested.
     pub const REQUEST_MAX_TOKENS: &str = "gen_ai.request.max_tokens";
     /// Sampling temperature (0.0–1.0).
@@ -356,4 +404,22 @@ pub fn record_execution_context(
     span.record(gen_ai_attrs::JAMJET_WORKFLOW_ID, workflow_id);
     span.record(gen_ai_attrs::JAMJET_NODE_ID, node_id);
     span.record(gen_ai_attrs::JAMJET_NODE_KIND, node_kind);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::metrics::gen_ai_metric_attrs;
+
+    #[test]
+    fn gen_ai_metric_attrs_carries_system_model_operation_and_token_type() {
+        let attrs = gen_ai_metric_attrs("anthropic", "claude-sonnet-4-6", "chat", "input");
+        let pairs: Vec<(String, String)> = attrs
+            .iter()
+            .map(|kv| (kv.key.as_str().to_string(), kv.value.to_string()))
+            .collect();
+        assert!(pairs.contains(&("gen_ai.system".into(), "anthropic".into())));
+        assert!(pairs.contains(&("gen_ai.request.model".into(), "claude-sonnet-4-6".into())));
+        assert!(pairs.contains(&("gen_ai.operation.name".into(), "chat".into())));
+        assert!(pairs.contains(&("gen_ai.token.type".into(), "input".into())));
+    }
 }

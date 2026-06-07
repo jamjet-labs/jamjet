@@ -4,20 +4,18 @@ use jamjet_audit::{AuditEnricher, NoopAuditBackend, SqliteAuditBackend};
 use jamjet_state::{InMemoryBackend, SqliteBackend};
 use std::sync::Arc;
 use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load .env if present
     dotenvy::dotenv().ok();
 
-    // Tracing
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
     let config = ApiConfig::default();
+
+    // Telemetry — installs OTLP trace + metric pipelines when
+    // OTEL_EXPORTER_OTLP_ENDPOINT is set, otherwise falls back to plain tracing.
+    let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+    jamjet_telemetry::init(config.dev_mode, otel_endpoint.as_deref());
     let storage_backend = std::env::var("STORAGE_BACKEND").unwrap_or_default();
     let storage_label = if storage_backend == "memory" {
         "memory"
