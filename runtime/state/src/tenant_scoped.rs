@@ -408,7 +408,13 @@ impl StateBackend for TenantScopedSqliteBackend {
         // MAX is scoped to the execution only (not the tenant), so it agrees with
         // the base backend's sequence even when an execution's events carry mixed
         // tenant_id rows (scheduler/worker run on the base backend in dev).
-        let mut tx = self.pool.begin().await.map_err(map_db_err)?;
+        // BEGIN IMMEDIATE: a deferred SELECT→INSERT upgrade hits an instant
+        // SQLITE_BUSY (busy handler skipped) under concurrency.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
         let seq_row = sqlx::query(
             "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
         )
@@ -598,7 +604,13 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?;
 
-        let mut tx = self.pool.begin().await.map_err(map_db_err)?;
+        // BEGIN IMMEDIATE: see SqliteBackend::append_event — a deferred
+        // SELECT→UPDATE upgrade hits an instant SQLITE_BUSY under concurrency.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
 
         let placeholders = queue_types
             .iter()

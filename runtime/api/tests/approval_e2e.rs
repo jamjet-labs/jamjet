@@ -12,6 +12,24 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Serializes the tests in this binary. Each test spawns a scheduler (25ms
+/// ticks) plus a 5-worker pool against its own temp SQLite DB; running three
+/// such stacks concurrently creates an fsync storm that stalls progress past
+/// the wait deadlines (observed: NodeStarted appended, next write starved for
+/// 10s+). Production self-heals via lease reclaim; tests must be deterministic.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Install a test-writer tracing subscriber so worker/scheduler `warn!`s
+/// (e.g. "Worker error: …") surface in failing-test output instead of being
+/// silently dropped. Controlled by RUST_LOG; no-op if already installed.
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init()
+        .ok();
+}
+
 /// Single tool node gated by a node-level require_approval policy, edge to end.
 ///
 /// NodeKind::Tool requires: tool_ref (String), input_mapping ({}), output_schema (String).
@@ -218,6 +236,8 @@ impl Harness {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gated_node_parks_without_dead_lettering() {
+    let _serial = SERIAL.lock().await;
+    init_tracing();
     let h = start().await;
 
     assert!(
@@ -225,7 +245,7 @@ async fn gated_node_parks_without_dead_lettering() {
             |ev| ev
                 .iter()
                 .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
-            10
+            30
         )
         .await,
         "ToolApprovalRequired should be emitted"
@@ -290,6 +310,8 @@ async fn gated_node_parks_without_dead_lettering() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approved_node_resumes_and_completes() {
+    let _serial = SERIAL.lock().await;
+    init_tracing();
     let h = start().await;
 
     assert!(
@@ -297,7 +319,7 @@ async fn approved_node_resumes_and_completes() {
             |ev| ev
                 .iter()
                 .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
-            10
+            30
         )
         .await
     );
@@ -308,7 +330,7 @@ async fn approved_node_resumes_and_completes() {
             |ev| ev
                 .iter()
                 .any(|e| matches!(e.kind, EventKind::WorkflowCompleted { .. })),
-            15
+            30
         )
         .await,
         "approved workflow should run to completion"
@@ -326,6 +348,8 @@ async fn approved_node_resumes_and_completes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_node_fails_workflow_with_reason() {
+    let _serial = SERIAL.lock().await;
+    init_tracing();
     let h = start().await;
 
     assert!(
@@ -333,7 +357,7 @@ async fn rejected_node_fails_workflow_with_reason() {
             |ev| ev
                 .iter()
                 .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
-            10
+            30
         )
         .await
     );
@@ -345,7 +369,7 @@ async fn rejected_node_fails_workflow_with_reason() {
             |ev| ev
                 .iter()
                 .any(|e| matches!(e.kind, EventKind::WorkflowFailed { .. })),
-            15
+            30
         )
         .await,
         "rejected workflow should fail"
