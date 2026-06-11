@@ -410,6 +410,13 @@ struct ExecProgress {
     final_state: serde_json::Map<String, serde_json::Value>,
     /// Highest event sequence already folded in.
     last_sequence: jamjet_state::EventSequence,
+    /// Nodes parked waiting for a human approval decision. They stay in
+    /// `scheduled` too, so the dispatcher won't re-enqueue them; this set
+    /// exists for observability and the rejected/approved transitions.
+    held: HashSet<NodeId>,
+    /// Rejected approvals awaiting their `NodeFailed` emission, node -> reason.
+    /// Cleared when the corresponding `NodeFailed{retryable: false}` folds in.
+    rejected: std::collections::HashMap<NodeId, String>,
 }
 
 impl ExecProgress {
@@ -447,6 +454,8 @@ impl ExecProgress {
             } => {
                 self.terminal_failed.insert(node_id.clone());
                 self.scheduled.remove(node_id);
+                self.rejected.remove(node_id);
+                self.held.remove(node_id);
             }
             EventKind::NodeFailed {
                 node_id,
@@ -458,6 +467,36 @@ impl ExecProgress {
             }
             EventKind::RetryScheduled { node_id, .. } => {
                 self.scheduled.insert(node_id.clone());
+            }
+            EventKind::ToolApprovalRequired { node_id, .. } => {
+                self.held.insert(node_id.clone());
+            }
+            EventKind::ApprovalReceived {
+                node_id,
+                user_id,
+                decision,
+                comment,
+                ..
+            } => {
+                // Only act on decisions that resolve an actual hold; the API
+                // validates, but the fold must stay total and tolerant.
+                if self.held.remove(node_id) {
+                    match decision {
+                        jamjet_state::event::ApprovalDecision::Approved => {
+                            // Free the slot so is_runnable() re-dispatches
+                            // through the normal path.
+                            self.scheduled.remove(node_id);
+                        }
+                        jamjet_state::event::ApprovalDecision::Rejected => {
+                            let mut reason = format!("approval rejected by {user_id}");
+                            if let Some(c) = comment {
+                                reason.push_str(": ");
+                                reason.push_str(c);
+                            }
+                            self.rejected.insert(node_id.clone(), reason);
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -672,5 +711,119 @@ mod tests {
         // `a` is terminally failed, `b` can never run, nothing is in flight.
         tick(&s, &e).await;
         assert_eq!(status(&b, &e).await, WorkflowStatus::Failed);
+    }
+
+    fn fold_events(kinds: Vec<EventKind>) -> ExecProgress {
+        let exec_id = ExecutionId::new();
+        let mut progress = ExecProgress::default();
+        for (i, kind) in kinds.into_iter().enumerate() {
+            progress.apply(&Event::new(exec_id.clone(), (i + 1) as i64, kind));
+        }
+        progress
+    }
+
+    #[test]
+    fn approval_required_marks_node_held() {
+        let progress = fold_events(vec![
+            EventKind::NodeScheduled { node_id: "a".into(), queue_type: "general".into() },
+            EventKind::ToolApprovalRequired {
+                node_id: "a".into(),
+                tool_name: "t".into(),
+                approver: "human".into(),
+                context: serde_json::json!({}),
+            },
+        ]);
+        assert!(progress.held.contains("a"));
+        // Still in scheduled: nothing must re-enqueue a held node.
+        assert!(progress.scheduled.contains("a"));
+    }
+
+    #[test]
+    fn approval_approved_unblocks_node_for_rescheduling() {
+        let progress = fold_events(vec![
+            EventKind::NodeScheduled { node_id: "a".into(), queue_type: "general".into() },
+            EventKind::ToolApprovalRequired {
+                node_id: "a".into(),
+                tool_name: "t".into(),
+                approver: "human".into(),
+                context: serde_json::json!({}),
+            },
+            EventKind::ApprovalReceived {
+                node_id: "a".into(),
+                user_id: "u".into(),
+                decision: jamjet_state::event::ApprovalDecision::Approved,
+                comment: None,
+                state_patch: None,
+            },
+        ]);
+        assert!(!progress.held.contains("a"));
+        // Removed from scheduled so is_runnable() can re-dispatch it.
+        assert!(!progress.scheduled.contains("a"));
+        assert!(progress.rejected.is_empty());
+    }
+
+    #[test]
+    fn approval_rejected_marks_node_for_failure() {
+        let progress = fold_events(vec![
+            EventKind::NodeScheduled { node_id: "a".into(), queue_type: "general".into() },
+            EventKind::ToolApprovalRequired {
+                node_id: "a".into(),
+                tool_name: "t".into(),
+                approver: "human".into(),
+                context: serde_json::json!({}),
+            },
+            EventKind::ApprovalReceived {
+                node_id: "a".into(),
+                user_id: "alice".into(),
+                decision: jamjet_state::event::ApprovalDecision::Rejected,
+                comment: Some("too risky".into()),
+                state_patch: None,
+            },
+        ]);
+        assert!(!progress.held.contains("a"));
+        let reason = progress.rejected.get("a").expect("rejected entry");
+        assert!(reason.contains("alice"));
+        assert!(reason.contains("too risky"));
+    }
+
+    #[test]
+    fn node_failed_clears_rejected_marker() {
+        let progress = fold_events(vec![
+            EventKind::ToolApprovalRequired {
+                node_id: "a".into(),
+                tool_name: "t".into(),
+                approver: "human".into(),
+                context: serde_json::json!({}),
+            },
+            EventKind::ApprovalReceived {
+                node_id: "a".into(),
+                user_id: "u".into(),
+                decision: jamjet_state::event::ApprovalDecision::Rejected,
+                comment: None,
+                state_patch: None,
+            },
+            EventKind::NodeFailed {
+                node_id: "a".into(),
+                error: "approval rejected".into(),
+                attempt: 0,
+                retryable: false,
+            },
+        ]);
+        assert!(progress.rejected.is_empty());
+        assert!(progress.terminal_failed.contains("a"));
+    }
+
+    #[test]
+    fn approval_decision_without_hold_is_ignored() {
+        let progress = fold_events(vec![EventKind::ApprovalReceived {
+            node_id: "ghost".into(),
+            user_id: "u".into(),
+            decision: jamjet_state::event::ApprovalDecision::Approved,
+            comment: None,
+            state_patch: None,
+        }]);
+        assert!(progress.held.is_empty());
+        assert!(progress.rejected.is_empty());
+        assert!(progress.scheduled.is_empty());
     }
 }
