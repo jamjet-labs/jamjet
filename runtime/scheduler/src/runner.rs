@@ -256,6 +256,7 @@ impl Scheduler {
             completed_nodes = completed.len(),
             scheduled_nodes = scheduled.len(),
             terminal_failed_nodes = terminal_failed.len(),
+            held_nodes = progress.held.len(),
             "Checking for runnable nodes"
         );
 
@@ -416,7 +417,9 @@ struct ExecProgress {
     held: HashSet<NodeId>,
     /// Rejected approvals awaiting their `NodeFailed` emission, node -> reason.
     /// Cleared when the corresponding `NodeFailed{retryable: false}` folds in.
-    rejected: std::collections::HashMap<NodeId, String>,
+    /// Note: a rejected node stays in `scheduled` (consuming a concurrency slot)
+    /// until the follow-up `NodeFailed` emission clears it.
+    rejected: HashMap<NodeId, String>,
 }
 
 impl ExecProgress {
@@ -446,6 +449,8 @@ impl ExecProgress {
             EventKind::NodeCancelled { node_id } => {
                 self.completed.insert(node_id.clone());
                 self.scheduled.remove(node_id);
+                self.held.remove(node_id);
+                self.rejected.remove(node_id);
             }
             EventKind::NodeFailed {
                 node_id,
@@ -464,6 +469,10 @@ impl ExecProgress {
             } => {
                 // Re-queued by the subsequent RetryScheduled event.
                 self.scheduled.remove(node_id);
+                // A hold is superseded by the re-queue; without this, a worker
+                // crash mid-hold leaves the node in `held` forever after its
+                // retry completes.
+                self.held.remove(node_id);
             }
             EventKind::RetryScheduled { node_id, .. } => {
                 self.scheduled.insert(node_id.clone());
@@ -825,5 +834,45 @@ mod tests {
         assert!(progress.held.is_empty());
         assert!(progress.rejected.is_empty());
         assert!(progress.scheduled.is_empty());
+    }
+
+    #[test]
+    fn retryable_failure_clears_hold() {
+        let progress = fold_events(vec![
+            EventKind::NodeScheduled { node_id: "a".into(), queue_type: "general".into() },
+            EventKind::ToolApprovalRequired {
+                node_id: "a".into(),
+                tool_name: "t".into(),
+                approver: "human".into(),
+                context: serde_json::json!({}),
+            },
+            EventKind::NodeFailed {
+                node_id: "a".into(),
+                error: "worker crashed mid-hold".into(),
+                attempt: 0,
+                retryable: true,
+            },
+            EventKind::RetryScheduled {
+                node_id: "a".into(),
+                attempt: 1,
+                delay_ms: 1000,
+            },
+            EventKind::NodeCompleted {
+                node_id: "a".into(),
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({}),
+                duration_ms: 1,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+            },
+        ]);
+        assert!(progress.held.is_empty(), "held must be cleared after retryable failure");
+        assert!(progress.completed.contains("a"), "node must be in completed after NodeCompleted");
+        assert!(progress.rejected.is_empty(), "rejected must be empty");
     }
 }
