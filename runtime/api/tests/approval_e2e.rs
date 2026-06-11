@@ -13,10 +13,12 @@ use std::time::Duration;
 use uuid::Uuid;
 
 /// Serializes the tests in this binary. Each test spawns a scheduler (25ms
-/// ticks) plus a 5-worker pool against its own temp SQLite DB; running three
-/// such stacks concurrently creates an fsync storm that stalls progress past
-/// the wait deadlines (observed: NodeStarted appended, next write starved for
-/// 10s+). Production self-heals via lease reclaim; tests must be deterministic.
+/// ticks) plus a 5-worker pool, which is a lot of concurrent machinery per
+/// test; running three such stacks at once adds CPU/IO noise on top. The
+/// historical flake here (worker stranded its claimed item until lease
+/// reclaim) was a real bug: deferred SQLite transactions upgrading read->write
+/// bypass the busy handler (fixed with BEGIN IMMEDIATE in the state backend).
+/// The mutex stays as belt-and-braces so timing assertions are load-independent.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Install a test-writer tracing subscriber so worker/scheduler `warn!`s
