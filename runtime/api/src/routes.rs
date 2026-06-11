@@ -42,6 +42,10 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         .route("/executions/:id/cancel", post(cancel_execution))
         .route("/executions/:id/events", get(list_events))
         .route("/executions/:id/approve", post(approve_execution))
+        .route(
+            "/executions/:id/approvals",
+            get(list_approvals_for_execution),
+        )
         .route("/executions/:id/external-event", post(send_external_event))
         // Agents
         .route("/agents", post(register_agent).get(list_agents))
@@ -397,29 +401,39 @@ async fn approve_execution(
         other => return Err(ApiError::BadRequest(format!("unknown decision: {other}"))),
     };
 
-    let seq = backend.latest_sequence(&execution_id).await? + 1;
-    let event = jamjet_state::Event::new(
-        execution_id.clone(),
-        seq,
-        jamjet_state::EventKind::ApprovalReceived {
-            node_id: body.node_id.unwrap_or_default(),
+    let node_id = crate::approvals::submit_approval(
+        &backend,
+        &execution_id,
+        crate::approvals::ApprovalSubmission {
+            node_id: body.node_id,
             user_id: body.user_id.unwrap_or_else(|| "anonymous".into()),
             decision,
             comment: body.comment,
             state_patch: body.state_patch,
         },
-    );
-    backend.append_event(event).await?;
+    )
+    .await
+    .map_err(|e| match e {
+        crate::approvals::SubmitError::MultiplePending(_) => ApiError::BadRequest(e.to_string()),
+        crate::approvals::SubmitError::NoPending
+        | crate::approvals::SubmitError::NodeNotPending(_) => ApiError::Conflict(e.to_string()),
+        crate::approvals::SubmitError::Backend(msg) => ApiError::Internal(msg),
+    })?;
 
-    if let Ok(Some(exec)) = backend.get_execution(&execution_id).await {
-        if exec.status == WorkflowStatus::Paused {
-            backend
-                .update_execution_status(&execution_id, WorkflowStatus::Running)
-                .await?;
-        }
-    }
+    Ok(Json(
+        json!({ "execution_id": id, "node_id": node_id, "accepted": true }),
+    ))
+}
 
-    Ok(Json(json!({ "execution_id": id, "accepted": true })))
+async fn list_approvals_for_execution(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&tenant_id);
+    let execution_id = parse_execution_id(&id)?;
+    let events = backend.get_events(&execution_id).await?;
+    Ok(Json(crate::approvals::approvals_view(&events)))
 }
 
 #[derive(Deserialize)]
