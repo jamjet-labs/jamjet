@@ -107,6 +107,9 @@ pub fn pending_approvals(events: &[Event]) -> Vec<PendingApproval> {
                 );
             }
             EventKind::ApprovalReceived { node_id, .. } => {
+                // Intentional asymmetry: node_approval_status returns NotRequested for a
+                // decision with no prior request; here we simply leave the event with no
+                // effect. Both paths ignore orphan decisions by design.
                 if let Some(slot) = by_node.get_mut(node_id) {
                     *slot = None;
                 }
@@ -218,6 +221,16 @@ mod tests {
             node_approval_status(&events, "a"),
             NodeApprovalStatus::NotRequested
         ));
+    }
+
+    #[test]
+    fn pending_approvals_order_is_deterministic() {
+        // Insert "b" before "a" to verify BTreeMap lexicographic ordering, not insertion order.
+        let events = vec![required(1, "b"), required(2, "a")];
+        let pending = pending_approvals(&events);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].node_id, "a");
+        assert_eq!(pending[1].node_id, "b");
     }
 
     #[test]
