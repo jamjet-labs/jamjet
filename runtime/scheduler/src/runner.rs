@@ -247,6 +247,32 @@ impl Scheduler {
             .unwrap()
             .insert(execution_id.clone(), progress.clone());
 
+        // Fail nodes whose approval was rejected. Guarded by terminal_failed so
+        // the emission fires exactly once: the next tick folds the NodeFailed,
+        // which clears the `rejected` marker and inserts into terminal_failed.
+        for (node_id, reason) in progress
+            .rejected
+            .iter()
+            .filter(|(n, _)| !progress.terminal_failed.contains(n.as_str()))
+            .map(|(n, r)| (n.clone(), r.clone()))
+            .collect::<Vec<_>>()
+        {
+            let seq = self.backend.latest_sequence(execution_id).await? + 1;
+            self.backend
+                .append_event(jamjet_state::Event::new(
+                    execution_id.clone(),
+                    seq,
+                    EventKind::NodeFailed {
+                        node_id: node_id.clone(),
+                        error: reason,
+                        attempt: 0,
+                        retryable: false,
+                    },
+                ))
+                .await?;
+            info!(execution_id = %execution_id, node_id = %node_id, "Approval rejected — node failed");
+        }
+
         let completed = &progress.completed;
         let scheduled = &progress.scheduled;
         let terminal_failed = &progress.terminal_failed;
@@ -834,6 +860,58 @@ mod tests {
         assert!(progress.held.is_empty());
         assert!(progress.rejected.is_empty());
         assert!(progress.scheduled.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_approval_fails_node_and_workflow() {
+        let (s, b, e) = setup(linear_ir()).await;
+
+        // Seed: node "a" scheduled, held, then rejected.
+        append(&b, &e, EventKind::NodeScheduled { node_id: "a".into(), queue_type: "general".into() }).await;
+        append(&b, &e, EventKind::ToolApprovalRequired {
+            node_id: "a".into(),
+            tool_name: "t".into(),
+            approver: "human".into(),
+            context: serde_json::json!({}),
+        }).await;
+        append(&b, &e, EventKind::ApprovalReceived {
+            node_id: "a".into(),
+            user_id: "alice".into(),
+            decision: jamjet_state::event::ApprovalDecision::Rejected,
+            comment: Some("nope".into()),
+            state_patch: None,
+        }).await;
+
+        // Tick 1: scheduler folds the rejection and emits NodeFailed.
+        tick(&s, &e).await;
+
+        let evs = b.get_events(&e).await.unwrap();
+        let failed: Vec<_> = evs.iter().filter(|ev| matches!(
+            &ev.kind,
+            EventKind::NodeFailed { node_id, retryable: false, .. } if node_id == "a"
+        )).collect();
+        assert_eq!(failed.len(), 1, "exactly one NodeFailed for the rejected node after tick 1");
+        if let EventKind::NodeFailed { error, .. } = &failed[0].kind {
+            assert!(error.contains("alice"), "reason must include decider: {error}");
+            assert!(error.contains("nope"), "reason must include comment: {error}");
+        }
+
+        // Tick 2: folds the NodeFailed, detects terminal state, emits WorkflowFailed.
+        tick(&s, &e).await;
+        let evs = b.get_events(&e).await.unwrap();
+        assert!(
+            evs.iter().any(|ev| matches!(ev.kind, EventKind::WorkflowFailed { .. })),
+            "WorkflowFailed must be emitted"
+        );
+        assert_eq!(status(&b, &e).await, WorkflowStatus::Failed);
+
+        // Tick 3: execution is terminal — must not duplicate NodeFailed.
+        // The execution is no longer Running so tick() won't visit it,
+        // but we call schedule_runnable_nodes directly to prove idempotence.
+        s.schedule_runnable_nodes(&e, "wf", "0.1.0").await.unwrap();
+        let evs = b.get_events(&e).await.unwrap();
+        let count = evs.iter().filter(|ev| matches!(&ev.kind, EventKind::NodeFailed { .. })).count();
+        assert_eq!(count, 1, "NodeFailed must not be duplicated on subsequent ticks");
     }
 
     #[test]
