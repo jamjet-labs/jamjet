@@ -85,6 +85,8 @@ pub async fn submit_approval(
         .await
         .map_err(|e| SubmitError::Backend(e.to_string()))?
         + 1;
+    // TOCTOU: a concurrent approve may have already appended a decision; the
+    // scheduler fold's held.remove gate makes the second event a no-op.
     backend
         .append_event(Event::new(
             execution_id.clone(),
@@ -149,6 +151,8 @@ pub fn approvals_view(events: &[Event]) -> serde_json::Value {
                 "comment": comment,
                 "sequence": sequence,
             }),
+            // Unreachable in practice: a node filtered out of `pending` has a
+            // decision by construction. Kept total so the view never panics.
             _ => serde_json::json!({ "node_id": n, "status": "unknown" }),
         })
         .collect();
