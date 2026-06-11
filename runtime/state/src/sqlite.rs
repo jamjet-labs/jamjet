@@ -446,7 +446,17 @@ impl StateBackend for SqliteBackend {
         // appends to the same execution cannot compute the same number and
         // collide on UNIQUE(execution_id, sequence). The caller-supplied
         // sequence is advisory; the database is the source of truth.
-        let mut tx = self.pool.begin().await.map_err(map_db_err)?;
+        //
+        // BEGIN IMMEDIATE: take the write lock up front. A deferred BEGIN would
+        // open a read transaction at the SELECT and upgrade to a write at the
+        // INSERT — and SQLite never invokes the busy handler on that upgrade
+        // (only on fresh transactions), so any concurrent writer produces an
+        // instant SQLITE_BUSY that bypasses the 5s busy_timeout.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
         let seq_row = sqlx::query(
             "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
         )
@@ -627,7 +637,13 @@ impl StateBackend for SqliteBackend {
 
         // SQLite doesn't support UPDATE ... RETURNING with a subquery easily, so
         // we use a transaction: SELECT FOR UPDATE equivalent via exclusive transaction.
-        let mut tx = self.pool.begin().await.map_err(map_db_err)?;
+        // BEGIN IMMEDIATE: see append_event — a deferred SELECT→UPDATE upgrade
+        // hits an instant SQLITE_BUSY (busy handler skipped) under concurrency.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
 
         // Build placeholders for queue_types IN clause
         let placeholders = queue_types

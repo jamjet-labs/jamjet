@@ -383,7 +383,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                 "Side effects: appends an ApprovalReceived event to the event log (with user_id 'mcp-client') and, if the execution is paused, ",
                 "resumes it to 'running' status so the next node can proceed. The decision is recorded in the immutable audit trail. ",
                 "Returns a JSON object with execution_id and accepted: true. ",
-                "Fails if execution_id is not found or if decision is not exactly 'approved' or 'rejected'. ",
+                "Fails if execution_id is not found, if decision is not exactly 'approved' or 'rejected', or if nothing is pending approval (or node_id does not match a pending approval). ",
                 "Related: use jamjet_get_events to see the ApprovalRequested event details before deciding."
             ).into()),
             input_schema: json!({
@@ -446,38 +446,27 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
 
-                let seq = backend
-                    .latest_sequence(&eid)
-                    .await
-                    .map_err(|e| format!("{e}"))?
-                    + 1;
-                let event = Event::new(
-                    eid.clone(),
-                    seq,
-                    EventKind::ApprovalReceived {
-                        node_id,
+                let resolved_node = crate::approvals::submit_approval(
+                    &backend,
+                    &eid,
+                    crate::approvals::ApprovalSubmission {
+                        node_id: if node_id.is_empty() {
+                            None
+                        } else {
+                            Some(node_id)
+                        },
                         user_id: "mcp-client".into(),
                         decision,
                         comment,
                         state_patch: None,
                     },
-                );
-                backend
-                    .append_event(event)
-                    .await
-                    .map_err(|e| format!("{e}"))?;
-
-                if let Ok(Some(exec)) = backend.get_execution(&eid).await {
-                    if exec.status == WorkflowStatus::Paused {
-                        backend
-                            .update_execution_status(&eid, WorkflowStatus::Running)
-                            .await
-                            .map_err(|e| format!("{e}"))?;
-                    }
-                }
+                )
+                .await
+                .map_err(|e| e.to_string())?;
 
                 Ok(vec![McpContent::Text {
-                    text: json!({"execution_id": id_str, "accepted": true}).to_string(),
+                    text: json!({"execution_id": id_str, "node_id": resolved_node, "accepted": true})
+                        .to_string(),
                 }])
             }
         },

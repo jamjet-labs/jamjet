@@ -43,3 +43,8 @@ anyhow = { workspace = true }
 reqwest = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
+tracing-subscriber = { workspace = true }

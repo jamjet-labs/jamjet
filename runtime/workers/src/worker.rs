@@ -7,7 +7,8 @@ use jamjet_ir::workflow::{NodeDef, WorkflowIr};
 use jamjet_policy::autonomy::{AutonomyContext, AutonomyDecision, AutonomyEnforcer};
 use jamjet_policy::engine::node_kind_tag;
 use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
-use jamjet_state::backend::{StateBackend, WorkItem};
+use jamjet_state::approvals::NodeApprovalStatus;
+use jamjet_state::backend::{StateBackend, WorkItem, WorkItemId};
 use jamjet_state::budget::BudgetState;
 use jamjet_state::event::EventKind;
 use jamjet_telemetry::{gen_ai_attrs, metrics, record_gen_ai_usage};
@@ -174,7 +175,15 @@ impl Worker {
 
                     // Policy check.
                     if let Some(r) = self
-                        .check_policy(&execution_id, &node_id, &tenant_id, kind, node_def, &ir)
+                        .check_policy(
+                            &execution_id,
+                            item_id,
+                            &node_id,
+                            &tenant_id,
+                            kind,
+                            node_def,
+                            &ir,
+                        )
                         .await
                     {
                         heartbeat.abort();
@@ -183,7 +192,7 @@ impl Worker {
 
                     // Autonomy check.
                     if let Some(r) = self
-                        .check_autonomy(&execution_id, &node_id, kind, &budget)
+                        .check_autonomy(&execution_id, item_id, &node_id, kind, &budget)
                         .await
                     {
                         heartbeat.abort();
@@ -327,11 +336,99 @@ impl Worker {
         Ok(())
     }
 
+    // ── Approval hold helper ──────────────────────────────────────────────────
+
+    /// Park a node pending human approval (or let it run if already approved).
+    ///
+    /// Consults the event log: an `ApprovalReceived{Approved}` with no newer
+    /// `ToolApprovalRequired` means the gate is satisfied — return None so the
+    /// caller proceeds to execute. Otherwise ensure exactly one outstanding
+    /// `ToolApprovalRequired` exists and settle the work item cleanly so the
+    /// lease never expires into the retry/dead-letter path. The node stays
+    /// parked because it remains in the scheduler fold's `scheduled` set (so
+    /// it is never re-dispatched); the fold's `held` set only gates which
+    /// decision events are acted on.
+    /// The helper requires the FULL event log because a partial fold could
+    /// misreport NotRequested for an already-approved node.
+    async fn hold_for_approval(
+        &self,
+        execution_id: &ExecutionId,
+        node_id: &str,
+        item_id: WorkItemId,
+        tool_name: String,
+        approver: String,
+        context: serde_json::Value,
+    ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        let events = match self.backend.get_events(execution_id).await {
+            Ok(events) => events,
+            Err(e) => {
+                // Fail closed: never run an approval-gated node blind.
+                return Some(Err(format!(
+                    "approval state unavailable; refusing to run unapproved: {e}"
+                )
+                .into()));
+            }
+        };
+
+        match jamjet_state::approvals::node_approval_status(&events, node_id) {
+            NodeApprovalStatus::Approved { .. } => {
+                info!(execution_id = %execution_id, node_id, "Approval satisfied — proceeding");
+                None
+            }
+            NodeApprovalStatus::Pending(_) | NodeApprovalStatus::Rejected { .. } => {
+                // Already requested (or decided rejected — scheduler owns the
+                // failure). Settle the item; emit nothing.
+                if let Err(e) = self.backend.complete_work_item(item_id).await {
+                    return Some(Err(format!("failed to settle held work item: {e}").into()));
+                }
+                Some(Ok(()))
+            }
+            NodeApprovalStatus::NotRequested => {
+                info!(execution_id = %execution_id, node_id, %approver, "Node requires approval");
+                let seq = match self.backend.latest_sequence(execution_id).await {
+                    Ok(s) => s + 1,
+                    Err(e) => {
+                        return Some(Err(format!(
+                            "approval required but could not be recorded: {e}"
+                        )
+                        .into()))
+                    }
+                };
+                if let Err(e) = self
+                    .backend
+                    .append_event(jamjet_state::Event::new(
+                        execution_id.clone(),
+                        seq,
+                        EventKind::ToolApprovalRequired {
+                            node_id: node_id.to_string(),
+                            tool_name,
+                            approver,
+                            context,
+                        },
+                    ))
+                    .await
+                {
+                    // Fail closed.
+                    return Some(Err(format!(
+                        "approval required but could not be recorded: {e}"
+                    )
+                    .into()));
+                }
+                if let Err(e) = self.backend.complete_work_item(item_id).await {
+                    return Some(Err(format!("failed to settle held work item: {e}").into()));
+                }
+                Some(Ok(()))
+            }
+        }
+    }
+
     // ── Policy check ──────────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     async fn check_policy(
         &self,
         execution_id: &ExecutionId,
+        item_id: WorkItemId,
         node_id: &str,
         tenant_id: &str,
         kind: &NodeKind,
@@ -399,33 +496,16 @@ impl Worker {
             }
 
             PolicyDecision::RequireApproval { approver } => {
-                info!(execution_id = %execution_id, node_id, %approver, "Node requires approval");
                 let tool_name = ctx.tool_name.unwrap_or_else(|| node_id.to_string());
-                // If we cannot record the approval requirement, fail closed rather
-                // than letting the node run unapproved.
-                let seq = match self.backend.latest_sequence(execution_id).await {
-                    Ok(s) => s + 1,
-                    Err(e) => {
-                        return Some(Err(format!(
-                            "approval required but could not be recorded: {e}"
-                        )
-                        .into()))
-                    }
-                };
-                let _ = self
-                    .backend
-                    .append_event(jamjet_state::Event::new(
-                        execution_id.clone(),
-                        seq,
-                        EventKind::ToolApprovalRequired {
-                            node_id: node_id.to_string(),
-                            tool_name,
-                            approver,
-                            context: serde_json::json!({ "node_id": node_id }),
-                        },
-                    ))
-                    .await;
-                Some(Ok(()))
+                self.hold_for_approval(
+                    execution_id,
+                    node_id,
+                    item_id,
+                    tool_name,
+                    approver,
+                    serde_json::json!({ "node_id": node_id }),
+                )
+                .await
             }
         }
     }
@@ -466,6 +546,7 @@ impl Worker {
     async fn check_autonomy(
         &self,
         execution_id: &ExecutionId,
+        item_id: WorkItemId,
         node_id: &str,
         kind: &NodeKind,
         budget: &BudgetState,
@@ -508,22 +589,20 @@ impl Worker {
         match decision {
             AutonomyDecision::Proceed => None,
 
+            // Currently unreachable at runtime: `AutonomyEnforcer.check` above
+            // is called with `tool_name: None` (pre-existing), so it never
+            // returns RequireToolApproval. The wiring is in place for when
+            // pending tool names are threaded through.
             AutonomyDecision::RequireToolApproval { tool_name } => {
-                let seq = self.backend.latest_sequence(execution_id).await.ok()? + 1;
-                let _ = self
-                    .backend
-                    .append_event(jamjet_state::Event::new(
-                        execution_id.clone(),
-                        seq,
-                        EventKind::ToolApprovalRequired {
-                            node_id: node_id.to_string(),
-                            tool_name,
-                            approver: "human".to_string(),
-                            context: serde_json::json!({ "agent_ref": agent_ref }),
-                        },
-                    ))
-                    .await;
-                Some(Ok(()))
+                self.hold_for_approval(
+                    execution_id,
+                    node_id,
+                    item_id,
+                    tool_name,
+                    "human".to_string(),
+                    serde_json::json!({ "agent_ref": agent_ref }),
+                )
+                .await
             }
 
             AutonomyDecision::EscalateLimit {
