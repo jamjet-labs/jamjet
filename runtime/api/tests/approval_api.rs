@@ -389,3 +389,36 @@ async fn list_approvals_shows_pending_then_decided() {
     assert_eq!(decided[0]["node_id"], "a");
     assert_eq!(decided[0]["status"], "approved");
 }
+
+#[tokio::test]
+async fn approve_on_terminal_execution_returns_409() {
+    let state = make_state();
+    let backend = state.backend.clone();
+    let app = build_router_with_opts(state, true);
+
+    let execution_id = create_execution(&backend).await;
+    seed_approval_required(&backend, &execution_id, "a").await;
+    backend
+        .update_execution_status(&execution_id, WorkflowStatus::Cancelled)
+        .await
+        .expect("cancel execution");
+    let id_str = execution_id.to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post(format!("/executions/{id_str}/approve"))
+                .header("content-type", "application/json")
+                .body(approve_body("approved", Some("a")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let json = body_json(resp.into_body()).await;
+    let error = json["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("Cancelled"),
+        "expected terminal status in error, got: {error}"
+    );
+}

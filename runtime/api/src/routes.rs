@@ -416,7 +416,8 @@ async fn approve_execution(
     .map_err(|e| match e {
         crate::approvals::SubmitError::MultiplePending(_) => ApiError::BadRequest(e.to_string()),
         crate::approvals::SubmitError::NoPending
-        | crate::approvals::SubmitError::NodeNotPending(_) => ApiError::Conflict(e.to_string()),
+        | crate::approvals::SubmitError::NodeNotPending(_)
+        | crate::approvals::SubmitError::ExecutionTerminal(_) => ApiError::Conflict(e.to_string()),
         crate::approvals::SubmitError::Backend(msg) => ApiError::Internal(msg),
     })?;
 

@@ -28,6 +28,8 @@ pub enum SubmitError {
     MultiplePending(Vec<String>),
     /// The named node has no outstanding approval request.
     NodeNotPending(String),
+    /// The execution is already terminal; a decision can no longer change it.
+    ExecutionTerminal(String),
     Backend(String),
 }
 
@@ -44,6 +46,10 @@ impl std::fmt::Display for SubmitError {
                 f,
                 "node '{n}' has no pending approval (unknown or already decided)"
             ),
+            Self::ExecutionTerminal(status) => write!(
+                f,
+                "execution is {status}; approvals can no longer be decided"
+            ),
             Self::Backend(e) => write!(f, "backend error: {e}"),
         }
     }
@@ -56,6 +62,30 @@ pub async fn submit_approval(
     execution_id: &ExecutionId,
     submission: ApprovalSubmission,
 ) -> Result<String, SubmitError> {
+    // Refuse decisions on terminal executions up front. The event-derived
+    // pending list can still show an undecided request after a cancellation
+    // (the fold intentionally ignores decisions for unheld nodes), so without
+    // this check an approve on a cancelled run would 200 while changing nothing.
+    let execution = backend
+        .get_execution(execution_id)
+        .await
+        .map_err(|e| SubmitError::Backend(e.to_string()))?;
+    let was_paused = match &execution {
+        Some(exec) => {
+            if matches!(
+                exec.status,
+                WorkflowStatus::Completed
+                    | WorkflowStatus::Failed
+                    | WorkflowStatus::Cancelled
+                    | WorkflowStatus::LimitExceeded
+            ) {
+                return Err(SubmitError::ExecutionTerminal(format!("{:?}", exec.status)));
+            }
+            exec.status == WorkflowStatus::Paused
+        }
+        None => false,
+    };
+
     let events = backend
         .get_events(execution_id)
         .await
@@ -102,14 +132,13 @@ pub async fn submit_approval(
         .await
         .map_err(|e| SubmitError::Backend(e.to_string()))?;
 
-    // Preserve the legacy paused -> running flip.
-    if let Ok(Some(exec)) = backend.get_execution(execution_id).await {
-        if exec.status == WorkflowStatus::Paused {
-            backend
-                .update_execution_status(execution_id, WorkflowStatus::Running)
-                .await
-                .map_err(|e| SubmitError::Backend(e.to_string()))?;
-        }
+    // Preserve the legacy paused -> running flip. Uses the pre-append status
+    // read; errors propagate rather than silently skipping the flip.
+    if was_paused {
+        backend
+            .update_execution_status(execution_id, WorkflowStatus::Running)
+            .await
+            .map_err(|e| SubmitError::Backend(e.to_string()))?;
     }
 
     Ok(node_id)
