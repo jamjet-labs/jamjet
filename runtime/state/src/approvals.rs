@@ -179,7 +179,10 @@ mod tests {
 
     #[test]
     fn approved_resolves_pending() {
-        let events = vec![required(1, "a"), received(2, "a", ApprovalDecision::Approved)];
+        let events = vec![
+            required(1, "a"),
+            received(2, "a", ApprovalDecision::Approved),
+        ];
         assert!(matches!(
             node_approval_status(&events, "a"),
             NodeApprovalStatus::Approved { .. }
@@ -189,7 +192,10 @@ mod tests {
 
     #[test]
     fn rejected_resolves_pending_with_comment() {
-        let events = vec![required(1, "a"), received(2, "a", ApprovalDecision::Rejected)];
+        let events = vec![
+            required(1, "a"),
+            received(2, "a", ApprovalDecision::Rejected),
+        ];
         match node_approval_status(&events, "a") {
             NodeApprovalStatus::Rejected {
                 user_id, comment, ..

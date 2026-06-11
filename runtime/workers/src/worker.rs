@@ -7,7 +7,8 @@ use jamjet_ir::workflow::{NodeDef, WorkflowIr};
 use jamjet_policy::autonomy::{AutonomyContext, AutonomyDecision, AutonomyEnforcer};
 use jamjet_policy::engine::node_kind_tag;
 use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
-use jamjet_state::backend::{StateBackend, WorkItem};
+use jamjet_state::approvals::NodeApprovalStatus;
+use jamjet_state::backend::{StateBackend, WorkItem, WorkItemId};
 use jamjet_state::budget::BudgetState;
 use jamjet_state::event::EventKind;
 use jamjet_telemetry::{gen_ai_attrs, metrics, record_gen_ai_usage};
@@ -174,7 +175,15 @@ impl Worker {
 
                     // Policy check.
                     if let Some(r) = self
-                        .check_policy(&execution_id, item_id, &node_id, &tenant_id, kind, node_def, &ir)
+                        .check_policy(
+                            &execution_id,
+                            item_id,
+                            &node_id,
+                            &tenant_id,
+                            kind,
+                            node_def,
+                            &ir,
+                        )
                         .await
                     {
                         heartbeat.abort();
@@ -337,11 +346,13 @@ impl Worker {
     /// `ToolApprovalRequired` exists and settle the work item cleanly so the
     /// lease never expires into the retry/dead-letter path. The scheduler's
     /// fold (`held` set) keeps the node parked until a decision event arrives.
+    /// The helper requires the FULL event log because a partial fold could
+    /// misreport NotRequested for an already-approved node.
     async fn hold_for_approval(
         &self,
         execution_id: &ExecutionId,
         node_id: &str,
-        item_id: uuid::Uuid,
+        item_id: WorkItemId,
         tool_name: String,
         approver: String,
         context: serde_json::Value,
@@ -350,13 +361,13 @@ impl Worker {
             Ok(events) => events,
             Err(e) => {
                 // Fail closed: never run an approval-gated node blind.
-                return Some(Err(
-                    format!("approval state unavailable; refusing to run unapproved: {e}").into(),
-                ));
+                return Some(Err(format!(
+                    "approval state unavailable; refusing to run unapproved: {e}"
+                )
+                .into()));
             }
         };
 
-        use jamjet_state::approvals::NodeApprovalStatus;
         match jamjet_state::approvals::node_approval_status(&events, node_id) {
             NodeApprovalStatus::Approved { .. } => {
                 info!(execution_id = %execution_id, node_id, "Approval satisfied — proceeding");
@@ -375,9 +386,10 @@ impl Worker {
                 let seq = match self.backend.latest_sequence(execution_id).await {
                     Ok(s) => s + 1,
                     Err(e) => {
-                        return Some(Err(
-                            format!("approval required but could not be recorded: {e}").into(),
-                        ))
+                        return Some(Err(format!(
+                            "approval required but could not be recorded: {e}"
+                        )
+                        .into()))
                     }
                 };
                 if let Err(e) = self
@@ -395,9 +407,10 @@ impl Worker {
                     .await
                 {
                     // Fail closed.
-                    return Some(Err(
-                        format!("approval required but could not be recorded: {e}").into(),
-                    ));
+                    return Some(Err(format!(
+                        "approval required but could not be recorded: {e}"
+                    )
+                    .into()));
                 }
                 if let Err(e) = self.backend.complete_work_item(item_id).await {
                     return Some(Err(format!("failed to settle held work item: {e}").into()));
@@ -413,7 +426,7 @@ impl Worker {
     async fn check_policy(
         &self,
         execution_id: &ExecutionId,
-        item_id: uuid::Uuid,
+        item_id: WorkItemId,
         node_id: &str,
         tenant_id: &str,
         kind: &NodeKind,
@@ -531,7 +544,7 @@ impl Worker {
     async fn check_autonomy(
         &self,
         execution_id: &ExecutionId,
-        item_id: uuid::Uuid,
+        item_id: WorkItemId,
         node_id: &str,
         kind: &NodeKind,
         budget: &BudgetState,

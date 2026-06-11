@@ -67,8 +67,11 @@ struct Harness {
 async fn start() -> Harness {
     let db_path = std::env::temp_dir().join(format!("jjtest-{}.db", Uuid::new_v4()));
     let url = format!("sqlite://{}", db_path.display());
-    let backend: Arc<dyn StateBackend> =
-        Arc::new(SqliteBackend::open(&url).await.expect("open sqlite backend"));
+    let backend: Arc<dyn StateBackend> = Arc::new(
+        SqliteBackend::open(&url)
+            .await
+            .expect("open sqlite backend"),
+    );
 
     backend
         .store_workflow(WorkflowDefinition {
@@ -114,7 +117,10 @@ async fn start() -> Harness {
         .append_event(Event::new(
             execution_id.clone(),
             2,
-            EventKind::NodeScheduled { node_id: "gated".into(), queue_type: "general".into() },
+            EventKind::NodeScheduled {
+                node_id: "gated".into(),
+                queue_type: "general".into(),
+            },
         ))
         .await
         .expect("append NodeScheduled");
@@ -143,21 +149,34 @@ async fn start() -> Harness {
     let sched_handle = tokio::spawn(async move { scheduler.run().await });
     let worker_handles = jamjet_worker::default_pool(backend.clone()).spawn();
 
-    Harness { backend, execution_id, db_path, sched_handle, worker_handles }
+    Harness {
+        backend,
+        execution_id,
+        db_path,
+        sched_handle,
+        worker_handles,
+    }
 }
 
 impl Harness {
     async fn wait_for<F: Fn(&[Event]) -> bool>(&self, pred: F, secs: u64) -> bool {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
         loop {
-            let events = self.backend.get_events(&self.execution_id).await.unwrap_or_default();
+            let events = self
+                .backend
+                .get_events(&self.execution_id)
+                .await
+                .unwrap_or_default();
             if pred(&events) {
                 return true;
             }
             if tokio::time::Instant::now() > deadline {
                 eprintln!(
                     "WAIT TIMEOUT — events: {:#?}",
-                    events.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>()
+                    events
+                        .iter()
+                        .map(|e| format!("{:?}", e.kind))
+                        .collect::<Vec<_>>()
                 );
                 return false;
             }
@@ -166,7 +185,12 @@ impl Harness {
     }
 
     async fn approve(&self, decision: ApprovalDecision, comment: Option<&str>) {
-        let seq = self.backend.latest_sequence(&self.execution_id).await.unwrap() + 1;
+        let seq = self
+            .backend
+            .latest_sequence(&self.execution_id)
+            .await
+            .unwrap()
+            + 1;
         self.backend
             .append_event(Event::new(
                 self.execution_id.clone(),
@@ -198,7 +222,9 @@ async fn gated_node_parks_without_dead_lettering() {
 
     assert!(
         h.wait_for(
-            |ev| ev.iter().any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
+            |ev| ev
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
             10
         )
         .await,
@@ -237,18 +263,27 @@ async fn gated_node_parks_without_dead_lettering() {
         .filter(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. }))
         .count();
     assert_eq!(
-        holds,
-        1,
+        holds, 1,
         "exactly one hold event — no retry loop, no duplicate from reclaimed items"
     );
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::NodeFailed { .. } | EventKind::NodeCompleted { .. })),
+        !events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::NodeFailed { .. } | EventKind::NodeCompleted { .. }
+        )),
         "held node neither ran nor failed"
     );
-    let exec = h.backend.get_execution(&h.execution_id).await.unwrap().unwrap();
-    assert_eq!(exec.status, WorkflowStatus::Running, "execution stays running while parked");
+    let exec = h
+        .backend
+        .get_execution(&h.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        exec.status,
+        WorkflowStatus::Running,
+        "execution stays running while parked"
+    );
 
     h.shutdown().await;
 }
@@ -259,7 +294,9 @@ async fn approved_node_resumes_and_completes() {
 
     assert!(
         h.wait_for(
-            |ev| ev.iter().any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
+            |ev| ev
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
             10
         )
         .await
@@ -268,7 +305,9 @@ async fn approved_node_resumes_and_completes() {
 
     assert!(
         h.wait_for(
-            |ev| ev.iter().any(|e| matches!(e.kind, EventKind::WorkflowCompleted { .. })),
+            |ev| ev
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::WorkflowCompleted { .. })),
             15
         )
         .await,
@@ -276,7 +315,9 @@ async fn approved_node_resumes_and_completes() {
     );
     let events = h.backend.get_events(&h.execution_id).await.unwrap();
     assert!(
-        events.iter().any(|e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == "gated")),
+        events.iter().any(
+            |e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == "gated")
+        ),
         "the gated node actually executed after approval"
     );
 
@@ -289,16 +330,21 @@ async fn rejected_node_fails_workflow_with_reason() {
 
     assert!(
         h.wait_for(
-            |ev| ev.iter().any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
+            |ev| ev
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
             10
         )
         .await
     );
-    h.approve(ApprovalDecision::Rejected, Some("not in business hours")).await;
+    h.approve(ApprovalDecision::Rejected, Some("not in business hours"))
+        .await;
 
     assert!(
         h.wait_for(
-            |ev| ev.iter().any(|e| matches!(e.kind, EventKind::WorkflowFailed { .. })),
+            |ev| ev
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::WorkflowFailed { .. })),
             15
         )
         .await,

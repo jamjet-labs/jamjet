@@ -760,7 +760,10 @@ mod tests {
     #[test]
     fn approval_required_marks_node_held() {
         let progress = fold_events(vec![
-            EventKind::NodeScheduled { node_id: "a".into(), queue_type: "general".into() },
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
             EventKind::ToolApprovalRequired {
                 node_id: "a".into(),
                 tool_name: "t".into(),
@@ -776,7 +779,10 @@ mod tests {
     #[test]
     fn approval_approved_unblocks_node_for_rescheduling() {
         let progress = fold_events(vec![
-            EventKind::NodeScheduled { node_id: "a".into(), queue_type: "general".into() },
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
             EventKind::ToolApprovalRequired {
                 node_id: "a".into(),
                 tool_name: "t".into(),
@@ -800,7 +806,10 @@ mod tests {
     #[test]
     fn approval_rejected_marks_node_for_failure() {
         let progress = fold_events(vec![
-            EventKind::NodeScheduled { node_id: "a".into(), queue_type: "general".into() },
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
             EventKind::ToolApprovalRequired {
                 node_id: "a".into(),
                 tool_name: "t".into(),
@@ -867,40 +876,74 @@ mod tests {
         let (s, b, e) = setup(linear_ir()).await;
 
         // Seed: node "a" scheduled, held, then rejected.
-        append(&b, &e, EventKind::NodeScheduled { node_id: "a".into(), queue_type: "general".into() }).await;
-        append(&b, &e, EventKind::ToolApprovalRequired {
-            node_id: "a".into(),
-            tool_name: "t".into(),
-            approver: "human".into(),
-            context: serde_json::json!({}),
-        }).await;
-        append(&b, &e, EventKind::ApprovalReceived {
-            node_id: "a".into(),
-            user_id: "alice".into(),
-            decision: jamjet_state::event::ApprovalDecision::Rejected,
-            comment: Some("nope".into()),
-            state_patch: None,
-        }).await;
+        append(
+            &b,
+            &e,
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
+        )
+        .await;
+        append(
+            &b,
+            &e,
+            EventKind::ToolApprovalRequired {
+                node_id: "a".into(),
+                tool_name: "t".into(),
+                approver: "human".into(),
+                context: serde_json::json!({}),
+            },
+        )
+        .await;
+        append(
+            &b,
+            &e,
+            EventKind::ApprovalReceived {
+                node_id: "a".into(),
+                user_id: "alice".into(),
+                decision: jamjet_state::event::ApprovalDecision::Rejected,
+                comment: Some("nope".into()),
+                state_patch: None,
+            },
+        )
+        .await;
 
         // Tick 1: scheduler folds the rejection and emits NodeFailed.
         tick(&s, &e).await;
 
         let evs = b.get_events(&e).await.unwrap();
-        let failed: Vec<_> = evs.iter().filter(|ev| matches!(
-            &ev.kind,
-            EventKind::NodeFailed { node_id, retryable: false, .. } if node_id == "a"
-        )).collect();
-        assert_eq!(failed.len(), 1, "exactly one NodeFailed for the rejected node after tick 1");
+        let failed: Vec<_> = evs
+            .iter()
+            .filter(|ev| {
+                matches!(
+                    &ev.kind,
+                    EventKind::NodeFailed { node_id, retryable: false, .. } if node_id == "a"
+                )
+            })
+            .collect();
+        assert_eq!(
+            failed.len(),
+            1,
+            "exactly one NodeFailed for the rejected node after tick 1"
+        );
         if let EventKind::NodeFailed { error, .. } = &failed[0].kind {
-            assert!(error.contains("alice"), "reason must include decider: {error}");
-            assert!(error.contains("nope"), "reason must include comment: {error}");
+            assert!(
+                error.contains("alice"),
+                "reason must include decider: {error}"
+            );
+            assert!(
+                error.contains("nope"),
+                "reason must include comment: {error}"
+            );
         }
 
         // Tick 2: folds the NodeFailed, detects terminal state, emits WorkflowFailed.
         tick(&s, &e).await;
         let evs = b.get_events(&e).await.unwrap();
         assert!(
-            evs.iter().any(|ev| matches!(ev.kind, EventKind::WorkflowFailed { .. })),
+            evs.iter()
+                .any(|ev| matches!(ev.kind, EventKind::WorkflowFailed { .. })),
             "WorkflowFailed must be emitted"
         );
         assert_eq!(status(&b, &e).await, WorkflowStatus::Failed);
@@ -910,14 +953,23 @@ mod tests {
         // but we call schedule_runnable_nodes directly to prove idempotence.
         s.schedule_runnable_nodes(&e, "wf", "0.1.0").await.unwrap();
         let evs = b.get_events(&e).await.unwrap();
-        let count = evs.iter().filter(|ev| matches!(&ev.kind, EventKind::NodeFailed { .. })).count();
-        assert_eq!(count, 1, "NodeFailed must not be duplicated on subsequent ticks");
+        let count = evs
+            .iter()
+            .filter(|ev| matches!(&ev.kind, EventKind::NodeFailed { .. }))
+            .count();
+        assert_eq!(
+            count, 1,
+            "NodeFailed must not be duplicated on subsequent ticks"
+        );
     }
 
     #[test]
     fn retryable_failure_clears_hold() {
         let progress = fold_events(vec![
-            EventKind::NodeScheduled { node_id: "a".into(), queue_type: "general".into() },
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
             EventKind::ToolApprovalRequired {
                 node_id: "a".into(),
                 tool_name: "t".into(),
@@ -949,8 +1001,14 @@ mod tests {
                 provenance: None,
             },
         ]);
-        assert!(progress.held.is_empty(), "held must be cleared after retryable failure");
-        assert!(progress.completed.contains("a"), "node must be in completed after NodeCompleted");
+        assert!(
+            progress.held.is_empty(),
+            "held must be cleared after retryable failure"
+        );
+        assert!(
+            progress.completed.contains("a"),
+            "node must be in completed after NodeCompleted"
+        );
         assert!(progress.rejected.is_empty(), "rejected must be empty");
     }
 }
