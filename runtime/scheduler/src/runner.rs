@@ -437,9 +437,10 @@ struct ExecProgress {
     final_state: serde_json::Map<String, serde_json::Value>,
     /// Highest event sequence already folded in.
     last_sequence: jamjet_state::EventSequence,
-    /// Nodes parked waiting for a human approval decision. They stay in
-    /// `scheduled` too, so the dispatcher won't re-enqueue them; this set
-    /// exists for observability and the rejected/approved transitions.
+    /// Nodes awaiting a human approval decision. This set does NOT keep the
+    /// node parked — that comes from the node remaining in `scheduled` (the
+    /// dispatcher won't re-enqueue it). `held` only gates which
+    /// `ApprovalReceived` decisions are acted on.
     held: HashSet<NodeId>,
     /// Rejected approvals awaiting their `NodeFailed` emission, node -> reason.
     /// Cleared when the corresponding `NodeFailed{retryable: false}` folds in.
@@ -459,6 +460,8 @@ impl ExecProgress {
             } => {
                 self.completed.insert(node_id.clone());
                 self.scheduled.remove(node_id);
+                // Stale-hold cleanup: a completed node no longer awaits approval.
+                self.held.remove(node_id);
                 if let serde_json::Value::Object(patch) = state_patch {
                     for (k, v) in patch {
                         self.final_state.insert(k.clone(), v.clone());
@@ -468,6 +471,8 @@ impl ExecProgress {
             EventKind::NodeSkipped { node_id, .. } => {
                 self.completed.insert(node_id.clone());
                 self.scheduled.remove(node_id);
+                // Stale-hold cleanup: a skipped node no longer awaits approval.
+                self.held.remove(node_id);
             }
             EventKind::NodeScheduled { node_id, .. } | EventKind::NodeStarted { node_id, .. } => {
                 self.scheduled.insert(node_id.clone());
@@ -495,10 +500,11 @@ impl ExecProgress {
             } => {
                 // Re-queued by the subsequent RetryScheduled event.
                 self.scheduled.remove(node_id);
-                // A hold is superseded by the re-queue; without this, a worker
-                // crash mid-hold leaves the node in `held` forever after its
-                // retry completes.
-                self.held.remove(node_id);
+                // Deliberately do NOT clear `held`: a lease reclaim can fire
+                // while the node is parked for approval, and the re-claimed
+                // worker settles quietly without re-emitting
+                // ToolApprovalRequired. Clearing the hold here would drop the
+                // eventual ApprovalReceived decision and wedge the execution.
             }
             EventKind::RetryScheduled { node_id, .. } => {
                 self.scheduled.insert(node_id.clone());
@@ -964,7 +970,12 @@ mod tests {
     }
 
     #[test]
-    fn retryable_failure_clears_hold() {
+    fn reclaimed_hold_still_resumes_on_approval() {
+        // Worker crashes mid-hold: the lease reclaim emits a retryable
+        // NodeFailed, the retry is re-queued, and the re-claimed worker sees
+        // the approval still Pending so it settles quietly — emitting nothing.
+        // The hold must survive all of that so the eventual approval still
+        // resumes the node instead of being silently dropped.
         let progress = fold_events(vec![
             EventKind::NodeScheduled {
                 node_id: "a".into(),
@@ -987,28 +998,69 @@ mod tests {
                 attempt: 1,
                 delay_ms: 1000,
             },
-            EventKind::NodeCompleted {
+            EventKind::ApprovalReceived {
                 node_id: "a".into(),
-                output: serde_json::json!({}),
-                state_patch: serde_json::json!({}),
-                duration_ms: 1,
-                gen_ai_system: None,
-                gen_ai_model: None,
-                input_tokens: None,
-                output_tokens: None,
-                finish_reason: None,
-                cost_usd: None,
-                provenance: None,
+                user_id: "u".into(),
+                decision: jamjet_state::event::ApprovalDecision::Approved,
+                comment: None,
+                state_patch: None,
             },
         ]);
         assert!(
             progress.held.is_empty(),
-            "held must be cleared after retryable failure"
+            "hold must be consumed by the approval"
         );
         assert!(
-            progress.completed.contains("a"),
-            "node must be in completed after NodeCompleted"
+            !progress.scheduled.contains("a"),
+            "approved node must leave `scheduled` so it is re-dispatchable"
         );
         assert!(progress.rejected.is_empty(), "rejected must be empty");
+    }
+
+    #[test]
+    fn reclaimed_hold_still_fails_on_rejection() {
+        let progress = fold_events(vec![
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
+            EventKind::ToolApprovalRequired {
+                node_id: "a".into(),
+                tool_name: "t".into(),
+                approver: "human".into(),
+                context: serde_json::json!({}),
+            },
+            EventKind::NodeFailed {
+                node_id: "a".into(),
+                error: "worker crashed mid-hold".into(),
+                attempt: 0,
+                retryable: true,
+            },
+            EventKind::RetryScheduled {
+                node_id: "a".into(),
+                attempt: 1,
+                delay_ms: 1000,
+            },
+            EventKind::ApprovalReceived {
+                node_id: "a".into(),
+                user_id: "u".into(),
+                decision: jamjet_state::event::ApprovalDecision::Rejected,
+                comment: Some("no".into()),
+                state_patch: None,
+            },
+        ]);
+        let reason = progress.rejected.get("a").expect("rejected entry for a");
+        assert!(
+            reason.contains("u"),
+            "reason must include decider: {reason}"
+        );
+        assert!(
+            reason.contains("no"),
+            "reason must include comment: {reason}"
+        );
+        assert!(
+            progress.held.is_empty(),
+            "hold must be consumed by the rejection"
+        );
     }
 }

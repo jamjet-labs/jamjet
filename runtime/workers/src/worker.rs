@@ -344,8 +344,10 @@ impl Worker {
     /// `ToolApprovalRequired` means the gate is satisfied — return None so the
     /// caller proceeds to execute. Otherwise ensure exactly one outstanding
     /// `ToolApprovalRequired` exists and settle the work item cleanly so the
-    /// lease never expires into the retry/dead-letter path. The scheduler's
-    /// fold (`held` set) keeps the node parked until a decision event arrives.
+    /// lease never expires into the retry/dead-letter path. The node stays
+    /// parked because it remains in the scheduler fold's `scheduled` set (so
+    /// it is never re-dispatched); the fold's `held` set only gates which
+    /// decision events are acted on.
     /// The helper requires the FULL event log because a partial fold could
     /// misreport NotRequested for an already-approved node.
     async fn hold_for_approval(
@@ -587,6 +589,10 @@ impl Worker {
         match decision {
             AutonomyDecision::Proceed => None,
 
+            // Currently unreachable at runtime: `AutonomyEnforcer.check` above
+            // is called with `tool_name: None` (pre-existing), so it never
+            // returns RequireToolApproval. The wiring is in place for when
+            // pending tool names are threaded through.
             AutonomyDecision::RequireToolApproval { tool_name } => {
                 self.hold_for_approval(
                     execution_id,
