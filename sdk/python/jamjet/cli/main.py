@@ -94,7 +94,7 @@ def _version_callback(value: bool) -> None:
             ver = importlib.metadata.version("jamjet")
         except importlib.metadata.PackageNotFoundError:
             ver = "unknown"
-        typer.echo(f"\nJamJet v{ver}  —  agent-native workflow runtime")
+        typer.echo(f"\nJamJet v{ver} - agent-native workflow runtime")
         raise typer.Exit()
 
 
@@ -107,7 +107,7 @@ class OutputFormat(enum.StrEnum):
 
 app = typer.Typer(
     name="jamjet",
-    help="JamJet — agent-native workflow runtime CLI",
+    help="JamJet - agent-native workflow runtime CLI",
     no_args_is_help=True,
 )
 
