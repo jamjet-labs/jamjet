@@ -11,6 +11,15 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## 0.10.2 - 2026-06-12
+
+### Fixed
+
+- `jamjet dev`: server binary cache is now keyed by SDK version (`~/.jamjet/bin/<version>/jamjet-server`) so upgrading via `pip install -U jamjet` always fetches the matching runtime binary. Previously a cached binary was reused indefinitely regardless of SDK version.
+- `jamjet approvals` table: title uses `-` instead of an em dash; missing comment cells render as empty instead of an em dash character.
+
+---
+
 ## 0.10.0 - 2026-06-12
 
 ### SDK
