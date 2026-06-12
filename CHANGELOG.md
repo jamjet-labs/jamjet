@@ -11,19 +11,19 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## 0.10.0 — 2026-06-12
+## 0.10.0 - 2026-06-12
 
 ### SDK
 
-- `jamjet approvals EXECUTION_ID` — table of pending (node_id, tool_name, approver) and decided (node_id, status, user_id, comment) entries; friendly empty-state message when nothing is on record.
-- `jamjet approve EXECUTION_ID --decision approved|rejected` — posts to the runtime approve endpoint, prints resolved node_id on success; `--node-id` and `--comment` are optional. Validated decision values give a clean parameter error instead of a traceback. HTTP 4xx from the server prints the `error` field and exits 1 without a traceback.
-- `client.list_approvals(execution_id)` — GETs `/executions/{id}/approvals`, returns `{"pending": [...], "decided": [...]}`.
+- `jamjet approvals EXECUTION_ID` - table of pending (node_id, tool_name, approver) and decided (node_id, status, user_id, comment) entries; friendly empty-state message when nothing is on record.
+- `jamjet approve EXECUTION_ID --decision approved|rejected` - posts to the runtime approve endpoint, prints resolved node_id on success; `--node-id` and `--comment` are optional. Validated decision values give a clean parameter error instead of a traceback. HTTP 4xx from the server prints the `error` field and exits 1 without a traceback.
+- `client.list_approvals(execution_id)` - GETs `/executions/{id}/approvals`, returns `{"pending": [...], "decided": [...]}`.
 - `client.approve()` gains an optional `node_id` parameter; the runtime infers the node when exactly one approval is pending.
 - `jamjet --version` reads the installed package version via `importlib.metadata` instead of the hardcoded string.
 
 ---
 
-## Runtime 0.4.0 — 2026-06-12
+## Runtime 0.4.0 - 2026-06-12
 
 ### Added
 - Approval/HITL loop end-to-end: nodes gated by `require_approval_for` policy park durably; `POST /executions/:id/approve` resumes or fails them through the normal scheduler path; rejected approvals fail closed with decider and comment recorded in the event log.
