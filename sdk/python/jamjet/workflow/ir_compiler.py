@@ -167,6 +167,7 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
         if node_type == "end":
             continue
         kind = _yaml_node_to_kind(node_id, node_type, node_data, end_ids)
+        node_policy = _compile_policy(node_data.get("policy"), location=f"node '{node_id}'")
         nodes[node_id] = {
             "id": node_id,
             "kind": kind,
@@ -174,6 +175,7 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
             "node_timeout_secs": _parse_timeout(node_data.get("timeout")),
             "description": node_data.get("description"),
             "labels": node_data.get("labels", {}),
+            "policy": node_policy,
         }
 
         next_val = node_data.get("next")
@@ -194,6 +196,8 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
         elif next_val == "end" or next_val is None:
             edges.append({"from": node_id, "to": "end", "condition": None})
 
+    workflow_policy = _compile_policy(data.get("policy"), location="workflow-level policy")
+
     return {
         "workflow_id": wf.get("id", "unknown"),
         "version": wf.get("version", "0.1.0"),
@@ -210,6 +214,7 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
         "mcp_servers": data.get("mcp", {}).get("servers", {}),
         "remote_agents": data.get("a2a", {}).get("remote_agents", {}),
         "labels": wf.get("labels", {}),
+        "policy": workflow_policy,
     }
 
 
@@ -498,3 +503,33 @@ def _parse_timeout(timeout: str | int | None) -> int | None:
     if s.endswith("h"):
         return int(s[:-1]) * 3600
     return int(s)
+
+
+# Known keys for the PolicySetIr struct (runtime/ir/src/workflow.rs).
+_POLICY_KNOWN_KEYS = frozenset({"blocked_tools", "require_approval_for", "model_allowlist"})
+
+
+def _compile_policy(raw: Any, *, location: str = "policy") -> dict[str, Any] | None:
+    """Compile a raw YAML policy block to a PolicySetIr-compatible dict.
+
+    Returns None when ``raw`` is None (policy absent).
+    Raises ``ValueError`` when unknown keys are present.
+
+    All three fields default to ``[]`` so the emitted JSON matches the
+    ``gated_ir()`` fixture in ``runtime/api/tests/approval_e2e.rs`` exactly.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"policy block at {location} must be a mapping, got {type(raw).__name__}")
+
+    unknown = set(raw) - _POLICY_KNOWN_KEYS
+    if unknown:
+        bad = ", ".join(sorted(unknown))
+        raise ValueError(f"Unknown key(s) in {location}: {bad}. Allowed keys: {', '.join(sorted(_POLICY_KNOWN_KEYS))}")
+
+    return {
+        "blocked_tools": list(raw.get("blocked_tools") or []),
+        "require_approval_for": list(raw.get("require_approval_for") or []),
+        "model_allowlist": list(raw.get("model_allowlist") or []),
+    }

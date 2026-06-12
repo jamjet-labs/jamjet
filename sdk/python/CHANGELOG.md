@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.1 — 2026-06-12
+
+### Added
+
+- YAML workflows: policy blocks (blocked_tools, require_approval_for, model_allowlist) at workflow and node scope now compile into runtime IR. Unknown keys inside a policy block raise ValueError.
+
 ## 0.9.0 — 2026-06-06
 
 ### Added — Multi-agent YAML fleets + scheduling
