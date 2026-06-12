@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import importlib.metadata
 import json
 import sys
 import time
@@ -89,7 +90,11 @@ def _print_logo() -> None:
 def _version_callback(value: bool) -> None:
     if value:
         _print_logo()
-        typer.echo("\nJamJet v0.1.1  —  agent-native workflow runtime")
+        try:
+            ver = importlib.metadata.version("jamjet")
+        except importlib.metadata.PackageNotFoundError:
+            ver = "unknown"
+        typer.echo(f"\nJamJet v{ver}  —  agent-native workflow runtime")
         raise typer.Exit()
 
 
@@ -2069,6 +2074,108 @@ def _effect_size_label(d: float) -> str:
         return "medium"
     else:
         return "large"
+
+
+# ── approvals ─────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def approvals(
+    execution_id: str = typer.Argument(..., help="Execution ID (exec_...)"),
+    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+) -> None:
+    """List pending and decided approvals for an execution."""
+
+    async def _approvals() -> None:
+        async with _client(runtime) as c:
+            data = await c.list_approvals(execution_id)
+
+        pending = data.get("pending", [])
+        decided = data.get("decided", [])
+
+        if not pending and not decided:
+            console.print(f"[dim]No approvals on {execution_id}.[/dim]")
+            return
+
+        if pending:
+            t = Table(title=f"Pending approvals — {execution_id}")
+            t.add_column("Node", style="bold")
+            t.add_column("Tool")
+            t.add_column("Approver")
+            t.add_column("Seq", style="dim", justify="right")
+            for entry in pending:
+                t.add_row(
+                    entry.get("node_id", "—"),
+                    entry.get("tool_name", "—"),
+                    entry.get("approver", "—"),
+                    str(entry.get("sequence", "")),
+                )
+            console.print(t)
+
+        if decided:
+            d = Table(title="Decided")
+            d.add_column("Node", style="bold")
+            d.add_column("Status")
+            d.add_column("User")
+            d.add_column("Comment")
+            d.add_column("Seq", style="dim", justify="right")
+            for entry in decided:
+                comment = entry.get("comment", "")
+                d.add_row(
+                    entry.get("node_id", "—"),
+                    entry.get("status", "—"),
+                    entry.get("user_id", "—"),
+                    comment if comment else "—",
+                    str(entry.get("sequence", "")),
+                )
+            console.print(d)
+
+    asyncio.run(_approvals())
+
+
+# ── approve ───────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def approve(
+    execution_id: str = typer.Argument(..., help="Execution ID (exec_...)"),
+    decision: str = typer.Option(..., "--decision", "-d", help="approved or rejected"),
+    node_id: str | None = typer.Option(None, "--node-id", help="Node to approve (inferred when one is pending)"),
+    comment: str | None = typer.Option(None, "--comment", "-c", help="Optional comment"),
+    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+) -> None:
+    """Approve or reject a pending HITL gate on an execution."""
+    if decision not in ("approved", "rejected"):
+        raise typer.BadParameter(
+            f"'{decision}' is not a valid decision. Use 'approved' or 'rejected'.",
+            param_hint="--decision",
+        )
+
+    async def _approve() -> None:
+        import httpx
+
+        async with _client(runtime) as c:
+            try:
+                result = await c.approve(
+                    execution_id,
+                    decision,
+                    node_id=node_id,
+                    comment=comment,
+                )
+            except httpx.HTTPStatusError as exc:
+                try:
+                    msg = exc.response.json().get("error") or exc.response.text
+                except Exception:
+                    msg = exc.response.text
+                console.print(f"[red]Error:[/red] {msg}")
+                raise typer.Exit(1) from exc
+
+        resolved = result.get("node_id", "?")
+        accepted = result.get("accepted", decision == "approved")
+        status_str = "[green]approved[/green]" if accepted else "[red]rejected[/red]"
+        console.print(f"{status_str}  node=[bold]{resolved}[/bold]  execution={execution_id}")
+
+    asyncio.run(_approve())
 
 
 if __name__ == "__main__":

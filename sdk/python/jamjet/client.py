@@ -129,15 +129,28 @@ class JamjetClient:
         self,
         execution_id: str,
         decision: str,
+        node_id: str | None = None,
         comment: str | None = None,
         state_patch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"decision": decision}
+        if node_id:
+            body["node_id"] = node_id
         if comment:
             body["comment"] = comment
         if state_patch:
             body["state_patch"] = state_patch
         r = await self._client.post(f"/executions/{execution_id}/approve", json=body)
+        r.raise_for_status()
+        return r.json()
+
+    async def list_approvals(self, execution_id: str) -> dict[str, Any]:
+        """Pending and decided approvals for an execution.
+
+        Returns ``{"pending": [...], "decided": [...]}`` as served by
+        ``GET /executions/{id}/approvals``.
+        """
+        r = await self._client.get(f"/executions/{execution_id}/approvals")
         r.raise_for_status()
         return r.json()
 

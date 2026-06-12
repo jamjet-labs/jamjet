@@ -11,8 +11,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-jamjet-core = { path = "../core", version = "=0.3.2" }
-jamjet-telemetry = { path = "../telemetry", version = "=0.3.2" }
+jamjet-core = { path = "../core", version = "=0.4.0" }
+jamjet-telemetry = { path = "../telemetry", version = "=0.4.0" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
