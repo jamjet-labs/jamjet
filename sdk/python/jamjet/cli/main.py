@@ -251,6 +251,22 @@ def init(
 # ── dev ──────────────────────────────────────────────────────────────────────
 
 
+def _sdk_version() -> str:
+    """Return the installed SDK version, or 'dev' for source checkouts."""
+    try:
+        return importlib.metadata.version("jamjet")
+    except importlib.metadata.PackageNotFoundError:
+        return "dev"
+
+
+def _server_cache_dir() -> str:
+    """Return the versioned binary cache directory: ~/.jamjet/bin/<sdk_version>."""
+    import os
+
+    version = _sdk_version()
+    return os.path.join(os.path.expanduser("~"), ".jamjet", "bin", version)
+
+
 def _find_server_binary() -> str:
     """Locate the jamjet-server binary, auto-downloading if necessary."""
     import os
@@ -275,13 +291,16 @@ def _find_server_binary() -> str:
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return os.path.abspath(path)
 
-    # 3. Check ~/.jamjet/bin/ cache (previously auto-downloaded)
-    cache_dir = os.path.join(os.path.expanduser("~"), ".jamjet", "bin")
+    # 3. Check versioned cache: ~/.jamjet/bin/<sdk_version>/jamjet-server
+    # The flat legacy path (~/.jamjet/bin/jamjet-server) is intentionally ignored
+    # so that upgrading the SDK always fetches the matching runtime binary.
+    # Users can remove old flat binaries manually; we never delete them automatically.
+    cache_dir = _server_cache_dir()
     cached = os.path.join(cache_dir, "jamjet-server")
     if os.path.isfile(cached) and os.access(cached, os.X_OK):
         return cached
 
-    # 4. Auto-download from GitHub Releases
+    # 4. Auto-download from GitHub Releases into the versioned cache dir
     return _download_server_binary(cache_dir)
 
 
@@ -370,6 +389,7 @@ def _download_server_binary(cache_dir: str) -> str:
     os.replace(dest_tmp, dest)
     os.chmod(dest, os.stat(dest).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     console.print(f"[green]✓[/green] Runtime binary cached at {dest}")
+    console.print("[dim]Older cached binaries under ~/.jamjet/bin can be removed manually.[/dim]")
     return dest
 
 
@@ -2098,16 +2118,16 @@ def approvals(
             return
 
         if pending:
-            t = Table(title=f"Pending approvals — {execution_id}")
+            t = Table(title=f"Pending approvals - {execution_id}")
             t.add_column("Node", style="bold")
             t.add_column("Tool")
             t.add_column("Approver")
             t.add_column("Seq", style="dim", justify="right")
             for entry in pending:
                 t.add_row(
-                    entry.get("node_id", "—"),
-                    entry.get("tool_name", "—"),
-                    entry.get("approver", "—"),
+                    entry.get("node_id", "-"),
+                    entry.get("tool_name", "-"),
+                    entry.get("approver", "-"),
                     str(entry.get("sequence", "")),
                 )
             console.print(t)
@@ -2122,10 +2142,10 @@ def approvals(
             for entry in decided:
                 comment = entry.get("comment", "")
                 d.add_row(
-                    entry.get("node_id", "—"),
-                    entry.get("status", "—"),
-                    entry.get("user_id", "—"),
-                    comment if comment else "—",
+                    entry.get("node_id", "-"),
+                    entry.get("status", "-"),
+                    entry.get("user_id", "-"),
+                    comment if comment else "",
                     str(entry.get("sequence", "")),
                 )
             console.print(d)
