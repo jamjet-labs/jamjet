@@ -526,10 +526,7 @@ def _compile_policy(raw: Any, *, location: str = "policy") -> dict[str, Any] | N
     unknown = set(raw) - _POLICY_KNOWN_KEYS
     if unknown:
         bad = ", ".join(sorted(unknown))
-        raise ValueError(
-            f"Unknown key(s) in {location}: {bad}. "
-            f"Allowed keys: {', '.join(sorted(_POLICY_KNOWN_KEYS))}"
-        )
+        raise ValueError(f"Unknown key(s) in {location}: {bad}. Allowed keys: {', '.join(sorted(_POLICY_KNOWN_KEYS))}")
 
     return {
         "blocked_tools": list(raw.get("blocked_tools") or []),
