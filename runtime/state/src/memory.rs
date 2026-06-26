@@ -71,6 +71,13 @@ impl InMemoryBackend {
     pub fn set_store_term_at_least(&self, term: i64) -> i64 {
         self.store_term.fetch_max(term, Ordering::SeqCst).max(term)
     }
+
+    /// Insert a key directly into the idempotency cache.
+    /// Only available on this in-memory (dev/test) backend; SQLite backends
+    /// record effects exclusively via `commit_turn`.
+    pub fn seed_tool_effect_for_test(&self, key: String, value: serde_json::Value) {
+        self.tool_effects.insert(key, value);
+    }
 }
 
 impl Default for InMemoryBackend {

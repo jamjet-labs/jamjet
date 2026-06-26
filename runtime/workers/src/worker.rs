@@ -10,6 +10,7 @@ use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
 use jamjet_state::approvals::NodeApprovalStatus;
 use jamjet_state::backend::{StateBackend, StateBackendError, WorkItem, WorkItemId};
 use jamjet_state::budget::BudgetState;
+use jamjet_state::content_hash;
 use jamjet_state::event::EventKind;
 use jamjet_telemetry::{gen_ai_attrs, metrics, record_gen_ai_usage};
 use std::collections::HashMap;
@@ -160,6 +161,9 @@ impl Worker {
             workflow_version.as_str(),
         );
 
+        // Idempotency key computed inside the node branch; used on NodeCompleted.
+        let mut computed_key: Option<String> = None;
+
         let result: Result<ExecutionResult, String> = match self
             .load_ir(&workflow_id, &workflow_version)
             .await
@@ -201,41 +205,124 @@ impl Worker {
                         return r;
                     }
 
-                    // Execute.
-                    let exec_result = match self.executors.get(&kind_tag) {
-                        Some(executor) if kind_tag == "agent_tool" => {
-                            let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
-                            let backend = Arc::clone(&self.backend);
-                            let eid = execution_id.clone();
-                            let receiver_handle = tokio::spawn(async move {
-                                while let Some(event) = rx.recv().await {
-                                    backend
-                                        .patch_append_array(&eid, "agent_tool_events", event)
-                                        .await
-                                        .map_err(|e| format!("patch_append_array failed: {e}"))?;
-                                }
-                                Ok::<(), String>(())
-                            });
-                            let result = executor.execute_streaming(&item, tx).await;
-                            match receiver_handle.await {
-                                Ok(Err(e)) => Err(e),
-                                Err(e) => Err(format!("Receiver task panicked: {e}")),
-                                Ok(Ok(())) => result,
-                            }
-                        }
-                        Some(executor) => executor.execute(&item).await,
-                        None => {
-                            info!(node_id = %node_id, kind = %kind_tag, "No executor; using stub");
+                    // Compute deterministic idempotency key: H(run, segment, step, node, input_hash).
+                    // step = count of NodeStarted events for this node already in the log minus 1
+                    // (the current NodeStarted was just appended above).
+                    let events_for_key = self.backend.get_events(&execution_id).await?;
+                    let step = events_for_key
+                        .iter()
+                        .filter(|e| {
+                            matches!(
+                                &e.kind,
+                                EventKind::NodeStarted { node_id: nid, .. } if nid == &node_id
+                            )
+                        })
+                        .count()
+                        .saturating_sub(1) as u64;
+                    let current_state = self
+                        .backend
+                        .get_execution(&execution_id)
+                        .await?
+                        .map(|e| e.current_state)
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let input_hash = content_hash(&current_state);
+                    let key = content_hash(&serde_json::json!({
+                        "run": execution_id.to_string(),
+                        "segment": 0,
+                        "step": step,
+                        "node": node_id,
+                        "input": input_hash,
+                    }));
+                    computed_key = Some(key.clone());
+
+                    // Replay-or-fire: if a result was already committed for this key,
+                    // reconstruct ExecutionResult from it and skip the executor entirely.
+                    let exec_result = match self.backend.get_tool_effect(&key).await? {
+                        Some(rec) => {
+                            info!(
+                                execution_id = %execution_id,
+                                node_id = %node_id,
+                                %key,
+                                "Replaying recorded result; executor skipped"
+                            );
                             Ok(ExecutionResult {
-                                output: serde_json::json!({}),
-                                state_patch: serde_json::json!({}),
-                                duration_ms: start.elapsed().as_millis() as u64,
-                                gen_ai_system: None,
-                                gen_ai_model: None,
-                                input_tokens: None,
-                                output_tokens: None,
-                                finish_reason: None,
+                                output: rec
+                                    .get("output")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({})),
+                                state_patch: rec
+                                    .get("state_patch")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({})),
+                                duration_ms: rec
+                                    .get("duration_ms")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                gen_ai_system: rec
+                                    .get("gen_ai_system")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                gen_ai_model: rec
+                                    .get("gen_ai_model")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                input_tokens: rec.get("input_tokens").and_then(|v| v.as_u64()),
+                                output_tokens: rec.get("output_tokens").and_then(|v| v.as_u64()),
+                                finish_reason: rec
+                                    .get("finish_reason")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
                             })
+                        }
+                        None => {
+                            // No recorded result — fire the executor.
+                            match self.executors.get(&kind_tag) {
+                                Some(executor) if kind_tag == "agent_tool" => {
+                                    let (tx, mut rx) =
+                                        tokio::sync::mpsc::channel::<serde_json::Value>(64);
+                                    let backend = Arc::clone(&self.backend);
+                                    let eid = execution_id.clone();
+                                    let receiver_handle = tokio::spawn(async move {
+                                        while let Some(event) = rx.recv().await {
+                                            backend
+                                                .patch_append_array(
+                                                    &eid,
+                                                    "agent_tool_events",
+                                                    event,
+                                                )
+                                                .await
+                                                .map_err(|e| {
+                                                    format!("patch_append_array failed: {e}")
+                                                })?;
+                                        }
+                                        Ok::<(), String>(())
+                                    });
+                                    let result = executor.execute_streaming(&item, tx).await;
+                                    match receiver_handle.await {
+                                        Ok(Err(e)) => Err(e),
+                                        Err(e) => Err(format!("Receiver task panicked: {e}")),
+                                        Ok(Ok(())) => result,
+                                    }
+                                }
+                                Some(executor) => executor.execute(&item).await,
+                                None => {
+                                    info!(
+                                        node_id = %node_id,
+                                        kind = %kind_tag,
+                                        "No executor; using stub"
+                                    );
+                                    Ok(ExecutionResult {
+                                        output: serde_json::json!({}),
+                                        state_patch: serde_json::json!({}),
+                                        duration_ms: start.elapsed().as_millis() as u64,
+                                        gen_ai_system: None,
+                                        gen_ai_model: None,
+                                        input_tokens: None,
+                                        output_tokens: None,
+                                        finish_reason: None,
+                                    })
+                                }
+                            }
                         }
                     };
 
@@ -307,7 +394,7 @@ impl Worker {
                         finish_reason: exec_result.finish_reason,
                         cost_usd: None,
                         provenance: None,
-                        idempotency_key: None, // Task 2 sets this
+                        idempotency_key: computed_key,
                     },
                 );
                 // Snapshot is computed inside commit_turn's BEGIN IMMEDIATE
@@ -1170,5 +1257,113 @@ mod tests {
             completed_count, 0,
             "zombie must not emit NodeCompleted; got {completed_count}"
         );
+    }
+
+    // ── Replay executor ───────────────────────────────────────────────────────
+
+    /// Executor that records whether it was called. Used to assert the replay
+    /// path skips executor invocation entirely.
+    struct TrackingExecutor {
+        was_called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for TrackingExecutor {
+        async fn execute(
+            &self,
+            _item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, String> {
+            self.was_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Err("TrackingExecutor fired — replay must prevent this".into())
+        }
+    }
+
+    /// Replay path: when a tool_effect is already recorded for the computed
+    /// idempotency key, the worker must skip the executor, reconstruct the
+    /// ExecutionResult from the cached record, and emit NodeCompleted with the
+    /// replayed output.
+    ///
+    /// Construction: we pre-seed the backend's idempotency cache with the key
+    /// that the worker will compute for this execution+node at step=0 (one
+    /// NodeStarted event in the log after the worker emits it → count=1 →
+    /// step=0). A TrackingExecutor registered for "tool" asserts it is never
+    /// invoked.
+    #[tokio::test]
+    async fn replay_skips_executor_when_result_recorded() {
+        use jamjet_state::content_hash;
+
+        let (backend, eid) = setup_backend().await;
+
+        // Compute the key that the worker will derive at step=0.
+        // At key-computation time the worker has just emitted NodeStarted{n1},
+        // so NodeStarted count = 1 → step = 1 - 1 = 0.
+        // The execution was seeded with current_state = {} in setup_backend.
+        let input_hash = content_hash(&serde_json::json!({}));
+        let expected_key = content_hash(&serde_json::json!({
+            "run": eid.to_string(),
+            "segment": 0,
+            "step": 0u64,
+            "node": "n1",
+            "input": input_hash,
+        }));
+
+        // Pre-seed the idempotency cache with a known output for that key.
+        let seeded_output = serde_json::json!({"answer": 42});
+        backend.seed_tool_effect_for_test(
+            expected_key.clone(),
+            serde_json::json!({
+                "output": seeded_output,
+                "state_patch": serde_json::json!({}),
+                "duration_ms": 7u64,
+                "gen_ai_system": serde_json::Value::Null,
+                "gen_ai_model": serde_json::Value::Null,
+                "input_tokens": serde_json::Value::Null,
+                "output_tokens": serde_json::Value::Null,
+                "finish_reason": serde_json::Value::Null,
+            }),
+        );
+
+        // Register a tracking executor for the "tool" kind. If the replay path
+        // is missing, execute() will be called and set was_called=true.
+        let was_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor(
+            "tool",
+            Arc::new(TrackingExecutor {
+                was_called: Arc::clone(&was_called),
+            }),
+        );
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        // Run: replay path must take over; executor must not be called.
+        worker.execute_item(item).await.unwrap();
+
+        assert!(
+            !was_called.load(std::sync::atomic::Ordering::SeqCst),
+            "executor must not be called when a recorded result exists"
+        );
+
+        // The replayed output must appear in the NodeCompleted event.
+        let events = backend.get_events(&eid).await.unwrap();
+        let completed = events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+            .expect("NodeCompleted must be emitted even on replay");
+        if let EventKind::NodeCompleted { output, .. } = &completed.kind {
+            assert_eq!(
+                output, &seeded_output,
+                "replayed output must match the seeded record"
+            );
+        }
     }
 }
