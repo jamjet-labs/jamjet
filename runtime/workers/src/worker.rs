@@ -206,19 +206,19 @@ impl Worker {
                     }
 
                     // Compute deterministic idempotency key: H(run, segment, step, node, input_hash).
-                    // step = count of NodeStarted events for this node already in the log minus 1
-                    // (the current NodeStarted was just appended above).
+                    // step = count of NodeCompleted events for this node_id in the event log.
+                    // Retries do not complete, so the count is stable across retries and advances
+                    // exactly once per successful loop occurrence — making recorded results replay-stable.
                     let events_for_key = self.backend.get_events(&execution_id).await?;
                     let step = events_for_key
                         .iter()
                         .filter(|e| {
                             matches!(
                                 &e.kind,
-                                EventKind::NodeStarted { node_id: nid, .. } if nid == &node_id
+                                EventKind::NodeCompleted { node_id: nid, .. } if nid == &node_id
                             )
                         })
-                        .count()
-                        .saturating_sub(1) as u64;
+                        .count() as u64;
                     let current_state = self
                         .backend
                         .get_execution(&execution_id)
@@ -1296,8 +1296,8 @@ mod tests {
         let (backend, eid) = setup_backend().await;
 
         // Compute the key that the worker will derive at step=0.
-        // At key-computation time the worker has just emitted NodeStarted{n1},
-        // so NodeStarted count = 1 → step = 1 - 1 = 0.
+        // At key-computation time no NodeCompleted for n1 exists in the log,
+        // so NodeCompleted count = 0 → step = 0.
         // The execution was seeded with current_state = {} in setup_backend.
         let input_hash = content_hash(&serde_json::json!({}));
         let expected_key = content_hash(&serde_json::json!({
@@ -1363,6 +1363,113 @@ mod tests {
             assert_eq!(
                 output, &seeded_output,
                 "replayed output must match the seeded record"
+            );
+        }
+    }
+
+    /// Record-replay exactly-once: pre-seed the idempotency cache for the step=0
+    /// key (simulating a crash after the effect was recorded but before
+    /// NodeCompleted was committed). Re-run the node with a counting executor.
+    /// The counter must stay at 0 (replay path — zero outbound calls).
+    /// The output emitted in NodeCompleted must match the cached record, not
+    /// what the executor would have returned.
+    #[tokio::test]
+    async fn record_replay_zero_outbound_calls() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct CountingExecutor {
+            count: Arc<AtomicU32>,
+        }
+
+        #[async_trait::async_trait]
+        impl NodeExecutor for CountingExecutor {
+            async fn execute(
+                &self,
+                _item: &jamjet_state::backend::WorkItem,
+            ) -> Result<ExecutionResult, String> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(ExecutionResult {
+                    output: serde_json::json!({"fresh": true}),
+                    state_patch: serde_json::json!({}),
+                    duration_ms: 1,
+                    gen_ai_system: None,
+                    gen_ai_model: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    finish_reason: None,
+                })
+            }
+        }
+
+        use jamjet_state::content_hash;
+
+        let (backend, eid) = setup_backend().await;
+
+        // Compute the idempotency key for step=0: no NodeCompleted events exist yet.
+        // current_state = {} as seeded in setup_backend.
+        let input_hash = content_hash(&serde_json::json!({}));
+        let expected_key = content_hash(&serde_json::json!({
+            "run": eid.to_string(),
+            "segment": 0,
+            "step": 0u64,
+            "node": "n1",
+            "input": input_hash,
+        }));
+
+        // Simulate: executor ran and its result was recorded in the idempotency
+        // cache, but NodeCompleted was never committed (crash before commit_turn).
+        let recorded_output = serde_json::json!({"cached": true});
+        backend.seed_tool_effect_for_test(
+            expected_key,
+            serde_json::json!({
+                "output": recorded_output,
+                "state_patch": serde_json::json!({}),
+                "duration_ms": 5u64,
+                "gen_ai_system": serde_json::Value::Null,
+                "gen_ai_model": serde_json::Value::Null,
+                "input_tokens": serde_json::Value::Null,
+                "output_tokens": serde_json::Value::Null,
+                "finish_reason": serde_json::Value::Null,
+            }),
+        );
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor(
+            "tool",
+            Arc::new(CountingExecutor {
+                count: Arc::clone(&call_count),
+            }),
+        );
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        worker.execute_item(item).await.unwrap();
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "executor must not be called when a cached result exists (exactly-once replay)"
+        );
+
+        // NodeCompleted must carry the cached output, not the executor's output.
+        let events = backend.get_events(&eid).await.unwrap();
+        let completed = events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+            .expect("NodeCompleted must be emitted even on replay");
+        if let EventKind::NodeCompleted { output, .. } = &completed.kind {
+            assert_eq!(
+                output, &recorded_output,
+                "replayed output must match the cached record"
             );
         }
     }

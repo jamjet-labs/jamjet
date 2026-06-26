@@ -305,6 +305,154 @@ async fn sqlite_concurrent_winner_insert_or_ignore() {
     );
 }
 
+// ── Key-stability unit tests ─────────────────────────────────────────────────
+
+/// The key formula is deterministic: the same (execution_id, node_id, step,
+/// current_state) inputs produce the same key regardless of when or how many
+/// times it is computed.
+#[test]
+fn key_stability_same_inputs_yields_same_key() {
+    let exec_id = "exec-stable-abc";
+    let node_id = "n1";
+    let step: u64 = 0;
+    let state = json!({});
+
+    let input_hash = jamjet_state::content_hash(&state);
+    let key_a = jamjet_state::content_hash(&json!({
+        "run": exec_id,
+        "segment": 0,
+        "step": step,
+        "node": node_id,
+        "input": input_hash,
+    }));
+    let key_b = jamjet_state::content_hash(&json!({
+        "run": exec_id,
+        "segment": 0,
+        "step": step,
+        "node": node_id,
+        "input": input_hash,
+    }));
+
+    assert_eq!(key_a, key_b, "same inputs must produce the same key");
+    assert_eq!(key_a.len(), 64, "key must be a 64-char hex sha256");
+    assert!(
+        key_a.chars().all(|c| c.is_ascii_hexdigit()),
+        "key must be lowercase hex"
+    );
+}
+
+/// A second loop occurrence (step advances once per NodeCompleted) produces a
+/// different key from the first occurrence. This ensures the cache cannot
+/// collide across loop passes.
+#[test]
+fn key_differs_when_step_advances() {
+    let exec_id = "exec-stable-abc";
+    let node_id = "n1";
+    let state = json!({});
+    let input_hash = jamjet_state::content_hash(&state);
+
+    let key_step0 = jamjet_state::content_hash(&json!({
+        "run": exec_id,
+        "segment": 0,
+        "step": 0u64,
+        "node": node_id,
+        "input": input_hash,
+    }));
+    let key_step1 = jamjet_state::content_hash(&json!({
+        "run": exec_id,
+        "segment": 0,
+        "step": 1u64,
+        "node": node_id,
+        "input": input_hash,
+    }));
+
+    assert_ne!(
+        key_step0, key_step1,
+        "step=0 and step=1 must yield different keys (second loop occurrence)"
+    );
+}
+
+// ── Restart-survival test ─────────────────────────────────────────────────────
+
+/// A tool_effect written to a file-backed SQLite database is readable after
+/// the connection is closed and reopened — simulating a process restart.
+#[tokio::test]
+async fn sqlite_tool_effect_survives_reopen() {
+    let mut path = std::env::temp_dir();
+    let unique = uuid::Uuid::new_v4().to_string().replace('-', "");
+    path.push(format!("jamjet_idem_test_{unique}.db"));
+    let url = format!("sqlite://{}", path.display());
+
+    // First "process": commit a NodeCompleted with an idempotency key.
+    {
+        let db = SqliteBackend::open(&url)
+            .await
+            .expect("failed to open db for write");
+
+        let exec_id = ExecutionId::new();
+        db.create_execution(sample_execution(&exec_id))
+            .await
+            .unwrap();
+        db.enqueue_work_item(sample_item(&exec_id, "n1"))
+            .await
+            .unwrap();
+
+        let item = db
+            .claim_work_item("worker-1", &["model"])
+            .await
+            .unwrap()
+            .expect("item must be claimed");
+
+        let event = Event::new(
+            exec_id.clone(),
+            0,
+            EventKind::NodeCompleted {
+                node_id: "n1".into(),
+                output: json!({"answer": 99}),
+                state_patch: json!({}),
+                duration_ms: 1,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+                idempotency_key: Some("restart-key".into()),
+            },
+        );
+
+        db.commit_turn(item.id, item.lease_fence, event, false)
+            .await
+            .expect("commit_turn must succeed");
+        // db dropped here — connection closed.
+    }
+
+    // Second "process": reopen the same file and verify the effect survived.
+    {
+        let db2 = SqliteBackend::open(&url)
+            .await
+            .expect("failed to reopen db");
+
+        let recorded = db2
+            .get_tool_effect("restart-key")
+            .await
+            .expect("get_tool_effect must not error after reopen");
+        assert!(
+            recorded.is_some(),
+            "tool_effect must survive process restart (db reopen)"
+        );
+        let val = recorded.unwrap();
+        assert_eq!(
+            val["output"],
+            json!({"answer": 99}),
+            "output must survive db reopen"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
 // ── In-memory backend tests ──────────────────────────────────────────────────
 
 /// Same round-trip test against the InMemoryBackend.
