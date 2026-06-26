@@ -10,7 +10,7 @@ use crate::event::{Event, EventKind};
 use crate::snapshot::DEFAULT_SNAPSHOT_INTERVAL;
 use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The materialized state of a workflow execution at a point in time.
 #[derive(Debug, Clone)]
@@ -31,9 +31,12 @@ pub struct MaterializedState {
 ///
 /// Algorithm:
 /// 1. Load the latest snapshot (if any). If none, start from the initial_input.
-/// 2. Load all events since the snapshot's `at_sequence`.
-/// 3. Apply state patches from `NodeCompleted` events in order.
-/// 4. Derive `status`, `completed_nodes`, and `active_nodes` from all events.
+/// 2. Seed the base `MaterializedState` from the snapshot's full persisted state
+///    (current_state, status, completed_nodes, active_nodes, last_sequence).
+/// 3. Load all events since the snapshot's `at_sequence`.
+/// 4. Fold those events on top of the base via `apply_events_seeded`.
+///
+/// This ensures that nodes completed before the snapshot cut are never lost.
 pub async fn materialize(
     backend: &dyn StateBackend,
     execution_id: &ExecutionId,
@@ -43,53 +46,70 @@ pub async fn materialize(
         .await?
         .ok_or_else(|| crate::backend::StateBackendError::NotFound(format!("{execution_id}")))?;
 
-    // Load the latest snapshot as the base.
-    let (base_state, base_sequence) = match backend.latest_snapshot(execution_id).await? {
-        Some(snap) => (snap.state, snap.at_sequence),
-        None => (execution.initial_input.clone(), 0),
+    // Build the base from the full snapshot state, or from the initial input.
+    let (base, base_sequence) = match backend.latest_snapshot(execution_id).await? {
+        Some(snap) => {
+            let seq = snap.at_sequence;
+            (
+                MaterializedState {
+                    current_state: snap.state,
+                    status: snap.status,
+                    completed_nodes: snap.completed_nodes,
+                    active_nodes: snap.active_nodes,
+                    last_sequence: snap.last_sequence,
+                },
+                seq,
+            )
+        }
+        None => (
+            MaterializedState {
+                current_state: execution.initial_input.clone(),
+                status: WorkflowStatus::Pending,
+                completed_nodes: HashMap::new(),
+                active_nodes: HashSet::new(),
+                last_sequence: 0,
+            },
+            0,
+        ),
     };
 
-    // Load all events since the snapshot (or from the beginning).
+    // Load events that arrived after the snapshot (or all events when no snapshot).
     let events = backend
         .get_events_since(execution_id, base_sequence)
         .await?;
 
-    Ok(apply_events(base_state, &events, &execution.status))
+    Ok(apply_events_seeded(base, &events))
 }
 
-/// Apply a sequence of events on top of a base state to produce `MaterializedState`.
-pub fn apply_events(
-    mut current_state: Value,
-    events: &[Event],
-    _initial_status: &WorkflowStatus,
-) -> MaterializedState {
-    let mut status = WorkflowStatus::Pending;
-    let mut completed_nodes: HashMap<String, Value> = HashMap::new();
-    let mut active_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut last_sequence = 0i64;
-
+/// Fold a sequence of events on top of an existing `MaterializedState`.
+///
+/// This is the core replay primitive. Both `materialize` and `apply_events`
+/// delegate here. The caller is responsible for seeding `base` correctly:
+/// - `materialize` seeds from the snapshot's full persisted state.
+/// - `apply_events` seeds with an empty base (from-origin replay).
+pub fn apply_events_seeded(mut base: MaterializedState, events: &[Event]) -> MaterializedState {
     for event in events {
-        last_sequence = last_sequence.max(event.sequence);
+        base.last_sequence = base.last_sequence.max(event.sequence);
 
         match &event.kind {
             EventKind::WorkflowStarted { .. } => {
-                status = WorkflowStatus::Running;
+                base.status = WorkflowStatus::Running;
             }
             EventKind::WorkflowCompleted { final_state } => {
-                current_state = final_state.clone();
-                status = WorkflowStatus::Completed;
+                base.current_state = final_state.clone();
+                base.status = WorkflowStatus::Completed;
             }
             EventKind::WorkflowFailed { .. } => {
-                status = WorkflowStatus::Failed;
+                base.status = WorkflowStatus::Failed;
             }
             EventKind::WorkflowCancelled { .. } => {
-                status = WorkflowStatus::Cancelled;
+                base.status = WorkflowStatus::Cancelled;
             }
             EventKind::StrategyLimitHit { .. } => {
-                status = WorkflowStatus::LimitExceeded;
+                base.status = WorkflowStatus::LimitExceeded;
             }
             EventKind::NodeScheduled { node_id, .. } | EventKind::NodeStarted { node_id, .. } => {
-                active_nodes.insert(node_id.clone());
+                base.active_nodes.insert(node_id.clone());
             }
             EventKind::NodeCompleted {
                 node_id,
@@ -97,38 +117,53 @@ pub fn apply_events(
                 state_patch,
                 ..
             } => {
-                active_nodes.remove(node_id);
-                completed_nodes.insert(node_id.clone(), output.clone());
+                base.active_nodes.remove(node_id);
+                base.completed_nodes.insert(node_id.clone(), output.clone());
                 // Apply JSON merge patch (RFC 7396) to current state.
-                json_merge_patch(&mut current_state, state_patch);
+                json_merge_patch(&mut base.current_state, state_patch);
             }
             EventKind::NodeFailed { node_id, .. }
             | EventKind::NodeSkipped { node_id, .. }
             | EventKind::NodeCancelled { node_id } => {
-                active_nodes.remove(node_id);
+                base.active_nodes.remove(node_id);
             }
             EventKind::InterruptRaised { .. } => {
-                if status == WorkflowStatus::Running {
-                    status = WorkflowStatus::Paused;
+                if base.status == WorkflowStatus::Running {
+                    base.status = WorkflowStatus::Paused;
                 }
             }
             EventKind::ApprovalReceived { state_patch, .. } => {
                 if let Some(patch) = state_patch {
-                    json_merge_patch(&mut current_state, patch);
+                    json_merge_patch(&mut base.current_state, patch);
                 }
-                status = WorkflowStatus::Running;
+                base.status = WorkflowStatus::Running;
             }
             _ => {}
         }
     }
 
-    MaterializedState {
-        current_state,
-        status,
-        completed_nodes,
-        active_nodes,
-        last_sequence,
-    }
+    base
+}
+
+/// Apply a sequence of events from the origin (empty derived state) to produce
+/// a `MaterializedState`. Use this when you have all events and no snapshot.
+///
+/// For snapshot-seeded replay, call `apply_events_seeded` directly.
+pub fn apply_events(
+    current_state: Value,
+    events: &[Event],
+    _initial_status: &WorkflowStatus,
+) -> MaterializedState {
+    apply_events_seeded(
+        MaterializedState {
+            current_state,
+            status: WorkflowStatus::Pending,
+            completed_nodes: HashMap::new(),
+            active_nodes: HashSet::new(),
+            last_sequence: 0,
+        },
+        events,
+    )
 }
 
 /// Apply a JSON merge patch (RFC 7396) to a target value.
