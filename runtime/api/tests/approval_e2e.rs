@@ -159,6 +159,7 @@ async fn start() -> Harness {
             created_at: now,
             lease_expires_at: None,
             worker_id: None,
+            lease_fence: 0,
             tenant_id: DEFAULT_TENANT.into(),
         })
         .await
@@ -273,6 +274,7 @@ async fn gated_node_parks_without_dead_lettering() {
             created_at: chrono::Utc::now(),
             lease_expires_at: None,
             worker_id: None,
+            lease_fence: 0,
             tenant_id: DEFAULT_TENANT.into(),
         })
         .await

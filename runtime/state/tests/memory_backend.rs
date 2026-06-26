@@ -158,6 +158,7 @@ async fn test_work_queue() {
         created_at: Utc::now(),
         lease_expires_at: None,
         worker_id: None,
+        lease_fence: 0,
         tenant_id: "default".into(),
     };
     let item_id = backend.enqueue_work_item(item).await.unwrap();

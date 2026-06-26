@@ -274,6 +274,7 @@ async fn start_execution(
         created_at: now,
         lease_expires_at: None,
         worker_id: None,
+        lease_fence: 0,
         tenant_id: tenant_id.0.clone(),
     };
     backend.enqueue_work_item(work_item).await?;
@@ -948,6 +949,7 @@ async fn enqueue_work_item(
         created_at: Utc::now(),
         lease_expires_at: None,
         worker_id: None,
+        lease_fence: 0,
         tenant_id: tenant_id.0.clone(),
     };
     let item_id = backend.enqueue_work_item(item).await?;

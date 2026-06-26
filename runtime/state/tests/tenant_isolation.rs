@@ -276,6 +276,7 @@ async fn work_items_are_tenant_isolated() {
         created_at: Utc::now(),
         lease_expires_at: None,
         worker_id: None,
+        lease_fence: 0,
         tenant_id: "alpha".to_string(),
     };
     tenant_a.enqueue_work_item(item).await.unwrap();
@@ -299,6 +300,7 @@ async fn work_items_are_tenant_isolated() {
         created_at: Utc::now(),
         lease_expires_at: None,
         worker_id: None,
+        lease_fence: 0,
         tenant_id: "alpha".to_string(),
     };
     // Create execution first for the foreign key

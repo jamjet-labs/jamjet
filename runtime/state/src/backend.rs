@@ -30,6 +30,9 @@ pub enum StateBackendError {
     #[error("optimistic concurrency conflict: sequence mismatch for {0}")]
     SequenceConflict(String),
 
+    #[error("lease fence superseded for work item {0}: lease was stolen or store failed over")]
+    FenceLost(String),
+
     #[error("database error: {0}")]
     Database(String),
 
@@ -224,6 +227,11 @@ pub struct WorkItem {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub worker_id: Option<String>,
+    /// Monotonic lease fence: store term * 2^32 + per-item epoch. Minted on
+    /// every claim/reclaim; a leased-worker write that presents a stale fence
+    /// matches zero rows and fails closed.
+    #[serde(default)]
+    pub lease_fence: i64,
     /// Tenant that owns this work item.
     #[serde(default = "default_tenant_string")]
     pub tenant_id: String,

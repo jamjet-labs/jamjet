@@ -210,6 +210,7 @@ fn row_to_work_item(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkItem> {
         worker_id: row
             .try_get::<Option<String>, _>("worker_id")
             .map_err(map_db_err)?,
+        lease_fence: row.try_get::<i64, _>("lease_fence").unwrap_or(0),
         tenant_id,
     })
 }
@@ -1122,6 +1123,7 @@ mod tests {
             created_at: Utc::now(),
             lease_expires_at: None,
             worker_id: None,
+            lease_fence: 0,
             tenant_id: crate::tenant::DEFAULT_TENANT.to_string(),
         };
         let item_id = item.id;

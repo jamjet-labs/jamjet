@@ -883,6 +883,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             lease_expires_at: None,
             worker_id: None,
+            lease_fence: 0,
             tenant_id: "default".into(),
         }
     }
