@@ -3,6 +3,12 @@
 No module outside this package may import a provider SDK on the hot path.
 """
 
+from jamjet.model.middleware import (
+    BaseModelMiddleware,
+    ModelAllowlistMiddleware,
+    ModelDeniedError,
+    ModelMiddleware,
+)
 from jamjet.model.types import (
     ModelRef,
     ModelRequest,
@@ -14,6 +20,10 @@ from jamjet.model.types import (
 )
 
 __all__ = [
+    "BaseModelMiddleware",
+    "ModelAllowlistMiddleware",
+    "ModelDeniedError",
+    "ModelMiddleware",
     "ModelRef",
     "ModelRequest",
     "ModelResponse",
