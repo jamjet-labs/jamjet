@@ -7,13 +7,16 @@
 
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+use jamjet_state::tenant::TenantId;
 use jamjet_state::{
-    apply_events, materialize,
+    apply_events, apply_events_seeded,
     backend::{StateBackend, StateBackendError, WorkItem},
     event::{Event, EventKind},
+    materialize,
     snapshot::Snapshot,
-    SqliteBackend,
+    InMemoryBackend, MaterializedState, SqliteBackend,
 };
+use proptest::prelude::*;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -204,7 +207,10 @@ async fn test_materialize_equals_full_apply_after_snapshot() {
         "completed_nodes mismatch: n1 must survive the snapshot cut"
     );
     assert_eq!(mat.active_nodes, full.active_nodes, "active_nodes mismatch");
-    assert_eq!(mat.last_sequence, full.last_sequence, "last_sequence mismatch");
+    assert_eq!(
+        mat.last_sequence, full.last_sequence,
+        "last_sequence mismatch"
+    );
 }
 
 // ── Helper fixtures ───────────────────────────────────────────────────────────
@@ -270,8 +276,12 @@ fn build_snapshot(exec_id: &ExecutionId) -> Snapshot {
 async fn commit_turn_with_snapshot_writes_event_and_snapshot() {
     let db = open_test_db().await;
     let exec_id = ExecutionId::new();
-    db.create_execution(sample_execution(&exec_id)).await.unwrap();
-    db.enqueue_work_item(sample_work_item(&exec_id)).await.unwrap();
+    db.create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
+    db.enqueue_work_item(sample_work_item(&exec_id))
+        .await
+        .unwrap();
 
     let item = db
         .claim_work_item("worker-A", &["model"])
@@ -296,7 +306,10 @@ async fn commit_turn_with_snapshot_writes_event_and_snapshot() {
         matches!(events[0].kind, EventKind::NodeCompleted { .. }),
         "event must be NodeCompleted"
     );
-    assert_eq!(events[0].sequence, seq, "event sequence must match returned seq");
+    assert_eq!(
+        events[0].sequence, seq,
+        "event sequence must match returned seq"
+    );
 
     // Snapshot was written with at_sequence == the terminal event's sequence.
     let loaded_snap = db
@@ -334,8 +347,12 @@ async fn commit_turn_with_snapshot_writes_event_and_snapshot() {
 async fn commit_turn_stale_fence_writes_nothing() {
     let db = open_test_db().await;
     let exec_id = ExecutionId::new();
-    db.create_execution(sample_execution(&exec_id)).await.unwrap();
-    db.enqueue_work_item(sample_work_item(&exec_id)).await.unwrap();
+    db.create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
+    db.enqueue_work_item(sample_work_item(&exec_id))
+        .await
+        .unwrap();
 
     // Worker A claims (fence F1). Expire + re-claim as worker B (fence F2).
     // Worker A is now a zombie holding stale fence F1.
@@ -386,4 +403,452 @@ async fn commit_turn_stale_fence_writes_nothing() {
         db.latest_snapshot(&exec_id).await.unwrap().is_none(),
         "stale-fence commit_turn must write no snapshot"
     );
+}
+
+// ── Task 5 helpers ────────────────────────────────────────────────────────────
+
+fn arb_nc_spec() -> impl Strategy<Value = (usize, usize, i64)> {
+    // (node_pool_index 0-3, key_pool_index 0-3, patch_value 0-99)
+    (0..4usize, 0..4usize, 0i64..100i64)
+}
+
+/// Build a NodeCompleted event kind for use in the proptest.
+fn nc_kind_for_spec(ni: usize, ki: usize, pv: i64) -> EventKind {
+    let node_pool = ["n0", "n1", "n2", "n3"];
+    let key_pool = ["a", "b", "c", "d"];
+    EventKind::NodeCompleted {
+        node_id: node_pool[ni].to_string(),
+        output: json!({"ok": true}),
+        state_patch: json!({key_pool[ki]: pv}),
+        duration_ms: 1,
+        gen_ai_system: None,
+        gen_ai_model: None,
+        input_tokens: None,
+        output_tokens: None,
+        finish_reason: None,
+        cost_usd: None,
+        provenance: None,
+    }
+}
+
+// ── Group 1: Replay-equivalence proptest ─────────────────────────────────────
+//
+// Generates random sequences of NodeCompleted events with repeated node ids
+// and small JSON patches. For EVERY cut K in 0..=N, asserts that:
+//   apply_events_seeded(Snapshot::from_materialized(fold[0..K]), events[K..])
+//       == apply_events(initial, &all_events)
+// on all four fields: current_state, status, completed_nodes, active_nodes.
+//
+// This is a pure fold (no DB), so it can run synchronously.
+proptest! {
+    #[test]
+    fn replay_equivalence(
+        specs in prop::collection::vec(arb_nc_spec(), 1..=12)
+    ) {
+        let exec_id = ExecutionId::new();
+        let events: Vec<Event> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, &(ni, ki, pv))| {
+                Event::new(exec_id.clone(), (i + 1) as i64, nc_kind_for_spec(ni, ki, pv))
+            })
+            .collect();
+
+        let initial = json!({});
+        let full = apply_events(initial.clone(), &events, &WorkflowStatus::Running);
+
+        for k in 0..=events.len() {
+            // Fold events[0..k] to get the mid-run materialized state.
+            let mid = apply_events(initial.clone(), &events[0..k], &WorkflowStatus::Running);
+
+            // Mirror what the worker does: build a Snapshot from that state.
+            let snap = Snapshot::from_materialized(exec_id.clone(), &mid);
+
+            // Seed a fresh MaterializedState from the snapshot and fold the tail.
+            let seed = MaterializedState {
+                current_state: snap.state,
+                status: snap.status,
+                completed_nodes: snap.completed_nodes,
+                active_nodes: snap.active_nodes,
+                last_sequence: snap.last_sequence,
+            };
+            let resumed = apply_events_seeded(seed, &events[k..]);
+
+            prop_assert_eq!(
+                &resumed.current_state,
+                &full.current_state,
+                "current_state mismatch at k={}",
+                k
+            );
+            prop_assert_eq!(
+                resumed.status,
+                full.status.clone(),
+                "status mismatch at k={}",
+                k
+            );
+            prop_assert_eq!(
+                &resumed.completed_nodes,
+                &full.completed_nodes,
+                "completed_nodes mismatch at k={} (pre-snapshot node lost?)",
+                k
+            );
+            prop_assert_eq!(
+                &resumed.active_nodes,
+                &full.active_nodes,
+                "active_nodes mismatch at k={}",
+                k
+            );
+        }
+    }
+}
+
+// ── Group 2: Fresh-process SQLite resume ─────────────────────────────────────
+//
+// Writes 3 successive per-turn snapshots via commit_turn into a temp SQLite
+// file, drops the backend, reopens the file, and asserts that materialize()
+// produces the same result as a from-origin apply_events fold.
+//
+// Also verifies that __budget placed in an early turn's state_patch survives
+// in the reopened snapshot's state (the budget key is just a regular JSON
+// merge-patch key living in current_state).
+#[tokio::test]
+async fn fresh_process_sqlite_resume() {
+    let db_path = std::path::PathBuf::from(format!("/tmp/jamjet-test-{}.sqlite3", Uuid::new_v4()));
+    let url = format!("sqlite://{}", db_path.display());
+
+    let db = SqliteBackend::open(&url)
+        .await
+        .expect("failed to open temp SQLite file");
+
+    let exec_id = ExecutionId::new();
+    db.create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
+
+    let initial = json!({});
+
+    // Materialize-and-advance helper: returns the new MaterializedState after
+    // applying `kind` on top of `prior` (using sequence 0; commit_turn will
+    // overwrite at_sequence / last_sequence to the real assigned sequence).
+    fn advance(
+        prior: MaterializedState,
+        exec_id: &ExecutionId,
+        kind: &EventKind,
+    ) -> MaterializedState {
+        let dummy = Event::new(exec_id.clone(), 0, kind.clone());
+        apply_events_seeded(prior, &[dummy])
+    }
+
+    // ── Turn 1: n1 with a __budget key in state_patch ────────────────────────
+    let t1_kind = EventKind::NodeCompleted {
+        node_id: "n1".into(),
+        output: json!("r1"),
+        state_patch: json!({"step": "n1", "__budget": {"remaining": 100, "spent": 10}}),
+        duration_ms: 5,
+        gen_ai_system: None,
+        gen_ai_model: None,
+        input_tokens: None,
+        output_tokens: None,
+        finish_reason: None,
+        cost_usd: None,
+        provenance: None,
+    };
+
+    db.enqueue_work_item(WorkItem {
+        id: Uuid::new_v4(),
+        execution_id: exec_id.clone(),
+        node_id: "n1".into(),
+        queue_type: "model".into(),
+        payload: json!({}),
+        attempt: 0,
+        max_attempts: 3,
+        created_at: Utc::now(),
+        lease_expires_at: None,
+        worker_id: None,
+        tenant_id: "default".into(),
+        lease_fence: 0,
+    })
+    .await
+    .unwrap();
+
+    let item1 = db.claim_work_item("w", &["model"]).await.unwrap().unwrap();
+    let prior0 = MaterializedState {
+        current_state: initial.clone(),
+        status: WorkflowStatus::Pending,
+        completed_nodes: HashMap::new(),
+        active_nodes: HashSet::new(),
+        last_sequence: 0,
+    };
+    let state1 = advance(prior0, &exec_id, &t1_kind);
+    let snap1 = Snapshot::from_materialized(exec_id.clone(), &state1);
+    db.commit_turn(
+        item1.id,
+        item1.lease_fence,
+        Event::new(exec_id.clone(), 0, t1_kind),
+        Some(snap1),
+    )
+    .await
+    .unwrap();
+
+    // ── Turn 2: n2 ───────────────────────────────────────────────────────────
+    let t2_kind = EventKind::NodeCompleted {
+        node_id: "n2".into(),
+        output: json!("r2"),
+        state_patch: json!({"step": "n2"}),
+        duration_ms: 5,
+        gen_ai_system: None,
+        gen_ai_model: None,
+        input_tokens: None,
+        output_tokens: None,
+        finish_reason: None,
+        cost_usd: None,
+        provenance: None,
+    };
+
+    db.enqueue_work_item(WorkItem {
+        id: Uuid::new_v4(),
+        execution_id: exec_id.clone(),
+        node_id: "n2".into(),
+        queue_type: "model".into(),
+        payload: json!({}),
+        attempt: 0,
+        max_attempts: 3,
+        created_at: Utc::now(),
+        lease_expires_at: None,
+        worker_id: None,
+        tenant_id: "default".into(),
+        lease_fence: 0,
+    })
+    .await
+    .unwrap();
+
+    let item2 = db.claim_work_item("w", &["model"]).await.unwrap().unwrap();
+    let state2 = advance(state1.clone(), &exec_id, &t2_kind);
+    let snap2 = Snapshot::from_materialized(exec_id.clone(), &state2);
+    db.commit_turn(
+        item2.id,
+        item2.lease_fence,
+        Event::new(exec_id.clone(), 0, t2_kind),
+        Some(snap2),
+    )
+    .await
+    .unwrap();
+
+    // ── Turn 3: n3 ───────────────────────────────────────────────────────────
+    let t3_kind = EventKind::NodeCompleted {
+        node_id: "n3".into(),
+        output: json!("r3"),
+        state_patch: json!({"step": "n3"}),
+        duration_ms: 5,
+        gen_ai_system: None,
+        gen_ai_model: None,
+        input_tokens: None,
+        output_tokens: None,
+        finish_reason: None,
+        cost_usd: None,
+        provenance: None,
+    };
+
+    db.enqueue_work_item(WorkItem {
+        id: Uuid::new_v4(),
+        execution_id: exec_id.clone(),
+        node_id: "n3".into(),
+        queue_type: "model".into(),
+        payload: json!({}),
+        attempt: 0,
+        max_attempts: 3,
+        created_at: Utc::now(),
+        lease_expires_at: None,
+        worker_id: None,
+        tenant_id: "default".into(),
+        lease_fence: 0,
+    })
+    .await
+    .unwrap();
+
+    let item3 = db.claim_work_item("w", &["model"]).await.unwrap().unwrap();
+    let state3 = advance(state2.clone(), &exec_id, &t3_kind);
+    let snap3 = Snapshot::from_materialized(exec_id.clone(), &state3);
+    db.commit_turn(
+        item3.id,
+        item3.lease_fence,
+        Event::new(exec_id.clone(), 0, t3_kind),
+        Some(snap3),
+    )
+    .await
+    .unwrap();
+
+    // Drop the backend so all connections are closed.
+    drop(db);
+
+    // ── Fresh process: reopen the file ───────────────────────────────────────
+    let db2 = SqliteBackend::open(&url)
+        .await
+        .expect("failed to reopen temp SQLite file");
+
+    let all_events = db2.get_events(&exec_id).await.unwrap();
+    assert_eq!(all_events.len(), 3, "expected exactly 3 events in the log");
+
+    // From-origin reference fold.
+    let full = apply_events(initial.clone(), &all_events, &WorkflowStatus::Running);
+
+    // Resume via materialize() (loads latest snapshot + applies tail events).
+    let resumed = materialize(&db2, &exec_id).await.unwrap();
+
+    assert_eq!(
+        resumed.current_state, full.current_state,
+        "current_state must be byte-identical after fresh-process resume"
+    );
+    assert_eq!(resumed.status, full.status, "status must match");
+    assert_eq!(
+        resumed.completed_nodes, full.completed_nodes,
+        "completed_nodes must contain all three nodes"
+    );
+    assert_eq!(
+        resumed.active_nodes, full.active_nodes,
+        "active_nodes must match"
+    );
+    assert_eq!(
+        resumed.last_sequence, full.last_sequence,
+        "last_sequence must match"
+    );
+
+    // Budget key placed in turn 1's state_patch must survive in the snapshot state.
+    assert!(
+        resumed.current_state.get("__budget").is_some(),
+        "__budget must survive in the resumed current_state"
+    );
+    assert_eq!(
+        resumed.current_state["__budget"]["remaining"],
+        json!(100),
+        "__budget.remaining must be 100 after fresh-process resume"
+    );
+
+    // Clean up.
+    drop(db2);
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("sqlite3-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("sqlite3-shm"));
+}
+
+// ── Group 3: Cross-backend resume ────────────────────────────────────────────
+//
+// Verifies the "write snapshot at mid-point + materialize() == full fold"
+// invariant against both InMemoryBackend and TenantScopedSqliteBackend.
+//
+// Uses append_event + write_snapshot directly (no work-item setup needed)
+// because this test is about the seeding/fold correctness, not the fenced
+// commit atomicity (that is Task 3's territory).
+
+async fn assert_resume_equivalence_for_backend(backend: &dyn StateBackend) {
+    let exec_id = ExecutionId::new();
+    backend
+        .create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
+
+    let initial = json!({});
+
+    // Five events: WorkflowStarted, NodeScheduled n1, NodeCompleted n1,
+    //              NodeScheduled n2, NodeCompleted n2.
+    let kinds: Vec<EventKind> = vec![
+        EventKind::WorkflowStarted {
+            workflow_id: "xb-wf".into(),
+            workflow_version: "1.0.0".into(),
+            initial_input: initial.clone(),
+        },
+        EventKind::NodeScheduled {
+            node_id: "n1".into(),
+            queue_type: "tool".into(),
+        },
+        EventKind::NodeCompleted {
+            node_id: "n1".into(),
+            output: json!("r1"),
+            state_patch: json!({"a": 1}),
+            duration_ms: 5,
+            gen_ai_system: None,
+            gen_ai_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            finish_reason: None,
+            cost_usd: None,
+            provenance: None,
+        },
+        EventKind::NodeScheduled {
+            node_id: "n2".into(),
+            queue_type: "tool".into(),
+        },
+        EventKind::NodeCompleted {
+            node_id: "n2".into(),
+            output: json!("r2"),
+            state_patch: json!({"b": 2}),
+            duration_ms: 5,
+            gen_ai_system: None,
+            gen_ai_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            finish_reason: None,
+            cost_usd: None,
+            provenance: None,
+        },
+    ];
+
+    for kind in &kinds {
+        backend
+            .append_event(Event::new(exec_id.clone(), 0, kind.clone()))
+            .await
+            .unwrap();
+    }
+
+    let all_events = backend.get_events(&exec_id).await.unwrap();
+    assert_eq!(all_events.len(), 5);
+
+    // Full from-origin reference.
+    let full = apply_events(initial.clone(), &all_events, &WorkflowStatus::Running);
+
+    // Take a snapshot at K=3 (after NodeCompleted n1).
+    let state_at_k3 = apply_events(initial.clone(), &all_events[0..3], &WorkflowStatus::Running);
+    assert!(
+        state_at_k3.completed_nodes.contains_key("n1"),
+        "n1 must be in completed_nodes at K=3"
+    );
+
+    let snap = Snapshot::from_materialized(exec_id.clone(), &state_at_k3);
+    backend.write_snapshot(snap).await.unwrap();
+
+    // materialize() must seed from that snapshot and fold events 4-5.
+    let resumed = materialize(backend, &exec_id).await.unwrap();
+
+    assert_eq!(
+        resumed.current_state, full.current_state,
+        "current_state mismatch"
+    );
+    assert_eq!(resumed.status, full.status, "status mismatch");
+    assert_eq!(
+        resumed.completed_nodes, full.completed_nodes,
+        "completed_nodes mismatch: n1 must survive the snapshot cut"
+    );
+    assert_eq!(
+        resumed.active_nodes, full.active_nodes,
+        "active_nodes mismatch"
+    );
+    assert_eq!(
+        resumed.last_sequence, full.last_sequence,
+        "last_sequence mismatch"
+    );
+}
+
+#[tokio::test]
+async fn cross_backend_in_memory() {
+    let backend = InMemoryBackend::new();
+    assert_resume_equivalence_for_backend(&backend).await;
+}
+
+#[tokio::test]
+async fn cross_backend_tenant_scoped_sqlite() {
+    let db = SqliteBackend::open("sqlite::memory:")
+        .await
+        .expect("failed to open in-memory SQLite");
+    let scoped = db.for_tenant(TenantId::default());
+    assert_resume_equivalence_for_backend(&scoped).await;
 }

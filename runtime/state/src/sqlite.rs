@@ -635,19 +635,17 @@ impl StateBackend for SqliteBackend {
             serde_json::from_str(row.try_get::<&str, _>("state_json").map_err(map_db_err)?)
                 .map_err(StateBackendError::Serialization)?;
         let created_at = parse_datetime(row.try_get::<&str, _>("created_at").map_err(map_db_err)?)?;
-        let status = str_to_status(
-            row.try_get::<&str, _>("status").unwrap_or("running"),
-        )
-        .unwrap_or(WorkflowStatus::Running);
+        let status = str_to_status(row.try_get::<&str, _>("status").unwrap_or("running"))
+            .unwrap_or(WorkflowStatus::Running);
         let completed_nodes: std::collections::HashMap<String, serde_json::Value> =
             serde_json::from_str(
-                row.try_get::<&str, _>("completed_nodes_json").unwrap_or("{}"),
+                row.try_get::<&str, _>("completed_nodes_json")
+                    .unwrap_or("{}"),
             )
             .unwrap_or_default();
-        let active_nodes: std::collections::HashSet<String> = serde_json::from_str(
-            row.try_get::<&str, _>("active_nodes_json").unwrap_or("[]"),
-        )
-        .unwrap_or_default();
+        let active_nodes: std::collections::HashSet<String> =
+            serde_json::from_str(row.try_get::<&str, _>("active_nodes_json").unwrap_or("[]"))
+                .unwrap_or_default();
         let last_sequence: i64 = row
             .try_get::<i64, _>("last_sequence")
             .unwrap_or(at_sequence);
