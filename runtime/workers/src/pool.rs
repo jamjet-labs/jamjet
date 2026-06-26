@@ -107,9 +107,13 @@ impl WorkerPool {
 
 /// Convenience: build a default pool with standard queue groups.
 ///
-/// - 2 general workers (`["general", "tool", "condition"]`)
+/// - 2 general workers (`["general", "tool", "condition", "mcp_tool"]`)
 /// - 2 model workers (`["model"]`)
 /// - 1 privileged worker (`["privileged"]`)
+/// - 0 python workers (`["python_tool"]`) — intent registration only. Durable
+///   Python `@tool` nodes are executed by an external `jamjet worker` process;
+///   no internal Rust worker claims this queue. Start the sidecar with:
+///   `jamjet worker --queue python_tool`
 pub fn default_pool(backend: Arc<dyn StateBackend>) -> WorkerPool {
     WorkerPool::new(backend)
         .with_group(WorkerGroupConfig::new(
@@ -131,5 +135,12 @@ pub fn default_pool(backend: Arc<dyn StateBackend>) -> WorkerPool {
             "privileged-worker",
             1,
             vec!["privileged".into()],
+        ))
+        // Register python_tool as a known queue without spawning internal workers.
+        // Items in this queue are claimed exclusively by an external `jamjet worker`.
+        .with_group(WorkerGroupConfig::new(
+            "python-worker",
+            0,
+            vec!["python_tool".into()],
         ))
 }

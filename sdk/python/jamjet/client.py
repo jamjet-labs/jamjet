@@ -210,23 +210,34 @@ class JamjetClient:
         self,
         worker_id: str,
         queue_types: list[str],
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
+        """Claim the next available work item.
+
+        Returns the work_item dict on success, or ``None`` when the queue is
+        empty (runtime responds with ``{"claimed": false}``).
+        """
         r = await self._client.post(
             "/work-items/claim",
             json={"worker_id": worker_id, "queue_types": queue_types},
         )
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        if not data.get("claimed"):
+            return None
+        return data["work_item"]
 
     async def complete_work_item(
         self,
         item_id: str,
-        output: dict[str, Any],
+        execution_id: str | None,
+        node_id: str | None,
+        output: Any,
         state_patch: dict[str, Any],
         duration_ms: int = 0,
-        execution_id: str | None = None,
-        node_id: str | None = None,
-    ) -> dict[str, Any]:
+        gen_ai_model: str | None = None,
+        finish_reason: str | None = None,
+    ) -> None:
+        """Mark a work item as completed and emit a NodeCompleted event."""
         body: dict[str, Any] = {
             "output": output,
             "state_patch": state_patch,
@@ -236,28 +247,40 @@ class JamjetClient:
             body["execution_id"] = execution_id
         if node_id:
             body["node_id"] = node_id
+        if gen_ai_model:
+            body["gen_ai_model"] = gen_ai_model
+        if finish_reason is not None:
+            body["finish_reason"] = finish_reason
         r = await self._client.post(
             f"/work-items/{item_id}/complete",
             json=body,
         )
         r.raise_for_status()
-        return r.json()
 
-    async def fail_work_item(self, item_id: str, error: str) -> dict[str, Any]:
+    async def fail_work_item(self, item_id: str, error: str) -> None:
+        """Mark a work item as failed."""
         r = await self._client.post(
             f"/work-items/{item_id}/fail",
             json={"error": error},
         )
         r.raise_for_status()
-        return r.json()
 
-    async def heartbeat_work_item(self, item_id: str, worker_id: str) -> dict[str, Any]:
+    async def heartbeat_work_item(
+        self,
+        item_id: str,
+        worker_id: str,
+        lease_fence: int = 0,
+    ) -> None:
+        """Renew the lease on a claimed work item.
+
+        ``lease_fence`` must match the value returned when the item was
+        claimed; a stale fence causes the runtime to reject the renewal.
+        """
         r = await self._client.post(
             f"/work-items/{item_id}/heartbeat",
-            json={"worker_id": worker_id},
+            json={"worker_id": worker_id, "lease_fence": lease_fence},
         )
         r.raise_for_status()
-        return r.json()
 
     # ── Generic helpers (for one-off API paths not covered above) ─────────
 

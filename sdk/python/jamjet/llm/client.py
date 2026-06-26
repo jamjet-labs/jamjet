@@ -17,6 +17,8 @@ class LlmResponse:
     text: str
     input_tokens: int = 0
     output_tokens: int = 0
+    gen_ai_model: str = ""
+    finish_reason: str | None = None
 
 
 async def call_llm(model: str, prompt: str, max_tokens: int = 512) -> LlmResponse:

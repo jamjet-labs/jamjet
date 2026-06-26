@@ -1604,129 +1604,166 @@ def workers(
     asyncio.run(_workers())
 
 
+async def _worker_loop(
+    client: Any,
+    worker_id: str,
+    queues: list[str],
+    *,
+    once: bool = False,
+) -> None:
+    """Core python_tool worker polling loop, separated for testability.
+
+    Claim work items from *queues*, resolve the handler named by
+    ``payload["module"]`` / ``payload["function"]``, invoke it with
+    ``payload["input"]``, and post complete / fail back to the runtime.
+    Heartbeats are sent every 10 seconds while the handler is running.
+    """
+    import importlib as _importlib
+
+    while True:
+        try:
+            work_item = await client.claim_work_item(worker_id, queues)
+            if work_item is None:
+                if once:
+                    return
+                await asyncio.sleep(2)
+                continue
+
+            item_id: str = work_item["id"]
+            exec_id: str = work_item["execution_id"]
+            node_id: str = work_item["node_id"]
+            payload: dict[str, Any] = work_item.get("payload", {})
+            lease_fence: int = work_item.get("lease_fence", 0)
+
+            console.print(f"[cyan]Claimed[/cyan] id={item_id} node=[bold]{node_id}[/bold] exec={exec_id}")
+
+            # Keep the lease alive while the handler runs.
+            async def _heartbeat_loop() -> None:
+                while True:
+                    await asyncio.sleep(10)
+                    try:
+                        await client.heartbeat_work_item(item_id, worker_id, lease_fence)
+                    except Exception as hb_err:
+                        console.print(f"[yellow]Heartbeat error:[/yellow] {hb_err}")
+
+            hb_task = asyncio.create_task(_heartbeat_loop())
+
+            t_start = time.monotonic()
+            try:
+                mod_path = payload.get("module")
+                fn_path = payload.get("function")
+                if not mod_path or not fn_path:
+                    raise ValueError(f"work item payload missing 'module' or 'function': {sorted(payload)}")
+
+                mod = _importlib.import_module(mod_path)
+                fn: Any = mod
+                for part in fn_path.split("."):
+                    fn = getattr(fn, part)
+
+                tool_input = payload.get("input", {})
+
+                # Inject deterministic seeds so handlers can opt into replay fidelity.
+                from jamjet.runtime.local.seed import _inject_seeds
+
+                _inject_seeds(exec_id)
+
+                result = fn(tool_input)
+                if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                    result = await result
+
+                duration_ms = int((time.monotonic() - t_start) * 1000)
+                output: Any = result if isinstance(result, dict) else {"result": result}
+
+                # Forward optional GenAI telemetry if the tool surfaced it.
+                gen_ai_model_field: str | None = None
+                finish_reason_field: str | None = None
+                if isinstance(output, dict):
+                    gen_ai_model_field = output.get("gen_ai_model") or None
+                    finish_reason_field = output.get("finish_reason") or None
+
+                await client.complete_work_item(
+                    item_id,
+                    exec_id,
+                    node_id,
+                    output,
+                    {},
+                    duration_ms,
+                    gen_ai_model=gen_ai_model_field,
+                    finish_reason=finish_reason_field,
+                )
+                console.print(f"[green]Completed[/green] id={item_id} node=[bold]{node_id}[/bold] {duration_ms}ms")
+            except Exception as exc:
+                console.print(f"[red]Failed[/red] node={node_id}: {exc}")
+                await client.fail_work_item(item_id, str(exc))
+            finally:
+                hb_task.cancel()
+
+            if once:
+                return
+
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            return
+        except Exception as poll_err:
+            console.print(f"[yellow]Poll error:[/yellow] {poll_err}")
+            if once:
+                raise
+            await asyncio.sleep(2)
+
+
 @app.command()
 def worker(
-    module: str = typer.Argument(..., help="Python module path containing the workflow (e.g., my_app.workflow)"),
-    workflow_name: str = typer.Option("workflow", "--name", "-n", help="Name of the Workflow variable in the module"),
-    queue: str = typer.Option("general", "--queue", "-q", help="Queue type(s) to consume, comma-separated"),
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r", help="Runtime URL"),
-    poll_interval: float = typer.Option(0.5, "--poll-interval", help="Seconds between poll attempts"),
-    worker_id: str | None = typer.Option(None, "--worker-id", help="Worker ID (auto-generated if omitted)"),
+    worker_id: str | None = typer.Option(None, "--worker-id", help="Worker ID (default: random uuid)"),
+    queue: list[str] = typer.Option(["python_tool"], "--queue", "-q", help="Queue type(s) to claim from (repeatable)"),
+    modules: str | None = typer.Option(
+        None, "--modules", help="Comma-separated Python modules to import before polling"
+    ),
+    once: bool = typer.Option(False, "--once", help="Claim and process one item then exit"),  # noqa: FBT001
 ) -> None:
-    """Start a Python worker that executes workflow steps.
+    """Poll the runtime for python_tool work items and invoke @tool handlers.
 
-    The worker polls the runtime for work items, executes the matching
-    step function from the loaded workflow, and reports results back.
+    Each claimed item's payload must include 'module' and 'function' keys
+    that resolve to an async callable.  Results are posted back as complete
+    or fail depending on whether the handler raises.
 
-    Example:
-        jamjet worker my_app.benchmark_workflow --name workflow --queue general
+    \b
+    Examples:
+        jamjet worker                           # poll python_tool queue forever
+        jamjet worker --queue python_tool       # same, explicit
+        jamjet worker --modules myapp.tools     # pre-import so @tool decorators register
+        jamjet worker --once                    # claim one item (or exit 0 if queue empty)
     """
-    import importlib
-    import time
+    import importlib as _importlib
     import uuid
 
-    from jamjet.client import JamjetClient
-    from jamjet.workflow import Workflow
-
     wid = worker_id or f"py-worker-{uuid.uuid4().hex[:8]}"
-    queues = [q.strip() for q in queue.split(",")]
+    queues = list(queue) if queue else ["python_tool"]
 
-    # Load the workflow module and find the Workflow object
-    try:
-        mod = importlib.import_module(module)
-    except ImportError as e:
-        console.print(f"[red]Error importing module:[/red] {e}")
-        raise typer.Exit(1)
+    # Pre-import user-specified modules so that @tool decorators fire before polling.
+    if modules:
+        for mod_name in (m.strip() for m in modules.split(",") if m.strip()):
+            try:
+                _importlib.import_module(mod_name)
+            except ImportError as exc:
+                console.print(f"[red]Error importing module:[/red] {mod_name}: {exc}")
+                raise typer.Exit(1)
 
-    wf = getattr(mod, workflow_name, None)
-    if wf is None or not isinstance(wf, Workflow):
-        console.print(f"[red]Error:[/red] {module}.{workflow_name} is not a Workflow instance")
-        raise typer.Exit(1)
-
-    # Build step lookup: node_id -> async step function
-    step_map: dict = {}
-    for step in wf._steps:
-        step_map[step.name] = step
-
-    console.print("[bold]JamJet Python Worker[/bold]")
+    console.print("[bold]JamJet Python Tool Worker[/bold]")
     console.print(f"  Worker ID: {wid}")
     console.print(f"  Queues:    {queues}")
-    console.print(f"  Workflow:  {wf.workflow_id} ({len(step_map)} steps: {list(step_map.keys())})")
     console.print(f"  Runtime:   {runtime}")
+    if once:
+        console.print("  Mode:      single-shot (--once)")
     console.print()
 
-    async def _run_worker() -> None:
+    async def _start() -> None:
         async with JamjetClient(base_url=runtime) as client:
-            console.print("[dim]Polling for work items... (Ctrl+C to stop)[/dim]")
-            while True:
-                try:
-                    resp = await client.claim_work_item(wid, queues)
-                    if not resp.get("claimed"):
-                        await asyncio.sleep(poll_interval)
-                        continue
-
-                    wi = resp["work_item"]
-                    item_id = wi["id"]
-                    node_id = wi["node_id"]
-                    exec_id = wi["execution_id"]
-                    attempt = wi.get("attempt", 0)
-
-                    console.print(f"[cyan]Claimed[/cyan] node=[bold]{node_id}[/bold] exec={exec_id} attempt={attempt}")
-
-                    step = step_map.get(node_id)
-                    if step is None:
-                        error_msg = f"unknown node_id: {node_id}"
-                        console.print(f"[red]Failed:[/red] {error_msg}")
-                        await client.fail_work_item(item_id, error_msg)
-                        continue
-
-                    # Get current execution state
-                    exec_data = await client.get_execution(exec_id)
-                    current_state = exec_data.get("current_state", {})
-
-                    # Instantiate the state model and run the step
-                    t_start = time.monotonic()
-                    try:
-                        state_cls = wf._state_class
-                        state_obj = state_cls(**current_state) if state_cls else current_state
-                        result = step.fn(state_obj)
-                        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
-                            result = await result
-                        duration_ms = int((time.monotonic() - t_start) * 1000)
-
-                        # Compute state patch (diff between old and new state)
-                        if hasattr(result, "model_dump"):
-                            new_state = result.model_dump()
-                        else:
-                            new_state = dict(result) if isinstance(result, dict) else {}
-
-                        state_patch = {k: v for k, v in new_state.items() if current_state.get(k) != v}
-
-                        await client.complete_work_item(
-                            item_id,
-                            output=new_state,
-                            state_patch=state_patch,
-                            duration_ms=duration_ms,
-                            execution_id=exec_id,
-                            node_id=node_id,
-                        )
-                        console.print(
-                            f"[green]Completed[/green] node=[bold]{node_id}[/bold] "
-                            f"{duration_ms}ms patch={list(state_patch.keys())}"
-                        )
-                    except Exception as e:
-                        duration_ms = int((time.monotonic() - t_start) * 1000)
-                        console.print(f"[red]Failed[/red] node={node_id}: {e}")
-                        await client.fail_work_item(item_id, str(e))
-
-                except KeyboardInterrupt:
-                    break
-                except Exception as e:
-                    console.print(f"[yellow]Poll error:[/yellow] {e}")
-                    await asyncio.sleep(poll_interval)
+            if not once:
+                console.print("[dim]Polling for work items... (Ctrl+C to stop)[/dim]")
+            await _worker_loop(client, wid, queues, once=once)
 
     try:
-        asyncio.run(_run_worker())
+        asyncio.run(_start())
     except KeyboardInterrupt:
         console.print("\n[yellow]Worker stopped.[/yellow]")
 

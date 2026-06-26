@@ -1,4 +1,4 @@
-use jamjet_core::node::NodeId;
+use jamjet_core::node::{NodeId, NodeKind};
 use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::WorkflowIr;
 use jamjet_state::backend::{StateBackend, WorkItem};
@@ -344,16 +344,42 @@ impl Scheduler {
                     _ => 3,
                 };
 
+                // Build the base payload that every work item carries.
+                let mut payload = serde_json::json!({
+                    "workflow_id": workflow_id,
+                    "workflow_version": workflow_version,
+                    "node_id": node_id,
+                });
+                // For PythonFn nodes, enrich the payload so the external Python
+                // worker is self-contained: it needs the module, the function to
+                // invoke, and the current workflow state as the call input.
+                // `progress.final_state` is the accumulated state (all
+                // `state_patch`es from completed nodes so far) and is available
+                // here without an additional backend call.
+                if let NodeKind::PythonFn {
+                    module, function, ..
+                } = &node.kind
+                {
+                    let obj = payload
+                        .as_object_mut()
+                        .expect("payload is always a JSON object");
+                    obj.insert("module".into(), serde_json::Value::String(module.clone()));
+                    obj.insert(
+                        "function".into(),
+                        serde_json::Value::String(function.clone()),
+                    );
+                    obj.insert(
+                        "input".into(),
+                        serde_json::Value::Object(progress.final_state.clone()),
+                    );
+                }
+
                 let item = WorkItem {
                     id: Uuid::new_v4(),
                     execution_id: execution_id.clone(),
                     node_id: node_id.clone(),
                     queue_type,
-                    payload: serde_json::json!({
-                        "workflow_id": workflow_id,
-                        "workflow_version": workflow_version,
-                        "node_id": node_id,
-                    }),
+                    payload,
                     attempt: 0,
                     max_attempts,
                     created_at: chrono::Utc::now(),
@@ -1064,5 +1090,94 @@ mod tests {
             progress.held.is_empty(),
             "hold must be consumed by the rejection"
         );
+    }
+
+    /// A single-node workflow whose only step is a `PythonFn`.
+    fn python_fn_ir() -> serde_json::Value {
+        serde_json::json!({
+            "workflow_id": "wf",
+            "version": "0.1.0",
+            "name": null,
+            "description": null,
+            "state_schema": "",
+            "start_node": "py_step",
+            "nodes": {
+                "py_step": {
+                    "id": "py_step",
+                    "kind": {
+                        "type": "python_fn",
+                        "module": "myapp.tools",
+                        "function": "run_check",
+                        "output_schema": ""
+                    },
+                    "retry_policy": null,
+                    "node_timeout_secs": null,
+                    "description": null,
+                    "labels": {}
+                }
+            },
+            "edges": [],
+            "retry_policies": {},
+            "timeouts": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {},
+            "labels": {}
+        })
+    }
+
+    /// The scheduler must enrich a `PythonFn` work-item payload with
+    /// `module`, `function`, and `input` so an external Python worker is
+    /// self-contained.  The base fields (`workflow_id`, `workflow_version`,
+    /// `node_id`) must still be present.
+    #[tokio::test]
+    async fn python_fn_work_item_payload_is_enriched() {
+        let (s, b, e) = setup(python_fn_ir()).await;
+
+        // Seed some accumulated state so we can assert it lands in `input`.
+        append(
+            &b,
+            &e,
+            node_completed("prev_node", serde_json::json!({ "key": "value" })),
+        )
+        .await;
+
+        // Tick: `py_step` is the start node with no predecessors — runnable.
+        tick(&s, &e).await;
+
+        // Claim the work item from the python_tool queue.
+        let item = b
+            .claim_work_item("test-worker", &["python_tool"])
+            .await
+            .expect("backend claim must not error")
+            .expect("a PythonFn node must produce exactly one work item");
+
+        // Queue type
+        assert_eq!(item.queue_type, "python_tool");
+
+        // PythonFn-specific enrichment
+        assert_eq!(
+            item.payload["module"], "myapp.tools",
+            "payload must carry the module path"
+        );
+        assert_eq!(
+            item.payload["function"], "run_check",
+            "payload must carry the function name"
+        );
+        assert!(
+            item.payload["input"].is_object(),
+            "payload.input must be a JSON object (accumulated workflow state)"
+        );
+        // The state seeded above must be reflected in input.
+        assert_eq!(
+            item.payload["input"]["key"], "value",
+            "payload.input must reflect accumulated state patches"
+        );
+
+        // Base fields must still be present.
+        assert_eq!(item.payload["workflow_id"], "wf");
+        assert_eq!(item.payload["workflow_version"], "0.1.0");
+        assert_eq!(item.payload["node_id"], "py_step");
     }
 }
