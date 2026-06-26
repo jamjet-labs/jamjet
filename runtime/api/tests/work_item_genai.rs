@@ -108,10 +108,7 @@ async fn complete_work_item_threads_gen_ai_fields() {
     assert_eq!(resp_json["completed"], true);
 
     // Verify the emitted NodeCompleted event carries the GenAI fields.
-    let events = backend
-        .get_events(&execution_id)
-        .await
-        .expect("get_events");
+    let events = backend.get_events(&execution_id).await.expect("get_events");
 
     let node_completed = events.iter().find(|e| {
         matches!(
@@ -140,8 +137,16 @@ async fn complete_work_item_threads_gen_ai_fields() {
                 Some("claude-3-5-sonnet-20241022"),
                 "gen_ai_model must be threaded through"
             );
-            assert_eq!(*input_tokens, Some(100), "input_tokens must be threaded through");
-            assert_eq!(*output_tokens, Some(50), "output_tokens must be threaded through");
+            assert_eq!(
+                *input_tokens,
+                Some(100),
+                "input_tokens must be threaded through"
+            );
+            assert_eq!(
+                *output_tokens,
+                Some(50),
+                "output_tokens must be threaded through"
+            );
             assert_eq!(
                 finish_reason.as_deref(),
                 Some("stop"),
@@ -229,8 +234,14 @@ async fn complete_work_item_without_gen_ai_fields_keeps_backward_compat() {
             finish_reason,
             ..
         } => {
-            assert!(gen_ai_system.is_none(), "gen_ai_system must be None for old callers");
-            assert!(gen_ai_model.is_none(), "gen_ai_model must be None for old callers");
+            assert!(
+                gen_ai_system.is_none(),
+                "gen_ai_system must be None for old callers"
+            );
+            assert!(
+                gen_ai_model.is_none(),
+                "gen_ai_model must be None for old callers"
+            );
             assert!(input_tokens.is_none());
             assert!(output_tokens.is_none());
             assert!(finish_reason.is_none());

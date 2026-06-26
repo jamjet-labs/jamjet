@@ -194,9 +194,7 @@ async def test_worker_seed_injection_deterministic() -> None:
     output_a = stub_a.complete_calls[0]["output"]["seed_value"]
     output_b = stub_b.complete_calls[0]["output"]["seed_value"]
     assert output_a is not None, "seed must be injected before handler invocation"
-    assert output_a == output_b, (
-        f"same execution_id must yield same seed: {output_a} != {output_b}"
-    )
+    assert output_a == output_b, f"same execution_id must yield same seed: {output_a} != {output_b}"
 
 
 async def test_worker_forwards_gen_ai_fields() -> None:
