@@ -5,6 +5,17 @@ use jamjet_state::{InMemoryBackend, SqliteBackend};
 use std::sync::Arc;
 use tracing::info;
 
+/// The store's failover generation, read from `JAMJET_STORE_TERM`. Orchestrators
+/// (a LiteFS-aware entrypoint, k8s, Fly) set this to the current promotion
+/// generation (LiteFS lease epoch / Postgres timeline ID) on every (re)start, so
+/// the lease fence is failover-safe. Absent or unparseable => `None` (term stays
+/// as-is; on a fresh store that is 0, the pre-F1 behavior).
+fn store_term_from_env() -> Option<i64> {
+    std::env::var("JAMJET_STORE_TERM")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load .env if present
@@ -34,6 +45,13 @@ async fn main() -> anyhow::Result<()> {
         info!("Using in-memory storage (ephemeral, no persistence)");
 
         let backend = Arc::new(InMemoryBackend::new());
+        if let Some(term) = store_term_from_env() {
+            let applied = backend.set_store_term_at_least(term);
+            info!(
+                store_term = applied,
+                "Applied failover generation from JAMJET_STORE_TERM"
+            );
+        }
         let backend_clone = backend.clone();
         let audit: Arc<dyn jamjet_audit::AuditBackend> = Arc::new(NoopAuditBackend);
         let enricher = Arc::new(AuditEnricher::new(Arc::clone(&audit)));
@@ -66,6 +84,22 @@ async fn main() -> anyhow::Result<()> {
         let backend = SqliteBackend::open(&database_url)
             .await
             .map_err(|e| anyhow::anyhow!("failed to open state backend: {e}"))?;
+
+        // Failover-safety: raise the store's failover generation to the promotion
+        // generation supplied by the orchestrator, so a lease fence minted under a
+        // previous primary is rejected after a failover (the fence packs term in
+        // its high bits). Without this the term stays 0 and only the per-item epoch
+        // protects, which a lost-tail failover can corrupt.
+        if let Some(term) = store_term_from_env() {
+            let applied = backend
+                .set_store_term_at_least(term)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to set store term: {e}"))?;
+            info!(
+                store_term = applied,
+                "Applied failover generation from JAMJET_STORE_TERM"
+            );
+        }
 
         let agents = SqliteAgentRegistry::connect(&database_url)
             .await

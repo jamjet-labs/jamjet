@@ -682,3 +682,40 @@ async fn commit_node_failed_stale_fence_fails_closed_tenant_scoped() {
     assert_fence_node_failed_stale_fails(&backend).await;
     std::fs::remove_file(&path).ok();
 }
+
+#[tokio::test]
+async fn set_store_term_at_least_is_monotonic_and_lifts_the_fence() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let eid = ExecutionId::new();
+    db.create_execution(sample_execution(&eid)).await.unwrap();
+
+    // Term starts at 0; lift to 5 (e.g. the promotion generation at startup).
+    assert_eq!(db.set_store_term_at_least(5).await.unwrap(), 5);
+    // Monotonic: a lower value is a no-op.
+    assert_eq!(db.set_store_term_at_least(3).await.unwrap(), 5);
+    // Equal is a no-op.
+    assert_eq!(db.set_store_term_at_least(5).await.unwrap(), 5);
+
+    // A fence minted now carries term 5: fence == 5 * 2^32 + epoch (epoch >= 1).
+    db.enqueue_work_item(sample_item(&eid)).await.unwrap();
+    let claimed = db.claim_work_item("w", &["model"]).await.unwrap().unwrap();
+    const BAND: i64 = 4_294_967_296; // 2^32
+    assert!(
+        claimed.lease_fence >= 5 * BAND && claimed.lease_fence < 6 * BAND,
+        "fence {} must be in the term-5 band [{}, {})",
+        claimed.lease_fence,
+        5 * BAND,
+        6 * BAND
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn set_store_term_at_least_monotonic_in_memory() {
+    use jamjet_state::InMemoryBackend;
+    let db = InMemoryBackend::new();
+    assert_eq!(db.set_store_term_at_least(7), 7);
+    assert_eq!(db.set_store_term_at_least(4), 7); // lower is a no-op
+    assert_eq!(db.set_store_term_at_least(9), 9);
+}
