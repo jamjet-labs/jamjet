@@ -205,10 +205,23 @@ impl Worker {
                         return r;
                     }
 
-                    // Compute deterministic idempotency key: H(run, segment, step, node, input_hash).
+                    // Compute deterministic idempotency key: content_hash({run, segment, step, node, input_hash}).
                     // step = count of NodeCompleted events for this node_id in the event log.
                     // Retries do not complete, so the count is stable across retries and advances
                     // exactly once per successful loop occurrence — making recorded results replay-stable.
+                    //
+                    // Exactly-once-COMMIT is delivered by the lease fence (a committed node settles
+                    // and the scheduler never re-dispatches it; a zombie's commit is fence-rejected).
+                    // This replay cache activates on (a) replaying a recorded run and (b) loop
+                    // re-entry / manual or API re-enqueue, where it returns the recorded result
+                    // instead of re-firing. A node that fired but crashed BEFORE commit has no
+                    // recorded result, so a reclaim re-fires (at-least-once-fire, the documented
+                    // v1 limit). [I1]
+                    //
+                    // input_hash is content_hash(current_state) at fire time; for concurrent sibling
+                    // nodes a sibling's state_patch landing between fire and replay changes
+                    // current_state and thus the key, so zero-outbound replay is exact for linear
+                    // runs in v1 (parallel-sibling replay exactness is a follow-up, see F-2c-3). [I2]
                     let events_for_key = self.backend.get_events(&execution_id).await?;
                     let step = events_for_key
                         .iter()

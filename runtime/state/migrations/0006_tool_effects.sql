@@ -1,6 +1,7 @@
 -- Migration 0006: per-node idempotency cache. A node fire records its result
--- keyed by H(run, segment, step, input_hash); a replay/reclaim reads it back
--- and skips re-firing the side effect.
+-- keyed by content_hash({run, segment, step, node, input_hash}); a replay/reclaim
+-- reads it back and skips re-firing the side effect. Including `node` in the key
+-- prevents cross-node key collisions when sibling nodes share the same step count.
 CREATE TABLE IF NOT EXISTS tool_effects (
     idempotency_key TEXT PRIMARY KEY,
     execution_id    TEXT NOT NULL,
