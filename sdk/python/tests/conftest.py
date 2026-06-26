@@ -145,14 +145,10 @@ def mock_openai_client(monkeypatch: pytest.MonkeyPatch) -> None:
     def _mock_completion_cost(completion_response: object = None, **kwargs: object) -> float:
         return 0.0
 
-    if "litellm" not in sys.modules:
-        mock_litellm = types.ModuleType("litellm")
-        mock_litellm.acompletion = _mock_acompletion  # type: ignore[attr-defined]
-        mock_litellm.completion_cost = _mock_completion_cost  # type: ignore[attr-defined]
-        sys.modules["litellm"] = mock_litellm
-    else:
-        monkeypatch.setattr("litellm.acompletion", _mock_acompletion)
-        monkeypatch.setattr("litellm.completion_cost", _mock_completion_cost)
+    mock_litellm = types.ModuleType("litellm")
+    mock_litellm.acompletion = _mock_acompletion  # type: ignore[attr-defined]
+    mock_litellm.completion_cost = _mock_completion_cost  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "litellm", mock_litellm)
 
 
 # ── Test-harness fixtures ────────────────────────────────────────────────────
