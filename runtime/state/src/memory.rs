@@ -258,17 +258,24 @@ impl StateBackend for InMemoryBackend {
         Ok(None)
     }
 
-    async fn renew_lease(&self, item_id: WorkItemId, worker_id: &str) -> BackendResult<()> {
+    async fn renew_lease(
+        &self,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
+    ) -> BackendResult<()> {
         match self.work_items.get_mut(&item_id) {
             Some(mut entry) => {
-                if entry.worker_id.as_deref() == Some(worker_id) {
-                    entry.lease_expires_at = Some(Utc::now() + chrono::Duration::seconds(30));
-                    Ok(())
-                } else {
-                    Err(StateBackendError::NotFound(format!(
+                if entry.worker_id.as_deref() != Some(worker_id) {
+                    return Err(StateBackendError::FenceLost(format!(
                         "lease not held by {worker_id}"
-                    )))
+                    )));
                 }
+                if entry.lease_fence != lease_fence {
+                    return Err(StateBackendError::FenceLost(item_id.to_string()));
+                }
+                entry.lease_expires_at = Some(Utc::now() + chrono::Duration::seconds(30));
+                Ok(())
             }
             None => Err(StateBackendError::NotFound(item_id.to_string())),
         }

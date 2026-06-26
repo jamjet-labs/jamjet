@@ -665,24 +665,30 @@ impl StateBackend for TenantScopedSqliteBackend {
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id, item_id = %item_id))]
-    async fn renew_lease(&self, item_id: WorkItemId, worker_id: &str) -> BackendResult<()> {
+    async fn renew_lease(
+        &self,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
+    ) -> BackendResult<()> {
         let lease_expires_at = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
         let id_str = item_id.to_string();
 
         let rows_affected = sqlx::query(
-            "UPDATE work_items SET lease_expires_at = ? WHERE id = ? AND worker_id = ? AND status = 'claimed' AND tenant_id = ?",
+            "UPDATE work_items SET lease_expires_at = ? WHERE id = ? AND worker_id = ? AND status = 'claimed' AND tenant_id = ? AND lease_fence = ?",
         )
         .bind(&lease_expires_at)
         .bind(&id_str)
         .bind(worker_id)
         .bind(&self.tenant_id.0)
+        .bind(lease_fence)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?
         .rows_affected();
 
         if rows_affected == 0 {
-            return Err(StateBackendError::NotFound(id_str));
+            return Err(StateBackendError::FenceLost(id_str));
         }
         Ok(())
     }

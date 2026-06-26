@@ -4,8 +4,7 @@
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::{
-    backend::{StateBackend, StateBackendError, WorkItem},
-    event::{Event, EventKind},
+    backend::{StateBackend, WorkItem},
     SqliteBackend,
 };
 use serde_json::json;
@@ -67,6 +66,46 @@ async fn claim_mints_nonzero_fence() {
 
     let claimed = db.claim_work_item("worker-A", &["model"]).await.unwrap().unwrap();
     assert!(claimed.lease_fence > 0, "claim must mint a non-zero fence");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// Verify that a re-claim (after a stale/expired lease) mints a strictly
+/// greater fence. This is the anti-double-commit invariant: a zombie worker
+/// holding the old fence value gets 0 rows on renew_lease / commit.
+///
+/// Adaptation from brief: `fail_work_item` sets status='failed' (not
+/// 'pending') in the SQLite backend, so we cannot use it to make the item
+/// re-claimable. Instead we use `force_lease_expired_for_test` to backdate the
+/// lease_expires_at, then call `claim_work_item` which has a built-in
+/// stale-expiry UPDATE that bumps `lease_epoch + 1` and resets to 'pending'
+/// before the second claim.
+#[tokio::test]
+async fn reclaim_bumps_fence() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let eid = ExecutionId::new();
+    db.create_execution(sample_execution(&eid)).await.unwrap();
+    db.enqueue_work_item(sample_item(&eid)).await.unwrap();
+
+    // First claim mints fence F1 (term=0, epoch=1 → F1=1).
+    let first = db.claim_work_item("worker-A", &["model"]).await.unwrap().unwrap();
+    assert!(first.lease_fence > 0, "first claim must mint a non-zero fence");
+
+    // Backdate the lease so the stale-expiry path inside claim_work_item fires.
+    // (fail_work_item sets status='failed', not 'pending', so it is not
+    //  directly re-claimable — see adaptation note above.)
+    db.force_lease_expired_for_test(first.id).await.unwrap();
+
+    // Re-claim: claim_work_item's stale-expiry UPDATE bumps lease_epoch+1 and
+    // resets status='pending'; the subsequent INSERT mints a strictly greater fence.
+    let second = db.claim_work_item("worker-B", &["model"]).await.unwrap().unwrap();
+    assert!(
+        second.lease_fence > first.lease_fence,
+        "re-claim must mint a strictly greater fence ({} !> {})",
+        second.lease_fence,
+        first.lease_fence
+    );
 
     std::fs::remove_file(&path).ok();
 }

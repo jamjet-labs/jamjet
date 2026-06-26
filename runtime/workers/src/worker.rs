@@ -147,6 +147,7 @@ impl Worker {
             Arc::clone(&self.backend),
             item_id,
             self.worker_id.clone(),
+            item.lease_fence,
             Duration::from_secs(15),
         );
 

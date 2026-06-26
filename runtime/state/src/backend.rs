@@ -139,8 +139,14 @@ pub trait StateBackend: Send + Sync {
         queue_types: &[&str],
     ) -> BackendResult<Option<WorkItem>>;
 
-    /// Renew the lease on a claimed work item (heartbeat).
-    async fn renew_lease(&self, item_id: WorkItemId, worker_id: &str) -> BackendResult<()>;
+    /// Renew the lease on a claimed work item (heartbeat). Fails closed if the
+    /// presented `lease_fence` no longer matches (lease stolen / failed over).
+    async fn renew_lease(
+        &self,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
+    ) -> BackendResult<()>;
 
     /// Mark a work item as completed and release the lease.
     async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()>;

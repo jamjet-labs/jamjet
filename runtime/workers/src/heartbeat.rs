@@ -11,13 +11,14 @@ pub fn spawn_heartbeat(
     backend: Arc<dyn StateBackend>,
     item_id: WorkItemId,
     worker_id: String,
+    lease_fence: i64,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if let Err(e) = backend.renew_lease(item_id, &worker_id).await {
+            if let Err(e) = backend.renew_lease(item_id, &worker_id, lease_fence).await {
                 warn!(
                     worker_id = %worker_id,
                     item_id = %item_id,
