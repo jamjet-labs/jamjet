@@ -126,6 +126,15 @@ fn node_completed(node: &str) -> EventKind {
     }
 }
 
+fn node_failed(node: &str) -> EventKind {
+    EventKind::NodeFailed {
+        node_id: node.into(),
+        error: "boom".into(),
+        attempt: 0,
+        retryable: false,
+    }
+}
+
 #[tokio::test]
 async fn commit_succeeds_with_correct_fence() {
     let path = temp_db_path();
@@ -363,6 +372,73 @@ async fn crash_before_commit_then_reclaim_yields_exactly_one_terminal() {
     std::fs::remove_file(&path).ok();
 }
 
+/// `commit_node_terminal` with a `NodeFailed` event and the correct fence must
+/// succeed, settle the item as failed (lease_expires_at=NULL, worker_id=NULL,
+/// completed_at=NULL), and append exactly one NodeFailed event to the log.
+#[tokio::test]
+async fn commit_node_terminal_node_failed_settles_failed() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let eid = ExecutionId::new();
+    db.create_execution(sample_execution(&eid)).await.unwrap();
+    db.enqueue_work_item(sample_item(&eid)).await.unwrap();
+
+    let item = db.claim_work_item("worker-A", &["model"]).await.unwrap().unwrap();
+    let event = Event::new(eid.clone(), 0, node_failed("n1"));
+    let seq = db
+        .commit_node_terminal(item.id, item.lease_fence, event)
+        .await
+        .expect("commit NodeFailed with correct fence must succeed");
+    assert!(seq >= 1, "sequence must be at least 1");
+
+    // Exactly one event in the log, and it is a NodeFailed.
+    let events = db.get_events(&eid).await.unwrap();
+    assert_eq!(events.len(), 1, "exactly one event must exist after NodeFailed commit");
+    assert!(
+        matches!(events[0].kind, EventKind::NodeFailed { .. }),
+        "the committed event must be NodeFailed, got {:?}",
+        events[0].kind
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A zombie (stale fence) attempting to commit a `NodeFailed` event must be
+/// rejected with `FenceLost` and must write zero events to the log.
+#[tokio::test]
+async fn commit_node_terminal_node_failed_stale_fence_fails_closed() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let eid = ExecutionId::new();
+    db.create_execution(sample_execution(&eid)).await.unwrap();
+    db.enqueue_work_item(sample_item(&eid)).await.unwrap();
+
+    // Worker A claims (fence F1), then has its lease expired and re-claimed by B.
+    let zombie = db.claim_work_item("worker-A", &["model"]).await.unwrap().unwrap();
+    db.force_lease_expired_for_test(zombie.id).await.unwrap();
+    let _b = db.claim_work_item("worker-B", &["model"]).await.unwrap().unwrap();
+
+    // Zombie tries to commit a NodeFailed with stale fence F1.
+    let event = Event::new(eid.clone(), 0, node_failed("n1"));
+    let err = db
+        .commit_node_terminal(zombie.id, zombie.lease_fence, event)
+        .await
+        .expect_err("zombie NodeFailed commit must fail closed");
+    assert!(
+        matches!(err, StateBackendError::FenceLost(_)),
+        "expected FenceLost, got {err:?}"
+    );
+
+    // Zero events written — the zombie's NodeFailed must not appear.
+    assert_eq!(
+        db.get_events(&eid).await.unwrap().len(),
+        0,
+        "zombie NodeFailed commit must emit zero events"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
 // ── Cross-backend helpers ─────────────────────────────────────────────────────
 
 /// Generic helper: asserts that `commit_node_terminal` with the CORRECT fence
@@ -455,5 +531,100 @@ async fn commit_fails_closed_with_stale_fence_tenant_scoped() {
     let base = open_db(&path).await;
     let backend = base.for_tenant(TenantId::default_tenant());
     assert_fence_commit_fails_stale(&backend).await;
+    std::fs::remove_file(&path).ok();
+}
+
+// ── NodeFailed cross-backend helpers ─────────────────────────────────────────
+
+/// Generic helper: asserts that `commit_node_terminal` with a `NodeFailed` event
+/// and the CORRECT fence succeeds and appends exactly one NodeFailed event.
+async fn assert_fence_node_failed_succeeds(backend: &dyn StateBackend) {
+    let eid = ExecutionId::new();
+    backend
+        .create_execution(sample_execution(&eid))
+        .await
+        .unwrap();
+    backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
+    let item = backend
+        .claim_work_item("worker-A", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
+    let ev = Event::new(eid.clone(), 0, node_failed("n1"));
+    let seq = backend
+        .commit_node_terminal(item.id, item.lease_fence, ev)
+        .await
+        .expect("NodeFailed commit with correct fence must succeed");
+    assert!(seq >= 1, "sequence must be at least 1");
+    let events = backend.get_events(&eid).await.unwrap();
+    assert_eq!(events.len(), 1, "exactly one event must exist after NodeFailed commit");
+    assert!(
+        matches!(events[0].kind, EventKind::NodeFailed { .. }),
+        "the committed event must be NodeFailed"
+    );
+}
+
+/// Generic helper: asserts that `commit_node_terminal` with a `NodeFailed` event
+/// and a FABRICATED wrong fence returns FenceLost and writes zero events.
+async fn assert_fence_node_failed_stale_fails(backend: &dyn StateBackend) {
+    let eid = ExecutionId::new();
+    backend
+        .create_execution(sample_execution(&eid))
+        .await
+        .unwrap();
+    backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
+    let item = backend
+        .claim_work_item("worker-A", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
+    let wrong_fence = item.lease_fence + 1;
+    let ev = Event::new(eid.clone(), 0, node_failed("n1"));
+    let err = backend
+        .commit_node_terminal(item.id, wrong_fence, ev)
+        .await
+        .expect_err("stale-fence NodeFailed must be rejected");
+    assert!(
+        matches!(err, StateBackendError::FenceLost(_)),
+        "expected FenceLost, got {err:?}"
+    );
+    assert_eq!(
+        backend.get_events(&eid).await.unwrap().len(),
+        0,
+        "stale-fence NodeFailed commit must emit zero events"
+    );
+}
+
+// ── NodeFailed — InMemoryBackend ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn commit_node_failed_succeeds_with_correct_fence_inmemory() {
+    let backend = InMemoryBackend::new();
+    assert_fence_node_failed_succeeds(&backend).await;
+}
+
+#[tokio::test]
+async fn commit_node_failed_stale_fence_fails_closed_inmemory() {
+    let backend = InMemoryBackend::new();
+    assert_fence_node_failed_stale_fails(&backend).await;
+}
+
+// ── NodeFailed — TenantScopedSqliteBackend ────────────────────────────────────
+
+#[tokio::test]
+async fn commit_node_failed_succeeds_with_correct_fence_tenant_scoped() {
+    let path = temp_db_path();
+    let base = open_db(&path).await;
+    let backend = base.for_tenant(TenantId::default_tenant());
+    assert_fence_node_failed_succeeds(&backend).await;
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn commit_node_failed_stale_fence_fails_closed_tenant_scoped() {
+    let path = temp_db_path();
+    let base = open_db(&path).await;
+    let backend = base.for_tenant(TenantId::default_tenant());
+    assert_fence_node_failed_stale_fails(&backend).await;
     std::fs::remove_file(&path).ok();
 }

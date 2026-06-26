@@ -864,6 +864,7 @@ fn parse_payload(payload: &serde_json::Value) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::{ExecutionResult, NodeExecutor};
     use chrono::Utc;
     use jamjet_state::{
         InMemoryBackend,
@@ -967,11 +968,12 @@ mod tests {
     /// Happy path: the worker routes completion through `commit_node_terminal`
     /// (fenced), producing exactly one `NodeCompleted` event.
     ///
-    /// Before this wiring was added, `execute_item` called `complete_work_item`
-    /// + separate `append_event`; now it calls `commit_node_terminal`. This test
-    /// would fail if we reverted to the unfenced path because the assertion is
-    /// on the event KIND (NodeCompleted), which only appears when the fenced
-    /// primitive succeeds and emits inside the same transaction.
+    /// Note: this test checks that a single NodeCompleted is emitted; it is NOT
+    /// the fence-bypass guard. The old unfenced path (`complete_work_item` +
+    /// `append_event`) also emitted exactly one NodeCompleted, so reverting to
+    /// it would not break this assertion. The real fence-bypass guard is
+    /// `zombie_commit_is_rejected_emits_no_node_completed`, which exercises the
+    /// stale-fence rejection path.
     #[tokio::test]
     async fn happy_path_emits_exactly_one_node_completed() {
         let (backend, eid) = setup_backend().await;
@@ -995,13 +997,66 @@ mod tests {
         assert_eq!(completed_count, 1, "expected exactly one NodeCompleted event; got {completed_count}");
     }
 
+    // ── Failure-path executor stub ────────────────────────────────────────────
+
+    /// A stub executor that always returns an error.  Used to drive the
+    /// `Err(error)` arm inside `execute_item`, which must emit exactly one
+    /// `NodeFailed` event via the fenced `commit_node_terminal` path.
+    struct FailingExecutor;
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for FailingExecutor {
+        async fn execute(
+            &self,
+            _item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, String> {
+            Err("boom".into())
+        }
+    }
+
+    /// Failure path: when the executor returns `Err`, `execute_item` must emit
+    /// exactly one `NodeFailed` event through the fenced `commit_node_terminal`
+    /// path and return `Ok(())` (node failure is not a worker error).
+    #[tokio::test]
+    async fn failure_path_emits_exactly_one_node_failed() {
+        let (backend, eid) = setup_backend().await;
+        // Register a failing executor for "tool" — the kind_tag of the node in
+        // minimal_ir_json. This drives the Err(error) arm in execute_item.
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("tool", Arc::new(FailingExecutor));
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        // execute_item returns Ok(()) even when the node fails — node failure is
+        // surfaced as a NodeFailed event, not a worker-level error.
+        worker.execute_item(item).await.unwrap();
+
+        let events = backend.get_events(&eid).await.unwrap();
+        let failed_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::NodeFailed { .. }))
+            .count();
+        assert_eq!(
+            failed_count, 1,
+            "expected exactly one NodeFailed event; got {failed_count}"
+        );
+    }
+
     /// Zombie path: a worker holding a stale fence (F1) tries to commit after
     /// the lease was stolen (the item now carries fence F2). The fenced
     /// `commit_node_terminal` must reject the zombie's write with FenceLost;
     /// the worker abandons quietly and emits zero `NodeCompleted` events.
     ///
-    /// This is the key moat invariant: even if two workers race to complete the
-    /// same work item, only one can commit — the one whose fence matches the
+    /// This is the key fence-bypass guard: even if two workers race to complete
+    /// the same work item, only one can commit — the one whose fence matches the
     /// current lease. The zombie returns `Ok(())` (silent abandon) rather than
     /// double-writing.
     #[tokio::test]
