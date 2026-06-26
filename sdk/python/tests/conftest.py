@@ -130,13 +130,29 @@ class _SmartMockClient:
 
 @pytest.fixture(autouse=True)
 def mock_openai_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Patch openai.AsyncOpenAI for all tests — no real API calls."""
+    """Patch openai.AsyncOpenAI and litellm for all tests — no real API calls."""
     if "openai" not in sys.modules:
         mock_module = types.ModuleType("openai")
         mock_module.AsyncOpenAI = _SmartMockClient  # type: ignore[attr-defined]
         sys.modules["openai"] = mock_module
     else:
         monkeypatch.setattr("openai.AsyncOpenAI", _SmartMockClient)
+
+    # Also mock litellm so SeamAdapter / LiteLLMBackend work without the package.
+    async def _mock_acompletion(model: str, messages: list, tools: list | None = None, **kwargs: object) -> object:
+        return await _SmartMockClient()._create(model=model, messages=messages, tools=tools)
+
+    def _mock_completion_cost(completion_response: object = None, **kwargs: object) -> float:
+        return 0.0
+
+    if "litellm" not in sys.modules:
+        mock_litellm = types.ModuleType("litellm")
+        mock_litellm.acompletion = _mock_acompletion  # type: ignore[attr-defined]
+        mock_litellm.completion_cost = _mock_completion_cost  # type: ignore[attr-defined]
+        sys.modules["litellm"] = mock_litellm
+    else:
+        monkeypatch.setattr("litellm.acompletion", _mock_acompletion)
+        monkeypatch.setattr("litellm.completion_cost", _mock_completion_cost)
 
 
 # ── Test-harness fixtures ────────────────────────────────────────────────────

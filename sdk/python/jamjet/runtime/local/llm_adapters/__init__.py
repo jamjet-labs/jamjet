@@ -1,14 +1,14 @@
-"""LLM adapters keyed by provider. Phase 3 adds Anthropic, Google, Ollama, openai_compatible."""
+"""LLM adapters. Every provider now routes through the governed Model seam."""
 
 from jamjet.runtime.local.llm_adapters.base import LLMAdapter
-from jamjet.runtime.local.llm_adapters.openai import OpenAIAdapter
+from jamjet.runtime.local.llm_adapters.seam_adapter import SeamAdapter
 from jamjet.spec import LLMConfig
 
 
 def get_adapter(config: LLMConfig) -> LLMAdapter:
-    if config.provider == "openai":
-        return OpenAIAdapter(config)
-    raise NotImplementedError(f"Provider {config.provider!r} not implemented; lands in Phase 3. Use 'openai' for now.")
+    """Return the seam-backed adapter for any provider (provider routing is
+    parsed from ``config.model`` inside the seam)."""
+    return SeamAdapter(config)
 
 
-__all__ = ["LLMAdapter", "OpenAIAdapter", "get_adapter"]
+__all__ = ["LLMAdapter", "SeamAdapter", "get_adapter"]
