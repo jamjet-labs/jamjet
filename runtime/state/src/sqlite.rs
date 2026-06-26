@@ -588,16 +588,24 @@ impl StateBackend for SqliteBackend {
         let execution_id = execution_id_str(&snapshot.execution_id);
         let state_json = serde_json::to_string(&snapshot.state)?;
         let created_at = snapshot.created_at.to_rfc3339();
+        let status_str = status_to_str(&snapshot.status);
+        let completed_json = serde_json::to_string(&snapshot.completed_nodes)?;
+        let active_json = serde_json::to_string(&snapshot.active_nodes)?;
 
         sqlx::query(
-            r#"INSERT OR REPLACE INTO snapshots (id, execution_id, at_sequence, state_json, created_at)
-               VALUES (?, ?, ?, ?, ?)"#,
+            r#"INSERT OR REPLACE INTO snapshots
+               (id, execution_id, at_sequence, state_json, created_at, status, completed_nodes_json, active_nodes_json, last_sequence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id)
         .bind(&execution_id)
         .bind(snapshot.at_sequence)
         .bind(&state_json)
         .bind(&created_at)
+        .bind(status_str)
+        .bind(&completed_json)
+        .bind(&active_json)
+        .bind(snapshot.last_sequence)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -627,12 +635,32 @@ impl StateBackend for SqliteBackend {
             serde_json::from_str(row.try_get::<&str, _>("state_json").map_err(map_db_err)?)
                 .map_err(StateBackendError::Serialization)?;
         let created_at = parse_datetime(row.try_get::<&str, _>("created_at").map_err(map_db_err)?)?;
+        let status = str_to_status(
+            row.try_get::<&str, _>("status").unwrap_or("running"),
+        )
+        .unwrap_or(WorkflowStatus::Running);
+        let completed_nodes: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_str(
+                row.try_get::<&str, _>("completed_nodes_json").unwrap_or("{}"),
+            )
+            .unwrap_or_default();
+        let active_nodes: std::collections::HashSet<String> = serde_json::from_str(
+            row.try_get::<&str, _>("active_nodes_json").unwrap_or("[]"),
+        )
+        .unwrap_or_default();
+        let last_sequence: i64 = row
+            .try_get::<i64, _>("last_sequence")
+            .unwrap_or(at_sequence);
 
         Ok(Some(Snapshot {
             id,
             execution_id,
             at_sequence,
             state,
+            status,
+            completed_nodes,
+            active_nodes,
+            last_sequence,
             created_at,
         }))
     }
