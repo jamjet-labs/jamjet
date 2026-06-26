@@ -7,7 +7,7 @@ use crate::backend::{
     ApiToken, BackendResult, ReclaimResult, StateBackend, StateBackendError, WorkItem, WorkItemId,
     WorkflowDefinition,
 };
-use crate::event::{Event, EventSequence};
+use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
 use crate::tenant::{Tenant, TenantId};
 use async_trait::async_trait;
@@ -313,6 +313,17 @@ impl StateBackend for InMemoryBackend {
         lease_fence: i64,
         terminal_event: Event,
     ) -> BackendResult<EventSequence> {
+        // Validate terminal event kind BEFORE mutating state. A miswired
+        // caller (non-terminal event) fails loud instead of silently settling.
+        match &terminal_event.kind {
+            EventKind::NodeCompleted { .. } | EventKind::NodeFailed { .. } => {}
+            _ => {
+                return Err(StateBackendError::Database(
+                    "commit_node_terminal requires a terminal event (NodeCompleted/NodeFailed)"
+                        .into(),
+                ))
+            }
+        }
         // Fenced settle: only the current holder (matching fence) may settle.
         // Note: the fence check and remove are two DashMap operations rather than
         // one atomic step. This is acceptable for the in-memory dev/test backend;

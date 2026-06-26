@@ -824,11 +824,15 @@ impl StateBackend for SqliteBackend {
         let created_at = terminal_event.created_at.to_rfc3339();
         let now = Utc::now().to_rfc3339();
 
-        // Settle status inferred from the terminal event kind.
+        // Validate terminal event kind BEFORE opening the transaction.
+        // A miswired caller (non-terminal event) fails loud instead of
+        // silently settling a non-terminal event as completed.
         let (status, set_completed_at) = match &terminal_event.kind {
             EventKind::NodeCompleted { .. } => ("completed", true),
             EventKind::NodeFailed { .. } => ("failed", false),
-            _ => ("completed", true),
+            _ => return Err(StateBackendError::Database(
+                "commit_node_terminal requires a terminal event (NodeCompleted/NodeFailed)".into(),
+            )),
         };
 
         let mut tx = self
