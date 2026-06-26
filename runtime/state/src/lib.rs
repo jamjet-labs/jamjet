@@ -6,6 +6,7 @@
 #![allow(clippy::collapsible_match, clippy::collapsible_if)]
 
 pub mod approvals;
+pub mod hashing;
 pub mod backend;
 pub mod budget;
 pub mod event;
@@ -28,3 +29,4 @@ pub use snapshot::Snapshot;
 pub use sqlite::SqliteBackend;
 pub use tenant::{Tenant, TenantId, TenantLimits, TenantStatus, DEFAULT_TENANT};
 pub use tenant_scoped::TenantScopedSqliteBackend;
+pub use hashing::{canonical_json, content_hash};
