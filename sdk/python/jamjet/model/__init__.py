@@ -10,6 +10,7 @@ from jamjet.model.middleware import (
     ModelDeniedError,
     ModelMiddleware,
 )
+from jamjet.model.seam import Model
 from jamjet.model.types import (
     ModelRef,
     ModelRequest,
@@ -23,6 +24,7 @@ from jamjet.model.types import (
 __all__ = [
     "BaseModelMiddleware",
     "MeteringMiddleware",
+    "Model",
     "ModelAllowlistMiddleware",
     "ModelCallRecord",
     "ModelDeniedError",
