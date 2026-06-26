@@ -34,6 +34,10 @@ pub struct InMemoryBackend {
     tenants: DashMap<TenantId, Tenant>,
     /// Global event sequence counter (monotonic across all executions).
     next_sequence: AtomicI64,
+    /// Per-work-item lease epoch (bumped on each claim/reclaim/fail).
+    lease_epochs: DashMap<WorkItemId, i64>,
+    /// Store failover generation (settable to simulate promotion).
+    store_term: AtomicI64,
 }
 
 impl InMemoryBackend {
@@ -48,7 +52,14 @@ impl InMemoryBackend {
             tokens: DashMap::new(),
             tenants: DashMap::new(),
             next_sequence: AtomicI64::new(1),
+            lease_epochs: DashMap::new(),
+            store_term: AtomicI64::new(0),
         }
+    }
+
+    /// Simulate a store failover by bumping the in-memory store term.
+    pub fn bump_store_term(&self) -> i64 {
+        self.store_term.fetch_add(1, Ordering::SeqCst) + 1
     }
 }
 
@@ -231,7 +242,7 @@ impl StateBackend for InMemoryBackend {
         Ok(self
             .snapshots
             .get(execution_id)
-            .and_then(|r| r.value().last().cloned()))
+            .and_then(|r| r.value().iter().max_by_key(|s| s.at_sequence).cloned()))
     }
 
     // ── Work queue ───────────────────────────────────────────────────
@@ -247,11 +258,21 @@ impl StateBackend for InMemoryBackend {
         worker_id: &str,
         queue_types: &[&str],
     ) -> BackendResult<Option<WorkItem>> {
+        let term = self.store_term.load(Ordering::SeqCst);
         for mut entry in self.work_items.iter_mut() {
             let item = entry.value_mut();
             if item.worker_id.is_none() && queue_types.contains(&item.queue_type.as_str()) {
+                let new_epoch = self
+                    .lease_epochs
+                    .get(&item.id)
+                    .map(|e| *e.value())
+                    .unwrap_or(0)
+                    + 1;
+                self.lease_epochs.insert(item.id, new_epoch);
+                let fence = term * 4_294_967_296_i64 + new_epoch;
                 item.worker_id = Some(worker_id.to_string());
                 item.lease_expires_at = Some(Utc::now() + chrono::Duration::seconds(30));
+                item.lease_fence = fence;
                 return Ok(Some(item.clone()));
             }
         }
@@ -286,12 +307,44 @@ impl StateBackend for InMemoryBackend {
         Ok(())
     }
 
+    async fn commit_node_terminal(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        terminal_event: Event,
+    ) -> BackendResult<EventSequence> {
+        // Fenced settle: only the current holder (matching fence) may settle.
+        // Note: the fence check and remove are two DashMap operations rather than
+        // one atomic step. This is acceptable for the in-memory dev/test backend;
+        // the SQLite backends are the production path where atomicity is guaranteed
+        // by BEGIN IMMEDIATE.
+        match self.work_items.get(&item_id) {
+            Some(entry) if entry.lease_fence == lease_fence => {}
+            _ => return Err(StateBackendError::FenceLost(item_id.to_string())),
+        }
+        self.work_items.remove(&item_id);
+        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        let mut ev = terminal_event;
+        ev.sequence = seq;
+        self.events.entry(ev.execution_id.clone()).or_default().push(ev);
+        Ok(seq)
+    }
+
     async fn fail_work_item(&self, item_id: WorkItemId, error: &str) -> BackendResult<()> {
         match self.work_items.get_mut(&item_id) {
             Some(mut entry) => {
                 entry.attempt += 1;
                 entry.worker_id = None;
                 entry.lease_expires_at = None;
+                // Bump epoch so any re-claim after a forced fail mints a
+                // strictly greater fence than the failed worker's stale token.
+                let next = self
+                    .lease_epochs
+                    .get(&item_id)
+                    .map(|e| *e.value())
+                    .unwrap_or(0)
+                    + 1;
+                self.lease_epochs.insert(item_id, next);
                 if let Some(obj) = entry.payload.as_object_mut() {
                     obj.insert(
                         "last_error".into(),
@@ -317,6 +370,14 @@ impl StateBackend for InMemoryBackend {
                     if item.attempt < item.max_attempts {
                         item.worker_id = None;
                         item.lease_expires_at = None;
+                        // Bump epoch so a re-claim mints a strictly greater fence.
+                        let next = self
+                            .lease_epochs
+                            .get(&item.id)
+                            .map(|e| *e.value())
+                            .unwrap_or(0)
+                            + 1;
+                        self.lease_epochs.insert(item.id, next);
                         result.retryable.push(item.clone());
                     } else {
                         to_dead_letter.push(item.clone());

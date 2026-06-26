@@ -810,6 +810,91 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
+    #[instrument(skip(self, terminal_event), fields(item_id = %item_id, fence = lease_fence))]
+    async fn commit_node_terminal(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        terminal_event: Event,
+    ) -> BackendResult<EventSequence> {
+        let id_str = item_id.to_string();
+        let execution_id = execution_id_str(&terminal_event.execution_id);
+        let event_id = terminal_event.id.to_string();
+        let kind_json = serde_json::to_string(&terminal_event.kind)?;
+        let created_at = terminal_event.created_at.to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+
+        // Settle status inferred from the terminal event kind.
+        let (status, set_completed_at) = match &terminal_event.kind {
+            EventKind::NodeCompleted { .. } => ("completed", true),
+            EventKind::NodeFailed { .. } => ("failed", false),
+            _ => ("completed", true),
+        };
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
+
+        // 1) Fenced settle. Zero rows => stale fence => fail closed, emit nothing.
+        let rows = if set_completed_at {
+            sqlx::query(
+                "UPDATE work_items SET status = ?, completed_at = ?, lease_expires_at = NULL WHERE id = ? AND lease_fence = ?",
+            )
+            .bind(status)
+            .bind(&now)
+            .bind(&id_str)
+            .bind(lease_fence)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE work_items SET status = ?, completed_at = NULL, lease_expires_at = NULL, worker_id = NULL WHERE id = ? AND lease_fence = ?",
+            )
+            .bind(status)
+            .bind(&id_str)
+            .bind(lease_fence)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            .rows_affected()
+        };
+
+        if rows == 0 {
+            tx.rollback().await.map_err(map_db_err)?;
+            return Err(StateBackendError::FenceLost(id_str));
+        }
+
+        // 2) Assign the next sequence and append the event in the same transaction.
+        let seq_row = sqlx::query(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
+        )
+        .bind(&execution_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+
+        sqlx::query(
+            r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at)
+               VALUES (?, ?, ?, ?, ?)"#,
+        )
+        .bind(&event_id)
+        .bind(&execution_id)
+        .bind(sequence)
+        .bind(&kind_json)
+        .bind(&created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        tx.commit().await.map_err(map_db_err)?;
+        Ok(sequence)
+    }
+
     #[instrument(skip(self))]
     async fn reclaim_expired_leases(&self) -> BackendResult<ReclaimResult> {
         let now = Utc::now().to_rfc3339();

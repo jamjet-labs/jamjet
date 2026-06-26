@@ -4,8 +4,8 @@
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::{
-    backend::{StateBackend, WorkItem},
-    SqliteBackend,
+    backend::{StateBackend, StateBackendError, WorkItem},
+    Event, EventKind, SqliteBackend,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -106,6 +106,76 @@ async fn reclaim_bumps_fence() {
         second.lease_fence,
         first.lease_fence
     );
+
+    std::fs::remove_file(&path).ok();
+}
+
+fn node_completed(node: &str) -> EventKind {
+    EventKind::NodeCompleted {
+        node_id: node.into(),
+        output: json!({ "ok": true }),
+        state_patch: json!({}),
+        duration_ms: 1,
+        gen_ai_system: None,
+        gen_ai_model: None,
+        input_tokens: None,
+        output_tokens: None,
+        finish_reason: None,
+        cost_usd: None,
+        provenance: None,
+    }
+}
+
+#[tokio::test]
+async fn commit_succeeds_with_correct_fence() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let eid = ExecutionId::new();
+    db.create_execution(sample_execution(&eid)).await.unwrap();
+    db.enqueue_work_item(sample_item(&eid)).await.unwrap();
+
+    let item = db.claim_work_item("worker-A", &["model"]).await.unwrap().unwrap();
+    let event = Event::new(eid.clone(), 0, node_completed("n1"));
+    let seq = db
+        .commit_node_terminal(item.id, item.lease_fence, event)
+        .await
+        .expect("commit with correct fence");
+    assert!(seq >= 1);
+
+    // Exactly one event was appended.
+    let events = db.get_events(&eid).await.unwrap();
+    assert_eq!(events.len(), 1);
+    // Item is settled — no longer claimable.
+    assert!(db.claim_work_item("worker-B", &["model"]).await.unwrap().is_none());
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[tokio::test]
+async fn commit_fails_closed_with_stale_fence() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let eid = ExecutionId::new();
+    db.create_execution(sample_execution(&eid)).await.unwrap();
+    db.enqueue_work_item(sample_item(&eid)).await.unwrap();
+
+    // Worker A claims (fence F1). Backdate the lease so the stale-expiry path
+    // in claim_work_item fires: it bumps lease_epoch+1 and resets to 'pending'.
+    // Worker B then re-claims and receives a strictly greater fence F2.
+    // Worker A is now a zombie holding F1.
+    let zombie = db.claim_work_item("worker-A", &["model"]).await.unwrap().unwrap();
+    db.force_lease_expired_for_test(zombie.id).await.unwrap();
+    let _b = db.claim_work_item("worker-B", &["model"]).await.unwrap().unwrap();
+
+    let event = Event::new(eid.clone(), 0, node_completed("n1"));
+    let err = db
+        .commit_node_terminal(zombie.id, zombie.lease_fence, event)
+        .await
+        .expect_err("zombie commit must fail closed");
+    assert!(matches!(err, StateBackendError::FenceLost(_)));
+
+    // The zombie's commit emitted NOTHING.
+    assert_eq!(db.get_events(&eid).await.unwrap().len(), 0);
 
     std::fs::remove_file(&path).ok();
 }
