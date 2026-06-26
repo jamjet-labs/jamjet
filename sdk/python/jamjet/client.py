@@ -234,6 +234,8 @@ class JamjetClient:
         output: Any,
         state_patch: dict[str, Any],
         duration_ms: int = 0,
+        gen_ai_model: str | None = None,
+        finish_reason: str | None = None,
     ) -> None:
         """Mark a work item as completed and emit a NodeCompleted event."""
         body: dict[str, Any] = {
@@ -245,6 +247,10 @@ class JamjetClient:
             body["execution_id"] = execution_id
         if node_id:
             body["node_id"] = node_id
+        if gen_ai_model:
+            body["gen_ai_model"] = gen_ai_model
+        if finish_reason is not None:
+            body["finish_reason"] = finish_reason
         r = await self._client.post(
             f"/work-items/{item_id}/complete",
             json=body,

@@ -844,6 +844,22 @@ struct CompleteWorkItemRequest {
     state_patch: Value,
     #[serde(default)]
     duration_ms: u64,
+    // ── GenAI telemetry (forwarded from the python_tool worker or other callers) ──
+    /// AI provider system (e.g. "anthropic", "openai").
+    #[serde(default)]
+    gen_ai_system: Option<String>,
+    /// Model name used.
+    #[serde(default)]
+    gen_ai_model: Option<String>,
+    /// Input tokens consumed.
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    /// Output tokens generated.
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    /// Finish reason (e.g. "stop", "length", "tool_calls").
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// `POST /work-items/:id/complete` — mark a work item as completed and emit NodeCompleted event.
@@ -872,11 +888,11 @@ async fn complete_work_item(
                 output: body.output.clone(),
                 state_patch: body.state_patch.clone(),
                 duration_ms: body.duration_ms,
-                gen_ai_system: None,
-                gen_ai_model: None,
-                input_tokens: None,
-                output_tokens: None,
-                finish_reason: None,
+                gen_ai_system: body.gen_ai_system.clone(),
+                gen_ai_model: body.gen_ai_model.clone(),
+                input_tokens: body.input_tokens,
+                output_tokens: body.output_tokens,
+                finish_reason: body.finish_reason.clone(),
                 cost_usd: None,
                 provenance: None,
                 idempotency_key: None,

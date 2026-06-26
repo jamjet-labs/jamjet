@@ -1,10 +1,12 @@
 """Tests for `jamjet worker` — python_tool work-item consumer.
 
-Covers three scenarios:
+Covers scenarios:
   (a) A claimed item whose payload names a module+function runs the handler
       and posts complete with the output.
   (b) A handler that raises causes fail_work_item to be posted.
   (c) --once with no claimed item is a clean no-op.
+  (d) Seed injection: same execution_id yields same random value (Task 4).
+  (e) GenAI fields in the output dict are forwarded to complete_work_item (Task 5).
 
 No live runtime is required; a _StubClient records all outbound calls.
 """
@@ -24,6 +26,23 @@ async def _add(input: dict) -> dict:
 async def _boom(input: dict) -> dict:
     """Always raises to exercise the fail path."""
     raise RuntimeError("intentional failure")
+
+
+def _read_seed(input: dict) -> dict:
+    """Return the first value from the injected seeded random (sync handler)."""
+    from jamjet.runtime.local.seed import get_current_random
+
+    rng = get_current_random()
+    return {"seed_value": rng.random() if rng is not None else None}
+
+
+async def _with_genai(input: dict) -> dict:
+    """Return output that includes optional GenAI telemetry fields."""
+    return {
+        "result": "answer",
+        "gen_ai_model": "claude-3-5-sonnet-20241022",
+        "finish_reason": "stop",
+    }
 
 
 # ── Stub client ───────────────────────────────────────────────────────────────
@@ -49,6 +68,8 @@ class _StubClient:
         output: object,
         state_patch: dict,
         duration_ms: int = 0,
+        gen_ai_model: str | None = None,
+        finish_reason: str | None = None,
     ) -> None:
         self.complete_calls.append(
             {
@@ -56,6 +77,8 @@ class _StubClient:
                 "execution_id": execution_id,
                 "node_id": node_id,
                 "output": output,
+                "gen_ai_model": gen_ai_model,
+                "finish_reason": finish_reason,
             }
         )
 
@@ -89,6 +112,32 @@ _BOOM_ITEM: dict = {
     "payload": {
         "module": "tests.test_worker",
         "function": "_boom",
+        "input": {},
+    },
+    "lease_fence": 0,
+}
+
+_SEED_ITEM: dict = {
+    "id": "wi-003",
+    "execution_id": "exec_seed_abc",
+    "node_id": "seed_step",
+    "queue_type": "python_tool",
+    "payload": {
+        "module": "tests.test_worker",
+        "function": "_read_seed",
+        "input": {},
+    },
+    "lease_fence": 0,
+}
+
+_GENAI_ITEM: dict = {
+    "id": "wi-004",
+    "execution_id": "exec_genai",
+    "node_id": "genai_step",
+    "queue_type": "python_tool",
+    "payload": {
+        "module": "tests.test_worker",
+        "function": "_with_genai",
         "input": {},
     },
     "lease_fence": 0,
@@ -131,3 +180,33 @@ async def test_worker_once_empty_queue_is_noop() -> None:
 
     assert len(stub.complete_calls) == 0
     assert len(stub.fail_calls) == 0
+
+
+async def test_worker_seed_injection_deterministic() -> None:
+    """(d) Same execution_id yields the same random value via injected context."""
+    # Run twice with the same execution_id — seeds must be identical.
+    stub_a = _StubClient(claimed_item=_SEED_ITEM)
+    await _worker_loop(stub_a, "test-worker", ["python_tool"], once=True)
+
+    stub_b = _StubClient(claimed_item=_SEED_ITEM)
+    await _worker_loop(stub_b, "test-worker", ["python_tool"], once=True)
+
+    output_a = stub_a.complete_calls[0]["output"]["seed_value"]
+    output_b = stub_b.complete_calls[0]["output"]["seed_value"]
+    assert output_a is not None, "seed must be injected before handler invocation"
+    assert output_a == output_b, (
+        f"same execution_id must yield same seed: {output_a} != {output_b}"
+    )
+
+
+async def test_worker_forwards_gen_ai_fields() -> None:
+    """(e) GenAI fields in the output dict are forwarded to complete_work_item."""
+    stub = _StubClient(claimed_item=_GENAI_ITEM)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+
+    assert len(stub.complete_calls) == 1
+    call = stub.complete_calls[0]
+    assert call["gen_ai_model"] == "claude-3-5-sonnet-20241022"
+    assert call["finish_reason"] == "stop"
+    # The full output dict (including GenAI fields) is still forwarded as-is.
+    assert call["output"]["result"] == "answer"

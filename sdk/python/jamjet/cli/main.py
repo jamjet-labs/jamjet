@@ -1661,12 +1661,25 @@ async def _worker_loop(
                     fn = getattr(fn, part)
 
                 tool_input = payload.get("input", {})
+
+                # Inject deterministic seeds so handlers can opt into replay fidelity.
+                from jamjet.runtime.local.seed import _inject_seeds
+
+                _inject_seeds(exec_id)
+
                 result = fn(tool_input)
                 if asyncio.iscoroutine(result) or asyncio.isfuture(result):
                     result = await result
 
                 duration_ms = int((time.monotonic() - t_start) * 1000)
                 output: Any = result if isinstance(result, dict) else {"result": result}
+
+                # Forward optional GenAI telemetry if the tool surfaced it.
+                gen_ai_model_field: str | None = None
+                finish_reason_field: str | None = None
+                if isinstance(output, dict):
+                    gen_ai_model_field = output.get("gen_ai_model") or None
+                    finish_reason_field = output.get("finish_reason") or None
 
                 await client.complete_work_item(
                     item_id,
@@ -1675,6 +1688,8 @@ async def _worker_loop(
                     output,
                     {},
                     duration_ms,
+                    gen_ai_model=gen_ai_model_field,
+                    finish_reason=finish_reason_field,
                 )
                 console.print(f"[green]Completed[/green] id={item_id} node=[bold]{node_id}[/bold] {duration_ms}ms")
             except Exception as exc:
