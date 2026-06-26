@@ -155,16 +155,21 @@ pub trait StateBackend: Send + Sync {
     async fn fail_work_item(&self, item_id: WorkItemId, error: &str) -> BackendResult<()>;
 
     /// Atomically settle a work item (status inferred from the terminal event
-    /// kind) and append the terminal event, in ONE transaction, gated by
-    /// `lease_fence`. A stale fence matches zero rows and returns `FenceLost`,
-    /// emitting nothing. Replaces the `complete_work_item` + `latest_sequence`
-    /// + `append_event` trio so a node completion is one fsync with no
-    /// crash window and no double-commit.
-    async fn commit_node_terminal(
+    /// kind), append the terminal event, and optionally write a snapshot, all
+    /// in ONE transaction, gated by `lease_fence`. A stale fence matches zero
+    /// rows and returns `FenceLost`, emitting nothing (no event, no snapshot).
+    ///
+    /// If `snapshot` is `Some`, its `at_sequence` is set to the sequence just
+    /// assigned to the terminal event and it is written with INSERT OR REPLACE
+    /// inside the same transaction. Replaces the `complete_work_item` +
+    /// `latest_sequence` + `append_event` trio so a node completion is one
+    /// fsync with no crash window and no double-commit.
+    async fn commit_turn(
         &self,
         item_id: WorkItemId,
         lease_fence: i64,
         terminal_event: Event,
+        snapshot: Option<Snapshot>,
     ) -> BackendResult<EventSequence>;
 
     /// Reclaim work items whose lease has expired (worker crashed or stalled).

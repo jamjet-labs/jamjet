@@ -313,11 +313,12 @@ impl StateBackend for InMemoryBackend {
         Ok(())
     }
 
-    async fn commit_node_terminal(
+    async fn commit_turn(
         &self,
         item_id: WorkItemId,
         lease_fence: i64,
         terminal_event: Event,
+        snapshot: Option<Snapshot>,
     ) -> BackendResult<EventSequence> {
         // Validate terminal event kind BEFORE mutating state. A miswired
         // caller (non-terminal event) fails loud instead of silently settling.
@@ -325,8 +326,7 @@ impl StateBackend for InMemoryBackend {
             EventKind::NodeCompleted { .. } | EventKind::NodeFailed { .. } => {}
             _ => {
                 return Err(StateBackendError::Database(
-                    "commit_node_terminal requires a terminal event (NodeCompleted/NodeFailed)"
-                        .into(),
+                    "commit_turn requires a terminal event (NodeCompleted/NodeFailed)".into(),
                 ))
             }
         }
@@ -341,12 +341,15 @@ impl StateBackend for InMemoryBackend {
         }
         self.work_items.remove(&item_id);
         let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        let eid = terminal_event.execution_id.clone();
         let mut ev = terminal_event;
         ev.sequence = seq;
-        self.events
-            .entry(ev.execution_id.clone())
-            .or_default()
-            .push(ev);
+        self.events.entry(eid.clone()).or_default().push(ev);
+        if let Some(mut snap) = snapshot {
+            snap.at_sequence = seq;
+            snap.last_sequence = seq;
+            self.snapshots.entry(eid).or_default().push(snap);
+        }
         Ok(seq)
     }
 

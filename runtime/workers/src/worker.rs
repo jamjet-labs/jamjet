@@ -311,7 +311,7 @@ impl Worker {
                 );
                 match self
                     .backend
-                    .commit_node_terminal(item_id, lease_fence, terminal)
+                    .commit_turn(item_id, lease_fence, terminal, None)
                     .await
                 {
                     Ok(_) => {
@@ -339,7 +339,7 @@ impl Worker {
                 );
                 match self
                     .backend
-                    .commit_node_terminal(item_id, lease_fence, terminal)
+                    .commit_turn(item_id, lease_fence, terminal, None)
                     .await
                 {
                     Ok(_) => {

@@ -782,12 +782,13 @@ impl StateBackend for TenantScopedSqliteBackend {
         Ok(())
     }
 
-    #[instrument(skip(self, terminal_event), fields(tenant = %self.tenant_id, item_id = %item_id))]
-    async fn commit_node_terminal(
+    #[instrument(skip(self, terminal_event, snapshot), fields(tenant = %self.tenant_id, item_id = %item_id))]
+    async fn commit_turn(
         &self,
         item_id: WorkItemId,
         lease_fence: i64,
         terminal_event: Event,
+        snapshot: Option<Snapshot>,
     ) -> BackendResult<EventSequence> {
         let id_str = item_id.to_string();
         let execution_id = execution_id_str(&terminal_event.execution_id);
@@ -804,8 +805,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             EventKind::NodeFailed { .. } => ("failed", false),
             _ => {
                 return Err(StateBackendError::Database(
-                    "commit_node_terminal requires a terminal event (NodeCompleted/NodeFailed)"
-                        .into(),
+                    "commit_turn requires a terminal event (NodeCompleted/NodeFailed)".into(),
                 ))
             }
         };
@@ -871,6 +871,38 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+
+        // Optionally write the snapshot in the SAME transaction (tenant-scoped).
+        if let Some(mut snap) = snapshot {
+            snap.at_sequence = sequence;
+            snap.last_sequence = sequence;
+            let snap_id = snap.id.to_string();
+            let snap_exec_id = execution_id_str(&snap.execution_id);
+            let snap_state_json = serde_json::to_string(&snap.state)?;
+            let snap_created_at = snap.created_at.to_rfc3339();
+            let snap_status = status_to_str(&snap.status);
+            let snap_completed_json = serde_json::to_string(&snap.completed_nodes)?;
+            let snap_active_json = serde_json::to_string(&snap.active_nodes)?;
+
+            sqlx::query(
+                r#"INSERT OR REPLACE INTO snapshots
+                   (id, execution_id, at_sequence, state_json, created_at, tenant_id, status, completed_nodes_json, active_nodes_json, last_sequence)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&snap_id)
+            .bind(&snap_exec_id)
+            .bind(snap.at_sequence)
+            .bind(&snap_state_json)
+            .bind(&snap_created_at)
+            .bind(&self.tenant_id.0)
+            .bind(snap_status)
+            .bind(&snap_completed_json)
+            .bind(&snap_active_json)
+            .bind(snap.last_sequence)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+        }
 
         tx.commit().await.map_err(map_db_err)?;
         Ok(sequence)
