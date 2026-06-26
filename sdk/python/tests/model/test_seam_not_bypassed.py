@@ -109,8 +109,7 @@ def test_no_unexempt_module_imports_a_provider_sdk() -> None:
             offenders[rel] = leaked
     assert not offenders, (
         "provider SDK imported outside the exempt set"
-        " (route through jamjet.model instead):\n"
-        + "\n".join(f"  {k}: {v}" for k, v in sorted(offenders.items()))
+        " (route through jamjet.model instead):\n" + "\n".join(f"  {k}: {v}" for k, v in sorted(offenders.items()))
     )
 
 

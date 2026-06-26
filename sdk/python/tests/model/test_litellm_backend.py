@@ -45,9 +45,11 @@ def _install_fake_litellm(monkeypatch, *, stream_parts=None):
     async def acompletion(**kwargs):
         captured.update(kwargs)
         if kwargs.get("stream"):
+
             async def gen():
                 for text in stream_parts or []:
                     yield types.SimpleNamespace(choices=[_StreamChoice(text)])
+
             return gen()
         return _Resp()
 
