@@ -227,6 +227,7 @@ mod tests {
                 finish_reason: None,
                 cost_usd: None,
                 provenance: None,
+                idempotency_key: None,
             },
         )];
         let mat = apply_events(base, &events, &WorkflowStatus::Running);
@@ -252,6 +253,7 @@ mod tests {
                 finish_reason: None,
                 cost_usd: None,
                 provenance: None,
+                idempotency_key: None,
             },
         )];
         let mat = apply_events(base, &events, &WorkflowStatus::Running);
@@ -291,6 +293,7 @@ mod tests {
                     finish_reason: None,
                     cost_usd: None,
                     provenance: None,
+                    idempotency_key: None,
                 },
             ),
             make_event(

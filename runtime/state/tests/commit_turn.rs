@@ -149,6 +149,7 @@ async fn test_materialize_equals_full_apply_after_snapshot() {
             finish_reason: None,
             cost_usd: None,
             provenance: None,
+            idempotency_key: None,
         },
         EventKind::NodeScheduled {
             node_id: "n2".into(),
@@ -166,6 +167,7 @@ async fn test_materialize_equals_full_apply_after_snapshot() {
             finish_reason: None,
             cost_usd: None,
             provenance: None,
+            idempotency_key: None,
         },
     ];
 
@@ -246,6 +248,7 @@ fn node_completed_kind(node: &str) -> EventKind {
         finish_reason: None,
         cost_usd: None,
         provenance: None,
+        idempotency_key: None,
     }
 }
 
@@ -408,6 +411,7 @@ fn nc_kind_for_spec(ni: usize, ki: usize, pv: i64) -> EventKind {
         finish_reason: None,
         cost_usd: None,
         provenance: None,
+        idempotency_key: None,
     }
 }
 
@@ -520,6 +524,7 @@ async fn fresh_process_sqlite_resume() {
         finish_reason: None,
         cost_usd: None,
         provenance: None,
+        idempotency_key: None,
     };
 
     db.enqueue_work_item(WorkItem {
@@ -562,6 +567,7 @@ async fn fresh_process_sqlite_resume() {
         finish_reason: None,
         cost_usd: None,
         provenance: None,
+        idempotency_key: None,
     };
 
     db.enqueue_work_item(WorkItem {
@@ -604,6 +610,7 @@ async fn fresh_process_sqlite_resume() {
         finish_reason: None,
         cost_usd: None,
         provenance: None,
+        idempotency_key: None,
     };
 
     db.enqueue_work_item(WorkItem {
@@ -728,6 +735,7 @@ async fn assert_resume_equivalence_for_backend(backend: &dyn StateBackend) {
             finish_reason: None,
             cost_usd: None,
             provenance: None,
+            idempotency_key: None,
         },
         EventKind::NodeScheduled {
             node_id: "n2".into(),
@@ -745,6 +753,7 @@ async fn assert_resume_equivalence_for_backend(backend: &dyn StateBackend) {
             finish_reason: None,
             cost_usd: None,
             provenance: None,
+            idempotency_key: None,
         },
     ];
 
@@ -881,6 +890,7 @@ async fn concurrent_sibling_commits_no_write_skew() {
             finish_reason: None,
             cost_usd: None,
             provenance: None,
+            idempotency_key: None,
         },
     );
     db.commit_turn(item_a.id, item_a.lease_fence, ev_a, true)
@@ -903,6 +913,7 @@ async fn concurrent_sibling_commits_no_write_skew() {
             finish_reason: None,
             cost_usd: None,
             provenance: None,
+            idempotency_key: None,
         },
     );
     db.commit_turn(item_b.id, item_b.lease_fence, ev_b, true)
@@ -1022,6 +1033,7 @@ async fn concurrent_sibling_commits_race() {
                 finish_reason: None,
                 cost_usd: None,
                 provenance: None,
+                idempotency_key: None,
             },
         );
         barrier_a.wait().await;
@@ -1049,6 +1061,7 @@ async fn concurrent_sibling_commits_race() {
                 finish_reason: None,
                 cost_usd: None,
                 provenance: None,
+                idempotency_key: None,
             },
         );
         barrier_b.wait().await;

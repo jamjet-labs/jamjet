@@ -126,6 +126,18 @@ pub trait StateBackend: Send + Sync {
     /// Load the latest snapshot for an execution.
     async fn latest_snapshot(&self, execution_id: &ExecutionId) -> BackendResult<Option<Snapshot>>;
 
+    // ── Idempotency cache (tool_effects) ─────────────────────────────────────
+
+    /// Look up a previously recorded node result by its idempotency key.
+    ///
+    /// Returns the `result_json` value — `{output, state_patch, duration_ms,
+    /// gen_ai_system, gen_ai_model, input_tokens, output_tokens, finish_reason}`
+    /// — if the key exists, or `None` if it has not been recorded yet.
+    ///
+    /// Recorded atomically inside `commit_turn` when the terminal event is a
+    /// `NodeCompleted` with `idempotency_key = Some(k)`.
+    async fn get_tool_effect(&self, key: &str) -> BackendResult<Option<serde_json::Value>>;
+
     // ── Queue (simple Postgres/SQLite backed queue in v1) ────────────────
 
     /// Enqueue a work item for execution.

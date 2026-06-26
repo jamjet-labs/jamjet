@@ -879,6 +879,7 @@ async fn complete_work_item(
                 finish_reason: None,
                 cost_usd: None,
                 provenance: None,
+                idempotency_key: None,
             },
         );
         backend.append_event(event).await?;

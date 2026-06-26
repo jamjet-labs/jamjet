@@ -109,6 +109,11 @@ pub enum EventKind {
         /// Provenance metadata for research traceability.
         #[serde(skip_serializing_if = "Option::is_none")]
         provenance: Option<Box<ProvenanceMetadata>>,
+        /// Deterministic idempotency key for this node fire: H(run,segment,step,input_hash).
+        /// When set, `commit_turn` records the result in `tool_effects` atomically.
+        /// The worker reads it back before re-firing a reclaimed node (Task 2).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     NodeFailed {
         node_id: NodeId,

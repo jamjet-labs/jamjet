@@ -307,6 +307,7 @@ impl Worker {
                         finish_reason: exec_result.finish_reason,
                         cost_usd: None,
                         provenance: None,
+                        idempotency_key: None, // Task 2 sets this
                     },
                 );
                 // Snapshot is computed inside commit_turn's BEGIN IMMEDIATE
