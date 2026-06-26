@@ -11,6 +11,7 @@ use jamjet_state::approvals::NodeApprovalStatus;
 use jamjet_state::backend::{StateBackend, StateBackendError, WorkItem, WorkItemId};
 use jamjet_state::budget::BudgetState;
 use jamjet_state::event::EventKind;
+use jamjet_state::{apply_events_seeded, materialize, MaterializedState, Snapshot};
 use jamjet_telemetry::{gen_ai_attrs, metrics, record_gen_ai_usage};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -294,7 +295,7 @@ impl Worker {
 
                 let terminal = jamjet_state::Event::new(
                     execution_id.clone(),
-                    0, // sequence assigned atomically inside commit_node_terminal
+                    0, // sequence assigned atomically inside commit_turn
                     EventKind::NodeCompleted {
                         node_id: node_id.clone(),
                         output: exec_result.output,
@@ -309,9 +310,32 @@ impl Worker {
                         provenance: None,
                     },
                 );
+                // Compute the post-turn snapshot by folding THIS turn's terminal
+                // event onto the materialized state that precedes it.
+                // `materialize` reflects state before this event (it is committed
+                // inside commit_turn). Folding the terminal event onto `prior` gives
+                // us the exact state that will exist after the commit, without a
+                // second DB round-trip.
+                //
+                // Note: `terminal.sequence` is 0 here; `commit_turn` overwrites
+                // `snap.at_sequence` and `snap.last_sequence` with the real
+                // assigned sequence, so the worker's 0 does not corrupt the key.
+                let snap = {
+                    let prior = materialize(self.backend.as_ref(), &execution_id)
+                        .await
+                        .unwrap_or_else(|_| MaterializedState {
+                            current_state: serde_json::json!({}),
+                            status: jamjet_core::workflow::WorkflowStatus::Running,
+                            completed_nodes: std::collections::HashMap::new(),
+                            active_nodes: std::collections::HashSet::new(),
+                            last_sequence: 0,
+                        });
+                    let next = apply_events_seeded(prior, &[terminal.clone()]);
+                    Some(Snapshot::from_materialized(execution_id.clone(), &next))
+                };
                 match self
                     .backend
-                    .commit_turn(item_id, lease_fence, terminal, None)
+                    .commit_turn(item_id, lease_fence, terminal, snap)
                     .await
                 {
                     Ok(_) => {
@@ -1061,6 +1085,50 @@ mod tests {
         assert_eq!(
             failed_count, 1,
             "expected exactly one NodeFailed event; got {failed_count}"
+        );
+    }
+
+    /// After a successful node completion the worker must write a per-turn
+    /// snapshot through `commit_turn`.  The snapshot must (a) record the
+    /// just-completed node in `completed_nodes` and (b) carry the real
+    /// `at_sequence` assigned to the `NodeCompleted` event.
+    #[tokio::test]
+    async fn success_writes_snapshot_with_completed_node() {
+        let (backend, eid) = setup_backend().await;
+        let worker = make_worker(Arc::clone(&backend));
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        worker.execute_item(item).await.unwrap();
+
+        // Snapshot must exist.
+        let snap = backend
+            .latest_snapshot(&eid)
+            .await
+            .unwrap()
+            .expect("snapshot must be Some after successful node completion");
+
+        // n1 must appear in completed_nodes.
+        assert!(
+            snap.completed_nodes.contains_key("n1"),
+            "snapshot must record n1 in completed_nodes; got {:?}",
+            snap.completed_nodes.keys().collect::<Vec<_>>()
+        );
+
+        // at_sequence must match the NodeCompleted event's sequence.
+        let events = backend.get_events(&eid).await.unwrap();
+        let completed_seq = events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+            .map(|e| e.sequence)
+            .expect("NodeCompleted event must exist");
+        assert_eq!(
+            snap.at_sequence, completed_seq,
+            "snapshot.at_sequence must equal the NodeCompleted event's sequence"
         );
     }
 
