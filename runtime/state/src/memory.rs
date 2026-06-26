@@ -337,7 +337,10 @@ impl StateBackend for InMemoryBackend {
         let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
         let mut ev = terminal_event;
         ev.sequence = seq;
-        self.events.entry(ev.execution_id.clone()).or_default().push(ev);
+        self.events
+            .entry(ev.execution_id.clone())
+            .or_default()
+            .push(ev);
         Ok(seq)
     }
 

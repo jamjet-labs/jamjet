@@ -309,7 +309,11 @@ impl Worker {
                         provenance: None,
                     },
                 );
-                match self.backend.commit_node_terminal(item_id, lease_fence, terminal).await {
+                match self
+                    .backend
+                    .commit_node_terminal(item_id, lease_fence, terminal)
+                    .await
+                {
                     Ok(_) => {
                         info!(execution_id = %execution_id, node_id = %node_id, duration_ms, "Node completed");
                     }
@@ -333,7 +337,11 @@ impl Worker {
                         retryable: false,
                     },
                 );
-                match self.backend.commit_node_terminal(item_id, lease_fence, terminal).await {
+                match self
+                    .backend
+                    .commit_node_terminal(item_id, lease_fence, terminal)
+                    .await
+                {
                     Ok(_) => {
                         warn!(execution_id = %execution_id, node_id = %node_id, attempt, %error, "Node failed");
                     }
@@ -866,12 +874,12 @@ mod tests {
     use super::*;
     use crate::executor::{ExecutionResult, NodeExecutor};
     use chrono::Utc;
-    use jamjet_state::{
-        InMemoryBackend,
-        backend::{StateBackend, WorkflowDefinition, WorkItem},
-        event::EventKind,
-    };
     use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+    use jamjet_state::{
+        backend::{StateBackend, WorkItem, WorkflowDefinition},
+        event::EventKind,
+        InMemoryBackend,
+    };
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -944,7 +952,10 @@ mod tests {
     async fn setup_backend() -> (Arc<InMemoryBackend>, ExecutionId) {
         let backend = Arc::new(InMemoryBackend::new());
         let eid = ExecutionId::new();
-        backend.create_execution(sample_execution(&eid)).await.unwrap();
+        backend
+            .create_execution(sample_execution(&eid))
+            .await
+            .unwrap();
         backend
             .store_workflow(WorkflowDefinition {
                 workflow_id: "test-wf".into(),
@@ -994,7 +1005,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
             .count();
-        assert_eq!(completed_count, 1, "expected exactly one NodeCompleted event; got {completed_count}");
+        assert_eq!(
+            completed_count, 1,
+            "expected exactly one NodeCompleted event; got {completed_count}"
+        );
     }
 
     // ── Failure-path executor stub ────────────────────────────────────────────
@@ -1091,7 +1105,10 @@ mod tests {
         // Drive Worker A's completion with the stale item (fence F1).
         // The fenced commit must detect the mismatch and return Ok(()) quietly.
         let result = worker.execute_item(item_a).await;
-        assert!(result.is_ok(), "zombie execute_item must not propagate FenceLost as error");
+        assert!(
+            result.is_ok(),
+            "zombie execute_item must not propagate FenceLost as error"
+        );
 
         // No NodeCompleted event must have been written by the zombie.
         let events = backend.get_events(&eid).await.unwrap();

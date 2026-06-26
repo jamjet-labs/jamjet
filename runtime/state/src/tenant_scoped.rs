@@ -774,9 +774,12 @@ impl StateBackend for TenantScopedSqliteBackend {
         let (status, set_completed_at) = match &terminal_event.kind {
             EventKind::NodeCompleted { .. } => ("completed", true),
             EventKind::NodeFailed { .. } => ("failed", false),
-            _ => return Err(StateBackendError::Database(
-                "commit_node_terminal requires a terminal event (NodeCompleted/NodeFailed)".into(),
-            )),
+            _ => {
+                return Err(StateBackendError::Database(
+                    "commit_node_terminal requires a terminal event (NodeCompleted/NodeFailed)"
+                        .into(),
+                ))
+            }
         };
 
         let mut tx = self

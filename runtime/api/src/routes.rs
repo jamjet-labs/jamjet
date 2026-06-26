@@ -981,6 +981,10 @@ async fn fail_work_item(
 #[derive(Deserialize)]
 struct HeartbeatRequest {
     worker_id: String,
+    /// The lease fence the worker received when it claimed the item. A renew
+    /// presenting a stale fence (lease stolen / failed over) fails closed.
+    #[serde(default)]
+    lease_fence: i64,
 }
 
 /// `POST /work-items/:id/heartbeat` — renew the lease on a claimed work item.
@@ -993,7 +997,9 @@ async fn heartbeat_work_item(
     let item_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
-    backend.renew_lease(item_id, &body.worker_id).await?;
+    backend
+        .renew_lease(item_id, &body.worker_id, body.lease_fence)
+        .await?;
     Ok(Json(json!({ "renewed": true, "work_item_id": id })))
 }
 

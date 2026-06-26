@@ -64,7 +64,11 @@ async fn claim_mints_nonzero_fence() {
     db.create_execution(sample_execution(&eid)).await.unwrap();
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
 
-    let claimed = db.claim_work_item("worker-A", &["model"]).await.unwrap().unwrap();
+    let claimed = db
+        .claim_work_item("worker-A", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
     assert!(claimed.lease_fence > 0, "claim must mint a non-zero fence");
 
     std::fs::remove_file(&path).ok();
@@ -89,8 +93,15 @@ async fn reclaim_bumps_fence() {
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
 
     // First claim mints fence F1 (term=0, epoch=1 → F1=1).
-    let first = db.claim_work_item("worker-A", &["model"]).await.unwrap().unwrap();
-    assert!(first.lease_fence > 0, "first claim must mint a non-zero fence");
+    let first = db
+        .claim_work_item("worker-A", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        first.lease_fence > 0,
+        "first claim must mint a non-zero fence"
+    );
 
     // Backdate the lease so the stale-expiry path inside claim_work_item fires.
     // (fail_work_item sets status='failed', not 'pending', so it is not
@@ -99,7 +110,11 @@ async fn reclaim_bumps_fence() {
 
     // Re-claim: claim_work_item's stale-expiry UPDATE bumps lease_epoch+1 and
     // resets status='pending'; the subsequent INSERT mints a strictly greater fence.
-    let second = db.claim_work_item("worker-B", &["model"]).await.unwrap().unwrap();
+    let second = db
+        .claim_work_item("worker-B", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
         second.lease_fence > first.lease_fence,
         "re-claim must mint a strictly greater fence ({} !> {})",
@@ -143,7 +158,11 @@ async fn commit_succeeds_with_correct_fence() {
     db.create_execution(sample_execution(&eid)).await.unwrap();
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
 
-    let item = db.claim_work_item("worker-A", &["model"]).await.unwrap().unwrap();
+    let item = db
+        .claim_work_item("worker-A", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
     let event = Event::new(eid.clone(), 0, node_completed("n1"));
     let seq = db
         .commit_node_terminal(item.id, item.lease_fence, event)
@@ -155,7 +174,11 @@ async fn commit_succeeds_with_correct_fence() {
     let events = db.get_events(&eid).await.unwrap();
     assert_eq!(events.len(), 1);
     // Item is settled — no longer claimable.
-    assert!(db.claim_work_item("worker-B", &["model"]).await.unwrap().is_none());
+    assert!(db
+        .claim_work_item("worker-B", &["model"])
+        .await
+        .unwrap()
+        .is_none());
 
     std::fs::remove_file(&path).ok();
 }
@@ -172,9 +195,17 @@ async fn commit_fails_closed_with_stale_fence() {
     // in claim_work_item fires: it bumps lease_epoch+1 and resets to 'pending'.
     // Worker B then re-claims and receives a strictly greater fence F2.
     // Worker A is now a zombie holding F1.
-    let zombie = db.claim_work_item("worker-A", &["model"]).await.unwrap().unwrap();
+    let zombie = db
+        .claim_work_item("worker-A", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
     db.force_lease_expired_for_test(zombie.id).await.unwrap();
-    let _b = db.claim_work_item("worker-B", &["model"]).await.unwrap().unwrap();
+    let _b = db
+        .claim_work_item("worker-B", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
 
     let event = Event::new(eid.clone(), 0, node_completed("n1"));
     let err = db
@@ -215,7 +246,10 @@ async fn fence_survives_lost_tail_failover() {
     // --- Primary store: claim under term 0 ---
     {
         let primary = open_db(&path).await;
-        primary.create_execution(sample_execution(&eid)).await.unwrap();
+        primary
+            .create_execution(sample_execution(&eid))
+            .await
+            .unwrap();
         zombie_item_id = primary.enqueue_work_item(sample_item(&eid)).await.unwrap();
         let z = primary
             .claim_work_item("worker-A", &["model"])
@@ -383,7 +417,11 @@ async fn commit_node_terminal_node_failed_settles_failed() {
     db.create_execution(sample_execution(&eid)).await.unwrap();
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
 
-    let item = db.claim_work_item("worker-A", &["model"]).await.unwrap().unwrap();
+    let item = db
+        .claim_work_item("worker-A", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
     let event = Event::new(eid.clone(), 0, node_failed("n1"));
     let seq = db
         .commit_node_terminal(item.id, item.lease_fence, event)
@@ -393,7 +431,11 @@ async fn commit_node_terminal_node_failed_settles_failed() {
 
     // Exactly one event in the log, and it is a NodeFailed.
     let events = db.get_events(&eid).await.unwrap();
-    assert_eq!(events.len(), 1, "exactly one event must exist after NodeFailed commit");
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one event must exist after NodeFailed commit"
+    );
     assert!(
         matches!(events[0].kind, EventKind::NodeFailed { .. }),
         "the committed event must be NodeFailed, got {:?}",
@@ -414,9 +456,17 @@ async fn commit_node_terminal_node_failed_stale_fence_fails_closed() {
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
 
     // Worker A claims (fence F1), then has its lease expired and re-claimed by B.
-    let zombie = db.claim_work_item("worker-A", &["model"]).await.unwrap().unwrap();
+    let zombie = db
+        .claim_work_item("worker-A", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
     db.force_lease_expired_for_test(zombie.id).await.unwrap();
-    let _b = db.claim_work_item("worker-B", &["model"]).await.unwrap().unwrap();
+    let _b = db
+        .claim_work_item("worker-B", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
 
     // Zombie tries to commit a NodeFailed with stale fence F1.
     let event = Event::new(eid.clone(), 0, node_failed("n1"));
@@ -557,7 +607,11 @@ async fn assert_fence_node_failed_succeeds(backend: &dyn StateBackend) {
         .expect("NodeFailed commit with correct fence must succeed");
     assert!(seq >= 1, "sequence must be at least 1");
     let events = backend.get_events(&eid).await.unwrap();
-    assert_eq!(events.len(), 1, "exactly one event must exist after NodeFailed commit");
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one event must exist after NodeFailed commit"
+    );
     assert!(
         matches!(events[0].kind, EventKind::NodeFailed { .. }),
         "the committed event must be NodeFailed"

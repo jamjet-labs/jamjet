@@ -6,10 +6,10 @@
 #![allow(clippy::collapsible_match, clippy::collapsible_if)]
 
 pub mod approvals;
-pub mod hashing;
 pub mod backend;
 pub mod budget;
 pub mod event;
+pub mod hashing;
 pub mod materializer;
 pub mod memory;
 pub mod snapshot;
@@ -23,10 +23,10 @@ pub use backend::{
 };
 pub use budget::BudgetState;
 pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};
+pub use hashing::{canonical_json, content_hash};
 pub use materializer::{apply_events, materialize, should_snapshot, MaterializedState};
 pub use memory::InMemoryBackend;
 pub use snapshot::Snapshot;
 pub use sqlite::SqliteBackend;
 pub use tenant::{Tenant, TenantId, TenantLimits, TenantStatus, DEFAULT_TENANT};
 pub use tenant_scoped::TenantScopedSqliteBackend;
-pub use hashing::{canonical_json, content_hash};
