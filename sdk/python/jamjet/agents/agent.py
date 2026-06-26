@@ -89,12 +89,18 @@ class Agent:
 
     def compile(self) -> AgentSpec:
         """Compile this agent to an AgentSpec."""
+        from jamjet.model.types import api_key_env_for, parse_model_ref, provider_literal_for  # noqa: PLC0415
         from jamjet.spec import AgentSpec, AgentStrategy, LLMConfig, ToolSpec  # noqa: PLC0415
 
+        ref = parse_model_ref(self.model)
         return AgentSpec(
             name=self.name,
             instructions=self.instructions,
-            llm=LLMConfig(provider="openai", model=self.model),
+            llm=LLMConfig(
+                provider=provider_literal_for(self.model),
+                model=ref.litellm_model,
+                api_key_env=api_key_env_for(ref.provider),
+            ),
             tools=[
                 ToolSpec(
                     name=td.name,
