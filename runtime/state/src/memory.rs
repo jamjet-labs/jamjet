@@ -61,6 +61,12 @@ impl InMemoryBackend {
     pub fn bump_store_term(&self) -> i64 {
         self.store_term.fetch_add(1, Ordering::SeqCst) + 1
     }
+
+    /// Raise the in-memory store term to at least `term`, monotonically. Mirrors
+    /// `SqliteBackend::set_store_term_at_least` (the production failover-generation seam).
+    pub fn set_store_term_at_least(&self, term: i64) -> i64 {
+        self.store_term.fetch_max(term, Ordering::SeqCst).max(term)
+    }
 }
 
 impl Default for InMemoryBackend {

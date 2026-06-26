@@ -5,6 +5,35 @@ use jamjet_state::{InMemoryBackend, SqliteBackend};
 use std::sync::Arc;
 use tracing::info;
 
+/// Parse a `JAMJET_STORE_TERM` value: a non-negative integer (the promotion
+/// generation). A present-but-invalid value is an error, not a silent no-op.
+fn parse_store_term(raw: &str) -> anyhow::Result<i64> {
+    let trimmed = raw.trim();
+    let term = trimmed
+        .parse::<i64>()
+        .map_err(|e| anyhow::anyhow!("invalid JAMJET_STORE_TERM `{trimmed}`: {e}"))?;
+    anyhow::ensure!(
+        term >= 0,
+        "JAMJET_STORE_TERM must be non-negative, got {term}"
+    );
+    Ok(term)
+}
+
+/// The store's failover generation from `JAMJET_STORE_TERM`. Orchestrators (a
+/// LiteFS-aware entrypoint, k8s, Fly) set this to the current promotion generation
+/// (LiteFS lease epoch / Postgres timeline ID) on every (re)start, so the lease
+/// fence is failover-safe. Absent => `Ok(None)` (not configured). Present-but-invalid
+/// => `Err` (fail startup loudly): a typo like `JAMJET_STORE_TERM=abc` must NOT be
+/// silently treated as "not configured", which would leave the term at 0 and re-open
+/// the failover-safety gap the operator believed they had closed.
+fn store_term_from_env() -> anyhow::Result<Option<i64>> {
+    match std::env::var("JAMJET_STORE_TERM") {
+        Ok(raw) => parse_store_term(&raw).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => anyhow::bail!("failed to read JAMJET_STORE_TERM: {e}"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load .env if present
@@ -17,6 +46,9 @@ async fn main() -> anyhow::Result<()> {
     let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
     jamjet_telemetry::init(config.dev_mode, otel_endpoint.as_deref());
     let storage_backend = std::env::var("STORAGE_BACKEND").unwrap_or_default();
+    // Parse the failover generation up front so a misconfiguration fails startup
+    // before we open any backend (rather than silently disabling failover-safety).
+    let configured_store_term = store_term_from_env()?;
     let storage_label = if storage_backend == "memory" {
         "memory"
     } else {
@@ -34,6 +66,13 @@ async fn main() -> anyhow::Result<()> {
         info!("Using in-memory storage (ephemeral, no persistence)");
 
         let backend = Arc::new(InMemoryBackend::new());
+        if let Some(term) = configured_store_term {
+            let applied = backend.set_store_term_at_least(term);
+            info!(
+                store_term = applied,
+                "Applied failover generation from JAMJET_STORE_TERM"
+            );
+        }
         let backend_clone = backend.clone();
         let audit: Arc<dyn jamjet_audit::AuditBackend> = Arc::new(NoopAuditBackend);
         let enricher = Arc::new(AuditEnricher::new(Arc::clone(&audit)));
@@ -66,6 +105,22 @@ async fn main() -> anyhow::Result<()> {
         let backend = SqliteBackend::open(&database_url)
             .await
             .map_err(|e| anyhow::anyhow!("failed to open state backend: {e}"))?;
+
+        // Failover-safety: raise the store's failover generation to the promotion
+        // generation supplied by the orchestrator, so a lease fence minted under a
+        // previous primary is rejected after a failover (the fence packs term in
+        // its high bits). Without this the term stays 0 and only the per-item epoch
+        // protects, which a lost-tail failover can corrupt.
+        if let Some(term) = configured_store_term {
+            let applied = backend
+                .set_store_term_at_least(term)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to set store term: {e}"))?;
+            info!(
+                store_term = applied,
+                "Applied failover generation from JAMJET_STORE_TERM"
+            );
+        }
 
         let agents = SqliteAgentRegistry::connect(&database_url)
             .await
@@ -178,4 +233,23 @@ async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
         .expect("failed to install Ctrl-C handler");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_store_term;
+
+    #[test]
+    fn parses_valid_non_negative() {
+        assert_eq!(parse_store_term("5").unwrap(), 5);
+        assert_eq!(parse_store_term("  0 ").unwrap(), 0);
+    }
+
+    #[test]
+    fn rejects_invalid_and_negative() {
+        // A typo must fail loud, not silently disable failover-safety.
+        assert!(parse_store_term("abc").is_err());
+        assert!(parse_store_term("-1").is_err());
+        assert!(parse_store_term("").is_err());
+    }
 }

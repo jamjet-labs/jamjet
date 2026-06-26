@@ -75,10 +75,26 @@ impl SqliteBackend {
         row.try_get::<i64, _>("term").map_err(map_db_err)
     }
 
-    /// Simulate a store failover by bumping the failover generation. Real
-    /// deployments bump this from the promotion coordinator (LiteFS lease epoch).
+    /// Simulate a store failover by bumping the failover generation. Used by
+    /// tests/simulators; production uses [`Self::set_store_term_at_least`].
     pub async fn bump_store_term(&self) -> BackendResult<i64> {
         sqlx::query("UPDATE store_identity SET term = term + 1 WHERE id = 1")
+            .execute(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+        let mut conn = self.pool.acquire().await.map_err(map_db_err)?;
+        self.current_term(&mut conn).await
+    }
+
+    /// Raise the store's failover generation to at least `term`, monotonically
+    /// (it never decreases). Call this at server startup with the promotion
+    /// generation from the coordinator (LiteFS lease epoch / Postgres timeline ID)
+    /// so a `lease_fence` minted under a previous primary is rejected after a
+    /// failover. Returns the resulting term. This is the production path that
+    /// makes the fence's failover-safety live (vs. the term staying 0).
+    pub async fn set_store_term_at_least(&self, term: i64) -> BackendResult<i64> {
+        sqlx::query("UPDATE store_identity SET term = max(term, ?) WHERE id = 1")
+            .bind(term)
             .execute(&self.pool)
             .await
             .map_err(map_db_err)?;
