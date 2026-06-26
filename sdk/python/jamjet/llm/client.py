@@ -5,10 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from jamjet.model import (
-    MeteringMiddleware,
     Model,
-    ModelAllowlistMiddleware,
     ModelRequest,
+    default_model_middleware,
     parse_model_ref,
 )
 
@@ -27,7 +26,7 @@ async def call_llm(model: str, prompt: str, max_tokens: int = 512) -> LlmRespons
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
     )
-    resp = await Model(middleware=[ModelAllowlistMiddleware(None), MeteringMiddleware()]).complete(request)
+    resp = await Model(middleware=default_model_middleware()).complete(request)
     return LlmResponse(
         text=resp.message.content or "",
         input_tokens=resp.input_tokens,

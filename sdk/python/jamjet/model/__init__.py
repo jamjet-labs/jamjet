@@ -3,6 +3,7 @@
 No module outside this package may import a provider SDK on the hot path.
 """
 
+from jamjet.model.defaults import default_model_middleware
 from jamjet.model.metering import MeteringMiddleware, ModelCallRecord
 from jamjet.model.middleware import (
     BaseModelMiddleware,
@@ -34,6 +35,7 @@ __all__ = [
     "ModelResponse",
     "StreamChunk",
     "api_key_env_for",
+    "default_model_middleware",
     "parse_model_ref",
     "provider_literal_for",
 ]

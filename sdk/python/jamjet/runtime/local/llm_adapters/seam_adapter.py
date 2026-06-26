@@ -9,8 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from jamjet.model.metering import MeteringMiddleware
-from jamjet.model.middleware import ModelAllowlistMiddleware
+from jamjet.model.defaults import default_model_middleware
 from jamjet.model.seam import Model
 from jamjet.model.types import ModelRequest, parse_model_ref
 from jamjet.spec import LLMConfig
@@ -22,11 +21,7 @@ class SeamAdapter:
     def __init__(self, config: LLMConfig, *, model: Model | None = None) -> None:
         self.config = config
         self._ref = parse_model_ref(config.model)
-        # Track 1 default chain: allow-all + metering. Track 3 derives the
-        # allowlist (and adds budget + PII) from the agent's policy.
-        self._model = model or Model(
-            middleware=[ModelAllowlistMiddleware(None), MeteringMiddleware()]
-        )
+        self._model = model or Model(middleware=default_model_middleware())
 
     async def generate(
         self,

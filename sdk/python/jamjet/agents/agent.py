@@ -153,13 +153,12 @@ class Agent:
         returns the checkpoint, it does not re-stream). The looped, durable
         stream over the full agent run lands in Track 2.
         """
-        from jamjet.model.metering import MeteringMiddleware  # noqa: PLC0415
-        from jamjet.model.middleware import ModelAllowlistMiddleware  # noqa: PLC0415
+        from jamjet.model.defaults import default_model_middleware  # noqa: PLC0415
         from jamjet.model.seam import Model  # noqa: PLC0415
         from jamjet.model.types import ModelRequest, parse_model_ref  # noqa: PLC0415
 
         spec = self.compile()
-        seam = model or Model(middleware=[ModelAllowlistMiddleware(None), MeteringMiddleware()])
+        seam = model or Model(middleware=default_model_middleware())
         request = ModelRequest(
             ref=parse_model_ref(spec.llm.model),
             messages=[
