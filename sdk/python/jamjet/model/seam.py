@@ -37,6 +37,12 @@ class Model:
         return response
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[StreamChunk]:
+        # Track 1 scope: only the ``before`` chain runs, so the allowlist (and any
+        # future deny/redact middleware) still gates streamed calls. The ``after``
+        # chain (metering, audit) is intentionally NOT run here -- streamed
+        # token/cost accounting needs a usage-bearing finalizer and lands in
+        # Track 2 with the looped, durable stream. Non-streamed completions are
+        # fully metered via ``complete()``.
         streaming = replace(request, stream=True)
         for mw in self._middleware:
             streaming = await mw.before(streaming)

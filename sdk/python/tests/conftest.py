@@ -140,6 +140,17 @@ def mock_openai_client(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # Also mock litellm so SeamAdapter / LiteLLMBackend work without the package.
     async def _mock_acompletion(model: str, messages: list, tools: list | None = None, **kwargs: object) -> object:
+        if kwargs.get("stream"):
+            # LiteLLMBackend.stream() does `async for part in await acompletion(...)`
+            # and reads part.choices[0].delta.content -- return an async generator.
+            async def _stream_gen() -> object:
+                for text in ("mock", "-stream"):
+                    yield types.SimpleNamespace(
+                        choices=[types.SimpleNamespace(delta=types.SimpleNamespace(content=text))],
+                        usage=None,
+                    )
+
+            return _stream_gen()
         return await _SmartMockClient()._create(model=model, messages=messages, tools=tools)
 
     def _mock_completion_cost(completion_response: object = None, **kwargs: object) -> float:

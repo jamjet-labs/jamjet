@@ -95,3 +95,10 @@ async def test_missing_litellm_raises_helpful_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "litellm", None)
     with pytest.raises(ImportError, match="jamjet\\[model\\]"):
         await LiteLLMBackend().complete(_req())
+
+
+async def test_shared_conftest_mock_supports_streaming():
+    # No local _install_fake_litellm: this exercises the autouse conftest litellm
+    # mock, which must return an async generator for stream=True (CodeRabbit #2).
+    chunks = [c.delta async for c in LiteLLMBackend().stream(_req())]
+    assert chunks == ["mock", "-stream"]
