@@ -29,7 +29,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
 from jamjet.compiler.strategies import StrategyLimits
@@ -140,6 +140,38 @@ class Agent:
     def run_sync(self, prompt: str) -> AgentResult:
         """Synchronous wrapper around :meth:`run` for scripts and notebooks."""
         return asyncio.run(self.run(prompt))
+
+    async def stream(
+        self,
+        prompt: str,
+        *,
+        model: Any | None = None,
+    ) -> AsyncIterator[Any]:
+        """Stream token deltas for a single turn.
+
+        Streaming is a view; durability records the completed turn (resume
+        returns the checkpoint, it does not re-stream). The looped, durable
+        stream over the full agent run lands in Track 2.
+        """
+        from jamjet.model.metering import MeteringMiddleware  # noqa: PLC0415
+        from jamjet.model.middleware import ModelAllowlistMiddleware  # noqa: PLC0415
+        from jamjet.model.seam import Model  # noqa: PLC0415
+        from jamjet.model.types import ModelRequest, parse_model_ref  # noqa: PLC0415
+
+        spec = self.compile()
+        seam = model or Model(middleware=[ModelAllowlistMiddleware(None), MeteringMiddleware()])
+        request = ModelRequest(
+            ref=parse_model_ref(spec.llm.model),
+            messages=[
+                {"role": "system", "content": self.instructions or "You are a helpful assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=spec.llm.temperature,
+            max_tokens=spec.llm.max_tokens,
+            stream=True,
+        )
+        async for chunk in seam.stream(request):
+            yield chunk
 
     def __repr__(self) -> str:
         return f"Agent(name={self.name!r}, model={self.model!r}, tools={self.tool_names}, strategy={self.strategy!r})"
