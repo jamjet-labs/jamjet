@@ -678,6 +678,7 @@ mod tests {
             finish_reason: None,
             cost_usd: None,
             provenance: None,
+            idempotency_key: None,
         }
     }
 

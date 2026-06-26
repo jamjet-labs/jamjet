@@ -38,6 +38,9 @@ pub struct InMemoryBackend {
     lease_epochs: DashMap<WorkItemId, i64>,
     /// Store failover generation (settable to simulate promotion).
     store_term: AtomicI64,
+    /// Idempotency cache: idempotency_key -> result_json.
+    /// Mirrors the `tool_effects` table in the SQLite backends.
+    tool_effects: DashMap<String, serde_json::Value>,
 }
 
 impl InMemoryBackend {
@@ -54,6 +57,7 @@ impl InMemoryBackend {
             next_sequence: AtomicI64::new(1),
             lease_epochs: DashMap::new(),
             store_term: AtomicI64::new(0),
+            tool_effects: DashMap::new(),
         }
     }
 
@@ -66,6 +70,13 @@ impl InMemoryBackend {
     /// `SqliteBackend::set_store_term_at_least` (the production failover-generation seam).
     pub fn set_store_term_at_least(&self, term: i64) -> i64 {
         self.store_term.fetch_max(term, Ordering::SeqCst).max(term)
+    }
+
+    /// Insert a key directly into the idempotency cache.
+    /// Only available on this in-memory (dev/test) backend; SQLite backends
+    /// record effects exclusively via `commit_turn`.
+    pub fn seed_tool_effect_for_test(&self, key: String, value: serde_json::Value) {
+        self.tool_effects.insert(key, value);
     }
 }
 
@@ -251,6 +262,12 @@ impl StateBackend for InMemoryBackend {
             .and_then(|r| r.value().iter().max_by_key(|s| s.at_sequence).cloned()))
     }
 
+    // ── Idempotency cache ─────────────────────────────────────────────────
+
+    async fn get_tool_effect(&self, key: &str) -> BackendResult<Option<serde_json::Value>> {
+        Ok(self.tool_effects.get(key).map(|r| r.value().clone()))
+    }
+
     // ── Work queue ───────────────────────────────────────────────────
 
     async fn enqueue_work_item(&self, item: WorkItem) -> BackendResult<WorkItemId> {
@@ -342,9 +359,47 @@ impl StateBackend for InMemoryBackend {
         self.work_items.remove(&item_id);
         let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
         let eid = terminal_event.execution_id.clone();
+
+        // Extract idempotency info BEFORE moving terminal_event into the event vec.
+        // INSERT OR IGNORE semantics: use `entry(...).or_insert(...)` to keep the
+        // first recorded result if the key is already present.
+        let idem_effect: Option<(String, serde_json::Value)> = if let EventKind::NodeCompleted {
+            ref output,
+            ref state_patch,
+            duration_ms,
+            ref gen_ai_system,
+            ref gen_ai_model,
+            input_tokens,
+            output_tokens,
+            ref finish_reason,
+            idempotency_key: Some(ref key),
+            ..
+        } = terminal_event.kind
+        {
+            let result_json = serde_json::json!({
+                "output": output,
+                "state_patch": state_patch,
+                "duration_ms": duration_ms,
+                "gen_ai_system": gen_ai_system,
+                "gen_ai_model": gen_ai_model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "finish_reason": finish_reason,
+            });
+            Some((key.clone(), result_json))
+        } else {
+            None
+        };
+
         let mut ev = terminal_event;
         ev.sequence = seq;
         self.events.entry(eid.clone()).or_default().push(ev);
+
+        // Record the idempotency effect if one was extracted above.
+        if let Some((key, result_json)) = idem_effect {
+            self.tool_effects.entry(key).or_insert(result_json);
+        }
+
         if write_snapshot {
             // Mirror the SQLite in-tx pattern: read latest snapshot (or seed from
             // initial_input), fold all events since it (including the one just

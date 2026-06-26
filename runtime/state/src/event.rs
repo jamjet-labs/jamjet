@@ -109,6 +109,15 @@ pub enum EventKind {
         /// Provenance metadata for research traceability.
         #[serde(skip_serializing_if = "Option::is_none")]
         provenance: Option<Box<ProvenanceMetadata>>,
+        /// Deterministic idempotency key for this node fire:
+        /// `content_hash({run, segment, step, node, input_hash})`.
+        /// Including `node` in the key prevents cross-node collisions when two
+        /// different nodes share the same `(run, segment, step, input_hash)` —
+        /// e.g. sibling nodes in the same segment at the same step count.
+        /// When set, `commit_turn` records the result in `tool_effects` atomically.
+        /// The worker reads it back before re-firing a reclaimed node (Task 2).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     NodeFailed {
         node_id: NodeId,

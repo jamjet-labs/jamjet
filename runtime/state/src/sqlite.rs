@@ -668,6 +668,23 @@ impl StateBackend for SqliteBackend {
         }))
     }
 
+    // ── Idempotency cache ─────────────────────────────────────────────────
+
+    async fn get_tool_effect(&self, key: &str) -> BackendResult<Option<serde_json::Value>> {
+        let row = sqlx::query("SELECT result_json FROM tool_effects WHERE idempotency_key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+
+        let Some(row) = row else { return Ok(None) };
+
+        let result_json: serde_json::Value =
+            serde_json::from_str(row.try_get::<&str, _>("result_json").map_err(map_db_err)?)
+                .map_err(StateBackendError::Serialization)?;
+        Ok(Some(result_json))
+    }
+
     // ── Work item queue ───────────────────────────────────────────────────
 
     #[instrument(skip(self, item), fields(execution_id = %item.execution_id, node_id = %item.node_id))]
@@ -944,6 +961,49 @@ impl StateBackend for SqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+
+        // 2b) If the terminal event is NodeCompleted with an idempotency key,
+        //     record the result in tool_effects in the SAME transaction.
+        //     INSERT OR IGNORE — a concurrent winner already recorded it.
+        if let EventKind::NodeCompleted {
+            node_id: ref nc_node_id,
+            ref output,
+            ref state_patch,
+            duration_ms,
+            ref gen_ai_system,
+            ref gen_ai_model,
+            input_tokens,
+            output_tokens,
+            ref finish_reason,
+            idempotency_key: Some(ref idem_key),
+            ..
+        } = terminal_event.kind
+        {
+            let result_json = serde_json::json!({
+                "output": output,
+                "state_patch": state_patch,
+                "duration_ms": duration_ms,
+                "gen_ai_system": gen_ai_system,
+                "gen_ai_model": gen_ai_model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "finish_reason": finish_reason,
+            });
+            let result_json_str = serde_json::to_string(&result_json)?;
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO tool_effects
+                   (idempotency_key, execution_id, node_id, result_json, tenant_id, recorded_at)
+                   VALUES (?, ?, ?, ?, 'default', ?)"#,
+            )
+            .bind(idem_key)
+            .bind(&execution_id)
+            .bind(nc_node_id.as_str())
+            .bind(&result_json_str)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+        }
 
         // 3) Optionally compute and write the snapshot IN-TX from committed state.
         //    BEGIN IMMEDIATE serializes writers, so this read sees a fully-committed
