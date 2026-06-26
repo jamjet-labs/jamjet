@@ -30,6 +30,9 @@ pub enum StateBackendError {
     #[error("optimistic concurrency conflict: sequence mismatch for {0}")]
     SequenceConflict(String),
 
+    #[error("lease fence superseded for work item {0}: lease was stolen or store failed over")]
+    FenceLost(String),
+
     #[error("database error: {0}")]
     Database(String),
 
@@ -136,14 +139,33 @@ pub trait StateBackend: Send + Sync {
         queue_types: &[&str],
     ) -> BackendResult<Option<WorkItem>>;
 
-    /// Renew the lease on a claimed work item (heartbeat).
-    async fn renew_lease(&self, item_id: WorkItemId, worker_id: &str) -> BackendResult<()>;
+    /// Renew the lease on a claimed work item (heartbeat). Fails closed if the
+    /// presented `lease_fence` no longer matches (lease stolen / failed over).
+    async fn renew_lease(
+        &self,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
+    ) -> BackendResult<()>;
 
     /// Mark a work item as completed and release the lease.
     async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()>;
 
     /// Mark a work item as failed. The scheduler will decide whether to retry.
     async fn fail_work_item(&self, item_id: WorkItemId, error: &str) -> BackendResult<()>;
+
+    /// Atomically settle a work item (status inferred from the terminal event
+    /// kind) and append the terminal event, in ONE transaction, gated by
+    /// `lease_fence`. A stale fence matches zero rows and returns `FenceLost`,
+    /// emitting nothing. Replaces the `complete_work_item` + `latest_sequence`
+    /// + `append_event` trio so a node completion is one fsync with no
+    /// crash window and no double-commit.
+    async fn commit_node_terminal(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        terminal_event: Event,
+    ) -> BackendResult<EventSequence>;
 
     /// Reclaim work items whose lease has expired (worker crashed or stalled).
     ///
@@ -224,6 +246,11 @@ pub struct WorkItem {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub worker_id: Option<String>,
+    /// Monotonic lease fence: store term * 2^32 + per-item epoch. Minted on
+    /// every claim/reclaim; a leased-worker write that presents a stale fence
+    /// matches zero rows and fails closed.
+    #[serde(default)]
+    pub lease_fence: i64,
     /// Tenant that owns this work item.
     #[serde(default = "default_tenant_string")]
     pub tenant_id: String,

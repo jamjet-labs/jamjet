@@ -127,6 +127,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                     created_at: now,
                     lease_expires_at: None,
                     worker_id: None,
+                    lease_fence: 0,
                     tenant_id: tenant_id.0.clone(),
                 };
                 backend.enqueue_work_item(work_item).await.map_err(|e| format!("{e}"))?;

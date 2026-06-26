@@ -8,7 +8,7 @@ use jamjet_policy::autonomy::{AutonomyContext, AutonomyDecision, AutonomyEnforce
 use jamjet_policy::engine::node_kind_tag;
 use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
 use jamjet_state::approvals::NodeApprovalStatus;
-use jamjet_state::backend::{StateBackend, WorkItem, WorkItemId};
+use jamjet_state::backend::{StateBackend, StateBackendError, WorkItem, WorkItemId};
 use jamjet_state::budget::BudgetState;
 use jamjet_state::event::EventKind;
 use jamjet_telemetry::{gen_ai_attrs, metrics, record_gen_ai_usage};
@@ -108,6 +108,7 @@ impl Worker {
         let tenant_id = item.tenant_id.clone();
         let attempt = item.attempt;
         let item_id = item.id;
+        let lease_fence = item.lease_fence;
 
         let node_span = tracing::info_span!(
             "jamjet.node",
@@ -147,6 +148,7 @@ impl Worker {
             Arc::clone(&self.backend),
             item_id,
             self.worker_id.clone(),
+            item.lease_fence,
             Duration::from_secs(15),
         );
 
@@ -290,47 +292,65 @@ impl Worker {
                     );
                 }
 
-                self.backend.complete_work_item(item_id).await?;
-
-                let seq = self.backend.latest_sequence(&execution_id).await? + 1;
-                self.backend
-                    .append_event(jamjet_state::Event::new(
-                        execution_id.clone(),
-                        seq,
-                        EventKind::NodeCompleted {
-                            node_id: node_id.clone(),
-                            output: exec_result.output,
-                            state_patch: exec_result.state_patch,
-                            duration_ms,
-                            gen_ai_system: exec_result.gen_ai_system,
-                            gen_ai_model: exec_result.gen_ai_model,
-                            input_tokens: exec_result.input_tokens,
-                            output_tokens: exec_result.output_tokens,
-                            finish_reason: exec_result.finish_reason,
-                            cost_usd: None,
-                            provenance: None,
-                        },
-                    ))
-                    .await?;
-
-                info!(execution_id = %execution_id, node_id = %node_id, duration_ms, "Node completed");
+                let terminal = jamjet_state::Event::new(
+                    execution_id.clone(),
+                    0, // sequence assigned atomically inside commit_node_terminal
+                    EventKind::NodeCompleted {
+                        node_id: node_id.clone(),
+                        output: exec_result.output,
+                        state_patch: exec_result.state_patch,
+                        duration_ms,
+                        gen_ai_system: exec_result.gen_ai_system,
+                        gen_ai_model: exec_result.gen_ai_model,
+                        input_tokens: exec_result.input_tokens,
+                        output_tokens: exec_result.output_tokens,
+                        finish_reason: exec_result.finish_reason,
+                        cost_usd: None,
+                        provenance: None,
+                    },
+                );
+                match self
+                    .backend
+                    .commit_node_terminal(item_id, lease_fence, terminal)
+                    .await
+                {
+                    Ok(_) => {
+                        info!(execution_id = %execution_id, node_id = %node_id, duration_ms, "Node completed");
+                    }
+                    Err(StateBackendError::FenceLost(_)) => {
+                        // This worker's lease was stolen (stall/failover). Another
+                        // worker owns the item now. Stop quietly; emit nothing.
+                        warn!(execution_id = %execution_id, node_id = %node_id, "Fence lost on commit; abandoning (lease stolen)");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(Box::new(e)),
+                }
             }
             Err(error) => {
-                self.backend.fail_work_item(item_id, &error).await?;
-                let seq = self.backend.latest_sequence(&execution_id).await? + 1;
-                self.backend
-                    .append_event(jamjet_state::Event::new(
-                        execution_id.clone(),
-                        seq,
-                        EventKind::NodeFailed {
-                            node_id: node_id.clone(),
-                            error: error.clone(),
-                            attempt,
-                            retryable: false,
-                        },
-                    ))
-                    .await?;
-                warn!(execution_id = %execution_id, node_id = %node_id, attempt, %error, "Node failed");
+                let terminal = jamjet_state::Event::new(
+                    execution_id.clone(),
+                    0, // sequence assigned atomically inside commit_node_terminal
+                    EventKind::NodeFailed {
+                        node_id: node_id.clone(),
+                        error: error.clone(),
+                        attempt,
+                        retryable: false,
+                    },
+                );
+                match self
+                    .backend
+                    .commit_node_terminal(item_id, lease_fence, terminal)
+                    .await
+                {
+                    Ok(_) => {
+                        warn!(execution_id = %execution_id, node_id = %node_id, attempt, %error, "Node failed");
+                    }
+                    Err(StateBackendError::FenceLost(_)) => {
+                        warn!(execution_id = %execution_id, node_id = %node_id, "Fence lost on failure commit; abandoning");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(Box::new(e)),
+                }
             }
         }
         Ok(())
@@ -847,4 +867,258 @@ fn parse_payload(payload: &serde_json::Value) -> (String, String) {
         .unwrap_or("1.0.0")
         .to_string();
     (workflow_id, workflow_version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::{ExecutionResult, NodeExecutor};
+    use chrono::Utc;
+    use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+    use jamjet_state::{
+        backend::{StateBackend, WorkItem, WorkflowDefinition},
+        event::EventKind,
+        InMemoryBackend,
+    };
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Minimal workflow IR with one tool node (no executor registered →
+    /// worker falls through to the stub path which succeeds instantly).
+    fn minimal_ir_json() -> serde_json::Value {
+        serde_json::json!({
+            "workflow_id": "test-wf",
+            "version": "1.0.0",
+            "state_schema": "{}",
+            "start_node": "n1",
+            "nodes": {
+                "n1": {
+                    "id": "n1",
+                    "kind": {
+                        "type": "tool",
+                        "tool_ref": "stub",
+                        "input_mapping": {},
+                        "output_schema": "{}"
+                    }
+                }
+            },
+            "edges": [],
+            "retry_policies": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {}
+        })
+    }
+
+    fn sample_execution(eid: &ExecutionId) -> WorkflowExecution {
+        let now = Utc::now();
+        WorkflowExecution {
+            execution_id: eid.clone(),
+            workflow_id: "test-wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: serde_json::json!({}),
+            current_state: serde_json::json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+        }
+    }
+
+    fn sample_item(eid: &ExecutionId) -> WorkItem {
+        WorkItem {
+            id: Uuid::new_v4(),
+            execution_id: eid.clone(),
+            node_id: "n1".into(),
+            queue_type: "default".into(),
+            payload: serde_json::json!({
+                "workflow_id": "test-wf",
+                "workflow_version": "1.0.0"
+            }),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            tenant_id: "default".into(),
+            lease_fence: 0,
+        }
+    }
+
+    async fn setup_backend() -> (Arc<InMemoryBackend>, ExecutionId) {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        backend
+            .create_execution(sample_execution(&eid))
+            .await
+            .unwrap();
+        backend
+            .store_workflow(WorkflowDefinition {
+                workflow_id: "test-wf".into(),
+                version: "1.0.0".into(),
+                ir: minimal_ir_json(),
+                created_at: Utc::now(),
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
+        (backend, eid)
+    }
+
+    fn make_worker(backend: Arc<InMemoryBackend>) -> Worker {
+        Worker::new("test-worker".into(), backend, vec!["default".into()])
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// Happy path: the worker routes completion through `commit_node_terminal`
+    /// (fenced), producing exactly one `NodeCompleted` event.
+    ///
+    /// Note: this test checks that a single NodeCompleted is emitted; it is NOT
+    /// the fence-bypass guard. The old unfenced path (`complete_work_item` +
+    /// `append_event`) also emitted exactly one NodeCompleted, so reverting to
+    /// it would not break this assertion. The real fence-bypass guard is
+    /// `zombie_commit_is_rejected_emits_no_node_completed`, which exercises the
+    /// stale-fence rejection path.
+    #[tokio::test]
+    async fn happy_path_emits_exactly_one_node_completed() {
+        let (backend, eid) = setup_backend().await;
+        let worker = make_worker(Arc::clone(&backend));
+
+        // Claim the item so we have a valid leased item to pass to execute_item.
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        // execute_item is private but accessible from this child module.
+        worker.execute_item(item).await.unwrap();
+
+        let events = backend.get_events(&eid).await.unwrap();
+        let completed_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+            .count();
+        assert_eq!(
+            completed_count, 1,
+            "expected exactly one NodeCompleted event; got {completed_count}"
+        );
+    }
+
+    // ── Failure-path executor stub ────────────────────────────────────────────
+
+    /// A stub executor that always returns an error.  Used to drive the
+    /// `Err(error)` arm inside `execute_item`, which must emit exactly one
+    /// `NodeFailed` event via the fenced `commit_node_terminal` path.
+    struct FailingExecutor;
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for FailingExecutor {
+        async fn execute(
+            &self,
+            _item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, String> {
+            Err("boom".into())
+        }
+    }
+
+    /// Failure path: when the executor returns `Err`, `execute_item` must emit
+    /// exactly one `NodeFailed` event through the fenced `commit_node_terminal`
+    /// path and return `Ok(())` (node failure is not a worker error).
+    #[tokio::test]
+    async fn failure_path_emits_exactly_one_node_failed() {
+        let (backend, eid) = setup_backend().await;
+        // Register a failing executor for "tool" — the kind_tag of the node in
+        // minimal_ir_json. This drives the Err(error) arm in execute_item.
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("tool", Arc::new(FailingExecutor));
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        // execute_item returns Ok(()) even when the node fails — node failure is
+        // surfaced as a NodeFailed event, not a worker-level error.
+        worker.execute_item(item).await.unwrap();
+
+        let events = backend.get_events(&eid).await.unwrap();
+        let failed_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::NodeFailed { .. }))
+            .count();
+        assert_eq!(
+            failed_count, 1,
+            "expected exactly one NodeFailed event; got {failed_count}"
+        );
+    }
+
+    /// Zombie path: a worker holding a stale fence (F1) tries to commit after
+    /// the lease was stolen (the item now carries fence F2). The fenced
+    /// `commit_node_terminal` must reject the zombie's write with FenceLost;
+    /// the worker abandons quietly and emits zero `NodeCompleted` events.
+    ///
+    /// This is the key fence-bypass guard: even if two workers race to complete
+    /// the same work item, only one can commit — the one whose fence matches the
+    /// current lease. The zombie returns `Ok(())` (silent abandon) rather than
+    /// double-writing.
+    #[tokio::test]
+    async fn zombie_commit_is_rejected_emits_no_node_completed() {
+        let (backend, eid) = setup_backend().await;
+        let worker = make_worker(Arc::clone(&backend));
+
+        // Worker A claims the item and gets fence F1.
+        let item_a = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+        let f1 = item_a.lease_fence;
+        assert!(f1 > 0, "fence must be non-zero after claim");
+
+        // Steal the lease: fail_work_item resets worker_id + bumps the epoch,
+        // making the item re-claimable.
+        backend
+            .fail_work_item(item_a.id, "lease stolen for test")
+            .await
+            .unwrap();
+
+        // Worker B claims and gets fence F2 > F1.
+        let item_b = backend
+            .claim_work_item("worker-B", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be re-claimable after fail");
+        assert!(item_b.lease_fence > f1, "F2 must be > F1");
+
+        // Drive Worker A's completion with the stale item (fence F1).
+        // The fenced commit must detect the mismatch and return Ok(()) quietly.
+        let result = worker.execute_item(item_a).await;
+        assert!(
+            result.is_ok(),
+            "zombie execute_item must not propagate FenceLost as error"
+        );
+
+        // No NodeCompleted event must have been written by the zombie.
+        let events = backend.get_events(&eid).await.unwrap();
+        let completed_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+            .count();
+        assert_eq!(
+            completed_count, 0,
+            "zombie must not emit NodeCompleted; got {completed_count}"
+        );
+    }
 }

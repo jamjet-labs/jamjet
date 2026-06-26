@@ -37,6 +37,15 @@ impl TenantScopedSqliteBackend {
     pub fn tenant_id(&self) -> &TenantId {
         &self.tenant_id
     }
+
+    /// The store's current failover generation (same table as SqliteBackend).
+    async fn current_term(&self, tx: &mut sqlx::SqliteConnection) -> BackendResult<i64> {
+        let row = sqlx::query("SELECT term FROM store_identity WHERE id = 1")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+        row.try_get::<i64, _>("term").map_err(map_db_err)
+    }
 }
 
 // ── Helpers (re-use sqlite.rs parsers) ────────────────────────────────────────
@@ -165,6 +174,7 @@ fn row_to_work_item(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkItem> {
         worker_id: row
             .try_get::<Option<String>, _>("worker_id")
             .map_err(map_db_err)?,
+        lease_fence: row.try_get::<i64, _>("lease_fence").unwrap_or(0),
         tenant_id,
     })
 }
@@ -593,9 +603,10 @@ impl StateBackend for TenantScopedSqliteBackend {
         }
 
         let now = Utc::now().to_rfc3339();
-        // Expire stale leases for this tenant.
+        // Expire stale leases for this tenant; bump lease_epoch so a re-claim
+        // mints a strictly greater fence than any zombie worker's stale token.
         sqlx::query(
-            "UPDATE work_items SET status = 'pending', worker_id = NULL, lease_expires_at = NULL \
+            "UPDATE work_items SET status = 'pending', worker_id = NULL, lease_expires_at = NULL, lease_epoch = lease_epoch + 1 \
              WHERE status = 'claimed' AND lease_expires_at < ? AND tenant_id = ?",
         )
         .bind(&now)
@@ -640,12 +651,19 @@ impl StateBackend for TenantScopedSqliteBackend {
         let lease_expires_at = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
         let claimed_at = Utc::now().to_rfc3339();
 
+        let term = self.current_term(&mut tx).await?;
+        let current_epoch: i64 = row.try_get::<i64, _>("lease_epoch").unwrap_or(0);
+        let new_epoch = current_epoch + 1;
+        let new_fence = term * 4_294_967_296_i64 + new_epoch;
+
         sqlx::query(
-            "UPDATE work_items SET status = 'claimed', worker_id = ?, lease_expires_at = ?, claimed_at = ? WHERE id = ?",
+            "UPDATE work_items SET status = 'claimed', worker_id = ?, lease_expires_at = ?, claimed_at = ?, lease_epoch = ?, lease_fence = ? WHERE id = ?",
         )
         .bind(worker_id)
         .bind(&lease_expires_at)
         .bind(&claimed_at)
+        .bind(new_epoch)
+        .bind(new_fence)
         .bind(&item_id)
         .execute(&mut *tx)
         .await
@@ -655,6 +673,7 @@ impl StateBackend for TenantScopedSqliteBackend {
 
         let mut claimed = item;
         claimed.worker_id = Some(worker_id.to_string());
+        claimed.lease_fence = new_fence;
         claimed.lease_expires_at = Some(
             DateTime::parse_from_rfc3339(&lease_expires_at)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -664,24 +683,30 @@ impl StateBackend for TenantScopedSqliteBackend {
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id, item_id = %item_id))]
-    async fn renew_lease(&self, item_id: WorkItemId, worker_id: &str) -> BackendResult<()> {
+    async fn renew_lease(
+        &self,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
+    ) -> BackendResult<()> {
         let lease_expires_at = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
         let id_str = item_id.to_string();
 
         let rows_affected = sqlx::query(
-            "UPDATE work_items SET lease_expires_at = ? WHERE id = ? AND worker_id = ? AND status = 'claimed' AND tenant_id = ?",
+            "UPDATE work_items SET lease_expires_at = ? WHERE id = ? AND worker_id = ? AND status = 'claimed' AND tenant_id = ? AND lease_fence = ?",
         )
         .bind(&lease_expires_at)
         .bind(&id_str)
         .bind(worker_id)
         .bind(&self.tenant_id.0)
+        .bind(lease_fence)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?
         .rows_affected();
 
         if rows_affected == 0 {
-            return Err(StateBackendError::NotFound(id_str));
+            return Err(StateBackendError::FenceLost(id_str));
         }
         Ok(())
     }
@@ -727,6 +752,100 @@ impl StateBackend for TenantScopedSqliteBackend {
             return Err(StateBackendError::NotFound(id_str));
         }
         Ok(())
+    }
+
+    #[instrument(skip(self, terminal_event), fields(tenant = %self.tenant_id, item_id = %item_id))]
+    async fn commit_node_terminal(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        terminal_event: Event,
+    ) -> BackendResult<EventSequence> {
+        let id_str = item_id.to_string();
+        let execution_id = execution_id_str(&terminal_event.execution_id);
+        let event_id = terminal_event.id.to_string();
+        let kind_json = serde_json::to_string(&terminal_event.kind)?;
+        let created_at = terminal_event.created_at.to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+
+        // Validate terminal event kind BEFORE opening the transaction.
+        // A miswired caller (non-terminal event) fails loud instead of
+        // silently settling a non-terminal event as completed.
+        let (status, set_completed_at) = match &terminal_event.kind {
+            EventKind::NodeCompleted { .. } => ("completed", true),
+            EventKind::NodeFailed { .. } => ("failed", false),
+            _ => {
+                return Err(StateBackendError::Database(
+                    "commit_node_terminal requires a terminal event (NodeCompleted/NodeFailed)"
+                        .into(),
+                ))
+            }
+        };
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
+
+        // Fenced settle with tenant isolation. Zero rows => stale fence => fail closed.
+        let rows = if set_completed_at {
+            sqlx::query(
+                "UPDATE work_items SET status = ?, completed_at = ?, lease_expires_at = NULL WHERE id = ? AND tenant_id = ? AND lease_fence = ?",
+            )
+            .bind(status)
+            .bind(&now)
+            .bind(&id_str)
+            .bind(&self.tenant_id.0)
+            .bind(lease_fence)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE work_items SET status = ?, completed_at = NULL, lease_expires_at = NULL, worker_id = NULL WHERE id = ? AND tenant_id = ? AND lease_fence = ?",
+            )
+            .bind(status)
+            .bind(&id_str)
+            .bind(&self.tenant_id.0)
+            .bind(lease_fence)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            .rows_affected()
+        };
+
+        if rows == 0 {
+            tx.rollback().await.map_err(map_db_err)?;
+            return Err(StateBackendError::FenceLost(id_str));
+        }
+
+        let seq_row = sqlx::query(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
+        )
+        .bind(&execution_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+
+        sqlx::query(
+            r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at, tenant_id)
+               VALUES (?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&event_id)
+        .bind(&execution_id)
+        .bind(sequence)
+        .bind(&kind_json)
+        .bind(&created_at)
+        .bind(&self.tenant_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        tx.commit().await.map_err(map_db_err)?;
+        Ok(sequence)
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id))]
@@ -786,7 +905,7 @@ impl StateBackend for TenantScopedSqliteBackend {
                     (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
 
                 sqlx::query(
-                    "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, retry_after = ? WHERE id = ?",
+                    "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, retry_after = ?, lease_epoch = lease_epoch + 1 WHERE id = ?",
                 )
                 .bind(new_attempt as i64)
                 .bind(&retry_after)

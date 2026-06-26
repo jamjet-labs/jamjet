@@ -124,6 +124,7 @@ async fn workflow_runs_to_completion() {
             created_at: now,
             lease_expires_at: None,
             worker_id: None,
+            lease_fence: 0,
             tenant_id: DEFAULT_TENANT.into(),
         })
         .await
