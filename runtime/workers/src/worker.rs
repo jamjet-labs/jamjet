@@ -294,7 +294,7 @@ impl Worker {
 
                 let terminal = jamjet_state::Event::new(
                     execution_id.clone(),
-                    0, // sequence assigned atomically inside commit_node_terminal
+                    0, // sequence assigned atomically inside commit_turn
                     EventKind::NodeCompleted {
                         node_id: node_id.clone(),
                         output: exec_result.output,
@@ -309,9 +309,14 @@ impl Worker {
                         provenance: None,
                     },
                 );
+                // Snapshot is computed inside commit_turn's BEGIN IMMEDIATE
+                // transaction — after the terminal event is inserted — by reading
+                // the latest snapshot + events since it and folding with
+                // apply_events_seeded. This avoids write-skew from concurrent
+                // sibling commits each seeing a stale pre-tx state.
                 match self
                     .backend
-                    .commit_node_terminal(item_id, lease_fence, terminal)
+                    .commit_turn(item_id, lease_fence, terminal, true)
                     .await
                 {
                     Ok(_) => {
@@ -339,7 +344,7 @@ impl Worker {
                 );
                 match self
                     .backend
-                    .commit_node_terminal(item_id, lease_fence, terminal)
+                    .commit_turn(item_id, lease_fence, terminal, false)
                     .await
                 {
                     Ok(_) => {
@@ -1061,6 +1066,50 @@ mod tests {
         assert_eq!(
             failed_count, 1,
             "expected exactly one NodeFailed event; got {failed_count}"
+        );
+    }
+
+    /// After a successful node completion the worker must write a per-turn
+    /// snapshot through `commit_turn`.  The snapshot must (a) record the
+    /// just-completed node in `completed_nodes` and (b) carry the real
+    /// `at_sequence` assigned to the `NodeCompleted` event.
+    #[tokio::test]
+    async fn success_writes_snapshot_with_completed_node() {
+        let (backend, eid) = setup_backend().await;
+        let worker = make_worker(Arc::clone(&backend));
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        worker.execute_item(item).await.unwrap();
+
+        // Snapshot must exist.
+        let snap = backend
+            .latest_snapshot(&eid)
+            .await
+            .unwrap()
+            .expect("snapshot must be Some after successful node completion");
+
+        // n1 must appear in completed_nodes.
+        assert!(
+            snap.completed_nodes.contains_key("n1"),
+            "snapshot must record n1 in completed_nodes; got {:?}",
+            snap.completed_nodes.keys().collect::<Vec<_>>()
+        );
+
+        // at_sequence must match the NodeCompleted event's sequence.
+        let events = backend.get_events(&eid).await.unwrap();
+        let completed_seq = events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+            .map(|e| e.sequence)
+            .expect("NodeCompleted event must exist");
+        assert_eq!(
+            snap.at_sequence, completed_seq,
+            "snapshot.at_sequence must equal the NodeCompleted event's sequence"
         );
     }
 

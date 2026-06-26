@@ -313,11 +313,12 @@ impl StateBackend for InMemoryBackend {
         Ok(())
     }
 
-    async fn commit_node_terminal(
+    async fn commit_turn(
         &self,
         item_id: WorkItemId,
         lease_fence: i64,
         terminal_event: Event,
+        write_snapshot: bool,
     ) -> BackendResult<EventSequence> {
         // Validate terminal event kind BEFORE mutating state. A miswired
         // caller (non-terminal event) fails loud instead of silently settling.
@@ -325,8 +326,7 @@ impl StateBackend for InMemoryBackend {
             EventKind::NodeCompleted { .. } | EventKind::NodeFailed { .. } => {}
             _ => {
                 return Err(StateBackendError::Database(
-                    "commit_node_terminal requires a terminal event (NodeCompleted/NodeFailed)"
-                        .into(),
+                    "commit_turn requires a terminal event (NodeCompleted/NodeFailed)".into(),
                 ))
             }
         }
@@ -341,12 +341,64 @@ impl StateBackend for InMemoryBackend {
         }
         self.work_items.remove(&item_id);
         let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        let eid = terminal_event.execution_id.clone();
         let mut ev = terminal_event;
         ev.sequence = seq;
-        self.events
-            .entry(ev.execution_id.clone())
-            .or_default()
-            .push(ev);
+        self.events.entry(eid.clone()).or_default().push(ev);
+        if write_snapshot {
+            // Mirror the SQLite in-tx pattern: read latest snapshot (or seed from
+            // initial_input), fold all events since it (including the one just
+            // appended), then write a new snapshot.
+            let (base, base_sequence) = if let Some(snap) = self
+                .snapshots
+                .get(&eid)
+                .and_then(|r| r.value().iter().max_by_key(|s| s.at_sequence).cloned())
+            {
+                let at_seq = snap.at_sequence;
+                (
+                    crate::materializer::MaterializedState {
+                        current_state: snap.state,
+                        status: snap.status,
+                        completed_nodes: snap.completed_nodes,
+                        active_nodes: snap.active_nodes,
+                        last_sequence: snap.last_sequence,
+                    },
+                    at_seq,
+                )
+            } else {
+                let initial_input = self
+                    .executions
+                    .get(&eid)
+                    .map(|e| e.value().initial_input.clone())
+                    .unwrap_or(serde_json::json!({}));
+                (
+                    crate::materializer::MaterializedState {
+                        current_state: initial_input,
+                        status: jamjet_core::workflow::WorkflowStatus::Pending,
+                        completed_nodes: std::collections::HashMap::new(),
+                        active_nodes: std::collections::HashSet::new(),
+                        last_sequence: 0,
+                    },
+                    0,
+                )
+            };
+
+            let tail_events: Vec<crate::event::Event> = self
+                .events
+                .get(&eid)
+                .map(|r| {
+                    r.value()
+                        .iter()
+                        .filter(|e| e.sequence > base_sequence)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mat = crate::materializer::apply_events_seeded(base, &tail_events);
+            let snap = Snapshot::from_materialized(eid.clone(), &mat);
+            self.snapshots.entry(eid).or_default().push(snap);
+        }
         Ok(seq)
     }
 

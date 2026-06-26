@@ -165,7 +165,7 @@ async fn commit_succeeds_with_correct_fence() {
         .unwrap();
     let event = Event::new(eid.clone(), 0, node_completed("n1"));
     let seq = db
-        .commit_node_terminal(item.id, item.lease_fence, event)
+        .commit_turn(item.id, item.lease_fence, event, false)
         .await
         .expect("commit with correct fence");
     assert!(seq >= 1);
@@ -209,7 +209,7 @@ async fn commit_fails_closed_with_stale_fence() {
 
     let event = Event::new(eid.clone(), 0, node_completed("n1"));
     let err = db
-        .commit_node_terminal(zombie.id, zombie.lease_fence, event)
+        .commit_turn(zombie.id, zombie.lease_fence, event, false)
         .await
         .expect_err("zombie commit must fail closed");
     assert!(matches!(err, StateBackendError::FenceLost(_)));
@@ -292,7 +292,7 @@ async fn fence_survives_lost_tail_failover() {
     // finds zero rows (current fence is the term-1 value) -> FenceLost.
     let ev = Event::new(eid.clone(), 0, node_completed("n1"));
     let err = promoted
-        .commit_node_terminal(zombie_item_id, zombie_fence, ev)
+        .commit_turn(zombie_item_id, zombie_fence, ev, false)
         .await
         .expect_err("term-0 zombie fence must be rejected after promotion to term 1");
     assert!(
@@ -332,7 +332,7 @@ async fn term_pin_reopens_window_negative_control() {
     let wrong_fence = item.lease_fence + 1;
     let ev = Event::new(eid.clone(), 0, node_completed("n1"));
     let err = db
-        .commit_node_terminal(item.id, wrong_fence, ev)
+        .commit_turn(item.id, wrong_fence, ev, false)
         .await
         .expect_err("fabricated wrong fence must be rejected");
     assert!(
@@ -386,7 +386,7 @@ async fn crash_before_commit_then_reclaim_yields_exactly_one_terminal() {
         .unwrap()
         .unwrap();
     let ev = Event::new(eid.clone(), 0, node_completed("n1"));
-    db.commit_node_terminal(b.id, b.lease_fence, ev)
+    db.commit_turn(b.id, b.lease_fence, ev, false)
         .await
         .expect("worker-B commit must succeed after re-claim");
 
@@ -424,7 +424,7 @@ async fn commit_node_terminal_node_failed_settles_failed() {
         .unwrap();
     let event = Event::new(eid.clone(), 0, node_failed("n1"));
     let seq = db
-        .commit_node_terminal(item.id, item.lease_fence, event)
+        .commit_turn(item.id, item.lease_fence, event, false)
         .await
         .expect("commit NodeFailed with correct fence must succeed");
     assert!(seq >= 1, "sequence must be at least 1");
@@ -471,7 +471,7 @@ async fn commit_node_terminal_node_failed_stale_fence_fails_closed() {
     // Zombie tries to commit a NodeFailed with stale fence F1.
     let event = Event::new(eid.clone(), 0, node_failed("n1"));
     let err = db
-        .commit_node_terminal(zombie.id, zombie.lease_fence, event)
+        .commit_turn(zombie.id, zombie.lease_fence, event, false)
         .await
         .expect_err("zombie NodeFailed commit must fail closed");
     assert!(
@@ -507,7 +507,7 @@ async fn assert_fence_commit_succeeds(backend: &dyn StateBackend) {
         .unwrap();
     let ev = Event::new(eid.clone(), 0, node_completed("n1"));
     let seq = backend
-        .commit_node_terminal(item.id, item.lease_fence, ev)
+        .commit_turn(item.id, item.lease_fence, ev, false)
         .await
         .expect("commit with correct fence must succeed");
     assert!(seq >= 1, "sequence must be at least 1");
@@ -535,7 +535,7 @@ async fn assert_fence_commit_fails_stale(backend: &dyn StateBackend) {
     let wrong_fence = item.lease_fence + 1; // fabricated — one higher than real
     let ev = Event::new(eid.clone(), 0, node_completed("n1"));
     let err = backend
-        .commit_node_terminal(item.id, wrong_fence, ev)
+        .commit_turn(item.id, wrong_fence, ev, false)
         .await
         .expect_err("fabricated wrong fence must be rejected");
     assert!(
@@ -602,7 +602,7 @@ async fn assert_fence_node_failed_succeeds(backend: &dyn StateBackend) {
         .unwrap();
     let ev = Event::new(eid.clone(), 0, node_failed("n1"));
     let seq = backend
-        .commit_node_terminal(item.id, item.lease_fence, ev)
+        .commit_turn(item.id, item.lease_fence, ev, false)
         .await
         .expect("NodeFailed commit with correct fence must succeed");
     assert!(seq >= 1, "sequence must be at least 1");
@@ -635,7 +635,7 @@ async fn assert_fence_node_failed_stale_fails(backend: &dyn StateBackend) {
     let wrong_fence = item.lease_fence + 1;
     let ev = Event::new(eid.clone(), 0, node_failed("n1"));
     let err = backend
-        .commit_node_terminal(item.id, wrong_fence, ev)
+        .commit_turn(item.id, wrong_fence, ev, false)
         .await
         .expect_err("stale-fence NodeFailed must be rejected");
     assert!(

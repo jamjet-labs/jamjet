@@ -510,10 +510,14 @@ impl StateBackend for TenantScopedSqliteBackend {
         let execution_id = execution_id_str(&snapshot.execution_id);
         let state_json = serde_json::to_string(&snapshot.state)?;
         let created_at = snapshot.created_at.to_rfc3339();
+        let status_str = status_to_str(&snapshot.status);
+        let completed_json = serde_json::to_string(&snapshot.completed_nodes)?;
+        let active_json = serde_json::to_string(&snapshot.active_nodes)?;
 
         sqlx::query(
-            r#"INSERT OR REPLACE INTO snapshots (id, execution_id, at_sequence, state_json, created_at, tenant_id)
-               VALUES (?, ?, ?, ?, ?, ?)"#,
+            r#"INSERT OR REPLACE INTO snapshots
+               (id, execution_id, at_sequence, state_json, created_at, tenant_id, status, completed_nodes_json, active_nodes_json, last_sequence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id)
         .bind(&execution_id)
@@ -521,6 +525,10 @@ impl StateBackend for TenantScopedSqliteBackend {
         .bind(&state_json)
         .bind(&created_at)
         .bind(&self.tenant_id.0)
+        .bind(status_str)
+        .bind(&completed_json)
+        .bind(&active_json)
+        .bind(snapshot.last_sequence)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -551,12 +559,35 @@ impl StateBackend for TenantScopedSqliteBackend {
             serde_json::from_str(row.try_get::<&str, _>("state_json").map_err(map_db_err)?)
                 .map_err(StateBackendError::Serialization)?;
         let created_at = parse_datetime(row.try_get::<&str, _>("created_at").map_err(map_db_err)?)?;
+        let status = str_to_status(row.try_get::<&str, _>("status").unwrap_or("running"))
+            .unwrap_or(WorkflowStatus::Running);
+        let completed_nodes: std::collections::HashMap<String, serde_json::Value> = {
+            match row.try_get::<Option<&str>, _>("completed_nodes_json") {
+                Err(_) => std::collections::HashMap::new(), // absent column (pre-0005 rows)
+                Ok(None) => std::collections::HashMap::new(),
+                Ok(Some(s)) => serde_json::from_str(s).map_err(StateBackendError::Serialization)?,
+            }
+        };
+        let active_nodes: std::collections::HashSet<String> = {
+            match row.try_get::<Option<&str>, _>("active_nodes_json") {
+                Err(_) => std::collections::HashSet::new(), // absent column (pre-0005 rows)
+                Ok(None) => std::collections::HashSet::new(),
+                Ok(Some(s)) => serde_json::from_str(s).map_err(StateBackendError::Serialization)?,
+            }
+        };
+        let last_sequence: i64 = row
+            .try_get::<i64, _>("last_sequence")
+            .unwrap_or(at_sequence);
 
         Ok(Some(Snapshot {
             id,
             execution_id,
             at_sequence,
             state,
+            status,
+            completed_nodes,
+            active_nodes,
+            last_sequence,
             created_at,
         }))
     }
@@ -755,11 +786,12 @@ impl StateBackend for TenantScopedSqliteBackend {
     }
 
     #[instrument(skip(self, terminal_event), fields(tenant = %self.tenant_id, item_id = %item_id))]
-    async fn commit_node_terminal(
+    async fn commit_turn(
         &self,
         item_id: WorkItemId,
         lease_fence: i64,
         terminal_event: Event,
+        write_snapshot: bool,
     ) -> BackendResult<EventSequence> {
         let id_str = item_id.to_string();
         let execution_id = execution_id_str(&terminal_event.execution_id);
@@ -776,8 +808,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             EventKind::NodeFailed { .. } => ("failed", false),
             _ => {
                 return Err(StateBackendError::Database(
-                    "commit_node_terminal requires a terminal event (NodeCompleted/NodeFailed)"
-                        .into(),
+                    "commit_turn requires a terminal event (NodeCompleted/NodeFailed)".into(),
                 ))
             }
         };
@@ -843,6 +874,133 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+
+        // Optionally compute and write the snapshot IN-TX from committed state (tenant-scoped).
+        // BEGIN IMMEDIATE serializes writers — no concurrent write-skew.
+        if write_snapshot {
+            // 3a. Read the latest snapshot for this execution IN-TX.
+            let snap_row = sqlx::query(
+                "SELECT * FROM snapshots WHERE execution_id = ? AND tenant_id = ? ORDER BY at_sequence DESC LIMIT 1",
+            )
+            .bind(&execution_id)
+            .bind(&self.tenant_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+
+            let (base, base_sequence) = if let Some(row) = snap_row {
+                let at_seq: i64 = row.try_get("at_sequence").map_err(map_db_err)?;
+                let current_state: serde_json::Value =
+                    serde_json::from_str(row.try_get::<&str, _>("state_json").map_err(map_db_err)?)
+                        .map_err(StateBackendError::Serialization)?;
+                let snap_status =
+                    str_to_status(row.try_get::<&str, _>("status").unwrap_or("running"))
+                        .unwrap_or(WorkflowStatus::Running);
+                let completed_nodes: std::collections::HashMap<String, serde_json::Value> = {
+                    match row.try_get::<Option<&str>, _>("completed_nodes_json") {
+                        Err(_) => std::collections::HashMap::new(),
+                        Ok(None) => std::collections::HashMap::new(),
+                        Ok(Some(s)) => {
+                            serde_json::from_str(s).map_err(StateBackendError::Serialization)?
+                        }
+                    }
+                };
+                let active_nodes: std::collections::HashSet<String> = {
+                    match row.try_get::<Option<&str>, _>("active_nodes_json") {
+                        Err(_) => std::collections::HashSet::new(),
+                        Ok(None) => std::collections::HashSet::new(),
+                        Ok(Some(s)) => {
+                            serde_json::from_str(s).map_err(StateBackendError::Serialization)?
+                        }
+                    }
+                };
+                let last_seq: i64 = row.try_get::<i64, _>("last_sequence").unwrap_or(at_seq);
+                (
+                    crate::materializer::MaterializedState {
+                        current_state,
+                        status: snap_status,
+                        completed_nodes,
+                        active_nodes,
+                        last_sequence: last_seq,
+                    },
+                    at_seq,
+                )
+            } else {
+                // No snapshot: seed from the execution's initial_input IN-TX.
+                let exec_row = sqlx::query(
+                    "SELECT initial_input FROM workflow_executions WHERE execution_id = ? AND tenant_id = ?",
+                )
+                .bind(&execution_id)
+                .bind(&self.tenant_id.0)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(map_db_err)?;
+                let initial_input: serde_json::Value = serde_json::from_str(
+                    exec_row
+                        .try_get::<&str, _>("initial_input")
+                        .map_err(map_db_err)?,
+                )
+                .map_err(StateBackendError::Serialization)?;
+                (
+                    crate::materializer::MaterializedState {
+                        current_state: initial_input,
+                        status: WorkflowStatus::Pending,
+                        completed_nodes: std::collections::HashMap::new(),
+                        active_nodes: std::collections::HashSet::new(),
+                        last_sequence: 0,
+                    },
+                    0,
+                )
+            };
+
+            // 3b. Read events since base_sequence IN-TX (includes the just-inserted terminal event).
+            let event_rows = sqlx::query(
+                "SELECT * FROM events WHERE execution_id = ? AND tenant_id = ? AND sequence > ? ORDER BY sequence ASC",
+            )
+            .bind(&execution_id)
+            .bind(&self.tenant_id.0)
+            .bind(base_sequence)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+
+            let tail_events: Vec<crate::event::Event> = event_rows
+                .iter()
+                .map(row_to_event)
+                .collect::<BackendResult<Vec<_>>>()?;
+
+            // 3c. Fold events onto the base state.
+            let mat = crate::materializer::apply_events_seeded(base, &tail_events);
+
+            // 3d. Build and INSERT the snapshot.
+            let snap = Snapshot::from_materialized(terminal_event.execution_id.clone(), &mat);
+            let snap_id = snap.id.to_string();
+            let snap_exec_id = execution_id_str(&snap.execution_id);
+            let snap_state_json = serde_json::to_string(&snap.state)?;
+            let snap_created_at = snap.created_at.to_rfc3339();
+            let snap_status_str = status_to_str(&snap.status);
+            let snap_completed_json = serde_json::to_string(&snap.completed_nodes)?;
+            let snap_active_json = serde_json::to_string(&snap.active_nodes)?;
+
+            sqlx::query(
+                r#"INSERT OR REPLACE INTO snapshots
+                   (id, execution_id, at_sequence, state_json, created_at, tenant_id, status, completed_nodes_json, active_nodes_json, last_sequence)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&snap_id)
+            .bind(&snap_exec_id)
+            .bind(snap.at_sequence)
+            .bind(&snap_state_json)
+            .bind(&snap_created_at)
+            .bind(&self.tenant_id.0)
+            .bind(snap_status_str)
+            .bind(&snap_completed_json)
+            .bind(&snap_active_json)
+            .bind(snap.last_sequence)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+        }
 
         tx.commit().await.map_err(map_db_err)?;
         Ok(sequence)
