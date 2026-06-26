@@ -248,30 +248,14 @@ fn node_completed_kind(node: &str) -> EventKind {
     }
 }
 
-fn build_snapshot(exec_id: &ExecutionId) -> Snapshot {
-    let mut completed_nodes = HashMap::new();
-    completed_nodes.insert("n1".to_string(), json!("result"));
-    let mut active_nodes = HashSet::new();
-    active_nodes.insert("n2".to_string());
-
-    Snapshot {
-        id: Uuid::new_v4(),
-        execution_id: exec_id.clone(),
-        at_sequence: 0, // will be overwritten by commit_turn
-        state: json!({"x": 1}),
-        status: WorkflowStatus::Running,
-        completed_nodes,
-        active_nodes,
-        last_sequence: 0, // will be overwritten by commit_turn
-        created_at: Utc::now(),
-    }
-}
-
 // ── Task 3 tests ─────────────────────────────────────────────────────────────
 
-/// `commit_turn` with `Some(snapshot)`: settles the work item, appends exactly
-/// one terminal event, AND writes the snapshot (with at_sequence == the assigned
-/// event sequence) in the same transaction. `latest_snapshot` returns it.
+/// `commit_turn` with `write_snapshot = true`: settles the work item, appends
+/// exactly one terminal event, AND writes a snapshot (computed in-tx from the
+/// committed event log) in the same transaction. `latest_snapshot` returns it.
+///
+/// The snapshot is computed from the event log rather than a pre-tx value, so
+/// `completed_nodes` reflects the actual committed NodeCompleted event.
 #[tokio::test]
 async fn commit_turn_with_snapshot_writes_event_and_snapshot() {
     let db = open_test_db().await;
@@ -290,12 +274,11 @@ async fn commit_turn_with_snapshot_writes_event_and_snapshot() {
         .unwrap();
 
     let event = Event::new(exec_id.clone(), 0, node_completed_kind("n1"));
-    let snap = build_snapshot(&exec_id);
 
     let seq = db
-        .commit_turn(item.id, item.lease_fence, event, Some(snap))
+        .commit_turn(item.id, item.lease_fence, event, true)
         .await
-        .expect("commit_turn with snapshot must succeed");
+        .expect("commit_turn with write_snapshot must succeed");
 
     assert!(seq >= 1, "returned sequence must be at least 1");
 
@@ -326,18 +309,15 @@ async fn commit_turn_with_snapshot_writes_event_and_snapshot() {
         loaded_snap.last_sequence, seq,
         "snapshot.last_sequence must equal the terminal event sequence"
     );
-    assert_eq!(
-        loaded_snap.status,
-        WorkflowStatus::Running,
-        "snapshot status must round-trip"
-    );
+    // Snapshot is computed from the event log: NodeCompleted n1 marks n1 as done.
     assert!(
         loaded_snap.completed_nodes.contains_key("n1"),
-        "completed_nodes must round-trip"
+        "completed_nodes must contain n1 (from the committed NodeCompleted event)"
     );
+    // No NodeScheduled event was emitted for any other node, so active_nodes is empty.
     assert!(
-        loaded_snap.active_nodes.contains("n2"),
-        "active_nodes must round-trip"
+        loaded_snap.active_nodes.is_empty(),
+        "active_nodes must be empty when no NodeScheduled events preceded the commit"
     );
 }
 
@@ -377,12 +357,11 @@ async fn commit_turn_stale_fence_writes_nothing() {
         .unwrap()
         .unwrap();
 
-    // Zombie tries to commit with stale fence and a snapshot.
+    // Zombie tries to commit with stale fence and write_snapshot = true.
     let event = Event::new(exec_id.clone(), 0, node_completed_kind("n1"));
-    let snap = build_snapshot(&exec_id);
 
     let err = db
-        .commit_turn(zombie.id, zombie.lease_fence, event, Some(snap))
+        .commit_turn(zombie.id, zombie.lease_fence, event, true)
         .await
         .expect_err("stale-fence commit_turn must fail closed");
 
@@ -527,18 +506,6 @@ async fn fresh_process_sqlite_resume() {
 
     let initial = json!({});
 
-    // Materialize-and-advance helper: returns the new MaterializedState after
-    // applying `kind` on top of `prior` (using sequence 0; commit_turn will
-    // overwrite at_sequence / last_sequence to the real assigned sequence).
-    fn advance(
-        prior: MaterializedState,
-        exec_id: &ExecutionId,
-        kind: &EventKind,
-    ) -> MaterializedState {
-        let dummy = Event::new(exec_id.clone(), 0, kind.clone());
-        apply_events_seeded(prior, &[dummy])
-    }
-
     // ── Turn 1: n1 with a __budget key in state_patch ────────────────────────
     let t1_kind = EventKind::NodeCompleted {
         node_id: "n1".into(),
@@ -572,20 +539,11 @@ async fn fresh_process_sqlite_resume() {
     .unwrap();
 
     let item1 = db.claim_work_item("w", &["model"]).await.unwrap().unwrap();
-    let prior0 = MaterializedState {
-        current_state: initial.clone(),
-        status: WorkflowStatus::Pending,
-        completed_nodes: HashMap::new(),
-        active_nodes: HashSet::new(),
-        last_sequence: 0,
-    };
-    let state1 = advance(prior0, &exec_id, &t1_kind);
-    let snap1 = Snapshot::from_materialized(exec_id.clone(), &state1);
     db.commit_turn(
         item1.id,
         item1.lease_fence,
         Event::new(exec_id.clone(), 0, t1_kind),
-        Some(snap1),
+        true,
     )
     .await
     .unwrap();
@@ -623,13 +581,11 @@ async fn fresh_process_sqlite_resume() {
     .unwrap();
 
     let item2 = db.claim_work_item("w", &["model"]).await.unwrap().unwrap();
-    let state2 = advance(state1.clone(), &exec_id, &t2_kind);
-    let snap2 = Snapshot::from_materialized(exec_id.clone(), &state2);
     db.commit_turn(
         item2.id,
         item2.lease_fence,
         Event::new(exec_id.clone(), 0, t2_kind),
-        Some(snap2),
+        true,
     )
     .await
     .unwrap();
@@ -667,13 +623,11 @@ async fn fresh_process_sqlite_resume() {
     .unwrap();
 
     let item3 = db.claim_work_item("w", &["model"]).await.unwrap().unwrap();
-    let state3 = advance(state2.clone(), &exec_id, &t3_kind);
-    let snap3 = Snapshot::from_materialized(exec_id.clone(), &state3);
     db.commit_turn(
         item3.id,
         item3.lease_fence,
         Event::new(exec_id.clone(), 0, t3_kind),
-        Some(snap3),
+        true,
     )
     .await
     .unwrap();
@@ -851,4 +805,132 @@ async fn cross_backend_tenant_scoped_sqlite() {
         .expect("failed to open in-memory SQLite");
     let scoped = db.for_tenant(TenantId::default());
     assert_resume_equivalence_for_backend(&scoped).await;
+}
+
+// ── Regression: concurrent sibling write-skew ────────────────────────────────
+
+/// Concurrent sibling commits must not produce write-skew.
+///
+/// Two sibling nodes (n_a and n_b) each hold their own work item and commit
+/// sequentially in the same test (simulating the losing-race scenario where B
+/// commits after A). Because the snapshot is computed IN-TX after the terminal
+/// event is inserted, B's snapshot sees A's committed event and must carry
+/// BOTH patches. A pre-tx snapshot computation would make B's snapshot miss
+/// A's patch (write-skew).
+#[tokio::test]
+async fn concurrent_sibling_commits_no_write_skew() {
+    let db = open_test_db().await;
+    let exec_id = ExecutionId::new();
+    db.create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
+
+    // Enqueue two sibling nodes.
+    for node_id in ["n_a", "n_b"] {
+        db.enqueue_work_item(WorkItem {
+            id: Uuid::new_v4(),
+            execution_id: exec_id.clone(),
+            node_id: node_id.into(),
+            queue_type: "model".into(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            tenant_id: "default".into(),
+            lease_fence: 0,
+        })
+        .await
+        .unwrap();
+    }
+
+    // Two concurrent workers each claim one item.
+    let first = db
+        .claim_work_item("worker-A", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
+    let second = db
+        .claim_work_item("worker-B", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Determine which claimed item belongs to which node.
+    let (item_a, item_b) = if first.node_id == "n_a" {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    // Worker A commits first with its patch.
+    let ev_a = Event::new(
+        exec_id.clone(),
+        0,
+        EventKind::NodeCompleted {
+            node_id: "n_a".into(),
+            output: json!("out_a"),
+            state_patch: json!({"key_a": "value_a"}),
+            duration_ms: 1,
+            gen_ai_system: None,
+            gen_ai_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            finish_reason: None,
+            cost_usd: None,
+            provenance: None,
+        },
+    );
+    db.commit_turn(item_a.id, item_a.lease_fence, ev_a, true)
+        .await
+        .expect("A commit must succeed");
+
+    // Worker B commits second with its own patch.
+    let ev_b = Event::new(
+        exec_id.clone(),
+        0,
+        EventKind::NodeCompleted {
+            node_id: "n_b".into(),
+            output: json!("out_b"),
+            state_patch: json!({"key_b": "value_b"}),
+            duration_ms: 1,
+            gen_ai_system: None,
+            gen_ai_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            finish_reason: None,
+            cost_usd: None,
+            provenance: None,
+        },
+    );
+    db.commit_turn(item_b.id, item_b.lease_fence, ev_b, true)
+        .await
+        .expect("B commit must succeed");
+
+    // The final snapshot must contain BOTH patches — no write-skew.
+    let snap = db
+        .latest_snapshot(&exec_id)
+        .await
+        .unwrap()
+        .expect("snapshot must exist after both commits");
+
+    assert_eq!(
+        snap.state.get("key_a"),
+        Some(&json!("value_a")),
+        "patch from n_a must be present in final snapshot (write-skew regression)"
+    );
+    assert_eq!(
+        snap.state.get("key_b"),
+        Some(&json!("value_b")),
+        "patch from n_b must be present in final snapshot (write-skew regression)"
+    );
+    assert!(
+        snap.completed_nodes.contains_key("n_a"),
+        "n_a must be in completed_nodes"
+    );
+    assert!(
+        snap.completed_nodes.contains_key("n_b"),
+        "n_b must be in completed_nodes"
+    );
 }

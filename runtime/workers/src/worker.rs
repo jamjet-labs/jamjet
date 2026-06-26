@@ -11,7 +11,6 @@ use jamjet_state::approvals::NodeApprovalStatus;
 use jamjet_state::backend::{StateBackend, StateBackendError, WorkItem, WorkItemId};
 use jamjet_state::budget::BudgetState;
 use jamjet_state::event::EventKind;
-use jamjet_state::{apply_events_seeded, materialize, MaterializedState, Snapshot};
 use jamjet_telemetry::{gen_ai_attrs, metrics, record_gen_ai_usage};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -310,32 +309,14 @@ impl Worker {
                         provenance: None,
                     },
                 );
-                // Compute the post-turn snapshot by folding THIS turn's terminal
-                // event onto the materialized state that precedes it.
-                // `materialize` reflects state before this event (it is committed
-                // inside commit_turn). Folding the terminal event onto `prior` gives
-                // us the exact state that will exist after the commit, without a
-                // second DB round-trip.
-                //
-                // Note: `terminal.sequence` is 0 here; `commit_turn` overwrites
-                // `snap.at_sequence` and `snap.last_sequence` with the real
-                // assigned sequence, so the worker's 0 does not corrupt the key.
-                let snap = {
-                    let prior = materialize(self.backend.as_ref(), &execution_id)
-                        .await
-                        .unwrap_or_else(|_| MaterializedState {
-                            current_state: serde_json::json!({}),
-                            status: jamjet_core::workflow::WorkflowStatus::Running,
-                            completed_nodes: std::collections::HashMap::new(),
-                            active_nodes: std::collections::HashSet::new(),
-                            last_sequence: 0,
-                        });
-                    let next = apply_events_seeded(prior, &[terminal.clone()]);
-                    Some(Snapshot::from_materialized(execution_id.clone(), &next))
-                };
+                // Snapshot is computed inside commit_turn's BEGIN IMMEDIATE
+                // transaction — after the terminal event is inserted — by reading
+                // the latest snapshot + events since it and folding with
+                // apply_events_seeded. This avoids write-skew from concurrent
+                // sibling commits each seeing a stale pre-tx state.
                 match self
                     .backend
-                    .commit_turn(item_id, lease_fence, terminal, snap)
+                    .commit_turn(item_id, lease_fence, terminal, true)
                     .await
                 {
                     Ok(_) => {
@@ -363,7 +344,7 @@ impl Worker {
                 );
                 match self
                     .backend
-                    .commit_turn(item_id, lease_fence, terminal, None)
+                    .commit_turn(item_id, lease_fence, terminal, false)
                     .await
                 {
                     Ok(_) => {

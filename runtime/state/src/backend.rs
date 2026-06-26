@@ -154,22 +154,22 @@ pub trait StateBackend: Send + Sync {
     /// Mark a work item as failed. The scheduler will decide whether to retry.
     async fn fail_work_item(&self, item_id: WorkItemId, error: &str) -> BackendResult<()>;
 
-    /// Atomically settle a work item (status inferred from the terminal event
-    /// kind), append the terminal event, and optionally write a snapshot, all
-    /// in ONE transaction, gated by `lease_fence`. A stale fence matches zero
-    /// rows and returns `FenceLost`, emitting nothing (no event, no snapshot).
-    ///
-    /// If `snapshot` is `Some`, its `at_sequence` is set to the sequence just
-    /// assigned to the terminal event and it is written with INSERT OR REPLACE
-    /// inside the same transaction. Replaces the `complete_work_item` +
-    /// `latest_sequence` + `append_event` trio so a node completion is one
-    /// fsync with no crash window and no double-commit.
+    /// Atomically settle a work item, append the terminal event, and optionally
+    /// compute and write a snapshot from the committed state, all in ONE
+    /// transaction gated by `lease_fence`. When `write_snapshot` is `true` the
+    /// snapshot is computed inside the same `BEGIN IMMEDIATE` transaction —
+    /// after the terminal event is inserted — by reading the latest snapshot +
+    /// all events since it (including the terminal event just written), folding
+    /// with `apply_events_seeded`, and writing with INSERT OR REPLACE. This
+    /// avoids write-skew: concurrent sibling nodes cannot produce snapshots that
+    /// each miss the other's patch. A stale fence returns `FenceLost` and writes
+    /// nothing.
     async fn commit_turn(
         &self,
         item_id: WorkItemId,
         lease_fence: i64,
         terminal_event: Event,
-        snapshot: Option<Snapshot>,
+        write_snapshot: bool,
     ) -> BackendResult<EventSequence>;
 
     /// Reclaim work items whose lease has expired (worker crashed or stalled).
