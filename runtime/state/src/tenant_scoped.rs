@@ -894,8 +894,8 @@ impl StateBackend for TenantScopedSqliteBackend {
                     serde_json::from_str(row.try_get::<&str, _>("state_json").map_err(map_db_err)?)
                         .map_err(StateBackendError::Serialization)?;
                 let snap_status =
-                    str_to_status(row.try_get::<&str, _>("status").unwrap_or("pending"))
-                        .unwrap_or(WorkflowStatus::Pending);
+                    str_to_status(row.try_get::<&str, _>("status").unwrap_or("running"))
+                        .unwrap_or(WorkflowStatus::Running);
                 let completed_nodes: std::collections::HashMap<String, serde_json::Value> = {
                     match row.try_get::<Option<&str>, _>("completed_nodes_json") {
                         Err(_) => std::collections::HashMap::new(),

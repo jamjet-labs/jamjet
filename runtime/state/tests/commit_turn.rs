@@ -19,6 +19,7 @@ use jamjet_state::{
 use proptest::prelude::*;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
 
 async fn open_test_db() -> SqliteBackend {
@@ -933,4 +934,181 @@ async fn concurrent_sibling_commits_no_write_skew() {
         snap.completed_nodes.contains_key("n_b"),
         "n_b must be in completed_nodes"
     );
+}
+
+// ── Regression: genuinely concurrent sibling write-skew (real file + two tasks) ──
+
+/// Two tokio tasks race to commit sibling nodes to the SAME execution on a
+/// real file-backed SQLite database. A `Barrier` forces both tasks to reach
+/// the commit point before either proceeds, maximising BEGIN IMMEDIATE
+/// contention. Both commits must succeed (busy_timeout serialises them), and
+/// the final snapshot must contain BOTH patches — proving the in-tx snapshot
+/// computation closes the write-skew even under real concurrent writers.
+#[tokio::test]
+async fn concurrent_sibling_commits_race() {
+    let db_path =
+        std::path::PathBuf::from(format!("/tmp/jamjet-race-test-{}.sqlite3", Uuid::new_v4()));
+    let url = format!("sqlite://{}", db_path.display());
+
+    let db = Arc::new(
+        SqliteBackend::open(&url)
+            .await
+            .expect("failed to open temp SQLite file for race test"),
+    );
+
+    let exec_id = ExecutionId::new();
+    db.create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
+
+    // Enqueue two sibling work items for the same execution.
+    for node_id in ["n_a", "n_b"] {
+        db.enqueue_work_item(WorkItem {
+            id: Uuid::new_v4(),
+            execution_id: exec_id.clone(),
+            node_id: node_id.into(),
+            queue_type: "model".into(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            tenant_id: "default".into(),
+            lease_fence: 0,
+        })
+        .await
+        .unwrap();
+    }
+
+    // Claim both items before spawning the tasks (both get distinct lease fences).
+    let first = db
+        .claim_work_item("worker-A", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
+    let second = db
+        .claim_work_item("worker-B", &["model"])
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (item_a, item_b) = if first.node_id == "n_a" {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    // Barrier ensures both tasks reach the commit call before either proceeds.
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    // ── Task A ────────────────────────────────────────────────────────────────
+    let db_a = Arc::clone(&db);
+    let barrier_a = Arc::clone(&barrier);
+    let exec_id_a = exec_id.clone();
+    let handle_a = tokio::spawn(async move {
+        let ev = Event::new(
+            exec_id_a,
+            0,
+            EventKind::NodeCompleted {
+                node_id: "n_a".into(),
+                output: json!("out_a"),
+                state_patch: json!({"a": 1}),
+                duration_ms: 1,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+            },
+        );
+        barrier_a.wait().await;
+        db_a.commit_turn(item_a.id, item_a.lease_fence, ev, true)
+            .await
+    });
+
+    // ── Task B ────────────────────────────────────────────────────────────────
+    let db_b = Arc::clone(&db);
+    let barrier_b = Arc::clone(&barrier);
+    let exec_id_b = exec_id.clone();
+    let handle_b = tokio::spawn(async move {
+        let ev = Event::new(
+            exec_id_b,
+            0,
+            EventKind::NodeCompleted {
+                node_id: "n_b".into(),
+                output: json!("out_b"),
+                state_patch: json!({"b": 2}),
+                duration_ms: 1,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+            },
+        );
+        barrier_b.wait().await;
+        db_b.commit_turn(item_b.id, item_b.lease_fence, ev, true)
+            .await
+    });
+
+    // Both commits must succeed.
+    handle_a
+        .await
+        .expect("task A panicked")
+        .expect("task A commit_turn failed");
+    handle_b
+        .await
+        .expect("task B panicked")
+        .expect("task B commit_turn failed");
+
+    // Final state must carry BOTH patches.
+    let all_events = db.get_events(&exec_id).await.unwrap();
+    assert_eq!(all_events.len(), 2, "expected exactly 2 events");
+
+    let full = apply_events(json!({}), &all_events, &WorkflowStatus::Running);
+    assert!(
+        full.current_state.get("a").is_some(),
+        "patch a must be in current_state"
+    );
+    assert!(
+        full.current_state.get("b").is_some(),
+        "patch b must be in current_state"
+    );
+    assert!(
+        full.completed_nodes.contains_key("n_a"),
+        "n_a must be in completed_nodes"
+    );
+    assert!(
+        full.completed_nodes.contains_key("n_b"),
+        "n_b must be in completed_nodes"
+    );
+
+    // Latest snapshot (written by whichever task committed second) must also
+    // contain both patches — this is the write-skew invariant.
+    let snap = db
+        .latest_snapshot(&exec_id)
+        .await
+        .unwrap()
+        .expect("snapshot must exist after both concurrent commits");
+    assert!(
+        snap.state.get("a").is_some() && snap.state.get("b").is_some(),
+        "snapshot state must contain both patches (a={:?}, b={:?})",
+        snap.state.get("a"),
+        snap.state.get("b"),
+    );
+    assert!(
+        snap.completed_nodes.contains_key("n_a") && snap.completed_nodes.contains_key("n_b"),
+        "snapshot completed_nodes must contain both n_a and n_b"
+    );
+
+    // Cleanup.
+    drop(db);
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("sqlite3-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("sqlite3-shm"));
 }
