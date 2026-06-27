@@ -1,6 +1,10 @@
 use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use crate::heartbeat::spawn_heartbeat;
 use chrono::Utc;
+
+/// Cap a provider-supplied Retry-After so an untrusted/huge value can't overflow
+/// the timestamp math or push the backoff into the past. One hour is plenty.
+const MAX_RETRY_AFTER_SECS: u64 = 3_600;
 use jamjet_agents::AgentRegistry;
 use jamjet_core::node::NodeKind;
 use jamjet_core::workflow::ExecutionId;
@@ -507,6 +511,9 @@ impl Worker {
                     // Park the work item — reset to pending with a future not-before time.
                     // retry_after uses the wall clock: this is a scheduling hint for
                     // future claim visibility, not replayed durable state, so real time is correct.
+                    // Clamp the provider-supplied value so a malicious or buggy huge value
+                    // cannot overflow the chrono DateTime addition or cast negative via as i64.
+                    let retry_after_secs = retry_after_secs.min(MAX_RETRY_AFTER_SECS);
                     let retry_after = (Utc::now()
                         + chrono::Duration::seconds(retry_after_secs as i64))
                     .to_rfc3339();
@@ -1495,6 +1502,22 @@ mod tests {
                 "replayed output must match the seeded record"
             );
         }
+    }
+
+    // ── Retry-After clamp ────────────────────────────────────────────────────
+
+    /// Verify that `MAX_RETRY_AFTER_SECS` bounds a u64::MAX value so the chrono
+    /// cast is always safe and the resulting timestamp is in the future.
+    #[test]
+    fn capped_retry_after_clamps_huge_value() {
+        let huge: u64 = u64::MAX;
+        let capped = huge.min(MAX_RETRY_AFTER_SECS);
+        assert_eq!(capped, MAX_RETRY_AFTER_SECS);
+        // Safe to cast — 3600 << i64::MAX.
+        let duration = chrono::Duration::seconds(capped as i64);
+        let ts = chrono::Utc::now() + duration;
+        let now = chrono::Utc::now();
+        assert!(ts > now, "parked timestamp must be in the future");
     }
 
     // ── Rate-limit executor ───────────────────────────────────────────────────

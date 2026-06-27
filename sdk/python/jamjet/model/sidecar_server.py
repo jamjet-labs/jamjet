@@ -22,6 +22,9 @@ from jamjet.model.seam import Model
 from jamjet.model.types import ModelRequest, parse_model_ref
 
 _RATE_LIMIT_FALLBACK_SECS = 5
+# Cap untrusted provider Retry-After so a huge value cannot overflow timestamp math
+# in the Rust worker. Must match MAX_RETRY_AFTER_SECS in runtime/workers/src/worker.rs.
+_MAX_RETRY_AFTER_SECS = 3_600
 
 
 def _extract_retry_after(exc: BaseException) -> int:
@@ -38,13 +41,13 @@ def _extract_retry_after(exc: BaseException) -> int:
         raw = headers.get("retry-after") or headers.get("Retry-After")
         if raw is not None:
             try:
-                return int(raw)
+                return min(int(raw), _MAX_RETRY_AFTER_SECS)
             except (ValueError, TypeError):
                 pass
     val = getattr(exc, "retry_after", None)
     if val is not None:
         try:
-            return int(val)
+            return min(int(val), _MAX_RETRY_AFTER_SECS)
         except (ValueError, TypeError):
             pass
     return _RATE_LIMIT_FALLBACK_SECS
