@@ -45,6 +45,8 @@ pub struct InMemoryBackend {
     proj_approvals: DashMap<(String, String), crate::backend::ApprovalProjectionRow>,
     /// Projector checkpoints. Key = (projection_name, execution_id as String).
     projector_checkpoints: DashMap<(String, String), i64>,
+    /// Content-addressed artifact store. Key = (tenant_id, hash).
+    artifacts: DashMap<(String, String), (Vec<u8>, Option<String>)>,
 }
 
 impl InMemoryBackend {
@@ -64,6 +66,7 @@ impl InMemoryBackend {
             tool_effects: DashMap::new(),
             proj_approvals: DashMap::new(),
             projector_checkpoints: DashMap::new(),
+            artifacts: DashMap::new(),
         }
     }
 
@@ -321,6 +324,33 @@ impl StateBackend for InMemoryBackend {
 
     async fn get_tool_effect(&self, key: &str) -> BackendResult<Option<serde_json::Value>> {
         Ok(self.tool_effects.get(key).map(|r| r.value().clone()))
+    }
+
+    // ── Content-addressed artifact store ─────────────────────────────────────
+
+    async fn put_artifact(
+        &self,
+        bytes: &[u8],
+        media_type: Option<&str>,
+    ) -> BackendResult<crate::artifact::ArtifactRef> {
+        let hash = crate::hashing::sha256_hex(bytes);
+        let size = bytes.len() as u64;
+        // Dedupe: only insert if not already present (INSERT OR IGNORE semantics).
+        self.artifacts
+            .entry(("default".to_string(), hash.clone()))
+            .or_insert_with(|| (bytes.to_vec(), media_type.map(|s| s.to_string())));
+        Ok(crate::artifact::ArtifactRef {
+            hash,
+            size,
+            media_type: media_type.map(|s| s.to_string()),
+        })
+    }
+
+    async fn get_artifact(&self, hash: &str) -> BackendResult<Option<Vec<u8>>> {
+        Ok(self
+            .artifacts
+            .get(&("default".to_string(), hash.to_string()))
+            .map(|r| r.value().0.clone()))
     }
 
     // ── Work queue ───────────────────────────────────────────────────

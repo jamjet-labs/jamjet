@@ -59,6 +59,18 @@ pub fn content_hash(value: &Value) -> String {
     hex
 }
 
+/// Lowercase hex SHA-256 of raw bytes. Used by the artifact store to hash
+/// the stored blob directly (not canonical JSON), so the hash matches the
+/// stored bytes exactly regardless of JSON key ordering.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

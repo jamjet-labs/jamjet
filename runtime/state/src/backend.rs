@@ -1,3 +1,4 @@
+use crate::artifact::ArtifactRef;
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
 use crate::tenant::{Tenant, TenantId, DEFAULT_TENANT};
@@ -180,6 +181,26 @@ pub trait StateBackend: Send + Sync {
     /// Recorded atomically inside `commit_turn` when the terminal event is a
     /// `NodeCompleted` with `idempotency_key = Some(k)`.
     async fn get_tool_effect(&self, key: &str) -> BackendResult<Option<serde_json::Value>>;
+
+    // ── Content-addressed artifact store ─────────────────────────────────────
+
+    /// Store bytes in the CAS, keyed by their SHA-256 hash.
+    ///
+    /// Uses `INSERT OR IGNORE` so writing the same bytes twice is idempotent:
+    /// only one row is ever stored per `(tenant_id, hash)`.
+    ///
+    /// Returns the `ArtifactRef` describing the stored content. Callers must
+    /// call this BEFORE `commit_turn` so that no event ever references an
+    /// artifact row that doesn't exist yet (put-then-commit write-order invariant).
+    async fn put_artifact(
+        &self,
+        bytes: &[u8],
+        media_type: Option<&str>,
+    ) -> BackendResult<ArtifactRef>;
+
+    /// Retrieve artifact bytes by hash (tenant-scoped). Returns `None` if the
+    /// artifact does not exist for this tenant.
+    async fn get_artifact(&self, hash: &str) -> BackendResult<Option<Vec<u8>>>;
 
     // ── Queue (simple Postgres/SQLite backed queue in v1) ────────────────
 

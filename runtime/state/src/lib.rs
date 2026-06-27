@@ -6,6 +6,7 @@
 #![allow(clippy::collapsible_match, clippy::collapsible_if)]
 
 pub mod approvals;
+pub mod artifact;
 pub mod backend;
 pub mod budget;
 pub mod event;
@@ -18,13 +19,16 @@ pub mod sqlite;
 pub mod tenant;
 pub mod tenant_scoped;
 
+pub use artifact::{
+    resolve_value, spill_bytes, ArtifactRef, ARTIFACT_SENTINEL_KEY, DEFAULT_SPILL_THRESHOLD,
+};
 pub use backend::{
     ApiToken, ApprovalProjectionRow, BackendResult, ReclaimResult, StateBackend, StateBackendError,
     WorkItem, WorkItemId, WorkflowDefinition,
 };
 pub use budget::BudgetState;
 pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};
-pub use hashing::{canonical_json, content_hash};
+pub use hashing::{canonical_json, content_hash, sha256_hex};
 pub use materializer::{
     apply_events, apply_events_seeded, materialize, should_snapshot, MaterializedState,
 };
