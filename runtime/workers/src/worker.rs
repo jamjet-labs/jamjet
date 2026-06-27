@@ -5,6 +5,15 @@ use chrono::Utc;
 /// Cap a provider-supplied Retry-After so an untrusted/huge value can't overflow
 /// the timestamp math or push the backoff into the past. One hour is plenty.
 const MAX_RETRY_AFTER_SECS: u64 = 3_600;
+
+/// Byte threshold above which a model-node event output is spilled to the
+/// content-addressed artifact store and replaced by an `ArtifactRef` sentinel.
+///
+/// 8 KiB keeps 2-3 short model turns inline. A 4 000-token response (~16 KB)
+/// is always spilled. Only the EVENT output is affected; `state_patch` and
+/// `current_state` stay inline so replay and the materializer are unaffected.
+/// Configurable at runtime via `JAMJET_ARTIFACT_THRESHOLD_BYTES` (future).
+const ARTIFACT_THRESHOLD: usize = 8 * 1024;
 use jamjet_agents::AgentRegistry;
 use jamjet_core::node::NodeKind;
 use jamjet_core::workflow::ExecutionId;
@@ -17,6 +26,7 @@ use jamjet_state::backend::{StateBackend, StateBackendError, WorkItem, WorkItemI
 use jamjet_state::budget::BudgetState;
 use jamjet_state::content_hash;
 use jamjet_state::event::EventKind;
+use jamjet_state::spill_bytes;
 use jamjet_state::{materialize, start_next_segment};
 use jamjet_telemetry::{gen_ai_attrs, metrics, record_gen_ai_usage};
 use std::collections::HashMap;
@@ -418,12 +428,39 @@ impl Worker {
                     );
                 }
 
+                // Spill the event output to the artifact store if above the
+                // threshold. Write-order invariant: the artifact is persisted
+                // BEFORE the NodeCompleted event that references it. A crash
+                // between put_artifact and commit_turn produces an orphaned
+                // artifact (benign, write-once) but NEVER a dangling ref in an
+                // event, because commit_turn has not been called yet.
+                //
+                // SCOPE: only the EVENT output is spilled here. state_patch
+                // stays inline so the materializer + replay path (which reads
+                // state_patch to advance current_state) are completely
+                // unaffected. Snapshot / state spill is F-2i-snapshot.
+                let event_output = {
+                    let maybe_bytes = spill_bytes(&exec_result.output, ARTIFACT_THRESHOLD);
+                    if let Some(bytes) = maybe_bytes {
+                        match self
+                            .backend
+                            .put_artifact(&bytes, Some("application/json"))
+                            .await
+                        {
+                            Ok(artifact_ref) => artifact_ref.to_sentinel(),
+                            Err(e) => return Err(Box::new(e)),
+                        }
+                    } else {
+                        exec_result.output
+                    }
+                };
+
                 let terminal = jamjet_state::Event::new(
                     execution_id.clone(),
                     0, // sequence assigned atomically inside commit_turn
                     EventKind::NodeCompleted {
                         node_id: node_id.clone(),
-                        output: exec_result.output,
+                        output: event_output,
                         state_patch: exec_result.state_patch,
                         duration_ms,
                         gen_ai_system: exec_result.gen_ai_system,
@@ -1263,7 +1300,7 @@ mod tests {
     use jamjet_state::{
         backend::{StateBackend, WorkItem, WorkflowDefinition},
         event::EventKind,
-        InMemoryBackend,
+        ArtifactRef, InMemoryBackend,
     };
     use std::sync::Arc;
     use uuid::Uuid;
@@ -2594,6 +2631,241 @@ mod tests {
             "Major-2 regression: old execution must be LimitExceeded after already-branch finalization; \
              got {:?} — means crash-before-terminal was not repaired",
             exec_final.status
+        );
+    }
+
+    // ── Artifact spill tests ──────────────────────────────────────────────────
+
+    /// Stub executor that returns a fixed `output` value and an empty
+    /// `state_patch`. Used to drive the spill path without a real model adapter.
+    struct FixedOutputExecutor {
+        output: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for FixedOutputExecutor {
+        async fn execute(
+            &self,
+            _item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            Ok(ExecutionResult {
+                output: self.output.clone(),
+                state_patch: serde_json::json!({}),
+                duration_ms: 0,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+            })
+        }
+    }
+
+    /// Minimal workflow IR whose single node has kind `"model"`. The executor
+    /// registered under `"model"` is what `execute_item` dispatches to.
+    fn model_ir_json() -> serde_json::Value {
+        serde_json::json!({
+            "workflow_id": "model-wf",
+            "version": "1.0.0",
+            "state_schema": "{}",
+            "start_node": "n1",
+            "nodes": {
+                "n1": {
+                    "id": "n1",
+                    "kind": {
+                        "type": "model",
+                        "model_ref": "fake",
+                        "prompt_ref": "",
+                        "output_schema": "{}"
+                    }
+                }
+            },
+            "edges": [],
+            "retry_policies": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {}
+        })
+    }
+
+    /// Set up an in-memory backend with a `model-wf` workflow and one enqueued
+    /// work item whose `queue_type` is `"model"`.
+    async fn setup_model_backend() -> (Arc<InMemoryBackend>, ExecutionId) {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = Utc::now();
+        backend
+            .create_execution(jamjet_core::workflow::WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "model-wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: serde_json::json!({}),
+                current_state: serde_json::json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        backend
+            .store_workflow(WorkflowDefinition {
+                workflow_id: "model-wf".into(),
+                version: "1.0.0".into(),
+                ir: model_ir_json(),
+                created_at: Utc::now(),
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        backend
+            .enqueue_work_item(WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "model".into(),
+                payload: serde_json::json!({
+                    "workflow_id": "model-wf",
+                    "workflow_version": "1.0.0"
+                }),
+                attempt: 0,
+                max_attempts: 3,
+                created_at: Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+        (backend, eid)
+    }
+
+    /// A model-node output that exceeds ARTIFACT_THRESHOLD (8 KiB) must be
+    /// spilled to the artifact store. The NodeCompleted event must carry an
+    /// ArtifactRef sentinel (not the inline 32 KiB payload). A round-trip via
+    /// `backend.get_artifact` must restore the original value exactly.
+    /// The state_patch must remain inline (never spilled) so the replay path
+    /// is unaffected.
+    #[tokio::test]
+    async fn large_model_output_is_spilled_to_artifact_store() {
+        // 32 KiB content string — well above the 8 KiB ARTIFACT_THRESHOLD.
+        let large_content = "x".repeat(32 * 1024);
+        let large_output = serde_json::json!({ "content": large_content });
+
+        let (backend, eid) = setup_model_backend().await;
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["model".into()],
+        )
+        .register_executor(
+            "model",
+            Arc::new(FixedOutputExecutor {
+                output: large_output.clone(),
+            }),
+        );
+
+        let item = backend
+            .claim_work_item("test-worker", &["model"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+        worker.execute_item(item).await.unwrap();
+
+        // Locate the NodeCompleted event.
+        let events = backend.get_events(&eid).await.unwrap();
+        let event = events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+            .expect("NodeCompleted event must exist");
+
+        let (event_output, state_patch) = match &event.kind {
+            EventKind::NodeCompleted {
+                output,
+                state_patch,
+                ..
+            } => (output, state_patch),
+            _ => unreachable!(),
+        };
+
+        // Event output must be a sentinel — NOT the inline 32 KiB value.
+        assert!(
+            event_output.get("$artifact").is_some(),
+            "expected ArtifactRef sentinel in NodeCompleted.output; got: {event_output}"
+        );
+
+        // Round-trip: bytes fetched from the store must deserialize to the original output.
+        let artifact_ref =
+            ArtifactRef::from_sentinel(event_output).expect("sentinel must parse as ArtifactRef");
+        let stored_bytes = backend
+            .get_artifact(&artifact_ref.hash)
+            .await
+            .unwrap()
+            .expect("artifact must be present in the store after spill");
+        let restored: serde_json::Value =
+            serde_json::from_slice(&stored_bytes).expect("stored bytes must round-trip to Value");
+        assert_eq!(
+            restored, large_output,
+            "round-trip fidelity: restored value must equal the original output"
+        );
+
+        // state_patch stays inline — the replay/materializer path must be unaffected.
+        assert!(
+            state_patch.get("$artifact").is_none(),
+            "state_patch must not be spilled; got: {state_patch}"
+        );
+    }
+
+    /// A model-node output below ARTIFACT_THRESHOLD stays inline in the
+    /// NodeCompleted event — no spill, no sentinel.
+    #[tokio::test]
+    async fn small_model_output_stays_inline() {
+        let small_output = serde_json::json!({ "content": "short response" });
+
+        let (backend, eid) = setup_model_backend().await;
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["model".into()],
+        )
+        .register_executor(
+            "model",
+            Arc::new(FixedOutputExecutor {
+                output: small_output.clone(),
+            }),
+        );
+
+        let item = backend
+            .claim_work_item("test-worker", &["model"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+        worker.execute_item(item).await.unwrap();
+
+        let events = backend.get_events(&eid).await.unwrap();
+        let event = events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+            .expect("NodeCompleted event must exist");
+
+        let event_output = match &event.kind {
+            EventKind::NodeCompleted { output, .. } => output,
+            _ => unreachable!(),
+        };
+
+        // Small output must be stored inline — no ArtifactRef sentinel.
+        assert!(
+            event_output.get("$artifact").is_none(),
+            "small output must stay inline; got sentinel: {event_output}"
+        );
+        assert_eq!(
+            *event_output, small_output,
+            "inline output must equal the original value"
         );
     }
 }
