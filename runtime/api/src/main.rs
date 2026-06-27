@@ -164,7 +164,11 @@ async fn main() -> anyhow::Result<()> {
     // worker processes against the same state backend instead. The base backend
     // claims across all tenants, so workers drain every execution's queue.
     if config.dev_mode || std::env::var("JAMJET_EMBED_WORKERS").is_ok() {
-        let model_registry = Arc::new(jamjet_models::registry::registry_from_env());
+        let model_registry = Arc::new(
+            jamjet_models::registry::registry_from_env_checked()
+                .await
+                .map_err(|e| anyhow::anyhow!("model seam coverage guard failed: {e}"))?,
+        );
         let pool = jamjet_worker::default_pool(state.backend.clone())
             .with_executor(
                 "model",

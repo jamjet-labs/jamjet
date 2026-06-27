@@ -30,11 +30,15 @@ impl NodeExecutor for ModelNodeExecutor {
 
         // Extract model config from the work item payload.
         // The payload is populated by the scheduler from the IR node definition.
+        // Default to the fully-qualified provider-prefixed string so that:
+        //  • the Python sidecar's parse_model_ref maps it to provider=anthropic
+        //    (a bare "claude-sonnet-4-6" mis-maps to provider=openai — C2 fix).
+        //  • the non-seam registry routes it via the "anthropic/" prefix route.
         let model = item
             .payload
             .get("model")
             .and_then(|v| v.as_str())
-            .unwrap_or("claude-sonnet-4-6")
+            .unwrap_or("anthropic/claude-sonnet-4-6")
             .to_string();
 
         let system_prompt = item
@@ -126,13 +130,25 @@ impl NodeExecutor for ModelNodeExecutor {
             state_patch,
             duration_ms,
             gen_ai_system: Some(
-                // Infer system from model name prefix.
-                if response.model.starts_with("claude") {
-                    "anthropic"
-                } else if response.model.starts_with("gpt") || response.model.starts_with("o1") {
-                    "openai"
-                } else {
-                    "unknown"
+                {
+                    // Infer the provider from the model name, tolerating an optional
+                    // "provider/" prefix (e.g. "anthropic/claude-sonnet-4-6" or bare
+                    // "claude-sonnet-4-6" both classify as "anthropic").
+                    let bare = response
+                        .model
+                        .split_once('/')
+                        .map(|(_, m)| m)
+                        .unwrap_or(response.model.as_str());
+                    if response.model.starts_with("anthropic/") || bare.starts_with("claude") {
+                        "anthropic"
+                    } else if response.model.starts_with("openai/")
+                        || bare.starts_with("gpt")
+                        || bare.starts_with("o1")
+                    {
+                        "openai"
+                    } else {
+                        "unknown"
+                    }
                 }
                 .to_string(),
             ),
