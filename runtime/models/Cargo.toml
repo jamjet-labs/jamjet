@@ -21,3 +21,7 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+
+[dev-dependencies]
+mockito = "1"
+tokio = { workspace = true }

@@ -15,9 +15,11 @@ pub mod google;
 pub mod ollama;
 pub mod openai;
 pub mod registry;
+pub mod sidecar;
 
 pub use adapter::{
     ChatMessage, ChatRole, ModelAdapter, ModelConfig, ModelError, ModelRequest, ModelResponse,
     StructuredRequest,
 };
 pub use registry::ModelRegistry;
+pub use sidecar::SidecarModelAdapter;

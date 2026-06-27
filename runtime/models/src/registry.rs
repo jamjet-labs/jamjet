@@ -96,6 +96,15 @@ impl Default for ModelRegistry {
     }
 }
 
+impl ModelRegistry {
+    /// The system name of the current default adapter, if one is set.
+    ///
+    /// Primarily for tests and introspection — not on the hot path.
+    pub fn default_system(&self) -> Option<&str> {
+        self.default.as_deref()
+    }
+}
+
 /// Build a `ModelRegistry` from environment variables.
 ///
 /// Registers adapters based on available API keys / services:
@@ -104,9 +113,16 @@ impl Default for ModelRegistry {
 /// - Google if `GOOGLE_API_KEY` or `GEMINI_API_KEY` is set
 /// - Ollama if `OLLAMA_HOST` is set or defaults to localhost:11434
 ///
+/// If `JAMJET_MODEL_SEAM_URL` is set, also registers the `SidecarModelAdapter`
+/// and sets it as the default so durable-path calls go through the governed
+/// Python seam.  Native adapters stay registered as prefix-routed fallbacks.
+///
 /// Sets up standard prefix routing:
 ///   claude-* → anthropic, gpt-*/o1-*/o3-* → openai,
 ///   gemini-* → google, ollama model names → ollama.
+///
+/// **Does NOT probe the sidecar health endpoint.** Call
+/// [`registry_from_env_checked`] at startup if you need the fail-loud guard.
 pub fn registry_from_env() -> ModelRegistry {
     use crate::{
         anthropic::AnthropicAdapter, google::GoogleAdapter, ollama::OllamaAdapter,
@@ -158,5 +174,116 @@ pub fn registry_from_env() -> ModelRegistry {
         }
     }
 
+    // Sidecar takes highest priority when configured — overrides the native default.
+    // Native adapters remain registered as prefix-routed fallbacks so explicit
+    // provider model strings (e.g. "claude-3-haiku") still route correctly.
+    if let Ok(url) = std::env::var("JAMJET_MODEL_SEAM_URL") {
+        registry = apply_sidecar(registry, url);
+    }
+
     registry
+}
+
+/// Wire the sidecar into `registry`, setting it as the default adapter.
+///
+/// Extracted so tests can call it directly without touching env vars.
+pub(crate) fn apply_sidecar(registry: ModelRegistry, url: String) -> ModelRegistry {
+    use crate::sidecar::SidecarModelAdapter;
+    registry
+        .register(Arc::new(SidecarModelAdapter::new(url)))
+        .with_default("sidecar")
+}
+
+/// Like [`registry_from_env`] but also probes the sidecar `/health` endpoint.
+///
+/// Returns `Err` if `JAMJET_MODEL_SEAM_URL` is set but the sidecar is
+/// unreachable or responds non-2xx — so a misconfigured deployment fails loud
+/// at startup rather than silently falling through to the native adapters.
+///
+/// Call this at the `main()` call site instead of `registry_from_env()`.
+pub async fn registry_from_env_checked() -> Result<ModelRegistry, ModelError> {
+    let registry = registry_from_env();
+    if let Ok(url) = std::env::var("JAMJET_MODEL_SEAM_URL") {
+        let client = reqwest::Client::new();
+        crate::sidecar::check_sidecar_health(&url, &client).await?;
+    }
+    Ok(registry)
+}
+
+// ── Registry wiring tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialise env-var-mutating tests to avoid races between parallel test threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn apply_sidecar_sets_sidecar_as_default() {
+        let registry = apply_sidecar(ModelRegistry::new(), "http://127.0.0.1:4280".into());
+        assert_eq!(
+            registry.default_system(),
+            Some("sidecar"),
+            "sidecar must be the default when URL is wired"
+        );
+    }
+
+    #[test]
+    fn apply_sidecar_registers_adapter_by_name() {
+        let registry = apply_sidecar(ModelRegistry::new(), "http://127.0.0.1:4280".into());
+        // The adapter must be reachable (resolve returns Some for empty model name).
+        let adapter = registry.resolve("");
+        assert!(adapter.is_some(), "sidecar adapter must be registered");
+        assert_eq!(adapter.unwrap().system_name(), "sidecar");
+    }
+
+    #[test]
+    fn registry_from_env_sets_sidecar_default_when_url_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Safety: guarded by ENV_LOCK; removed immediately after.
+        unsafe {
+            std::env::set_var("JAMJET_MODEL_SEAM_URL", "http://127.0.0.1:4280");
+        }
+        let registry = registry_from_env();
+        unsafe {
+            std::env::remove_var("JAMJET_MODEL_SEAM_URL");
+        }
+        assert_eq!(
+            registry.default_system(),
+            Some("sidecar"),
+            "registry_from_env must make sidecar the default when JAMJET_MODEL_SEAM_URL is set"
+        );
+    }
+
+    #[test]
+    fn registry_from_env_no_sidecar_when_url_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("JAMJET_MODEL_SEAM_URL");
+        }
+        let registry = registry_from_env();
+        assert_ne!(
+            registry.default_system(),
+            Some("sidecar"),
+            "sidecar must not be default when JAMJET_MODEL_SEAM_URL is absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_from_env_checked_errors_on_unreachable_sidecar() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            // Port 1 is never open — connection will be refused immediately.
+            std::env::set_var("JAMJET_MODEL_SEAM_URL", "http://127.0.0.1:1");
+        }
+        let result = registry_from_env_checked().await;
+        unsafe {
+            std::env::remove_var("JAMJET_MODEL_SEAM_URL");
+        }
+        assert!(
+            result.is_err(),
+            "registry_from_env_checked must fail when sidecar is unreachable"
+        );
+    }
 }
