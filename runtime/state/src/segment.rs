@@ -31,7 +31,7 @@
 //! materialize output unchanged.
 
 use crate::backend::{BackendResult, StateBackend, WorkItem};
-use crate::event::{Event, EventKind};
+use crate::event::EventKind;
 use crate::materializer::MaterializedState;
 use crate::snapshot::Snapshot;
 use chrono::Utc;
@@ -70,6 +70,13 @@ const SEGMENT_NS: Uuid = Uuid::from_u128(0x6a8e_f5c3_d3a4_4b9c_8b2e_4f5d_6e7a_8c
 /// `new_exec.initial_input == new_exec.current_state == carried_state.current_state`
 /// (byte-identical canonical JSON).
 ///
+/// # Atomicity
+/// The 5 backend writes (execution, snapshot, 2 events, work item) are
+/// performed inside a single transaction via `create_segment_atomic`. A crash
+/// mid-creation rolls back entirely; the idempotency guard at the top of this
+/// function is now sound — the child row exists if and only if the whole
+/// segment committed.
+///
 /// # Returns
 /// The `ExecutionId` of the newly created (or pre-existing idempotent) segment.
 // Nine parameters are required by the plan interface; suppressing the lint rather
@@ -95,85 +102,69 @@ pub async fn start_next_segment(
     );
     let new_id = ExecutionId(child_uuid);
 
-    // Idempotency guard: if a prior attempt already created the child (crash
-    // between this function and the caller's SegmentBoundary append), return
-    // the existing id without re-seeding or re-enqueuing.
+    // Idempotency guard: if the child execution row already exists, a prior
+    // create_segment_atomic committed successfully — the row exists if and
+    // ONLY IF the whole segment committed atomically (execution + snapshot +
+    // 2 events + work item). A crashed partial create would have rolled back,
+    // leaving no row here. This check is now SOUND.
     if backend.get_execution(&new_id).await?.is_some() {
         return Ok(new_id);
     }
 
     let now = Utc::now();
 
-    // Step 1: create the new execution row with carried state as seed.
-    backend
-        .create_execution(WorkflowExecution {
-            execution_id: new_id.clone(),
-            workflow_id: workflow_id.to_string(),
-            workflow_version: workflow_version.to_string(),
-            status: WorkflowStatus::Running,
-            initial_input: carried_state.current_state.clone(),
-            current_state: carried_state.current_state.clone(),
-            started_at: now,
-            updated_at: now,
-            completed_at: None,
-            session_type: None,
-            parent_execution_id: Some(parent_id.clone()),
-            segment_number: next_segment_number,
-        })
-        .await?;
+    let execution = WorkflowExecution {
+        execution_id: new_id.clone(),
+        workflow_id: workflow_id.to_string(),
+        workflow_version: workflow_version.to_string(),
+        status: WorkflowStatus::Running,
+        initial_input: carried_state.current_state.clone(),
+        current_state: carried_state.current_state.clone(),
+        started_at: now,
+        updated_at: now,
+        completed_at: None,
+        session_type: None,
+        parent_execution_id: Some(parent_id.clone()),
+        segment_number: next_segment_number,
+    };
 
-    // Step 2: write the seed snapshot so `materialize(new_id)` picks up the
-    // carried state as its base without replaying the parent's event log.
-    // IMPORTANT: seed at at_sequence=0 (child's own sequence space), NOT at
-    // the parent's last_sequence.  See `Snapshot::seed_for_segment` for the
-    // full rationale.
+    // Seed at at_sequence=0 (child sequence space). See Snapshot::seed_for_segment.
     let seed = Snapshot::seed_for_segment(new_id.clone(), &carried_state.current_state);
-    backend.write_snapshot(seed).await?;
 
-    // Step 3: WorkflowStarted at sequence 1 (mirrors routes.rs).
-    backend
-        .append_event(Event::new(
-            new_id.clone(),
-            1,
-            EventKind::WorkflowStarted {
-                workflow_id: workflow_id.to_string(),
-                workflow_version: workflow_version.to_string(),
-                initial_input: carried_state.current_state.clone(),
-            },
-        ))
-        .await?;
+    let started_event = EventKind::WorkflowStarted {
+        workflow_id: workflow_id.to_string(),
+        workflow_version: workflow_version.to_string(),
+        initial_input: carried_state.current_state.clone(),
+    };
 
-    // Step 4: NodeScheduled at sequence 2 (mirrors routes.rs).
-    backend
-        .append_event(Event::new(
-            new_id.clone(),
-            2,
-            EventKind::NodeScheduled {
-                node_id: start_node_id.to_string(),
-                queue_type: queue_type.to_string(),
-            },
-        ))
-        .await?;
+    let scheduled_event = EventKind::NodeScheduled {
+        node_id: start_node_id.to_string(),
+        queue_type: queue_type.to_string(),
+    };
 
-    // Step 5: enqueue the start-node work item (mirrors routes.rs).
+    let work_item = WorkItem {
+        id: Uuid::new_v4(),
+        execution_id: new_id.clone(),
+        node_id: start_node_id.to_string(),
+        queue_type: queue_type.to_string(),
+        payload: serde_json::json!({
+            "workflow_id": workflow_id,
+            "workflow_version": workflow_version,
+        }),
+        attempt: 0,
+        max_attempts: 3,
+        created_at: now,
+        lease_expires_at: None,
+        worker_id: None,
+        lease_fence: 0,
+        tenant_id: tenant_id.to_string(),
+    };
+
+    // ONE atomic call: execution + snapshot + 2 events + work item in one
+    // transaction. A crash mid-creation rolls back entirely; the idempotency
+    // guard above is now sound (row exists ↔ whole segment committed).
     backend
-        .enqueue_work_item(WorkItem {
-            id: Uuid::new_v4(),
-            execution_id: new_id.clone(),
-            node_id: start_node_id.to_string(),
-            queue_type: queue_type.to_string(),
-            payload: serde_json::json!({
-                "workflow_id": workflow_id,
-                "workflow_version": workflow_version,
-            }),
-            attempt: 0,
-            max_attempts: 3,
-            created_at: now,
-            lease_expires_at: None,
-            worker_id: None,
-            lease_fence: 0,
-            tenant_id: tenant_id.to_string(),
-        })
+        .create_segment_atomic(execution, seed, started_event, scheduled_event, work_item)
         .await?;
 
     Ok(new_id)

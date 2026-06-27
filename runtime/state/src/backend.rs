@@ -1,4 +1,4 @@
-use crate::event::{Event, EventSequence};
+use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
 use crate::tenant::{Tenant, TenantId, DEFAULT_TENANT};
 use async_trait::async_trait;
@@ -125,6 +125,21 @@ pub trait StateBackend: Send + Sync {
 
     /// Load the latest snapshot for an execution.
     async fn latest_snapshot(&self, execution_id: &ExecutionId) -> BackendResult<Option<Snapshot>>;
+
+    /// Atomically create a continuation segment: the execution row, its seed
+    /// snapshot, the WorkflowStarted + NodeScheduled events, and the start-node
+    /// work item, in one transaction. All-or-nothing so a crash mid-creation
+    /// leaves no partial child. The caller-supplied `execution.execution_id` MUST
+    /// be fresh (not yet committed); the idempotency guard lives in
+    /// `start_next_segment`.
+    async fn create_segment_atomic(
+        &self,
+        execution: WorkflowExecution,
+        seed_snapshot: Snapshot,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+    ) -> BackendResult<()>;
 
     // ── Idempotency cache (tool_effects) ─────────────────────────────────────
 

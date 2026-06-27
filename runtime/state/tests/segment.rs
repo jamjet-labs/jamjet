@@ -10,11 +10,13 @@
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::{
-    backend::StateBackend, content_hash, materialize, segment_chain, start_next_segment, Event,
-    EventKind, InMemoryBackend, MaterializedState, SqliteBackend,
+    backend::{StateBackend, WorkItem},
+    content_hash, materialize, segment_chain, start_next_segment, Event, EventKind,
+    InMemoryBackend, MaterializedState, Snapshot, SqliteBackend,
 };
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
@@ -1085,5 +1087,215 @@ async fn sqlite_idempotent_start_next_segment_prevents_double_roll() {
         second.is_none(),
         "queue must be empty after draining the single work item; \
          a second item means the idempotency guard did not prevent re-enqueue"
+    );
+}
+
+// ── 2g partial-creation gap fix: all-artifacts regression guard ───────────────
+
+/// Generic helper: after `start_next_segment`, ALL 5 artifacts (execution, snapshot,
+/// WorkflowStarted seq1, NodeScheduled seq2, claimable work item) must exist.
+/// This is the regression guard that proves the partial-creation gap is closed.
+async fn assert_all_artifacts_present(backend: &dyn StateBackend) {
+    let parent_id = ExecutionId::new();
+    backend
+        .create_execution(root_execution(&parent_id))
+        .await
+        .expect("create parent");
+    let carried = carried_materialized_state();
+
+    let new_id = start_next_segment(
+        backend, &parent_id, &carried, "seg-wf", "1.0.0", 1, "start", "general", "default",
+    )
+    .await
+    .expect("start_next_segment");
+
+    // 1. Execution row exists.
+    assert!(
+        backend
+            .get_execution(&new_id)
+            .await
+            .expect("get_execution")
+            .is_some(),
+        "child execution row must exist"
+    );
+
+    // 2. Seed snapshot exists.
+    assert!(
+        backend
+            .latest_snapshot(&new_id)
+            .await
+            .expect("latest_snapshot")
+            .is_some(),
+        "seed snapshot must exist"
+    );
+
+    // 3. Both seed events exist with correct sequences.
+    let events = backend.get_events(&new_id).await.expect("get_events");
+    assert_eq!(events.len(), 2, "must have exactly 2 seed events");
+    assert!(
+        matches!(events[0].kind, EventKind::WorkflowStarted { .. }),
+        "event[0] must be WorkflowStarted"
+    );
+    assert_eq!(events[0].sequence, 1, "WorkflowStarted must be seq 1");
+    assert!(
+        matches!(events[1].kind, EventKind::NodeScheduled { .. }),
+        "event[1] must be NodeScheduled"
+    );
+    assert_eq!(events[1].sequence, 2, "NodeScheduled must be seq 2");
+
+    // 4. A CLAIMABLE work item exists. This is the key regression guard:
+    //    before the fix a partial-created child had no work item, so this
+    //    claim would return None and the continuation would be stuck forever.
+    let item = backend
+        .claim_work_item("regression-guard-worker", &["general"])
+        .await
+        .expect("claim_work_item")
+        .expect("a work item MUST be claimable: partial-creation gap would leave child stuck");
+    assert_eq!(
+        item.execution_id, new_id,
+        "work item must belong to the new segment"
+    );
+    assert_eq!(
+        item.node_id, "start",
+        "work item must target the start node"
+    );
+}
+
+/// Regression guard — SQLite: child always has a claimable work item (partial-creation
+/// gap is closed).
+#[tokio::test]
+async fn sqlite_all_artifacts_present_after_start_next_segment() {
+    let db = open_sqlite().await;
+    assert_all_artifacts_present(&db).await;
+}
+
+/// Regression guard — in-memory: child always has a claimable work item.
+#[tokio::test]
+async fn memory_all_artifacts_present_after_start_next_segment() {
+    let backend = InMemoryBackend::new();
+    assert_all_artifacts_present(&backend).await;
+}
+
+/// Regression guard — tenant-scoped: child always has a claimable work item.
+#[tokio::test]
+async fn tenant_scoped_all_artifacts_present_after_start_next_segment() {
+    use jamjet_state::tenant::{Tenant, TenantId, TenantStatus};
+
+    let db = open_sqlite().await;
+    let tenant_id = TenantId::from("artifacts-acme");
+    let scoped_admin = db.for_tenant(TenantId::default());
+    let now = Utc::now();
+    scoped_admin
+        .create_tenant(Tenant {
+            id: tenant_id.clone(),
+            name: "ArtifactsAcme".into(),
+            status: TenantStatus::Active,
+            policy: None,
+            limits: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("register tenant");
+
+    let scoped = db.for_tenant(tenant_id);
+    assert_all_artifacts_present(&scoped).await;
+}
+
+/// Atomic rollback: if the work item INSERT fails (duplicate id conflict), the
+/// execution row (and snapshot + events) must be rolled back — no partial child.
+///
+/// Calls `create_segment_atomic` directly so we can supply a known work_item id
+/// that we pre-insert to trigger the constraint violation.
+///
+/// The in-memory backend is NOT tested for rollback here: its DashMap inserts
+/// have no ACID rollback, so a failure mid-way leaves the execution row inserted
+/// (by design — the in-memory backend has no crash-durability guarantee). The
+/// all-artifacts tests + SQLite transaction code review cover atomicity for the
+/// durable path.
+#[tokio::test]
+async fn sqlite_segment_atomic_rollback_on_work_item_conflict() {
+    let db = open_sqlite().await;
+    let parent_id = ExecutionId::new();
+    db.create_execution(root_execution(&parent_id))
+        .await
+        .expect("create parent");
+
+    // Pre-insert a work item with a known id to force a UNIQUE(id) conflict.
+    let conflicting_id = Uuid::new_v4();
+    db.enqueue_work_item(WorkItem {
+        id: conflicting_id,
+        execution_id: parent_id.clone(),
+        node_id: "placeholder".into(),
+        queue_type: "general".into(),
+        payload: serde_json::json!({}),
+        attempt: 0,
+        max_attempts: 3,
+        created_at: Utc::now(),
+        lease_expires_at: None,
+        worker_id: None,
+        lease_fence: 0,
+        tenant_id: "default".into(),
+    })
+    .await
+    .expect("pre-insert conflicting work item");
+
+    // Build the child segment artifacts — use the same conflicting_id for the work item.
+    let child_id = ExecutionId::new();
+    let carried = carried_materialized_state();
+
+    let exec = WorkflowExecution {
+        execution_id: child_id.clone(),
+        workflow_id: "seg-wf".into(),
+        workflow_version: "1.0.0".into(),
+        status: WorkflowStatus::Running,
+        initial_input: carried.current_state.clone(),
+        current_state: carried.current_state.clone(),
+        started_at: Utc::now(),
+        updated_at: Utc::now(),
+        completed_at: None,
+        session_type: None,
+        parent_execution_id: Some(parent_id.clone()),
+        segment_number: 1,
+    };
+    let seed = Snapshot::seed_for_segment(child_id.clone(), &carried.current_state);
+    let started = EventKind::WorkflowStarted {
+        workflow_id: "seg-wf".into(),
+        workflow_version: "1.0.0".into(),
+        initial_input: carried.current_state.clone(),
+    };
+    let scheduled = EventKind::NodeScheduled {
+        node_id: "start".into(),
+        queue_type: "general".into(),
+    };
+    let wi = WorkItem {
+        id: conflicting_id, // DUPLICATE — triggers UNIQUE(id) conflict at step 5
+        execution_id: child_id.clone(),
+        node_id: "start".into(),
+        queue_type: "general".into(),
+        payload: serde_json::json!({"workflow_id": "seg-wf", "workflow_version": "1.0.0"}),
+        attempt: 0,
+        max_attempts: 3,
+        created_at: Utc::now(),
+        lease_expires_at: None,
+        worker_id: None,
+        lease_fence: 0,
+        tenant_id: "default".into(),
+    };
+
+    // create_segment_atomic must fail at the work item INSERT.
+    let result = db
+        .create_segment_atomic(exec, seed, started, scheduled, wi)
+        .await;
+    assert!(
+        result.is_err(),
+        "create_segment_atomic must fail on duplicate work_item id"
+    );
+
+    // KEY ASSERTION: execution row must NOT exist — the transaction rolled back.
+    let fetched = db.get_execution(&child_id).await.expect("get_execution");
+    assert!(
+        fetched.is_none(),
+        "execution row must be rolled back on atomic failure — partial child not left behind"
     );
 }
