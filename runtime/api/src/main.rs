@@ -187,6 +187,10 @@ async fn main() -> anyhow::Result<()> {
             .with_executor(
                 "eval",
                 Arc::new(jamjet_worker::EvalExecutor::new(model_registry.clone())),
+            )
+            .with_executor(
+                "condition",
+                Arc::new(jamjet_worker::ConditionNodeExecutor::new()),
             );
         // Detaching the handles lets the workers run for the lifetime of the process
         // (same pattern as the scheduler above).

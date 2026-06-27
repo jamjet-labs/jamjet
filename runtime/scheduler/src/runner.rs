@@ -430,6 +430,28 @@ impl Scheduler {
                     }
                 }
 
+                // For Condition nodes, enrich the payload with the branch list
+                // and the current workflow state so the condition executor is
+                // self-contained.  The executor evaluates each branch's expression
+                // against `state` and records the routing decision on NodeCompleted.
+                // `progress.final_state` is the accumulated state from all
+                // completed nodes so far — exactly what the condition gate reads.
+                if let NodeKind::Condition { branches } = &node.kind {
+                    if !branches.is_empty() {
+                        let obj = payload
+                            .as_object_mut()
+                            .expect("payload is always a JSON object");
+                        obj.insert(
+                            "branches".into(),
+                            serde_json::to_value(branches).unwrap_or(serde_json::json!([])),
+                        );
+                        obj.insert(
+                            "state".into(),
+                            serde_json::Value::Object(progress.final_state.clone()),
+                        );
+                    }
+                }
+
                 let item = WorkItem {
                     id: Uuid::new_v4(),
                     execution_id: execution_id.clone(),
@@ -1451,5 +1473,129 @@ mod tests {
         );
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["content"], "What is the weather in London?");
+    }
+
+    /// Condition node work-item payload carries `branches` and committed `state`.
+    ///
+    /// A Condition node with non-empty branches must have both:
+    ///   - `payload["branches"]`: the serialized branch list from the IR
+    ///   - `payload["state"]`: the accumulated workflow state at dispatch time
+    ///
+    /// This is the payload the condition executor (FDL-2) reads to evaluate the route.
+    #[tokio::test]
+    async fn condition_node_payload_carries_branches_and_state() {
+        // Build a 2-node IR:
+        //   start (empty-branches Condition — used as a simple pass-through) -> gate
+        //   gate  (Condition with non-empty branches)                         -> a | b
+        let ir = serde_json::json!({
+            "workflow_id": "wf",
+            "version": "0.1.0",
+            "name": null,
+            "description": null,
+            "state_schema": "",
+            "start_node": "start",
+            "nodes": {
+                "start": {
+                    "id": "start",
+                    "kind": { "type": "condition", "branches": [] },
+                    "retry_policy": null,
+                    "node_timeout_secs": null,
+                    "description": null,
+                    "labels": {}
+                },
+                "gate": {
+                    "id": "gate",
+                    "kind": {
+                        "type": "condition",
+                        "branches": [
+                            {"condition": "state.x == \"stop\"", "target": "end"},
+                            {"condition": null, "target": "tools"}
+                        ]
+                    },
+                    "retry_policy": null,
+                    "node_timeout_secs": null,
+                    "description": null,
+                    "labels": {}
+                }
+            },
+            "edges": [
+                {"from": "start", "to": "gate", "condition": null},
+                {"from": "gate", "to": "end",   "condition": "state.x == \"stop\""},
+                {"from": "gate", "to": "tools", "condition": null}
+            ],
+            "retry_policies": {},
+            "timeouts": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {},
+            "labels": {}
+        });
+        let (s, b, e) = setup(ir).await;
+
+        // Tick 1: schedules `start` (no predecessors).
+        tick(&s, &e).await;
+
+        // Drain the `start` work item so it is no longer in the queue.
+        // Without this the next claim_work_item would return `start` instead of
+        // `gate` (work items are returned in FIFO order).
+        let _start_item = b
+            .claim_work_item("test-worker-a", &["general"])
+            .await
+            .expect("claim start must not error")
+            .expect("start work item must be present");
+
+        // Simulate `start` completing with some workflow state.
+        let patch = serde_json::json!({ "x": "stop", "other": 42 });
+        append(&b, &e, node_completed("start", patch)).await;
+
+        // Tick 2: `gate` is now runnable; the scheduler must enrich its payload.
+        tick(&s, &e).await;
+
+        // Claim from the general queue (Condition nodes use QueueType::General).
+        let item = b
+            .claim_work_item("test-worker-b", &["general"])
+            .await
+            .expect("backend claim must not error")
+            .expect("gate Condition node must produce exactly one work item");
+
+        // The claimed item is for `gate`, not `start` (which has no branches).
+        assert_eq!(
+            item.node_id, "gate",
+            "claimed item must be for the gate node"
+        );
+
+        // payload["branches"] must carry the two branches from the IR.
+        let branches = item.payload["branches"]
+            .as_array()
+            .expect("payload.branches must be a JSON array");
+        assert_eq!(branches.len(), 2, "both branches must be in the payload");
+        assert_eq!(
+            branches[0]["target"], "end",
+            "first branch target must be 'end'"
+        );
+        assert!(
+            !branches[0]["condition"].is_null(),
+            "first branch must have a condition expression"
+        );
+        assert_eq!(
+            branches[1]["target"], "tools",
+            "second branch target must be 'tools'"
+        );
+        assert!(
+            branches[1]["condition"].is_null(),
+            "second branch must be the default (condition: null)"
+        );
+
+        // payload["state"] must carry the accumulated workflow state.
+        let state = &item.payload["state"];
+        assert_eq!(
+            state["x"], "stop",
+            "payload.state must carry the state_patch from 'start'"
+        );
+        assert_eq!(
+            state["other"], 42,
+            "payload.state must carry all state keys"
+        );
     }
 }
