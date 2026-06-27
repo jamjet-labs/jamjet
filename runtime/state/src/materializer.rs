@@ -127,6 +127,11 @@ pub fn apply_events_seeded(mut base: MaterializedState, events: &[Event]) -> Mat
             | EventKind::NodeCancelled { node_id } => {
                 base.active_nodes.remove(node_id);
             }
+            // NodeParked is an audit/observability event. The node stays in
+            // `active_nodes` (it remains scheduled; the work item is back in
+            // `pending` and will be re-picked up after `retry_after` passes).
+            // No state mutation here.
+            EventKind::NodeParked { .. } => {}
             EventKind::InterruptRaised { .. } => {
                 if base.status == WorkflowStatus::Running {
                     base.status = WorkflowStatus::Paused;

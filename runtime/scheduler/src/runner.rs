@@ -536,6 +536,13 @@ impl ExecProgress {
             EventKind::RetryScheduled { node_id, .. } => {
                 self.scheduled.insert(node_id.clone());
             }
+            EventKind::NodeParked { .. } => {
+                // NodeParked is an audit/observability event. The node is
+                // already in `self.scheduled` (put there by NodeScheduled) and
+                // stays there — the work item is back in `pending` with a
+                // future `retry_after`; a worker picks it up when ready.
+                // No change to self.scheduled here.
+            }
             EventKind::ToolApprovalRequired { node_id, .. } => {
                 self.held.insert(node_id.clone());
             }
