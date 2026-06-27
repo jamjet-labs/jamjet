@@ -1006,6 +1006,61 @@ impl StateBackend for TenantScopedSqliteBackend {
         Ok(rows_affected > 0)
     }
 
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %execution_id, item_id = %work_item_id, fence = lease_fence))]
+    async fn finalize_rollover_fenced(
+        &self,
+        execution_id: &ExecutionId,
+        work_item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool> {
+        let exec_id_str = execution_id_str(execution_id);
+        let item_id_str = work_item_id.to_string();
+        let now = Utc::now().to_rfc3339();
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
+
+        // 1. Fence-gated settle — tenant-scoped.
+        let rows = sqlx::query(
+            "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL \
+             WHERE id = ? AND lease_fence = ? AND tenant_id = ?",
+        )
+        .bind(&now)
+        .bind(&item_id_str)
+        .bind(lease_fence)
+        .bind(&self.tenant_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+
+        if rows == 0 {
+            tx.rollback().await.map_err(map_db_err)?;
+            return Ok(false);
+        }
+
+        // 2. Idempotent terminal update — tenant-scoped.
+        sqlx::query(
+            "UPDATE workflow_executions \
+             SET status = 'limit_exceeded', updated_at = ?, completed_at = COALESCE(completed_at, ?) \
+             WHERE execution_id = ? AND tenant_id = ? \
+             AND status NOT IN ('completed', 'failed', 'cancelled', 'limit_exceeded')",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(&exec_id_str)
+        .bind(&self.tenant_id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        tx.commit().await.map_err(map_db_err)?;
+        Ok(true)
+    }
+
     #[instrument(skip(self, terminal_event), fields(tenant = %self.tenant_id, item_id = %item_id))]
     async fn commit_turn(
         &self,

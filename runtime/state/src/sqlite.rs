@@ -1077,6 +1077,59 @@ impl StateBackend for SqliteBackend {
         Ok(rows_affected > 0)
     }
 
+    #[instrument(skip(self), fields(execution_id = %execution_id, item_id = %work_item_id, fence = lease_fence))]
+    async fn finalize_rollover_fenced(
+        &self,
+        execution_id: &ExecutionId,
+        work_item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool> {
+        let exec_id_str = execution_id_str(execution_id);
+        let item_id_str = work_item_id.to_string();
+        let now = Utc::now().to_rfc3339();
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
+
+        // 1. Fence-gated settle of the work item.
+        let rows = sqlx::query(
+            "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL \
+             WHERE id = ? AND lease_fence = ?",
+        )
+        .bind(&now)
+        .bind(&item_id_str)
+        .bind(lease_fence)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+
+        if rows == 0 {
+            tx.rollback().await.map_err(map_db_err)?;
+            return Ok(false);
+        }
+
+        // 2. Idempotent terminal update: only transitions non-terminal executions.
+        sqlx::query(
+            "UPDATE workflow_executions \
+             SET status = 'limit_exceeded', updated_at = ?, completed_at = COALESCE(completed_at, ?) \
+             WHERE execution_id = ? \
+             AND status NOT IN ('completed', 'failed', 'cancelled', 'limit_exceeded')",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(&exec_id_str)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        tx.commit().await.map_err(map_db_err)?;
+        Ok(true)
+    }
+
     #[instrument(skip(self, terminal_event), fields(item_id = %item_id, fence = lease_fence))]
     async fn commit_turn(
         &self,
@@ -1750,5 +1803,148 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["chunk"], 0);
         assert_eq!(events[1]["chunk"], 1);
+    }
+
+    #[tokio::test]
+    async fn finalize_rollover_fenced_matching_fence_marks_terminal_and_settles() {
+        use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+
+        let db = open_test_db().await;
+
+        // Create an execution in Running state.
+        let exec_id = ExecutionId::new();
+        let now = chrono::Utc::now();
+        db.create_execution(WorkflowExecution {
+            execution_id: exec_id.clone(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: json!({}),
+            current_state: json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        })
+        .await
+        .unwrap();
+
+        // Enqueue and claim a work item so it gets a real fence.
+        let wi_id = uuid::Uuid::new_v4();
+        db.enqueue_work_item(crate::backend::WorkItem {
+            id: wi_id,
+            execution_id: exec_id.clone(),
+            node_id: "n1".into(),
+            queue_type: "default".into(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "default".into(),
+        })
+        .await
+        .unwrap();
+
+        let claimed = db
+            .claim_work_item("w1", &["default"])
+            .await
+            .unwrap()
+            .expect("must be claimable");
+        let fence = claimed.lease_fence;
+        assert!(fence != 0, "claimed fence must be non-zero");
+
+        // finalize_rollover_fenced with MATCHING fence must return true,
+        // mark execution LimitExceeded, and settle the work item.
+        let settled = db
+            .finalize_rollover_fenced(&exec_id, wi_id, fence)
+            .await
+            .expect("finalize_rollover_fenced must not error");
+        assert!(settled, "matching fence must return true");
+
+        let exec = db.get_execution(&exec_id).await.unwrap().unwrap();
+        assert_eq!(
+            exec.status,
+            WorkflowStatus::LimitExceeded,
+            "execution must be LimitExceeded after finalize_rollover_fenced"
+        );
+
+        // Work item must be gone (completed).
+        let not_claimable = db.claim_work_item("w2", &["default"]).await.unwrap();
+        assert!(
+            not_claimable.is_none(),
+            "work item must be settled (not re-claimable)"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_rollover_fenced_stale_fence_is_noop() {
+        use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+
+        let db = open_test_db().await;
+
+        let exec_id = ExecutionId::new();
+        let now = chrono::Utc::now();
+        db.create_execution(WorkflowExecution {
+            execution_id: exec_id.clone(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: json!({}),
+            current_state: json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        })
+        .await
+        .unwrap();
+
+        let wi_id = uuid::Uuid::new_v4();
+        db.enqueue_work_item(crate::backend::WorkItem {
+            id: wi_id,
+            execution_id: exec_id.clone(),
+            node_id: "n1".into(),
+            queue_type: "default".into(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "default".into(),
+        })
+        .await
+        .unwrap();
+
+        let claimed = db
+            .claim_work_item("w1", &["default"])
+            .await
+            .unwrap()
+            .expect("must be claimable");
+        let real_fence = claimed.lease_fence;
+
+        // Present a STALE fence (real_fence + 1 is never a valid fence).
+        let stale_fence = real_fence + 1;
+        let settled = db
+            .finalize_rollover_fenced(&exec_id, wi_id, stale_fence)
+            .await
+            .expect("stale fence must not error — just Ok(false)");
+        assert!(!settled, "stale fence must return false (no-op)");
+
+        // Execution must still be Running (zombie did not mark it terminal).
+        let exec = db.get_execution(&exec_id).await.unwrap().unwrap();
+        assert_eq!(
+            exec.status,
+            WorkflowStatus::Running,
+            "execution must remain Running after stale-fence finalize attempt"
+        );
     }
 }

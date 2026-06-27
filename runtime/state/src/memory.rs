@@ -571,6 +571,29 @@ impl StateBackend for InMemoryBackend {
         }
     }
 
+    async fn finalize_rollover_fenced(
+        &self,
+        execution_id: &ExecutionId,
+        work_item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool> {
+        // Fence check: only the current holder may finalize.
+        match self.work_items.get(&work_item_id) {
+            Some(entry) if entry.lease_fence == lease_fence => {}
+            _ => return Ok(false),
+        }
+        // Fence matched — settle the work item.
+        self.work_items.remove(&work_item_id);
+        // Idempotent terminal update on the execution.
+        if let Some(mut entry) = self.executions.get_mut(execution_id) {
+            if !entry.status.is_terminal() {
+                entry.status = WorkflowStatus::LimitExceeded;
+                entry.updated_at = Utc::now();
+            }
+        }
+        Ok(true)
+    }
+
     async fn reclaim_expired_leases(&self) -> BackendResult<ReclaimResult> {
         let now = Utc::now();
         let mut result = ReclaimResult::default();

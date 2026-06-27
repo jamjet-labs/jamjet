@@ -215,6 +215,26 @@ pub trait StateBackend: Send + Sync {
         next_attempt: u32,
     ) -> BackendResult<bool>;
 
+    /// Fence-guarded finalization of a continue-as-new rollover on the OLD execution.
+    ///
+    /// In one transaction:
+    /// 1. Attempt `UPDATE work_items SET status='completed', completed_at=?, lease_expires_at=NULL
+    ///    WHERE id=? AND lease_fence=?`. Zero rows means the fence no longer matches
+    ///    (lease was stolen or item already settled) — rollback and return `Ok(false)`.
+    /// 2. Idempotently mark the execution terminal:
+    ///    `UPDATE workflow_executions SET status='limit_exceeded', updated_at=?, completed_at=COALESCE(completed_at,?)
+    ///    WHERE execution_id=? AND status NOT IN ('completed','failed','cancelled','limit_exceeded')`.
+    ///    (This is a no-op if the execution is already terminal, which is safe.)
+    /// 3. Commit and return `Ok(true)`.
+    ///
+    /// A zombie worker (stale fence) gets `Ok(false)` and must not proceed further.
+    async fn finalize_rollover_fenced(
+        &self,
+        execution_id: &ExecutionId,
+        work_item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool>;
+
     /// Reclaim work items whose lease has expired (worker crashed or stalled).
     ///
     /// For each expired item:

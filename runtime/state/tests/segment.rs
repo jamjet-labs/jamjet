@@ -546,11 +546,16 @@ async fn assert_segment_chain_lineage(backend: &dyn StateBackend) {
     .await
     .expect("start_next_segment seg1");
 
-    // Drain the work item so a second claim does not interfere.
-    backend
+    // Drain seg1's continuation work item; assert it is claimable.
+    let wi_seg1 = backend
         .claim_work_item("cleanup-chain-1", &["general"])
         .await
-        .ok();
+        .expect("claim_work_item must not error")
+        .expect("seg1 continuation work item must be claimable");
+    assert_eq!(
+        wi_seg1.execution_id, seg1_id,
+        "seg1 work item must belong to seg1"
+    );
 
     let seg2_carried = MaterializedState {
         current_state: json!({ "counter": 2 }),
@@ -574,11 +579,16 @@ async fn assert_segment_chain_lineage(backend: &dyn StateBackend) {
     .await
     .expect("start_next_segment seg2");
 
-    // Drain so the queue does not leak into other tests.
-    backend
+    // Drain seg2's continuation work item; assert it is claimable.
+    let wi_seg2 = backend
         .claim_work_item("cleanup-chain-2", &["general"])
         .await
-        .ok();
+        .expect("claim_work_item must not error")
+        .expect("seg2 continuation work item must be claimable");
+    assert_eq!(
+        wi_seg2.execution_id, seg2_id,
+        "seg2 work item must belong to seg2"
+    );
 
     // Walk the chain from seg2 back to root.
     let chain = segment_chain(backend, &seg2_id)
@@ -676,10 +686,16 @@ async fn sqlite_bounded_replay_independent_of_root_event_count() {
     .await
     .expect("start_next_segment");
 
-    // Drain the work item (not needed for this test's logic).
-    db.claim_work_item("cleanup-bounded", &["general"])
+    // Drain seg1's continuation work item; assert it is claimable.
+    let wi_bounded = db
+        .claim_work_item("cleanup-bounded", &["general"])
         .await
-        .ok();
+        .expect("claim_work_item must not error")
+        .expect("seg1 continuation work item must be claimable");
+    assert_eq!(
+        wi_bounded.execution_id, seg1_id,
+        "bounded-replay work item must belong to seg1"
+    );
 
     // Seg1's event count is SMALL and independent of root's 50 events.
     let seg1_events = db.get_events(&seg1_id).await.expect("get_events seg1");
@@ -752,7 +768,15 @@ async fn sqlite_inert_old_segment_does_not_leak() {
     .await
     .expect("start_next_segment");
 
-    db.claim_work_item("cleanup-inert", &["general"]).await.ok();
+    let wi_inert = db
+        .claim_work_item("cleanup-inert", &["general"])
+        .await
+        .expect("claim_work_item must not error")
+        .expect("seg1 continuation work item must be claimable");
+    assert_eq!(
+        wi_inert.execution_id, seg1_id,
+        "inert-old-segment work item must belong to seg1"
+    );
 
     // Capture seg1's state BEFORE the late commit.
     let seg1_before = materialize(&db, &seg1_id)
@@ -844,10 +868,15 @@ async fn assert_two_rollover_byte_identity(backend: &dyn StateBackend) {
     .await
     .expect("start_next_segment seg1");
 
-    backend
+    let wi_ro1 = backend
         .claim_work_item("cleanup-2ro-1", &["general"])
         .await
-        .ok();
+        .expect("claim_work_item must not error")
+        .expect("seg1 continuation work item must be claimable after first rollover");
+    assert_eq!(
+        wi_ro1.execution_id, seg1_id,
+        "first rollover work item must belong to seg1"
+    );
 
     // Verify seg1 carries the state byte-identically.
     let seg1_exec = backend
@@ -872,10 +901,15 @@ async fn assert_two_rollover_byte_identity(backend: &dyn StateBackend) {
     .await
     .expect("start_next_segment seg2");
 
-    backend
+    let wi_ro2 = backend
         .claim_work_item("cleanup-2ro-2", &["general"])
         .await
-        .ok();
+        .expect("claim_work_item must not error")
+        .expect("seg2 continuation work item must be claimable after second rollover");
+    assert_eq!(
+        wi_ro2.execution_id, seg2_id,
+        "second rollover work item must belong to seg2"
+    );
 
     let seg2_exec = backend
         .get_execution(&seg2_id)
@@ -982,8 +1016,16 @@ async fn sqlite_child_forward_progress_after_rollover() {
     .await
     .expect("start_next_segment");
 
-    // Drain the start-node work item.
-    db.claim_work_item("cleanup-fwd", &["general"]).await.ok();
+    // Drain the start-node work item; assert it is claimable (regression guard).
+    let wi_fwd = db
+        .claim_work_item("cleanup-fwd", &["general"])
+        .await
+        .expect("claim_work_item must not error")
+        .expect("child start-node work item must be claimable");
+    assert_eq!(
+        wi_fwd.execution_id, seg1_id,
+        "forward-progress work item must belong to seg1"
+    );
 
     // Drive a state mutation on the child at seq 3 (after WorkflowStarted=1,
     // NodeScheduled=2).  state_patch sets counter to 100.

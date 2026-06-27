@@ -7,7 +7,7 @@ use chrono::Utc;
 const MAX_RETRY_AFTER_SECS: u64 = 3_600;
 use jamjet_agents::AgentRegistry;
 use jamjet_core::node::NodeKind;
-use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
+use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::workflow::{NodeDef, WorkflowIr};
 use jamjet_policy::autonomy::{AutonomyContext, AutonomyDecision, AutonomyEnforcer};
 use jamjet_policy::engine::node_kind_tag;
@@ -379,6 +379,7 @@ impl Worker {
                                             &tenant_id,
                                             item_id,
                                             &queue_type,
+                                            lease_fence,
                                         )
                                         .await;
                                 }
@@ -1115,6 +1116,7 @@ impl Worker {
         tenant_id: &str,
         item_id: WorkItemId,
         queue_type: &str,
+        lease_fence: i64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Double-roll guard: check SegmentBoundary event OR terminal status.
         let events = self.backend.get_events(execution_id).await?;
@@ -1126,7 +1128,25 @@ impl Worker {
                 execution_id = %execution_id,
                 "continue-as-new: SegmentBoundary already exists; skipping duplicate rollover"
             );
-            let _ = self.backend.complete_work_item(item_id).await;
+            // Fence-guarded: ensure the old execution is terminal AND settle the
+            // work item atomically. Handles Major-2: a crash before
+            // update_execution_status leaves the execution non-terminal; the
+            // retry hits `already` and finalizes via this path.
+            // Ok(false) = stale fence (zombie); log and return without error.
+            match self
+                .backend
+                .finalize_rollover_fenced(execution_id, item_id, lease_fence)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        execution_id = %execution_id,
+                        "continue-as-new already-branch: stale fence — another worker owns this item"
+                    );
+                }
+                Err(e) => return Err(e.to_string().into()),
+            }
             return Ok(());
         }
 
@@ -1142,7 +1162,17 @@ impl Worker {
                 status = ?exec.status,
                 "continue-as-new: old execution already terminal; skipping rollover"
             );
-            let _ = self.backend.complete_work_item(item_id).await;
+            // Fence-guarded settle: idempotent — the terminal update is a no-op
+            // since the execution is already terminal; only the work item settle
+            // is meaningful (fence-guarded against zombie workers).
+            match self
+                .backend
+                .finalize_rollover_fenced(execution_id, item_id, lease_fence)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => return Err(e.to_string().into()),
+            }
             return Ok(());
         }
 
@@ -1180,13 +1210,24 @@ impl Worker {
             ))
             .await?;
 
-        // Mark old execution terminal (LimitExceeded = clean terminal, NOT failed).
-        self.backend
-            .update_execution_status(execution_id, WorkflowStatus::LimitExceeded)
-            .await?;
-
-        // Clean up the current work item so it doesn't linger as a claimed item.
-        let _ = self.backend.complete_work_item(item_id).await;
+        // Fence-guarded finalization: marks old execution terminal (LimitExceeded)
+        // AND settles the work item in one transaction. Ok(false) = stale fence
+        // (zombie worker — another lease holder now owns this item).
+        match self
+            .backend
+            .finalize_rollover_fenced(execution_id, item_id, lease_fence)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    execution_id = %execution_id,
+                    "continue-as-new: stale fence during finalization — new lease holder owns the item"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e.to_string().into()),
+        }
 
         info!(
             old_execution_id = %execution_id,
@@ -2434,6 +2475,125 @@ mod tests {
                 .count(),
             1,
             "must still have exactly one SegmentBoundary event after double-roll attempt"
+        );
+    }
+
+    /// Regression test for Major-2: crash after SegmentBoundary but before terminal marking.
+    ///
+    /// Simulates: the worker appended SegmentBoundary to the old execution and created the
+    /// new segment, then crashed before calling update_execution_status (old execution is
+    /// still Running). On retry, the worker hits the `already` branch and must mark the
+    /// old execution LimitExceeded via finalize_rollover_fenced.
+    #[tokio::test]
+    async fn continue_as_new_already_branch_marks_old_execution_terminal() {
+        let (backend, old_eid) = setup_budget_backend(true).await;
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("tool", Arc::new(BudgetTriggerExecutor));
+
+        // First rollover: succeeds normally.
+        let item1 = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item1 must be claimable");
+        worker
+            .execute_item(item1)
+            .await
+            .expect("first rollover must succeed");
+
+        // Verify old execution is now terminal.
+        let exec_after_first = backend
+            .get_execution(&old_eid)
+            .await
+            .unwrap()
+            .expect("old execution must exist");
+        assert_eq!(exec_after_first.status, WorkflowStatus::LimitExceeded);
+
+        // Simulate crash-before-terminal: reset the old execution back to Running.
+        // This represents what would have happened if the worker crashed between
+        // appending SegmentBoundary and calling update_execution_status.
+        backend
+            .update_execution_status(&old_eid, WorkflowStatus::Running)
+            .await
+            .expect("reset status for crash simulation");
+
+        let exec_reset = backend
+            .get_execution(&old_eid)
+            .await
+            .unwrap()
+            .expect("old execution must exist after reset");
+        assert_eq!(
+            exec_reset.status,
+            WorkflowStatus::Running,
+            "status must be reset to Running"
+        );
+
+        // Enqueue a second work item for the old execution (as crash-recovery reclaim would do).
+        backend
+            .enqueue_work_item(jamjet_state::backend::WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: old_eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "default".into(),
+                payload: serde_json::json!({
+                    "workflow_id": "seg-wf",
+                    "workflow_version": "1.0.0"
+                }),
+                attempt: 0,
+                max_attempts: 3,
+                created_at: Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+
+        // Claim the retry item for the OLD execution.
+        // Drain any new segment item first if it comes up first.
+        let item2a = backend
+            .claim_work_item("test-worker-retry", &["default"])
+            .await
+            .unwrap()
+            .expect("must be claimable");
+
+        let item2_old = if item2a.execution_id != old_eid {
+            backend
+                .claim_work_item("test-worker-retry2", &["default"])
+                .await
+                .unwrap()
+                .expect("old execution's retry item must be claimable")
+        } else {
+            item2a
+        };
+
+        assert_eq!(
+            item2_old.execution_id, old_eid,
+            "retry item must belong to old execution"
+        );
+
+        worker
+            .execute_item(item2_old)
+            .await
+            .expect("retry rollover (already branch) must succeed");
+
+        // KEY ASSERTION (Major-2 regression): old execution must now be terminal.
+        let exec_final = backend
+            .get_execution(&old_eid)
+            .await
+            .unwrap()
+            .expect("old execution must exist");
+        assert_eq!(
+            exec_final.status,
+            WorkflowStatus::LimitExceeded,
+            "Major-2 regression: old execution must be LimitExceeded after already-branch finalization; \
+             got {:?} — means crash-before-terminal was not repaired",
+            exec_final.status
         );
     }
 }
