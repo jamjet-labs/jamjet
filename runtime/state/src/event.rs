@@ -372,6 +372,15 @@ pub enum EventKind {
         message: String,
         retryable: bool,
     },
+    /// Audit record written to the OLD execution when a continue-as-new rollover
+    /// occurs. Records which segment was created next and the new execution_id.
+    /// Pure audit — does NOT mutate `MaterializedState`.
+    SegmentBoundary {
+        /// The segment_number of the newly created execution (old + 1).
+        segment_number: u32,
+        /// The execution_id of the new segment (as a string).
+        next_execution_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -143,6 +143,9 @@ pub fn apply_events_seeded(mut base: MaterializedState, events: &[Event]) -> Mat
                 }
                 base.status = WorkflowStatus::Running;
             }
+            // SegmentBoundary is a pure audit record on the OLD (closed) execution.
+            // It links to the new segment but does not mutate this execution's state.
+            EventKind::SegmentBoundary { .. } => {}
             _ => {}
         }
     }

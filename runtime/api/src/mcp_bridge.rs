@@ -98,6 +98,8 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                     updated_at: now,
                     completed_at: None,
                     session_type: None,
+                    parent_execution_id: None,
+                    segment_number: 0,
                 };
                 let eid = execution.execution_id.clone();
                 backend.create_execution(execution).await.map_err(|e| format!("{e}"))?;

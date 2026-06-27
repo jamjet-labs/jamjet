@@ -61,6 +61,8 @@ async fn complete_work_item_threads_gen_ai_fields() {
             updated_at: now,
             completed_at: None,
             session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
         })
         .await
         .expect("create_execution");
@@ -178,6 +180,8 @@ async fn complete_work_item_without_gen_ai_fields_keeps_backward_compat() {
             updated_at: now,
             completed_at: None,
             session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
         })
         .await
         .expect("create_execution");

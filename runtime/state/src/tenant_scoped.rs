@@ -103,6 +103,13 @@ fn row_to_execution(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkflowExec
         .map(parse_datetime)
         .transpose()?;
 
+    let parent_execution_id: Option<ExecutionId> = row
+        .try_get::<Option<&str>, _>("parent_execution_id")
+        .map_err(map_db_err)?
+        .map(parse_execution_id)
+        .transpose()?;
+    let segment_number: u32 = row.try_get::<i64, _>("segment_number").unwrap_or(0).max(0) as u32;
+
     Ok(WorkflowExecution {
         execution_id,
         workflow_id: row
@@ -118,6 +125,8 @@ fn row_to_execution(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkflowExec
         updated_at,
         completed_at,
         session_type: None,
+        parent_execution_id,
+        segment_number,
     })
 }
 
@@ -252,12 +261,14 @@ impl StateBackend for TenantScopedSqliteBackend {
         let started_at = execution.started_at.to_rfc3339();
         let updated_at = execution.updated_at.to_rfc3339();
         let completed_at = execution.completed_at.map(|dt| dt.to_rfc3339());
+        let parent_id = execution.parent_execution_id.as_ref().map(execution_id_str);
+        let segment_number = execution.segment_number as i64;
 
         sqlx::query(
             r#"INSERT INTO workflow_executions
                (execution_id, workflow_id, workflow_version, status, initial_input, current_state,
-                started_at, updated_at, completed_at, tenant_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                started_at, updated_at, completed_at, tenant_id, parent_execution_id, segment_number)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id)
         .bind(&execution.workflow_id)
@@ -269,6 +280,8 @@ impl StateBackend for TenantScopedSqliteBackend {
         .bind(&updated_at)
         .bind(completed_at.as_deref())
         .bind(&self.tenant_id.0)
+        .bind(parent_id.as_deref())
+        .bind(segment_number)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
