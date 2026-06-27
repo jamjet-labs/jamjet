@@ -2225,4 +2225,219 @@ mod tests {
             "the run must still terminate when no branch matched (no hang)"
         );
     }
+
+    // ── FDL-4: determinism / replay of the route + skip set ─────────────────────
+
+    /// Re-fold an event log into a FRESH `ExecProgress` — exactly what a recovery
+    /// or replay does (rebuild scheduling state purely from the durable log).
+    fn replay(events: &[Event]) -> ExecProgress {
+        let mut progress = ExecProgress::default();
+        for ev in events {
+            progress.apply(ev);
+        }
+        progress
+    }
+
+    /// The sorted set of nodes the dispatcher would consider runnable against a
+    /// folded progress — the pure routing decision `is_runnable` makes each tick.
+    fn runnable_set(ir: &WorkflowIr, p: &ExecProgress) -> Vec<String> {
+        let mut v: Vec<String> = ir
+            .nodes
+            .keys()
+            .filter(|nid| is_runnable(nid, ir, &p.completed, &p.scheduled, &p.skipped, &p.routes))
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// REPLAY DETERMINISM (headline): drive the agent-loop early-exit to
+    /// completion, then re-fold the durable event log from scratch. The recorded
+    /// `chosen_target` + the emitted `NodeSkipped` events reproduce the EXACT same
+    /// route + skip set + completed set on every replay — no re-evaluation drift.
+    #[tokio::test]
+    async fn early_exit_route_and_skips_replay_deterministically() {
+        let (s, b, e) = setup(agent_loop_ir()).await;
+
+        // Run the early-exit (gate_0 -> end) all the way to terminal.
+        tick(&s, &e).await; // model_0
+        append(
+            &b,
+            &e,
+            node_completed(
+                "model_0",
+                serde_json::json!({"last_model_finish_reason": "stop"}),
+            ),
+        )
+        .await;
+        tick(&s, &e).await; // gate_0
+        append(
+            &b,
+            &e,
+            condition_completed("gate_0", Some("end"), &["tools_0", "end"]),
+        )
+        .await;
+        tick(&s, &e).await; // cascade skips the dead branch, dispatches `end`
+        append(&b, &e, node_completed("end", serde_json::json!({}))).await;
+        tick(&s, &e).await; // completes
+        assert_eq!(status(&b, &e).await, WorkflowStatus::Completed);
+
+        // Re-fold the SAME durable log twice (two independent replays).
+        let evs = b.get_events(&e).await.unwrap();
+        let r1 = replay(&evs);
+        let r2 = replay(&evs);
+
+        // The fold is a pure function of the log: replay == replay (no drift).
+        assert_eq!(
+            r1.routes, r2.routes,
+            "re-folding the log is deterministic (routes)"
+        );
+        assert_eq!(
+            r1.skipped, r2.skipped,
+            "re-folding the log is deterministic (skips)"
+        );
+        assert_eq!(
+            r1.completed, r2.completed,
+            "re-folding the log is deterministic (completed)"
+        );
+
+        // ...and reproduces the exact recorded route + dead-branch skip set.
+        assert_eq!(
+            r1.routes.get("gate_0").map(String::as_str),
+            Some("end"),
+            "the recorded route is reproduced verbatim on replay"
+        );
+        for n in ["tools_0", "model_1", "gate_1", "tools_1", "model_2"] {
+            assert!(
+                r1.skipped.contains(n),
+                "{n} must be skipped on replay (dead branch)"
+            );
+        }
+        assert!(
+            !r1.skipped.contains("end"),
+            "end (shared join, live in-edge) must never be skipped on replay"
+        );
+
+        // A completed run replays to NO runnable node — replay never resurrects a
+        // skipped node nor strands the terminal.
+        let ir: WorkflowIr = serde_json::from_value(agent_loop_ir()).unwrap();
+        assert!(
+            runnable_set(&ir, &r1).is_empty(),
+            "a completed run replays with an empty runnable set"
+        );
+    }
+
+    /// DETERMINISM — the route is the RECORDED `chosen_target`, never recomputed.
+    /// Fold a durable record whose gate routed to `end` even though the committed
+    /// state (`finish_reason == "tool_calls"`) would, if re-evaluated, route to
+    /// `tools_0`. The recorded route + `NodeSkipped` events ALONE determine the
+    /// runnable set: `end` runs, the dead branch never does — identical on replay.
+    #[test]
+    fn recorded_route_and_skips_determine_runnable_node() {
+        let ir: WorkflowIr = serde_json::from_value(agent_loop_ir()).unwrap();
+
+        // The committed state says "tool_calls" (re-evaluation would pick tools_0)
+        // but the RECORDED route is `end`; the durable skips fold the dead branch.
+        let skip = |n: &str| EventKind::NodeSkipped {
+            node_id: n.into(),
+            reason: "branch not taken".into(),
+        };
+        let log = vec![
+            node_completed(
+                "model_0",
+                serde_json::json!({"last_model_finish_reason": "tool_calls"}),
+            ),
+            condition_completed("gate_0", Some("end"), &["tools_0", "end"]),
+            skip("tools_0"),
+            skip("model_1"),
+            skip("gate_1"),
+            skip("tools_1"),
+            skip("model_2"),
+        ];
+        let p1 = fold_events(log.clone());
+        let p2 = fold_events(log);
+
+        // The recorded route is honored, NOT recomputed from the (tool_calls) state.
+        assert_eq!(
+            p1.routes.get("gate_0").map(String::as_str),
+            Some("end"),
+            "the recorded route stands even when live state would evaluate otherwise"
+        );
+        assert_eq!(
+            p1.routes, p2.routes,
+            "route fold is deterministic across replays"
+        );
+        assert_eq!(
+            p1.skipped, p2.skipped,
+            "skip fold is deterministic across replays"
+        );
+
+        // The route + skips alone make `end` the sole runnable node; the dead
+        // branch's `tools_0` is never runnable — identical on every replay.
+        assert_eq!(
+            runnable_set(&ir, &p1),
+            vec!["end".to_string()],
+            "the recorded route + skips determine `end` as the only runnable node"
+        );
+        assert_eq!(
+            runnable_set(&ir, &p1),
+            runnable_set(&ir, &p2),
+            "the runnable decision is deterministic across replays"
+        );
+    }
+
+    /// NULL-ROUTE replay determinism: a Condition that matched no branch and had no
+    /// default records NO route, and that absence replays deterministically — every
+    /// branch target is skipped on every re-fold and the run still terminates.
+    /// (`no_matching_branch_skips_all_targets_and_terminates` covers the live run;
+    /// this locks the REPLAY of that null-route decision.)
+    #[tokio::test]
+    async fn null_route_skips_replay_deterministically() {
+        let ir = build_ir(
+            "start",
+            serde_json::json!({
+                "start": cond_node("start", serde_json::json!([])),
+                "gate": cond_node("gate", serde_json::json!([
+                    {"condition": "state.x == \"1\"", "target": "A"},
+                    {"condition": "state.y == \"2\"", "target": "B"}
+                ])),
+                "A": cond_node("A", serde_json::json!([])),
+                "B": cond_node("B", serde_json::json!([]))
+            }),
+            serde_json::json!([
+                {"from": "start", "to": "gate", "condition": null},
+                {"from": "gate", "to": "A", "condition": "state.x == \"1\""},
+                {"from": "gate", "to": "B", "condition": "state.y == \"2\""}
+            ]),
+        );
+        let (s, b, e) = setup(ir).await;
+
+        tick(&s, &e).await; // start
+        append(&b, &e, node_completed("start", serde_json::json!({}))).await;
+        tick(&s, &e).await; // gate
+        append(&b, &e, condition_completed("gate", None, &["A", "B"])).await;
+        tick(&s, &e).await; // cascade skips A + B
+        assert_eq!(status(&b, &e).await, WorkflowStatus::Completed);
+
+        // Re-fold the durable log twice: the null route records NO entry and both
+        // targets are skipped — deterministically, on every replay.
+        let evs = b.get_events(&e).await.unwrap();
+        let r1 = replay(&evs);
+        let r2 = replay(&evs);
+        assert!(
+            !r1.routes.contains_key("gate"),
+            "a null route records no entry — reproduced on replay"
+        );
+        assert_eq!(r1.routes, r2.routes, "null-route fold is deterministic");
+        assert_eq!(
+            r1.skipped, r2.skipped,
+            "null-route skip fold is deterministic"
+        );
+        for n in ["A", "B"] {
+            assert!(
+                r1.skipped.contains(n),
+                "{n} must be skipped on replay (null route)"
+            );
+        }
+    }
 }
