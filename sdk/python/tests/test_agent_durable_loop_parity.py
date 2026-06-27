@@ -18,11 +18,13 @@ Instead we drive the **real** compiled IR (:func:`compile_agent_to_ir`) and the
 re-implementation of the engine's control flow (:func:`drive_agent_loop`), with a
 deterministic mock model. The driver mirrors the engine exactly:
 
-* the scheduler dispatches a node once all its predecessors completed
-  (``runner.rs::is_runnable``); it does NOT evaluate edge conditions — the
-  condition node is a no-op stub and ``NodeSkipped`` is never emitted today, so
-  the static unroll runs to its ``max_turns`` bound (the per-turn gate's
-  short-circuit is the F-2j-dynamic-loop follow-up);
+* the scheduler dispatches a node once its LIVE predecessors completed
+  (``runner.rs::is_runnable``); it NOW evaluates the per-turn gate (F-2j-dynamic-loop /
+  FDL): a Condition gate records the branch it routes to, the dead branch's
+  exclusive tail is marked ``NodeSkipped`` via a dead-edge fixpoint, and the loop
+  EARLY-EXITS the moment a gate routes to ``end`` — the remaining turns are
+  skipped, never run (so a model that finishes at turn 0 makes exactly ONE model
+  call, not ``max_turns + 1``);
 * a Model node reads ``state['messages']`` and writes
   ``last_model_output`` / ``last_model_finish_reason`` / ``last_model_tool_calls``
   (``model_node.rs`` state_patch);
@@ -56,17 +58,26 @@ if str(_EXAMPLE_DIR) not in sys.path:
 import weather_agent  # noqa: E402  (path inserted just above)
 
 _PROMPT = "What's the weather in Paris?"
-# max_turns=2 -> two tool turns plus the final model node (__model_2__); the engine
-# does not yet evaluate gate conditions, so the static unroll visits the full chain
-# and terminates at the final model node (never at a tool-dispatch node).
-_LOOP_NODES = [
+# The engine NOW evaluates the per-turn gate (FDL), so the durable loop EARLY-EXITS
+# instead of running the full max_turns unroll: a turn whose model returns a tool
+# call routes gate -> dispatch and proceeds; a turn whose model returns a final
+# answer (finish_reason "stop") routes gate -> end, and the scheduler skips the
+# remaining turns. The visit order is therefore the LIVE path only.
+#
+# tool-then-stop (turn 0 asks for a tool, turn 1 answers): the turn-1 gate routes
+# to `end`, so __tools_1__ / __model_2__ are skipped — two model calls, not three.
+_EARLY_EXIT_TOOL_THEN_STOP = [
     "__model_0__",
     "__tool_gate_0__",
     "__tools_0__",
     "__model_1__",
     "__tool_gate_1__",
-    "__tools_1__",
-    "__model_2__",
+]
+# stop-at-turn-0 (the model answers immediately): the turn-0 gate routes to `end`,
+# so EVERY tool turn is skipped — exactly ONE model call.
+_EARLY_EXIT_STOP_AT_0 = [
+    "__model_0__",
+    "__tool_gate_0__",
 ]
 
 
@@ -77,27 +88,31 @@ class ScriptedModel:
     """A deterministic model, shared by the durable loop and the in-process run so
     the parity assertion compares like for like.
 
-    Turn 0     -> one tool call: ``get_weather(city="Paris")`` (finish ``tool_calls``).
-    Turn 1 on  -> a final answer with no tool calls (finish ``stop``); this also
-                  covers the bounded final model node the durable unroll appends.
+    ``tool_turns`` leading turns ask for ``get_weather(city="Paris")`` (finish
+    ``tool_calls``); every turn after that returns a final answer with no tool
+    calls (finish ``stop``). The default (``tool_turns=1``) is the canonical
+    react case: turn 0 asks for the tool, turn 1 answers. ``tool_turns=0`` makes
+    the model answer immediately at turn 0 (so the gate routes straight to ``end``
+    and the loop early-exits after a single model call).
     """
 
     FINAL_ANSWER = "It is sunny in Paris."
     TOOL_NAME = "get_weather"
     TOOL_ARGS = {"city": "Paris"}
 
-    def __init__(self) -> None:
+    def __init__(self, tool_turns: int = 1) -> None:
         self.calls = 0
+        self._tool_turns = tool_turns
 
     def next_turn(self) -> dict[str, Any]:
         """Return the next turn in engine-state shape (content/finish/tool_calls)."""
         turn = self.calls
         self.calls += 1
-        if turn == 0:
+        if turn < self._tool_turns:
             return {
                 "content": "",
                 "finish_reason": "tool_calls",
-                "tool_calls": [{"id": "call_0", "name": self.TOOL_NAME, "arguments": dict(self.TOOL_ARGS)}],
+                "tool_calls": [{"id": f"call_{turn}", "name": self.TOOL_NAME, "arguments": dict(self.TOOL_ARGS)}],
             }
         return {"content": self.FINAL_ANSWER, "finish_reason": "stop", "tool_calls": []}
 
@@ -148,23 +163,83 @@ class ScriptedAdapter:
 
 
 async def drive_agent_loop(ir: dict[str, Any], state: dict[str, Any], model: ScriptedModel) -> list[str]:
-    """Drive the compiled agent-loop IR exactly as the JamJet engine would.
+    """Drive the compiled agent-loop IR exactly as the JamJet engine now does.
 
-    Returns the visit order of node ids (for the ``model -> tool -> model``
-    assertion). Mutates *state* in place to the terminal state.
+    Mirrors the FDL scheduler (``runner.rs``): a Condition gate evaluates its
+    branches against committed state and records the chosen route; the dead
+    branch's exclusive tail is marked ``NodeSkipped`` via a dead-edge fixpoint
+    (``edge_dead``); a node is runnable iff it has a LIVE in-edge whose every live
+    source has completed (``is_runnable``, the AND-join over live edges only). The
+    loop therefore EARLY-EXITS the moment a gate routes to ``end``: the remaining
+    turns are skipped, never run.
+
+    ``end`` is the graph's terminal sentinel (``agent_ir._END``), not a node, so it
+    is never runnable — routing to it simply leaves no runnable node and the loop
+    stops. Returns the visit order of node ids; mutates *state* in place to the
+    terminal state.
     """
     nodes = ir["nodes"]
     edges = ir["edges"]
-    preds = {nid: [e["from"] for e in edges if e["to"] == nid] for nid in nodes}
+    in_edges = {nid: [e for e in edges if e["to"] == nid] for nid in nodes}
 
     completed: set[str] = set()
+    skipped: set[str] = set()
+    routes: dict[str, str | None] = {}  # condition node id -> chosen branch target
     visited: list[str] = []
+
+    def edge_dead(src: str, dst: str) -> bool:
+        # A skipped source kills its out-edges (cascades a skip down the branch).
+        if src in skipped:
+            return True
+        # A COMPLETED routing Condition's only live out-edge is its recorded route;
+        # every other out-edge is dead (a null route makes ALL of them dead).
+        node = nodes.get(src)
+        if node is not None and node["kind"]["type"] == "condition":
+            branches = node["kind"].get("branches") or []
+            if branches and src in completed:
+                return routes.get(src) != dst
+        return False
+
+    def is_runnable(nid: str) -> bool:
+        if nid in completed or nid in skipped:
+            return False
+        ins = in_edges[nid]
+        if not ins:
+            return True  # root
+        has_live = False
+        all_live_sources_done = True
+        for e in ins:
+            if not edge_dead(e["from"], nid):
+                has_live = True
+                if e["from"] not in completed:
+                    all_live_sources_done = False
+        return has_live and all_live_sources_done
+
+    def skip_cascade() -> None:
+        # Fixpoint: a node whose EVERY in-edge is dead can never run, so skip it.
+        # The skip folds into `completed` (satisfying a downstream AND-join without
+        # it) AND into `skipped` (so its out-edges die, which may make more nodes
+        # skippable). Roots (no in-edges) are never skipped here.
+        changed = True
+        while changed:
+            changed = False
+            for nid in nodes:
+                if nid in completed or nid in skipped:
+                    continue
+                ins = in_edges[nid]
+                if ins and all(edge_dead(e["from"], nid) for e in ins):
+                    skipped.add(nid)
+                    completed.add(nid)
+                    changed = True
+
     while True:
-        runnable = [nid for nid in nodes if nid not in completed and all(p in completed for p in preds[nid])]
+        skip_cascade()
+        runnable = [nid for nid in nodes if is_runnable(nid)]
         if not runnable:
             break
-        # The v1 static unroll is a linear chain: exactly one node runs per step.
-        assert len(runnable) == 1, f"static-unroll loop must be linear; runnable={runnable}"
+        # The live path of the static unroll is linear: the gate's route makes
+        # exactly one successor live, so exactly one node runs per step.
+        assert len(runnable) == 1, f"agent-loop unroll must be linear; runnable={runnable}"
         node_id = runnable[0]
         kind = nodes[node_id]["kind"]["type"]
 
@@ -181,7 +256,12 @@ async def drive_agent_loop(ir: dict[str, Any], state: dict[str, Any], model: Scr
             for key, value in patch.items():
                 state[key] = value
         elif kind == "condition":
-            pass  # no-op stub: the engine does not evaluate edge conditions today
+            # FDL: honor the gate. Evaluate the branches against committed state
+            # and record the chosen route (empty branches = pass-through, no
+            # route). The next skip_cascade()/is_runnable() act on it.
+            branches = nodes[node_id]["kind"].get("branches") or []
+            if branches:
+                routes[node_id] = _route_gate(branches, state)
         else:  # pragma: no cover - the compiler only emits these three kinds
             raise AssertionError(f"unexpected node kind {kind!r}")
 
@@ -190,7 +270,7 @@ async def drive_agent_loop(ir: dict[str, Any], state: dict[str, Any], model: Scr
     return visited
 
 
-# ── Authored gate semantics (what F-2j-dynamic-loop will wire into the engine) ─
+# ── Authored gate semantics (wired into drive_agent_loop above) ───────────────
 
 
 def _eval_branch_condition(condition: str | None, state: dict[str, Any]) -> bool:
@@ -214,8 +294,9 @@ def _route_gate(branches: list[dict[str, Any]], state: dict[str, Any]) -> str | 
 
 
 async def test_agent_loop_ir_runs_model_tool_model_and_terminates() -> None:
-    """The compiled IR drives a model -> tool -> model loop that terminates with
-    the final answer, invoking the tool once and accumulating the messages."""
+    """The compiled IR drives a model -> tool -> model loop that EARLY-EXITS at the
+    turn the model answers: the tool is invoked once, the messages accumulate, and
+    the gate routes the final turn to `end` so the remaining unroll is skipped."""
     agent = weather_agent.build_agent()
     ir = compile_agent_to_ir(agent, _PROMPT, max_turns=2)
 
@@ -229,9 +310,11 @@ async def test_agent_loop_ir_runs_model_tool_model_and_terminates() -> None:
     model = ScriptedModel()
     visited = await drive_agent_loop(ir, state, model)
 
-    # The loop ran model -> tool -> model and terminated at the final model node.
-    assert visited == _LOOP_NODES
-    assert model.calls == 3  # two turn-models + the final answer model
+    # The model asked for a tool at turn 0 then answered at turn 1, so the turn-1
+    # gate routes to `end`: the loop runs model -> tool -> model and EARLY-EXITS,
+    # skipping __tools_1__/__model_2__ (NOT the full max_turns unroll).
+    assert visited == _EARLY_EXIT_TOOL_THEN_STOP
+    assert model.calls == 2  # turn 0 (tool) + turn 1 (final answer); NOT max_turns + 1
 
     # The tool was actually invoked once, with the model's arguments, and its
     # result was appended to the running messages (message accumulation).
@@ -248,11 +331,32 @@ async def test_agent_loop_ir_runs_model_tool_model_and_terminates() -> None:
     assert state["last_model_output"] == ScriptedModel.FINAL_ANSWER
 
 
+async def test_durable_loop_early_exits_on_immediate_stop() -> None:
+    """EARLY-EXIT headline: a model that answers at turn 0 (finish_reason "stop")
+    makes EXACTLY ONE model call — the turn-0 gate routes to `end`, every tool turn
+    is skipped, and the loop never reaches __model_1__ (NOT the max_turns unroll)."""
+    agent = weather_agent.build_agent()
+    ir = compile_agent_to_ir(agent, _PROMPT, max_turns=2)
+
+    state = build_initial_state(agent, _PROMPT)
+    model = ScriptedModel(tool_turns=0)  # answer immediately, no tool call
+    visited = await drive_agent_loop(ir, state, model)
+
+    # One model call, the gate, then `end` — the rest of the unroll is skipped.
+    assert visited == _EARLY_EXIT_STOP_AT_0
+    assert model.calls == 1, "stop at turn 0 must make exactly ONE model call"
+    # The dispatch node never ran, so no tool was invoked.
+    assert [m for m in state["messages"] if m.get("role") == "tool"] == []
+    # The answer is turn 0's output.
+    assert state["last_model_output"] == ScriptedModel.FINAL_ANSWER
+
+
 def test_compiled_gate_routes_tool_calls_to_dispatch_and_stop_to_end() -> None:
     """The authored gate routes tool_calls -> dispatch and a final answer -> end.
 
-    The engine does not yet act on these edge conditions (F-2j-dynamic-loop), but
-    the IR encodes the correct branch logic, ready for when it does.
+    The engine NOW acts on these edge conditions (F-2j-dynamic-loop / FDL): the
+    same branch logic that ``drive_agent_loop`` honors above is what the scheduler
+    evaluates to early-exit the durable run.
     """
     ir = compile_agent_to_ir(weather_agent.build_agent(), _PROMPT, max_turns=2)
     gate = ir["nodes"]["__tool_gate_0__"]["kind"]
@@ -271,7 +375,8 @@ async def test_inprocess_run_matches_durable_loop_answer(monkeypatch: Any) -> No
     # Durable loop path: real IR + real dispatch_tool_calls + scripted model.
     ir = compile_agent_to_ir(agent, _PROMPT, max_turns=2)
     state = build_initial_state(agent, _PROMPT)
-    visited = await drive_agent_loop(ir, state, ScriptedModel())
+    durable_model = ScriptedModel()
+    visited = await drive_agent_loop(ir, state, durable_model)
     durable_output = state["last_model_output"]
 
     # In-process path: Agent.run() with the same scripted model injected at the
@@ -288,8 +393,10 @@ async def test_inprocess_run_matches_durable_loop_answer(monkeypatch: Any) -> No
     # Both paths invoked the tool exactly once.
     assert [c["tool"] for c in inproc.tool_calls] == ["get_weather"]
     assert [m["name"] for m in state["messages"] if m.get("role") == "tool"] == ["get_weather"]
-    # And the durable path ran the full model -> tool -> model loop.
-    assert visited == _LOOP_NODES
+    # And the durable path ran the model -> tool -> model loop, EARLY-EXITING at
+    # the turn the model answered (exactly two model calls, not the full unroll).
+    assert visited == _EARLY_EXIT_TOOL_THEN_STOP
+    assert durable_model.calls == 2
 
 
 def test_example_react_agent_durable_compiles() -> None:

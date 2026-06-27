@@ -15,7 +15,8 @@ pub mod worker;
 
 pub use executor::{ExecutionResult, ExecutorError, NodeExecutor};
 pub use executors::{
-    A2aTaskExecutor, AgentDiscoveryExecutor, EvalExecutor, McpToolExecutor, ModelNodeExecutor,
+    A2aTaskExecutor, AgentDiscoveryExecutor, ConditionNodeExecutor, EvalExecutor, McpToolExecutor,
+    ModelNodeExecutor,
 };
 pub use pool::{default_pool, WorkerGroupConfig, WorkerPool};
 pub use worker::Worker;

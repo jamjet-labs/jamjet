@@ -10,16 +10,18 @@ use std::collections::{HashSet, VecDeque};
 /// 2. No duplicate node ids
 /// 3. start_node exists in nodes
 /// 4. All edge targets exist
-/// 5. All nodes are reachable from start_node
-/// 6. All paths from start lead to a terminal node ("end" or a terminal kind)
-/// 7. All tool_ref, model_ref, agent_ref resolve to known definitions
-/// 8. All MCP servers referenced by mcp_tool nodes are configured
-/// 9. All remote agents referenced by a2a_task nodes are configured
+/// 5. Every Condition node's branch targets exist
+/// 6. All nodes are reachable from start_node
+/// 7. All paths from start lead to a terminal node ("end" or a terminal kind)
+/// 8. All tool_ref, model_ref, agent_ref resolve to known definitions
+/// 9. All MCP servers referenced by mcp_tool nodes are configured
+/// 10. All remote agents referenced by a2a_task nodes are configured
 pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_metadata(ir)?;
     validate_no_duplicate_nodes(ir)?;
     validate_start_node(ir)?;
     validate_edges(ir)?;
+    validate_branch_targets(ir)?;
     validate_reachability(ir)?;
     validate_refs(ir)?;
     Ok(())
@@ -65,6 +67,47 @@ fn validate_edges(ir: &WorkflowIr) -> IrResult<()> {
                 from: edge.from.clone(),
                 to: edge.to.clone(),
             });
+        }
+    }
+    Ok(())
+}
+
+// FDL-5: every `ConditionalBranch.target` of a Condition node must reference an
+// existing node id (or the terminal sentinel `"end"`, like an edge target). A
+// dangling branch target is a validation error: the scheduler would route to a
+// node that never runs, silently stranding the branch. This mirrors
+// `validate_edges` but checks the branch list the routing executor reads, which a
+// hand-built or miscompiled IR could leave inconsistent with the edges.
+//
+// Additionally, each branch target must appear as a `to` in the Condition node's
+// out-edges. The compiler emits branches and edges 1:1; a mismatch means the
+// executor would resolve a target that the scheduler's edge graph can never
+// traverse, silently dropping the branch at runtime.
+fn validate_branch_targets(ir: &WorkflowIr) -> IrResult<()> {
+    use jamjet_core::node::NodeKind;
+
+    for (node_id, node) in &ir.nodes {
+        if let NodeKind::Condition { branches } = &node.kind {
+            let out_targets: HashSet<&str> = ir
+                .edges_from(node_id)
+                .into_iter()
+                .map(|e| e.to.as_str())
+                .collect();
+
+            for branch in branches {
+                if branch.target != "end" && !ir.nodes.contains_key(&branch.target) {
+                    return Err(IrError::UnknownBranchTarget {
+                        node: node_id.clone(),
+                        target: branch.target.clone(),
+                    });
+                }
+                if !out_targets.contains(branch.target.as_str()) {
+                    return Err(IrError::BranchTargetMissingOutEdge {
+                        node: node_id.clone(),
+                        target: branch.target.clone(),
+                    });
+                }
+            }
         }
     }
     Ok(())
@@ -138,7 +181,7 @@ fn validate_refs(ir: &WorkflowIr) -> IrResult<()> {
 mod tests {
     use super::*;
     use crate::workflow::*;
-    use jamjet_core::node::NodeKind;
+    use jamjet_core::node::{ConditionalBranch, NodeKind};
     use jamjet_core::timeout::TimeoutConfig;
     use std::collections::HashMap;
 
@@ -222,6 +265,94 @@ mod tests {
         );
         let err = validate_workflow(&ir);
         assert!(matches!(err, Err(IrError::UnreachableNode(_))));
+    }
+
+    #[test]
+    fn unknown_branch_target() {
+        // A Condition whose branch points at a node that doesn't exist. The edges
+        // are all valid (validate_edges passes), so the dangling BRANCH target is
+        // what gets caught — a clear, branch-specific error.
+        let cond = NodeKind::Condition {
+            branches: vec![
+                ConditionalBranch {
+                    condition: Some("state.x == \"go\"".into()),
+                    target: "ghost".into(),
+                },
+                ConditionalBranch {
+                    condition: None,
+                    target: "b".into(),
+                },
+            ],
+        };
+        let b = NodeKind::Condition { branches: vec![] };
+        let ir = make_ir(
+            "a",
+            vec![("a", cond), ("b", b)],
+            vec![("a", "b"), ("b", "end")],
+        );
+        let err = validate_workflow(&ir);
+        assert!(
+            matches!(&err, Err(IrError::UnknownBranchTarget { node, target }) if node == "a" && target == "ghost"),
+            "a dangling branch target must fail with UnknownBranchTarget, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn valid_branch_targets_pass() {
+        // Branches targeting a real node and the `end` sentinel both validate
+        // (the agent-loop gate's `{tool_calls -> tools, else -> end}` shape).
+        let cond = NodeKind::Condition {
+            branches: vec![
+                ConditionalBranch {
+                    condition: Some("state.x == \"go\"".into()),
+                    target: "b".into(),
+                },
+                ConditionalBranch {
+                    condition: None,
+                    target: "end".into(),
+                },
+            ],
+        };
+        let b = NodeKind::Condition { branches: vec![] };
+        let ir = make_ir(
+            "a",
+            vec![("a", cond), ("b", b)],
+            vec![("a", "b"), ("a", "end"), ("b", "end")],
+        );
+        assert!(
+            validate_workflow(&ir).is_ok(),
+            "branch targets that are real nodes or `end` must validate"
+        );
+    }
+
+    #[test]
+    fn branch_target_missing_out_edge() {
+        // Branch declares target "b" (a known node), but no edge a->b exists.
+        // The cross-check must catch the mismatch before reachability does.
+        let cond = NodeKind::Condition {
+            branches: vec![
+                ConditionalBranch {
+                    condition: Some("state.x == \"go\"".into()),
+                    target: "b".into(),
+                },
+                ConditionalBranch {
+                    condition: None,
+                    target: "end".into(),
+                },
+            ],
+        };
+        let b = NodeKind::Condition { branches: vec![] };
+        // Edge a->b intentionally absent; only a->end and b->end present.
+        let ir = make_ir(
+            "a",
+            vec![("a", cond), ("b", b)],
+            vec![("a", "end"), ("b", "end")],
+        );
+        let err = validate_workflow(&ir);
+        assert!(
+            matches!(&err, Err(IrError::BranchTargetMissingOutEdge { node, target }) if node == "a" && target == "b"),
+            "a branch target with no matching out-edge must fail with BranchTargetMissingOutEdge, got {err:?}"
+        );
     }
 
     #[test]
