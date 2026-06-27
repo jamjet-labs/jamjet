@@ -10,7 +10,7 @@
 //! - `GET /health` → `{ok:true}`
 
 use crate::adapter::{
-    ChatRole, ModelAdapter, ModelError, ModelRequest, ModelResponse, StructuredRequest,
+    ChatRole, ModelAdapter, ModelError, ModelRequest, ModelResponse, StructuredRequest, ToolCall,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -97,6 +97,21 @@ impl SidecarModelAdapter {
             )
         })?;
 
+        // Parse tool_calls when the sidecar surfaces them (finish_reason == "tool_calls").
+        // The sidecar normalises arguments to a JSON object when possible; we store
+        // whatever Value arrives (object or string) so no information is lost.
+        let tool_calls: Vec<ToolCall> = json["tool_calls"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tc| ToolCall {
+                id: tc["id"].as_str().unwrap_or("").to_string(),
+                name: tc["name"].as_str().unwrap_or("").to_string(),
+                arguments: tc["arguments"].clone(),
+            })
+            .collect();
+
         Ok(ModelResponse {
             content,
             model,
@@ -104,6 +119,7 @@ impl SidecarModelAdapter {
             input_tokens,
             output_tokens,
             structured: None,
+            tool_calls,
         })
     }
 
@@ -160,6 +176,11 @@ impl ModelAdapter for SidecarModelAdapter {
         if let Some(max) = request.config.max_tokens {
             body["max_tokens"] = json!(max);
         }
+        // Forward tool schemas to the sidecar when tools are offered; the governed
+        // seam (allowlist + PII + metering middleware) still runs on the sidecar side.
+        if !request.tools.is_empty() {
+            body["tools"] = json!(request.tools);
+        }
 
         let resp_json = self.call_complete(body).await?;
         self.parse_response(resp_json)
@@ -181,6 +202,7 @@ impl ModelAdapter for SidecarModelAdapter {
         let chat_req = ModelRequest {
             messages: request.messages,
             config,
+            tools: vec![],
         };
         let mut response = self.chat(chat_req).await?;
 
@@ -519,6 +541,71 @@ mod tests {
             matches!(result, Err(ModelError::Serialization(_))),
             "health guard must reject a non-JSON 200 body, got {result:?}"
         );
+    }
+
+    // 2j-1: tool_calls round-trip — sidecar returns tool_calls -> ModelResponse.tool_calls populated.
+    #[tokio::test]
+    async fn chat_returns_tool_calls_from_sidecar() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("POST", "/v1/complete")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                "message": {"content": null, "role": "assistant"},
+                "tool_calls": [{"id": "c1", "name": "get_weather", "arguments": {"city": "SF"}}],
+                "finish_reason": "tool_calls",
+                "input_tokens": 5,
+                "output_tokens": 3,
+                "model": "anthropic/claude-sonnet-4-6"
+            }"#,
+            )
+            .create_async()
+            .await;
+
+        let adapter = SidecarModelAdapter::new(server.url());
+        let req = ModelRequest::new(vec![ChatMessage::user("what's the weather?")]);
+        let resp = adapter.chat(req).await.expect("chat should succeed");
+
+        assert_eq!(resp.finish_reason, "tool_calls");
+        assert_eq!(resp.tool_calls.len(), 1);
+        let tc = &resp.tool_calls[0];
+        assert_eq!(tc.id, "c1");
+        assert_eq!(tc.name, "get_weather");
+        assert_eq!(tc.arguments, serde_json::json!({"city": "SF"}));
+    }
+
+    // 2j-1: tools forwarded — a request with non-empty tools sends them in the POST body.
+    #[tokio::test]
+    async fn chat_sends_tools_in_post_body() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("POST", "/v1/complete")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"tools":[{"type":"function","function":{"name":"get_weather"}}]}"#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                "message": {"content": "ok", "role": "assistant"},
+                "finish_reason": "stop",
+                "input_tokens": 5,
+                "output_tokens": 3,
+                "model": "anthropic/claude-sonnet-4-6"
+            }"#,
+            )
+            .create_async()
+            .await;
+
+        let adapter = SidecarModelAdapter::new(server.url());
+        let req = ModelRequest::new(vec![ChatMessage::user("hi")]).with_tools(vec![
+            serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+        ]);
+        adapter.chat(req).await.expect("chat should succeed");
     }
 
     // I4: missing output_tokens must cause chat() to return Err, not a zero-metered response.

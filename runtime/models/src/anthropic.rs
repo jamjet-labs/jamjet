@@ -154,6 +154,7 @@ impl AnthropicAdapter {
             input_tokens,
             output_tokens,
             structured: None,
+            tool_calls: vec![],
         })
     }
 }
@@ -224,6 +225,7 @@ impl ModelAdapter for AnthropicAdapter {
         let chat_req = ModelRequest {
             messages: request.messages,
             config,
+            tools: vec![],
         };
         let mut response = self.chat(chat_req).await?;
 

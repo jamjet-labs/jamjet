@@ -10,6 +10,7 @@ Run with:
 
 from __future__ import annotations
 
+import json as _json
 from typing import Any
 
 from starlette.applications import Starlette
@@ -65,26 +66,58 @@ def _get_model() -> Model:
     return _model
 
 
+def _extract_tool_calls(message: Any) -> list[dict[str, Any]]:
+    """Extract and normalise tool_calls from an OpenAI-shaped message.
+
+    litellm returns tool_calls as a list of objects with:
+      tc.id, tc.function.name, tc.function.arguments (JSON-serialised string)
+
+    We normalise arguments to a JSON object when possible; the Rust side stores
+    whatever Value arrives so no information is lost.
+    """
+    raw = getattr(message, "tool_calls", None)
+    if not raw:
+        return []
+    out: list[dict[str, Any]] = []
+    for tc in raw:
+        fn = getattr(tc, "function", None)
+        name = getattr(fn, "name", None) if fn else getattr(tc, "name", None)
+        raw_args = getattr(fn, "arguments", None) if fn else getattr(tc, "arguments", None)
+        if isinstance(raw_args, str):
+            try:
+                raw_args = _json.loads(raw_args)
+            except Exception:
+                pass  # keep as string if the provider emits malformed JSON
+        out.append({"id": getattr(tc, "id", ""), "name": name or "", "arguments": raw_args})
+    return out
+
+
 async def _complete(body: dict[str, Any], model: Model) -> dict[str, Any]:
     """Core completion handler; injectable for testing without Starlette."""
     ref = parse_model_ref(body["model"])
     req = ModelRequest(
         ref=ref,
         messages=body["messages"],
+        tools=body.get("tools") or None,
         temperature=body.get("temperature"),
         max_tokens=body.get("max_tokens"),
     )
     resp = await model.complete(req)
+
+    tool_calls = _extract_tool_calls(resp.message)
+    finish_reason = getattr(resp.message, "finish_reason", None) or ("tool_calls" if tool_calls else None) or "stop"
+
     return {
         "message": {
-            "content": resp.message.content,
+            "content": resp.message.content or "",
             "role": "assistant",
         },
+        "tool_calls": tool_calls,
         "input_tokens": resp.input_tokens,
         "output_tokens": resp.output_tokens,
         "cost_usd": resp.cost_usd,
         "model": ref.litellm_model,
-        "finish_reason": getattr(resp.message, "finish_reason", None) or "stop",
+        "finish_reason": finish_reason,
     }
 
 

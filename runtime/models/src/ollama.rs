@@ -149,6 +149,7 @@ impl OllamaAdapter {
             input_tokens,
             output_tokens,
             structured: None,
+            tool_calls: vec![],
         })
     }
 }
