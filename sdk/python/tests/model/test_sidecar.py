@@ -1,4 +1,4 @@
-"""Tests for the Model-seam sidecar server (Task 2e-1).
+"""Tests for the Model-seam sidecar server (Task 2e-1, 2f-5).
 
 Tests the core _complete handler directly (no Starlette required) and also
 exercises the HTTP routes via httpx ASGITransport (starlette is installed).
@@ -178,6 +178,119 @@ async def test_complete_route_missing_model_key(monkeypatch: pytest.MonkeyPatch)
 
     assert resp.status_code == 400
     assert "error" in resp.json()
+
+
+# --------------------------------------------------------------------------- #
+# 2f-5: provider 429 must surface as HTTP 429 with retry_after
+# --------------------------------------------------------------------------- #
+
+
+class _FakeRateLimitResponse:
+    """Minimal response object carrying a Retry-After header."""
+
+    def __init__(self, retry_after: int | None = None) -> None:
+        self.headers: dict[str, str] = {}
+        if retry_after is not None:
+            self.headers["retry-after"] = str(retry_after)
+
+
+class _RateLimitError(Exception):
+    """Stub that mimics litellm.exceptions.RateLimitError without importing litellm.
+
+    The production handler checks ``status_code == 429`` (duck typing), so this
+    stub exercises the exact same code path as the real litellm exception.
+    """
+
+    status_code = 429
+
+    def __init__(self, msg: str = "rate limited", *, retry_after: int | None = None) -> None:
+        super().__init__(msg)
+        self.response = _FakeRateLimitResponse(retry_after=retry_after)
+
+
+class FakeRateLimitModel:
+    """Injects a _RateLimitError (no Retry-After header) into the completion path."""
+
+    async def complete(self, request):  # noqa: ANN001, ANN201
+        raise _RateLimitError("provider rate limit")
+
+
+class FakeRateLimitModelWithRetryAfter:
+    """Injects a _RateLimitError carrying Retry-After: 30 in the response headers."""
+
+    async def complete(self, request):  # noqa: ANN001, ANN201
+        raise _RateLimitError("provider rate limit", retry_after=30)
+
+
+async def test_complete_route_rate_limited_returns_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provider 429 must surface as HTTP 429 with retry_after in the body (2f-5)."""
+    monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeRateLimitModel())
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/complete",
+            json={
+                "model": "anthropic/claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert resp.status_code == 429, f"expected 429, got {resp.status_code}"
+    body = resp.json()
+    assert "retry_after" in body, f"retry_after missing from 429 body: {body}"
+    assert isinstance(body["retry_after"], int), "retry_after must be an integer"
+    assert "error" in body
+
+
+async def test_complete_route_rate_limited_propagates_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry-After header from the provider response must be forwarded in the body (2f-5)."""
+    monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeRateLimitModelWithRetryAfter())
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/complete",
+            json={
+                "model": "anthropic/claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert resp.status_code == 429
+    assert resp.json()["retry_after"] == 30, f"expected 30, got {resp.json()}"
+
+
+async def test_complete_route_model_denied_is_non_200(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ModelDeniedError must NOT be caught by the 429 branch (fail-closed preserved).
+
+    Starlette's ServerErrorMiddleware converts unhandled exceptions to 500 in
+    production (uvicorn).  We use ``raise_server_exceptions=False`` so httpx
+    also converts them to 500 rather than re-raising, matching that behaviour.
+    """
+    from jamjet.model.middleware import ModelDeniedError
+
+    class FakeDeniedModel:
+        async def complete(self, request):  # noqa: ANN001, ANN201
+            raise ModelDeniedError("model not in allowlist", code="model_not_allowed")
+
+    monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeDeniedModel())
+
+    # raise_app_exceptions=False mirrors uvicorn: unhandled exceptions become 500.
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/complete",
+            json={
+                "model": "bad/model",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert resp.status_code != 200, f"ModelDeniedError must never return 200, got {resp.status_code}"
+    assert resp.status_code != 429, "ModelDeniedError must not be swallowed by the 429 branch"
 
 
 # --------------------------------------------------------------------------- #

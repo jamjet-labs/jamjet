@@ -52,9 +52,15 @@ impl SidecarModelAdapter {
             .map_err(|e| ModelError::Network(e.to_string()))?;
 
         if status == 429 {
-            return Err(ModelError::RateLimited {
-                retry_after_secs: 60,
-            });
+            // Prefer the retry_after the sidecar extracts from the provider response
+            // (passed back as `{"retry_after": <secs>}` in the body).  Fall back to
+            // 60 s when the body is absent or unparseable — keeps the existing safe
+            // default for responses that predate this contract.
+            let retry_after_secs = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v["retry_after"].as_u64())
+                .unwrap_or(60);
+            return Err(ModelError::RateLimited { retry_after_secs });
         }
         if status != 200 {
             return Err(ModelError::Api { status, body: text });
@@ -362,6 +368,61 @@ mod tests {
         assert!(
             matches!(result, Err(ModelError::RateLimited { .. })),
             "expected RateLimited, got {result:?}"
+        );
+    }
+
+    // 2f-5: 429 body with retry_after must be propagated into ModelError::RateLimited.
+    #[tokio::test]
+    async fn chat_rate_limit_uses_body_retry_after() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("POST", "/v1/complete")
+            .with_status(429)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"rate limit","retry_after":12}"#)
+            .create_async()
+            .await;
+
+        let adapter = SidecarModelAdapter::new(server.url());
+        let req = ModelRequest::new(vec![ChatMessage::user("hi")]);
+        let result = adapter.chat(req).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ModelError::RateLimited {
+                    retry_after_secs: 12
+                })
+            ),
+            "expected RateLimited{{retry_after_secs:12}}, got {result:?}"
+        );
+    }
+
+    // 2f-5: 429 with no parseable body falls back to 60 s default.
+    #[tokio::test]
+    async fn chat_rate_limit_falls_back_when_no_retry_after() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("POST", "/v1/complete")
+            .with_status(429)
+            .with_body("too many requests")
+            .create_async()
+            .await;
+
+        let adapter = SidecarModelAdapter::new(server.url());
+        let req = ModelRequest::new(vec![ChatMessage::user("hi")]);
+        let result = adapter.chat(req).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ModelError::RateLimited {
+                    retry_after_secs: 60
+                })
+            ),
+            "expected RateLimited{{retry_after_secs:60}}, got {result:?}"
         );
     }
 

@@ -21,6 +21,35 @@ from jamjet.model.defaults import default_model_middleware
 from jamjet.model.seam import Model
 from jamjet.model.types import ModelRequest, parse_model_ref
 
+_RATE_LIMIT_FALLBACK_SECS = 5
+
+
+def _extract_retry_after(exc: BaseException) -> int:
+    """Return retry_after seconds from a provider rate-limit exception.
+
+    Checks, in order:
+    1. ``exc.response.headers["retry-after"]`` (set by litellm / openai SDK).
+    2. ``exc.retry_after`` attribute (defensive; uncommon in practice).
+    Falls back to ``_RATE_LIMIT_FALLBACK_SECS`` if nothing is found.
+    """
+    response = getattr(exc, "response", None)
+    if response is not None:
+        headers = getattr(response, "headers", {})
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+        if raw is not None:
+            try:
+                return int(raw)
+            except (ValueError, TypeError):
+                pass
+    val = getattr(exc, "retry_after", None)
+    if val is not None:
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            pass
+    return _RATE_LIMIT_FALLBACK_SECS
+
+
 # Module-level singleton -- created lazily on first call so tests can inject
 # a fake model by monkeypatching _get_model.
 _model: Model | None = None
@@ -63,6 +92,19 @@ async def _handle_complete(request: Request) -> JSONResponse:
         return JSONResponse(result)
     except (KeyError, ValueError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        # Duck-typed check: litellm.exceptions.RateLimitError (and openai.RateLimitError)
+        # carry status_code=429.  We check this without importing litellm at module level
+        # so the sidecar server remains importable when the model extra is absent.
+        # ModelDeniedError has no status_code attribute and will fall through to ``raise``,
+        # preserving the governance fail-closed contract.
+        if getattr(exc, "status_code", None) == 429:
+            retry_after = _extract_retry_after(exc)
+            return JSONResponse(
+                {"error": str(exc), "retry_after": retry_after},
+                status_code=429,
+            )
+        raise
 
 
 async def _handle_health(request: Request) -> JSONResponse:
