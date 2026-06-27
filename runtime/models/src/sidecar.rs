@@ -69,8 +69,23 @@ impl SidecarModelAdapter {
             .to_string();
         let model = json["model"].as_str().unwrap_or(DEFAULT_MODEL).to_string();
         let finish_reason = json["finish_reason"].as_str().unwrap_or("stop").to_string();
-        let input_tokens = json["input_tokens"].as_u64().unwrap_or(0);
-        let output_tokens = json["output_tokens"].as_u64().unwrap_or(0);
+
+        // I4: parse token counts strictly — a missing or wrong-type field means the
+        // metering data is corrupt; fail closed rather than silently zeroing the count.
+        // Cost is recorded by the Python MeteringMiddleware after C1; cost_usd is not
+        // threaded to the Rust event here.
+        // F-2e-cost: cost_usd from the Python MeteringMiddleware is not yet threaded to the Rust event.
+        let input_tokens = json["input_tokens"].as_u64().ok_or_else(|| {
+            ModelError::Serialization(
+                "sidecar response missing or invalid 'input_tokens' field".to_string(),
+            )
+        })?;
+        let output_tokens = json["output_tokens"].as_u64().ok_or_else(|| {
+            ModelError::Serialization(
+                "sidecar response missing or invalid 'output_tokens' field".to_string(),
+            )
+        })?;
+
         Ok(ModelResponse {
             content,
             model,
@@ -197,18 +212,43 @@ pub async fn check_sidecar_health(
              Cause: {e}"
         ))
     })?;
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
+
+    let status = resp.status();
+    if !status.is_success() {
+        let code = status.as_u16();
         let body = resp.text().await.unwrap_or_default();
         return Err(ModelError::Api {
-            status,
+            status: code,
             body: format!(
-                "JAMJET_MODEL_SEAM_URL set but sidecar /health returned {status} — \
+                "JAMJET_MODEL_SEAM_URL set but sidecar /health returned {code} — \
                  refusing to start so model calls never silently bypass the governed seam. \
                  Body: {body}"
             ),
         });
     }
+
+    // I3: also validate the JSON body — a wrong service returning 200 must not pass.
+    // The sidecar contract guarantees {"ok": true}; anything else is treated as a failure.
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| ModelError::Network(e.to_string()))?;
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+        ModelError::Serialization(format!(
+            "sidecar /health returned a non-JSON body — \
+             refusing to start. Body: {body}"
+        ))
+    })?;
+    if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return Err(ModelError::Api {
+            status: status.as_u16(),
+            body: format!(
+                "sidecar /health did not return {{\"ok\":true}} — \
+                 refusing to start. Body: {body}"
+            ),
+        });
+    }
+
     Ok(())
 }
 
@@ -370,6 +410,109 @@ mod tests {
         assert!(
             matches!(result, Err(ModelError::Network(_))),
             "expected Network error, got {result:?}"
+        );
+    }
+
+    // I3: health guard must reject ok=false and non-JSON 200 bodies.
+
+    #[tokio::test]
+    async fn health_check_errors_on_ok_false() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":false}"#)
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = check_sidecar_health(&server.url(), &client).await;
+        assert!(
+            matches!(result, Err(ModelError::Api { .. })),
+            "health guard must reject {{\"ok\":false}}, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_errors_on_non_json_200() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("OK")
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = check_sidecar_health(&server.url(), &client).await;
+        assert!(
+            matches!(result, Err(ModelError::Serialization(_))),
+            "health guard must reject a non-JSON 200 body, got {result:?}"
+        );
+    }
+
+    // I4: missing output_tokens must cause chat() to return Err, not a zero-metered response.
+
+    #[tokio::test]
+    async fn chat_errors_when_output_tokens_missing() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Response omits output_tokens — the old unwrap_or(0) would silently zero it.
+        let _mock = server
+            .mock("POST", "/v1/complete")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                "message": {"content": "hi", "role": "assistant"},
+                "input_tokens": 5,
+                "model": "anthropic/claude-sonnet-4-6",
+                "finish_reason": "stop"
+            }"#,
+            )
+            .create_async()
+            .await;
+
+        let adapter = SidecarModelAdapter::new(server.url());
+        let req = ModelRequest::new(vec![ChatMessage::user("hi")]);
+        let result = adapter.chat(req).await;
+
+        assert!(
+            matches!(result, Err(ModelError::Serialization(_))),
+            "missing output_tokens must produce Serialization error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_errors_when_input_tokens_missing() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("POST", "/v1/complete")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                "message": {"content": "hi", "role": "assistant"},
+                "output_tokens": 3,
+                "model": "anthropic/claude-sonnet-4-6",
+                "finish_reason": "stop"
+            }"#,
+            )
+            .create_async()
+            .await;
+
+        let adapter = SidecarModelAdapter::new(server.url());
+        let req = ModelRequest::new(vec![ChatMessage::user("hi")]);
+        let result = adapter.chat(req).await;
+
+        assert!(
+            matches!(result, Err(ModelError::Serialization(_))),
+            "missing input_tokens must produce Serialization error, got {result:?}"
         );
     }
 }

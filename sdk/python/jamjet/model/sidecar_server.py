@@ -17,6 +17,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from jamjet.model.defaults import default_model_middleware
 from jamjet.model.seam import Model
 from jamjet.model.types import ModelRequest, parse_model_ref
 
@@ -28,7 +29,7 @@ _model: Model | None = None
 def _get_model() -> Model:
     global _model  # noqa: PLW0603 -- intentional singleton
     if _model is None:
-        _model = Model()
+        _model = Model(middleware=default_model_middleware())
     return _model
 
 

@@ -157,3 +157,34 @@ async def test_complete_route_missing_model_key(monkeypatch: pytest.MonkeyPatch)
 
     assert resp.status_code == 400
     assert "error" in resp.json()
+
+
+# --------------------------------------------------------------------------- #
+# C1: sidecar Model must be governed (non-empty middleware chain)
+# --------------------------------------------------------------------------- #
+
+
+def test_get_model_has_governed_middleware() -> None:
+    """The real _get_model() constructs a Model with the default middleware chain.
+
+    This test would FAIL against the old bare ``Model()`` construction (no middleware)
+    and PASSES once ``default_model_middleware()`` is wired in.
+    """
+    from jamjet.model.metering import MeteringMiddleware
+    from jamjet.model.middleware import ModelAllowlistMiddleware
+
+    # Force a fresh singleton so monkeypatching in other tests doesn't affect us.
+    sidecar_module._model = None
+    model = sidecar_module._get_model()
+
+    assert len(model._middleware) > 0, (
+        "_get_model() returned a bare Model() with no middleware — the sidecar is ungoverned"
+    )
+    mw_types = [type(mw) for mw in model._middleware]
+    assert ModelAllowlistMiddleware in mw_types, (
+        "ModelAllowlistMiddleware must be in the sidecar Model's middleware chain"
+    )
+    assert MeteringMiddleware in mw_types, "MeteringMiddleware must be in the sidecar Model's middleware chain"
+
+    # Restore singleton state so subsequent tests get a fresh instance.
+    sidecar_module._model = None

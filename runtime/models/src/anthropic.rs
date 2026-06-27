@@ -79,7 +79,10 @@ impl AnthropicAdapter {
     }
 
     fn build_request_body(&self, messages: &[ChatMessage], config: &ModelConfig) -> Value {
-        let model = config.model.as_deref().unwrap_or(&self.default_model);
+        let raw_model = config.model.as_deref().unwrap_or(&self.default_model);
+        // Strip "anthropic/" prefix when present — callers may send the fully-qualified
+        // form ("anthropic/claude-sonnet-4-6") but the Anthropic API expects bare names.
+        let model = raw_model.strip_prefix("anthropic/").unwrap_or(raw_model);
         let max_tokens = config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
         // Anthropic separates system prompt from messages.

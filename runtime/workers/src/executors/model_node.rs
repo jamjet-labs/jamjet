@@ -30,11 +30,15 @@ impl NodeExecutor for ModelNodeExecutor {
 
         // Extract model config from the work item payload.
         // The payload is populated by the scheduler from the IR node definition.
+        // Default to the fully-qualified provider-prefixed string so that:
+        //  • the Python sidecar's parse_model_ref maps it to provider=anthropic
+        //    (a bare "claude-sonnet-4-6" mis-maps to provider=openai — C2 fix).
+        //  • the non-seam registry routes it via the "anthropic/" prefix route.
         let model = item
             .payload
             .get("model")
             .and_then(|v| v.as_str())
-            .unwrap_or("claude-sonnet-4-6")
+            .unwrap_or("anthropic/claude-sonnet-4-6")
             .to_string();
 
         let system_prompt = item
