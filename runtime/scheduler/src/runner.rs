@@ -419,6 +419,15 @@ impl Scheduler {
                     if !tools.is_empty() {
                         obj.insert("tools".into(), serde_json::Value::Array(tools.clone()));
                     }
+                    // Running conversation history — thread the accumulated
+                    // `messages` from state into the payload so each turn's model
+                    // call sees the full history (the agent loop accumulates them
+                    // in `state["messages"]`; the executor builds its ChatMessage
+                    // list from this when the node carries no inline `prompt`).
+                    // Without this the loop cannot feed tool results forward.
+                    if let Some(messages) = progress.final_state.get("messages") {
+                        obj.insert("messages".into(), messages.clone());
+                    }
                 }
 
                 let item = WorkItem {
@@ -618,6 +627,24 @@ impl ExecProgress {
                             self.rejected.insert(node_id.clone(), reason);
                         }
                     }
+                }
+            }
+            EventKind::WorkflowStarted {
+                initial_input: serde_json::Value::Object(input),
+                ..
+            } => {
+                // Seed the running state from the execution's `initial_input` so
+                // the FIRST node sees it — e.g. the agent loop's seeded
+                // `messages` (system + user) and the `{name: "module:function"}`
+                // tool-resolver map, which turn 0's model node and every
+                // tool-dispatch node read before any node has produced a
+                // `state_patch`. Mirrors the state materializer, which starts
+                // `current_state` from `initial_input` before folding patches,
+                // so the scheduler's `final_state` stays consistent with the
+                // persisted `current_state`. A non-object `initial_input` falls
+                // through to the no-op arm (nothing to seed).
+                for (k, v) in input {
+                    self.final_state.insert(k.clone(), v.clone());
                 }
             }
             _ => {}
@@ -1347,5 +1374,82 @@ mod tests {
         assert_eq!(item.payload["workflow_id"], "wf");
         assert_eq!(item.payload["workflow_version"], "0.1.0");
         assert_eq!(item.payload["node_id"], "model_step");
+    }
+
+    /// 2j-4 G1a: a `WorkflowStarted` event seeds `final_state` from its
+    /// `initial_input` so the first node (turn 0's model node, every
+    /// tool-dispatch node) sees the seeded `messages` + tool-resolver `tools`
+    /// map before any node has produced a `state_patch`.
+    #[tokio::test]
+    async fn workflow_started_seeds_final_state_from_initial_input() {
+        let progress = fold_events(vec![EventKind::WorkflowStarted {
+            workflow_id: "wf".into(),
+            workflow_version: "0.1.0".into(),
+            initial_input: serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "Hi"}
+                ],
+                "tools": {"get_weather": "myapp.tools:get_weather"}
+            }),
+        }]);
+
+        assert_eq!(
+            progress.final_state["messages"]
+                .as_array()
+                .expect("seeded messages must be an array")
+                .len(),
+            2,
+            "initial_input.messages must seed final_state.messages"
+        );
+        assert_eq!(
+            progress.final_state["tools"]["get_weather"], "myapp.tools:get_weather",
+            "initial_input.tools resolver map must seed final_state.tools"
+        );
+    }
+
+    /// 2j-4 G1b: the Model work-item payload must carry the running `messages`
+    /// threaded from state (seeded here via `initial_input`) so each turn's
+    /// model call sees the accumulated conversation history.
+    #[tokio::test]
+    async fn model_node_payload_carries_messages_from_state() {
+        let (s, b, e) = setup(model_node_ir()).await;
+
+        // Seed the running conversation the way `start_execution` does — a
+        // WorkflowStarted event whose initial_input carries `messages`.
+        append(
+            &b,
+            &e,
+            EventKind::WorkflowStarted {
+                workflow_id: "wf".into(),
+                workflow_version: "0.1.0".into(),
+                initial_input: serde_json::json!({
+                    "messages": [
+                        {"role": "system", "content": "You are a test assistant."},
+                        {"role": "user", "content": "What is the weather in London?"}
+                    ]
+                }),
+            },
+        )
+        .await;
+
+        tick(&s, &e).await;
+
+        let item = b
+            .claim_work_item("test-worker", &["model"])
+            .await
+            .expect("backend claim must not error")
+            .expect("a Model node must produce exactly one work item");
+
+        let messages = item.payload["messages"]
+            .as_array()
+            .expect("payload.messages must be a JSON array threaded from state");
+        assert_eq!(
+            messages.len(),
+            2,
+            "payload.messages must carry the full accumulated conversation"
+        );
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["content"], "What is the weather in London?");
     }
 }

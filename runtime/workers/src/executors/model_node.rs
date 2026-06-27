@@ -230,6 +230,40 @@ mod tests {
         kind: FakeKind,
     }
 
+    /// Records the `ModelRequest` it is called with so a test can assert how the
+    /// executor mapped the work-item payload (e.g. `messages`) into the request.
+    struct CapturingAdapter {
+        captured: Arc<std::sync::Mutex<Option<ModelRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelAdapter for CapturingAdapter {
+        fn system_name(&self) -> &'static str {
+            "capturing"
+        }
+        fn default_model(&self) -> &str {
+            "fake-model"
+        }
+        async fn chat(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+            *self.captured.lock().unwrap() = Some(req);
+            Ok(ModelResponse {
+                content: "ok".to_string(),
+                model: "fake-model".to_string(),
+                finish_reason: "stop".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                structured: None,
+                tool_calls: vec![],
+            })
+        }
+        async fn structured_output(
+            &self,
+            _req: StructuredRequest,
+        ) -> Result<ModelResponse, ModelError> {
+            unimplemented!()
+        }
+    }
+
     #[async_trait::async_trait]
     impl ModelAdapter for FakeAdapter {
         fn system_name(&self) -> &'static str {
@@ -440,5 +474,76 @@ mod tests {
             sp_tool_calls.is_empty(),
             "expected empty tool_calls in state_patch"
         );
+    }
+
+    /// 2j-4 G1: when the work-item payload carries a `messages` array (and no
+    /// inline `prompt`, as the agent-loop IR emits), the executor must build the
+    /// `ModelRequest.messages` (ChatMessage list) from it — preserving order and
+    /// content so each turn's model call sees the accumulated conversation.
+    /// (Role mapping: system->System, user->User, assistant->Assistant; any
+    /// other role, e.g. a `tool` result, flattens to User — a deliberate v1
+    /// simplification since ChatMessage carries only role + content.)
+    #[tokio::test]
+    async fn executor_maps_payload_messages_into_request() {
+        use jamjet_models::adapter::ChatRole;
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let registry = Arc::new(
+            ModelRegistry::new()
+                .register(Arc::new(CapturingAdapter {
+                    captured: captured.clone(),
+                }))
+                .with_default("capturing"),
+        );
+        let executor = ModelNodeExecutor::new(registry);
+
+        let item = WorkItem {
+            id: uuid::Uuid::new_v4(),
+            execution_id: jamjet_core::workflow::ExecutionId::new(),
+            node_id: "model_step".into(),
+            queue_type: "model".into(),
+            payload: serde_json::json!({
+                "model": "fake-model",
+                "messages": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "What is the weather?"},
+                    {"role": "assistant", "content": "Let me check."},
+                    {"role": "tool", "content": "72F and sunny"}
+                ]
+            }),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: chrono::Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "default".into(),
+        };
+
+        executor
+            .execute(&item)
+            .await
+            .expect("execute with messages must not error");
+
+        let req = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the adapter must have captured a request");
+
+        assert_eq!(
+            req.messages.len(),
+            4,
+            "all 4 conversation messages must be threaded into the request"
+        );
+        assert!(matches!(req.messages[0].role, ChatRole::System));
+        assert_eq!(req.messages[0].content, "You are helpful.");
+        assert!(matches!(req.messages[1].role, ChatRole::User));
+        assert_eq!(req.messages[1].content, "What is the weather?");
+        assert!(matches!(req.messages[2].role, ChatRole::Assistant));
+        assert_eq!(req.messages[2].content, "Let me check.");
+        // `tool` role flattens to User; its content is still carried forward.
+        assert!(matches!(req.messages[3].role, ChatRole::User));
+        assert_eq!(req.messages[3].content, "72F and sunny");
     }
 }

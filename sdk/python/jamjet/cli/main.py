@@ -1674,6 +1674,16 @@ async def _worker_loop(
                 duration_ms = int((time.monotonic() - t_start) * 1000)
                 output: Any = result if isinstance(result, dict) else {"result": result}
 
+                # The node mutates workflow state with its return value: a
+                # PythonFn node's return dict IS its `state_patch` (merge-patched
+                # into state, top-level keys replaced). This is what carries the
+                # agent loop's `dispatch_tool_calls` return — {"messages": [...]}
+                # — into state["messages"] for the next turn's model node.
+                # A non-dict return is coerced to {"result": <value>} above, so a
+                # plain tool additively records {"result": ...}; nodes that mean
+                # to leave state untouched simply return {}.
+                state_patch: dict[str, Any] = output
+
                 # Forward optional GenAI telemetry if the tool surfaced it.
                 gen_ai_model_field: str | None = None
                 finish_reason_field: str | None = None
@@ -1686,7 +1696,7 @@ async def _worker_loop(
                     exec_id,
                     node_id,
                     output,
-                    {},
+                    state_patch,
                     duration_ms,
                     gen_ai_model=gen_ai_model_field,
                     finish_reason=finish_reason_field,

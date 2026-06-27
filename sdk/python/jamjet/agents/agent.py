@@ -29,6 +29,8 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +40,11 @@ from jamjet.tools.decorators import ToolDefinition
 
 if TYPE_CHECKING:
     from jamjet.spec import AgentSpec
+
+# Terminal execution statuses (WorkflowStatus, snake_case) the durable poll stops on.
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "limit_exceeded"})
+# How often run_durable polls get_execution while waiting for a terminal state.
+_POLL_INTERVAL_SECONDS = 0.5
 
 
 class Agent:
@@ -140,6 +147,187 @@ class Agent:
     def run_sync(self, prompt: str) -> AgentResult:
         """Synchronous wrapper around :meth:`run` for scripts and notebooks."""
         return asyncio.run(self.run(prompt))
+
+    async def run_durable(
+        self,
+        prompt: str,
+        *,
+        max_turns: int = 8,
+        runtime_url: str = "http://127.0.0.1:8080",
+    ) -> AgentResult:
+        """Run the agent durably on the JamJet engine, mirroring :meth:`run`.
+
+        Compiles the agent to an agent-loop IR (``model -> tools -> model``,
+        statically unrolled and bounded by *max_turns*), registers it, then
+        starts an execution seeded with the system+user ``messages`` and the
+        ``{name: "module:function"}`` tool-resolver map. It polls the execution
+        to a terminal state and extracts an :class:`AgentResult` with the SAME
+        fields as the in-process :meth:`run` (final content, the tool calls made,
+        the IR, and the wall-clock duration).
+
+        Unlike :meth:`run` (a pure in-process loop), this routes every model call
+        and tool dispatch through the durable event-sourced engine, so the run
+        gets the event log, replay, idempotency, park-on-429, and artifacts for
+        free. It requires a running engine at *runtime_url* and a running
+        ``jamjet worker`` (the python_tool worker) to execute the ``@tool``
+        functions.
+
+        Raises
+        ------
+        RuntimeError
+            If the execution reaches a non-``completed`` terminal state
+            (``failed`` / ``cancelled`` / ``limit_exceeded``).
+        TimeoutError
+            If no terminal state is reached within the agent's
+            ``timeout_seconds`` limit.
+        """
+        from jamjet.client import JamjetClient  # noqa: PLC0415 - patch point / avoid import cycle
+        from jamjet.compiler.agent_ir import build_initial_state, compile_agent_to_ir  # noqa: PLC0415
+
+        ir = compile_agent_to_ir(self, prompt, max_turns)
+        initial_input = build_initial_state(self, prompt)
+        workflow_id: str = ir["workflow_id"]
+        workflow_version: str | None = ir.get("version")
+
+        t0 = time.monotonic()
+        async with JamjetClient(runtime_url) as client:
+            # Register the compiled IR, then start an execution seeded with the
+            # running messages + tool-resolver map (build_initial_state).
+            await client.create_workflow(ir)
+            started = await client.start_execution(workflow_id, initial_input, workflow_version=workflow_version)
+            exec_id = started.get("execution_id")
+            if not exec_id:
+                raise RuntimeError(f"start_execution returned no execution_id: {started!r}")
+
+            execution = await self._poll_to_terminal(client, exec_id)
+            # Events carry artifact-resolved NodeCompleted outputs (server-side),
+            # used only as a fallback if a spilled answer sentinel slips through.
+            try:
+                events = (await client.get_events(exec_id)).get("events", [])
+            except Exception:  # noqa: BLE001 - events are a best-effort fallback
+                events = []
+
+        duration_us = int((time.monotonic() - t0) * 1_000_000)
+        return self._extract_result(execution, events, ir, duration_us)
+
+    async def _poll_to_terminal(self, client: Any, exec_id: str) -> dict[str, Any]:
+        """Poll ``get_execution`` until the execution reaches a terminal state."""
+        elapsed = 0.0
+        timeout_s = self.limits.timeout_seconds
+        while True:
+            execution = await client.get_execution(exec_id)
+            status = execution.get("status", "unknown")
+            if status in _TERMINAL_STATUSES:
+                return execution
+            if elapsed >= timeout_s:
+                raise TimeoutError(
+                    f"durable agent run {exec_id} did not reach a terminal state "
+                    f"within {timeout_s}s (last status: {status!r})"
+                )
+            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+            elapsed += _POLL_INTERVAL_SECONDS
+
+    def _extract_result(
+        self,
+        execution: dict[str, Any],
+        events: list[dict[str, Any]],
+        ir: dict[str, Any],
+        duration_us: int,
+    ) -> AgentResult:
+        """Build an :class:`AgentResult` from a terminal durable execution.
+
+        The final answer is the last model turn's content
+        (``current_state["last_model_output"]``, written inline by the Model
+        executor; falls back to the last assistant message). The tool-call trace
+        is reconstructed from the accumulated ``messages``. Field shape matches
+        the in-process :meth:`run` result exactly.
+        """
+        status = execution.get("status")
+        if status != "completed":
+            detail = execution.get("detail") or status
+            raise RuntimeError(f"durable agent run ended in non-completed state: {detail}")
+
+        state = execution.get("current_state") or {}
+        messages = state.get("messages") or []
+
+        output = state.get("last_model_output")
+        if output is None:
+            output = self._last_assistant_content(messages)
+        output = self._resolve_artifact_sentinel(output, events)
+
+        return AgentResult(
+            output=output if isinstance(output, str) else ("" if output is None else str(output)),
+            tool_calls=self._tool_calls_from_messages(messages),
+            ir=ir,
+            duration_us=duration_us,
+        )
+
+    @staticmethod
+    def _last_assistant_content(messages: list[dict[str, Any]]) -> str | None:
+        """The content of the last assistant message that carried text."""
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant" and msg.get("content"):
+                return msg["content"]
+        return None
+
+    @staticmethod
+    def _tool_calls_from_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Reconstruct the in-process tool-call trace from the message history.
+
+        Pairs each ``role: tool`` result with the arguments from the assistant
+        ``tool_calls`` that requested it (matched by ``tool_call_id``), yielding
+        dicts with the same keys as the in-process ``ToolCallRecord.model_dump()``
+        (``tool`` / ``input`` / ``output`` / ``duration_us``). Per-call durations
+        are not carried in the message history, so ``duration_us`` is ``0``.
+        """
+        args_by_id: dict[str, Any] = {}
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            for call in msg.get("tool_calls") or []:
+                fn = call.get("function") or {}
+                raw = fn.get("arguments")
+                try:
+                    parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                except (TypeError, ValueError):
+                    parsed = {}
+                if call.get("id") is not None:
+                    args_by_id[call["id"]] = parsed
+
+        calls: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") != "tool":
+                continue
+            calls.append(
+                {
+                    "tool": msg.get("name"),
+                    "input": args_by_id.get(msg.get("tool_call_id"), {}),
+                    "output": msg.get("content"),
+                    "duration_us": 0,
+                }
+            )
+        return calls
+
+    @staticmethod
+    def _resolve_artifact_sentinel(value: Any, events: list[dict[str, Any]]) -> Any:
+        """Recover the answer if it surfaced as a 2i artifact spill sentinel.
+
+        ``last_model_output`` is written inline (never spilled to the artifact
+        store), so it is normally already the answer text. As a guard, if a
+        ``{"$artifact": ...}`` sentinel slips through, recover the resolved text
+        from the most recent NodeCompleted event's ``output.content`` (the
+        ``get_events`` endpoint resolves sentinels server-side).
+        """
+        if not (isinstance(value, dict) and "$artifact" in value):
+            return value
+        for ev in reversed(events):
+            kind = ev.get("kind") or {}
+            if kind.get("type") != "node_completed":
+                continue
+            out = kind.get("output")
+            if isinstance(out, dict) and "content" in out and "$artifact" not in out:
+                return out["content"]
+        return value
 
     async def stream(
         self,
