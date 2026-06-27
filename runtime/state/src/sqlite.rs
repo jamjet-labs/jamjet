@@ -858,6 +858,49 @@ impl StateBackend for SqliteBackend {
         Ok(Some(result_json))
     }
 
+    // ── Content-addressed artifact store ─────────────────────────────────────
+
+    async fn put_artifact(
+        &self,
+        bytes: &[u8],
+        media_type: Option<&str>,
+    ) -> BackendResult<crate::artifact::ArtifactRef> {
+        let hash = crate::hashing::sha256_hex(bytes);
+        let size = bytes.len() as u64;
+        let created_at = chrono::Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO artifacts
+               (tenant_id, hash, bytes, size, media_type, created_at)
+               VALUES ('default', ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&hash)
+        .bind(bytes)
+        .bind(size as i64)
+        .bind(media_type)
+        .bind(&created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+
+        Ok(crate::artifact::ArtifactRef {
+            hash,
+            size,
+            media_type: media_type.map(|s| s.to_string()),
+        })
+    }
+
+    async fn get_artifact(&self, hash: &str) -> BackendResult<Option<Vec<u8>>> {
+        let row =
+            sqlx::query("SELECT bytes FROM artifacts WHERE tenant_id = 'default' AND hash = ?")
+                .bind(hash)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_db_err)?;
+
+        Ok(row.map(|r| r.get::<Vec<u8>, _>("bytes")))
+    }
+
     // ── Work item queue ───────────────────────────────────────────────────
 
     #[instrument(skip(self, item), fields(execution_id = %item.execution_id, node_id = %item.node_id))]
