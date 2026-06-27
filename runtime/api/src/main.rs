@@ -159,6 +159,14 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move { scheduler.run().await });
     info!("Scheduler started");
 
+    // Spawn the async projector alongside the scheduler.  Maintains the durable
+    // proj_approvals read-model so the approvals endpoint serves from a projection
+    // instead of replaying the event log on every request.
+    // No shutdown signal wired today — matches the scheduler; follow-up: F-2h-shutdown.
+    let projector = jamjet_scheduler::Projector::new(state.backend.clone());
+    tokio::spawn(async move { projector.run().await });
+    info!("Projector started");
+
     // In dev mode (or when JAMJET_EMBED_WORKERS is set), run an in-process worker
     // pool so submitted workflows actually execute. In production, run dedicated
     // worker processes against the same state backend instead. The base backend

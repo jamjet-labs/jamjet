@@ -19,8 +19,8 @@ pub mod tenant;
 pub mod tenant_scoped;
 
 pub use backend::{
-    ApiToken, BackendResult, ReclaimResult, StateBackend, StateBackendError, WorkItem, WorkItemId,
-    WorkflowDefinition,
+    ApiToken, ApprovalProjectionRow, BackendResult, ReclaimResult, StateBackend, StateBackendError,
+    WorkItem, WorkItemId, WorkflowDefinition,
 };
 pub use budget::BudgetState;
 pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};

@@ -11,8 +11,9 @@ use jamjet_agents::InMemoryAgentRegistry;
 use jamjet_api::{routes::build_router_with_opts, state::AppState};
 use jamjet_audit::{AuditEnricher, NoopAuditBackend};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+use jamjet_scheduler::Projector;
 use jamjet_state::backend::StateBackend;
-use jamjet_state::event::EventKind;
+use jamjet_state::event::{ApprovalDecision, EventKind};
 use jamjet_state::{Event, InMemoryBackend};
 use serde_json::Value;
 use std::sync::Arc;
@@ -324,6 +325,11 @@ async fn list_approvals_shows_pending_then_decided() {
     seed_approval_required(&backend, &execution_id, "b").await;
     let id_str = execution_id.to_string();
 
+    // The endpoint now reads from the async projection.  Run a tick to
+    // fold the seeded events into the projection before querying.
+    let projector = Projector::new(backend.clone());
+    projector.tick().await.expect("projector tick 1");
+
     // GET /executions/:id/approvals — both pending.
     let resp = router
         .clone()
@@ -356,7 +362,7 @@ async fn list_approvals_shows_pending_then_decided() {
         assert!(p["approver"].is_string(), "pending entry missing approver");
     }
 
-    // Approve node "a".
+    // Approve node "a" via the write path (uses get_events for strong consistency).
     let approve_resp = router
         .clone()
         .oneshot(
@@ -368,6 +374,9 @@ async fn list_approvals_shows_pending_then_decided() {
         .await
         .unwrap();
     assert_eq!(approve_resp.status(), StatusCode::OK);
+
+    // Fold the new ApprovalReceived event into the projection.
+    projector.tick().await.expect("projector tick 2");
 
     // GET again — "a" decided, "b" still pending.
     let resp2 = router
@@ -423,4 +432,217 @@ async fn approve_on_terminal_execution_returns_409() {
         error.contains("Cancelled"),
         "expected terminal status in error, got: {error}"
     );
+}
+
+/// Verify the projection-driven GET /executions/:id/approvals endpoint:
+/// seed approval events, run a projector tick, assert the response shape
+/// matches what the events imply (node, latest status, user, comment, tool_name).
+/// Also covers a Rejected outcome and the "pending" pending-metadata fields
+/// (tool_name, approver) that the legacy approvals_view always returned.
+#[tokio::test]
+async fn projection_driven_approvals_endpoint() {
+    let state = make_state();
+    let backend = state.backend.clone();
+    let app = build_router_with_opts(state, true);
+
+    let execution_id = create_execution(&backend).await;
+
+    // Seed: node "gate" gets ToolApprovalRequired, then ApprovalReceived(Rejected).
+    // node "check" stays pending (only ToolApprovalRequired, no decision yet).
+    let seq = backend.latest_sequence(&execution_id).await.unwrap();
+    backend
+        .append_event(Event::new(
+            execution_id.clone(),
+            seq + 1,
+            EventKind::ToolApprovalRequired {
+                node_id: "gate".into(),
+                tool_name: "run_payment".into(),
+                approver: "compliance".into(),
+                context: serde_json::json!({"amount": 5000}),
+            },
+        ))
+        .await
+        .unwrap();
+    backend
+        .append_event(Event::new(
+            execution_id.clone(),
+            seq + 2,
+            EventKind::ApprovalReceived {
+                node_id: "gate".into(),
+                user_id: "carol".into(),
+                decision: ApprovalDecision::Rejected,
+                comment: Some("exceeds limit".into()),
+                state_patch: None,
+            },
+        ))
+        .await
+        .unwrap();
+    backend
+        .append_event(Event::new(
+            execution_id.clone(),
+            seq + 3,
+            EventKind::ToolApprovalRequired {
+                node_id: "check".into(),
+                tool_name: "verify_id".into(),
+                approver: "human".into(),
+                context: serde_json::json!({}),
+            },
+        ))
+        .await
+        .unwrap();
+
+    // Run a projector tick to fold events into the projection.
+    let projector = Projector::new(backend.clone());
+    projector.tick().await.expect("projector tick must succeed");
+
+    // Call the endpoint — now served from the projection.
+    let id_str = execution_id.to_string();
+    let resp = app
+        .oneshot(
+            Request::get(format!("/executions/{id_str}/approvals"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+
+    // "check" is pending; "gate" is decided (rejected).
+    let pending = json["pending"]
+        .as_array()
+        .expect("pending must be an array");
+    assert_eq!(pending.len(), 1, "one node still pending");
+    let p = &pending[0];
+    assert_eq!(p["node_id"], "check");
+    assert_eq!(
+        p["tool_name"], "verify_id",
+        "tool_name must be preserved in projection"
+    );
+    assert_eq!(
+        p["approver"], "human",
+        "approver must be preserved in projection"
+    );
+    assert!(p["sequence"].is_number(), "sequence must be present");
+
+    let decided = json["decided"]
+        .as_array()
+        .expect("decided must be an array");
+    assert_eq!(decided.len(), 1, "one node decided");
+    let d = &decided[0];
+    assert_eq!(d["node_id"], "gate");
+    assert_eq!(d["status"], "rejected");
+    assert_eq!(d["user_id"], "carol");
+    assert_eq!(d["comment"], "exceeds limit");
+    assert!(d["sequence"].is_number(), "sequence must be present");
+
+    // Second tick with no new events: idempotent — response unchanged.
+    let resp2 = Projector::new(backend.clone())
+        .tick()
+        .await
+        .expect("second tick");
+    assert_eq!(resp2, 0, "second tick with no new events applies zero rows");
+}
+
+/// Finding A + B — event-log fallback: an execution that has approval events but
+/// whose projector tick has never run (projection table is empty) must NOT return
+/// an empty list.  The endpoint falls back to event-log replay.
+///
+/// This is the same code path exercised by:
+/// - Terminal executions (projector only scans Running status; terminal execs
+///   never get a row in proj_approvals).
+/// - Non-default-tenant executions (the projector writes proj_approvals with
+///   tenant_id='default'; reading via backend_for(&tenant) returns nothing).
+#[tokio::test]
+async fn list_approvals_fallback_when_not_yet_projected() {
+    let state = make_state();
+    let backend = state.backend.clone();
+    let app = build_router_with_opts(state, true);
+
+    let execution_id = create_execution(&backend).await;
+    seed_approval_required(&backend, &execution_id, "gate").await;
+    let id_str = execution_id.to_string();
+
+    // No projector tick: proj_approvals is empty for this execution.
+    // The endpoint must fall back to event-log replay and return the pending approval.
+    let resp = app
+        .oneshot(
+            Request::get(format!("/executions/{id_str}/approvals"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    let pending = json["pending"]
+        .as_array()
+        .expect("pending must be an array");
+    assert_eq!(
+        pending.len(),
+        1,
+        "endpoint must return the pending approval via fallback when projection is empty"
+    );
+    assert_eq!(
+        pending[0]["node_id"], "gate",
+        "fallback must identify the correct node"
+    );
+    assert!(
+        pending[0]["tool_name"].is_string(),
+        "fallback must return tool_name from event log"
+    );
+    let decided = json["decided"]
+        .as_array()
+        .expect("decided must be an array");
+    assert_eq!(decided.len(), 0, "no decided approvals yet");
+}
+
+/// Finding A + B — projection fast path: once the projector has ticked, the
+/// endpoint serves from proj_approvals (not the event log).
+/// Both paths return the same JSON shape, so the response is byte-compatible.
+#[tokio::test]
+async fn list_approvals_fast_path_from_projection_after_tick() {
+    let state = make_state();
+    let backend = state.backend.clone();
+    let app = build_router_with_opts(state, true);
+
+    let execution_id = create_execution(&backend).await;
+    seed_approval_required(&backend, &execution_id, "check").await;
+    let id_str = execution_id.to_string();
+
+    // Run a projector tick to populate proj_approvals.
+    let projector = Projector::new(backend.clone());
+    projector.tick().await.expect("projector tick");
+
+    // Projection is now populated: endpoint must serve from it (non-empty fast path).
+    let resp = app
+        .oneshot(
+            Request::get(format!("/executions/{id_str}/approvals"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    let pending = json["pending"]
+        .as_array()
+        .expect("pending must be an array");
+    assert_eq!(pending.len(), 1, "one pending approval from projection");
+    assert_eq!(pending[0]["node_id"], "check");
+    assert_eq!(
+        pending[0]["tool_name"], "tool_check",
+        "projection preserves tool_name from ToolApprovalRequired"
+    );
+    assert_eq!(
+        pending[0]["approver"], "human",
+        "projection preserves approver from ToolApprovalRequired"
+    );
+    let decided = json["decided"]
+        .as_array()
+        .expect("decided must be an array");
+    assert_eq!(decided.len(), 0, "no decided approvals");
 }

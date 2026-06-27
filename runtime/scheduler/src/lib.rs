@@ -7,7 +7,9 @@
 //! 4. Handle retry scheduling on node failure
 //! 5. Wake suspended executions on timer/external-event
 
+pub mod projector;
 pub mod runner;
 pub mod strategy_bridge;
 
+pub use projector::Projector;
 pub use runner::{Scheduler, SchedulerConfig};

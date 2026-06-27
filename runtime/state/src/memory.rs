@@ -41,6 +41,10 @@ pub struct InMemoryBackend {
     /// Idempotency cache: idempotency_key -> result_json.
     /// Mirrors the `tool_effects` table in the SQLite backends.
     tool_effects: DashMap<String, serde_json::Value>,
+    /// Projected approval read-model. Key = (execution_id as String, node_id).
+    proj_approvals: DashMap<(String, String), crate::backend::ApprovalProjectionRow>,
+    /// Projector checkpoints. Key = (projection_name, execution_id as String).
+    projector_checkpoints: DashMap<(String, String), i64>,
 }
 
 impl InMemoryBackend {
@@ -58,6 +62,8 @@ impl InMemoryBackend {
             lease_epochs: DashMap::new(),
             store_term: AtomicI64::new(0),
             tool_effects: DashMap::new(),
+            proj_approvals: DashMap::new(),
+            projector_checkpoints: DashMap::new(),
         }
     }
 
@@ -661,6 +667,81 @@ impl StateBackend for InMemoryBackend {
 
     async fn validate_token(&self, token: &str) -> BackendResult<Option<ApiToken>> {
         Ok(self.tokens.get(token).map(|r| r.value().clone()))
+    }
+
+    // ── Async read-model projector ────────────────────────────────────
+
+    async fn apply_approval_projection(
+        &self,
+        row: crate::backend::ApprovalProjectionRow,
+        projection_name: &str,
+        new_checkpoint: i64,
+    ) -> BackendResult<()> {
+        // In-memory: no ACID atomicity, but both writes happen in the same
+        // synchronous step so there is no observable gap in tests.
+        let key = (row.execution_id.0.to_string(), row.node_id.clone());
+        self.proj_approvals.insert(key, row.clone());
+        let cp_key = (projection_name.to_string(), row.execution_id.0.to_string());
+        self.projector_checkpoints.insert(cp_key, new_checkpoint);
+        Ok(())
+    }
+
+    async fn apply_approval_projection_batch(
+        &self,
+        rows: Vec<crate::backend::ApprovalProjectionRow>,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+        new_checkpoint: i64,
+    ) -> BackendResult<()> {
+        // In-memory: DashMap operations are individually atomic; we apply all
+        // rows then the checkpoint in a tight synchronous sequence with no
+        // await between them — sufficient for single-threaded test use.
+        for row in rows {
+            let key = (row.execution_id.0.to_string(), row.node_id.clone());
+            self.proj_approvals.insert(key, row);
+        }
+        let cp_key = (projection_name.to_string(), execution_id.0.to_string());
+        self.projector_checkpoints.insert(cp_key, new_checkpoint);
+        Ok(())
+    }
+
+    async fn get_approval_projection(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<Vec<crate::backend::ApprovalProjectionRow>> {
+        let exec_str = execution_id.0.to_string();
+        let mut rows: Vec<crate::backend::ApprovalProjectionRow> = self
+            .proj_approvals
+            .iter()
+            .filter(|e| e.key().0 == exec_str)
+            .map(|e| e.value().clone())
+            .collect();
+        rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        Ok(rows)
+    }
+
+    async fn get_projector_checkpoint(
+        &self,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<i64> {
+        let key = (projection_name.to_string(), execution_id.0.to_string());
+        Ok(self
+            .projector_checkpoints
+            .get(&key)
+            .map(|v| *v.value())
+            .unwrap_or(0))
+    }
+
+    async fn set_projector_checkpoint(
+        &self,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+        new_checkpoint: i64,
+    ) -> BackendResult<()> {
+        let key = (projection_name.to_string(), execution_id.0.to_string());
+        self.projector_checkpoints.insert(key, new_checkpoint);
+        Ok(())
     }
 
     // ── Tenants ──────────────────────────────────────────────────────
