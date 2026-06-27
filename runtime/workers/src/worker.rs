@@ -1825,4 +1825,127 @@ mod tests {
             );
         }
     }
+
+    // ── Task 2f-4: exhaustion boundary complement ─────────────────────────────
+
+    /// Penultimate-attempt boundary: when the executor returns `RateLimited` at
+    /// the last attempt index that is still BELOW `max_attempts`, the worker must
+    /// park (not fail terminally).
+    ///
+    /// Complements the two existing exhaustion tests:
+    ///   - `park_on_rate_limit_under_max_attempts` uses attempt=0 (far from the boundary).
+    ///   - `rate_limit_fails_terminally_at_max_attempts` uses attempt=2 (max_attempts-1 → fails).
+    ///
+    /// Here we use attempt=1, max_attempts=3 so next_attempt=2, which satisfies
+    /// `2 < 3` → parks.  This covers the off-by-one: the penultimate attempt must
+    /// produce a `NodeParked` event, NOT a terminal `NodeFailed`.
+    #[tokio::test]
+    async fn rate_limit_parks_at_penultimate_attempt() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        backend
+            .create_execution(sample_execution(&eid))
+            .await
+            .unwrap();
+        backend
+            .store_workflow(jamjet_state::backend::WorkflowDefinition {
+                workflow_id: "test-wf".into(),
+                version: "1.0.0".into(),
+                ir: minimal_ir_json(),
+                created_at: Utc::now(),
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        // attempt=1 (penultimate), max_attempts=3: next_attempt=2 < 3 → parks.
+        backend
+            .enqueue_work_item(jamjet_state::backend::WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "default".into(),
+                payload: serde_json::json!({
+                    "workflow_id": "test-wf",
+                    "workflow_version": "1.0.0"
+                }),
+                attempt: 1,
+                max_attempts: 3,
+                created_at: Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor(
+            "tool",
+            Arc::new(RateLimitingExecutor {
+                retry_after_secs: 30,
+            }),
+        );
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        worker.execute_item(item).await.unwrap();
+
+        let events = backend.get_events(&eid).await.unwrap();
+
+        // Must emit exactly one NodeParked (not NodeFailed) at the penultimate attempt.
+        let parked_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::NodeParked { .. }))
+            .count();
+        assert_eq!(
+            parked_count, 1,
+            "penultimate attempt must emit NodeParked, not NodeFailed; got {parked_count}"
+        );
+
+        // Must NOT emit NodeFailed.
+        let failed_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::NodeFailed { .. }))
+            .count();
+        assert_eq!(
+            failed_count, 0,
+            "penultimate attempt must NOT emit NodeFailed; got {failed_count}"
+        );
+
+        // NodeParked must carry attempt=2 (next_attempt after attempt=1).
+        let parked_event = events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::NodeParked { .. }))
+            .unwrap();
+        if let EventKind::NodeParked { attempt, .. } = &parked_event.kind {
+            assert_eq!(
+                *attempt, 2,
+                "NodeParked.attempt must be 2 (next after penultimate)"
+            );
+        }
+
+        // Item must be re-claimable with attempt=2 (in-memory ignores retry_after window).
+        let re_claimed = backend
+            .claim_work_item("worker-2", &["default"])
+            .await
+            .unwrap();
+        assert!(
+            re_claimed.is_some(),
+            "item must be re-claimable after penultimate park"
+        );
+        assert_eq!(
+            re_claimed.unwrap().attempt,
+            2,
+            "re-claimed item must be at attempt=2"
+        );
+    }
 }
