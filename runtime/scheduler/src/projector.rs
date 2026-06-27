@@ -89,7 +89,12 @@ impl Projector {
 
         for event in &events {
             match &event.kind {
-                EventKind::ToolApprovalRequired { node_id, .. } => {
+                EventKind::ToolApprovalRequired {
+                    node_id,
+                    tool_name,
+                    approver,
+                    context,
+                } => {
                     node_map.insert(
                         node_id.clone(),
                         ApprovalProjectionRow {
@@ -99,6 +104,9 @@ impl Projector {
                             user_id: None,
                             comment: None,
                             last_sequence: event.sequence,
+                            tool_name: Some(tool_name.clone()),
+                            approver: Some(approver.clone()),
+                            context: Some(context.clone()),
                         },
                     );
                 }
@@ -113,6 +121,8 @@ impl Projector {
                         ApprovalDecision::Approved => "approved",
                         ApprovalDecision::Rejected => "rejected",
                     };
+                    // Pending metadata (tool_name/approver/context) is cleared on
+                    // resolution — the node is no longer waiting for a decision.
                     node_map.insert(
                         node_id.clone(),
                         ApprovalProjectionRow {
@@ -122,6 +132,9 @@ impl Projector {
                             user_id: Some(user_id.clone()),
                             comment: comment.clone(),
                             last_sequence: event.sequence,
+                            tool_name: None,
+                            approver: None,
+                            context: None,
                         },
                     );
                 }

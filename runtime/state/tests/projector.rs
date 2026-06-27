@@ -30,6 +30,9 @@ fn granted_row(execution_id: ExecutionId) -> ApprovalProjectionRow {
         user_id: Some("alice".into()),
         comment: Some("looks good".into()),
         last_sequence: 5,
+        tool_name: None,
+        approver: None,
+        context: None,
     }
 }
 
@@ -84,6 +87,9 @@ async fn assert_upsert_idempotency(backend: &dyn StateBackend) {
         user_id: Some("bob".into()),
         comment: None,
         last_sequence: 9,
+        tool_name: None,
+        approver: None,
+        context: None,
     };
     backend
         .apply_approval_projection(updated, "approvals", 9)
@@ -129,6 +135,9 @@ async fn assert_two_nodes_same_execution(backend: &dyn StateBackend) {
         user_id: None,
         comment: None,
         last_sequence: 3,
+        tool_name: None,
+        approver: None,
+        context: None,
     };
     let row_b = ApprovalProjectionRow {
         execution_id: exec.clone(),
@@ -137,6 +146,9 @@ async fn assert_two_nodes_same_execution(backend: &dyn StateBackend) {
         user_id: None,
         comment: None,
         last_sequence: 7,
+        tool_name: None,
+        approver: None,
+        context: None,
     };
 
     backend
@@ -301,6 +313,9 @@ async fn tenant_isolation() {
                 user_id: None,
                 comment: None,
                 last_sequence: 1,
+                tool_name: None,
+                approver: None,
+                context: None,
             },
             "approvals",
             1,

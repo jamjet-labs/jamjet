@@ -9,16 +9,27 @@ use thiserror::Error;
 /// node) pair, maintained asynchronously by the projector.
 ///
 /// Keyed by `(execution_id, node_id)`; `status` is the latest approval state
-/// (`"pending"`, `"granted"`, `"denied"`). `last_sequence` is the event
+/// (`"pending"`, `"approved"`, `"rejected"`). `last_sequence` is the event
 /// sequence that produced this row (used for idempotent re-application).
+///
+/// `tool_name`, `approver`, and `context` are populated only for `"pending"`
+/// rows (from `ToolApprovalRequired`); they are cleared to `None` when the
+/// node transitions to `"approved"` or `"rejected"`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalProjectionRow {
     pub execution_id: ExecutionId,
     pub node_id: String,
+    /// `"pending"` | `"approved"` | `"rejected"`
     pub status: String,
     pub user_id: Option<String>,
     pub comment: Option<String>,
     pub last_sequence: i64,
+    /// Populated for `"pending"` rows from `ToolApprovalRequired.tool_name`.
+    pub tool_name: Option<String>,
+    /// Populated for `"pending"` rows from `ToolApprovalRequired.approver`.
+    pub approver: Option<String>,
+    /// Populated for `"pending"` rows from `ToolApprovalRequired.context`.
+    pub context: Option<serde_json::Value>,
 }
 
 /// Workflow definition stored in the registry (the compiled IR as JSON).

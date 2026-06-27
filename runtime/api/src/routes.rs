@@ -436,8 +436,55 @@ async fn list_approvals_for_execution(
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
     let execution_id = parse_execution_id(&id)?;
-    let events = backend.get_events(&execution_id).await?;
-    Ok(Json(crate::approvals::approvals_view(&events)))
+
+    // Read from the durable projection (eventually-consistent; lags the write
+    // path by up to one projector tick, ~500 ms).  The write path (submit_approval
+    // in POST /executions/:id/approve) continues to use get_events() for strong
+    // consistency.  The response shape is byte-compatible with the legacy
+    // event-derived approvals_view: { "pending": [...], "decided": [...] }.
+    // Follow-up: F-2h-shutdown (projector graceful shutdown wiring).
+    let rows = backend.get_approval_projection(&execution_id).await?;
+
+    let mut pending: Vec<serde_json::Value> = Vec::new();
+    let mut decided: Vec<serde_json::Value> = Vec::new();
+
+    for row in &rows {
+        match row.status.as_str() {
+            "pending" => {
+                pending.push(serde_json::json!({
+                    "node_id":   row.node_id,
+                    "tool_name": row.tool_name,
+                    "approver":  row.approver,
+                    "context":   row.context,
+                    "sequence":  row.last_sequence,
+                }));
+            }
+            "approved" => {
+                decided.push(serde_json::json!({
+                    "node_id":  row.node_id,
+                    "status":   "approved",
+                    "user_id":  row.user_id,
+                    "sequence": row.last_sequence,
+                }));
+            }
+            "rejected" => {
+                decided.push(serde_json::json!({
+                    "node_id":  row.node_id,
+                    "status":   "rejected",
+                    "user_id":  row.user_id,
+                    "comment":  row.comment,
+                    "sequence": row.last_sequence,
+                }));
+            }
+            _ => {
+                // Unknown status: skip rather than panic.
+            }
+        }
+    }
+
+    Ok(Json(
+        serde_json::json!({ "pending": pending, "decided": decided }),
+    ))
 }
 
 #[derive(Deserialize)]

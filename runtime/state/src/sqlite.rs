@@ -1621,15 +1621,25 @@ impl StateBackend for SqliteBackend {
             .await
             .map_err(map_db_err)?;
 
+        let context_json = row
+            .context
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
         sqlx::query(
             r#"INSERT INTO proj_approvals
-               (execution_id, node_id, status, user_id, comment, last_sequence, tenant_id, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'default', ?)
+               (execution_id, node_id, status, user_id, comment, last_sequence,
+                tool_name, approver, context_json, tenant_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'default', ?)
                ON CONFLICT(execution_id, node_id) DO UPDATE SET
                  status        = excluded.status,
                  user_id       = excluded.user_id,
                  comment       = excluded.comment,
                  last_sequence = excluded.last_sequence,
+                 tool_name     = excluded.tool_name,
+                 approver      = excluded.approver,
+                 context_json  = excluded.context_json,
                  updated_at    = excluded.updated_at"#,
         )
         .bind(&exec_id_str)
@@ -1638,6 +1648,9 @@ impl StateBackend for SqliteBackend {
         .bind(&row.user_id)
         .bind(&row.comment)
         .bind(row.last_sequence)
+        .bind(&row.tool_name)
+        .bind(&row.approver)
+        .bind(&context_json)
         .bind(&now)
         .execute(&mut *tx)
         .await
@@ -1669,7 +1682,8 @@ impl StateBackend for SqliteBackend {
     ) -> BackendResult<Vec<crate::backend::ApprovalProjectionRow>> {
         let id_str = execution_id_str(execution_id);
         let rows = sqlx::query(
-            "SELECT node_id, status, user_id, comment, last_sequence \
+            "SELECT node_id, status, user_id, comment, last_sequence, \
+                    tool_name, approver, context_json \
              FROM proj_approvals WHERE execution_id = ? ORDER BY node_id",
         )
         .bind(&id_str)
@@ -1679,6 +1693,12 @@ impl StateBackend for SqliteBackend {
 
         rows.iter()
             .map(|r| {
+                let context_json: Option<String> = r
+                    .try_get::<Option<String>, _>("context_json")
+                    .map_err(map_db_err)?;
+                let context = context_json
+                    .map(|s| serde_json::from_str::<serde_json::Value>(&s))
+                    .transpose()?;
                 Ok(crate::backend::ApprovalProjectionRow {
                     execution_id: execution_id.clone(),
                     node_id: r.try_get::<String, _>("node_id").map_err(map_db_err)?,
@@ -1690,6 +1710,13 @@ impl StateBackend for SqliteBackend {
                         .try_get::<Option<String>, _>("comment")
                         .map_err(map_db_err)?,
                     last_sequence: r.try_get::<i64, _>("last_sequence").map_err(map_db_err)?,
+                    tool_name: r
+                        .try_get::<Option<String>, _>("tool_name")
+                        .map_err(map_db_err)?,
+                    approver: r
+                        .try_get::<Option<String>, _>("approver")
+                        .map_err(map_db_err)?,
+                    context,
                 })
             })
             .collect()
