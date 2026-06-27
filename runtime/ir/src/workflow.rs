@@ -55,6 +55,10 @@ pub struct WorkflowIr {
     /// If absent, the execution fails with `WorkflowFailed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_budget_exceeded: Option<String>,
+    /// If true, when a budget ceiling is hit the execution rolls over to a new
+    /// segment (continue-as-new) instead of failing. Default: false.
+    #[serde(default)]
+    pub continue_as_new: bool,
     /// Data handling policy (PII redaction + retention controls).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_policy: Option<DataPolicyIr>,
@@ -306,6 +310,7 @@ mod tests {
             token_budget: None,
             cost_budget_usd: None,
             on_budget_exceeded: None,
+            continue_as_new: false,
             data_policy: None,
             state_schema: "schemas.TestState".into(),
             start_node: "start".into(),

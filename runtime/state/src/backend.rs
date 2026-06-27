@@ -1,4 +1,4 @@
-use crate::event::{Event, EventSequence};
+use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
 use crate::tenant::{Tenant, TenantId, DEFAULT_TENANT};
 use async_trait::async_trait;
@@ -126,6 +126,21 @@ pub trait StateBackend: Send + Sync {
     /// Load the latest snapshot for an execution.
     async fn latest_snapshot(&self, execution_id: &ExecutionId) -> BackendResult<Option<Snapshot>>;
 
+    /// Atomically create a continuation segment: the execution row, its seed
+    /// snapshot, the WorkflowStarted + NodeScheduled events, and the start-node
+    /// work item, in one transaction. All-or-nothing so a crash mid-creation
+    /// leaves no partial child. The caller-supplied `execution.execution_id` MUST
+    /// be fresh (not yet committed); the idempotency guard lives in
+    /// `start_next_segment`.
+    async fn create_segment_atomic(
+        &self,
+        execution: WorkflowExecution,
+        seed_snapshot: Snapshot,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+    ) -> BackendResult<()>;
+
     // ── Idempotency cache (tool_effects) ─────────────────────────────────────
 
     /// Look up a previously recorded node result by its idempotency key.
@@ -198,6 +213,26 @@ pub trait StateBackend: Send + Sync {
         lease_fence: i64,
         retry_after: &str,
         next_attempt: u32,
+    ) -> BackendResult<bool>;
+
+    /// Fence-guarded finalization of a continue-as-new rollover on the OLD execution.
+    ///
+    /// In one transaction:
+    /// 1. Attempt `UPDATE work_items SET status='completed', completed_at=?, lease_expires_at=NULL
+    ///    WHERE id=? AND lease_fence=?`. Zero rows means the fence no longer matches
+    ///    (lease was stolen or item already settled) — rollback and return `Ok(false)`.
+    /// 2. Idempotently mark the execution terminal:
+    ///    `UPDATE workflow_executions SET status='limit_exceeded', updated_at=?, completed_at=COALESCE(completed_at,?)
+    ///    WHERE execution_id=? AND status NOT IN ('completed','failed','cancelled','limit_exceeded')`.
+    ///    (This is a no-op if the execution is already terminal, which is safe.)
+    /// 3. Commit and return `Ok(true)`.
+    ///
+    /// A zombie worker (stale fence) gets `Ok(false)` and must not proceed further.
+    async fn finalize_rollover_fenced(
+        &self,
+        execution_id: &ExecutionId,
+        work_item_id: WorkItemId,
+        lease_fence: i64,
     ) -> BackendResult<bool>;
 
     /// Reclaim work items whose lease has expired (worker crashed or stalled).

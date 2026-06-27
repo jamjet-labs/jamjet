@@ -222,6 +222,8 @@ async fn start_execution(
         updated_at: now,
         completed_at: None,
         session_type: None,
+        parent_execution_id: None,
+        segment_number: 0,
     };
     let execution_id = execution.execution_id.clone();
     backend.create_execution(execution).await?;

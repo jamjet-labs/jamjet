@@ -188,6 +188,13 @@ fn row_to_execution(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkflowExec
         .map(parse_datetime)
         .transpose()?;
 
+    let parent_execution_id: Option<ExecutionId> = row
+        .try_get::<Option<&str>, _>("parent_execution_id")
+        .map_err(map_db_err)?
+        .map(parse_execution_id)
+        .transpose()?;
+    let segment_number: u32 = row.try_get::<i64, _>("segment_number").unwrap_or(0).max(0) as u32;
+
     Ok(WorkflowExecution {
         execution_id,
         workflow_id: row
@@ -203,6 +210,8 @@ fn row_to_execution(row: &sqlx::sqlite::SqliteRow) -> BackendResult<WorkflowExec
         updated_at,
         completed_at,
         session_type: None,
+        parent_execution_id,
+        segment_number,
     })
 }
 
@@ -340,12 +349,14 @@ impl StateBackend for SqliteBackend {
         let started_at = execution.started_at.to_rfc3339();
         let updated_at = execution.updated_at.to_rfc3339();
         let completed_at = execution.completed_at.map(|dt| dt.to_rfc3339());
+        let parent_id = execution.parent_execution_id.as_ref().map(execution_id_str);
+        let segment_number = execution.segment_number as i64;
 
         sqlx::query(
             r#"INSERT INTO workflow_executions
                (execution_id, workflow_id, workflow_version, status, initial_input, current_state,
-                started_at, updated_at, completed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                started_at, updated_at, completed_at, parent_execution_id, segment_number)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id)
         .bind(&execution.workflow_id)
@@ -356,6 +367,8 @@ impl StateBackend for SqliteBackend {
         .bind(&started_at)
         .bind(&updated_at)
         .bind(completed_at.as_deref())
+        .bind(parent_id.as_deref())
+        .bind(segment_number)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -610,6 +623,166 @@ impl StateBackend for SqliteBackend {
         .await
         .map_err(map_db_err)?;
 
+        Ok(())
+    }
+
+    async fn create_segment_atomic(
+        &self,
+        execution: WorkflowExecution,
+        seed_snapshot: Snapshot,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+    ) -> BackendResult<()> {
+        // Serialize all data before opening the transaction (avoids holding
+        // the write lock while doing JSON serialization).
+        let exec_id_str = execution_id_str(&execution.execution_id);
+        let exec_status = status_to_str(&execution.status);
+        let initial_input_json = serde_json::to_string(&execution.initial_input)?;
+        let current_state_json = serde_json::to_string(&execution.current_state)?;
+        let exec_started_at = execution.started_at.to_rfc3339();
+        let exec_updated_at = execution.updated_at.to_rfc3339();
+        let exec_completed_at = execution.completed_at.map(|dt| dt.to_rfc3339());
+        let parent_id = execution.parent_execution_id.as_ref().map(execution_id_str);
+        let segment_number = execution.segment_number as i64;
+
+        let snap_id = seed_snapshot.id.to_string();
+        let snap_state_json = serde_json::to_string(&seed_snapshot.state)?;
+        let snap_created_at = seed_snapshot.created_at.to_rfc3339();
+        let snap_status_str = status_to_str(&seed_snapshot.status);
+        let snap_completed_json = serde_json::to_string(&seed_snapshot.completed_nodes)?;
+        let snap_active_json = serde_json::to_string(&seed_snapshot.active_nodes)?;
+
+        let ev1_id = Uuid::new_v4().to_string();
+        let ev1_kind_json = serde_json::to_string(&started_event)?;
+        let ev1_created_at = Utc::now().to_rfc3339();
+
+        let ev2_id = Uuid::new_v4().to_string();
+        let ev2_kind_json = serde_json::to_string(&scheduled_event)?;
+        let ev2_created_at = Utc::now().to_rfc3339();
+
+        let wi_id = work_item.id.to_string();
+        let wi_exec_id = execution_id_str(&work_item.execution_id);
+        let wi_payload_json = serde_json::to_string(&work_item.payload)?;
+        let wi_created_at = work_item.created_at.to_rfc3339();
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
+
+        // 1. Execution row.
+        sqlx::query(
+            r#"INSERT INTO workflow_executions
+               (execution_id, workflow_id, workflow_version, status, initial_input, current_state,
+                started_at, updated_at, completed_at, parent_execution_id, segment_number)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&exec_id_str)
+        .bind(&execution.workflow_id)
+        .bind(&execution.workflow_version)
+        .bind(exec_status)
+        .bind(&initial_input_json)
+        .bind(&current_state_json)
+        .bind(&exec_started_at)
+        .bind(&exec_updated_at)
+        .bind(exec_completed_at.as_deref())
+        .bind(parent_id.as_deref())
+        .bind(segment_number)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        // 2. Seed snapshot.
+        sqlx::query(
+            r#"INSERT OR REPLACE INTO snapshots
+               (id, execution_id, at_sequence, state_json, created_at, status,
+                completed_nodes_json, active_nodes_json, last_sequence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&snap_id)
+        .bind(&exec_id_str)
+        .bind(seed_snapshot.at_sequence)
+        .bind(&snap_state_json)
+        .bind(&snap_created_at)
+        .bind(snap_status_str)
+        .bind(&snap_completed_json)
+        .bind(&snap_active_json)
+        .bind(seed_snapshot.last_sequence)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        // 3. WorkflowStarted at seq 1. Replicate append_event's SELECT MAX+1 logic
+        //    inside the txn so sequence assignment is correct even if this method is
+        //    ever called on a non-fresh execution.
+        let seq1_row = sqlx::query(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
+        )
+        .bind(&exec_id_str)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        let seq1: i64 = seq1_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+
+        sqlx::query(
+            r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at)
+               VALUES (?, ?, ?, ?, ?)"#,
+        )
+        .bind(&ev1_id)
+        .bind(&exec_id_str)
+        .bind(seq1)
+        .bind(&ev1_kind_json)
+        .bind(&ev1_created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        // 4. NodeScheduled at seq 2 (MAX is now 1 after the insertion above).
+        let seq2_row = sqlx::query(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
+        )
+        .bind(&exec_id_str)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        let seq2: i64 = seq2_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+
+        sqlx::query(
+            r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at)
+               VALUES (?, ?, ?, ?, ?)"#,
+        )
+        .bind(&ev2_id)
+        .bind(&exec_id_str)
+        .bind(seq2)
+        .bind(&ev2_kind_json)
+        .bind(&ev2_created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        // 5. Start-node work item. Rolls back (with execution + snapshot + events)
+        //    on any failure — no partial child is ever left behind.
+        sqlx::query(
+            r#"INSERT INTO work_items
+               (id, execution_id, node_id, queue_type, payload_json, attempt, max_attempts,
+                status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)"#,
+        )
+        .bind(&wi_id)
+        .bind(&wi_exec_id)
+        .bind(&work_item.node_id)
+        .bind(&work_item.queue_type)
+        .bind(&wi_payload_json)
+        .bind(work_item.attempt as i64)
+        .bind(work_item.max_attempts as i64)
+        .bind(&wi_created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        tx.commit().await.map_err(map_db_err)?;
         Ok(())
     }
 
@@ -902,6 +1075,59 @@ impl StateBackend for SqliteBackend {
         .map_err(map_db_err)?
         .rows_affected();
         Ok(rows_affected > 0)
+    }
+
+    #[instrument(skip(self), fields(execution_id = %execution_id, item_id = %work_item_id, fence = lease_fence))]
+    async fn finalize_rollover_fenced(
+        &self,
+        execution_id: &ExecutionId,
+        work_item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool> {
+        let exec_id_str = execution_id_str(execution_id);
+        let item_id_str = work_item_id.to_string();
+        let now = Utc::now().to_rfc3339();
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
+
+        // 1. Fence-gated settle of the work item.
+        let rows = sqlx::query(
+            "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL \
+             WHERE id = ? AND lease_fence = ?",
+        )
+        .bind(&now)
+        .bind(&item_id_str)
+        .bind(lease_fence)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+
+        if rows == 0 {
+            tx.rollback().await.map_err(map_db_err)?;
+            return Ok(false);
+        }
+
+        // 2. Idempotent terminal update: only transitions non-terminal executions.
+        sqlx::query(
+            "UPDATE workflow_executions \
+             SET status = 'limit_exceeded', updated_at = ?, completed_at = COALESCE(completed_at, ?) \
+             WHERE execution_id = ? \
+             AND status NOT IN ('completed', 'failed', 'cancelled', 'limit_exceeded')",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(&exec_id_str)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        tx.commit().await.map_err(map_db_err)?;
+        Ok(true)
     }
 
     #[instrument(skip(self, terminal_event), fields(item_id = %item_id, fence = lease_fence))]
@@ -1406,6 +1632,8 @@ mod tests {
             updated_at: now,
             completed_at: None,
             session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
         }
     }
 
@@ -1575,5 +1803,148 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["chunk"], 0);
         assert_eq!(events[1]["chunk"], 1);
+    }
+
+    #[tokio::test]
+    async fn finalize_rollover_fenced_matching_fence_marks_terminal_and_settles() {
+        use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+
+        let db = open_test_db().await;
+
+        // Create an execution in Running state.
+        let exec_id = ExecutionId::new();
+        let now = chrono::Utc::now();
+        db.create_execution(WorkflowExecution {
+            execution_id: exec_id.clone(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: json!({}),
+            current_state: json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        })
+        .await
+        .unwrap();
+
+        // Enqueue and claim a work item so it gets a real fence.
+        let wi_id = uuid::Uuid::new_v4();
+        db.enqueue_work_item(crate::backend::WorkItem {
+            id: wi_id,
+            execution_id: exec_id.clone(),
+            node_id: "n1".into(),
+            queue_type: "default".into(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "default".into(),
+        })
+        .await
+        .unwrap();
+
+        let claimed = db
+            .claim_work_item("w1", &["default"])
+            .await
+            .unwrap()
+            .expect("must be claimable");
+        let fence = claimed.lease_fence;
+        assert!(fence != 0, "claimed fence must be non-zero");
+
+        // finalize_rollover_fenced with MATCHING fence must return true,
+        // mark execution LimitExceeded, and settle the work item.
+        let settled = db
+            .finalize_rollover_fenced(&exec_id, wi_id, fence)
+            .await
+            .expect("finalize_rollover_fenced must not error");
+        assert!(settled, "matching fence must return true");
+
+        let exec = db.get_execution(&exec_id).await.unwrap().unwrap();
+        assert_eq!(
+            exec.status,
+            WorkflowStatus::LimitExceeded,
+            "execution must be LimitExceeded after finalize_rollover_fenced"
+        );
+
+        // Work item must be gone (completed).
+        let not_claimable = db.claim_work_item("w2", &["default"]).await.unwrap();
+        assert!(
+            not_claimable.is_none(),
+            "work item must be settled (not re-claimable)"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_rollover_fenced_stale_fence_is_noop() {
+        use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+
+        let db = open_test_db().await;
+
+        let exec_id = ExecutionId::new();
+        let now = chrono::Utc::now();
+        db.create_execution(WorkflowExecution {
+            execution_id: exec_id.clone(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: json!({}),
+            current_state: json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        })
+        .await
+        .unwrap();
+
+        let wi_id = uuid::Uuid::new_v4();
+        db.enqueue_work_item(crate::backend::WorkItem {
+            id: wi_id,
+            execution_id: exec_id.clone(),
+            node_id: "n1".into(),
+            queue_type: "default".into(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "default".into(),
+        })
+        .await
+        .unwrap();
+
+        let claimed = db
+            .claim_work_item("w1", &["default"])
+            .await
+            .unwrap()
+            .expect("must be claimable");
+        let real_fence = claimed.lease_fence;
+
+        // Present a STALE fence (real_fence + 1 is never a valid fence).
+        let stale_fence = real_fence + 1;
+        let settled = db
+            .finalize_rollover_fenced(&exec_id, wi_id, stale_fence)
+            .await
+            .expect("stale fence must not error — just Ok(false)");
+        assert!(!settled, "stale fence must return false (no-op)");
+
+        // Execution must still be Running (zombie did not mark it terminal).
+        let exec = db.get_execution(&exec_id).await.unwrap().unwrap();
+        assert_eq!(
+            exec.status,
+            WorkflowStatus::Running,
+            "execution must remain Running after stale-fence finalize attempt"
+        );
     }
 }

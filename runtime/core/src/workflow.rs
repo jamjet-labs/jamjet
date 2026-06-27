@@ -129,6 +129,13 @@ pub struct WorkflowExecution {
     /// Session type label for governance and durability classification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_type: Option<SessionType>,
+    /// For a segment chain (continue-as-new): the execution_id of the preceding
+    /// segment. `None` for an original (root) execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_execution_id: Option<ExecutionId>,
+    /// Position of this execution in a segment chain. 0 for a root execution.
+    #[serde(default)]
+    pub segment_number: u32,
 }
 
 #[cfg(test)]

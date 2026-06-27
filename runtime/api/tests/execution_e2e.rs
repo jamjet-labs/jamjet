@@ -82,6 +82,8 @@ async fn workflow_runs_to_completion() {
             updated_at: now,
             completed_at: None,
             session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
         })
         .await
         .expect("create_execution");

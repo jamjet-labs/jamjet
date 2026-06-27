@@ -255,6 +255,55 @@ impl StateBackend for InMemoryBackend {
         Ok(())
     }
 
+    async fn create_segment_atomic(
+        &self,
+        execution: WorkflowExecution,
+        seed_snapshot: Snapshot,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+    ) -> BackendResult<()> {
+        // In-memory has no ACID crash-durability, but we replicate the write
+        // order of the SQLite impl so behavior is consistent in tests.
+        let exec_id = execution.execution_id.clone();
+
+        // 1. Execution row.
+        self.executions.insert(exec_id.clone(), execution);
+
+        // 2. Seed snapshot.
+        self.snapshots
+            .entry(exec_id.clone())
+            .or_default()
+            .push(seed_snapshot);
+
+        // 3. WorkflowStarted — replicates append_event's fetch_add for sequence.
+        let seq1 = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        let ev1 = Event {
+            id: Uuid::new_v4(),
+            execution_id: exec_id.clone(),
+            sequence: seq1,
+            kind: started_event,
+            created_at: Utc::now(),
+        };
+        self.events.entry(exec_id.clone()).or_default().push(ev1);
+
+        // 4. NodeScheduled.
+        let seq2 = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        let ev2 = Event {
+            id: Uuid::new_v4(),
+            execution_id: exec_id.clone(),
+            sequence: seq2,
+            kind: scheduled_event,
+            created_at: Utc::now(),
+        };
+        self.events.entry(exec_id.clone()).or_default().push(ev2);
+
+        // 5. Start-node work item.
+        self.work_items.insert(work_item.id, work_item);
+
+        Ok(())
+    }
+
     async fn latest_snapshot(&self, execution_id: &ExecutionId) -> BackendResult<Option<Snapshot>> {
         Ok(self
             .snapshots
@@ -520,6 +569,29 @@ impl StateBackend for InMemoryBackend {
             }
             None => Ok(false),
         }
+    }
+
+    async fn finalize_rollover_fenced(
+        &self,
+        execution_id: &ExecutionId,
+        work_item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool> {
+        // Fence check: only the current holder may finalize.
+        match self.work_items.get(&work_item_id) {
+            Some(entry) if entry.lease_fence == lease_fence => {}
+            _ => return Ok(false),
+        }
+        // Fence matched — settle the work item.
+        self.work_items.remove(&work_item_id);
+        // Idempotent terminal update on the execution.
+        if let Some(mut entry) = self.executions.get_mut(execution_id) {
+            if !entry.status.is_terminal() {
+                entry.status = WorkflowStatus::LimitExceeded;
+                entry.updated_at = Utc::now();
+            }
+        }
+        Ok(true)
     }
 
     async fn reclaim_expired_leases(&self) -> BackendResult<ReclaimResult> {
