@@ -934,3 +934,156 @@ async fn tenant_scoped_two_rollover_byte_identity() {
     let scoped = db.for_tenant(tenant_id);
     assert_two_rollover_byte_identity(&scoped).await;
 }
+
+// ── C2 regression: SQLite child forward-progress after rollover ───────────────
+
+/// Regression test for the "frozen child state" bug on SQLite.
+///
+/// Root with `last_sequence = 50` rolls over to seg1.  A `NodeCompleted`
+/// event is then appended to seg1 at sequence 3 with `state_patch = {"counter": 100}`.
+///
+/// BUG (before fix): `Snapshot::from_materialized` seeded the child snapshot at
+/// `at_sequence = 50` (the parent's last_sequence).  SQLite's
+/// `get_events_since(seg1, 50)` returns only events with `sequence > 50`, so
+/// the child's seq-1/2/3 events were ALL silently dropped.
+/// `materialize(seg1)` returned `{"counter": 0}` — frozen at the carried value.
+///
+/// FIX: `Snapshot::seed_for_segment` anchors the seed at `at_sequence = 0`.
+/// `get_events_since(seg1, 0)` returns all child events; the patch is applied;
+/// `materialize(seg1).current_state["counter"]` must equal 100.
+#[tokio::test]
+async fn sqlite_child_forward_progress_after_rollover() {
+    let db = open_sqlite().await;
+
+    let parent_id = ExecutionId::new();
+    db.create_execution(root_execution(&parent_id))
+        .await
+        .expect("create parent");
+
+    // Give the parent 50 events so its event log is large.
+    append_many_events(&db, &parent_id, 1, 50).await;
+
+    // Build carried state with last_sequence = 50 — this is exactly the
+    // value that Snapshot::from_materialized would have copied into at_sequence,
+    // causing child seq 1/2/3 to be silently dropped.
+    let carried = MaterializedState {
+        current_state: json!({ "counter": 0 }),
+        status: WorkflowStatus::Running,
+        completed_nodes: HashMap::new(),
+        active_nodes: HashSet::new(),
+        last_sequence: 50,
+    };
+
+    let seg1_id = start_next_segment(
+        &db, &parent_id, &carried, "seg-wf", "1.0.0", 1, "start", "general", "default",
+    )
+    .await
+    .expect("start_next_segment");
+
+    // Drain the start-node work item.
+    db.claim_work_item("cleanup-fwd", &["general"]).await.ok();
+
+    // Drive a state mutation on the child at seq 3 (after WorkflowStarted=1,
+    // NodeScheduled=2).  state_patch sets counter to 100.
+    db.append_event(Event::new(
+        seg1_id.clone(),
+        3,
+        EventKind::NodeCompleted {
+            node_id: "step_1".into(),
+            output: json!({ "result": "ok" }),
+            state_patch: json!({ "counter": 100 }),
+            duration_ms: 1,
+            gen_ai_system: None,
+            gen_ai_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            finish_reason: None,
+            cost_usd: None,
+            provenance: None,
+            idempotency_key: None,
+        },
+    ))
+    .await
+    .expect("append NodeCompleted on child");
+
+    // Before fix: returns {"counter": 0} (frozen — at_sequence=50 dropped seq 1/2/3).
+    // After fix:  returns {"counter": 100} (at_sequence=0 folds all child events).
+    let mat = materialize(&db, &seg1_id).await.expect("materialize child");
+
+    assert_eq!(
+        mat.current_state["counter"], 100,
+        "child state must reflect the post-rollover NodeCompleted commit on SQLite; \
+         got {:?} — value 0 means the frozen-state bug is still present",
+        mat.current_state
+    );
+}
+
+// ── C1 regression: pre-boundary crash cannot fork child segment ───────────────
+
+/// Regression test for the "crash double-roll" / "state fork" bug.
+///
+/// BUG (before fix): `new_id = ExecutionId::new()` was random on each call.
+/// A crash between `start_next_segment` and the `SegmentBoundary` append caused
+/// the worker to reclaim the parent item, pass the double-roll guard (no
+/// SegmentBoundary yet), and call `start_next_segment` again — creating a SECOND
+/// child with a different random id.  Two independent children each held a copy
+/// of the carried state, forking the segment chain.
+///
+/// FIX: the child id is now deterministic (UUID v5 of parent+segment_number) and
+/// `start_next_segment` is idempotent: a second call with the same arguments
+/// detects the existing child and returns early without re-seeding or re-enqueuing.
+///
+/// This test simulates the crash window by calling `start_next_segment` twice
+/// with identical arguments and asserting:
+/// - Both calls return the SAME child `ExecutionId`.
+/// - Exactly ONE work item is enqueued (the second call was a no-op).
+#[tokio::test]
+async fn sqlite_idempotent_start_next_segment_prevents_double_roll() {
+    let db = open_sqlite().await;
+
+    let parent_id = ExecutionId::new();
+    db.create_execution(root_execution(&parent_id))
+        .await
+        .expect("create parent");
+
+    let carried = carried_materialized_state();
+
+    // First invocation: creates the child execution + seed + 2 events + work item.
+    let id1 = start_next_segment(
+        &db, &parent_id, &carried, "seg-wf", "1.0.0", 1, "start", "general", "default",
+    )
+    .await
+    .expect("first start_next_segment");
+
+    // Second invocation: simulates re-run after a crash before SegmentBoundary.
+    // Must return the SAME id and must NOT enqueue a duplicate work item.
+    let id2 = start_next_segment(
+        &db, &parent_id, &carried, "seg-wf", "1.0.0", 1, "start", "general", "default",
+    )
+    .await
+    .expect("second start_next_segment (idempotent re-run)");
+
+    assert_eq!(
+        id1, id2,
+        "second call must return the same child ExecutionId as the first (deterministic id)"
+    );
+
+    // Claim the one expected work item.
+    let item = db
+        .claim_work_item("dedup-check-1", &["general"])
+        .await
+        .expect("claim_work_item")
+        .expect("exactly one work item must exist");
+    assert_eq!(item.execution_id, id1, "work item must belong to the child");
+
+    // The queue must now be empty — no second work item was enqueued.
+    let second = db
+        .claim_work_item("dedup-check-2", &["general"])
+        .await
+        .expect("claim second");
+    assert!(
+        second.is_none(),
+        "queue must be empty after draining the single work item; \
+         a second item means the idempotency guard did not prevent re-enqueue"
+    );
+}

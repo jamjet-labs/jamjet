@@ -59,6 +59,32 @@ impl Snapshot {
         }
     }
 
+    /// Build the seed snapshot for a new segment (continue-as-new child).
+    ///
+    /// The seed is anchored at `at_sequence = 0` and `last_sequence = 0` so
+    /// that `materialize(child)` folds ALL of the child's own events (which
+    /// start at sequence 1) on top of it.  Using `from_materialized` here
+    /// would copy the PARENT's `last_sequence` (e.g. 50) into the seed, and
+    /// SQLite's `get_events_since(child, 50)` would silently drop every child
+    /// event with sequence <= 50 — freezing the child's state forever.
+    ///
+    /// `completed_nodes` and `active_nodes` are empty because the new segment
+    /// re-enters at its start node with a clean node graph; the carried value
+    /// lives only in `current_state` / `initial_input`.
+    pub fn seed_for_segment(execution_id: ExecutionId, current_state: &serde_json::Value) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            execution_id,
+            at_sequence: 0,
+            state: current_state.clone(),
+            status: jamjet_core::workflow::WorkflowStatus::Running,
+            completed_nodes: std::collections::HashMap::new(),
+            active_nodes: std::collections::HashSet::new(),
+            last_sequence: 0,
+            created_at: Utc::now(),
+        }
+    }
+
     /// Build a snapshot directly from a `MaterializedState`, capturing the
     /// full per-turn resume base.
     pub fn from_materialized(

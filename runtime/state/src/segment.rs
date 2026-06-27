@@ -38,6 +38,13 @@ use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use uuid::Uuid;
 
+/// Stable UUID namespace for deterministic segment child IDs.
+///
+/// This constant is fixed forever — changing it would make existing segment
+/// chains unresolvable after a crash-recovery cycle.  The value was chosen
+/// as a random v4 UUID and then frozen.
+const SEGMENT_NS: Uuid = Uuid::from_u128(0x6a8e_f5c3_d3a4_4b9c_8b2e_4f5d_6e7a_8c9bu128);
+
 /// Create segment N+1: a fresh execution linked to `parent_id`, seeded with the
 /// carried materialized state, ready to resume the workflow from its start node.
 ///
@@ -45,12 +52,26 @@ use uuid::Uuid;
 /// seq 2 + work-item enqueue). The seed snapshot written here ensures that
 /// `materialize(new_id)` returns the carried state, not an empty base.
 ///
+/// # Child ID stability (crash safety)
+/// The child `ExecutionId` is derived deterministically via UUID v5 from the
+/// parent id and segment number, so a re-run after a crash between
+/// `start_next_segment` and the `SegmentBoundary` append always produces the
+/// SAME child id.  Combined with the idempotency guard at the top of this
+/// function (returns early if the child already exists), a double invocation
+/// cannot fork the segment chain into two concurrent children.
+///
+/// # Seed snapshot sequence space (SQLite correctness)
+/// The seed snapshot is anchored at `at_sequence = 0` (`Snapshot::seed_for_segment`),
+/// NOT at the parent's `last_sequence`.  SQLite `get_events_since` filters with
+/// `sequence > at_sequence`; seeding from the parent sequence would drop every
+/// child event with a sequence <= that value (child events start at 1).
+///
 /// # State carry invariant
 /// `new_exec.initial_input == new_exec.current_state == carried_state.current_state`
 /// (byte-identical canonical JSON).
 ///
 /// # Returns
-/// The `ExecutionId` of the newly created segment execution.
+/// The `ExecutionId` of the newly created (or pre-existing idempotent) segment.
 // Nine parameters are required by the plan interface; suppressing the lint rather
 // than breaking the caller signature with a builder/struct at this stage.
 #[allow(clippy::too_many_arguments)]
@@ -65,7 +86,22 @@ pub async fn start_next_segment(
     queue_type: &str,
     tenant_id: &str,
 ) -> BackendResult<ExecutionId> {
-    let new_id = ExecutionId::new();
+    // Derive a DETERMINISTIC child id from the parent id + segment number.
+    // This guarantees that a re-run after a crash always targets the same
+    // child row, preventing a second random child from forking the chain.
+    let child_uuid = Uuid::new_v5(
+        &SEGMENT_NS,
+        format!("{}:{}", parent_id.0, next_segment_number).as_bytes(),
+    );
+    let new_id = ExecutionId(child_uuid);
+
+    // Idempotency guard: if a prior attempt already created the child (crash
+    // between this function and the caller's SegmentBoundary append), return
+    // the existing id without re-seeding or re-enqueuing.
+    if backend.get_execution(&new_id).await?.is_some() {
+        return Ok(new_id);
+    }
+
     let now = Utc::now();
 
     // Step 1: create the new execution row with carried state as seed.
@@ -88,7 +124,10 @@ pub async fn start_next_segment(
 
     // Step 2: write the seed snapshot so `materialize(new_id)` picks up the
     // carried state as its base without replaying the parent's event log.
-    let seed = Snapshot::from_materialized(new_id.clone(), carried_state);
+    // IMPORTANT: seed at at_sequence=0 (child's own sequence space), NOT at
+    // the parent's last_sequence.  See `Snapshot::seed_for_segment` for the
+    // full rationale.
+    let seed = Snapshot::seed_for_segment(new_id.clone(), &carried_state.current_state);
     backend.write_snapshot(seed).await?;
 
     // Step 3: WorkflowStarted at sequence 1 (mirrors routes.rs).
