@@ -1628,6 +1628,123 @@ impl StateBackend for TenantScopedSqliteBackend {
         }
         Ok(())
     }
+
+    // ── Async read-model projector ──────────────────────────────────────────
+
+    async fn apply_approval_projection(
+        &self,
+        row: crate::backend::ApprovalProjectionRow,
+        projection_name: &str,
+        new_checkpoint: i64,
+    ) -> BackendResult<()> {
+        let exec_id_str = execution_id_str(&row.execution_id);
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
+
+        sqlx::query(
+            r#"INSERT INTO proj_approvals
+               (execution_id, node_id, status, user_id, comment, last_sequence, tenant_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(execution_id, node_id) DO UPDATE SET
+                 status        = excluded.status,
+                 user_id       = excluded.user_id,
+                 comment       = excluded.comment,
+                 last_sequence = excluded.last_sequence,
+                 updated_at    = excluded.updated_at"#,
+        )
+        .bind(&exec_id_str)
+        .bind(&row.node_id)
+        .bind(&row.status)
+        .bind(&row.user_id)
+        .bind(&row.comment)
+        .bind(row.last_sequence)
+        .bind(&self.tenant_id.0)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        sqlx::query(
+            r#"INSERT INTO projector_checkpoints
+               (projection_name, execution_id, last_sequence, tenant_id, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(projection_name, execution_id) DO UPDATE SET
+                 last_sequence = excluded.last_sequence,
+                 updated_at    = excluded.updated_at"#,
+        )
+        .bind(projection_name)
+        .bind(&exec_id_str)
+        .bind(new_checkpoint)
+        .bind(&self.tenant_id.0)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        tx.commit().await.map_err(map_db_err)?;
+        Ok(())
+    }
+
+    async fn get_approval_projection(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<Vec<crate::backend::ApprovalProjectionRow>> {
+        let id_str = execution_id_str(execution_id);
+        let rows = sqlx::query(
+            "SELECT node_id, status, user_id, comment, last_sequence \
+             FROM proj_approvals WHERE execution_id = ? AND tenant_id = ? ORDER BY node_id",
+        )
+        .bind(&id_str)
+        .bind(&self.tenant_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+
+        rows.iter()
+            .map(|r| {
+                Ok(crate::backend::ApprovalProjectionRow {
+                    execution_id: execution_id.clone(),
+                    node_id: r.try_get::<String, _>("node_id").map_err(map_db_err)?,
+                    status: r.try_get::<String, _>("status").map_err(map_db_err)?,
+                    user_id: r
+                        .try_get::<Option<String>, _>("user_id")
+                        .map_err(map_db_err)?,
+                    comment: r
+                        .try_get::<Option<String>, _>("comment")
+                        .map_err(map_db_err)?,
+                    last_sequence: r.try_get::<i64, _>("last_sequence").map_err(map_db_err)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn get_projector_checkpoint(
+        &self,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<i64> {
+        let id_str = execution_id_str(execution_id);
+        let row = sqlx::query(
+            "SELECT last_sequence FROM projector_checkpoints \
+             WHERE projection_name = ? AND execution_id = ? AND tenant_id = ?",
+        )
+        .bind(projection_name)
+        .bind(&id_str)
+        .bind(&self.tenant_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+
+        match row {
+            Some(r) => Ok(r.try_get::<i64, _>("last_sequence").map_err(map_db_err)?),
+            None => Ok(0),
+        }
+    }
 }
 
 /// Parse a datetime that might be either RFC 3339 or SQLite's `datetime('now')` format.

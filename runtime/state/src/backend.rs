@@ -5,6 +5,22 @@ use async_trait::async_trait;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use thiserror::Error;
 
+/// A projected approval row — the CQRS read-model for a single (execution,
+/// node) pair, maintained asynchronously by the projector.
+///
+/// Keyed by `(execution_id, node_id)`; `status` is the latest approval state
+/// (`"pending"`, `"granted"`, `"denied"`). `last_sequence` is the event
+/// sequence that produced this row (used for idempotent re-application).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalProjectionRow {
+    pub execution_id: ExecutionId,
+    pub node_id: String,
+    pub status: String,
+    pub user_id: Option<String>,
+    pub comment: Option<String>,
+    pub last_sequence: i64,
+}
+
 /// Workflow definition stored in the registry (the compiled IR as JSON).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowDefinition {
@@ -257,6 +273,35 @@ pub trait StateBackend: Send + Sync {
 
     /// Validate a plaintext API token. Returns the token info if valid and not revoked.
     async fn validate_token(&self, token: &str) -> BackendResult<Option<ApiToken>>;
+
+    // ── Async read-model projector ───────────────────────────────────────────
+
+    /// Atomically UPSERT an approval projection row AND advance the named
+    /// projection's checkpoint for this execution to `new_checkpoint`, in one
+    /// transaction.  Crash-safe: if the process dies between the UPSERT and the
+    /// checkpoint write they are the same commit, so neither can be partially
+    /// applied.
+    async fn apply_approval_projection(
+        &self,
+        row: ApprovalProjectionRow,
+        projection_name: &str,
+        new_checkpoint: i64,
+    ) -> BackendResult<()>;
+
+    /// All approval projection rows for an execution (the projected read model).
+    async fn get_approval_projection(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<Vec<ApprovalProjectionRow>>;
+
+    /// Current checkpoint (last consumed sequence) for (projection_name,
+    /// execution_id).  Returns 0 if no checkpoint exists yet — the projector
+    /// will re-read from the beginning of the event log.
+    async fn get_projector_checkpoint(
+        &self,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<i64>;
 
     // ── Tenant management ───────────────────────────────────────────────
 
