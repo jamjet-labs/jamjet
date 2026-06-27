@@ -376,7 +376,44 @@ async fn list_events(
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
     let execution_id = parse_execution_id(&id)?;
-    let events = backend.get_events(&execution_id).await?;
+    let mut events = backend.get_events(&execution_id).await?;
+
+    // Resolve ArtifactRef sentinels in NodeCompleted.output before returning to
+    // the client.  The write path (2i-2) spills large outputs to the artifact
+    // store before commit_turn and replaces the inline value with a
+    // {"$artifact": {...}} sentinel; here we fetch and restore the original.
+    //
+    // A missing artifact (dangling ref) is impossible by the put-then-commit
+    // write-order invariant, but is handled gracefully: the sentinel is kept and
+    // an "unresolved": true flag is added inside the $artifact object.  Never
+    // panics; logs a WARN so the anomaly is visible.
+    for event in &mut events {
+        if let jamjet_state::EventKind::NodeCompleted {
+            output, node_id, ..
+        } = &mut event.kind
+        {
+            let resolved = jamjet_state::resolve_value(output, &*backend).await;
+            match resolved {
+                Ok(v) => *output = v,
+                Err(e) => {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        error = %e,
+                        "artifact resolve failed for NodeCompleted output; \
+                         returning sentinel with unresolved=true"
+                    );
+                    // Add unresolved=true inside the $artifact inner object so
+                    // callers can detect the anomaly without a 5xx.
+                    if let Some(inner) = output.get_mut(jamjet_state::ARTIFACT_SENTINEL_KEY) {
+                        if let Some(obj) = inner.as_object_mut() {
+                            obj.insert("unresolved".to_string(), Value::Bool(true));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(Json(json!({ "events": events })))
 }
 
