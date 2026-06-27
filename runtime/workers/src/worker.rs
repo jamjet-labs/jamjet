@@ -1,5 +1,6 @@
 use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use crate::heartbeat::spawn_heartbeat;
+use chrono::Utc;
 use jamjet_agents::AgentRegistry;
 use jamjet_core::node::NodeKind;
 use jamjet_core::workflow::ExecutionId;
@@ -108,6 +109,7 @@ impl Worker {
         let node_id = item.node_id.clone();
         let tenant_id = item.tenant_id.clone();
         let attempt = item.attempt;
+        let max_attempts = item.max_attempts;
         let item_id = item.id;
         let lease_fence = item.lease_fence;
 
@@ -436,13 +438,14 @@ impl Worker {
                     Err(e) => return Err(Box::new(e)),
                 }
             }
-            Err(error) => {
+            Err(ExecutorError::Fatal(msg)) => {
+                // Non-retryable failure — terminal NodeFailed via the fenced commit path.
                 let terminal = jamjet_state::Event::new(
                     execution_id.clone(),
                     0, // sequence assigned atomically inside commit_node_terminal
                     EventKind::NodeFailed {
                         node_id: node_id.clone(),
-                        error: error.to_string(),
+                        error: msg.clone(),
                         attempt,
                         retryable: false,
                     },
@@ -453,13 +456,123 @@ impl Worker {
                     .await
                 {
                     Ok(_) => {
-                        warn!(execution_id = %execution_id, node_id = %node_id, attempt, %error, "Node failed");
+                        warn!(execution_id = %execution_id, node_id = %node_id, attempt, error = %msg, "Node failed");
                     }
                     Err(StateBackendError::FenceLost(_)) => {
                         warn!(execution_id = %execution_id, node_id = %node_id, "Fence lost on failure commit; abandoning");
                         return Ok(());
                     }
                     Err(e) => return Err(Box::new(e)),
+                }
+            }
+            Err(ExecutorError::RateLimited { retry_after_secs }) => {
+                let next_attempt = attempt + 1;
+                if next_attempt >= max_attempts {
+                    // Max attempts exhausted — terminal NodeFailed; never parked.
+                    let terminal = jamjet_state::Event::new(
+                        execution_id.clone(),
+                        0,
+                        EventKind::NodeFailed {
+                            node_id: node_id.clone(),
+                            error: format!("rate limited: exhausted {max_attempts} attempts"),
+                            attempt,
+                            retryable: false,
+                        },
+                    );
+                    match self
+                        .backend
+                        .commit_turn(item_id, lease_fence, terminal, false)
+                        .await
+                    {
+                        Ok(_) => {
+                            warn!(
+                                execution_id = %execution_id,
+                                node_id = %node_id,
+                                attempt,
+                                max_attempts,
+                                "Node failed: rate limited and max attempts exhausted"
+                            );
+                        }
+                        Err(StateBackendError::FenceLost(_)) => {
+                            warn!(
+                                execution_id = %execution_id,
+                                node_id = %node_id,
+                                "Fence lost on rate-limit terminal commit; abandoning"
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => return Err(Box::new(e)),
+                    }
+                } else {
+                    // Park the work item — reset to pending with a future not-before time.
+                    // retry_after uses the wall clock: this is a scheduling hint for
+                    // future claim visibility, not replayed durable state, so real time is correct.
+                    let retry_after = (Utc::now()
+                        + chrono::Duration::seconds(retry_after_secs as i64))
+                    .to_rfc3339();
+
+                    // Append NodeParked before park_work_item (audit event — non-terminal;
+                    // no commit_turn; the item must stay re-claimable). On a stale-fence
+                    // park (Ok(false)) this event is a harmless audit record — the newer
+                    // attempt already owns the item.
+                    let seq = match self.backend.latest_sequence(&execution_id).await {
+                        Ok(s) => s + 1,
+                        Err(e) => {
+                            warn!(
+                                execution_id = %execution_id,
+                                node_id = %node_id,
+                                "Failed to get latest sequence for NodeParked; abandoning: {e}"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    if let Err(e) = self
+                        .backend
+                        .append_event(jamjet_state::Event::new(
+                            execution_id.clone(),
+                            seq,
+                            EventKind::NodeParked {
+                                node_id: node_id.clone(),
+                                attempt: next_attempt,
+                                retry_after: retry_after.clone(),
+                            },
+                        ))
+                        .await
+                    {
+                        warn!(
+                            execution_id = %execution_id,
+                            node_id = %node_id,
+                            "Failed to append NodeParked event; abandoning park: {e}"
+                        );
+                        return Ok(());
+                    }
+
+                    // Fence-guarded reset to pending with retry_after backoff.
+                    match self
+                        .backend
+                        .park_work_item(item_id, lease_fence, &retry_after, next_attempt)
+                        .await
+                    {
+                        Ok(true) => {
+                            info!(
+                                execution_id = %execution_id,
+                                node_id = %node_id,
+                                attempt = next_attempt,
+                                %retry_after,
+                                "Node parked on rate limit; will retry after backoff"
+                            );
+                        }
+                        Ok(false) => {
+                            // Stale fence — a newer attempt already owns this item.
+                            // The NodeParked event already appended is a harmless audit record.
+                            warn!(
+                                execution_id = %execution_id,
+                                node_id = %node_id,
+                                "Stale fence on park; a newer attempt already owns this item — abandoning"
+                            );
+                        }
+                        Err(e) => return Err(Box::new(e)),
+                    }
                 }
             }
         }
@@ -1382,6 +1495,228 @@ mod tests {
                 "replayed output must match the seeded record"
             );
         }
+    }
+
+    // ── Rate-limit executor ───────────────────────────────────────────────────
+
+    /// A stub executor that always returns `ExecutorError::RateLimited`. Used to
+    /// drive the park path and the max-attempts exhaustion path.
+    struct RateLimitingExecutor {
+        retry_after_secs: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for RateLimitingExecutor {
+        async fn execute(
+            &self,
+            _item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            Err(ExecutorError::RateLimited {
+                retry_after_secs: self.retry_after_secs,
+            })
+        }
+    }
+
+    /// Park path: when the executor returns `RateLimited` and `attempt + 1 < max_attempts`,
+    /// the worker must:
+    /// 1. Emit exactly one `NodeParked` event (non-terminal — no commit_turn).
+    /// 2. Reset the work item to pending via `park_work_item` with incremented attempt.
+    /// 3. NOT emit `NodeFailed` or `NodeCompleted`.
+    ///
+    /// The in-memory backend does not enforce the `retry_after` not-before window,
+    /// so the item is immediately re-claimable in this test.
+    #[tokio::test]
+    async fn park_on_rate_limit_under_max_attempts() {
+        let (backend, eid) = setup_backend().await; // item: attempt=0, max_attempts=3
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor(
+            "tool",
+            Arc::new(RateLimitingExecutor {
+                retry_after_secs: 5,
+            }),
+        );
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        worker.execute_item(item).await.unwrap();
+
+        let events = backend.get_events(&eid).await.unwrap();
+
+        // Must emit exactly one NodeParked event.
+        let parked_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::NodeParked { .. }))
+            .count();
+        assert_eq!(
+            parked_count, 1,
+            "expected exactly one NodeParked event; got {parked_count}"
+        );
+
+        // Must NOT emit NodeFailed.
+        let failed_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::NodeFailed { .. }))
+            .count();
+        assert_eq!(
+            failed_count, 0,
+            "NodeFailed must not be emitted for a parked item; got {failed_count}"
+        );
+
+        // Must NOT emit NodeCompleted.
+        let completed_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+            .count();
+        assert_eq!(
+            completed_count, 0,
+            "NodeCompleted must not be emitted for a parked item; got {completed_count}"
+        );
+
+        // NodeParked must carry the incremented attempt and a future RFC3339 retry_after.
+        let parked_event = events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::NodeParked { .. }))
+            .unwrap();
+        if let EventKind::NodeParked {
+            node_id,
+            attempt,
+            retry_after,
+        } = &parked_event.kind
+        {
+            assert_eq!(node_id, "n1", "NodeParked.node_id must be n1");
+            assert_eq!(*attempt, 1, "NodeParked.attempt must be next_attempt (1)");
+            // retry_after must parse as RFC3339 and be in the future.
+            let ra = chrono::DateTime::parse_from_rfc3339(retry_after)
+                .expect("retry_after must be valid RFC3339");
+            assert!(
+                ra > Utc::now(),
+                "retry_after must be in the future; got {retry_after}"
+            );
+        }
+
+        // Work item must be re-claimable with incremented attempt (the in-memory
+        // backend does not enforce the not-before window, so the item is
+        // immediately claimable for test purposes).
+        let re_claimed = backend
+            .claim_work_item("worker-2", &["default"])
+            .await
+            .unwrap();
+        assert!(
+            re_claimed.is_some(),
+            "work item must be re-claimable after park"
+        );
+        assert_eq!(
+            re_claimed.unwrap().attempt,
+            1,
+            "re-claimed item must have attempt=1 after park"
+        );
+    }
+
+    /// Exhaustion path: when the executor returns `RateLimited` and
+    /// `attempt + 1 >= max_attempts`, the worker must emit a terminal
+    /// `NodeFailed { retryable: false }` via `commit_turn` and must NOT park
+    /// the item.
+    #[tokio::test]
+    async fn rate_limit_fails_terminally_at_max_attempts() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        backend
+            .create_execution(sample_execution(&eid))
+            .await
+            .unwrap();
+        backend
+            .store_workflow(jamjet_state::backend::WorkflowDefinition {
+                workflow_id: "test-wf".into(),
+                version: "1.0.0".into(),
+                ir: minimal_ir_json(),
+                created_at: Utc::now(),
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        // Item at attempt=2: next_attempt=3 >= max_attempts=3 → terminal.
+        backend
+            .enqueue_work_item(jamjet_state::backend::WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "default".into(),
+                payload: serde_json::json!({
+                    "workflow_id": "test-wf",
+                    "workflow_version": "1.0.0"
+                }),
+                attempt: 2,
+                max_attempts: 3,
+                created_at: Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor(
+            "tool",
+            Arc::new(RateLimitingExecutor {
+                retry_after_secs: 5,
+            }),
+        );
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        worker.execute_item(item).await.unwrap();
+
+        let events = backend.get_events(&eid).await.unwrap();
+
+        // Must emit exactly one NodeFailed with retryable=false.
+        let failed = events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::NodeFailed { .. }))
+            .expect("NodeFailed must be emitted at max attempts");
+        if let EventKind::NodeFailed { retryable, .. } = &failed.kind {
+            assert!(
+                !retryable,
+                "NodeFailed must have retryable=false at max attempts"
+            );
+        }
+
+        // Must NOT emit NodeParked.
+        let parked_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::NodeParked { .. }))
+            .count();
+        assert_eq!(
+            parked_count, 0,
+            "NodeParked must not be emitted at max attempts; got {parked_count}"
+        );
+
+        // Must NOT emit NodeCompleted.
+        let completed_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+            .count();
+        assert_eq!(
+            completed_count, 0,
+            "NodeCompleted must not be emitted at max attempts; got {completed_count}"
+        );
     }
 
     /// Record-replay exactly-once: pre-seed the idempotency cache for the step=0
