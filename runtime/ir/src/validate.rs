@@ -192,6 +192,7 @@ mod tests {
             cost_budget_usd: None,
             on_budget_exceeded: None,
             data_policy: None,
+            continue_as_new: false,
         }
     }
 

@@ -1,4 +1,5 @@
-//! Continue-as-new: create the state-seeded continuation execution (segment N+1).
+//! Continue-as-new: create the state-seeded continuation execution (segment N+1)
+//! and walk the segment chain.
 //!
 //! A long-running durable agent bounds its event-log/replay cost by rolling over
 //! to a new execution at a strategy ceiling. `start_next_segment` mirrors the
@@ -8,6 +9,26 @@
 //!
 //! The seed snapshot written here means `materialize(new_id)` loads only the new
 //! segment's own events (bounded replay), not the parent's full history.
+//!
+//! ## Continue-as-new caveats
+//!
+//! F-2g-timers: a timer that was registered against the OLD execution_id will not
+//! automatically fire into the new segment. The timer table references
+//! execution_id; after rollover, the old execution is in a terminal completed
+//! state and the scheduler drops its ExecProgress. Any pending timer for the old
+//! execution_id simply fires against a closed log and has no effect on the new
+//! segment. Carry-over of pending timers across a rollover boundary is future work
+//! (F-2g-timers).
+//!
+//! In-flight / parked items at rollover: the rollover fires at the strategy-limit
+//! point (same semantics as the existing limit-terminate path). A work item that
+//! was parked (retry_after = future) when the limit is hit will eventually be
+//! claimed by a worker, execute, and attempt commit_turn against the OLD
+//! (completed) execution. That commit lands on the closed event log and is inert:
+//! it does not affect the new segment's state. This is safe but should be logged
+//! by the worker's commit path. The test `inert_old_segment_does_not_leak` proves
+//! that a late append to the old terminal execution leaves the new segment's
+//! materialize output unchanged.
 
 use crate::backend::{BackendResult, StateBackend, WorkItem};
 use crate::event::{Event, EventKind};
@@ -117,4 +138,53 @@ pub async fn start_next_segment(
         .await?;
 
     Ok(new_id)
+}
+
+/// Maximum number of hops allowed when walking the segment chain. A well-formed
+/// chain is acyclic; exceeding this limit indicates data corruption or a cycle.
+const SEGMENT_CHAIN_MAX_DEPTH: usize = 10_000;
+
+/// Walk the segment chain backward from any segment to the root, returning the
+/// `ExecutionId`s from root..=given in ascending segment order.
+///
+/// The result is ordered root-first (lowest segment_number first). For a
+/// 3-segment chain `root -> seg1 -> seg2`, `segment_chain(backend, &seg2_id)`
+/// returns `[root_id, seg1_id, seg2_id]`.
+///
+/// # Errors
+/// Returns an error if `get_execution` fails for any node in the chain, if any
+/// node in the chain does not exist, or if the chain depth exceeds
+/// [`SEGMENT_CHAIN_MAX_DEPTH`] (cycle guard).
+pub async fn segment_chain(
+    backend: &dyn StateBackend,
+    id: &ExecutionId,
+) -> BackendResult<Vec<ExecutionId>> {
+    let mut chain: Vec<ExecutionId> = Vec::new();
+    let mut current = id.clone();
+
+    loop {
+        if chain.len() >= SEGMENT_CHAIN_MAX_DEPTH {
+            return Err(crate::backend::StateBackendError::Database(format!(
+                "segment_chain exceeded max depth ({SEGMENT_CHAIN_MAX_DEPTH}): \
+                 possible cycle starting near {current}"
+            )));
+        }
+
+        let exec = backend.get_execution(&current).await?.ok_or_else(|| {
+            crate::backend::StateBackendError::NotFound(format!(
+                "segment_chain: execution {current} not found"
+            ))
+        })?;
+
+        chain.push(current.clone());
+
+        match exec.parent_execution_id {
+            None => break,
+            Some(parent) => current = parent,
+        }
+    }
+
+    // We walked tail-to-root; reverse so root is first.
+    chain.reverse();
+    Ok(chain)
 }

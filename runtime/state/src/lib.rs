@@ -29,7 +29,7 @@ pub use materializer::{
     apply_events, apply_events_seeded, materialize, should_snapshot, MaterializedState,
 };
 pub use memory::InMemoryBackend;
-pub use segment::start_next_segment;
+pub use segment::{segment_chain, start_next_segment};
 pub use snapshot::Snapshot;
 pub use sqlite::SqliteBackend;
 pub use tenant::{Tenant, TenantId, TenantLimits, TenantStatus, DEFAULT_TENANT};
