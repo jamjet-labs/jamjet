@@ -144,6 +144,27 @@ async def test_complete_route(monkeypatch: pytest.MonkeyPatch) -> None:
     assert data["model"] == "anthropic/claude-sonnet-4-6"
 
 
+async def test_complete_route_malformed_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POST /v1/complete with a non-JSON body returns 400, not 500.
+
+    Regression guard for the json.JSONDecodeError (a ValueError subclass) fix:
+    request.json() is now inside the try so a malformed body returns the intended
+    400 rather than an unhandled 500.
+    """
+    monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/complete",
+            content=b"not json at all",
+            headers={"content-type": "application/json"},
+        )
+
+    assert resp.status_code == 400
+    assert "error" in resp.json()
+
+
 async def test_complete_route_missing_model_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """POST /v1/complete with missing 'model' key returns 400."""
     monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())

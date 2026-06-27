@@ -57,8 +57,8 @@ async def _complete(body: dict[str, Any], model: Model) -> dict[str, Any]:
 
 
 async def _handle_complete(request: Request) -> JSONResponse:
-    body = await request.json()
     try:
+        body = await request.json()
         result = await _complete(body, _get_model())
         return JSONResponse(result)
     except (KeyError, ValueError) as exc:

@@ -103,4 +103,11 @@ async fn model_node_routes_through_sidecar_seam() {
         Some("anthropic/claude-sonnet-4-6"),
         "model name must propagate to telemetry"
     );
+    // Regression guard for the prefix-tolerant gen_ai_system fix:
+    // "anthropic/claude-sonnet-4-6" must classify as "anthropic", not "unknown".
+    assert_eq!(
+        result.gen_ai_system,
+        Some("anthropic".to_string()),
+        "gen_ai_system must classify provider-prefixed model names correctly"
+    );
 }

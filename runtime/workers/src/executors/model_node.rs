@@ -130,13 +130,25 @@ impl NodeExecutor for ModelNodeExecutor {
             state_patch,
             duration_ms,
             gen_ai_system: Some(
-                // Infer system from model name prefix.
-                if response.model.starts_with("claude") {
-                    "anthropic"
-                } else if response.model.starts_with("gpt") || response.model.starts_with("o1") {
-                    "openai"
-                } else {
-                    "unknown"
+                {
+                    // Infer the provider from the model name, tolerating an optional
+                    // "provider/" prefix (e.g. "anthropic/claude-sonnet-4-6" or bare
+                    // "claude-sonnet-4-6" both classify as "anthropic").
+                    let bare = response
+                        .model
+                        .split_once('/')
+                        .map(|(_, m)| m)
+                        .unwrap_or(response.model.as_str());
+                    if response.model.starts_with("anthropic/") || bare.starts_with("claude") {
+                        "anthropic"
+                    } else if response.model.starts_with("openai/")
+                        || bare.starts_with("gpt")
+                        || bare.starts_with("o1")
+                    {
+                        "openai"
+                    } else {
+                        "unknown"
+                    }
                 }
                 .to_string(),
             ),

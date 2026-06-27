@@ -179,9 +179,10 @@ pub fn registry_from_env() -> ModelRegistry {
         }
     }
 
-    // Sidecar takes highest priority when configured — overrides the native default.
-    // Native adapters remain registered as prefix-routed fallbacks so explicit
-    // provider model strings (e.g. "claude-3-haiku") still route correctly.
+    // Sidecar takes highest priority when configured. In seam mode the registry
+    // is sidecar-only: apply_sidecar discards the native adapters and returns a
+    // fresh registry with no prefix routes and no native fallback. Every model
+    // string routes to the governed Python seam; nothing can bypass it.
     if let Ok(url) = std::env::var("JAMJET_MODEL_SEAM_URL") {
         registry = apply_sidecar(registry, url);
     }
