@@ -35,6 +35,10 @@ pub enum NodeKind {
         prompt_ref: String,
         output_schema: String,
         system_prompt: Option<String>,
+        /// OpenAI-format tool/function schemas offered to the model for this call.
+        /// Empty means no tools are offered (standard text completion).
+        #[serde(default)]
+        tools: Vec<serde_json::Value>,
     },
 
     /// Python function, HTTP endpoint, or gRPC tool.
@@ -346,6 +350,7 @@ mod tests {
             prompt_ref: "prompts/summarize.md".into(),
             output_schema: "schemas.Summary".into(),
             system_prompt: None,
+            tools: vec![],
         };
         assert_eq!(node.queue_type(), QueueType::Model);
         assert!(node.is_durable());

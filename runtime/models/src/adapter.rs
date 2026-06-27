@@ -80,11 +80,27 @@ pub struct ModelConfig {
     pub stop_sequences: Option<Vec<String>>,
 }
 
+/// A tool call returned by the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Provider-issued call id (e.g. "call_abc123").
+    pub id: String,
+    /// Name of the tool to invoke (matches a name in the request `tools` list).
+    pub name: String,
+    /// Arguments as a JSON value.  Providers (and the Python sidecar) normalise
+    /// the arguments string to a JSON object when possible; callers should
+    /// tolerate a `Value::String` if the model emits malformed JSON.
+    pub arguments: serde_json::Value,
+}
+
 /// A request to a chat model.
 #[derive(Debug, Clone)]
 pub struct ModelRequest {
     pub messages: Vec<ChatMessage>,
     pub config: ModelConfig,
+    /// OpenAI-format tool/function schemas passed to the model.  Empty means no
+    /// tools are offered to the model for this call.
+    pub tools: Vec<serde_json::Value>,
 }
 
 impl ModelRequest {
@@ -92,11 +108,17 @@ impl ModelRequest {
         Self {
             messages,
             config: ModelConfig::default(),
+            tools: vec![],
         }
     }
 
     pub fn with_config(mut self, config: ModelConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    pub fn with_tools(mut self, tools: Vec<serde_json::Value>) -> Self {
+        self.tools = tools;
         self
     }
 }
@@ -113,7 +135,8 @@ pub struct StructuredRequest {
 /// A response from a chat model.
 #[derive(Debug, Clone)]
 pub struct ModelResponse {
-    /// The generated text content.
+    /// The generated text content.  Empty string when finish_reason is
+    /// "tool_calls" (the model is requesting tool invocations, not producing text).
     pub content: String,
     /// The model that actually served the request (may differ from requested).
     pub model: String,
@@ -125,6 +148,8 @@ pub struct ModelResponse {
     pub output_tokens: u64,
     /// Structured output parsed from JSON (for `structured_output()` calls).
     pub structured: Option<serde_json::Value>,
+    /// Tool calls requested by the model.  Empty when finish_reason != "tool_calls".
+    pub tool_calls: Vec<ToolCall>,
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -152,4 +177,33 @@ pub trait ModelAdapter: Send + Sync {
         &self,
         request: StructuredRequest,
     ) -> Result<ModelResponse, ModelError>;
+}
+
+/// One-time-per-adapter warning that a native (direct-to-provider) adapter
+/// received tool schemas it does not forward.
+///
+/// The native adapters (anthropic/openai/google/ollama) map only `role` +
+/// `content` and never send `request.tools` to the provider, so a Model call
+/// that carries tools silently no-ops and an agent tool loop degenerates. Tool
+/// calls must route through the model-seam sidecar (`JAMJET_MODEL_SEAM_URL`),
+/// which forwards tools. Logged once per distinct adapter so a degenerate loop's
+/// repeated calls do not spam the log, while a second adapter still gets its own
+/// warning (a single global `Once` would let the first adapter silence the rest).
+pub(crate) fn warn_tools_not_forwarded(adapter: &'static str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    // `insert` returns true the first time this adapter name is seen.
+    if warned
+        .lock()
+        .expect("warn_tools_not_forwarded mutex poisoned")
+        .insert(adapter)
+    {
+        tracing::warn!(
+            adapter,
+            "tools provided but this adapter does not forward them; \
+             use the model seam sidecar (JAMJET_MODEL_SEAM_URL) for tool calls"
+        );
+    }
 }

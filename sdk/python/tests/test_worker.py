@@ -45,6 +45,11 @@ async def _with_genai(input: dict) -> dict:
     }
 
 
+def _echo_tool(text: str) -> str:
+    """A plain @tool-style handler resolved by dispatch_tool_calls' tools map."""
+    return f"echo:{text}"
+
+
 # ── Stub client ───────────────────────────────────────────────────────────────
 
 
@@ -77,6 +82,7 @@ class _StubClient:
                 "execution_id": execution_id,
                 "node_id": node_id,
                 "output": output,
+                "state_patch": state_patch,
                 "gen_ai_model": gen_ai_model,
                 "finish_reason": finish_reason,
             }
@@ -158,6 +164,9 @@ async def test_worker_runs_handler_and_posts_complete() -> None:
     assert call["execution_id"] == "exec_abc"
     assert call["node_id"] == "add_step"
     assert call["output"] == {"sum": 7}
+    # 2j-4 G2: a PythonFn node's return dict IS its state_patch (it mutates
+    # state with its return), so the dict reaches state via the merge-patch.
+    assert call["state_patch"] == {"sum": 7}, "the handler's return dict must be the state_patch"
     assert len(stub.fail_calls) == 0, "fail must not be called on success"
 
 
@@ -208,3 +217,55 @@ async def test_worker_forwards_gen_ai_fields() -> None:
     assert call["finish_reason"] == "stop"
     # The full output dict (including GenAI fields) is still forwarded as-is.
     assert call["output"]["result"] == "answer"
+
+
+_DISPATCH_ITEM: dict = {
+    "id": "wi-005",
+    "execution_id": "exec_dispatch",
+    "node_id": "__tools_0__",
+    "queue_type": "python_tool",
+    "payload": {
+        "module": "jamjet.agents.tool_runtime",
+        "function": "dispatch_tool_calls",
+        # input == the full accumulated state the scheduler passes to a PythonFn
+        # node (messages + the model turn's tool_calls + the resolver map).
+        "input": {
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "echo hi"},
+            ],
+            "last_model_output": "",
+            "last_model_tool_calls": [
+                {"id": "call_1", "name": "echo", "arguments": {"text": "hi"}},
+            ],
+            "tools": {"echo": f"{__name__}:_echo_tool"},
+        },
+    },
+    "lease_fence": 0,
+}
+
+
+async def test_worker_dispatch_tool_calls_return_reaches_state() -> None:
+    """2j-4 G2: the agent loop's dispatch_tool_calls runs on the worker and its
+    {"messages": [...]} return is posted as the state_patch — so the accumulated
+    conversation (assistant tool-call turn + tool result) reaches state["messages"]
+    for the next turn's model node, instead of being silently dropped."""
+    stub = _StubClient(claimed_item=_DISPATCH_ITEM)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+
+    assert len(stub.complete_calls) == 1
+    call = stub.complete_calls[0]
+
+    # The dispatch return must be threaded into the state_patch as `messages`.
+    patch = call["state_patch"]
+    assert "messages" in patch, "dispatch_tool_calls' {messages} return must be the state_patch"
+    msgs = patch["messages"]
+    # original system + user, then the assistant tool-call turn and the tool result.
+    assert len(msgs) == 4, f"expected 4 accumulated messages, got {len(msgs)}"
+    assert msgs[2]["role"] == "assistant"
+    assert msgs[2]["tool_calls"][0]["function"]["name"] == "echo"
+    assert msgs[3]["role"] == "tool"
+    assert msgs[3]["tool_call_id"] == "call_1"
+    assert msgs[3]["content"] == "echo:hi", "the resolved tool's result must be carried forward"
+    # output mirrors the same dict (the worker coerces a dict return as-is).
+    assert call["output"]["messages"] == msgs

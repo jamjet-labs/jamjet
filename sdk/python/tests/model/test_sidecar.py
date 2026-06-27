@@ -18,12 +18,36 @@ from jamjet.model.sidecar_server import (
 from jamjet.model.types import ModelResponse
 
 
+class _FakeFunction:
+    """Minimal function-call descriptor on a tool call (mirrors litellm shape)."""
+
+    def __init__(self, name: str, arguments: str) -> None:
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeToolCall:
+    """Minimal tool-call descriptor returned by litellm on a message."""
+
+    def __init__(self, id: str, name: str, arguments: object) -> None:
+        self.id = id
+        # Mimic litellm: store under .function.name / .function.arguments
+        args_str = arguments if isinstance(arguments, str) else __import__("json").dumps(arguments)
+        self.function = _FakeFunction(name=name, arguments=args_str)
+
+
 class FakeMessage:
     """Minimal OpenAI-shaped message object returned by the fake backend."""
 
-    def __init__(self, content: str = "hi", finish_reason: str | None = None) -> None:
+    def __init__(
+        self,
+        content: str = "hi",
+        finish_reason: str | None = None,
+        tool_calls: list | None = None,
+    ) -> None:
         self.content = content
         self.finish_reason = finish_reason
+        self.tool_calls = tool_calls
 
 
 class FakeModel:
@@ -109,6 +133,80 @@ async def test_complete_core_optional_params_forwarded() -> None:
     req = received_reqs[0]
     assert req.temperature == pytest.approx(0.7)
     assert req.max_tokens == 512
+
+
+# --------------------------------------------------------------------------- #
+# 2j-1: tool-call round-trip and tools forwarded through the governed seam
+# --------------------------------------------------------------------------- #
+
+
+async def test_complete_core_tools_forwarded_to_model() -> None:
+    """tools in the request body are passed through to ModelRequest.tools (governed path)."""
+    received_reqs = []
+
+    class CapturingModel:
+        async def complete(self, request):  # noqa: ANN001, ANN201
+            received_reqs.append(request)
+            return ModelResponse(message=FakeMessage(content="ok"), input_tokens=0, output_tokens=0, cost_usd=0.0)
+
+    tool_schema = {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
+    await _complete(
+        {
+            "model": "anthropic/claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool_schema],
+        },
+        CapturingModel(),  # type: ignore[arg-type]
+    )
+
+    assert len(received_reqs) == 1
+    assert received_reqs[0].tools == [tool_schema], "tools must be threaded into ModelRequest (governed path)"
+
+
+async def test_complete_core_tool_calls_returned() -> None:
+    """When the model returns tool_calls, they appear in the response with finish_reason='tool_calls'."""
+
+    class FakeToolCallModel:
+        async def complete(self, request):  # noqa: ANN001, ANN201
+            tc = _FakeToolCall(id="c1", name="get_weather", arguments={"city": "SF"})
+            return ModelResponse(
+                message=FakeMessage(content=None, finish_reason="tool_calls", tool_calls=[tc]),
+                input_tokens=5,
+                output_tokens=3,
+                cost_usd=0.001,
+            )
+
+    result = await _complete(
+        {"model": "anthropic/claude-sonnet-4-6", "messages": [{"role": "user", "content": "weather?"}]},
+        FakeToolCallModel(),  # type: ignore[arg-type]
+    )
+
+    assert result["finish_reason"] == "tool_calls"
+    assert result["tool_calls"] == [{"id": "c1", "name": "get_weather", "arguments": {"city": "SF"}}]
+    # content is empty string when the model is making tool calls, not producing text
+    assert result["message"]["content"] == ""
+
+
+async def test_complete_core_tool_calls_infer_finish_reason() -> None:
+    """finish_reason is inferred as 'tool_calls' when tool_calls are present but finish_reason is None."""
+
+    class FakeToolCallModelNoReason:
+        async def complete(self, request):  # noqa: ANN001, ANN201
+            tc = _FakeToolCall(id="c2", name="search", arguments={"q": "hello"})
+            return ModelResponse(
+                message=FakeMessage(content=None, finish_reason=None, tool_calls=[tc]),
+                input_tokens=2,
+                output_tokens=1,
+                cost_usd=0.0,
+            )
+
+    result = await _complete(
+        {"model": "openai/gpt-4o", "messages": []},
+        FakeToolCallModelNoReason(),  # type: ignore[arg-type]
+    )
+
+    assert result["finish_reason"] == "tool_calls", "must infer tool_calls finish_reason when tool_calls present"
+    assert len(result["tool_calls"]) == 1
 
 
 # --------------------------------------------------------------------------- #
