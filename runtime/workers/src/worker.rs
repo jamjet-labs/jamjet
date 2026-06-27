@@ -6,14 +6,6 @@ use chrono::Utc;
 /// the timestamp math or push the backoff into the past. One hour is plenty.
 const MAX_RETRY_AFTER_SECS: u64 = 3_600;
 
-/// Byte threshold above which a model-node event output is spilled to the
-/// content-addressed artifact store and replaced by an `ArtifactRef` sentinel.
-///
-/// 8 KiB keeps 2-3 short model turns inline. A 4 000-token response (~16 KB)
-/// is always spilled. Only the EVENT output is affected; `state_patch` and
-/// `current_state` stay inline so replay and the materializer are unaffected.
-/// Configurable at runtime via `JAMJET_ARTIFACT_THRESHOLD_BYTES` (future).
-const ARTIFACT_THRESHOLD: usize = 8 * 1024;
 use jamjet_agents::AgentRegistry;
 use jamjet_core::node::NodeKind;
 use jamjet_core::workflow::ExecutionId;
@@ -27,7 +19,7 @@ use jamjet_state::budget::BudgetState;
 use jamjet_state::content_hash;
 use jamjet_state::event::EventKind;
 use jamjet_state::spill_bytes;
-use jamjet_state::{materialize, start_next_segment};
+use jamjet_state::{artifact_threshold, materialize, start_next_segment};
 use jamjet_telemetry::{gen_ai_attrs, metrics, record_gen_ai_usage};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -429,7 +421,8 @@ impl Worker {
                 }
 
                 // Spill the event output to the artifact store if above the
-                // threshold. Write-order invariant: the artifact is persisted
+                // threshold. The threshold is read from JAMJET_ARTIFACT_THRESHOLD_BYTES
+                // (default 8 KiB). Write-order invariant: the artifact is persisted
                 // BEFORE the NodeCompleted event that references it. A crash
                 // between put_artifact and commit_turn produces an orphaned
                 // artifact (benign, write-once) but NEVER a dangling ref in an
@@ -440,7 +433,7 @@ impl Worker {
                 // state_patch to advance current_state) are completely
                 // unaffected. Snapshot / state spill is F-2i-snapshot.
                 let event_output = {
-                    let maybe_bytes = spill_bytes(&exec_result.output, ARTIFACT_THRESHOLD);
+                    let maybe_bytes = spill_bytes(&exec_result.output, artifact_threshold());
                     if let Some(bytes) = maybe_bytes {
                         match self
                             .backend
@@ -2745,15 +2738,15 @@ mod tests {
         (backend, eid)
     }
 
-    /// A model-node output that exceeds ARTIFACT_THRESHOLD (8 KiB) must be
-    /// spilled to the artifact store. The NodeCompleted event must carry an
-    /// ArtifactRef sentinel (not the inline 32 KiB payload). A round-trip via
-    /// `backend.get_artifact` must restore the original value exactly.
-    /// The state_patch must remain inline (never spilled) so the replay path
-    /// is unaffected.
+    /// A model-node output that exceeds the spill threshold (default 8 KiB, set
+    /// via `JAMJET_ARTIFACT_THRESHOLD_BYTES`) must be spilled to the artifact
+    /// store. The NodeCompleted event must carry an ArtifactRef sentinel (not
+    /// the inline 32 KiB payload). A round-trip via `backend.get_artifact` must
+    /// restore the original value exactly. The state_patch must remain inline
+    /// (never spilled) so the replay path is unaffected.
     #[tokio::test]
     async fn large_model_output_is_spilled_to_artifact_store() {
-        // 32 KiB content string — well above the 8 KiB ARTIFACT_THRESHOLD.
+        // 32 KiB content string — well above the default 8 KiB threshold.
         let large_content = "x".repeat(32 * 1024);
         let large_output = serde_json::json!({ "content": large_content });
 
@@ -2821,7 +2814,7 @@ mod tests {
         );
     }
 
-    /// A model-node output below ARTIFACT_THRESHOLD stays inline in the
+    /// A model-node output below the spill threshold stays inline in the
     /// NodeCompleted event — no spill, no sentinel.
     #[tokio::test]
     async fn small_model_output_stays_inline() {

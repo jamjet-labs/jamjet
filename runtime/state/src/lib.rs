@@ -20,7 +20,8 @@ pub mod tenant;
 pub mod tenant_scoped;
 
 pub use artifact::{
-    resolve_value, spill_bytes, ArtifactRef, ARTIFACT_SENTINEL_KEY, DEFAULT_SPILL_THRESHOLD,
+    artifact_threshold, resolve_value, spill_bytes, ArtifactRef, ARTIFACT_SENTINEL_KEY,
+    DEFAULT_SPILL_THRESHOLD,
 };
 pub use backend::{
     ApiToken, ApprovalProjectionRow, BackendResult, ReclaimResult, StateBackend, StateBackendError,

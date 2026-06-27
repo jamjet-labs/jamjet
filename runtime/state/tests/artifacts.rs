@@ -22,6 +22,13 @@ use serde_json::json;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// Finding 4 (pool isolation) assessment: SqliteBackend::connect uses
+// SqlitePool::connect_with(opts) without capping max_connections, so multiple
+// connections to sqlite::memory: would each see an empty database.  However,
+// #[tokio::test] uses a single-threaded executor and the pool's
+// min_connections=0 default ensures at most one connection is ever live within
+// a test.  Tests pass by the sequential, single-connection guarantee of the
+// single-threaded runtime, NOT by luck.  No fix needed; risk is theoretical.
 async fn open_db() -> SqliteBackend {
     SqliteBackend::open("sqlite::memory:")
         .await
@@ -217,11 +224,73 @@ fn artifact_ref_sentinel_round_trip() {
     assert_eq!(parsed, artifact_ref);
 }
 
+/// Finding 1 — strict sentinel validation: `from_sentinel` must return `None`
+/// for any `$artifact` payload that does not match the exact expected shape.
+/// This prevents model-emitted objects that happen to contain `"$artifact"` from
+/// being mis-identified as refs and triggering spurious CAS lookups.
 #[test]
 fn artifact_ref_from_sentinel_returns_none_for_non_sentinel() {
+    // Plain objects and scalars without the $artifact key.
     assert!(ArtifactRef::from_sentinel(&json!({"foo": "bar"})).is_none());
     assert!(ArtifactRef::from_sentinel(&json!("just a string")).is_none());
     assert!(ArtifactRef::from_sentinel(&json!(42)).is_none());
+
+    // $artifact present but inner value is not an object.
+    assert!(ArtifactRef::from_sentinel(&json!({"$artifact": "foo"})).is_none());
+
+    // $artifact is an object but missing required fields.
+    assert!(ArtifactRef::from_sentinel(&json!({"$artifact": {}})).is_none());
+    assert!(ArtifactRef::from_sentinel(&json!({"$artifact": {"hash": "short"}})).is_none());
+
+    // $artifact has hash + size but hash is too short (not 64 hex chars).
+    // Without the strict-shape check this previously returned Some — the key
+    // regression case that motivated Finding 1.
+    assert!(
+        ArtifactRef::from_sentinel(&json!({"$artifact": {"hash": "tooshort", "size": 10}}))
+            .is_none(),
+        "short hash with size must not parse as an ArtifactRef"
+    );
+
+    // 64-char uppercase hex — fails because sentinel requires lowercase.
+    let upper_hash = "A".repeat(64);
+    assert!(
+        ArtifactRef::from_sentinel(&json!({"$artifact": {"hash": upper_hash, "size": 10}}))
+            .is_none(),
+        "uppercase hex hash must not parse as an ArtifactRef"
+    );
+}
+
+/// Finding 1 — a non-conforming `$artifact` object must be returned UNCHANGED
+/// by `resolve_value`, NOT treated as `unresolved` or yielding a NotFound error.
+/// This covers the case where a model emits an object with a `$artifact` key
+/// that does not satisfy the strict-shape check (missing size, short hash, etc.).
+#[tokio::test]
+async fn resolve_value_non_conforming_artifact_key_returns_unchanged() {
+    let backend = InMemoryBackend::new();
+
+    // Short hash + size: currently would error without the strict check.
+    let v = json!({"$artifact": {"hash": "tooshort", "size": 10}});
+    let result = resolve_value(&v, &backend).await.unwrap();
+    assert_eq!(
+        result, v,
+        "non-conforming $artifact must pass through unchanged"
+    );
+
+    // Object with $artifact key but no size — also non-conforming.
+    let v2 = json!({"$artifact": {"not": "a ref"}});
+    let result2 = resolve_value(&v2, &backend).await.unwrap();
+    assert_eq!(
+        result2, v2,
+        "missing-fields $artifact must pass through unchanged"
+    );
+
+    // Plain string inside $artifact — non-conforming.
+    let v3 = json!({"$artifact": "just a string"});
+    let result3 = resolve_value(&v3, &backend).await.unwrap();
+    assert_eq!(
+        result3, v3,
+        "string-valued $artifact must pass through unchanged"
+    );
 }
 
 // ── spill_bytes threshold behaviour ──────────────────────────────────────────
