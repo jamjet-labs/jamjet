@@ -1938,6 +1938,10 @@ openai-agents = [
 pii = [
     { name = "presidio-analyzer" },
 ]
+sidecar = [
+    { name = "starlette" },
+    { name = "uvicorn" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1969,11 +1973,13 @@ requires-dist = [
     { name = "rich", specifier = ">=13.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
     { name = "scipy", marker = "extra == 'dev'", specifier = ">=1.11" },
+    { name = "starlette", marker = "extra == 'sidecar'", specifier = ">=0.40" },
     { name = "syrupy", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "typer", specifier = ">=0.12" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
+    { name = "uvicorn", marker = "extra == 'sidecar'", specifier = ">=0.30" },
 ]
-provides-extras = ["dev", "openai", "anthropic", "cloud-all", "model", "langchain", "crewai", "adk", "anthropic-agent", "openai-agents", "pii", "memory"]
+provides-extras = ["dev", "openai", "anthropic", "cloud-all", "model", "sidecar", "langchain", "crewai", "adk", "anthropic-agent", "openai-agents", "pii", "memory"]
 
 [[package]]
 name = "jamjet-engram"
