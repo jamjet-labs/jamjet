@@ -4,7 +4,7 @@
 //! the discovered capabilities as the node output so the workflow can select
 //! an agent and delegate to it dynamically.
 
-use crate::executor::{ExecutionResult, NodeExecutor};
+use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use async_trait::async_trait;
 use jamjet_state::backend::WorkItem;
 use serde_json::{json, Value};
@@ -15,7 +15,7 @@ pub struct AgentDiscoveryExecutor;
 #[async_trait]
 impl NodeExecutor for AgentDiscoveryExecutor {
     #[instrument(skip(self, item), fields(node_id = %item.node_id))]
-    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, String> {
+    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
 
         let agent_url = item

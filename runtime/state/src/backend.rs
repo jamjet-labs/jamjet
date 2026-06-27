@@ -184,6 +184,22 @@ pub trait StateBackend: Send + Sync {
         write_snapshot: bool,
     ) -> BackendResult<EventSequence>;
 
+    /// Atomically return a leased work item to `pending`, visible again at
+    /// `retry_after`, with the attempt count set to `next_attempt` and a fresh
+    /// lease epoch (so the next claim mints a strictly-greater fence).
+    ///
+    /// Fence-guarded: if `lease_fence` no longer matches the stored value (stale
+    /// worker, race, or already parked by another path) the update matches zero
+    /// rows and `Ok(false)` is returned — a no-op, consistent with the
+    /// `FenceLost` zombie path in `commit_turn`.
+    async fn park_work_item(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        retry_after: &str,
+        next_attempt: u32,
+    ) -> BackendResult<bool>;
+
     /// Reclaim work items whose lease has expired (worker crashed or stalled).
     ///
     /// For each expired item:

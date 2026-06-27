@@ -874,6 +874,36 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(item_id = %item_id, fence = lease_fence))]
+    async fn park_work_item(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        retry_after: &str,
+        next_attempt: u32,
+    ) -> BackendResult<bool> {
+        let id_str = item_id.to_string();
+        // Atomically reset the work item to pending with a future not-before time.
+        // The fence guard (WHERE id=? AND lease_fence=?) ensures a stale worker
+        // cannot park over a newer attempt. Bumping lease_epoch ensures the next
+        // claim mints a strictly-greater fence than any fence the parking worker held.
+        let rows_affected = sqlx::query(
+            "UPDATE work_items \
+             SET status = 'pending', retry_after = ?, attempt = ?, worker_id = NULL, \
+                 lease_expires_at = NULL, lease_epoch = lease_epoch + 1, lease_fence = 0 \
+             WHERE id = ? AND lease_fence = ?",
+        )
+        .bind(retry_after)
+        .bind(next_attempt as i64)
+        .bind(&id_str)
+        .bind(lease_fence)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
     #[instrument(skip(self, terminal_event), fields(item_id = %item_id, fence = lease_fence))]
     async fn commit_turn(
         &self,

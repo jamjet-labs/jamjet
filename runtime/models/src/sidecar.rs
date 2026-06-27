@@ -17,6 +17,10 @@ use serde_json::{json, Value};
 
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-6";
 
+/// Cap a provider-supplied Retry-After so an untrusted/huge value can't overflow
+/// the timestamp math or push the backoff into the past. One hour is plenty.
+const MAX_RETRY_AFTER_SECS: u64 = 3_600;
+
 /// Routes durable-path model calls to the Python model-seam sidecar via HTTP.
 ///
 /// The sidecar wraps `jamjet.model.Model` (Track-1 seam), so every call
@@ -52,9 +56,16 @@ impl SidecarModelAdapter {
             .map_err(|e| ModelError::Network(e.to_string()))?;
 
         if status == 429 {
-            return Err(ModelError::RateLimited {
-                retry_after_secs: 60,
-            });
+            // Prefer the retry_after the sidecar extracts from the provider response
+            // (passed back as `{"retry_after": <secs>}` in the body).  Fall back to
+            // 60 s when the body is absent or unparseable — keeps the existing safe
+            // default for responses that predate this contract.
+            let retry_after_secs = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v["retry_after"].as_u64())
+                .unwrap_or(60)
+                .min(MAX_RETRY_AFTER_SECS);
+            return Err(ModelError::RateLimited { retry_after_secs });
         }
         if status != 200 {
             return Err(ModelError::Api { status, body: text });
@@ -365,6 +376,61 @@ mod tests {
         );
     }
 
+    // 2f-5: 429 body with retry_after must be propagated into ModelError::RateLimited.
+    #[tokio::test]
+    async fn chat_rate_limit_uses_body_retry_after() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("POST", "/v1/complete")
+            .with_status(429)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"rate limit","retry_after":12}"#)
+            .create_async()
+            .await;
+
+        let adapter = SidecarModelAdapter::new(server.url());
+        let req = ModelRequest::new(vec![ChatMessage::user("hi")]);
+        let result = adapter.chat(req).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ModelError::RateLimited {
+                    retry_after_secs: 12
+                })
+            ),
+            "expected RateLimited{{retry_after_secs:12}}, got {result:?}"
+        );
+    }
+
+    // 2f-5: 429 with no parseable body falls back to 60 s default.
+    #[tokio::test]
+    async fn chat_rate_limit_falls_back_when_no_retry_after() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("POST", "/v1/complete")
+            .with_status(429)
+            .with_body("too many requests")
+            .create_async()
+            .await;
+
+        let adapter = SidecarModelAdapter::new(server.url());
+        let req = ModelRequest::new(vec![ChatMessage::user("hi")]);
+        let result = adapter.chat(req).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ModelError::RateLimited {
+                    retry_after_secs: 60
+                })
+            ),
+            "expected RateLimited{{retry_after_secs:60}}, got {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn health_check_passes_on_200() {
         let mut server = mockito::Server::new_async().await;
@@ -485,6 +551,35 @@ mod tests {
             matches!(result, Err(ModelError::Serialization(_))),
             "missing output_tokens must produce Serialization error, got {result:?}"
         );
+    }
+
+    // 2f-security: a huge (malicious or buggy) provider Retry-After must be clamped
+    // to MAX_RETRY_AFTER_SECS so it cannot overflow the timestamp math in the worker.
+    #[tokio::test]
+    async fn chat_rate_limit_clamps_huge_retry_after() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("POST", "/v1/complete")
+            .with_status(429)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"rate limit","retry_after":99999999999999}"#)
+            .create_async()
+            .await;
+
+        let adapter = SidecarModelAdapter::new(server.url());
+        let req = ModelRequest::new(vec![ChatMessage::user("hi")]);
+        let result = adapter.chat(req).await;
+
+        match result {
+            Err(ModelError::RateLimited { retry_after_secs }) => {
+                assert!(
+                    retry_after_secs <= MAX_RETRY_AFTER_SECS,
+                    "retry_after_secs {retry_after_secs} must be <= MAX_RETRY_AFTER_SECS ({MAX_RETRY_AFTER_SECS})"
+                );
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 
     #[tokio::test]

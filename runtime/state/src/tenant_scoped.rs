@@ -805,6 +805,34 @@ impl StateBackend for TenantScopedSqliteBackend {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, item_id = %item_id, fence = lease_fence))]
+    async fn park_work_item(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        retry_after: &str,
+        next_attempt: u32,
+    ) -> BackendResult<bool> {
+        let id_str = item_id.to_string();
+        // Same as SqliteBackend::park_work_item but scoped to tenant_id.
+        let rows_affected = sqlx::query(
+            "UPDATE work_items \
+             SET status = 'pending', retry_after = ?, attempt = ?, worker_id = NULL, \
+                 lease_expires_at = NULL, lease_epoch = lease_epoch + 1, lease_fence = 0 \
+             WHERE id = ? AND lease_fence = ? AND tenant_id = ?",
+        )
+        .bind(retry_after)
+        .bind(next_attempt as i64)
+        .bind(&id_str)
+        .bind(lease_fence)
+        .bind(&self.tenant_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
     #[instrument(skip(self, terminal_event), fields(tenant = %self.tenant_id, item_id = %item_id))]
     async fn commit_turn(
         &self,

@@ -484,6 +484,44 @@ impl StateBackend for InMemoryBackend {
         }
     }
 
+    async fn park_work_item(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        retry_after: &str,
+        next_attempt: u32,
+    ) -> BackendResult<bool> {
+        // Suppress unused-variable warning; retry_after is only meaningful in
+        // SQL backends (the claim query filters `retry_after <= now`). The
+        // in-memory backend does not enforce the not-before window — it is a
+        // dev/test backend. The WorkItem struct has no retry_after field.
+        let _ = retry_after;
+        match self.work_items.get_mut(&item_id) {
+            Some(mut entry) => {
+                // Fence guard: a stale worker (mismatched lease_fence) is a no-op.
+                if entry.lease_fence != lease_fence {
+                    return Ok(false);
+                }
+                // Reset to pending state, mirror the SQL SET columns.
+                entry.attempt = next_attempt;
+                entry.worker_id = None;
+                entry.lease_expires_at = None;
+                // Bump epoch so the next claim mints a strictly-greater fence.
+                let next_epoch = self
+                    .lease_epochs
+                    .get(&item_id)
+                    .map(|e| *e.value())
+                    .unwrap_or(0)
+                    + 1;
+                self.lease_epochs.insert(item_id, next_epoch);
+                // Clear the fence; next claim will mint a fresh one via term*2^32+epoch.
+                entry.lease_fence = 0;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn reclaim_expired_leases(&self) -> BackendResult<ReclaimResult> {
         let now = Utc::now();
         let mut result = ReclaimResult::default();

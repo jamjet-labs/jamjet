@@ -10,7 +10,7 @@
 //! Each invocation opens a fresh connection. For Phase 2, connection pooling
 //! and persistent stdio processes can be added.
 
-use crate::executor::{ExecutionResult, NodeExecutor};
+use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use async_trait::async_trait;
 use jamjet_ir::workflow::{McpServerConfig, McpTransport as IrMcpTransport};
 use jamjet_mcp::{HttpSseTransport, McpClient, StdioTransport};
@@ -33,7 +33,7 @@ impl McpToolExecutor {
 #[async_trait]
 impl NodeExecutor for McpToolExecutor {
     #[instrument(skip(self, item), fields(node_id = %item.node_id))]
-    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, String> {
+    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
 
         // Extract server alias and tool name from the payload.

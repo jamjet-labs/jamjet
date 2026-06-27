@@ -3,9 +3,9 @@
 //! Resolves the model configuration from the workflow IR, calls the appropriate
 //! `ModelAdapter` via `ModelRegistry`, and records GenAI telemetry.
 
-use crate::executor::{ExecutionResult, NodeExecutor};
+use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use async_trait::async_trait;
-use jamjet_models::{ChatMessage, ModelConfig, ModelRegistry, ModelRequest};
+use jamjet_models::{ChatMessage, ModelConfig, ModelError, ModelRegistry, ModelRequest};
 use jamjet_state::backend::WorkItem;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -25,7 +25,7 @@ impl ModelNodeExecutor {
 #[async_trait]
 impl NodeExecutor for ModelNodeExecutor {
     #[instrument(skip(self, item), fields(node_id = %item.node_id))]
-    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, String> {
+    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
 
         // Extract model config from the work item payload.
@@ -105,11 +105,15 @@ impl NodeExecutor for ModelNodeExecutor {
         debug!(model = %model, messages = messages.len(), "Calling model");
 
         let request = ModelRequest::new(messages).with_config(config);
-        let response = self
-            .registry
-            .chat(request)
-            .await
-            .map_err(|e| format!("Model call failed: {e}"))?;
+        // Intercept RateLimited before erasing the type. ONLY RateLimited becomes
+        // ExecutorError::RateLimited; every other ModelError variant becomes Fatal.
+        let response = match self.registry.chat(request).await {
+            Ok(r) => r,
+            Err(ModelError::RateLimited { retry_after_secs }) => {
+                return Err(ExecutorError::RateLimited { retry_after_secs });
+            }
+            Err(e) => return Err(ExecutorError::Fatal(format!("Model call failed: {e}"))),
+        };
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -157,5 +161,116 @@ impl NodeExecutor for ModelNodeExecutor {
             output_tokens: Some(response.output_tokens),
             finish_reason: Some(response.finish_reason),
         })
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::ExecutorError;
+    use jamjet_models::{ModelAdapter, ModelError, ModelRequest, ModelResponse, StructuredRequest};
+    use jamjet_state::backend::WorkItem;
+    use std::sync::Arc;
+
+    // ── Fake adapter ──────────────────────────────────────────────────────────
+
+    enum FakeKind {
+        RateLimited { retry_after_secs: u64 },
+        ApiError,
+    }
+
+    struct FakeAdapter {
+        kind: FakeKind,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelAdapter for FakeAdapter {
+        fn system_name(&self) -> &'static str {
+            "fake"
+        }
+        fn default_model(&self) -> &str {
+            "fake-model"
+        }
+        async fn chat(&self, _req: ModelRequest) -> Result<ModelResponse, ModelError> {
+            match &self.kind {
+                FakeKind::RateLimited { retry_after_secs } => Err(ModelError::RateLimited {
+                    retry_after_secs: *retry_after_secs,
+                }),
+                FakeKind::ApiError => Err(ModelError::Api {
+                    status: 500,
+                    body: "internal server error".into(),
+                }),
+            }
+        }
+        async fn structured_output(
+            &self,
+            _req: StructuredRequest,
+        ) -> Result<ModelResponse, ModelError> {
+            unimplemented!()
+        }
+    }
+
+    fn make_item() -> WorkItem {
+        WorkItem {
+            id: uuid::Uuid::new_v4(),
+            execution_id: jamjet_core::workflow::ExecutionId::new(),
+            node_id: "test-node".into(),
+            queue_type: "model".into(),
+            payload: serde_json::json!({
+                "model": "fake-model",
+                "prompt": "hello",
+            }),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: chrono::Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "default".into(),
+        }
+    }
+
+    fn make_executor(kind: FakeKind) -> ModelNodeExecutor {
+        let registry = Arc::new(
+            ModelRegistry::new()
+                .register(Arc::new(FakeAdapter { kind }))
+                .with_default("fake"),
+        );
+        ModelNodeExecutor::new(registry)
+    }
+
+    /// ONLY ModelError::RateLimited maps to ExecutorError::RateLimited, with the
+    /// correct retry_after_secs forwarded.
+    #[tokio::test]
+    async fn rate_limited_maps_to_executor_rate_limited() {
+        let executor = make_executor(FakeKind::RateLimited {
+            retry_after_secs: 7,
+        });
+        let result = executor.execute(&make_item()).await;
+        assert!(
+            matches!(
+                result,
+                Err(ExecutorError::RateLimited {
+                    retry_after_secs: 7
+                })
+            ),
+            "expected RateLimited(7), got: {:?}",
+            result
+        );
+    }
+
+    /// Non-rate-limit ModelErrors (Api, Network, Timeout, etc.) must map to
+    /// ExecutorError::Fatal, never to RateLimited.
+    #[tokio::test]
+    async fn non_rate_limit_error_maps_to_fatal() {
+        let executor = make_executor(FakeKind::ApiError);
+        let result = executor.execute(&make_item()).await;
+        assert!(
+            matches!(result, Err(ExecutorError::Fatal(_))),
+            "expected Fatal, got: {:?}",
+            result
+        );
     }
 }

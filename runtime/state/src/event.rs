@@ -125,6 +125,18 @@ pub enum EventKind {
         attempt: u32,
         retryable: bool,
     },
+    /// Emitted when a work item is parked on a provider rate-limit (429).
+    /// The item is reset to `pending` with `retry_after` set; the node stays
+    /// in `scheduled` and is re-picked up by a worker when the not-before
+    /// time passes. This is an audit/observability event — it does not mutate
+    /// the ExecProgress state (the node is already in `scheduled`).
+    NodeParked {
+        node_id: NodeId,
+        attempt: u32,
+        /// RFC3339 timestamp (now + retry_after_secs) stored as TEXT, matching
+        /// the `retry_after` column type in `work_items`.
+        retry_after: String,
+    },
     NodeSkipped {
         node_id: NodeId,
         reason: String,
@@ -377,6 +389,7 @@ impl EventKind {
             | Self::NodeStarted { node_id, .. }
             | Self::NodeCompleted { node_id, .. }
             | Self::NodeFailed { node_id, .. }
+            | Self::NodeParked { node_id, .. }
             | Self::NodeSkipped { node_id, .. }
             | Self::NodeCancelled { node_id }
             | Self::RetryScheduled { node_id, .. }

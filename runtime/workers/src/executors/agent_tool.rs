@@ -7,7 +7,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::executor::{ExecutionResult, NodeExecutor, StreamEventSender};
+use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor, StreamEventSender};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use futures::StreamExt;
@@ -399,7 +399,7 @@ impl AgentToolExecutor {
 #[async_trait]
 impl NodeExecutor for AgentToolExecutor {
     #[instrument(skip(self, item), fields(node_id = %item.node_id))]
-    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, String> {
+    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
         let p = &item.payload;
 
@@ -470,8 +470,8 @@ impl NodeExecutor for AgentToolExecutor {
         debug!(agent_uri = %agent_uri, mode = %mode, protocol = %protocol, "AgentTool: invoking");
 
         match mode.as_str() {
-            "sync" => {
-                self.execute_sync(
+            "sync" => self
+                .execute_sync(
                     item,
                     agent_uri,
                     protocol,
@@ -482,9 +482,9 @@ impl NodeExecutor for AgentToolExecutor {
                     start,
                 )
                 .await
-            }
-            "streaming" => {
-                self.stream_ndjson(
+                .map_err(ExecutorError::Fatal),
+            "streaming" => self
+                .stream_ndjson(
                     item,
                     agent_uri,
                     protocol,
@@ -496,9 +496,9 @@ impl NodeExecutor for AgentToolExecutor {
                     start,
                 )
                 .await
-            }
-            "conversational" => {
-                self.execute_conversational(
+                .map_err(ExecutorError::Fatal),
+            "conversational" => self
+                .execute_conversational(
                     item,
                     agent_uri,
                     protocol,
@@ -509,8 +509,10 @@ impl NodeExecutor for AgentToolExecutor {
                     start,
                 )
                 .await
-            }
-            other => Err(format!("Unknown agent_tool mode: '{other}'")),
+                .map_err(ExecutorError::Fatal),
+            other => Err(ExecutorError::Fatal(format!(
+                "Unknown agent_tool mode: '{other}'"
+            ))),
         }
     }
 
@@ -521,7 +523,7 @@ impl NodeExecutor for AgentToolExecutor {
         &self,
         item: &WorkItem,
         tx: StreamEventSender,
-    ) -> Result<ExecutionResult, String> {
+    ) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
         let p = &item.payload;
 
@@ -623,7 +625,7 @@ impl NodeExecutor for AgentToolExecutor {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Agent returned error {status}: {body}"));
+            return Err(format!("Agent returned error {status}: {body}").into());
         }
 
         // ── Incremental NDJSON read loop ────────────────────────────────
@@ -813,7 +815,7 @@ impl NodeExecutor for AgentToolExecutor {
 
         // ── Return error for hard failures ───────────────────────────────
         if let Some(error) = terminal_error {
-            return Err(error);
+            return Err(error.into());
         }
 
         // ── Emit completed (if not terminated early) ────────────────────

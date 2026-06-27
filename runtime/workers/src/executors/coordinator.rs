@@ -3,7 +3,7 @@
 //! Runs the three-phase coordinator pipeline: discovery → scoring → decision,
 //! delegating each phase to the Python strategy bridge via REST.
 
-use crate::executor::{ExecutionResult, NodeExecutor};
+use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use async_trait::async_trait;
 use jamjet_scheduler::strategy_bridge::{
     DecideRequest, DiscoverRequest, ScoreRequest, StrategyBridge,
@@ -27,7 +27,7 @@ impl CoordinatorExecutor {
 #[async_trait]
 impl NodeExecutor for CoordinatorExecutor {
     #[instrument(skip(self, item), fields(node_id = %item.node_id))]
-    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, String> {
+    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
         let p = &item.payload;
 

@@ -9,7 +9,7 @@
 //! The executor is crash-resumable: if the worker dies mid-poll, the scheduler
 //! will reclaim the lease and re-submit the task on the next attempt.
 
-use crate::executor::{ExecutionResult, NodeExecutor};
+use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use async_trait::async_trait;
 use jamjet_a2a_proto::A2aMessage as Message;
 use jamjet_a2a_proto::A2aPart as Part;
@@ -54,7 +54,7 @@ impl Default for A2aTaskExecutor {
 #[async_trait]
 impl NodeExecutor for A2aTaskExecutor {
     #[instrument(skip(self, item), fields(node_id = %item.node_id))]
-    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, String> {
+    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
 
         // Extract agent URI and skill from the work item payload.
@@ -180,7 +180,7 @@ impl NodeExecutor for A2aTaskExecutor {
                         })
                     })
                     .unwrap_or_else(|| "A2A task failed".into());
-                Err(error)
+                Err(error.into())
             }
             A2aTaskState::InputRequired => {
                 // The workflow should be paused for user input — return error
@@ -188,7 +188,7 @@ impl NodeExecutor for A2aTaskExecutor {
                 warn!(task_id = %response_task_id, "A2A task requires input — not yet handled");
                 Err("A2A task requires input — multi-turn not yet supported in this node".into())
             }
-            other => Err(format!("A2A task ended in unexpected state: {other:?}")),
+            other => Err(format!("A2A task ended in unexpected state: {other:?}").into()),
         }
     }
 }
