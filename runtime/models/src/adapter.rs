@@ -178,3 +178,23 @@ pub trait ModelAdapter: Send + Sync {
         request: StructuredRequest,
     ) -> Result<ModelResponse, ModelError>;
 }
+
+/// One-time warning that a native (direct-to-provider) adapter received tool
+/// schemas it does not forward.
+///
+/// The native adapters (anthropic/openai/google/ollama) map only `role` +
+/// `content` and never send `request.tools` to the provider, so a Model call
+/// that carries tools silently no-ops and an agent tool loop degenerates. Tool
+/// calls must route through the model-seam sidecar (`JAMJET_MODEL_SEAM_URL`),
+/// which forwards tools. Logged once per process so a degenerate loop's
+/// repeated calls do not spam the log.
+pub(crate) fn warn_tools_not_forwarded(adapter: &'static str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            adapter,
+            "tools provided but this adapter does not forward them; \
+             use the model seam sidecar (JAMJET_MODEL_SEAM_URL) for tool calls"
+        );
+    });
+}

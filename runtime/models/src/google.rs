@@ -5,8 +5,8 @@
 //! Uses the REST API directly (no SDK dependency).
 
 use crate::adapter::{
-    ChatMessage, ChatRole, ModelAdapter, ModelConfig, ModelError, ModelRequest, ModelResponse,
-    StructuredRequest,
+    warn_tools_not_forwarded, ChatMessage, ChatRole, ModelAdapter, ModelConfig, ModelError,
+    ModelRequest, ModelResponse, StructuredRequest,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -207,6 +207,12 @@ impl ModelAdapter for GoogleAdapter {
         gen_ai.usage.output_tokens = tracing::field::Empty,
     ))]
     async fn chat(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        // Native adapter: tools are not forwarded to the provider. Warn (once) so
+        // a tool-carrying call does not silently degenerate the agent loop.
+        if !request.tools.is_empty() {
+            warn_tools_not_forwarded(self.system_name());
+        }
+
         let model = request
             .config
             .model

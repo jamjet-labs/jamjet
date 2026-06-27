@@ -101,11 +101,23 @@ and the **real** tool-dispatch helper through the engine's control flow with a
 deterministic mock model, and asserts the `model -> tool -> model` loop runs, the
 tool is invoked, and the final answer matches the in-process run.
 
-## Notes and limits
+## Limitations (v1)
 
-- `max_turns` bounds the static unroll. The v1 loop runs the unroll to completion;
-  the per-turn gate that would short-circuit as soon as the model returns a final
-  answer is not yet wired into the engine, so size `max_turns` to the conversation
+- **Bounded `max_turns`, no early exit yet.** `max_turns` bounds the static
+  unroll and the loop runs it to completion. The per-turn gate that would
+  short-circuit as soon as the model returns a final answer is not yet wired
+  into the engine (F-2j-dynamic-loop), so size `max_turns` to the conversation
   depth you expect. The extracted answer is the last model turn's output.
-- Tool results are threaded back to the model as conversation text. Full
-  assistant/tool message-role fidelity through the engine is a follow-up.
+- **The model is re-invoked every remaining turn (cost).** Because there is no
+  early exit, a real model is called once per turn for all `max_turns`, so cost
+  scales with `max_turns` and the answer can drift across turns.
+- **Tool-message fidelity is lossy across turns.** Tool results are threaded
+  back to the model as conversation text; the Rust `ChatMessage` carries only
+  `role` + `content`, so full assistant/tool message-role fidelity through the
+  engine is a follow-up (F-2j-chatmessage-fidelity).
+- **A `@tool`'s return value merge-patches execution state.** A `python_tool`
+  node's return dict is applied as a `state_patch` (top-level keys replace, the
+  rest merge). This is how the loop threads `{"messages": [...]}` into the next
+  turn. Avoid returning reserved loop keys like `messages` or
+  `last_model_output` from a plain `@tool`, or you will clobber loop state
+  (F-2j-statepatch-namespace).

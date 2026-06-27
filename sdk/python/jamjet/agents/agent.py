@@ -153,7 +153,7 @@ class Agent:
         prompt: str,
         *,
         max_turns: int = 8,
-        runtime_url: str = "http://127.0.0.1:8080",
+        runtime_url: str = "http://127.0.0.1:7700",
     ) -> AgentResult:
         """Run the agent durably on the JamJet engine, mirroring :meth:`run`.
 
@@ -168,9 +168,23 @@ class Agent:
         Unlike :meth:`run` (a pure in-process loop), this routes every model call
         and tool dispatch through the durable event-sourced engine, so the run
         gets the event log, replay, idempotency, park-on-429, and artifacts for
-        free. It requires a running engine at *runtime_url* and a running
-        ``jamjet worker`` (the python_tool worker) to execute the ``@tool``
-        functions.
+        free.
+
+        v1 limitations
+        --------------
+        - **Static unroll, no early exit.** The loop runs up to *max_turns* model
+          turns and currently does NOT short-circuit when the model returns a
+          final answer; the engine has no edge-condition evaluator yet
+          (F-2j-dynamic-loop). A real model is re-invoked on every remaining
+          turn, so cost scales with *max_turns* and the answer can drift across
+          turns. Size *max_turns* to the conversation depth you actually expect.
+        - **Requires running services.** A live engine at *runtime_url*, a
+          ``jamjet worker`` draining the ``python_tool`` queue (to execute the
+          ``@tool`` functions), and the model sidecar (``JAMJET_MODEL_SEAM_URL``,
+          which forwards tools to the provider) must all be running.
+        - **The read is the final state.** The returned answer is the durable
+          execution's final state (the last model turn's output), not a
+          per-turn early-stop result.
 
         Raises
         ------
