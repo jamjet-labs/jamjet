@@ -273,8 +273,90 @@ impl Scheduler {
             info!(execution_id = %execution_id, node_id = %node_id, "Approval rejected — node failed");
         }
 
+        // FDL-3 skip cascade (the dead-edge fixpoint). A node whose EVERY
+        // in-edge is dead can never run, so emit `NodeSkipped` for it. The skip
+        // folds into `completed` (satisfying downstream AND-joins without it) and
+        // into `skipped` (making this node's OUT-edges dead), which can make MORE
+        // nodes skippable — so iterate to a fixpoint. A node reachable via ANY
+        // live in-edge is never all-dead, so shared joins (the agent loop's
+        // `end`, a `__finalize__` join) survive; only a dead branch's exclusive
+        // tail is skipped. Capped at node-count passes defensively — each pass
+        // skips >= 1 new node or stops, so it converges well within the cap.
+        let max_passes = ir.nodes.len() + 1;
+        for _ in 0..max_passes {
+            // Collect the nodes that become skippable in this pass against the
+            // current progress, then emit + fold them. A node is skippable iff
+            // it is not already resolved, has >= 1 in-edge, and ALL its in-edges
+            // are dead. (Roots — no in-edges — are never skipped here.)
+            let mut newly_skippable: Vec<NodeId> = Vec::new();
+            for node_id in ir.nodes.keys() {
+                let n = node_id.as_str();
+                if progress.completed.contains(n)
+                    || progress.scheduled.contains(n)
+                    || progress.skipped.contains(n)
+                    || progress.terminal_failed.contains(n)
+                {
+                    continue;
+                }
+                let mut has_in_edge = false;
+                let mut all_dead = true;
+                for e in ir.edges.iter().filter(|e| e.to == *node_id) {
+                    has_in_edge = true;
+                    if !edge_dead(
+                        &e.from,
+                        n,
+                        &ir,
+                        &progress.completed,
+                        &progress.skipped,
+                        &progress.routes,
+                    ) {
+                        all_dead = false;
+                        break;
+                    }
+                }
+                if has_in_edge && all_dead {
+                    newly_skippable.push(node_id.clone());
+                }
+            }
+            if newly_skippable.is_empty() {
+                break;
+            }
+            // Sort for deterministic event sequencing (ir.nodes is a HashMap).
+            newly_skippable.sort();
+            for node_id in newly_skippable {
+                let seq = self.backend.latest_sequence(execution_id).await? + 1;
+                let skip_event = jamjet_state::Event::new(
+                    execution_id.clone(),
+                    seq,
+                    EventKind::NodeSkipped {
+                        node_id: node_id.clone(),
+                        reason: "branch not taken".to_string(),
+                    },
+                );
+                self.backend.append_event(skip_event.clone()).await?;
+                // Fold the skip into LOCAL progress immediately so the next pass
+                // (and this tick's dispatch) sees it — reaching the fixpoint
+                // within one tick rather than one skip per tick.
+                progress.apply(&skip_event);
+                info!(
+                    execution_id = %execution_id,
+                    node_id = %node_id,
+                    "Skipped node (dead branch — all in-edges dead)"
+                );
+            }
+        }
+
+        // Persist the cascade's advance (skips + last_sequence) so an early
+        // return below (e.g. the concurrency cap) doesn't replay the same delta.
+        self.progress
+            .lock()
+            .unwrap()
+            .insert(execution_id.clone(), progress.clone());
+
         let completed = &progress.completed;
         let scheduled = &progress.scheduled;
+        let skipped = &progress.skipped;
+        let routes = &progress.routes;
         let terminal_failed = &progress.terminal_failed;
 
         debug!(
@@ -316,7 +398,7 @@ impl Scheduler {
             if terminal_failed.contains(node_id.as_str()) {
                 continue; // permanently failed
             }
-            if is_runnable(node_id, &ir, completed, scheduled) {
+            if is_runnable(node_id, &ir, completed, scheduled, skipped, routes) {
                 // Serialize the QueueType variant name to snake_case string.
                 let queue_type = serde_json::to_value(node.kind.queue_type())
                     .ok()
@@ -552,6 +634,23 @@ struct ExecProgress {
     /// Note: a rejected node stays in `scheduled` (consuming a concurrency slot)
     /// until the follow-up `NodeFailed` emission clears it.
     rejected: HashMap<NodeId, String>,
+    /// FDL-3: a Condition node's recorded route — condition node id -> the single
+    /// chosen branch target. Populated when a Condition `NodeCompleted` carries a
+    /// non-null `chosen_target` (the condition executor's routing decision). The
+    /// route is a deterministic function of committed state recorded once at the
+    /// condition's completion, so replay reproduces the exact route.
+    ///
+    /// A routing Condition that completed with a NULL `chosen_target` (no branch
+    /// matched and no default) records NO entry here; the dead-edge predicate
+    /// then reads `routes.get(cond) == None` for a completed routing Condition as
+    /// "every out-edge is dead" — so all its branch targets are skipped.
+    routes: HashMap<NodeId, NodeId>,
+    /// FDL-3: nodes that were emitted as `NodeSkipped` (the dead-branch tails).
+    /// A skipped node also folds into `completed` (so a downstream AND-join is
+    /// satisfied without it), but is tracked separately here so the dead-edge
+    /// predicate can treat a skipped node's OUT-edges as dead — which is what
+    /// cascades a skip down a fully-dead branch to its exclusive tail.
+    skipped: HashSet<NodeId>,
 }
 
 impl ExecProgress {
@@ -560,6 +659,7 @@ impl ExecProgress {
         match &event.kind {
             EventKind::NodeCompleted {
                 node_id,
+                output,
                 state_patch,
                 ..
             } => {
@@ -567,6 +667,18 @@ impl ExecProgress {
                 self.scheduled.remove(node_id);
                 // Stale-hold cleanup: a completed node no longer awaits approval.
                 self.held.remove(node_id);
+                // FDL-3: record a Condition node's routing decision. The condition
+                // executor (FDL-2) records `chosen_target` on its `output`: a
+                // non-null string is the single live out-edge; a null/absent
+                // target (no branch matched, no default) records no route so the
+                // dead-edge predicate treats every out-edge of this completed
+                // Condition as dead. A spurious `chosen_target` on a NON-Condition
+                // node's output is harmless: the dead-edge predicate only consults
+                // `routes` for nodes the IR confirms are Condition nodes with
+                // non-empty branches.
+                if let Some(target) = output.get("chosen_target").and_then(|v| v.as_str()) {
+                    self.routes.insert(node_id.clone(), target.to_string());
+                }
                 if let serde_json::Value::Object(patch) = state_patch {
                     for (k, v) in patch {
                         self.final_state.insert(k.clone(), v.clone());
@@ -574,7 +686,11 @@ impl ExecProgress {
                 }
             }
             EventKind::NodeSkipped { node_id, .. } => {
+                // A skipped node folds into `completed` (satisfying downstream
+                // AND-joins) AND into `skipped` (so its OUT-edges read as dead in
+                // the dead-edge predicate, cascading the skip down the branch).
                 self.completed.insert(node_id.clone());
+                self.skipped.insert(node_id.clone());
                 self.scheduled.remove(node_id);
                 // Stale-hold cleanup: a skipped node no longer awaits approval.
                 self.held.remove(node_id);
@@ -675,22 +791,88 @@ impl ExecProgress {
     }
 }
 
-/// Check if a node is runnable: all its predecessors are completed and
-/// it hasn't been scheduled yet.
+/// FDL-3: is the edge `src -> dst` DEAD (i.e. it must never enable `dst`)?
+///
+/// An edge is dead iff EITHER:
+///   - `src` was skipped — a skipped node's out-edges cannot enable anything
+///     (this is what cascades a skip down a fully-dead branch); OR
+///   - `src` is a routing Condition (a `Condition` node with NON-EMPTY
+///     `branches`) that has COMPLETED and routed somewhere other than `dst`.
+///     A completed routing Condition routes to exactly one target — the live
+///     out-edge — so every other out-edge is dead. The null-route case (no
+///     branch matched, no default) records no entry in `routes`, so
+///     `routes.get(src)` is `None`, which differs from `Some(dst)` for every
+///     `dst`: ALL its out-edges are dead.
+///
+/// Edges that are LIVE (this returns false):
+///   - a routing Condition that has NOT YET completed — its out-edges are
+///     pending, not dead (the route is unknown until it runs);
+///   - an empty-`branches` Condition (a generic pass-through) — never routes,
+///     so its out-edges are governed only by the skip rule (backward-compat);
+///   - any non-Condition source that has not been skipped.
+fn edge_dead(
+    src: &str,
+    dst: &str,
+    ir: &WorkflowIr,
+    completed: &HashSet<NodeId>,
+    skipped: &HashSet<NodeId>,
+    routes: &HashMap<NodeId, NodeId>,
+) -> bool {
+    if skipped.contains(src) {
+        return true;
+    }
+    if let Some(node) = ir.nodes.get(src) {
+        if let NodeKind::Condition { branches } = &node.kind {
+            if !branches.is_empty() && completed.contains(src) {
+                // Completed routing Condition: live edge is `routes[src]` only.
+                return routes.get(src).map(String::as_str) != Some(dst);
+            }
+        }
+    }
+    false
+}
+
+/// Check if a node is runnable. Route-aware AND-join over LIVE edges only.
+///
+/// A node runs iff it is not already completed/scheduled/skipped, it has at
+/// least one LIVE in-edge (an in-edge `src -> node` that is not [`edge_dead`]),
+/// and EVERY live in-edge's source has COMPLETED. A node with NO in-edges is a
+/// root — runnable until it has run (matches the original topology behaviour).
+///
+/// A node whose every in-edge is dead is NOT runnable here (it is a skip
+/// candidate the cascade marks `NodeSkipped`); a node reachable via any live
+/// in-edge is never skipped, so the dead branch's exclusive tail is skipped
+/// while shared joins (the agent loop's `end`, a `__finalize__` join) survive.
 fn is_runnable(
     node_id: &str,
     ir: &WorkflowIr,
     completed: &HashSet<NodeId>,
     scheduled: &HashSet<NodeId>,
+    skipped: &HashSet<NodeId>,
+    routes: &HashMap<NodeId, NodeId>,
 ) -> bool {
-    if scheduled.contains(node_id) || completed.contains(node_id) {
+    if scheduled.contains(node_id) || completed.contains(node_id) || skipped.contains(node_id) {
         return false;
     }
-    // All predecessors (nodes with an edge TO this node) must be completed.
-    ir.edges
-        .iter()
-        .filter(|e| e.to == node_id)
-        .all(|e| completed.contains(&e.from))
+    let mut has_in_edge = false;
+    let mut has_live_edge = false;
+    let mut all_live_sources_done = true;
+    for e in ir.edges.iter().filter(|e| e.to == node_id) {
+        has_in_edge = true;
+        if !edge_dead(&e.from, node_id, ir, completed, skipped, routes) {
+            has_live_edge = true;
+            if !completed.contains(&e.from) {
+                all_live_sources_done = false;
+            }
+        }
+    }
+    // A node with no in-edges is a root — runnable (subject to the already-run
+    // guards above). A node with in-edges runs iff it has a live in-edge AND
+    // every live in-edge's source has completed.
+    if !has_in_edge {
+        return true;
+    }
+    has_live_edge && all_live_sources_done
 }
 
 #[cfg(test)]
@@ -1596,6 +1778,451 @@ mod tests {
         assert_eq!(
             state["other"], 42,
             "payload.state must carry all state keys"
+        );
+    }
+
+    // ── FDL-3: route-aware is_runnable + NodeSkipped skip cascade ───────────────
+
+    /// Assemble a workflow IR JSON value from a start node, a `nodes` object and
+    /// an `edges` array — the empty config maps are boilerplate every IR needs.
+    fn build_ir(
+        start: &str,
+        nodes: serde_json::Value,
+        edges: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "workflow_id": "wf",
+            "version": "0.1.0",
+            "name": null,
+            "description": null,
+            "state_schema": "",
+            "start_node": start,
+            "nodes": nodes,
+            "edges": edges,
+            "retry_policies": {},
+            "timeouts": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {},
+            "labels": {}
+        })
+    }
+
+    /// A `condition`-kind node. Non-empty `branches` make it a routing gate;
+    /// empty `branches` make it a generic pass-through (the scheduler dispatches
+    /// off edges, so the concrete kind doesn't matter for non-gate nodes).
+    fn cond_node(id: &str, branches: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "kind": { "type": "condition", "branches": branches },
+            "retry_policy": null,
+            "node_timeout_secs": null,
+            "description": null,
+            "labels": {}
+        })
+    }
+
+    /// A `NodeCompleted` the way the FDL-2 condition executor emits it: the
+    /// routing decision recorded on BOTH `output` and `state_patch`.
+    /// `chosen_target = None` is the null-route case (no branch matched, no
+    /// default) — the scheduler records no route, so every branch target dies.
+    fn condition_completed(
+        node_id: &str,
+        chosen_target: Option<&str>,
+        branch_targets: &[&str],
+    ) -> EventKind {
+        let chosen = match chosen_target {
+            Some(t) => serde_json::Value::String(t.to_string()),
+            None => serde_json::Value::Null,
+        };
+        let targets: Vec<serde_json::Value> = branch_targets
+            .iter()
+            .map(|t| serde_json::Value::String(t.to_string()))
+            .collect();
+        let routing = serde_json::json!({
+            "chosen_target": chosen,
+            "branch_targets": targets,
+        });
+        EventKind::NodeCompleted {
+            node_id: node_id.into(),
+            output: routing.clone(),
+            state_patch: routing,
+            duration_ms: 1,
+            gen_ai_system: None,
+            gen_ai_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            finish_reason: None,
+            cost_usd: None,
+            provenance: None,
+            idempotency_key: None,
+        }
+    }
+
+    fn skipped_nodes(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|ev| match &ev.kind {
+                EventKind::NodeSkipped { node_id, .. } => Some(node_id.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A static agent-loop unroll (turns 0,1 + a final model_2):
+    /// `model_0 -> gate_0`; `gate_0` branches `{tool_calls -> tools_0 | else -> end}`;
+    /// `tools_0 -> model_1 -> gate_1 -> {tools_1 | end}`; `tools_1 -> model_2 -> end`.
+    /// `end` is a shared JOIN: both gates' `else` edges and the final model feed it.
+    fn agent_loop_ir() -> serde_json::Value {
+        let tool_calls = "state.last_model_finish_reason == \"tool_calls\"";
+        build_ir(
+            "model_0",
+            serde_json::json!({
+                "model_0": cond_node("model_0", serde_json::json!([])),
+                "gate_0": cond_node("gate_0", serde_json::json!([
+                    {"condition": tool_calls, "target": "tools_0"},
+                    {"condition": null, "target": "end"}
+                ])),
+                "tools_0": cond_node("tools_0", serde_json::json!([])),
+                "model_1": cond_node("model_1", serde_json::json!([])),
+                "gate_1": cond_node("gate_1", serde_json::json!([
+                    {"condition": tool_calls, "target": "tools_1"},
+                    {"condition": null, "target": "end"}
+                ])),
+                "tools_1": cond_node("tools_1", serde_json::json!([])),
+                "model_2": cond_node("model_2", serde_json::json!([])),
+                "end": cond_node("end", serde_json::json!([]))
+            }),
+            serde_json::json!([
+                {"from": "model_0", "to": "gate_0", "condition": null},
+                {"from": "gate_0", "to": "tools_0", "condition": tool_calls},
+                {"from": "gate_0", "to": "end", "condition": null},
+                {"from": "tools_0", "to": "model_1", "condition": null},
+                {"from": "model_1", "to": "gate_1", "condition": null},
+                {"from": "gate_1", "to": "tools_1", "condition": tool_calls},
+                {"from": "gate_1", "to": "end", "condition": null},
+                {"from": "tools_1", "to": "model_2", "condition": null},
+                {"from": "model_2", "to": "end", "condition": null}
+            ]),
+        )
+    }
+
+    /// FOLD: a Condition `NodeCompleted` with a non-null `chosen_target` records
+    /// the route; the node also folds into `completed`.
+    #[test]
+    fn condition_completion_records_route() {
+        let progress = fold_events(vec![condition_completed(
+            "gate",
+            Some("end"),
+            &["tools", "end"],
+        )]);
+        assert_eq!(
+            progress.routes.get("gate").map(String::as_str),
+            Some("end"),
+            "non-null chosen_target must be recorded as the route"
+        );
+        assert!(progress.completed.contains("gate"));
+    }
+
+    /// FOLD: a null `chosen_target` records NO route entry (the dead-edge
+    /// predicate reads a completed routing Condition with no route as
+    /// "every out-edge dead").
+    #[test]
+    fn null_route_records_no_route_entry() {
+        let progress = fold_events(vec![condition_completed("gate", None, &["A", "B"])]);
+        assert!(
+            !progress.routes.contains_key("gate"),
+            "null chosen_target must record no route"
+        );
+        assert!(progress.completed.contains("gate"));
+    }
+
+    /// FOLD: `NodeSkipped` folds into BOTH `completed` (satisfies AND-joins) and
+    /// `skipped` (so its out-edges read as dead, cascading the skip).
+    #[test]
+    fn skipped_event_folds_into_completed_and_skipped() {
+        let progress = fold_events(vec![EventKind::NodeSkipped {
+            node_id: "x".into(),
+            reason: "branch not taken".into(),
+        }]);
+        assert!(
+            progress.completed.contains("x"),
+            "skipped folds into completed"
+        );
+        assert!(
+            progress.skipped.contains("x"),
+            "skipped is tracked for the dead-edge predicate"
+        );
+    }
+
+    /// HEADLINE — agent-loop early-exit. With `gate_0` routing to `end`
+    /// (model_0 returned finish_reason "stop"), the ENTIRE remaining loop is
+    /// skipped, `end` is reached via its live in-edge from `gate_0`, and the
+    /// workflow completes WITHOUT ever scheduling `model_1`.
+    #[tokio::test]
+    async fn agent_loop_early_exit_skips_unused_turns() {
+        let (s, b, e) = setup(agent_loop_ir()).await;
+
+        // Tick 1: model_0 (start, no in-edges) is scheduled.
+        tick(&s, &e).await;
+        let evs = b.get_events(&e).await.unwrap();
+        assert!(scheduled_nodes(&evs).contains(&"model_0".to_string()));
+
+        // model_0 completes — the model is done (finish_reason "stop").
+        append(
+            &b,
+            &e,
+            node_completed(
+                "model_0",
+                serde_json::json!({"last_model_finish_reason": "stop"}),
+            ),
+        )
+        .await;
+
+        // Tick 2: gate_0 becomes runnable.
+        tick(&s, &e).await;
+        let evs = b.get_events(&e).await.unwrap();
+        assert!(scheduled_nodes(&evs).contains(&"gate_0".to_string()));
+
+        // gate_0 routes to `end` (the FDL-2 executor records chosen_target="end").
+        append(
+            &b,
+            &e,
+            condition_completed("gate_0", Some("end"), &["tools_0", "end"]),
+        )
+        .await;
+
+        // Tick 3: the cascade skips the whole dead branch and dispatches `end`.
+        tick(&s, &e).await;
+        let evs = b.get_events(&e).await.unwrap();
+        let skipped = skipped_nodes(&evs);
+        for n in ["tools_0", "model_1", "gate_1", "tools_1", "model_2"] {
+            assert!(
+                skipped.contains(&n.to_string()),
+                "{n} must be skipped (dead branch tail)"
+            );
+        }
+        // `end` survives (live in-edge from gate_0) and is reached.
+        assert!(
+            scheduled_nodes(&evs).contains(&"end".to_string()),
+            "end must be reached via its live in-edge from gate_0"
+        );
+        // The early-exit: model_1 must NEVER be scheduled.
+        assert!(
+            !scheduled_nodes(&evs).contains(&"model_1".to_string()),
+            "model_1 must never be scheduled (early exit)"
+        );
+        // `end` is not skipped.
+        assert!(
+            !skipped.contains(&"end".to_string()),
+            "end must NOT be skipped — it has a live in-edge"
+        );
+
+        // end completes -> workflow completes.
+        append(&b, &e, node_completed("end", serde_json::json!({}))).await;
+        tick(&s, &e).await;
+        assert_eq!(status(&b, &e).await, WorkflowStatus::Completed);
+    }
+
+    /// Inverse — when `gate_0` routes to `tools_0` (the model asked for a tool),
+    /// the loop proceeds and NOTHING is wrongly skipped.
+    #[tokio::test]
+    async fn agent_loop_route_to_tools_proceeds_without_skipping() {
+        let (s, b, e) = setup(agent_loop_ir()).await;
+
+        tick(&s, &e).await; // model_0
+        append(
+            &b,
+            &e,
+            node_completed(
+                "model_0",
+                serde_json::json!({"last_model_finish_reason": "tool_calls"}),
+            ),
+        )
+        .await;
+        tick(&s, &e).await; // gate_0
+        append(
+            &b,
+            &e,
+            condition_completed("gate_0", Some("tools_0"), &["tools_0", "end"]),
+        )
+        .await;
+        tick(&s, &e).await;
+
+        let evs = b.get_events(&e).await.unwrap();
+        assert!(
+            scheduled_nodes(&evs).contains(&"tools_0".to_string()),
+            "tools_0 must proceed when gate_0 routes to it"
+        );
+        assert!(
+            skipped_nodes(&evs).is_empty(),
+            "no node may be skipped while the loop continues"
+        );
+        assert!(
+            !scheduled_nodes(&evs).contains(&"end".to_string()),
+            "end must not be reached yet (later gates/model still pending)"
+        );
+        assert_eq!(status(&b, &e).await, WorkflowStatus::Running);
+    }
+
+    /// A diamond AND-join: `C -> {L, R}`, `L -> J`, `R -> J`, `J -> end`.
+    /// `C` routes to `L`. The dead branch `R` is skipped, but `J` STILL RUNS
+    /// (live in-edge from L) once L completes — neither premature completion
+    /// (J skipped) nor hang (J waiting on the skipped R).
+    fn diamond_ir() -> serde_json::Value {
+        build_ir(
+            "C",
+            serde_json::json!({
+                "C": cond_node("C", serde_json::json!([
+                    {"condition": "state.go == \"L\"", "target": "L"},
+                    {"condition": null, "target": "R"}
+                ])),
+                "L": cond_node("L", serde_json::json!([])),
+                "R": cond_node("R", serde_json::json!([])),
+                "J": cond_node("J", serde_json::json!([])),
+                "end": cond_node("end", serde_json::json!([]))
+            }),
+            serde_json::json!([
+                {"from": "C", "to": "L", "condition": "state.go == \"L\""},
+                {"from": "C", "to": "R", "condition": null},
+                {"from": "L", "to": "J", "condition": null},
+                {"from": "R", "to": "J", "condition": null},
+                {"from": "J", "to": "end", "condition": null}
+            ]),
+        )
+    }
+
+    #[tokio::test]
+    async fn diamond_join_skips_dead_branch_but_join_survives() {
+        let (s, b, e) = setup(diamond_ir()).await;
+
+        tick(&s, &e).await; // C
+        append(&b, &e, condition_completed("C", Some("L"), &["L", "R"])).await;
+        tick(&s, &e).await;
+
+        let evs = b.get_events(&e).await.unwrap();
+        assert!(
+            skipped_nodes(&evs).contains(&"R".to_string()),
+            "R (dead branch) must be skipped"
+        );
+        assert!(
+            !skipped_nodes(&evs).contains(&"J".to_string()),
+            "J must NOT be skipped — it has a live in-edge from L"
+        );
+        assert!(
+            scheduled_nodes(&evs).contains(&"L".to_string()),
+            "L (taken branch) must be scheduled"
+        );
+        assert!(
+            !scheduled_nodes(&evs).contains(&"J".to_string()),
+            "J must not run until L completes"
+        );
+
+        // L completes -> J becomes runnable via the AND-join over LIVE edges only.
+        append(&b, &e, node_completed("L", serde_json::json!({}))).await;
+        tick(&s, &e).await;
+        let evs = b.get_events(&e).await.unwrap();
+        assert!(
+            scheduled_nodes(&evs).contains(&"J".to_string()),
+            "J must run once L completes — it must not wait on the skipped R"
+        );
+
+        // J -> end -> complete.
+        append(&b, &e, node_completed("J", serde_json::json!({}))).await;
+        tick(&s, &e).await; // schedules end
+        append(&b, &e, node_completed("end", serde_json::json!({}))).await;
+        tick(&s, &e).await; // completes
+        assert_eq!(
+            status(&b, &e).await,
+            WorkflowStatus::Completed,
+            "workflow completes via J (no premature completion, no hang)"
+        );
+    }
+
+    /// BACKWARD-COMPAT: an empty-`branches` Condition is a pass-through — both
+    /// successors run, nothing is skipped (a workflow with no routing gates is
+    /// entirely unaffected by FDL-3).
+    #[tokio::test]
+    async fn empty_branches_condition_runs_all_successors() {
+        let ir = build_ir(
+            "start",
+            serde_json::json!({
+                "start": cond_node("start", serde_json::json!([])),
+                "a": cond_node("a", serde_json::json!([])),
+                "b": cond_node("b", serde_json::json!([]))
+            }),
+            serde_json::json!([
+                {"from": "start", "to": "a", "condition": null},
+                {"from": "start", "to": "b", "condition": null}
+            ]),
+        );
+        let (s, b, e) = setup(ir).await;
+
+        tick(&s, &e).await; // start
+        append(&b, &e, node_completed("start", serde_json::json!({}))).await;
+        tick(&s, &e).await;
+
+        let evs = b.get_events(&e).await.unwrap();
+        assert!(
+            scheduled_nodes(&evs).contains(&"a".to_string()),
+            "both successors of an empty-branches condition must run (a)"
+        );
+        assert!(
+            scheduled_nodes(&evs).contains(&"b".to_string()),
+            "both successors of an empty-branches condition must run (b)"
+        );
+        assert!(
+            skipped_nodes(&evs).is_empty(),
+            "an empty-branches condition must never skip a successor"
+        );
+    }
+
+    /// NO-ROUTE: a Condition that matched no branch and had no default
+    /// (`chosen_target = null`) skips ALL its branch targets' exclusive tails,
+    /// and the run still TERMINATES (no hang).
+    #[tokio::test]
+    async fn no_matching_branch_skips_all_targets_and_terminates() {
+        let ir = build_ir(
+            "start",
+            serde_json::json!({
+                "start": cond_node("start", serde_json::json!([])),
+                "gate": cond_node("gate", serde_json::json!([
+                    {"condition": "state.x == \"1\"", "target": "A"},
+                    {"condition": "state.y == \"2\"", "target": "B"}
+                ])),
+                "A": cond_node("A", serde_json::json!([])),
+                "B": cond_node("B", serde_json::json!([]))
+            }),
+            serde_json::json!([
+                {"from": "start", "to": "gate", "condition": null},
+                {"from": "gate", "to": "A", "condition": "state.x == \"1\""},
+                {"from": "gate", "to": "B", "condition": "state.y == \"2\""}
+            ]),
+        );
+        let (s, b, e) = setup(ir).await;
+
+        tick(&s, &e).await; // start
+        append(&b, &e, node_completed("start", serde_json::json!({}))).await;
+        tick(&s, &e).await; // gate
+                            // gate matched no branch and has no default -> chosen_target null.
+        append(&b, &e, condition_completed("gate", None, &["A", "B"])).await;
+        tick(&s, &e).await;
+
+        let evs = b.get_events(&e).await.unwrap();
+        let skipped = skipped_nodes(&evs);
+        assert!(
+            skipped.contains(&"A".to_string()),
+            "A must be skipped (null route -> every target dead)"
+        );
+        assert!(
+            skipped.contains(&"B".to_string()),
+            "B must be skipped (null route -> every target dead)"
+        );
+        assert_eq!(
+            status(&b, &e).await,
+            WorkflowStatus::Completed,
+            "the run must still terminate when no branch matched (no hang)"
         );
     }
 }
