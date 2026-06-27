@@ -714,6 +714,17 @@ impl StateBackend for InMemoryBackend {
             .unwrap_or(0))
     }
 
+    async fn set_projector_checkpoint(
+        &self,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+        new_checkpoint: i64,
+    ) -> BackendResult<()> {
+        let key = (projection_name.to_string(), execution_id.0.to_string());
+        self.projector_checkpoints.insert(key, new_checkpoint);
+        Ok(())
+    }
+
     // ── Tenants ──────────────────────────────────────────────────────
 
     async fn create_tenant(&self, tenant: Tenant) -> BackendResult<()> {

@@ -303,6 +303,19 @@ pub trait StateBackend: Send + Sync {
         execution_id: &ExecutionId,
     ) -> BackendResult<i64>;
 
+    /// Advance the projector checkpoint for (projection_name, execution_id)
+    /// to `new_checkpoint` WITHOUT writing any projection row.
+    ///
+    /// Used when a batch of events contained NO approval events (only
+    /// non-approval events) — the checkpoint must still advance to `batch_max`
+    /// so those events are not re-scanned on the next tick.
+    async fn set_projector_checkpoint(
+        &self,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+        new_checkpoint: i64,
+    ) -> BackendResult<()>;
+
     // ── Tenant management ───────────────────────────────────────────────
 
     /// Create a new tenant.

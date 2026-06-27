@@ -1745,6 +1745,33 @@ impl StateBackend for TenantScopedSqliteBackend {
             None => Ok(0),
         }
     }
+
+    async fn set_projector_checkpoint(
+        &self,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+        new_checkpoint: i64,
+    ) -> BackendResult<()> {
+        let id_str = execution_id_str(execution_id);
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"INSERT INTO projector_checkpoints
+               (projection_name, execution_id, last_sequence, tenant_id, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(projection_name, execution_id) DO UPDATE SET
+                 last_sequence = excluded.last_sequence,
+                 updated_at    = excluded.updated_at"#,
+        )
+        .bind(projection_name)
+        .bind(&id_str)
+        .bind(new_checkpoint)
+        .bind(&self.tenant_id.0)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        Ok(())
+    }
 }
 
 /// Parse a datetime that might be either RFC 3339 or SQLite's `datetime('now')` format.
