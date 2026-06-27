@@ -64,28 +64,42 @@ impl NodeExecutor for ConditionNodeExecutor {
     async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
 
-        // Deserialize the branches array from the payload (scheduler-enriched).
-        // An absent or empty branches list falls through to the no-op path.
-        let branches: Vec<BranchDef> = item
-            .payload
-            .get("branches")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+        // Three-case handling for the `branches` payload field:
+        //
+        //   1. Missing key  -> no-op (backward-compat: a non-Condition or
+        //      unenriched node; the scheduler didn't inject branches).
+        //   2. Present + explicitly empty array `[]` -> no-op (backward-compat:
+        //      empty-branches Condition used as a pass-through in topology tests).
+        //   3. Present but malformed (wrong type, or objects missing required
+        //      fields) -> Fatal error. Silently dropping routing is worse than
+        //      failing loudly; the scheduler must not run all branches.
+        let noop_result = || ExecutionResult {
+            output: json!({}),
+            state_patch: json!({}),
+            duration_ms: start.elapsed().as_millis() as u64,
+            gen_ai_system: None,
+            gen_ai_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            finish_reason: None,
+        };
 
-        // No-op path: empty branches = pass-through (backward-compat with
-        // the old stub and with condition nodes used as generic topology nodes
-        // in tests — e.g. runner.rs `linear_ir`).
+        let branches_raw = match item.payload.get("branches") {
+            None => return Ok(noop_result()), // case 1: key absent
+            Some(v) => v.clone(),
+        };
+
+        let branches: Vec<BranchDef> = serde_json::from_value(branches_raw).map_err(|e| {
+            ExecutorError::Fatal(format!(
+                "condition node `{}`: malformed `branches` payload — \
+                     expected an array of {{condition, target}} objects; {e}",
+                item.node_id
+            ))
+        })?; // case 3: present but malformed -> propagate Fatal
+
+        // Case 2: present but explicitly empty -> no-op pass-through.
         if branches.is_empty() {
-            return Ok(ExecutionResult {
-                output: json!({}),
-                state_patch: json!({}),
-                duration_ms: start.elapsed().as_millis() as u64,
-                gen_ai_system: None,
-                gen_ai_model: None,
-                input_tokens: None,
-                output_tokens: None,
-                finish_reason: None,
-            });
+            return Ok(noop_result());
         }
 
         // Committed workflow state injected by the scheduler into the payload.
@@ -174,6 +188,24 @@ mod tests {
                 "branches": branches,
                 "state": state,
             }),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: chrono::Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "default".into(),
+        }
+    }
+
+    /// Build a WorkItem with a fully-custom payload (no implicit `branches` key).
+    fn make_item_raw(payload: serde_json::Value) -> WorkItem {
+        WorkItem {
+            id: uuid::Uuid::new_v4(),
+            execution_id: jamjet_core::workflow::ExecutionId::new(),
+            node_id: "gate".into(),
+            queue_type: "general".into(),
+            payload,
             attempt: 0,
             max_attempts: 3,
             created_at: chrono::Utc::now(),
@@ -297,5 +329,66 @@ mod tests {
             result.output["chosen_target"], "TOOLS",
             "absent state key -> condition false -> default branch taken"
         );
+    }
+
+    /// G6: `branches` is present but malformed (not an array) -> Fatal error.
+    ///
+    /// Regression: the old code silently fell through to the no-op path, which
+    /// would disable routing without any signal.
+    #[tokio::test]
+    async fn malformed_branches_string_returns_fatal_error() {
+        let executor = ConditionNodeExecutor::new();
+        let item = make_item_raw(json!({
+            "workflow_id": "wf",
+            "workflow_version": "0.1.0",
+            "node_id": "gate",
+            "branches": "not an array",
+            "state": {},
+        }));
+        let result = executor.execute(&item).await;
+        assert!(
+            matches!(result, Err(ExecutorError::Fatal(_))),
+            "malformed branches must return ExecutorError::Fatal, got: {:?}",
+            result
+        );
+    }
+
+    /// G7: `branches` is present but contains objects missing required fields -> Fatal error.
+    #[tokio::test]
+    async fn malformed_branches_missing_target_returns_fatal_error() {
+        let executor = ConditionNodeExecutor::new();
+        let item = make_item_raw(json!({
+            "workflow_id": "wf",
+            "workflow_version": "0.1.0",
+            "node_id": "gate",
+            "branches": [{"no_target": true}],
+            "state": {},
+        }));
+        let result = executor.execute(&item).await;
+        assert!(
+            matches!(result, Err(ExecutorError::Fatal(_))),
+            "branches array with objects missing `target` must return ExecutorError::Fatal, got: {:?}",
+            result
+        );
+    }
+
+    /// G8: `branches` key is absent entirely -> no-op success (backward-compat).
+    #[tokio::test]
+    async fn missing_branches_key_is_noop() {
+        let executor = ConditionNodeExecutor::new();
+        let item = make_item_raw(json!({
+            "workflow_id": "wf",
+            "workflow_version": "0.1.0",
+            "node_id": "gate",
+            // no "branches" key
+            "state": {"x": "go"},
+        }));
+        let result = executor.execute(&item).await.expect("must not error");
+        assert_eq!(
+            result.output,
+            json!({}),
+            "missing branches key -> no-op empty output"
+        );
+        assert_eq!(result.state_patch, json!({}));
     }
 }

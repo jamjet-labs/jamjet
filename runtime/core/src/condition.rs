@@ -53,11 +53,11 @@ use serde_json::Value;
 ///
 /// # Literal parsing (comparison form)
 ///
-/// The RHS is parsed with `serde_json::from_str`, which handles `"..."`,
-/// `true`, `false`, `null`, and numbers. If parsing fails the raw trimmed
-/// text is treated as a bare string.
-///
-/// Comparison uses typed `serde_json::Value` equality: `"5" != 5`.
+/// The RHS must be a valid JSON literal: a double-quoted string (`"x"`),
+/// `true`, `false`, `null`, or a JSON number. Bare words (e.g. `done`) are NOT
+/// valid literals; an unparseable RHS causes the whole comparison to return
+/// `false` (fail-closed). Comparison uses typed `serde_json::Value` equality:
+/// `"5" != 5`.
 pub fn eval_condition(expr: &str, state: &Value) -> bool {
     let expr = expr.trim();
     if expr.is_empty() {
@@ -111,8 +111,21 @@ fn eval_comparison(expr: &str, state: &Value, op_pos: usize, op: &str) -> bool {
         }
     };
 
+    // Fail closed: an unparseable RHS literal (e.g. bare word `done`) is an
+    // invalid expression — return false rather than silently coercing to a string.
+    let rhs_val = match parse_literal(rhs) {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                "eval_condition: RHS `{}` is not a valid literal \
+                 (must be a quoted string, true, false, null, or a number); returning false",
+                rhs
+            );
+            return false;
+        }
+    };
+
     let resolved = resolve_path(state, path);
-    let rhs_val = parse_literal(rhs);
     let equal = values_equal(resolved, &rhs_val);
 
     match op {
@@ -177,13 +190,12 @@ fn is_truthy(v: Option<&Value>) -> bool {
 
 /// Parse an RHS literal string into a `serde_json::Value`.
 ///
-/// `serde_json::from_str` handles `"..."`, `true`, `false`, `null`, and numbers.
-/// If parsing fails the raw trimmed text is treated as a bare `Value::String`.
-fn parse_literal(s: &str) -> Value {
-    match serde_json::from_str::<Value>(s) {
-        Ok(v) => v,
-        Err(_) => Value::String(s.to_string()),
-    }
+/// Valid forms: double-quoted JSON string (`"x"`), `true`, `false`, `null`,
+/// or a JSON number. Returns `None` for any other input (e.g. bare words),
+/// which the caller must treat as an invalid expression (fail-closed: return
+/// `false`).
+fn parse_literal(s: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(s).ok()
 }
 
 /// Compare a resolved path value to an RHS literal.
@@ -390,5 +402,27 @@ mod tests {
     #[test]
     fn malformed_whitespace_only() {
         assert!(!eval_condition("   ", &json!({})));
+    }
+
+    // ---- fail-closed: invalid (unquoted) RHS literal ----
+
+    #[test]
+    fn unquoted_rhs_bareword_fail_closed() {
+        // `done` is a bare word, not a valid JSON literal.
+        // Even though state.status == "done" would be true, the malformed
+        // expression must return false (fail-closed contract).
+        assert!(!eval_condition(
+            "state.status == done",
+            &json!({"status": "done"}),
+        ));
+    }
+
+    #[test]
+    fn quoted_rhs_string_still_works() {
+        // The quoted form must continue to work correctly.
+        assert!(eval_condition(
+            r#"state.status == "done""#,
+            &json!({"status": "done"}),
+        ));
     }
 }
