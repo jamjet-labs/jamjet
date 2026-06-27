@@ -102,9 +102,20 @@ impl NodeExecutor for ModelNodeExecutor {
             stop_sequences: None,
         };
 
+        // Read tool schemas from the work-item payload (scheduler-enriched from the
+        // IR Model node's `tools` field).
+        let tools: Vec<serde_json::Value> = item
+            .payload
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
         debug!(model = %model, messages = messages.len(), "Calling model");
 
-        let request = ModelRequest::new(messages).with_config(config);
+        let request = ModelRequest::new(messages)
+            .with_config(config)
+            .with_tools(tools);
         // Intercept RateLimited before erasing the type. ONLY RateLimited becomes
         // ExecutorError::RateLimited; every other ModelError variant becomes Fatal.
         let response = match self.registry.chat(request).await {
@@ -117,16 +128,46 @@ impl NodeExecutor for ModelNodeExecutor {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        // Build output — structured or plain text.
+        // Serialize tool_calls to JSON values.  These are small (id/name/arguments
+        // only) and are intentionally placed in state_patch so they NEVER get
+        // spilled to the artifact store (state_patch stays inline per the 2i
+        // spill comment in worker.rs:430-434).
+        let tool_calls_json: Vec<serde_json::Value> = response
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                serde_json::json!({
+                    "id": tc.id,
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                })
+            })
+            .collect();
+
+        // Build output — carries content + tool_calls + finish_reason.
+        // Note: if content is large, the output blob may be spilled to the
+        // artifact store (2i).  tool_calls and finish_reason are ALSO written to
+        // state_patch (see below) so the condition gate and tool nodes always
+        // find them inline in current_state, even if the output was spilled.
         let output: Value = json!({
             "content": response.content,
             "model": response.model,
             "finish_reason": response.finish_reason,
+            "tool_calls": tool_calls_json,
         });
 
-        // State patch: write content to `last_model_output` in workflow state.
+        // State patch: write model outputs inline into workflow state.
+        // Convention for 2j-3's condition gate and tool-dispatch nodes:
+        //   state["last_model_finish_reason"] — "tool_calls", "stop", etc.
+        //   state["last_model_tool_calls"]    — [{id, name, arguments}, ...]
+        //   state["last_model_output"]        — content text (last model turn)
+        // These keys are safe to overwrite per turn because the static unroll
+        // executes model nodes sequentially; the condition gate for turn N always
+        // reads after that turn's model node completes.
         let state_patch = json!({
             "last_model_output": response.content,
+            "last_model_finish_reason": response.finish_reason,
+            "last_model_tool_calls": tool_calls_json,
         });
 
         Ok(ExecutionResult {
@@ -170,15 +211,19 @@ impl NodeExecutor for ModelNodeExecutor {
 mod tests {
     use super::*;
     use crate::executor::ExecutorError;
+    use jamjet_models::adapter::ToolCall;
     use jamjet_models::{ModelAdapter, ModelError, ModelRequest, ModelResponse, StructuredRequest};
     use jamjet_state::backend::WorkItem;
     use std::sync::Arc;
 
     // ── Fake adapter ──────────────────────────────────────────────────────────
 
+    #[allow(dead_code)]
     enum FakeKind {
         RateLimited { retry_after_secs: u64 },
         ApiError,
+        ToolCallResponse,
+        TextResponse,
     }
 
     struct FakeAdapter {
@@ -202,6 +247,28 @@ mod tests {
                     status: 500,
                     body: "internal server error".into(),
                 }),
+                FakeKind::ToolCallResponse => Ok(ModelResponse {
+                    content: "".to_string(),
+                    model: "fake-model".to_string(),
+                    finish_reason: "tool_calls".to_string(),
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    structured: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_abc123".to_string(),
+                        name: "get_weather".to_string(),
+                        arguments: serde_json::json!({"location": "London"}),
+                    }],
+                }),
+                FakeKind::TextResponse => Ok(ModelResponse {
+                    content: "Hello, world!".to_string(),
+                    model: "fake-model".to_string(),
+                    finish_reason: "stop".to_string(),
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    structured: None,
+                    tool_calls: vec![],
+                }),
             }
         }
         async fn structured_output(
@@ -221,6 +288,29 @@ mod tests {
             payload: serde_json::json!({
                 "model": "fake-model",
                 "prompt": "hello",
+            }),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: chrono::Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "default".into(),
+        }
+    }
+
+    fn make_item_with_tools() -> WorkItem {
+        WorkItem {
+            id: uuid::Uuid::new_v4(),
+            execution_id: jamjet_core::workflow::ExecutionId::new(),
+            node_id: "test-node".into(),
+            queue_type: "model".into(),
+            payload: serde_json::json!({
+                "model": "fake-model",
+                "prompt": "What is the weather in London?",
+                "tools": [
+                    {"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {}}}
+                ]
             }),
             attempt: 0,
             max_attempts: 3,
@@ -271,6 +361,84 @@ mod tests {
             matches!(result, Err(ExecutorError::Fatal(_))),
             "expected Fatal, got: {:?}",
             result
+        );
+    }
+
+    /// When the model returns tool_calls, the output and state_patch must carry
+    /// the serialized tool calls and the finish_reason "tool_calls".
+    #[tokio::test]
+    async fn tool_calls_response_lands_in_output_and_state_patch() {
+        let executor = make_executor(FakeKind::ToolCallResponse);
+        let result = executor
+            .execute(&make_item_with_tools())
+            .await
+            .expect("ToolCallResponse must not error");
+
+        // output["tool_calls"] must be an array with one entry.
+        let tool_calls = result.output["tool_calls"]
+            .as_array()
+            .expect("output.tool_calls must be an array");
+        assert_eq!(tool_calls.len(), 1, "expected exactly one tool call");
+        assert_eq!(tool_calls[0]["id"], "call_abc123");
+        assert_eq!(tool_calls[0]["name"], "get_weather");
+        assert_eq!(tool_calls[0]["arguments"]["location"], "London");
+
+        // output["finish_reason"] must be "tool_calls".
+        assert_eq!(
+            result.output["finish_reason"], "tool_calls",
+            "output.finish_reason must be 'tool_calls'"
+        );
+
+        // state_patch must carry finish_reason and tool_calls inline.
+        assert_eq!(
+            result.state_patch["last_model_finish_reason"], "tool_calls",
+            "state_patch.last_model_finish_reason must be 'tool_calls'"
+        );
+        let sp_tool_calls = result.state_patch["last_model_tool_calls"]
+            .as_array()
+            .expect("state_patch.last_model_tool_calls must be an array");
+        assert_eq!(
+            sp_tool_calls.len(),
+            1,
+            "expected exactly one tool call in state_patch"
+        );
+        assert_eq!(sp_tool_calls[0]["name"], "get_weather");
+    }
+
+    /// When the model returns a plain text response with no tool_calls, the
+    /// output and state_patch must contain empty tool_calls arrays and
+    /// finish_reason "stop".
+    #[tokio::test]
+    async fn no_tool_calls_response_has_empty_tool_calls() {
+        let executor = make_executor(FakeKind::TextResponse);
+        let result = executor
+            .execute(&make_item())
+            .await
+            .expect("TextResponse must not error");
+
+        // output["tool_calls"] must be an empty array.
+        let tool_calls = result.output["tool_calls"]
+            .as_array()
+            .expect("output.tool_calls must be an array");
+        assert!(tool_calls.is_empty(), "expected empty tool_calls array");
+
+        // output["finish_reason"] must be "stop".
+        assert_eq!(
+            result.output["finish_reason"], "stop",
+            "output.finish_reason must be 'stop'"
+        );
+
+        // state_patch must carry finish_reason "stop" and empty tool_calls.
+        assert_eq!(
+            result.state_patch["last_model_finish_reason"], "stop",
+            "state_patch.last_model_finish_reason must be 'stop'"
+        );
+        let sp_tool_calls = result.state_patch["last_model_tool_calls"]
+            .as_array()
+            .expect("state_patch.last_model_tool_calls must be an array");
+        assert!(
+            sp_tool_calls.is_empty(),
+            "expected empty tool_calls in state_patch"
         );
     }
 }

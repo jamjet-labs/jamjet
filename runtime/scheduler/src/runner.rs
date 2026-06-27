@@ -374,6 +374,53 @@ impl Scheduler {
                     );
                 }
 
+                // For Model nodes, enrich the payload with model configuration and tool
+                // schemas so the model worker is self-contained.
+                if let NodeKind::Model {
+                    model_ref,
+                    system_prompt,
+                    tools,
+                    ..
+                } = &node.kind
+                {
+                    let obj = payload
+                        .as_object_mut()
+                        .expect("payload is always a JSON object");
+                    // Resolve model identifier from the IR's named models map.
+                    let model_id = ir
+                        .models
+                        .get(model_ref.as_str())
+                        .map(|cfg| {
+                            if cfg.provider.is_empty() {
+                                cfg.model.clone()
+                            } else {
+                                format!("{}/{}", cfg.provider, cfg.model)
+                            }
+                        })
+                        .unwrap_or_else(|| model_ref.clone());
+                    obj.insert("model".into(), serde_json::Value::String(model_id));
+                    // Optional model config overrides.
+                    if let Some(cfg) = ir.models.get(model_ref.as_str()) {
+                        if let Some(temp) = cfg.temperature {
+                            obj.insert("temperature".into(), serde_json::json!(temp));
+                        }
+                        if let Some(mt) = cfg.max_tokens {
+                            obj.insert("max_tokens".into(), serde_json::json!(mt));
+                        }
+                    }
+                    // Node-level system prompt.
+                    if let Some(sp) = system_prompt {
+                        obj.insert(
+                            "system_prompt".into(),
+                            serde_json::Value::String(sp.clone()),
+                        );
+                    }
+                    // Tool schemas — passed to the model so it can emit tool_calls.
+                    if !tools.is_empty() {
+                        obj.insert("tools".into(), serde_json::Value::Array(tools.clone()));
+                    }
+                }
+
                 let item = WorkItem {
                     id: Uuid::new_v4(),
                     execution_id: execution_id.clone(),
@@ -1188,5 +1235,117 @@ mod tests {
         assert_eq!(item.payload["workflow_id"], "wf");
         assert_eq!(item.payload["workflow_version"], "0.1.0");
         assert_eq!(item.payload["node_id"], "py_step");
+    }
+
+    /// A single-node workflow whose only step is a `Model` node with tools.
+    fn model_node_ir() -> serde_json::Value {
+        serde_json::json!({
+            "workflow_id": "wf",
+            "version": "0.1.0",
+            "name": null,
+            "description": null,
+            "state_schema": "",
+            "start_node": "model_step",
+            "nodes": {
+                "model_step": {
+                    "id": "model_step",
+                    "kind": {
+                        "type": "model",
+                        "model_ref": "test_model",
+                        "prompt_ref": "prompts/test.md",
+                        "output_schema": "",
+                        "system_prompt": "You are a test assistant.",
+                        "tools": [
+                            {"type": "function", "function": {"name": "get_weather", "description": "Get the weather", "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}}},
+                            {"type": "function", "function": {"name": "search_web", "description": "Search the web", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}
+                        ]
+                    },
+                    "retry_policy": null,
+                    "node_timeout_secs": null,
+                    "description": null,
+                    "labels": {}
+                }
+            },
+            "edges": [],
+            "retry_policies": {},
+            "timeouts": {},
+            "models": {
+                "test_model": {
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-6",
+                    "timeout_secs": null,
+                    "retry_policy": null,
+                    "temperature": null,
+                    "max_tokens": 1024
+                }
+            },
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {},
+            "labels": {}
+        })
+    }
+
+    /// The scheduler must enrich a `Model` work-item payload with `model`,
+    /// `max_tokens`, `system_prompt`, and `tools` so the model worker is
+    /// self-contained.
+    #[tokio::test]
+    async fn model_node_tools_payload_is_enriched() {
+        let (s, b, e) = setup(model_node_ir()).await;
+
+        // Seed some accumulated state.
+        append(
+            &b,
+            &e,
+            node_completed("prev_node", serde_json::json!({ "key": "value" })),
+        )
+        .await;
+
+        // Tick: `model_step` is the start node with no predecessors — runnable.
+        tick(&s, &e).await;
+
+        // Claim the work item from the model queue.
+        let item = b
+            .claim_work_item("test-worker", &["model"])
+            .await
+            .expect("backend claim must not error")
+            .expect("a Model node must produce exactly one work item");
+
+        // Queue type
+        assert_eq!(item.queue_type, "model");
+
+        // Model identifier resolved from IR models map.
+        assert_eq!(
+            item.payload["model"], "anthropic/claude-sonnet-4-6",
+            "payload must carry the resolved model identifier"
+        );
+
+        // max_tokens from model config.
+        assert_eq!(
+            item.payload["max_tokens"], 1024,
+            "payload must carry max_tokens from model config"
+        );
+
+        // system_prompt from node definition.
+        assert_eq!(
+            item.payload["system_prompt"], "You are a test assistant.",
+            "payload must carry the node-level system prompt"
+        );
+
+        // Tools array must be present and have the expected length.
+        assert!(
+            item.payload["tools"].is_array(),
+            "payload.tools must be a JSON array"
+        );
+        assert_eq!(
+            item.payload["tools"].as_array().unwrap().len(),
+            2,
+            "payload.tools must contain all 2 tool schemas"
+        );
+
+        // Base fields must still be present.
+        assert_eq!(item.payload["workflow_id"], "wf");
+        assert_eq!(item.payload["workflow_version"], "0.1.0");
+        assert_eq!(item.payload["node_id"], "model_step");
     }
 }
