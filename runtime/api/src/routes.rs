@@ -437,54 +437,72 @@ async fn list_approvals_for_execution(
     let backend = state.backend_for(&tenant_id);
     let execution_id = parse_execution_id(&id)?;
 
-    // Read from the durable projection (eventually-consistent; lags the write
-    // path by up to one projector tick, ~500 ms).  The write path (submit_approval
-    // in POST /executions/:id/approve) continues to use get_events() for strong
-    // consistency.  The response shape is byte-compatible with the legacy
-    // event-derived approvals_view: { "pending": [...], "decided": [...] }.
-    // Follow-up: F-2h-shutdown (projector graceful shutdown wiring).
+    // Fast path: serve from the durable projection (eventually-consistent; lags
+    // the write path by up to one projector tick, ~500 ms).
+    //
+    // Fallback to event-log replay when the projection is empty.  This covers:
+    // - Running executions not yet visited by the projector (no tick yet).
+    // - Terminal executions that completed before a projector tick (projector
+    //   only scans Running; their events were never folded into proj_approvals).
+    // - Non-default-tenant executions (the projector runs on the base backend
+    //   and writes proj_approvals with tenant_id='default'; reading via
+    //   backend_for(&tenant_id) returns nothing for the real tenant).
+    // - Genuinely-no-approval executions: event replay also returns empty, correct.
+    //
+    // Follow-up: F-2h-tenant (thread tenant into projector writes) + F-2h-terminal
+    // (project terminal executions) will close the coverage gap so the fallback
+    // shrinks to a thin cold-start edge case.
     let rows = backend.get_approval_projection(&execution_id).await?;
 
-    let mut pending: Vec<serde_json::Value> = Vec::new();
-    let mut decided: Vec<serde_json::Value> = Vec::new();
+    if !rows.is_empty() {
+        // Projection fast path: build the response from the durable read model.
+        let mut pending: Vec<serde_json::Value> = Vec::new();
+        let mut decided: Vec<serde_json::Value> = Vec::new();
 
-    for row in &rows {
-        match row.status.as_str() {
-            "pending" => {
-                pending.push(serde_json::json!({
-                    "node_id":   row.node_id,
-                    "tool_name": row.tool_name,
-                    "approver":  row.approver,
-                    "context":   row.context,
-                    "sequence":  row.last_sequence,
-                }));
-            }
-            "approved" => {
-                decided.push(serde_json::json!({
-                    "node_id":  row.node_id,
-                    "status":   "approved",
-                    "user_id":  row.user_id,
-                    "sequence": row.last_sequence,
-                }));
-            }
-            "rejected" => {
-                decided.push(serde_json::json!({
-                    "node_id":  row.node_id,
-                    "status":   "rejected",
-                    "user_id":  row.user_id,
-                    "comment":  row.comment,
-                    "sequence": row.last_sequence,
-                }));
-            }
-            _ => {
-                // Unknown status: skip rather than panic.
+        for row in &rows {
+            match row.status.as_str() {
+                "pending" => {
+                    pending.push(serde_json::json!({
+                        "node_id":   row.node_id,
+                        "tool_name": row.tool_name,
+                        "approver":  row.approver,
+                        "context":   row.context,
+                        "sequence":  row.last_sequence,
+                    }));
+                }
+                "approved" => {
+                    decided.push(serde_json::json!({
+                        "node_id":  row.node_id,
+                        "status":   "approved",
+                        "user_id":  row.user_id,
+                        "sequence": row.last_sequence,
+                    }));
+                }
+                "rejected" => {
+                    decided.push(serde_json::json!({
+                        "node_id":  row.node_id,
+                        "status":   "rejected",
+                        "user_id":  row.user_id,
+                        "comment":  row.comment,
+                        "sequence": row.last_sequence,
+                    }));
+                }
+                _ => {
+                    // Unknown status: skip rather than panic.
+                }
             }
         }
-    }
 
-    Ok(Json(
-        serde_json::json!({ "pending": pending, "decided": decided }),
-    ))
+        Ok(Json(
+            serde_json::json!({ "pending": pending, "decided": decided }),
+        ))
+    } else {
+        // Event-log fallback: guarantees the endpoint is never worse than before
+        // the projection switch (2h-3).  Covers unprojected, terminal, and
+        // non-default-tenant executions until F-2h-tenant + F-2h-terminal land.
+        let events = backend.get_events(&execution_id).await?;
+        Ok(Json(crate::approvals::approvals_view(&events)))
+    }
 }
 
 #[derive(Deserialize)]

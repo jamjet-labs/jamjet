@@ -544,3 +544,105 @@ async fn projection_driven_approvals_endpoint() {
         .expect("second tick");
     assert_eq!(resp2, 0, "second tick with no new events applies zero rows");
 }
+
+/// Finding A + B — event-log fallback: an execution that has approval events but
+/// whose projector tick has never run (projection table is empty) must NOT return
+/// an empty list.  The endpoint falls back to event-log replay.
+///
+/// This is the same code path exercised by:
+/// - Terminal executions (projector only scans Running status; terminal execs
+///   never get a row in proj_approvals).
+/// - Non-default-tenant executions (the projector writes proj_approvals with
+///   tenant_id='default'; reading via backend_for(&tenant) returns nothing).
+#[tokio::test]
+async fn list_approvals_fallback_when_not_yet_projected() {
+    let state = make_state();
+    let backend = state.backend.clone();
+    let app = build_router_with_opts(state, true);
+
+    let execution_id = create_execution(&backend).await;
+    seed_approval_required(&backend, &execution_id, "gate").await;
+    let id_str = execution_id.to_string();
+
+    // No projector tick: proj_approvals is empty for this execution.
+    // The endpoint must fall back to event-log replay and return the pending approval.
+    let resp = app
+        .oneshot(
+            Request::get(format!("/executions/{id_str}/approvals"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    let pending = json["pending"]
+        .as_array()
+        .expect("pending must be an array");
+    assert_eq!(
+        pending.len(),
+        1,
+        "endpoint must return the pending approval via fallback when projection is empty"
+    );
+    assert_eq!(
+        pending[0]["node_id"], "gate",
+        "fallback must identify the correct node"
+    );
+    assert!(
+        pending[0]["tool_name"].is_string(),
+        "fallback must return tool_name from event log"
+    );
+    let decided = json["decided"]
+        .as_array()
+        .expect("decided must be an array");
+    assert_eq!(decided.len(), 0, "no decided approvals yet");
+}
+
+/// Finding A + B — projection fast path: once the projector has ticked, the
+/// endpoint serves from proj_approvals (not the event log).
+/// Both paths return the same JSON shape, so the response is byte-compatible.
+#[tokio::test]
+async fn list_approvals_fast_path_from_projection_after_tick() {
+    let state = make_state();
+    let backend = state.backend.clone();
+    let app = build_router_with_opts(state, true);
+
+    let execution_id = create_execution(&backend).await;
+    seed_approval_required(&backend, &execution_id, "check").await;
+    let id_str = execution_id.to_string();
+
+    // Run a projector tick to populate proj_approvals.
+    let projector = Projector::new(backend.clone());
+    projector.tick().await.expect("projector tick");
+
+    // Projection is now populated: endpoint must serve from it (non-empty fast path).
+    let resp = app
+        .oneshot(
+            Request::get(format!("/executions/{id_str}/approvals"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    let pending = json["pending"]
+        .as_array()
+        .expect("pending must be an array");
+    assert_eq!(pending.len(), 1, "one pending approval from projection");
+    assert_eq!(pending[0]["node_id"], "check");
+    assert_eq!(
+        pending[0]["tool_name"], "tool_check",
+        "projection preserves tool_name from ToolApprovalRequired"
+    );
+    assert_eq!(
+        pending[0]["approver"], "human",
+        "projection preserves approver from ToolApprovalRequired"
+    );
+    let decided = json["decided"]
+        .as_array()
+        .expect("decided must be an array");
+    assert_eq!(decided.len(), 0, "no decided approvals");
+}

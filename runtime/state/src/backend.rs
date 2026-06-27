@@ -136,6 +136,7 @@ pub trait StateBackend: Send + Sync {
     async fn get_events(&self, execution_id: &ExecutionId) -> BackendResult<Vec<Event>>;
 
     /// Load events since a given sequence number (exclusive).
+    /// Returns events in ascending `sequence` order.
     async fn get_events_since(
         &self,
         execution_id: &ExecutionId,

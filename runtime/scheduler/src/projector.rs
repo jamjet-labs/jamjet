@@ -116,7 +116,12 @@ impl Projector {
             .get_projector_checkpoint("approvals", execution_id)
             .await?;
 
-        let events = self.backend.get_events_since(execution_id, cp).await?;
+        let mut events = self.backend.get_events_since(execution_id, cp).await?;
+        // Defensive sort: the trait contract requires ascending sequence order, but
+        // sort here so the fold is correct regardless of backend implementation.
+        // An ApprovalReceived processed before its ToolApprovalRequired (reversed
+        // delivery) would be treated as an orphan, leaving the node stuck pending.
+        events.sort_by_key(|e| e.sequence);
 
         if events.is_empty() {
             return Ok(0);
@@ -1113,5 +1118,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cp, seq_late, "checkpoint advances past the ignored event");
+    }
+
+    /// Finding C — the fold must process events in sequence order.
+    /// Without the sort, an ApprovalReceived delivered before its
+    /// ToolApprovalRequired (reversed delivery) would be treated as an orphan
+    /// and the node would be left pending even after approval.
+    ///
+    /// The InMemoryBackend always returns events in ascending sequence order so
+    /// the sort is a no-op here; this test documents what the sort guards against
+    /// by verifying the sort places Required (seq 1) before Received (seq 2)
+    /// when the input vec is constructed in reverse delivery order.
+    #[test]
+    fn sort_by_sequence_places_required_before_received() {
+        use jamjet_state::event::{ApprovalDecision, Event as StateEvent, EventKind};
+        let exec = ExecutionId::new();
+        let received_first = StateEvent::new(
+            exec.clone(),
+            2,
+            EventKind::ApprovalReceived {
+                node_id: "nodeA".into(),
+                user_id: "alice".into(),
+                decision: ApprovalDecision::Approved,
+                comment: None,
+                state_patch: None,
+            },
+        );
+        let required_second = StateEvent::new(
+            exec.clone(),
+            1,
+            EventKind::ToolApprovalRequired {
+                node_id: "nodeA".into(),
+                tool_name: "tool_nodeA".into(),
+                approver: "human".into(),
+                context: serde_json::json!({}),
+            },
+        );
+        // Simulate reversed delivery: Received (seq 2) arrives before Required (seq 1).
+        let mut events = vec![received_first, required_second];
+        events.sort_by_key(|e| e.sequence);
+        // After sort: seq 1 (Required) must be first.
+        assert_eq!(
+            events[0].sequence, 1,
+            "Required (seq 1) must come first after sort"
+        );
+        assert_eq!(
+            events[1].sequence, 2,
+            "Received (seq 2) must come second after sort"
+        );
+        assert!(
+            matches!(&events[0].kind, EventKind::ToolApprovalRequired { node_id, .. } if node_id == "nodeA"),
+            "first event after sort must be ToolApprovalRequired"
+        );
+        assert!(
+            matches!(&events[1].kind, EventKind::ApprovalReceived { node_id, .. } if node_id == "nodeA"),
+            "second event after sort must be ApprovalReceived"
+        );
     }
 }
