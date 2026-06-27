@@ -7,6 +7,7 @@ use serde_json::Value;
 /// Channel sender for real-time streaming events from executors.
 pub type StreamEventSender = tokio::sync::mpsc::Sender<Value>;
 
+#[derive(Debug)]
 pub struct ExecutionResult {
     pub output: Value,
     pub state_patch: Value,
@@ -23,17 +24,59 @@ pub struct ExecutionResult {
     pub finish_reason: Option<String>,
 }
 
+/// Structured error returned by node executors.
+///
+/// The variant tells the worker whether to park the work item for a later retry
+/// (rate-limit) or to terminate it immediately (fatal). ONLY `ModelError::RateLimited`
+/// maps to `RateLimited`; every other error from every executor maps to `Fatal`.
+#[derive(Debug)]
+pub enum ExecutorError {
+    /// Provider rate limit. The worker should park the work item and retry after
+    /// `retry_after_secs` seconds. Only `ModelError::RateLimited` produces this
+    /// variant; all other errors produce `Fatal`.
+    RateLimited { retry_after_secs: u64 },
+    /// Non-retryable failure. Equivalent to the previous `String` error type.
+    Fatal(String),
+}
+
+impl std::fmt::Display for ExecutorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecutorError::RateLimited { retry_after_secs } => {
+                write!(f, "rate limited, retry after {retry_after_secs}s")
+            }
+            ExecutorError::Fatal(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl std::error::Error for ExecutorError {}
+
+/// `Err("message".to_string())` and `Err(format!(...))` callers compile unchanged.
+impl From<String> for ExecutorError {
+    fn from(s: String) -> Self {
+        ExecutorError::Fatal(s)
+    }
+}
+
+/// `Err("literal".into())` and `ok_or("literal")?` callers compile unchanged.
+impl From<&str> for ExecutorError {
+    fn from(s: &str) -> Self {
+        ExecutorError::Fatal(s.to_string())
+    }
+}
+
 /// Trait implemented by each node kind executor.
 #[async_trait::async_trait]
 pub trait NodeExecutor: Send + Sync {
-    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, String>;
+    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError>;
 
     /// Execute with streaming event emission. Default delegates to `execute()`.
     async fn execute_streaming(
         &self,
         item: &WorkItem,
         _tx: StreamEventSender,
-    ) -> Result<ExecutionResult, String> {
+    ) -> Result<ExecutionResult, ExecutorError> {
         self.execute(item).await
     }
 }

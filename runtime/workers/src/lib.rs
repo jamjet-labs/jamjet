@@ -13,7 +13,7 @@ pub mod heartbeat;
 pub mod pool;
 pub mod worker;
 
-pub use executor::{ExecutionResult, NodeExecutor};
+pub use executor::{ExecutionResult, ExecutorError, NodeExecutor};
 pub use executors::{
     A2aTaskExecutor, AgentDiscoveryExecutor, EvalExecutor, McpToolExecutor, ModelNodeExecutor,
 };

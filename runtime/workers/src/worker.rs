@@ -1,4 +1,4 @@
-use crate::executor::{ExecutionResult, NodeExecutor};
+use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use crate::heartbeat::spawn_heartbeat;
 use jamjet_agents::AgentRegistry;
 use jamjet_core::node::NodeKind;
@@ -164,13 +164,15 @@ impl Worker {
         // Idempotency key computed inside the node branch; used on NodeCompleted.
         let mut computed_key: Option<String> = None;
 
-        let result: Result<ExecutionResult, String> = match self
+        let result: Result<ExecutionResult, ExecutorError> = match self
             .load_ir(&workflow_id, &workflow_version)
             .await
         {
-            Err(e) => Err(format!("failed to load IR: {e}")),
+            Err(e) => Err(ExecutorError::Fatal(format!("failed to load IR: {e}"))),
             Ok(ir) => match ir.node(&node_id) {
-                None => Err(format!("node {node_id} not found in IR")),
+                None => Err(ExecutorError::Fatal(format!(
+                    "node {node_id} not found in IR"
+                ))),
                 Some(node_def) => {
                     let kind = &node_def.kind;
                     let kind_tag = node_kind_tag(kind);
@@ -312,8 +314,10 @@ impl Worker {
                                     });
                                     let result = executor.execute_streaming(&item, tx).await;
                                     match receiver_handle.await {
-                                        Ok(Err(e)) => Err(e),
-                                        Err(e) => Err(format!("Receiver task panicked: {e}")),
+                                        Ok(Err(e)) => Err(ExecutorError::Fatal(e)),
+                                        Err(e) => Err(ExecutorError::Fatal(format!(
+                                            "Receiver task panicked: {e}"
+                                        ))),
                                         Ok(Ok(())) => result,
                                     }
                                 }
@@ -438,7 +442,7 @@ impl Worker {
                     0, // sequence assigned atomically inside commit_node_terminal
                     EventKind::NodeFailed {
                         node_id: node_id.clone(),
-                        error: error.clone(),
+                        error: error.to_string(),
                         attempt,
                         retryable: false,
                     },
@@ -978,7 +982,7 @@ fn parse_payload(payload: &serde_json::Value) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::{ExecutionResult, NodeExecutor};
+    use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
     use chrono::Utc;
     use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
     use jamjet_state::{
@@ -1129,7 +1133,7 @@ mod tests {
         async fn execute(
             &self,
             _item: &jamjet_state::backend::WorkItem,
-        ) -> Result<ExecutionResult, String> {
+        ) -> Result<ExecutionResult, ExecutorError> {
             Err("boom".into())
         }
     }
@@ -1285,7 +1289,7 @@ mod tests {
         async fn execute(
             &self,
             _item: &jamjet_state::backend::WorkItem,
-        ) -> Result<ExecutionResult, String> {
+        ) -> Result<ExecutionResult, ExecutorError> {
             self.was_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Err("TrackingExecutor fired — replay must prevent this".into())
@@ -1399,7 +1403,7 @@ mod tests {
             async fn execute(
                 &self,
                 _item: &jamjet_state::backend::WorkItem,
-            ) -> Result<ExecutionResult, String> {
+            ) -> Result<ExecutionResult, ExecutorError> {
                 self.count.fetch_add(1, Ordering::SeqCst);
                 Ok(ExecutionResult {
                     output: serde_json::json!({"fresh": true}),

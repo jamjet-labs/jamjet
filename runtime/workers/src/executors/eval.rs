@@ -10,7 +10,7 @@
 //! On failure, the configured `on_fail` action determines the next step:
 //! `retry_with_feedback`, `escalate`, `halt`, or `log_and_continue`.
 
-use crate::executor::{ExecutionResult, NodeExecutor};
+use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use async_trait::async_trait;
 use jamjet_core::node::{EvalOnFail, EvalScorer};
 use jamjet_models::{ChatMessage, ModelConfig, ModelRegistry, ModelRequest};
@@ -173,7 +173,7 @@ impl EvalExecutor {
 #[async_trait]
 impl NodeExecutor for EvalExecutor {
     #[instrument(skip(self, item), fields(node_id = %item.node_id))]
-    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, String> {
+    async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
 
         // Deserialize scorer configs from payload.
@@ -291,7 +291,8 @@ impl NodeExecutor for EvalExecutor {
                     .map(|r| r.message.as_str())
                     .collect::<Vec<_>>()
                     .join("; ")
-            ));
+            )
+            .into());
         }
 
         Ok(ExecutionResult {
