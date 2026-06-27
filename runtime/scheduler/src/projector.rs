@@ -468,4 +468,314 @@ mod tests {
         let applied2 = projector.tick().await.unwrap();
         assert_eq!(applied2, 0, "second tick is a no-op");
     }
+
+    // ── 2h-4 hardening tests ──────────────────────────────────────────────────
+
+    /// Test 5 (2h-4): A brand-new Projector (simulating a process restart) resumes
+    /// from the durable checkpoint rather than reprocessing all events from the
+    /// start.
+    ///
+    /// Phase 1: seed events seq 1..N for nodeA (Requested + Approved), run tick(),
+    /// assert checkpoint=N.  Phase 2: construct a SECOND Projector over the same
+    /// backend (no in-memory state carried — process restart), append events
+    /// seq N+1..M for nodeB (Requested + Rejected), run tick().  Assert:
+    ///   - checkpoint advances to M.
+    ///   - nodeA remains "approved" (seq 1..N were NOT re-read by projector2).
+    ///   - nodeB is "rejected" (seq N+1..M were processed correctly).
+    ///   - Structural proof: the checkpoint equalled N before the restart tick, so
+    ///     get_events_since(exec, N) returned only seq > N, which excludes seq 1..N.
+    #[tokio::test]
+    async fn checkpoint_resume_after_restart() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let exec = ExecutionId::new();
+        backend
+            .create_execution(running_execution(&exec))
+            .await
+            .unwrap();
+
+        // Phase 1: events up to N (nodeA: Requested seq 1, Approved seq 2).
+        let _seq_req_a = backend
+            .append_event(ev_tool_approval_required(&exec, "nodeA"))
+            .await
+            .unwrap();
+        let seq_n = backend
+            .append_event(ev_approval_received(
+                &exec,
+                "nodeA",
+                "alice",
+                ApprovalDecision::Approved,
+            ))
+            .await
+            .unwrap();
+
+        // First projector instance (original process).
+        let projector1 = Projector::new(backend.clone());
+        let applied1 = projector1.tick().await.unwrap();
+        assert_eq!(applied1, 1, "phase 1: one row applied");
+
+        let cp_before_restart = backend
+            .get_projector_checkpoint("approvals", &exec)
+            .await
+            .unwrap();
+        assert_eq!(
+            cp_before_restart, seq_n,
+            "checkpoint at N after phase-1 tick"
+        );
+
+        let rows_phase1 = backend.get_approval_projection(&exec).await.unwrap();
+        assert_eq!(rows_phase1.len(), 1);
+        assert_eq!(rows_phase1[0].status, "approved");
+
+        // Phase 2: append new events (seq N+1..M) to simulate work arriving post-restart.
+        let _seq_req_b = backend
+            .append_event(ev_tool_approval_required(&exec, "nodeB"))
+            .await
+            .unwrap();
+        let seq_m = backend
+            .append_event(ev_approval_received(
+                &exec,
+                "nodeB",
+                "bob",
+                ApprovalDecision::Rejected,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            seq_m > seq_n,
+            "M > N: new events are strictly after the pre-restart checkpoint"
+        );
+
+        // BRAND-NEW Projector — no in-memory state carried (simulated restart).
+        let projector2 = Projector::new(backend.clone());
+        let applied2 = projector2.tick().await.unwrap();
+
+        // The new projector reads events since N (get_events_since(exec, N))
+        // and processes ONLY nodeB (seq N+1..M).
+        assert_eq!(
+            applied2, 1,
+            "restart tick: only events > N are processed (no re-scan of seq 1..N)"
+        );
+
+        let cp_after_restart = backend
+            .get_projector_checkpoint("approvals", &exec)
+            .await
+            .unwrap();
+        assert_eq!(
+            cp_after_restart, seq_m,
+            "checkpoint advances to M after restart tick"
+        );
+
+        let rows_final = backend.get_approval_projection(&exec).await.unwrap();
+        assert_eq!(rows_final.len(), 2, "both nodes present in projection");
+
+        let row_a = rows_final
+            .iter()
+            .find(|r| r.node_id == "nodeA")
+            .expect("nodeA must remain in projection after restart");
+        let row_b = rows_final
+            .iter()
+            .find(|r| r.node_id == "nodeB")
+            .expect("nodeB must be added by the restart tick");
+
+        // nodeA was NOT re-read: still approved (seq 1..N excluded by checkpoint).
+        assert_eq!(row_a.status, "approved", "nodeA must not be re-processed");
+        assert_eq!(row_a.user_id.as_deref(), Some("alice"));
+
+        // nodeB was processed from the delta (seq N+1..M).
+        assert_eq!(row_b.status, "rejected");
+        assert_eq!(row_b.user_id.as_deref(), Some("bob"));
+
+        // Structural proof: checkpoint was N before the restart tick.
+        assert_eq!(cp_before_restart, seq_n);
+    }
+
+    /// Test 6 (2h-4): Idempotent re-apply at scale — multiple nodes with
+    /// interleaved Requested/Approved/Rejected events.  Running tick() twice
+    /// yields an identical projection and a stable checkpoint, confirming that
+    /// the UPSERT-keyed write is a pure function of the events.
+    #[tokio::test]
+    async fn multi_node_idempotent_retick() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let exec = ExecutionId::new();
+        backend
+            .create_execution(running_execution(&exec))
+            .await
+            .unwrap();
+
+        // Five interleaved events across three nodes.
+        backend
+            .append_event(ev_tool_approval_required(&exec, "nodeA"))
+            .await
+            .unwrap(); // seq 1
+        backend
+            .append_event(ev_tool_approval_required(&exec, "nodeB"))
+            .await
+            .unwrap(); // seq 2
+        backend
+            .append_event(ev_approval_received(
+                &exec,
+                "nodeA",
+                "alice",
+                ApprovalDecision::Approved,
+            ))
+            .await
+            .unwrap(); // seq 3
+        backend
+            .append_event(ev_tool_approval_required(&exec, "nodeC"))
+            .await
+            .unwrap(); // seq 4
+        let seq_last = backend
+            .append_event(ev_approval_received(
+                &exec,
+                "nodeB",
+                "bob",
+                ApprovalDecision::Rejected,
+            ))
+            .await
+            .unwrap(); // seq 5
+
+        let projector = Projector::new(backend.clone());
+
+        // First tick: projects all three nodes in one batch.
+        let applied1 = projector.tick().await.unwrap();
+        assert_eq!(applied1, 3, "three nodes written on first tick");
+
+        let rows1 = backend.get_approval_projection(&exec).await.unwrap();
+        let cp1 = backend
+            .get_projector_checkpoint("approvals", &exec)
+            .await
+            .unwrap();
+        assert_eq!(cp1, seq_last, "checkpoint at last seq after first tick");
+        assert_eq!(rows1.len(), 3);
+
+        // Second tick with no new events: must be a no-op.
+        let applied2 = projector.tick().await.unwrap();
+        assert_eq!(applied2, 0, "second tick must apply zero rows (idempotent)");
+
+        let rows2 = backend.get_approval_projection(&exec).await.unwrap();
+        let cp2 = backend
+            .get_projector_checkpoint("approvals", &exec)
+            .await
+            .unwrap();
+        assert_eq!(cp2, cp1, "checkpoint stable after second tick");
+        // Projection is a pure function of the events regardless of tick count.
+        assert_eq!(
+            rows2, rows1,
+            "projection content identical after idempotent second tick"
+        );
+    }
+
+    /// Test 7 (2h-4): Read fidelity — for a three-node approval event sequence,
+    /// the durable projection returned by get_approval_projection faithfully
+    /// represents the latest approval state implied by the events:
+    ///   - nodeA (Requested → Approved): status="approved", user_id="alice",
+    ///     tool_name cleared (node is resolved).
+    ///   - nodeB (Requested → Rejected with comment): status="rejected",
+    ///     user_id="bob", comment="exceeds limit", tool_name cleared.
+    ///   - nodeC (Requested only): status="pending", tool_name and approver
+    ///     preserved from the ToolApprovalRequired event.
+    ///
+    /// Crash-mid-apply safety note: `apply_approval_projection` and the checkpoint
+    /// advance share one SQLite transaction (proven by the 2h-1 atomic tests in
+    /// state/tests/projector.rs).  A checkpoint can therefore never be observed as
+    /// advanced past an unapplied approval row — it is structurally impossible to
+    /// land in a state where the checkpoint says "seq N processed" but the row for
+    /// that seq is absent from proj_approvals.  Rely on that atomic test rather
+    /// than duplicating a forced-failure scenario here.
+    #[tokio::test]
+    async fn read_fidelity_three_node_abc() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let exec = ExecutionId::new();
+        backend
+            .create_execution(running_execution(&exec))
+            .await
+            .unwrap();
+
+        // nodeA: Requested → Approved.
+        backend
+            .append_event(ev_tool_approval_required(&exec, "nodeA"))
+            .await
+            .unwrap();
+        backend
+            .append_event(ev_approval_received(
+                &exec,
+                "nodeA",
+                "alice",
+                ApprovalDecision::Approved,
+            ))
+            .await
+            .unwrap();
+
+        // nodeB: Requested → Rejected with a comment.
+        backend
+            .append_event(ev_tool_approval_required(&exec, "nodeB"))
+            .await
+            .unwrap();
+        backend
+            .append_event(Event::new(
+                exec.clone(),
+                0, // sequence assigned by append_event
+                EventKind::ApprovalReceived {
+                    node_id: "nodeB".into(),
+                    user_id: "bob".into(),
+                    decision: ApprovalDecision::Rejected,
+                    comment: Some("exceeds limit".into()),
+                    state_patch: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        // nodeC: Requested only — stays pending.
+        backend
+            .append_event(ev_tool_approval_required(&exec, "nodeC"))
+            .await
+            .unwrap();
+
+        let projector = Projector::new(backend.clone());
+        projector.tick().await.expect("tick must succeed");
+
+        let rows = backend.get_approval_projection(&exec).await.unwrap();
+        assert_eq!(rows.len(), 3, "one projection row per node");
+
+        let find = |node: &str| {
+            rows.iter()
+                .find(|r| r.node_id == node)
+                .unwrap_or_else(|| panic!("projection row missing for {node}"))
+        };
+
+        // nodeA: approved, user identified, pending metadata cleared.
+        let row_a = find("nodeA");
+        assert_eq!(row_a.status, "approved");
+        assert_eq!(row_a.user_id.as_deref(), Some("alice"));
+        assert!(
+            row_a.tool_name.is_none(),
+            "approved row must not carry tool_name"
+        );
+
+        // nodeB: rejected, user identified, comment preserved, pending metadata cleared.
+        let row_b = find("nodeB");
+        assert_eq!(row_b.status, "rejected");
+        assert_eq!(row_b.user_id.as_deref(), Some("bob"));
+        assert_eq!(row_b.comment.as_deref(), Some("exceeds limit"));
+        assert!(
+            row_b.tool_name.is_none(),
+            "rejected row must not carry tool_name"
+        );
+
+        // nodeC: pending, tool_name and approver preserved from ToolApprovalRequired.
+        let row_c = find("nodeC");
+        assert_eq!(row_c.status, "pending");
+        assert_eq!(
+            row_c.tool_name.as_deref(),
+            Some("tool_nodeC"),
+            "pending row must preserve tool_name from ToolApprovalRequired event"
+        );
+        assert_eq!(
+            row_c.approver.as_deref(),
+            Some("human"),
+            "pending row must preserve approver from ToolApprovalRequired event"
+        );
+        assert!(row_c.user_id.is_none(), "pending row has no user_id");
+    }
 }
