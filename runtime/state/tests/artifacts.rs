@@ -345,3 +345,304 @@ async fn resolve_value_walks_object_one_level() {
     assert_eq!(resolved["output"], inner);
     assert_eq!(resolved["meta"], json!("unchanged"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 2i-4 — new coverage only; does NOT duplicate any 2i-1/2/3 tests.
+//
+// Not re-tested here (already covered):
+//   - put/get basics + basic 2-put dedupe (2i-1: sqlite_put_*/sqlite_get_*/memory_*)
+//   - get_artifact tenant isolation (2i-1: tenant_scoped_isolation_*)
+//   - sentinel helpers (2i-1: artifact_ref_*)
+//   - spill_bytes threshold logic incl. boundary (2i-1: spill_bytes_*)
+//   - sqlite + memory resolve round-trips (2i-1: sqlite_resolve_*/memory_resolve_*)
+//   - dangling-ref via unscoped SQLite (2i-1: resolve_value_missing_artifact_returns_error)
+//   - object-level walk (2i-1: resolve_value_walks_object_one_level)
+//   - API endpoint resolve (2i-3: artifact_resolve.rs)
+//   - worker spill path (2i-2: worker.rs)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// == Group A: Round-trip fidelity — four value shapes =========================
+//
+// Each shape is exercised through the full chain:
+//   spill_bytes → put_artifact → to_sentinel → resolve_value → original value
+// All use threshold=8 to force spilling even for tiny payloads.
+
+/// Plain JSON string, well above threshold.
+#[tokio::test]
+async fn round_trip_string_value_above_threshold() {
+    let db = open_db().await;
+    let original = json!("The quick brown fox jumps over the lazy dog. ".repeat(20));
+
+    let bytes = spill_bytes(&original, 8).expect("long string must exceed 8-byte threshold");
+    let aref = db
+        .put_artifact(&bytes, Some("application/json"))
+        .await
+        .unwrap();
+    let sentinel = aref.to_sentinel();
+
+    let resolved = resolve_value(&sentinel, &db).await.unwrap();
+    assert_eq!(resolved, original, "string round-trip must be byte-perfect");
+}
+
+/// Five-level-deep JSON object, above threshold.
+#[tokio::test]
+async fn round_trip_deeply_nested_object_above_threshold() {
+    let db = open_db().await;
+    let data = "a".repeat(200);
+    let original = json!({
+        "level1": {
+            "level2": {
+                "level3": {
+                    "level4": {
+                        "level5": {
+                            "data": data,
+                            "tags": ["alpha", "beta", "gamma"],
+                            "count": 42
+                        }
+                    },
+                    "sibling": "value at l3"
+                }
+            },
+            "meta": {"created": "2026-06-26", "version": 3}
+        }
+    });
+
+    let bytes =
+        spill_bytes(&original, 8).expect("deeply-nested object must exceed 8-byte threshold");
+    let aref = db
+        .put_artifact(&bytes, Some("application/json"))
+        .await
+        .unwrap();
+    let sentinel = aref.to_sentinel();
+
+    let resolved = resolve_value(&sentinel, &db).await.unwrap();
+    assert_eq!(
+        resolved, original,
+        "deeply-nested object round-trip must be byte-perfect"
+    );
+}
+
+/// Array of heterogeneous objects, above threshold.
+#[tokio::test]
+async fn round_trip_array_of_objects_above_threshold() {
+    let db = open_db().await;
+    let long_payload = "x".repeat(300);
+    let original = json!([
+        {"id": 1, "name": "alpha", "tags": ["a", "b"], "active": true},
+        {"id": 2, "name": "beta", "scores": [1.1, 2.2, 3.3], "meta": null},
+        {"id": 3, "name": "gamma", "nested": {"x": 10, "y": 20}},
+        {"id": 4, "payload": long_payload}
+    ]);
+
+    let bytes = spill_bytes(&original, 8).expect("array of objects must exceed 8-byte threshold");
+    let aref = db
+        .put_artifact(&bytes, Some("application/json"))
+        .await
+        .unwrap();
+    let sentinel = aref.to_sentinel();
+
+    let resolved = resolve_value(&sentinel, &db).await.unwrap();
+    assert_eq!(
+        resolved, original,
+        "array-of-objects round-trip must be byte-perfect"
+    );
+}
+
+/// Object containing multi-script unicode, emojis, and JSON escape sequences.
+#[tokio::test]
+async fn round_trip_unicode_and_special_chars_above_threshold() {
+    let db = open_db().await;
+    let long_unicode = "音楽".repeat(100);
+    let original = json!({
+        "emoji": "🚀🌍🤖🦀",
+        "cjk": "日本語テスト中文测试한국어",
+        "arabic": "مرحبا بالعالم",
+        "escapes": "tab:\there\nnewline and \"quotes\"",
+        "long_unicode": long_unicode
+    });
+
+    let bytes = spill_bytes(&original, 8).expect("unicode object must exceed 8-byte threshold");
+    let aref = db
+        .put_artifact(&bytes, Some("application/json"))
+        .await
+        .unwrap();
+    let sentinel = aref.to_sentinel();
+
+    let resolved = resolve_value(&sentinel, &db).await.unwrap();
+    assert_eq!(
+        resolved, original,
+        "unicode round-trip must preserve all multi-byte code points exactly"
+    );
+}
+
+// == Group B: Below-threshold stays inline ====================================
+
+/// For each of the four shape categories, a value whose serialized size is
+/// BELOW the threshold must produce `None` from `spill_bytes` — the value
+/// stays inline and no artifact store write is needed.
+#[test]
+fn below_threshold_all_four_shapes_stay_inline() {
+    let large_threshold = 1 << 20; // 1 MiB — all values here fit comfortably
+
+    assert!(
+        spill_bytes(&json!("short string"), large_threshold).is_none(),
+        "small string must stay inline"
+    );
+    assert!(
+        spill_bytes(&json!({"level1": {"level2": "v"}}), large_threshold).is_none(),
+        "small nested object must stay inline"
+    );
+    assert!(
+        spill_bytes(&json!([{"a": 1}, {"b": 2}]), large_threshold).is_none(),
+        "small array of objects must stay inline"
+    );
+    assert!(
+        spill_bytes(&json!({"emoji": "🦀"}), large_threshold).is_none(),
+        "small unicode value must stay inline"
+    );
+}
+
+// == Group C: Dedupe at scale + hash stability ================================
+
+/// The same 50 KB blob put 10 times must produce exactly ONE row (INSERT OR
+/// IGNORE) and an identical hash on every call (hash stability / content-
+/// addressed guarantee). Supplements the existing 2-put test.
+#[tokio::test]
+async fn dedupe_at_scale_fifty_kb_blob_put_ten_times() {
+    let db = open_db().await;
+
+    // 50 KB of repeating bytes — realistic large model-output size.
+    let blob: Vec<u8> = (0u8..=255).cycle().take(50 * 1024).collect();
+    let mut reference_hash = String::new();
+
+    for i in 0..10usize {
+        let aref = db
+            .put_artifact(&blob, Some("application/octet-stream"))
+            .await
+            .unwrap();
+        if i == 0 {
+            reference_hash = aref.hash.clone();
+        } else {
+            assert_eq!(
+                aref.hash, reference_hash,
+                "hash must be identical on every put (hash stability, call {i})"
+            );
+        }
+    }
+
+    // Exactly one row — INSERT OR IGNORE deduped all subsequent writes.
+    let pool = db.pool();
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM artifacts WHERE hash = ?")
+        .bind(&reference_hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.0, 1,
+        "10 identical puts must produce exactly one row (dedupe at scale)"
+    );
+}
+
+/// Two different 50 KB blobs must each land in their own row with distinct hashes.
+#[tokio::test]
+async fn dedupe_two_distinct_blobs_produce_two_rows_and_different_hashes() {
+    let db = open_db().await;
+
+    let blob_a: Vec<u8> = vec![0xAA; 50 * 1024];
+    let blob_b: Vec<u8> = vec![0xBB; 50 * 1024];
+
+    let ref_a = db.put_artifact(&blob_a, None).await.unwrap();
+    let ref_b = db.put_artifact(&blob_b, None).await.unwrap();
+
+    assert_ne!(
+        ref_a.hash, ref_b.hash,
+        "distinct blobs must hash to distinct values"
+    );
+
+    let pool = db.pool();
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM artifacts WHERE hash IN (?, ?)")
+        .bind(&ref_a.hash)
+        .bind(&ref_b.hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.0, 2, "two distinct blobs must occupy two separate rows");
+}
+
+// == Group D: Tenant isolation hard case — resolve_value cross-tenant =========
+//
+// 2i-1 tested get_artifact isolation. 2i-4 adds the resolve_value path:
+// tenant-B resolving tenant-A's sentinel must fail (no cross-tenant read).
+
+#[tokio::test]
+async fn tenant_cross_resolve_value_returns_error_no_cross_tenant_read() {
+    let db = open_db().await;
+    let backend_a = db.for_tenant(TenantId::from("tenant-a-xr"));
+    let backend_b = db.for_tenant(TenantId::from("tenant-b-xr"));
+
+    let original = json!({"secret": "tenant-A-only", "data": "x".repeat(200)});
+    let bytes = spill_bytes(&original, 8).unwrap();
+    let aref = backend_a
+        .put_artifact(&bytes, Some("application/json"))
+        .await
+        .unwrap();
+    // B gets A's sentinel but tries to resolve it through B's backend.
+    let sentinel_a = aref.to_sentinel();
+
+    let result = resolve_value(&sentinel_a, &backend_b).await;
+    assert!(
+        result.is_err(),
+        "tenant-B must not resolve tenant-A's sentinel (no cross-tenant read); got Ok"
+    );
+}
+
+// == Group E: Cross-backend — TenantScopedSqliteBackend full round-trip =======
+//
+// 2i-1 proved put/get per-tenant; 2i-4 proves the full
+// spill → put → sentinel → resolve cycle through TenantScopedSqliteBackend.
+
+#[tokio::test]
+async fn tenant_scoped_full_spill_resolve_round_trip() {
+    let db = open_db().await;
+    let backend = db.for_tenant(TenantId::from("tenant-rtt"));
+
+    let original = json!({
+        "tenant": "tenant-rtt",
+        "payload": "z".repeat(300),
+        "tags": ["tag1", "tag2", "tag3"]
+    });
+
+    let bytes = spill_bytes(&original, 8).unwrap();
+    let aref = backend
+        .put_artifact(&bytes, Some("application/json"))
+        .await
+        .unwrap();
+    let sentinel = aref.to_sentinel();
+
+    let resolved = resolve_value(&sentinel, &backend).await.unwrap();
+    assert_eq!(
+        resolved, original,
+        "tenant-scoped spill+resolve must be byte-perfect"
+    );
+}
+
+/// Dangling ref through a TenantScopedSqliteBackend must return Err, not panic.
+/// Complements `resolve_value_missing_artifact_returns_error` (unscoped SQLite).
+#[tokio::test]
+async fn tenant_scoped_dangling_ref_returns_error_no_panic() {
+    let db = open_db().await;
+    let backend = db.for_tenant(TenantId::from("tenant-dangling"));
+
+    let dangling = ArtifactRef {
+        hash: "b".repeat(64),
+        size: 100,
+        media_type: Some("application/json".to_string()),
+    };
+    let sentinel = dangling.to_sentinel();
+
+    let result = resolve_value(&sentinel, &backend).await;
+    assert!(
+        result.is_err(),
+        "dangling ref via TenantScopedSqliteBackend must return Err, never panic"
+    );
+}
