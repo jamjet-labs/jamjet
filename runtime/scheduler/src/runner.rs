@@ -1824,7 +1824,8 @@ mod tests {
     }
 
     /// A `NodeCompleted` the way the FDL-2 condition executor emits it: the
-    /// routing decision recorded on BOTH `output` and `state_patch`.
+    /// routing decision recorded on `output` only; `state_patch` is empty so
+    /// routing metadata never bleeds into workflow state.
     /// `chosen_target = None` is the null-route case (no branch matched, no
     /// default) — the scheduler records no route, so every branch target dies.
     fn condition_completed(
@@ -1846,8 +1847,8 @@ mod tests {
         });
         EventKind::NodeCompleted {
             node_id: node_id.into(),
-            output: routing.clone(),
-            state_patch: routing,
+            output: routing,
+            state_patch: serde_json::json!({}),
             duration_ms: 1,
             gen_ai_system: None,
             gen_ai_model: None,

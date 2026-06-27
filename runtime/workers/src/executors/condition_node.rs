@@ -17,13 +17,14 @@
 //!
 //! # Output shape
 //!
-//! Both `output` and `state_patch` carry:
+//! Only `output` carries the routing dict:
 //! ```json
 //! { "chosen_target": "<NodeId>" | null, "branch_targets": ["<NodeId>", ...] }
 //! ```
+//! `state_patch` is always `{}` — routing metadata must not enter workflow state.
 //!
 //! FDL-3 reads `chosen_target` and `branch_targets` off the `NodeCompleted`
-//! event to build the dead-edge set and emit `NodeSkipped` for dominated tails.
+//! `output` to build the dead-edge set and emit `NodeSkipped` for dominated tails.
 //!
 //! # Backward compatibility
 //!
@@ -132,17 +133,17 @@ impl NodeExecutor for ConditionNodeExecutor {
             }
         };
 
-        // Record the routing decision on both output and state_patch so the
-        // scheduler (FDL-3) can read it off the NodeCompleted event.
-        // Kept small + inline (NOT spilled): these are short strings.
+        // Record the routing decision on output only so the scheduler (FDL-3)
+        // can read it off the NodeCompleted event. state_patch stays empty so
+        // routing metadata never bleeds into workflow state or final_state.
         let routing = json!({
             "chosen_target": chosen_json,
             "branch_targets": branch_targets,
         });
 
         Ok(ExecutionResult {
-            output: routing.clone(),
-            state_patch: routing,
+            output: routing,
+            state_patch: json!({}),
             duration_ms: start.elapsed().as_millis() as u64,
             gen_ai_system: None,
             gen_ai_model: None,
@@ -201,8 +202,9 @@ mod tests {
             "first branch condition matches -> chosen_target A"
         );
         assert_eq!(
-            result.state_patch["chosen_target"], "A",
-            "state_patch must also carry chosen_target"
+            result.state_patch,
+            json!({}),
+            "routing is output-only; state_patch must be empty"
         );
         let targets = result.output["branch_targets"]
             .as_array()

@@ -23,6 +23,9 @@ pub enum IrError {
     #[error("condition node '{node}' branch targets unknown node '{target}'")]
     UnknownBranchTarget { node: String, target: String },
 
+    #[error("condition node '{node}' branch target '{target}' has no matching out-edge")]
+    BranchTargetMissingOutEdge { node: String, target: String },
+
     #[error("node '{0}' is unreachable from the start node")]
     UnreachableNode(String),
 
