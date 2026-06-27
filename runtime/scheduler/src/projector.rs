@@ -2,22 +2,34 @@
 //! `proj_approvals` read-model keyed by `(execution_id, node_id)`.
 //!
 //! The projector runs as a background task alongside the scheduler.  Each tick
-//! it: loads all running executions; for each, reads events since its
-//! per-execution checkpoint; folds approval events into the projection (last-
-//! write-wins per node); and advances the checkpoint to the maximum event
-//! sequence seen in the batch regardless of whether any approval rows changed.
-//! This ensures non-approval events do not stall the cursor.
+//! it: paginates over all running executions (avoiding the 100-execution cap);
+//! for each, reads events since its per-execution checkpoint; folds approval
+//! events into the projection using first-decision-wins semantics (matching the
+//! runtime's canonical fold in `approvals.rs`); seeds prior-tick state from the
+//! existing projection so a cross-tick late decision cannot overwrite a decided
+//! node; and advances the checkpoint atomically with ALL changed rows in a
+//! single transaction (via `apply_approval_projection_batch`).
 //!
-//! Crash-safe: the UPSERT and checkpoint advance happen in one transaction
-//! inside `apply_approval_projection`.  A restart re-reads only the delta
-//! since the durable checkpoint.
+//! # Invariants
+//!
+//! - **Atomicity**: the checkpoint advances IFF every changed row in the batch
+//!   committed.  A crash before `commit()` leaves both rows and checkpoint
+//!   unchanged; the next tick re-reads the same events and re-applies.
+//!
+//! - **First-decision-wins**: an `ApprovalReceived` event only transitions a
+//!   node that is currently `"pending"`.  A node that is already `"approved"`
+//!   or `"rejected"` cannot be overwritten by a later decision.  Orphan
+//!   `ApprovalReceived` events (no prior `ToolApprovalRequired`) are ignored.
+//!
+//! - **Full coverage**: `tick()` paginates over all Running executions so the
+//!   100-row default limit cannot silently drop executions beyond the first page.
 
 use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use jamjet_state::{
     backend::{ApprovalProjectionRow, BackendResult, StateBackend},
     event::{ApprovalDecision, EventKind},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
@@ -37,38 +49,67 @@ impl Projector {
 
     /// One projection pass over all running executions.
     ///
-    /// Returns the total number of approval rows written (for tests and
-    /// monitoring).  Non-approval events are consumed and the checkpoint is
-    /// advanced past them, but they do not contribute to the returned count.
+    /// Paginates over Running executions so the 100-row page limit does not
+    /// silently cap coverage.  Returns the total number of approval rows
+    /// written (for tests and monitoring).  Non-approval events are consumed
+    /// and the checkpoint is advanced past them, but they do not contribute to
+    /// the returned count.  Per-execution errors are logged and skipped so a
+    /// single bad execution does not abort the whole tick.
     pub async fn tick(&self) -> BackendResult<usize> {
-        let executions = self
-            .backend
-            .list_executions(Some(WorkflowStatus::Running), 100, 0)
-            .await?;
-
+        let page_size: u32 = 100;
+        let mut offset: u32 = 0;
         let mut total_applied = 0usize;
 
-        for exec in executions {
-            match self.project_execution(&exec.execution_id).await {
-                Ok(n) => total_applied += n,
-                Err(e) => {
-                    warn!(
-                        execution_id = %exec.execution_id,
-                        "Projector: error projecting execution: {e}"
-                    );
+        loop {
+            let page = self
+                .backend
+                .list_executions(Some(WorkflowStatus::Running), page_size, offset)
+                .await?;
+            let page_len = page.len();
+
+            for exec in page {
+                match self.project_execution(&exec.execution_id).await {
+                    Ok(n) => total_applied += n,
+                    Err(e) => {
+                        warn!(
+                            execution_id = %exec.execution_id,
+                            "Projector: error projecting execution: {e}"
+                        );
+                    }
                 }
             }
+
+            if (page_len as u32) < page_size {
+                break;
+            }
+            offset += page_len as u32;
         }
 
         Ok(total_applied)
     }
 
     /// Project a single execution: fetch the event delta, fold approval events,
-    /// and advance the checkpoint to the batch maximum.
+    /// and advance the checkpoint to the batch maximum atomically with all
+    /// changed rows.
     ///
-    /// The checkpoint always reaches `batch_max` whether or not approval rows
-    /// changed — preventing both re-scan (stale cursor) and skip (approval
-    /// after a non-approval tail).
+    /// ### Fold semantics (first-decision-wins, matching `approvals.rs`)
+    ///
+    /// 1. Seed the working node-state from the existing projection
+    ///    (`get_approval_projection`).  This means prior-tick decisions are
+    ///    visible during the fold and cannot be overwritten.
+    /// 2. For each new event in sequence order:
+    ///    - `ToolApprovalRequired` → set node to `"pending"` with
+    ///      tool/approver/context metadata.
+    ///    - `ApprovalReceived` → only if the node is currently `"pending"`,
+    ///      set to `"approved"` / `"rejected"`.  If the node is already
+    ///      decided (or never requested — orphan), ignore the event.
+    /// 3. Emit only the rows for nodes actually modified in this batch.
+    ///
+    /// ### Atomicity
+    ///
+    /// `apply_approval_projection_batch` writes all changed rows AND the
+    /// checkpoint in one `BEGIN IMMEDIATE` transaction.  If the process crashes
+    /// mid-batch, the next tick re-reads from the old checkpoint and re-applies.
     async fn project_execution(&self, execution_id: &ExecutionId) -> BackendResult<usize> {
         let cp = self
             .backend
@@ -84,8 +125,17 @@ impl Projector {
         // Safety: events is non-empty so max() is Some.
         let batch_max = events.iter().map(|e| e.sequence).max().unwrap();
 
-        // Fold approval events (last-write-wins per node_id, ordered by seq).
-        let mut node_map: HashMap<String, ApprovalProjectionRow> = HashMap::new();
+        // Seed working state from the existing projection so prior-tick
+        // decisions are visible during the fold (first-decision-wins across
+        // ticks).
+        let existing = self.backend.get_approval_projection(execution_id).await?;
+        let mut node_map: HashMap<String, ApprovalProjectionRow> = existing
+            .into_iter()
+            .map(|r| (r.node_id.clone(), r))
+            .collect();
+
+        // Track nodes modified in this batch (these are the rows to write).
+        let mut touched: HashSet<String> = HashSet::new();
 
         for event in &events {
             match &event.kind {
@@ -95,6 +145,7 @@ impl Projector {
                     approver,
                     context,
                 } => {
+                    touched.insert(node_id.clone());
                     node_map.insert(
                         node_id.clone(),
                         ApprovalProjectionRow {
@@ -117,26 +168,39 @@ impl Projector {
                     comment,
                     ..
                 } => {
-                    let status = match decision {
-                        ApprovalDecision::Approved => "approved",
-                        ApprovalDecision::Rejected => "rejected",
-                    };
-                    // Pending metadata (tool_name/approver/context) is cleared on
-                    // resolution — the node is no longer waiting for a decision.
-                    node_map.insert(
-                        node_id.clone(),
-                        ApprovalProjectionRow {
-                            execution_id: execution_id.clone(),
-                            node_id: node_id.clone(),
-                            status: status.into(),
-                            user_id: Some(user_id.clone()),
-                            comment: comment.clone(),
-                            last_sequence: event.sequence,
-                            tool_name: None,
-                            approver: None,
-                            context: None,
-                        },
-                    );
+                    // First-decision-wins: only transition a node that is
+                    // currently pending.  A decided node (approved / rejected)
+                    // and an orphan (never requested) are both ignored.
+                    let currently_pending = node_map
+                        .get(node_id)
+                        .map(|r| r.status == "pending")
+                        .unwrap_or(false);
+
+                    if currently_pending {
+                        touched.insert(node_id.clone());
+                        let status = match decision {
+                            ApprovalDecision::Approved => "approved",
+                            ApprovalDecision::Rejected => "rejected",
+                        };
+                        // Pending metadata (tool_name/approver/context) is
+                        // cleared on resolution — the node is no longer
+                        // waiting for a decision.
+                        node_map.insert(
+                            node_id.clone(),
+                            ApprovalProjectionRow {
+                                execution_id: execution_id.clone(),
+                                node_id: node_id.clone(),
+                                status: status.into(),
+                                user_id: Some(user_id.clone()),
+                                comment: comment.clone(),
+                                last_sequence: event.sequence,
+                                tool_name: None,
+                                approver: None,
+                                context: None,
+                            },
+                        );
+                    }
+                    // else: orphan or already-decided → ignore.
                 }
                 _ => {
                     // Non-approval event: ignored for content, but the cursor
@@ -145,20 +209,28 @@ impl Projector {
             }
         }
 
-        if !node_map.is_empty() {
-            let count = node_map.len();
-            for row in node_map.into_values() {
-                // apply_approval_projection atomically UPSERTs the row AND sets
-                // the checkpoint to batch_max.  For the second and later rows in
-                // the same batch the checkpoint write is idempotent (same value).
-                self.backend
-                    .apply_approval_projection(row, "approvals", batch_max)
-                    .await?;
-            }
+        // Collect only the rows that were modified in this batch.
+        let rows_to_write: Vec<ApprovalProjectionRow> = touched
+            .iter()
+            .filter_map(|node_id| node_map.remove(node_id))
+            .collect();
+
+        if !rows_to_write.is_empty() {
+            let count = rows_to_write.len();
+            // Atomic: all rows + checkpoint in one transaction.
+            self.backend
+                .apply_approval_projection_batch(
+                    rows_to_write,
+                    "approvals",
+                    execution_id,
+                    batch_max,
+                )
+                .await?;
             Ok(count)
         } else {
-            // Batch had events but none were approval events.  Advance the
-            // checkpoint only so this tail is not re-scanned next tick.
+            // Batch had events but none produced approval changes (all
+            // non-approval, all orphan decisions, or all late post-decision
+            // events).  Advance the checkpoint so this tail is not re-scanned.
             self.backend
                 .set_projector_checkpoint("approvals", execution_id, batch_max)
                 .await?;
@@ -264,11 +336,10 @@ mod tests {
     }
 
     /// Test 1: ToolApprovalRequired followed by ApprovalReceived(Approved) for the
-    /// same node.  Projector must surface the LAST event (last-write-wins) as
-    /// "approved", advance the checkpoint to the max sequence, and be idempotent
-    /// on a second tick.
+    /// same node in the same tick.  First-decision-wins within a batch: approved
+    /// wins; checkpoint advances to max sequence; second tick is a no-op.
     #[tokio::test]
-    async fn last_write_wins_and_checkpoint_idempotent() {
+    async fn approved_beats_prior_pending_and_checkpoint_idempotent() {
         let backend = Arc::new(InMemoryBackend::new());
         let exec = ExecutionId::new();
         backend
@@ -299,7 +370,7 @@ mod tests {
         assert_eq!(rows[0].node_id, "nodeA");
         assert_eq!(
             rows[0].status, "approved",
-            "last-write-wins: granted overrides pending"
+            "approved overrides pending within the same batch"
         );
         assert_eq!(rows[0].user_id.as_deref(), Some("alice"));
 
@@ -324,10 +395,11 @@ mod tests {
         assert_eq!(rows2, rows, "projection unchanged after idle tick");
     }
 
-    /// Test 2: After an Approved row, appending an ApprovalReceived(Rejected)
-    /// updates the same node to "rejected" and advances the checkpoint.
+    /// Test 2 (first-decision-wins, cross-tick): nodeA is approved in tick 1.
+    /// A late Rejected event arriving in tick 2 must be ignored — the earlier
+    /// approved decision stands.  The checkpoint still advances.
     #[tokio::test]
-    async fn denied_overwrites_approved() {
+    async fn late_decision_ignored_after_first_approval() {
         let backend = Arc::new(InMemoryBackend::new());
         let exec = ExecutionId::new();
         backend
@@ -350,8 +422,9 @@ mod tests {
             .unwrap();
 
         let projector = Projector::new(backend.clone());
-        projector.tick().await.unwrap();
+        projector.tick().await.unwrap(); // Tick 1: nodeA approved.
 
+        // Late rejection arrives after the first decision.
         let seq_rejected = backend
             .append_event(ev_approval_received(
                 &exec,
@@ -362,22 +435,31 @@ mod tests {
             .await
             .unwrap();
 
+        // Tick 2: the late rejection is ignored because nodeA is already decided.
         let applied = projector.tick().await.unwrap();
-        assert_eq!(applied, 1, "one row updated to rejected");
+        assert_eq!(
+            applied, 0,
+            "late rejection ignored: nodeA already approved (first-decision-wins)"
+        );
 
         let rows = backend.get_approval_projection(&exec).await.unwrap();
         assert_eq!(rows.len(), 1, "still exactly one row (upsert)");
-        assert_eq!(rows[0].status, "rejected");
-        assert_eq!(rows[0].user_id.as_deref(), Some("bob"));
+        assert_eq!(
+            rows[0].status, "approved",
+            "approved must not be overwritten"
+        );
+        assert_eq!(
+            rows[0].user_id.as_deref(),
+            Some("alice"),
+            "alice's approval stands"
+        );
 
+        // Checkpoint still advances past the ignored event.
         let cp = backend
             .get_projector_checkpoint("approvals", &exec)
             .await
             .unwrap();
-        assert_eq!(
-            cp, seq_rejected,
-            "checkpoint advanced to rejected event seq"
-        );
+        assert_eq!(cp, seq_rejected, "checkpoint advances past the late event");
     }
 
     /// Test 3: A batch where the highest-sequence events are NON-approval events
@@ -407,7 +489,7 @@ mod tests {
         let applied = projector.tick().await.unwrap();
 
         // node_map has nodeA (pending from ToolApprovalRequired).
-        // batch_max = seq_completed; apply_approval_projection advances checkpoint there.
+        // batch_max = seq_completed; apply_approval_projection_batch advances checkpoint there.
         assert_eq!(applied, 1, "pending row written");
 
         let rows = backend.get_approval_projection(&exec).await.unwrap();
@@ -577,7 +659,9 @@ mod tests {
             .find(|r| r.node_id == "nodeB")
             .expect("nodeB must be added by the restart tick");
 
-        // nodeA was NOT re-read: still approved (seq 1..N excluded by checkpoint).
+        // nodeA was NOT re-read from events: still approved (seq 1..N excluded by
+        // checkpoint).  The seeded state from get_approval_projection confirmed its
+        // "approved" status and the late-rejection path correctly ignored it.
         assert_eq!(row_a.status, "approved", "nodeA must not be re-processed");
         assert_eq!(row_a.user_id.as_deref(), Some("alice"));
 
@@ -675,13 +759,12 @@ mod tests {
     ///   - nodeC (Requested only): status="pending", tool_name and approver
     ///     preserved from the ToolApprovalRequired event.
     ///
-    /// Crash-mid-apply safety note: `apply_approval_projection` and the checkpoint
-    /// advance share one SQLite transaction (proven by the 2h-1 atomic tests in
-    /// state/tests/projector.rs).  A checkpoint can therefore never be observed as
-    /// advanced past an unapplied approval row — it is structurally impossible to
-    /// land in a state where the checkpoint says "seq N processed" but the row for
-    /// that seq is absent from proj_approvals.  Rely on that atomic test rather
-    /// than duplicating a forced-failure scenario here.
+    /// Crash-mid-apply safety note: `apply_approval_projection_batch` and the
+    /// checkpoint advance share one SQLite transaction (proven by the 2h-1
+    /// atomic tests in state/tests/projector.rs).  A checkpoint can therefore
+    /// never be observed as advanced past an unapplied approval row — it is
+    /// structurally impossible to land in a state where the checkpoint says
+    /// "seq N processed" but the row for that seq is absent from proj_approvals.
     #[tokio::test]
     async fn read_fidelity_three_node_abc() {
         let backend = Arc::new(InMemoryBackend::new());
@@ -777,5 +860,258 @@ mod tests {
             "pending row must preserve approver from ToolApprovalRequired event"
         );
         assert!(row_c.user_id.is_none(), "pending row has no user_id");
+    }
+
+    // ── C1: batch atomicity ───────────────────────────────────────────────────
+
+    /// C1: A batch with 3 Required events (nodes A, B, C) in one tick must write
+    /// all 3 rows and advance the checkpoint to batch_max in one atomic apply.
+    ///
+    /// The single-transaction guarantee means a crash mid-batch leaves NO rows
+    /// committed and the checkpoint un-advanced; the next tick re-reads the same
+    /// events and re-applies correctly.  (The happy-path here proves the all-3
+    /// case; the rollback guarantee is structural — one `BEGIN IMMEDIATE` in
+    /// `apply_approval_projection_batch`.)
+    #[tokio::test]
+    async fn batch_atomic_three_nodes_all_committed() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let exec = ExecutionId::new();
+        backend
+            .create_execution(running_execution(&exec))
+            .await
+            .unwrap();
+
+        let _seq_a = backend
+            .append_event(ev_tool_approval_required(&exec, "nodeA"))
+            .await
+            .unwrap();
+        let _seq_b = backend
+            .append_event(ev_tool_approval_required(&exec, "nodeB"))
+            .await
+            .unwrap();
+        let seq_c = backend
+            .append_event(ev_tool_approval_required(&exec, "nodeC"))
+            .await
+            .unwrap();
+
+        let projector = Projector::new(backend.clone());
+        let applied = projector.tick().await.expect("tick must succeed");
+        assert_eq!(applied, 3, "all 3 nodes written in one atomic batch apply");
+
+        let rows = backend.get_approval_projection(&exec).await.unwrap();
+        assert_eq!(rows.len(), 3, "all 3 rows present after batch apply");
+
+        let node_ids: Vec<&str> = rows.iter().map(|r| r.node_id.as_str()).collect();
+        assert!(node_ids.contains(&"nodeA"), "nodeA must be in projection");
+        assert!(node_ids.contains(&"nodeB"), "nodeB must be in projection");
+        assert!(node_ids.contains(&"nodeC"), "nodeC must be in projection");
+
+        let cp = backend
+            .get_projector_checkpoint("approvals", &exec)
+            .await
+            .unwrap();
+        assert_eq!(
+            cp, seq_c,
+            "checkpoint == batch_max: all rows + checkpoint committed atomically"
+        );
+    }
+
+    // ── I2: pagination ────────────────────────────────────────────────────────
+
+    /// I2: Create 105 Running executions (> one 100-row page) each with a pending
+    /// approval.  A single tick() must project ALL 105; none dropped due to the
+    /// old hard-coded limit=100,offset=0 query.
+    #[tokio::test]
+    async fn pagination_covers_more_than_100_running_executions() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let count = 105usize;
+        let mut exec_ids = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let exec = ExecutionId::new();
+            backend
+                .create_execution(running_execution(&exec))
+                .await
+                .unwrap();
+            backend
+                .append_event(ev_tool_approval_required(&exec, "nodeA"))
+                .await
+                .unwrap();
+            exec_ids.push(exec);
+        }
+
+        let projector = Projector::new(backend.clone());
+        let applied = projector.tick().await.expect("tick must succeed");
+        assert_eq!(
+            applied, count,
+            "all {count} executions must be projected (pagination works)"
+        );
+
+        // Verify every execution individually has its row.
+        let mut missing = 0usize;
+        for exec in &exec_ids {
+            let rows = backend.get_approval_projection(exec).await.unwrap();
+            if rows.is_empty() {
+                missing += 1;
+            }
+        }
+        assert_eq!(
+            missing, 0,
+            "every execution must have a projected row — {missing} were missing"
+        );
+    }
+
+    // ── I3: first-decision-wins ───────────────────────────────────────────────
+
+    /// I3a: Required(s1) + Approved-alice(s2) + Rejected-bob(s3) in one tick →
+    /// projection shows approved/alice (first decision wins within batch).
+    #[tokio::test]
+    async fn first_decision_wins_approved_beats_same_tick_rejection() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let exec = ExecutionId::new();
+        backend
+            .create_execution(running_execution(&exec))
+            .await
+            .unwrap();
+
+        backend
+            .append_event(ev_tool_approval_required(&exec, "nodeA"))
+            .await
+            .unwrap();
+        backend
+            .append_event(ev_approval_received(
+                &exec,
+                "nodeA",
+                "alice",
+                ApprovalDecision::Approved,
+            ))
+            .await
+            .unwrap();
+        let seq_last = backend
+            .append_event(ev_approval_received(
+                &exec,
+                "nodeA",
+                "bob",
+                ApprovalDecision::Rejected,
+            ))
+            .await
+            .unwrap();
+
+        let projector = Projector::new(backend.clone());
+        let applied = projector.tick().await.expect("tick must succeed");
+        assert_eq!(applied, 1, "exactly one row written");
+
+        let rows = backend.get_approval_projection(&exec).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status, "approved",
+            "first decision wins: approved/alice beats rejected/bob"
+        );
+        assert_eq!(rows[0].user_id.as_deref(), Some("alice"));
+
+        let cp = backend
+            .get_projector_checkpoint("approvals", &exec)
+            .await
+            .unwrap();
+        assert_eq!(
+            cp, seq_last,
+            "checkpoint advances to batch_max even though last event was ignored"
+        );
+    }
+
+    /// I3b: Orphan ApprovalReceived (no prior ToolApprovalRequired) must not
+    /// create a projection row.  The checkpoint still advances.
+    #[tokio::test]
+    async fn orphan_approval_received_creates_no_row() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let exec = ExecutionId::new();
+        backend
+            .create_execution(running_execution(&exec))
+            .await
+            .unwrap();
+
+        let seq = backend
+            .append_event(ev_approval_received(
+                &exec,
+                "nodeA",
+                "alice",
+                ApprovalDecision::Approved,
+            ))
+            .await
+            .unwrap();
+
+        let projector = Projector::new(backend.clone());
+        let applied = projector.tick().await.expect("tick must succeed");
+        assert_eq!(applied, 0, "orphan ApprovalReceived must not create a row");
+
+        let rows = backend.get_approval_projection(&exec).await.unwrap();
+        assert!(rows.is_empty(), "no projection rows for orphan decision");
+
+        let cp = backend
+            .get_projector_checkpoint("approvals", &exec)
+            .await
+            .unwrap();
+        assert_eq!(cp, seq, "checkpoint still advances past orphan event");
+    }
+
+    /// I3c: Decision split across two ticks — Required+Approved in tick 1, a late
+    /// Rejected in tick 2.  Projection stays approved (seed-from-existing-projection
+    /// path: nodeA is "approved" at tick-2 seed time, so the Rejected is ignored).
+    #[tokio::test]
+    async fn cross_tick_first_decision_wins_stays_approved() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let exec = ExecutionId::new();
+        backend
+            .create_execution(running_execution(&exec))
+            .await
+            .unwrap();
+
+        backend
+            .append_event(ev_tool_approval_required(&exec, "nodeA"))
+            .await
+            .unwrap();
+        backend
+            .append_event(ev_approval_received(
+                &exec,
+                "nodeA",
+                "alice",
+                ApprovalDecision::Approved,
+            ))
+            .await
+            .unwrap();
+
+        let projector = Projector::new(backend.clone());
+        projector.tick().await.unwrap(); // Tick 1: nodeA approved.
+
+        // Late rejection arrives in a separate tick.
+        let seq_late = backend
+            .append_event(ev_approval_received(
+                &exec,
+                "nodeA",
+                "bob",
+                ApprovalDecision::Rejected,
+            ))
+            .await
+            .unwrap();
+
+        let applied = projector.tick().await.expect("tick 2 must succeed");
+        assert_eq!(
+            applied, 0,
+            "late rejection ignored: nodeA already decided in prior tick"
+        );
+
+        let rows = backend.get_approval_projection(&exec).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status, "approved",
+            "nodeA stays approved after cross-tick late rejection"
+        );
+        assert_eq!(rows[0].user_id.as_deref(), Some("alice"));
+
+        let cp = backend
+            .get_projector_checkpoint("approvals", &exec)
+            .await
+            .unwrap();
+        assert_eq!(cp, seq_late, "checkpoint advances past the ignored event");
     }
 }

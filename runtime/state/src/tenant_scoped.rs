@@ -1703,6 +1703,82 @@ impl StateBackend for TenantScopedSqliteBackend {
         Ok(())
     }
 
+    async fn apply_approval_projection_batch(
+        &self,
+        rows: Vec<crate::backend::ApprovalProjectionRow>,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+        new_checkpoint: i64,
+    ) -> BackendResult<()> {
+        let exec_id_str = execution_id_str(execution_id);
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
+
+        for row in rows {
+            let context_json = row
+                .context
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+
+            sqlx::query(
+                r#"INSERT INTO proj_approvals
+                   (execution_id, node_id, status, user_id, comment, last_sequence,
+                    tool_name, approver, context_json, tenant_id, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(execution_id, node_id) DO UPDATE SET
+                     status        = excluded.status,
+                     user_id       = excluded.user_id,
+                     comment       = excluded.comment,
+                     last_sequence = excluded.last_sequence,
+                     tool_name     = excluded.tool_name,
+                     approver      = excluded.approver,
+                     context_json  = excluded.context_json,
+                     updated_at    = excluded.updated_at"#,
+            )
+            .bind(&exec_id_str)
+            .bind(&row.node_id)
+            .bind(&row.status)
+            .bind(&row.user_id)
+            .bind(&row.comment)
+            .bind(row.last_sequence)
+            .bind(&row.tool_name)
+            .bind(&row.approver)
+            .bind(&context_json)
+            .bind(&self.tenant_id.0)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+        }
+
+        // Advance checkpoint once for the whole batch.
+        sqlx::query(
+            r#"INSERT INTO projector_checkpoints
+               (projection_name, execution_id, last_sequence, tenant_id, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(projection_name, execution_id) DO UPDATE SET
+                 last_sequence = excluded.last_sequence,
+                 updated_at    = excluded.updated_at"#,
+        )
+        .bind(projection_name)
+        .bind(&exec_id_str)
+        .bind(new_checkpoint)
+        .bind(&self.tenant_id.0)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        tx.commit().await.map_err(map_db_err)?;
+        Ok(())
+    }
+
     async fn get_approval_projection(
         &self,
         execution_id: &ExecutionId,

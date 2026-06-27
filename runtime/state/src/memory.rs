@@ -686,6 +686,25 @@ impl StateBackend for InMemoryBackend {
         Ok(())
     }
 
+    async fn apply_approval_projection_batch(
+        &self,
+        rows: Vec<crate::backend::ApprovalProjectionRow>,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+        new_checkpoint: i64,
+    ) -> BackendResult<()> {
+        // In-memory: DashMap operations are individually atomic; we apply all
+        // rows then the checkpoint in a tight synchronous sequence with no
+        // await between them — sufficient for single-threaded test use.
+        for row in rows {
+            let key = (row.execution_id.0.to_string(), row.node_id.clone());
+            self.proj_approvals.insert(key, row);
+        }
+        let cp_key = (projection_name.to_string(), execution_id.0.to_string());
+        self.projector_checkpoints.insert(cp_key, new_checkpoint);
+        Ok(())
+    }
+
     async fn get_approval_projection(
         &self,
         execution_id: &ExecutionId,

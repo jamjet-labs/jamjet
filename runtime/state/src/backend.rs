@@ -299,6 +299,26 @@ pub trait StateBackend: Send + Sync {
         new_checkpoint: i64,
     ) -> BackendResult<()>;
 
+    /// Atomically UPSERT all approval projection rows for one execution AND
+    /// advance the named projection's checkpoint to `new_checkpoint`, in ONE
+    /// transaction.
+    ///
+    /// This is the correct primitive to use when a tick produces multiple
+    /// changed nodes: a crash after writing row 1 but before row 2 would
+    /// otherwise leave the checkpoint advanced past unwritten rows.  With this
+    /// method the checkpoint advances IFF every row in the batch committed.
+    ///
+    /// If `rows` is empty the checkpoint is still advanced (callers that want
+    /// to skip the checkpoint update when there is nothing to write should
+    /// check before calling).
+    async fn apply_approval_projection_batch(
+        &self,
+        rows: Vec<ApprovalProjectionRow>,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+        new_checkpoint: i64,
+    ) -> BackendResult<()>;
+
     /// All approval projection rows for an execution (the projected read model).
     async fn get_approval_projection(
         &self,
