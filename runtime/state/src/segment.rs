@@ -13,7 +13,6 @@ use crate::backend::{BackendResult, StateBackend, WorkItem};
 use crate::event::{Event, EventKind};
 use crate::materializer::MaterializedState;
 use crate::snapshot::Snapshot;
-use crate::tenant::DEFAULT_TENANT;
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use uuid::Uuid;
@@ -31,7 +30,7 @@ use uuid::Uuid;
 ///
 /// # Returns
 /// The `ExecutionId` of the newly created segment execution.
-// Eight parameters are required by the plan interface; suppressing the lint rather
+// Nine parameters are required by the plan interface; suppressing the lint rather
 // than breaking the caller signature with a builder/struct at this stage.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_next_segment(
@@ -43,6 +42,7 @@ pub async fn start_next_segment(
     next_segment_number: u32,
     start_node_id: &str,
     queue_type: &str,
+    tenant_id: &str,
 ) -> BackendResult<ExecutionId> {
     let new_id = ExecutionId::new();
     let now = Utc::now();
@@ -112,7 +112,7 @@ pub async fn start_next_segment(
             lease_expires_at: None,
             worker_id: None,
             lease_fence: 0,
-            tenant_id: DEFAULT_TENANT.to_string(),
+            tenant_id: tenant_id.to_string(),
         })
         .await?;
 

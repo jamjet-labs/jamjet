@@ -7,7 +7,7 @@ use chrono::Utc;
 const MAX_RETRY_AFTER_SECS: u64 = 3_600;
 use jamjet_agents::AgentRegistry;
 use jamjet_core::node::NodeKind;
-use jamjet_core::workflow::ExecutionId;
+use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use jamjet_ir::workflow::{NodeDef, WorkflowIr};
 use jamjet_policy::autonomy::{AutonomyContext, AutonomyDecision, AutonomyEnforcer};
 use jamjet_policy::engine::node_kind_tag;
@@ -17,6 +17,7 @@ use jamjet_state::backend::{StateBackend, StateBackendError, WorkItem, WorkItemI
 use jamjet_state::budget::BudgetState;
 use jamjet_state::content_hash;
 use jamjet_state::event::EventKind;
+use jamjet_state::{materialize, start_next_segment};
 use jamjet_telemetry::{gen_ai_attrs, metrics, record_gen_ai_usage};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -112,6 +113,7 @@ impl Worker {
         let execution_id = item.execution_id.clone();
         let node_id = item.node_id.clone();
         let tenant_id = item.tenant_id.clone();
+        let queue_type = item.queue_type.clone();
         let attempt = item.attempt;
         let max_attempts = item.max_attempts;
         let item_id = item.id;
@@ -367,6 +369,19 @@ impl Worker {
                                 .await
                             {
                                 heartbeat.abort();
+                                if ir.continue_as_new {
+                                    return self
+                                        .rollover_segment(
+                                            &execution_id,
+                                            &ir,
+                                            &workflow_id,
+                                            &workflow_version,
+                                            &tenant_id,
+                                            item_id,
+                                            &queue_type,
+                                        )
+                                        .await;
+                                }
                                 return r;
                             }
                             Ok(result)
@@ -1080,6 +1095,107 @@ impl Worker {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("workflow {workflow_id} v{workflow_version} not found"))?;
         serde_json::from_value(def.ir).map_err(|e| e.to_string())
+    }
+
+    // ── Continue-as-new rollover ──────────────────────────────────────────────
+
+    /// Perform a continue-as-new rollover at the strategy ceiling.
+    ///
+    /// Crash-safety order: create new segment FIRST (durable), THEN append
+    /// SegmentBoundary to old execution, THEN mark old execution terminal.
+    /// Double-roll guard: if the old execution already has a SegmentBoundary event
+    /// OR is already terminal, skip the rollover (idempotent on re-run after crash).
+    #[allow(clippy::too_many_arguments)]
+    async fn rollover_segment(
+        &self,
+        execution_id: &ExecutionId,
+        ir: &WorkflowIr,
+        workflow_id: &str,
+        workflow_version: &str,
+        tenant_id: &str,
+        item_id: WorkItemId,
+        queue_type: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Double-roll guard: check SegmentBoundary event OR terminal status.
+        let events = self.backend.get_events(execution_id).await?;
+        let already = events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }));
+        if already {
+            warn!(
+                execution_id = %execution_id,
+                "continue-as-new: SegmentBoundary already exists; skipping duplicate rollover"
+            );
+            let _ = self.backend.complete_work_item(item_id).await;
+            return Ok(());
+        }
+
+        let exec = self
+            .backend
+            .get_execution(execution_id)
+            .await?
+            .ok_or_else(|| format!("execution {execution_id} not found for rollover"))?;
+
+        if exec.status.is_terminal() {
+            warn!(
+                execution_id = %execution_id,
+                status = ?exec.status,
+                "continue-as-new: old execution already terminal; skipping rollover"
+            );
+            let _ = self.backend.complete_work_item(item_id).await;
+            return Ok(());
+        }
+
+        let next_seg = exec.segment_number + 1;
+        let start_node_id = ir.start_node.as_str();
+
+        // Materialize carried state.
+        let mat = materialize(self.backend.as_ref(), execution_id).await?;
+
+        // ORDER: new segment FIRST (crash-safe chain), THEN SegmentBoundary audit,
+        // THEN terminal status on old execution.
+        let next_id = start_next_segment(
+            self.backend.as_ref(),
+            execution_id,
+            &mat,
+            workflow_id,
+            workflow_version,
+            next_seg,
+            start_node_id,
+            queue_type,
+            tenant_id,
+        )
+        .await?;
+
+        // Append SegmentBoundary to the OLD execution's event log (pure audit).
+        let seq = self.backend.latest_sequence(execution_id).await? + 1;
+        self.backend
+            .append_event(jamjet_state::Event::new(
+                execution_id.clone(),
+                seq,
+                EventKind::SegmentBoundary {
+                    segment_number: next_seg,
+                    next_execution_id: next_id.to_string(),
+                },
+            ))
+            .await?;
+
+        // Mark old execution terminal (LimitExceeded = clean terminal, NOT failed).
+        self.backend
+            .update_execution_status(execution_id, WorkflowStatus::LimitExceeded)
+            .await?;
+
+        // Clean up the current work item so it doesn't linger as a claimed item.
+        let _ = self.backend.complete_work_item(item_id).await;
+
+        info!(
+            old_execution_id = %execution_id,
+            new_execution_id = %next_id,
+            segment_number = next_seg,
+            "continue-as-new: rolled over to new segment"
+        );
+
+        Ok(())
     }
 }
 
@@ -1969,6 +2085,355 @@ mod tests {
             re_claimed.unwrap().attempt,
             2,
             "re-claimed item must be at attempt=2"
+        );
+    }
+
+    // ── Continue-as-new tests (Task 2g-3) ────────────────────────────────────
+
+    /// Returns 1 input token -- triggers any IR with token_budget.total_tokens: 0.
+    struct BudgetTriggerExecutor;
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for BudgetTriggerExecutor {
+        async fn execute(
+            &self,
+            _item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            Ok(ExecutionResult {
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({}),
+                duration_ms: 1,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: Some(1), // triggers total_tokens budget check
+                output_tokens: None,
+                finish_reason: None,
+            })
+        }
+    }
+
+    fn budget_ceiling_ir_json(continue_as_new: bool) -> serde_json::Value {
+        serde_json::json!({
+            "workflow_id": "seg-wf",
+            "version": "1.0.0",
+            "state_schema": "{}",
+            "start_node": "n1",
+            "continue_as_new": continue_as_new,
+            "token_budget": { "total_tokens": 0 }, // any >0 tokens exceeds this
+            "nodes": {
+                "n1": {
+                    "id": "n1",
+                    "kind": {
+                        "type": "tool",
+                        "tool_ref": "stub",
+                        "input_mapping": {},
+                        "output_schema": "{}"
+                    }
+                }
+            },
+            "edges": [],
+            "retry_policies": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {}
+        })
+    }
+
+    async fn setup_budget_backend(continue_as_new: bool) -> (Arc<InMemoryBackend>, ExecutionId) {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+
+        let now = Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "seg-wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: serde_json::json!({ "counter": 5 }),
+                current_state: serde_json::json!({ "counter": 5 }),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+
+        backend
+            .store_workflow(jamjet_state::backend::WorkflowDefinition {
+                workflow_id: "seg-wf".into(),
+                version: "1.0.0".into(),
+                ir: budget_ceiling_ir_json(continue_as_new),
+                created_at: Utc::now(),
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+
+        backend
+            .enqueue_work_item(jamjet_state::backend::WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "default".into(),
+                payload: serde_json::json!({
+                    "workflow_id": "seg-wf",
+                    "workflow_version": "1.0.0"
+                }),
+                attempt: 0,
+                max_attempts: 3,
+                created_at: Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+
+        (backend, eid)
+    }
+
+    /// With `continue_as_new: true`, hitting the token budget ceiling must roll
+    /// over to a new linked segment instead of returning Err.
+    #[tokio::test]
+    async fn continue_as_new_rolls_over_at_budget_ceiling() {
+        let (backend, old_eid) = setup_budget_backend(true).await;
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("tool", Arc::new(BudgetTriggerExecutor));
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        let result = worker.execute_item(item).await;
+        assert!(
+            result.is_ok(),
+            "execute_item must return Ok(()) after rollover; got: {result:?}"
+        );
+
+        let old_events = backend.get_events(&old_eid).await.unwrap();
+        let boundary = old_events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }))
+            .expect("old execution must have a SegmentBoundary event");
+
+        let (next_seg, next_id_str) = match &boundary.kind {
+            EventKind::SegmentBoundary {
+                segment_number,
+                next_execution_id,
+            } => (*segment_number, next_execution_id.clone()),
+            _ => unreachable!(),
+        };
+        assert_eq!(next_seg, 1, "segment_number in SegmentBoundary must be 1");
+
+        let old_exec = backend
+            .get_execution(&old_eid)
+            .await
+            .unwrap()
+            .expect("old execution must still exist");
+        assert_eq!(
+            old_exec.status,
+            WorkflowStatus::LimitExceeded,
+            "old execution must be LimitExceeded, not Failed"
+        );
+
+        // ExecutionId Display is "exec_{uuid_simple}" (no hyphens). Strip the prefix
+        // and parse the simple UUID to reconstruct the ExecutionId.
+        let new_eid = if next_id_str.starts_with("exec_") {
+            let uuid_str = next_id_str.trim_start_matches("exec_");
+            ExecutionId(uuid::Uuid::parse_str(uuid_str).expect("valid uuid"))
+        } else {
+            ExecutionId(uuid::Uuid::parse_str(&next_id_str).expect("valid uuid"))
+        };
+
+        let new_exec = backend
+            .get_execution(&new_eid)
+            .await
+            .unwrap()
+            .expect("new execution must exist");
+
+        assert_eq!(
+            new_exec.parent_execution_id.as_ref(),
+            Some(&old_eid),
+            "new execution must link to the old execution"
+        );
+        assert_eq!(
+            new_exec.segment_number, 1,
+            "new execution must have segment_number = 1"
+        );
+
+        let old_mat = jamjet_state::materialize(backend.as_ref(), &old_eid)
+            .await
+            .expect("materialize old execution");
+        assert_eq!(
+            new_exec.current_state, old_mat.current_state,
+            "new execution current_state must equal old execution's materialized current_state"
+        );
+
+        let new_item = backend
+            .claim_work_item("test-worker-2", &["default"])
+            .await
+            .unwrap()
+            .expect("new execution must have a claimable work item");
+        assert_eq!(
+            new_item.execution_id, new_eid,
+            "new work item must belong to the new segment execution"
+        );
+        assert_eq!(
+            new_item.node_id, "n1",
+            "new work item must target the start node"
+        );
+    }
+
+    /// With `continue_as_new: false`, budget ceiling must return Err (old behavior).
+    #[tokio::test]
+    async fn continue_as_new_false_keeps_old_terminate_behavior() {
+        let (backend, old_eid) = setup_budget_backend(false).await;
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("tool", Arc::new(BudgetTriggerExecutor));
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        let result = worker.execute_item(item).await;
+        assert!(
+            result.is_err(),
+            "with continue_as_new=false, execute_item must return Err on budget ceiling"
+        );
+
+        let old_events = backend.get_events(&old_eid).await.unwrap();
+        let boundary_count = old_events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }))
+            .count();
+        assert_eq!(
+            boundary_count, 0,
+            "no SegmentBoundary event when continue_as_new=false"
+        );
+
+        let old_exec = backend
+            .get_execution(&old_eid)
+            .await
+            .unwrap()
+            .expect("old execution must still exist");
+        assert_ne!(
+            old_exec.status,
+            WorkflowStatus::LimitExceeded,
+            "old execution must NOT be LimitExceeded when continue_as_new=false"
+        );
+    }
+
+    /// Double-roll guard: a second work item for the OLD execution after a
+    /// successful rollover must not create a second new segment.
+    #[tokio::test]
+    async fn continue_as_new_double_roll_guard() {
+        let (backend, old_eid) = setup_budget_backend(true).await;
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("tool", Arc::new(BudgetTriggerExecutor));
+
+        // First rollover.
+        let item1 = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item1 must be claimable");
+        worker
+            .execute_item(item1)
+            .await
+            .expect("first rollover must succeed");
+
+        // Verify first rollover happened.
+        let old_events = backend.get_events(&old_eid).await.unwrap();
+        assert_eq!(
+            old_events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }))
+                .count(),
+            1,
+            "must have exactly one SegmentBoundary after first rollover"
+        );
+
+        // Simulate a second work item arriving for the OLD execution
+        // (e.g., crash-recovery re-enqueue scenario).
+        backend
+            .enqueue_work_item(jamjet_state::backend::WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: old_eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "default".into(),
+                payload: serde_json::json!({
+                    "workflow_id": "seg-wf",
+                    "workflow_version": "1.0.0"
+                }),
+                attempt: 0,
+                max_attempts: 3,
+                created_at: Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+
+        // Claim items until we find the OLD execution's second item.
+        let item2a = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        let item2_old = if item2a.execution_id != old_eid {
+            backend
+                .claim_work_item("test-worker", &["default"])
+                .await
+                .unwrap()
+                .expect("old execution's second item must be claimable")
+        } else {
+            item2a
+        };
+
+        assert_eq!(
+            item2_old.execution_id, old_eid,
+            "item2_old must belong to the OLD execution"
+        );
+
+        let result = worker.execute_item(item2_old).await;
+        assert!(
+            result.is_ok(),
+            "double-roll guard path must return Ok(()): {result:?}"
+        );
+
+        let old_events_after = backend.get_events(&old_eid).await.unwrap();
+        assert_eq!(
+            old_events_after
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }))
+                .count(),
+            1,
+            "must still have exactly one SegmentBoundary event after double-roll attempt"
         );
     }
 }

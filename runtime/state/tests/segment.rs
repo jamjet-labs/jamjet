@@ -309,7 +309,7 @@ async fn assert_start_next_segment(backend: &dyn StateBackend) {
     let carried = carried_materialized_state();
 
     let new_id = start_next_segment(
-        backend, &parent_id, &carried, "seg-wf", "1.0.0", 1, "start", "general",
+        backend, &parent_id, &carried, "seg-wf", "1.0.0", 1, "start", "general", "default",
     )
     .await
     .expect("start_next_segment must succeed");
