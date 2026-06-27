@@ -9,7 +9,12 @@ import httpx
 import pytest
 
 import jamjet.model.sidecar_server as sidecar_module
-from jamjet.model.sidecar_server import _complete, app
+from jamjet.model.sidecar_server import (
+    _RATE_LIMIT_FALLBACK_SECS,
+    _complete,
+    _extract_retry_after,
+    app,
+)
 from jamjet.model.types import ModelResponse
 
 
@@ -261,6 +266,36 @@ async def test_complete_route_rate_limited_propagates_retry_after(
 
     assert resp.status_code == 429
     assert resp.json()["retry_after"] == 30, f"expected 30, got {resp.json()}"
+
+
+def test_extract_retry_after_negative_header_clamps_to_zero() -> None:
+    """A negative Retry-After header value must clamp to 0, never go negative (2f-5)."""
+
+    class _FakeResp:
+        headers = {"retry-after": "-1"}
+
+    class _ExcError(Exception):
+        status_code = 429
+        response = _FakeResp()
+
+    result = _extract_retry_after(_ExcError())
+    assert result == 0, f"expected 0 for Retry-After: -1, got {result}"
+
+
+def test_extract_retry_after_non_numeric_header_falls_back_to_default() -> None:
+    """A non-numeric Retry-After (e.g. an HTTP-date) must not crash; fall back to default (2f-5)."""
+
+    class _FakeResp:
+        headers = {"retry-after": "Wed, 21 Oct 2015 07:28:00 GMT"}
+
+    class _ExcError(Exception):
+        status_code = 429
+        response = _FakeResp()
+
+    result = _extract_retry_after(_ExcError())
+    assert result == _RATE_LIMIT_FALLBACK_SECS, (
+        f"non-numeric Retry-After must fall back to {_RATE_LIMIT_FALLBACK_SECS}, got {result}"
+    )
 
 
 async def test_complete_route_model_denied_is_non_200(monkeypatch: pytest.MonkeyPatch) -> None:

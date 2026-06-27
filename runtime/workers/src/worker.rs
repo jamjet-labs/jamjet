@@ -518,49 +518,47 @@ impl Worker {
                         + chrono::Duration::seconds(retry_after_secs as i64))
                     .to_rfc3339();
 
-                    // Append NodeParked before park_work_item (audit event — non-terminal;
-                    // no commit_turn; the item must stay re-claimable). On a stale-fence
-                    // park (Ok(false)) this event is a harmless audit record — the newer
-                    // attempt already owns the item.
-                    let seq = match self.backend.latest_sequence(&execution_id).await {
-                        Ok(s) => s + 1,
-                        Err(e) => {
-                            warn!(
-                                execution_id = %execution_id,
-                                node_id = %node_id,
-                                "Failed to get latest sequence for NodeParked; abandoning: {e}"
-                            );
-                            return Ok(());
-                        }
-                    };
-                    if let Err(e) = self
-                        .backend
-                        .append_event(jamjet_state::Event::new(
-                            execution_id.clone(),
-                            seq,
-                            EventKind::NodeParked {
-                                node_id: node_id.clone(),
-                                attempt: next_attempt,
-                                retry_after: retry_after.clone(),
-                            },
-                        ))
-                        .await
-                    {
-                        warn!(
-                            execution_id = %execution_id,
-                            node_id = %node_id,
-                            "Failed to append NodeParked event; abandoning park: {e}"
-                        );
-                        return Ok(());
-                    }
-
                     // Fence-guarded reset to pending with retry_after backoff.
+                    // Park first; only append NodeParked if the park actually succeeds.
+                    // A stale-fence park (Ok(false)) must NOT produce a false audit record.
                     match self
                         .backend
                         .park_work_item(item_id, lease_fence, &retry_after, next_attempt)
                         .await
                     {
                         Ok(true) => {
+                            // Park succeeded — now record the audit event.
+                            let seq = match self.backend.latest_sequence(&execution_id).await {
+                                Ok(s) => s + 1,
+                                Err(e) => {
+                                    warn!(
+                                        execution_id = %execution_id,
+                                        node_id = %node_id,
+                                        "Failed to get latest sequence for NodeParked; abandoning: {e}"
+                                    );
+                                    return Ok(());
+                                }
+                            };
+                            if let Err(e) = self
+                                .backend
+                                .append_event(jamjet_state::Event::new(
+                                    execution_id.clone(),
+                                    seq,
+                                    EventKind::NodeParked {
+                                        node_id: node_id.clone(),
+                                        attempt: next_attempt,
+                                        retry_after: retry_after.clone(),
+                                    },
+                                ))
+                                .await
+                            {
+                                warn!(
+                                    execution_id = %execution_id,
+                                    node_id = %node_id,
+                                    "Failed to append NodeParked event; abandoning: {e}"
+                                );
+                                return Ok(());
+                            }
                             info!(
                                 execution_id = %execution_id,
                                 node_id = %node_id,
@@ -571,7 +569,7 @@ impl Worker {
                         }
                         Ok(false) => {
                             // Stale fence — a newer attempt already owns this item.
-                            // The NodeParked event already appended is a harmless audit record.
+                            // Do NOT append NodeParked: the park didn't succeed for this attempt.
                             warn!(
                                 execution_id = %execution_id,
                                 node_id = %node_id,

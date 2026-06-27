@@ -41,13 +41,13 @@ def _extract_retry_after(exc: BaseException) -> int:
         raw = headers.get("retry-after") or headers.get("Retry-After")
         if raw is not None:
             try:
-                return min(int(raw), _MAX_RETRY_AFTER_SECS)
+                return max(0, min(int(raw), _MAX_RETRY_AFTER_SECS))
             except (ValueError, TypeError):
                 pass
     val = getattr(exc, "retry_after", None)
     if val is not None:
         try:
-            return min(int(val), _MAX_RETRY_AFTER_SECS)
+            return max(0, min(int(val), _MAX_RETRY_AFTER_SECS))
         except (ValueError, TypeError):
             pass
     return _RATE_LIMIT_FALLBACK_SECS
