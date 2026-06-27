@@ -65,7 +65,7 @@ python main.py
 Expected output (Terminal 4): the model's final answer, followed by the tool calls
 it made durably, for example:
 
-```
+```text
 answer: It is sunny in Paris, and 19 + 23 = 42.
 
   tool get_weather({'city': 'Paris'}) -> sunny, 24C
@@ -104,10 +104,12 @@ tool is invoked, and the final answer matches the in-process run.
 ## Limitations (v1)
 
 - **Bounded `max_turns`, no early exit yet.** `max_turns` bounds the static
-  unroll and the loop runs it to completion. The per-turn gate that would
-  short-circuit as soon as the model returns a final answer is not yet wired
-  into the engine (F-2j-dynamic-loop), so size `max_turns` to the conversation
-  depth you expect. The extracted answer is the last model turn's output.
+  unroll (that many tool turns, then a final answer-only model turn) and the loop
+  runs it to completion. The per-turn gate that would short-circuit as soon as the
+  model returns a final answer is not yet wired into the engine
+  (F-2j-dynamic-loop), so size `max_turns` to the conversation depth you expect.
+  The extracted answer is that final model turn's output, which consumes the last
+  tool results.
 - **The model is re-invoked every remaining turn (cost).** Because there is no
   early exit, a real model is called once per turn for all `max_turns`, so cost
   scales with `max_turns` and the answer can drift across turns.
@@ -115,9 +117,13 @@ tool is invoked, and the final answer matches the in-process run.
   back to the model as conversation text; the Rust `ChatMessage` carries only
   `role` + `content`, so full assistant/tool message-role fidelity through the
   engine is a follow-up (F-2j-chatmessage-fidelity).
-- **A `@tool`'s return value merge-patches execution state.** A `python_tool`
-  node's return dict is applied as a `state_patch` (top-level keys replace, the
-  rest merge). This is how the loop threads `{"messages": [...]}` into the next
-  turn. Avoid returning reserved loop keys like `messages` or
-  `last_model_output` from a plain `@tool`, or you will clobber loop state
+- **The tool-dispatch node owns the `messages` state-patch, not your `@tool`.**
+  In this durable loop the `python_tool` node runs `dispatch_tool_calls` (not your
+  `@tool` directly): it executes the model's requested calls, appends each tool's
+  return value as a `role: tool` message, and returns `{"messages": [...]}`. That
+  return dict is applied as the node's `state_patch` (top-level keys replace, the
+  rest merge), which threads the accumulated conversation into the next turn. Your
+  `@tool` functions just return a result (string or JSON) that becomes tool-message
+  content — they never return the reserved loop keys (`messages`,
+  `last_model_output`), which the dispatch node and model node manage
   (F-2j-statepatch-namespace).

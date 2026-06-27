@@ -56,6 +56,9 @@ if str(_EXAMPLE_DIR) not in sys.path:
 import weather_agent  # noqa: E402  (path inserted just above)
 
 _PROMPT = "What's the weather in Paris?"
+# max_turns=2 -> two tool turns plus the final model node (__model_2__); the engine
+# does not yet evaluate gate conditions, so the static unroll visits the full chain
+# and terminates at the final model node (never at a tool-dispatch node).
 _LOOP_NODES = [
     "__model_0__",
     "__tool_gate_0__",
@@ -63,6 +66,7 @@ _LOOP_NODES = [
     "__model_1__",
     "__tool_gate_1__",
     "__tools_1__",
+    "__model_2__",
 ]
 
 
@@ -70,11 +74,12 @@ _LOOP_NODES = [
 
 
 class ScriptedModel:
-    """A deterministic two-turn model, shared by the durable loop and the
-    in-process run so the parity assertion compares like for like.
+    """A deterministic model, shared by the durable loop and the in-process run so
+    the parity assertion compares like for like.
 
-    Turn 0 -> one tool call: ``get_weather(city="Paris")`` (finish ``tool_calls``).
-    Turn 1 -> a final answer with no tool calls (finish ``stop``).
+    Turn 0     -> one tool call: ``get_weather(city="Paris")`` (finish ``tool_calls``).
+    Turn 1 on  -> a final answer with no tool calls (finish ``stop``); this also
+                  covers the bounded final model node the durable unroll appends.
     """
 
     FINAL_ANSWER = "It is sunny in Paris."
@@ -224,9 +229,9 @@ async def test_agent_loop_ir_runs_model_tool_model_and_terminates() -> None:
     model = ScriptedModel()
     visited = await drive_agent_loop(ir, state, model)
 
-    # The loop ran model -> tool -> model and terminated at the unroll bound.
+    # The loop ran model -> tool -> model and terminated at the final model node.
     assert visited == _LOOP_NODES
-    assert model.calls == 2  # exactly two model turns
+    assert model.calls == 3  # two turn-models + the final answer model
 
     # The tool was actually invoked once, with the model's arguments, and its
     # result was appended to the running messages (message accumulation).

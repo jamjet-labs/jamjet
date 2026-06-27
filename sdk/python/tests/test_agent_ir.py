@@ -83,8 +83,9 @@ def test_node_and_edge_invariants():
 # ── Model nodes ───────────────────────────────────────────────────────────────
 
 
-def test_three_model_nodes_each_carry_both_tool_schemas():
+def test_turn_model_nodes_each_carry_both_tool_schemas():
     ir = compile_agent_to_ir(_agent(), "hi", max_turns=3)
+    # The per-turn model nodes (0..max_turns-1) carry the tool schemas.
     model_ids = [f"__model_{t}__" for t in range(3)]
     assert all(mid in ir["nodes"] for mid in model_ids)
     for mid in model_ids:
@@ -103,6 +104,21 @@ def test_three_model_nodes_each_carry_both_tool_schemas():
         assert params["type"] == "object"
         assert params["properties"]["city"] == "string"
         assert params["required"] == ["city"]
+
+
+def test_final_model_node_carries_no_tools_and_ends():
+    """The final model node (index == max_turns) consumes the last tool results and
+    must answer (no tool schemas), and is the only node routing to `end` besides the
+    per-turn gates — the terminal is always reached via a model node."""
+    ir = compile_agent_to_ir(_agent(), "hi", max_turns=3)
+    final = ir["nodes"]["__model_3__"]
+    assert final["kind"]["type"] == "model"
+    assert final["kind"]["tools"] == [], "final model must offer no tools so it answers"
+    assert final["labels"].get("jamjet.agent.final") == "true"
+    assert ("__model_3__", "end") in _edge_set(ir)
+    # No node with a tool-dispatch kind routes directly to `end`.
+    tool_ids = {nid for nid, n in ir["nodes"].items() if n["kind"]["type"] == "python_fn"}
+    assert not any(frm in tool_ids and to == "end" for frm, to in _edge_set(ir))
 
 
 # ── Condition gates ───────────────────────────────────────────────────────────
@@ -157,13 +173,16 @@ def test_loop_edges_route_model_gate_tools_next():
         assert (f"__model_{t}__", f"__tool_gate_{t}__") in edges
         assert (f"__tool_gate_{t}__", f"__tools_{t}__") in edges
         assert (f"__tool_gate_{t}__", "end") in edges
-    # tools loop forward to the next model node...
+    # Every tools node loops forward to the NEXT model node — including the last
+    # turn, whose dispatch flows into the final model node (never directly to end).
     assert (f"__tools_{0}__", "__model_1__") in edges
     assert (f"__tools_{1}__", "__model_2__") in edges
-    # ...except the last turn, which is bounded -> end.
-    assert (f"__tools_{2}__", "end") in edges
-    assert ("__tools_2__", "__model_3__") not in edges
-    assert "__model_3__" not in ir["nodes"]
+    assert ("__tools_2__", "__model_3__") in edges
+    assert ("__tools_2__", "end") not in edges
+    # The final model node is the bounded terminal model -> end, and has no gate.
+    assert "__model_3__" in ir["nodes"]
+    assert ("__model_3__", "end") in edges
+    assert "__tool_gate_3__" not in ir["nodes"]
 
 
 def test_terminal_is_reachable_end_sentinel():
@@ -176,7 +195,8 @@ def test_terminal_is_reachable_end_sentinel():
 def test_node_counts_scale_with_max_turns():
     ir = compile_agent_to_ir(_agent(), "hi", max_turns=4)
     kinds = [n["kind"]["type"] for n in ir["nodes"].values()]
-    assert kinds.count("model") == 4
+    # max_turns turn-models + 1 final model; one gate and one dispatch per turn.
+    assert kinds.count("model") == 5
     assert kinds.count("condition") == 4
     assert kinds.count("python_fn") == 4
 
@@ -184,10 +204,15 @@ def test_node_counts_scale_with_max_turns():
 # ── max_turns=1 + validation ──────────────────────────────────────────────────
 
 
-def test_single_turn_dispatch_routes_to_end():
+def test_single_turn_dispatch_routes_to_final_model_then_end():
     ir = compile_agent_to_ir(_agent(), "hi", max_turns=1)
-    assert set(ir["nodes"]) == {"__model_0__", "__tool_gate_0__", "__tools_0__"}
-    assert ("__tools_0__", "end") in _edge_set(ir)
+    # One turn (model_0/gate_0/tools_0) plus the final model node (model_1).
+    assert set(ir["nodes"]) == {"__model_0__", "__tool_gate_0__", "__tools_0__", "__model_1__"}
+    edges = _edge_set(ir)
+    # The single dispatch routes into the final model, which routes to end.
+    assert ("__tools_0__", "__model_1__") in edges
+    assert ("__model_1__", "end") in edges
+    assert ("__tools_0__", "end") not in edges
 
 
 def test_max_turns_must_be_positive():
@@ -204,3 +229,50 @@ def test_build_initial_state_seeds_messages_and_tools():
     assert state["messages"][1] == {"role": "user", "content": "what's the weather?"}
     assert set(state["tools"]) == {"get_weather", "search_web"}
     assert state["tools"]["get_weather"].endswith(":get_weather")
+
+
+# ── Retry policy (tool-dispatch nodes must not auto-retry) ─────────────────────
+
+
+def test_tool_dispatch_nodes_disable_retry():
+    """The __tools__ nodes run non-idempotent @tool functions, so they must carry a
+    no-retry policy (scheduler resolves no_retry -> max_attempts 1); model nodes keep
+    the rate-limit-friendly llm_default."""
+    ir = compile_agent_to_ir(_agent(), "hi", max_turns=3)
+    for t in range(3):
+        assert ir["nodes"][f"__tools_{t}__"]["retry_policy"] == "no_retry"
+        assert ir["nodes"][f"__model_{t}__"]["retry_policy"] == "llm_default"
+    assert ir["nodes"]["__model_3__"]["retry_policy"] == "llm_default"
+
+
+# ── Content-derived version + stable description (cache key + privacy) ─────────
+
+
+def test_version_is_content_derived_and_prompt_independent():
+    base = compile_agent_to_ir(_agent(), "prompt A", max_turns=3)["version"]
+    assert base.startswith("0.1.0+")
+    # Same agent + same max_turns => same cache key, regardless of the prompt.
+    assert compile_agent_to_ir(_agent(), "a different prompt", max_turns=3)["version"] == base
+    # A changed max_turns changes the cache key (a different graph).
+    assert compile_agent_to_ir(_agent(), "prompt A", max_turns=4)["version"] != base
+    # Changed instructions => changed key.
+    other = Agent(
+        "research",
+        model="anthropic/claude-sonnet-4-6",
+        tools=[get_weather, search_web],
+        instructions="You are a DIFFERENT assistant.",
+    )
+    assert compile_agent_to_ir(other, "prompt A", max_turns=3)["version"] != base
+
+
+def test_description_is_stable_and_never_the_prompt():
+    prompt = "this prompt must not leak into the workflow definition"
+    ir = compile_agent_to_ir(_agent(), prompt, max_turns=2)
+    # Instructions are set, so the description is the instructions (stable) — never the prompt.
+    assert ir["description"] == "You are a research assistant."
+    assert prompt not in ir["description"]
+    # With empty instructions, the description is a stable agent-name string, not the prompt.
+    bare = Agent("bare", model="anthropic/claude-sonnet-4-6", tools=[get_weather])
+    ir_bare = compile_agent_to_ir(bare, prompt, max_turns=2)
+    assert ir_bare["description"] == "Durable agent: bare"
+    assert prompt not in ir_bare["description"]

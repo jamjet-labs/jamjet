@@ -179,22 +179,31 @@ pub trait ModelAdapter: Send + Sync {
     ) -> Result<ModelResponse, ModelError>;
 }
 
-/// One-time warning that a native (direct-to-provider) adapter received tool
-/// schemas it does not forward.
+/// One-time-per-adapter warning that a native (direct-to-provider) adapter
+/// received tool schemas it does not forward.
 ///
 /// The native adapters (anthropic/openai/google/ollama) map only `role` +
 /// `content` and never send `request.tools` to the provider, so a Model call
 /// that carries tools silently no-ops and an agent tool loop degenerates. Tool
 /// calls must route through the model-seam sidecar (`JAMJET_MODEL_SEAM_URL`),
-/// which forwards tools. Logged once per process so a degenerate loop's
-/// repeated calls do not spam the log.
+/// which forwards tools. Logged once per distinct adapter so a degenerate loop's
+/// repeated calls do not spam the log, while a second adapter still gets its own
+/// warning (a single global `Once` would let the first adapter silence the rest).
 pub(crate) fn warn_tools_not_forwarded(adapter: &'static str) {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    // `insert` returns true the first time this adapter name is seen.
+    if warned
+        .lock()
+        .expect("warn_tools_not_forwarded mutex poisoned")
+        .insert(adapter)
+    {
         tracing::warn!(
             adapter,
             "tools provided but this adapter does not forward them; \
              use the model seam sidecar (JAMJET_MODEL_SEAM_URL) for tool calls"
         );
-    });
+    }
 }

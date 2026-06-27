@@ -123,6 +123,20 @@ async def test_registry_fallback_when_not_in_map():
     assert result["messages"][1]["content"] == "registry: v"
 
 
+async def test_registry_fallback_when_map_ref_is_stale():
+    """A present-but-non-importable map ref must not mask the @tool registry: the
+    bad ref fails to import, then the name resolves via the registry."""
+    result = await dispatch_tool_calls(
+        {
+            "messages": [],
+            "tool_calls": [{"id": "c1", "name": "registry_tool", "arguments": {"value": "v"}}],
+            # Stale ref: the module/attr no longer exists, but the @tool is registered.
+            "tools": {"registry_tool": "jamjet._gone_module:registry_tool"},
+        }
+    )
+    assert result["messages"][1]["content"] == "registry: v"
+
+
 async def test_unknown_tool_raises():
     with pytest.raises(KeyError, match="nope"):
         await dispatch_tool_calls(

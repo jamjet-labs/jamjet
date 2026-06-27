@@ -112,6 +112,29 @@ impl SidecarModelAdapter {
             })
             .collect();
 
+        // 2j fail-closed: when the model is requesting tool calls, this data drives
+        // tool dispatch and tool_call_id correlation downstream. A missing/empty
+        // array, or a call with a blank id or name, would silently degrade to
+        // "no tool executed" or mismatched correlation — a provider/sidecar bug
+        // must surface as an error here rather than as a wrong answer.
+        if finish_reason == "tool_calls" {
+            if tool_calls.is_empty() {
+                return Err(ModelError::Serialization(
+                    "sidecar finish_reason is 'tool_calls' but tool_calls is missing or empty"
+                        .to_string(),
+                ));
+            }
+            if let Some(bad) = tool_calls
+                .iter()
+                .find(|tc| tc.id.is_empty() || tc.name.is_empty())
+            {
+                return Err(ModelError::Serialization(format!(
+                    "sidecar tool_call missing id or name (id={:?}, name={:?})",
+                    bad.id, bad.name
+                )));
+            }
+        }
+
         Ok(ModelResponse {
             content,
             model,
@@ -575,6 +598,71 @@ mod tests {
         assert_eq!(tc.id, "c1");
         assert_eq!(tc.name, "get_weather");
         assert_eq!(tc.arguments, serde_json::json!({"city": "SF"}));
+    }
+
+    // 2j fail-closed: finish_reason "tool_calls" but no tool_calls array must Err,
+    // not silently degrade to an empty dispatch.
+    #[tokio::test]
+    async fn chat_errors_when_tool_calls_missing_for_tool_finish() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("POST", "/v1/complete")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                "message": {"content": null, "role": "assistant"},
+                "finish_reason": "tool_calls",
+                "input_tokens": 5,
+                "output_tokens": 3,
+                "model": "anthropic/claude-sonnet-4-6"
+            }"#,
+            )
+            .create_async()
+            .await;
+
+        let adapter = SidecarModelAdapter::new(server.url());
+        let req = ModelRequest::new(vec![ChatMessage::user("hi")]);
+        let result = adapter.chat(req).await;
+
+        assert!(
+            matches!(result, Err(ModelError::Serialization(_))),
+            "finish_reason tool_calls with no tool_calls must Err, got {result:?}"
+        );
+    }
+
+    // 2j fail-closed: a tool_call missing its id (or name) must Err — a blank id
+    // would break tool_call_id correlation downstream.
+    #[tokio::test]
+    async fn chat_errors_when_tool_call_missing_id() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("POST", "/v1/complete")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                "message": {"content": null, "role": "assistant"},
+                "tool_calls": [{"name": "get_weather", "arguments": {"city": "SF"}}],
+                "finish_reason": "tool_calls",
+                "input_tokens": 5,
+                "output_tokens": 3,
+                "model": "anthropic/claude-sonnet-4-6"
+            }"#,
+            )
+            .create_async()
+            .await;
+
+        let adapter = SidecarModelAdapter::new(server.url());
+        let req = ModelRequest::new(vec![ChatMessage::user("what's the weather?")]);
+        let result = adapter.chat(req).await;
+
+        assert!(
+            matches!(result, Err(ModelError::Serialization(_))),
+            "tool_call with a blank id must Err, got {result:?}"
+        );
     }
 
     // 2j-1: tools forwarded — a request with non-empty tools sends them in the POST body.

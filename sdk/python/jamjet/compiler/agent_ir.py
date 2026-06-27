@@ -16,8 +16,16 @@ unroll** the loop into ``max_turns`` turns, each turn being three nodes:
      * false -> the terminal ``end`` (the final answer is ``last_model_output``).
 3. ``__tools_{t}__``     — a single PythonFn node running
    :func:`jamjet.agents.tool_runtime.dispatch_tool_calls`, which executes every
-   requested call and accumulates the messages, then loops to ``__model_{t+1}__``
-   (or, on the last turn, to ``end`` — the loop is bounded).
+   requested call and accumulates the messages, then loops to ``__model_{t+1}__``.
+   It carries the ``no_retry`` policy: the dispatch runs user ``@tool`` functions
+   (possible non-idempotent external writes), so the scheduler must NOT re-run an
+   already-succeeded dispatch on a retry.
+
+A **final** Model node ``__model_{max_turns}__`` (no tool schemas, so it must
+return a text answer) consumes the last tool results and produces the answer,
+then routes to ``end``. The terminal is therefore ALWAYS reached via a model node
+— never directly from a tool-dispatch node — so the extracted answer is a real
+model turn that saw the tool results, not a stale tool-requesting message.
 
 The IR dict shape mirrors ``jamjet.workflow.ir_compiler`` exactly (the canonical
 ``WorkflowIr`` the engine deserializes); node-kind shapes mirror
@@ -27,6 +35,8 @@ The IR dict shape mirrors ``jamjet.workflow.ir_compiler`` exactly (the canonical
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import TYPE_CHECKING, Any
 
 from jamjet.model.types import parse_model_ref
@@ -45,6 +55,18 @@ _TOOL_CALLS_EXPR = 'state.last_model_finish_reason == "tool_calls"'
 # Graph terminal sentinel (matches the strategy compiler's edge-to-"end").
 _END = "end"
 
+# Retry-policy names the scheduler resolves to a max_attempts (runner.rs):
+# llm_default -> 3 (model calls retry on rate-limit/timeout); no_retry -> 1
+# (the tool-dispatch node runs non-idempotent user @tool functions, so a retry
+# must NOT re-run already-succeeded calls).
+_MODEL_RETRY_POLICY = "llm_default"
+_TOOLS_RETRY_POLICY = "no_retry"
+
+# Base of the workflow version. The real cache key is suffixed with a hash of the
+# IR content (see :func:`_content_version`) so a changed agent never reuses a
+# stale immutably-cached graph.
+_VERSION_BASE = "0.1.0"
+
 
 def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[str, Any]:
     """Compile *agent* + *prompt* into a durable agent-loop ``WorkflowIr`` dict.
@@ -55,12 +77,15 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
         A constructed :class:`jamjet.Agent` (model + ``@tool`` functions +
         instructions).
     prompt:
-        The user prompt; seeds the initial ``user`` message (see
-        :func:`build_initial_state`, which the durable run entrypoint passes as
-        the execution ``initial_input``).
+        The user prompt. It is deliberately NOT embedded in the workflow
+        definition (the prompt is per-run and private); it seeds the initial
+        ``user`` message via :func:`build_initial_state`, which the durable run
+        entrypoint passes as the execution ``initial_input``. Accepted here to
+        keep the call symmetric with ``build_initial_state``.
     max_turns:
         Static unroll bound — the maximum number of ``model -> tools`` turns.
-        Must be ``>= 1``.
+        Must be ``>= 1``. The compiled graph has ``max_turns`` tool turns plus a
+        final model node that produces the answer.
 
     Returns
     -------
@@ -78,27 +103,18 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
     nodes: dict[str, Any] = {}
     edges: list[dict[str, Any]] = []
 
+    system_prompt = agent.instructions or None
+
     for t in range(max_turns):
         model_id = f"__model_{t}__"
         gate_id = f"__tool_gate_{t}__"
         tools_id = f"__tools_{t}__"
-        is_last = t == max_turns - 1
-        next_target = _END if is_last else f"__model_{t + 1}__"
 
         # ── Model node: carries tool schemas, reads messages from state. ──────
         nodes[model_id] = _node(
             model_id,
-            {
-                "type": "model",
-                "model_ref": model_ref,
-                # Empty prompt_ref => the executor uses the `messages` list from
-                # state rather than a single templated user prompt.
-                "prompt_ref": "",
-                "output_schema": "",
-                "system_prompt": agent.instructions or None,
-                "tools": tool_schemas,
-            },
-            retry_policy="llm_default",
+            _model_kind(model_ref, system_prompt, tool_schemas),
+            retry_policy=_MODEL_RETRY_POLICY,
             description=f"agent turn {t} — model call",
             labels={"jamjet.agent.loop": "model", "jamjet.agent.turn": str(t)},
         )
@@ -124,6 +140,9 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
         edges.append(_edge(gate_id, _END, None))
 
         # ── Tool-dispatch node: one PythonFn runs every requested call. ───────
+        # no_retry: the dispatch runs user @tool functions (possible
+        # non-idempotent external writes), so the scheduler must not re-run an
+        # already-succeeded dispatch on a retry (runner.rs no_retry -> 1 attempt).
         nodes[tools_id] = _node(
             tools_id,
             {
@@ -143,16 +162,42 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
                     "tools": tools_map,
                 },
             },
+            retry_policy=_TOOLS_RETRY_POLICY,
             description=f"agent turn {t} — dispatch tool calls",
             labels={"jamjet.agent.loop": "tools", "jamjet.agent.turn": str(t)},
         )
-        edges.append(_edge(tools_id, next_target))
+        # Always route forward to the NEXT model node — including the last turn,
+        # whose tool-dispatch flows into the final model node below. A
+        # tool-dispatch node never routes directly to `end`.
+        edges.append(_edge(tools_id, f"__model_{t + 1}__"))
 
-    return {
+    # ── Final model node: consume the last tool results, produce the answer. ──
+    # Reached when every turn requested tools (the unroll hit its bound). It
+    # carries NO tool schemas, so the model must return a text answer rather than
+    # request more tools, and routes straight to `end`. This guarantees the
+    # terminal is always reached via a model turn that saw the tool results —
+    # never a tool-dispatch node whose state holds a stale tool-requesting message.
+    final_id = f"__model_{max_turns}__"
+    nodes[final_id] = _node(
+        final_id,
+        _model_kind(model_ref, system_prompt, []),
+        retry_policy=_MODEL_RETRY_POLICY,
+        description=f"agent turn {max_turns} — final answer (no tools)",
+        labels={
+            "jamjet.agent.loop": "model",
+            "jamjet.agent.turn": str(max_turns),
+            "jamjet.agent.final": "true",
+        },
+    )
+    edges.append(_edge(final_id, _END))
+
+    ir = {
         "workflow_id": agent.name,
-        "version": "0.1.0",
+        "version": _VERSION_BASE,  # replaced with a content hash below
         "name": agent.name,
-        "description": agent.instructions or prompt,
+        # A STABLE description (never the per-run prompt — the prompt is private
+        # and belongs only in the execution input seeded by build_initial_state).
+        "description": agent.instructions or f"Durable agent: {agent.name}",
         "state_schema": "",
         "start_node": "__model_0__",
         "nodes": nodes,
@@ -172,6 +217,12 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
             "jamjet.agent.max_turns": str(max_turns),
         },
     }
+    # Content-version the IR: the runtime caches by (workflow_id, version)
+    # immutably, so a changed agent (tools / instructions / max_turns / timeout)
+    # must yield a new key or a stale graph could run. The prompt is excluded
+    # (it is not in the IR), so re-running the SAME agent reuses the cached graph.
+    ir["version"] = _content_version(ir)
+    return ir
 
 
 def build_initial_state(agent: Agent, prompt: str) -> dict[str, Any]:
@@ -213,6 +264,39 @@ def _tool_schema(td: ToolDefinition) -> dict[str, Any]:
             "parameters": td.input_schema,
         },
     }
+
+
+def _model_kind(model_ref: str, system_prompt: str | None, tool_schemas: list[dict[str, Any]]) -> dict[str, Any]:
+    """A Model node kind. ``tool_schemas=[]`` offers the model no tools.
+
+    Empty ``prompt_ref`` => the executor reads the running ``messages`` list from
+    state rather than a single templated user prompt.
+    """
+    return {
+        "type": "model",
+        "model_ref": model_ref,
+        "prompt_ref": "",
+        "output_schema": "",
+        "system_prompt": system_prompt,
+        "tools": tool_schemas,
+    }
+
+
+def _content_version(ir: dict[str, Any]) -> str:
+    """Derive an immutable cache key from the IR content (sans ``version``).
+
+    Returns ``"{_VERSION_BASE}+{sha256(canonical_ir)[:12]}"`` so two compiles of
+    the same agent share a version (and the runtime's immutable cache) while any
+    change to tools / instructions / max_turns / timeout yields a fresh key.
+    """
+    canonical = json.dumps(
+        {k: v for k, v in ir.items() if k != "version"},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    return f"{_VERSION_BASE}+{digest}"
 
 
 def _node(

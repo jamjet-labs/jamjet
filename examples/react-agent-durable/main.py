@@ -18,8 +18,8 @@ import asyncio
 
 from weather_agent import build_agent
 
-# The local dev engine (`jamjet dev`) listens on 7700. `run_durable`'s own
-# default points elsewhere, so we pass the engine URL explicitly.
+# The local dev engine (`jamjet dev`) listens on 7700, which is also
+# `run_durable`'s default; we pass it explicitly here to make the target clear.
 RUNTIME_URL = "http://localhost:7700"
 PROMPT = "What's the weather in Paris right now, and what is 19 plus 23?"
 

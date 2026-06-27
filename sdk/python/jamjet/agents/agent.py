@@ -172,19 +172,20 @@ class Agent:
 
         v1 limitations
         --------------
-        - **Static unroll, no early exit.** The loop runs up to *max_turns* model
-          turns and currently does NOT short-circuit when the model returns a
-          final answer; the engine has no edge-condition evaluator yet
-          (F-2j-dynamic-loop). A real model is re-invoked on every remaining
-          turn, so cost scales with *max_turns* and the answer can drift across
-          turns. Size *max_turns* to the conversation depth you actually expect.
+        - **Static unroll, no early exit.** The loop runs up to *max_turns* tool
+          turns plus a final answer-only model turn, and currently does NOT
+          short-circuit when the model returns a final answer early; the engine has
+          no edge-condition evaluator yet (F-2j-dynamic-loop). A real model is
+          re-invoked on every remaining turn, so cost scales with *max_turns* and
+          the answer can drift across turns. Size *max_turns* to the conversation
+          depth you actually expect.
         - **Requires running services.** A live engine at *runtime_url*, a
           ``jamjet worker`` draining the ``python_tool`` queue (to execute the
           ``@tool`` functions), and the model sidecar (``JAMJET_MODEL_SEAM_URL``,
           which forwards tools to the provider) must all be running.
         - **The read is the final state.** The returned answer is the durable
-          execution's final state (the last model turn's output), not a
-          per-turn early-stop result.
+          execution's final state — the final model turn's output, which consumes
+          the last tool results — not a per-turn early-stop result.
 
         Raises
         ------
@@ -226,20 +227,21 @@ class Agent:
 
     async def _poll_to_terminal(self, client: Any, exec_id: str) -> dict[str, Any]:
         """Poll ``get_execution`` until the execution reaches a terminal state."""
-        elapsed = 0.0
         timeout_s = self.limits.timeout_seconds
+        # Monotonic deadline: time spent inside slow get_execution() calls counts
+        # toward the timeout, so a stalled run can't blow past timeout_seconds.
+        deadline = time.monotonic() + timeout_s
         while True:
             execution = await client.get_execution(exec_id)
             status = execution.get("status", "unknown")
             if status in _TERMINAL_STATUSES:
                 return execution
-            if elapsed >= timeout_s:
+            if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"durable agent run {exec_id} did not reach a terminal state "
                     f"within {timeout_s}s (last status: {status!r})"
                 )
             await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-            elapsed += _POLL_INTERVAL_SECONDS
 
     def _extract_result(
         self,

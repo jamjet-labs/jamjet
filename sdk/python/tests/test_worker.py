@@ -238,7 +238,7 @@ _DISPATCH_ITEM: dict = {
             "last_model_tool_calls": [
                 {"id": "call_1", "name": "echo", "arguments": {"text": "hi"}},
             ],
-            "tools": {"echo": "tests.test_worker:_echo_tool"},
+            "tools": {"echo": f"{__name__}:_echo_tool"},
         },
     },
     "lease_fence": 0,

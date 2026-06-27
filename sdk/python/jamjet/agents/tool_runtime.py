@@ -119,16 +119,22 @@ def _coerce_arguments(arguments: Any) -> Any:
 def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]:
     """Resolve a tool name to a callable via the ``module:function`` map.
 
-    Falls back to the in-process ``@tool`` registry when the name is not in the
-    map (useful for in-process tests and dev).
+    Falls back to the in-process ``@tool`` registry both when the name is absent
+    from the map AND when a present-but-stale ref fails to import/resolve (useful
+    for in-process tests and dev, and resilient to a renamed/moved tool module).
     """
     ref = tools.get(name) if (name and isinstance(tools, dict)) else None
     if ref:
-        module_path, _, fn_path = ref.partition(":")
-        obj: Any = importlib.import_module(module_path)
-        for part in fn_path.split("."):
-            obj = getattr(obj, part)
-        return obj
+        try:
+            module_path, _, fn_path = ref.partition(":")
+            obj: Any = importlib.import_module(module_path)
+            for part in fn_path.split("."):
+                obj = getattr(obj, part)
+            return obj
+        except (ImportError, AttributeError):
+            # A stale/non-importable map ref must not mask the @tool registry
+            # fallback below — fall through and try the registry before raising.
+            pass
 
     from jamjet.tools.decorators import get_tool  # noqa: PLC0415 - avoid import cycle
 
