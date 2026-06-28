@@ -8,8 +8,6 @@ sub-agents are scripted real Agents (see ``tests/team_fakes.py``).
 
 from __future__ import annotations
 
-import pytest
-
 from jamjet.team import Collect, First, Parallel, Sequential, Team
 from tests.team_fakes import scripted_agent
 
@@ -152,9 +150,68 @@ async def test_coordinator_isolates_a_failing_router() -> None:
     assert result.output == ""
 
 
-async def test_callable_coordinator_unknown_name_raises_clear_error() -> None:
-    """A routing CALLABLE that returns an invalid name is a code bug -> fail loud
-    (unlike a router AGENT's fuzzy free-text, which falls back to the first agent)."""
+async def test_callable_coordinator_unknown_name_is_isolated() -> None:
+    """A routing CALLABLE that returns an invalid name is misuse -> a clear,
+    ISOLATED error recorded in per_agent (the team does not crash), consistent
+    with a bad index / foreign agent below. A router AGENT's fuzzy free-text still
+    falls back to the first agent (that path is unchanged)."""
     x = scripted_agent("x", output="x")
-    with pytest.raises(ValueError, match="unknown agent name"):
-        await Team([x], coordinator=lambda inp, agents: "does-not-exist").run("t")
+    result = await Team([x], coordinator=lambda inp, agents: "does-not-exist").run("t")
+    err = result.per_agent["team:coordinator"]
+    assert isinstance(err, ValueError)
+    assert "unknown agent name" in str(err)
+    assert result.output == ""  # clean empty TeamResult, not a crash
+    assert x.calls == []  # no specialist ran
+
+
+async def test_callable_coordinator_out_of_range_index_is_isolated() -> None:
+    """An out-of-range index is recorded as a clear, isolated error, not an opaque
+    IndexError that crashes the team."""
+    x = scripted_agent("x", output="x-out")
+    result = await Team([x], coordinator=lambda inp, agents: 99).run("t")
+    err = result.per_agent["team:coordinator"]
+    assert isinstance(err, ValueError)
+    assert str(err) == "coordinator returned out-of-range agent index 99; team has 1 agents"
+    assert result.output == ""
+    assert x.calls == []
+
+
+async def test_callable_coordinator_foreign_agent_is_isolated() -> None:
+    """An Agent that is not a team member is recorded as a clear, isolated error,
+    not an opaque 'is not in list' ValueError from _orchestrate's .index()."""
+    member = scripted_agent("member", output="member-out")
+    foreign = scripted_agent("foreign", output="foreign-out")
+    result = await Team([member], coordinator=lambda inp, agents: foreign).run("t")
+    err = result.per_agent["team:coordinator"]
+    assert isinstance(err, ValueError)
+    assert str(err) == "coordinator returned an Agent that is not a member of this team"
+    assert result.output == ""
+    assert member.calls == []
+    assert foreign.calls == []
+
+
+# ── Coordinator: word-boundary specialist match (no substring mis-route) ───────
+
+
+async def test_coordinator_router_word_boundary_does_not_misroute_overlap() -> None:
+    """Router free-text naming 'rewriter' runs rewriter, NOT the overlapping
+    substring 'writer' (a whole-word match, not a naive substring match)."""
+    writer = scripted_agent("writer", output="written")
+    rewriter = scripted_agent("rewriter", output="rewritten")
+    router = scripted_agent("router", output="use the rewriter")
+    result = await Team([writer, rewriter], coordinator=router).run("task")
+    assert result.output == "rewritten"  # rewriter ran
+    assert "rewriter" in result.per_agent
+    assert "writer" not in result.per_agent  # the overlapping name did NOT run
+    assert writer.calls == []
+
+
+async def test_coordinator_router_exact_name_still_matches_overlap() -> None:
+    """The exact-name pass still wins: output 'writer' runs writer even though the
+    overlapping 'rewriter' is also a member."""
+    writer = scripted_agent("writer", output="written")
+    rewriter = scripted_agent("rewriter", output="rewritten")
+    router = scripted_agent("router", output="writer")
+    result = await Team([writer, rewriter], coordinator=router).run("task")
+    assert result.output == "written"  # exact match -> writer
+    assert "writer" in result.per_agent

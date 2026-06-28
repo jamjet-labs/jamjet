@@ -31,10 +31,14 @@ the run was ``durable``.
 Governance + sessions (T6-5)
 ----------------------------
 Each sub-agent compiles and enforces its OWN governance (budget / PII / policy /
-allowlist) — a team adds no enforcement layer and removes none, so there is **no
-governance bypass**. A team may carry a ``governance=`` default that is applied
-only to sub-agents built with all-default governance (an explicitly-governed
-sub-agent is never overridden). A team may carry a ``session=`` that namespaces a
+allowlist); a team adds no enforcement layer, so a sub-agent's own explicit
+governance is never bypassed. A team may carry a ``governance=`` default applied
+ONLY to a sub-agent that set no explicit governance (all-default); it never
+overrides a sub-agent's own explicit knob, so a governed sub-agent is never
+weakened by the team (explicit beats inherited). The default is not a
+tighten-only knob: applied to an all-default sub-agent it may turn a
+framework-default-on protection (such as PII) off, which is the team author's
+deliberate choice, not a bypass. A team may carry a ``session=`` that namespaces a
 per-sub-agent child session so concurrent sub-agents never race on one SQLite row
 (see :func:`derive_child_session`).
 """
@@ -42,6 +46,7 @@ per-sub-agent child session so concurrent sub-agents never race on one SQLite ro
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -228,15 +233,19 @@ _DEFAULT_GOVERNANCE = GovernanceConfig()
 
 
 def _apply_governance_default(agents: list[Agent], team_governance: GovernanceConfig | None) -> None:
-    """Apply the team governance default to un-governed sub-agents (in place).
+    """Apply the team governance default to all-default sub-agents (in place).
 
     A sub-agent whose ``governance`` is the all-default sentinel set no explicit
     knob, so it INHERITS the team default (its compiled IR then carries the team's
     budget / policy / PII and enforces it). A sub-agent that set ANY governance
-    knob keeps its own config wholesale — explicit beats inherited, and an
-    explicitly-governed sub-agent is never weakened (no bypass). This mutates the
-    sub-agent's ``governance`` attribute; it only ever happens when the team
-    carries a default AND the sub-agent was un-governed.
+    knob keeps its own config wholesale (explicit beats inherited), so a governed
+    sub-agent is never overridden or weakened by the team. The default is applied
+    ONLY to an all-default sub-agent and NEVER overrides a sub-agent's own explicit
+    knob; it does not only tighten, since for an all-default sub-agent a team
+    default such as ``pii=False`` turns a framework-default-on protection off (the
+    team author's deliberate choice, not a bypass). This mutates the sub-agent's
+    ``governance`` attribute; it only happens when the team carries a default AND
+    the sub-agent was all-default.
     """
     if team_governance is None:
         return
@@ -269,8 +278,9 @@ class _TeamBase:
         self.name = name
         self.session = session
         self.governance = _resolve_team_governance(governance)
-        # T6-5: push the team governance default into un-governed sub-agents so
-        # each sub-agent compiles + enforces it (no bypass; explicit wins).
+        # T6-5: push the team governance default into all-default sub-agents so
+        # each sub-agent compiles + enforces it (explicit knobs always win; the
+        # default never overrides a sub-agent's own governance).
         _apply_governance_default(self.agents, self.governance)
 
     async def run(self, input: str) -> TeamResult:
@@ -471,21 +481,27 @@ class Team(_TeamBase):
             return self._match_specialist(router_result.output)
 
         # A routing callable: (input, agents) -> Agent | name | index (maybe async).
+        # Coercion runs INSIDE the try so a misuse (unknown name, out-of-range
+        # index, foreign Agent) becomes an ISOLATED recorded error and a clean
+        # empty TeamResult, not an opaque team crash.
         try:
             choice = coord(input, self.agents)
             if asyncio.iscoroutine(choice):
                 choice = await choice
+            return self._coerce_choice(choice)
         except Exception as exc:  # noqa: BLE001 - isolate routing-callable failure
             per_agent[f"{self.name}:coordinator"] = exc
             return None
-        return self._coerce_choice(choice)
 
     def _match_specialist(self, router_output: str) -> Agent:
         """Match a router's free-text output to a specialist by name.
 
-        Exact name match wins; otherwise the first agent whose name appears
-        (case-insensitive) in the output; otherwise the first agent (a safe,
-        documented fallback so an ambiguous router never crashes the team).
+        Exact name match wins; otherwise the first agent whose name appears as a
+        WHOLE WORD (case-insensitive, word-boundary) in the output; otherwise the
+        first agent (a safe, documented fallback so an ambiguous router never
+        crashes the team). The word-boundary pass avoids mis-routing overlapping
+        names: output "rewriter" matches ``rewriter`` and not the substring
+        ``writer``.
         """
         text = (router_output or "").strip()
         for agent in self.agents:
@@ -493,16 +509,28 @@ class Team(_TeamBase):
                 return agent
         low = text.lower()
         for agent in self.agents:
-            if agent.name.lower() in low:
+            if re.search(rf"\b{re.escape(agent.name.lower())}\b", low):
                 return agent
         return self.agents[0]
 
     def _coerce_choice(self, choice: Agent | str | int) -> Agent:
-        """Coerce a routing callable's return (Agent / name / index) to an Agent."""
+        """Coerce a routing callable's return (Agent / name / index) to an Agent.
+
+        A misuse (a foreign Agent, an out-of-range index, or an unknown name)
+        raises a clear ValueError/TypeError; the caller (_route) catches it so the
+        error is isolated and recorded rather than crashing the team opaquely.
+        """
         if _is_agent(choice):
+            if choice not in self.agents:
+                raise ValueError("coordinator returned an Agent that is not a member of this team")
             return choice  # type: ignore[return-value]
         if isinstance(choice, int):
-            return self.agents[choice]
+            try:
+                return self.agents[choice]
+            except IndexError:
+                raise ValueError(
+                    f"coordinator returned out-of-range agent index {choice}; team has {len(self.agents)} agents"
+                ) from None
         if isinstance(choice, str):
             for agent in self.agents:
                 if agent.name == choice:
