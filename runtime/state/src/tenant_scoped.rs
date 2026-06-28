@@ -1014,6 +1014,32 @@ impl StateBackend for TenantScopedSqliteBackend {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, item_id = %item_id, fence = lease_fence))]
+    async fn complete_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool> {
+        let id_str = item_id.to_string();
+        let completed_at = Utc::now().to_rfc3339();
+
+        // Tenant-scoped mirror of the durable fence guard: settle only the current
+        // holder of a still-claimed item for this tenant; zero rows -> false.
+        let rows_affected = sqlx::query(
+            "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL \
+             WHERE id = ? AND tenant_id = ? AND lease_fence = ? AND status = 'claimed'",
+        )
+        .bind(&completed_at)
+        .bind(&id_str)
+        .bind(&self.tenant_id.0)
+        .bind(lease_fence)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
     #[instrument(skip(self, error), fields(tenant = %self.tenant_id, item_id = %item_id))]
     async fn fail_work_item(&self, item_id: WorkItemId, error: &str) -> BackendResult<()> {
         let id_str = item_id.to_string();

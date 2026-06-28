@@ -422,6 +422,25 @@ impl StateBackend for InMemoryBackend {
         Ok(())
     }
 
+    async fn complete_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool> {
+        // Mirror the `commit_turn` fence guard: only the current holder (matching
+        // fence) of a still-present (claimed) item may settle. A mismatched fence,
+        // an absent item, or one already settled (removed) returns `false`. The
+        // get-then-remove is two DashMap ops rather than one atomic step; that is
+        // acceptable for the in-memory dev/test backend (the SQLite backends are
+        // the production path where atomicity is guaranteed by the single UPDATE).
+        match self.work_items.get(&item_id) {
+            Some(entry) if entry.lease_fence == lease_fence => {}
+            _ => return Ok(false),
+        }
+        self.work_items.remove(&item_id);
+        Ok(true)
+    }
+
     async fn commit_turn(
         &self,
         item_id: WorkItemId,

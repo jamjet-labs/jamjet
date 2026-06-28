@@ -227,6 +227,22 @@ pub trait StateBackend: Send + Sync {
     /// Mark a work item as completed and release the lease.
     async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()>;
 
+    /// Fence-guarded completion of a work item. Settles the item ONLY if the
+    /// stored `lease_fence` still matches AND the item is still claimable
+    /// (`status = 'claimed'`), returning `true` iff a row was actually updated.
+    ///
+    /// Returns `false` — never an error — on a fence mismatch, an already-settled
+    /// item, or one that was reclaimed under a newer fence. This is the
+    /// exactly-once-COMMIT guard for the EXTERNAL HTTP worker path: a reclaimed /
+    /// replayed worker holding a stale fence is rejected (`false`) so the caller
+    /// can refuse to emit a duplicate terminal event. Mirrors the fence semantics
+    /// (`term * 2^32 + epoch`) the internal worker tier gets from `commit_turn`.
+    async fn complete_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool>;
+
     /// Mark a work item as failed. The scheduler will decide whether to retry.
     async fn fail_work_item(&self, item_id: WorkItemId, error: &str) -> BackendResult<()>;
 

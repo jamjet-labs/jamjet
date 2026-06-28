@@ -181,6 +181,49 @@ async fn test_work_queue() {
 }
 
 #[tokio::test]
+async fn test_complete_work_item_fenced() {
+    let backend = InMemoryBackend::new();
+    let exec_id = ExecutionId::new();
+    let item = WorkItem {
+        id: Uuid::new_v4(),
+        execution_id: exec_id,
+        node_id: "n1".into(),
+        queue_type: "default".into(),
+        payload: json!({}),
+        attempt: 0,
+        max_attempts: 3,
+        created_at: Utc::now(),
+        lease_expires_at: None,
+        worker_id: None,
+        lease_fence: 0,
+        tenant_id: "default".into(),
+    };
+    let item_id = backend.enqueue_work_item(item).await.unwrap();
+    let claimed = backend
+        .claim_work_item("w1", &["default"])
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = claimed.lease_fence;
+    assert!(fence > 0);
+
+    // Mismatched fence settles nothing; matching fence settles exactly once; a
+    // repeat settle is a no-op (item already removed) — exactly-once-COMMIT.
+    assert!(!backend
+        .complete_work_item_fenced(item_id, fence + 1)
+        .await
+        .unwrap());
+    assert!(backend
+        .complete_work_item_fenced(item_id, fence)
+        .await
+        .unwrap());
+    assert!(!backend
+        .complete_work_item_fenced(item_id, fence)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
 async fn test_patch_append_array() {
     let backend = InMemoryBackend::new();
     let id = ExecutionId::new();

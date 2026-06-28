@@ -1032,6 +1032,9 @@ async fn claim_work_item(
                 "queue_type": wi.queue_type,
                 "payload": wi.payload,
                 "attempt": wi.attempt,
+                // The lease fence the external worker echoes on complete so the
+                // engine can prove the lease is still held (exactly-once-COMMIT).
+                "lease_fence": wi.lease_fence,
             }
         }))),
         None => Ok(Json(json!({ "claimed": false }))),
@@ -1048,6 +1051,12 @@ struct CompleteWorkItemRequest {
     state_patch: Value,
     #[serde(default)]
     duration_ms: u64,
+    /// Lease fence echoed from the claim response. When present, the completion is
+    /// gated on it: a stale/forged fence is rejected (409) and NO `NodeCompleted`
+    /// is emitted. When absent, the legacy unfenced settle-by-id path is used
+    /// (backward-compat for callers not yet echoing the fence).
+    #[serde(default)]
+    lease_fence: Option<i64>,
     // ── GenAI telemetry (forwarded from the python_tool worker or other callers) ──
     /// AI provider system (e.g. "anthropic", "openai").
     #[serde(default)]
@@ -1072,13 +1081,33 @@ async fn complete_work_item(
     Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
     Json(body): Json<CompleteWorkItemRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let item_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
 
-    // Mark the work item as completed.
-    backend.complete_work_item(item_id).await?;
+    // Settle the work item. When the worker echoes its lease fence, the settle is
+    // fence-gated: a stale / forged fence (reclaimed or replayed worker) is
+    // rejected with 409 and we emit NO terminal event, so a lost lease can never
+    // duplicate a NodeCompleted. When the fence is absent, fall back to the legacy
+    // unfenced settle-by-id (backward-compat for callers not yet echoing it).
+    match body.lease_fence {
+        Some(fence) => {
+            let settled = backend.complete_work_item_fenced(item_id, fence).await?;
+            if !settled {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "completed": false,
+                        "reason": "stale or invalid lease fence",
+                    })),
+                ));
+            }
+        }
+        None => {
+            backend.complete_work_item(item_id).await?;
+        }
+    }
 
     // Emit NodeCompleted event if execution_id and node_id are provided.
     if let (Some(exec_id_str), Some(node_id)) = (&body.execution_id, &body.node_id) {
@@ -1119,7 +1148,10 @@ async fn complete_work_item(
         }
     }
 
-    Ok(Json(json!({ "completed": true, "work_item_id": id })))
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "completed": true, "work_item_id": id })),
+    ))
 }
 
 #[derive(Deserialize)]

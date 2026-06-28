@@ -1083,6 +1083,32 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(item_id = %item_id, fence = lease_fence))]
+    async fn complete_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool> {
+        let id_str = item_id.to_string();
+        let completed_at = Utc::now().to_rfc3339();
+
+        // Fence + status guard: only the current holder (matching fence) of a
+        // still-claimed item may settle. A stale/forged fence, an already-completed
+        // item, or one reclaimed under a newer fence matches zero rows -> false.
+        let rows_affected = sqlx::query(
+            "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL \
+             WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
+        )
+        .bind(&completed_at)
+        .bind(&id_str)
+        .bind(lease_fence)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
     #[instrument(skip(self, error), fields(item_id = %item_id))]
     async fn fail_work_item(&self, item_id: WorkItemId, error: &str) -> BackendResult<()> {
         let id_str = item_id.to_string();
@@ -2068,6 +2094,56 @@ mod tests {
         // No more items
         let none = db.claim_work_item("worker-1", &["default"]).await.unwrap();
         assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_complete_work_item_fenced_match_and_mismatch() {
+        let db = open_test_db().await;
+        let exec = sample_execution();
+        let exec_id = exec.execution_id.clone();
+        db.create_execution(exec).await.unwrap();
+
+        let item = WorkItem {
+            id: Uuid::new_v4(),
+            execution_id: exec_id,
+            node_id: "node-1".to_string(),
+            queue_type: "default".to_string(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: crate::tenant::DEFAULT_TENANT.to_string(),
+        };
+        let item_id = item.id;
+        db.enqueue_work_item(item).await.unwrap();
+
+        let claimed = db
+            .claim_work_item("worker-1", &["default"])
+            .await
+            .unwrap()
+            .unwrap();
+        let fence = claimed.lease_fence;
+        assert!(fence > 0, "a claimed item must have a non-zero fence");
+
+        // A mismatched (stale/forged) fence settles nothing and leaves the item
+        // claimable by the true holder.
+        let mismatched = db
+            .complete_work_item_fenced(item_id, fence + 1)
+            .await
+            .unwrap();
+        assert!(!mismatched, "a mismatched fence must not settle the item");
+
+        // The matching fence settles exactly one row.
+        let matched = db.complete_work_item_fenced(item_id, fence).await.unwrap();
+        assert!(matched, "the matching fence must settle the item");
+
+        // A second settle with the same fence is now a no-op (already completed,
+        // status != 'claimed') — proving exactly-once-COMMIT, not double-settle.
+        let again = db.complete_work_item_fenced(item_id, fence).await.unwrap();
+        assert!(!again, "an already-completed item must not settle again");
     }
 
     #[tokio::test]
