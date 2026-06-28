@@ -34,6 +34,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
+from jamjet.agents.governance import Budget, GovernanceConfig, normalize_governance
 from jamjet.compiler.strategies import StrategyLimits
 from jamjet.runtime.local import LocalRuntime
 from jamjet.tools.decorators import ToolDefinition
@@ -70,6 +71,13 @@ class Agent:
         max_cost_usd: float = 1.0,
         timeout_seconds: int = 300,
         on_limit_exceeded: Callable[[str | None, str, Any, Any], str | None] | None = None,
+        # Governance knobs (T3-1).  T3-2..6 read self.governance to enforce.
+        policy: str | dict | None = None,
+        approval_required: bool | list[str] = False,
+        budget: Budget | float | int | dict | None = None,
+        pii: bool = True,
+        audit: bool = True,
+        receipts: bool = True,
     ) -> None:
         self.name = name
         self.model = model
@@ -80,6 +88,30 @@ class Agent:
             max_iterations=max_iterations,
             max_cost_usd=max_cost_usd,
             timeout_seconds=timeout_seconds,
+        )
+
+        # Build the immutable governance config.
+        #
+        # budget vs max_cost_usd reconciliation: max_cost_usd is the legacy
+        # StrategyLimits cap (used by strategy runners for iteration budgets).
+        # budget= is the new governance-layer cap read by the seam middleware
+        # (T3-2) and compiled into the durable IR (T3-5).  When budget= is not
+        # set but max_cost_usd is explicitly provided, we fold the legacy value
+        # into GovernanceConfig.budget.cost_usd so the governance layer inherits
+        # the same ceiling without requiring callers to set both.  T3-2 will
+        # reconcile and document the authoritative enforcement point.
+        _effective_budget: Budget | float | int | dict | None = budget
+        if _effective_budget is None and max_cost_usd != 1.0:
+            # Non-default max_cost_usd -> carry it forward as the budget cap.
+            _effective_budget = max_cost_usd
+
+        self.governance: GovernanceConfig = normalize_governance(
+            policy=policy,
+            approval_required=approval_required,
+            budget=_effective_budget,
+            pii=pii,
+            audit=audit,
+            receipts=receipts,
         )
 
         # Resolve tool definitions from decorated functions
