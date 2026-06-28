@@ -80,3 +80,51 @@ def _last_assistant_content(messages: list[Any]) -> str:
         if role == "assistant" and content:
             return str(content)
     return ""
+
+
+def seed_history(
+    initial_messages: list[dict[str, Any]] | None,
+    system: str,
+) -> list[dict[str, Any]]:
+    """Leading messages a strategy's GENERATIVE phase should build on.
+
+    Session / memory continuity (C1).  When *initial_messages* is provided it is
+    the carried thread built by ``agents.session.seed_messages_for_run`` (and,
+    when memory is on, ``Agent._inject_memory_block``)::
+
+        [{"role": "system",    "content": <agent instructions>},
+         {"role": "system",    "content": "Relevant memory ..."},   # optional
+         {"role": "user",      "content": "<prior turn 1>"},
+         {"role": "assistant", "content": "<prior reply 1>"},
+         ...
+         {"role": "user",      "content": "<new prompt>"}]          # trailing
+
+    This returns that thread with two adjustments so a multi-phase strategy can
+    layer its own phase prompt on top while the model still sees the conversation
+    so far + any retrieved memory (matching ``react``'s behaviour):
+
+    1. The **trailing new-user prompt is dropped** — the strategy re-frames it
+       into its own phase prompt and appends that itself.
+    2. The **leading system block is swapped for *system*** — so a phase's role
+       augmentation ("You are the proposer", "agent N of M") is preserved, while
+       any injected memory block and every prior user/assistant turn are kept.
+
+    When *initial_messages* is ``None`` (a fresh, sessionless run) it returns the
+    single default system block ``[{"role": "system", "content": system}]`` — the
+    prior per-strategy behaviour, unchanged.
+
+    NOTE: meta phases that intentionally use a DIFFERENT system persona (critic,
+    judge, devil's-advocate, self-evaluator) do NOT call this — they evaluate the
+    draft text a generative phase already produced, so they keep their own system
+    and need no history.
+    """
+    if not initial_messages:
+        return [{"role": "system", "content": system}]
+    # Copy each carried message so the strategy can append/extend freely without
+    # mutating the caller's seed list.
+    prefix = [dict(m) for m in initial_messages[:-1]]
+    if prefix and prefix[0].get("role") == "system":
+        prefix[0] = {"role": "system", "content": system}
+    else:
+        prefix.insert(0, {"role": "system", "content": system})
+    return prefix

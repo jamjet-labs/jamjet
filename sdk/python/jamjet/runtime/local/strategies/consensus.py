@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from jamjet.runtime.local.llm_adapters.base import LLMAdapter
-from jamjet.runtime.local.strategies.base import execute_tool_calls, resolve_tool_map
+from jamjet.runtime.local.strategies.base import execute_tool_calls, resolve_tool_map, seed_history
 from jamjet.spec import AgentSpec
 
 
@@ -23,13 +23,14 @@ async def run(
     system = spec.instructions or "You are a helpful assistant."
     n_agents = min(3, max_iter)
 
+    # Session/memory continuity (C1): each independent agent speaks as the agent,
+    # so it builds on the carried conversation history + retrieved memory before
+    # its prompt. The judge phase keeps its own persona and synthesizes the
+    # candidate responses, so it needs no history.
     responses: list[str] = []
     for i in range(n_agents):
         msgs: list[Any] = [
-            {
-                "role": "system",
-                "content": f"{system}\nYou are agent {i + 1} of {n_agents}. Think independently.",
-            },
+            *seed_history(initial_messages, f"{system}\nYou are agent {i + 1} of {n_agents}. Think independently."),
             {"role": "user", "content": prompt},
         ]
         for _ in range(max_iter):

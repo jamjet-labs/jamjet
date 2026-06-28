@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from jamjet.runtime.local.llm_adapters.base import LLMAdapter
-from jamjet.runtime.local.strategies.base import execute_tool_calls, resolve_tool_map
+from jamjet.runtime.local.strategies.base import execute_tool_calls, resolve_tool_map, seed_history
 from jamjet.spec import AgentSpec
 
 
@@ -22,9 +22,13 @@ async def run(
     max_iter = spec.limits.get("max_iterations", 10)
     system = spec.instructions or "You are a helpful assistant."
 
+    # Session/memory continuity (C1): the proposer (and the reviser below) speak
+    # as the agent, so they build on the carried conversation history + retrieved
+    # memory. The devil's-advocate and judge phases keep their own personas and
+    # operate on the proposed/revised answer text, so they need no history.
     proposal = ""
     prop_msgs: list[Any] = [
-        {"role": "system", "content": f"{system}\nYou are the proposer. Give your best answer."},
+        *seed_history(initial_messages, f"{system}\nYou are the proposer. Give your best answer."),
         {"role": "user", "content": prompt},
     ]
     for _ in range(max_iter):
@@ -51,10 +55,7 @@ async def run(
         critique = counter_msg.content or ""
 
         revise_msgs: list[Any] = [
-            {
-                "role": "system",
-                "content": f"{system}\nRevise your answer addressing the critique.",
-            },
+            *seed_history(initial_messages, f"{system}\nRevise your answer addressing the critique."),
             {
                 "role": "user",
                 "content": f"Task: {prompt}\n\nYour answer:\n{counter}\n\nCritique:\n{critique}",

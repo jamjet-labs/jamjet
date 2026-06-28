@@ -327,3 +327,75 @@ def test_injected_memory_is_used_directly(
     # The injected fake (not a freshly-built Engram bridge) handled the calls.
     assert fake.context_calls, "the injected memory should have served retrieval"
     assert fake.records, "the injected memory should have served the record"
+
+
+# ---------------------------------------------------------------------------
+# 7. I3 — concurrent runs on ONE cached AgentMemory must not cross scopes
+# ---------------------------------------------------------------------------
+
+
+def test_as_scope_per_run_clone_no_cross_session_bleed() -> None:
+    """I3: ``as_scope`` yields a per-run view; concurrent sessions never cross.
+
+    The agent caches ONE :class:`AgentMemory` for ``memory=True`` and scopes
+    every retrieve/record by the per-run ``session.id`` via ``as_scope``.  The
+    pre-fix ``as_scope`` mutated a SHARED ``self._scope`` around the ``await``
+    inside the block, so two concurrent runs on different sessions could record
+    under the WRONG session.  This drives two concurrent record loops (mirroring
+    ``_record_turn``: two awaits in one ``as_scope`` block) on the SAME memory
+    with different scopes and asserts each run's SECOND record (written after the
+    interleaving await) is keyed by its OWN session.
+
+    Skipped when the optional ``engram`` extra is absent (the bridge imports it).
+    """
+    pytest.importorskip("engram")
+    from engram import Scope as EngramScope  # noqa: PLC0415
+
+    from jamjet.memory.engram_bridge import AgentMemory  # noqa: PLC0415
+    from jamjet.spec import MemoryConfig  # noqa: PLC0415
+
+    class _ProbeEngram:
+        """Stand-in Engram that records the scope it was called under, with an
+        await between calls so concurrent runs interleave."""
+
+        def __init__(self) -> None:
+            self.records: list[tuple[str, str, str | None]] = []
+
+        async def record(
+            self,
+            text: str,
+            *,
+            user_id: str,
+            org_id: str | None = None,
+            session_id: str | None = None,
+            role: str | None = None,
+            **_kw: Any,
+        ) -> None:
+            await asyncio.sleep(0.01)  # force the two runs to interleave
+            self.records.append((user_id, text, role))
+            return None
+
+    probe = _ProbeEngram()
+    mem = AgentMemory(
+        probe,  # type: ignore[arg-type]
+        scope=EngramScope(user_id="base", org_id="o"),
+        config=MemoryConfig(),
+    )
+
+    async def _two_records(sid: str) -> None:
+        with mem.as_scope(user_id=sid) as scoped:
+            await scoped.record(f"{sid}-first", role="user")
+            await scoped.record(f"{sid}-second", role="assistant")
+
+    async def _drive() -> None:
+        await asyncio.gather(_two_records("A"), _two_records("B"))
+
+    asyncio.run(_drive())
+
+    # Each run's SECOND record (after the interleaving await) is keyed by its OWN
+    # session — never the other run's.  Pre-fix, one of these landed under the
+    # other scope.
+    assert ("A", "A-second", "assistant") in probe.records, probe.records
+    assert ("B", "B-second", "assistant") in probe.records, probe.records
+    # The shared instance's scope is never mutated by as_scope.
+    assert mem._scope.user_id == "base"

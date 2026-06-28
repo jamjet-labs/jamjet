@@ -138,13 +138,26 @@ class AgentMemory:
 
     @contextmanager
     def as_scope(self, *, user_id: str | None = None, org_id: str | None = None) -> Any:
-        old = self._scope
-        new = EngramScope(
-            org_id=org_id if org_id is not None else old.org_id,
-            user_id=user_id if user_id is not None else old.user_id,
+        """Yield a memory view bound to an overridden scope for the duration of
+        the block.
+
+        Concurrency (I3): this yields a NEW ``AgentMemory`` bound to the new scope
+        rather than mutating ``self._scope`` around the ``await`` inside the
+        block.  The agent caches ONE ``AgentMemory`` for ``memory=True`` and
+        scopes every retrieve/record by the per-run ``session.id`` via this
+        method; if it mutated shared state around the await, two concurrent runs
+        on different sessions would read each other's scope mid-flight and
+        record/retrieve under the WRONG session.  Returning a per-call view keeps
+        each run's scope local, so concurrent sessions never cross.  The new view
+        shares the same underlying Engram, config, and session id.
+        """
+        new_scope = EngramScope(
+            org_id=org_id if org_id is not None else self._scope.org_id,
+            user_id=user_id if user_id is not None else self._scope.user_id,
         )
-        self._scope = new
-        try:
-            yield self
-        finally:
-            self._scope = old
+        yield AgentMemory(
+            self._engram,
+            scope=new_scope,
+            config=self._config,
+            session_id=self._session_id,
+        )

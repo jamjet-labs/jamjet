@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from jamjet.runtime.local.llm_adapters.base import LLMAdapter
-from jamjet.runtime.local.strategies.base import execute_tool_calls, resolve_tool_map
+from jamjet.runtime.local.strategies.base import execute_tool_calls, resolve_tool_map, seed_history
 from jamjet.spec import AgentSpec
 
 
@@ -22,8 +22,13 @@ async def run(
     max_iter = spec.limits.get("max_iterations", 10)
     system = spec.instructions or "You are a helpful assistant."
 
+    # Session/memory continuity (C1): the plan, every step, and the synthesis are
+    # all generative phases that speak as the agent, so each builds on the carried
+    # conversation history + retrieved memory (seed_history) before its own phase
+    # prompt. Without this the model would never see prior turns and the plan
+    # would be drawn up — and executed — blind to the thread.
     plan_messages: list[Any] = [
-        {"role": "system", "content": system},
+        *seed_history(initial_messages, system),
         {
             "role": "user",
             "content": (
@@ -44,7 +49,7 @@ async def run(
     step_results: list[str] = []
     for step in steps[:max_iter]:
         step_messages: list[Any] = [
-            {"role": "system", "content": system},
+            *seed_history(initial_messages, system),
             {
                 "role": "user",
                 "content": (
@@ -66,7 +71,7 @@ async def run(
             step_results.append("")
 
     synthesis_messages: list[Any] = [
-        {"role": "system", "content": system},
+        *seed_history(initial_messages, system),
         {
             "role": "user",
             "content": (

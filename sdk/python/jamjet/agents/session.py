@@ -56,6 +56,24 @@ class Session:
             ``{"role": str, "content": str}`` dicts.  System messages are
             **not** stored here; they are always re-injected from the
             agent's current ``instructions`` at seed time.
+
+            Persistence asymmetry (I2 — the documented contract).  What lands
+            in this thread depends on which run path produced the turn:
+
+            - ``Agent.run()`` (in-process) persists the user prompt + the
+              FINAL assistant output for the turn.  Strategy runners own their
+              multi-phase message lists internally and do not surface a single
+              tool-interleaved thread, so intermediate tool turns are NOT
+              stored.
+            - ``Agent.run_durable()`` (durable engine) persists the FULL
+              tool-interleaved ledger from the engine's terminal
+              ``current_state["messages"]`` (assistant tool-call turns + tool
+              results + final answer), system messages stripped.
+
+            Both paths always persist the user prompt and the final assistant
+            turn, so re-seeding never DROPS a user/assistant turn; durable
+            additionally carries the intermediate tool turns.  Within a single
+            path the thread is consistent across runs.
         latest_execution_id: The engine's internal lineage id for the most
             recent run started under this session.  Distinct from ``id``.
         metadata: Arbitrary caller-supplied key/value data.
@@ -91,18 +109,21 @@ class Session:
         returns an :class:`~jamjet.client.ArtifactRef`;
         ``await session.artifacts.get(hash)`` fetches them back.
 
-        Lazily builds an :class:`~jamjet.agents.artifacts.ArtifactStore` over a
-        default :class:`~jamjet.client.JamjetClient` (``http://localhost:7700``)
-        on first use; call :meth:`attach_client` first to target a specific
-        runtime (or to inject a stub in tests).
+        Requires a client: call :meth:`attach_client` first to bind a
+        :class:`~jamjet.client.JamjetClient` (or a compatible stub in tests).
+        Accessing this property before a client is attached raises
+        ``RuntimeError`` — rather than silently defaulting to a
+        ``http://localhost:7700`` runtime, which would mask a missing-client
+        misconfiguration as confusing connection errors at call time.
         """
         store = getattr(self, "_artifacts", None)
         if store is None:
-            from jamjet.agents.artifacts import ArtifactStore
-            from jamjet.client import JamjetClient
-
-            store = ArtifactStore(JamjetClient())
-            self._artifacts = store
+            raise RuntimeError(
+                f"Session {self.id!r}: no artifact client attached. Call "
+                "session.attach_client(JamjetClient(<runtime_url>)) before using "
+                "session.artifacts (it stores/fetches content-addressed bytes "
+                "through that client)."
+            )
         return store
 
     async def run(
@@ -142,6 +163,13 @@ class SessionStore:
     row per session.  Multiple ``SessionStore`` instances pointing at the
     same path share the same data — a fresh instance sees sessions saved by
     a previous instance (survives restart).
+
+    Concurrency contract (v1): SINGLE WRITER PER SESSION ID.  :meth:`save` is a
+    whole-row ``INSERT OR REPLACE`` (last-writer-wins), so two runs racing on the
+    SAME ``session.id`` would clobber each other's thread — the loser's turn is
+    lost.  Concurrent runs on ONE session are NOT supported in v1; serialize them
+    (or use distinct session ids).  Different session ids are independent rows and
+    are safe to run concurrently.
 
     Args:
         path: Path to the SQLite database file.  ``None`` uses the default
@@ -212,6 +240,11 @@ class SessionStore:
 
         Idempotent — calling ``save`` twice with the same session updates
         the existing row.
+
+        Last-writer-wins: this replaces the whole row, so it assumes a SINGLE
+        WRITER PER SESSION ID (see the class docstring).  Two concurrent runs on
+        the same session would overwrite each other's thread; serialize runs on a
+        given session id in v1.
         """
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
@@ -306,13 +339,26 @@ def persist_session_turn(
     Called after BOTH ``Agent.run()`` and ``Agent.run_durable()`` so the
     session thread is updated regardless of which path ran.
 
-    When *full_messages* is provided (the durable engine's
-    ``current_state["messages"]``), the session thread is replaced with those
-    messages minus any system messages (the full, tool-interleaved thread).
+    Persistence asymmetry (I2 — the documented contract).  The two paths persist
+    threads of DIFFERENT granularity, and this asymmetry is intentional and
+    contractual (see :class:`Session`'s ``messages`` docstring):
 
-    When *full_messages* is ``None`` (in-process path; strategy runners own
-    their message list internally), the turn is reconstructed from *prompt* +
-    *output* and appended to the existing thread.
+    - When *full_messages* is provided (the durable engine's
+      ``current_state["messages"]``), the session thread is REPLACED with those
+      messages minus any system messages — the full, tool-interleaved ledger
+      (assistant tool-call turns + tool results + final answer).
+    - When *full_messages* is ``None`` (in-process path; strategy runners own
+      their multi-phase message lists internally and do not surface a single
+      tool-interleaved thread), the turn is reconstructed from *prompt* +
+      *output* and appended to the existing thread — user prompt + final
+      assistant output only, no intermediate tool turns.
+
+    Both paths always persist the user prompt and the final assistant turn, so
+    re-seeding the thread on the next run never drops a user/assistant turn;
+    durable additionally carries the intermediate tool turns.  Aligning the
+    in-process path to also emit the tool-interleaved thread would require every
+    strategy runner to surface its internal messages (tracked as a follow-up);
+    until then this documented asymmetry IS the contract.
 
     Args:
         session: The :class:`Session` to update in-place and persist.

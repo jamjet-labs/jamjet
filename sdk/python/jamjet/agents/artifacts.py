@@ -2,8 +2,10 @@
 
 ``ArtifactStore`` wraps a :class:`~jamjet.client.JamjetClient` (or any object
 exposing the same async ``put_artifact``/``get_artifact`` methods) and gives a
-session a small store/fetch namespace surfaced as ``Session.artifacts``:
+session a small store/fetch namespace surfaced as ``Session.artifacts``
+(attach a client first — ``Session.artifacts`` fails loud without one):
 
+    >>> session.attach_client(JamjetClient("http://127.0.0.1:7700"))
     >>> ref = await session.artifacts.put(b"report bytes", "text/plain")
     >>> data = await session.artifacts.get(ref.hash)
 

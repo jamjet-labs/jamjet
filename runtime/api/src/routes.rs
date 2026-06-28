@@ -4,13 +4,20 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use axum::{
     body::Bytes,
-    extract::{Extension, Path, Query, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
+
+/// Maximum request body for `POST /artifacts`. Set EXPLICITLY (rather than
+/// inheriting axum's implicit 2 MiB default) so the cap on the content-addressed
+/// store is an intentional contract: artifacts are developer-supplied blobs
+/// (tool outputs, small files), so a few MiB is the sane ceiling. Bodies over
+/// this are rejected with `413 Payload Too Large` before the handler runs.
+const ARTIFACT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 use chrono::Utc;
 use jamjet_agents::{AgentCard, AgentFilter, AgentStatus};
 use jamjet_audit::backend::AuditQuery;
@@ -49,8 +56,12 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
             get(list_approvals_for_execution),
         )
         .route("/executions/:id/external-event", post(send_external_event))
-        // Artifacts (content-addressed store) — tenant-scoped developer API
-        .route("/artifacts", post(put_artifact))
+        // Artifacts (content-addressed store) — tenant-scoped developer API.
+        // The POST carries an explicit body limit (see ARTIFACT_MAX_BODY_BYTES).
+        .route(
+            "/artifacts",
+            post(put_artifact).layer(DefaultBodyLimit::max(ARTIFACT_MAX_BODY_BYTES)),
+        )
         .route("/artifacts/:hash", get(get_artifact))
         // Agents
         .route("/agents", post(register_agent).get(list_agents))
@@ -612,6 +623,9 @@ struct PutArtifactQuery {
 /// `'default'`-pinned base path.
 ///
 /// Returns `200 { "hash": <sha256 hex>, "size": <bytes>, "media_type": <type|null> }`.
+///
+/// The route carries an explicit `DefaultBodyLimit` of `ARTIFACT_MAX_BODY_BYTES`;
+/// bodies larger than that are rejected with `413` before this handler runs.
 async fn put_artifact(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
@@ -1482,6 +1496,46 @@ mod tests {
         assert!(
             matches!(got_b, Err(ApiError::NotFound(_))),
             "tenant B must not read tenant A's artifact (tenant isolation)"
+        );
+    }
+
+    /// `POST /artifacts` enforces the explicit body limit: a body over
+    /// `ARTIFACT_MAX_BODY_BYTES` is rejected with `413`, while a small body is
+    /// accepted — exercised through the real router so the `DefaultBodyLimit`
+    /// layer (not just the handler) is on the path.
+    #[tokio::test]
+    async fn put_artifact_enforces_explicit_body_limit() {
+        use tower::ServiceExt; // for `oneshot`
+
+        let app = build_router_with_opts(tenant_routing_state(), /* dev_mode */ true);
+
+        // Just over the cap -> 413 Payload Too Large.
+        let oversized = vec![0u8; ARTIFACT_MAX_BODY_BYTES + 1];
+        let too_big_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/artifacts")
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(oversized))
+            .unwrap();
+        let resp = app.clone().oneshot(too_big_req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "oversized artifact body must be rejected with 413"
+        );
+
+        // A small body still succeeds (the limit didn't break the happy path).
+        let small_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/artifacts")
+            .header("content-type", "text/plain")
+            .body(axum::body::Body::from("ok"))
+            .unwrap();
+        let resp = app.oneshot(small_req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a small artifact body must still be accepted"
         );
     }
 }

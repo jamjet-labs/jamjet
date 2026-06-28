@@ -156,9 +156,17 @@ async def test_session_artifacts_round_trip():
     assert await session.artifacts.get(ref.hash) == b"hello session"
 
 
-def test_session_artifacts_property_is_lazy_store():
-    """Without attach_client, .artifacts builds a default ArtifactStore."""
+def test_session_artifacts_without_client_raises():
+    """Without attach_client, .artifacts fails loud (no silent localhost default)."""
     session = Session(id="s-2")
+    with pytest.raises(RuntimeError, match="no artifact client attached"):
+        _ = session.artifacts
+
+
+def test_session_artifacts_memoised_after_attach():
+    """After attach_client, .artifacts returns the same store on repeat access."""
+    session = Session(id="s-2b")
+    session.attach_client(_FakeArtifactClient())
     assert isinstance(session.artifacts, ArtifactStore)
     # Memoised: the same store instance is returned on repeat access.
     assert session.artifacts is session.artifacts

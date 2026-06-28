@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from jamjet.runtime.local.llm_adapters.base import LLMAdapter
-from jamjet.runtime.local.strategies.base import execute_tool_calls, resolve_tool_map
+from jamjet.runtime.local.strategies.base import execute_tool_calls, resolve_tool_map, seed_history
 from jamjet.spec import AgentSpec
 
 
@@ -33,8 +33,12 @@ async def run(
                 "Revise the draft to address the critic's feedback above. "
                 "Return only the improved draft."
             )
+        # Session/memory continuity (C1): the draft is the generative phase that
+        # speaks as the agent, so it builds on the carried conversation history +
+        # retrieved memory before the draft/revise prompt. The critic phase below
+        # keeps its own evaluator persona and operates on the produced draft.
         draft_messages: list[Any] = [
-            {"role": "system", "content": system},
+            *seed_history(initial_messages, system),
             {"role": "user", "content": draft_prompt},
         ]
         for _ in range(max_iter):

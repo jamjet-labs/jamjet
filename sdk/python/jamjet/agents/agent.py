@@ -358,9 +358,14 @@ class Agent:
           session, no memory) — existing behaviour unchanged.
         """
         resolved_session = self._resolve_session(session)
-        memory = await self._ensure_memory()
 
-        if memory is not None and resolved_session is None:
+        # Memory requires a session to key on.  Do this fail-loud check BEFORE
+        # opening any Engram handle: ``memory=True`` opens a DB handle inside
+        # ``_ensure_memory`` (cached for the agent's lifetime), so raising first
+        # means the no-session error path never leaks an open handle.  We key off
+        # ``self._memory_enabled`` (set at __init__) rather than the resolved
+        # backend so we never construct it on the error path.
+        if self._memory_enabled and resolved_session is None:
             raise RuntimeError(
                 f"Agent {self.name!r}: memory= is enabled but no session= was "
                 "provided to the run. Memory is keyed by the stable session.id so "
@@ -368,6 +373,8 @@ class Agent:
                 "key would never retrieve. Pass session=<Session or id> to "
                 "run()/run_durable(), or drop memory= for a stateless run."
             )
+
+        memory = await self._ensure_memory()
 
         system = self.instructions or "You are a helpful assistant."
         initial_messages: list[dict[str, Any]] | None = None
