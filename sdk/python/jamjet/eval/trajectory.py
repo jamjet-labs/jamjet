@@ -166,6 +166,16 @@ class Trajectory:
                 )
         return cls(steps)
 
+    @classmethod
+    def from_tool_sequence(cls, tools: list[str]) -> Trajectory:
+        """Build a Trajectory from a bare ordered list of tool names.
+
+        Handy for reconstructing a trajectory from a persisted ``tool_sequence``
+        (e.g. the ``trajectory`` field of an eval-run results file) for
+        replay-regression diffing.
+        """
+        return cls([TrajectoryStep(tool=t) for t in tools])
+
     # ── Rendering ─────────────────────────────────────────────────────────────
 
     def render(self) -> str:
@@ -421,3 +431,70 @@ class TrajectoryScorer(BaseScorer):
         )
         trace_text = trajectory.render()
         return await judge.score(trace_text, expected=None)
+
+
+# ── Replay-regression trajectory diff ─────────────────────────────────────────
+
+
+@dataclass
+class TrajectoryDiff:
+    """Difference between two trajectories' tool sequences (replay-regression).
+
+    ``changed`` is True whenever the ordered tool sequences differ at all. The
+    ``added`` / ``removed`` lists are the multiset difference of tools (so a pure
+    reordering reports neither), and ``reordered`` is True when the two runs used
+    the same multiset of tools in a different order.
+    """
+
+    before: list[str]
+    after: list[str]
+    added: list[str]
+    removed: list[str]
+    reordered: bool
+    changed: bool
+
+    def render(self) -> str:
+        """Human-readable summary of the diff."""
+        if not self.changed:
+            return f"No trajectory change: {self.before}"
+        lines = ["Trajectory CHANGED:"]
+        lines.append(f"  before: {self.before}")
+        lines.append(f"  after:  {self.after}")
+        if self.added:
+            lines.append(f"  + added:    {self.added}")
+        if self.removed:
+            lines.append(f"  - removed:  {self.removed}")
+        if self.reordered:
+            lines.append("  ~ reordered (same tools, different order)")
+        return "\n".join(lines)
+
+
+def diff_trajectories(before: Trajectory, after: Trajectory) -> TrajectoryDiff:
+    """Diff two trajectories' tool sequences for replay-regression detection.
+
+    Reuses the event-sourced trajectory: pass two :class:`Trajectory` objects
+    (e.g. ``Trajectory.from_events(...)`` over two runs of the SAME case) and get
+    back which tools were added, removed, or merely reordered between the runs.
+    Deterministic: the result is a pure function of the two tool sequences.
+    """
+    from collections import Counter  # noqa: PLC0415
+
+    before_seq = before.tool_sequence
+    after_seq = after.tool_sequence
+
+    before_counts = Counter(before_seq)
+    after_counts = Counter(after_seq)
+    added = sorted((after_counts - before_counts).elements())
+    removed = sorted((before_counts - after_counts).elements())
+
+    changed = before_seq != after_seq
+    reordered = changed and before_counts == after_counts
+
+    return TrajectoryDiff(
+        before=before_seq,
+        after=after_seq,
+        added=added,
+        removed=removed,
+        reordered=reordered,
+        changed=changed,
+    )

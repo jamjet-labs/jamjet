@@ -17,6 +17,7 @@ Commands:
   jamjet eval run       Run batch evaluation of a workflow
   jamjet eval export    Export eval results as LaTeX, CSV, or JSON
   jamjet eval compare   Compare two conditions with statistical tests
+  jamjet eval trajectory-diff  Diff two runs' tool sequences (replay-regression)
   jamjet demo unsafe-tool-call    Show how JamJet blocks destructive tool calls
   jamjet demo approval            Show pause-for-approval flow
   jamjet demo budget-cap          Show budget enforcement
@@ -39,6 +40,7 @@ import yaml
 
 if TYPE_CHECKING:
     from jamjet.eval.grid import ComparisonResult
+    from jamjet.eval.trajectory import Trajectory
 
 import typer
 from rich.console import Console
@@ -1998,6 +2000,7 @@ def eval_run(
                 "output": r.output,
                 "input": r.input,
                 "expected": r.expected,
+                "trajectory": r.trajectory,
             }
             for r in results
         ]
@@ -2202,6 +2205,105 @@ def eval_compare(
         typer.echo(json.dumps(dataclasses.asdict(result), indent=2, default=str))
     else:
         _print_comparison_table(result, alpha=alpha)
+
+
+def _load_trajectory_from_file(path: str, *, row_id: str | None = None) -> Trajectory:
+    """Load a Trajectory from one of the accepted replay-regression inputs.
+
+    Accepts:
+    - a ``{"events": [...]}`` dict (a get_events / `jamjet events --json` dump)
+    - a raw list of event dicts (each item has a ``"kind"``)
+    - an eval-run results list (each item has ``row_id``/``trajectory``); pass
+      ``row_id`` to select the case, else the first row is used
+    - a bare list of tool-name strings (an explicit tool sequence)
+    """
+    from jamjet.eval.trajectory import Trajectory
+
+    with open(path) as f:
+        data = json.load(f)
+
+    # Shape 1: {"events": [...]} -- a get_events() dump.
+    if isinstance(data, dict) and "events" in data:
+        return Trajectory.from_events(data)
+
+    if isinstance(data, list):
+        if not data:
+            return Trajectory.from_events([])
+        first = data[0]
+        # Shape 2: raw event list (each item carries a "kind").
+        if isinstance(first, dict) and "kind" in first:
+            return Trajectory.from_events(data)
+        # Shape 3: eval-run results list (each item has row_id/trajectory).
+        if isinstance(first, dict) and ("row_id" in first or "trajectory" in first):
+            chosen = data[0]
+            if row_id is not None:
+                match = next((r for r in data if r.get("row_id") == row_id), None)
+                if match is None:
+                    raise ValueError(f"row_id {row_id!r} not found in {path}")
+                chosen = match
+            return Trajectory.from_tool_sequence(chosen.get("trajectory") or [])
+        # Shape 4: bare list of tool-name strings.
+        if all(isinstance(x, str) for x in data):
+            return Trajectory.from_tool_sequence(data)
+
+    raise ValueError(f"Unrecognized trajectory/event-log shape in {path}")
+
+
+@eval_app.command("trajectory-diff")
+def eval_trajectory_diff(
+    before: str = typer.Argument(
+        ..., help="Baseline run: an event-log JSON, an eval-run results JSON, or a tool-name list"
+    ),
+    after: str = typer.Argument(..., help="New run: same accepted shapes as <before>"),
+    row_id: str | None = typer.Option(
+        None, "--row-id", help="When the inputs are eval-run results files, the case row_id to diff"
+    ),
+    fail_on_change: bool = typer.Option(  # noqa: FBT001
+        True,
+        "--fail-on-change/--no-fail-on-change",
+        help="Exit 1 if the tool sequence changed (replay-regression gate; default on)",
+    ),
+    fmt: str = typer.Option("table", "--format", "-f", help="Output format: table (default) or json"),
+) -> None:
+    """Diff two runs' TRAJECTORIES (tool sequences) for replay-regression.
+
+    Reconstructs each run's tool sequence from its event log and reports whether
+    tools were added, removed, or reordered between the two runs -- the signal
+    for "did a model/prompt change alter HOW the agent used its tools?".
+
+    \b
+    Examples:
+      jamjet eval trajectory-diff before_events.json after_events.json
+      jamjet eval trajectory-diff v1_results.json v2_results.json --row-id q1
+      jamjet eval trajectory-diff a.json b.json --no-fail-on-change --format json
+    """
+    from jamjet.eval.trajectory import diff_trajectories
+
+    try:
+        before_traj = _load_trajectory_from_file(before, row_id=row_id)
+        after_traj = _load_trajectory_from_file(after, row_id=row_id)
+    except FileNotFoundError as e:
+        console.print(f"[red]Error:[/red] file not found: {e.filename}")
+        raise typer.Exit(1)
+    except (json.JSONDecodeError, ValueError) as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    diff = diff_trajectories(before_traj, after_traj)
+
+    if fmt.lower() == "json":
+        import dataclasses
+
+        typer.echo(json.dumps(dataclasses.asdict(diff), indent=2, default=str))
+    else:
+        if diff.changed:
+            console.print("[bold red]REGRESSION:[/bold red] trajectory changed")
+        else:
+            console.print("[green]OK:[/green] trajectory unchanged")
+        console.print(diff.render())
+
+    if fail_on_change and diff.changed:
+        raise typer.Exit(1)
 
 
 def _resolve_condition(name: str, agg: Mapping[str, object]) -> str | None:

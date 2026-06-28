@@ -35,9 +35,11 @@ from jamjet.eval.scorers import (
 from jamjet.eval.trajectory import (
     Trajectory,
     TrajectoryAssertionResult,
+    TrajectoryDiff,
     TrajectoryResult,
     TrajectoryScorer,
     TrajectoryStep,
+    diff_trajectories,
 )
 
 __all__ = [
@@ -60,9 +62,11 @@ __all__ = [
     "ScorerResult",
     "Trajectory",
     "TrajectoryAssertionResult",
+    "TrajectoryDiff",
     "TrajectoryResult",
     "TrajectoryScorer",
     "TrajectoryStep",
+    "diff_trajectories",
     "get_scorer_registry",
     "invoke_scorer",
     "scorer",
