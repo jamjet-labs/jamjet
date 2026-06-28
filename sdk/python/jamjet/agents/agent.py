@@ -43,6 +43,7 @@ from jamjet.runtime.local import LocalRuntime
 from jamjet.tools.decorators import ToolDefinition
 
 if TYPE_CHECKING:
+    from jamjet.deploy import DeployResult
     from jamjet.memory.engram_bridge import AgentMemory
     from jamjet.spec import AgentSpec
 
@@ -722,6 +723,95 @@ class Agent:
             await self._record_turn(memory, resolved_session.id, prompt, result.output)
 
         return result
+
+    async def deploy(
+        self,
+        *,
+        runtime: str | None = None,
+        schedule: str | None = None,
+        runtime_url: str | None = None,
+    ) -> DeployResult:
+        """Ship this agent's compiled IR to a JamJet runtime (Track 7a).
+
+        Compiles the SAME agent-loop IR that :meth:`run_durable` builds and
+        registers it (``POST /workflows``) onto a ``jamjet-server`` engine, so a
+        finished ADK agent ships unchanged to any of three runtimes that differ
+        only by URL + token:
+
+        - ``runtime=None`` / ``"local"`` — the dev default
+          (``http://127.0.0.1:7700``); a bare ``deploy()`` NEVER targets a remote
+          URL.
+        - ``runtime="self-host"`` — your own engine at ``JAMJET_RUNTIME_URL``.
+        - ``runtime="cloud"`` — YOUR hosted engine at ``JAMJET_CLOUD_RUNTIME_URL``
+          with JamJet Cloud governance layered on. The honest model: ``cloud`` is
+          a hosted engine URL + Cloud span-push governance, NOT a managed
+          execution cell; the deploy client is never pointed at ``api.jamjet.dev``.
+        - ``runtime="https://..."`` or ``runtime_url="https://..."`` — an explicit
+          engine URL, used directly.
+
+        Unlike :meth:`run_durable`, deploy registers the workflow (and, when
+        *schedule* is a cron expression, installs a cron job) WITHOUT starting or
+        polling an execution. The agent's governance knobs (budget / policy / PII)
+        stay in the registered IR — deploy never strips them. ``cloud_governance``
+        in the result only RECORDS that Cloud governance is wired (the
+        ``jamjet.cloud.*`` span pusher is configured separately); deploy does not
+        call into Cloud and so succeeds even when Cloud is unreachable.
+
+        Parameters
+        ----------
+        runtime:
+            A leg name (``local`` / ``self-host`` / ``cloud``) or a base URL.
+        schedule:
+            A cron expression. When set, a cron job is installed so the engine
+            fires the workflow on that schedule (the recurring intent belongs in
+            the agent's ``instructions``; the scheduled seed is an empty user turn).
+        runtime_url:
+            An explicit engine URL. Mutually exclusive with *runtime*.
+
+        Returns
+        -------
+        DeployResult
+            ``workflow_id`` + the resolved ``runtime`` / ``url`` + whether it was
+            ``scheduled`` and whether ``cloud_governance`` is on.
+        """
+        from jamjet.client import JamjetClient  # noqa: PLC0415 - patch point / avoid import cycle
+        from jamjet.compiler.agent_ir import build_initial_state, compile_agent_to_ir  # noqa: PLC0415
+        from jamjet.deploy import DeployResult, resolve_runtime_target  # noqa: PLC0415
+
+        if runtime is not None and runtime_url is not None:
+            raise ValueError(
+                "pass either runtime= (a leg name or URL) or runtime_url= (an explicit engine URL), not both."
+            )
+        target = resolve_runtime_target(runtime_url if runtime_url is not None else runtime)
+
+        # The SAME agent-loop IR run_durable builds. The prompt is per-run and is
+        # NOT embedded in the workflow definition, so deploy compiles with an empty
+        # prompt; governance fields (cost_budget_usd / policy / data_policy) are
+        # merged into the IR by compile_agent_to_ir and are not stripped here.
+        ir = compile_agent_to_ir(self, "")
+        workflow_id: str = ir["workflow_id"]
+        workflow_version: str | None = ir.get("version")
+
+        scheduled = False
+        async with JamjetClient(base_url=target.url, api_token=target.token) as client:
+            await client.create_workflow(ir)
+            if schedule is not None:
+                await client.create_cron_job(
+                    name=workflow_id,
+                    cron_expression=schedule,
+                    workflow_id=workflow_id,
+                    workflow_version=workflow_version,
+                    input=build_initial_state(self, ""),
+                )
+                scheduled = True
+
+        return DeployResult(
+            workflow_id=workflow_id,
+            runtime=target.name,
+            url=target.url,
+            scheduled=scheduled,
+            cloud_governance=target.cloud_governance,
+        )
 
     async def _poll_to_terminal(self, client: Any, exec_id: str) -> dict[str, Any]:
         """Poll ``get_execution`` until the execution reaches a terminal state."""

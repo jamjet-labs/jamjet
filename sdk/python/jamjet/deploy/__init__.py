@@ -52,6 +52,29 @@ class RuntimeTarget:
     name: str
 
 
+@dataclass(frozen=True)
+class DeployResult:
+    """The outcome of an :meth:`~jamjet.agents.agent.Agent.deploy` call.
+
+    Attributes:
+        workflow_id: The registered workflow id (the agent's name) — the handle
+            you ``start_execution`` against, or that a cron schedule fires.
+        runtime: The leg the IR was shipped to (``local`` / ``self-host`` /
+            ``cloud``) or the bare URL when one was passed directly.
+        url: The engine base URL the IR was registered against.
+        scheduled: ``True`` when a cron schedule was installed for the workflow.
+        cloud_governance: ``True`` when JamJet Cloud span-push governance is
+            wired alongside this deploy (the ``cloud`` leg). Recording only — the
+            deploy does not call into Cloud, so it succeeds even if Cloud is down.
+    """
+
+    workflow_id: str
+    runtime: str
+    url: str
+    scheduled: bool
+    cloud_governance: bool
+
+
 def _is_url(runtime: str) -> bool:
     return runtime.lower().startswith(("http://", "https://"))
 
@@ -114,4 +137,4 @@ def resolve_runtime_target(runtime: str | None = None) -> RuntimeTarget:
     raise ValueError(f"unknown runtime {runtime!r}; use 'local', 'self-host', 'cloud', or a base URL.")
 
 
-__all__ = ["LOCAL_RUNTIME_URL", "RuntimeTarget", "resolve_runtime_target"]
+__all__ = ["LOCAL_RUNTIME_URL", "DeployResult", "RuntimeTarget", "resolve_runtime_target"]
