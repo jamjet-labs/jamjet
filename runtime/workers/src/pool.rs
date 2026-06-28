@@ -114,6 +114,10 @@ impl WorkerPool {
 ///   Python `@tool` nodes are executed by an external `jamjet worker` process;
 ///   no internal Rust worker claims this queue. Start the sidecar with:
 ///   `jamjet worker --queue python_tool`
+/// - 0 java workers (`["java_tool"]`) — intent registration only, mirroring
+///   `python_tool`. Durable Java `@Tool` nodes are executed by an external Java
+///   tool-worker that claims this queue over the same HTTP claim/complete API;
+///   no internal Rust worker claims it.
 pub fn default_pool(backend: Arc<dyn StateBackend>) -> WorkerPool {
     WorkerPool::new(backend)
         .with_group(WorkerGroupConfig::new(
@@ -142,5 +146,13 @@ pub fn default_pool(backend: Arc<dyn StateBackend>) -> WorkerPool {
             "python-worker",
             0,
             vec!["python_tool".into()],
+        ))
+        // Register java_tool as a known queue without spawning internal workers,
+        // mirroring python_tool. Items in this queue are claimed exclusively by an
+        // external Java tool-worker over the same HTTP claim/complete API.
+        .with_group(WorkerGroupConfig::new(
+            "java-worker",
+            0,
+            vec!["java_tool".into()],
         ))
 }
