@@ -78,12 +78,18 @@ class Agent:
         pii: bool = True,
         audit: bool = True,
         receipts: bool = True,
+        # Optional sink for AgentBoundary receipts (T3-4).  When set, every
+        # minted receipt is also shipped here (e.g. a JSONL writer); the receipt
+        # is always attached to the run result regardless.  Defaults to None so
+        # receipts ship nowhere noisy by default while still being produced.
+        receipt_emitter: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.name = name
         self.model = model
         self.instructions = instructions
         self.strategy = strategy
         self._on_limit_exceeded = on_limit_exceeded
+        self._receipt_emitter = receipt_emitter
         self.limits = StrategyLimits(
             max_iterations=max_iterations,
             max_cost_usd=max_cost_usd,
@@ -157,6 +163,30 @@ class Agent:
             },
         )
 
+    # ── Governance: receipts on by default (T3-4) ──────────────────────────
+
+    def _maybe_mint_receipt(self, prompt: str, output: Any) -> dict[str, Any] | None:
+        """Mint an AgentBoundary receipt for this turn when receipts are enabled.
+
+        Receipts are ON by default (``GovernanceConfig.receipts``); a plain
+        ``Agent()`` produces one without the developer opting in. Returns the
+        receipt dict (also attached to the :class:`AgentResult` and shipped to
+        ``receipt_emitter`` if set), or ``None`` when ``receipts=False``. Reuses
+        the exact mint path :func:`jamjet.gate` uses, so agent receipts and
+        gated-tool receipts are consistent.
+        """
+        if not self.governance.receipts:
+            return None
+        from jamjet.agents.receipts import mint_agent_receipt  # noqa: PLC0415
+
+        return mint_agent_receipt(
+            agent_name=self.name,
+            model=self.model,
+            prompt=prompt,
+            output="" if output is None else str(output),
+            emitter=self._receipt_emitter,
+        )
+
     # ── Public run interface ───────────────────────────────────────────────
 
     async def run(self, prompt: str) -> AgentResult:
@@ -164,16 +194,19 @@ class Agent:
         Run the agent on a single prompt via LocalRuntime.
 
         Compiles to AgentSpec, hands off to LocalRuntime which dispatches to
-        the appropriate strategy runner.
+        the appropriate strategy runner. Emits a signed-audit-aligned
+        AgentBoundary receipt for the turn (on by default).
         """
         spec = self.compile()
         rt = LocalRuntime()
         result = await rt.execute(spec, prompt)
+        receipt = self._maybe_mint_receipt(prompt, result.output)
         return AgentResult(
             output=result.output,
             tool_calls=[tc.model_dump() for tc in result.tool_calls],
             ir=spec.model_dump(),
             duration_us=result.duration_ms * 1000,
+            receipt=receipt,
         )
 
     def run_sync(self, prompt: str) -> AgentResult:
@@ -255,7 +288,11 @@ class Agent:
                 events = []
 
         duration_us = int((time.monotonic() - t0) * 1_000_000)
-        return self._extract_result(execution, events, ir, duration_us)
+        result = self._extract_result(execution, events, ir, duration_us)
+        # Mint the turn receipt from the durable run's extracted result (on by
+        # default), mirroring the in-process run().
+        result.receipt = self._maybe_mint_receipt(prompt, result.output)
+        return result
 
     async def _poll_to_terminal(self, client: Any, exec_id: str) -> dict[str, Any]:
         """Poll ``get_execution`` until the execution reaches a terminal state."""
@@ -413,7 +450,14 @@ class Agent:
 
 
 class AgentResult:
-    """Result returned by Agent.run()."""
+    """Result returned by Agent.run().
+
+    ``receipt`` is the AgentBoundary Action Receipt minted for the turn (on by
+    default), or ``None`` when ``receipts=False``. It is a portable, validatable
+    proof of the action -- ``agentboundary.validate_receipt`` /
+    ``check_conformance`` accept it, and its ``arguments_hash`` binds it to this
+    prompt/agent/model.
+    """
 
     def __init__(
         self,
@@ -421,11 +465,13 @@ class AgentResult:
         tool_calls: list[dict[str, Any]],
         ir: Any,
         duration_us: float = 0.0,
+        receipt: dict[str, Any] | None = None,
     ) -> None:
         self.output = output
         self.tool_calls = tool_calls
         self.ir = ir
         self.duration_us = duration_us
+        self.receipt = receipt
 
     def __str__(self) -> str:
         return self.output
