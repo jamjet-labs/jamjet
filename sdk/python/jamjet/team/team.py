@@ -310,24 +310,43 @@ class _TeamBase:
         *,
         runtime: str | None = None,
         schedule: str | None = None,
-    ) -> list[DeployResult]:
+        max_turns: int = 8,
+    ) -> dict[str, DeployResult | BaseException]:
         """Register each sub-agent's workflow on a runtime (Track 7a-3).
 
         A team is N agent IRs (Path A): deploy reuses :meth:`Agent.deploy` per
-        member and returns one :class:`~jamjet.deploy.DeployResult` per sub-agent,
+        member and returns a ``{agent.name: DeployResult | BaseException}`` mapping
         in declared order. The Python orchestration (sequencing / routing / merge)
         still runs CLIENT-SIDE when you call :meth:`run_durable`; deploy only
         pre-registers the building-block workflows. A fully engine-native single
         team deployment is a follow-up (F-t6-native-nodes).
+
+        Isolation (mirrors the run path)
+        --------------------------------
+        Each sub-agent deploys INDEPENDENTLY: a sub-agent whose deploy raises has
+        its exception CAPTURED as that name's value in the returned mapping and the
+        remaining members still deploy, so a partial deploy reports exactly what
+        registered and never aborts on the first failure. This mirrors the run
+        path's per-agent child-crash isolation (``TeamResult.per_agent``).
+        Registration is idempotent by ``(workflow_id, version)`` (the runtime
+        caches the IR immutably), so re-running ``deploy`` after a partial failure
+        safely re-registers the survivors and retries the failed member.
 
         *runtime* is resolved the same way as :meth:`Agent.deploy`
         (``local`` / ``self-host`` / ``cloud`` / a URL). *schedule* installs the
         SAME cron expression on EACH sub-agent's workflow: for a
         :class:`Parallel` team that reproduces the fan-out, but for
         :class:`Sequential` / :class:`Loop` the engine fires each member
-        independently (orchestrated scheduling stays client-side).
+        independently (orchestrated scheduling stays client-side). *max_turns* is
+        threaded into each sub-agent's compiled IR, matching :meth:`Agent.deploy`.
         """
-        return [await agent.deploy(runtime=runtime, schedule=schedule) for agent in self.agents]
+        results: dict[str, DeployResult | BaseException] = {}
+        for agent in self.agents:
+            try:
+                results[agent.name] = await agent.deploy(runtime=runtime, schedule=schedule, max_turns=max_turns)
+            except Exception as exc:  # noqa: BLE001 - isolate a sub-agent deploy failure
+                results[agent.name] = exc
+        return results
 
     # -- the per-sub-agent run primitive --------------------------------------
 

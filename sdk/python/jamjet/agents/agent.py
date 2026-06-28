@@ -730,13 +730,17 @@ class Agent:
         runtime: str | None = None,
         schedule: str | None = None,
         runtime_url: str | None = None,
+        max_turns: int = 8,
     ) -> DeployResult:
         """Ship this agent's compiled IR to a JamJet runtime (Track 7a).
 
-        Compiles the SAME agent-loop IR that :meth:`run_durable` builds and
-        registers it (``POST /workflows``) onto a ``jamjet-server`` engine, so a
-        finished ADK agent ships unchanged to any of three runtimes that differ
-        only by URL + token:
+        Compiles the SAME agent-loop IR that :meth:`run_durable` builds at the
+        SAME *max_turns*, then registers it (``POST /workflows``) onto a
+        ``jamjet-server`` engine, so a finished ADK agent ships unchanged to any
+        of three runtimes that differ only by URL + token. Because the agent loop
+        is statically unrolled by *max_turns*, deploy at the same *max_turns* you
+        tested with :meth:`run_durable` so the registered graph matches the one
+        you ran:
 
         - ``runtime=None`` / ``"local"`` — the dev default
           (``http://127.0.0.1:7700``); a bare ``deploy()`` NEVER targets a remote
@@ -767,6 +771,10 @@ class Agent:
             the agent's ``instructions``; the scheduled seed is an empty user turn).
         runtime_url:
             An explicit engine URL. Mutually exclusive with *runtime*.
+        max_turns:
+            Static unroll bound for the agent loop (``model -> tools`` turns),
+            matching :meth:`run_durable`. Deploy at the same *max_turns* you ran
+            with so the registered IR is the one you tested. Defaults to ``8``.
 
         Returns
         -------
@@ -784,11 +792,12 @@ class Agent:
             )
         target = resolve_runtime_target(runtime_url if runtime_url is not None else runtime)
 
-        # The SAME agent-loop IR run_durable builds. The prompt is per-run and is
-        # NOT embedded in the workflow definition, so deploy compiles with an empty
-        # prompt; governance fields (cost_budget_usd / policy / data_policy) are
-        # merged into the IR by compile_agent_to_ir and are not stripped here.
-        ir = compile_agent_to_ir(self, "")
+        # The SAME agent-loop IR run_durable builds, at the SAME max_turns. The
+        # prompt is per-run and is NOT embedded in the workflow definition, so
+        # deploy compiles with an empty prompt; governance fields (cost_budget_usd
+        # / policy / data_policy) are merged into the IR by compile_agent_to_ir and
+        # are not stripped here.
+        ir = compile_agent_to_ir(self, "", max_turns=max_turns)
         workflow_id: str = ir["workflow_id"]
         workflow_version: str | None = ir.get("version")
 

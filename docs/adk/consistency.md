@@ -47,9 +47,10 @@ the log to exactly the committed state.
 
 ## Across runs: eventually consistent
 
-Read and aggregate views that span more than one execution are built by an
-asynchronous projector that tails the event log. They converge; they are not
-instantaneously consistent with the latest write.
+Read-side projections are asynchronous: they lag the authoritative event log
+rather than updating in lockstep with it. Any view you assemble across more than
+one execution is therefore eventually consistent. It converges on the latest
+write; it is not instantaneously consistent with it.
 
 - **The projector is a background loop.** `Projector::run` loops forever, calling
   `tick()` and then sleeping 500ms between passes

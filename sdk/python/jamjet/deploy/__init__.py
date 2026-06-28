@@ -43,7 +43,7 @@ class RuntimeTarget:
             never load-bearing: deploy succeeds even if Cloud is unreachable.
         name: A stable label for the leg (``local`` / ``self-host`` / ``cloud``)
             or the bare URL when one was passed directly. Surfaced on
-            :class:`~jamjet.agents.agent.DeployResult.runtime`.
+            :class:`~jamjet.deploy.DeployResult.runtime`.
     """
 
     url: str

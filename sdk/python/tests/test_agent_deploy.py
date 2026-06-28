@@ -122,6 +122,20 @@ async def test_deploy_registers_the_compiled_ir(monkeypatch: pytest.MonkeyPatch)
     assert result.workflow_id == "weatherbot"
 
 
+async def test_deploy_threads_max_turns_into_ir(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_env(monkeypatch)
+    captured = _patch_client(monkeypatch)
+    agent = _agent()
+
+    await agent.deploy(max_turns=12)
+
+    deployed_ir = captured["client"].created[0]
+    # Registered at the requested max_turns — same IR run_durable(max_turns=12) ships.
+    assert deployed_ir == compile_agent_to_ir(agent, "", max_turns=12)
+    # And NOT the default-8 IR: more turns unroll more nodes -> a different version.
+    assert deployed_ir != compile_agent_to_ir(agent, "", max_turns=8)
+
+
 # ── governance is never stripped on deploy ────────────────────────────────────
 
 

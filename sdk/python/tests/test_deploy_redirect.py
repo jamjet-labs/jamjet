@@ -82,8 +82,11 @@ async def test_entry_deploy_redirects_team(monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.warns(DeprecationWarning):
         results = await entry_deploy(Sequential([_agent("a"), _agent("b")]))
 
-    assert isinstance(results, list)
-    assert [r.workflow_id for r in results] == ["a", "b"]
+    # Team.deploy returns a {name: DeployResult | exception} mapping; entry.deploy
+    # passes it through unchanged.
+    assert isinstance(results, dict)
+    assert list(results.keys()) == ["a", "b"]
+    assert [r.workflow_id for r in results.values()] == ["a", "b"]
 
 
 async def test_entry_deploy_non_agent_raises_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
