@@ -50,9 +50,7 @@ class TestDictPolicyAllowlist:
 
     def test_allowed_model_passes(self):
         """A model in the dict allowlist is not denied."""
-        allowlist = resolve_policy_allowlist(
-            {"model_allowlist": ["anthropic/claude-sonnet-4-6"]}
-        )
+        allowlist = resolve_policy_allowlist({"model_allowlist": ["anthropic/claude-sonnet-4-6"]})
         assert allowlist == {"anthropic/claude-sonnet-4-6"}
 
     def test_allowed_by_provider_passes(self):
@@ -72,9 +70,7 @@ class TestDictPolicyAllowlist:
     @pytest.mark.asyncio
     async def test_disallowed_model_raises_before_provider(self):
         """A model call whose provider/model is not in the allowlist raises ModelDeniedError."""
-        gov = normalize_governance(
-            policy={"model_allowlist": ["anthropic/claude-sonnet-4-6"]}
-        )
+        gov = normalize_governance(policy={"model_allowlist": ["anthropic/claude-sonnet-4-6"]})
         chain = default_model_middleware(governance=gov)
         allowlist_mw = chain[0]
         assert isinstance(allowlist_mw, ModelAllowlistMiddleware)
@@ -86,9 +82,7 @@ class TestDictPolicyAllowlist:
     @pytest.mark.asyncio
     async def test_allowed_model_does_not_raise(self):
         """A model call whose model string IS in the allowlist proceeds."""
-        gov = normalize_governance(
-            policy={"model_allowlist": ["anthropic/claude-sonnet-4-6"]}
-        )
+        gov = normalize_governance(policy={"model_allowlist": ["anthropic/claude-sonnet-4-6"]})
         chain = default_model_middleware(governance=gov)
         allowlist_mw = chain[0]
         assert isinstance(allowlist_mw, ModelAllowlistMiddleware)

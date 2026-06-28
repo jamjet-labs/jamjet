@@ -325,9 +325,7 @@ class TestGovernanceIrBudget:
         assert ir.get("token_budget") == {"total_tokens": 1000}
 
     def test_budget_both_fields_emits_both_ir_keys(self):
-        ir = compile_agent_to_ir(
-            _governed_agent(budget=Budget(tokens=5000, cost_usd=1.00)), "hi"
-        )
+        ir = compile_agent_to_ir(_governed_agent(budget=Budget(tokens=5000, cost_usd=1.00)), "hi")
         assert ir.get("cost_budget_usd") == 1.00
         assert ir.get("token_budget") == {"total_tokens": 5000}
 
@@ -378,9 +376,7 @@ class TestGovernanceIrPolicy:
     def test_dict_policy_and_approval_required_are_merged(self):
         """approval_required globs are union-appended into a dict policy's require_approval_for."""
         p = {"require_approval_for": ["pay_*"]}
-        ir = compile_agent_to_ir(
-            _governed_agent(policy=p, approval_required=["delete_*"]), "hi"
-        )
+        ir = compile_agent_to_ir(_governed_agent(policy=p, approval_required=["delete_*"]), "hi")
         policy = ir.get("policy")
         assert policy is not None
         assert "pay_*" in policy["require_approval_for"]
@@ -435,7 +431,5 @@ class TestGovernanceIrCacheKey:
 
     def test_adding_approval_changes_version(self):
         base_version = compile_agent_to_ir(_agent(), "hi")["version"]
-        approved_version = compile_agent_to_ir(
-            _governed_agent(approval_required=["delete_*"]), "hi"
-        )["version"]
+        approved_version = compile_agent_to_ir(_governed_agent(approval_required=["delete_*"]), "hi")["version"]
         assert base_version != approved_version

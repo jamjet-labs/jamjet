@@ -124,6 +124,4 @@ def resolve_policy_allowlist(policy: str | dict | None) -> set[str] | None:
             return None
         return set(al)
 
-    raise TypeError(
-        f"policy must be str, dict, or None — got {type(policy).__name__!r}"
-    )
+    raise TypeError(f"policy must be str, dict, or None — got {type(policy).__name__!r}")
