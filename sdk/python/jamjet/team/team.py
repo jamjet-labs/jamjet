@@ -57,6 +57,7 @@ from jamjet.agents.session import Session, SessionStore
 
 if TYPE_CHECKING:
     from jamjet.agents.agent import Agent, AgentResult
+    from jamjet.deploy import DeployResult
 
 # A sub-agent run can succeed (AgentResult) or fail (the exception is captured so
 # one failing sub-agent never crashes the team — child-crash isolation).
@@ -303,6 +304,30 @@ class _TeamBase:
         """Run the team durably (each sub-agent its own :meth:`Agent.run_durable`
         execution, polled to a terminal state)."""
         return await self._orchestrate(input, durable=True, runtime_url=runtime_url)
+
+    async def deploy(
+        self,
+        *,
+        runtime: str | None = None,
+        schedule: str | None = None,
+    ) -> list[DeployResult]:
+        """Register each sub-agent's workflow on a runtime (Track 7a-3).
+
+        A team is N agent IRs (Path A): deploy reuses :meth:`Agent.deploy` per
+        member and returns one :class:`~jamjet.deploy.DeployResult` per sub-agent,
+        in declared order. The Python orchestration (sequencing / routing / merge)
+        still runs CLIENT-SIDE when you call :meth:`run_durable`; deploy only
+        pre-registers the building-block workflows. A fully engine-native single
+        team deployment is a follow-up (F-t6-native-nodes).
+
+        *runtime* is resolved the same way as :meth:`Agent.deploy`
+        (``local`` / ``self-host`` / ``cloud`` / a URL). *schedule* installs the
+        SAME cron expression on EACH sub-agent's workflow: for a
+        :class:`Parallel` team that reproduces the fan-out, but for
+        :class:`Sequential` / :class:`Loop` the engine fires each member
+        independently (orchestrated scheduling stays client-side).
+        """
+        return [await agent.deploy(runtime=runtime, schedule=schedule) for agent in self.agents]
 
     # -- the per-sub-agent run primitive --------------------------------------
 
