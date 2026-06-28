@@ -1850,16 +1850,36 @@ async def _worker_loop(
                     gen_ai_model_field = output.get("gen_ai_model") or None
                     finish_reason_field = output.get("finish_reason") or None
 
-                await client.complete_work_item(
-                    item_id,
-                    exec_id,
-                    node_id,
-                    output,
-                    state_patch,
-                    duration_ms,
-                    gen_ai_model=gen_ai_model_field,
-                    finish_reason=finish_reason_field,
-                )
+                try:
+                    await client.complete_work_item(
+                        item_id,
+                        exec_id,
+                        node_id,
+                        output,
+                        state_patch,
+                        duration_ms,
+                        gen_ai_model=gen_ai_model_field,
+                        finish_reason=finish_reason_field,
+                        # Echo the lease fence from the claim so the runtime can fence
+                        # the completion (reject a stale/reclaimed lease). Omitted when
+                        # 0/absent, keeping the unfenced fallback backward-compatible.
+                        lease_fence=lease_fence,
+                    )
+                except Exception as complete_exc:
+                    # A 409 means our echoed fence no longer matches: the lease was
+                    # reclaimed and a NEW worker owns this item now. This (stale)
+                    # worker must NOT fail_work_item — that would clobber the
+                    # reclaimed work the new claimant is running and defeat the fence.
+                    # Treat the lost lease as a no-op and move on. httpx surfaces the
+                    # rejection as HTTPStatusError carrying .response.status_code.
+                    status = getattr(getattr(complete_exc, "response", None), "status_code", None)
+                    if status == 409:
+                        console.print(f"[yellow]Completion rejected; lease lost[/yellow] id={item_id}")
+                        if once:
+                            return
+                        continue
+                    # Any other completion error keeps the existing fail behavior.
+                    raise
                 console.print(f"[green]Completed[/green] id={item_id} node=[bold]{node_id}[/bold] {duration_ms}ms")
             except Exception as exc:
                 console.print(f"[red]Failed[/red] node={node_id}: {exc}")

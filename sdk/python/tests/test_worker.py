@@ -13,6 +13,8 @@ No live runtime is required; a _StubClient records all outbound calls.
 
 from __future__ import annotations
 
+import httpx
+
 from jamjet.cli.main import _worker_loop  # noqa: E402
 
 # ── Test handler functions ────────────────────────────────────────────────────
@@ -75,6 +77,7 @@ class _StubClient:
         duration_ms: int = 0,
         gen_ai_model: str | None = None,
         finish_reason: str | None = None,
+        lease_fence: int | None = None,
     ) -> None:
         self.complete_calls.append(
             {
@@ -85,6 +88,7 @@ class _StubClient:
                 "state_patch": state_patch,
                 "gen_ai_model": gen_ai_model,
                 "finish_reason": finish_reason,
+                "lease_fence": lease_fence,
             }
         )
 
@@ -93,6 +97,30 @@ class _StubClient:
 
     async def heartbeat_work_item(self, item_id: str, worker_id: str, lease_fence: int = 0) -> None:
         self.heartbeat_calls.append({"item_id": item_id, "lease_fence": lease_fence})
+
+
+def _http_status_error(status: int) -> httpx.HTTPStatusError:
+    """Build the exact exception JamjetClient.complete_work_item raises on a non-2xx
+    response: httpx's HTTPStatusError carrying `.response.status_code` (the engine
+    returns 409 when the echoed lease fence no longer matches)."""
+    req = httpx.Request("POST", "http://runtime/work-items/wi/complete")
+    resp = httpx.Response(status, request=req)
+    return httpx.HTTPStatusError(f"HTTP {status}", request=req, response=resp)
+
+
+class _Conflict409Client(_StubClient):
+    """Stub whose complete_work_item raises a 409 — i.e. the lease was reclaimed and
+    a NEW worker now owns the item; this (stale) worker's settle is rejected."""
+
+    async def complete_work_item(self, *args: object, **kwargs: object) -> None:
+        raise _http_status_error(409)
+
+
+class _ServerError500Client(_StubClient):
+    """Stub whose complete_work_item raises a NON-409 error (transient server fault)."""
+
+    async def complete_work_item(self, *args: object, **kwargs: object) -> None:
+        raise _http_status_error(500)
 
 
 # ── Fixtures / constants ──────────────────────────────────────────────────────
@@ -243,6 +271,74 @@ _DISPATCH_ITEM: dict = {
     },
     "lease_fence": 0,
 }
+
+
+_FENCED_ITEM: dict = {
+    "id": "wi-006",
+    "execution_id": "exec_fenced",
+    "node_id": "fenced_step",
+    "queue_type": "python_tool",
+    "payload": {
+        "module": "tests.test_worker",
+        "function": "_add",
+        "input": {"a": 1, "b": 1},
+    },
+    # A real claim carries a non-zero lease fence (term * 2^32 + epoch).
+    "lease_fence": 4_294_967_297,
+}
+
+
+async def test_worker_echoes_lease_fence_on_complete() -> None:
+    """The fence from the claim response is echoed on complete so the runtime can
+    fence the settle (exactly-once-COMMIT for the external python_tool path)."""
+    stub = _StubClient(claimed_item=_FENCED_ITEM)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+
+    assert len(stub.complete_calls) == 1
+    assert stub.complete_calls[0]["lease_fence"] == 4_294_967_297, (
+        "the worker must echo the claim's lease_fence on complete"
+    )
+
+
+async def test_worker_absent_fence_forwarded_as_zero() -> None:
+    """When the claim response OMITS the lease_fence key ENTIRELY (not even an
+    explicit 0), the worker must still forward 0 — the client then drops it, keeping
+    the unfenced fallback backward-compatible.
+
+    Regression: this previously claimed an item built from _ADD_ITEM, which already
+    carries an explicit lease_fence=0, so it only exercised the explicit-0 path and
+    never the missing-key path it is named for. Build an item without the key."""
+    no_fence_item = {k: v for k, v in _ADD_ITEM.items() if k != "lease_fence"}
+    assert "lease_fence" not in no_fence_item, "the key must be truly absent from the claim"
+    stub = _StubClient(claimed_item=no_fence_item)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+
+    assert len(stub.complete_calls) == 1
+    assert stub.complete_calls[0]["lease_fence"] == 0, (
+        "an absent fence is forwarded as 0 and dropped by the client (unfenced path)"
+    )
+
+
+async def test_worker_409_complete_is_lost_lease_noop() -> None:
+    """A 409 from complete_work_item means our lease fence no longer matches: the
+    item was reclaimed and a NEW worker owns it now. The stale worker must treat the
+    rejection as a lost-lease no-op — it must NOT call fail_work_item, because that
+    would clobber the reclaimed work the new claimant is running. With --once it
+    returns cleanly."""
+    stub = _Conflict409Client(claimed_item=_FENCED_ITEM)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+
+    assert len(stub.fail_calls) == 0, "a 409 lost-lease must NOT call fail_work_item"
+
+
+async def test_worker_non_409_complete_error_still_fails() -> None:
+    """A NON-409 completion error keeps the existing behavior: it falls through to
+    fail_work_item (the lease is still ours; the settle just did not land)."""
+    stub = _ServerError500Client(claimed_item=_FENCED_ITEM)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+
+    assert len(stub.fail_calls) == 1, "a non-409 completion error must still call fail_work_item"
+    assert stub.fail_calls[0]["item_id"] == "wi-006"
 
 
 async def test_worker_dispatch_tool_calls_return_reaches_state() -> None:

@@ -87,6 +87,16 @@ impl InMemoryBackend {
     pub fn seed_tool_effect_for_test(&self, key: String, value: serde_json::Value) {
         self.tool_effects.insert(key, value);
     }
+
+    /// Test helper: backdate a work item's lease so the reclaim sweep
+    /// (`reclaim_expired_leases`) treats it as expired. Mirrors
+    /// `SqliteBackend::force_lease_expired_for_test`. Not part of the
+    /// StateBackend trait; only used in tests / simulators.
+    pub fn force_lease_expired_for_test(&self, item_id: WorkItemId) {
+        if let Some(mut entry) = self.work_items.get_mut(&item_id) {
+            entry.lease_expires_at = Some(Utc::now() - chrono::Duration::hours(1));
+        }
+    }
 }
 
 impl Default for InMemoryBackend {
@@ -420,6 +430,35 @@ impl StateBackend for InMemoryBackend {
     async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
         self.work_items.remove(&item_id);
         Ok(())
+    }
+
+    async fn complete_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> BackendResult<bool> {
+        // Mirror the SQLite `status = 'claimed'` guard: only the current holder
+        // of a still-CLAIMED item may settle. "Claimed" in memory is
+        // `worker_id.is_some()` (the same predicate `claim_work_item` uses).
+        // Requiring it closes two fail-opens a fence-only check leaves open:
+        //   1. A forged `lease_fence: 0` against a never-claimed pending item —
+        //      pending items carry `lease_fence == 0`, so `0 == 0` would match.
+        //   2. A stale fence after a reclaim — `reclaim_expired_leases` clears
+        //      `worker_id` but LEAVES `lease_fence` set, so the old fence lingers.
+        // Either case now returns `Ok(false)`. A mismatched fence, an absent
+        // item, or one already settled (removed) also returns `false`.
+        //
+        // `remove_if` makes the guard check and the delete a SINGLE atomic step
+        // (it holds the shard lock across the predicate and removal), closing the
+        // get-then-remove TOCTOU where two concurrent settles could both observe a
+        // claimed+matching item and both remove it. It returns `Some` iff the
+        // predicate held and the entry was removed, so exactly one racer settles.
+        Ok(self
+            .work_items
+            .remove_if(&item_id, |_k, entry| {
+                entry.worker_id.is_some() && entry.lease_fence == lease_fence
+            })
+            .is_some())
     }
 
     async fn commit_turn(
