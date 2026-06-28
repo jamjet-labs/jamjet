@@ -119,6 +119,10 @@ class Agent:
         self._memory_enabled: bool = False
         self._memory_resolved: AgentMemory | None = None
         self._engram: Any | None = None  # the lazily-opened embedded Engram (memory=True)
+        # Serializes the FIRST embedded-Engram init so two concurrent first runs
+        # open it exactly once (see _ensure_memory).  Created lazily inside the
+        # running loop to stay loop-agnostic across separate asyncio.run() calls.
+        self._memory_lock: asyncio.Lock | None = None
         if memory is None or memory is False:
             self._memory_enabled = False
         elif memory is True:
@@ -278,7 +282,9 @@ class Agent:
         """Return a Session object.
 
         - ``None`` -> ``None`` (no session, default path unchanged).
-        - :class:`Session` -> returned as-is (caller owns persistence).
+        - :class:`Session` -> returned as-is (caller owns persistence).  A Session
+          loaded from a store carries a back-reference to that store (set by
+          ``SessionStore.load``/``create``), so the run persists it back there.
         - ``str`` -> loaded from the agent's session store; raises
           ``ValueError`` if not found.
         """
@@ -295,6 +301,20 @@ class Agent:
                 "Create it first with SessionStore.create()."
             )
         return loaded
+
+    def _store_for_session(self, session: Session) -> SessionStore:
+        """The :class:`SessionStore` a run should persist *session* back to.
+
+        A session loaded/created via a ``SessionStore`` carries a back-reference
+        to that store (``session._store``); using it means a session loaded from
+        store X is saved back to X, not silently to the agent's default store.  A
+        bare ``Session(...)`` constructed by the caller has no originating store,
+        so it falls back to the agent's store (documented behaviour).
+        """
+        store = getattr(session, "_store", None)
+        if store is not None:
+            return store
+        return self._get_default_store()
 
     # ── Memory: governed auto retrieve/record loop (T4-3) ──────────────────
 
@@ -313,29 +333,41 @@ class Agent:
             return None
         if self._memory_resolved is not None:
             return self._memory_resolved
-        try:
-            from engram import Engram  # noqa: PLC0415
-            from engram import Scope as EngramScope  # noqa: PLC0415
-        except ImportError as e:  # pragma: no cover - guarded at __init__
-            raise ImportError(
-                "Agent(memory=True) requires the optional 'memory' extra "
-                "(jamjet-engram). Install with: pip install 'jamjet[memory]'."
-            ) from e
-        from jamjet.memory.engram_bridge import AgentMemory  # noqa: PLC0415
-        from jamjet.spec import MemoryConfig  # noqa: PLC0415
+        # Serialize the first init: two concurrent first runs both see
+        # _memory_resolved is None, so without a lock each would await
+        # Engram.open(), leaking a handle and breaking open-once.  Create the lock
+        # lazily here (a pure sync check, race-free in the single-threaded loop);
+        # after the first init succeeds _memory_resolved short-circuits above so
+        # the lock is never taken again.
+        if self._memory_lock is None:
+            self._memory_lock = asyncio.Lock()
+        async with self._memory_lock:
+            # Double-checked: a racing first run may have opened it while we waited.
+            if self._memory_resolved is not None:
+                return self._memory_resolved
+            try:
+                from engram import Engram  # noqa: PLC0415
+                from engram import Scope as EngramScope  # noqa: PLC0415
+            except ImportError as e:  # pragma: no cover - guarded at __init__
+                raise ImportError(
+                    "Agent(memory=True) requires the optional 'memory' extra "
+                    "(jamjet-engram). Install with: pip install 'jamjet[memory]'."
+                ) from e
+            from jamjet.memory.engram_bridge import AgentMemory  # noqa: PLC0415
+            from jamjet.spec import MemoryConfig  # noqa: PLC0415
 
-        db_path = Path.home() / ".jamjet" / "engram.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        engram = await Engram.open(path=str(db_path))
-        self._engram = engram
-        # The per-run memory KEY is the stable session id, applied at call time
-        # via as_scope() (Engram retrieval filters by scope); org defaults here.
-        self._memory_resolved = AgentMemory(
-            engram,
-            scope=EngramScope(user_id="default", org_id="default"),
-            config=MemoryConfig(),
-        )
-        return self._memory_resolved
+            db_path = Path.home() / ".jamjet" / "engram.db"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            engram = await Engram.open(path=str(db_path))
+            self._engram = engram
+            # The per-run memory KEY is the stable session id, applied at call time
+            # via as_scope() (Engram retrieval filters by scope); org defaults here.
+            self._memory_resolved = AgentMemory(
+                engram,
+                scope=EngramScope(user_id="default", org_id="default"),
+                config=MemoryConfig(),
+            )
+            return self._memory_resolved
 
     async def _prepare_run(
         self,
@@ -441,10 +473,15 @@ class Agent:
     def _inject_memory_block(messages: list[dict[str, Any]] | None, ctx: str) -> list[dict[str, Any]]:
         """Insert a 'Relevant memory' system block into the seed *messages*.
 
-        The block is placed right after the agent's system instruction so the
-        model sees prior-session knowledge before the conversation thread.
+        The block is placed right after the agent's system instruction (when one
+        is present) so the model sees prior-session knowledge before the
+        conversation thread.  It is tagged with :data:`MEMORY_BLOCK_PREFIX` so the
+        non-react strategies' ``seed_history`` can tell it apart from the
+        instruction slot and never clobber it (see ``strategies/base.py``).
         """
-        block = {"role": "system", "content": f"Relevant memory from prior sessions:\n{ctx}"}
+        from jamjet.runtime.local.strategies.base import MEMORY_BLOCK_PREFIX  # noqa: PLC0415
+
+        block = {"role": "system", "content": f"{MEMORY_BLOCK_PREFIX}\n{ctx}"}
         msgs = list(messages or [])
         if msgs and msgs[0].get("role") == "system":
             return [msgs[0], block, *msgs[1:]]
@@ -546,7 +583,7 @@ class Agent:
 
         # T4-2: persist the session turn (in-process path: no full_messages).
         if resolved_session is not None:
-            store = self._get_default_store()
+            store = self._store_for_session(resolved_session)
             persist_session_turn(
                 resolved_session,
                 prompt,
@@ -669,7 +706,7 @@ class Agent:
         if resolved_session is not None:
             state = execution.get("current_state") or {}
             full_messages: list[dict[str, Any]] | None = state.get("messages")
-            store = self._get_default_store()
+            store = self._store_for_session(resolved_session)
             persist_session_turn(
                 resolved_session,
                 prompt,

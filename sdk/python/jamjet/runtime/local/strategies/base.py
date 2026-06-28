@@ -11,6 +11,13 @@ from typing import Any, Protocol, runtime_checkable
 from jamjet.runtime.local.llm_adapters.base import LLMAdapter
 from jamjet.spec import AgentSpec, ToolSpec
 
+# Leading text of the retrieved-memory system block injected by
+# ``Agent._inject_memory_block`` (T4-3).  ``seed_history`` uses it to tell the
+# injected memory block apart from the agent-instruction system slot so it never
+# clobbers recall.  Kept here (the lowest-level consumer) so both sides share one
+# definition; ``_inject_memory_block`` imports it to BUILD the block.
+MEMORY_BLOCK_PREFIX = "Relevant memory from prior sessions:"
+
 
 @runtime_checkable
 class StrategyRunner(Protocol):
@@ -105,9 +112,20 @@ def seed_history(
 
     1. The **trailing new-user prompt is dropped** — the strategy re-frames it
        into its own phase prompt and appends that itself.
-    2. The **leading system block is swapped for *system*** — so a phase's role
-       augmentation ("You are the proposer", "agent N of M") is preserved, while
-       any injected memory block and every prior user/assistant turn are kept.
+    2. The **agent-instruction system slot is swapped for *system*** — so a
+       phase's role augmentation ("You are the proposer", "agent N of M") is
+       preserved, while any injected memory block and every prior user/assistant
+       turn are kept.
+
+    Distinguishing the instruction slot from the memory block (the Track-4 fix).
+    ``seed_messages_for_run`` only emits the instruction system slot when the
+    agent's instructions are NON-empty; for a memory-enabled run with EMPTY
+    instructions the FIRST system message is the injected memory block, not the
+    persona.  So we replace the leading system message ONLY when it is the
+    instruction slot (identified by NOT starting with
+    :data:`MEMORY_BLOCK_PREFIX`); otherwise we PREPEND *system*, keeping the
+    memory block intact.  Replacing blindly would drop recall for every non-react
+    strategy whenever instructions are empty.
 
     When *initial_messages* is ``None`` (a fresh, sessionless run) it returns the
     single default system block ``[{"role": "system", "content": system}]`` — the
@@ -123,8 +141,17 @@ def seed_history(
     # Copy each carried message so the strategy can append/extend freely without
     # mutating the caller's seed list.
     prefix = [dict(m) for m in initial_messages[:-1]]
-    if prefix and prefix[0].get("role") == "system":
+    leads_with_instruction_slot = (
+        bool(prefix)
+        and prefix[0].get("role") == "system"
+        and not str(prefix[0].get("content", "")).startswith(MEMORY_BLOCK_PREFIX)
+    )
+    if leads_with_instruction_slot:
+        # Swap the agent-instruction slot for the phase persona.
         prefix[0] = {"role": "system", "content": system}
     else:
+        # No instruction slot to swap (empty instructions, so the lead is the
+        # memory block, or no leading system at all): prepend the persona and keep
+        # the memory block / turns untouched.
         prefix.insert(0, {"role": "system", "content": system})
     return prefix

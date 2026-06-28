@@ -39,10 +39,12 @@ Turn 2 (after a simulated restart with a fresh `Agent` + `SessionStore`): the ag
 ## Key API
 
 ```python
-from jamjet import Agent, Session, SessionStore, tool
+from jamjet import Agent, JamjetClient, Session, SessionStore, tool
 
 store = SessionStore()               # defaults to ~/.jamjet/sessions.db
 session = store.create("my-session")
+# Artifacts go through a runtime client; attach one before session.artifacts.
+session.attach_client(JamjetClient("http://127.0.0.1:7700"))
 
 agent = Agent(
     "assistant",
@@ -57,6 +59,7 @@ ref = await session.artifacts.put(b"some bytes", "text/plain")
 
 # Reload after restart:
 session2 = SessionStore().load("my-session")
+session2.attach_client(JamjetClient("http://127.0.0.1:7700"))  # binding is not persisted; reattach
 r2 = await agent.run("Turn 2 prompt", session=session2)  # sees turn 1 + memory
 data = await session2.artifacts.get(ref.hash)
 ```

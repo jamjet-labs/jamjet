@@ -26,14 +26,13 @@ import asyncio
 import hashlib
 import sys
 import types
-from contextlib import contextmanager
 from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
-from jamjet import Agent, ArtifactRef, Session, SessionStore, tool
-
+from jamjet import Agent, ArtifactRef, SessionStore, tool
 
 # ---------------------------------------------------------------------------
 # Shared tool
@@ -81,26 +80,15 @@ class _ScriptedModel:
         return resp
 
 
-class _FakeMemory:
-    """In-process duck-typed AgentMemory for demo mode."""
+class _ScopedFakeMemory:
+    """A scope-bound view yielded by ``_FakeMemory.as_scope``.
 
-    def __init__(self) -> None:
-        self._store: list[str] = []
-        self._scoped_user_id: str | None = None
+    Reads/writes ONLY the list for its scope, so memory never bleeds across
+    sessions, mirroring the real ``AgentMemory.as_scope`` per-run clone.
+    """
 
-    @contextmanager
-    def as_scope(
-        self,
-        *,
-        user_id: str | None = None,
-        org_id: str | None = None,
-    ) -> Generator[_FakeMemory, None, None]:
-        old = self._scoped_user_id
-        self._scoped_user_id = user_id
-        try:
-            yield self
-        finally:
-            self._scoped_user_id = old
+    def __init__(self, store: list[str]) -> None:
+        self._store = store
 
     async def record(self, text: str, **kwargs: Any) -> None:
         self._store.append(text)
@@ -108,9 +96,31 @@ class _FakeMemory:
     async def context(self, query: str, **kwargs: Any) -> str:
         if not self._store:
             return ""
-        # Return a summary of what was recorded in the session.
+        # Return a summary of what was recorded in THIS scope.
         recorded = "; ".join(self._store[-3:])
         return f"[Recalled from session memory: {recorded}]"
+
+
+class _FakeMemory:
+    """In-process duck-typed AgentMemory for demo mode.
+
+    Storage is keyed by scope ``user_id`` (the agent scopes every retrieve/record
+    by the stable ``session.id``), and ``as_scope`` yields a scoped instance bound
+    to that key, so two different sessions never see each other's memory, exactly
+    like the real ``AgentMemory``.
+    """
+
+    def __init__(self) -> None:
+        self._by_scope: dict[str | None, list[str]] = {}
+
+    @contextmanager
+    def as_scope(
+        self,
+        *,
+        user_id: str | None = None,
+        org_id: str | None = None,
+    ) -> Generator[_ScopedFakeMemory, None, None]:
+        yield _ScopedFakeMemory(self._by_scope.setdefault(user_id, []))
 
 
 class _FakeArtifactClient:

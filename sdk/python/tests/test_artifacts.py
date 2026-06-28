@@ -22,7 +22,7 @@ from jamjet.client import JamjetClient
 # ---------------------------------------------------------------------------
 
 
-def _mock_client() -> JamjetClient:
+async def _mock_client() -> JamjetClient:
     """A JamjetClient whose transport implements the artifact routes in memory.
 
     POST /artifacts hashes the body and stores it; GET /artifacts/:hash returns
@@ -56,6 +56,9 @@ def _mock_client() -> JamjetClient:
         return httpx.Response(404, json={"error": "not found"})
 
     client = JamjetClient(base_url="http://test")
+    # JamjetClient.__init__ eagerly opens an AsyncClient; close it before swapping
+    # in the mock-transport one so the original is not leaked (ResourceWarning).
+    await client._client.aclose()
     client._client = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(handler))
     return client
 
@@ -77,13 +80,20 @@ def test_artifact_ref_media_type_optional():
     assert ref.media_type is None
 
 
+def test_artifact_ref_reexported_from_agents():
+    """ArtifactRef is re-exported from jamjet.agents (alongside ArtifactStore)."""
+    from jamjet.agents import ArtifactRef as AgentsArtifactRef
+
+    assert AgentsArtifactRef is ArtifactRef
+
+
 # ---------------------------------------------------------------------------
 # JamjetClient.put_artifact / get_artifact (mock HTTP)
 # ---------------------------------------------------------------------------
 
 
 async def test_client_put_artifact_returns_ref():
-    client = _mock_client()
+    client = await _mock_client()
     try:
         ref = await client.put_artifact(b"hello", media_type="text/plain")
         assert isinstance(ref, ArtifactRef)
@@ -95,7 +105,7 @@ async def test_client_put_artifact_returns_ref():
 
 
 async def test_client_round_trips_blob_by_hash():
-    client = _mock_client()
+    client = await _mock_client()
     try:
         ref = await client.put_artifact(b"hello")
         got = await client.get_artifact(ref.hash)
@@ -105,7 +115,7 @@ async def test_client_round_trips_blob_by_hash():
 
 
 async def test_client_get_unknown_hash_raises_404():
-    client = _mock_client()
+    client = await _mock_client()
     try:
         with pytest.raises(httpx.HTTPStatusError) as exc:
             await client.get_artifact("0" * 64)

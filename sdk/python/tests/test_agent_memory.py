@@ -399,3 +399,48 @@ def test_as_scope_per_run_clone_no_cross_session_bleed() -> None:
     assert ("B", "B-second", "assistant") in probe.records, probe.records
     # The shared instance's scope is never mutated by as_scope.
     assert mem._scope.user_id == "base"
+
+
+# ---------------------------------------------------------------------------
+# 8. Finding 3 — two concurrent FIRST runs must open the embedded Engram ONCE
+#    (the lazy init is serialized with an asyncio.Lock + double-check).
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_first_memory_init_opens_engram_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two concurrent first ``_ensure_memory`` calls open Engram exactly once.
+
+    Without the lock both racing coroutines see ``_memory_resolved is None`` and
+    each ``await Engram.open(...)``, leaking a handle and breaking open-once.  We
+    patch ``Engram.open`` to count + yield (widening the race window) and assert
+    it ran once and both calls resolve to the SAME backend.
+
+    Skipped when the optional ``engram`` extra is absent (memory=True needs it).
+    """
+    pytest.importorskip("engram")
+    import engram as engram_mod  # noqa: PLC0415
+
+    calls = {"n": 0}
+
+    class _FakeHandle:
+        async def close(self) -> None:
+            return None
+
+    async def _fake_open(*_args: Any, path: str | None = None, **_kw: Any) -> _FakeHandle:
+        calls["n"] += 1
+        await asyncio.sleep(0.02)  # widen the window so a missing lock races
+        return _FakeHandle()
+
+    monkeypatch.setattr(engram_mod.Engram, "open", _fake_open)
+
+    agent = _agent(memory=True)  # import engram succeeds at __init__ (extra present)
+    assert agent._memory_enabled is True
+
+    async def _drive() -> tuple[Any, Any]:
+        return await asyncio.gather(agent._ensure_memory(), agent._ensure_memory())
+
+    a, b = asyncio.run(_drive())
+
+    assert calls["n"] == 1, f"Engram.open must be called exactly once, got {calls['n']}"
+    assert a is b, "both concurrent first inits must resolve to the same memory backend"
+    assert agent._memory_resolved is a

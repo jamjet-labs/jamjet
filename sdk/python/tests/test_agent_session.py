@@ -350,17 +350,97 @@ def test_persist_session_turn_with_full_messages(db_path: str) -> None:
     assert loaded.latest_execution_id == "exec-002"
 
 
-def test_parity_seed_same_for_both_paths() -> None:
-    """The seed helper is path-agnostic: same output regardless of path."""
-    s = Session("z")
-    s.messages = [
-        {"role": "user", "content": "prior"},
-        {"role": "assistant", "content": "prior-reply"},
-    ]
-    # Both run() and run_durable() call the same function.
-    msgs_run = seed_messages_for_run(s, "system", "new")
-    msgs_durable = seed_messages_for_run(s, "system", "new")
-    assert msgs_run == msgs_durable
+class _FakeDurableClient:
+    """Async-context-manager fake of JamjetClient for the run_durable seam test.
+
+    Captures the ``initial_input`` passed to ``start_execution`` (so a test can
+    assert the session thread was SEEDED) and returns a terminal execution whose
+    ``current_state.messages`` is the durable ledger (so the persist seam runs).
+    """
+
+    def __init__(self, execution: dict[str, Any]) -> None:
+        self._execution = execution
+        self.started: list[tuple[str, dict[str, Any]]] = []
+
+    async def __aenter__(self) -> _FakeDurableClient:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+    async def create_workflow(self, ir: dict[str, Any]) -> dict[str, Any]:
+        return {"workflow_id": ir["workflow_id"]}
+
+    async def start_execution(
+        self, workflow_id: str, input: dict[str, Any], workflow_version: str | None = None
+    ) -> dict[str, Any]:
+        self.started.append((workflow_id, input))
+        return {"execution_id": "exec-durable-1"}
+
+    async def get_execution(self, execution_id: str) -> dict[str, Any]:
+        return self._execution
+
+    async def get_events(self, execution_id: str) -> dict[str, Any]:
+        return {"events": []}
+
+
+def test_run_durable_seeds_and_persists_session_thread(
+    db_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The REAL run_durable() path seeds the carried thread + persists the ledger.
+
+    Drives ``Agent.run_durable`` against a mocked durable engine (no live engine)
+    and asserts BOTH ends of the carried-state seam: the prior session thread is
+    seeded into the execution's ``initial_input``, and the durable ledger is
+    persisted back to the session.  Unlike the old test (which called
+    ``seed_messages_for_run`` directly and stayed green even if run_durable
+    stopped seeding/persisting), this exercises the actual run_durable seam.
+    """
+    store = SessionStore(db_path)
+    s = store.create("durable-seam")
+    s.append_message("user", "my name is Alice")
+    s.append_message("assistant", "your name is Alice")
+    store.save(s)
+
+    completed = {
+        "execution_id": "exec-durable-1",
+        "status": "completed",
+        "current_state": {
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "my name is Alice"},
+                {"role": "assistant", "content": "your name is Alice"},
+                {"role": "user", "content": "what is my name?"},
+                {"role": "assistant", "content": "Your name is Alice."},
+            ],
+            "last_model_output": "Your name is Alice.",
+        },
+    }
+    fake = _FakeDurableClient(completed)
+    # run_durable does `from jamjet.client import JamjetClient` at call time, so
+    # patching the module attribute swaps in our fake (mirrors run_durable tests).
+    monkeypatch.setattr("jamjet.client.JamjetClient", lambda *a, **k: fake)
+
+    agent = Agent("d", model="gpt-4o-mini", tools=[echo], session_store=store)
+    result = asyncio.run(agent.run_durable("what is my name?", session=s))
+
+    # SEED: the prior session thread reached start_execution's initial_input.
+    assert fake.started, "run_durable must have started an execution"
+    _wf_id, initial_input = fake.started[0]
+    seeded = " ".join(str(m.get("content", "")) for m in initial_input["messages"])
+    assert "my name is Alice" in seeded, initial_input["messages"]
+    assert "what is my name?" in seeded, initial_input["messages"]
+
+    # PERSIST: the session now carries the durable ledger (system stripped) and
+    # the execution id — written through the real run_durable persist seam.
+    reloaded = store.load("durable-seam")
+    assert reloaded is not None
+    assert all(m["role"] != "system" for m in reloaded.messages)
+    assert {"role": "user", "content": "what is my name?"} in reloaded.messages
+    assert {"role": "assistant", "content": "Your name is Alice."} in reloaded.messages
+    assert reloaded.latest_execution_id == "exec-durable-1"
+    assert result.output == "Your name is Alice."
 
 
 # ---------------------------------------------------------------------------
@@ -417,3 +497,70 @@ def test_str_session_id_not_found(db_path: str) -> None:
     agent = Agent("err", model="gpt-4o-mini", tools=[echo], session_store=store)
     with pytest.raises(ValueError, match="not found"):
         asyncio.run(agent.run("hello", session="no-such-session"))
+
+
+# ---------------------------------------------------------------------------
+# Finding 1 — create() is get-or-create; it must never clobber an existing
+# session (save() is INSERT OR REPLACE, so a naive create() wiped the thread).
+# ---------------------------------------------------------------------------
+
+
+def test_create_does_not_clobber_existing_session(db_path: str) -> None:
+    """create() over an existing id returns it UNCHANGED (no silent data loss)."""
+    store = SessionStore(db_path)
+    s = store.create("s1")
+    s.append_message("user", "remember me")
+    s.append_message("assistant", "noted")
+    s.metadata["k"] = "v"
+    store.save(s)
+
+    # create("s1") again must NOT wipe the thread/metadata.
+    again = store.create("s1")
+    assert again.messages == [
+        {"role": "user", "content": "remember me"},
+        {"role": "assistant", "content": "noted"},
+    ], "create() clobbered the existing thread (silent data loss)"
+    assert again.metadata == {"k": "v"}
+
+    # The persisted row is intact too (not just the returned object).
+    reloaded = store.load("s1")
+    assert reloaded is not None
+    assert reloaded.messages == again.messages
+    assert reloaded.metadata == {"k": "v"}
+
+
+def test_create_new_id_still_creates_empty_session(db_path: str) -> None:
+    """create() for a genuinely new id still creates+persists an empty session."""
+    store = SessionStore(db_path)
+    s = store.create("fresh")
+    assert s.messages == []
+    assert store.load("fresh") is not None
+
+
+# ---------------------------------------------------------------------------
+# Finding 4 — a session loaded from store X is persisted back to X, not to the
+# agent's default store.
+# ---------------------------------------------------------------------------
+
+
+def test_session_persists_back_to_its_originating_store(
+    capturing_mock: _CapturingMockClient,
+    tmp_path: Path,
+) -> None:
+    """A Session loaded from store A is saved back to A, never the agent's store B."""
+    store_a = SessionStore(str(tmp_path / "store_a.db"))  # the session's origin
+    store_b = SessionStore(str(tmp_path / "store_b.db"))  # the agent's default store
+    store_a.create("cross")
+
+    loaded = store_a.load("cross")  # carries a back-ref to store_a
+    assert loaded is not None
+    agent = Agent("x", model="gpt-4o-mini", tools=[echo], strategy="react", session_store=store_b)
+
+    asyncio.run(agent.run("my name is Alice", session=loaded))
+
+    # The turn landed in store A (the originating store) ...
+    from_a = store_a.load("cross")
+    assert from_a is not None
+    assert any(m["role"] == "user" for m in from_a.messages), "run did not persist to the originating store A"
+    # ... and NOT in the agent's default store B.
+    assert store_b.load("cross") is None, "run leaked the session into the agent's default store B"

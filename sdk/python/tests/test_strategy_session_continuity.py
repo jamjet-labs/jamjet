@@ -178,3 +178,111 @@ def test_non_react_strategies_continue_thread(
     store = SessionStore(db_path)
     calls = _run_two_turns(capturing_model, store, strategy=strategy)
     _assert_secret_in_some_call(calls, strategy=strategy)
+
+
+# ---------------------------------------------------------------------------
+# Finding 2 — seed_history must preserve the injected MEMORY block when the
+# instruction slot is absent (empty instructions).  seed_messages_for_run emits
+# the instruction system slot ONLY for non-empty instructions; for a
+# memory-enabled run with EMPTY instructions the FIRST system message is the
+# retrieved-memory block.  The pre-fix seed_history blindly REPLACED the leading
+# system message with the strategy persona, dropping recall for every non-react
+# strategy.  These pin the fix.
+# ---------------------------------------------------------------------------
+
+
+def test_seed_history_preserves_memory_block_when_it_leads() -> None:
+    """seed_history: a leading MEMORY block (empty instructions) is NOT clobbered.
+
+    Pre-fix, prefix[0] (the memory block, role=system) was replaced with the
+    persona and recall was lost.  Post-fix the persona is PREPENDED and the memory
+    block survives.
+    """
+    from jamjet.runtime.local.strategies.base import MEMORY_BLOCK_PREFIX, seed_history
+
+    memory_block = {"role": "system", "content": f"{MEMORY_BLOCK_PREFIX}\nThe codeword is {SECRET}."}
+    initial_messages = [
+        memory_block,
+        {"role": "user", "content": "earlier turn"},
+        {"role": "assistant", "content": "earlier reply"},
+        {"role": "user", "content": "new prompt"},  # trailing, dropped by seed_history
+    ]
+    out = seed_history(initial_messages, "You are the proposer.")
+
+    # The persona is present as the FIRST system message ...
+    assert out[0] == {"role": "system", "content": "You are the proposer."}
+    # ... and the memory block is preserved (not clobbered).
+    assert any(m.get("role") == "system" and str(m.get("content", "")).startswith(MEMORY_BLOCK_PREFIX) for m in out), (
+        f"memory block dropped by seed_history: {out}"
+    )
+    assert SECRET in " ".join(m.get("content", "") for m in out)
+
+
+def test_seed_history_swaps_instruction_slot_keeps_memory() -> None:
+    """seed_history: with an instruction slot present it is swapped (not duplicated)
+    for the persona, and the memory block right after it is kept."""
+    from jamjet.runtime.local.strategies.base import MEMORY_BLOCK_PREFIX, seed_history
+
+    initial_messages = [
+        {"role": "system", "content": "Original agent instructions."},
+        {"role": "system", "content": f"{MEMORY_BLOCK_PREFIX}\nremember {SECRET}"},
+        {"role": "user", "content": "earlier"},
+        {"role": "user", "content": "new prompt"},  # trailing, dropped
+    ]
+    out = seed_history(initial_messages, "You are agent 1 of 3. Think independently.")
+
+    systems = [m for m in out if m.get("role") == "system"]
+    # Exactly the persona + the memory block (instruction slot swapped, not duplicated).
+    assert systems[0]["content"] == "You are agent 1 of 3. Think independently."
+    assert "Original agent instructions." not in " ".join(m.get("content", "") for m in out)
+    assert any(str(m["content"]).startswith(MEMORY_BLOCK_PREFIX) for m in systems), out
+
+
+def test_non_react_strategy_carries_memory_block_with_empty_instructions() -> None:
+    """End-to-end through a non-react strategy: a memory-first seed (empty
+    instructions) carries the memory block INTO the model call.
+
+    Drives the real ``plan_and_execute`` generative phase with a memory-first
+    seed and a capturing adapter; asserts the retrieved-memory block reached the
+    model.  Fails pre-fix (seed_history dropped the leading memory block).
+    """
+    from jamjet.runtime.local.strategies import plan_and_execute
+    from jamjet.runtime.local.strategies.base import MEMORY_BLOCK_PREFIX
+
+    captured: list[list[dict]] = []
+
+    class _FakeAdapter:
+        async def generate(self, messages: list[dict[str, Any]], *, tools: Any = None) -> Any:
+            captured.append([dict(m) if isinstance(m, dict) else m for m in messages])
+            msg = MagicMock()
+            msg.content = _GENERIC_REPLY
+            msg.role = "assistant"
+            msg.tool_calls = []
+            return msg
+
+    # Build a valid spec with EMPTY instructions via the real compile path.
+    spec = Agent("m", model="gpt-4o-mini", tools=[echo], instructions="", strategy="plan-and-execute").compile()
+
+    memory_block = {"role": "system", "content": f"{MEMORY_BLOCK_PREFIX}\nThe codeword is {SECRET}."}
+    initial_messages = [
+        memory_block,  # leads (no instruction slot — empty instructions)
+        {"role": "user", "content": "earlier turn"},
+        {"role": "assistant", "content": "earlier reply"},
+        {"role": "user", "content": "what is my codeword?"},
+    ]
+
+    asyncio.run(
+        plan_and_execute.run(
+            adapter=_FakeAdapter(),
+            spec=spec,
+            prompt="what is my codeword?",
+            tools=[],
+            tool_calls_log=[],
+            initial_messages=initial_messages,
+        )
+    )
+
+    assert captured, "the strategy must have hit the model"
+    joined = "\n".join(" ".join((m.get("content") or "") for m in call if isinstance(m, dict)) for call in captured)
+    assert MEMORY_BLOCK_PREFIX in joined, f"memory block never reached the model: {captured}"
+    assert SECRET in joined, f"recalled secret dropped before the model call: {captured}"

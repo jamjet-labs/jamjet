@@ -200,16 +200,31 @@ class SessionStore:
     # ------------------------------------------------------------------
 
     def create(self, id: str | None = None) -> Session:
-        """Create and persist a new empty :class:`Session`.
+        """Get-or-create a :class:`Session` by id (never clobbers an existing one).
+
+        :meth:`save` is an ``INSERT OR REPLACE``, so creating over an existing id
+        would WIPE that session's thread + metadata.  To avoid silent data loss
+        ``create`` is get-or-create: if a session with *id* already exists it is
+        loaded and RETURNED UNCHANGED (no overwrite).  Only a genuinely new id is
+        persisted as an empty session.  To deliberately reset an existing session,
+        call :meth:`save` with a fresh :class:`Session` (the explicit overwrite).
 
         Args:
-            id: Optional session id.  If ``None`` a UUID4 is generated.
+            id: Optional session id.  If ``None`` a UUID4 is generated (always new).
 
         Returns:
-            The freshly-created :class:`Session` (already saved).
+            The existing :class:`Session` if *id* is already known, otherwise a
+            freshly-created empty one (already saved).
         """
+        if id is not None:
+            existing = self.load(id)
+            if existing is not None:
+                return existing
         session = Session(id=id if id is not None else str(uuid.uuid4()))
         self.save(session)
+        # Tag the originating store so a later run persists back HERE, not to the
+        # agent's default store (see Agent._store_for_session).
+        session._store = self
         return session
 
     def load(self, id: str) -> Session | None:
@@ -228,12 +243,16 @@ class SessionStore:
             row = cur.fetchone()
         if row is None:
             return None
-        return Session(
+        session = Session(
             id=row[0],
             messages=json.loads(row[1]),
             latest_execution_id=row[2],
             metadata=json.loads(row[3]),
         )
+        # Tag the originating store so a run that mutates this session persists it
+        # back HERE, not to the agent's default store (see Agent._store_for_session).
+        session._store = self
+        return session
 
     def save(self, session: Session) -> None:
         """Upsert a :class:`Session` (persist messages, latest_execution_id, metadata).

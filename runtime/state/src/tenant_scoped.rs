@@ -811,10 +811,23 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?;
 
+        // INSERT OR IGNORE keeps the FIRST row for a given (tenant, hash), so a
+        // second put of the same bytes with a different media_type does not change
+        // what is stored. Read the canonical media_type back rather than echoing
+        // this request's value, so the returned ref reflects what is actually
+        // persisted (and matches a later GET).
+        let media_type: Option<String> =
+            sqlx::query_scalar("SELECT media_type FROM artifacts WHERE tenant_id = ? AND hash = ?")
+                .bind(&self.tenant_id.0)
+                .bind(&hash)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(map_db_err)?;
+
         Ok(crate::artifact::ArtifactRef {
             hash,
             size,
-            media_type: media_type.map(|s| s.to_string()),
+            media_type,
         })
     }
 
