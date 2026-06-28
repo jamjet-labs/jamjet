@@ -16,8 +16,8 @@ result, always. No model calls are made unless you opt in with `judge=True`.
 
 ## Dataset (`evalset.jsonl`)
 
-```
-search-then-calc   expects ["web_search", "calculator"] in order, max 4 steps
+```text
+search-then-calc   expects ["web_search", "calculator"] in order, max 4 model turns
 search-only        expects web_search was used; calculator was NOT used
 no-trajectory      no expected_trajectory -- output scoring only (backward compatible)
 ```
@@ -90,7 +90,7 @@ EvalRunner.print_summary(results)
 | `expected_tools` | `list[str]` | All these tools appear (subset; add `"expected_tools_exact": true` to forbid extras) |
 | `used_tool` | `str` or `list[str]` | Each named tool appears at least once |
 | `did_not_use` | `str` or `list[str]` | None of these tools appear |
-| `max_turns` | `int` | Total step count is at most this value |
+| `max_turns` | `int` | Model turn count is at most this value (a turn may emit several parallel tool calls) |
 | `step_count` | `int` | Total step count equals this value exactly |
 
 All keys are optional. Only the keys that are present in `expected_trajectory` are checked.

@@ -83,6 +83,18 @@ def test_quickstart_pyproject_has_jamjet_dependency():
     assert "jamjet" in toml
 
 
+def test_quickstart_pyproject_dependency_includes_model_extra():
+    """The generated dependency must carry the [model] extra: the quickstart's
+    "anthropic/claude-sonnet-4-6" model is called through the in-process litellm
+    seam, which the [model] extra provides. A bare `jamjet` dep cannot run it."""
+    files = render_template("quickstart", "myagent")
+    toml = files["pyproject.toml"]
+    assert "jamjet[model]" in toml
+    # The README install command must match the dependency so a fresh project runs.
+    readme = files["README.md"]
+    assert "jamjet[model]" in readme
+
+
 # ---------------------------------------------------------------------------
 # `jamjet create` CLI tests
 # ---------------------------------------------------------------------------

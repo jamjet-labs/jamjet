@@ -297,7 +297,18 @@ class DevStack:
         try:
             for spec in self.build_specs():
                 self.log(f"Starting {spec.name}...")
-                proc = self.spawn(spec)
+                try:
+                    proc = self.spawn(spec)
+                except DevStackError:
+                    raise
+                except Exception as e:  # noqa: BLE001 - normalize ANY spawn failure
+                    # The spawner failed to even start the process (e.g. the server
+                    # binary is missing -> FileNotFoundError, or an OSError from the
+                    # OS). Re-raise as DevStackError so the CLI -- which only catches
+                    # DevStackError -- prints the intended dev-stack failure message
+                    # instead of a raw traceback. Already-started children are torn
+                    # down by the outer handler below.
+                    raise DevStackError(f"{spec.name} failed to spawn: {e}") from e
                 self._started.append((proc, spec))
                 self._attach_logs(proc, spec.name)
                 if spec.health_url is not None:

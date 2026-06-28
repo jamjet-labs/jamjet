@@ -2241,7 +2241,21 @@ def _load_trajectory_from_file(path: str, *, row_id: str | None = None) -> Traje
                 if match is None:
                     raise ValueError(f"row_id {row_id!r} not found in {path}")
                 chosen = match
-            return Trajectory.from_tool_sequence(chosen.get("trajectory") or [])
+            # Require a real trajectory field. A missing trajectory means this is
+            # NOT a trajectory-bearing results artifact (e.g. an old/malformed
+            # `jamjet eval run --output` file). Defaulting it to [] would forge a
+            # bogus "no tools used" baseline and emit fake added/removed diffs, so
+            # fail fast instead. An explicit empty list (the agent used no tools)
+            # is legitimate and accepted.
+            traj = chosen.get("trajectory")
+            if not isinstance(traj, list):
+                row_label = f"row_id {row_id!r}" if row_id is not None else "the first row"
+                raise ValueError(
+                    f"{path}: {row_label} has no 'trajectory' field -- this is not a "
+                    "trajectory-bearing eval-results file. Re-run `jamjet eval run` with a "
+                    "build that records trajectories, or pass an event-log JSON instead."
+                )
+            return Trajectory.from_tool_sequence(traj)
         # Shape 4: bare list of tool-name strings.
         if all(isinstance(x, str) for x in data):
             return Trajectory.from_tool_sequence(data)

@@ -235,6 +235,35 @@ def test_engine_dies_before_healthy_fails_loud_and_tears_down_sidecar():
     assert "worker" not in _spawn_order(rec)
 
 
+def test_spawn_failure_is_wrapped_in_devstackerror_and_tears_down():
+    """A spawner that RAISES (e.g. the server binary is missing -> FileNotFoundError)
+    surfaces as DevStackError -- the only exception the CLI catches -- with the raw
+    error chained, and the already-started sidecar is torn down (CodeRabbit #6)."""
+    rec = Recorder()
+    clock = FakeClock()
+    real_spawn = rec.spawn
+
+    def failing_spawn(spec):  # noqa: ANN001, ANN202
+        if spec.name == "engine":
+            raise FileNotFoundError(2, "No such file or directory", "/fake/jamjet-server")
+        return real_spawn(spec)
+
+    stack = _make_stack(rec, clock, spawn=failing_spawn)
+
+    with pytest.raises(DevStackError) as exc_info:
+        stack.start()
+
+    # The intended dev-stack message names the failing process; the raw
+    # FileNotFoundError is wrapped (chained), not surfaced to the CLI.
+    assert "engine" in str(exc_info.value).lower()
+    assert isinstance(exc_info.value.__cause__, FileNotFoundError)
+    # The already-started sidecar must be torn down (no orphan).
+    sidecar_proc = next(p for p in rec.procs if p.name == "sidecar")
+    assert sidecar_proc.terminated or sidecar_proc.killed
+    # Worker never started.
+    assert "worker" not in _spawn_order(rec)
+
+
 # ---------------------------------------------------------------------------
 # Flags: --no-sidecar / --no-worker / --engine-only
 # ---------------------------------------------------------------------------

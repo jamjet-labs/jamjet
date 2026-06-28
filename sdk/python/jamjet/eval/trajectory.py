@@ -16,6 +16,15 @@ Trajectory sources
 Both sources produce the same Trajectory shape; the tool_sequence and step_count
 are identical for the same run.
 
+Turns vs steps
+--------------
+A TURN is one model call. A STEP is one tool call. A single model turn may emit
+several tool calls (parallel tool-calling), so ``turn_count`` and ``step_count``
+differ. ``max_turns`` is checked against ``turn_count``; ``step_count`` against
+the flattened tool steps. ``from_events`` counts one turn per model
+``NodeCompleted`` event; sources with no turn signal (``from_agent_result``,
+``from_tool_sequence``) fall back to one turn per step.
+
 Spec keys (all optional -- only keys present are checked)
 ---------------------------------------------------------
 - ``expected_tools``: list[str] -- all these tools must appear (subset check)
@@ -23,8 +32,10 @@ Spec keys (all optional -- only keys present are checked)
 - ``tool_sequence``: list[str] -- tools must appear in this order (ordered subsequence)
 - ``used_tool``: str | list[str] -- each named tool must appear
 - ``did_not_use``: str | list[str] -- each named tool must NOT appear
-- ``max_turns``: int -- step count must be <= this value
-- ``step_count``: int -- step count must equal this value exactly
+- ``max_turns``: int -- model TURN count must be <= this value (a turn = one model
+  call; a single turn may emit several parallel tool calls)
+- ``step_count``: int -- tool-step count must equal this value exactly (one step
+  per tool call)
 
 Determinism guarantee
 ---------------------
@@ -110,6 +121,25 @@ def _tool_calls_from_node_completed(kind: dict[str, Any]) -> list[Any]:
     return []
 
 
+def _is_model_node_completed(kind: dict[str, Any]) -> bool:
+    """True iff a ``node_completed`` event kind is a MODEL turn (one model call).
+
+    A model node writes ``output.tool_calls`` (an empty list when the model stops
+    without calling a tool) and ``state_patch.last_model_tool_calls``; a
+    tool-dispatch or plain node writes neither. Either marker identifies a model
+    turn -- so the empty-tool-calls final turn (``finish_reason="stop"``) still
+    counts as a turn, and the artifact-spilled-output case is covered by the
+    ``state_patch`` fallback.
+    """
+    output = kind.get("output")
+    if isinstance(output, dict) and "tool_calls" in output:
+        return True
+    state_patch = kind.get("state_patch")
+    if isinstance(state_patch, dict) and "last_model_tool_calls" in state_patch:
+        return True
+    return False
+
+
 class Trajectory:
     """Ordered sequence of steps (tool calls) in an agent run.
 
@@ -119,8 +149,13 @@ class Trajectory:
     - :meth:`from_events` -- durable event log from get_events()
     """
 
-    def __init__(self, steps: list[TrajectoryStep]) -> None:
+    def __init__(self, steps: list[TrajectoryStep], *, turns: int | None = None) -> None:
         self._steps = list(steps)
+        # Number of model TURNS (model calls), distinct from the flattened tool
+        # step count. ``None`` means "no turn signal available" -> turn_count
+        # falls back to step_count (one turn per tool step). ``from_events``
+        # supplies a real turn count from the model NodeCompleted events.
+        self._turns = turns
 
     # ── Properties ───────────────────────────────────────────────────────────
 
@@ -141,8 +176,21 @@ class Trajectory:
 
     @property
     def step_count(self) -> int:
-        """Total number of steps (including non-tool steps)."""
+        """Total number of tool steps (one step per tool call)."""
         return len(self._steps)
+
+    @property
+    def turn_count(self) -> int:
+        """Number of model TURNS (model calls) in the run.
+
+        A turn is one model call; a single turn may emit several tool calls
+        (parallel tool-calling), so this is distinct from :attr:`step_count`.
+        ``from_events`` counts one turn per model ``NodeCompleted`` event. When no
+        turn signal is available (in-process ``from_agent_result`` or a bare
+        ``from_tool_sequence``) this falls back to ``step_count`` -- one turn per
+        tool step.
+        """
+        return self._turns if self._turns is not None else self.step_count
 
     # ── Constructors ──────────────────────────────────────────────────────────
 
@@ -194,12 +242,19 @@ class Trajectory:
             event_list = events
 
         steps: list[TrajectoryStep] = []
+        model_turns = 0
         for evt in event_list:
             kind = evt.get("kind", {})
             if not isinstance(kind, dict):
                 continue
             ktype = kind.get("type")
             if ktype == "node_completed":
+                # A model NodeCompleted is one TURN (one model call); count it
+                # whether or not it emitted tool calls -- the final stop turn emits
+                # none but is still a turn. Non-model completions (tool dispatch,
+                # plain nodes) are not turns and carry no tool_calls -> no steps.
+                if _is_model_node_completed(kind):
+                    model_turns += 1
                 # Authoritative durable source: the model node's requested tool
                 # calls. Non-model completions carry no tool_calls -> no steps.
                 node_id = kind.get("node_id")
@@ -230,7 +285,10 @@ class Trajectory:
                             output=None,
                         )
                     )
-        return cls(steps)
+        # A real durable log carries model NodeCompleted turns; a legacy or
+        # hand-built tool_called-only log has no turn signal, so fall back to step
+        # count (turns=None) -- one turn per tool step.
+        return cls(steps, turns=model_turns if model_turns > 0 else None)
 
     @classmethod
     def from_tool_sequence(cls, tools: list[str]) -> Trajectory:
@@ -464,11 +522,16 @@ class TrajectoryScorer(BaseScorer):
         return TrajectoryAssertionResult(name="did_not_use", passed=passed, message=msg)
 
     def _check_max_turns(self, trajectory: Trajectory) -> TrajectoryAssertionResult:
-        """Step count must not exceed the configured limit."""
+        """Model TURN count must not exceed the configured limit.
+
+        A turn is one model call; a single turn may emit several parallel tool
+        calls. This checks ``turn_count`` (NOT the flattened tool-step count), so a
+        one-turn run that calls two tools satisfies ``max_turns: 1``.
+        """
         limit: int = self.expected["max_turns"]
-        actual = trajectory.step_count
+        actual = trajectory.turn_count
         passed = actual <= limit
-        msg = f"{actual} step(s) (max {limit})"
+        msg = f"{actual} turn(s) (max {limit})"
         return TrajectoryAssertionResult(name="max_turns", passed=passed, message=msg)
 
     def _check_step_count(self, trajectory: Trajectory) -> TrajectoryAssertionResult:

@@ -1467,7 +1467,10 @@ if __name__ == "__main__":
 name = "{name}"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["jamjet>=0.10.0"]
+# The [model] extra pulls in litellm, which the in-process model seam uses to
+# call the agent's "anthropic/claude-sonnet-4-6" model. Without it `agent.run()`
+# raises at the first model call.
+dependencies = ["jamjet[model]>=0.10.0"]
 
 [build-system]
 requires = ["hatchling"]
@@ -1481,7 +1484,7 @@ A minimal JamJet agent built with the `quickstart` template.
 ## Prerequisites
 
 ```bash
-pip install jamjet
+pip install 'jamjet[model]'
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 

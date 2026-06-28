@@ -516,6 +516,66 @@ async def test_max_turns_fail():
     assert "4" in result.assertions[0].message
 
 
+async def test_max_turns_counts_model_turns_not_tool_calls():
+    """One model turn that emits TWO parallel tool calls is ONE turn, not two.
+
+    Regression guard for CodeRabbit #1: max_turns must count model TURNS, so a
+    single turn calling two tools satisfies {max_turns: 1} (it used to fail
+    because the two flattened tool steps were miscounted as two turns). The same
+    trajectory has step_count 2.
+    """
+    events = [_model_node_completed(["search", "calculate"], node_id="model_turn_1", seq=1)]
+    traj = Trajectory.from_events(events)
+    assert traj.turn_count == 1
+    assert traj.step_count == 2
+
+    # max_turns: 1 PASSES (one model turn), step_count: 2 PASSES (two tool steps).
+    r_turns = await TrajectoryScorer(expected={"max_turns": 1}).score(None, trajectory=traj)
+    assert r_turns.passed is True, "1 model turn with 2 tool calls must satisfy max_turns: 1"
+    r_steps = await TrajectoryScorer(expected={"step_count": 2}).score(None, trajectory=traj)
+    assert r_steps.passed is True
+
+
+async def test_max_turns_two_model_turns_fails_max_turns_one():
+    """Two model turns -> turn_count 2 -> fails {max_turns: 1} (the negative dual)."""
+    events = [
+        _model_node_completed(["search"], node_id="m1", seq=1),
+        _model_node_completed(["calculate"], node_id="m2", seq=2),
+    ]
+    traj = Trajectory.from_events(events)
+    assert traj.turn_count == 2
+    result = await TrajectoryScorer(expected={"max_turns": 1}).score(None, trajectory=traj)
+    assert result.passed is False
+    assert result.assertions[0].name == "max_turns"
+    assert "turn" in result.assertions[0].message
+
+
+async def test_max_turns_final_stop_turn_counts_as_a_turn():
+    """A final model turn with no tool calls (finish_reason=stop) still counts."""
+    events = [
+        _model_node_completed(["search"], node_id="m1", seq=1),
+        _model_node_completed([], node_id="m2", finish_reason="stop", seq=2),
+    ]
+    traj = Trajectory.from_events(events)
+    assert traj.turn_count == 2  # both model calls are turns
+    assert traj.step_count == 1  # only one tool call
+
+
+def test_turn_count_falls_back_to_step_count_in_process():
+    """In-process AgentResult has no turn signal -> turn_count falls back to steps."""
+    tc = [
+        {"tool": "search", "input": {}, "output": "", "duration_us": 0},
+        {"tool": "calculate", "input": {}, "output": "", "duration_us": 0},
+    ]
+    from unittest.mock import MagicMock
+
+    r = MagicMock()
+    r.tool_calls = tc
+    traj = Trajectory.from_agent_result(r)
+    assert traj.turn_count == 2  # == step_count (no turn signal)
+    assert traj.step_count == 2
+
+
 # ── step_count assertion ──────────────────────────────────────────────────────
 
 

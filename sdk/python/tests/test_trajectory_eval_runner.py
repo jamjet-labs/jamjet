@@ -377,3 +377,54 @@ def test_cli_trajectory_diff_json_format(tmp_path):
     payload = json.loads(result.stdout)
     assert payload["added"] == ["web"]
     assert payload["changed"] is True
+
+
+# ── CodeRabbit #3: reject eval-results rows that carry no real trajectory ──────
+
+
+def test_load_trajectory_rejects_results_row_without_trajectory(tmp_path):
+    """An eval-results row with row_id but NO trajectory field fails fast with a
+    clear error -- it must NOT default to [] and forge a bogus 'no tools' baseline."""
+    from jamjet.cli.main import _load_trajectory_from_file
+
+    p = tmp_path / "results.json"
+    # Old/malformed `jamjet eval run --output` artifact: rows lack `trajectory`.
+    p.write_text(json.dumps([{"row_id": "q1", "passed": True}, {"row_id": "q2", "passed": False}]))
+
+    with pytest.raises(ValueError, match="trajectory"):
+        _load_trajectory_from_file(str(p), row_id="q1")
+
+
+def test_load_trajectory_accepts_explicit_empty_trajectory(tmp_path):
+    """An explicit empty trajectory (the agent legitimately used no tools) is
+    accepted -- only a MISSING trajectory field is an error."""
+    from jamjet.cli.main import _load_trajectory_from_file
+
+    p = tmp_path / "results.json"
+    p.write_text(json.dumps([{"row_id": "q1", "trajectory": []}]))
+
+    traj = _load_trajectory_from_file(str(p), row_id="q1")
+    assert traj.tool_sequence == []
+
+
+def test_cli_trajectory_diff_rejects_results_without_trajectory(tmp_path):
+    """End-to-end: diffing a results file whose rows lack `trajectory` exits 1 with
+    an error, NOT a bogus 'OK / unchanged' empty-trajectory diff."""
+    from typer.testing import CliRunner
+
+    from jamjet.cli.main import app
+
+    before = tmp_path / "before.json"
+    after = tmp_path / "after.json"
+    rows = json.dumps([{"row_id": "q1", "passed": True}])
+    before.write_text(rows)
+    after.write_text(rows)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["eval", "trajectory-diff", str(before), str(after), "--row-id", "q1"])
+
+    assert result.exit_code == 1
+    assert "Error" in result.stdout
+    # Must not have produced a bogus baseline diff.
+    assert "OK:" not in result.stdout
+    assert "unchanged" not in result.stdout.lower()
