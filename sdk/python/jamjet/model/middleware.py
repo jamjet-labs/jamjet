@@ -20,6 +20,35 @@ class ModelDeniedError(Exception):
         self.code = code
 
 
+class BudgetExceededError(ModelDeniedError):
+    """Raised by ``BudgetMiddleware`` when accumulated spend has reached the budget.
+
+    Fail-closed: the call is denied *before* it reaches the provider.
+    Both the limit and the consumed amount are named in the message so callers
+    can surface the exact figures to the user or an audit log.
+    """
+
+    def __init__(
+        self,
+        *,
+        limit_usd: float | None,
+        limit_tokens: int | None,
+        consumed_usd: float,
+        consumed_tokens: int,
+    ) -> None:
+        parts: list[str] = []
+        if limit_usd is not None:
+            parts.append(f"cost ${consumed_usd:.6f} >= limit ${limit_usd:.6f}")
+        if limit_tokens is not None:
+            parts.append(f"tokens {consumed_tokens} >= limit {limit_tokens}")
+        reason = "budget exceeded: " + "; ".join(parts) if parts else "budget exceeded"
+        super().__init__(reason, code="budget_exceeded")
+        self.limit_usd = limit_usd
+        self.limit_tokens = limit_tokens
+        self.consumed_usd = consumed_usd
+        self.consumed_tokens = consumed_tokens
+
+
 @runtime_checkable
 class ModelMiddleware(Protocol):
     async def before(self, request: ModelRequest) -> ModelRequest: ...

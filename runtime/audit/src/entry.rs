@@ -1,8 +1,16 @@
 //! `AuditLogEntry` — the canonical immutable record written to the audit log.
 
+use crate::signer::AuditSigner;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+/// Field separator used when building the canonical content of an entry for
+/// hashing. A control character that never appears in our field values, so
+/// concatenation is unambiguous (`"a" || "bc"` cannot collide with
+/// `"ab" || "c"`).
+const FIELD_SEP: u8 = 0x1f;
 
 /// A single immutable audit log entry.
 ///
@@ -51,6 +59,22 @@ pub struct AuditLogEntry {
     /// Whether PII redaction was applied to raw_event.
     #[serde(default)]
     pub redacted: bool,
+    /// Hash of the *previous* sealed entry in the log (its `entry_hash`).
+    ///
+    /// `None` for the genesis entry of a chain. Each entry's `entry_hash`
+    /// covers this field, so the entries form a tamper-evident chain: altering
+    /// any past entry's content (or re-linking the chain) breaks verification
+    /// from that point forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    /// SHA-256 hex digest of this entry's canonical content **plus**
+    /// `prev_hash`. Set by [`AuditLogEntry::seal`]. `None` until sealed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_hash: Option<String>,
+    /// Keyed HMAC-SHA256 (hex) over `entry_hash`. Set by
+    /// [`AuditLogEntry::seal`]. A verifier without the key cannot forge it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 fn default_tenant() -> String {
@@ -86,7 +110,76 @@ impl AuditLogEntry {
             tenant_id: "default".to_string(),
             expires_at: None,
             redacted: false,
+            prev_hash: None,
+            entry_hash: None,
+            signature: None,
         }
+    }
+
+    /// Compute this entry's content hash, chained onto `prev_hash`.
+    ///
+    /// The hash covers every immutable, security-relevant field (everything
+    /// except `entry_hash`/`signature`, which are derived) plus the supplied
+    /// `prev_hash`. The serialization is deterministic and round-trips through
+    /// SQLite storage: scalars are hashed as their stored textual form,
+    /// `raw_event` via canonical (sorted-key) JSON, fields separated by
+    /// [`FIELD_SEP`].
+    pub fn content_hash(&self, prev_hash: Option<&str>) -> String {
+        let mut hasher = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            hasher.update(bytes);
+            hasher.update([FIELD_SEP]);
+        };
+
+        field(self.id.as_bytes());
+        field(self.event_id.as_bytes());
+        field(self.execution_id.as_bytes());
+        field(&self.sequence.to_le_bytes());
+        field(self.event_type.as_bytes());
+        field(self.actor_id.as_bytes());
+        field(self.actor_type.as_str().as_bytes());
+        field(self.tool_call_hash.as_deref().unwrap_or("").as_bytes());
+        field(self.policy_decision.as_deref().unwrap_or("").as_bytes());
+        field(self.http_request_id.as_deref().unwrap_or("").as_bytes());
+        field(self.http_method.as_deref().unwrap_or("").as_bytes());
+        field(self.http_path.as_deref().unwrap_or("").as_bytes());
+        field(self.ip_address.as_deref().unwrap_or("").as_bytes());
+        field(self.created_at.to_rfc3339().as_bytes());
+        field(
+            serde_json::to_string(&self.raw_event)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        field(self.tenant_id.as_bytes());
+        field(
+            self.expires_at
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        field(&[u8::from(self.redacted)]);
+        field(prev_hash.unwrap_or("").as_bytes());
+
+        hex::encode(hasher.finalize())
+    }
+
+    /// Seal this entry into the chain: record `prev_hash`, compute `entry_hash`
+    /// over the content + `prev_hash`, then sign `entry_hash` with `signer`.
+    ///
+    /// Call this once, after all enrichment/redaction is applied, immediately
+    /// before persisting the entry. The `prev_hash` is the `entry_hash` of the
+    /// previous sealed entry in the log (`None` for the genesis entry).
+    ///
+    /// When `signer` has no key (the unsigned/refused signer — no
+    /// `JAMJET_AUDIT_SIGNING_KEY` and no insecure opt-in), `signature` is left
+    /// `None`: the entry is still hash-chained but honestly unsigned, and
+    /// [`crate::verify_chain`] reports it as `Unsigned` rather than trusting a
+    /// forgeable dev-key signature.
+    pub fn seal(&mut self, prev_hash: Option<String>, signer: &AuditSigner) {
+        let hash = self.content_hash(prev_hash.as_deref());
+        self.signature = signer.sign(hash.as_bytes());
+        self.entry_hash = Some(hash);
+        self.prev_hash = prev_hash;
     }
 }
 
@@ -101,4 +194,15 @@ pub enum ActorType {
     Agent,
     /// The JamJet runtime itself (scheduler, worker, heartbeat).
     System,
+}
+
+impl ActorType {
+    /// The stable lowercase wire/storage form (matches the SQLite encoding).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ActorType::Human => "human",
+            ActorType::Agent => "agent",
+            ActorType::System => "system",
+        }
+    }
 }

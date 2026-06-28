@@ -56,12 +56,15 @@ impl std::fmt::Display for SubmitError {
 }
 
 /// Validate against derived pending state, then append `ApprovalReceived`.
-/// Returns the resolved `node_id`.
+///
+/// Returns the resolved `node_id` and the `ApprovalReceived` event that was
+/// appended, so callers can seal it into the signed, hash-chained audit log
+/// (via `AuditEnricher::enrich_and_append`) after the durable event write.
 pub async fn submit_approval(
     backend: &Arc<dyn StateBackend>,
     execution_id: &ExecutionId,
     submission: ApprovalSubmission,
-) -> Result<String, SubmitError> {
+) -> Result<(String, Event), SubmitError> {
     // Refuse decisions on terminal executions up front. The event-derived
     // pending list can still show an undecided request after a cancellation
     // (the fold intentionally ignores decisions for unheld nodes), so without
@@ -117,18 +120,19 @@ pub async fn submit_approval(
         + 1;
     // TOCTOU: a concurrent approve may have already appended a decision; the
     // scheduler fold's held.remove gate makes the second event a no-op.
+    let event = Event::new(
+        execution_id.clone(),
+        seq,
+        EventKind::ApprovalReceived {
+            node_id: node_id.clone(),
+            user_id: submission.user_id,
+            decision: submission.decision,
+            comment: submission.comment,
+            state_patch: submission.state_patch,
+        },
+    );
     backend
-        .append_event(Event::new(
-            execution_id.clone(),
-            seq,
-            EventKind::ApprovalReceived {
-                node_id: node_id.clone(),
-                user_id: submission.user_id,
-                decision: submission.decision,
-                comment: submission.comment,
-                state_patch: submission.state_patch,
-            },
-        ))
+        .append_event(event.clone())
         .await
         .map_err(|e| SubmitError::Backend(e.to_string()))?;
 
@@ -141,7 +145,7 @@ pub async fn submit_approval(
             .map_err(|e| SubmitError::Backend(e.to_string()))?;
     }
 
-    Ok(node_id)
+    Ok((node_id, event))
 }
 
 /// Pending + decided approval view for `GET /executions/:id/approvals`.

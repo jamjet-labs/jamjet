@@ -20,7 +20,10 @@ pub struct AppState {
     pub agents: Arc<dyn AgentRegistry>,
     /// Audit log backend — append-only, immutable.
     pub audit: Arc<dyn AuditBackend>,
-    /// Audit enricher — wraps all `append_event` calls with audit metadata.
+    /// Audit enricher — seals events into the signed, hash-chained audit log.
+    /// Live on the approval append path (`POST /executions/:id/approve` + the
+    /// MCP `jamjet_approve` tool); extending it to the worker's per-node fenced
+    /// `commit_turn` events is tracked as F-t3-audit-emit.
     pub enricher: Arc<AuditEnricher>,
     /// Protocol adapter registry — pre-loaded with MCP, A2A, and ANP adapters.
     pub protocols: ProtocolRegistry,

@@ -1,8 +1,15 @@
-"""Structural tests for the agent-loop IR builder (Track 2j-3).
+"""Structural tests for the agent-loop IR builder (Track 2j-3 + T3-5).
 
 No engine: assert the compiled ``WorkflowIr`` dict has the model/condition/
 tool-dispatch nodes, the correct edges (model -> gate -> (tools -> next | end)),
 and the canonical top-level shape the Rust engine deserializes.
+
+T3-5 section (at the bottom) verifies that governance knobs from GovernanceConfig
+compile into the correct IR fields:
+  budget.cost_usd  -> cost_budget_usd
+  budget.tokens    -> token_budget.total_tokens
+  policy/approval_required -> policy.require_approval_for
+  pii=True (default) -> data_policy with standard PII detectors
 """
 
 from __future__ import annotations
@@ -10,6 +17,7 @@ from __future__ import annotations
 import pytest
 
 from jamjet.agents.agent import Agent
+from jamjet.agents.governance import Budget
 from jamjet.compiler.agent_ir import build_initial_state, compile_agent_to_ir
 from jamjet.tools.decorators import tool
 
@@ -276,3 +284,152 @@ def test_description_is_stable_and_never_the_prompt():
     ir_bare = compile_agent_to_ir(bare, prompt, max_turns=2)
     assert ir_bare["description"] == "Durable agent: bare"
     assert prompt not in ir_bare["description"]
+
+
+# ── Governance IR (T3-5) ──────────────────────────────────────────────────────
+#
+# Verify that GovernanceConfig knobs compile into the correct Rust WorkflowIr
+# fields.  Field names must match workflow.rs exactly (serde snake_case):
+#   cost_budget_usd           -> Option<f64>
+#   token_budget.total_tokens -> Option<u32>  (inside TokenBudgetIr)
+#   policy.require_approval_for -> Vec<String> (inside PolicySetIr)
+#   data_policy.pii_detectors   -> Vec<String> (inside DataPolicyIr)
+
+
+def _governed_agent(**kwargs) -> Agent:
+    """Build a minimal Agent with governance knobs for IR tests."""
+    return Agent(
+        "governed",
+        model="anthropic/claude-sonnet-4-6",
+        tools=[get_weather],
+        **kwargs,
+    )
+
+
+class TestGovernanceIrBudget:
+    """budget= knob compiles to cost_budget_usd / token_budget IR fields."""
+
+    def test_float_budget_emits_cost_budget_usd(self):
+        ir = compile_agent_to_ir(_governed_agent(budget=0.50), "hi")
+        assert ir.get("cost_budget_usd") == 0.50
+        assert "token_budget" not in ir
+
+    def test_int_budget_emits_cost_budget_usd(self):
+        ir = compile_agent_to_ir(_governed_agent(budget=2), "hi")
+        assert ir.get("cost_budget_usd") == 2.0
+        assert "token_budget" not in ir
+
+    def test_budget_tokens_emits_token_budget(self):
+        ir = compile_agent_to_ir(_governed_agent(budget=Budget(tokens=1000)), "hi")
+        assert "cost_budget_usd" not in ir
+        assert ir.get("token_budget") == {"total_tokens": 1000}
+
+    def test_budget_both_fields_emits_both_ir_keys(self):
+        ir = compile_agent_to_ir(_governed_agent(budget=Budget(tokens=5000, cost_usd=1.00)), "hi")
+        assert ir.get("cost_budget_usd") == 1.00
+        assert ir.get("token_budget") == {"total_tokens": 5000}
+
+    def test_no_budget_emits_no_budget_fields(self):
+        """A plain Agent() must not produce budget IR — a zero-value would deny all runs."""
+        ir = compile_agent_to_ir(_agent(), "hi")
+        assert "cost_budget_usd" not in ir
+        assert "token_budget" not in ir
+
+
+class TestGovernanceIrPolicy:
+    """policy= and approval_required= knobs compile to the PolicySetIr block."""
+
+    def test_approval_required_list_emits_require_approval_for(self):
+        ir = compile_agent_to_ir(
+            _governed_agent(policy="strict", approval_required=["delete_*"], budget=0.50),
+            "hi",
+        )
+        # budget
+        assert ir.get("cost_budget_usd") == 0.50
+        # policy block with the glob
+        policy = ir.get("policy")
+        assert policy is not None, "policy block must be present"
+        assert policy["require_approval_for"] == ["delete_*"]
+
+    def test_approval_required_true_maps_to_wildcard(self):
+        ir = compile_agent_to_ir(_governed_agent(approval_required=True), "hi")
+        policy = ir.get("policy")
+        assert policy is not None
+        assert policy["require_approval_for"] == ["*"]
+
+    def test_approval_required_multi_glob(self):
+        globs = ["send_*", "transfer_*"]
+        ir = compile_agent_to_ir(_governed_agent(approval_required=globs), "hi")
+        policy = ir.get("policy")
+        assert policy is not None
+        assert policy["require_approval_for"] == globs
+
+    def test_dict_policy_passes_through_blocked_tools_and_allowlist(self):
+        p = {"blocked_tools": ["rm_*"], "model_allowlist": ["claude-*"]}
+        ir = compile_agent_to_ir(_governed_agent(policy=p), "hi")
+        policy = ir.get("policy")
+        assert policy is not None
+        assert policy["blocked_tools"] == ["rm_*"]
+        assert policy["model_allowlist"] == ["claude-*"]
+        assert policy["require_approval_for"] == []
+
+    def test_dict_policy_and_approval_required_are_merged(self):
+        """approval_required globs are union-appended into a dict policy's require_approval_for."""
+        p = {"require_approval_for": ["pay_*"]}
+        ir = compile_agent_to_ir(_governed_agent(policy=p, approval_required=["delete_*"]), "hi")
+        policy = ir.get("policy")
+        assert policy is not None
+        assert "pay_*" in policy["require_approval_for"]
+        assert "delete_*" in policy["require_approval_for"]
+
+    def test_no_policy_no_approval_omits_policy_block(self):
+        """A plain Agent() must not emit a policy block."""
+        ir = compile_agent_to_ir(_agent(), "hi")
+        assert "policy" not in ir
+
+    def test_approval_required_false_and_no_policy_omits_policy_block(self):
+        ir = compile_agent_to_ir(_governed_agent(approval_required=False), "hi")
+        assert "policy" not in ir
+
+    def test_empty_approval_list_omits_policy_block(self):
+        ir = compile_agent_to_ir(_governed_agent(approval_required=[]), "hi")
+        assert "policy" not in ir
+
+
+class TestGovernanceIrDataPolicy:
+    """pii= knob compiles to the DataPolicyIr block."""
+
+    def test_default_pii_true_emits_data_policy(self):
+        """pii=True (default) -> data_policy with the five standard detectors."""
+        ir = compile_agent_to_ir(_agent(), "hi")
+        dp = ir.get("data_policy")
+        assert dp is not None, "data_policy must be present when pii=True"
+        detectors = dp["pii_detectors"]
+        for expected in ("email", "ssn", "credit_card", "phone", "ip_address"):
+            assert expected in detectors, f"missing detector: {expected}"
+        assert dp["redaction_mode"] == "mask"
+        assert dp["retain_prompts"] is False
+        assert dp["retain_outputs"] is True
+
+    def test_explicit_pii_true_emits_data_policy(self):
+        ir = compile_agent_to_ir(_governed_agent(pii=True), "hi")
+        assert ir.get("data_policy") is not None
+
+    def test_pii_false_omits_data_policy(self):
+        """pii=False -> no data_policy emitted (no Rust-side PII redaction)."""
+        ir = compile_agent_to_ir(_governed_agent(pii=False), "hi")
+        assert "data_policy" not in ir
+
+
+class TestGovernanceIrCacheKey:
+    """Governance changes must produce a different content-version (cache key)."""
+
+    def test_adding_budget_changes_version(self):
+        base_version = compile_agent_to_ir(_agent(), "hi")["version"]
+        budgeted_version = compile_agent_to_ir(_governed_agent(budget=0.50), "hi")["version"]
+        assert base_version != budgeted_version
+
+    def test_adding_approval_changes_version(self):
+        base_version = compile_agent_to_ir(_agent(), "hi")["version"]
+        approved_version = compile_agent_to_ir(_governed_agent(approval_required=["delete_*"]), "hi")["version"]
+        assert base_version != approved_version

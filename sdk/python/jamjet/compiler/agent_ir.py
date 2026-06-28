@@ -39,10 +39,12 @@ import hashlib
 import json
 from typing import TYPE_CHECKING, Any
 
+from jamjet.model.policy_resolver import resolve_named_policy
 from jamjet.model.types import parse_model_ref
 
 if TYPE_CHECKING:
     from jamjet.agents.agent import Agent
+    from jamjet.agents.governance import GovernanceConfig
     from jamjet.tools.decorators import ToolDefinition
 
 # The tool-dispatch PythonFn node points at this coroutine.
@@ -66,6 +68,157 @@ _TOOLS_RETRY_POLICY = "no_retry"
 # IR content (see :func:`_content_version`) so a changed agent never reuses a
 # stale immutably-cached graph.
 _VERSION_BASE = "0.1.0"
+
+# ---------------------------------------------------------------------------
+# Governance IR constants (T3-5)
+# ---------------------------------------------------------------------------
+
+# Standard PII detector names that match the Rust PiiRedactor
+# (runtime/policy/src/redaction.rs) and the Python cloud redactor
+# (cloud/middleware/pii.py). Enabling all five built-in types by default.
+_DEFAULT_PII_DETECTORS: list[str] = [
+    "email",
+    "ssn",
+    "credit_card",
+    "phone",
+    "ip_address",
+]
+
+# DataPolicyIr dict emitted when GovernanceConfig.pii is True (the default).
+# Field names match the serde snake_case fields in DataPolicyIr (workflow.rs:231-258).
+_DEFAULT_DATA_POLICY_IR: dict[str, Any] = {
+    "pii_fields": [],  # no extra JSON-path patterns beyond the detectors
+    "pii_detectors": _DEFAULT_PII_DETECTORS,
+    "redaction_mode": "mask",  # replace PII with [REDACTED]
+    "retain_prompts": False,  # do not persist raw prompts in the audit log
+    "retain_outputs": True,  # model outputs ARE retained for audit/debug
+    # retention_days omitted -> indefinite (matches serde skip_serializing_if = "Option::is_none")
+}
+
+
+def _compile_agent_policy_ir(gov: GovernanceConfig) -> dict[str, Any] | None:
+    """Build a PolicySetIr dict from *gov*, or ``None`` when no policy rules are needed.
+
+    Mapping (GovernanceConfig -> PolicySetIr — workflow.rs:201-211):
+    - ``policy`` dict  -> base values for ``blocked_tools`` / ``require_approval_for``
+                          / ``model_allowlist``; unknown keys are passed through so the
+                          Rust serde ``deny_unknown_fields``-free schema accepts them.
+    - ``policy`` str   -> resolved via :func:`~jamjet.model.policy_resolver.resolve_named_policy`
+                          to real ``blocked_tools`` / ``require_approval_for`` /
+                          ``model_allowlist``; raises ``ValueError`` for unknown names.
+    - ``approval_required=True``   -> ``require_approval_for = ["*"]`` (all tools).
+    - ``approval_required=[...]``  -> ``require_approval_for = [...]`` (those globs).
+
+    Returns ``None`` only when both ``policy`` and ``approval_required`` are unset/empty,
+    which prevents emitting a no-op policy block that wastes bytes and confuses the cache.
+    """
+    approval = gov.approval_required
+    has_policy_ref = gov.policy is not None
+    has_approval = (approval is True) or (isinstance(approval, list) and len(approval) > 0)
+
+    if not has_policy_ref and not has_approval:
+        return None
+
+    # Base from dict-shaped inline policy spec.
+    if isinstance(gov.policy, dict):
+        blocked: list[str] = list(gov.policy.get("blocked_tools") or [])
+        require: list[str] = list(gov.policy.get("require_approval_for") or [])
+        allowlist: list[str] = list(gov.policy.get("model_allowlist") or [])
+    elif isinstance(gov.policy, str):
+        # T3-6: resolve the named policy to real rules so the IR carries
+        # the actual allowlist (not an empty skeleton).  Raises ValueError
+        # for unknown names — a misconfigured policy string is a hard error,
+        # never a silent allow-all in the compiled IR.
+        rules = resolve_named_policy(gov.policy)
+        blocked = list(rules.get("blocked_tools") or [])
+        require = list(rules.get("require_approval_for") or [])
+        allowlist = list(rules.get("model_allowlist") or [])
+    else:
+        blocked = []
+        require = []
+        allowlist = []
+
+    # Merge approval_required into require_approval_for.
+    if approval is True:
+        require = ["*"]  # wildcard: every tool requires human approval
+    elif isinstance(approval, list) and approval:
+        # Union the caller-provided globs with any dict-policy require_approval_for,
+        # preserving declaration order and deduplicating.
+        seen: set[str] = set(require)
+        merged: list[str] = list(require)
+        for glob in approval:
+            if glob not in seen:
+                merged.append(glob)
+                seen.add(glob)
+        require = merged
+
+    return {
+        "blocked_tools": blocked,
+        "require_approval_for": require,
+        "model_allowlist": allowlist,
+    }
+
+
+def _compile_governance_ir(agent: Agent) -> dict[str, Any]:
+    """Emit the governance top-level IR fields from ``agent.governance``.
+
+    This is the single T3-5 wiring point: it translates the typed
+    ``GovernanceConfig`` into the exact dict keys the Rust ``WorkflowIr``
+    deserializes (workflow.rs:45-65).  Only fields with *non-trivial* values
+    are emitted to avoid spurious deny-all budget blocks and to keep the IR
+    clean for agents that don't set governance knobs.
+
+    Field mapping (Python -> Rust IR):
+    =========================================================
+    budget.cost_usd  ->  cost_budget_usd: f64          (only when set)
+    budget.tokens    ->  token_budget.total_tokens: u32 (only when set)
+    policy / approval_required  ->  policy: PolicySetIr (only when rules exist)
+    pii=True         ->  data_policy: DataPolicyIr      (metadata; see below)
+    pii=False        ->  (omitted)
+    =========================================================
+
+    ``data_policy`` is emitted as METADATA, not a durable enforcement point:
+    durable outbound PII redaction is the model-seam sidecar's job
+    (F-t3-durable-data-policy).  See :func:`_compile_governance_ir` for the
+    precise honest scope.
+    """
+    gov = agent.governance
+    out: dict[str, Any] = {}
+
+    # ── Budget (workflow.rs:49-57) ──────────────────────────────────────────
+    # Emit ONLY when the respective field is explicitly set; a zero-value
+    # budget block would immediately exceed the cap and deny all runs.
+    if gov.budget is not None:
+        if gov.budget.cost_usd is not None:
+            # cost_budget_usd: Option<f64> — execution fails when exceeded.
+            out["cost_budget_usd"] = gov.budget.cost_usd
+        if gov.budget.tokens is not None:
+            # token_budget: Option<TokenBudgetIr> — total_tokens cap covers
+            # combined input+output, which is the most useful single-knob limit.
+            out["token_budget"] = {"total_tokens": gov.budget.tokens}
+
+    # ── Policy + Approval (workflow.rs:46-47) ───────────────────────────────
+    policy_ir = _compile_agent_policy_ir(gov)
+    if policy_ir is not None:
+        out["policy"] = policy_ir
+
+    # ── Data policy / PII (workflow.rs:63-64) ───────────────────────────────
+    # pii=True (the default) -> emit the standard DataPolicyIr as METADATA.
+    #
+    # HONEST SCOPE (F-t3-durable-data-policy): on the durable path, outbound PII
+    # redaction is performed by the model-seam SIDECAR (made prod-mandatory by
+    # 2e's fail-loud coverage guard), NOT by this IR field.  The native Rust
+    # model adapters send UNREDACTED prompts when JAMJET_MODEL_SEAM_URL is unset
+    # (the dev/fallback path).  This `data_policy` block is consumed by the audit
+    # enricher's log redactor only when a RequestContext carries it
+    # (enricher.rs:153) — which the current API request contexts do not yet set,
+    # so it is metadata, not an active Rust enforcement point.  Do not read this
+    # field as a guarantee that durable model calls are PII-redacted.
+    # pii=False -> omit the field entirely.
+    if gov.pii:
+        out["data_policy"] = _DEFAULT_DATA_POLICY_IR
+
+    return out
 
 
 def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[str, Any]:
@@ -217,10 +370,21 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
             "jamjet.agent.max_turns": str(max_turns),
         },
     }
+
+    # ── Governance IR fields (T3-5) ────────────────────────────────────────────
+    # Emit policy / budget / data_policy from the agent's GovernanceConfig so the
+    # Rust engine enforces them fail-closed (enforcement already exists in
+    # workers/src/worker.rs; this is the compile-side wiring that turns it on).
+    # These are merged BEFORE content-versioning so the cache key changes when
+    # governance config changes (a different budget or policy must NOT reuse a
+    # cached graph compiled without those constraints).
+    ir.update(_compile_governance_ir(agent))
+
     # Content-version the IR: the runtime caches by (workflow_id, version)
-    # immutably, so a changed agent (tools / instructions / max_turns / timeout)
-    # must yield a new key or a stale graph could run. The prompt is excluded
-    # (it is not in the IR), so re-running the SAME agent reuses the cached graph.
+    # immutably, so a changed agent (tools / instructions / max_turns / timeout
+    # / governance) must yield a new key or a stale graph could run. The prompt
+    # is excluded (it is not in the IR), so re-running the SAME agent reuses
+    # the cached graph.
     ir["version"] = _content_version(ir)
     return ir
 

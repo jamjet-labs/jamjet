@@ -8,7 +8,7 @@ import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from jamjet.runtime.local.checkpoint import CheckpointStore
 from jamjet.runtime.local.injector import inject_runtime_attributes
@@ -25,6 +25,9 @@ from jamjet.runtime.types import (
 )
 from jamjet.spec import AgentSpec, DurableAgentSpec, ToolSpec, WorkflowSpec
 
+if TYPE_CHECKING:
+    from jamjet.agents.governance import GovernanceConfig
+
 
 class LocalRuntime:
     name = "local"
@@ -38,6 +41,7 @@ class LocalRuntime:
         execution_id: str | None = None,
         scope: Scope | None = None,
         on_event: Callable[[RuntimeEvent], None] | None = None,
+        governance: GovernanceConfig | None = None,
     ) -> RuntimeResult:
         eid = execution_id or str(uuid.uuid4())
         t0 = time.perf_counter()
@@ -56,6 +60,7 @@ class LocalRuntime:
                 input,
                 eid,
                 on_event,
+                governance,
             )
         elif isinstance(spec, WorkflowSpec):
             output, steps, tool_calls, llm_calls = await self._run_workflow(
@@ -80,8 +85,13 @@ class LocalRuntime:
         self,
         spec: AgentSpec | WorkflowSpec,
         execution_id: str,
+        *,
+        governance: GovernanceConfig | None = None,
     ) -> RuntimeResult:
-        return await self.execute(spec, input=None, execution_id=execution_id)
+        # M6 parity: thread governance so a resumed in-process run keeps budget /
+        # allowlist / PII enforcement (without it, a resumed AgentSpec run rebuilt
+        # the seam allow-all / no-budget and silently lost governance).
+        return await self.execute(spec, input=None, execution_id=execution_id, governance=governance)
 
     async def _run_agent(
         self,
@@ -89,8 +99,13 @@ class LocalRuntime:
         input: Any,
         eid: str,
         on_event: Any,
+        governance: GovernanceConfig | None = None,
     ) -> tuple[Any, list[StepRecord], list[ToolCallRecord], list[LLMCallRecord]]:
-        adapter = get_adapter(spec.llm)
+        # T3-7: thread the agent's GovernanceConfig into the seam-backed adapter
+        # so budget / allowlist / PII enforce on the in-process path (agent.run),
+        # at parity with the durable IR.  A fresh adapter (and therefore fresh
+        # budget accumulator) is built per execution, giving per-run scoping.
+        adapter = get_adapter(spec.llm, governance)
         runner = get_strategy_runner(spec.strategy.name)
         tool_calls_log: list[dict[str, Any]] = []
         openai_tools = [self._tool_to_openai_schema(t) for t in spec.tools]

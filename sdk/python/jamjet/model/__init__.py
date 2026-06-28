@@ -3,14 +3,17 @@
 No module outside this package may import a provider SDK on the hot path.
 """
 
+from jamjet.model.budget import BudgetMiddleware
 from jamjet.model.defaults import default_model_middleware
 from jamjet.model.metering import MeteringMiddleware, ModelCallRecord
 from jamjet.model.middleware import (
     BaseModelMiddleware,
+    BudgetExceededError,
     ModelAllowlistMiddleware,
     ModelDeniedError,
     ModelMiddleware,
 )
+from jamjet.model.pii import PiiRedactionMiddleware
 from jamjet.model.seam import Model
 from jamjet.model.types import (
     ModelRef,
@@ -24,6 +27,8 @@ from jamjet.model.types import (
 
 __all__ = [
     "BaseModelMiddleware",
+    "BudgetExceededError",
+    "BudgetMiddleware",
     "MeteringMiddleware",
     "Model",
     "ModelAllowlistMiddleware",
@@ -33,6 +38,7 @@ __all__ = [
     "ModelRef",
     "ModelRequest",
     "ModelResponse",
+    "PiiRedactionMiddleware",
     "StreamChunk",
     "api_key_env_for",
     "default_model_middleware",

@@ -30,6 +30,8 @@ class _StubBase:
         self,
         spec: AgentSpec | WorkflowSpec,
         execution_id: str,
+        *,
+        governance: Any | None = None,
     ) -> RuntimeResult:
         raise NotImplementedError(f"{self.name}Runtime.resume lands in Phase 5.")
 

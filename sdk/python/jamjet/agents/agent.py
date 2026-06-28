@@ -31,9 +31,11 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import warnings
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
+from jamjet.agents.governance import Budget, GovernanceConfig, normalize_governance
 from jamjet.compiler.strategies import StrategyLimits
 from jamjet.runtime.local import LocalRuntime
 from jamjet.tools.decorators import ToolDefinition
@@ -70,16 +72,53 @@ class Agent:
         max_cost_usd: float = 1.0,
         timeout_seconds: int = 300,
         on_limit_exceeded: Callable[[str | None, str, Any, Any], str | None] | None = None,
+        # Governance knobs (T3-1).  T3-2..6 read self.governance to enforce.
+        policy: str | dict | None = None,
+        approval_required: bool | list[str] = False,
+        budget: Budget | float | int | dict | None = None,
+        pii: bool = True,
+        audit: bool = True,
+        receipts: bool = True,
+        # Optional sink for AgentBoundary receipts (T3-4).  When set, every
+        # minted receipt is also shipped here (e.g. a JSONL writer); the receipt
+        # is always attached to the run result regardless.  Defaults to None so
+        # receipts ship nowhere noisy by default while still being produced.
+        receipt_emitter: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.name = name
         self.model = model
         self.instructions = instructions
         self.strategy = strategy
         self._on_limit_exceeded = on_limit_exceeded
+        self._receipt_emitter = receipt_emitter
         self.limits = StrategyLimits(
             max_iterations=max_iterations,
             max_cost_usd=max_cost_usd,
             timeout_seconds=timeout_seconds,
+        )
+
+        # Build the immutable governance config.
+        #
+        # budget vs max_cost_usd reconciliation: max_cost_usd is the legacy
+        # StrategyLimits cap (used by strategy runners for iteration budgets).
+        # budget= is the new governance-layer cap read by the seam middleware
+        # (T3-2) and compiled into the durable IR (T3-5).  When budget= is not
+        # set but max_cost_usd is explicitly provided, we fold the legacy value
+        # into GovernanceConfig.budget.cost_usd so the governance layer inherits
+        # the same ceiling without requiring callers to set both.  T3-2 will
+        # reconcile and document the authoritative enforcement point.
+        _effective_budget: Budget | float | int | dict | None = budget
+        if _effective_budget is None and max_cost_usd != 1.0:
+            # Non-default max_cost_usd -> carry it forward as the budget cap.
+            _effective_budget = max_cost_usd
+
+        self.governance: GovernanceConfig = normalize_governance(
+            policy=policy,
+            approval_required=approval_required,
+            budget=_effective_budget,
+            pii=pii,
+            audit=audit,
+            receipts=receipts,
         )
 
         # Resolve tool definitions from decorated functions
@@ -125,6 +164,64 @@ class Agent:
             },
         )
 
+    # ── Governance: receipts on by default (T3-4) ──────────────────────────
+
+    def _maybe_mint_receipt(self, prompt: str, output: Any) -> dict[str, Any] | None:
+        """Mint an AgentBoundary receipt for this turn when receipts are enabled.
+
+        Receipts are ON by default (``GovernanceConfig.receipts``); a plain
+        ``Agent()`` produces one without the developer opting in. Returns the
+        receipt dict (also attached to the :class:`AgentResult` and shipped to
+        ``receipt_emitter`` if set), or ``None`` when ``receipts=False``. Reuses
+        the exact mint path :func:`jamjet.gate` uses, so agent receipts and
+        gated-tool receipts are consistent.
+        """
+        if not self.governance.receipts:
+            return None
+        from jamjet.agents.receipts import mint_agent_receipt  # noqa: PLC0415
+
+        return mint_agent_receipt(
+            agent_name=self.name,
+            model=self.model,
+            prompt=prompt,
+            output="" if output is None else str(output),
+            emitter=self._receipt_emitter,
+        )
+
+    # ── Governance: per-action signed audit on by default (C1) ─────────────
+
+    def _maybe_emit_audit(
+        self,
+        prompt: str,
+        result: AgentResult,
+        *,
+        execution_id: str,
+    ) -> list[Any] | None:
+        """Emit a signed, hash-chained audit record for this run's actions.
+
+        Audit is ON by default (``GovernanceConfig.audit``): a plain governed
+        ``Agent`` produces one :class:`~jamjet.agents.audit.AuditAction` per tool
+        call plus one for the model turn, sealed into a tamper-evident chain and
+        signed with the keyed HMAC (``JAMJET_AUDIT_SIGNING_KEY``; unsigned-but-
+        chained with a loud warning until a key is provisioned). Returns the list
+        of sealed actions (also attached to :class:`AgentResult.audit`), or
+        ``None`` when ``audit=False``. This is the in-process / SDK audit path;
+        the durable engine additionally signs approval-decision events, and
+        per-node engine-internal audit emission is tracked as F-t3-audit-emit.
+        """
+        if not self.governance.audit:
+            return None
+        from jamjet.agents.audit import build_action_chain  # noqa: PLC0415
+
+        return build_action_chain(
+            agent_name=self.name,
+            model=self.model,
+            execution_id=execution_id,
+            prompt=prompt,
+            output=result.output,
+            tool_calls=result.tool_calls,
+        )
+
     # ── Public run interface ───────────────────────────────────────────────
 
     async def run(self, prompt: str) -> AgentResult:
@@ -132,17 +229,44 @@ class Agent:
         Run the agent on a single prompt via LocalRuntime.
 
         Compiles to AgentSpec, hands off to LocalRuntime which dispatches to
-        the appropriate strategy runner.
+        the appropriate strategy runner. Emits a signed-audit-aligned
+        AgentBoundary receipt for the turn (on by default).
         """
+        # T3-6: approval_required parity — the in-process path cannot enforce
+        # tool-level approval gates (the @gate mechanism is opt-in per function;
+        # the durable Rust engine enforces require_approval_for via the IR).
+        # Fail LOUD rather than silently no-op so the developer knows approval
+        # won't fire here.  See follow-up F-t3-inprocess-approval for full
+        # in-process enforcement.
+        ar = self.governance.approval_required
+        if ar is not False and ar != []:
+            warnings.warn(
+                f"Agent {self.name!r}: approval_required is set but agent.run() uses "
+                "the in-process path, which does not enforce approval gates. "
+                "Use agent.run_durable() — the durable IR carries "
+                "require_approval_for and the Rust engine enforces it fail-closed. "
+                "Follow-up: F-t3-inprocess-approval.",
+                UserWarning,
+                stacklevel=2,
+            )
         spec = self.compile()
         rt = LocalRuntime()
-        result = await rt.execute(spec, prompt)
-        return AgentResult(
+        # T3-7: thread governance into the in-process seam so budget / allowlist
+        # / PII enforce on agent.run() (in-process) at parity with run_durable()
+        # (the durable IR).  Without this the seam was built allow-all / no-budget
+        # and the budget + policy knobs silently no-opped on the in-process path
+        # (the gap deferred from T3-2).
+        result = await rt.execute(spec, prompt, governance=self.governance)
+        receipt = self._maybe_mint_receipt(prompt, result.output)
+        agent_result = AgentResult(
             output=result.output,
             tool_calls=[tc.model_dump() for tc in result.tool_calls],
             ir=spec.model_dump(),
             duration_us=result.duration_ms * 1000,
+            receipt=receipt,
         )
+        agent_result.audit = self._maybe_emit_audit(prompt, agent_result, execution_id=result.execution_id)
+        return agent_result
 
     def run_sync(self, prompt: str) -> AgentResult:
         """Synchronous wrapper around :meth:`run` for scripts and notebooks."""
@@ -223,7 +347,12 @@ class Agent:
                 events = []
 
         duration_us = int((time.monotonic() - t0) * 1_000_000)
-        return self._extract_result(execution, events, ir, duration_us)
+        result = self._extract_result(execution, events, ir, duration_us)
+        # Mint the turn receipt + emit the per-action signed audit chain from the
+        # durable run's extracted result (both on by default), mirroring run().
+        result.receipt = self._maybe_mint_receipt(prompt, result.output)
+        result.audit = self._maybe_emit_audit(prompt, result, execution_id=exec_id)
+        return result
 
     async def _poll_to_terminal(self, client: Any, exec_id: str) -> dict[str, Any]:
         """Poll ``get_execution`` until the execution reaches a terminal state."""
@@ -356,13 +485,33 @@ class Agent:
         Streaming is a view; durability records the completed turn (resume
         returns the checkpoint, it does not re-stream). The looped, durable
         stream over the full agent run lands in Track 2.
+
+        Governance on streams (M6 parity)
+        ---------------------------------
+        The seam ``before`` chain still runs, so the **policy/model allowlist and
+        PII redaction ENFORCE** on streamed turns exactly as on ``run()``. What a
+        stream cannot do is run the ``after`` chain (budget accumulation /
+        metering / per-action audit) — a streamed turn carries no usage-bearing
+        finalizer (the streaming ``after`` hook was deferred in Track 1). Rather
+        than silently drop budget enforcement, a ``budget``-capped agent FAILS
+        LOUD here: use :meth:`run` / :meth:`run_durable` for budget-enforced runs,
+        or drop the budget to stream. Audit/metering are likewise not accumulated
+        for the streamed view (documented, never claimed).
         """
+        if self.governance.budget is not None:
+            raise RuntimeError(
+                f"Agent {self.name!r}: stream() cannot enforce a budget cap — streamed "
+                "turns have no usage-bearing finalizer, so token/cost is never "
+                "accumulated and the budget would silently not apply. Use agent.run() "
+                "or agent.run_durable() for budget-enforced runs, or remove the budget "
+                "to stream. (Policy/allowlist and PII redaction DO enforce on streams.)"
+            )
         from jamjet.model.defaults import default_model_middleware  # noqa: PLC0415
         from jamjet.model.seam import Model  # noqa: PLC0415
         from jamjet.model.types import ModelRequest, parse_model_ref  # noqa: PLC0415
 
         spec = self.compile()
-        seam = model or Model(middleware=default_model_middleware())
+        seam = model or Model(middleware=default_model_middleware(self.governance))
         request = ModelRequest(
             ref=parse_model_ref(spec.llm.model),
             messages=[
@@ -381,7 +530,14 @@ class Agent:
 
 
 class AgentResult:
-    """Result returned by Agent.run()."""
+    """Result returned by Agent.run().
+
+    ``receipt`` is the AgentBoundary Action Receipt minted for the turn (on by
+    default), or ``None`` when ``receipts=False``. It is a portable, validatable
+    proof of the action -- ``agentboundary.validate_receipt`` /
+    ``check_conformance`` accept it, and its ``arguments_hash`` binds it to this
+    prompt/agent/model.
+    """
 
     def __init__(
         self,
@@ -389,11 +545,18 @@ class AgentResult:
         tool_calls: list[dict[str, Any]],
         ir: Any,
         duration_us: float = 0.0,
+        receipt: dict[str, Any] | None = None,
+        audit: list[Any] | None = None,
     ) -> None:
         self.output = output
         self.tool_calls = tool_calls
         self.ir = ir
         self.duration_us = duration_us
+        self.receipt = receipt
+        # ``audit`` is the per-action signed, hash-chained audit record for the
+        # run (a list of jamjet.agents.audit.AuditAction), on by default; None
+        # when ``audit=False``. ``jamjet.agents.audit.verify_chain`` accepts it.
+        self.audit = audit
 
     def __str__(self) -> str:
         return self.output
