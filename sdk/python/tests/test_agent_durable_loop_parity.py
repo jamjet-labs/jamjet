@@ -383,7 +383,9 @@ async def test_inprocess_run_matches_durable_loop_answer(monkeypatch: Any) -> No
     # adapter seam (so neither litellm nor the network is touched).
     monkeypatch.setattr(
         "jamjet.runtime.local.executor.get_adapter",
-        lambda _cfg: ScriptedAdapter(ScriptedModel()),
+        # T3-7: get_adapter now takes (config, governance); the scripted adapter
+        # ignores governance because it injects its own ScriptedModel.
+        lambda _cfg, _gov=None: ScriptedAdapter(ScriptedModel()),
     )
     inproc = await agent.run(_PROMPT)
 

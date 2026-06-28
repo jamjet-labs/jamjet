@@ -12,9 +12,10 @@ async def test_agent_run_dispatches_to_local_runtime(monkeypatch):
         name = "local"
         supported_ir_versions = ("1.0",)
 
-        async def execute(self, spec, input, *, execution_id=None, scope=None, on_event=None):
+        async def execute(self, spec, input, *, execution_id=None, scope=None, on_event=None, governance=None):
             seen["spec"] = spec
             seen["input"] = input
+            seen["governance"] = governance
             return RuntimeResult(
                 output="fake-output",
                 execution_id="ex1",
@@ -34,3 +35,6 @@ async def test_agent_run_dispatches_to_local_runtime(monkeypatch):
     assert result.output == "fake-output"
     assert seen["input"] == "hello"
     assert seen["spec"].name == "x"
+    # T3-7: run() threads the agent's GovernanceConfig into the in-process
+    # runtime so the seam enforces budget/allowlist/PII (parity with durable).
+    assert seen["governance"] is a.governance

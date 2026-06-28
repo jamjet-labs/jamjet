@@ -217,7 +217,12 @@ class Agent:
             )
         spec = self.compile()
         rt = LocalRuntime()
-        result = await rt.execute(spec, prompt)
+        # T3-7: thread governance into the in-process seam so budget / allowlist
+        # / PII enforce on agent.run() (in-process) at parity with run_durable()
+        # (the durable IR).  Without this the seam was built allow-all / no-budget
+        # and the budget + policy knobs silently no-opped on the in-process path
+        # (the gap deferred from T3-2).
+        result = await rt.execute(spec, prompt, governance=self.governance)
         receipt = self._maybe_mint_receipt(prompt, result.output)
         return AgentResult(
             output=result.output,
