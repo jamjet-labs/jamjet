@@ -29,8 +29,16 @@ def _patch_client(monkeypatch: pytest.MonkeyPatch, fake: MultiAgentFakeClient, u
     """
 
     def factory(*args: object, **kwargs: object) -> MultiAgentFakeClient:
-        if urls is not None and args:
-            urls.append(args[0])
+        # Record the runtime_url from a positional OR keyword construction so the
+        # capture survives whether JamjetClient(url) or JamjetClient(base_url=url)
+        # is used. One append per construction == one per sub-agent (the count).
+        if urls is not None:
+            if args:
+                urls.append(args[0])
+            elif "base_url" in kwargs:
+                urls.append(kwargs["base_url"])
+            elif "runtime_url" in kwargs:
+                urls.append(kwargs["runtime_url"])
         return fake
 
     monkeypatch.setattr("jamjet.client.JamjetClient", factory)
@@ -142,5 +150,7 @@ async def test_run_durable_threads_runtime_url_to_each_subagent(monkeypatch: pyt
 
     await Parallel([a, b]).run_durable("go", runtime_url="http://engine:7777")
 
-    # every sub-agent's durable client was constructed against the team's runtime_url.
-    assert urls and all(u == "http://engine:7777" for u in urls)
+    # one durable client constructed per sub-agent (count), each against the team's
+    # runtime_url — robust to positional OR keyword JamjetClient construction.
+    assert len(urls) == 2
+    assert all(u == "http://engine:7777" for u in urls)

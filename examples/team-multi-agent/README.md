@@ -71,3 +71,8 @@ log, replay, idempotency, and artifacts. It needs the engine, a `jamjet worker`
 draining the tool queue, and the model sidecar running. See the
 `react-agent-durable` example for the four-terminal setup; a team simply starts
 one such execution per sub-agent.
+
+The worker has to import the `specialists` module to run the tools. Each compiled
+agent records its tools as `specialists:<fn>` refs, and the worker resolves those
+by importing the module. Start `jamjet worker` from `examples/team-multi-agent/`,
+or add that directory to `PYTHONPATH`, so the import resolves.

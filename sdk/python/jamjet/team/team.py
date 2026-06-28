@@ -46,6 +46,7 @@ per-sub-agent child session so concurrent sub-agents never race on one SQLite ro
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -275,6 +276,17 @@ class _TeamBase:
         if not agents:
             raise ValueError("a team needs at least one agent")
         self.agents = list(agents)
+        # Names must be unique: per_agent keys by agent.name and the coordinator
+        # routes by name, so two members sharing a name would silently overwrite a
+        # result and make routing ambiguous. Catch it at construction.
+        seen: set[str] = set()
+        dupes: set[str] = set()
+        for agent in self.agents:
+            if agent.name in seen:
+                dupes.add(agent.name)
+            seen.add(agent.name)
+        if dupes:
+            raise ValueError(f"team members must have unique names; duplicates: {sorted(dupes)}")
         self.name = name
         self.session = session
         self.governance = _resolve_team_governance(governance)
@@ -486,7 +498,9 @@ class Team(_TeamBase):
         # empty TeamResult, not an opaque team crash.
         try:
             choice = coord(input, self.agents)
-            if asyncio.iscoroutine(choice):
+            # Await ANY awaitable (a coroutine, a Future/Task, or a custom
+            # __await__), not just a coroutine, before coercing the choice.
+            if inspect.isawaitable(choice):
                 choice = await choice
             return self._coerce_choice(choice)
         except Exception as exc:  # noqa: BLE001 - isolate routing-callable failure

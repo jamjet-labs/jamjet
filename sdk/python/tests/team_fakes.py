@@ -96,6 +96,10 @@ class MultiAgentFakeClient:
     def __init__(self, terminals: dict[str, dict[str, Any]]) -> None:
         self._terminals = terminals
         self._by_exec: dict[str, dict[str, Any]] = {}
+        # A deterministic, monotonically increasing counter so every
+        # start_execution call gets a UNIQUE exec_id (two starts of the same
+        # workflow_id never collide in _by_exec). No clock / randomness.
+        self._exec_seq = 0
         self.created: list[str] = []
         self.started: list[tuple[str, dict[str, Any]]] = []
 
@@ -112,9 +116,10 @@ class MultiAgentFakeClient:
     async def start_execution(
         self, workflow_id: str, input: dict[str, Any], workflow_version: str | None = None
     ) -> dict[str, Any]:
-        exec_id = f"exec-{workflow_id}"
+        self._exec_seq += 1
+        exec_id = f"exec-{workflow_id}-{self._exec_seq}"
         term = dict(self._terminals[workflow_id])
-        term.setdefault("execution_id", exec_id)
+        term["execution_id"] = exec_id
         self._by_exec[exec_id] = term
         self.started.append((workflow_id, input))
         return {"execution_id": exec_id}

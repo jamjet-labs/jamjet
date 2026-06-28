@@ -8,6 +8,8 @@ sub-agents are scripted real Agents (see ``tests/team_fakes.py``).
 
 from __future__ import annotations
 
+import asyncio
+
 from jamjet.team import Collect, First, Parallel, Sequential, Team
 from tests.team_fakes import scripted_agent
 
@@ -124,6 +126,44 @@ async def test_coordinator_callable_can_return_a_name() -> None:
     y = scripted_agent("y", output="y-out")
     result = await Team([x, y], coordinator=lambda inp, agents: "x").run("task")
     assert result.output == "x-out"
+
+
+async def test_coordinator_callable_returns_a_noncoroutine_awaitable() -> None:
+    """A routing callable may return ANY awaitable, not only a coroutine: a custom
+    ``__await__`` object resolves to the chosen name and routes correctly (the route
+    path awaits via ``inspect.isawaitable``, not the narrower ``asyncio.iscoroutine``)."""
+    x = scripted_agent("x", output="x-out")
+    y = scripted_agent("y", output="y-out")
+
+    class _Awaitable:
+        def __init__(self, value: object) -> None:
+            self._value = value
+
+        def __await__(self):  # type: ignore[no-untyped-def]
+            async def _inner() -> object:
+                return self._value
+
+            return _inner().__await__()
+
+    result = await Team([x, y], coordinator=lambda inp, agents: _Awaitable("y")).run("task")
+    assert result.output == "y-out"
+    assert "y" in result.per_agent
+    assert "x" not in result.per_agent
+
+
+async def test_coordinator_callable_returns_a_future() -> None:
+    """A routing callable returning an ``asyncio.Future`` (awaitable but not a
+    coroutine) is awaited and routed correctly."""
+    x = scripted_agent("x", output="x-out")
+    y = scripted_agent("y", output="y-out")
+
+    def route(inp: str, agents: list) -> object:
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        fut.set_result("y")
+        return fut
+
+    result = await Team([x, y], coordinator=route).run("task")
+    assert result.output == "y-out"
 
 
 async def test_coordinator_none_runs_first_agent() -> None:

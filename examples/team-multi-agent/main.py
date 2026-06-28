@@ -26,7 +26,10 @@ async def main() -> None:
     # ── Pattern 1: coordinator routing ────────────────────────────────────────
     desk = build_desk()
 
-    fact_task = "Find the latest on durable agent runtimes."
+    # A timeless explainer (not a freshness query): the example's web_search tool
+    # is a canned stub, so the prompt asks for a definition that does not change
+    # rather than implying live, up-to-the-minute data.
+    fact_task = "Explain what a durable agent runtime is and why it matters."
     routed = await desk.run(fact_task)
     print(f"[desk] {fact_task}")
     print(f"  routed to: {', '.join(k for k in routed.per_agent if k != 'router')}")

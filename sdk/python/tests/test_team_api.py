@@ -106,6 +106,26 @@ def test_loop_constructs() -> None:
     assert loop.max_iters == 3
 
 
+# ── Duplicate member names rejected ───────────────────────────────────────────
+
+
+def test_duplicate_member_names_are_rejected() -> None:
+    """``per_agent`` keys by name and the coordinator routes by name, so two members
+    sharing a name would silently overwrite / mis-route. Construction must reject it."""
+    import pytest
+
+    for ctor in (Sequential, Parallel, Team):
+        with pytest.raises(ValueError, match="unique names"):
+            ctor([_agent("dup"), _agent("dup")])
+
+
+def test_unique_member_names_still_construct() -> None:
+    a, b = _agent("a"), _agent("b")
+    assert Sequential([a, b]).agents == [a, b]
+    assert Parallel([a, b]).agents == [a, b]
+    assert Team([a, b]).agents == [a, b]
+
+
 # ── TeamResult ────────────────────────────────────────────────────────────────
 
 
