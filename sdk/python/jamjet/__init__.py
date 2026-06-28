@@ -60,6 +60,7 @@ from jamjet.spec import (  # noqa: F401
     ToolSpec,
     WorkflowSpec,
 )
+from jamjet.team import Loop, Parallel, Sequential, Team, TeamResult
 from jamjet.tools.decorators import tool
 from jamjet.workflow.workflow import Workflow
 from jamjet.decorators import DurableAgent, workflow  # noqa: F401, E402
@@ -85,10 +86,15 @@ __all__ = [
     "MemoryConfig",
     "ProtocolAdapter",
     "ProtocolRegistry",
+    "Loop",
+    "Parallel",
     "Runtime",
     "RuntimeEvent",
     "RuntimeResult",
     "Scope",
+    "Sequential",
+    "Team",
+    "TeamResult",
     "ToolSpec",
     "Workflow",
     "WorkflowSpec",
