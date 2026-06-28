@@ -458,14 +458,40 @@ def _download_server_binary(cache_dir: str) -> str:
 
 @app.command()
 def dev(
-    port: int = typer.Option(7700, help="Port to run the runtime on"),
+    port: int = typer.Option(7700, help="Port to run the engine on"),
     db: str | None = typer.Option(None, "--db", help="SQLite database path (default: .jamjet/runtime.db)"),
     build: bool = typer.Option(False, "--build", help="Build the runtime binary before starting"),
+    sidecar_port: int = typer.Option(4280, "--sidecar-port", help="Port for the model sidecar"),
+    modules: str | None = typer.Option(
+        None, "--modules", help="Comma-separated Python modules for the worker to pre-import (your @tool code)"
+    ),
+    engine_only: bool = typer.Option(
+        False, "--engine-only", help="Start ONLY the engine (the legacy behavior; no sidecar, no worker)"
+    ),
+    no_sidecar: bool = typer.Option(
+        False, "--no-sidecar", help="Do not start the model sidecar (engine talks to providers directly)"
+    ),
+    no_worker: bool = typer.Option(False, "--no-worker", help="Do not start the python_tool worker"),
 ) -> None:
-    """Start the local dev runtime (SQLite mode)."""
+    """Start the whole local dev stack with one command.
+
+    Brings up, in order, the model sidecar (health-gated), the durable engine
+    (with the model seam wired to the sidecar) and the python_tool worker. Press
+    Ctrl+C to stop the whole stack gracefully — no orphaned processes.
+
+    \b
+    Examples:
+      jamjet dev                          # sidecar + engine + worker
+      jamjet dev --modules myapp.tools    # worker pre-imports your @tool module
+      jamjet dev --no-sidecar             # engine + worker, providers called directly
+      jamjet dev --engine-only            # just the engine (legacy)
+    """
+    import importlib.util
     import os
     import signal
     import subprocess
+
+    from jamjet.cli import dev_stack
 
     if build:
         console.print("[dim]Building jamjet-server...[/dim]")
@@ -483,36 +509,76 @@ def dev(
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
 
+    enable_sidecar = not (engine_only or no_sidecar)
+    enable_worker = not (engine_only or no_worker)
+
+    # The sidecar needs the optional `sidecar` extra (starlette + uvicorn). Fail
+    # with a clear hint rather than a cryptic "sidecar exited" later.
+    if enable_sidecar and importlib.util.find_spec("uvicorn") is None:
+        console.print(
+            "[red]Error:[/red] the model sidecar needs uvicorn.\n"
+            "  Install it:   [bold]pip install 'jamjet[sidecar]'[/bold]\n"
+            "  Or skip it:   [bold]jamjet dev --no-sidecar[/bold]"
+        )
+        raise typer.Exit(1)
+
     db_url = f"sqlite://{db}" if db else None
-    env = os.environ.copy()
-    env["PORT"] = str(port)
-    env["JAMJET_PORT"] = str(port)
-    env["JAMJET_DEV_MODE"] = "1"
-    env["RUST_LOG"] = env.get("RUST_LOG", "info")
-    if db_url:
-        env["DATABASE_URL"] = db_url
 
     _print_logo()
-    console.rule("[bold green]JamJet Dev Runtime[/bold green]")
-    console.print(f"  [bold]Binary:[/bold] {binary}")
-    console.print(f"  [bold]Port:[/bold]   {port}")
-    console.print("  [bold]Mode:[/bold]   local (SQLite)")
-    console.print(f"  [bold]API:[/bold]    http://localhost:{port}")
+    console.rule("[bold green]JamJet Dev Stack[/bold green]")
+    console.print(f"  [bold]Binary:[/bold]  {binary}")
+    console.print(f"  [bold]Engine:[/bold]  http://localhost:{port}")
+    if enable_sidecar:
+        console.print(f"  [bold]Sidecar:[/bold] http://127.0.0.1:{sidecar_port}  [dim](governed model seam)[/dim]")
+    else:
+        console.print("  [bold]Sidecar:[/bold] [dim]disabled (engine calls providers directly)[/dim]")
+    console.print(f"  [bold]Worker:[/bold]  {'python_tool' if enable_worker else '[dim]disabled[/dim]'}")
+    console.print("  [bold]Mode:[/bold]    local (SQLite)")
     console.print()
-    console.print("[dim]Press Ctrl+C to stop.[/dim]")
+    console.print("[dim]Press Ctrl+C to stop the whole stack.[/dim]")
     console.rule()
 
-    proc = subprocess.Popen([binary], env=env)
+    def _log(msg: str = "") -> None:
+        # markup=False so subprocess log lines (which may contain '[...]') are
+        # printed verbatim and never interpreted as Rich markup.
+        console.print(msg, markup=False, highlight=False)
+
+    stack = dev_stack.DevStack(
+        binary=binary,
+        base_env=os.environ.copy(),
+        port=port,
+        sidecar_port=sidecar_port,
+        db_url=db_url,
+        modules=modules,
+        enable_sidecar=enable_sidecar,
+        enable_worker=enable_worker,
+        log=_log,
+    )
+
+    # Route SIGTERM through the same graceful path as Ctrl+C (SIGINT).
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _on_sigterm(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
     try:
-        proc.wait()
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Stopping runtime...[/yellow]")
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    console.print("[green]Runtime stopped.[/green]")
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        previous_sigterm = None  # not in the main thread; rely on SIGINT only
+
+    try:
+        stack.run()
+    except dev_stack.DevStackError as e:
+        console.print(f"[red]Dev stack failed to start:[/red] {e}")
+        raise typer.Exit(1)
+    finally:
+        if previous_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+            except (ValueError, OSError):
+                pass
+
+    console.print("[green]Dev stack stopped.[/green]")
 
 
 # ── validate ─────────────────────────────────────────────────────────────────
