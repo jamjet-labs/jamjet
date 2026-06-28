@@ -59,11 +59,18 @@ async def resume(
     target: Any,
     execution_id: str,
     *,
+    governance: Any | None = None,
     target_runtime: str | None = None,
 ) -> RuntimeResult:
+    """Resume a durable execution, keeping its governance enforced (M6 parity).
+
+    Pass ``governance`` (e.g. ``agent.governance``) so a resumed in-process run
+    keeps the SAME budget / allowlist / PII enforcement as the original run
+    instead of silently resuming ungoverned.
+    """
     spec = _resolve_spec(target)
     rt = _select_runtime(target_runtime)
-    return await rt.resume(spec, execution_id)
+    return await rt.resume(spec, execution_id, governance=governance)
 
 
 async def deploy(target: Any, *, runtime: str = "cloud") -> None:

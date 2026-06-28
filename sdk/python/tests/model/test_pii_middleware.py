@@ -12,6 +12,8 @@ assertions can inspect what the provider would actually see.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from jamjet.agents.governance import normalize_governance
@@ -128,6 +130,137 @@ class TestRedactMessages:
         _redact_messages(msgs, mw._detector)
         # Original dict is unchanged.
         assert msgs[0]["content"] == original_content
+
+
+# ---------------------------------------------------------------------------
+# I2 — recursive, fail-CLOSED traversal: every reachable string is redacted, or
+# the call is denied.  No passthrough leak on bare-string lists / non-"text"
+# keys / nested blocks / non-dict messages.
+# ---------------------------------------------------------------------------
+
+
+class _Opaque:
+    """A content part the redactor cannot traverse, holding a hidden string."""
+
+    def __init__(self, secret: str) -> None:
+        self._secret = secret
+
+
+class _MsgObject:
+    """A non-dict message object (like a provider SDK message / test mock)."""
+
+    def __init__(self, content) -> None:
+        self.content = content
+        self.role = "assistant"
+
+
+class TestRecursiveFailClosed:
+    def test_bare_string_list_part_is_redacted(self) -> None:
+        mw = PiiRedactionMiddleware()
+        msgs = [{"role": "user", "content": ["my ssn is 123-45-6789", "and clean text"]}]
+        out = _redact_messages(msgs, mw._detector)
+        assert "123-45-6789" not in out[0]["content"][0]
+        assert "[REDACTED:US_SSN]" in out[0]["content"][0]
+        assert out[0]["content"][1] == "and clean text"
+
+    def test_text_under_non_text_key_is_redacted(self) -> None:
+        mw = PiiRedactionMiddleware()
+        msgs = [{"role": "user", "content": [{"type": "input_text", "value": "ssn 123-45-6789"}]}]
+        out = _redact_messages(msgs, mw._detector)
+        assert "123-45-6789" not in out[0]["content"][0]["value"]
+        assert "[REDACTED:US_SSN]" in out[0]["content"][0]["value"]
+
+    def test_deeply_nested_block_is_redacted(self) -> None:
+        mw = PiiRedactionMiddleware()
+        msgs = [
+            {
+                "role": "user",
+                "content": [{"type": "wrapper", "blocks": [{"inner": {"deep": "email bob@corp.io"}}]}],
+            }
+        ]
+        out = _redact_messages(msgs, mw._detector)
+        flat = json.dumps(out)
+        assert "bob@corp.io" not in flat
+        assert "[REDACTED:EMAIL]" in flat
+
+    def test_non_dict_message_object_content_is_redacted(self) -> None:
+        """The non-dict-message gap: an assistant message OBJECT's content is
+        redacted (was passed through unredacted before)."""
+        mw = PiiRedactionMiddleware()
+        msg = _MsgObject("contact alice@example.com")
+        out = _redact_messages([msg], mw._detector)
+        assert "alice@example.com" not in out[0].content
+        assert "[REDACTED:EMAIL]" in out[0].content
+        # The original object is NOT mutated.
+        assert msg.content == "contact alice@example.com"
+
+    def test_non_dict_message_object_list_content_is_redacted(self) -> None:
+        mw = PiiRedactionMiddleware()
+        msg = _MsgObject([{"type": "text", "text": "ssn 123-45-6789"}])
+        out = _redact_messages([msg], mw._detector)
+        assert "123-45-6789" not in json.dumps(out[0].content)
+
+    def test_unreachable_string_part_is_denied(self) -> None:
+        """Fail-CLOSED: an opaque content part the redactor cannot traverse ->
+        DENY (never forwarded unredacted)."""
+        mw = PiiRedactionMiddleware()
+        msgs = [{"role": "user", "content": [_Opaque("ssn 123-45-6789")]}]
+        with pytest.raises(ModelDeniedError) as exc:
+            _redact_messages(msgs, mw._detector)
+        assert exc.value.code == "pii_unredactable_content"
+
+    def test_opaque_message_is_denied(self) -> None:
+        """A non-dict message with no textual surface -> DENY (fail-closed)."""
+        mw = PiiRedactionMiddleware()
+        with pytest.raises(ModelDeniedError) as exc:
+            _redact_messages([object()], mw._detector)
+        assert exc.value.code == "pii_unredactable_content"
+
+    def test_non_textual_parts_pass_through(self) -> None:
+        """Genuinely non-textual leaves (bytes, an image-url with no PII) pass."""
+        mw = PiiRedactionMiddleware()
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "http://example.com/img.png"}},
+                    {"type": "blob", "data": b"\x00\x01\x02"},
+                    "clean text only",
+                ],
+            }
+        ]
+        out = _redact_messages(msgs, mw._detector)
+        assert out[0]["content"][0]["image_url"]["url"] == "http://example.com/img.png"
+        assert out[0]["content"][1]["data"] == b"\x00\x01\x02"
+        assert out[0]["content"][2] == "clean text only"
+
+
+class TestRecursiveFailClosedViaModel:
+    async def test_backend_receives_redacted_nested_content(self) -> None:
+        """The critical assertion via the seam: the provider never sees raw PII
+        hidden in a bare-string list / non-text key / nested block."""
+        backend = CapturingBackend()
+        model = Model(backend=backend, middleware=[PiiRedactionMiddleware()])
+        req = _req_multipart(
+            [
+                "leading ssn 111-22-3333",
+                {"type": "input_text", "value": "email carol@corp.io"},
+                {"type": "w", "blocks": [{"deep": "card 4111 1111 1111 1111"}]},
+            ]
+        )
+        await model.complete(req)
+        flat = json.dumps(backend.received[0].messages, default=str)
+        assert "111-22-3333" not in flat
+        assert "carol@corp.io" not in flat
+        assert "4111 1111 1111 1111" not in flat
+
+    async def test_unreachable_string_denies_and_backend_not_called(self) -> None:
+        backend = CapturingBackend()
+        model = Model(backend=backend, middleware=[PiiRedactionMiddleware()])
+        with pytest.raises(ModelDeniedError) as exc:
+            await model.complete(_req_multipart([_Opaque("ssn 123-45-6789")]))
+        assert exc.value.code == "pii_unredactable_content"
+        assert backend.received == [], "provider must NOT be called when content can't be redacted"
 
 
 # ---------------------------------------------------------------------------

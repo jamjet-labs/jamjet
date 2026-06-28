@@ -11,14 +11,21 @@ If the detector genuinely raises while redacting a STRING it was handed
 ``ModelDeniedError(code="pii_redaction_error")`` so the provider is never
 called with unredacted text.
 
-Robust content extraction
--------------------------
-The detector only ever runs on plain-string content.  A message whose shape
-the redactor does not understand — a non-dict message (a provider SDK message
-object or a test mock), ``None`` / non-string content, or a structured content
-block without a string ``text`` field — is PASSED THROUGH unchanged.  An
-unexpected message shape is not a redaction failure and never trips the deny
-path; only a real detector error on real string input does.
+Recursive, fail-closed content traversal
+----------------------------------------
+The redactor RECURSES through the whole message/content structure and runs the
+detector on **every string it can reach**, regardless of key or nesting:
+plain-string content, bare strings inside a content list, text under any key
+(not only ``"text"``), and arbitrarily nested dicts/lists.  A non-dict message
+(a provider SDK message object or a test mock) has its textual ``content``
+surface redacted on a copy.  Genuinely non-textual leaves — ``bytes``, numbers,
+``None``, an image-URL with no PII — pass through.
+
+If a reachable value is an opaque object the redactor cannot traverse but which
+may hold string data, the call is DENIED (``ModelDeniedError`` with code
+``pii_unredactable_content``) rather than forwarded — fail-CLOSED: any reachable
+string is redacted, or the call is denied; nothing unredacted reaches the
+provider.
 
 A prompt that contains no PII passes through unchanged.
 
@@ -56,6 +63,8 @@ tracked as follow-up F-t3-pii-output.
 
 from __future__ import annotations
 
+import copy
+from collections.abc import Mapping
 from typing import Any
 
 from jamjet.cloud.middleware.pii import RegexDetector
@@ -84,11 +93,12 @@ class PiiRedactionMiddleware(BaseModelMiddleware):
 
     Fail-closed
     -----------
-    A genuine exception from ``detector.redact`` on string input raises
-    ``ModelDeniedError(code="pii_redaction_error")`` -- the provider is NEVER
-    called with unredacted text (redact-or-deny posture).  An unexpected
-    message shape (non-dict message, non-string content) is skipped and passed
-    through unchanged rather than denied.
+    Every reachable string is redacted.  A genuine exception from
+    ``detector.redact`` on string input raises
+    ``ModelDeniedError(code="pii_redaction_error")``; an opaque value the
+    redactor cannot traverse (but which may hold strings) raises
+    ``ModelDeniedError(code="pii_unredactable_content")``.  Either way the
+    provider is NEVER called with unredacted text (redact-or-deny posture).
     """
 
     def __init__(
@@ -106,16 +116,13 @@ class PiiRedactionMiddleware(BaseModelMiddleware):
     async def before(self, request: ModelRequest) -> ModelRequest:
         """Redact PII from all message content before it reaches the provider.
 
-        Only plain-string content (and the string ``text`` field of multi-part
-        content blocks) is run through the detector.  Messages whose shape the
-        redactor does not understand — a non-dict message, ``None`` / non-string
-        content, or a block without a string ``text`` field — are passed through
-        unchanged; an unexpected shape is skipped, never denied.
-
-        Fail-closed: the deny path lives in :func:`_redact_text` and triggers
-        ONLY when the detector genuinely raises on string input, raising
-        ``ModelDeniedError(code="pii_redaction_error")`` so the provider is
-        never called with unredacted text.
+        Recurses through every message and content block and runs the detector
+        on every reachable string (regardless of key or nesting).  Fail-closed:
+        a detector error on string input raises
+        ``ModelDeniedError(code="pii_redaction_error")``; an opaque value the
+        redactor cannot traverse raises
+        ``ModelDeniedError(code="pii_unredactable_content")`` — so the provider
+        is never called with unredacted text.
         """
         request.messages = _redact_messages(request.messages, self._detector)
         return request
@@ -147,23 +154,85 @@ def _redact_text(text: str, detector: Any) -> str:
         ) from exc
 
 
+class _UnredactableError(Exception):
+    """Internal sentinel: an opaque value the redactor cannot traverse but which
+    may hold string data.  Caught at the message boundary and turned into a
+    fail-closed ``ModelDeniedError`` (never propagated to callers)."""
+
+
+def _redact_value(value: Any, detector: Any) -> Any:
+    """Recursively redact every string reachable inside ``value``.
+
+    ``str`` -> redacted; ``Mapping`` -> values recursed (keys are field names,
+    left as-is); ``list`` / ``tuple`` -> elements recursed; ``bytes``-like and
+    non-string scalars (``bool`` / ``int`` / ``float`` / ``None``) pass through
+    as genuinely non-textual.  Any other opaque object raises
+    :class:`_UnredactableError` so the caller fails CLOSED rather than forwarding a
+    string it could not reach.  Builds new containers so the caller's structures
+    are never mutated.
+    """
+    if isinstance(value, str):
+        return _redact_text(value, detector)
+    # bool is an int subclass; both (and float / None) are non-textual scalars.
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return value
+    if isinstance(value, Mapping):
+        return {k: _redact_value(v, detector) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(v, detector) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_value(v, detector) for v in value)
+    # An opaque object that is not provably non-textual -- cannot guarantee no
+    # string slips through, so fail CLOSED.
+    raise _UnredactableError(type(value).__name__)
+
+
+def _redact_message(msg: Any, detector: Any) -> Any:
+    """Redact one message, returning a redacted copy (never mutating ``msg``).
+
+    A mapping message is recursed in full.  A provider/mock message OBJECT (the
+    assistant message the in-process loop appends back into the running list)
+    has its textual ``content`` surface redacted on a shallow copy.  An object
+    with no recognizable textual surface fails CLOSED via :class:`_UnredactableError`.
+    """
+    if isinstance(msg, Mapping):
+        return _redact_value(msg, detector)
+
+    # Message-like object (e.g. a provider SDK message or a test mock): redact
+    # its ``content``.  When there is no PII the original is returned untouched
+    # (no copy, no mutation); only a genuine change forces a redacted copy.
+    if hasattr(msg, "content"):
+        content = msg.content
+        if content is None:
+            return msg
+        redacted = _redact_value(content, detector)  # may raise _UnredactableError
+        if redacted == content:
+            return msg
+        new = copy.copy(msg)
+        try:
+            new.content = redacted
+        except Exception as exc:  # noqa: BLE001 - read-only/frozen -> cannot redact -> deny
+            raise _UnredactableError(type(msg).__name__) from exc
+        return new
+
+    # Opaque, non-mapping message with no content surface -- fail CLOSED.
+    raise _UnredactableError(type(msg).__name__)
+
+
 def _redact_messages(
     messages: list[dict[str, Any]],
     detector: Any,
 ) -> list[dict[str, Any]]:
-    """Return a new message list with PII redacted from all text content.
+    """Return a new message list with PII redacted from every reachable string.
 
-    Robust to unexpected message shapes: only plain-string content (and the
-    string ``text`` field of multi-part content blocks) is run through the
-    detector.  A message that is not a dict, or whose content is ``None`` or a
-    non-string object the redactor does not understand, is passed through
-    unchanged — an unexpected shape is skipped, never denied.  The fail-closed
-    deny path lives in :func:`_redact_text` and fires only on a real detector
-    error against string input.
-
-    Builds a shallow copy of each message dict so the caller's list is never
-    mutated.  Handles both ``"content": "string"`` and
-    ``"content": [{"type": "text", "text": "..."}]`` shapes.
+    Recurses through each message (and arbitrarily nested content) and redacts
+    all strings.  Fail-closed: a detector error on string input raises
+    ``ModelDeniedError(code="pii_redaction_error")`` (in :func:`_redact_text`);
+    an opaque value the redactor cannot traverse raises
+    ``ModelDeniedError(code="pii_unredactable_content")``.  The caller's list and
+    dicts are never mutated.
     """
     # Degenerate / unexpected top-level shape -- nothing to iterate, pass through.
     if not isinstance(messages, list):
@@ -171,24 +240,12 @@ def _redact_messages(
 
     result: list[Any] = []
     for msg in messages:
-        # Unexpected message shape (e.g. a provider SDK message object or a test
-        # mock) -- not a redactable dict, so pass it through untouched.
-        if not isinstance(msg, dict):
-            result.append(msg)
-            continue
-        msg = dict(msg)  # shallow copy -- do not mutate caller's list
-        content = msg.get("content")
-        if isinstance(content, str):
-            msg["content"] = _redact_text(content, detector)
-        elif isinstance(content, list):
-            new_parts: list[Any] = []
-            for part in content:
-                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    part = dict(part)  # copy before mutating
-                    part["text"] = _redact_text(part["text"], detector)
-                new_parts.append(part)
-            msg["content"] = new_parts
-        # else: content is None or a non-string object the redactor does not
-        # understand -- leave it unchanged (skip, do not deny).
-        result.append(msg)
+        try:
+            result.append(_redact_message(msg, detector))
+        except _UnredactableError as exc:
+            raise ModelDeniedError(
+                f"PII redaction cannot traverse message content of type {exc}; call "
+                "denied to prevent sending unredacted data to the provider.",
+                code="pii_unredactable_content",
+            ) from exc
     return result

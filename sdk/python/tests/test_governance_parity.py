@@ -44,6 +44,7 @@ from typing import Any
 import pytest
 
 from jamjet import Agent, tool
+from jamjet.agents.audit import AuditSigner, ChainError, resolve_signer, verify_chain
 from jamjet.agents.governance import Budget, normalize_governance
 from jamjet.compiler.agent_ir import compile_agent_to_ir
 from jamjet.model.budget import BudgetMiddleware
@@ -57,6 +58,7 @@ from jamjet.model.middleware import (
 from jamjet.model.pii import PiiRedactionMiddleware
 from jamjet.model.policy_resolver import resolve_policy_allowlist
 from jamjet.model.types import ModelRequest, parse_model_ref
+from jamjet.runtime.local import LocalRuntime
 from jamjet.runtime.local.llm_adapters import SeamAdapter, get_adapter
 
 # Repo root (.../jamjet) from .../sdk/python/tests/<this file>.
@@ -525,3 +527,143 @@ class TestNoKnobSilentlyNoOps:
         assert ir["policy"]["model_allowlist"] == ["anthropic"]
         assert ir["policy"]["require_approval_for"] == ["delete_*"]
         assert "data_policy" in ir
+
+
+# ===========================================================================
+# 9. C1 — PER-ACTION SIGNED AUDIT IS ON BY DEFAULT (the false-guarantee fix).
+#    A governed agent.run() emits a signed, hash-chained audit record for every
+#    action (tool calls + the turn); audit=False emits none; tamper breaks it.
+# ===========================================================================
+
+
+class TestPerActionAuditOnByDefault:
+    def test_governed_run_emits_verifiable_signed_audit_chain(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A plain governed agent.run() produces signed audit entries that
+        verify_chain accepts — audit is TRUE, not just claimed."""
+        monkeypatch.setenv("JAMJET_AUDIT_SIGNING_KEY", "review-fix-test-key")
+        _install_backend(monkeypatch)
+        agent = Agent("aud", model="anthropic/claude-sonnet-4-6", tools=[search], strategy="react")
+        result = asyncio.run(agent.run("look up the weather"))
+        assert result.audit is not None, "audit on by default -> a chain is attached"
+        # Per-ACTION: at least the model turn, plus one per tool call.
+        assert len(result.audit) >= 1
+        assert result.audit[-1].action_type == "agent_turn"
+        assert any(e.action_type == "tool_call" for e in result.audit), "tool calls are audited"
+        # Every entry is sealed + signed.
+        assert all(e.entry_hash and e.signature for e in result.audit)
+        # The chain verifies under the same signing key.
+        verify_chain(result.audit, resolve_signer())
+
+    def test_audit_false_emits_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JAMJET_AUDIT_SIGNING_KEY", "review-fix-test-key")
+        _install_backend(monkeypatch)
+        agent = Agent("noaud", model="anthropic/claude-sonnet-4-6", tools=[search], strategy="react", audit=False)
+        result = asyncio.run(agent.run("q"))
+        assert result.audit is None, "audit=False -> no emission"
+
+    def test_audit_tamper_breaks_verification(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JAMJET_AUDIT_SIGNING_KEY", "review-fix-test-key")
+        _install_backend(monkeypatch)
+        agent = Agent("aud", model="anthropic/claude-sonnet-4-6", tools=[search], strategy="react")
+        result = asyncio.run(agent.run("q"))
+        signer = resolve_signer()
+        verify_chain(result.audit, signer)  # clean chain verifies
+        # Mutate a sealed entry's content -> recomputed hash no longer matches.
+        result.audit[0].result_hash = "forged"
+        with pytest.raises(ChainError):
+            verify_chain(result.audit, signer)
+
+    def test_audit_unsigned_without_key_is_honest_not_forged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No key + no opt-in -> entries are chained but UNSIGNED; verify_chain
+        reports them as unsigned rather than trusting a forgeable dev key."""
+        monkeypatch.delenv("JAMJET_AUDIT_SIGNING_KEY", raising=False)
+        monkeypatch.delenv("JAMJET_AUDIT_ALLOW_INSECURE_KEY", raising=False)
+        _install_backend(monkeypatch)
+        agent = Agent("aud", model="anthropic/claude-sonnet-4-6", tools=[search], strategy="react")
+        result = asyncio.run(agent.run("q"))
+        assert result.audit is not None
+        assert all(e.signature is None for e in result.audit), "no key -> unsigned, never forged"
+        with pytest.raises(ChainError) as exc:
+            verify_chain(result.audit, resolve_signer())
+        assert exc.value.reason == "unsigned"
+
+    def test_wrong_key_fails_signature_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("JAMJET_AUDIT_SIGNING_KEY", "the-real-key")
+        _install_backend(monkeypatch)
+        agent = Agent("aud", model="anthropic/claude-sonnet-4-6", tools=[search], strategy="react")
+        result = asyncio.run(agent.run("q"))
+        with pytest.raises(ChainError) as exc:
+            verify_chain(result.audit, AuditSigner(b"attacker-key"))
+        assert exc.value.reason == "bad_signature"
+
+
+# ===========================================================================
+# 10. M6 — RESUME + STREAM GOVERNANCE PARITY (never a silent no-op).
+# ===========================================================================
+
+
+class TestResumeGovernanceParity:
+    def test_resume_threads_governance_and_denies(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A resumed in-process run KEEPS governance: policy='strict' on a gpt
+        model denies at the seam (was a silent no-op before — resume dropped it)."""
+        backend = _install_backend(monkeypatch)
+        spec = Agent("r", model="gpt-5.2", tools=[search], strategy="react").compile()
+        gov = normalize_governance(policy="strict")
+        with pytest.raises(ModelDeniedError):
+            asyncio.run(LocalRuntime().resume(spec, "exec-resume-1", governance=gov))
+        assert backend.calls == 0, "denied at the seam on resume, never reached the provider"
+
+    def test_resume_without_governance_does_not_deny(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The dual: resume with no governance is allow-all (back-compat)."""
+        backend = _install_backend(monkeypatch)
+        spec = Agent("r", model="gpt-5.2", tools=[search], strategy="react").compile()
+        asyncio.run(LocalRuntime().resume(spec, "exec-resume-2"))
+        assert backend.calls >= 1
+
+
+class TestStreamGovernanceParity:
+    def test_stream_with_budget_fails_loud(self) -> None:
+        """A budget-capped agent.stream() FAILS LOUD (streams can't accumulate
+        budget) rather than silently running ungoverned."""
+        agent = Agent("s", model="anthropic/claude-sonnet-4-6", tools=[search], budget=0.5)
+
+        async def _drain() -> None:
+            async for _ in agent.stream("hi"):
+                pass
+
+        with pytest.raises(RuntimeError, match="budget"):
+            asyncio.run(_drain())
+
+    def test_stream_without_budget_enforces_pii_in_before_chain(self) -> None:
+        """The dual: a plain agent streams, and PII/allowlist still enforce via
+        the before-chain (no silent ungoverned stream).  The seam is built with
+        the agent's governance middleware + a stub backend so we can inspect the
+        request the backend actually received."""
+        from jamjet.model.seam import Model
+        from jamjet.model.types import StreamChunk
+
+        class _StreamBackend:
+            def __init__(self) -> None:
+                self.seen = None
+
+            async def complete(self, request):  # pragma: no cover
+                raise AssertionError("stream must not call complete")
+
+            async def stream(self, request):
+                self.seen = request
+                yield StreamChunk(delta="ok")
+
+        backend = _StreamBackend()
+        agent = Agent("s", model="anthropic/claude-sonnet-4-6", tools=[search], instructions="be brief")
+        # The governed seam: agent.governance middleware (incl. PII) + stub backend.
+        seam = Model(middleware=default_model_middleware(agent.governance), backend=backend)
+
+        async def _drain() -> list[str]:
+            return [c.delta async for c in agent.stream("email me at a@b.com", model=seam)]
+
+        out = asyncio.run(_drain())
+        assert out == ["ok"]
+        # PiiRedactionMiddleware ran in the before-chain: the backend saw redacted text.
+        flat = json.dumps(backend.seen.messages, default=str)
+        assert "a@b.com" not in flat
+        assert "[REDACTED:EMAIL]" in flat

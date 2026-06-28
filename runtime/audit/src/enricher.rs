@@ -64,7 +64,10 @@ struct ChainHead {
 pub struct AuditEnricher {
     backend: Arc<dyn AuditBackend>,
     /// Signs each entry's content hash. Sourced from the environment by
-    /// default (`AuditSigner::from_env`); see [`AuditSigner`] for the key.
+    /// default (`AuditSigner::from_env`). With no `JAMJET_AUDIT_SIGNING_KEY`
+    /// and no `JAMJET_AUDIT_ALLOW_INSECURE_KEY` opt-in this signer is
+    /// unsigned/refused, so entries are chained but left unsigned (never signed
+    /// with a forgeable dev key by default); see [`AuditSigner`].
     signer: AuditSigner,
     /// Serializes the read-head -> seal -> append -> advance-head sequence so
     /// concurrent appends form a single linear chain.
@@ -73,7 +76,8 @@ pub struct AuditEnricher {
 
 impl AuditEnricher {
     /// Build an enricher that signs with the key from the environment
-    /// (`JAMJET_AUDIT_SIGNING_KEY`, or the insecure dev key with a warning).
+    /// (`JAMJET_AUDIT_SIGNING_KEY`; the insecure dev key only behind the
+    /// explicit `JAMJET_AUDIT_ALLOW_INSECURE_KEY` opt-in; otherwise unsigned).
     pub fn new(backend: Arc<dyn AuditBackend>) -> Self {
         Self::with_signer(backend, AuditSigner::from_env())
     }

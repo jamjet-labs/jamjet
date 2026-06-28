@@ -85,8 +85,13 @@ class LocalRuntime:
         self,
         spec: AgentSpec | WorkflowSpec,
         execution_id: str,
+        *,
+        governance: GovernanceConfig | None = None,
     ) -> RuntimeResult:
-        return await self.execute(spec, input=None, execution_id=execution_id)
+        # M6 parity: thread governance so a resumed in-process run keeps budget /
+        # allowlist / PII enforcement (without it, a resumed AgentSpec run rebuilt
+        # the seam allow-all / no-budget and silently lost governance).
+        return await self.execute(spec, input=None, execution_id=execution_id, governance=governance)
 
     async def _run_agent(
         self,

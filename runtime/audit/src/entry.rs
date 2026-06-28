@@ -169,9 +169,15 @@ impl AuditLogEntry {
     /// Call this once, after all enrichment/redaction is applied, immediately
     /// before persisting the entry. The `prev_hash` is the `entry_hash` of the
     /// previous sealed entry in the log (`None` for the genesis entry).
+    ///
+    /// When `signer` has no key (the unsigned/refused signer — no
+    /// `JAMJET_AUDIT_SIGNING_KEY` and no insecure opt-in), `signature` is left
+    /// `None`: the entry is still hash-chained but honestly unsigned, and
+    /// [`crate::verify_chain`] reports it as `Unsigned` rather than trusting a
+    /// forgeable dev-key signature.
     pub fn seal(&mut self, prev_hash: Option<String>, signer: &AuditSigner) {
         let hash = self.content_hash(prev_hash.as_deref());
-        self.signature = Some(signer.sign(hash.as_bytes()));
+        self.signature = signer.sign(hash.as_bytes());
         self.entry_hash = Some(hash);
         self.prev_hash = prev_hash;
     }

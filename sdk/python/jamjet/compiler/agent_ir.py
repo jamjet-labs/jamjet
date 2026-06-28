@@ -87,11 +87,11 @@ _DEFAULT_PII_DETECTORS: list[str] = [
 # DataPolicyIr dict emitted when GovernanceConfig.pii is True (the default).
 # Field names match the serde snake_case fields in DataPolicyIr (workflow.rs:231-258).
 _DEFAULT_DATA_POLICY_IR: dict[str, Any] = {
-    "pii_fields": [],                  # no extra JSON-path patterns beyond the detectors
+    "pii_fields": [],  # no extra JSON-path patterns beyond the detectors
     "pii_detectors": _DEFAULT_PII_DETECTORS,
-    "redaction_mode": "mask",          # replace PII with [REDACTED]
-    "retain_prompts": False,           # do not persist raw prompts in the audit log
-    "retain_outputs": True,            # model outputs ARE retained for audit/debug
+    "redaction_mode": "mask",  # replace PII with [REDACTED]
+    "retain_prompts": False,  # do not persist raw prompts in the audit log
+    "retain_outputs": True,  # model outputs ARE retained for audit/debug
     # retention_days omitted -> indefinite (matches serde skip_serializing_if = "Option::is_none")
 }
 
@@ -173,9 +173,14 @@ def _compile_governance_ir(agent: Agent) -> dict[str, Any]:
     budget.cost_usd  ->  cost_budget_usd: f64          (only when set)
     budget.tokens    ->  token_budget.total_tokens: u32 (only when set)
     policy / approval_required  ->  policy: PolicySetIr (only when rules exist)
-    pii=True         ->  data_policy: DataPolicyIr      (always for pii-on agents)
-    pii=False        ->  (omitted — no Rust-side PII redaction)
+    pii=True         ->  data_policy: DataPolicyIr      (metadata; see below)
+    pii=False        ->  (omitted)
     =========================================================
+
+    ``data_policy`` is emitted as METADATA, not a durable enforcement point:
+    durable outbound PII redaction is the model-seam sidecar's job
+    (F-t3-durable-data-policy).  See :func:`_compile_governance_ir` for the
+    precise honest scope.
     """
     gov = agent.governance
     out: dict[str, Any] = {}
@@ -198,9 +203,18 @@ def _compile_governance_ir(agent: Agent) -> dict[str, Any]:
         out["policy"] = policy_ir
 
     # ── Data policy / PII (workflow.rs:63-64) ───────────────────────────────
-    # pii=True (the default) -> emit the standard DataPolicyIr so the Rust
-    # audit enricher redacts PII from raw_event before persisting.
-    # pii=False -> omit the field entirely (no Rust-side redaction).
+    # pii=True (the default) -> emit the standard DataPolicyIr as METADATA.
+    #
+    # HONEST SCOPE (F-t3-durable-data-policy): on the durable path, outbound PII
+    # redaction is performed by the model-seam SIDECAR (made prod-mandatory by
+    # 2e's fail-loud coverage guard), NOT by this IR field.  The native Rust
+    # model adapters send UNREDACTED prompts when JAMJET_MODEL_SEAM_URL is unset
+    # (the dev/fallback path).  This `data_policy` block is consumed by the audit
+    # enricher's log redactor only when a RequestContext carries it
+    # (enricher.rs:153) — which the current API request contexts do not yet set,
+    # so it is metadata, not an active Rust enforcement point.  Do not read this
+    # field as a guarantee that durable model calls are PII-redacted.
+    # pii=False -> omit the field entirely.
     if gov.pii:
         out["data_policy"] = _DEFAULT_DATA_POLICY_IR
 

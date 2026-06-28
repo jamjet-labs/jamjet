@@ -61,9 +61,23 @@ class GovernanceConfig:
     budget
         Optional per-run spending cap.  ``None`` when uncapped.
     pii
-        Redact PII from prompts/outputs at the seam.  ON by default.
+        Redact PII from outbound prompts at the model seam.  ON by default.
+        Enforced on the in-process ``agent.run()`` path by the seam middleware
+        (``PiiRedactionMiddleware``) and on the durable path by the model-seam
+        SIDECAR (made prod-mandatory by 2e's fail-loud coverage guard).  The
+        compiled ``data_policy`` IR is emitted as metadata for the audit-log
+        redactor, but the native Rust model adapters do NOT perform outbound PII
+        redaction without the sidecar (dev/fallback path) — see
+        :mod:`jamjet.compiler.agent_ir` and F-t3-durable-data-policy.
     audit
-        Emit signed audit records for every governed action.  ON by default.
+        Emit a signed, hash-chained audit record per governed ACTION (each tool
+        call + the model turn) on the in-process / SDK path (``agent.run`` /
+        ``agent.run_durable``), attached to ``AgentResult.audit`` and verifiable
+        with :func:`jamjet.agents.audit.verify_chain`.  ON by default; ``audit=
+        False`` emits none.  Signed with ``JAMJET_AUDIT_SIGNING_KEY`` (unsigned-
+        but-chained, with a loud warning, until a key is provisioned).  The
+        durable engine additionally signs approval-decision events; per-node
+        engine-internal audit emission is tracked as F-t3-audit-emit.
     receipts
         Mint AgentBoundary receipts per turn.  ON by default.
     """
@@ -138,9 +152,7 @@ def _parse_budget(value: Budget | float | int | dict | None) -> Budget | None:
             tokens=value.get("tokens"),
             cost_usd=value.get("cost_usd"),
         )
-    raise TypeError(
-        f"budget must be a Budget, number, dict, or None — got {type(value).__name__!r}"
-    )
+    raise TypeError(f"budget must be a Budget, number, dict, or None — got {type(value).__name__!r}")
 
 
 def _parse_approval_required(value: ApprovalRequired) -> ApprovalRequired:
@@ -150,6 +162,4 @@ def _parse_approval_required(value: ApprovalRequired) -> ApprovalRequired:
         if not all(isinstance(item, str) for item in value):
             raise TypeError("approval_required list entries must be strings (tool-name globs)")
         return list(value)
-    raise TypeError(
-        f"approval_required must be bool or list[str] — got {type(value).__name__!r}"
-    )
+    raise TypeError(f"approval_required must be bool or list[str] — got {type(value).__name__!r}")

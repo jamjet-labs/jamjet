@@ -4,13 +4,26 @@
 instance) and denies the next model call — before it reaches the provider —
 when the configured ``Budget`` is already met or exceeded.
 
-Enforcement rule
-----------------
+Enforcement rule (post-hoc, ``>=``)
+-----------------------------------
 Check BEFORE the call: if accumulated spend (tokens and/or cost_usd) is
 already >= the configured limit, raise ``BudgetExceededError`` without calling
 the backend.  After a successful provider response, accumulate the response's
 ``cost_usd`` and total tokens (``input_tokens + output_tokens``) for future
 checks.
+
+Precise semantics (M5):
+
+* The check is ``>=`` and POST-HOC.  Accumulation happens in ``after`` (once a
+  call has already completed), and the next call's ``before`` is what denies.
+* The **first** call of a run ALWAYS proceeds (accumulated spend starts at 0,
+  and ``0 >= limit`` is false for any positive cap).
+* The call that BREACHES the cap still completes — its cost is what pushes the
+  accumulator to/over the limit; the *next* call is the one denied.  So a single
+  unavoidable overshoot of one call is expected by design; the cap bounds how
+  far a run can keep going, it does not abort an in-flight call.
+* A zero/negative budget cannot be constructed (``Budget`` rejects it at
+  construction), so ``>=`` can never deny-all a freshly-started run via a 0 cap.
 
 Run-scoped state
 ----------------

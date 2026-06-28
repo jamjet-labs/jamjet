@@ -84,4 +84,6 @@ class Runtime(Protocol):
         self,
         spec: AgentSpec | WorkflowSpec,
         execution_id: str,
+        *,
+        governance: Any | None = None,
     ) -> RuntimeResult: ...

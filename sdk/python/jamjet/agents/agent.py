@@ -188,6 +188,40 @@ class Agent:
             emitter=self._receipt_emitter,
         )
 
+    # ── Governance: per-action signed audit on by default (C1) ─────────────
+
+    def _maybe_emit_audit(
+        self,
+        prompt: str,
+        result: AgentResult,
+        *,
+        execution_id: str,
+    ) -> list[Any] | None:
+        """Emit a signed, hash-chained audit record for this run's actions.
+
+        Audit is ON by default (``GovernanceConfig.audit``): a plain governed
+        ``Agent`` produces one :class:`~jamjet.agents.audit.AuditAction` per tool
+        call plus one for the model turn, sealed into a tamper-evident chain and
+        signed with the keyed HMAC (``JAMJET_AUDIT_SIGNING_KEY``; unsigned-but-
+        chained with a loud warning until a key is provisioned). Returns the list
+        of sealed actions (also attached to :class:`AgentResult.audit`), or
+        ``None`` when ``audit=False``. This is the in-process / SDK audit path;
+        the durable engine additionally signs approval-decision events, and
+        per-node engine-internal audit emission is tracked as F-t3-audit-emit.
+        """
+        if not self.governance.audit:
+            return None
+        from jamjet.agents.audit import build_action_chain  # noqa: PLC0415
+
+        return build_action_chain(
+            agent_name=self.name,
+            model=self.model,
+            execution_id=execution_id,
+            prompt=prompt,
+            output=result.output,
+            tool_calls=result.tool_calls,
+        )
+
     # ── Public run interface ───────────────────────────────────────────────
 
     async def run(self, prompt: str) -> AgentResult:
@@ -224,13 +258,15 @@ class Agent:
         # (the gap deferred from T3-2).
         result = await rt.execute(spec, prompt, governance=self.governance)
         receipt = self._maybe_mint_receipt(prompt, result.output)
-        return AgentResult(
+        agent_result = AgentResult(
             output=result.output,
             tool_calls=[tc.model_dump() for tc in result.tool_calls],
             ir=spec.model_dump(),
             duration_us=result.duration_ms * 1000,
             receipt=receipt,
         )
+        agent_result.audit = self._maybe_emit_audit(prompt, agent_result, execution_id=result.execution_id)
+        return agent_result
 
     def run_sync(self, prompt: str) -> AgentResult:
         """Synchronous wrapper around :meth:`run` for scripts and notebooks."""
@@ -312,9 +348,10 @@ class Agent:
 
         duration_us = int((time.monotonic() - t0) * 1_000_000)
         result = self._extract_result(execution, events, ir, duration_us)
-        # Mint the turn receipt from the durable run's extracted result (on by
-        # default), mirroring the in-process run().
+        # Mint the turn receipt + emit the per-action signed audit chain from the
+        # durable run's extracted result (both on by default), mirroring run().
         result.receipt = self._maybe_mint_receipt(prompt, result.output)
+        result.audit = self._maybe_emit_audit(prompt, result, execution_id=exec_id)
         return result
 
     async def _poll_to_terminal(self, client: Any, exec_id: str) -> dict[str, Any]:
@@ -448,7 +485,27 @@ class Agent:
         Streaming is a view; durability records the completed turn (resume
         returns the checkpoint, it does not re-stream). The looped, durable
         stream over the full agent run lands in Track 2.
+
+        Governance on streams (M6 parity)
+        ---------------------------------
+        The seam ``before`` chain still runs, so the **policy/model allowlist and
+        PII redaction ENFORCE** on streamed turns exactly as on ``run()``. What a
+        stream cannot do is run the ``after`` chain (budget accumulation /
+        metering / per-action audit) — a streamed turn carries no usage-bearing
+        finalizer (the streaming ``after`` hook was deferred in Track 1). Rather
+        than silently drop budget enforcement, a ``budget``-capped agent FAILS
+        LOUD here: use :meth:`run` / :meth:`run_durable` for budget-enforced runs,
+        or drop the budget to stream. Audit/metering are likewise not accumulated
+        for the streamed view (documented, never claimed).
         """
+        if self.governance.budget is not None:
+            raise RuntimeError(
+                f"Agent {self.name!r}: stream() cannot enforce a budget cap — streamed "
+                "turns have no usage-bearing finalizer, so token/cost is never "
+                "accumulated and the budget would silently not apply. Use agent.run() "
+                "or agent.run_durable() for budget-enforced runs, or remove the budget "
+                "to stream. (Policy/allowlist and PII redaction DO enforce on streams.)"
+            )
         from jamjet.model.defaults import default_model_middleware  # noqa: PLC0415
         from jamjet.model.seam import Model  # noqa: PLC0415
         from jamjet.model.types import ModelRequest, parse_model_ref  # noqa: PLC0415
@@ -489,12 +546,17 @@ class AgentResult:
         ir: Any,
         duration_us: float = 0.0,
         receipt: dict[str, Any] | None = None,
+        audit: list[Any] | None = None,
     ) -> None:
         self.output = output
         self.tool_calls = tool_calls
         self.ir = ir
         self.duration_us = duration_us
         self.receipt = receipt
+        # ``audit`` is the per-action signed, hash-chained audit record for the
+        # run (a list of jamjet.agents.audit.AuditAction), on by default; None
+        # when ``audit=False``. ``jamjet.agents.audit.verify_chain`` accepts it.
+        self.audit = audit
 
     def __str__(self) -> str:
         return self.output
