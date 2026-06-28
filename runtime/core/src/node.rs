@@ -55,6 +55,18 @@ pub enum NodeKind {
         output_schema: String,
     },
 
+    /// Arbitrary Java method executed by an external Java tool-worker.
+    ///
+    /// The Java analog of [`NodeKind::PythonFn`]: a `class_name` + `method`
+    /// pair the worker reflects/dispatches. Routes to the `java_tool` queue,
+    /// which a net-new Java worker drains over the same HTTP claim/complete
+    /// API the Python `python_tool` worker uses — durable, exactly-once.
+    JavaFn {
+        class_name: String,
+        method: String,
+        output_schema: String,
+    },
+
     /// Router — evaluates expressions and branches.
     Condition { branches: Vec<ConditionalBranch> },
 
@@ -205,6 +217,7 @@ impl NodeKind {
             Self::Model { .. } => QueueType::Model,
             Self::Tool { .. } | Self::Finalizer { .. } => QueueType::Tool,
             Self::PythonFn { .. } => QueueType::PythonTool,
+            Self::JavaFn { .. } => QueueType::JavaTool,
             Self::MemoryRetrieval { .. } => QueueType::Retrieval,
             Self::McpTool { .. } | Self::A2aTask { .. } => QueueType::Tool,
             Self::Agent { .. } => QueueType::General,
@@ -231,6 +244,7 @@ pub enum QueueType {
     Model,
     Tool,
     PythonTool,
+    JavaTool,
     Retrieval,
     Privileged,
     General,
@@ -398,6 +412,43 @@ mod tests {
         assert!(matches!(deserialized, NodeKind::AgentTool { .. }));
         assert_eq!(node.queue_type(), QueueType::General);
         assert!(node.is_durable());
+    }
+
+    #[test]
+    fn java_fn_node_round_trip() {
+        let node = NodeKind::JavaFn {
+            class_name: "com.example.tools.WeatherTool".into(),
+            method: "getWeather".into(),
+            output_schema: "schemas.Weather".into(),
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        let deserialized: NodeKind = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, NodeKind::JavaFn { .. }));
+        assert!(node.is_durable());
+        // Node-kind serde tag mirrors PythonFn's snake_case ("python_fn" -> "java_fn").
+        assert_eq!(
+            serde_json::to_value(&node).unwrap()["type"],
+            "java_fn",
+            "JavaFn must serialize with the snake_case type tag"
+        );
+    }
+
+    #[test]
+    fn java_fn_dispatches_to_java_tool_queue() {
+        let node = NodeKind::JavaFn {
+            class_name: "com.example.tools.WeatherTool".into(),
+            method: "getWeather".into(),
+            output_schema: String::new(),
+        };
+        // Mirrors PythonFn -> PythonTool: JavaFn routes to its own durable queue.
+        assert_eq!(node.queue_type(), QueueType::JavaTool);
+        // The queue string the work item carries (routes.rs/runner.rs serialize
+        // `queue_type()` to snake_case) must be exactly "java_tool".
+        assert_eq!(
+            serde_json::to_value(node.queue_type()).unwrap(),
+            "java_tool",
+            "QueueType::JavaTool must serialize to the \"java_tool\" queue string"
+        );
     }
 
     #[test]

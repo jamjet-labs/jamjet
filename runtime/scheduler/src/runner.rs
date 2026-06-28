@@ -456,6 +456,31 @@ impl Scheduler {
                     );
                 }
 
+                // For JavaFn nodes, enrich the payload so the external Java
+                // tool-worker is self-contained — exactly mirroring the PythonFn
+                // arm above, bar the language-appropriate dispatch coordinates:
+                // it needs the class to reflect, the method to invoke, and the
+                // current workflow state as the call input. The Java worker
+                // claims these `java_tool` items over the same HTTP claim/complete
+                // API the Python worker uses, so the contract is identical.
+                if let NodeKind::JavaFn {
+                    class_name, method, ..
+                } = &node.kind
+                {
+                    let obj = payload
+                        .as_object_mut()
+                        .expect("payload is always a JSON object");
+                    obj.insert(
+                        "class".into(),
+                        serde_json::Value::String(class_name.clone()),
+                    );
+                    obj.insert("method".into(), serde_json::Value::String(method.clone()));
+                    obj.insert(
+                        "input".into(),
+                        serde_json::Value::Object(progress.final_state.clone()),
+                    );
+                }
+
                 // For Model nodes, enrich the payload with model configuration and tool
                 // schemas so the model worker is self-contained.
                 if let NodeKind::Model {
@@ -1468,6 +1493,96 @@ mod tests {
         assert_eq!(item.payload["node_id"], "py_step");
     }
 
+    /// A single-node workflow whose only step is a `JavaFn` (the Java analog of
+    /// the `python_fn_ir` fixture above).
+    fn java_fn_ir() -> serde_json::Value {
+        serde_json::json!({
+            "workflow_id": "wf",
+            "version": "0.1.0",
+            "name": null,
+            "description": null,
+            "state_schema": "",
+            "start_node": "java_step",
+            "nodes": {
+                "java_step": {
+                    "id": "java_step",
+                    "kind": {
+                        "type": "java_fn",
+                        "class_name": "com.example.tools.WeatherTool",
+                        "method": "getWeather",
+                        "output_schema": ""
+                    },
+                    "retry_policy": null,
+                    "node_timeout_secs": null,
+                    "description": null,
+                    "labels": {}
+                }
+            },
+            "edges": [],
+            "retry_policies": {},
+            "timeouts": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {},
+            "labels": {}
+        })
+    }
+
+    /// The scheduler must enrich a `JavaFn` work-item payload with `class`,
+    /// `method`, and `input` so an external Java tool-worker is self-contained —
+    /// exactly mirroring the PythonFn enrichment (bar the dispatch coordinates),
+    /// and the work item must route to the `java_tool` queue.
+    #[tokio::test]
+    async fn java_fn_work_item_payload_is_enriched() {
+        let (s, b, e) = setup(java_fn_ir()).await;
+
+        // Seed some accumulated state so we can assert it lands in `input`.
+        append(
+            &b,
+            &e,
+            node_completed("prev_node", serde_json::json!({ "key": "value" })),
+        )
+        .await;
+
+        // Tick: `java_step` is the start node with no predecessors — runnable.
+        tick(&s, &e).await;
+
+        // Claim the work item from the java_tool queue.
+        let item = b
+            .claim_work_item("test-worker", &["java_tool"])
+            .await
+            .expect("backend claim must not error")
+            .expect("a JavaFn node must produce exactly one work item");
+
+        // Queue type
+        assert_eq!(item.queue_type, "java_tool");
+
+        // JavaFn-specific enrichment
+        assert_eq!(
+            item.payload["class"], "com.example.tools.WeatherTool",
+            "payload must carry the class name to reflect"
+        );
+        assert_eq!(
+            item.payload["method"], "getWeather",
+            "payload must carry the method name to invoke"
+        );
+        assert!(
+            item.payload["input"].is_object(),
+            "payload.input must be a JSON object (accumulated workflow state)"
+        );
+        // The state seeded above must be reflected in input.
+        assert_eq!(
+            item.payload["input"]["key"], "value",
+            "payload.input must reflect accumulated state patches"
+        );
+
+        // Base fields must still be present.
+        assert_eq!(item.payload["workflow_id"], "wf");
+        assert_eq!(item.payload["workflow_version"], "0.1.0");
+        assert_eq!(item.payload["node_id"], "java_step");
+    }
+
     /// A single-node workflow whose only step is a `Model` node with tools.
     fn model_node_ir() -> serde_json::Value {
         serde_json::json!({
@@ -2064,6 +2179,193 @@ mod tests {
             !scheduled_nodes(&evs).contains(&"end".to_string()),
             "end must not be reached yet (later gates/model still pending)"
         );
+        assert_eq!(status(&b, &e).await, WorkflowStatus::Running);
+    }
+
+    /// A `java_fn`-kind tool-dispatch node — the Java analog of the PythonFn
+    /// tool node `compile_agent_to_ir` emits. The Java `Agent` builder (Phase B)
+    /// emits these so the agent loop's tools route to the durable `java_tool`
+    /// queue an external Java worker drains. `no_retry` mirrors the PythonFn tool
+    /// node: the dispatch runs user `@Tool` methods (possible non-idempotent
+    /// writes), so an already-succeeded dispatch must not re-run on retry.
+    fn java_fn_node(id: &str, class_name: &str, method: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "kind": {
+                "type": "java_fn",
+                "class_name": class_name,
+                "method": method,
+                "output_schema": ""
+            },
+            "retry_policy": "no_retry",
+            "node_timeout_secs": null,
+            "description": null,
+            "labels": {}
+        })
+    }
+
+    /// A `model`-kind agent-turn node carrying OpenAI tool schemas, the way
+    /// `compile_agent_to_ir` emits them. `with_tools=false` is the final-answer
+    /// node (no tools, so the model must return text).
+    fn agent_model_node(id: &str, with_tools: bool) -> serde_json::Value {
+        let tools = if with_tools {
+            serde_json::json!([
+                {"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}}}
+            ])
+        } else {
+            serde_json::json!([])
+        };
+        serde_json::json!({
+            "id": id,
+            "kind": {
+                "type": "model",
+                "model_ref": "agent_model",
+                "prompt_ref": "",
+                "output_schema": "",
+                "system_prompt": "You are a helpful agent.",
+                "tools": tools
+            },
+            "retry_policy": "llm_default",
+            "node_timeout_secs": null,
+            "description": null,
+            "labels": {}
+        })
+    }
+
+    /// The Java analog of `agent_loop_ir`: the SAME static-unroll agent loop
+    /// (`model -> tool-gate -> tool-dispatch -> model`), but the tool-dispatch
+    /// nodes are `java_fn` (route to `java_tool`) instead of `python_fn`. This
+    /// documents the IR shape the Java `Agent` builder (Phase B) must emit.
+    fn java_agent_loop_ir() -> serde_json::Value {
+        let tool_calls = "state.last_model_finish_reason == \"tool_calls\"";
+        let mut ir = build_ir(
+            "model_0",
+            serde_json::json!({
+                "model_0": agent_model_node("model_0", true),
+                "gate_0": cond_node("gate_0", serde_json::json!([
+                    {"condition": tool_calls, "target": "tools_0"},
+                    {"condition": null, "target": "end"}
+                ])),
+                "tools_0": java_fn_node("tools_0", "com.example.AgentTools", "dispatch"),
+                "model_1": agent_model_node("model_1", true),
+                "gate_1": cond_node("gate_1", serde_json::json!([
+                    {"condition": tool_calls, "target": "tools_1"},
+                    {"condition": null, "target": "end"}
+                ])),
+                "tools_1": java_fn_node("tools_1", "com.example.AgentTools", "dispatch"),
+                "model_2": agent_model_node("model_2", false)
+                // `end` is the terminal sentinel — edges target it, but it is NOT
+                // a node (the validator + scheduler treat edge-to-"end" as the
+                // terminal), matching `compile_agent_to_ir`'s emitted IR.
+            }),
+            serde_json::json!([
+                {"from": "model_0", "to": "gate_0", "condition": null},
+                {"from": "gate_0", "to": "tools_0", "condition": tool_calls},
+                {"from": "gate_0", "to": "end", "condition": null},
+                {"from": "tools_0", "to": "model_1", "condition": null},
+                {"from": "model_1", "to": "gate_1", "condition": null},
+                {"from": "gate_1", "to": "tools_1", "condition": tool_calls},
+                {"from": "gate_1", "to": "end", "condition": null},
+                {"from": "tools_1", "to": "model_2", "condition": null},
+                {"from": "model_2", "to": "end", "condition": null}
+            ]),
+        );
+        // Register the model the agent-turn model nodes reference, so the IR
+        // validates (the engine accepts/registers the agent loop).
+        ir["models"] = serde_json::json!({
+            "agent_model": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "timeout_secs": null,
+                "retry_policy": null,
+                "temperature": null,
+                "max_tokens": 1024
+            }
+        });
+        ir
+    }
+
+    /// A-4: the engine REGISTERS (validates) a JavaFn agent-loop IR and SCHEDULES
+    /// its tool node to the `java_tool` queue. The model turn is a deterministic
+    /// mock — we append the model's `NodeCompleted` (finish_reason "tool_calls")
+    /// the way a model worker would, then the gate routes to the JavaFn node.
+    #[tokio::test]
+    async fn java_agent_loop_ir_registers_and_schedules_java_tool_node() {
+        let ir_json = java_agent_loop_ir();
+
+        // REGISTERS: the engine's IR validator accepts the JavaFn agent loop.
+        let parsed: jamjet_ir::WorkflowIr = serde_json::from_value(ir_json.clone())
+            .expect("JavaFn agent-loop IR must deserialize into WorkflowIr");
+        jamjet_ir::validate_workflow(&parsed)
+            .expect("the engine must accept (register) a JavaFn agent-loop IR");
+
+        let (s, b, e) = setup(ir_json).await;
+
+        // Tick 1: model_0 (start) is scheduled.
+        tick(&s, &e).await;
+        let evs = b.get_events(&e).await.unwrap();
+        assert!(scheduled_nodes(&evs).contains(&"model_0".to_string()));
+
+        // Deterministic mock model: model_0 asks for a tool (finish_reason
+        // "tool_calls"), exactly what drives the gate to the tool-dispatch node.
+        append(
+            &b,
+            &e,
+            node_completed(
+                "model_0",
+                serde_json::json!({"last_model_finish_reason": "tool_calls"}),
+            ),
+        )
+        .await;
+
+        // Tick 2: gate_0 becomes runnable; route it to tools_0.
+        tick(&s, &e).await;
+        append(
+            &b,
+            &e,
+            condition_completed("gate_0", Some("tools_0"), &["tools_0", "end"]),
+        )
+        .await;
+
+        // Tick 3: the JavaFn tool node is scheduled.
+        tick(&s, &e).await;
+        let evs = b.get_events(&e).await.unwrap();
+        assert!(
+            scheduled_nodes(&evs).contains(&"tools_0".to_string()),
+            "the JavaFn tool node must be scheduled when the gate routes to it"
+        );
+        // SCHEDULES to java_tool: the NodeScheduled event carries the queue.
+        let tools_queue = evs.iter().find_map(|ev| match &ev.kind {
+            EventKind::NodeScheduled {
+                node_id,
+                queue_type,
+            } if node_id == "tools_0" => Some(queue_type.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            tools_queue.as_deref(),
+            Some("java_tool"),
+            "the agent-loop tool node must be scheduled to the java_tool queue"
+        );
+
+        // The enqueued work item is a claimable java_tool item carrying the
+        // dispatch enrichment the Phase B Java worker reflects against.
+        let item = b
+            .claim_work_item("java-tool-worker", &["java_tool"])
+            .await
+            .unwrap()
+            .expect("the scheduled JavaFn node must enqueue a java_tool work item");
+        assert_eq!(item.queue_type, "java_tool");
+        assert_eq!(item.node_id, "tools_0");
+        assert_eq!(item.payload["class"], "com.example.AgentTools");
+        assert_eq!(item.payload["method"], "dispatch");
+        assert!(
+            item.payload["input"].is_object(),
+            "payload.input must carry the accumulated agent state"
+        );
+
+        // The loop is still live: nothing wrongly skipped, terminal not reached.
+        assert!(skipped_nodes(&evs).is_empty());
         assert_eq!(status(&b, &e).await, WorkflowStatus::Running);
     }
 
