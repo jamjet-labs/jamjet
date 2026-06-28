@@ -87,6 +87,16 @@ impl InMemoryBackend {
     pub fn seed_tool_effect_for_test(&self, key: String, value: serde_json::Value) {
         self.tool_effects.insert(key, value);
     }
+
+    /// Test helper: backdate a work item's lease so the reclaim sweep
+    /// (`reclaim_expired_leases`) treats it as expired. Mirrors
+    /// `SqliteBackend::force_lease_expired_for_test`. Not part of the
+    /// StateBackend trait; only used in tests / simulators.
+    pub fn force_lease_expired_for_test(&self, item_id: WorkItemId) {
+        if let Some(mut entry) = self.work_items.get_mut(&item_id) {
+            entry.lease_expires_at = Some(Utc::now() - chrono::Duration::hours(1));
+        }
+    }
 }
 
 impl Default for InMemoryBackend {
@@ -427,14 +437,21 @@ impl StateBackend for InMemoryBackend {
         item_id: WorkItemId,
         lease_fence: i64,
     ) -> BackendResult<bool> {
-        // Mirror the `commit_turn` fence guard: only the current holder (matching
-        // fence) of a still-present (claimed) item may settle. A mismatched fence,
-        // an absent item, or one already settled (removed) returns `false`. The
+        // Mirror the SQLite `status = 'claimed'` guard: only the current holder
+        // of a still-CLAIMED item may settle. "Claimed" in memory is
+        // `worker_id.is_some()` (the same predicate `claim_work_item` uses).
+        // Requiring it closes two fail-opens a fence-only check leaves open:
+        //   1. A forged `lease_fence: 0` against a never-claimed pending item —
+        //      pending items carry `lease_fence == 0`, so `0 == 0` would match.
+        //   2. A stale fence after a reclaim — `reclaim_expired_leases` clears
+        //      `worker_id` but LEAVES `lease_fence` set, so the old fence lingers.
+        // Either case now returns `Ok(false)`. A mismatched fence, an absent
+        // item, or one already settled (removed) also returns `false`. The
         // get-then-remove is two DashMap ops rather than one atomic step; that is
         // acceptable for the in-memory dev/test backend (the SQLite backends are
         // the production path where atomicity is guaranteed by the single UPDATE).
         match self.work_items.get(&item_id) {
-            Some(entry) if entry.lease_fence == lease_fence => {}
+            Some(entry) if entry.worker_id.is_some() && entry.lease_fence == lease_fence => {}
             _ => return Ok(false),
         }
         self.work_items.remove(&item_id);

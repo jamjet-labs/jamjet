@@ -223,6 +223,128 @@ async fn test_complete_work_item_fenced() {
         .unwrap());
 }
 
+/// Build a never-claimed pending work item (worker_id = None, lease_fence = 0).
+fn pending_item(exec_id: &ExecutionId) -> WorkItem {
+    WorkItem {
+        id: Uuid::new_v4(),
+        execution_id: exec_id.clone(),
+        node_id: "n1".into(),
+        queue_type: "default".into(),
+        payload: json!({}),
+        attempt: 0,
+        max_attempts: 3,
+        created_at: Utc::now(),
+        lease_expires_at: None,
+        worker_id: None,
+        lease_fence: 0,
+        tenant_id: "default".into(),
+    }
+}
+
+/// Reclaim fail-open: after `reclaim_expired_leases` hands a claimed item back
+/// to the queue it clears `worker_id` but LEAVES `lease_fence` set. A zombie
+/// worker presenting that now-stale fence must NOT settle the item.
+#[tokio::test]
+async fn fenced_complete_rejects_stale_fence_after_reclaim() {
+    let backend = InMemoryBackend::new();
+    let exec_id = ExecutionId::new();
+    let item_id = backend
+        .enqueue_work_item(pending_item(&exec_id))
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_work_item("w1", &["default"])
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = claimed.lease_fence;
+    assert!(fence > 0, "a claimed item must carry a non-zero fence");
+
+    // Force the lease to expire and run the REAL reclaim sweep (the same path
+    // the scheduler drives). It clears worker_id but leaves lease_fence = F1.
+    backend.force_lease_expired_for_test(item_id);
+    let reclaimed = backend.reclaim_expired_leases().await.unwrap();
+    assert_eq!(
+        reclaimed.retryable.len(),
+        1,
+        "the expired item must be reclaimed as retryable"
+    );
+
+    // The zombie presents its stale fence F1. Pre-fix this settled (fence-only
+    // match: 0 != F1 but worker_id was never checked); post-fix the
+    // worker_id-is-None (reclaimed) item is rejected.
+    assert!(
+        !backend
+            .complete_work_item_fenced(item_id, fence)
+            .await
+            .unwrap(),
+        "a reclaimed item (worker_id cleared) must not settle via the stale fence"
+    );
+
+    // The item must survive the rejected settle and remain re-claimable.
+    assert!(
+        backend
+            .claim_work_item("w2", &["default"])
+            .await
+            .unwrap()
+            .is_some(),
+        "the item must still be claimable after the stale-fence settle was rejected"
+    );
+}
+
+/// Forged-fence-0 fail-open: a never-claimed pending item carries
+/// `lease_fence == 0`. A forged `lease_fence: 0` (the value an attacker can put
+/// on the HTTP complete request) must NOT settle it.
+#[tokio::test]
+async fn fenced_complete_rejects_forged_fence_zero_on_pending_item() {
+    let backend = InMemoryBackend::new();
+    let exec_id = ExecutionId::new();
+    let item_id = backend
+        .enqueue_work_item(pending_item(&exec_id))
+        .await
+        .unwrap();
+
+    // Pre-fix: 0 == 0 matched the pending item's fence and removed it.
+    assert!(
+        !backend.complete_work_item_fenced(item_id, 0).await.unwrap(),
+        "a forged fence 0 must not settle a never-claimed pending item"
+    );
+
+    // The pending item must survive and remain claimable.
+    assert!(
+        backend
+            .claim_work_item("w1", &["default"])
+            .await
+            .unwrap()
+            .is_some(),
+        "the pending item must still be claimable after the forged-fence settle was rejected"
+    );
+}
+
+/// Happy path: a currently-claimed item settled with its matching fence returns
+/// true (the worker_id-is-some guard must not block the legitimate holder).
+#[tokio::test]
+async fn fenced_complete_settles_claimed_item_with_matching_fence() {
+    let backend = InMemoryBackend::new();
+    let exec_id = ExecutionId::new();
+    let item_id = backend
+        .enqueue_work_item(pending_item(&exec_id))
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_work_item("w1", &["default"])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        backend
+            .complete_work_item_fenced(item_id, claimed.lease_fence)
+            .await
+            .unwrap(),
+        "the current holder with the matching fence must settle the item"
+    );
+}
+
 #[tokio::test]
 async fn test_patch_append_array() {
     let backend = InMemoryBackend::new();
