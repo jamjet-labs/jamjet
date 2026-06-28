@@ -109,8 +109,11 @@ async fn java_tool_claim_complete_round_trip_advances_durably() {
     // HTTP router so the round-trip is genuinely durable (committed to disk).
     let db_path = std::env::temp_dir().join(format!("jjtest-java-{}.db", Uuid::new_v4()));
     let url = format!("sqlite://{}", db_path.display());
-    let backend: Arc<dyn StateBackend> =
-        Arc::new(SqliteBackend::open(&url).await.expect("open sqlite backend"));
+    let backend: Arc<dyn StateBackend> = Arc::new(
+        SqliteBackend::open(&url)
+            .await
+            .expect("open sqlite backend"),
+    );
 
     backend
         .store_workflow(WorkflowDefinition {

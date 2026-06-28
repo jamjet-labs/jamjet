@@ -2336,9 +2336,10 @@ mod tests {
         );
         // SCHEDULES to java_tool: the NodeScheduled event carries the queue.
         let tools_queue = evs.iter().find_map(|ev| match &ev.kind {
-            EventKind::NodeScheduled { node_id, queue_type } if node_id == "tools_0" => {
-                Some(queue_type.clone())
-            }
+            EventKind::NodeScheduled {
+                node_id,
+                queue_type,
+            } if node_id == "tools_0" => Some(queue_type.clone()),
             _ => None,
         });
         assert_eq!(
