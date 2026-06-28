@@ -73,6 +73,35 @@ async def resume(
     return await rt.resume(spec, execution_id, governance=governance)
 
 
-async def deploy(target: Any, *, runtime: str = "cloud") -> None:
-    """Phase 5 — dispatch to remote runtime. Stub for now."""
-    raise NotImplementedError("deploy() lands in Phase 5.")
+async def deploy(target: Any, *, runtime: str | None = None, **kwargs: Any) -> Any:
+    """Deprecated — use :meth:`jamjet.Agent.deploy` / :meth:`jamjet.Team.deploy`.
+
+    The old top-level ``deploy()`` was a Phase-5 ``NotImplementedError`` stub. The
+    real deploy surface now lives on the ADK objects: ``Agent.deploy(runtime=...)``
+    and ``Team.deploy(...)`` ship the compiled IR to a ``jamjet-server`` engine
+    (local / self-host / cloud) over the working ``JamjetClient`` path (Track 7a).
+
+    For backward compatibility this delegates to ``target.deploy(...)`` when
+    *target* is an :class:`~jamjet.agents.agent.Agent` or a team (anything with a
+    ``deploy`` method), emitting a :class:`DeprecationWarning`. For any other
+    target (a ``@DurableAgent`` class / ``@workflow`` function / spec, which never
+    had a working deploy) it raises a clear error pointing at the new API — it
+    never silently no-ops and never raises the old "lands in Phase 5" stub.
+    """
+    import warnings
+
+    deploy_method = getattr(target, "deploy", None)
+    if callable(deploy_method):
+        warnings.warn(
+            "jamjet.deploy(target) is deprecated; call target.deploy(runtime=...) "
+            "directly (Agent.deploy / Team.deploy).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return await deploy_method(runtime=runtime, **kwargs)
+    raise TypeError(
+        f"Cannot deploy {target!r}: the top-level deploy() stub is removed. Use "
+        "Agent.deploy(runtime=...) on a jamjet.Agent (or Team.deploy(...)). 'cloud' "
+        "ships the IR to YOUR hosted jamjet-server engine plus JamJet Cloud "
+        "governance; it is not a managed execution cell."
+    )
