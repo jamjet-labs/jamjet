@@ -12,6 +12,12 @@ Fields:
 - `expected` (optional) — expected output (for assertion scorers)
 - `metadata` (optional) — arbitrary tags, passed through to results
 - `id` (optional) — row identifier; auto-assigned if absent
+- `expected_trajectory` (optional) — the TrajectoryScorer spec for this case
+  (e.g. ``{"tool_sequence": ["search", "calc"]}``). When present, the runner
+  scores the run's trajectory IN ADDITION to the final output.
+
+Datasets load from `.json` (top-level array), `.yaml`/`.yml` (top-level list),
+or JSONL (one object per line).
 """
 
 from __future__ import annotations
@@ -29,6 +35,9 @@ class EvalRow:
     input: dict[str, Any]
     expected: Any | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Optional TrajectoryScorer spec (tool_sequence / expected_tools / used_tool /
+    # did_not_use / max_turns / step_count). None -> output-only scoring.
+    expected_trajectory: dict[str, Any] | None = None
 
 
 class EvalDataset:
@@ -39,7 +48,7 @@ class EvalDataset:
 
     @classmethod
     def from_file(cls, path: str | Path) -> EvalDataset:
-        """Load a dataset from a JSONL or JSON file."""
+        """Load a dataset from a JSON array, a YAML list, or a JSONL file."""
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Dataset file not found: {path}")
@@ -51,6 +60,13 @@ class EvalDataset:
             data = json.loads(text)
             if not isinstance(data, list):
                 raise ValueError("JSON dataset must be a top-level array")
+            raw_rows = data
+        elif path.suffix in (".yaml", ".yml"):
+            import yaml
+
+            data = yaml.safe_load(text)
+            if not isinstance(data, list):
+                raise ValueError("YAML dataset must be a top-level list")
             raw_rows = data
         else:
             # JSONL: one JSON object per line, skip blanks and comments
@@ -67,6 +83,7 @@ class EvalDataset:
                     input=raw["input"],
                     expected=raw.get("expected"),
                     metadata=raw.get("metadata", {}),
+                    expected_trajectory=raw.get("expected_trajectory"),
                 )
             )
 

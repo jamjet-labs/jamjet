@@ -17,6 +17,7 @@ Commands:
   jamjet eval run       Run batch evaluation of a workflow
   jamjet eval export    Export eval results as LaTeX, CSV, or JSON
   jamjet eval compare   Compare two conditions with statistical tests
+  jamjet eval trajectory-diff  Diff two runs' tool sequences (replay-regression)
   jamjet demo unsafe-tool-call    Show how JamJet blocks destructive tool calls
   jamjet demo approval            Show pause-for-approval flow
   jamjet demo budget-cap          Show budget enforcement
@@ -39,6 +40,7 @@ import yaml
 
 if TYPE_CHECKING:
     from jamjet.eval.grid import ComparisonResult
+    from jamjet.eval.trajectory import Trajectory
 
 import typer
 from rich.console import Console
@@ -248,6 +250,69 @@ def init(
     console.print("  jamjet run workflow.yaml  [dim]# run in another terminal[/dim]")
 
 
+# ── create ───────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def create(
+    name: str = typer.Argument(..., help="Name for the new agent project (creates a directory <name>/)."),
+    template: str = typer.Option(
+        "quickstart",
+        "--template",
+        "-t",
+        help="Starter template. Run `jamjet init --list-templates` to see all options.",
+    ),
+) -> None:
+    """Scaffold a new agent project directory from a template.
+
+    Creates <name>/ and writes the template files into it. Fails if the directory
+    already exists so you never overwrite existing work.
+
+    Example:
+        jamjet create my-agent
+        cd my-agent
+        jamjet dev
+    """
+    import os
+
+    from jamjet.templates import AVAILABLE_TEMPLATES, render_template
+
+    if template not in AVAILABLE_TEMPLATES:
+        console.print(
+            f"[red]Error:[/red] unknown template '{template}'. "
+            f"Run [bold]jamjet init --list-templates[/bold] to see options."
+        )
+        raise typer.Exit(1)
+
+    project_dir = os.path.join(os.getcwd(), name)
+    if os.path.exists(project_dir):
+        console.print(
+            f"[red]Error:[/red] directory '{name}' already exists. "
+            "Choose a different name or remove the existing directory."
+        )
+        raise typer.Exit(1)
+
+    os.makedirs(project_dir)
+
+    files = render_template(template, name)
+    written: list[str] = []
+    for rel_path, content in files.items():
+        abs_path = os.path.join(project_dir, rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, "w") as fh:
+            fh.write(content)
+        written.append(rel_path)
+
+    console.print(f"[green]✓[/green] Created [bold]{name}[/bold] from template [bold]{template}[/bold]")
+    for rel_path in written:
+        console.print(f"  [dim]{rel_path}[/dim]")
+    console.print()
+    console.print("[bold]Next steps:[/bold]")
+    console.print(f"  cd {name}")
+    console.print("  jamjet dev               [dim]# start the runtime[/dim]")
+    console.print("  python agent.py          [dim]# run your agent[/dim]")
+
+
 # ── dev ──────────────────────────────────────────────────────────────────────
 
 
@@ -395,14 +460,40 @@ def _download_server_binary(cache_dir: str) -> str:
 
 @app.command()
 def dev(
-    port: int = typer.Option(7700, help="Port to run the runtime on"),
+    port: int = typer.Option(7700, help="Port to run the engine on"),
     db: str | None = typer.Option(None, "--db", help="SQLite database path (default: .jamjet/runtime.db)"),
     build: bool = typer.Option(False, "--build", help="Build the runtime binary before starting"),
+    sidecar_port: int = typer.Option(4280, "--sidecar-port", help="Port for the model sidecar"),
+    modules: str | None = typer.Option(
+        None, "--modules", help="Comma-separated Python modules for the worker to pre-import (your @tool code)"
+    ),
+    engine_only: bool = typer.Option(
+        False, "--engine-only", help="Start ONLY the engine (the legacy behavior; no sidecar, no worker)"
+    ),
+    no_sidecar: bool = typer.Option(
+        False, "--no-sidecar", help="Do not start the model sidecar (engine talks to providers directly)"
+    ),
+    no_worker: bool = typer.Option(False, "--no-worker", help="Do not start the python_tool worker"),
 ) -> None:
-    """Start the local dev runtime (SQLite mode)."""
+    """Start the whole local dev stack with one command.
+
+    Brings up, in order, the model sidecar (health-gated), the durable engine
+    (with the model seam wired to the sidecar) and the python_tool worker. Press
+    Ctrl+C to stop the whole stack gracefully — no orphaned processes.
+
+    \b
+    Examples:
+      jamjet dev                          # sidecar + engine + worker
+      jamjet dev --modules myapp.tools    # worker pre-imports your @tool module
+      jamjet dev --no-sidecar             # engine + worker, providers called directly
+      jamjet dev --engine-only            # just the engine (legacy)
+    """
+    import importlib.util
     import os
     import signal
     import subprocess
+
+    from jamjet.cli import dev_stack
 
     if build:
         console.print("[dim]Building jamjet-server...[/dim]")
@@ -420,36 +511,76 @@ def dev(
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
 
+    enable_sidecar = not (engine_only or no_sidecar)
+    enable_worker = not (engine_only or no_worker)
+
+    # The sidecar needs the optional `sidecar` extra (starlette + uvicorn). Fail
+    # with a clear hint rather than a cryptic "sidecar exited" later.
+    if enable_sidecar and importlib.util.find_spec("uvicorn") is None:
+        console.print(
+            "[red]Error:[/red] the model sidecar needs uvicorn.\n"
+            "  Install it:   [bold]pip install 'jamjet[sidecar]'[/bold]\n"
+            "  Or skip it:   [bold]jamjet dev --no-sidecar[/bold]"
+        )
+        raise typer.Exit(1)
+
     db_url = f"sqlite://{db}" if db else None
-    env = os.environ.copy()
-    env["PORT"] = str(port)
-    env["JAMJET_PORT"] = str(port)
-    env["JAMJET_DEV_MODE"] = "1"
-    env["RUST_LOG"] = env.get("RUST_LOG", "info")
-    if db_url:
-        env["DATABASE_URL"] = db_url
 
     _print_logo()
-    console.rule("[bold green]JamJet Dev Runtime[/bold green]")
-    console.print(f"  [bold]Binary:[/bold] {binary}")
-    console.print(f"  [bold]Port:[/bold]   {port}")
-    console.print("  [bold]Mode:[/bold]   local (SQLite)")
-    console.print(f"  [bold]API:[/bold]    http://localhost:{port}")
+    console.rule("[bold green]JamJet Dev Stack[/bold green]")
+    console.print(f"  [bold]Binary:[/bold]  {binary}")
+    console.print(f"  [bold]Engine:[/bold]  http://localhost:{port}")
+    if enable_sidecar:
+        console.print(f"  [bold]Sidecar:[/bold] http://127.0.0.1:{sidecar_port}  [dim](governed model seam)[/dim]")
+    else:
+        console.print("  [bold]Sidecar:[/bold] [dim]disabled (engine calls providers directly)[/dim]")
+    console.print(f"  [bold]Worker:[/bold]  {'python_tool' if enable_worker else '[dim]disabled[/dim]'}")
+    console.print("  [bold]Mode:[/bold]    local (SQLite)")
     console.print()
-    console.print("[dim]Press Ctrl+C to stop.[/dim]")
+    console.print("[dim]Press Ctrl+C to stop the whole stack.[/dim]")
     console.rule()
 
-    proc = subprocess.Popen([binary], env=env)
+    def _log(msg: str = "") -> None:
+        # markup=False so subprocess log lines (which may contain '[...]') are
+        # printed verbatim and never interpreted as Rich markup.
+        console.print(msg, markup=False, highlight=False)
+
+    stack = dev_stack.DevStack(
+        binary=binary,
+        base_env=os.environ.copy(),
+        port=port,
+        sidecar_port=sidecar_port,
+        db_url=db_url,
+        modules=modules,
+        enable_sidecar=enable_sidecar,
+        enable_worker=enable_worker,
+        log=_log,
+    )
+
+    # Route SIGTERM through the same graceful path as Ctrl+C (SIGINT).
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _on_sigterm(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
     try:
-        proc.wait()
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Stopping runtime...[/yellow]")
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    console.print("[green]Runtime stopped.[/green]")
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        previous_sigterm = None  # not in the main thread; rely on SIGINT only
+
+    try:
+        stack.run()
+    except dev_stack.DevStackError as e:
+        console.print(f"[red]Dev stack failed to start:[/red] {e}")
+        raise typer.Exit(1)
+    finally:
+        if previous_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+            except (ValueError, OSError):
+                pass
+
+    console.print("[green]Dev stack stopped.[/green]")
 
 
 # ── validate ─────────────────────────────────────────────────────────────────
@@ -1869,6 +2000,7 @@ def eval_run(
                 "output": r.output,
                 "input": r.input,
                 "expected": r.expected,
+                "trajectory": r.trajectory,
             }
             for r in results
         ]
@@ -2073,6 +2205,119 @@ def eval_compare(
         typer.echo(json.dumps(dataclasses.asdict(result), indent=2, default=str))
     else:
         _print_comparison_table(result, alpha=alpha)
+
+
+def _load_trajectory_from_file(path: str, *, row_id: str | None = None) -> Trajectory:
+    """Load a Trajectory from one of the accepted replay-regression inputs.
+
+    Accepts:
+    - a ``{"events": [...]}`` dict (a get_events / `jamjet events --json` dump)
+    - a raw list of event dicts (each item has a ``"kind"``)
+    - an eval-run results list (each item has ``row_id``/``trajectory``); pass
+      ``row_id`` to select the case, else the first row is used
+    - a bare list of tool-name strings (an explicit tool sequence)
+    """
+    from jamjet.eval.trajectory import Trajectory
+
+    with open(path) as f:
+        data = json.load(f)
+
+    # Shape 1: {"events": [...]} -- a get_events() dump.
+    if isinstance(data, dict) and "events" in data:
+        return Trajectory.from_events(data)
+
+    if isinstance(data, list):
+        if not data:
+            return Trajectory.from_events([])
+        first = data[0]
+        # Shape 2: raw event list (each item carries a "kind").
+        if isinstance(first, dict) and "kind" in first:
+            return Trajectory.from_events(data)
+        # Shape 3: eval-run results list (each item has row_id/trajectory).
+        if isinstance(first, dict) and ("row_id" in first or "trajectory" in first):
+            chosen = data[0]
+            if row_id is not None:
+                match = next((r for r in data if r.get("row_id") == row_id), None)
+                if match is None:
+                    raise ValueError(f"row_id {row_id!r} not found in {path}")
+                chosen = match
+            # Require a real trajectory field. A missing trajectory means this is
+            # NOT a trajectory-bearing results artifact (e.g. an old/malformed
+            # `jamjet eval run --output` file). Defaulting it to [] would forge a
+            # bogus "no tools used" baseline and emit fake added/removed diffs, so
+            # fail fast instead. An explicit empty list (the agent used no tools)
+            # is legitimate and accepted.
+            traj = chosen.get("trajectory")
+            if not isinstance(traj, list):
+                row_label = f"row_id {row_id!r}" if row_id is not None else "the first row"
+                raise ValueError(
+                    f"{path}: {row_label} has no 'trajectory' field -- this is not a "
+                    "trajectory-bearing eval-results file. Re-run `jamjet eval run` with a "
+                    "build that records trajectories, or pass an event-log JSON instead."
+                )
+            return Trajectory.from_tool_sequence(traj)
+        # Shape 4: bare list of tool-name strings.
+        if all(isinstance(x, str) for x in data):
+            return Trajectory.from_tool_sequence(data)
+
+    raise ValueError(f"Unrecognized trajectory/event-log shape in {path}")
+
+
+@eval_app.command("trajectory-diff")
+def eval_trajectory_diff(
+    before: str = typer.Argument(
+        ..., help="Baseline run: an event-log JSON, an eval-run results JSON, or a tool-name list"
+    ),
+    after: str = typer.Argument(..., help="New run: same accepted shapes as <before>"),
+    row_id: str | None = typer.Option(
+        None, "--row-id", help="When the inputs are eval-run results files, the case row_id to diff"
+    ),
+    fail_on_change: bool = typer.Option(  # noqa: FBT001
+        True,
+        "--fail-on-change/--no-fail-on-change",
+        help="Exit 1 if the tool sequence changed (replay-regression gate; default on)",
+    ),
+    fmt: str = typer.Option("table", "--format", "-f", help="Output format: table (default) or json"),
+) -> None:
+    """Diff two runs' TRAJECTORIES (tool sequences) for replay-regression.
+
+    Reconstructs each run's tool sequence from its event log and reports whether
+    tools were added, removed, or reordered between the two runs -- the signal
+    for "did a model/prompt change alter HOW the agent used its tools?".
+
+    \b
+    Examples:
+      jamjet eval trajectory-diff before_events.json after_events.json
+      jamjet eval trajectory-diff v1_results.json v2_results.json --row-id q1
+      jamjet eval trajectory-diff a.json b.json --no-fail-on-change --format json
+    """
+    from jamjet.eval.trajectory import diff_trajectories
+
+    try:
+        before_traj = _load_trajectory_from_file(before, row_id=row_id)
+        after_traj = _load_trajectory_from_file(after, row_id=row_id)
+    except FileNotFoundError as e:
+        console.print(f"[red]Error:[/red] file not found: {e.filename}")
+        raise typer.Exit(1)
+    except (json.JSONDecodeError, ValueError) as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    diff = diff_trajectories(before_traj, after_traj)
+
+    if fmt.lower() == "json":
+        import dataclasses
+
+        typer.echo(json.dumps(dataclasses.asdict(diff), indent=2, default=str))
+    else:
+        if diff.changed:
+            console.print("[bold red]REGRESSION:[/bold red] trajectory changed")
+        else:
+            console.print("[green]OK:[/green] trajectory unchanged")
+        console.print(diff.render())
+
+    if fail_on_change and diff.changed:
+        raise typer.Exit(1)
 
 
 def _resolve_condition(name: str, agg: Mapping[str, object]) -> str | None:

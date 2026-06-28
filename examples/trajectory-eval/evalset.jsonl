@@ -1,0 +1,14 @@
+# Trajectory evalset for jamjet eval run
+# Each row carries an optional expected_trajectory spec that the TrajectoryScorer checks
+# in addition to the final output.
+#
+# Spec keys (all optional; only present keys are checked):
+#   tool_sequence:  list[str] -- tools must appear in this order (ordered subsequence)
+#   expected_tools: list[str] -- all these tools must appear (subset check)
+#   used_tool:      str | list[str] -- each named tool must appear
+#   did_not_use:    str | list[str] -- each named tool must NOT appear
+#   max_turns:      int -- step count must be <= this value
+#   step_count:     int -- step count must equal this value exactly
+{"id": "search-then-calc", "input": {"query": "Look up the speed of light in km/s, then divide it by 2."}, "expected": "approximately 149896 km/s", "expected_trajectory": {"tool_sequence": ["web_search", "calculator"], "max_turns": 4}, "metadata": {"category": "math+research"}}
+{"id": "search-only", "input": {"query": "In what year did the Apollo 11 mission first land humans on the Moon?"}, "expected": "1969", "expected_trajectory": {"used_tool": "web_search", "did_not_use": "calculator"}, "metadata": {"category": "lookup"}}
+{"id": "no-trajectory", "input": {"query": "Say hello"}, "expected": "hello", "metadata": {"category": "trivial"}}

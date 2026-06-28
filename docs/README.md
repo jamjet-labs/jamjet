@@ -9,6 +9,7 @@ Welcome to the JamJet documentation. Use the table below to find what you need.
 | Guide | Description |
 |-------|-------------|
 | [Quickstart](guides/quickstart.md) | Running your first workflow in under 10 minutes |
+| [Five-Minute Dev Loop](guides/dev-loop.md) | `jamjet create` + `jamjet dev` + trajectory eval from scratch |
 | [Core Concepts](guides/concepts.md) | Agents, workflows, nodes, state, durability explained |
 | [Workflow Authoring](guides/workflow-authoring.md) | YAML and Python authoring — everything you need to know |
 | [Python SDK](guides/python-sdk.md) | Full Python SDK reference with examples |

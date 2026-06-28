@@ -27,6 +27,7 @@ from typing import Any
 
 from jamjet.eval.dataset import EvalDataset, EvalRow
 from jamjet.eval.scorers import BaseScorer, ScorerResult
+from jamjet.eval.trajectory import Trajectory, TrajectoryScorer
 
 
 @dataclass
@@ -39,9 +40,15 @@ class EvalResult:
     duration_ms: float
     cost_usd: float | None
     error: str | None = None
+    # Ordered tool names the run actually called (captured for inspection and
+    # replay-regression diffing). None when no trajectory could be reconstructed.
+    trajectory: list[str] | None = None
 
     @property
     def passed(self) -> bool:
+        # A case passes only when it has no error AND every scorer passed. The
+        # TrajectoryScorer (when a case carries an expected_trajectory) is one of
+        # those scorers, so a case passes only if output AND trajectory pass.
         return self.error is None and all(s.passed for s in self.scorers)
 
     @property
@@ -50,6 +57,100 @@ class EvalResult:
         if not numeric:
             return None
         return sum(numeric) / len(numeric)
+
+
+async def _score_trajectory(
+    row: EvalRow,
+    trajectory: Trajectory,
+    output: Any,
+    scorer_results: list[ScorerResult],
+) -> None:
+    """Score the run's trajectory IN ADDITION to the output scorers.
+
+    When ``row.expected_trajectory`` is set, a TrajectoryScorer scores the
+    reconstructed trajectory and its result is appended to ``scorer_results``
+    (alongside, not replacing, the output scorers). A row with no
+    expected_trajectory is left output-only (no-op).
+    """
+    if row.expected_trajectory is None:
+        return
+    tscorer = TrajectoryScorer(expected=row.expected_trajectory)
+    try:
+        scorer_results.append(await tscorer.score(output, trajectory=trajectory))
+    except Exception as e:
+        scorer_results.append(
+            ScorerResult(
+                scorer=tscorer.name,
+                passed=False,
+                score=None,
+                message=f"scorer error: {e}",
+            )
+        )
+
+
+def _trajectory_cell(result: EvalResult) -> str:
+    """Render the trajectory scorer's pass/fail (+ failed assertions) for summaries."""
+    for s in result.scorers:
+        if s.scorer == "trajectory":
+            icon = "[green]✓[/green]" if s.passed else "[red]✗[/red]"
+            if s.passed:
+                return icon
+            failed = [a.name for a in getattr(s, "assertions", []) if not a.passed]
+            return f"{icon} {', '.join(failed)}" if failed else f"{icon} {s.message}"
+    return "—"
+
+
+def _print_summary_table(results: list[EvalResult], *, console: Any = None) -> None:
+    """Print a Rich summary table of eval results.
+
+    The per-case row shows the overall pass/fail (output AND trajectory), the
+    output-scorer score, a dedicated Trajectory column (pass/fail + the failed
+    trajectory assertions), and the per-scorer detail string.
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    if console is None:
+        console = Console()
+
+    total = len(results)
+    passed = sum(1 for r in results if r.passed)
+    failed = total - passed
+    pass_rate = passed / total * 100 if total else 0
+
+    console.rule(f"[bold]Eval Results — {passed}/{total} passed ({pass_rate:.1f}%)[/bold]")
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Row", style="dim")
+    table.add_column("Passed")
+    table.add_column("Score")
+    table.add_column("Trajectory")
+    table.add_column("Duration (ms)", justify="right")
+    table.add_column("Cost (USD)", justify="right")
+    table.add_column("Scorer Details")
+
+    for r in results:
+        passed_icon = "[green]✓[/green]" if r.passed else "[red]✗[/red]"
+        score_str = f"{r.overall_score:.2f}" if r.overall_score is not None else "—"
+        cost_str = f"${r.cost_usd:.6f}" if r.cost_usd is not None else "—"
+        details = "; ".join(f"{s.scorer}={'✓' if s.passed else '✗'}({s.message})" for s in r.scorers)
+        if r.error:
+            details = f"[red]{r.error}[/red]"
+
+        table.add_row(
+            r.row_id,
+            passed_icon,
+            score_str,
+            _trajectory_cell(r),
+            f"{r.duration_ms:.0f}",
+            cost_str,
+            details,
+        )
+
+    console.print(table)
+    console.print(
+        f"[bold]Pass rate:[/bold] {pass_rate:.1f}%  [bold]Passed:[/bold] {passed}  [bold]Failed:[/bold] {failed}"
+    )
 
 
 class EvalRunner:
@@ -90,6 +191,7 @@ class EvalRunner:
         output = None
         cost_usd = None
         error = None
+        events_list: list[dict[str, Any]] | None = None
 
         try:
             async with JamjetClient(base_url=self.runtime) as client:
@@ -118,10 +220,12 @@ class EvalRunner:
                     else:
                         error = f"execution {status}: {state.get('error', '')}"
 
-                    # Extract cost from events if available.
+                    # Fetch the event log once: reused for both cost extraction
+                    # and trajectory reconstruction (the trajectory-eval hook).
                     try:
                         events_data = await client.get_events(exec_id)
-                        for evt in events_data.get("events", []):
+                        events_list = events_data.get("events", [])
+                        for evt in events_list:
                             kind = evt.get("kind", {})
                             if kind.get("type") == "node_completed":
                                 cost = kind.get("cost_usd")
@@ -158,6 +262,16 @@ class EvalRunner:
                         )
                     )
 
+        # Trajectory scoring (T5-4): reconstruct the run's trajectory from the
+        # event log and, when the row carries an expected_trajectory, score it
+        # IN ADDITION to the output scorers. tool_sequence is captured regardless
+        # for inspection / replay-regression diffing.
+        trajectory_seq: list[str] | None = None
+        if events_list is not None:
+            traj = Trajectory.from_events(events_list)
+            trajectory_seq = traj.tool_sequence
+            await _score_trajectory(row, traj, output, scorer_results)
+
         return EvalResult(
             row_id=row.id,
             input=row.input,
@@ -167,53 +281,13 @@ class EvalRunner:
             duration_ms=duration_ms,
             cost_usd=cost_usd,
             error=error,
+            trajectory=trajectory_seq,
         )
 
     @staticmethod
     def print_summary(results: list[EvalResult], *, console: Any = None) -> None:
         """Print a Rich summary table of eval results."""
-        from rich.console import Console
-        from rich.table import Table
-
-        if console is None:
-            console = Console()
-
-        total = len(results)
-        passed = sum(1 for r in results if r.passed)
-        failed = total - passed
-        pass_rate = passed / total * 100 if total else 0
-
-        console.rule(f"[bold]Eval Results — {passed}/{total} passed ({pass_rate:.1f}%)[/bold]")
-
-        table = Table(show_header=True, header_style="bold")
-        table.add_column("Row", style="dim")
-        table.add_column("Passed")
-        table.add_column("Score")
-        table.add_column("Duration (ms)", justify="right")
-        table.add_column("Cost (USD)", justify="right")
-        table.add_column("Scorer Details")
-
-        for r in results:
-            passed_icon = "[green]✓[/green]" if r.passed else "[red]✗[/red]"
-            score_str = f"{r.overall_score:.2f}" if r.overall_score is not None else "—"
-            cost_str = f"${r.cost_usd:.6f}" if r.cost_usd is not None else "—"
-            details = "; ".join(f"{s.scorer}={'✓' if s.passed else '✗'}({s.message})" for s in r.scorers)
-            if r.error:
-                details = f"[red]{r.error}[/red]"
-
-            table.add_row(
-                r.row_id,
-                passed_icon,
-                score_str,
-                f"{r.duration_ms:.0f}",
-                cost_str,
-                details,
-            )
-
-        console.print(table)
-        console.print(
-            f"[bold]Pass rate:[/bold] {pass_rate:.1f}%  [bold]Passed:[/bold] {passed}  [bold]Failed:[/bold] {failed}"
-        )
+        _print_summary_table(results, console=console)
 
 
 class AgentEvalRunner:
@@ -267,6 +341,7 @@ class AgentEvalRunner:
         output = None
         cost_usd = None
         error = None
+        agent_result_obj: Any = None
 
         condition = row.input.get("_condition", {})
         strategy = condition.get("strategy", "plan-and-execute")
@@ -288,6 +363,7 @@ class AgentEvalRunner:
                 agent.run(task_text),
                 timeout=self.timeout_s,
             )
+            agent_result_obj = agent_result
             output = agent_result.output
         except TimeoutError:
             error = f"timeout after {self.timeout_s}s"
@@ -318,6 +394,15 @@ class AgentEvalRunner:
                         )
                     )
 
+        # Trajectory scoring (T5-4): build the trajectory from the in-process
+        # AgentResult.tool_calls and score it IN ADDITION to the output scorers
+        # when the row carries an expected_trajectory.
+        trajectory_seq: list[str] | None = None
+        if agent_result_obj is not None:
+            traj = Trajectory.from_agent_result(agent_result_obj)
+            trajectory_seq = traj.tool_sequence
+            await _score_trajectory(row, traj, output, scorer_results)
+
         return EvalResult(
             row_id=row.id,
             input=row.input,
@@ -327,50 +412,10 @@ class AgentEvalRunner:
             duration_ms=duration_ms,
             cost_usd=cost_usd,
             error=error,
+            trajectory=trajectory_seq,
         )
 
     @staticmethod
     def print_summary(results: list[EvalResult], *, console: Any = None) -> None:
         """Print a Rich summary table of eval results."""
-        from rich.console import Console
-        from rich.table import Table
-
-        if console is None:
-            console = Console()
-
-        total = len(results)
-        passed = sum(1 for r in results if r.passed)
-        failed = total - passed
-        pass_rate = passed / total * 100 if total else 0
-
-        console.rule(f"[bold]Eval Results — {passed}/{total} passed ({pass_rate:.1f}%)[/bold]")
-
-        table = Table(show_header=True, header_style="bold")
-        table.add_column("Row", style="dim")
-        table.add_column("Passed")
-        table.add_column("Score")
-        table.add_column("Duration (ms)", justify="right")
-        table.add_column("Cost (USD)", justify="right")
-        table.add_column("Scorer Details")
-
-        for r in results:
-            passed_icon = "[green]✓[/green]" if r.passed else "[red]✗[/red]"
-            score_str = f"{r.overall_score:.2f}" if r.overall_score is not None else "—"
-            cost_str = f"${r.cost_usd:.6f}" if r.cost_usd is not None else "—"
-            details = "; ".join(f"{s.scorer}={'✓' if s.passed else '✗'}({s.message})" for s in r.scorers)
-            if r.error:
-                details = f"[red]{r.error}[/red]"
-
-            table.add_row(
-                r.row_id,
-                passed_icon,
-                score_str,
-                f"{r.duration_ms:.0f}",
-                cost_str,
-                details,
-            )
-
-        console.print(table)
-        console.print(
-            f"[bold]Pass rate:[/bold] {pass_rate:.1f}%  [bold]Passed:[/bold] {passed}  [bold]Failed:[/bold] {failed}"
-        )
+        _print_summary_table(results, console=console)
