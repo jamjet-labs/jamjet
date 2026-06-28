@@ -389,19 +389,34 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
     return ir
 
 
-def build_initial_state(agent: Agent, prompt: str) -> dict[str, Any]:
+def build_initial_state(
+    agent: Agent,
+    prompt: str,
+    initial_messages: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """The execution ``initial_input`` for a compiled agent-loop IR.
 
     Seeds the running ``messages`` (system + user) and the
     ``{name: "module:function"}`` tool resolver map into workflow state, so the
     first model node and every ``dispatch_tool_calls`` node find them. The
     durable run entrypoint (Track 2j-4) passes this to ``start_execution``.
+
+    When *initial_messages* is provided (T4-2 session continuation), those
+    messages are used verbatim as the seed instead of the default
+    ``[system, user: prompt]`` pair.  The caller (``Agent.run_durable``) is
+    responsible for building ``initial_messages`` via
+    :func:`~jamjet.agents.session.seed_messages_for_run` so the session
+    thread is carried forward correctly.
     """
-    return {
-        "messages": [
+    if initial_messages is not None:
+        messages: list[dict[str, Any]] = initial_messages
+    else:
+        messages = [
             {"role": "system", "content": agent.instructions or "You are a helpful assistant."},
             {"role": "user", "content": prompt},
-        ],
+        ]
+    return {
+        "messages": messages,
         "tools": _tools_map(agent),
     }
 

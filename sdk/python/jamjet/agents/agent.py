@@ -36,6 +36,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
 from jamjet.agents.governance import Budget, GovernanceConfig, normalize_governance
+from jamjet.agents.session import Session, SessionStore, persist_session_turn, seed_messages_for_run
 from jamjet.compiler.strategies import StrategyLimits
 from jamjet.runtime.local import LocalRuntime
 from jamjet.tools.decorators import ToolDefinition
@@ -84,6 +85,13 @@ class Agent:
         # is always attached to the run result regardless.  Defaults to None so
         # receipts ship nowhere noisy by default while still being produced.
         receipt_emitter: Callable[[dict[str, Any]], None] | None = None,
+        # T4-2: optional SessionStore for resolving str session ids and for
+        # auto-saving sessions after run()/run_durable().  When None, a default
+        # SessionStore() (~/.jamjet/sessions.db) is created lazily on first use.
+        # Callers that pass Session objects directly and manage persistence
+        # themselves can still omit this; the agent only touches the store when
+        # session= is set on a run call.
+        session_store: SessionStore | None = None,
     ) -> None:
         self.name = name
         self.model = model
@@ -91,6 +99,7 @@ class Agent:
         self.strategy = strategy
         self._on_limit_exceeded = on_limit_exceeded
         self._receipt_emitter = receipt_emitter
+        self._session_store: SessionStore | None = session_store
         self.limits = StrategyLimits(
             max_iterations=max_iterations,
             max_cost_usd=max_cost_usd,
@@ -222,15 +231,61 @@ class Agent:
             tool_calls=result.tool_calls,
         )
 
+    # ── Session helpers (T4-2) ────────────────────────────────────────────
+
+    def _get_default_store(self) -> SessionStore:
+        """Return the agent's SessionStore, creating a default one lazily."""
+        if self._session_store is None:
+            self._session_store = SessionStore()
+        return self._session_store
+
+    def _resolve_session(self, session: Session | str | None) -> Session | None:
+        """Return a Session object.
+
+        - ``None`` -> ``None`` (no session, default path unchanged).
+        - :class:`Session` -> returned as-is (caller owns persistence).
+        - ``str`` -> loaded from the agent's session store; raises
+          ``ValueError`` if not found.
+        """
+        if session is None:
+            return None
+        if isinstance(session, Session):
+            return session
+        # str session id: resolve from store
+        store = self._get_default_store()
+        loaded = store.load(session)
+        if loaded is None:
+            raise ValueError(
+                f"Session {session!r} not found in the agent's SessionStore. "
+                "Create it first with SessionStore.create()."
+            )
+        return loaded
+
     # ── Public run interface ───────────────────────────────────────────────
 
-    async def run(self, prompt: str) -> AgentResult:
+    async def run(self, prompt: str, *, session: Session | str | None = None) -> AgentResult:
         """
         Run the agent on a single prompt via LocalRuntime.
 
         Compiles to AgentSpec, hands off to LocalRuntime which dispatches to
         the appropriate strategy runner. Emits a signed-audit-aligned
         AgentBoundary receipt for the turn (on by default).
+
+        T4-2 — Session continuation
+        ---------------------------
+        When *session* is provided (a :class:`~jamjet.agents.session.Session`
+        object or a session id string), the run CONTINUES the session's
+        conversation thread instead of re-seeding from scratch.  The model
+        receives the full prior thread followed by the new user prompt.  After
+        the run the session is updated with the new turn and persisted.
+
+        Args:
+            prompt: The user turn to run.
+            session: Optional session to continue.  Pass a
+                     :class:`~jamjet.agents.session.Session` object (caller
+                     manages the store) or a ``str`` session id (resolved via
+                     the agent's ``session_store``).  ``None`` (default) runs
+                     from scratch — existing behaviour unchanged.
         """
         # T3-6: approval_required parity — the in-process path cannot enforce
         # tool-level approval gates (the @gate mechanism is opt-in per function;
@@ -249,6 +304,14 @@ class Agent:
                 UserWarning,
                 stacklevel=2,
             )
+
+        # T4-2: resolve session and build the seed messages for this run.
+        resolved_session = self._resolve_session(session)
+        system = self.instructions or "You are a helpful assistant."
+        initial_messages: list[dict[str, Any]] | None = None
+        if resolved_session is not None:
+            initial_messages = seed_messages_for_run(resolved_session, system, prompt)
+
         spec = self.compile()
         rt = LocalRuntime()
         # T3-7: thread governance into the in-process seam so budget / allowlist
@@ -256,7 +319,12 @@ class Agent:
         # (the durable IR).  Without this the seam was built allow-all / no-budget
         # and the budget + policy knobs silently no-opped on the in-process path
         # (the gap deferred from T3-2).
-        result = await rt.execute(spec, prompt, governance=self.governance)
+        result = await rt.execute(
+            spec,
+            prompt,
+            governance=self.governance,
+            initial_messages=initial_messages,
+        )
         receipt = self._maybe_mint_receipt(prompt, result.output)
         agent_result = AgentResult(
             output=result.output,
@@ -266,6 +334,19 @@ class Agent:
             receipt=receipt,
         )
         agent_result.audit = self._maybe_emit_audit(prompt, agent_result, execution_id=result.execution_id)
+
+        # T4-2: persist the session turn (in-process path: no full_messages).
+        if resolved_session is not None:
+            store = self._get_default_store()
+            persist_session_turn(
+                resolved_session,
+                prompt,
+                agent_result.output,
+                result.execution_id,
+                full_messages=None,  # in-process path; reconstruct from prompt+output
+                store=store,
+            )
+
         return agent_result
 
     def run_sync(self, prompt: str) -> AgentResult:
@@ -278,6 +359,7 @@ class Agent:
         *,
         max_turns: int = 8,
         runtime_url: str = "http://127.0.0.1:7700",
+        session: Session | str | None = None,
     ) -> AgentResult:
         """Run the agent durably on the JamJet engine, mirroring :meth:`run`.
 
@@ -293,6 +375,14 @@ class Agent:
         and tool dispatch through the durable event-sourced engine, so the run
         gets the event log, replay, idempotency, park-on-429, and artifacts for
         free.
+
+        T4-2 — Session continuation
+        ---------------------------
+        Same carried-state contract as :meth:`run`.  When *session* is provided
+        the run is seeded from the session's persisted ``messages`` thread plus
+        the new user prompt.  After the run the full ``messages`` ledger from
+        ``current_state`` (which includes all tool turns) is persisted back to
+        the session.
 
         v1 limitations
         --------------
@@ -323,8 +413,16 @@ class Agent:
         from jamjet.client import JamjetClient  # noqa: PLC0415 - patch point / avoid import cycle
         from jamjet.compiler.agent_ir import build_initial_state, compile_agent_to_ir  # noqa: PLC0415
 
+        # T4-2: resolve session and build the seed using the shared helper.
+        resolved_session = self._resolve_session(session)
+        if resolved_session is not None:
+            system = self.instructions or "You are a helpful assistant."
+            seeded_messages = seed_messages_for_run(resolved_session, system, prompt)
+            initial_input = build_initial_state(self, prompt, initial_messages=seeded_messages)
+        else:
+            initial_input = build_initial_state(self, prompt)
+
         ir = compile_agent_to_ir(self, prompt, max_turns)
-        initial_input = build_initial_state(self, prompt)
         workflow_id: str = ir["workflow_id"]
         workflow_version: str | None = ir.get("version")
 
@@ -352,6 +450,22 @@ class Agent:
         # durable run's extracted result (both on by default), mirroring run().
         result.receipt = self._maybe_mint_receipt(prompt, result.output)
         result.audit = self._maybe_emit_audit(prompt, result, execution_id=exec_id)
+
+        # T4-2: persist the session with the full messages from the engine
+        # (durable path has the complete tool-interleaved thread in current_state).
+        if resolved_session is not None:
+            state = execution.get("current_state") or {}
+            full_messages: list[dict[str, Any]] | None = state.get("messages")
+            store = self._get_default_store()
+            persist_session_turn(
+                resolved_session,
+                prompt,
+                result.output,
+                exec_id,
+                full_messages=full_messages,
+                store=store,
+            )
+
         return result
 
     async def _poll_to_terminal(self, client: Any, exec_id: str) -> dict[str, Any]:

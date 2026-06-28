@@ -8,6 +8,13 @@ Storage: a single SQLite file at ``~/.jamjet/sessions.db`` (one row per
 session), reusing the same ``~/.jamjet/`` directory convention as the
 CheckpointStore.  All public methods are synchronous; no async overhead
 for simple session state.
+
+T4-2 helpers
+------------
+``seed_messages_for_run`` and ``persist_session_turn`` are the SHARED
+carried-state contract used by BOTH ``Agent.run()`` (in-process) and
+``Agent.run_durable()`` (durable engine path) to ensure a session thread is
+seeded and persisted identically regardless of which run path is used.
 """
 
 from __future__ import annotations
@@ -18,6 +25,10 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from jamjet.agents.agent import Agent, AgentResult
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -41,8 +52,9 @@ class Session:
             This is NOT the engine's internal ``execution_id``; the two
             are explicitly separate (see ``latest_execution_id``).
         messages: The running conversation thread — a list of
-            ``{"role": str, "content": str}`` dicts, the same shape that
-            ``build_initial_state`` emits.
+            ``{"role": str, "content": str}`` dicts.  System messages are
+            **not** stored here; they are always re-injected from the
+            agent's current ``instructions`` at seed time.
         latest_execution_id: The engine's internal lineage id for the most
             recent run started under this session.  Distinct from ``id``.
         metadata: Arbitrary caller-supplied key/value data.
@@ -56,6 +68,35 @@ class Session:
     def append_message(self, role: str, content: str) -> None:
         """Append a ``{"role", "content"}`` dict to the message thread."""
         self.messages.append({"role": role, "content": content})
+
+    async def run(
+        self,
+        agent: Agent,
+        prompt: str,
+        *,
+        durable: bool = False,
+        **kwargs: Any,
+    ) -> AgentResult:
+        """Ergonomic form: run *agent* on *prompt* continuing this session thread.
+
+        Equivalent to ``agent.run(prompt, session=self)`` (or
+        ``agent.run_durable`` when ``durable=True``).
+
+        Args:
+            agent: The :class:`~jamjet.agents.agent.Agent` to invoke.
+            prompt: The new user turn to add to this session.
+            durable: When ``True`` use :meth:`~jamjet.agents.agent.Agent.run_durable`
+                     instead of :meth:`~jamjet.agents.agent.Agent.run`.
+            **kwargs: Forwarded to the chosen run method (e.g. ``max_turns``,
+                      ``runtime_url`` for ``run_durable``).
+
+        Returns:
+            :class:`~jamjet.agents.agent.AgentResult` — same shape as the
+            direct ``agent.run()`` / ``agent.run_durable()`` result.
+        """
+        if durable:
+            return await agent.run_durable(prompt, session=self, **kwargs)
+        return await agent.run(prompt, session=self, **kwargs)
 
 
 class SessionStore:
@@ -156,3 +197,107 @@ class SessionStore:
         with sqlite3.connect(self._db_path) as conn:
             cur = conn.execute("SELECT session_id FROM sessions ORDER BY updated_at")
             return [row[0] for row in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# T4-2 shared carried-state helpers
+# ---------------------------------------------------------------------------
+# These two functions are the SINGLE source of truth for how a session thread
+# is seeded into a run and how the completed turn is persisted back.  Both
+# ``Agent.run()`` (in-process) and ``Agent.run_durable()`` (durable engine)
+# call the same helpers so the thread is consistent across the two paths.
+
+
+def seed_messages_for_run(
+    session: Session | None,
+    system_instructions: str,
+    prompt: str,
+) -> list[dict[str, Any]]:
+    """Build the initial messages list for a run.
+
+    When *session* is ``None`` (or empty), returns the default scratch seed::
+
+        [{"role": "system", "content": system_instructions},
+         {"role": "user",   "content": prompt}]
+
+    When *session* is provided, returns the carried thread (prior turns) with
+    the current agent's system instruction and the new user prompt appended::
+
+        [{"role": "system",    "content": system_instructions},   # always fresh
+         {"role": "user",      "content": "<turn 1>"},            # from session
+         {"role": "assistant", "content": "<reply 1>"},           # from session
+         ...                                                       # more turns
+         {"role": "user",      "content": prompt}]                # new turn
+
+    System messages stored in *session.messages* are stripped here; the
+    current agent's instructions always win as the single system message.
+    This keeps session threads portable across agent versions.
+
+    Args:
+        session: The :class:`Session` carrying prior turns, or ``None`` for a
+                 fresh run (default behaviour, no change to callers that omit
+                 ``session=``).
+        system_instructions: The agent's current ``instructions`` string.
+        prompt: The new user turn to add.
+
+    Returns:
+        The ``messages`` list ready to pass to a model / strategy runner.
+    """
+    msgs: list[dict[str, Any]] = []
+    if system_instructions:
+        msgs.append({"role": "system", "content": system_instructions})
+
+    if session is not None and session.messages:
+        # Re-inject prior turns, skipping any stale system messages.
+        for m in session.messages:
+            if m.get("role") != "system":
+                msgs.append(dict(m))
+
+    msgs.append({"role": "user", "content": prompt})
+    return msgs
+
+
+def persist_session_turn(
+    session: Session,
+    prompt: str,
+    output: str,
+    execution_id: str | None,
+    full_messages: list[dict[str, Any]] | None,
+    store: SessionStore,
+) -> None:
+    """Append the completed turn to *session* and persist via *store*.
+
+    Called after BOTH ``Agent.run()`` and ``Agent.run_durable()`` so the
+    session thread is updated regardless of which path ran.
+
+    When *full_messages* is provided (the durable engine's
+    ``current_state["messages"]``), the session thread is replaced with those
+    messages minus any system messages (the full, tool-interleaved thread).
+
+    When *full_messages* is ``None`` (in-process path; strategy runners own
+    their message list internally), the turn is reconstructed from *prompt* +
+    *output* and appended to the existing thread.
+
+    Args:
+        session: The :class:`Session` to update in-place and persist.
+        prompt: The user prompt that was just run.
+        output: The assistant's final output for this turn.
+        execution_id: The engine's ``execution_id`` for the run (may be
+                      ``None`` for the in-process path which generates one
+                      internally).
+        full_messages: The full ``messages`` list from the durable engine's
+                       terminal state, or ``None`` for the in-process path.
+        store: :class:`SessionStore` to call ``save()`` on after updating.
+    """
+    if full_messages is not None:
+        # Durable path: replace thread with full message ledger, strip system.
+        session.messages = [m for m in full_messages if m.get("role") != "system"]
+    else:
+        # In-process path: append the new user+assistant turn.
+        session.append_message("user", prompt)
+        session.append_message("assistant", output)
+
+    if execution_id is not None:
+        session.latest_execution_id = execution_id
+
+    store.save(session)

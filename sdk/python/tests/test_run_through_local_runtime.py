@@ -12,7 +12,9 @@ async def test_agent_run_dispatches_to_local_runtime(monkeypatch):
         name = "local"
         supported_ir_versions = ("1.0",)
 
-        async def execute(self, spec, input, *, execution_id=None, scope=None, on_event=None, governance=None):
+        async def execute(
+            self, spec, input, *, execution_id=None, scope=None, on_event=None, governance=None, initial_messages=None
+        ):
             seen["spec"] = spec
             seen["input"] = input
             seen["governance"] = governance

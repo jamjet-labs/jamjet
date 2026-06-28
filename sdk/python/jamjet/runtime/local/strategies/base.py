@@ -22,6 +22,7 @@ class StrategyRunner(Protocol):
         prompt: str,
         tools: list[dict[str, Any]],
         tool_calls_log: list[dict[str, Any]],
+        initial_messages: list[dict[str, Any]] | None = None,
     ) -> str: ...
 
 

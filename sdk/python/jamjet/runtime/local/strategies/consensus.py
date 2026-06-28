@@ -16,6 +16,7 @@ async def run(
     prompt: str,
     tools: list[dict[str, Any]],
     tool_calls_log: list[dict[str, Any]],
+    initial_messages: list[dict[str, Any]] | None = None,
 ) -> str:
     tool_map = resolve_tool_map(spec.tools)
     max_iter = spec.limits.get("max_iterations", 10)
