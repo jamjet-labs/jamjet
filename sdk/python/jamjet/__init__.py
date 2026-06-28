@@ -32,6 +32,7 @@ Quick start:
 # MUST come after `from jamjet.workflow.workflow import Workflow` so the
 # `workflow` name in this namespace binds to the decorator, not the subpackage.
 from jamjet.agents.agent import Agent, AgentResult
+from jamjet.agents.session import Session, SessionStore
 from jamjet.agents.task import task
 from jamjet.client import JamjetClient
 from jamjet.durable import (
@@ -69,6 +70,8 @@ __all__ = [
     "AgentResult",
     "AgentMemory",
     "AgentSpec",
+    "Session",
+    "SessionStore",
     "DurabilityConfig",
     "DurableAgent",
     "DurableAgentSpec",
