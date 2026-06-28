@@ -437,6 +437,7 @@ def test_get_model_has_governed_middleware() -> None:
     This test would FAIL against the old bare ``Model()`` construction (no middleware)
     and PASSES once ``default_model_middleware()`` is wired in.
     """
+    from jamjet.model.budget import BudgetMiddleware
     from jamjet.model.metering import MeteringMiddleware
     from jamjet.model.middleware import ModelAllowlistMiddleware
 
@@ -451,6 +452,7 @@ def test_get_model_has_governed_middleware() -> None:
     assert ModelAllowlistMiddleware in mw_types, (
         "ModelAllowlistMiddleware must be in the sidecar Model's middleware chain"
     )
+    assert BudgetMiddleware in mw_types, "BudgetMiddleware must be in the sidecar Model's middleware chain (T3-2)"
     assert MeteringMiddleware in mw_types, "MeteringMiddleware must be in the sidecar Model's middleware chain"
 
     # Restore singleton state so subsequent tests get a fresh instance.

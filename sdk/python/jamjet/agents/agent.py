@@ -394,7 +394,7 @@ class Agent:
         from jamjet.model.types import ModelRequest, parse_model_ref  # noqa: PLC0415
 
         spec = self.compile()
-        seam = model or Model(middleware=default_model_middleware())
+        seam = model or Model(middleware=default_model_middleware(self.governance))
         request = ModelRequest(
             ref=parse_model_ref(spec.llm.model),
             messages=[
