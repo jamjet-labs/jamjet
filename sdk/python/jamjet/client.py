@@ -287,8 +287,15 @@ class JamjetClient:
         duration_ms: int = 0,
         gen_ai_model: str | None = None,
         finish_reason: str | None = None,
+        lease_fence: int | None = None,
     ) -> None:
-        """Mark a work item as completed and emit a NodeCompleted event."""
+        """Mark a work item as completed and emit a NodeCompleted event.
+
+        When ``lease_fence`` is provided (and non-zero), it is echoed back so the
+        runtime can prove this worker still holds the lease: a stale fence (the
+        item was reclaimed/replayed) is rejected with 409 and no NodeCompleted is
+        emitted. A falsy/absent fence keeps the legacy unfenced behavior.
+        """
         body: dict[str, Any] = {
             "output": output,
             "state_patch": state_patch,
@@ -302,6 +309,8 @@ class JamjetClient:
             body["gen_ai_model"] = gen_ai_model
         if finish_reason is not None:
             body["finish_reason"] = finish_reason
+        if lease_fence:
+            body["lease_fence"] = lease_fence
         r = await self._client.post(
             f"/work-items/{item_id}/complete",
             json=body,

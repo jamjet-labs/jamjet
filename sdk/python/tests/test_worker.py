@@ -75,6 +75,7 @@ class _StubClient:
         duration_ms: int = 0,
         gen_ai_model: str | None = None,
         finish_reason: str | None = None,
+        lease_fence: int | None = None,
     ) -> None:
         self.complete_calls.append(
             {
@@ -85,6 +86,7 @@ class _StubClient:
                 "state_patch": state_patch,
                 "gen_ai_model": gen_ai_model,
                 "finish_reason": finish_reason,
+                "lease_fence": lease_fence,
             }
         )
 
@@ -243,6 +245,45 @@ _DISPATCH_ITEM: dict = {
     },
     "lease_fence": 0,
 }
+
+
+_FENCED_ITEM: dict = {
+    "id": "wi-006",
+    "execution_id": "exec_fenced",
+    "node_id": "fenced_step",
+    "queue_type": "python_tool",
+    "payload": {
+        "module": "tests.test_worker",
+        "function": "_add",
+        "input": {"a": 1, "b": 1},
+    },
+    # A real claim carries a non-zero lease fence (term * 2^32 + epoch).
+    "lease_fence": 4_294_967_297,
+}
+
+
+async def test_worker_echoes_lease_fence_on_complete() -> None:
+    """The fence from the claim response is echoed on complete so the runtime can
+    fence the settle (exactly-once-COMMIT for the external python_tool path)."""
+    stub = _StubClient(claimed_item=_FENCED_ITEM)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+
+    assert len(stub.complete_calls) == 1
+    assert stub.complete_calls[0]["lease_fence"] == 4_294_967_297, (
+        "the worker must echo the claim's lease_fence on complete"
+    )
+
+
+async def test_worker_absent_fence_forwarded_as_zero() -> None:
+    """An item with no real fence (lease_fence=0) forwards 0; the client omits it,
+    keeping the unfenced fallback backward-compatible."""
+    stub = _StubClient(claimed_item=_ADD_ITEM)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+
+    assert len(stub.complete_calls) == 1
+    assert stub.complete_calls[0]["lease_fence"] == 0, (
+        "absent fence is forwarded as 0 and dropped by the client (unfenced path)"
+    )
 
 
 async def test_worker_dispatch_tool_calls_return_reaches_state() -> None:

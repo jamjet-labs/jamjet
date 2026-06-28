@@ -1859,6 +1859,10 @@ async def _worker_loop(
                     duration_ms,
                     gen_ai_model=gen_ai_model_field,
                     finish_reason=finish_reason_field,
+                    # Echo the lease fence from the claim so the runtime can fence
+                    # the completion (reject a stale/reclaimed lease). Omitted when
+                    # 0/absent, keeping the unfenced fallback backward-compatible.
+                    lease_fence=lease_fence,
                 )
                 console.print(f"[green]Completed[/green] id={item_id} node=[bold]{node_id}[/bold] {duration_ms}ms")
             except Exception as exc:
