@@ -17,6 +17,15 @@ Numbered examples in this directory:
 Each example is self-contained. The fifth example includes its own virtual
 environment setup script and runs without a model API key.
 
+## Five-minute dev loop and eval
+
+- `trajectory-eval/` - A trajectory evalset (`evalset.jsonl`) with `expected_trajectory`
+  assertions on tool sequences. Shows `jamjet eval run evalset.jsonl --workflow <name>` for
+  batch trajectory scoring and `jamjet eval trajectory-diff` for replay-regression detection.
+  See [`trajectory-eval/README.md`](./trajectory-eval/README.md) and
+  [`docs/guides/dev-loop.md`](../docs/guides/dev-loop.md) for the full five-minute loop
+  starting from `jamjet create myagent`.
+
 ## Sessions, memory, artifacts
 
 - `session-memory/` - An agent with a persistent `Session` running across two turns. The second turn receives the full prior thread (session continuity), a retrieved memory block (Engram recall), and fetches an artifact stored before a simulated restart. Demo mode requires no API key. See `session-memory/README.md`.
