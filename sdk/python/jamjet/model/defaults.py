@@ -8,6 +8,7 @@ from jamjet.model.budget import BudgetMiddleware
 from jamjet.model.metering import MeteringMiddleware
 from jamjet.model.middleware import ModelAllowlistMiddleware, ModelMiddleware
 from jamjet.model.pii import PiiRedactionMiddleware
+from jamjet.model.policy_resolver import resolve_policy_allowlist
 
 if TYPE_CHECKING:
     from jamjet.agents.governance import GovernanceConfig
@@ -24,8 +25,11 @@ def default_model_middleware(
 
     Chain order
     -----------
-    1. ``ModelAllowlistMiddleware`` -- deny disallowed models (allow-all when
-       ``allowed=None``; Track 3 T3-6 wires the real policy-derived list).
+    1. ``ModelAllowlistMiddleware`` -- deny disallowed models.  T3-6 derives the
+       allowlist from ``governance.policy``: ``None`` -> allow-all; dict with
+       ``model_allowlist`` -> use that set; string -> resolved from the built-in
+       named-policy table (unknown string raises ``ValueError``, never silently
+       allows).
     2. ``PiiRedactionMiddleware`` -- redact PII from outbound prompt messages
        BEFORE the provider or any other middleware sees them; fail-closed
        (redact-or-deny).  Omitted when ``governance.pii`` is ``False``.
@@ -57,8 +61,16 @@ def default_model_middleware(
     """
     budget = governance.budget if governance is not None else None
     pii_on = governance.pii if governance is not None else True
+    policy = governance.policy if governance is not None else None
 
-    chain: list[ModelMiddleware] = [ModelAllowlistMiddleware(None)]
+    # T3-6: resolve the policy to a model allowlist.
+    # - None              -> allow-all (ModelAllowlistMiddleware(None))
+    # - dict w/ allowlist -> use that set
+    # - known str         -> built-in named policy's allowlist
+    # - unknown str       -> ValueError raised here (fail loud, never silent-allow)
+    allowlist = resolve_policy_allowlist(policy)
+
+    chain: list[ModelMiddleware] = [ModelAllowlistMiddleware(allowlist)]
     if pii_on:
         chain.append(PiiRedactionMiddleware())
     chain.append(BudgetMiddleware(budget))

@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import warnings
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -197,6 +198,23 @@ class Agent:
         the appropriate strategy runner. Emits a signed-audit-aligned
         AgentBoundary receipt for the turn (on by default).
         """
+        # T3-6: approval_required parity — the in-process path cannot enforce
+        # tool-level approval gates (the @gate mechanism is opt-in per function;
+        # the durable Rust engine enforces require_approval_for via the IR).
+        # Fail LOUD rather than silently no-op so the developer knows approval
+        # won't fire here.  See follow-up F-t3-inprocess-approval for full
+        # in-process enforcement.
+        ar = self.governance.approval_required
+        if ar is not False and ar != []:
+            warnings.warn(
+                f"Agent {self.name!r}: approval_required is set but agent.run() uses "
+                "the in-process path, which does not enforce approval gates. "
+                "Use agent.run_durable() — the durable IR carries "
+                "require_approval_for and the Rust engine enforces it fail-closed. "
+                "Follow-up: F-t3-inprocess-approval.",
+                UserWarning,
+                stacklevel=2,
+            )
         spec = self.compile()
         rt = LocalRuntime()
         result = await rt.execute(spec, prompt)

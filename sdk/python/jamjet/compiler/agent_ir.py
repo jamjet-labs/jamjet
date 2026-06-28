@@ -39,6 +39,7 @@ import hashlib
 import json
 from typing import TYPE_CHECKING, Any
 
+from jamjet.model.policy_resolver import resolve_named_policy
 from jamjet.model.types import parse_model_ref
 
 if TYPE_CHECKING:
@@ -102,7 +103,9 @@ def _compile_agent_policy_ir(gov: GovernanceConfig) -> dict[str, Any] | None:
     - ``policy`` dict  -> base values for ``blocked_tools`` / ``require_approval_for``
                           / ``model_allowlist``; unknown keys are passed through so the
                           Rust serde ``deny_unknown_fields``-free schema accepts them.
-    - ``policy`` str   -> empty skeleton now; T3-6 resolves the string to real rules.
+    - ``policy`` str   -> resolved via :func:`~jamjet.model.policy_resolver.resolve_named_policy`
+                          to real ``blocked_tools`` / ``require_approval_for`` /
+                          ``model_allowlist``; raises ``ValueError`` for unknown names.
     - ``approval_required=True``   -> ``require_approval_for = ["*"]`` (all tools).
     - ``approval_required=[...]``  -> ``require_approval_for = [...]`` (those globs).
 
@@ -121,10 +124,16 @@ def _compile_agent_policy_ir(gov: GovernanceConfig) -> dict[str, Any] | None:
         blocked: list[str] = list(gov.policy.get("blocked_tools") or [])
         require: list[str] = list(gov.policy.get("require_approval_for") or [])
         allowlist: list[str] = list(gov.policy.get("model_allowlist") or [])
+    elif isinstance(gov.policy, str):
+        # T3-6: resolve the named policy to real rules so the IR carries
+        # the actual allowlist (not an empty skeleton).  Raises ValueError
+        # for unknown names — a misconfigured policy string is a hard error,
+        # never a silent allow-all in the compiled IR.
+        rules = resolve_named_policy(gov.policy)
+        blocked = list(rules.get("blocked_tools") or [])
+        require = list(rules.get("require_approval_for") or [])
+        allowlist = list(rules.get("model_allowlist") or [])
     else:
-        # String policy reference (e.g. "strict") — T3-6 will load and expand it
-        # into blocked_tools / model_allowlist; emit an empty skeleton so that any
-        # approval_required rules set below still take effect on the durable path.
         blocked = []
         require = []
         allowlist = []
