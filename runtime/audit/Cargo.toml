@@ -23,6 +23,9 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
 sha2 = { workspace = true }
+hmac = "0.12"
+hex = "0.4"
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

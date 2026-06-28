@@ -1,7 +1,8 @@
 //! `AuditEnricher` — derives audit metadata from events and writes to the audit log.
 
-use crate::backend::AuditBackend;
+use crate::backend::{AuditBackend, AuditQuery};
 use crate::entry::{ActorType, AuditLogEntry};
+use crate::signer::AuditSigner;
 use chrono::Duration;
 use jamjet_ir::workflow::DataPolicyIr;
 use jamjet_policy::redaction::PiiRedactor;
@@ -49,14 +50,53 @@ impl RequestContext {
     }
 }
 
-/// Enriches events with audit metadata and appends them to the audit log.
+/// In-memory head of the tamper-evident audit chain for this enricher.
+#[derive(Default)]
+struct ChainHead {
+    /// Whether `head` has been seeded from the backend yet.
+    seeded: bool,
+    /// `entry_hash` of the most recently appended entry (`None` at genesis).
+    head: Option<String>,
+}
+
+/// Enriches events with audit metadata, seals them into the tamper-evident
+/// chain, and appends them to the audit log.
 pub struct AuditEnricher {
     backend: Arc<dyn AuditBackend>,
+    /// Signs each entry's content hash. Sourced from the environment by
+    /// default (`AuditSigner::from_env`); see [`AuditSigner`] for the key.
+    signer: AuditSigner,
+    /// Serializes the read-head -> seal -> append -> advance-head sequence so
+    /// concurrent appends form a single linear chain.
+    chain: tokio::sync::Mutex<ChainHead>,
 }
 
 impl AuditEnricher {
+    /// Build an enricher that signs with the key from the environment
+    /// (`JAMJET_AUDIT_SIGNING_KEY`, or the insecure dev key with a warning).
     pub fn new(backend: Arc<dyn AuditBackend>) -> Self {
-        Self { backend }
+        Self::with_signer(backend, AuditSigner::from_env())
+    }
+
+    /// Build an enricher with an explicit signer (tests / callers that load the
+    /// signing key from their own secret store).
+    pub fn with_signer(backend: Arc<dyn AuditBackend>, signer: AuditSigner) -> Self {
+        Self {
+            backend,
+            signer,
+            chain: tokio::sync::Mutex::new(ChainHead::default()),
+        }
+    }
+
+    /// The `entry_hash` of the most recent entry already in the log, used to
+    /// resume the chain across process restarts. `None` for an empty log.
+    async fn latest_entry_hash(&self) -> Option<String> {
+        let q = AuditQuery {
+            limit: 1,
+            ..Default::default()
+        };
+        let latest = self.backend.query(&q).await.ok()?.into_iter().next()?;
+        latest.entry_hash
     }
 
     /// Derive audit metadata from an event and append it to the audit log.
@@ -131,8 +171,23 @@ impl AuditEnricher {
             }
         }
 
-        if let Err(e) = self.backend.append(entry).await {
-            warn!("Failed to write audit log entry: {e}");
+        // Seal the entry into the tamper-evident chain: link it to the
+        // previous entry's hash, then sign. Held under the chain lock for the
+        // whole read-head -> seal -> append -> advance-head sequence so that
+        // concurrent appends produce one linear chain.
+        let mut chain = self.chain.lock().await;
+        if !chain.seeded {
+            chain.head = self.latest_entry_hash().await;
+            chain.seeded = true;
+        }
+        entry.seal(chain.head.clone(), &self.signer);
+        let sealed_hash = entry.entry_hash.clone();
+
+        match self.backend.append(entry).await {
+            // Advance the head only after a durable append, so a failed write
+            // never leaves a gap that the next entry would link straight past.
+            Ok(()) => chain.head = sealed_hash,
+            Err(e) => warn!("Failed to write audit log entry: {e}"),
         }
     }
 }

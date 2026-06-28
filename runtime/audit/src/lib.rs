@@ -9,13 +9,17 @@
 //! without touching the workflow execution tables.
 
 pub mod backend;
+pub mod chain;
 pub mod enricher;
 pub mod entry;
 pub mod noop;
+pub mod signer;
 pub mod sqlite;
 
 pub use backend::{AuditBackend, AuditError, AuditQuery};
+pub use chain::{verify_chain, ChainError};
 pub use enricher::{AuditEnricher, RequestContext};
 pub use entry::{ActorType, AuditLogEntry};
 pub use noop::NoopAuditBackend;
+pub use signer::AuditSigner;
 pub use sqlite::SqliteAuditBackend;

@@ -32,7 +32,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
     raw_event       TEXT NOT NULL,
     tenant_id       TEXT NOT NULL DEFAULT 'default',
     expires_at      TEXT,
-    redacted        INTEGER NOT NULL DEFAULT 0
+    redacted        INTEGER NOT NULL DEFAULT 0,
+    prev_hash       TEXT,
+    entry_hash      TEXT,
+    signature       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_execution_id ON audit_log (execution_id);
 CREATE INDEX IF NOT EXISTS idx_audit_actor_id     ON audit_log (actor_id);
@@ -81,6 +84,18 @@ impl SqliteAuditBackend {
             }
             sqlx::query(stmt).execute(&self.pool).await?;
         }
+        // Forward-migrate audit_log tables created before the tamper-evidence
+        // columns existed (the CREATE above is `IF NOT EXISTS`, so a pre-existing
+        // table is left untouched). Adding a column that is already present is a
+        // benign "duplicate column name" error we deliberately ignore.
+        for col in ["prev_hash", "entry_hash", "signature"] {
+            let sql = format!("ALTER TABLE audit_log ADD COLUMN {col} TEXT");
+            if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
+                if !e.to_string().to_lowercase().contains("duplicate column") {
+                    return Err(e);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -99,8 +114,9 @@ impl AuditBackend for SqliteAuditBackend {
                 (id, event_id, execution_id, sequence, event_type,
                  actor_id, actor_type, tool_call_hash, policy_decision,
                  http_request_id, http_method, http_path, ip_address,
-                 created_at, raw_event, tenant_id, expires_at, redacted)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 created_at, raw_event, tenant_id, expires_at, redacted,
+                 prev_hash, entry_hash, signature)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(entry.id.to_string())
@@ -121,6 +137,9 @@ impl AuditBackend for SqliteAuditBackend {
         .bind(&entry.tenant_id)
         .bind(expires_at.as_deref())
         .bind(entry.redacted as i32)
+        .bind(&entry.prev_hash)
+        .bind(&entry.entry_hash)
+        .bind(&entry.signature)
         .execute(&self.pool)
         .await
         .map_err(|e| AuditError::Database(e.to_string()))?;
@@ -223,6 +242,9 @@ struct AuditRow {
     tenant_id: String,
     expires_at: Option<String>,
     redacted: i32,
+    prev_hash: Option<String>,
+    entry_hash: Option<String>,
+    signature: Option<String>,
 }
 
 fn row_to_entry(row: AuditRow) -> Result<AuditLogEntry, AuditError> {
@@ -256,6 +278,9 @@ fn row_to_entry(row: AuditRow) -> Result<AuditLogEntry, AuditError> {
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc)),
         redacted: row.redacted != 0,
+        prev_hash: row.prev_hash,
+        entry_hash: row.entry_hash,
+        signature: row.signature,
     })
 }
 
