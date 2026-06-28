@@ -456,6 +456,31 @@ impl Scheduler {
                     );
                 }
 
+                // For JavaFn nodes, enrich the payload so the external Java
+                // tool-worker is self-contained — exactly mirroring the PythonFn
+                // arm above, bar the language-appropriate dispatch coordinates:
+                // it needs the class to reflect, the method to invoke, and the
+                // current workflow state as the call input. The Java worker
+                // claims these `java_tool` items over the same HTTP claim/complete
+                // API the Python worker uses, so the contract is identical.
+                if let NodeKind::JavaFn {
+                    class_name, method, ..
+                } = &node.kind
+                {
+                    let obj = payload
+                        .as_object_mut()
+                        .expect("payload is always a JSON object");
+                    obj.insert(
+                        "class".into(),
+                        serde_json::Value::String(class_name.clone()),
+                    );
+                    obj.insert("method".into(), serde_json::Value::String(method.clone()));
+                    obj.insert(
+                        "input".into(),
+                        serde_json::Value::Object(progress.final_state.clone()),
+                    );
+                }
+
                 // For Model nodes, enrich the payload with model configuration and tool
                 // schemas so the model worker is self-contained.
                 if let NodeKind::Model {
@@ -1466,6 +1491,96 @@ mod tests {
         assert_eq!(item.payload["workflow_id"], "wf");
         assert_eq!(item.payload["workflow_version"], "0.1.0");
         assert_eq!(item.payload["node_id"], "py_step");
+    }
+
+    /// A single-node workflow whose only step is a `JavaFn` (the Java analog of
+    /// the `python_fn_ir` fixture above).
+    fn java_fn_ir() -> serde_json::Value {
+        serde_json::json!({
+            "workflow_id": "wf",
+            "version": "0.1.0",
+            "name": null,
+            "description": null,
+            "state_schema": "",
+            "start_node": "java_step",
+            "nodes": {
+                "java_step": {
+                    "id": "java_step",
+                    "kind": {
+                        "type": "java_fn",
+                        "class_name": "com.example.tools.WeatherTool",
+                        "method": "getWeather",
+                        "output_schema": ""
+                    },
+                    "retry_policy": null,
+                    "node_timeout_secs": null,
+                    "description": null,
+                    "labels": {}
+                }
+            },
+            "edges": [],
+            "retry_policies": {},
+            "timeouts": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {},
+            "labels": {}
+        })
+    }
+
+    /// The scheduler must enrich a `JavaFn` work-item payload with `class`,
+    /// `method`, and `input` so an external Java tool-worker is self-contained —
+    /// exactly mirroring the PythonFn enrichment (bar the dispatch coordinates),
+    /// and the work item must route to the `java_tool` queue.
+    #[tokio::test]
+    async fn java_fn_work_item_payload_is_enriched() {
+        let (s, b, e) = setup(java_fn_ir()).await;
+
+        // Seed some accumulated state so we can assert it lands in `input`.
+        append(
+            &b,
+            &e,
+            node_completed("prev_node", serde_json::json!({ "key": "value" })),
+        )
+        .await;
+
+        // Tick: `java_step` is the start node with no predecessors — runnable.
+        tick(&s, &e).await;
+
+        // Claim the work item from the java_tool queue.
+        let item = b
+            .claim_work_item("test-worker", &["java_tool"])
+            .await
+            .expect("backend claim must not error")
+            .expect("a JavaFn node must produce exactly one work item");
+
+        // Queue type
+        assert_eq!(item.queue_type, "java_tool");
+
+        // JavaFn-specific enrichment
+        assert_eq!(
+            item.payload["class"], "com.example.tools.WeatherTool",
+            "payload must carry the class name to reflect"
+        );
+        assert_eq!(
+            item.payload["method"], "getWeather",
+            "payload must carry the method name to invoke"
+        );
+        assert!(
+            item.payload["input"].is_object(),
+            "payload.input must be a JSON object (accumulated workflow state)"
+        );
+        // The state seeded above must be reflected in input.
+        assert_eq!(
+            item.payload["input"]["key"], "value",
+            "payload.input must reflect accumulated state patches"
+        );
+
+        // Base fields must still be present.
+        assert_eq!(item.payload["workflow_id"], "wf");
+        assert_eq!(item.payload["workflow_version"], "0.1.0");
+        assert_eq!(item.payload["node_id"], "java_step");
     }
 
     /// A single-node workflow whose only step is a `Model` node with tools.
