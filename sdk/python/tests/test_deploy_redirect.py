@@ -120,7 +120,9 @@ async def test_cloud_runtime_resume_points_at_agent_deploy() -> None:
 
     with pytest.raises(NotImplementedError) as exc:
         await CloudRuntime().resume(object(), "exec_1")
-    assert "Phase 5" not in str(exc.value)
+    msg = str(exc.value)
+    assert "Agent.deploy" in msg  # same actionable hint as execute()
+    assert "Phase 5" not in msg
 
 
 # ── no name collision: jamjet.deploy is the module ────────────────────────────

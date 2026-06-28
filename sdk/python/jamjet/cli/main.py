@@ -48,6 +48,7 @@ from rich.table import Table
 
 from jamjet.cli.demo import demo_app
 from jamjet.client import JamjetClient
+from jamjet.deploy import LOCAL_RUNTIME_URL
 
 # ── Logo — block letter J  (0=bg  1=yellow#f5c518  2=orange#ea580c) ──────────
 # 6×7 grid: clean J — top bar + vertical stem + orange hook at base.
@@ -142,7 +143,7 @@ app.add_typer(demo_app, name="demo")
 console = Console()
 
 
-def _client(runtime: str = "http://localhost:7700", token: str | None = None) -> JamjetClient:
+def _client(runtime: str = LOCAL_RUNTIME_URL, token: str | None = None) -> JamjetClient:
     return JamjetClient(base_url=runtime, api_token=token)
 
 
@@ -650,7 +651,7 @@ def validate(
 def deploy(
     file: str = typer.Argument(..., help="Path to a fleet YAML (agents:/workflows:)"),
     runtime: str = typer.Option(
-        "http://localhost:7700",
+        LOCAL_RUNTIME_URL,
         "--runtime",
         "-r",
         help="Target engine: local | self-host | cloud | a base URL.",
@@ -661,8 +662,9 @@ def deploy(
     ``--runtime`` is resolved with the SAME resolver as ``Agent.deploy``:
     ``local`` (the dev engine on 7700), ``self-host`` (``$JAMJET_RUNTIME_URL``),
     ``cloud`` (your hosted engine at ``$JAMJET_CLOUD_RUNTIME_URL`` plus JamJet
-    Cloud governance), or a base URL used directly. The default keeps the existing
-    ``http://localhost:7700`` behavior.
+    Cloud governance), or a base URL used directly. The default is the shared
+    local engine URL (``LOCAL_RUNTIME_URL``, ``http://127.0.0.1:7700``) — the SAME
+    source ``Agent.deploy`` uses, so the CLI and the SDK agree on the local target.
     """
     from jamjet.deploy import resolve_runtime_target
     from jamjet.workflow.bundle import compile_bundle

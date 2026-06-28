@@ -216,6 +216,11 @@ async def test_deploy_with_schedule_creates_cron_job(monkeypatch: pytest.MonkeyP
     assert job["cron_expression"] == "0 9 * * *"
     assert job["workflow_id"] == "weatherbot"
     assert result.scheduled is True
+    # The scheduled seed is build_initial_state(agent, "") — an empty user turn
+    # (the recurring intent lives in the agent's instructions, not the seed). The
+    # last message is the empty prompt the engine fires the workflow with.
+    seed = job["input"]
+    assert seed["messages"][-1] == {"role": "user", "content": ""}
 
 
 async def test_deploy_without_schedule_creates_no_cron(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -247,3 +252,68 @@ async def test_deploy_runtime_and_runtime_url_conflict_raises(monkeypatch: pytes
     _patch_client(monkeypatch)
     with pytest.raises(ValueError, match="runtime"):
         await _agent().deploy(runtime="local", runtime_url="https://box.example.com")
+
+
+# ── registered-but-unscheduled is honest and distinguishable ──────────────────
+
+
+async def test_deploy_schedule_failure_after_register_is_distinguishable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_workflow succeeds, create_cron_job fails: the workflow IS registered
+    but unscheduled. The raised error must say so AND chain the cron error, so the
+    registered-but-unscheduled state is distinguishable from a never-registered one
+    (and Team.deploy's captured exception carries that distinction)."""
+    _clear_env(monkeypatch)
+
+    class _CronFailsClient(_FakeDeployClient):
+        async def create_cron_job(self, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("cron backend down")
+
+    captured: dict[str, Any] = {}
+
+    def factory(base_url: str = "http://localhost:7700", api_token: str | None = None, **_: Any) -> _CronFailsClient:
+        client = _CronFailsClient(base_url=base_url, api_token=api_token)
+        captured["client"] = client
+        return client
+
+    monkeypatch.setattr("jamjet.client.JamjetClient", factory)
+
+    with pytest.raises(RuntimeError) as exc:
+        await _agent().deploy(schedule="0 9 * * *")
+
+    msg = str(exc.value)
+    assert "weatherbot" in msg  # names the registered workflow id
+    assert "registered" in msg  # states it WAS registered
+    assert "scheduling failed" in msg  # only the schedule step failed
+    # Chained from the underlying cron error (registered-but-unscheduled, not lost).
+    assert isinstance(exc.value.__cause__, RuntimeError)
+    assert "cron backend down" in str(exc.value.__cause__)
+    # The workflow really was registered before the schedule step blew up.
+    assert captured["client"].created and captured["client"].created[0]["workflow_id"] == "weatherbot"
+
+
+async def test_deploy_create_workflow_failure_is_not_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_workflow itself fails: the workflow is NOT registered, so the error
+    must NOT claim it was registered (the opposite of the schedule-failure case)."""
+    _clear_env(monkeypatch)
+
+    class _RegisterFailsClient(_FakeDeployClient):
+        async def create_workflow(self, ir: dict[str, Any]) -> dict[str, Any]:
+            raise RuntimeError("engine rejected the IR")
+
+    monkeypatch.setattr(
+        "jamjet.client.JamjetClient",
+        lambda base_url="http://localhost:7700", api_token=None, **_: _RegisterFailsClient(
+            base_url=base_url, api_token=api_token
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        await _agent().deploy(schedule="0 9 * * *")
+
+    msg = str(exc.value)
+    assert "engine rejected the IR" in msg
+    assert "registered" not in msg.lower()  # a create_workflow failure never claims registration

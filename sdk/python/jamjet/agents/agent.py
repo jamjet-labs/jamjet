@@ -805,13 +805,26 @@ class Agent:
         async with JamjetClient(base_url=target.url, api_token=target.token) as client:
             await client.create_workflow(ir)
             if schedule is not None:
-                await client.create_cron_job(
-                    name=workflow_id,
-                    cron_expression=schedule,
-                    workflow_id=workflow_id,
-                    workflow_version=workflow_version,
-                    input=build_initial_state(self, ""),
-                )
+                try:
+                    await client.create_cron_job(
+                        name=workflow_id,
+                        cron_expression=schedule,
+                        workflow_id=workflow_id,
+                        workflow_version=workflow_version,
+                        input=build_initial_state(self, ""),
+                    )
+                except Exception as exc:
+                    # The workflow IS registered (create_workflow already returned);
+                    # only the scheduling step failed, leaving it registered-but-
+                    # unscheduled. Raise a clear, chained error that says so, so this
+                    # state is distinguishable from a create_workflow failure (never
+                    # registered) — Team.deploy captures THIS exception, so the
+                    # distinction must live in the exception itself. Registration is
+                    # idempotent by (workflow_id, version), so re-running deploy after
+                    # this safely re-registers and retries the schedule.
+                    raise RuntimeError(
+                        f"workflow {workflow_id!r} registered on {target.url} but scheduling failed: {exc}"
+                    ) from exc
                 scheduled = True
 
         return DeployResult(

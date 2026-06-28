@@ -53,7 +53,7 @@ python deploy.py
 
 Expected output:
 
-```
+```text
 deployed 'status-reporter' to local (http://127.0.0.1:7700)
   scheduled=False  cloud_governance=False
 ```

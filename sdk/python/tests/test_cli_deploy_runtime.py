@@ -4,7 +4,8 @@ The CLI deploy command resolves ``--runtime`` with the SAME resolver as
 ``Agent.deploy`` (local / self-host / cloud / a URL), so the CLI and the SDK
 agree on targeting. We patch the JamjetClient class (so the resolver actually
 runs) and assert the resolved base URL + token reach it; a bad runtime errors
-clearly; the default preserves the existing ``http://localhost:7700`` behavior.
+clearly; the default resolves to the shared local engine URL (``LOCAL_RUNTIME_URL``,
+``http://127.0.0.1:7700``) — the SAME source ``Agent.deploy`` uses.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import pytest
 from typer.testing import CliRunner
 
 from jamjet.cli.main import app
+from jamjet.deploy import LOCAL_RUNTIME_URL
 
 runner = CliRunner()
 
@@ -82,8 +84,9 @@ def test_deploy_default_runtime_preserved(tmp_path, monkeypatch: pytest.MonkeyPa
     result = runner.invoke(app, ["deploy", str(f)])
 
     assert result.exit_code == 0, result.output
-    # Existing behavior: default --runtime is http://localhost:7700, passed through.
-    assert captured["client"].base_url == "http://localhost:7700"
+    # The default --runtime resolves through the SAME resolver as Agent.deploy, so
+    # the CLI and the SDK agree on the local engine URL (127.0.0.1:7700, not localhost).
+    assert captured["client"].base_url == LOCAL_RUNTIME_URL
     assert captured["client"].api_token is None
 
 
