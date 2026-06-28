@@ -1422,6 +1422,99 @@ nodes:
     type: end
 """,
     },
+    # ── quickstart ────────────────────────────────────────────────────────────
+    "quickstart": {
+        "agent.py": """\
+\"\"\"
+{name} -- a minimal JamJet agent.
+
+Run in-process (no dev server needed):
+    python agent.py
+\"\"\"
+
+from __future__ import annotations
+
+import asyncio
+
+from jamjet import Agent, tool
+
+
+@tool
+async def add(a: float, b: float) -> str:
+    \"\"\"Add two numbers and return the sum.\"\"\"
+    return f"{{a + b:g}}"
+
+
+agent = Agent(
+    "{name}",
+    model="anthropic/claude-sonnet-4-6",
+    tools=[add],
+    instructions="You are a helpful assistant. Use the add tool when asked to sum numbers.",
+    strategy="react",
+)
+
+
+async def main() -> None:
+    result = await agent.run("What is 7 plus 35?")
+    print(result.output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+""",
+        "pyproject.toml": """\
+[project]
+name = "{name}"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["jamjet>=0.10.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+""",
+        "README.md": """\
+# {name}
+
+A minimal JamJet agent built with the `quickstart` template.
+
+## Prerequisites
+
+```bash
+pip install jamjet
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+## Run in-process
+
+```bash
+python agent.py
+```
+
+Runs the agent via `LocalRuntime` -- no server needed.
+
+## Run with the durable engine
+
+Start the local stack:
+
+```bash
+jamjet dev
+```
+
+Then in a second terminal:
+
+```bash
+python agent.py
+```
+
+The durable engine records every turn to SQLite so you can inspect, replay, and fork runs.
+
+```bash
+jamjet inspect <execution-id>
+jamjet events  <execution-id>
+```
+""",
+    },
 }
 
 # ── Public API ────────────────────────────────────────────────────────────────

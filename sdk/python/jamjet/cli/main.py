@@ -248,6 +248,69 @@ def init(
     console.print("  jamjet run workflow.yaml  [dim]# run in another terminal[/dim]")
 
 
+# ── create ───────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def create(
+    name: str = typer.Argument(..., help="Name for the new agent project (creates a directory <name>/)."),
+    template: str = typer.Option(
+        "quickstart",
+        "--template",
+        "-t",
+        help="Starter template. Run `jamjet init --list-templates` to see all options.",
+    ),
+) -> None:
+    """Scaffold a new agent project directory from a template.
+
+    Creates <name>/ and writes the template files into it. Fails if the directory
+    already exists so you never overwrite existing work.
+
+    Example:
+        jamjet create my-agent
+        cd my-agent
+        jamjet dev
+    """
+    import os
+
+    from jamjet.templates import AVAILABLE_TEMPLATES, render_template
+
+    if template not in AVAILABLE_TEMPLATES:
+        console.print(
+            f"[red]Error:[/red] unknown template '{template}'. "
+            f"Run [bold]jamjet init --list-templates[/bold] to see options."
+        )
+        raise typer.Exit(1)
+
+    project_dir = os.path.join(os.getcwd(), name)
+    if os.path.exists(project_dir):
+        console.print(
+            f"[red]Error:[/red] directory '{name}' already exists. "
+            "Choose a different name or remove the existing directory."
+        )
+        raise typer.Exit(1)
+
+    os.makedirs(project_dir)
+
+    files = render_template(template, name)
+    written: list[str] = []
+    for rel_path, content in files.items():
+        abs_path = os.path.join(project_dir, rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, "w") as fh:
+            fh.write(content)
+        written.append(rel_path)
+
+    console.print(f"[green]✓[/green] Created [bold]{name}[/bold] from template [bold]{template}[/bold]")
+    for rel_path in written:
+        console.print(f"  [dim]{rel_path}[/dim]")
+    console.print()
+    console.print("[bold]Next steps:[/bold]")
+    console.print(f"  cd {name}")
+    console.print("  jamjet dev               [dim]# start the runtime[/dim]")
+    console.print("  python agent.py          [dim]# run your agent[/dim]")
+
+
 # ── dev ──────────────────────────────────────────────────────────────────────
 
 
