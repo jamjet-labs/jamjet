@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from jamjet.agents.agent import Agent, AgentResult
+    from jamjet.agents.artifacts import ArtifactStore
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -68,6 +69,41 @@ class Session:
     def append_message(self, role: str, content: str) -> None:
         """Append a ``{"role", "content"}`` dict to the message thread."""
         self.messages.append({"role": role, "content": content})
+
+    def attach_client(self, client: Any) -> ArtifactStore:
+        """Bind a :class:`~jamjet.client.JamjetClient` (or compatible object)
+        so :attr:`artifacts` stores/fetches through *client*.
+
+        Returns the :class:`~jamjet.agents.artifacts.ArtifactStore` now backing
+        :attr:`artifacts`.
+        """
+        from jamjet.agents.artifacts import ArtifactStore
+
+        store = ArtifactStore(client)
+        self._artifacts = store
+        return store
+
+    @property
+    def artifacts(self) -> ArtifactStore:
+        """Artifact namespace for this session.
+
+        ``await session.artifacts.put(data, media_type)`` stores bytes and
+        returns an :class:`~jamjet.client.ArtifactRef`;
+        ``await session.artifacts.get(hash)`` fetches them back.
+
+        Lazily builds an :class:`~jamjet.agents.artifacts.ArtifactStore` over a
+        default :class:`~jamjet.client.JamjetClient` (``http://localhost:7700``)
+        on first use; call :meth:`attach_client` first to target a specific
+        runtime (or to inject a stub in tests).
+        """
+        store = getattr(self, "_artifacts", None)
+        if store is None:
+            from jamjet.agents.artifacts import ArtifactStore
+            from jamjet.client import JamjetClient
+
+            store = ArtifactStore(JamjetClient())
+            self._artifacts = store
+        return store
 
     async def run(
         self,

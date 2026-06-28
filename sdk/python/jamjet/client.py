@@ -7,9 +7,27 @@ Used by the CLI and the SDK to communicate with a running JamJet runtime.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
+
+
+@dataclass(frozen=True)
+class ArtifactRef:
+    """A reference to a content-addressed artifact in the JamJet CAS.
+
+    Mirrors the Rust ``ArtifactRef`` returned by ``POST /artifacts``.
+
+    Attributes:
+        hash: SHA-256 hex of the stored bytes (64 lowercase hex chars).
+        size: Byte length of the stored content.
+        media_type: Optional MIME type recorded at store time.
+    """
+
+    hash: str
+    size: int
+    media_type: str | None = None
 
 
 class JamjetClient:
@@ -166,6 +184,39 @@ class JamjetClient:
         )
         r.raise_for_status()
         return r.json()
+
+    # ── Artifacts (content-addressed store) ───────────────────────────────
+
+    async def put_artifact(
+        self,
+        data: bytes,
+        media_type: str | None = None,
+    ) -> ArtifactRef:
+        """Store raw bytes in the tenant-scoped CAS and return an ``ArtifactRef``.
+
+        The bytes are content-addressed: storing identical bytes twice yields
+        the same ``hash``. ``media_type`` is sent as the request ``Content-Type``
+        and echoed back on the returned ref.
+        """
+        headers = {"Content-Type": media_type} if media_type else None
+        r = await self._client.post("/artifacts", content=data, headers=headers)
+        r.raise_for_status()
+        j = r.json()
+        return ArtifactRef(
+            hash=j["hash"],
+            size=int(j["size"]),
+            media_type=j.get("media_type"),
+        )
+
+    async def get_artifact(self, hash: str) -> bytes:
+        """Fetch artifact bytes by hash from the tenant-scoped CAS.
+
+        Raises ``httpx.HTTPStatusError`` (404) when no artifact with that hash
+        exists for the caller's tenant.
+        """
+        r = await self._client.get(f"/artifacts/{hash}")
+        r.raise_for_status()
+        return r.content
 
     # ── Agents ────────────────────────────────────────────────────────────
 

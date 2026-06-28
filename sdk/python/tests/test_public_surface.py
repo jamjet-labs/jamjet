@@ -28,6 +28,8 @@ def test_public_surface_complete():
         "deploy",
         "Session",
         "SessionStore",
+        "ArtifactRef",
+        "ArtifactStore",
     }
     public_attrs = {n for n in dir(jamjet) if not n.startswith("_")}
     missing = expected - public_attrs
