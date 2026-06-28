@@ -9,7 +9,7 @@ from jamjet.spec import AgentSpec, AgentStrategy, LLMConfig
 async def test_local_runtime_executes_agent_spec(monkeypatch):
     """AgentSpec → strategy executor path. Uses fake LLM via monkeypatch."""
 
-    async def fake_runner(*, adapter, spec, prompt, tools, tool_calls_log):
+    async def fake_runner(*, adapter, spec, prompt, tools, tool_calls_log, initial_messages=None):
         return f"echo: {prompt}"
 
     monkeypatch.setattr(

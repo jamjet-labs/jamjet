@@ -715,3 +715,94 @@ async fn tenant_scoped_dangling_ref_returns_error_no_panic() {
         "dangling ref via TenantScopedSqliteBackend must return Err, never panic"
     );
 }
+
+// == Group F: Canonical media_type on a deduped put ===========================
+//
+// put_artifact is INSERT OR IGNORE on (tenant_id, hash): a second put of the
+// SAME bytes with a DIFFERENT media_type keeps the original row, so the
+// returned ArtifactRef must carry the FIRST (stored) media_type — never the
+// new request's value that was never persisted. Covers all three backends.
+
+#[tokio::test]
+async fn sqlite_deduped_put_returns_stored_media_type() {
+    let db = open_db().await;
+    let bytes = b"canonical media type payload";
+
+    let ref1 = db.put_artifact(bytes, Some("text/plain")).await.unwrap();
+    assert_eq!(ref1.media_type, Some("text/plain".to_string()));
+
+    // Second put of identical bytes with a DIFFERENT media type.
+    let ref2 = db
+        .put_artifact(bytes, Some("application/json"))
+        .await
+        .unwrap();
+    assert_eq!(ref1.hash, ref2.hash, "same bytes must dedupe to one hash");
+    assert_eq!(
+        ref2.media_type,
+        Some("text/plain".to_string()),
+        "deduped put must return the stored media type, not the new request's"
+    );
+}
+
+/// First store with NO media_type, then re-put the same bytes WITH one: the
+/// stored value (NULL) wins, so the returned ref must be None — exercises the
+/// nullable read-back path.
+#[tokio::test]
+async fn sqlite_deduped_put_returns_stored_null_media_type() {
+    let db = open_db().await;
+    let bytes = b"null media type payload";
+
+    let ref1 = db.put_artifact(bytes, None).await.unwrap();
+    assert_eq!(ref1.media_type, None);
+
+    let ref2 = db.put_artifact(bytes, Some("text/plain")).await.unwrap();
+    assert_eq!(
+        ref2.media_type, None,
+        "stored NULL media type must win over a later request's value"
+    );
+}
+
+#[tokio::test]
+async fn memory_deduped_put_returns_stored_media_type() {
+    let backend = InMemoryBackend::new();
+    let bytes = b"in-memory canonical media type";
+
+    let ref1 = backend
+        .put_artifact(bytes, Some("text/plain"))
+        .await
+        .unwrap();
+    let ref2 = backend
+        .put_artifact(bytes, Some("application/json"))
+        .await
+        .unwrap();
+
+    assert_eq!(ref1.hash, ref2.hash);
+    assert_eq!(
+        ref2.media_type,
+        Some("text/plain".to_string()),
+        "in-memory deduped put must return the stored media type"
+    );
+}
+
+#[tokio::test]
+async fn tenant_scoped_deduped_put_returns_stored_media_type() {
+    let db = open_db().await;
+    let backend = db.for_tenant(TenantId::from("tenant-mt"));
+    let bytes = b"tenant canonical media type";
+
+    let ref1 = backend
+        .put_artifact(bytes, Some("text/plain"))
+        .await
+        .unwrap();
+    let ref2 = backend
+        .put_artifact(bytes, Some("application/json"))
+        .await
+        .unwrap();
+
+    assert_eq!(ref1.hash, ref2.hash);
+    assert_eq!(
+        ref2.media_type,
+        Some("text/plain".to_string()),
+        "tenant-scoped deduped put must return the stored media type"
+    );
+}

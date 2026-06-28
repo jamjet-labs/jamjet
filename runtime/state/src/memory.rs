@@ -336,13 +336,20 @@ impl StateBackend for InMemoryBackend {
         let hash = crate::hashing::sha256_hex(bytes);
         let size = bytes.len() as u64;
         // Dedupe: only insert if not already present (INSERT OR IGNORE semantics).
-        self.artifacts
-            .entry(("default".to_string(), hash.clone()))
-            .or_insert_with(|| (bytes.to_vec(), media_type.map(|s| s.to_string())));
+        // Read the canonical (FIRST-stored) media_type back out so a second put of
+        // the same bytes with a different media_type returns what is actually
+        // stored, not this request's value (mirrors the SQLite backends).
+        let stored_media_type = {
+            let entry = self
+                .artifacts
+                .entry(("default".to_string(), hash.clone()))
+                .or_insert_with(|| (bytes.to_vec(), media_type.map(|s| s.to_string())));
+            entry.1.clone()
+        };
         Ok(crate::artifact::ArtifactRef {
             hash,
             size,
-            media_type: media_type.map(|s| s.to_string()),
+            media_type: stored_media_type,
         })
     }
 

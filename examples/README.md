@@ -17,6 +17,10 @@ Numbered examples in this directory:
 Each example is self-contained. The fifth example includes its own virtual
 environment setup script and runs without a model API key.
 
+## Sessions, memory, artifacts
+
+- `session-memory/` - An agent with a persistent `Session` running across two turns. The second turn receives the full prior thread (session continuity), a retrieved memory block (Engram recall), and fetches an artifact stored before a simulated restart. Demo mode requires no API key. See `session-memory/README.md`.
+
 ## Durable agents (Python)
 
 - `react-agent-durable/` - a ReAct-style `Agent` (model + two `@tool` functions +

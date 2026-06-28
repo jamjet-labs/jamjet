@@ -11,6 +11,13 @@ from typing import Any, Protocol, runtime_checkable
 from jamjet.runtime.local.llm_adapters.base import LLMAdapter
 from jamjet.spec import AgentSpec, ToolSpec
 
+# Leading text of the retrieved-memory system block injected by
+# ``Agent._inject_memory_block`` (T4-3).  ``seed_history`` uses it to tell the
+# injected memory block apart from the agent-instruction system slot so it never
+# clobbers recall.  Kept here (the lowest-level consumer) so both sides share one
+# definition; ``_inject_memory_block`` imports it to BUILD the block.
+MEMORY_BLOCK_PREFIX = "Relevant memory from prior sessions:"
+
 
 @runtime_checkable
 class StrategyRunner(Protocol):
@@ -22,6 +29,7 @@ class StrategyRunner(Protocol):
         prompt: str,
         tools: list[dict[str, Any]],
         tool_calls_log: list[dict[str, Any]],
+        initial_messages: list[dict[str, Any]] | None = None,
     ) -> str: ...
 
 
@@ -79,3 +87,71 @@ def _last_assistant_content(messages: list[Any]) -> str:
         if role == "assistant" and content:
             return str(content)
     return ""
+
+
+def seed_history(
+    initial_messages: list[dict[str, Any]] | None,
+    system: str,
+) -> list[dict[str, Any]]:
+    """Leading messages a strategy's GENERATIVE phase should build on.
+
+    Session / memory continuity (C1).  When *initial_messages* is provided it is
+    the carried thread built by ``agents.session.seed_messages_for_run`` (and,
+    when memory is on, ``Agent._inject_memory_block``)::
+
+        [{"role": "system",    "content": <agent instructions>},
+         {"role": "system",    "content": "Relevant memory ..."},   # optional
+         {"role": "user",      "content": "<prior turn 1>"},
+         {"role": "assistant", "content": "<prior reply 1>"},
+         ...
+         {"role": "user",      "content": "<new prompt>"}]          # trailing
+
+    This returns that thread with two adjustments so a multi-phase strategy can
+    layer its own phase prompt on top while the model still sees the conversation
+    so far + any retrieved memory (matching ``react``'s behaviour):
+
+    1. The **trailing new-user prompt is dropped** — the strategy re-frames it
+       into its own phase prompt and appends that itself.
+    2. The **agent-instruction system slot is swapped for *system*** — so a
+       phase's role augmentation ("You are the proposer", "agent N of M") is
+       preserved, while any injected memory block and every prior user/assistant
+       turn are kept.
+
+    Distinguishing the instruction slot from the memory block (the Track-4 fix).
+    ``seed_messages_for_run`` only emits the instruction system slot when the
+    agent's instructions are NON-empty; for a memory-enabled run with EMPTY
+    instructions the FIRST system message is the injected memory block, not the
+    persona.  So we replace the leading system message ONLY when it is the
+    instruction slot (identified by NOT starting with
+    :data:`MEMORY_BLOCK_PREFIX`); otherwise we PREPEND *system*, keeping the
+    memory block intact.  Replacing blindly would drop recall for every non-react
+    strategy whenever instructions are empty.
+
+    When *initial_messages* is ``None`` (a fresh, sessionless run) it returns the
+    single default system block ``[{"role": "system", "content": system}]`` — the
+    prior per-strategy behaviour, unchanged.
+
+    NOTE: meta phases that intentionally use a DIFFERENT system persona (critic,
+    judge, devil's-advocate, self-evaluator) do NOT call this — they evaluate the
+    draft text a generative phase already produced, so they keep their own system
+    and need no history.
+    """
+    if not initial_messages:
+        return [{"role": "system", "content": system}]
+    # Copy each carried message so the strategy can append/extend freely without
+    # mutating the caller's seed list.
+    prefix = [dict(m) for m in initial_messages[:-1]]
+    leads_with_instruction_slot = (
+        bool(prefix)
+        and prefix[0].get("role") == "system"
+        and not str(prefix[0].get("content", "")).startswith(MEMORY_BLOCK_PREFIX)
+    )
+    if leads_with_instruction_slot:
+        # Swap the agent-instruction slot for the phase persona.
+        prefix[0] = {"role": "system", "content": system}
+    else:
+        # No instruction slot to swap (empty instructions, so the lead is the
+        # memory block, or no leading system at all): prepend the persona and keep
+        # the memory block / turns untouched.
+        prefix.insert(0, {"role": "system", "content": system})
+    return prefix

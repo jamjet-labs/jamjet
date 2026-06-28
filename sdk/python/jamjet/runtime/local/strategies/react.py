@@ -20,14 +20,20 @@ async def run(
     prompt: str,
     tools: list[dict[str, Any]],
     tool_calls_log: list[dict[str, Any]],
+    initial_messages: list[dict[str, Any]] | None = None,
 ) -> str:
     tool_map = resolve_tool_map(spec.tools)
     max_iter = spec.limits.get("max_iterations", 10)
 
-    messages: list[Any] = []
-    if spec.instructions:
-        messages.append({"role": "system", "content": spec.instructions})
-    messages.append({"role": "user", "content": prompt})
+    if initial_messages is not None:
+        # Session continuation: initial_messages already contains the system
+        # message and all prior turns with the new user prompt appended.
+        messages: list[Any] = list(initial_messages)
+    else:
+        messages = []
+        if spec.instructions:
+            messages.append({"role": "system", "content": spec.instructions})
+        messages.append({"role": "user", "content": prompt})
 
     for _ in range(max_iter):
         msg = await adapter.generate(messages, tools=tools or None)

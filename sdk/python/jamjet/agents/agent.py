@@ -33,14 +33,17 @@ import json
 import time
 import warnings
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from jamjet.agents.governance import Budget, GovernanceConfig, normalize_governance
+from jamjet.agents.session import Session, SessionStore, persist_session_turn, seed_messages_for_run
 from jamjet.compiler.strategies import StrategyLimits
 from jamjet.runtime.local import LocalRuntime
 from jamjet.tools.decorators import ToolDefinition
 
 if TYPE_CHECKING:
+    from jamjet.memory.engram_bridge import AgentMemory
     from jamjet.spec import AgentSpec
 
 # Terminal execution statuses (WorkflowStatus, snake_case) the durable poll stops on.
@@ -84,6 +87,22 @@ class Agent:
         # is always attached to the run result regardless.  Defaults to None so
         # receipts ship nowhere noisy by default while still being produced.
         receipt_emitter: Callable[[dict[str, Any]], None] | None = None,
+        # T4-2: optional SessionStore for resolving str session ids and for
+        # auto-saving sessions after run()/run_durable().  When None, a default
+        # SessionStore() (~/.jamjet/sessions.db) is created lazily on first use.
+        # Callers that pass Session objects directly and manage persistence
+        # themselves can still omit this; the agent only touches the store when
+        # session= is set on a run call.
+        session_store: SessionStore | None = None,
+        # T4-3: opt-in Engram memory with an AUTOMATIC, GOVERNED retrieve-at-
+        # start / record-at-end loop keyed by the session id.  OFF by default.
+        #   None / False        -> no memory (default; no behaviour change).
+        #   True                -> the default embedded Engram bridge (opened
+        #                          lazily on first run; FAILS LOUD here if the
+        #                          optional jamjet-engram extra is not installed).
+        #   an AgentMemory-like -> used as-is (duck-typed, so a fake can be
+        #                          injected in tests without a real Engram).
+        memory: bool | AgentMemory | None = None,
     ) -> None:
         self.name = name
         self.model = model
@@ -91,6 +110,35 @@ class Agent:
         self.strategy = strategy
         self._on_limit_exceeded = on_limit_exceeded
         self._receipt_emitter = receipt_emitter
+        self._session_store: SessionStore | None = session_store
+
+        # T4-3: resolve the memory= knob.  See the constructor docstring above.
+        # The default embedded Engram (memory=True) is opened LAZILY on the first
+        # run because Engram.open is async and __init__ is sync; we only verify
+        # the optional extra is importable HERE so the failure is loud and early.
+        self._memory_enabled: bool = False
+        self._memory_resolved: AgentMemory | None = None
+        self._engram: Any | None = None  # the lazily-opened embedded Engram (memory=True)
+        # Serializes the FIRST embedded-Engram init so two concurrent first runs
+        # open it exactly once (see _ensure_memory).  Created lazily inside the
+        # running loop to stay loop-agnostic across separate asyncio.run() calls.
+        self._memory_lock: asyncio.Lock | None = None
+        if memory is None or memory is False:
+            self._memory_enabled = False
+        elif memory is True:
+            try:
+                import engram  # noqa: F401, PLC0415
+            except ImportError as e:
+                raise ImportError(
+                    "Agent(memory=True) requires the optional 'memory' extra "
+                    "(jamjet-engram). Install with: pip install 'jamjet[memory]'."
+                ) from e
+            self._memory_enabled = True
+        else:
+            # A memory backend object: a real AgentMemory or a duck-typed fake.
+            self._memory_resolved = memory
+            self._memory_enabled = True
+
         self.limits = StrategyLimits(
             max_iterations=max_iterations,
             max_cost_usd=max_cost_usd,
@@ -222,15 +270,270 @@ class Agent:
             tool_calls=result.tool_calls,
         )
 
+    # ── Session helpers (T4-2) ────────────────────────────────────────────
+
+    def _get_default_store(self) -> SessionStore:
+        """Return the agent's SessionStore, creating a default one lazily."""
+        if self._session_store is None:
+            self._session_store = SessionStore()
+        return self._session_store
+
+    def _resolve_session(self, session: Session | str | None) -> Session | None:
+        """Return a Session object.
+
+        - ``None`` -> ``None`` (no session, default path unchanged).
+        - :class:`Session` -> returned as-is (caller owns persistence).  A Session
+          loaded from a store carries a back-reference to that store (set by
+          ``SessionStore.load``/``create``), so the run persists it back there.
+        - ``str`` -> loaded from the agent's session store; raises
+          ``ValueError`` if not found.
+        """
+        if session is None:
+            return None
+        if isinstance(session, Session):
+            return session
+        # str session id: resolve from store
+        store = self._get_default_store()
+        loaded = store.load(session)
+        if loaded is None:
+            raise ValueError(
+                f"Session {session!r} not found in the agent's SessionStore. "
+                "Create it first with SessionStore.create()."
+            )
+        return loaded
+
+    def _store_for_session(self, session: Session) -> SessionStore:
+        """The :class:`SessionStore` a run should persist *session* back to.
+
+        A session loaded/created via a ``SessionStore`` carries a back-reference
+        to that store (``session._store``); using it means a session loaded from
+        store X is saved back to X, not silently to the agent's default store.  A
+        bare ``Session(...)`` constructed by the caller has no originating store,
+        so it falls back to the agent's store (documented behaviour).
+        """
+        store = getattr(session, "_store", None)
+        if store is not None:
+            return store
+        return self._get_default_store()
+
+    # ── Memory: governed auto retrieve/record loop (T4-3) ──────────────────
+
+    async def _ensure_memory(self) -> AgentMemory | None:
+        """Return the agent's memory backend, opening the default Engram lazily.
+
+        - memory off          -> ``None``.
+        - an injected backend -> returned as-is (the caller owns its lifecycle).
+        - ``memory=True``     -> open the embedded Engram ONCE and cache an
+          :class:`~jamjet.memory.engram_bridge.AgentMemory` over it.  The same
+          instance is reused across runs so memory persists; close it with
+          :meth:`aclose`.  FAILS LOUD if the optional extra is missing (already
+          verified at ``__init__``, re-guarded here for safety).
+        """
+        if not self._memory_enabled:
+            return None
+        if self._memory_resolved is not None:
+            return self._memory_resolved
+        # Serialize the first init: two concurrent first runs both see
+        # _memory_resolved is None, so without a lock each would await
+        # Engram.open(), leaking a handle and breaking open-once.  Create the lock
+        # lazily here (a pure sync check, race-free in the single-threaded loop);
+        # after the first init succeeds _memory_resolved short-circuits above so
+        # the lock is never taken again.
+        if self._memory_lock is None:
+            self._memory_lock = asyncio.Lock()
+        async with self._memory_lock:
+            # Double-checked: a racing first run may have opened it while we waited.
+            if self._memory_resolved is not None:
+                return self._memory_resolved
+            try:
+                from engram import Engram  # noqa: PLC0415
+                from engram import Scope as EngramScope  # noqa: PLC0415
+            except ImportError as e:  # pragma: no cover - guarded at __init__
+                raise ImportError(
+                    "Agent(memory=True) requires the optional 'memory' extra "
+                    "(jamjet-engram). Install with: pip install 'jamjet[memory]'."
+                ) from e
+            from jamjet.memory.engram_bridge import AgentMemory  # noqa: PLC0415
+            from jamjet.spec import MemoryConfig  # noqa: PLC0415
+
+            db_path = Path.home() / ".jamjet" / "engram.db"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            engram = await Engram.open(path=str(db_path))
+            self._engram = engram
+            # The per-run memory KEY is the stable session id, applied at call time
+            # via as_scope() (Engram retrieval filters by scope); org defaults here.
+            self._memory_resolved = AgentMemory(
+                engram,
+                scope=EngramScope(user_id="default", org_id="default"),
+                config=MemoryConfig(),
+            )
+            return self._memory_resolved
+
+    async def _prepare_run(
+        self,
+        session: Session | str | None,
+        prompt: str,
+    ) -> tuple[Session | None, AgentMemory | None, list[dict[str, Any]] | None]:
+        """Resolve session + memory and build the seed messages for a run.
+
+        Returns ``(resolved_session, memory, initial_messages)`` shared by both
+        :meth:`run` (in-process) and :meth:`run_durable` (durable):
+
+        - *memory* is the resolved backend, or ``None`` when memory is off.
+        - When memory is ON it REQUIRES a ``session`` to key on — fail LOUD if
+          none was given.  Memory is keyed by the stable ``session.id`` so it
+          persists and is retrievable across runs; an ephemeral per-run key
+          would never retrieve, silently defeating cross-run memory.
+        - *initial_messages* carries the session thread (T4-2) and, when memory
+          is on, the AUTO-RETRIEVED "Relevant memory" block prepended after the
+          system instruction.  ``None`` means the default scratch seed (no
+          session, no memory) — existing behaviour unchanged.
+        """
+        resolved_session = self._resolve_session(session)
+
+        # Memory requires a session to key on.  Do this fail-loud check BEFORE
+        # opening any Engram handle: ``memory=True`` opens a DB handle inside
+        # ``_ensure_memory`` (cached for the agent's lifetime), so raising first
+        # means the no-session error path never leaks an open handle.  We key off
+        # ``self._memory_enabled`` (set at __init__) rather than the resolved
+        # backend so we never construct it on the error path.
+        if self._memory_enabled and resolved_session is None:
+            raise RuntimeError(
+                f"Agent {self.name!r}: memory= is enabled but no session= was "
+                "provided to the run. Memory is keyed by the stable session.id so "
+                "it can persist and be retrieved across runs; an ephemeral per-run "
+                "key would never retrieve. Pass session=<Session or id> to "
+                "run()/run_durable(), or drop memory= for a stateless run."
+            )
+
+        memory = await self._ensure_memory()
+
+        system = self.instructions or "You are a helpful assistant."
+        initial_messages: list[dict[str, Any]] | None = None
+        if resolved_session is not None:
+            initial_messages = seed_messages_for_run(resolved_session, system, prompt)
+
+        if memory is not None and resolved_session is not None:
+            ctx = await self._memory_retrieve(memory, resolved_session.id, prompt)
+            if ctx:
+                initial_messages = self._inject_memory_block(initial_messages, ctx)
+
+        return resolved_session, memory, initial_messages
+
+    async def _memory_retrieve(self, memory: AgentMemory, session_id: str, query: str) -> str:
+        """Retrieve a context block for *query*, keyed (scoped) by *session_id*.
+
+        The read is scoped to the stable session id via ``as_scope`` (Engram
+        retrieval filters by scope — see ``memory/engram_bridge.py``), so a run
+        only sees memory written under the same session.  Returns the
+        token-budgeted context block (possibly an empty string).
+        """
+        with memory.as_scope(user_id=session_id) as scoped:
+            ctx = await scoped.context(query=query)
+        return ctx or ""
+
+    async def _record_turn(
+        self,
+        memory: AgentMemory,
+        session_id: str,
+        prompt: str,
+        output: Any,
+    ) -> None:
+        """Record this turn to memory, keyed by *session_id*, PII-REDACTED.
+
+        Governance: the user prompt and the assistant output are PII-redacted
+        (the Track-3 redactor, :meth:`_redact_for_memory`) BEFORE the write, so
+        raw PII never lands in the durable temporal KG.  Both records are scoped
+        to the stable session id.
+        """
+        user_text = self._redact_for_memory(prompt)
+        with memory.as_scope(user_id=session_id) as scoped:
+            await scoped.record(user_text, role="user")
+            if output is not None and str(output):
+                assistant_text = self._redact_for_memory(str(output))
+                await scoped.record(assistant_text, role="assistant")
+
+    def _redact_for_memory(self, text: str) -> str:
+        """Redact PII from *text* before a memory write (governed write).
+
+        Uses the same conservative, high-signal PII types as the model seam
+        (``jamjet.model.pii``) so memory redaction matches outbound-prompt
+        redaction.  Respects ``governance.pii``: when PII governance is disabled
+        the caller has opted out and the text is written verbatim, consistent
+        with the model seam (which only redacts when ``pii`` is on).
+        """
+        if not self.governance.pii:
+            return text
+        from jamjet.cloud.middleware.pii import RegexDetector  # noqa: PLC0415
+        from jamjet.model.pii import _DEFAULT_PII_TYPES  # noqa: PLC0415
+
+        return RegexDetector(types=list(_DEFAULT_PII_TYPES)).redact(text)
+
+    @staticmethod
+    def _inject_memory_block(messages: list[dict[str, Any]] | None, ctx: str) -> list[dict[str, Any]]:
+        """Insert a 'Relevant memory' system block into the seed *messages*.
+
+        The block is placed right after the agent's system instruction (when one
+        is present) so the model sees prior-session knowledge before the
+        conversation thread.  It is tagged with :data:`MEMORY_BLOCK_PREFIX` so the
+        non-react strategies' ``seed_history`` can tell it apart from the
+        instruction slot and never clobber it (see ``strategies/base.py``).
+        """
+        from jamjet.runtime.local.strategies.base import MEMORY_BLOCK_PREFIX  # noqa: PLC0415
+
+        block = {"role": "system", "content": f"{MEMORY_BLOCK_PREFIX}\n{ctx}"}
+        msgs = list(messages or [])
+        if msgs and msgs[0].get("role") == "system":
+            return [msgs[0], block, *msgs[1:]]
+        return [block, *msgs]
+
+    async def aclose(self) -> None:
+        """Close the embedded Engram opened by ``memory=True`` (if any).
+
+        Injected memory backends are owned by the caller and are NOT closed
+        here.  Safe to call when memory is off (no-op).
+        """
+        engram = self._engram
+        if engram is not None:
+            self._engram = None
+            await engram.close()
+
     # ── Public run interface ───────────────────────────────────────────────
 
-    async def run(self, prompt: str) -> AgentResult:
+    async def run(self, prompt: str, *, session: Session | str | None = None) -> AgentResult:
         """
         Run the agent on a single prompt via LocalRuntime.
 
         Compiles to AgentSpec, hands off to LocalRuntime which dispatches to
         the appropriate strategy runner. Emits a signed-audit-aligned
         AgentBoundary receipt for the turn (on by default).
+
+        T4-2 — Session continuation
+        ---------------------------
+        When *session* is provided (a :class:`~jamjet.agents.session.Session`
+        object or a session id string), the run CONTINUES the session's
+        conversation thread instead of re-seeding from scratch.  The model
+        receives the full prior thread followed by the new user prompt.  After
+        the run the session is updated with the new turn and persisted.
+
+        T4-3 — Memory (``memory=``)
+        ---------------------------
+        When the agent was built with ``memory=`` (a bool or an
+        :class:`~jamjet.memory.engram_bridge.AgentMemory`), the run runs an
+        AUTOMATIC, GOVERNED loop keyed by the stable ``session.id``: it RETRIEVES
+        a "Relevant memory" context block and injects it before the thread
+        (retrieve-at-start), then RECORDS the turn after the run
+        (record-at-end), PII-REDACTED so no raw PII is written to the temporal
+        KG.  Memory requires a ``session`` to key on (fail-loud if absent) and is
+        OFF by default.
+
+        Args:
+            prompt: The user turn to run.
+            session: Optional session to continue.  Pass a
+                     :class:`~jamjet.agents.session.Session` object (caller
+                     manages the store) or a ``str`` session id (resolved via
+                     the agent's ``session_store``).  ``None`` (default) runs
+                     from scratch — existing behaviour unchanged.
         """
         # T3-6: approval_required parity — the in-process path cannot enforce
         # tool-level approval gates (the @gate mechanism is opt-in per function;
@@ -249,6 +552,12 @@ class Agent:
                 UserWarning,
                 stacklevel=2,
             )
+
+        # T4-2/T4-3: resolve session + memory and build the seed messages.  The
+        # seed carries the session thread (T4-2) plus, when memory is on, the
+        # auto-retrieved "Relevant memory" block (T4-3 retrieve-at-start).
+        resolved_session, memory, initial_messages = await self._prepare_run(session, prompt)
+
         spec = self.compile()
         rt = LocalRuntime()
         # T3-7: thread governance into the in-process seam so budget / allowlist
@@ -256,7 +565,12 @@ class Agent:
         # (the durable IR).  Without this the seam was built allow-all / no-budget
         # and the budget + policy knobs silently no-opped on the in-process path
         # (the gap deferred from T3-2).
-        result = await rt.execute(spec, prompt, governance=self.governance)
+        result = await rt.execute(
+            spec,
+            prompt,
+            governance=self.governance,
+            initial_messages=initial_messages,
+        )
         receipt = self._maybe_mint_receipt(prompt, result.output)
         agent_result = AgentResult(
             output=result.output,
@@ -266,6 +580,24 @@ class Agent:
             receipt=receipt,
         )
         agent_result.audit = self._maybe_emit_audit(prompt, agent_result, execution_id=result.execution_id)
+
+        # T4-2: persist the session turn (in-process path: no full_messages).
+        if resolved_session is not None:
+            store = self._store_for_session(resolved_session)
+            persist_session_turn(
+                resolved_session,
+                prompt,
+                agent_result.output,
+                result.execution_id,
+                full_messages=None,  # in-process path; reconstruct from prompt+output
+                store=store,
+            )
+
+        # T4-3: record-at-end — write this turn to memory keyed by session.id,
+        # PII-redacted (governed write).  No-op when memory is off.
+        if memory is not None and resolved_session is not None:
+            await self._record_turn(memory, resolved_session.id, prompt, agent_result.output)
+
         return agent_result
 
     def run_sync(self, prompt: str) -> AgentResult:
@@ -278,6 +610,7 @@ class Agent:
         *,
         max_turns: int = 8,
         runtime_url: str = "http://127.0.0.1:7700",
+        session: Session | str | None = None,
     ) -> AgentResult:
         """Run the agent durably on the JamJet engine, mirroring :meth:`run`.
 
@@ -293,6 +626,14 @@ class Agent:
         and tool dispatch through the durable event-sourced engine, so the run
         gets the event log, replay, idempotency, park-on-429, and artifacts for
         free.
+
+        T4-2 — Session continuation
+        ---------------------------
+        Same carried-state contract as :meth:`run`.  When *session* is provided
+        the run is seeded from the session's persisted ``messages`` thread plus
+        the new user prompt.  After the run the full ``messages`` ledger from
+        ``current_state`` (which includes all tool turns) is persisted back to
+        the session.
 
         v1 limitations
         --------------
@@ -323,8 +664,15 @@ class Agent:
         from jamjet.client import JamjetClient  # noqa: PLC0415 - patch point / avoid import cycle
         from jamjet.compiler.agent_ir import build_initial_state, compile_agent_to_ir  # noqa: PLC0415
 
+        # T4-2/T4-3: resolve session + memory and build the seed (session thread
+        # plus the auto-retrieved "Relevant memory" block when memory is on).
+        resolved_session, memory, seeded_messages = await self._prepare_run(session, prompt)
+        if seeded_messages is not None:
+            initial_input = build_initial_state(self, prompt, initial_messages=seeded_messages)
+        else:
+            initial_input = build_initial_state(self, prompt)
+
         ir = compile_agent_to_ir(self, prompt, max_turns)
-        initial_input = build_initial_state(self, prompt)
         workflow_id: str = ir["workflow_id"]
         workflow_version: str | None = ir.get("version")
 
@@ -352,6 +700,27 @@ class Agent:
         # durable run's extracted result (both on by default), mirroring run().
         result.receipt = self._maybe_mint_receipt(prompt, result.output)
         result.audit = self._maybe_emit_audit(prompt, result, execution_id=exec_id)
+
+        # T4-2: persist the session with the full messages from the engine
+        # (durable path has the complete tool-interleaved thread in current_state).
+        if resolved_session is not None:
+            state = execution.get("current_state") or {}
+            full_messages: list[dict[str, Any]] | None = state.get("messages")
+            store = self._store_for_session(resolved_session)
+            persist_session_turn(
+                resolved_session,
+                prompt,
+                result.output,
+                exec_id,
+                full_messages=full_messages,
+                store=store,
+            )
+
+        # T4-3: record-at-end — write this turn to memory keyed by session.id,
+        # PII-redacted (governed write).  No-op when memory is off.
+        if memory is not None and resolved_session is not None:
+            await self._record_turn(memory, resolved_session.id, prompt, result.output)
+
         return result
 
     async def _poll_to_terminal(self, client: Any, exec_id: str) -> dict[str, Any]:

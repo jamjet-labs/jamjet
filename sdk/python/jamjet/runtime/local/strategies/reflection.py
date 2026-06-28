@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from jamjet.runtime.local.llm_adapters.base import LLMAdapter
-from jamjet.runtime.local.strategies.base import execute_tool_calls, resolve_tool_map
+from jamjet.runtime.local.strategies.base import execute_tool_calls, resolve_tool_map, seed_history
 from jamjet.spec import AgentSpec
 
 
@@ -16,6 +16,7 @@ async def run(
     prompt: str,
     tools: list[dict[str, Any]],
     tool_calls_log: list[dict[str, Any]],
+    initial_messages: list[dict[str, Any]] | None = None,
 ) -> str:
     tool_map = resolve_tool_map(spec.tools)
     max_iter = spec.limits.get("max_iterations", 10)
@@ -33,8 +34,12 @@ async def run(
                 f"Your self-reflection:\n{reflection}\n\n"
                 "Revise your answer based on the reflection. Return only the improved answer."
             )
+        # Session/memory continuity (C1): the execute phase speaks as the agent,
+        # so it builds on the carried conversation history + retrieved memory
+        # before its prompt. The self-evaluator phase keeps its own persona and
+        # reflects on the produced answer, so it needs no history.
         exec_msgs: list[Any] = [
-            {"role": "system", "content": system},
+            *seed_history(initial_messages, system),
             {"role": "user", "content": exec_prompt},
         ]
         for _ in range(max_iter):

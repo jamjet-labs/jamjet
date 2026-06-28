@@ -42,6 +42,7 @@ class LocalRuntime:
         scope: Scope | None = None,
         on_event: Callable[[RuntimeEvent], None] | None = None,
         governance: GovernanceConfig | None = None,
+        initial_messages: list[dict[str, Any]] | None = None,
     ) -> RuntimeResult:
         eid = execution_id or str(uuid.uuid4())
         t0 = time.perf_counter()
@@ -61,6 +62,7 @@ class LocalRuntime:
                 eid,
                 on_event,
                 governance,
+                initial_messages=initial_messages,
             )
         elif isinstance(spec, WorkflowSpec):
             output, steps, tool_calls, llm_calls = await self._run_workflow(
@@ -100,6 +102,8 @@ class LocalRuntime:
         eid: str,
         on_event: Any,
         governance: GovernanceConfig | None = None,
+        *,
+        initial_messages: list[dict[str, Any]] | None = None,
     ) -> tuple[Any, list[StepRecord], list[ToolCallRecord], list[LLMCallRecord]]:
         # T3-7: thread the agent's GovernanceConfig into the seam-backed adapter
         # so budget / allowlist / PII enforce on the in-process path (agent.run),
@@ -116,6 +120,7 @@ class LocalRuntime:
             prompt=prompt,
             tools=openai_tools,
             tool_calls_log=tool_calls_log,
+            initial_messages=initial_messages,
         )
         tool_calls = [
             ToolCallRecord(

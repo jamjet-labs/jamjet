@@ -23,7 +23,9 @@ class FakeLocalRuntime:
     name = "local"
     supported_ir_versions = ("1.0",)
 
-    async def execute(self, spec, input, *, execution_id=None, scope=None, on_event=None, governance=None):
+    async def execute(
+        self, spec, input, *, execution_id=None, scope=None, on_event=None, governance=None, initial_messages=None
+    ):
         return RuntimeResult(
             output=_OUTPUT,
             execution_id="ex1",

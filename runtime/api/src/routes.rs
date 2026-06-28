@@ -3,12 +3,21 @@ use crate::cron::{create_cron, delete_cron, list_cron};
 use crate::error::ApiError;
 use crate::state::AppState;
 use axum::{
-    extract::{Extension, Path, Query, State},
-    http::StatusCode,
+    body::Bytes,
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
+    http::{header, HeaderMap, StatusCode},
     middleware,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
+
+/// Maximum request body for `POST /artifacts`. Set EXPLICITLY (rather than
+/// inheriting axum's implicit 2 MiB default) so the cap on the content-addressed
+/// store is an intentional contract: artifacts are developer-supplied blobs
+/// (tool outputs, small files), so a few MiB is the sane ceiling. Bodies over
+/// this are rejected with `413 Payload Too Large` before the handler runs.
+const ARTIFACT_MAX_BODY_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 use chrono::Utc;
 use jamjet_agents::{AgentCard, AgentFilter, AgentStatus};
 use jamjet_audit::backend::AuditQuery;
@@ -47,6 +56,13 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
             get(list_approvals_for_execution),
         )
         .route("/executions/:id/external-event", post(send_external_event))
+        // Artifacts (content-addressed store) — tenant-scoped developer API.
+        // The POST carries an explicit body limit (see ARTIFACT_MAX_BODY_BYTES).
+        .route(
+            "/artifacts",
+            post(put_artifact).layer(DefaultBodyLimit::max(ARTIFACT_MAX_BODY_BYTES)),
+        )
+        .route("/artifacts/:hash", get(get_artifact))
         // Agents
         .route("/agents", post(register_agent).get(list_agents))
         .route("/agents/discover", post(discover_agent))
@@ -586,6 +602,73 @@ async fn send_external_event(
     backend.append_event(event).await?;
 
     Ok(Json(json!({ "execution_id": id, "accepted": true })))
+}
+
+// ── Artifacts (content-addressed store) ──────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PutArtifactQuery {
+    /// Optional media type override. When present it wins over the
+    /// `Content-Type` request header.
+    media_type: Option<String>,
+}
+
+/// `POST /artifacts` — store raw bytes in the tenant-scoped content-addressed
+/// store and return the resulting `ArtifactRef` as JSON.
+///
+/// The request body is the raw artifact bytes. The media type is taken from the
+/// `?media_type=` query parameter if present, otherwise from the `Content-Type`
+/// request header. Writes go through the TENANT-SCOPED backend
+/// (`backend_for(&tenant_id)`) so artifacts are isolated per tenant — never the
+/// `'default'`-pinned base path.
+///
+/// Returns `200 { "hash": <sha256 hex>, "size": <bytes>, "media_type": <type|null> }`.
+///
+/// The route carries an explicit `DefaultBodyLimit` of `ARTIFACT_MAX_BODY_BYTES`;
+/// bodies larger than that are rejected with `413` before this handler runs.
+async fn put_artifact(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Query(query): Query<PutArtifactQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let media_type = query.media_type.or_else(|| {
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    });
+    let backend = state.backend_for(&tenant_id);
+    let artifact_ref = backend.put_artifact(&body, media_type.as_deref()).await?;
+    Ok(Json(json!({
+        "hash": artifact_ref.hash,
+        "size": artifact_ref.size,
+        "media_type": artifact_ref.media_type,
+    })))
+}
+
+/// `GET /artifacts/:hash` — fetch artifact bytes from the tenant-scoped store.
+///
+/// Returns `200` with the raw bytes or `404` when no artifact with that hash
+/// exists for the caller's tenant. Reads go through `backend_for(&tenant_id)`
+/// so a tenant can only read its own artifacts.
+///
+/// The response `Content-Type` is `application/octet-stream`: `get_artifact`
+/// yields only the bytes, not the stored media type (that is returned on the
+/// `POST /artifacts` response). Surfacing the media type on GET is a follow-up
+/// (F-2i-media-type) that would need the backend to return it alongside bytes.
+async fn get_artifact(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Path(hash): Path<String>,
+) -> Result<Response, ApiError> {
+    let backend = state.backend_for(&tenant_id);
+    match backend.get_artifact(&hash).await? {
+        // `Vec<u8>` renders as `application/octet-stream` by default.
+        Some(bytes) => Ok(bytes.into_response()),
+        None => Err(ApiError::NotFound(format!("artifact {hash}"))),
+    }
 }
 
 // ── Agents ───────────────────────────────────────────────────────────────────
@@ -1322,4 +1405,137 @@ fn parse_execution_id(s: &str) -> Result<ExecutionId, ApiError> {
     let uuid = uuid::Uuid::parse_str(hex)
         .map_err(|_| ApiError::BadRequest(format!("invalid execution id: {s}")))?;
     Ok(ExecutionId(uuid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+    use jamjet_agents::InMemoryAgentRegistry;
+    use jamjet_audit::{AuditEnricher, NoopAuditBackend};
+    use jamjet_state::InMemoryBackend;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// Build an `AppState` whose `backend_for` returns a DISTINCT in-memory
+    /// backend per tenant id (created on first use). This lets a test prove the
+    /// artifact routes are genuinely tenant-scoped: the real
+    /// `TenantScopedSqliteBackend` binds the tenant inside its SQL, and here a
+    /// per-tenant backend stands in so bytes written under one tenant are
+    /// invisible to another. The dev/prod HTTP middleware pins a single tenant,
+    /// so the handlers are exercised directly with chosen `TenantId`s.
+    fn tenant_routing_state() -> AppState {
+        let backends: Arc<Mutex<HashMap<String, Arc<InMemoryBackend>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let backends_for = backends.clone();
+        let audit: Arc<dyn jamjet_audit::AuditBackend> = Arc::new(NoopAuditBackend);
+        let enricher = Arc::new(AuditEnricher::new(Arc::clone(&audit)));
+        let base = Arc::new(InMemoryBackend::new());
+        AppState {
+            backend: base as Arc<dyn jamjet_state::StateBackend>,
+            backend_for_fn: Arc::new(move |tenant_id: &TenantId| {
+                let mut map = backends_for.lock().unwrap();
+                let backend = map
+                    .entry(tenant_id.0.clone())
+                    .or_insert_with(|| Arc::new(InMemoryBackend::new()));
+                backend.clone() as Arc<dyn jamjet_state::StateBackend>
+            }),
+            agents: Arc::new(InMemoryAgentRegistry::new()),
+            audit,
+            enricher,
+            protocols: crate::state::default_protocol_registry(),
+            cron_store: None,
+        }
+    }
+
+    /// An artifact stored under tenant A must NOT be readable as tenant B, and
+    /// the routes must thread the request's tenant into `backend_for` (not the
+    /// `'default'` base path). Also covers the put -> get happy path and the
+    /// `media_type` round-trip on the `POST` response.
+    #[tokio::test]
+    async fn artifacts_are_tenant_isolated() {
+        let state = tenant_routing_state();
+        let tenant_a = TenantId::from("tenant-a");
+        let tenant_b = TenantId::from("tenant-b");
+
+        // Store bytes under tenant A.
+        let put = put_artifact(
+            State(state.clone()),
+            Extension(tenant_a.clone()),
+            Query(PutArtifactQuery {
+                media_type: Some("text/plain".into()),
+            }),
+            HeaderMap::new(),
+            Bytes::from_static(b"secret-a"),
+        )
+        .await
+        .expect("put under tenant A");
+        let hash = put.0["hash"].as_str().expect("hash present").to_string();
+        assert_eq!(hash.len(), 64, "hash is sha256 hex");
+        assert_eq!(put.0["size"].as_u64(), Some(8));
+        assert_eq!(put.0["media_type"], "text/plain");
+
+        // Tenant A reads its own bytes back (happy path).
+        let got_a = get_artifact(
+            State(state.clone()),
+            Extension(tenant_a.clone()),
+            Path(hash.clone()),
+        )
+        .await
+        .expect("tenant A reads its artifact");
+        let body_a = got_a.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body_a[..], b"secret-a");
+
+        // Tenant B must not see tenant A's artifact -> 404 (NotFound).
+        let got_b = get_artifact(
+            State(state.clone()),
+            Extension(tenant_b.clone()),
+            Path(hash.clone()),
+        )
+        .await;
+        assert!(
+            matches!(got_b, Err(ApiError::NotFound(_))),
+            "tenant B must not read tenant A's artifact (tenant isolation)"
+        );
+    }
+
+    /// `POST /artifacts` enforces the explicit body limit: a body over
+    /// `ARTIFACT_MAX_BODY_BYTES` is rejected with `413`, while a small body is
+    /// accepted — exercised through the real router so the `DefaultBodyLimit`
+    /// layer (not just the handler) is on the path.
+    #[tokio::test]
+    async fn put_artifact_enforces_explicit_body_limit() {
+        use tower::ServiceExt; // for `oneshot`
+
+        let app = build_router_with_opts(tenant_routing_state(), /* dev_mode */ true);
+
+        // Just over the cap -> 413 Payload Too Large.
+        let oversized = vec![0u8; ARTIFACT_MAX_BODY_BYTES + 1];
+        let too_big_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/artifacts")
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(oversized))
+            .unwrap();
+        let resp = app.clone().oneshot(too_big_req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "oversized artifact body must be rejected with 413"
+        );
+
+        // A small body still succeeds (the limit didn't break the happy path).
+        let small_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/artifacts")
+            .header("content-type", "text/plain")
+            .body(axum::body::Body::from("ok"))
+            .unwrap();
+        let resp = app.oneshot(small_req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a small artifact body must still be accepted"
+        );
+    }
 }
