@@ -449,7 +449,7 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
 
-                let resolved_node = crate::approvals::submit_approval(
+                let (resolved_node, event) = crate::approvals::submit_approval(
                     &backend,
                     &eid,
                     crate::approvals::ApprovalSubmission {
@@ -466,6 +466,18 @@ pub fn build_mcp_bridge(state: AppState) -> Router {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+
+                // Seal the approval into the signed, hash-chained audit log,
+                // mirroring the REST approve path: best-effort, after the
+                // durable event write, off the worker's fenced commit path.
+                let ctx = jamjet_audit::RequestContext {
+                    actor_type: jamjet_audit::ActorType::Human,
+                    tenant_id: tenant_id.0.clone(),
+                    method: Some("POST".to_string()),
+                    path: Some("/mcp/tools/jamjet_approve".to_string()),
+                    ..Default::default()
+                };
+                s.enricher.enrich_and_append(&event, Some(&ctx)).await;
 
                 Ok(vec![McpContent::Text {
                     text: json!({"execution_id": id_str, "node_id": resolved_node, "accepted": true})

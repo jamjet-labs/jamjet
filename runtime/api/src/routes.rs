@@ -441,7 +441,7 @@ async fn approve_execution(
         other => return Err(ApiError::BadRequest(format!("unknown decision: {other}"))),
     };
 
-    let node_id = crate::approvals::submit_approval(
+    let (node_id, event) = crate::approvals::submit_approval(
         &backend,
         &execution_id,
         crate::approvals::ApprovalSubmission {
@@ -460,6 +460,23 @@ async fn approve_execution(
         | crate::approvals::SubmitError::ExecutionTerminal(_) => ApiError::Conflict(e.to_string()),
         crate::approvals::SubmitError::Backend(msg) => ApiError::Internal(msg),
     })?;
+
+    // Seal this approval into the signed, hash-chained audit log. This runs
+    // *after* the event is durably appended, never fails the request
+    // (`enrich_and_append` warns-and-continues on a write error), and is off
+    // the worker's fenced commit hot path — so it adds tamper-evident audit
+    // without touching the durability invariant. The per-tool-call / per-node
+    // worker events emitted through the fenced `commit_turn` path are not yet
+    // routed through the enricher (that needs the enricher threaded into the
+    // worker pool); tracked as F-t3-audit-emit.
+    let ctx = jamjet_audit::RequestContext {
+        actor_type: jamjet_audit::ActorType::Human,
+        tenant_id: tenant_id.0.clone(),
+        method: Some("POST".to_string()),
+        path: Some(format!("/executions/{id}/approve")),
+        ..Default::default()
+    };
+    state.enricher.enrich_and_append(&event, Some(&ctx)).await;
 
     Ok(Json(
         json!({ "execution_id": id, "node_id": node_id, "accepted": true }),
