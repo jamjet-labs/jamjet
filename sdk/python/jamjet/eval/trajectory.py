@@ -9,7 +9,9 @@ calls in the default path.
 Trajectory sources
 ------------------
 - ``Trajectory.from_agent_result(result)`` -- in-process AgentResult.tool_calls
-- ``Trajectory.from_events(events)`` -- event log from get_events() (ToolCalled events)
+- ``Trajectory.from_events(events)`` -- durable event log from get_events(): the
+  tool calls the model requested, read off each model ``NodeCompleted`` event's
+  ``output.tool_calls`` (the shape the durable engine actually emits)
 
 Both sources produce the same Trajectory shape; the tool_sequence and step_count
 are identical for the same run.
@@ -80,6 +82,34 @@ class TrajectoryResult(ScorerResult):
     assertions: list[TrajectoryAssertionResult] = field(default_factory=list)
 
 
+def _tool_calls_from_node_completed(kind: dict[str, Any]) -> list[Any]:
+    """Extract the model's requested tool calls from a ``node_completed`` event kind.
+
+    The durable model-node executor (``runtime/workers/src/executors/model_node.rs``)
+    writes the model turn's tool calls to TWO places on its ``NodeCompleted`` event:
+
+    - ``output.tool_calls`` -- ``[{"id", "name", "arguments"}, ...]`` (authoritative)
+    - ``state_patch.last_model_tool_calls`` -- the SAME list, written inline so it
+      is never spilled to the artifact store.
+
+    ``output`` is preferred; ``state_patch.last_model_tool_calls`` is the fallback
+    for the rare case where ``output`` was artifact-spilled and could not be
+    resolved on read. A non-model ``NodeCompleted`` (a tool-dispatch node, a plain
+    node) carries neither and contributes no tool calls.
+    """
+    output = kind.get("output")
+    if isinstance(output, dict):
+        tcs = output.get("tool_calls")
+        if isinstance(tcs, list):
+            return tcs
+    state_patch = kind.get("state_patch")
+    if isinstance(state_patch, dict):
+        tcs = state_patch.get("last_model_tool_calls")
+        if isinstance(tcs, list):
+            return tcs
+    return []
+
+
 class Trajectory:
     """Ordered sequence of steps (tool calls) in an agent run.
 
@@ -144,8 +174,19 @@ class Trajectory:
         - A raw list of event dicts (the ``events`` list from get_events)
         - The wrapped ``{"events": [...]}`` dict returned by get_events()
 
-        Only ``ToolCalled`` events (``kind.type == "tool_called"``) contribute
-        steps; all other event kinds are ignored.
+        Reconstructs the tool trajectory from what a durable run ACTUALLY emits:
+        the tool calls the model requested across the run's model
+        ``NodeCompleted`` events. Each model ``NodeCompleted`` carries the turn's
+        tool calls in ``output.tool_calls``
+        (``[{"id", "name", "arguments"}, ...]`` -- see
+        ``runtime/workers/src/executors/model_node.rs``); every such tool call,
+        in event order, contributes one step (the tool name). Tool-dispatch and
+        plain node completions carry no ``tool_calls`` and add nothing.
+
+        Legacy ``ToolCalled`` events (``kind.type == "tool_called"``) are still
+        honored if present, but the durable engine does not emit them -- the
+        model-node ``tool_calls`` is the authoritative "tools the agent called"
+        source.
         """
         if isinstance(events, dict):
             event_list: list[dict[str, Any]] = events.get("events", [])
@@ -155,15 +196,40 @@ class Trajectory:
         steps: list[TrajectoryStep] = []
         for evt in event_list:
             kind = evt.get("kind", {})
-            if kind.get("type") == "tool_called":
-                steps.append(
-                    TrajectoryStep(
-                        tool=kind.get("tool"),
-                        node_id=kind.get("node_id"),
-                        args={},
-                        output=None,
+            if not isinstance(kind, dict):
+                continue
+            ktype = kind.get("type")
+            if ktype == "node_completed":
+                # Authoritative durable source: the model node's requested tool
+                # calls. Non-model completions carry no tool_calls -> no steps.
+                node_id = kind.get("node_id")
+                for tc in _tool_calls_from_node_completed(kind):
+                    if not isinstance(tc, dict):
+                        continue
+                    name = tc.get("name")
+                    if not name:
+                        continue
+                    steps.append(
+                        TrajectoryStep(
+                            tool=name,
+                            node_id=node_id,
+                            args=tc.get("arguments") or {},
+                            output=None,
+                        )
                     )
-                )
+            elif ktype == "tool_called":
+                # Legacy/secondary: defined + consumed but not produced by the
+                # durable model loop. Honored for hand-built or strategy logs.
+                name = kind.get("tool")
+                if name:
+                    steps.append(
+                        TrajectoryStep(
+                            tool=name,
+                            node_id=kind.get("node_id"),
+                            args={},
+                            output=None,
+                        )
+                    )
         return cls(steps)
 
     @classmethod

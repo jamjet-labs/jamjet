@@ -12,18 +12,16 @@ Coverage:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
 from jamjet.eval.trajectory import (
     Trajectory,
-    TrajectoryAssertionResult,
     TrajectoryResult,
     TrajectoryScorer,
     TrajectoryStep,
 )
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -43,6 +41,141 @@ def _tool_event(tool: str, node_id: str = "n1") -> dict:
 def _other_event(kind_type: str) -> dict:
     """Non-tool event (NodeStarted, NodeCompleted, etc.)."""
     return {"kind": {"type": kind_type, "node_id": "n1"}}
+
+
+def _model_node_completed(
+    tool_calls: list[str],
+    *,
+    node_id: str = "model",
+    finish_reason: str = "tool_calls",
+    seq: int = 0,
+) -> dict:
+    """A model-node ``NodeCompleted`` event in the SHAPE the durable engine emits.
+
+    Mirrors ``runtime/workers/src/executors/model_node.rs`` +
+    ``runtime/state/src/event.rs``: the EventKind serializes with
+    ``serde(tag="type", rename_all="snake_case")``, so the variant nests under
+    ``kind`` with ``type="node_completed"``; ``output`` carries
+    ``content/model/finish_reason/tool_calls`` and ``state_patch`` carries
+    ``last_model_tool_calls``. Each tool_call entry is ``{id, name, arguments}``.
+    """
+    tc = [{"id": f"call_{i}", "name": name, "arguments": {}} for i, name in enumerate(tool_calls)]
+    return {
+        "id": f"evt-{seq}",
+        "execution_id": "exec-1",
+        "sequence": seq,
+        "kind": {
+            "type": "node_completed",
+            "node_id": node_id,
+            "output": {
+                "content": "",
+                "model": "anthropic/claude-sonnet-4-6",
+                "finish_reason": finish_reason,
+                "tool_calls": tc,
+            },
+            "state_patch": {
+                "last_model_output": "",
+                "last_model_finish_reason": finish_reason,
+                "last_model_tool_calls": tc,
+            },
+            "duration_ms": 7,
+            "gen_ai_system": "anthropic",
+            "gen_ai_model": "anthropic/claude-sonnet-4-6",
+        },
+        "created_at": "2026-01-01T00:00:00Z",
+    }
+
+
+def _dispatch_node_completed(node_id: str, result: object) -> dict:
+    """A tool-dispatch PythonFn ``NodeCompleted``: result payload, NO tool_calls."""
+    return {
+        "kind": {
+            "type": "node_completed",
+            "node_id": node_id,
+            "output": {"result": result},
+            "state_patch": {},
+            "duration_ms": 2,
+        }
+    }
+
+
+# ── Realistic durable event log (the SHAPE the engine actually emits) ──────────
+
+
+def test_from_events_realistic_durable_node_completed():
+    """A real durable run reconstructs its tool trajectory from model
+    ``NodeCompleted.output.tool_calls`` -- NOT from never-emitted ``tool_called``
+    events.
+
+    C1 regression guard: this FAILS against ``tool_called``-keyed code (which
+    finds zero tool calls in a real durable log) and passes once ``from_events``
+    reads the model node's ``tool_calls``.
+    """
+    # A two-turn durable run: model asks for search, a dispatch node runs it,
+    # model asks for calculate, a dispatch node runs it, model stops.
+    events = {
+        "events": [
+            {
+                "kind": {
+                    "type": "workflow_started",
+                    "workflow_id": "wf",
+                    "workflow_version": "1",
+                    "initial_input": {},
+                }
+            },
+            {"kind": {"type": "node_started", "node_id": "model", "worker_id": "w1", "attempt": 1}},
+            _model_node_completed(["search"], node_id="model_turn_1", seq=1),
+            _dispatch_node_completed("dispatch_1", "hits"),
+            _model_node_completed(["calculate"], node_id="model_turn_2", seq=3),
+            _dispatch_node_completed("dispatch_2", "42"),
+            _model_node_completed([], node_id="model_turn_3", finish_reason="stop", seq=5),
+        ]
+    }
+    traj = Trajectory.from_events(events)
+    assert traj.tool_sequence == ["search", "calculate"]
+    assert traj.step_count == 2
+    # node_id is carried from the model node that requested the tool.
+    assert traj.steps[0].node_id == "model_turn_1"
+    assert traj.steps[1].node_id == "model_turn_2"
+
+
+def test_from_events_durable_parallel_tool_calls_in_one_turn():
+    """A single model turn that requests two tools (parallel tool-calling)
+    contributes both, in order."""
+    events = [_model_node_completed(["search", "calculate"], node_id="model_turn_1", seq=1)]
+    traj = Trajectory.from_events(events)
+    assert traj.tool_sequence == ["search", "calculate"]
+    assert traj.steps[0].node_id == "model_turn_1"
+
+
+def test_from_events_durable_falls_back_to_state_patch():
+    """When ``output.tool_calls`` is unavailable (e.g. output artifact-spilled and
+    unresolved), the always-inline ``state_patch.last_model_tool_calls`` is used."""
+    evt = _model_node_completed(["search"], node_id="m", seq=1)
+    # Simulate an unresolved artifact sentinel output (no tool_calls in output).
+    evt["kind"]["output"] = {"$artifact": {"ref": "blob://x", "unresolved": True}}
+    traj = Trajectory.from_events([evt])
+    assert traj.tool_sequence == ["search"]
+
+
+def test_from_events_durable_plain_node_completed_contributes_nothing():
+    """A ``node_completed`` with no model tool_calls (dispatch / plain node) adds
+    no steps -- so a did_not_use / max_turns-only spec is NOT falsely satisfied."""
+    events = [_dispatch_node_completed("dispatch_1", "x"), _other_event("node_completed")]
+    traj = Trajectory.from_events(events)
+    assert traj.tool_sequence == []
+    assert traj.step_count == 0
+
+
+async def test_from_events_durable_trajectory_scores_tool_sequence():
+    """End-to-end: a realistic durable log scores a ``tool_sequence`` spec
+    correctly (the path ``jamjet eval run`` exercises via the durable runner)."""
+    events = {"events": [_model_node_completed(["search"], seq=1), _model_node_completed(["calculate"], seq=2)]}
+    traj = Trajectory.from_events(events)
+    scorer = TrajectoryScorer(expected={"tool_sequence": ["search", "calculate"]})
+    result = await scorer.score(None, trajectory=traj)
+    assert result.passed is True
+    assert result.assertions[0].passed is True
 
 
 # ── Trajectory construction ───────────────────────────────────────────────────

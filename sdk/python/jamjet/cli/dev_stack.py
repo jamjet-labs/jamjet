@@ -20,6 +20,7 @@ a *health probe* so it can be unit-tested without starting real processes.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -129,12 +130,29 @@ def real_spawn(spec: ProcessSpec) -> ManagedProcess:
 
 
 def http_health_probe(url: str) -> bool:
-    """Return True iff ``GET url`` answers 200 (a healthy ``/health`` endpoint)."""
+    """Return True iff ``GET url`` answers 2xx AND its body affirms health.
+
+    The ``/health`` contract promises a healthy JSON body, so a 2xx alone is not
+    enough -- a 200 with a wrong, absent, or non-JSON body is NOT healthy (fail
+    closed). Both probed services are accepted in their real documented shapes:
+    the model sidecar returns ``{"ok": true}`` and the engine returns
+    ``{"status": "ok", ...}``. Total: never raises -- any error (unreachable,
+    non-JSON, non-dict body) returns False.
+    """
     try:
         with urllib.request.urlopen(url, timeout=2) as resp:  # noqa: S310 - fixed localhost URL
-            return 200 <= resp.status < 300
+            if not (200 <= resp.status < 300):
+                return False
+            body = resp.read()
     except (urllib.error.URLError, OSError, ValueError):
         return False
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("ok") is True or payload.get("status") == "ok"
 
 
 # ── Log prefixing ─────────────────────────────────────────────────────────────
@@ -317,12 +335,19 @@ class DevStack:
             raise DevStackError(f"{spec.name} exited immediately (exit code {rc}).")
 
     def shutdown(self) -> None:
-        """Terminate every started process as a group, SIGKILL stragglers."""
+        """Terminate every started process as a group, SIGKILL stragglers.
+
+        Guarantees termination with no infinite block and no orphan: every live
+        child gets a SIGTERM, a bounded shared grace wait (the wait timeout is
+        ALWAYS floored above zero, so a SIGTERM-ignoring child can never make
+        ``wait()`` block forever), then a final UNCONDITIONAL SIGKILL sweep with
+        a short bounded wait over anything still alive.
+        """
         if self._shut_down:
             return
         self._shut_down = True
 
-        # SIGTERM all live children (reverse start order).
+        # Phase 1: SIGTERM all live children (reverse start order).
         for proc, spec in reversed(self._started):
             if proc.poll() is None:
                 self.log(f"Stopping {spec.name}...")
@@ -331,20 +356,34 @@ class DevStack:
                 except Exception:  # noqa: BLE001 - best-effort teardown
                     pass
 
-        # Wait up to the grace period (shared deadline), then SIGKILL survivors.
+        # Phase 2: bounded grace wait for clean SIGTERM exits (shared deadline).
+        # The timeout is ALWAYS floored above zero: once an earlier child has
+        # exhausted the shared deadline, later children still get a tiny bounded
+        # wait (never timeout=None), so wait() can never block forever on a
+        # SIGTERM-ignoring child.
         deadline = self.monotonic() + self.shutdown_grace
         for proc, spec in reversed(self._started):
-            remaining = max(0.0, deadline - self.monotonic())
+            remaining = deadline - self.monotonic()
             try:
-                proc.wait(timeout=remaining if remaining > 0 else None)
+                proc.wait(timeout=max(remaining, 0.1))
             except subprocess.TimeoutExpired:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=self.shutdown_grace)
-                except Exception:  # noqa: BLE001 - best-effort teardown
-                    pass
+                pass
             except Exception:  # noqa: BLE001 - never let teardown raise
                 pass
+
+        # Phase 3: UNCONDITIONAL SIGKILL sweep over anything still alive, then a
+        # short bounded wait so every survivor is reaped (no orphan, no hang).
+        # This is what fires for a child that ignored SIGTERM during Phase 2.
+        for proc, spec in reversed(self._started):
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001 - best-effort teardown
+                    pass
+                try:
+                    proc.wait(timeout=max(self.shutdown_grace, 1.0))
+                except Exception:  # noqa: BLE001 - never let teardown raise (incl. TimeoutExpired)
+                    pass
 
     def run(self) -> None:
         """Start the stack, then block until a child exits or Ctrl+C, then tear down."""

@@ -7,9 +7,11 @@ health probe injected. No real processes are started.
 
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
-from jamjet.cli.dev_stack import DevStack, DevStackError
+from jamjet.cli.dev_stack import DevStack, DevStackError, ProcessSpec, http_health_probe
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -328,6 +330,190 @@ def test_keyboard_interrupt_during_start_tears_down():
 
     # The sidecar (first spawned) must be torn down.
     assert rec.procs[0].terminated or rec.procs[0].killed
+
+
+# ---------------------------------------------------------------------------
+# Teardown — SIGTERM-ignoring child is SIGKILLed (no hang, no orphan) [I2]
+# ---------------------------------------------------------------------------
+
+
+class _WouldBlockForeverError(Exception):
+    """Raised by the stubborn fake when wait(timeout=None) is called — the buggy
+    path where a real Popen.wait() would block forever on a live child."""
+
+
+class StubbornProcess:
+    """A child that IGNORES SIGTERM.
+
+    ``terminate()`` has no effect on liveness; the first bounded ``wait()``
+    consumes its whole timeout (advancing the shared clock) and then times out;
+    it only dies after ``kill()``. ``wait(timeout=None)`` is the buggy path and
+    raises ``_WouldBlockForeverError`` (instead of hanging) so the old behavior is
+    caught deterministically rather than freezing the test.
+    """
+
+    def __init__(self, name: str, clock: FakeClock) -> None:
+        self.name = name
+        self.clock = clock
+        self.stdout = None
+        self.terminated = False
+        self.killed = False
+        self.wait_calls = 0
+        self.blocked_forever = False  # set if wait(timeout=None) is ever called
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        if self.killed:
+            self.returncode = -9
+            return -9
+        return None  # SIGTERM ignored -> stays alive until killed
+
+    def terminate(self) -> None:
+        self.terminated = True  # no effect on liveness (SIGTERM ignored)
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls += 1
+        if self.killed:
+            self.returncode = -9
+            return -9
+        if timeout is None:
+            # A real Popen.wait(None) BLOCKS FOREVER on a live child.
+            self.blocked_forever = True
+            raise _WouldBlockForeverError(self.name)
+        # Alive + bounded wait: consume the timeout (advance the shared clock),
+        # then report the timeout, exactly like a stubborn child.
+        self.clock.sleep(timeout)
+        raise subprocess.TimeoutExpired(cmd=self.name, timeout=timeout)
+
+
+def _spec(name: str) -> ProcessSpec:
+    return ProcessSpec(name=name, argv=[name], env={})
+
+
+def test_shutdown_sigkills_sigterm_ignoring_child_no_hang():
+    """A child that ignores SIGTERM is still SIGKILLed and wait() returns.
+
+    Two stubborn children: the first consumes the WHOLE shared grace deadline in
+    its wait, so the second sees remaining == 0. The old code passed
+    ``timeout=None`` there and blocked forever; the fix floors the wait and runs
+    a final unconditional SIGKILL sweep. Asserts both are SIGKILLed, the
+    wait(timeout=None) hang path is never taken, and shutdown() returns.
+    """
+    clock = FakeClock()
+    rec = Recorder()
+    stack = _make_stack(rec, clock, shutdown_grace=5.0)
+
+    first = StubbornProcess("engine", clock)
+    second = StubbornProcess("worker", clock)
+    # _started order is [engine, worker]; shutdown walks it in reverse, so worker
+    # is waited first and exhausts the deadline, leaving engine at remaining == 0.
+    stack._started = [(first, _spec("engine")), (second, _spec("worker"))]
+
+    stack.shutdown()  # must RETURN — not hang
+
+    for p in (first, second):
+        assert p.terminated, f"{p.name} was not SIGTERMed"
+        assert p.killed, f"{p.name} was not SIGKILLed (escalation must fire)"
+        assert p.blocked_forever is False, f"{p.name} hit the wait(timeout=None) hang path"
+
+
+def test_shutdown_sigkills_single_child_when_grace_already_zero():
+    """Degenerate deadline (grace == 0 -> remaining == 0 immediately) still
+    escalates to SIGKILL instead of blocking on wait(timeout=None)."""
+    clock = FakeClock()
+    rec = Recorder()
+    stack = _make_stack(rec, clock, shutdown_grace=0.0)
+
+    proc = StubbornProcess("engine", clock)
+    stack._started = [(proc, _spec("engine"))]
+
+    stack.shutdown()
+
+    assert proc.terminated
+    assert proc.killed
+    assert proc.blocked_forever is False
+
+
+# ---------------------------------------------------------------------------
+# Health probe — body must affirm health, not just HTTP 200 [M3]
+# ---------------------------------------------------------------------------
+
+
+class _FakeResp:
+    def __init__(self, status: int, body: bytes) -> None:
+        self.status = status
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> _FakeResp:
+        return self
+
+    def __exit__(self, *_a: object) -> bool:
+        return False
+
+
+def _patch_urlopen(monkeypatch, status: int, body: bytes) -> None:
+    import jamjet.cli.dev_stack as ds
+
+    monkeypatch.setattr(ds.urllib.request, "urlopen", lambda url, timeout=2: _FakeResp(status, body))
+
+
+def test_health_probe_ok_true_body_is_healthy(monkeypatch):
+    """Sidecar shape {"ok": true} -> healthy."""
+    _patch_urlopen(monkeypatch, 200, b'{"ok": true}')
+    assert http_health_probe("http://x/health") is True
+
+
+def test_health_probe_status_ok_body_is_healthy(monkeypatch):
+    """Engine shape {"status": "ok", ...} -> healthy (the probe gates BOTH)."""
+    _patch_urlopen(monkeypatch, 200, b'{"status": "ok", "version": "0.10.2"}')
+    assert http_health_probe("http://x/health") is True
+
+
+def test_health_probe_200_wrong_body_not_healthy(monkeypatch):
+    """A 200 with {"ok": false} is NOT healthy."""
+    _patch_urlopen(monkeypatch, 200, b'{"ok": false}')
+    assert http_health_probe("http://x/health") is False
+
+
+def test_health_probe_200_absent_body_not_healthy(monkeypatch):
+    """A 200 with an empty/absent health field is NOT healthy."""
+    _patch_urlopen(monkeypatch, 200, b"{}")
+    assert http_health_probe("http://x/health") is False
+
+
+def test_health_probe_200_non_json_body_not_healthy_no_crash(monkeypatch):
+    """A 200 with a non-JSON body is NOT healthy and does not crash (total)."""
+    _patch_urlopen(monkeypatch, 200, b"not json at all")
+    assert http_health_probe("http://x/health") is False
+
+
+def test_health_probe_200_non_dict_json_not_healthy(monkeypatch):
+    """A 200 whose JSON body is not an object (e.g. a bare ``true``) is NOT healthy."""
+    _patch_urlopen(monkeypatch, 200, b"true")
+    assert http_health_probe("http://x/health") is False
+
+
+def test_health_probe_non_2xx_not_healthy(monkeypatch):
+    """A non-2xx status is NOT healthy even with an otherwise-healthy body."""
+    _patch_urlopen(monkeypatch, 503, b'{"ok": true}')
+    assert http_health_probe("http://x/health") is False
+
+
+def test_health_probe_unreachable_not_healthy(monkeypatch):
+    """An unreachable endpoint is NOT healthy and does not raise."""
+    import jamjet.cli.dev_stack as ds
+
+    def _boom(url, timeout=2):
+        raise ds.urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(ds.urllib.request, "urlopen", _boom)
+    assert http_health_probe("http://x/health") is False
 
 
 # ---------------------------------------------------------------------------

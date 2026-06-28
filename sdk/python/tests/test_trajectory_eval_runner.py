@@ -32,6 +32,34 @@ def _tool_event(tool: str, node_id: str = "n1") -> dict:
     return {"kind": {"type": "tool_called", "node_id": node_id, "tool": tool}}
 
 
+def _model_turn(tool: str, *, node_id: str = "model", seq: int = 0) -> dict:
+    """A model-node ``NodeCompleted`` event in the SHAPE a real durable run emits.
+
+    This is what ``client.get_events`` actually returns for a durable agent run
+    (per ``runtime/workers/src/executors/model_node.rs``): the model's requested
+    tool calls live on ``kind.output.tool_calls`` as ``{id, name, arguments}``,
+    NOT in a (never-emitted) ``tool_called`` event. The runner reconstructs the
+    trajectory from these.
+    """
+    tc = [{"id": f"call_{seq}", "name": tool, "arguments": {}}]
+    return {
+        "id": f"evt-{seq}",
+        "sequence": seq,
+        "kind": {
+            "type": "node_completed",
+            "node_id": node_id,
+            "output": {
+                "content": "",
+                "model": "anthropic/claude-sonnet-4-6",
+                "finish_reason": "tool_calls",
+                "tool_calls": tc,
+            },
+            "state_patch": {"last_model_tool_calls": tc, "last_model_finish_reason": "tool_calls"},
+            "duration_ms": 5,
+        },
+    }
+
+
 def _mock_client(*, output: dict, events: list[dict]) -> MagicMock:
     client = MagicMock()
     client.__aenter__ = AsyncMock(return_value=client)
@@ -86,8 +114,16 @@ def test_loader_parses_expected_trajectory_yaml(tmp_path):
 
 @pytest.mark.asyncio
 async def test_runner_trajectory_pass(monkeypatch):
-    """A case whose events match expected_trajectory -> trajectory PASS, case passes."""
-    client = _mock_client(output={"answer": "42"}, events=[_tool_event("search"), _tool_event("calc")])
+    """A case whose events match expected_trajectory -> trajectory PASS, case passes.
+
+    Events are the REAL durable shape (model ``node_completed`` with
+    ``output.tool_calls``), so this also guards C1: the runner reconstructs the
+    trajectory from what the engine actually emits, not from ``tool_called``.
+    """
+    client = _mock_client(
+        output={"answer": "42"},
+        events=[_model_turn("search", node_id="m1", seq=1), _model_turn("calc", node_id="m2", seq=2)],
+    )
     import jamjet.client as client_mod
 
     monkeypatch.setattr(client_mod, "JamjetClient", lambda **kw: client)
@@ -114,7 +150,10 @@ async def test_runner_trajectory_pass(monkeypatch):
 async def test_runner_trajectory_fail_even_if_output_matches(monkeypatch):
     """Wrong tools -> trajectory FAIL and the case FAILS even though output matched."""
     # Output matches the assertion, but the agent used the wrong tools.
-    client = _mock_client(output={"answer": "42"}, events=[_tool_event("search"), _tool_event("web")])
+    client = _mock_client(
+        output={"answer": "42"},
+        events=[_model_turn("search", node_id="m1", seq=1), _model_turn("web", node_id="m2", seq=2)],
+    )
     import jamjet.client as client_mod
 
     monkeypatch.setattr(client_mod, "JamjetClient", lambda **kw: client)
@@ -140,7 +179,7 @@ async def test_runner_trajectory_fail_even_if_output_matches(monkeypatch):
 @pytest.mark.asyncio
 async def test_runner_no_expected_trajectory_is_output_only(monkeypatch):
     """expected_trajectory=None -> output-only, unchanged (no trajectory scorer)."""
-    client = _mock_client(output={"answer": "42"}, events=[_tool_event("search")])
+    client = _mock_client(output={"answer": "42"}, events=[_model_turn("search", node_id="m1", seq=1)])
     import jamjet.client as client_mod
 
     monkeypatch.setattr(client_mod, "JamjetClient", lambda **kw: client)
