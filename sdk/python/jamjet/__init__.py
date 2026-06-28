@@ -42,7 +42,13 @@ from jamjet.durable import (
     reset_execution_context,
     set_execution_context,
 )
-from jamjet.entry import deploy, resume, run
+
+# NB: ``deploy`` is intentionally NOT re-exported here. The deploy surface is the
+# ``jamjet.deploy`` SUBMODULE (resolve_runtime_target / RuntimeTarget /
+# DeployResult) plus the ``Agent.deploy`` / ``Team.deploy`` methods (Track 7a);
+# re-binding a top-level ``deploy`` function would shadow that submodule. The
+# deprecated top-level function still lives at ``jamjet.entry.deploy``.
+from jamjet.entry import resume, run
 from jamjet.eval.registry import scorer
 from jamjet.protocols.adapter import ProtocolAdapter
 from jamjet.protocols.registry import ProtocolRegistry
@@ -99,7 +105,6 @@ __all__ = [
     "Workflow",
     "WorkflowSpec",
     "PolicyDeniedError",
-    "deploy",
     "durable",
     "durable_run",
     "gate",

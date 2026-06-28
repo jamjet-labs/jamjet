@@ -37,7 +37,28 @@ class _StubBase:
 
 
 class CloudRuntime(_StubBase):
+    """There is no in-process "cloud" runtime: JamJet Cloud is the GOVERNANCE
+    plane (a span/observability API), independent of the execution engine. To run
+    on a hosted engine, ship the IR with :meth:`jamjet.Agent.deploy` instead. Both
+    methods raise an honest, actionable error rather than a "coming soon" stub.
+    """
+
     name = "Cloud"
+
+    _GUIDANCE = (
+        "There is no in-process 'cloud' runtime: JamJet Cloud is the governance "
+        "plane, not an execution engine. To run on a hosted engine, use "
+        "Agent.deploy(runtime='cloud') (ships the compiled IR to your hosted "
+        "jamjet-server at JAMJET_CLOUD_RUNTIME_URL, with JamJet Cloud governance "
+        "layered on) or Agent.run_durable(runtime_url=...). For in-process runs "
+        "use LocalRuntime."
+    )
+
+    async def execute(self, *args: Any, **kwargs: Any) -> RuntimeResult:
+        raise NotImplementedError(self._GUIDANCE)
+
+    async def resume(self, *args: Any, **kwargs: Any) -> RuntimeResult:
+        raise NotImplementedError(self._GUIDANCE)
 
 
 class JavaRuntime(_StubBase):

@@ -40,6 +40,15 @@ environment setup script and runs without a model API key.
   idempotency, and park-on-429. The model call still goes through the governed
   seam, and the `@tool` functions run on a separate `jamjet worker`. See
   `react-agent-durable/README.md` for the engine, sidecar, and worker commands.
+- `deploy-an-agent/` - ship a finished agent to a runtime with
+  `agent.deploy(runtime=...)`. The same compiled IR `run_durable` builds is
+  registered on a `jamjet-server` engine, so one agent deploys unchanged to
+  `local` (the dev default on 7700), `self-host` (`$JAMJET_RUNTIME_URL`), or
+  `cloud` (your hosted engine at `$JAMJET_CLOUD_RUNTIME_URL` plus JamJet Cloud
+  governance). A bare `deploy()` always targets local, and the cloud leg is a
+  hosted engine URL plus governance, not a managed execution cell. Governance
+  travels with the deploy. See `deploy-an-agent/README.md` and
+  `docs/adk/consistency.md` for the engine's guarantees.
 
 ## Java
 

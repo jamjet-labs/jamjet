@@ -48,6 +48,7 @@ from rich.table import Table
 
 from jamjet.cli.demo import demo_app
 from jamjet.client import JamjetClient
+from jamjet.deploy import LOCAL_RUNTIME_URL
 
 # ── Logo — block letter J  (0=bg  1=yellow#f5c518  2=orange#ea580c) ──────────
 # 6×7 grid: clean J — top bar + vertical stem + orange hook at base.
@@ -142,8 +143,8 @@ app.add_typer(demo_app, name="demo")
 console = Console()
 
 
-def _client(runtime: str = "http://localhost:7700") -> JamjetClient:
-    return JamjetClient(base_url=runtime)
+def _client(runtime: str = LOCAL_RUNTIME_URL, token: str | None = None) -> JamjetClient:
+    return JamjetClient(base_url=runtime, api_token=token)
 
 
 # ── Protocol trace helpers ───────────────────────────────────────────────────
@@ -649,16 +650,36 @@ def validate(
 @app.command()
 def deploy(
     file: str = typer.Argument(..., help="Path to a fleet YAML (agents:/workflows:)"),
-    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+    runtime: str = typer.Option(
+        LOCAL_RUNTIME_URL,
+        "--runtime",
+        "-r",
+        help="Target engine: local | self-host | cloud | a base URL.",
+    ),
 ) -> None:
-    """Register every unit in a fleet file and install its cron schedules."""
+    """Register every unit in a fleet file and install its cron schedules.
+
+    ``--runtime`` is resolved with the SAME resolver as ``Agent.deploy``:
+    ``local`` (the dev engine on 7700), ``self-host`` (``$JAMJET_RUNTIME_URL``),
+    ``cloud`` (your hosted engine at ``$JAMJET_CLOUD_RUNTIME_URL`` plus JamJet
+    Cloud governance), or a base URL used directly. The default is the shared
+    local engine URL (``LOCAL_RUNTIME_URL``, ``http://127.0.0.1:7700``) — the SAME
+    source ``Agent.deploy`` uses, so the CLI and the SDK agree on the local target.
+    """
+    from jamjet.deploy import resolve_runtime_target
     from jamjet.workflow.bundle import compile_bundle
+
+    try:
+        target = resolve_runtime_target(runtime)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
 
     data = yaml.safe_load(Path(file).read_text())
     bundle = compile_bundle(data)
 
     async def _deploy() -> None:
-        async with _client(runtime) as c:
+        async with _client(target.url, target.token) as c:
             for ir in bundle.workflows:
                 ir["workflow_id"] = str(ir["workflow_id"])
                 ir["version"] = str(ir["version"])
