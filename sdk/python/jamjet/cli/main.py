@@ -142,8 +142,8 @@ app.add_typer(demo_app, name="demo")
 console = Console()
 
 
-def _client(runtime: str = "http://localhost:7700") -> JamjetClient:
-    return JamjetClient(base_url=runtime)
+def _client(runtime: str = "http://localhost:7700", token: str | None = None) -> JamjetClient:
+    return JamjetClient(base_url=runtime, api_token=token)
 
 
 # ── Protocol trace helpers ───────────────────────────────────────────────────
@@ -649,16 +649,35 @@ def validate(
 @app.command()
 def deploy(
     file: str = typer.Argument(..., help="Path to a fleet YAML (agents:/workflows:)"),
-    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+    runtime: str = typer.Option(
+        "http://localhost:7700",
+        "--runtime",
+        "-r",
+        help="Target engine: local | self-host | cloud | a base URL.",
+    ),
 ) -> None:
-    """Register every unit in a fleet file and install its cron schedules."""
+    """Register every unit in a fleet file and install its cron schedules.
+
+    ``--runtime`` is resolved with the SAME resolver as ``Agent.deploy``:
+    ``local`` (the dev engine on 7700), ``self-host`` (``$JAMJET_RUNTIME_URL``),
+    ``cloud`` (your hosted engine at ``$JAMJET_CLOUD_RUNTIME_URL`` plus JamJet
+    Cloud governance), or a base URL used directly. The default keeps the existing
+    ``http://localhost:7700`` behavior.
+    """
+    from jamjet.deploy import resolve_runtime_target
     from jamjet.workflow.bundle import compile_bundle
+
+    try:
+        target = resolve_runtime_target(runtime)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
 
     data = yaml.safe_load(Path(file).read_text())
     bundle = compile_bundle(data)
 
     async def _deploy() -> None:
-        async with _client(runtime) as c:
+        async with _client(target.url, target.token) as c:
             for ir in bundle.workflows:
                 ir["workflow_id"] = str(ir["workflow_id"])
                 ir["version"] = str(ir["version"])
