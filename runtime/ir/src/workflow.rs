@@ -333,4 +333,97 @@ mod tests {
         let parsed = WorkflowIr::from_json(&json).unwrap();
         assert_eq!(parsed.workflow_id, ir.workflow_id);
     }
+
+    /// T3-5: verify that a WorkflowIr JSON carrying all governance fields emitted
+    /// by compile_agent_to_ir (Python) deserializes correctly into the Rust struct.
+    /// Field names, types, and nesting must match exactly — a mismatch here means
+    /// the Python emitter and the Rust deserializer are out of sync.
+    #[test]
+    fn governance_fields_deserialize_from_python_shape() {
+        // This JSON mirrors the exact output of _compile_governance_ir() in
+        // sdk/python/jamjet/compiler/agent_ir.py (T3-5).
+        let json = r#"{
+            "workflow_id": "governed_agent",
+            "version": "0.1.0+abc123456789",
+            "name": "governed_agent",
+            "description": "Durable agent: governed_agent",
+            "state_schema": "",
+            "start_node": "start",
+            "nodes": {},
+            "edges": [],
+            "retry_policies": {},
+            "timeouts": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {},
+            "labels": {},
+            "policy": {
+                "blocked_tools": [],
+                "require_approval_for": ["delete_*"],
+                "model_allowlist": []
+            },
+            "token_budget": {
+                "total_tokens": 1000
+            },
+            "cost_budget_usd": 0.5,
+            "data_policy": {
+                "pii_fields": [],
+                "pii_detectors": ["email", "ssn", "credit_card", "phone", "ip_address"],
+                "redaction_mode": "mask",
+                "retain_prompts": false,
+                "retain_outputs": true
+            }
+        }"#;
+
+        let ir = WorkflowIr::from_json(json)
+            .expect("governance fields emitted by Python must deserialize into WorkflowIr");
+
+        // Policy / approval
+        let policy = ir.policy.expect("policy must be Some");
+        assert_eq!(policy.require_approval_for, vec!["delete_*"]);
+        assert!(policy.blocked_tools.is_empty());
+        assert!(policy.model_allowlist.is_empty());
+
+        // Token budget
+        let token_budget = ir.token_budget.expect("token_budget must be Some");
+        assert_eq!(token_budget.total_tokens, Some(1000));
+        assert!(token_budget.input_tokens.is_none());
+        assert!(token_budget.output_tokens.is_none());
+
+        // Cost budget
+        let cost = ir.cost_budget_usd.expect("cost_budget_usd must be Some");
+        assert!((cost - 0.5_f64).abs() < f64::EPSILON);
+
+        // Data policy / PII
+        let dp = ir.data_policy.expect("data_policy must be Some");
+        assert!(dp.pii_detectors.contains(&"email".to_string()));
+        assert!(dp.pii_detectors.contains(&"ssn".to_string()));
+        assert!(dp.pii_detectors.contains(&"credit_card".to_string()));
+        assert!(dp.pii_detectors.contains(&"phone".to_string()));
+        assert!(dp.pii_detectors.contains(&"ip_address".to_string()));
+        assert_eq!(dp.redaction_mode, "mask");
+        assert!(!dp.retain_prompts);
+        assert!(dp.retain_outputs);
+    }
+
+    /// approval_required=True (all tools) compiles to require_approval_for=["*"].
+    /// This shape must deserialize and the wildcard must be preserved.
+    #[test]
+    fn approval_wildcard_deserializes() {
+        let json = r#"{
+            "workflow_id": "w", "version": "0.1.0", "state_schema": "",
+            "start_node": "s", "nodes": {}, "edges": [], "retry_policies": {},
+            "timeouts": {}, "models": {}, "tools": {}, "mcp_servers": {},
+            "remote_agents": {}, "labels": {},
+            "policy": {
+                "blocked_tools": [],
+                "require_approval_for": ["*"],
+                "model_allowlist": []
+            }
+        }"#;
+        let ir = WorkflowIr::from_json(json).expect("must deserialize");
+        let policy = ir.policy.unwrap();
+        assert_eq!(policy.require_approval_for, vec!["*"]);
+    }
 }
