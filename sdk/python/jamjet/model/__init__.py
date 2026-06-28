@@ -13,6 +13,7 @@ from jamjet.model.middleware import (
     ModelDeniedError,
     ModelMiddleware,
 )
+from jamjet.model.pii import PiiRedactionMiddleware
 from jamjet.model.seam import Model
 from jamjet.model.types import (
     ModelRef,
@@ -37,6 +38,7 @@ __all__ = [
     "ModelRef",
     "ModelRequest",
     "ModelResponse",
+    "PiiRedactionMiddleware",
     "StreamChunk",
     "api_key_env_for",
     "default_model_middleware",

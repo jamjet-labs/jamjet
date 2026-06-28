@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from jamjet.model.budget import BudgetMiddleware
 from jamjet.model.metering import MeteringMiddleware
 from jamjet.model.middleware import ModelAllowlistMiddleware, ModelMiddleware
+from jamjet.model.pii import PiiRedactionMiddleware
 
 if TYPE_CHECKING:
     from jamjet.agents.governance import GovernanceConfig
@@ -19,14 +20,25 @@ def default_model_middleware(
 
     Track 1 default: allow-all allowlist + no-budget + metering.
     Track 3 (T3-2): passing ``governance`` enables budget enforcement.
+    Track 3 (T3-3): PII redaction is ON by default; ``pii=False`` omits it.
 
     Chain order
     -----------
-    1. ``ModelAllowlistMiddleware`` — deny disallowed models (allow-all when
+    1. ``ModelAllowlistMiddleware`` -- deny disallowed models (allow-all when
        ``allowed=None``; Track 3 T3-6 wires the real policy-derived list).
-    2. ``BudgetMiddleware`` — fail-closed per-run budget enforcement; no-op
+    2. ``PiiRedactionMiddleware`` -- redact PII from outbound prompt messages
+       BEFORE the provider or any other middleware sees them; fail-closed
+       (redact-or-deny).  Omitted when ``governance.pii`` is ``False``.
+    3. ``BudgetMiddleware`` -- fail-closed per-run budget enforcement; no-op
        when ``governance`` is ``None`` or ``governance.budget`` is ``None``.
-    3. ``MeteringMiddleware`` — passive cost/token recorder; always active.
+    4. ``MeteringMiddleware`` -- passive cost/token recorder; always active.
+
+    PII is DEFAULT ON
+    -----------------
+    When ``governance`` is ``None`` (no explicit governance config), PII
+    redaction is ENABLED (the safe default).  Pass
+    ``GovernanceConfig(pii=False)`` or ``normalize_governance(pii=False)``
+    to disable it explicitly and receive unredacted prompts at the provider.
 
     Threading the budget
     --------------------
@@ -44,8 +56,11 @@ def default_model_middleware(
     runs.
     """
     budget = governance.budget if governance is not None else None
-    return [
-        ModelAllowlistMiddleware(None),
-        BudgetMiddleware(budget),
-        MeteringMiddleware(),
-    ]
+    pii_on = governance.pii if governance is not None else True
+
+    chain: list[ModelMiddleware] = [ModelAllowlistMiddleware(None)]
+    if pii_on:
+        chain.append(PiiRedactionMiddleware())
+    chain.append(BudgetMiddleware(budget))
+    chain.append(MeteringMiddleware())
+    return chain
