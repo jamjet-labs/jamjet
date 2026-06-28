@@ -32,6 +32,13 @@ from jamjet.eval.scorers import (
     LlmJudgeScorer,
     ScorerResult,
 )
+from jamjet.eval.trajectory import (
+    Trajectory,
+    TrajectoryAssertionResult,
+    TrajectoryResult,
+    TrajectoryScorer,
+    TrajectoryStep,
+)
 
 __all__ = [
     "AgentEvalRunner",
@@ -51,6 +58,11 @@ __all__ = [
     "ScorerDefinition",
     "ScorerRegistry",
     "ScorerResult",
+    "Trajectory",
+    "TrajectoryAssertionResult",
+    "TrajectoryResult",
+    "TrajectoryScorer",
+    "TrajectoryStep",
     "get_scorer_registry",
     "invoke_scorer",
     "scorer",
