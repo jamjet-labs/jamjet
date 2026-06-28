@@ -345,6 +345,59 @@ async fn fenced_complete_settles_claimed_item_with_matching_fence() {
     );
 }
 
+/// Atomicity: many concurrent fenced completes of the SAME claimed item with the
+/// SAME matching fence must yield EXACTLY ONE `true`. `complete_work_item_fenced`
+/// uses DashMap's `remove_if`, so the claimed+fence-match check and the delete are
+/// one atomic step — the get-then-remove TOCTOU where two racers both observe the
+/// item and both remove it (double-settle) cannot happen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fenced_complete_is_atomic_under_concurrency() {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let exec_id = ExecutionId::new();
+    let item_id = backend
+        .enqueue_work_item(pending_item(&exec_id))
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_work_item("w1", &["default"])
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = claimed.lease_fence;
+    assert!(fence > 0);
+
+    // Release all racers simultaneously (the barrier maximizes the overlap on the
+    // single contended item) and have each present the matching fence.
+    const RACERS: usize = 16;
+    let barrier = Arc::new(Barrier::new(RACERS));
+    let mut handles = Vec::with_capacity(RACERS);
+    for _ in 0..RACERS {
+        let backend = Arc::clone(&backend);
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            backend
+                .complete_work_item_fenced(item_id, fence)
+                .await
+                .unwrap()
+        }));
+    }
+
+    let mut settled = 0usize;
+    for h in handles {
+        if h.await.unwrap() {
+            settled += 1;
+        }
+    }
+    assert_eq!(
+        settled, 1,
+        "exactly one concurrent fenced complete may settle the item (atomic check-and-delete)"
+    );
+}
+
 #[tokio::test]
 async fn test_patch_append_array() {
     let backend = InMemoryBackend::new();

@@ -446,16 +446,19 @@ impl StateBackend for InMemoryBackend {
         //   2. A stale fence after a reclaim — `reclaim_expired_leases` clears
         //      `worker_id` but LEAVES `lease_fence` set, so the old fence lingers.
         // Either case now returns `Ok(false)`. A mismatched fence, an absent
-        // item, or one already settled (removed) also returns `false`. The
-        // get-then-remove is two DashMap ops rather than one atomic step; that is
-        // acceptable for the in-memory dev/test backend (the SQLite backends are
-        // the production path where atomicity is guaranteed by the single UPDATE).
-        match self.work_items.get(&item_id) {
-            Some(entry) if entry.worker_id.is_some() && entry.lease_fence == lease_fence => {}
-            _ => return Ok(false),
-        }
-        self.work_items.remove(&item_id);
-        Ok(true)
+        // item, or one already settled (removed) also returns `false`.
+        //
+        // `remove_if` makes the guard check and the delete a SINGLE atomic step
+        // (it holds the shard lock across the predicate and removal), closing the
+        // get-then-remove TOCTOU where two concurrent settles could both observe a
+        // claimed+matching item and both remove it. It returns `Some` iff the
+        // predicate held and the entry was removed, so exactly one racer settles.
+        Ok(self
+            .work_items
+            .remove_if(&item_id, |_k, entry| {
+                entry.worker_id.is_some() && entry.lease_fence == lease_fence
+            })
+            .is_some())
     }
 
     async fn commit_turn(
