@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.0 — 2026-06-29
+
+The full ADK feature set. A plain `Agent` is now durable and governed by default, with first-class sessions, memory, multi-agent teams, deploy, and a five-minute dev loop.
+
+### Added
+
+- Governance on by default. `Agent(policy=, approval_required=, budget=, pii=, audit=, receipts=)`: a model allowlist, fail-closed budget caps, PII redaction at the model seam, a signed hash-chained audit record per action, and an AgentBoundary receipt per turn. Enforced on both `run()` and `run_durable()`.
+- Sessions and memory. `Session` + a persistent `SessionStore` continue a conversation thread across runs and restarts; `memory=` wires the Engram bridge with an automatic, governed retrieve/record loop keyed by the session.
+- Team multi-agent API: `Sequential`, `Parallel` (with `MergeStrategy`), `Team` (coordinator), and `Loop`. Each sub-agent runs as its own governed durable execution; `run()` / `run_durable()` return a `TeamResult` with per-agent isolation.
+- `agent.deploy(runtime="local" | "self-host" | "cloud" | "<url>")` and `Team.deploy(...)`: ship the same compiled IR to any runtime over the durable engine. Artifacts API (`POST/GET /artifacts`).
+- Devtools: `jamjet create` scaffolds a runnable project, `jamjet dev` runs the whole local stack (model sidecar + engine + worker) with one command, and `jamjet eval` adds deterministic trajectory evaluation (`jamjet eval trajectory-diff`).
+
 ## 0.10.1 — 2026-06-12
 
 ### Added
