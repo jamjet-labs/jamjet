@@ -7,14 +7,10 @@
 [![jamjet MCP server](https://glama.ai/mcp/servers/jamjet-labs/jamjet/badges/score.svg)](https://glama.ai/mcp/servers/jamjet-labs/jamjet)
 [![CI](https://img.shields.io/github/actions/workflow/status/jamjet-labs/jamjet/ci.yml?label=CI&style=flat-square)](https://github.com/jamjet-labs/jamjet/actions)
 [![PyPI](https://img.shields.io/pypi/v/jamjet?style=flat-square&color=f5c518)](https://pypi.org/project/jamjet)
-[![crates.io](https://img.shields.io/crates/v/jamjet-engram?style=flat-square&color=f5c518)](https://crates.io/crates/jamjet-engram)
+[![Maven Central](https://img.shields.io/maven-central/v/dev.jamjet/jamjet-runtime-core?style=flat-square&color=f5c518&label=maven)](https://central.sonatype.com/artifact/dev.jamjet/jamjet-runtime-core)
+[![crates.io](https://img.shields.io/crates/v/jamjet-policy?style=flat-square&color=f5c518&label=crates.io)](https://crates.io/crates/jamjet-policy)
 [![License](https://img.shields.io/badge/license-Apache%202.0-f5c518?style=flat-square)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/jamjet-labs/jamjet?style=flat-square&color=f5c518)](https://github.com/jamjet-labs/jamjet/stargazers)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square)](https://rustup.rs)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)](https://python.org)
-[![Java](https://img.shields.io/badge/java-21%2B-red?style=flat-square)](https://openjdk.org)
-[![Docs](https://img.shields.io/badge/docs-jamjet.dev-f5c518?style=flat-square)](https://jamjet.dev/quickstart)
-[![Discord](https://img.shields.io/discord/1484398867611910305?style=flat-square&logo=discord&label=Discord&color=5865F2)](https://discord.gg/SAYnEj86fr)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/SAYnEj86fr)
 
 [jamjet.dev](https://jamjet.dev) · [Quickstart](https://jamjet.dev/quickstart) · [Docs](https://jamjet.dev/concepts) · [Examples](https://jamjet.dev/examples) · [Blog](https://jamjet.dev/blog) · [Discord](https://discord.gg/SAYnEj86fr)
 
@@ -27,9 +23,9 @@
 
 > *Write the safety policy once. Run it everywhere your agents can act.*
 
-JamJet sits underneath your agent — Claude Code, OpenAI Agents SDK, MCP clients, LangChain, CrewAI, ADK, custom code — and enforces what prompts cannot:
+JamJet sits underneath your agent (Claude Code, OpenAI Agents SDK, MCP clients, LangChain, CrewAI, ADK, Spring AI, custom code) and enforces what prompts cannot:
 
-- 🛡️ **Block unsafe tool calls** at runtime (database deletes, payments, file writes)
+- 🛡️ **Block unsafe tool calls** at runtime: database deletes, payments, file writes
 - ✋ **Pause for human approval** on risky actions, durably
 - 💸 **Cap cost** per agent, per run, per project
 - 📒 **Record an audit trail** that survives a regulator's review
@@ -56,6 +52,29 @@ jamjet demo mcp-tool-policy # MCP-shaped policy (preview of JamJet Gateway)
 
 Works alongside **Claude Code · OpenAI Agents SDK · MCP clients · LangChain · CrewAI · ADK · Spring AI · LangChain4j**.
 
+## On the JVM: one dependency
+
+Spring AI and LangChain4j teams get the same layer without writing glue code. The Spring Boot starter auto-injects JamJet advisors into your `ChatClient`: every call becomes durable and audited, with no changes to your application code.
+
+```xml
+<dependency>
+    <groupId>dev.jamjet</groupId>
+    <artifactId>jamjet-spring-boot-starter</artifactId>
+    <version>0.1.0</version>
+</dependency>
+```
+
+```properties
+spring.jamjet.runtime-url=http://localhost:7700
+spring.jamjet.approval.enabled=true   # opt-in human-in-the-loop approval
+```
+
+Crash recovery, event sourcing, and a REST endpoint to approve or reject held actions. Falls back gracefully if the runtime is unreachable.
+
+Prefer no sidecar at all? **[JamJet Java Runtime](https://github.com/jamjet-labs/jamjet-runtime-java)** embeds durable execution directly in your JVM process: Java 21, no Docker, **8.9× faster** than calling out to a REST sidecar ([benchmark and launch post](https://jamjet.dev/blog/zero-sidecar-durable-agents-java/)). Works with Spring AI, LangChain4j, and Google ADK.
+
+→ See a Spring Boot agent survive `kill -9` mid-run in **[`examples/loan-underwriter-agent`](examples/loan-underwriter-agent)**: resumes from disk checkpoints, gates disbursement on human approval, emits a signed receipt bundle.
+
 ## The same policy, everywhere
 
 Every agent toolchain is inventing its own safety layer. JamJet gives you one policy file and one audit trail across all of them.
@@ -67,12 +86,13 @@ Every agent toolchain is inventing its own safety layer. JamJet gives you one po
 | [`@jamjet/openai-guardrail`](https://npmjs.com/package/@jamjet/openai-guardrail) | `npm i @jamjet/openai-guardrail` | [OpenAI Agents SDK](https://github.com/openai/openai-agents-js) tool guardrail (TS) |
 | [`jamjet.integrations.openai_guardrail`](https://pypi.org/project/jamjet/) | `pip install jamjet` | [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) tool guardrail (Python) |
 | [`jamjet`](https://pypi.org/project/jamjet/) | `pip install jamjet` | Python SDK + runtime |
+| [`dev.jamjet:jamjet-spring-boot-starter`](https://central.sonatype.com/artifact/dev.jamjet/jamjet-spring-boot-starter) | Maven / Gradle | [Spring AI](https://spring.io/projects/spring-ai) ChatClient advisors |
 | [`@jamjet/cloud`](https://npmjs.com/package/@jamjet/cloud) | `npm i @jamjet/cloud` | TypeScript SDK + shared engine |
 | [`@jamjet/cli`](https://npmjs.com/package/@jamjet/cli) | `npm i -g @jamjet/cli` | Unified `jamjet audit show` / `jamjet approve` |
 
 All adapters load the same `policy.yaml`. All emit conformant audit JSONL to `~/.jamjet/audit/`. Run `jamjet audit show` to tail every decision across every adapter in one chronological view.
 
-**Respect the platforms you plug into.** Claude Code gave developers a hook point — JamJet gives that hook point a real policy engine, approval flow, and audit trail, and the same rules carry to OpenAI Agents SDK, MCP, and your own Python/TS code. OpenAI Agents SDK has guardrails — JamJet lets you express the policy once and reuse it elsewhere. If your MCP gateway supports plugins, JamJet can be the policy brain; if not, the `@jamjet/mcp-shim` proxy fills the gap.
+JamJet does not replace the hook points these platforms give you. It makes them do more: Claude Code's PreToolUse hook gets a real policy engine, approval flow, and audit trail, and the same rules carry unchanged to OpenAI Agents SDK, MCP clients, Spring AI, and your own Python or TypeScript code.
 
 ### One policy, every adapter
 
@@ -94,7 +114,7 @@ Drop this file in `~/.jamjet/`. Every adapter listed above uses it automatically
 
 ## Policy in your own code
 
-Drop a policy beside your agent code. The runtime intercepts any matching tool call *before* it leaves the agent's process — `blocked_tools` are refused outright, `require_approval_for` pauses execution durably and waits for an out-of-band decision (crashes don't lose the approval; execution resumes when it arrives).
+Drop a policy beside your agent code. The runtime intercepts any matching tool call *before* it leaves the agent's process: `blocked_tools` are refused outright, `require_approval_for` pauses execution durably and waits for an out-of-band decision. Crashes don't lose the approval; execution resumes when it arrives.
 
 ```yaml
 # workflow.yaml
@@ -156,10 +176,22 @@ jamjet.cloud.policy("require_approval", "database.*")
 | Human approval is custom glue | Approval is a durable workflow step |
 | Costs are discovered after the bill | Budgets enforced per agent / per run |
 | Audit evidence is stitched from logs | Append-only event log, signed export |
-| Memory is framework-specific | Pair with [Engram](#sub-products) for portable memory (MCP · REST · Python · Java) |
+| Memory is framework-specific | Pair with [Engram](#engram) for portable memory (MCP · REST · Python · Java) |
 | Frameworks stay siloed | MCP + A2A connect tools and agents |
 
-## Works with your stack — not a replacement
+## A full runtime underneath
+
+The safety layer runs on a durable, event-sourced execution engine. When you want more than enforcement, it's already there:
+
+- **Durable execution.** Event log, snapshots, crash recovery, deterministic replay. `agent.run_durable(...)` in [`examples/react-agent-durable`](examples/react-agent-durable).
+- **Sessions and memory.** Persistent `Session` threads across runs and restarts, with a governed Engram retrieve/record loop. [`examples/session-memory`](examples/session-memory).
+- **Multi-agent.** `Sequential`, `Parallel`, coordinator `Team`, and `Loop`; each sub-agent runs as its own governed durable execution. [`examples/team-multi-agent`](examples/team-multi-agent). Declare whole fleets in YAML with cron schedules: [`examples/fleet`](examples/fleet).
+- **Evaluation.** Batch eval with LLM-judge scoring ([`examples/eval-harness`](examples/eval-harness)) and trajectory regression diffs ([`examples/trajectory-eval`](examples/trajectory-eval)).
+- **Deploy.** `agent.deploy(runtime="local" | "self-host" | "cloud")` ships the same compiled IR to any runtime. [`examples/deploy-an-agent`](examples/deploy-an-agent).
+- **Dev loop.** `jamjet create` scaffolds a project; `jamjet dev` runs the whole local stack with one command.
+- **Web Companion.** A UI embedded in the runtime binary: graph view, timeline, state inspector, replay and fork controls.
+
+## Works with your stack, not a replacement
 
 JamJet does not replace LangChain, LangGraph, CrewAI, Google ADK, Spring AI, or your custom agent code. Use those to build agent behavior. Use JamJet to control what happens at runtime.
 
@@ -168,27 +200,27 @@ JamJet does not replace LangChain, LangGraph, CrewAI, Google ADK, Spring AI, or 
 | **LangChain · LangGraph · CrewAI · Google ADK · AutoGen** | Authoring agent behavior | Runtime safety: policy, audit, replay, approvals |
 | **LangSmith · Arize · Weights & Biases** | Observability and evaluation | Active enforcement (block at runtime) + durable recovery |
 | **Temporal · Orkes · DBOS** | General durable workflows | Agent-native primitives: policy on tool calls, MCP/A2A, memory |
-| **Google · AWS · Azure agent platforms** | Cloud-native ecosystems | Open-source, cloud-neutral governance — works on-prem |
+| **Google · AWS · Azure agent platforms** | Cloud-native ecosystems | Open-source, cloud-neutral governance that works on-prem |
 
-Community-built integrations for **LangChain, LlamaIndex, CrewAI, AutoGen, Pydantic-AI, DSPy, Spring AI, and LangChain4j** live in [`jamjet-labs/jamjet-examples/integrations`](https://github.com/jamjet-labs/jamjet-examples/tree/main/integrations). Want to build the official integration for *your* framework? **[Claim a slot](https://github.com/jamjet-labs/jamjet-examples/issues?q=is%3Aissue+is%3Aopen+label%3Awanted-integration)** — first 10 merged contributors get JamJet swag.
+Want to build the official integration for *your* framework? **[Claim a slot](https://github.com/jamjet-labs/jamjet-examples/issues?q=is%3Aissue+is%3Aopen+label%3Awanted-integration)**: 8 slots open, the first 10 merged contributors get JamJet swag.
 
 ## Examples
 
 | Example | What it shows |
 |---------|--------------|
+| [`01-block-unsafe-tool`](examples/01-block-unsafe-tool) | A destructive tool call blocked before execution |
 | [`hitl-approval`](examples/hitl-approval) | Human approval as a first-class workflow primitive |
-| [`coordinator-routing`](examples/coordinator-routing) | Dynamic agent routing with structured scoring |
-| [`claims-processing`](examples/claims-processing) | Insurance pipeline — 4 specialist agents + HITL + audit |
+| [`react-agent-durable`](examples/react-agent-durable) | A ReAct agent on the durable engine: event log, replay, park-on-429 |
+| [`team-multi-agent`](examples/team-multi-agent) | Multi-agent Teams, each sub-agent its own governed run |
+| [`loan-underwriter-agent`](examples/loan-underwriter-agent) | Spring Boot agent that survives `kill -9` and gates on human approval |
+| [`claims-processing`](examples/claims-processing) | Insurance pipeline: 4 specialist agents + HITL + audit |
 | [`eval-harness`](examples/eval-harness) | Batch evaluation with LLM judge scoring |
-| [`mcp-tool-consumer`](examples/mcp-tool-consumer) | Connect to external MCP tool servers |
 
-→ [All 19 examples](examples/) · [Community integrations](https://github.com/jamjet-labs/jamjet-examples/tree/main/integrations) · [Build your own](https://github.com/jamjet-labs/jamjet-examples/issues?q=is%3Aissue+is%3Aopen+label%3Awanted-integration)
+→ [All 33 examples](examples/)
 
-## Sub-products
+## Engram
 
-**[Engram](runtime/engram-server/README.md)** — the JamJet ecosystem's memory layer for agents. Where JamJet provides durable *execution* (process can crash and resume), Engram provides durable *memory* (facts persist across runs and version cleanly via `supersede()`). Temporal knowledge graph, hybrid retrieval, conflict detection. Ships as a [Rust crate](https://crates.io/crates/jamjet-engram) (also bundled into the Rust runtime above), an [MCP server](https://registry.modelcontextprotocol.io/servers/io.github.jamjet-labs/engram-server) (Docker · GHCR), a [standalone Python library](https://pypi.org/project/jamjet-engram) ([github.com/jamjet-labs/engram](https://github.com/jamjet-labs/engram), 71% on LongMemEval-S), a [Python client](https://pypi.org/project/jamjet) for the MCP server, and a [Spring AI `ChatMemoryRepository`](https://central.sonatype.com/artifact/dev.jamjet/engram-spring-boot-starter). Comparison with Mem0/Zep → [java-ai-memory.dev](https://java-ai-memory.dev).
-
-**[JamJet Java Runtime](https://github.com/jamjet-labs/jamjet-runtime-java)** — embeds durable execution directly in your JVM, no Docker or sidecar, **8.9× faster** than calling out to one. Works with Spring AI, LangChain4j, and Google ADK. → [Launch post](https://jamjet.dev/blog/zero-sidecar-durable-agents-java/).
+**[Engram](runtime/engram-server/README.md)** is the JamJet ecosystem's memory layer for agents. Where JamJet provides durable *execution* (process can crash and resume), Engram provides durable *memory* (facts persist across runs and version cleanly via `supersede()`). Temporal knowledge graph, hybrid retrieval, conflict detection. Ships as a [Rust crate](https://crates.io/crates/jamjet-engram) (also bundled into the Rust runtime above), an [MCP server](https://registry.modelcontextprotocol.io/servers/io.github.jamjet-labs/engram-server) (Docker · GHCR), a [standalone Python library](https://pypi.org/project/jamjet-engram) ([github.com/jamjet-labs/engram](https://github.com/jamjet-labs/engram), 71% on LongMemEval-S), a [Python client](https://pypi.org/project/jamjet) for the MCP server, and a [Spring AI `ChatMemoryRepository`](https://central.sonatype.com/artifact/dev.jamjet/engram-spring-boot-starter). Comparison with Mem0/Zep → [java-ai-memory.dev](https://java-ai-memory.dev).
 
 ## Architecture
 
@@ -198,7 +230,7 @@ Community-built integrations for **LangChain, LlamaIndex, CrewAI, AutoGen, Pydan
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                     Authoring Layer                       │
-│     Python SDK  |  Java SDK  |  Go SDK (planned)  |  YAML  │
+│    Python SDK  |  Java SDK  |  TypeScript SDK  |  YAML     │
 ├──────────────────────────────────────────────────────────┤
 │                 Compilation / Validation                   │
 │           Graph IR  |  Schema  |  Policy lint             │
@@ -219,7 +251,7 @@ Community-built integrations for **LangChain, LlamaIndex, CrewAI, AutoGen, Pydan
 └──────────────────────────────────────────────────────────┘
 ```
 
-*"Engram Memory" here is the in-process distribution bundled with the Rust runtime. Engram also ships standalone — see [Sub-products](#sub-products).*
+*"Engram Memory" here is the in-process distribution bundled with the Rust runtime. Engram also ships standalone; see [Engram](#engram).*
 
 </details>
 
@@ -231,10 +263,10 @@ Full docs at **[jamjet.dev](https://jamjet.dev/quickstart)**
 
 ## Contributing
 
-Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Looking for a starter task?**
-- Build a [framework integration](https://github.com/jamjet-labs/jamjet-examples/issues?q=is%3Aissue+is%3Aopen+label%3Awanted-integration) — 8 slots open, first 10 contributors get JamJet swag
+- Build a [framework integration](https://github.com/jamjet-labs/jamjet-examples/issues?q=is%3Aissue+is%3Aopen+label%3Awanted-integration): 8 slots open, first 10 contributors get JamJet swag
 - Browse [good first issues](https://github.com/jamjet-labs/jamjet/labels/good%20first%20issue)
 - Join the conversation in [Discord](https://discord.gg/SAYnEj86fr)
 
@@ -244,13 +276,13 @@ Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0. See [LICENSE](LICENSE).
 
 ---
 
 <div align="center">
 
-*Hosted control plane available at [app.jamjet.dev](https://app.jamjet.dev) — traces, approval queue, audit retention, team projects. Optional. The runtime, both SDKs, and Engram are Apache-2.0 with no usage limits.*
+*Hosted control plane available at [app.jamjet.dev](https://app.jamjet.dev): traces, approval queue, audit retention, team projects. Optional. The runtime, all SDKs, and Engram are Apache-2.0 with no usage limits.*
 
 ### ⭐ Star JamJet if you believe agents need a runtime safety layer
 
