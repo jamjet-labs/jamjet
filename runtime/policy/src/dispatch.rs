@@ -8,6 +8,8 @@
 //! readable here — the same bytes the dispatch will consume, which is what
 //! makes this free of a time-of-check-to-time-of-use window.
 
+use crate::{EvaluationContext, PolicyDecision, PolicyEvaluator};
+use jamjet_ir::workflow::PolicySetIr;
 use serde_json::Value;
 
 /// One tool call an agent dispatch node is about to execute.
@@ -58,13 +60,95 @@ pub fn pending_tool_calls(input: &Value) -> Option<Vec<PendingToolCall>> {
     Some(out)
 }
 
+/// The aggregate policy outcome for one dispatch batch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DispatchDecision {
+    Allow,
+    Block {
+        tool_name: String,
+        reason: String,
+    },
+    RequireApproval {
+        approver: String,
+        gated: Vec<String>,
+    },
+}
+
+/// Evaluate every pending call and collapse the results to one decision.
+///
+/// Precedence is fail-closed: any Block blocks the batch, otherwise any
+/// RequireApproval holds the batch, otherwise Allow. The first block wins and
+/// short-circuits, since the outcome for the batch cannot get any stricter.
+///
+/// Approval is per-batch rather than per-call because `hold_for_approval` keys
+/// approval state on `node_id` (`runtime/workers/src/worker.rs:667`). `gated`
+/// carries every call that asked for approval so the approver sees all of them.
+pub fn evaluate_dispatch(
+    node_id: &str,
+    calls: &[PendingToolCall],
+    policy_sets: &[&PolicySetIr],
+) -> DispatchDecision {
+    let ev = PolicyEvaluator;
+    let mut gated: Vec<String> = Vec::new();
+    let mut approver: Option<String> = None;
+
+    for call in calls {
+        let ctx = EvaluationContext {
+            node_id: node_id.to_string(),
+            // "tool", not "python_fn": only the model-allowlist branch keys on
+            // the tag (runtime/policy/src/lib.rs:62), and "tool" is what makes
+            // blocked_tools / require_approval_for read naturally here.
+            node_kind_tag: "tool".to_string(),
+            tool_name: Some(call.name.clone()),
+            model_ref: None,
+        };
+        match ev.evaluate(&ctx, policy_sets) {
+            PolicyDecision::Block { reason } => {
+                return DispatchDecision::Block {
+                    tool_name: call.name.clone(),
+                    reason,
+                }
+            }
+            PolicyDecision::RequireApproval { approver: a } => {
+                gated.push(call.name.clone());
+                approver.get_or_insert(a);
+            }
+            PolicyDecision::Allow => {}
+        }
+    }
+
+    match approver {
+        Some(a) => DispatchDecision::RequireApproval { approver: a, gated },
+        None => DispatchDecision::Allow,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jamjet_ir::workflow::PolicySetIr;
     use serde_json::json;
 
     fn call(name: &str) -> serde_json::Value {
         json!({"id": "c1", "name": name, "arguments": {"x": 1}})
+    }
+
+    fn policy(blocked: &[&str], approval: &[&str]) -> PolicySetIr {
+        PolicySetIr {
+            blocked_tools: blocked.iter().map(|s| s.to_string()).collect(),
+            require_approval_for: approval.iter().map(|s| s.to_string()).collect(),
+            model_allowlist: vec![],
+        }
+    }
+
+    fn pending(names: &[&str]) -> Vec<PendingToolCall> {
+        names
+            .iter()
+            .map(|n| PendingToolCall {
+                name: n.to_string(),
+                arguments: json!({}),
+            })
+            .collect()
     }
 
     #[test]
@@ -157,5 +241,82 @@ mod tests {
         let input = json!({"tool_calls": [{"id": "c1", "name": "t"}]});
         let calls = pending_tool_calls(&input).expect("readable");
         assert_eq!(calls[0].arguments, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn ungated_batch_is_allowed() {
+        let p = policy(&[], &[]);
+        let d = evaluate_dispatch("__tools_0__", &pending(&["read_file"]), &[&p]);
+        assert_eq!(d, DispatchDecision::Allow);
+    }
+
+    #[test]
+    fn blocked_tool_blocks_the_batch() {
+        let p = policy(&["send_wire"], &[]);
+        let d = evaluate_dispatch("__tools_0__", &pending(&["read_file", "send_wire"]), &[&p]);
+        match d {
+            DispatchDecision::Block { tool_name, .. } => assert_eq!(tool_name, "send_wire"),
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_tool_holds_the_batch() {
+        let p = policy(&[], &["send_wire"]);
+        let d = evaluate_dispatch("__tools_0__", &pending(&["send_wire"]), &[&p]);
+        match d {
+            DispatchDecision::RequireApproval { gated, .. } => assert_eq!(gated, vec!["send_wire"]),
+            other => panic!("expected RequireApproval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_gated_call_holds_the_whole_batch() {
+        // Documented limitation: approval is per-batch, because hold_for_approval
+        // keys approval state on node_id.
+        let p = policy(&[], &["send_wire"]);
+        let d = evaluate_dispatch(
+            "__tools_0__",
+            &pending(&["read_file", "send_wire", "log"]),
+            &[&p],
+        );
+        match d {
+            DispatchDecision::RequireApproval { gated, .. } => assert_eq!(gated, vec!["send_wire"]),
+            other => panic!("expected RequireApproval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_wins_over_approval() {
+        // Fail closed: a batch containing both must never merely hold.
+        let p = policy(&["drop_table"], &["send_wire"]);
+        let d = evaluate_dispatch("__tools_0__", &pending(&["send_wire", "drop_table"]), &[&p]);
+        assert!(matches!(d, DispatchDecision::Block { .. }));
+    }
+
+    #[test]
+    fn glob_patterns_match_per_call() {
+        let p = policy(&["admin_*"], &[]);
+        let d = evaluate_dispatch("__tools_0__", &pending(&["admin_delete"]), &[&p]);
+        assert!(matches!(d, DispatchDecision::Block { .. }));
+    }
+
+    #[test]
+    fn empty_batch_is_allowed() {
+        let p = policy(&["send_wire"], &[]);
+        assert_eq!(
+            evaluate_dispatch("__tools_0__", &[], &[&p]),
+            DispatchDecision::Allow
+        );
+    }
+
+    #[test]
+    fn node_policy_overrides_tenant_policy() {
+        // Sets are ordered least-specific to most-specific; the evaluator
+        // iterates in reverse, so the node layer wins.
+        let tenant = policy(&["send_wire"], &[]);
+        let node = policy(&[], &["send_wire"]);
+        let d = evaluate_dispatch("__tools_0__", &pending(&["send_wire"]), &[&tenant, &node]);
+        assert!(matches!(d, DispatchDecision::RequireApproval { .. }));
     }
 }
