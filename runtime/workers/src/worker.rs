@@ -201,6 +201,7 @@ impl Worker {
                             kind,
                             node_def,
                             &ir,
+                            &item.payload,
                         )
                         .await
                     {
@@ -728,6 +729,7 @@ impl Worker {
         kind: &NodeKind,
         node_def: &NodeDef,
         ir: &WorkflowIr,
+        payload: &serde_json::Value,
     ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
         let ctx = EvaluationContext::from_node_kind(node_id, kind);
 
@@ -754,6 +756,153 @@ impl Worker {
         }
         if sets.is_empty() {
             return None;
+        }
+
+        // ADK agent dispatch nodes hide their tool names behind a single
+        // python_fn / java_fn, so `ctx` above carries no tool_name and every
+        // blocked_tools / require_approval_for rule silently misses (C1).
+        // Evaluate the frozen pending calls from the work item instead. Those
+        // are the same bytes the executor will hand the dispatch, so there is
+        // no time-of-check-to-time-of-use window: we deliberately do NOT
+        // re-read state from the backend or from a snapshot here.
+        if is_agent_tool_dispatch(kind) {
+            let input = payload_input(payload);
+            let calls = match jamjet_policy::dispatch::pending_tool_calls(&input) {
+                Some(calls) => calls,
+                None => {
+                    // Fail closed, mirroring hold_for_approval's unavailable-state
+                    // arm: never run a node whose policy-relevant state we cannot
+                    // read. `Some(vec![])` (genuinely nothing to run) is distinct
+                    // and falls through to Allow below — do not collapse the two
+                    // with unwrap_or_default.
+                    warn!(
+                        execution_id = %execution_id,
+                        node_id,
+                        "agent dispatch tool calls unreadable — refusing to run"
+                    );
+                    return Some(Err(
+                        "policy blocked: agent dispatch tool calls unreadable".into(),
+                    ));
+                }
+            };
+
+            return match jamjet_policy::dispatch::evaluate_dispatch(node_id, &calls, &sets) {
+                jamjet_policy::dispatch::DispatchDecision::Allow => None,
+
+                jamjet_policy::dispatch::DispatchDecision::Block { tool_name, reason } => {
+                    // Attribute the scope using the same per-call context
+                    // `evaluate_dispatch` matched on; `ctx` has no tool_name, so
+                    // reusing it would record every dispatch block as "unknown".
+                    let blocked_ctx = EvaluationContext {
+                        node_id: node_id.to_string(),
+                        node_kind_tag: "tool".to_string(),
+                        tool_name: Some(tool_name.clone()),
+                        model_ref: None,
+                    };
+                    let policy_scope = self.identify_policy_scope(
+                        &blocked_ctx,
+                        tenant_policy_set.as_ref(),
+                        ir.policy.as_ref(),
+                        node_def.policy.as_ref(),
+                    );
+                    warn!(execution_id = %execution_id, node_id, %tool_name, %reason, %policy_scope, "Policy blocked agent tool call");
+                    // Best-effort audit. The block is enforced regardless of
+                    // whether recording the violation succeeds.
+                    if let Ok(latest) = self.backend.latest_sequence(execution_id).await {
+                        let _ = self
+                            .backend
+                            .append_event(jamjet_state::Event::new(
+                                execution_id.clone(),
+                                latest + 1,
+                                EventKind::PolicyViolation {
+                                    node_id: node_id.to_string(),
+                                    rule: reason.clone(),
+                                    decision: "blocked".to_string(),
+                                    policy_scope,
+                                },
+                            ))
+                            .await;
+                    }
+                    Some(Err(format!("policy blocked: {reason}").into()))
+                }
+
+                jamjet_policy::dispatch::DispatchDecision::RequireApproval { approver, gated } => {
+                    // Bind the approval to the exact calls it authorises, so a
+                    // settled approval cannot be replayed against a different
+                    // payload (approval-loop hardening: decision not bound to
+                    // resolved params).
+                    let calls_json = serde_json::json!(calls
+                        .iter()
+                        .map(|c| serde_json::json!({"name": c.name, "arguments": c.arguments}))
+                        .collect::<Vec<_>>());
+                    let current_hash = content_hash(&calls_json);
+
+                    // An existing approval authorised one specific call set. If
+                    // the pending calls differ, the approval must not carry over
+                    // — otherwise a settled approval authorises whatever happens
+                    // to be pending when the node re-fires.
+                    match self.backend.get_events(execution_id).await {
+                        Err(e) => {
+                            return Some(Err(format!(
+                                "approval state unavailable; refusing to run unapproved: {e}"
+                            )
+                            .into()))
+                        }
+                        Ok(events) => {
+                            if matches!(
+                                jamjet_state::approvals::node_approval_status(&events, node_id),
+                                NodeApprovalStatus::Approved { .. }
+                            ) {
+                                // The latest request for this node is the one the
+                                // approval settled, so its hash is the authorised
+                                // call set. A request with no hash (e.g. from the
+                                // non-dispatch path) yields None and blocks.
+                                let approved_hash =
+                                    events.iter().rev().find_map(|e| match &e.kind {
+                                        EventKind::ToolApprovalRequired {
+                                            node_id: n,
+                                            context,
+                                            ..
+                                        } if n == node_id => context
+                                            .get("calls_hash")
+                                            .and_then(|h| h.as_str())
+                                            .map(|s| s.to_string()),
+                                        _ => None,
+                                    });
+                                if approved_hash.as_deref() != Some(current_hash.as_str()) {
+                                    warn!(
+                                        execution_id = %execution_id,
+                                        node_id,
+                                        "approved call set does not match pending calls — refusing"
+                                    );
+                                    return Some(Err(
+                                        "policy blocked: approved tool calls do not match pending calls".into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    // `gated` carries tool NAMES only: two calls to the same
+                    // gated tool render as ["send_wire", "send_wire"] with no
+                    // discriminator. `calls` below is what identifies them.
+                    let context = serde_json::json!({
+                        "node_id": node_id,
+                        "gated_tools": gated,
+                        "calls": calls_json,
+                        "calls_hash": current_hash,
+                    });
+                    self.hold_for_approval(
+                        execution_id,
+                        node_id,
+                        item_id,
+                        gated.join(", "),
+                        approver,
+                        context,
+                    )
+                    .await
+                }
+            };
         }
 
         let decision = PolicyEvaluator.evaluate(&ctx, &sets);
@@ -1282,6 +1431,37 @@ fn parse_payload(payload: &serde_json::Value) -> (String, String) {
         .unwrap_or("1.0.0")
         .to_string();
     (workflow_id, workflow_version)
+}
+
+/// The frozen accumulated state the scheduler enriched onto a PythonFn/JavaFn
+/// work item (`runtime/scheduler/src/runner.rs:441-480`). This is the exact
+/// input the dispatch will consume, which is what makes policy evaluation over
+/// it free of a time-of-check-to-time-of-use window.
+///
+/// It MUST be `payload["input"]`, never `payload`. The pending calls live one
+/// level down; reading the whole payload would leave both call keys absent, so
+/// `pending_tool_calls` would return `Some(vec![])` and every tool would be
+/// allowed while the code read like a correct allow. When the key is missing,
+/// this yields `Value::Null`, which `pending_tool_calls` rejects as unreadable.
+fn payload_input(payload: &serde_json::Value) -> serde_json::Value {
+    payload
+        .get("input")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// True for nodes that run a whole agent turn's model-chosen tool calls.
+fn is_agent_tool_dispatch(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::PythonFn {
+            agent_tool_dispatch: true,
+            ..
+        } | NodeKind::JavaFn {
+            agent_tool_dispatch: true,
+            ..
+        }
+    )
 }
 
 #[cfg(test)]
@@ -2860,5 +3040,471 @@ mod tests {
             *event_output, small_output,
             "inline output must equal the original value"
         );
+    }
+
+    // ── C1: agent tool-dispatch policy enforcement ────────────────────────────
+
+    /// Records every tool dispatch so a test can prove one never happened.
+    #[derive(Clone, Default)]
+    struct CountingDispatchExecutor {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for CountingDispatchExecutor {
+        async fn execute(&self, _item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ExecutionResult {
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({}),
+                duration_ms: 0,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+            })
+        }
+    }
+
+    /// IR with a single marked agent tool-dispatch node under a workflow policy.
+    fn dispatch_ir_json(
+        kind_type: &str,
+        marked: bool,
+        blocked: &[&str],
+        approval: &[&str],
+    ) -> serde_json::Value {
+        let kind = if kind_type == "java_fn" {
+            serde_json::json!({
+                "type": "java_fn",
+                "class_name": "C",
+                "method": "dispatch",
+                "output_schema": "",
+                "agent_tool_dispatch": marked
+            })
+        } else {
+            serde_json::json!({
+                "type": "python_fn",
+                "module": "jamjet.agents.tool_runtime",
+                "function": "dispatch_tool_calls",
+                "output_schema": "",
+                "agent_tool_dispatch": marked
+            })
+        };
+        serde_json::json!({
+            "workflow_id": "adk-wf",
+            "version": "1.0.0",
+            "state_schema": "{}",
+            "start_node": "n1",
+            "nodes": { "n1": { "id": "n1", "kind": kind } },
+            "edges": [],
+            "retry_policies": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {},
+            "policy": {
+                "blocked_tools": blocked,
+                "require_approval_for": approval,
+                "model_allowlist": []
+            }
+        })
+    }
+
+    /// Drive one marked dispatch node and return (result, events, dispatch count).
+    ///
+    /// `seed` events are appended before the item is claimed, which is how a test
+    /// stages an already-settled approval for the node.
+    async fn run_dispatch_node_seeded(
+        ir: serde_json::Value,
+        input: serde_json::Value,
+        seed: Vec<EventKind>,
+    ) -> (
+        Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        Vec<jamjet_state::Event>,
+        usize,
+    ) {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "adk-wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: serde_json::json!({}),
+                current_state: serde_json::json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        backend
+            .store_workflow(WorkflowDefinition {
+                workflow_id: "adk-wf".into(),
+                version: "1.0.0".into(),
+                ir,
+                created_at: now,
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        for kind in seed {
+            // InMemoryBackend assigns the sequence itself, so 0 is a placeholder.
+            backend
+                .append_event(jamjet_state::Event::new(eid.clone(), 0, kind))
+                .await
+                .unwrap();
+        }
+        backend
+            .enqueue_work_item(WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "default".into(),
+                payload: serde_json::json!({
+                    "workflow_id": "adk-wf",
+                    "workflow_version": "1.0.0",
+                    "input": input
+                }),
+                attempt: 0,
+                max_attempts: 1,
+                created_at: now,
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+
+        let exec = CountingDispatchExecutor::default();
+        let counter = exec.calls.clone();
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("python_fn", Arc::new(exec.clone()))
+        .register_executor("java_fn", Arc::new(exec));
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+        let result = worker.execute_item(item).await;
+        let events = backend.get_events(&eid).await.unwrap();
+        let count = counter.load(std::sync::atomic::Ordering::SeqCst);
+        (result, events, count)
+    }
+
+    async fn run_dispatch_node(
+        ir: serde_json::Value,
+        input: serde_json::Value,
+    ) -> (
+        Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        Vec<jamjet_state::Event>,
+        usize,
+    ) {
+        run_dispatch_node_seeded(ir, input, Vec::new()).await
+    }
+
+    fn one_call(name: &str) -> serde_json::Value {
+        serde_json::json!({"id": "c1", "name": name, "arguments": {}})
+    }
+
+    /// C1 core: a blocked tool must never execute.
+    #[tokio::test]
+    async fn blocked_tool_in_dispatch_never_executes() {
+        let (result, events, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+        )
+        .await;
+        assert_eq!(count, 0, "the blocked tool dispatch must not run");
+        assert!(result.is_err(), "a blocked node must not succeed");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::PolicyViolation { .. })),
+            "a PolicyViolation must be recorded"
+        );
+    }
+
+    /// C1 core: an approval-gated tool must hold, not fire.
+    #[tokio::test]
+    async fn approval_gated_tool_in_dispatch_holds_and_never_executes() {
+        let (_, events, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &[], &["send_wire"]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+        )
+        .await;
+        assert_eq!(count, 0, "a gated tool dispatch must not run");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
+            "a ToolApprovalRequired must be recorded"
+        );
+    }
+
+    /// One gated call holds the whole batch; none of the three run.
+    #[tokio::test]
+    async fn one_gated_call_holds_the_whole_batch() {
+        let (_, events, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &[], &["send_wire"]),
+            serde_json::json!({"tool_calls": [
+                one_call("read_file"), one_call("send_wire"), one_call("log")
+            ]}),
+        )
+        .await;
+        assert_eq!(count, 0, "no call in a held batch may run");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })));
+    }
+
+    /// Fail closed: unreadable pending calls must block, not pass.
+    #[tokio::test]
+    async fn unreadable_tool_calls_block() {
+        let (result, _, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": "not-an-array"}),
+        )
+        .await;
+        assert_eq!(count, 0);
+        assert!(result.is_err(), "unreadable calls must block");
+    }
+
+    /// Fail closed: a call we cannot name is a call we cannot police.
+    #[tokio::test]
+    async fn nameless_call_blocks() {
+        let (result, _, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": [{"id": "c1", "arguments": {}}]}),
+        )
+        .await;
+        assert_eq!(count, 0);
+        assert!(result.is_err(), "a nameless call must block");
+    }
+
+    /// Fail closed: the payload's `input` is where the frozen calls live. Reading
+    /// the whole payload instead would make both call keys absent and read as
+    /// "nothing to run", allowing every tool through while looking like a
+    /// correct allow. A missing `input` must therefore block, not allow.
+    #[tokio::test]
+    async fn missing_payload_input_blocks() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "adk-wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: serde_json::json!({}),
+                current_state: serde_json::json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        backend
+            .store_workflow(WorkflowDefinition {
+                workflow_id: "adk-wf".into(),
+                version: "1.0.0".into(),
+                ir: dispatch_ir_json("python_fn", true, &["send_wire"], &[]),
+                created_at: now,
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        backend
+            .enqueue_work_item(WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "default".into(),
+                // No "input" key at all, but a top-level tool_calls decoy: if the
+                // worker read the whole payload this would be readable and allow.
+                payload: serde_json::json!({
+                    "workflow_id": "adk-wf",
+                    "workflow_version": "1.0.0",
+                    "tool_calls": []
+                }),
+                attempt: 0,
+                max_attempts: 1,
+                created_at: now,
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+
+        let exec = CountingDispatchExecutor::default();
+        let counter = exec.calls.clone();
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("python_fn", Arc::new(exec));
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+        let result = worker.execute_item(item).await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            result.is_err(),
+            "an absent payload input must block, not allow"
+        );
+    }
+
+    /// Narrowness: an ordinary python_fn is unaffected by the new branch.
+    #[tokio::test]
+    async fn unmarked_python_fn_is_unaffected() {
+        let (result, _, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", false, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+        )
+        .await;
+        assert_eq!(count, 1, "a non-ADK python_fn must still run");
+        assert!(result.is_ok());
+    }
+
+    /// The approval must be bound to the calls it authorises.
+    #[tokio::test]
+    async fn approval_context_carries_resolved_calls_and_hash() {
+        let (_, events, _) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &[], &["send_wire"]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+        )
+        .await;
+        let ctx = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ToolApprovalRequired { context, .. } => Some(context.clone()),
+                _ => None,
+            })
+            .expect("ToolApprovalRequired must exist");
+        assert_eq!(ctx["gated_tools"][0], "send_wire");
+        assert!(
+            ctx["calls_hash"].as_str().is_some_and(|h| !h.is_empty()),
+            "the approval must be bound to a hash of the resolved calls"
+        );
+    }
+
+    /// The Java dispatch arm has the identical hole and the identical fix.
+    #[tokio::test]
+    async fn blocked_tool_in_java_dispatch_never_executes() {
+        let (result, _, count) = run_dispatch_node(
+            dispatch_ir_json("java_fn", true, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+        )
+        .await;
+        assert_eq!(count, 0, "the blocked Java tool dispatch must not run");
+        assert!(result.is_err());
+    }
+
+    /// The exact `calls_json` shape the enforcement hashes. Both the recorded
+    /// approval context and the re-fire check must hash this same shape, or the
+    /// binding never matches and an approved node can never proceed.
+    fn calls_json_for(names: &[&str]) -> serde_json::Value {
+        serde_json::json!(names
+            .iter()
+            .map(|n| serde_json::json!({"name": n, "arguments": {}}))
+            .collect::<Vec<_>>())
+    }
+
+    /// An approval authorises a specific set of calls, not the node forever.
+    #[tokio::test]
+    async fn approval_does_not_authorise_a_different_call_set() {
+        // The node was already approved for `read_file`. It now re-fires with
+        // `send_wire` pending — a different call set, so the settled approval
+        // must not carry over.
+        let approved_hash = content_hash(&calls_json_for(&["read_file"]));
+        let (result, _, count) = run_dispatch_node_seeded(
+            dispatch_ir_json("python_fn", true, &[], &["send_wire", "read_file"]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+            vec![
+                EventKind::ToolApprovalRequired {
+                    node_id: "n1".into(),
+                    tool_name: "read_file".into(),
+                    approver: "human".into(),
+                    context: serde_json::json!({
+                        "node_id": "n1",
+                        "gated_tools": ["read_file"],
+                        "calls": calls_json_for(&["read_file"]),
+                        "calls_hash": approved_hash,
+                    }),
+                },
+                EventKind::ApprovalReceived {
+                    node_id: "n1".into(),
+                    user_id: "approver".into(),
+                    decision: jamjet_state::event::ApprovalDecision::Approved,
+                    comment: None,
+                    state_patch: None,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(
+            count, 0,
+            "an approval for one call set must not release a different one"
+        );
+        assert!(
+            result.is_err(),
+            "a mismatched approved call set must block, not run"
+        );
+    }
+
+    /// The dual: the approval DOES release the exact call set it authorised.
+    /// Without this, the binding check could be satisfied by blocking always.
+    #[tokio::test]
+    async fn approval_releases_the_call_set_it_authorised() {
+        let approved_hash = content_hash(&calls_json_for(&["send_wire"]));
+        let (result, _, count) = run_dispatch_node_seeded(
+            dispatch_ir_json("python_fn", true, &[], &["send_wire"]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+            vec![
+                EventKind::ToolApprovalRequired {
+                    node_id: "n1".into(),
+                    tool_name: "send_wire".into(),
+                    approver: "human".into(),
+                    context: serde_json::json!({
+                        "node_id": "n1",
+                        "gated_tools": ["send_wire"],
+                        "calls": calls_json_for(&["send_wire"]),
+                        "calls_hash": approved_hash,
+                    }),
+                },
+                EventKind::ApprovalReceived {
+                    node_id: "n1".into(),
+                    user_id: "approver".into(),
+                    decision: jamjet_state::event::ApprovalDecision::Approved,
+                    comment: None,
+                    state_patch: None,
+                },
+            ],
+        )
+        .await;
+        assert!(result.is_ok(), "an approved, matching call set must run");
+        assert_eq!(count, 1, "the approved dispatch must execute exactly once");
     }
 }
