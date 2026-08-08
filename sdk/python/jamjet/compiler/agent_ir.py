@@ -303,6 +303,11 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
                 "module": _DISPATCH_MODULE,
                 "function": _DISPATCH_FUNCTION,
                 "output_schema": "",
+                # Tells the Rust worker this python_fn runs a whole turn's
+                # model-chosen tool calls, so tool policy and approval must be
+                # evaluated against the pending calls in the work-item payload
+                # rather than against this node's (nameless) static kind.
+                "agent_tool_dispatch": True,
                 # Descriptor of the data the dispatch coroutine consumes. The
                 # engine passes the full accumulated state to PythonFn nodes
                 # (no per-node input mapping), so `dispatch_tool_calls` reads
