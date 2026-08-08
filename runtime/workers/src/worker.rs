@@ -780,6 +780,16 @@ impl Worker {
                         node_id,
                         "agent dispatch tool calls unreadable — refusing to run"
                     );
+                    // A fail-closed refusal is a policy denial and must reach the
+                    // audit surface like any other. Scope is "unknown" because the
+                    // engine's fail-closed rule denied here, not a policy layer.
+                    self.record_policy_violation(
+                        execution_id,
+                        node_id,
+                        "agent dispatch tool calls unreadable".to_string(),
+                        "unknown".to_string(),
+                    )
+                    .await;
                     return Some(Err(
                         "policy blocked: agent dispatch tool calls unreadable".into(),
                     ));
@@ -806,23 +816,13 @@ impl Worker {
                         node_def.policy.as_ref(),
                     );
                     warn!(execution_id = %execution_id, node_id, %tool_name, %reason, %policy_scope, "Policy blocked agent tool call");
-                    // Best-effort audit. The block is enforced regardless of
-                    // whether recording the violation succeeds.
-                    if let Ok(latest) = self.backend.latest_sequence(execution_id).await {
-                        let _ = self
-                            .backend
-                            .append_event(jamjet_state::Event::new(
-                                execution_id.clone(),
-                                latest + 1,
-                                EventKind::PolicyViolation {
-                                    node_id: node_id.to_string(),
-                                    rule: reason.clone(),
-                                    decision: "blocked".to_string(),
-                                    policy_scope,
-                                },
-                            ))
-                            .await;
-                    }
+                    self.record_policy_violation(
+                        execution_id,
+                        node_id,
+                        reason.clone(),
+                        policy_scope,
+                    )
+                    .await;
                     Some(Err(format!("policy blocked: {reason}").into()))
                 }
 
@@ -831,6 +831,15 @@ impl Worker {
                     // settled approval cannot be replayed against a different
                     // payload (approval-loop hardening: decision not bound to
                     // resolved params).
+                    //
+                    // COVERAGE: the bound material is `name` + `arguments` per
+                    // call, in order, and nothing else. Every other field a
+                    // producer may carry on a raw call — `id` above all, plus any
+                    // provider-specific extras — is deliberately UNBOUND, so a
+                    // re-fire that differs only in call id still matches the
+                    // approval. Widening this to the raw call objects would bind
+                    // the approval to fields that carry no authority and would
+                    // make benign re-issues fail the check.
                     let calls_json = serde_json::json!(calls
                         .iter()
                         .map(|c| serde_json::json!({"name": c.name, "arguments": c.arguments}))
@@ -853,17 +862,27 @@ impl Worker {
                                 jamjet_state::approvals::node_approval_status(&events, node_id),
                                 NodeApprovalStatus::Approved { .. }
                             ) {
-                                // The latest request for this node is the one the
-                                // approval settled, so its hash is the authorised
-                                // call set. A request with no hash (e.g. from the
-                                // non-dispatch path) yields None and blocks.
-                                let approved_hash =
-                                    events.iter().rev().find_map(|e| match &e.kind {
-                                        EventKind::ToolApprovalRequired {
-                                            node_id: n,
-                                            context,
-                                            ..
-                                        } if n == node_id => context
+                                // `node_approval_status` resets to Pending on each
+                                // new request, so `Approved` always refers to the
+                                // LATEST request for this node. Find that event
+                                // FIRST, then read its hash — a `find_map` over
+                                // the hash would skip a hash-less latest request
+                                // and silently inherit an older, superseded
+                                // request's hash, which is a fail-open. Selecting
+                                // the event first makes an absent hash yield None,
+                                // which never equals `Some(current)` and blocks.
+                                let approved_hash = events
+                                    .iter()
+                                    .rev()
+                                    .find(|e| {
+                                        matches!(
+                                            &e.kind,
+                                            EventKind::ToolApprovalRequired { node_id: n, .. }
+                                                if n == node_id
+                                        )
+                                    })
+                                    .and_then(|e| match &e.kind {
+                                        EventKind::ToolApprovalRequired { context, .. } => context
                                             .get("calls_hash")
                                             .and_then(|h| h.as_str())
                                             .map(|s| s.to_string()),
@@ -875,6 +894,17 @@ impl Worker {
                                         node_id,
                                         "approved call set does not match pending calls — refusing"
                                     );
+                                    // The highest-value audit record in this
+                                    // change: an approval was on file but did not
+                                    // authorise these calls. Scope is "unknown" —
+                                    // the binding check denied, not a policy layer.
+                                    self.record_policy_violation(
+                                        execution_id,
+                                        node_id,
+                                        "approved tool calls do not match pending calls".to_string(),
+                                        "unknown".to_string(),
+                                    )
+                                    .await;
                                     return Some(Err(
                                         "policy blocked: approved tool calls do not match pending calls".into(),
                                     ));
@@ -950,6 +980,37 @@ impl Worker {
                 )
                 .await
             }
+        }
+    }
+
+    /// Record a policy denial in the event log, best effort.
+    ///
+    /// The denial is enforced by the caller regardless of whether this record
+    /// lands: fail closed, never open. Used by every deny path in the agent
+    /// dispatch branch — the policy-rule block AND the two fail-closed refusals
+    /// (unreadable calls, approved-set mismatch) — so that no refusal is
+    /// invisible to the audit surface.
+    async fn record_policy_violation(
+        &self,
+        execution_id: &ExecutionId,
+        node_id: &str,
+        rule: String,
+        policy_scope: String,
+    ) {
+        if let Ok(latest) = self.backend.latest_sequence(execution_id).await {
+            let _ = self
+                .backend
+                .append_event(jamjet_state::Event::new(
+                    execution_id.clone(),
+                    latest + 1,
+                    EventKind::PolicyViolation {
+                        node_id: node_id.to_string(),
+                        rule,
+                        decision: "blocked".to_string(),
+                        policy_scope,
+                    },
+                ))
+                .await;
         }
     }
 
@@ -3219,6 +3280,80 @@ mod tests {
         serde_json::json!({"id": "c1", "name": name, "arguments": {}})
     }
 
+    /// Pin WHICH guard denied. `is_err()` alone is satisfied by any failure,
+    /// including an unrelated IR-load or backend error, so a fail-closed test
+    /// that only asserts `is_err()` can pass without the guard ever running.
+    fn assert_denied_because(
+        result: Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        needle: &str,
+    ) {
+        let err = result
+            .err()
+            .map(|e| e.to_string())
+            .expect("the node must be denied");
+        assert!(
+            err.contains(needle),
+            "expected the denial reason to contain {needle:?}; got {err:?}"
+        );
+    }
+
+    fn has_policy_violation(events: &[jamjet_state::Event], rule_needle: &str) -> bool {
+        events.iter().any(|e| match &e.kind {
+            EventKind::PolicyViolation { rule, decision, .. } => {
+                rule.contains(rule_needle) && decision == "blocked"
+            }
+            _ => false,
+        })
+    }
+
+    /// The availability dual of the whole feature, and the most common
+    /// production shape: an ADK agent calling a permitted tool while a real
+    /// policy is in force. An implementation that denied on `Allow` would pass
+    /// every deny test in this module but fail here.
+    #[tokio::test]
+    async fn allowed_tool_in_marked_dispatch_runs() {
+        let (result, events, count) = run_dispatch_node(
+            // A non-trivial policy that simply does not name `read_file`, so the
+            // Allow arm is reached through real rule evaluation rather than
+            // through the `sets.is_empty()` short-circuit.
+            dispatch_ir_json("python_fn", true, &["send_wire"], &["wire_batch"]),
+            serde_json::json!({"tool_calls": [one_call("read_file")]}),
+        )
+        .await;
+        assert!(result.is_ok(), "a permitted tool must run; got {result:?}");
+        assert_eq!(count, 1, "the permitted dispatch must execute exactly once");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::PolicyViolation { .. })),
+            "a permitted dispatch must record no PolicyViolation"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
+            "a permitted dispatch must not be held for approval"
+        );
+    }
+
+    /// `Some(vec![])` (genuinely nothing to run) must stay distinct from `None`
+    /// (unreadable) at THIS seam, not only inside `pending_tool_calls`. A single
+    /// `unwrap_or_default` on that Option would erase the difference in the
+    /// other direction and turn every unreadable payload into an allow.
+    #[tokio::test]
+    async fn empty_tool_call_list_is_allowed_not_unreadable() {
+        let (result, _, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": []}),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "an empty call list is nothing to run, not unreadable; got {result:?}"
+        );
+        assert_eq!(count, 1, "the node itself must still run");
+    }
+
     /// C1 core: a blocked tool must never execute.
     #[tokio::test]
     async fn blocked_tool_in_dispatch_never_executes() {
@@ -3228,7 +3363,7 @@ mod tests {
         )
         .await;
         assert_eq!(count, 0, "the blocked tool dispatch must not run");
-        assert!(result.is_err(), "a blocked node must not succeed");
+        assert_denied_because(result, "matches blocked pattern 'send_wire'");
         assert!(
             events
                 .iter()
@@ -3270,28 +3405,37 @@ mod tests {
             .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })));
     }
 
-    /// Fail closed: unreadable pending calls must block, not pass.
+    /// Fail closed: unreadable pending calls must block, not pass — and the
+    /// refusal must be visible to audit like any other policy denial.
     #[tokio::test]
     async fn unreadable_tool_calls_block() {
-        let (result, _, count) = run_dispatch_node(
+        let (result, events, count) = run_dispatch_node(
             dispatch_ir_json("python_fn", true, &["send_wire"], &[]),
             serde_json::json!({"tool_calls": "not-an-array"}),
         )
         .await;
         assert_eq!(count, 0);
-        assert!(result.is_err(), "unreadable calls must block");
+        assert_denied_because(result, "agent dispatch tool calls unreadable");
+        assert!(
+            has_policy_violation(&events, "agent dispatch tool calls unreadable"),
+            "a fail-closed refusal must still record a PolicyViolation"
+        );
     }
 
     /// Fail closed: a call we cannot name is a call we cannot police.
     #[tokio::test]
     async fn nameless_call_blocks() {
-        let (result, _, count) = run_dispatch_node(
+        let (result, events, count) = run_dispatch_node(
             dispatch_ir_json("python_fn", true, &["send_wire"], &[]),
             serde_json::json!({"tool_calls": [{"id": "c1", "arguments": {}}]}),
         )
         .await;
         assert_eq!(count, 0);
-        assert!(result.is_err(), "a nameless call must block");
+        assert_denied_because(result, "agent dispatch tool calls unreadable");
+        assert!(has_policy_violation(
+            &events,
+            "agent dispatch tool calls unreadable"
+        ));
     }
 
     /// Fail closed: the payload's `input` is where the frozen calls live. Reading
@@ -3370,10 +3514,7 @@ mod tests {
             .expect("item must be claimable");
         let result = worker.execute_item(item).await;
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(
-            result.is_err(),
-            "an absent payload input must block, not allow"
-        );
+        assert_denied_because(result, "agent dispatch tool calls unreadable");
     }
 
     /// Narrowness: an ordinary python_fn is unaffected by the new branch.
@@ -3419,7 +3560,7 @@ mod tests {
         )
         .await;
         assert_eq!(count, 0, "the blocked Java tool dispatch must not run");
-        assert!(result.is_err());
+        assert_denied_because(result, "matches blocked pattern 'send_wire'");
     }
 
     /// The exact `calls_json` shape the enforcement hashes. Both the recorded
@@ -3439,7 +3580,7 @@ mod tests {
         // `send_wire` pending — a different call set, so the settled approval
         // must not carry over.
         let approved_hash = content_hash(&calls_json_for(&["read_file"]));
-        let (result, _, count) = run_dispatch_node_seeded(
+        let (result, events, count) = run_dispatch_node_seeded(
             dispatch_ir_json("python_fn", true, &[], &["send_wire", "read_file"]),
             serde_json::json!({"tool_calls": [one_call("send_wire")]}),
             vec![
@@ -3468,10 +3609,76 @@ mod tests {
             count, 0,
             "an approval for one call set must not release a different one"
         );
+        assert_denied_because(result, "approved tool calls do not match pending calls");
         assert!(
-            result.is_err(),
-            "a mismatched approved call set must block, not run"
+            has_policy_violation(&events, "approved tool calls do not match pending calls"),
+            "the approval-binding denial is the highest-value audit record here \
+             and must reach the event log"
         );
+    }
+
+    /// The approved hash must come from the LATEST request for the node, and an
+    /// absent hash on that request must block.
+    ///
+    /// `node_approval_status` resets to Pending on every new
+    /// `ToolApprovalRequired`, so an `Approved` status always refers to the
+    /// latest request. A lookup that scans backwards for the first event
+    /// *yielding a hash* — rather than for the latest matching event — walks
+    /// straight past a hash-less latest request and inherits the hash of an
+    /// older, already-superseded one. That is a fail-open: an approval settled
+    /// against an unbound request would authorise the older request's calls.
+    ///
+    /// Latent while no in-tree producer writes a hash-less request for a marked
+    /// dispatch node; live the moment a second writer (the claim route) exists.
+    #[tokio::test]
+    async fn hashless_latest_request_does_not_inherit_an_older_hash() {
+        // The pending calls deliberately MATCH the OLD request's hash. A lookup
+        // that skipped back to it would find a match and allow, so this test
+        // only passes when the lookup stops at the latest (hash-less) request.
+        let old_hash = content_hash(&calls_json_for(&["read_file"]));
+        let (result, events, count) = run_dispatch_node_seeded(
+            dispatch_ir_json("python_fn", true, &[], &["read_file"]),
+            serde_json::json!({"tool_calls": [one_call("read_file")]}),
+            vec![
+                // Older request: carries a hash for exactly these calls.
+                EventKind::ToolApprovalRequired {
+                    node_id: "n1".into(),
+                    tool_name: "read_file".into(),
+                    approver: "human".into(),
+                    context: serde_json::json!({
+                        "node_id": "n1",
+                        "gated_tools": ["read_file"],
+                        "calls": calls_json_for(&["read_file"]),
+                        "calls_hash": old_hash,
+                    }),
+                },
+                // Newer request: supersedes the one above and carries NO hash.
+                EventKind::ToolApprovalRequired {
+                    node_id: "n1".into(),
+                    tool_name: "read_file".into(),
+                    approver: "human".into(),
+                    context: serde_json::json!({"node_id": "n1"}),
+                },
+                // The approval settles the NEWER, unbound request.
+                EventKind::ApprovalReceived {
+                    node_id: "n1".into(),
+                    user_id: "approver".into(),
+                    decision: jamjet_state::event::ApprovalDecision::Approved,
+                    comment: None,
+                    state_patch: None,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(
+            count, 0,
+            "an approval settled against an unbound request must authorise nothing"
+        );
+        assert_denied_because(result, "approved tool calls do not match pending calls");
+        assert!(has_policy_violation(
+            &events,
+            "approved tool calls do not match pending calls"
+        ));
     }
 
     /// The dual: the approval DOES release the exact call set it authorised.
