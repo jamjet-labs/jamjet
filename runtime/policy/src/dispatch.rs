@@ -287,6 +287,26 @@ mod tests {
     }
 
     #[test]
+    fn every_gated_call_is_reported_to_the_approver() {
+        // `gated` is what a human approver is shown as the tools they are
+        // authorising. A truncated list means approving `send_wire` silently
+        // releases `wire_batch` too, so membership AND order are load-bearing.
+        // The ungated call in the middle also re-proves the filter.
+        let p = policy(&[], &["send_wire", "wire_batch"]);
+        let d = evaluate_dispatch(
+            "__tools_0__",
+            &pending(&["send_wire", "read_file", "wire_batch"]),
+            &[&p],
+        );
+        match d {
+            DispatchDecision::RequireApproval { gated, .. } => {
+                assert_eq!(gated, vec!["send_wire", "wire_batch"])
+            }
+            other => panic!("expected RequireApproval, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn block_wins_over_approval() {
         // Fail closed: a batch containing both must never merely hold.
         let p = policy(&["drop_table"], &["send_wire"]);
