@@ -1,3 +1,4 @@
+use crate::dispatch_guard::{self, DispatchGuardOutcome};
 use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use crate::heartbeat::spawn_heartbeat;
 use chrono::Utc;
@@ -731,6 +732,48 @@ impl Worker {
         ir: &WorkflowIr,
         payload: &serde_json::Value,
     ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        // ADK agent dispatch nodes hide their tool names behind a single
+        // python_fn / java_fn, so a node-kind context carries no tool_name and
+        // every blocked_tools / require_approval_for rule silently misses (C1).
+        // The decision lives in `dispatch_guard` so the HTTP claim route — the
+        // transport ADK nodes actually take in production — runs the identical
+        // logic. This branch owns only the SETTLE, which is worker-specific.
+        if dispatch_guard::is_agent_tool_dispatch(kind) {
+            let input = dispatch_guard::payload_input(payload);
+            return match dispatch_guard::guard_dispatch(
+                self.backend.as_ref(),
+                execution_id,
+                node_id,
+                tenant_id,
+                ir,
+                node_def,
+                &input,
+            )
+            .await
+            {
+                DispatchGuardOutcome::Allow => None,
+                DispatchGuardOutcome::Blocked { reason } => {
+                    Some(Err(format!("policy blocked: {reason}").into()))
+                }
+                // Not a denial: the decision could not be made or recorded, so
+                // the node fails and is retried rather than being audited as
+                // blocked. Same shape as a block to the scheduler, deliberately
+                // different on the Prove surface.
+                DispatchGuardOutcome::Unavailable { reason } => Some(Err(reason.into())),
+                // Settle the item cleanly so the lease never expires into the
+                // retry/dead-letter path. The node stays parked because it
+                // remains in the scheduler fold's `scheduled` set (so it is
+                // never re-dispatched); the fold's `held` set only gates which
+                // decision events are acted on.
+                DispatchGuardOutcome::Held { .. } => {
+                    match self.backend.complete_work_item(item_id).await {
+                        Ok(()) => Some(Ok(())),
+                        Err(e) => Some(Err(format!("failed to settle held work item: {e}").into())),
+                    }
+                }
+            };
+        }
+
         let ctx = EvaluationContext::from_node_kind(node_id, kind);
 
         // Load tenant policy (sits between global and workflow in the chain).
@@ -758,190 +801,13 @@ impl Worker {
             return None;
         }
 
-        // ADK agent dispatch nodes hide their tool names behind a single
-        // python_fn / java_fn, so `ctx` above carries no tool_name and every
-        // blocked_tools / require_approval_for rule silently misses (C1).
-        // Evaluate the frozen pending calls from the work item instead. Those
-        // are the same bytes the executor will hand the dispatch, so there is
-        // no time-of-check-to-time-of-use window: we deliberately do NOT
-        // re-read state from the backend or from a snapshot here.
-        if is_agent_tool_dispatch(kind) {
-            let input = payload_input(payload);
-            let calls = match jamjet_policy::dispatch::pending_tool_calls(&input) {
-                Some(calls) => calls,
-                None => {
-                    // Fail closed, mirroring hold_for_approval's unavailable-state
-                    // arm: never run a node whose policy-relevant state we cannot
-                    // read. `Some(vec![])` (genuinely nothing to run) is distinct
-                    // and falls through to Allow below — do not collapse the two
-                    // with unwrap_or_default.
-                    warn!(
-                        execution_id = %execution_id,
-                        node_id,
-                        "agent dispatch tool calls unreadable — refusing to run"
-                    );
-                    // A fail-closed refusal is a policy denial and must reach the
-                    // audit surface like any other. Scope is "unknown" because the
-                    // engine's fail-closed rule denied here, not a policy layer.
-                    self.record_policy_violation(
-                        execution_id,
-                        node_id,
-                        "agent dispatch tool calls unreadable".to_string(),
-                        "unknown".to_string(),
-                    )
-                    .await;
-                    return Some(Err(
-                        "policy blocked: agent dispatch tool calls unreadable".into(),
-                    ));
-                }
-            };
-
-            return match jamjet_policy::dispatch::evaluate_dispatch(node_id, &calls, &sets) {
-                jamjet_policy::dispatch::DispatchDecision::Allow => None,
-
-                jamjet_policy::dispatch::DispatchDecision::Block { tool_name, reason } => {
-                    // Attribute the scope using the same per-call context
-                    // `evaluate_dispatch` matched on; `ctx` has no tool_name, so
-                    // reusing it would record every dispatch block as "unknown".
-                    let blocked_ctx = EvaluationContext {
-                        node_id: node_id.to_string(),
-                        node_kind_tag: "tool".to_string(),
-                        tool_name: Some(tool_name.clone()),
-                        model_ref: None,
-                    };
-                    let policy_scope = self.identify_policy_scope(
-                        &blocked_ctx,
-                        tenant_policy_set.as_ref(),
-                        ir.policy.as_ref(),
-                        node_def.policy.as_ref(),
-                    );
-                    warn!(execution_id = %execution_id, node_id, %tool_name, %reason, %policy_scope, "Policy blocked agent tool call");
-                    self.record_policy_violation(
-                        execution_id,
-                        node_id,
-                        reason.clone(),
-                        policy_scope,
-                    )
-                    .await;
-                    Some(Err(format!("policy blocked: {reason}").into()))
-                }
-
-                jamjet_policy::dispatch::DispatchDecision::RequireApproval { approver, gated } => {
-                    // Bind the approval to the exact calls it authorises, so a
-                    // settled approval cannot be replayed against a different
-                    // payload (approval-loop hardening: decision not bound to
-                    // resolved params).
-                    //
-                    // COVERAGE: the bound material is `name` + `arguments` per
-                    // call, in order, and nothing else. Every other field a
-                    // producer may carry on a raw call — `id` above all, plus any
-                    // provider-specific extras — is deliberately UNBOUND, so a
-                    // re-fire that differs only in call id still matches the
-                    // approval. Widening this to the raw call objects would bind
-                    // the approval to fields that carry no authority and would
-                    // make benign re-issues fail the check.
-                    let calls_json = serde_json::json!(calls
-                        .iter()
-                        .map(|c| serde_json::json!({"name": c.name, "arguments": c.arguments}))
-                        .collect::<Vec<_>>());
-                    let current_hash = content_hash(&calls_json);
-
-                    // An existing approval authorised one specific call set. If
-                    // the pending calls differ, the approval must not carry over
-                    // — otherwise a settled approval authorises whatever happens
-                    // to be pending when the node re-fires.
-                    match self.backend.get_events(execution_id).await {
-                        Err(e) => {
-                            return Some(Err(format!(
-                                "approval state unavailable; refusing to run unapproved: {e}"
-                            )
-                            .into()))
-                        }
-                        Ok(events) => {
-                            if matches!(
-                                jamjet_state::approvals::node_approval_status(&events, node_id),
-                                NodeApprovalStatus::Approved { .. }
-                            ) {
-                                // `node_approval_status` resets to Pending on each
-                                // new request, so `Approved` always refers to the
-                                // LATEST request for this node. Find that event
-                                // FIRST, then read its hash — a `find_map` over
-                                // the hash would skip a hash-less latest request
-                                // and silently inherit an older, superseded
-                                // request's hash, which is a fail-open. Selecting
-                                // the event first makes an absent hash yield None,
-                                // which never equals `Some(current)` and blocks.
-                                let approved_hash = events
-                                    .iter()
-                                    .rev()
-                                    .find(|e| {
-                                        matches!(
-                                            &e.kind,
-                                            EventKind::ToolApprovalRequired { node_id: n, .. }
-                                                if n == node_id
-                                        )
-                                    })
-                                    .and_then(|e| match &e.kind {
-                                        EventKind::ToolApprovalRequired { context, .. } => context
-                                            .get("calls_hash")
-                                            .and_then(|h| h.as_str())
-                                            .map(|s| s.to_string()),
-                                        _ => None,
-                                    });
-                                if approved_hash.as_deref() != Some(current_hash.as_str()) {
-                                    warn!(
-                                        execution_id = %execution_id,
-                                        node_id,
-                                        "approved call set does not match pending calls — refusing"
-                                    );
-                                    // The highest-value audit record in this
-                                    // change: an approval was on file but did not
-                                    // authorise these calls. Scope is "unknown" —
-                                    // the binding check denied, not a policy layer.
-                                    self.record_policy_violation(
-                                        execution_id,
-                                        node_id,
-                                        "approved tool calls do not match pending calls".to_string(),
-                                        "unknown".to_string(),
-                                    )
-                                    .await;
-                                    return Some(Err(
-                                        "policy blocked: approved tool calls do not match pending calls".into(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-
-                    // `gated` carries tool NAMES only: two calls to the same
-                    // gated tool render as ["send_wire", "send_wire"] with no
-                    // discriminator. `calls` below is what identifies them.
-                    let context = serde_json::json!({
-                        "node_id": node_id,
-                        "gated_tools": gated,
-                        "calls": calls_json,
-                        "calls_hash": current_hash,
-                    });
-                    self.hold_for_approval(
-                        execution_id,
-                        node_id,
-                        item_id,
-                        gated.join(", "),
-                        approver,
-                        context,
-                    )
-                    .await
-                }
-            };
-        }
-
         let decision = PolicyEvaluator.evaluate(&ctx, &sets);
 
         match decision {
             PolicyDecision::Allow => None,
 
             PolicyDecision::Block { reason } => {
-                let policy_scope = self.identify_policy_scope(
+                let policy_scope = dispatch_guard::identify_policy_scope(
                     &ctx,
                     tenant_policy_set.as_ref(),
                     ir.policy.as_ref(),
@@ -981,68 +847,6 @@ impl Worker {
                 .await
             }
         }
-    }
-
-    /// Record a policy denial in the event log, best effort.
-    ///
-    /// The denial is enforced by the caller regardless of whether this record
-    /// lands: fail closed, never open. Used by every deny path in the agent
-    /// dispatch branch — the policy-rule block AND the two fail-closed refusals
-    /// (unreadable calls, approved-set mismatch) — so that no refusal is
-    /// invisible to the audit surface.
-    async fn record_policy_violation(
-        &self,
-        execution_id: &ExecutionId,
-        node_id: &str,
-        rule: String,
-        policy_scope: String,
-    ) {
-        if let Ok(latest) = self.backend.latest_sequence(execution_id).await {
-            let _ = self
-                .backend
-                .append_event(jamjet_state::Event::new(
-                    execution_id.clone(),
-                    latest + 1,
-                    EventKind::PolicyViolation {
-                        node_id: node_id.to_string(),
-                        rule,
-                        decision: "blocked".to_string(),
-                        policy_scope,
-                    },
-                ))
-                .await;
-        }
-    }
-
-    /// Determine which policy scope triggered a non-Allow decision.
-    ///
-    /// Checks each scope individually from most-specific (node) to least-specific
-    /// (tenant), returning the name of the first scope that produces a non-Allow
-    /// decision.
-    fn identify_policy_scope(
-        &self,
-        ctx: &EvaluationContext,
-        tenant_policy: Option<&jamjet_ir::workflow::PolicySetIr>,
-        workflow_policy: Option<&jamjet_ir::workflow::PolicySetIr>,
-        node_policy: Option<&jamjet_ir::workflow::PolicySetIr>,
-    ) -> String {
-        // Check most-specific first (same order as evaluator's reverse iteration).
-        if let Some(p) = node_policy {
-            if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
-                return "node".to_string();
-            }
-        }
-        if let Some(p) = workflow_policy {
-            if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
-                return "workflow".to_string();
-            }
-        }
-        if let Some(p) = tenant_policy {
-            if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
-                return "tenant".to_string();
-            }
-        }
-        "unknown".to_string()
     }
 
     // ── Autonomy check ────────────────────────────────────────────────────────
@@ -1492,37 +1296,6 @@ fn parse_payload(payload: &serde_json::Value) -> (String, String) {
         .unwrap_or("1.0.0")
         .to_string();
     (workflow_id, workflow_version)
-}
-
-/// The frozen accumulated state the scheduler enriched onto a PythonFn/JavaFn
-/// work item (`runtime/scheduler/src/runner.rs:441-480`). This is the exact
-/// input the dispatch will consume, which is what makes policy evaluation over
-/// it free of a time-of-check-to-time-of-use window.
-///
-/// It MUST be `payload["input"]`, never `payload`. The pending calls live one
-/// level down; reading the whole payload would leave both call keys absent, so
-/// `pending_tool_calls` would return `Some(vec![])` and every tool would be
-/// allowed while the code read like a correct allow. When the key is missing,
-/// this yields `Value::Null`, which `pending_tool_calls` rejects as unreadable.
-fn payload_input(payload: &serde_json::Value) -> serde_json::Value {
-    payload
-        .get("input")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null)
-}
-
-/// True for nodes that run a whole agent turn's model-chosen tool calls.
-fn is_agent_tool_dispatch(kind: &NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::PythonFn {
-            agent_tool_dispatch: true,
-            ..
-        } | NodeKind::JavaFn {
-            agent_tool_dispatch: true,
-            ..
-        }
-    )
 }
 
 #[cfg(test)]

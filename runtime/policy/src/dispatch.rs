@@ -19,45 +19,79 @@ pub struct PendingToolCall {
     pub arguments: Value,
 }
 
+/// Why a dispatch payload's pending calls could not be read.
+///
+/// Every variant means the same thing to the enforcement decision — the caller
+/// MUST block — but they are different production failures, and an operator
+/// reading the Prove surface should be able to tell a malformed producer from a
+/// call the model named badly. The audit vocabulary that renders these lives at
+/// the enforcement layer (`jamjet_worker::dispatch_guard`); this enum only
+/// reports which shape failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreadableCalls {
+    /// `input` itself is not a JSON object. The live case is `Value::Null`,
+    /// which is what `payload["input"]` yields when the key is absent.
+    NotAnObject,
+    /// A call-list key is present but does not hold a JSON array.
+    NotAList,
+    /// A call in the list has no readable string `name`, so it cannot be matched
+    /// against `blocked_tools` / `require_approval_for`.
+    UnnamedCall,
+}
+
 /// Read the tool calls a marked agent-dispatch node will execute from its
-/// frozen work-item input.
+/// frozen work-item input, reporting WHY when they cannot be read.
 ///
 /// The key order MUST stay identical to `dispatch_tool_calls` in
 /// `sdk/python/jamjet/agents/tool_runtime.py:48-50`: `tool_calls` first (unless
 /// null/absent), then `last_model_tool_calls`. If the two sides ever disagree,
 /// policy evaluates a different list than the one that executes.
 ///
-/// Returns `None` when the input is not an object, or when the calls are present
-/// but not well-formed. Callers MUST treat `None` as a block. `Some(vec![])`
-/// means there is genuinely nothing to run and is safe to allow.
-pub fn pending_tool_calls(input: &Value) -> Option<Vec<PendingToolCall>> {
+/// `Ok(vec![])` means there is genuinely nothing to run and is safe to allow;
+/// every `Err` is a block. This is the single implementation —
+/// [`pending_tool_calls`] discards the cause and is kept for callers that only
+/// need the decision.
+pub fn read_pending_tool_calls(input: &Value) -> Result<Vec<PendingToolCall>, UnreadableCalls> {
     // A non-object input is unreadable, not empty. `Value::get` returns `None`
     // for every non-object variant rather than only for a missing key, so
     // without this check a non-object would fall through both arms below and
     // read as "nothing to run" — allowing the whole dispatch unpoliced. The
     // live case: `payload["input"]` yields `Value::Null` when the key is absent
     // or misspelled, because `Index for Value` returns null instead of panicking.
-    let obj = input.as_object()?;
+    let obj = input.as_object().ok_or(UnreadableCalls::NotAnObject)?;
 
     let raw = match obj.get("tool_calls") {
         Some(v) if !v.is_null() => v,
         _ => match obj.get("last_model_tool_calls") {
             Some(v) if !v.is_null() => v,
             // Neither key present: the dispatch has nothing to execute.
-            _ => return Some(Vec::new()),
+            _ => return Ok(Vec::new()),
         },
     };
 
-    let arr = raw.as_array()?;
+    let arr = raw.as_array().ok_or(UnreadableCalls::NotAList)?;
     let mut out = Vec::with_capacity(arr.len());
     for call in arr {
         // A call whose name cannot be read cannot be matched against
-        // blocked_tools or require_approval_for, so it must not run.
-        let name = call.get("name")?.as_str()?.to_string();
+        // blocked_tools or require_approval_for, so it must not run. `get`
+        // returns None for a non-object element too, so a null entry lands here.
+        let name = call
+            .get("name")
+            .and_then(|n| n.as_str())
+            .ok_or(UnreadableCalls::UnnamedCall)?
+            .to_string();
         let arguments = call.get("arguments").cloned().unwrap_or(Value::Null);
         out.push(PendingToolCall { name, arguments });
     }
-    Some(out)
+    Ok(out)
+}
+
+/// [`read_pending_tool_calls`] with the cause discarded.
+///
+/// Callers MUST treat `None` as a block. `Some(vec![])` means there is
+/// genuinely nothing to run and is safe to allow.
+pub fn pending_tool_calls(input: &Value) -> Option<Vec<PendingToolCall>> {
+    read_pending_tool_calls(input).ok()
 }
 
 /// The aggregate policy outcome for one dispatch batch.
@@ -234,6 +268,55 @@ mod tests {
     #[test]
     fn null_call_element_is_unreadable() {
         assert!(pending_tool_calls(&json!({"tool_calls": [null]})).is_none());
+    }
+
+    #[test]
+    fn unreadable_causes_are_reported_distinctly() {
+        // The decision is identical for all three — block — but a production
+        // denial must be attributable on the Prove surface, so the cause has to
+        // survive the read. Collapsing these back into one value would make a
+        // malformed producer indistinguishable from a badly named call.
+        assert_eq!(
+            read_pending_tool_calls(&serde_json::Value::Null),
+            Err(UnreadableCalls::NotAnObject)
+        );
+        assert_eq!(
+            read_pending_tool_calls(&json!({"tool_calls": "send_wire"})),
+            Err(UnreadableCalls::NotAList)
+        );
+        assert_eq!(
+            read_pending_tool_calls(&json!({"tool_calls": [{"id": "c1"}]})),
+            Err(UnreadableCalls::UnnamedCall)
+        );
+        assert_eq!(
+            read_pending_tool_calls(&json!({"tool_calls": [null]})),
+            Err(UnreadableCalls::UnnamedCall)
+        );
+        assert_eq!(
+            read_pending_tool_calls(&json!({"tool_calls": [{"name": 123}]})),
+            Err(UnreadableCalls::UnnamedCall)
+        );
+    }
+
+    #[test]
+    fn the_option_form_agrees_with_the_result_form() {
+        // `pending_tool_calls` must stay a pure projection of
+        // `read_pending_tool_calls`; a second parse would be a second place for
+        // the fail-closed shape checks to drift.
+        for input in [
+            serde_json::Value::Null,
+            json!({}),
+            json!({"tool_calls": []}),
+            json!({"tool_calls": "x"}),
+            json!({"tool_calls": [call("send_wire")]}),
+            json!({"last_model_tool_calls": [call("send_wire")]}),
+        ] {
+            assert_eq!(
+                pending_tool_calls(&input),
+                read_pending_tool_calls(&input).ok(),
+                "disagreement on {input}"
+            );
+        }
     }
 
     #[test]

@@ -7,12 +7,14 @@
 //! - Emit heartbeats to renew leases
 //! - Report results back via the state backend
 
+pub mod dispatch_guard;
 pub mod executor;
 pub mod executors;
 pub mod heartbeat;
 pub mod pool;
 pub mod worker;
 
+pub use dispatch_guard::{guard_dispatch, DispatchGuardOutcome};
 pub use executor::{ExecutionResult, ExecutorError, NodeExecutor};
 pub use executors::{
     A2aTaskExecutor, AgentDiscoveryExecutor, ConditionNodeExecutor, EvalExecutor, McpToolExecutor,
