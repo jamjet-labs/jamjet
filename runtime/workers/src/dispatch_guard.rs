@@ -273,6 +273,31 @@ pub async fn guard_dispatch(
                 }
 
                 NodeApprovalStatus::NotRequested => {
+                    // KNOWN LIMIT: reading `NotRequested` and then appending the
+                    // request is a read-modify-write with no compare-and-set,
+                    // the same shape as `record_policy_violation` below — but
+                    // NOT the same consequence, so do not carry that note's
+                    // "cosmetic" reading over to here.
+                    //
+                    // Under a lease exactly one worker holds a work item, so the
+                    // worker path is safe. On the HTTP claim route, two
+                    // concurrent claims for the same node can each read
+                    // `NotRequested` from their own snapshot and each append a
+                    // `ToolApprovalRequired`. The damage is a DUPLICATE
+                    // OUTSTANDING APPROVAL REQUEST, not a colliding sequence
+                    // number: `node_approval_status` resets to `Pending` on every
+                    // new request, so a human's settled decision would refer to a
+                    // request that has already been superseded and could never
+                    // stick. That is precisely the invariant
+                    // `an_already_pending_node_is_held_without_a_duplicate_request`
+                    // exists to protect, and today it holds only because a lease
+                    // keeps the writer single.
+                    //
+                    // The backend trait offers no conditional/CAS append, so this
+                    // cannot be closed here — it needs a primitive that makes
+                    // "append iff no open request for this node" atomic, and the
+                    // route path must supply it. Fail-closed is preserved either
+                    // way: both racers return `Held`, so nothing runs unapproved.
                     info!(execution_id = %execution_id, node_id, %approver, "Node requires approval");
                     // `gated` carries tool NAMES only: two calls to the same
                     // gated tool render as ["send_wire", "send_wire"] with no
@@ -388,6 +413,12 @@ fn latest_request_calls_hash(events: &[Event], node_id: &str) -> Option<String> 
 /// offers no CAS append, so this is not fixable here; it is a known limit of the
 /// route path, and it affects only the audit record's sequence — never whether
 /// the denial is enforced.
+///
+/// That last sentence is about THIS append and no other. The `NotRequested` arm
+/// of `guard_dispatch` performs a read-modify-write of the same shape whose
+/// consequence is materially worse — duplicate outstanding approval requests,
+/// which can stop a human decision from ever settling. See the KNOWN LIMIT note
+/// there before concluding the route path is only cosmetically affected.
 async fn record_policy_violation(
     backend: &dyn StateBackend,
     execution_id: &ExecutionId,
@@ -607,6 +638,443 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    // ── A backend that cannot read its own event log ──────────────────────────
+
+    /// An `InMemoryBackend` whose `get_events` fails, and only `get_events`.
+    ///
+    /// `InMemoryBackend` never errors, so without this every `Unavailable` arm in
+    /// the guard is unreachable from a test and an implementation that returned
+    /// `Blocked` on a backend failure would pass the whole suite — while writing
+    /// a `PolicyViolation` saying policy denied something the engine merely could
+    /// not read. Delegating every other method to a real backend is what makes
+    /// "nothing was written" an observation rather than an artefact of a stub
+    /// that cannot write at all: the append path here works perfectly.
+    struct FailingGetEvents {
+        inner: InMemoryBackend,
+    }
+
+    impl FailingGetEvents {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryBackend::new(),
+            }
+        }
+
+        /// Read the log the guard could not, bypassing the injected failure.
+        async fn recorded(&self, execution_id: &ExecutionId) -> Vec<Event> {
+            self.inner.get_events(execution_id).await.unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateBackend for FailingGetEvents {
+        // ── The one injected failure ──────────────────────────────────────────
+
+        async fn get_events(
+            &self,
+            _execution_id: &ExecutionId,
+        ) -> jamjet_state::backend::BackendResult<Vec<Event>> {
+            Err(jamjet_state::backend::StateBackendError::Database(
+                "injected: event log unreadable".into(),
+            ))
+        }
+
+        // ── Everything else is the real backend ───────────────────────────────
+
+        async fn store_workflow(
+            &self,
+            def: jamjet_state::backend::WorkflowDefinition,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner.store_workflow(def).await
+        }
+
+        async fn get_workflow(
+            &self,
+            workflow_id: &str,
+            version: &str,
+        ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::backend::WorkflowDefinition>>
+        {
+            self.inner.get_workflow(workflow_id, version).await
+        }
+
+        async fn create_execution(
+            &self,
+            execution: jamjet_core::workflow::WorkflowExecution,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner.create_execution(execution).await
+        }
+
+        async fn get_execution(
+            &self,
+            id: &ExecutionId,
+        ) -> jamjet_state::backend::BackendResult<Option<jamjet_core::workflow::WorkflowExecution>>
+        {
+            self.inner.get_execution(id).await
+        }
+
+        async fn update_execution_status(
+            &self,
+            id: &ExecutionId,
+            status: jamjet_core::workflow::WorkflowStatus,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner.update_execution_status(id, status).await
+        }
+
+        async fn update_execution_current_state(
+            &self,
+            id: &ExecutionId,
+            current_state: &serde_json::Value,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner
+                .update_execution_current_state(id, current_state)
+                .await
+        }
+
+        async fn patch_append_array(
+            &self,
+            execution_id: &ExecutionId,
+            key: &str,
+            value: serde_json::Value,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner
+                .patch_append_array(execution_id, key, value)
+                .await
+        }
+
+        async fn list_executions(
+            &self,
+            status: Option<jamjet_core::workflow::WorkflowStatus>,
+            limit: u32,
+            offset: u32,
+        ) -> jamjet_state::backend::BackendResult<Vec<jamjet_core::workflow::WorkflowExecution>>
+        {
+            self.inner.list_executions(status, limit, offset).await
+        }
+
+        async fn append_event(
+            &self,
+            event: Event,
+        ) -> jamjet_state::backend::BackendResult<jamjet_state::EventSequence> {
+            self.inner.append_event(event).await
+        }
+
+        async fn get_events_since(
+            &self,
+            execution_id: &ExecutionId,
+            since_sequence: jamjet_state::EventSequence,
+        ) -> jamjet_state::backend::BackendResult<Vec<Event>> {
+            self.inner
+                .get_events_since(execution_id, since_sequence)
+                .await
+        }
+
+        async fn latest_sequence(
+            &self,
+            execution_id: &ExecutionId,
+        ) -> jamjet_state::backend::BackendResult<jamjet_state::EventSequence> {
+            self.inner.latest_sequence(execution_id).await
+        }
+
+        async fn write_snapshot(
+            &self,
+            snapshot: jamjet_state::Snapshot,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner.write_snapshot(snapshot).await
+        }
+
+        async fn latest_snapshot(
+            &self,
+            execution_id: &ExecutionId,
+        ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::Snapshot>> {
+            self.inner.latest_snapshot(execution_id).await
+        }
+
+        async fn create_segment_atomic(
+            &self,
+            execution: jamjet_core::workflow::WorkflowExecution,
+            seed_snapshot: jamjet_state::Snapshot,
+            started_event: EventKind,
+            scheduled_event: EventKind,
+            work_item: jamjet_state::backend::WorkItem,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner
+                .create_segment_atomic(
+                    execution,
+                    seed_snapshot,
+                    started_event,
+                    scheduled_event,
+                    work_item,
+                )
+                .await
+        }
+
+        async fn get_tool_effect(
+            &self,
+            key: &str,
+        ) -> jamjet_state::backend::BackendResult<Option<serde_json::Value>> {
+            self.inner.get_tool_effect(key).await
+        }
+
+        async fn put_artifact(
+            &self,
+            bytes: &[u8],
+            media_type: Option<&str>,
+        ) -> jamjet_state::backend::BackendResult<jamjet_state::ArtifactRef> {
+            self.inner.put_artifact(bytes, media_type).await
+        }
+
+        async fn get_artifact(
+            &self,
+            hash: &str,
+        ) -> jamjet_state::backend::BackendResult<Option<Vec<u8>>> {
+            self.inner.get_artifact(hash).await
+        }
+
+        async fn enqueue_work_item(
+            &self,
+            item: jamjet_state::backend::WorkItem,
+        ) -> jamjet_state::backend::BackendResult<jamjet_state::backend::WorkItemId> {
+            self.inner.enqueue_work_item(item).await
+        }
+
+        async fn claim_work_item(
+            &self,
+            worker_id: &str,
+            queue_types: &[&str],
+        ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::backend::WorkItem>> {
+            self.inner.claim_work_item(worker_id, queue_types).await
+        }
+
+        async fn renew_lease(
+            &self,
+            item_id: jamjet_state::backend::WorkItemId,
+            worker_id: &str,
+            lease_fence: i64,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner
+                .renew_lease(item_id, worker_id, lease_fence)
+                .await
+        }
+
+        async fn complete_work_item(
+            &self,
+            item_id: jamjet_state::backend::WorkItemId,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner.complete_work_item(item_id).await
+        }
+
+        async fn complete_work_item_fenced(
+            &self,
+            item_id: jamjet_state::backend::WorkItemId,
+            lease_fence: i64,
+        ) -> jamjet_state::backend::BackendResult<bool> {
+            self.inner
+                .complete_work_item_fenced(item_id, lease_fence)
+                .await
+        }
+
+        async fn fail_work_item(
+            &self,
+            item_id: jamjet_state::backend::WorkItemId,
+            error: &str,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner.fail_work_item(item_id, error).await
+        }
+
+        async fn commit_turn(
+            &self,
+            item_id: jamjet_state::backend::WorkItemId,
+            lease_fence: i64,
+            terminal_event: Event,
+            write_snapshot: bool,
+        ) -> jamjet_state::backend::BackendResult<jamjet_state::EventSequence> {
+            self.inner
+                .commit_turn(item_id, lease_fence, terminal_event, write_snapshot)
+                .await
+        }
+
+        async fn park_work_item(
+            &self,
+            item_id: jamjet_state::backend::WorkItemId,
+            lease_fence: i64,
+            retry_after: &str,
+            next_attempt: u32,
+        ) -> jamjet_state::backend::BackendResult<bool> {
+            self.inner
+                .park_work_item(item_id, lease_fence, retry_after, next_attempt)
+                .await
+        }
+
+        async fn finalize_rollover_fenced(
+            &self,
+            execution_id: &ExecutionId,
+            work_item_id: jamjet_state::backend::WorkItemId,
+            lease_fence: i64,
+        ) -> jamjet_state::backend::BackendResult<bool> {
+            self.inner
+                .finalize_rollover_fenced(execution_id, work_item_id, lease_fence)
+                .await
+        }
+
+        async fn reclaim_expired_leases(
+            &self,
+        ) -> jamjet_state::backend::BackendResult<jamjet_state::backend::ReclaimResult> {
+            self.inner.reclaim_expired_leases().await
+        }
+
+        async fn move_to_dead_letter(
+            &self,
+            item_id: jamjet_state::backend::WorkItemId,
+            last_error: &str,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner.move_to_dead_letter(item_id, last_error).await
+        }
+
+        async fn create_token(
+            &self,
+            name: &str,
+            role: &str,
+        ) -> jamjet_state::backend::BackendResult<(String, jamjet_state::backend::ApiToken)>
+        {
+            self.inner.create_token(name, role).await
+        }
+
+        async fn validate_token(
+            &self,
+            token: &str,
+        ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::backend::ApiToken>> {
+            self.inner.validate_token(token).await
+        }
+
+        async fn apply_approval_projection(
+            &self,
+            row: jamjet_state::ApprovalProjectionRow,
+            projection_name: &str,
+            new_checkpoint: i64,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner
+                .apply_approval_projection(row, projection_name, new_checkpoint)
+                .await
+        }
+
+        async fn apply_approval_projection_batch(
+            &self,
+            rows: Vec<jamjet_state::ApprovalProjectionRow>,
+            projection_name: &str,
+            execution_id: &ExecutionId,
+            new_checkpoint: i64,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner
+                .apply_approval_projection_batch(
+                    rows,
+                    projection_name,
+                    execution_id,
+                    new_checkpoint,
+                )
+                .await
+        }
+
+        async fn get_approval_projection(
+            &self,
+            execution_id: &ExecutionId,
+        ) -> jamjet_state::backend::BackendResult<Vec<jamjet_state::ApprovalProjectionRow>>
+        {
+            self.inner.get_approval_projection(execution_id).await
+        }
+
+        async fn get_projector_checkpoint(
+            &self,
+            projection_name: &str,
+            execution_id: &ExecutionId,
+        ) -> jamjet_state::backend::BackendResult<i64> {
+            self.inner
+                .get_projector_checkpoint(projection_name, execution_id)
+                .await
+        }
+
+        async fn set_projector_checkpoint(
+            &self,
+            projection_name: &str,
+            execution_id: &ExecutionId,
+            new_checkpoint: i64,
+        ) -> jamjet_state::backend::BackendResult<()> {
+            self.inner
+                .set_projector_checkpoint(projection_name, execution_id, new_checkpoint)
+                .await
+        }
+
+        async fn create_tenant(&self, tenant: Tenant) -> jamjet_state::backend::BackendResult<()> {
+            self.inner.create_tenant(tenant).await
+        }
+
+        async fn get_tenant(
+            &self,
+            id: &jamjet_state::TenantId,
+        ) -> jamjet_state::backend::BackendResult<Option<Tenant>> {
+            self.inner.get_tenant(id).await
+        }
+
+        async fn list_tenants(&self) -> jamjet_state::backend::BackendResult<Vec<Tenant>> {
+            self.inner.list_tenants().await
+        }
+
+        async fn update_tenant(&self, tenant: Tenant) -> jamjet_state::backend::BackendResult<()> {
+            self.inner.update_tenant(tenant).await
+        }
+    }
+
+    /// An unreadable event log is infrastructure, not a decision.
+    ///
+    /// The outcome assertion is half the point; the audit assertion is the other
+    /// half and the more important one. Returning `Blocked` here would record a
+    /// `PolicyViolation` claiming a policy denied the batch, when in truth no
+    /// policy was ever consulted — a false denial on the Prove surface, and a
+    /// permanent one, since the caller would stop retrying something that only
+    /// needed a working backend.
+    #[tokio::test]
+    async fn an_unreadable_event_log_is_unavailable_and_records_no_denial() {
+        let backend = FailingGetEvents::new();
+        let execution_id = ExecutionId::new();
+        let ir = ir(&[], &["send_wire"]);
+        let node_def = ir.node("n1").expect("node n1 must exist");
+
+        let outcome = guard_dispatch(
+            &backend,
+            &execution_id,
+            "n1",
+            "default",
+            &ir,
+            node_def,
+            &input_for(&["send_wire"]),
+        )
+        .await;
+
+        match &outcome {
+            DispatchGuardOutcome::Unavailable { reason } => {
+                assert!(
+                    reason.contains("injected: event log unreadable"),
+                    "the underlying failure must survive into the reason; got {reason:?}"
+                );
+            }
+            other => {
+                panic!("a backend failure is infrastructure, not a policy denial; got {other:?}")
+            }
+        }
+
+        let recorded = backend.recorded(&execution_id).await;
+        assert!(
+            !recorded
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::PolicyViolation { .. })),
+            "no policy denied — a PolicyViolation here is a false denial in the \
+             audit log; got {recorded:?}"
+        );
+        assert!(
+            recorded.is_empty(),
+            "an undecidable dispatch writes nothing at all; got {recorded:?}"
+        );
     }
 
     fn approved(node_id: &str) -> EventKind {
