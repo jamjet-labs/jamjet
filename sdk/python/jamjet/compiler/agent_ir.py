@@ -306,9 +306,8 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
                 # Tells the engine this python_fn runs a whole turn's
                 # model-chosen tool calls, so tool policy and approval must be
                 # evaluated against the pending calls in the work-item payload
-                # rather than against this node's (nameless) static kind.  That
-                # evaluation is server-side, on the work-item claim route, so it
-                # happens before any worker receives the payload.
+                # rather than against this node's (nameless) static kind.  Where
+                # that evaluation happens, and why: `Agent.run`.
                 "agent_tool_dispatch": True,
                 # Descriptor of the data the dispatch coroutine consumes. The
                 # engine passes the full accumulated state to PythonFn nodes
@@ -381,10 +380,11 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
     # ── Governance IR fields (T3-5) ────────────────────────────────────────────
     # Emit policy / budget / data_policy from the agent's GovernanceConfig — the
     # compile-side wiring that turns the engine's own enforcement on.  Honest
-    # scope: `policy` and `budget` are enforced engine-side (a dispatch node's
-    # tool policy is decided by the shared guard the work-item claim route runs
-    # before any worker receives the payload); `data_policy` is metadata, NOT an
-    # enforcement point — see `_compile_governance_ir` above.
+    # scope, per field: `policy` is enforced engine-side (where, and why it holds
+    # against an untrusted worker: `Agent.run`); `budget` is checked by the
+    # engine AFTER each node, so a single node can overshoot the cap;
+    # `data_policy` is metadata, NOT an enforcement point — see
+    # `_compile_governance_ir` above.
     # These are merged BEFORE content-versioning so the cache key changes when
     # governance config changes (a different budget or policy must NOT reuse a
     # cached graph compiled without those constraints).
