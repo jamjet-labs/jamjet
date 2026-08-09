@@ -27,7 +27,7 @@ pub use backend::{
     ApiToken, ApprovalProjectionRow, BackendResult, ReclaimResult, StateBackend, StateBackendError,
     WorkItem, WorkItemId, WorkflowDefinition,
 };
-pub use budget::BudgetState;
+pub use budget::{BudgetState, BudgetTrip};
 pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};
 pub use hashing::{canonical_json, content_hash, sha256_hex};
 pub use materializer::{

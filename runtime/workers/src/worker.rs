@@ -210,6 +210,18 @@ impl Worker {
                         return r;
                     }
 
+                    // Budget check BEFORE execution — never fire on a spent budget.
+                    // The post-execution check trips only after the call is paid
+                    // for, so without this a rollover child inherits pinned
+                    // counters and buys one more call per segment (C2).
+                    if let Some(r) = self
+                        .check_budget_before_execution(&execution_id, &node_id, &ir, &budget)
+                        .await
+                    {
+                        heartbeat.abort();
+                        return r;
+                    }
+
                     // Autonomy check.
                     if let Some(r) = self
                         .check_autonomy(&execution_id, item_id, &node_id, kind, &budget)
@@ -1001,6 +1013,89 @@ impl Worker {
             .flatten()
             .map(|s| BudgetState::from_snapshot_state(&s.state))
             .unwrap_or_default()
+    }
+
+    /// Refuse to fire when the budget is already spent.
+    ///
+    /// `check_budget_after_execution` only trips once the call has been made and
+    /// paid for. This pre-check is what makes a spent budget refuse the *next*
+    /// call instead of buying it first.
+    ///
+    /// SCOPE — this is half of C2, and the half it is not closes elsewhere.
+    /// Because the post-execution check is `>` and a tripping turn is DISCARDED
+    /// rather than committed, committed counters normally settle strictly BELOW
+    /// the ceiling. This guard's `>=` therefore catches the case where a turn
+    /// lands exactly ON the ceiling, not the ordinary rollover chain: a
+    /// `continue_as_new` child inherits under-ceiling counters, passes this
+    /// guard, and buys one more discarded call per segment. Stopping that chain
+    /// means not rolling over on a budget trip at all, which is a separate change
+    /// to the rollover branch in `execute_item`.
+    ///
+    /// Deliberately kind-agnostic: budget accounting follows the tokens an
+    /// executor reports, not the node kind, so a kind allowlist would leak — the
+    /// budget fixture in this file trips on a `tool` node.
+    ///
+    /// SEMANTIC CHANGE: under `>=`, a ceiling of literally zero (`total_tokens:
+    /// 0`, `cost_budget_usd: 0.0`) now refuses every node up front, where it
+    /// previously allowed exactly one call before tripping. "Spend nothing" now
+    /// means nothing.
+    ///
+    /// Returns `Some(Err(..))` to refuse, `None` to let the node fire.
+    async fn check_budget_before_execution(
+        &self,
+        execution_id: &ExecutionId,
+        node_id: &str,
+        ir: &WorkflowIr,
+        budget: &BudgetState,
+    ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        let trip = budget.exhausted(ir.token_budget.as_ref(), ir.cost_budget_usd)?;
+        warn!(
+            execution_id = %execution_id,
+            node_id,
+            kind = %trip.kind,
+            limit = trip.limit,
+            current = trip.current,
+            "Budget already exhausted; refusing to fire"
+        );
+
+        // The audit record is best-effort; the refusal is not. A backend read
+        // failure here must never downgrade into letting the node fire, so the
+        // sequence lookup is `if let Ok` rather than `?`.
+        if let Ok(latest) = self.backend.latest_sequence(execution_id).await {
+            // A cost trip carries dollars, which do not survive the u64 cast that
+            // TokenBudgetExceeded's limit/current fields require: a $0.50 ceiling
+            // would be recorded as 0. Report it on the cost event instead, exactly
+            // as the post-execution path does. Token ceilings are u32 in the IR,
+            // so their f64 -> u64 roundtrip is lossless.
+            let kind = if trip.kind == "cost_usd" {
+                EventKind::CostBudgetExceeded {
+                    node_id: node_id.to_string(),
+                    limit_usd: trip.limit,
+                    current_usd: trip.current,
+                }
+            } else {
+                EventKind::TokenBudgetExceeded {
+                    node_id: node_id.to_string(),
+                    kind: trip.kind.clone(),
+                    limit: trip.limit as u64,
+                    current: trip.current as u64,
+                }
+            };
+            let _ = self
+                .backend
+                .append_event(jamjet_state::Event::new(
+                    execution_id.clone(),
+                    latest + 1,
+                    kind,
+                ))
+                .await;
+        }
+
+        Some(Err(format!(
+            "budget exhausted before execution: {} {} >= {}",
+            trip.kind, trip.current, trip.limit
+        )
+        .into()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2175,7 +2270,9 @@ mod tests {
 
     // ── Continue-as-new tests (Task 2g-3) ────────────────────────────────────
 
-    /// Returns 1 input token -- triggers any IR with token_budget.total_tokens: 0.
+    /// Returns 2 input tokens -- exceeds `budget_ceiling_ir_json`'s
+    /// `total_tokens: 1` ceiling on the post-execution `>` check, while leaving a
+    /// fresh execution genuinely under the ceiling for the pre-execution `>=` check.
     struct BudgetTriggerExecutor;
 
     #[async_trait::async_trait]
@@ -2190,7 +2287,7 @@ mod tests {
                 duration_ms: 1,
                 gen_ai_system: None,
                 gen_ai_model: None,
-                input_tokens: Some(1), // triggers total_tokens budget check
+                input_tokens: Some(2), // exceeds the total_tokens: 1 ceiling
                 output_tokens: None,
                 finish_reason: None,
             })
@@ -2204,7 +2301,11 @@ mod tests {
             "state_schema": "{}",
             "start_node": "n1",
             "continue_as_new": continue_as_new,
-            "token_budget": { "total_tokens": 0 }, // any >0 tokens exceeds this
+            // A ceiling of 1, not 0: the executor's 2 tokens exceed it after the
+            // fact, but a FRESH execution (0 tokens) is genuinely under it, so the
+            // pre-execution `>=` guard lets the first turn fire. A zero ceiling
+            // would read as already-exhausted before anything ran.
+            "token_budget": { "total_tokens": 1 },
             "nodes": {
                 "n1": {
                     "id": "n1",
@@ -2639,6 +2740,230 @@ mod tests {
              got {:?} — means crash-before-terminal was not repaired",
             exec_final.status
         );
+    }
+
+    // ── Pre-execution budget guard tests (C2) ─────────────────────────────────
+
+    /// Counts every executor invocation. A refused node must leave it at 0 —
+    /// that count IS the money, so it is the assertion that matters.
+    struct CountingBudgetExecutor {
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for CountingBudgetExecutor {
+        async fn execute(
+            &self,
+            _item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ExecutionResult {
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({}),
+                duration_ms: 1,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: Some(2),
+                output_tokens: None,
+                finish_reason: None,
+            })
+        }
+    }
+
+    /// Seed the execution's latest snapshot with an already-spent `__budget`.
+    ///
+    /// This is exactly the state a continue-as-new child inherits: the parent's
+    /// counters, carried forward by `materialize`, sitting at the ceiling with the
+    /// same ceiling still in the same IR.
+    async fn seed_spent_budget(backend: &InMemoryBackend, eid: &ExecutionId, input_tokens: u64) {
+        let budget = BudgetState {
+            total_input_tokens: input_tokens,
+            ..Default::default()
+        };
+        let mut state = serde_json::json!({ "counter": 5 });
+        budget.patch_into_snapshot_state(&mut state);
+        backend
+            .write_snapshot(jamjet_state::Snapshot::new(eid.clone(), 0, state))
+            .await
+            .expect("seed snapshot must write");
+    }
+
+    /// The guard is wired into `execute_item` ahead of every executor dispatch:
+    /// an execution whose counters already sit at the ceiling makes ZERO executor
+    /// calls. That count is the whole point — it is the money.
+    ///
+    /// This does NOT prove the `continue_as_new` chain terminates. It cannot: the
+    /// chain's carried counters land strictly BELOW the ceiling (the post-check is
+    /// `>`, the tripping turn is discarded), so the seeded state here is reached
+    /// by a turn landing exactly on the ceiling, not by the chain. Terminating the
+    /// chain means not rolling over on a trip, which lives in the rollover branch.
+    ///
+    /// Driven with `continue_as_new: true` so a regression that lets the node fire
+    /// shows up as the runaway itself: without the guard this returns `Ok(())`,
+    /// having paid for one call, discarded it, and rolled over.
+    #[tokio::test]
+    async fn exhausted_budget_makes_no_executor_call() {
+        let (backend, eid) = setup_budget_backend(true).await;
+        // The fixture node is a TOOL node, not a model node. That is deliberate:
+        // budget accounting follows the tokens an executor reports, not the node
+        // kind, so a `Model | Agent` allowlist in the guard would silently let
+        // this through and this assertion would still pass while the count did not.
+        let ir: WorkflowIr =
+            serde_json::from_value(budget_ceiling_ir_json(true)).expect("fixture IR must parse");
+        assert_eq!(
+            node_kind_tag(&ir.node("n1").expect("n1 exists").kind),
+            "tool",
+            "fixture node must be a tool node for the kind-agnostic claim to bite"
+        );
+
+        // Ceiling is total_tokens: 1; 1 input token means the counters sit exactly
+        // on it, which is the state a turn landing on the ceiling commits.
+        seed_spent_budget(&backend, &eid, 1).await;
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor(
+            "tool",
+            Arc::new(CountingBudgetExecutor {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        let result = worker.execute_item(item).await;
+        assert!(
+            result.is_err(),
+            "an exhausted budget must refuse the node, not run it: {result:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "C2: an exhausted budget must not pay for one more call"
+        );
+
+        // The refusal is on the record, and it names the ceiling that tripped.
+        let events = backend.get_events(&eid).await.unwrap();
+        let trip = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::TokenBudgetExceeded {
+                    kind, limit, current, ..
+                } => Some((kind.clone(), *limit, *current)),
+                _ => None,
+            })
+            .expect("refusal must emit TokenBudgetExceeded");
+        assert_eq!(trip, ("total_tokens".to_string(), 1, 1));
+
+        // And it must NOT roll over: rolling over on an exhausted budget is the
+        // runaway itself, since the child inherits the same spent counters.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }))
+                .count(),
+            0,
+            "C2: a refused node must not roll over into another segment"
+        );
+    }
+
+    /// A fresh budget under the ceiling fires normally — the guard must not be a
+    /// blanket stop.
+    #[tokio::test]
+    async fn budget_under_the_ceiling_fires() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        );
+        let ir: WorkflowIr =
+            serde_json::from_value(budget_ceiling_ir_json(false)).expect("fixture IR must parse");
+        let refused = worker
+            .check_budget_before_execution(&ExecutionId::new(), "n1", &ir, &BudgetState::default())
+            .await;
+        assert!(refused.is_none(), "a fresh budget must not be refused");
+    }
+
+    /// No budget configured means the guard never fires, however large the counters.
+    #[tokio::test]
+    async fn no_budget_configured_never_refuses() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        );
+        let mut ir_json = budget_ceiling_ir_json(false);
+        ir_json["token_budget"] = serde_json::Value::Null;
+        let ir: WorkflowIr = serde_json::from_value(ir_json).expect("IR must parse");
+        let huge = BudgetState {
+            total_input_tokens: 10_000_000,
+            ..Default::default()
+        };
+        let refused = worker
+            .check_budget_before_execution(&ExecutionId::new(), "n1", &ir, &huge)
+            .await;
+        assert!(refused.is_none());
+    }
+
+    /// A spent COST budget reports as `CostBudgetExceeded`, matching the
+    /// post-execution path. Routing it through `TokenBudgetExceeded` would cast
+    /// the dollar limit to u64 and record a $0.50 ceiling as `limit: 0`.
+    #[tokio::test]
+    async fn exhausted_cost_budget_reports_dollars_not_truncated_tokens() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        );
+        let mut ir_json = budget_ceiling_ir_json(false);
+        ir_json["token_budget"] = serde_json::Value::Null;
+        ir_json["cost_budget_usd"] = serde_json::json!(0.5);
+        let ir: WorkflowIr = serde_json::from_value(ir_json).expect("IR must parse");
+        let spent = BudgetState {
+            total_cost_usd: 0.5,
+            ..Default::default()
+        };
+
+        let refused = worker
+            .check_budget_before_execution(&eid, "n1", &ir, &spent)
+            .await;
+        assert!(
+            refused.expect("a spent cost budget must refuse").is_err(),
+            "refusal must be an Err"
+        );
+
+        let events = backend.get_events(&eid).await.unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::TokenBudgetExceeded { .. })),
+            "a cost trip must not be recorded as a token trip"
+        );
+        let cost = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::CostBudgetExceeded {
+                    limit_usd,
+                    current_usd,
+                    ..
+                } => Some((*limit_usd, *current_usd)),
+                _ => None,
+            })
+            .expect("cost refusal must emit CostBudgetExceeded");
+        assert_eq!(cost, (0.5, 0.5), "dollar amounts must survive intact");
     }
 
     // ── Artifact spill tests ──────────────────────────────────────────────────
