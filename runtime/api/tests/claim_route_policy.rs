@@ -133,8 +133,17 @@ fn dispatch_ir(marked: bool, blocked: &[&str], approval: &[&str]) -> Value {
 
 /// A node kind that can never be an agent dispatch — the "every other queue"
 /// case the route must not perturb.
-fn condition_ir() -> Value {
+///
+/// It carries a REAL `blocked_tools` policy on purpose. An unpoliced fixture
+/// would prove nothing: `guard_dispatch` short-circuits an empty policy chain
+/// and returns `Allow` before it reads anything, so such a node sails through
+/// whether or not the marker gate exists. With a policy in force and a payload
+/// that has no `input` key, removing the gate makes the guard read the calls,
+/// get `NotAnObject`, and terminally fail the item — which is precisely the
+/// "breaks all durable tool execution" regression this fixture must catch.
+fn policed_condition_ir() -> Value {
     ir_with_node(json!({ "id": "n1", "kind": { "type": "condition", "branches": [] } }))
+        .tap_policy(&["send_wire"], &[])
 }
 
 fn ir_with_node(node: Value) -> Value {
@@ -211,18 +220,22 @@ async fn seed(
     queue_type: &str,
     payload: Value,
 ) -> (ExecutionId, Uuid) {
-    let now = chrono::Utc::now();
+    store(backend, WF, VERSION, ir).await;
+    seed_item(backend, queue_type, payload).await
+}
+
+/// Store one workflow definition under explicit coordinates.
+async fn store(backend: &Arc<dyn StateBackend>, workflow_id: &str, version: &str, ir: Value) {
     backend
         .store_workflow(WorkflowDefinition {
-            workflow_id: WF.into(),
-            version: VERSION.into(),
+            workflow_id: workflow_id.into(),
+            version: version.into(),
             ir,
-            created_at: now,
+            created_at: chrono::Utc::now(),
             tenant_id: DEFAULT_TENANT.into(),
         })
         .await
         .expect("store_workflow");
-    seed_item(backend, queue_type, payload).await
 }
 
 /// Enqueue a claimable item for a fresh execution WITHOUT storing a workflow —
@@ -318,6 +331,47 @@ fn memory() -> Arc<dyn StateBackend> {
     Arc::new(InMemoryBackend::new())
 }
 
+/// A durable backend plus the raw pool used to read `work_items.status`.
+///
+/// `StateBackend` exposes no work-item read, so the SETTLE a claim performed can
+/// only be observed in the table. Indirect probes (re-claim, `renew_lease`)
+/// cannot separate `fail_work_item` from `complete_work_item` — both leave the
+/// item unclaimable — which is exactly how an unbound settle assertion hides.
+struct Durable {
+    backend: Arc<dyn StateBackend>,
+    pool: sqlx::SqlitePool,
+    db_path: std::path::PathBuf,
+}
+
+impl Durable {
+    async fn new() -> Self {
+        let db_path = std::env::temp_dir().join(format!("jjtest-claim-{}.db", Uuid::new_v4()));
+        let url = format!("sqlite://{}", db_path.display());
+        let backend: Arc<dyn StateBackend> =
+            Arc::new(SqliteBackend::open(&url).await.expect("open sqlite"));
+        let pool = sqlx::SqlitePool::connect(&url).await.expect("open pool");
+        Self {
+            backend,
+            pool,
+            db_path,
+        }
+    }
+
+    /// The item's durable `status`: `claimed`, `completed`, `failed`, `pending`.
+    async fn status(&self, item_id: Uuid) -> String {
+        sqlx::query_scalar::<_, String>("SELECT status FROM work_items WHERE id = ?")
+            .bind(item_id.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .expect("the work item row must exist")
+    }
+
+    async fn cleanup(self) {
+        self.pool.close().await;
+        let _ = std::fs::remove_file(&self.db_path);
+    }
+}
+
 // ══ 1. Enforcement ════════════════════════════════════════════════════════════
 
 /// **The C1 reproduction.** Before this route ran the guard, `send_wire` came
@@ -410,35 +464,76 @@ async fn a_blocked_item_never_leaks_its_payload_however_often_it_is_reclaimed() 
     );
 }
 
-/// On a durable backend `fail_work_item` is terminal (`status = 'failed'`), so a
-/// blocked item is never re-claimed at all: the violation count stays at one.
+/// On a durable backend a blocked item is TERMINALLY failed.
+///
+/// The status assertion is the load-bearing one: `failed` and `completed` are
+/// both unclaimable, so any probe that only re-claims would pass for either, and
+/// the settle would be untested.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blocked_dispatch_is_terminally_failed_on_a_durable_backend() {
-    let db_path = std::env::temp_dir().join(format!("jjtest-claim-{}.db", Uuid::new_v4()));
-    let backend: Arc<dyn StateBackend> = Arc::new(
-        SqliteBackend::open(&format!("sqlite://{}", db_path.display()))
-            .await
-            .expect("open sqlite"),
-    );
-    let (execution_id, _) = seed(
-        &backend,
+    let d = Durable::new().await;
+    let (execution_id, item_id) = seed(
+        &d.backend,
         dispatch_ir(true, &["send_wire"], &[]),
         "python_tool",
         dispatch_payload(calls_input(&["send_wire"])),
     )
     .await;
-    let state = make_state(backend.clone());
+    let state = make_state(d.backend.clone());
 
-    assert_withheld(&claim(&state, "python_tool").await);
     assert_withheld(&claim(&state, "python_tool").await);
 
     assert_eq!(
-        violations(&backend, &execution_id).await.len(),
+        d.status(item_id).await,
+        "failed",
+        "a blocked dispatch must be failed, not completed and not left claimed"
+    );
+
+    // And terminal: never re-claimed, so never re-evaluated.
+    assert_withheld(&claim(&state, "python_tool").await);
+    assert_eq!(
+        violations(&d.backend, &execution_id).await.len(),
         1,
         "a terminally failed item is not re-claimed, so it is not re-evaluated"
     );
 
-    let _ = std::fs::remove_file(&db_path);
+    d.cleanup().await;
+}
+
+/// A held item is SETTLED, and settled as `completed` — not failed, and above
+/// all not left `claimed` with a lease ticking down into the retry path.
+///
+/// This assertion is what binds the `Held` arm's settle. Removing the settle
+/// leaves the item `claimed`, which no re-claim probe can detect: an item still
+/// leased is skipped by `claim_work_item` exactly as a completed one is, so the
+/// re-claim returns nothing and the request count stays at one either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_dispatch_is_settled_as_completed_on_a_durable_backend() {
+    let d = Durable::new().await;
+    let (execution_id, item_id) = seed(
+        &d.backend,
+        dispatch_ir(true, &[], &["send_wire"]),
+        "python_tool",
+        dispatch_payload(calls_input(&["send_wire"])),
+    )
+    .await;
+    let state = make_state(d.backend.clone());
+
+    assert_withheld(&claim(&state, "python_tool").await);
+
+    assert_eq!(
+        d.status(item_id).await,
+        "completed",
+        "a held item must be settled so its lease never expires into the retry \
+         path; still 'claimed' means the settle is missing"
+    );
+    assert_eq!(
+        approval_requests(&d.backend, &execution_id).await.len(),
+        1,
+        "exactly one approval request"
+    );
+
+    d.cleanup().await;
 }
 
 /// An approval-gated batch is held, not handed out, and the request carries the
@@ -640,6 +735,162 @@ async fn an_item_whose_node_is_absent_from_the_ir_is_not_handed_out() {
     assert_withheld(&claim(&make_state(backend), "python_tool").await);
 }
 
+// ══ 2b. Policy authority — the execution, not the payload ════════════════════
+//
+// `POST /work-items` copies a caller-supplied `payload` and `node_id` verbatim
+// into the queue behind the same write role as the claim route. If the payload
+// chose which workflow's policy applied, that caller could simply name a
+// workflow with no `blocked_tools` and walk the batch straight through a
+// legitimate external worker. The execution record is engine-written, so it is
+// the only trustworthy answer to "which policy governs this item".
+
+/// The attack: the execution belongs to a policed workflow, but the payload
+/// names an unpoliced one. Trusting the payload drops the workflow layer out of
+/// the chain and allows `send_wire`.
+#[tokio::test]
+async fn a_payload_naming_a_different_workflow_than_the_execution_is_not_handed_out() {
+    let backend = memory();
+    // The workflow the EXECUTION belongs to: blocks send_wire.
+    store(
+        &backend,
+        WF,
+        VERSION,
+        dispatch_ir(true, &["send_wire"], &[]),
+    )
+    .await;
+    // A real, stored, but UNPOLICED workflow the attacker would rather be judged by.
+    store(
+        &backend,
+        "unpoliced-wf",
+        VERSION,
+        dispatch_ir(true, &[], &[]),
+    )
+    .await;
+
+    let mut payload = dispatch_payload(calls_input(&["send_wire"]));
+    payload["workflow_id"] = json!("unpoliced-wf");
+    seed_item(&backend, "python_tool", payload).await;
+
+    assert_withheld(&claim(&make_state(backend), "python_tool").await);
+}
+
+/// The version variant: v1.0.0 is unpoliced, the execution is on v2.0.0 which
+/// blocks `send_wire`. Trusting the payload evaluates the wrong version's rules.
+#[tokio::test]
+async fn a_payload_naming_a_different_workflow_version_is_not_handed_out() {
+    let backend = memory();
+    store(
+        &backend,
+        WF,
+        "2.0.0",
+        dispatch_ir(true, &["send_wire"], &[]),
+    )
+    .await;
+    store(&backend, WF, VERSION, dispatch_ir(true, &[], &[])).await;
+
+    let execution_id = ExecutionId::new();
+    let now = chrono::Utc::now();
+    backend
+        .create_execution(WorkflowExecution {
+            execution_id: execution_id.clone(),
+            workflow_id: WF.into(),
+            workflow_version: "2.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: json!({}),
+            current_state: json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        })
+        .await
+        .expect("create_execution");
+    backend
+        .enqueue_work_item(WorkItem {
+            id: Uuid::new_v4(),
+            execution_id,
+            node_id: "n1".into(),
+            queue_type: "python_tool".into(),
+            // Claims v1.0.0, which is unpoliced.
+            payload: dispatch_payload(calls_input(&["send_wire"])),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: DEFAULT_TENANT.into(),
+        })
+        .await
+        .expect("enqueue_work_item");
+
+    assert_withheld(&claim(&make_state(backend), "python_tool").await);
+}
+
+/// With the coordinates gone from the payload entirely, the execution still
+/// selects the policy. This is what proves the `unwrap_or("unknown")` /
+/// `unwrap_or("1.0.0")` defaults are gone: under those, this item resolved no
+/// IR at all and could never have been policed by the workflow that owns it.
+#[tokio::test]
+async fn an_item_with_no_payload_coordinates_is_still_policed_by_its_execution() {
+    let backend = memory();
+    let mut payload = dispatch_payload(calls_input(&["send_wire"]));
+    let obj = payload.as_object_mut().unwrap();
+    obj.remove("workflow_id");
+    obj.remove("workflow_version");
+
+    let (execution_id, _) = seed(
+        &backend,
+        dispatch_ir(true, &["send_wire"], &[]),
+        "python_tool",
+        payload,
+    )
+    .await;
+
+    assert_withheld(&claim(&make_state(backend.clone()), "python_tool").await);
+    assert_eq!(
+        violations(&backend, &execution_id).await.len(),
+        1,
+        "the execution's workflow policy must have been the one that decided"
+    );
+}
+
+/// No execution record means no authoritative coordinates, so nothing can be
+/// evaluated.
+#[tokio::test]
+async fn an_item_whose_execution_is_missing_is_not_handed_out() {
+    let backend = memory();
+    store(
+        &backend,
+        WF,
+        VERSION,
+        dispatch_ir(true, &["send_wire"], &[]),
+    )
+    .await;
+    backend
+        .enqueue_work_item(WorkItem {
+            id: Uuid::new_v4(),
+            // An execution that was never created.
+            execution_id: ExecutionId::new(),
+            node_id: "n1".into(),
+            queue_type: "python_tool".into(),
+            payload: dispatch_payload(calls_input(&["send_wire"])),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: chrono::Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: DEFAULT_TENANT.into(),
+        })
+        .await
+        .expect("enqueue_work_item");
+
+    assert_withheld(&claim(&make_state(backend), "python_tool").await);
+}
+
 // ══ 3. Approval binding ═══════════════════════════════════════════════════════
 
 /// The availability dual. Without this, an implementation that withheld
@@ -774,12 +1025,17 @@ async fn an_unmarked_python_fn_item_is_handed_out_untouched() {
 
 /// Every other queue — the regression that would break all durable tool
 /// execution if the guard were not gated on the dispatch marker.
+///
+/// The workflow is POLICED and the payload has no `input` key, which is the
+/// ordinary shape for a non-dispatch node. Without the marker gate the guard
+/// would read the calls out of a `Null` input, fail closed on `NotAnObject`,
+/// and terminally fail this item at claim time.
 #[tokio::test]
 async fn an_ordinary_item_on_another_queue_is_handed_out_untouched() {
     let backend = memory();
     let (execution_id, _) = seed(
         &backend,
-        condition_ir(),
+        policed_condition_ir(),
         "tool",
         json!({ "workflow_id": WF, "workflow_version": VERSION, "node_id": "n1" }),
     )

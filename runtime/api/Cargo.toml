@@ -49,3 +49,7 @@ async-trait = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
 tracing-subscriber = { workspace = true }
+# Route tests that assert a work item's DURABLE settle state read `work_items.status`
+# directly; `StateBackend` exposes no work-item read, and an indirect probe cannot
+# tell `fail_work_item` from `complete_work_item`.
+sqlx = { workspace = true }

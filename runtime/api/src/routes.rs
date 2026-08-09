@@ -1109,18 +1109,66 @@ async fn claim_work_item(
 /// same `{"claimed": false}` — so acting on it would create exactly the signal
 /// the uniform response exists to deny the caller.
 async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkItem) -> ClaimGate {
-    // The same coordinates `Worker::execute_item` reads (`parse_payload`), so
-    // both transports resolve the same IR for the same item.
-    let workflow_id = wi
-        .payload
-        .get("workflow_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let workflow_version = wi
-        .payload
-        .get("workflow_version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("1.0.0");
+    // AUTHORITY. The coordinates that select the policy chain come from the
+    // EXECUTION record, never from the payload.
+    //
+    // `POST /work-items` copies a caller-supplied `payload` and `node_id`
+    // verbatim into the queue behind the same write role as this route. If the
+    // payload chose the workflow, that caller could point a `python_tool` item
+    // at an unpoliced workflow and drop the workflow layer out of the chain, or
+    // omit the version and have v1.0.0's rules evaluated against a v2.0.0
+    // execution. The execution record is engine-written, so it is the only
+    // trustworthy answer to "which policy governs this item".
+    let execution = match backend.get_execution(&wi.execution_id).await {
+        // Infrastructure — see the `get_workflow` Err arm below.
+        Err(e) => {
+            warn!(
+                execution_id = %wi.execution_id,
+                node_id = %wi.node_id,
+                error = %e,
+                "claim: execution lookup failed; withholding the payload"
+            );
+            return ClaimGate::Withhold;
+        }
+        Ok(None) => {
+            return fail_closed(backend, wi, "execution not found".to_string()).await;
+        }
+        Ok(Some(e)) => e,
+    };
+    let workflow_id = execution.workflow_id.as_str();
+    let workflow_version = execution.workflow_version.as_str();
+
+    // Tripwire. `Worker::execute_item` still resolves its IR from the payload
+    // (`parse_payload`), so a payload that disagrees with its own execution
+    // would make the two enforcement seams evaluate different policy for the
+    // same item. There is no legitimate producer of that shape — the scheduler
+    // builds every payload from these very coordinates
+    // (`runtime/scheduler/src/runner.rs`) — so a disagreement means one of the
+    // two is lying and we cannot tell which. Refuse rather than pick.
+    //
+    // Absent coordinates are NOT a mismatch: nothing is claimed, so nothing can
+    // conflict, and the execution's values are used regardless. There is no
+    // default here to exploit — the old `unwrap_or("unknown")` /
+    // `unwrap_or("1.0.0")` fallbacks are gone.
+    let payload_disagrees = |key: &str, authoritative: &str| {
+        wi.payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|claimed| claimed != authoritative)
+    };
+    if payload_disagrees("workflow_id", workflow_id)
+        || payload_disagrees("workflow_version", workflow_version)
+    {
+        return fail_closed(
+            backend,
+            wi,
+            format!(
+                "work item payload coordinates disagree with execution {workflow_id} \
+                 v{workflow_version}"
+            ),
+        )
+        .await;
+    }
 
     let ir = match backend.get_workflow(workflow_id, workflow_version).await {
         // Infrastructure, not a decision: the engine could not read its own
@@ -1188,6 +1236,24 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
         // The guard already recorded the `PolicyViolation`. Failing the item is
         // what stops a blocked dispatch from being re-claimed forever: on a
         // durable backend `fail_work_item` is terminal.
+        //
+        // KNOWN ASYMMETRY — this seam and the worker seam disagree on
+        // terminality, and this is the outcome of EVERY successful enforcement
+        // here, not an edge case.
+        //
+        // `SqliteBackend::fail_work_item` sets `status = 'failed'`
+        // unconditionally, so the reclaimer never returns the item and NOTHING
+        // emits `NodeFailed`. The execution therefore stays `Running` with the
+        // node still in the scheduler fold's `scheduled` set — it stalls rather
+        // than going terminal. `Worker::execute_item` does emit the terminal
+        // event, via the fenced `commit_turn`, so the same policy denial ends
+        // the execution on the in-process path and hangs it here.
+        //
+        // Safety is unaffected: the tool does not run and the denial is on the
+        // Prove surface either way. Closing the gap means emitting a
+        // fence-committed terminal event from the claim route, which is a
+        // scheduler-interaction change and is deliberately NOT done inside this
+        // security fix. It needs its own task.
         DispatchGuardOutcome::Blocked { reason } => {
             warn!(
                 execution_id = %wi.execution_id,
@@ -1206,7 +1272,13 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
         // An outstanding `ToolApprovalRequired` exists for the node. Settle the
         // item cleanly so its lease never expires into the retry path; the node
         // stays parked in the scheduler fold's `scheduled` set until a human
-        // decides. Same settle the in-process worker performs.
+        // decides.
+        //
+        // Fenced, unlike the worker's plain `complete_work_item`: we hold a
+        // fence minted by the claim we just made, so we can prove the lease is
+        // still ours. A lost fence means something else already settled or
+        // reclaimed the item, which is not ours to overwrite — and the payload
+        // is withheld either way.
         DispatchGuardOutcome::Held { gated } => {
             info!(
                 execution_id = %wi.execution_id,
@@ -1214,7 +1286,21 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
                 gated = ?gated,
                 "claim: agent tool dispatch awaiting approval"
             );
-            settle(backend.complete_work_item(wi.id).await, wi)
+            match backend
+                .complete_work_item_fenced(wi.id, wi.lease_fence)
+                .await
+            {
+                Ok(true) => ClaimGate::Withhold,
+                Ok(false) => {
+                    warn!(
+                        execution_id = %wi.execution_id,
+                        node_id = %wi.node_id,
+                        "claim: lease fence lost while settling a held work item"
+                    );
+                    ClaimGate::Withhold
+                }
+                Err(e) => settle(Err(e), wi),
+            }
         }
 
         // NOT a denial — no policy was ever consulted, so nothing is audited and
