@@ -214,7 +214,9 @@ mod tests {
     }
 
     #[test]
-    fn input_and_output_sub_ceilings_trip_independently() {
+    fn input_sub_ceiling_trips_without_reporting_output() {
+        // Only an input ceiling is set, and output counters are non-zero: the trip
+        // must name and report the input dimension, never the output one.
         let b = BudgetState {
             total_input_tokens: 900,
             total_output_tokens: 10,
@@ -226,8 +228,39 @@ mod tests {
             output_tokens: None,
         };
         assert_eq!(
-            b.exhausted(Some(&tb), None).expect("exhausted").kind,
-            "input_tokens"
+            b.exhausted(Some(&tb), None),
+            Some(BudgetTrip {
+                kind: "input_tokens".into(),
+                limit: 900.0,
+                current: 900.0,
+            })
+        );
+    }
+
+    #[test]
+    fn output_sub_ceiling_trips_at_its_own_ceiling() {
+        // The mirror of the input case, and the one that catches a copy-pasted
+        // output branch: input is well under its own count, so an implementation
+        // that compares (or reports) `total_input_tokens` while labelling
+        // "output_tokens" fails here. Sitting exactly on the ceiling also pins
+        // `>=` on this branch specifically.
+        let b = BudgetState {
+            total_input_tokens: 10,
+            total_output_tokens: 500,
+            ..Default::default()
+        };
+        let tb = TokenBudgetIr {
+            total_tokens: None,
+            input_tokens: None,
+            output_tokens: Some(500),
+        };
+        assert_eq!(
+            b.exhausted(Some(&tb), None),
+            Some(BudgetTrip {
+                kind: "output_tokens".into(),
+                limit: 500.0,
+                current: 500.0,
+            })
         );
     }
 
