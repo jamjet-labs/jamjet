@@ -16,6 +16,7 @@ use std::collections::{HashSet, VecDeque};
 /// 8. All tool_ref, model_ref, agent_ref resolve to known definitions
 /// 9. All MCP servers referenced by mcp_tool nodes are configured
 /// 10. All remote agents referenced by a2a_task nodes are configured
+/// 11. Every ADK tool-dispatch node carries its `agent_tool_dispatch` marker
 pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_metadata(ir)?;
     validate_no_duplicate_nodes(ir)?;
@@ -24,6 +25,46 @@ pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_branch_targets(ir)?;
     validate_reachability(ir)?;
     validate_refs(ir)?;
+    validate_agent_tool_dispatch(ir)?;
+    Ok(())
+}
+
+/// The ADK tool-dispatch coroutine. Kept in sync with `_DISPATCH_MODULE` and
+/// `_DISPATCH_FUNCTION` in `sdk/python/jamjet/compiler/agent_ir.py:51-52`.
+const ADK_DISPATCH_MODULE: &str = "jamjet.agents.tool_runtime";
+const ADK_DISPATCH_FUNCTION: &str = "dispatch_tool_calls";
+
+/// Reject an ADK tool-dispatch node that is missing its policy marker.
+///
+/// Without the marker the worker treats the node as an opaque python_fn and
+/// enforces no tool policy on it. An IR compiled before the marker existed
+/// deserializes to `false`, so this makes the drift loud instead of silent.
+///
+/// The dispatch coordinates are the only signal that survives to Rust: the
+/// compiler nests its `tools` resolver map inside the *kind* dict, `PythonFn`
+/// has no such field, and serde drops unknown keys.
+///
+/// Python coordinates only — no Java ADK compiler emits `java_fn` dispatch
+/// nodes yet. Add the Java pair here when that compiler lands.
+fn validate_agent_tool_dispatch(ir: &WorkflowIr) -> IrResult<()> {
+    use jamjet_core::node::NodeKind;
+
+    for (id, node) in &ir.nodes {
+        if let NodeKind::PythonFn {
+            module,
+            function,
+            agent_tool_dispatch,
+            ..
+        } = &node.kind
+        {
+            if module == ADK_DISPATCH_MODULE
+                && function == ADK_DISPATCH_FUNCTION
+                && !agent_tool_dispatch
+            {
+                return Err(IrError::UnmarkedAgentToolDispatch(id.clone()));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -353,6 +394,68 @@ mod tests {
             matches!(&err, Err(IrError::BranchTargetMissingOutEdge { node, target }) if node == "a" && target == "b"),
             "a branch target with no matching out-edge must fail with BranchTargetMissingOutEdge, got {err:?}"
         );
+    }
+
+    /// A one-node IR built from raw JSON, so a node kind can omit
+    /// `agent_tool_dispatch` entirely — exactly how a pre-marker IR
+    /// deserializes. The struct fixture above cannot express that: the field is
+    /// not optional in Rust, so it can only ever be written as `false`.
+    ///
+    /// The maps are spelled out because `WorkflowIr` has no serde defaults for
+    /// them; this mirrors the dispatch fixtures in `runtime/workers` and
+    /// `runtime/api`.
+    fn ir_with_kind(kind: serde_json::Value) -> WorkflowIr {
+        serde_json::from_value(serde_json::json!({
+            "workflow_id": "wf",
+            "version": "1.0.0",
+            "state_schema": "{}",
+            "start_node": "n1",
+            "nodes": { "n1": { "id": "n1", "kind": kind } },
+            "edges": [],
+            "retry_policies": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {}
+        }))
+        .expect("fixture IR must parse")
+    }
+
+    #[test]
+    fn unmarked_adk_dispatch_node_is_rejected() {
+        // An ADK IR compiled before the flag existed would otherwise run with
+        // no tool policy at all (C1 regression guard).
+        let ir = ir_with_kind(serde_json::json!({
+            "type": "python_fn",
+            "module": "jamjet.agents.tool_runtime",
+            "function": "dispatch_tool_calls",
+            "output_schema": ""
+        }));
+        let err = validate_workflow(&ir).expect_err("must reject an unmarked dispatch node");
+        assert!(format!("{err}").contains("agent_tool_dispatch"));
+    }
+
+    #[test]
+    fn marked_adk_dispatch_node_validates() {
+        let ir = ir_with_kind(serde_json::json!({
+            "type": "python_fn",
+            "module": "jamjet.agents.tool_runtime",
+            "function": "dispatch_tool_calls",
+            "output_schema": "",
+            "agent_tool_dispatch": true
+        }));
+        assert!(validate_workflow(&ir).is_ok());
+    }
+
+    #[test]
+    fn ordinary_python_fn_validates() {
+        let ir = ir_with_kind(serde_json::json!({
+            "type": "python_fn",
+            "module": "my.module",
+            "function": "my_fn",
+            "output_schema": ""
+        }));
+        assert!(validate_workflow(&ir).is_ok());
     }
 
     #[test]
