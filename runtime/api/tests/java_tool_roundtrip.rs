@@ -361,9 +361,29 @@ fn temp_sqlite_url() -> (std::path::PathBuf, String) {
 
 /// Create a Running execution and enqueue a single claimable `java_tool` work
 /// item for it, mirroring what the scheduler would enqueue for a JavaFn node.
+///
+/// The workflow definition is stored and the payload carries the workflow
+/// coordinates because that is what the scheduler always produces
+/// (`runtime/scheduler/src/runner.rs` builds every payload with `workflow_id` /
+/// `workflow_version`, and it could not have scheduled the node at all without
+/// the definition on file). The claim route resolves those coordinates to
+/// decide whether the node is an ADK agent tool dispatch that needs policy
+/// evaluation, so a fixture without them is not a shape production can reach.
 async fn seed_claimable_java_item(backend: &Arc<dyn StateBackend>) -> ExecutionId {
     let execution_id = ExecutionId::new();
     let now = chrono::Utc::now();
+    let mut ir = java_tool_workflow_ir();
+    ir["workflow_id"] = serde_json::json!("java-tool-fence");
+    backend
+        .store_workflow(WorkflowDefinition {
+            workflow_id: "java-tool-fence".into(),
+            version: "0.1.0".into(),
+            ir,
+            created_at: now,
+            tenant_id: DEFAULT_TENANT.into(),
+        })
+        .await
+        .expect("store_workflow");
     backend
         .create_execution(WorkflowExecution {
             execution_id: execution_id.clone(),
@@ -400,6 +420,9 @@ async fn seed_claimable_java_item(backend: &Arc<dyn StateBackend>) -> ExecutionI
             node_id: "java_tool_node".into(),
             queue_type: "java_tool".into(),
             payload: serde_json::json!({
+                "workflow_id": "java-tool-fence",
+                "workflow_version": "0.1.0",
+                "node_id": "java_tool_node",
                 "class": "com.example.tools.WeatherTool",
                 "method": "getWeather",
                 "input": {},
