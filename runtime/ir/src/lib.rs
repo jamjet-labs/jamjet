@@ -3,5 +3,5 @@ pub mod validate;
 pub mod workflow;
 
 pub use error::IrError;
-pub use validate::validate_workflow;
+pub use validate::{validate_agent_tool_dispatch, validate_workflow};
 pub use workflow::{EdgeDef, NodeDef, WorkflowIr};

@@ -46,7 +46,11 @@ const ADK_DISPATCH_FUNCTION: &str = "dispatch_tool_calls";
 ///
 /// Python coordinates only — no Java ADK compiler emits `java_fn` dispatch
 /// nodes yet. Add the Java pair here when that compiler lands.
-fn validate_agent_tool_dispatch(ir: &WorkflowIr) -> IrResult<()> {
+///
+/// Public, and callable independently of [`validate_workflow`], because the
+/// `POST /workflows` route needs exactly this rule without the ref rules it
+/// deliberately skips (see `runtime/api/src/routes.rs`).
+pub fn validate_agent_tool_dispatch(ir: &WorkflowIr) -> IrResult<()> {
     use jamjet_core::node::NodeKind;
 
     for (id, node) in &ir.nodes {

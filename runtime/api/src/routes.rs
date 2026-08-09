@@ -174,7 +174,19 @@ async fn create_workflow(
     // (Reference resolution is deliberately left to the runtime: models/tools are
     // resolved against the worker registry, not the IR maps, so we validate the
     // shape here, not `validate_workflow`'s ref rules.)
-    serde_json::from_value::<jamjet_ir::WorkflowIr>(body.ir.clone())
+    let parsed = serde_json::from_value::<jamjet_ir::WorkflowIr>(body.ir.clone())
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+
+    // ONE rule from `validate_workflow` runs here, deliberately, while the ref
+    // rules above do not. An unmarked ADK tool-dispatch node is not a reference
+    // problem the runtime can resolve later — it is a policy-enforcement hole,
+    // and registration is the only place it is detectable. An IR compiled by a
+    // pre-marker SDK deserializes with `agent_tool_dispatch: false`, so the
+    // claim route treats it as an ordinary `python_fn` and hands out a whole
+    // turn's model-chosen tool calls with no tool policy evaluated at all.
+    // Storing it would bake that hole in permanently; rejecting it makes the
+    // version skew loud at the one moment the operator can act on it.
+    jamjet_ir::validate_agent_tool_dispatch(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let backend = state.backend_for(&tenant_id);
