@@ -58,6 +58,11 @@ class GovernanceConfig:
         ``True``   – every tool call requires approval.
         ``list``   – tool-name globs that require approval (e.g.
                      ``["delete_*", "send_*"]``).
+        Enforced on the DURABLE path (``agent.run_durable``): the compiled
+        ``require_approval_for`` is evaluated engine-side, before any worker
+        receives the tool-dispatch payload.  The in-process ``agent.run()`` path
+        has no policy engine in its loop and CANNOT enforce a gate; it warns
+        loudly instead (F-t3-inprocess-approval).
     budget
         Optional per-run spending cap.  ``None`` when uncapped.
     pii

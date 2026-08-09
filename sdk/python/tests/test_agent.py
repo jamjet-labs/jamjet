@@ -103,6 +103,61 @@ class TestAgent:
         assert agent.limits.timeout_seconds == 60
 
 
+# ── approval_required warning copy ────────────────────────────────────────────
+#
+# The warning on agent.run() is security guidance, so its wording is under test.
+# It has to say two things and no more: (a) THIS call is not enforced, and (b)
+# where enforcement actually lives. The durable path is genuinely enforced now,
+# but by the engine server-side — the guard on the work-item claim route runs
+# before the external tool worker ever receives the payload — not by the SDK.
+# The old copy promised "the Rust engine enforces it fail-closed" while
+# sitting on the unenforced in-process path, which reads as a guarantee about
+# the call the developer just made.
+
+
+def _agent_with_approval_required() -> Agent:
+    return Agent(
+        "approval_copy",
+        model="gpt-5.2",
+        tools=[search],
+        approval_required=True,
+    )
+
+
+def _approval_warning(record: list) -> str:
+    """The one approval warning out of everything run() emits (audit warns too)."""
+    matches = [w for w in record if "approval_required" in str(w.message)]
+    assert len(matches) == 1, f"expected exactly one approval warning, got {len(matches)}"
+    return str(matches[0].message)
+
+
+def test_in_process_run_warning_does_not_promise_enforcement_here():
+    """run() must warn without implying the in-process path is enforced."""
+    agent = _agent_with_approval_required()
+    with pytest.warns(UserWarning) as record:
+        asyncio.run(agent.run("hi"))
+    message = _approval_warning(record)
+    assert "does not enforce approval gates" in message
+    # The durable path is now genuinely enforced (C1), but this warning is on
+    # the in-process path and must not read as a guarantee about this call.
+    assert "fail-closed" not in message
+
+
+def test_in_process_run_warning_points_at_the_real_enforcement_point():
+    """The redirect must name where enforcement lives, accurately.
+
+    Server-side, before the payload leaves the engine — that is what makes the
+    durable claim true even for a stale or hostile external tool worker. Copy
+    that credits the worker would be both weaker and wrong.
+    """
+    agent = _agent_with_approval_required()
+    with pytest.warns(UserWarning) as record:
+        asyncio.run(agent.run("hi"))
+    message = _approval_warning(record)
+    assert "run_durable" in message
+    assert "before any worker" in message
+
+
 # ── @task tests ───────────────────────────────────────────────────────────────
 
 

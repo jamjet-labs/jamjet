@@ -537,8 +537,18 @@ class Agent:
                      from scratch — existing behaviour unchanged.
         """
         # T3-6: approval_required parity — the in-process path cannot enforce
-        # tool-level approval gates (the @gate mechanism is opt-in per function;
-        # the durable Rust engine enforces require_approval_for via the IR).
+        # tool-level approval gates (the @gate mechanism is opt-in per function).
+        # The loop below calls tools directly with no policy engine in it, so an
+        # approval gate can be neither evaluated nor held here.
+        #
+        # run_durable() IS enforced — but by the ENGINE, and not by this SDK.
+        # ADK dispatch nodes run on the `python_tool` queue, which has no
+        # in-process worker; the guard on POST /work-items/claim decides a
+        # dispatch node's pending tool calls, so a gated call's payload never
+        # reaches the external worker at all.  That is why it holds even against
+        # a stale or hostile worker build.  Do not restate any of it as a
+        # property of the code below: nothing here inherits it.
+        #
         # Fail LOUD rather than silently no-op so the developer knows approval
         # won't fire here.  See follow-up F-t3-inprocess-approval for full
         # in-process enforcement.
@@ -547,8 +557,8 @@ class Agent:
             warnings.warn(
                 f"Agent {self.name!r}: approval_required is set but agent.run() uses "
                 "the in-process path, which does not enforce approval gates. "
-                "Use agent.run_durable() — the durable IR carries "
-                "require_approval_for and the Rust engine enforces it fail-closed. "
+                "Use agent.run_durable(), where the engine evaluates every tool call "
+                "against policy server-side, before any worker receives the payload. "
                 "Follow-up: F-t3-inprocess-approval.",
                 UserWarning,
                 stacklevel=2,
