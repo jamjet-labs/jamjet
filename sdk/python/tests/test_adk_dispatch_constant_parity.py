@@ -76,11 +76,7 @@ def test_python_constants_are_the_ones_the_compiler_emits() -> None:
 
     agent = Agent("a", model="anthropic/claude-sonnet-4-6", tools=[echo], strategy="react")
     ir = compile_agent_to_ir(agent, "hi", max_turns=2)
-    dispatch = [
-        node["kind"]
-        for node in ir["nodes"].values()
-        if node["kind"].get("agent_tool_dispatch") is True
-    ]
+    dispatch = [node["kind"] for node in ir["nodes"].values() if node["kind"].get("agent_tool_dispatch") is True]
     assert dispatch, "the compiler must emit at least one marked dispatch node"
     for kind in dispatch:
         assert kind["module"] == _DISPATCH_MODULE
