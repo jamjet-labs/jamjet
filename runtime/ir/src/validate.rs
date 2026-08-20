@@ -31,8 +31,20 @@ pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
 
 /// The ADK tool-dispatch coroutine. Kept in sync with `_DISPATCH_MODULE` and
 /// `_DISPATCH_FUNCTION` in `sdk/python/jamjet/compiler/agent_ir.py:51-52`.
-const ADK_DISPATCH_MODULE: &str = "jamjet.agents.tool_runtime";
-const ADK_DISPATCH_FUNCTION: &str = "dispatch_tool_calls";
+pub const ADK_DISPATCH_MODULE: &str = "jamjet.agents.tool_runtime";
+pub const ADK_DISPATCH_FUNCTION: &str = "dispatch_tool_calls";
+
+/// True when a `python_fn`'s coordinates are the ADK tool-dispatch coroutine.
+///
+/// The marker is the declarative signal, but it is `#[serde(default)]`, so an IR
+/// stored before the marker existed reads as unmarked — and nothing re-validates
+/// a workflow already in the backend. Enforcement therefore keys on these
+/// coordinates too, which is why this is public rather than inlined into
+/// [`validate_agent_tool_dispatch`]: the validator and the worker must agree on
+/// what an ADK dispatch node IS, from one definition.
+pub fn is_adk_dispatch_coordinates(module: &str, function: &str) -> bool {
+    module == ADK_DISPATCH_MODULE && function == ADK_DISPATCH_FUNCTION
+}
 
 /// Reject an ADK tool-dispatch node that is missing its policy marker.
 ///
@@ -61,10 +73,7 @@ pub fn validate_agent_tool_dispatch(ir: &WorkflowIr) -> IrResult<()> {
             ..
         } = &node.kind
         {
-            if module == ADK_DISPATCH_MODULE
-                && function == ADK_DISPATCH_FUNCTION
-                && !agent_tool_dispatch
-            {
+            if is_adk_dispatch_coordinates(module, function) && !agent_tool_dispatch {
                 return Err(IrError::UnmarkedAgentToolDispatch(id.clone()));
             }
         }

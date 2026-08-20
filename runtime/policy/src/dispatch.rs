@@ -19,6 +19,26 @@ pub struct PendingToolCall {
     pub arguments: Value,
 }
 
+/// The longest tool name that may reach the matcher.
+///
+/// These names are model output, so a prompt injection can choose them. They are
+/// matched by [`crate::glob_match`], which recurses once per character and never
+/// memoizes: recursion depth is linear in the name length, and a Rust stack
+/// overflow aborts the process rather than unwinding. A multi-star pattern also
+/// backtracks superlinearly over the same input.
+///
+/// 512 is far above any real tool name — the OpenAI and Anthropic function-name
+/// limits are 64 — and far below anything that threatens a worker stack, so it
+/// rejects only implausible input.
+pub const MAX_TOOL_NAME_LEN: usize = 512;
+
+/// The most pending calls one dispatch batch may carry.
+///
+/// Bounds the total matching work for a batch, so a single payload cannot force
+/// an unbounded number of glob evaluations. A model turn emits a handful of tool
+/// calls; 256 is generous for a legitimate batch.
+pub const MAX_PENDING_CALLS: usize = 256;
+
 /// Why a dispatch payload's pending calls could not be read.
 ///
 /// Every variant means the same thing to the enforcement decision — the caller
@@ -37,6 +57,11 @@ pub enum UnreadableCalls {
     /// A call in the list has no readable string `name`, so it cannot be matched
     /// against `blocked_tools` / `require_approval_for`.
     UnnamedCall,
+    /// A call's `name` exceeds [`MAX_TOOL_NAME_LEN`]. Refused before it reaches
+    /// the matcher, because the matcher's recursion depth is linear in the name.
+    NameTooLong,
+    /// The call list holds more than [`MAX_PENDING_CALLS`] entries.
+    TooManyCalls,
 }
 
 /// Read the tool calls a marked agent-dispatch node will execute from its
@@ -70,6 +95,13 @@ pub fn read_pending_tool_calls(input: &Value) -> Result<Vec<PendingToolCall>, Un
     };
 
     let arr = raw.as_array().ok_or(UnreadableCalls::NotAList)?;
+    // Bound the batch before reading it, so an oversized list cannot force an
+    // unbounded number of glob evaluations downstream.
+    if arr.len() > MAX_PENDING_CALLS {
+        return Err(UnreadableCalls::TooManyCalls);
+    }
+    // `with_capacity(arr.len())` is safe only because the length is bounded
+    // above; without that check a payload could dictate a huge allocation.
     let mut out = Vec::with_capacity(arr.len());
     for call in arr {
         // A call whose name cannot be read cannot be matched against
@@ -78,8 +110,13 @@ pub fn read_pending_tool_calls(input: &Value) -> Result<Vec<PendingToolCall>, Un
         let name = call
             .get("name")
             .and_then(|n| n.as_str())
-            .ok_or(UnreadableCalls::UnnamedCall)?
-            .to_string();
+            .ok_or(UnreadableCalls::UnnamedCall)?;
+        // Counted in chars, not bytes: `glob_match` collects both sides into
+        // `Vec<char>` and recurses per char, so chars are what bound the depth.
+        if name.chars().count() > MAX_TOOL_NAME_LEN {
+            return Err(UnreadableCalls::NameTooLong);
+        }
+        let name = name.to_string();
         let arguments = call.get("arguments").cloned().unwrap_or(Value::Null);
         out.push(PendingToolCall { name, arguments });
     }
@@ -421,5 +458,55 @@ mod tests {
         let node = policy(&[], &["send_wire"]);
         let d = evaluate_dispatch("__tools_0__", &pending(&["send_wire"]), &[&tenant, &node]);
         assert!(matches!(d, DispatchDecision::RequireApproval { .. }));
+    }
+
+    // ── Bounds on model-controlled input ──────────────────────────────────────
+    //
+    // These names come from model output, so they are attacker-influenceable via
+    // prompt injection. They are matched with `glob_match`, which recurses once
+    // per character and never memoizes: depth is linear in the name, so a long
+    // enough name overflows the stack (an abort in Rust, not a catchable error),
+    // and a multi-star pattern backtracks superlinearly on top of that. Bounding
+    // the input here is what keeps an unbounded string from reaching it.
+
+    #[test]
+    fn an_overlong_tool_name_is_unreadable() {
+        let long = "a".repeat(MAX_TOOL_NAME_LEN + 1);
+        let input = json!({"tool_calls": [{"name": long, "arguments": {}}]});
+        assert_eq!(
+            read_pending_tool_calls(&input),
+            Err(UnreadableCalls::NameTooLong)
+        );
+    }
+
+    #[test]
+    fn a_tool_name_at_the_limit_still_reads() {
+        // The bound must reject only what is implausible, never a legitimate
+        // name sitting exactly at the edge.
+        let name = "a".repeat(MAX_TOOL_NAME_LEN);
+        let input = json!({"tool_calls": [{"name": name, "arguments": {}}]});
+        let calls = read_pending_tool_calls(&input).expect("a name at the limit is readable");
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn an_oversized_call_list_is_unreadable() {
+        let calls: Vec<_> = (0..MAX_PENDING_CALLS + 1)
+            .map(|i| json!({"name": format!("t{i}"), "arguments": {}}))
+            .collect();
+        let input = json!({ "tool_calls": calls });
+        assert_eq!(
+            read_pending_tool_calls(&input),
+            Err(UnreadableCalls::TooManyCalls)
+        );
+    }
+
+    #[test]
+    fn bounds_are_enforced_before_any_matching() {
+        // Fail closed: an over-long name must be refused as unreadable rather
+        // than reaching the evaluator, even when no rule would have matched it.
+        let long = "a".repeat(MAX_TOOL_NAME_LEN + 1);
+        let input = json!({"tool_calls": [{"name": long, "arguments": {}}]});
+        assert!(pending_tool_calls(&input).is_none());
     }
 }

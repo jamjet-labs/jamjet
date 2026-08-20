@@ -999,12 +999,30 @@ async fn an_approval_for_a_different_call_set_does_not_release_the_payload() {
 /// An ordinary `python_fn` (not an ADK dispatch) carries no model-chosen calls,
 /// so the guard must not touch it — even though it is on the same queue and its
 /// payload holds a name a `blocked_tools` rule would match.
+///
+/// The coordinates matter: this fixture must NOT be the ADK dispatch coroutine.
+/// A node at `jamjet.agents.tool_runtime::dispatch_tool_calls` IS an agent
+/// dispatch whether or not it carries the marker, and is guarded on its
+/// coordinates — see `an_unmarked_adk_dispatch_is_still_enforced` directly
+/// below. Narrowness is about ordinary python functions, not about unmarked
+/// dispatch nodes.
 #[tokio::test]
 async fn an_unmarked_python_fn_item_is_handed_out_untouched() {
     let backend = memory();
+    let ordinary = ir_with_node(json!({
+        "id": "n1",
+        "kind": {
+            "type": "python_fn",
+            "module": "my_app.tasks",
+            "function": "resize_image",
+            "output_schema": "",
+            "agent_tool_dispatch": false
+        }
+    }))
+    .tap_policy(&["send_wire"], &[]);
     let (execution_id, _) = seed(
         &backend,
-        dispatch_ir(false, &["send_wire"], &[]),
+        ordinary,
         "python_tool",
         dispatch_payload(calls_input(&["send_wire"])),
     )
@@ -1020,6 +1038,40 @@ async fn an_unmarked_python_fn_item_is_handed_out_untouched() {
     assert!(
         backend.get_events(&execution_id).await.unwrap().is_empty(),
         "an untouched item writes nothing"
+    );
+}
+
+/// A workflow registered before the marker existed deserializes to
+/// `agent_tool_dispatch: false`, and nothing re-validates an IR already in the
+/// backend — `validate_agent_tool_dispatch` guards the REGISTRATION route only.
+/// Keying enforcement on the marker alone would therefore hand this payload
+/// straight out, with a `blocked_tools` rule in force and a blocked call inside
+/// it: C1 still open, for exactly the workflows that predate the fix.
+///
+/// The dispatch coordinates identify the node without the marker, so the route
+/// blocks it on those instead.
+#[tokio::test]
+async fn an_unmarked_adk_dispatch_is_still_enforced() {
+    let backend = memory();
+    let (execution_id, _) = seed(
+        &backend,
+        dispatch_ir(false, &["send_wire"], &[]),
+        "python_tool",
+        dispatch_payload(calls_input(&["send_wire"])),
+    )
+    .await;
+
+    assert_withheld(&claim(&make_state(backend.clone()), "python_tool").await);
+    let recorded = violations(&backend, &execution_id).await;
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the denial must reach the Prove surface like any other"
+    );
+    assert!(
+        recorded[0].contains("send_wire"),
+        "the audit rule must name the blocked tool, got {:?}",
+        recorded[0]
     );
 }
 

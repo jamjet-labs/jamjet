@@ -68,17 +68,43 @@ pub enum DispatchGuardOutcome {
 }
 
 /// True for nodes that run a whole agent turn's model-chosen tool calls.
+///
+/// TWO signals, and the second is not redundant. The marker is declarative and
+/// covers both languages, but it is `#[serde(default)]`, so an IR compiled
+/// before the marker existed deserializes to `false`.
+/// `validate_agent_tool_dispatch` makes that drift loud — on the REGISTRATION
+/// route only. Nothing re-validates a workflow already sitting in the backend,
+/// so a workflow registered before this change and started from stored IR (a
+/// cron/scheduled fleet, or any `start_execution` without a fresh
+/// `create_workflow`) would reach the executor unmarked and run every tool
+/// unpoliced. That is C1 exactly, still open, for precisely the population that
+/// cannot be fixed by validating new registrations.
+///
+/// So enforcement falls back to the dispatch coordinates, which identify the
+/// node with no marker at all — the same rule the validator matches on, shared
+/// from one definition. The marker stays the cheap path; it is no longer the
+/// only one.
+///
+/// NARROWNESS is preserved: an ordinary `python_fn` that merely lacks the marker
+/// is still not a dispatch node. Only the ADK dispatch coroutine's own
+/// coordinates qualify. Java keeps the marker as its sole signal because no Java
+/// ADK compiler emits `java_fn` dispatch nodes yet, so there is no pre-marker
+/// population to rescue — add the coordinate pair here when that compiler lands.
 pub fn is_agent_tool_dispatch(kind: &NodeKind) -> bool {
-    matches!(
-        kind,
+    match kind {
         NodeKind::PythonFn {
             agent_tool_dispatch: true,
             ..
-        } | NodeKind::JavaFn {
+        }
+        | NodeKind::JavaFn {
             agent_tool_dispatch: true,
             ..
-        }
-    )
+        } => true,
+        NodeKind::PythonFn {
+            module, function, ..
+        } => jamjet_ir::is_adk_dispatch_coordinates(module, function),
+        _ => false,
+    }
 }
 
 /// The frozen accumulated state the scheduler enriched onto a PythonFn/JavaFn
@@ -368,6 +394,8 @@ fn unreadable_rule(cause: UnreadableCalls) -> String {
         UnreadableCalls::NotAnObject => "input is not an object",
         UnreadableCalls::NotAList => "the call list is not an array",
         UnreadableCalls::UnnamedCall => "a call has no readable name",
+        UnreadableCalls::NameTooLong => "a call name exceeds the length bound",
+        UnreadableCalls::TooManyCalls => "the call list exceeds the batch bound",
     };
     format!("{UNREADABLE}: {detail}")
 }
@@ -1123,7 +1151,10 @@ mod tests {
     async fn a_permitted_tool_is_allowed_and_audits_nothing() {
         let f = Fixture::new();
         let outcome = f
-            .guard(&ir(&["send_wire"], &["wire_batch"]), &input_for(&["read_file"]))
+            .guard(
+                &ir(&["send_wire"], &["wire_batch"]),
+                &input_for(&["read_file"]),
+            )
             .await;
         assert_eq!(outcome, DispatchGuardOutcome::Allow);
         assert!(
@@ -1157,7 +1188,8 @@ mod tests {
         );
         // Even an unreadable payload: with no policy there is no decision to make.
         assert_eq!(
-            f.guard(&unpoliced_ir(), &json!({"tool_calls": "nope"})).await,
+            f.guard(&unpoliced_ir(), &json!({"tool_calls": "nope"}))
+                .await,
             DispatchGuardOutcome::Allow
         );
         assert!(f.events().await.is_empty());
@@ -1169,7 +1201,10 @@ mod tests {
     async fn a_blocked_tool_is_blocked_and_audited_exactly_once() {
         let f = Fixture::new();
         let outcome = f
-            .guard(&ir(&["send_wire"], &[]), &input_for(&["read_file", "send_wire"]))
+            .guard(
+                &ir(&["send_wire"], &[]),
+                &input_for(&["read_file", "send_wire"]),
+            )
             .await;
         match outcome {
             DispatchGuardOutcome::Blocked { reason } => {
@@ -1221,7 +1256,10 @@ mod tests {
     async fn a_non_array_call_list_is_blocked() {
         let f = Fixture::new();
         let outcome = f
-            .guard(&ir(&["send_wire"], &[]), &json!({"tool_calls": "send_wire"}))
+            .guard(
+                &ir(&["send_wire"], &[]),
+                &json!({"tool_calls": "send_wire"}),
+            )
             .await;
         assert!(matches!(outcome, DispatchGuardOutcome::Blocked { .. }));
         assert_eq!(f.violations().await.len(), 1);
@@ -1261,7 +1299,9 @@ mod tests {
     async fn an_absent_input_key_is_blocked() {
         let f = Fixture::new();
         let payload = json!({"workflow_id": "adk-wf", "tool_calls": []});
-        let outcome = f.guard(&ir(&["send_wire"], &[]), &payload_input(&payload)).await;
+        let outcome = f
+            .guard(&ir(&["send_wire"], &[]), &payload_input(&payload))
+            .await;
         assert!(matches!(outcome, DispatchGuardOutcome::Blocked { .. }));
         assert_eq!(f.violations().await.len(), 1);
     }
@@ -1303,7 +1343,9 @@ mod tests {
     #[tokio::test]
     async fn a_gated_tool_is_held_and_requests_approval_exactly_once() {
         let f = Fixture::new();
-        let outcome = f.guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"])).await;
+        let outcome = f
+            .guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"]))
+            .await;
         assert_eq!(
             outcome,
             DispatchGuardOutcome::Held {
@@ -1369,8 +1411,12 @@ mod tests {
     #[tokio::test]
     async fn an_already_pending_node_is_held_without_a_duplicate_request() {
         let f = Fixture::new();
-        let first = f.guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"])).await;
-        let second = f.guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"])).await;
+        let first = f
+            .guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"]))
+            .await;
+        let second = f
+            .guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"]))
+            .await;
         assert!(matches!(first, DispatchGuardOutcome::Held { .. }));
         assert!(matches!(second, DispatchGuardOutcome::Held { .. }));
         assert_eq!(
@@ -1387,9 +1433,15 @@ mod tests {
         let f = Fixture::new();
         f.seed(vec![request_for(&["send_wire"], None), rejected("n1")])
             .await;
-        let outcome = f.guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"])).await;
+        let outcome = f
+            .guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"]))
+            .await;
         assert!(matches!(outcome, DispatchGuardOutcome::Held { .. }));
-        assert_eq!(f.requests().await.len(), 1, "no new request for a rejection");
+        assert_eq!(
+            f.requests().await.len(),
+            1,
+            "no new request for a rejection"
+        );
     }
 
     /// The dual of the binding check: an approval DOES release the exact call
@@ -1403,7 +1455,9 @@ mod tests {
             approved("n1"),
         ])
         .await;
-        let outcome = f.guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"])).await;
+        let outcome = f
+            .guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"]))
+            .await;
         assert_eq!(outcome, DispatchGuardOutcome::Allow);
         assert_eq!(
             f.requests().await.len(),
@@ -1418,8 +1472,11 @@ mod tests {
     async fn an_approval_does_not_authorise_a_different_call_set() {
         let f = Fixture::new();
         let hash = content_hash(&calls_json_for(&["read_file"]));
-        f.seed(vec![request_for(&["read_file"], Some(hash)), approved("n1")])
-            .await;
+        f.seed(vec![
+            request_for(&["read_file"], Some(hash)),
+            approved("n1"),
+        ])
+        .await;
         let outcome = f
             .guard(
                 &ir(&[], &["send_wire", "read_file"]),
@@ -1491,6 +1548,37 @@ mod tests {
         }))
         .unwrap();
         assert!(!is_agent_tool_dispatch(&unmarked.node("n1").unwrap().kind));
+    }
+
+    /// An IR stored before the marker existed deserializes to
+    /// `agent_tool_dispatch: false`, and nothing re-validates a workflow that is
+    /// already in the backend — `validate_agent_tool_dispatch` runs on the
+    /// REGISTRATION route only. Keying enforcement solely on the marker would
+    /// therefore leave C1 fully open for every ADK workflow registered before
+    /// this change and started from stored IR (a cron/scheduled fleet, or any
+    /// `start_execution` without a fresh `create_workflow`).
+    ///
+    /// The dispatch coordinates identify the node without the marker — that is
+    /// exactly what the registration validator matches on — so enforcement keys
+    /// on them too. The marker stays as the cheap path, not the only signal.
+    #[tokio::test]
+    async fn unmarked_adk_dispatch_coordinates_are_still_guarded() {
+        let unmarked: WorkflowIr = serde_json::from_value(json!({
+            "workflow_id": "wf", "version": "1.0.0", "state_schema": "{}",
+            "start_node": "n1",
+            "nodes": { "n1": { "id": "n1", "kind": {
+                "type": "python_fn",
+                "module": "jamjet.agents.tool_runtime",
+                "function": "dispatch_tool_calls",
+                "output_schema": "", "agent_tool_dispatch": false }}},
+            "edges": [], "retry_policies": {}, "models": {}, "tools": {},
+            "mcp_servers": {}, "remote_agents": {}
+        }))
+        .unwrap();
+        assert!(
+            is_agent_tool_dispatch(&unmarked.node("n1").unwrap().kind),
+            "an unmarked node carrying the ADK dispatch coordinates must still be guarded"
+        );
     }
 
     #[test]

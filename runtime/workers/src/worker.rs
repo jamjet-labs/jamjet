@@ -2756,8 +2756,7 @@ mod tests {
             &self,
             _item: &jamjet_state::backend::WorkItem,
         ) -> Result<ExecutionResult, ExecutorError> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(ExecutionResult {
                 output: serde_json::json!({}),
                 state_patch: serde_json::json!({}),
@@ -2857,7 +2856,10 @@ mod tests {
             .iter()
             .find_map(|e| match &e.kind {
                 EventKind::TokenBudgetExceeded {
-                    kind, limit, current, ..
+                    kind,
+                    limit,
+                    current,
+                    ..
                 } => Some((kind.clone(), *limit, *current)),
                 _ => None,
             })
@@ -3270,6 +3272,15 @@ mod tests {
         })
     }
 
+    /// A policed `python_fn` that is a real application function, not the ADK
+    /// dispatch coroutine — the narrowness fixture.
+    fn ordinary_python_fn_ir_json(blocked: &[&str]) -> serde_json::Value {
+        let mut ir = dispatch_ir_json("python_fn", false, blocked, &[]);
+        ir["nodes"]["n1"]["kind"]["module"] = serde_json::json!("my_app.tasks");
+        ir["nodes"]["n1"]["kind"]["function"] = serde_json::json!("resize_image");
+        ir
+    }
+
     /// Drive one marked dispatch node and return (result, events, dispatch count).
     ///
     /// `seed` events are appended before the item is claimed, which is how a test
@@ -3616,15 +3627,37 @@ mod tests {
     }
 
     /// Narrowness: an ordinary python_fn is unaffected by the new branch.
+    ///
+    /// "Ordinary" means the coordinates too. A node at
+    /// `jamjet.agents.tool_runtime::dispatch_tool_calls` is an agent dispatch
+    /// whether or not it carries the marker — see
+    /// `unmarked_adk_dispatch_is_still_enforced` below — so this fixture uses a
+    /// genuine application function. Using the dispatch coordinates here would
+    /// assert the fail-open instead of narrowness.
     #[tokio::test]
     async fn unmarked_python_fn_is_unaffected() {
         let (result, _, count) = run_dispatch_node(
-            dispatch_ir_json("python_fn", false, &["send_wire"], &[]),
+            ordinary_python_fn_ir_json(&["send_wire"]),
             serde_json::json!({"tool_calls": [one_call("send_wire")]}),
         )
         .await;
         assert_eq!(count, 1, "a non-ADK python_fn must still run");
         assert!(result.is_ok());
+    }
+
+    /// An IR stored before the marker existed deserializes to `false`, and only
+    /// the registration route re-validates. Enforcement therefore keys on the
+    /// dispatch coordinates as well, so a pre-marker workflow is still policed
+    /// on the in-process path.
+    #[tokio::test]
+    async fn unmarked_adk_dispatch_is_still_enforced() {
+        let (result, _, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", false, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+        )
+        .await;
+        assert_eq!(count, 0, "the blocked tool must never dispatch");
+        assert_denied_because(result, "send_wire");
     }
 
     /// The approval must be bound to the calls it authorises.
