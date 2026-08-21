@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege for the whole workflow. Every job here reads the repo, builds,
+# and reports — none of them writes to it, so none needs the default write-capable
+# token. Declared once at the top rather than per job, so a job added later
+# inherits the floor instead of silently getting write.
+#
+# Publishing is unaffected: the release workflows are separate files and keep
+# their own `id-token: write` for OIDC.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
