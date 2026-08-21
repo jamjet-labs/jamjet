@@ -22,7 +22,7 @@ use chrono::Utc;
 use jamjet_agents::{AgentCard, AgentFilter, AgentStatus};
 use jamjet_audit::backend::AuditQuery;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
-use jamjet_state::{Tenant, TenantId, TenantStatus, WorkItem, WorkflowDefinition};
+use jamjet_state::{FailOutcome, Tenant, TenantId, TenantStatus, WorkItem, WorkflowDefinition};
 use jamjet_worker::DispatchGuardOutcome;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1552,20 +1552,135 @@ async fn enqueue_work_item(
 #[derive(Deserialize)]
 struct FailWorkItemRequest {
     error: String,
+    /// Lease fence echoed from the claim response. Gates the failure on still
+    /// holding the lease, exactly as `/complete` does.
+    ///
+    /// Absent means the legacy unfenced path: the item is settled `'failed'` and
+    /// NO event is emitted, which strands the node. It is kept only so callers
+    /// that predate the fence keep working, and it is deprecated — a caller that
+    /// echoes the fence gets retry semantics and a terminal event instead.
+    #[serde(default)]
+    lease_fence: Option<i64>,
 }
 
-/// `POST /work-items/:id/fail` — mark a work item as failed.
+/// `POST /work-items/:id/fail` — a worker reports that its node failed.
+///
+/// The fenced path applies the SAME retry, backoff and dead-letter rules that
+/// lease reclamation applies, and emits the SAME events, so a node whose worker
+/// reported a failure and a node whose worker died converge on one state machine.
+///
+/// Before this, the whole endpoint was `fail_work_item` and nothing else: no
+/// fence, so any caller holding an id could settle someone else's item, and no
+/// event, so the scheduler fold kept the node in `scheduled` while the row sat in
+/// a `'failed'` status that no sweep ever selects. Every legitimate tool failure
+/// stranded its execution as `Running`, permanently.
 async fn fail_work_item(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
     Json(body): Json<FailWorkItemRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let item_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
-    backend.fail_work_item(item_id, &body.error).await?;
-    Ok(Json(json!({ "failed": true, "work_item_id": id })))
+
+    let Some(fence) = body.lease_fence else {
+        // Legacy unfenced path, deprecated. Preserved verbatim so existing
+        // callers do not break, and deliberately NOT given the new event
+        // emission: without a fence we cannot show the item was ours to fail, and
+        // emitting a terminal event on an item another worker may now hold is
+        // worse than the stranding this path already causes.
+        warn!(
+            work_item_id = %id,
+            "fail: unfenced legacy path — the node will be stranded; echo lease_fence to get retry semantics"
+        );
+        backend.fail_work_item(item_id, &body.error).await?;
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "failed": true,
+                "work_item_id": id,
+                "retryable": false,
+                "warning": "unfenced fail: no NodeFailed emitted and the node is not rescheduled; echo lease_fence",
+            })),
+        ));
+    };
+
+    let Some(outcome) = backend
+        .fail_work_item_fenced(item_id, fence, &body.error)
+        .await?
+    else {
+        // Someone else owns it now — reclaimed, already settled, or a forged
+        // fence. Emit nothing: the holder decides this item's fate.
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "failed": false,
+                "work_item_id": id,
+                "reason": "stale or invalid lease fence",
+            })),
+        ));
+    };
+
+    // Emit exactly what `SchedulerRunner::reclaim_expired_leases` emits for the
+    // same transition, so the fold cannot tell the two apart.
+    let (item, retryable, delay_ms) = match &outcome {
+        FailOutcome::Retryable { item, delay_ms } => (item, true, Some(*delay_ms)),
+        FailOutcome::Exhausted { item } => (item, false, None),
+    };
+
+    let seq = backend.latest_sequence(&item.execution_id).await? + 1;
+    backend
+        .append_event(jamjet_state::Event::new(
+            item.execution_id.clone(),
+            seq,
+            jamjet_state::EventKind::NodeFailed {
+                node_id: item.node_id.clone(),
+                error: body.error.clone(),
+                // Retryable reports the attempt that just failed; exhausted
+                // reports the final count. Mirrors the reclaimer's arithmetic.
+                attempt: if retryable {
+                    item.attempt.saturating_sub(1)
+                } else {
+                    item.attempt
+                },
+                retryable,
+            },
+        ))
+        .await?;
+
+    if let Some(delay_ms) = delay_ms {
+        let seq = backend.latest_sequence(&item.execution_id).await? + 1;
+        backend
+            .append_event(jamjet_state::Event::new(
+                item.execution_id.clone(),
+                seq,
+                jamjet_state::EventKind::RetryScheduled {
+                    node_id: item.node_id.clone(),
+                    attempt: item.attempt,
+                    delay_ms,
+                },
+            ))
+            .await?;
+    }
+
+    warn!(
+        execution_id = %item.execution_id,
+        node_id = %item.node_id,
+        attempt = item.attempt,
+        retryable,
+        "fail: worker reported a node failure"
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "failed": true,
+            "work_item_id": id,
+            "retryable": retryable,
+            "attempt": item.attempt,
+        })),
+    ))
 }
 
 #[derive(Deserialize)]

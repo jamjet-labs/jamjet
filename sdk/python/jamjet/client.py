@@ -317,11 +317,24 @@ class JamjetClient:
         )
         r.raise_for_status()
 
-    async def fail_work_item(self, item_id: str, error: str) -> None:
-        """Mark a work item as failed."""
+    async def fail_work_item(self, item_id: str, error: str, lease_fence: int = 0) -> None:
+        """Report that this work item's node failed.
+
+        Echo ``lease_fence`` from the claim. With it, the runtime applies the
+        same retry / backoff / dead-letter rules a expired lease gets, and
+        appends ``NodeFailed`` so the execution can actually reach a terminal
+        state. Without it the runtime takes the legacy path, which settles the
+        item but emits nothing — leaving the node scheduled forever.
+
+        A 409 means the fence no longer matches: another worker owns this item,
+        and this one must not narrate its failure.
+        """
+        body: dict[str, Any] = {"error": error}
+        if lease_fence:
+            body["lease_fence"] = lease_fence
         r = await self._client.post(
             f"/work-items/{item_id}/fail",
-            json={"error": error},
+            json=body,
         )
         r.raise_for_status()
 

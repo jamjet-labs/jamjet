@@ -1,6 +1,6 @@
 use crate::backend::{
-    ApiToken, BackendResult, ReclaimResult, StateBackend, StateBackendError, WorkItem, WorkItemId,
-    WorkflowDefinition,
+    ApiToken, BackendResult, FailOutcome, ReclaimResult, StateBackend, StateBackendError, WorkItem,
+    WorkItemId, WorkflowDefinition,
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
@@ -1144,6 +1144,123 @@ impl StateBackend for SqliteBackend {
             return Err(StateBackendError::NotFound(id_str));
         }
         Ok(())
+    }
+
+    #[instrument(skip(self, error), fields(item_id = %item_id, fence = lease_fence))]
+    async fn fail_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        let id_str = item_id.to_string();
+
+        // BEGIN IMMEDIATE: this reads the item, decides retry-vs-dead-letter from
+        // its attempt count, and writes — a deferred BEGIN would upgrade from read
+        // to write mid-way, where SQLite skips the busy handler entirely. The
+        // transaction is also what keeps the decision and the settle atomic, so a
+        // concurrent reclaim cannot land between them and leave the item retried
+        // AND dead-lettered.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
+
+        // The fence + status guard lives on the READ as well as the write. Reading
+        // an item this worker no longer owns and then refusing is correct but
+        // wasteful; refusing here keeps the not-ours case to a single statement.
+        let Some(row) = sqlx::query(
+            "SELECT * FROM work_items WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
+        )
+        .bind(&id_str)
+        .bind(lease_fence)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        else {
+            return Ok(None);
+        };
+
+        let item = row_to_work_item(&row)?;
+        let new_attempt = item.attempt + 1;
+
+        // Identical rule to `reclaim_expired_leases`, deliberately: a node that
+        // died with its worker and a node whose worker reported the failure must
+        // not get different retry budgets.
+        if new_attempt >= item.max_attempts {
+            let dead_lettered_at = Utc::now().to_rfc3339();
+            let rows = sqlx::query(
+                "UPDATE work_items SET status = 'dead_lettered', attempt = ?, lease_expires_at = NULL, worker_id = NULL \
+                 WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
+            )
+            .bind(new_attempt as i64)
+            .bind(&id_str)
+            .bind(lease_fence)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            .rows_affected();
+            if rows == 0 {
+                return Ok(None);
+            }
+
+            // Only after the settle actually landed, so a refused failure never
+            // leaves an orphan dead-letter row behind.
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO dead_letter_items
+                   (id, execution_id, node_id, queue_type, payload_json, attempt, last_error, created_at, dead_lettered_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&id_str)
+            .bind(execution_id_str(&item.execution_id))
+            .bind(&item.node_id)
+            .bind(&item.queue_type)
+            .bind(serde_json::to_string(&item.payload)?)
+            .bind(new_attempt as i64)
+            .bind(error)
+            .bind(item.created_at.to_rfc3339())
+            .bind(dead_lettered_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+
+            tx.commit().await.map_err(map_db_err)?;
+            let mut exhausted = item;
+            exhausted.attempt = new_attempt;
+            return Ok(Some(FailOutcome::Exhausted {
+                item: Box::new(exhausted),
+            }));
+        }
+
+        // Retryable — same exponential backoff the reclaimer applies.
+        let backoff_secs = 1u64 << new_attempt.min(6);
+        let retry_after =
+            (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
+        let rows = sqlx::query(
+            "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, \
+             retry_after = ?, lease_epoch = lease_epoch + 1 \
+             WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
+        )
+        .bind(new_attempt as i64)
+        .bind(&retry_after)
+        .bind(&id_str)
+        .bind(lease_fence)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+        if rows == 0 {
+            return Ok(None);
+        }
+
+        tx.commit().await.map_err(map_db_err)?;
+        let mut retried = item;
+        retried.attempt = new_attempt;
+        Ok(Some(FailOutcome::Retryable {
+            item: Box::new(retried),
+            delay_ms: backoff_secs * 1000,
+        }))
     }
 
     #[instrument(skip(self), fields(item_id = %item_id, fence = lease_fence))]
