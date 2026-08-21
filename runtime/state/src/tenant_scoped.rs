@@ -1102,7 +1102,11 @@ impl StateBackend for TenantScopedSqliteBackend {
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(&id_str)
-            .bind(item.execution_id.to_string())
+            // `execution_id_str`, NOT `to_string()`: Display formats an
+            // ExecutionId as `exec_<simple>`, while every execution_id column
+            // stores the bare UUID. Display here would write a dead-letter row
+            // that joins to nothing and hides the item from per-execution queries.
+            .bind(execution_id_str(&item.execution_id))
             .bind(&item.node_id)
             .bind(&item.queue_type)
             .bind(serde_json::to_string(&item.payload)?)

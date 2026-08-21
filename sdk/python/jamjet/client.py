@@ -321,7 +321,7 @@ class JamjetClient:
         """Report that this work item's node failed.
 
         Echo ``lease_fence`` from the claim. With it, the runtime applies the
-        same retry / backoff / dead-letter rules a expired lease gets, and
+        same retry / backoff / dead-letter rules an expired lease gets, and
         appends ``NodeFailed`` so the execution can actually reach a terminal
         state. Without it the runtime takes the legacy path, which settles the
         item but emits nothing — leaving the node scheduled forever.
