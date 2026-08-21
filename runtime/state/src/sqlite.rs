@@ -955,10 +955,27 @@ impl StateBackend for SqliteBackend {
 
         // Expire stale leases first; bump lease_epoch so a re-claim mints a
         // strictly greater fence than the zombie worker's stale token.
+        //
+        // `attempt + 1` matters as much as the epoch. This reset races the
+        // scheduler's reclaim sweep — the only OTHER place attempts increment —
+        // and normally wins, because it runs on every claim poll while the sweep
+        // runs on an interval. Without the increment, a node that reliably kills
+        // its worker is resurrected forever at attempt 0: max_attempts is never
+        // reached, the dead-letter queue never sees it, and the loop is
+        // unbounded.
+        //
+        // `attempt + 1 < max_attempts` then stops this fast path from
+        // resurrecting an item that has spent its budget. Such an item keeps
+        // `status = 'claimed'` with an expired lease, which is precisely what the
+        // reclaim sweep selects — so it dead-letters there, WITH the NodeFailed
+        // the sweep emits and this path cannot. The division is deliberate: the
+        // claim path handles the retryable case cheaply, the sweep owns anything
+        // terminal, because only the sweep's caller writes events.
         let now = Utc::now().to_rfc3339();
         sqlx::query(
-            "UPDATE work_items SET status = 'pending', worker_id = NULL, lease_expires_at = NULL, lease_epoch = lease_epoch + 1 \
-             WHERE status = 'claimed' AND lease_expires_at < ?",
+            "UPDATE work_items SET status = 'pending', worker_id = NULL, lease_expires_at = NULL, \
+             lease_epoch = lease_epoch + 1, attempt = attempt + 1 \
+             WHERE status = 'claimed' AND lease_expires_at < ? AND attempt + 1 < max_attempts",
         )
         .bind(&now)
         .execute(&self.pool)
@@ -1492,7 +1509,33 @@ impl StateBackend for SqliteBackend {
             let id_str = item.id.to_string();
 
             if new_attempt >= item.max_attempts {
-                // Exhausted — move to dead-letter (caller emits the event)
+                // Settle FIRST, guarded, then record. `AND status = 'claimed'`
+                // is what makes this safe: the SELECT above ran in its own
+                // statement, so a worker can settle between the two, and an
+                // unguarded UPDATE would flip a COMPLETED item back into the
+                // queue — re-claimed, re-run at a shifted step ordinal, so a
+                // different idempotency key, so the side effect fires twice.
+                // The guard turns that race into a no-op: zero rows, item stays
+                // settled. Doing the settle before the dead-letter insert is
+                // what keeps a lost race from leaving an orphan row describing
+                // a node that actually succeeded.
+                let rows = sqlx::query(
+                    "UPDATE work_items SET status = 'dead_lettered', attempt = ?, lease_expires_at = NULL, worker_id = NULL \
+                     WHERE id = ? AND status = 'claimed'",
+                )
+                .bind(new_attempt as i64)
+                .bind(&id_str)
+                .execute(&self.pool)
+                .await
+                .map_err(map_db_err)?
+                .rows_affected();
+                if rows == 0 {
+                    // Settled under us. Do NOT report it: the caller emits
+                    // NodeFailed from this list, and a terminal event for a node
+                    // that actually completed is worse than a missed sweep.
+                    continue;
+                }
+
                 let dead_lettered_at = Utc::now().to_rfc3339();
                 sqlx::query(
                     r#"INSERT OR IGNORE INTO dead_letter_items
@@ -1512,13 +1555,6 @@ impl StateBackend for SqliteBackend {
                 .await
                 .map_err(map_db_err)?;
 
-                sqlx::query("UPDATE work_items SET status = 'dead_lettered', attempt = ?, lease_expires_at = NULL, worker_id = NULL WHERE id = ?")
-                    .bind(new_attempt as i64)
-                    .bind(&id_str)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(map_db_err)?;
-
                 let mut exhausted_item = item;
                 exhausted_item.attempt = new_attempt;
                 result.exhausted.push(exhausted_item);
@@ -1529,15 +1565,25 @@ impl StateBackend for SqliteBackend {
                 let retry_after =
                     (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
 
-                sqlx::query(
-                    "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, retry_after = ?, lease_epoch = lease_epoch + 1 WHERE id = ?",
+                // Same `status = 'claimed'` guard as the exhausted branch, and
+                // for the sharper reason: requeueing a COMPLETED item is exactly
+                // the double-execution path — it goes straight back on the queue
+                // and runs its side effect again.
+                let rows = sqlx::query(
+                    "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, \
+                     retry_after = ?, lease_epoch = lease_epoch + 1 \
+                     WHERE id = ? AND status = 'claimed'",
                 )
                 .bind(new_attempt as i64)
                 .bind(&retry_after)
                 .bind(&id_str)
                 .execute(&self.pool)
                 .await
-                .map_err(map_db_err)?;
+                .map_err(map_db_err)?
+                .rows_affected();
+                if rows == 0 {
+                    continue;
+                }
 
                 let mut retry_item = item;
                 retry_item.attempt = new_attempt;
