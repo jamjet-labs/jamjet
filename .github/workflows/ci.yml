@@ -128,8 +128,19 @@ jobs:
           # --deny unsound: fail on CVEs/unsound advisories (not on unmaintained warnings)
           # --ignore RUSTSEC-2023-0071: rsa Marvin Attack — no upstream fix available yet;
           #   we use rsa only as a transitive dep of tonic, not for key operations.
+          # --ignore RUSTSEC-2026-0258: h2 unbounded empty DATA frames (h2 0.3.27).
+          #   The fix is h2 >=0.4.16, which means moving off hyper 0.14 entirely.
+          #   The vulnerable copy reaches us ONLY as
+          #   jamjet-telemetry -> opentelemetry-otlp 0.15 -> tonic 0.11 -> hyper 0.14,
+          #   i.e. the OTLP exporter, which is an outbound client: reaching it needs a
+          #   hostile collector we already trust with our telemetry, not an inbound
+          #   request. Every server that accepts untrusted traffic — jamjet-api and the
+          #   a2a server — is on axum 0.7 -> hyper 1.x -> h2 0.4.15, which this advisory
+          #   does not flag. Tracked for the opentelemetry/tonic upgrade in #115;
+          #   re-evaluate when that lands.
           cargo audit --deny unsound \
-            --ignore RUSTSEC-2023-0071
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2026-0258
 
   python-audit:
     name: Python dependency audit
