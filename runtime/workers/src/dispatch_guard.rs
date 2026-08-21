@@ -138,12 +138,31 @@ pub async fn guard_dispatch(
     payload_input: &Value,
 ) -> DispatchGuardOutcome {
     // Load tenant policy (sits between global and workflow in the chain).
-    let tenant_policy_set = backend
+    //
+    // `Ok(None)` — this tenant has no policy — and `Err` — we could not find out
+    // — must NOT collapse together. Swallowing the error makes an unreadable
+    // tenant record look like an absent policy: when the tenant layer is the
+    // whole chain, `sets` empties and the guard returns `Allow` before it even
+    // reads the pending calls, so a tenant-level `blocked_tools` rule goes
+    // unenforced on a transient backend blip. That contradicts this module's own
+    // contract, which is that unreadable state yields `Unavailable` and the
+    // caller retries — never a decision no policy made.
+    let tenant_policy_set = match backend
         .get_tenant(&jamjet_state::TenantId::from(tenant_id))
         .await
-        .ok()
-        .flatten()
-        .and_then(|t| t.policy_set());
+    {
+        Ok(tenant) => tenant.and_then(|t| t.policy_set()),
+        Err(e) => {
+            warn!(
+                execution_id = %execution_id,
+                node_id,
+                "tenant policy unreadable — refusing to decide"
+            );
+            return DispatchGuardOutcome::Unavailable {
+                reason: format!("tenant policy unavailable; refusing to run unpoliced: {e}"),
+            };
+        }
+    };
 
     // Build policy chain: tenant -> workflow -> node (least-specific to
     // most-specific). The evaluator iterates in reverse, so node rules win.
@@ -681,12 +700,26 @@ mod tests {
     /// that cannot write at all: the append path here works perfectly.
     struct FailingGetEvents {
         inner: InMemoryBackend,
+        fail_events: bool,
+        fail_tenant: bool,
     }
 
     impl FailingGetEvents {
         fn new() -> Self {
             Self {
                 inner: InMemoryBackend::new(),
+                fail_events: true,
+                fail_tenant: false,
+            }
+        }
+
+        /// Fail `get_tenant` instead, so the tenant layer is unreadable rather
+        /// than absent — the two must not be confused.
+        fn failing_tenant() -> Self {
+            Self {
+                inner: InMemoryBackend::new(),
+                fail_events: false,
+                fail_tenant: true,
             }
         }
 
@@ -702,8 +735,11 @@ mod tests {
 
         async fn get_events(
             &self,
-            _execution_id: &ExecutionId,
+            execution_id: &ExecutionId,
         ) -> jamjet_state::backend::BackendResult<Vec<Event>> {
+            if !self.fail_events {
+                return self.inner.get_events(execution_id).await;
+            }
             Err(jamjet_state::backend::StateBackendError::Database(
                 "injected: event log unreadable".into(),
             ))
@@ -1041,6 +1077,11 @@ mod tests {
             &self,
             id: &jamjet_state::TenantId,
         ) -> jamjet_state::backend::BackendResult<Option<Tenant>> {
+            if self.fail_tenant {
+                return Err(jamjet_state::backend::StateBackendError::Database(
+                    "injected: tenant record unreadable".into(),
+                ));
+            }
             self.inner.get_tenant(id).await
         }
 
@@ -1051,6 +1092,48 @@ mod tests {
         async fn update_tenant(&self, tenant: Tenant) -> jamjet_state::backend::BackendResult<()> {
             self.inner.update_tenant(tenant).await
         }
+    }
+
+    /// An unreadable TENANT record is infrastructure too, and collapsing it into
+    /// "this tenant has no policy" is a fail-open.
+    ///
+    /// The tenant layer is the only policy here, so treating a backend error as
+    /// an absent policy empties the chain, and the guard returns `Allow` without
+    /// even reading the pending calls — a tenant-level `blocked_tools` rule
+    /// silently not enforced, on the transport ADK nodes actually take. The
+    /// module contract is that state the guard cannot read yields `Unavailable`,
+    /// never a decision.
+    #[tokio::test]
+    async fn an_unreadable_tenant_record_is_unavailable_not_allow() {
+        let backend = FailingGetEvents::failing_tenant();
+        let execution_id = ExecutionId::new();
+        // No workflow and no node policy: the tenant layer is the whole chain,
+        // which is what makes a swallowed error decide the outcome.
+        let ir = ir(&[], &[]);
+        let node_def = ir.node("n1").expect("node n1 must exist");
+
+        let outcome = guard_dispatch(
+            &backend,
+            &execution_id,
+            "n1",
+            "default",
+            &ir,
+            node_def,
+            &input_for(&["send_wire"]),
+        )
+        .await;
+
+        match &outcome {
+            DispatchGuardOutcome::Unavailable { reason } => assert!(
+                reason.contains("injected: tenant record unreadable"),
+                "the underlying failure must survive into the reason; got {reason:?}"
+            ),
+            other => panic!("an unreadable tenant record must be Unavailable, got {other:?}"),
+        }
+        assert!(
+            backend.recorded(&execution_id).await.is_empty(),
+            "no policy denied anything, so nothing may be audited"
+        );
     }
 
     /// An unreadable event log is infrastructure, not a decision.

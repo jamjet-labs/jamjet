@@ -126,7 +126,19 @@ impl BudgetState {
             }
         }
         if let Some(limit) = cost_budget_usd {
-            if self.total_cost_usd >= limit {
+            // NaN loses every comparison, so a plain `>=` would return false and
+            // let the run keep spending — for the REST OF THE RUN, since the
+            // accumulator never recovers once a NaN lands in it. A ceiling that
+            // silently stops existing is the failure this predicate exists to
+            // prevent, so NaN on either side counts as tripped. It reaches us
+            // from arithmetic, not from JSON, which cannot encode it: a provider
+            // adapter computing a price from a zero divisor is enough.
+            //
+            // Infinities are deliberately left to the ordinary comparison. An
+            // infinite ACCUMULATED cost trips against any finite ceiling, which
+            // is right; an infinite CEILING reads as "no limit" and must not be
+            // forced closed, or configuring one would refuse every node.
+            if self.total_cost_usd.is_nan() || limit.is_nan() || self.total_cost_usd >= limit {
                 return Some(BudgetTrip {
                     kind: "cost_usd".into(),
                     limit,
@@ -284,5 +296,54 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(b.exhausted(None, None), None);
+    }
+
+    /// A NaN accumulated cost must trip, not vanish.
+    ///
+    /// `NaN >= limit` is false, so a bare comparison would report "not
+    /// exhausted" — and keep doing so for the rest of the run, because the
+    /// accumulator never recovers. The ceiling would be silently gone at exactly
+    /// the moment it was needed.
+    #[test]
+    fn a_nan_accumulated_cost_counts_as_exhausted() {
+        let b = BudgetState {
+            total_cost_usd: f64::NAN,
+            ..Default::default()
+        };
+        let trip = b
+            .exhausted(None, Some(2.00))
+            .expect("a NaN cost must never read as budget remaining");
+        assert_eq!(trip.kind, "cost_usd");
+    }
+
+    /// A NaN ceiling is broken configuration; refuse rather than spend against it.
+    #[test]
+    fn a_nan_cost_ceiling_counts_as_exhausted() {
+        let b = BudgetState {
+            total_cost_usd: 0.01,
+            ..Default::default()
+        };
+        assert!(b.exhausted(None, Some(f64::NAN)).is_some());
+    }
+
+    /// An infinite ceiling reads as "no limit" and must NOT be forced closed —
+    /// otherwise configuring one would refuse every node in the run.
+    #[test]
+    fn an_infinite_cost_ceiling_does_not_trip() {
+        let b = BudgetState {
+            total_cost_usd: 1e9,
+            ..Default::default()
+        };
+        assert_eq!(b.exhausted(None, Some(f64::INFINITY)), None);
+    }
+
+    /// An infinite accumulated cost is over every finite ceiling.
+    #[test]
+    fn an_infinite_accumulated_cost_trips() {
+        let b = BudgetState {
+            total_cost_usd: f64::INFINITY,
+            ..Default::default()
+        };
+        assert!(b.exhausted(None, Some(2.00)).is_some());
     }
 }

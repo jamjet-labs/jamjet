@@ -1223,10 +1223,21 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
         return fail_closed(backend, wi, format!("node {} not found in IR", wi.node_id)).await;
     };
 
-    // NARROWNESS. This route serves every queue. Everything that is not a
-    // marked agent tool dispatch — every model node, tool node, condition,
-    // ordinary python_fn — leaves here having had zero policy evaluation and
-    // zero extra backend calls, and is returned exactly as before.
+    // NARROWNESS. This route serves every queue. Everything that is not an agent
+    // tool dispatch — every model node, tool node, condition, ordinary python_fn
+    // — leaves here having had zero POLICY evaluation, and is returned exactly
+    // as before.
+    //
+    // Not free, though: reaching this line already cost `get_execution`,
+    // `get_workflow` and a full `WorkflowIr` parse, and this is the hot path
+    // every external worker polls. Those lookups are what make the decision
+    // trustworthy — the execution record is the only engine-written answer to
+    // "which policy governs this item" — so they cannot simply move below this
+    // check. A `wi.queue_type` gate above them would skip the whole function for
+    // queues that can never hold a dispatch node, but it would also skip the
+    // coordinate tripwire and the execution-not-found fail-closed for those
+    // queues, which is a behaviour change and not one to make inside a security
+    // fix. Tracked in #116.
     if !jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&node_def.kind) {
         return ClaimGate::Release;
     }
