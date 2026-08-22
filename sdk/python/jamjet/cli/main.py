@@ -1786,6 +1786,8 @@ async def _worker_loop(
             node_id: str = work_item["node_id"]
             payload: dict[str, Any] = work_item.get("payload", {})
             lease_fence: int = work_item.get("lease_fence", 0)
+            # Echoed on complete so the engine records the result against it.
+            idempotency_key: str | None = work_item.get("idempotency_key")
 
             console.print(f"[cyan]Claimed[/cyan] id={item_id} node=[bold]{node_id}[/bold] exec={exec_id}")
 
@@ -1864,6 +1866,7 @@ async def _worker_loop(
                         # the completion (reject a stale/reclaimed lease). Omitted when
                         # 0/absent, keeping the unfenced fallback backward-compatible.
                         lease_fence=lease_fence,
+                        idempotency_key=idempotency_key,
                     )
                 except Exception as complete_exc:
                     # A 409 means our echoed fence no longer matches: the lease was

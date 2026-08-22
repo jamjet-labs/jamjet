@@ -18,7 +18,7 @@ use jamjet_agents::InMemoryAgentRegistry;
 use jamjet_api::{routes::build_router_with_opts, state::AppState};
 use jamjet_audit::{AuditEnricher, NoopAuditBackend};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
-use jamjet_state::backend::{StateBackend, WorkItem};
+use jamjet_state::backend::{StateBackend, WorkItem, WorkflowDefinition};
 use jamjet_state::event::EventKind;
 use jamjet_state::{Event, InMemoryBackend, DEFAULT_TENANT};
 use serde_json::{json, Value};
@@ -637,5 +637,188 @@ async fn a_zero_fence_cannot_complete_an_unclaimed_item() {
             .unwrap()
             .is_some(),
         "the item must remain claimable — a forged completion must not consume it"
+    );
+}
+
+/// Seed an execution and a claimable item WITHOUT claiming it, so the route's
+/// own claim path can be exercised.
+///
+/// Not `seed_and_claim` + a reset: `fail_work_item` writes the terminal
+/// `'failed'` status, which no sweep ever selects, so the item would never come
+/// back — the dead end this suite exists to keep fixed.
+async fn seed_unclaimed(backend: &Arc<dyn StateBackend>) -> (ExecutionId, Uuid) {
+    let execution_id = ExecutionId::new();
+    let now = chrono::Utc::now();
+    // The claim route's enforcement gate resolves policy from the workflow
+    // catalogue and WITHHOLDS the payload when it cannot read it. An
+    // unregistered workflow yields `{"claimed": false}` — no error, no item —
+    // so a fixture that skips this looks like "the route hands out no key"
+    // when the truth is "the route was handed no work".
+    backend
+        .store_workflow(WorkflowDefinition {
+            workflow_id: "wf".into(),
+            version: "1.0.0".into(),
+            ir: json!({
+                "workflow_id": "wf",
+                "version": "1.0.0",
+                "state_schema": "{}",
+                "start_node": "n1",
+                // A plain, unpoliced tool node: the gate must pass it through.
+                "nodes": { "n1": { "id": "n1", "kind": {
+                    "type": "python_fn",
+                    "module": "tools",
+                    "function": "lookup",
+                    "output_schema": ""
+                }}},
+                "edges": [],
+                "retry_policies": {},
+                "models": {},
+                "tools": {},
+                "mcp_servers": {},
+                "remote_agents": {}
+            }),
+            created_at: now,
+            tenant_id: DEFAULT_TENANT.into(),
+        })
+        .await
+        .expect("store_workflow");
+    backend
+        .create_execution(WorkflowExecution {
+            execution_id: execution_id.clone(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: json!({}),
+            current_state: json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        })
+        .await
+        .expect("create_execution");
+    let id = Uuid::new_v4();
+    backend
+        .enqueue_work_item(WorkItem {
+            id,
+            execution_id: execution_id.clone(),
+            node_id: "n1".into(),
+            queue_type: "python_tool".into(),
+            payload: json!({"node_id": "n1"}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: DEFAULT_TENANT.into(),
+        })
+        .await
+        .expect("enqueue_work_item");
+    (execution_id, id)
+}
+
+async fn claim_via_route(state: &AppState) -> Value {
+    let resp = build_router_with_opts(state.clone(), true)
+        .oneshot(
+            Request::post("/work-items/claim")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(
+                        &json!({"worker_id": "ext-worker", "queue_types": ["python_tool"]}),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
+}
+
+// ── External tool effects are recorded, so a re-run replays ──────────────────
+
+/// The claim hands out an idempotency key, and completing with it records the
+/// effect — so the next reader replays instead of firing the tool again.
+///
+/// Before this, `/complete` always sent `idempotency_key: None`, nothing landed
+/// in `tool_effects`, and the replay guard covered the in-process tier only.
+#[tokio::test]
+async fn a_claimed_item_carries_a_key_and_completing_records_the_effect() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let (execution_id, id) = seed_unclaimed(&backend).await;
+    let state = make_state(backend.clone());
+    let claim = claim_via_route(&state).await;
+
+    let key = claim["work_item"]["idempotency_key"]
+        .as_str()
+        .expect("the claim must hand out an idempotency key")
+        .to_string();
+    let fence = claim["work_item"]["lease_fence"].as_i64().unwrap();
+
+    // Nothing recorded yet.
+    assert!(backend.get_tool_effect(&key).await.unwrap().is_none());
+
+    let (status, _) = post_complete(
+        &state,
+        id,
+        json!({
+            "execution_id": execution_id.to_string(),
+            "node_id": "n1",
+            "output": {"answer": 42},
+            "state_patch": {},
+            "lease_fence": fence,
+            "idempotency_key": key,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let recorded = backend
+        .get_tool_effect(&key)
+        .await
+        .unwrap()
+        .expect("completing with a key must record the effect, or a re-run re-fires the tool");
+    assert_eq!(recorded["output"]["answer"], json!(42));
+}
+
+/// The claim route's key is the documented formula, spelled out independently.
+///
+/// Both transports now call one `derive_idempotency_key`, so they cannot drift
+/// from each other — but they can drift together. The key is a persisted
+/// identity: effects recorded under yesterday's formula are invisible to
+/// today's reader, so every in-flight run silently re-fires its tools on the
+/// deploy that changes it. This spells the shape out by hand so that change
+/// has to be deliberate.
+#[tokio::test]
+async fn the_claim_route_key_matches_the_shared_formula() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let (execution_id, _id) = seed_unclaimed(&backend).await;
+    let state = make_state(backend.clone());
+    let claim = claim_via_route(&state).await;
+    let from_route = claim["work_item"]["idempotency_key"].as_str().unwrap();
+
+    let current_state = backend
+        .get_execution(&execution_id)
+        .await
+        .unwrap()
+        .map(|e| e.current_state)
+        .unwrap();
+    // Written out literally, NOT via `jamjet_state::idempotency_key` — calling
+    // the function under test to compute the expectation would make this pass
+    // for any formula, which is exactly the tautology it must avoid.
+    let expected = jamjet_state::content_hash(&json!({
+        "run": execution_id.to_string(),
+        "segment": 0,
+        "step": 0, // no NodeCompleted yet
+        "node": "n1",
+        "input": jamjet_state::content_hash(&current_state),
+    }));
+    assert_eq!(
+        from_route, expected,
+        "the idempotency-key formula changed; every effect recorded under the old \
+         shape is now unreadable and its tool will re-fire on replay"
     );
 }

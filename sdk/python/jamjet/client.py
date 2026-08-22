@@ -288,6 +288,7 @@ class JamjetClient:
         gen_ai_model: str | None = None,
         finish_reason: str | None = None,
         lease_fence: int | None = None,
+        idempotency_key: str | None = None,
     ) -> None:
         """Mark a work item as completed and emit a NodeCompleted event.
 
@@ -311,6 +312,11 @@ class JamjetClient:
             body["finish_reason"] = finish_reason
         if lease_fence:
             body["lease_fence"] = lease_fence
+        if idempotency_key:
+            # Echoed from the claim so the engine records this result against it.
+            # Without it nothing lands in tool_effects and a re-run fires the tool
+            # again — the replay guard covers the in-process path only.
+            body["idempotency_key"] = idempotency_key
         r = await self._client.post(
             f"/work-items/{item_id}/complete",
             json=body,

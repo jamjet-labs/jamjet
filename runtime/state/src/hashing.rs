@@ -71,6 +71,32 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex
 }
 
+/// The deterministic idempotency key for one node occurrence.
+///
+/// ONE definition, because two transports compute it: `Worker::execute_item`
+/// for an in-process node, and `POST /work-items/claim` for a node handed to an
+/// external tool worker. If the two ever disagreed the replay guard would look
+/// present and do nothing — the recorded effect would be filed under a key no
+/// reader ever asks for.
+///
+/// `step` is the number of `NodeCompleted` events already logged for this node.
+/// Retries do not complete, so it is stable across them and advances exactly
+/// once per successful loop occurrence.
+///
+/// `input_hash` is `content_hash` of the execution state at FIRE time — claim
+/// time for the external tier, which is the same moment for that transport.
+pub fn idempotency_key(run: &str, segment: u64, step: u64, node: &str, input_hash: &str) -> String {
+    content_hash(&serde_json::json!({
+        "run": run,
+        "segment": segment,
+        "step": step,
+        "node": node,
+        // "input", not "input_hash" — the field name is part of the hashed
+        // shape, so renaming it silently changes every key ever computed.
+        "input": input_hash,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,4 +131,46 @@ mod tests {
         let b = json!({ "step": 4 });
         assert_ne!(content_hash(&a), content_hash(&b));
     }
+}
+
+/// The idempotency key for the NEXT occurrence of `node_id` in this run.
+///
+/// Both enforcement transports call this: `Worker::execute_item` for the
+/// in-process tier and the claim route for the external one. It exists as one
+/// function because a key is only useful if the writer and the reader agree —
+/// two call sites deriving `step` or `input_hash` slightly differently would
+/// file effects under a key no reader asks for, leaving a replay guard that
+/// looks present and does nothing.
+///
+/// `step` counts this node's prior `NodeCompleted` events, so a retry of the
+/// same occurrence hashes the same and a genuine second visit (a loop) does
+/// not. `input_hash` covers the accumulated state the node will read, so a
+/// node whose input changed is a different effect.
+pub async fn derive_idempotency_key(
+    backend: &dyn crate::backend::StateBackend,
+    execution_id: &jamjet_core::workflow::ExecutionId,
+    node_id: &str,
+) -> crate::backend::BackendResult<String> {
+    let events = backend.get_events(execution_id).await?;
+    let step = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.kind,
+                crate::event::EventKind::NodeCompleted { node_id: nid, .. } if nid == node_id
+            )
+        })
+        .count() as u64;
+    let current_state = backend
+        .get_execution(execution_id)
+        .await?
+        .map(|e| e.current_state)
+        .unwrap_or_else(|| serde_json::json!({}));
+    Ok(idempotency_key(
+        &execution_id.to_string(),
+        0,
+        step,
+        node_id,
+        &content_hash(&current_state),
+    ))
 }

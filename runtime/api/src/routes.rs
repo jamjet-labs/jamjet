@@ -1069,6 +1069,21 @@ async fn claim_work_item(
         return Ok(nothing_to_claim());
     }
 
+    // The idempotency key for THIS node occurrence, computed here because claim
+    // time is fire time for the external tier — the moment the payload leaves
+    // the engine is the moment the effect becomes possible.
+    //
+    // Without it, an external tool's result was recorded with
+    // `idempotency_key: None`, so nothing ever landed in `tool_effects` and the
+    // replay guard covered the in-process tier only. Re-running a node re-fired
+    // the tool, on the transport ADK nodes actually take.
+    //
+    // Best effort: if the state needed to compute it cannot be read, the item is
+    // still handed out. That is the behaviour this route had all along, and
+    // withholding real work because a replay OPTIMISATION could not be prepared
+    // would trade a live queue for a hygiene property.
+    let idem_key = compute_idempotency_key(backend.as_ref(), &wi).await;
+
     Ok(Json(json!({
         "claimed": true,
         "work_item": {
@@ -1081,8 +1096,25 @@ async fn claim_work_item(
             // The lease fence the external worker echoes on complete so the
             // engine can prove the lease is still held (exactly-once-COMMIT).
             "lease_fence": wi.lease_fence,
+            // Echoed on complete so the result is recorded against it and a
+            // re-run replays instead of re-firing the tool.
+            "idempotency_key": idem_key,
         }
     })))
+}
+
+/// The idempotency key for a claimed item, or `None` if it cannot be computed.
+///
+/// Delegates to `jamjet_state::derive_idempotency_key`, the SAME function
+/// `Worker::execute_item` uses, so the in-process and external transports
+/// cannot drift into filing effects under different keys.
+async fn compute_idempotency_key(
+    backend: &dyn jamjet_state::backend::StateBackend,
+    wi: &WorkItem,
+) -> Option<String> {
+    jamjet_state::derive_idempotency_key(backend, &wi.execution_id, &wi.node_id)
+        .await
+        .ok()
 }
 
 /// Run the shared agent-dispatch guard over a freshly claimed item.
@@ -1394,6 +1426,15 @@ struct CompleteWorkItemRequest {
     /// (backward-compat for callers not yet echoing the fence).
     #[serde(default)]
     lease_fence: Option<i64>,
+    /// Idempotency key echoed from the claim response.
+    ///
+    /// With it, `commit_turn` records the result in `tool_effects` in the same
+    /// transaction, so a re-run of this node replays the recorded output instead
+    /// of firing the tool again. Without it nothing is recorded and the replay
+    /// guard simply does not cover this node — which was the case for EVERY
+    /// external tool effect until now.
+    #[serde(default)]
+    idempotency_key: Option<String>,
     // ── GenAI telemetry (forwarded from the python_tool worker or other callers) ──
     /// AI provider system (e.g. "anthropic", "openai").
     #[serde(default)]
@@ -1441,7 +1482,7 @@ async fn complete_work_item(
                 finish_reason: body.finish_reason.clone(),
                 cost_usd: None,
                 provenance: None,
-                idempotency_key: None,
+                idempotency_key: body.idempotency_key.clone(),
             },
         )
     };
