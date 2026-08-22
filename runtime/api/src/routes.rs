@@ -1214,7 +1214,7 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
         .await;
     }
 
-    let ir = match backend.get_workflow(workflow_id, workflow_version).await {
+    let ir_value = match backend.get_workflow(workflow_id, workflow_version).await {
         // Infrastructure, not a decision: the engine could not read its own
         // catalogue. Settle NOTHING — failing the item would kill work that was
         // never evaluated, and completing it would silently drop it. The lease
@@ -1241,18 +1241,36 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
             )
             .await;
         }
-        Ok(Some(def)) => match serde_json::from_value::<jamjet_ir::WorkflowIr>(def.ir) {
-            Ok(ir) => ir,
+        Ok(Some(def)) => def.ir,
+    };
+
+    // Read ONLY this node's kind first. Deciding "is this a dispatch node" needs
+    // one node; `guard_dispatch` needs the whole graph, but it only runs for the
+    // dispatch nodes. Every model / tool / retrieval / general claim used to pay
+    // a full `WorkflowIr` deserialization to reach a check that hands it straight
+    // back, on the hot path every external worker polls.
+    //
+    // NOT gated on `wi.queue_type`, which is the obvious version of this and is
+    // unsafe: `POST /work-items` copies a caller-supplied `queue_type` verbatim,
+    // so enqueueing a dispatch node as `queue_type: "model"` would skip policy
+    // evaluation entirely. The node's KIND comes from the engine-written
+    // catalogue and cannot be forged that way. See #116.
+    let kind: jamjet_core::NodeKind = match ir_value
+        .get("nodes")
+        .and_then(|nodes| nodes.get(&wi.node_id))
+        .and_then(|node| node.get("kind"))
+    {
+        // The node id selects both the policy set and the dispatch marker, so a
+        // node that is not in the IR has neither and cannot be evaluated.
+        None => {
+            return fail_closed(backend, wi, format!("node {} not found in IR", wi.node_id)).await;
+        }
+        Some(raw) => match serde_json::from_value(raw.clone()) {
+            Ok(kind) => kind,
             Err(e) => {
                 return fail_closed(backend, wi, format!("failed to load IR: {e}")).await;
             }
         },
-    };
-
-    // The node id selects both the policy set and the dispatch marker, so a
-    // node that is not in the IR has neither and cannot be evaluated.
-    let Some(node_def) = ir.node(&wi.node_id) else {
-        return fail_closed(backend, wi, format!("node {} not found in IR", wi.node_id)).await;
     };
 
     // NARROWNESS. This route serves every queue. Everything that is not an agent
@@ -1270,9 +1288,21 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
     // coordinate tripwire and the execution-not-found fail-closed for those
     // queues, which is a behaviour change and not one to make inside a security
     // fix. Tracked in #116.
-    if !jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&node_def.kind) {
+    if !jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&kind) {
         return ClaimGate::Release;
     }
+
+    // A dispatch node: now the whole graph is genuinely needed, because the
+    // policy chain `guard_dispatch` evaluates is workflow-wide.
+    let ir = match serde_json::from_value::<jamjet_ir::WorkflowIr>(ir_value) {
+        Ok(ir) => ir,
+        Err(e) => {
+            return fail_closed(backend, wi, format!("failed to load IR: {e}")).await;
+        }
+    };
+    let Some(node_def) = ir.node(&wi.node_id) else {
+        return fail_closed(backend, wi, format!("node {} not found in IR", wi.node_id)).await;
+    };
 
     let input = jamjet_worker::dispatch_guard::payload_input(&wi.payload);
     match jamjet_worker::dispatch_guard::guard_dispatch(

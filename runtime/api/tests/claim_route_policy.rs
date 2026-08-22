@@ -1594,3 +1594,59 @@ async fn a_backend_failure_withholds_without_auditing_or_settling() {
         "the item was failed back onto the queue instead of being left leased"
     );
 }
+
+// ── #116: cheaper claim path, without the bypass the obvious version opens ───
+
+/// A dispatch node is gated even when its work item claims another queue.
+///
+/// The obvious optimisation for #116 is to short-circuit `gate_claimed_item` on
+/// `wi.queue_type`, since only `python_tool` / `java_tool` can carry a dispatch
+/// node. That is unsafe: `POST /work-items` copies a caller-supplied
+/// `queue_type` verbatim, so enqueueing a dispatch node as `queue_type: "model"`
+/// would skip policy evaluation entirely — a complete bypass of the enforcement
+/// this route exists to apply.
+///
+/// The node's KIND comes from the engine-written catalogue and cannot be forged
+/// that way, which is why the gate reads that instead.
+#[tokio::test]
+async fn a_dispatch_node_is_gated_even_when_the_item_claims_another_queue() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    store(
+        &backend,
+        WF,
+        VERSION,
+        dispatch_ir(true, &["send_wire"], &[]),
+    )
+    .await;
+    // Enqueued on the model queue, but the IR says this node is a dispatch.
+    let (_execution_id, id) = seed_item(
+        &backend,
+        "model",
+        dispatch_payload(calls_input(&["send_wire"])),
+    )
+    .await;
+
+    let state = make_state(backend.clone());
+    let resp = claim(&state, "model").await;
+
+    assert_withheld(&resp);
+    // ...and it must not simply come back on the next poll.
+    assert_withheld(&claim(&state, "model").await);
+    let _ = id;
+}
+
+/// The unblocked case still comes back, so the gate is not simply refusing.
+#[tokio::test]
+async fn an_ordinary_model_item_is_still_handed_out() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    store(&backend, WF, VERSION, policed_condition_ir()).await;
+    let (_execution_id, _id) = seed_item(&backend, "model", json!({"node_id": "n1"})).await;
+
+    let state = make_state(backend.clone());
+    let resp = claim(&state, "model").await;
+    assert_eq!(
+        resp["claimed"],
+        json!(true),
+        "a non-dispatch item must be released, and released without a full IR parse"
+    );
+}
