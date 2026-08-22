@@ -53,5 +53,14 @@ jobs:
           cache-dependency-path: sdk/typescript/pnpm-lock.yaml
       - uses: oven-sh/setup-bun@v2
       - run: pnpm install --frozen-lockfile
-      - run: bun --bun pnpm test
+      # `bun run --bun test`, not `bun --bun pnpm test`. Bun resolves the first
+      # argument as a package.json script or a node_modules/.bin entry, and
+      # pnpm/action-setup v6 installs pnpm globally instead — so `pnpm` was not
+      # a name Bun could resolve and the job died with `Script not found "pnpm"`
+      # on every commit from 2026-05-13 onward.
+      #
+      # Going through the package's own `test` script drops pnpm out of the
+      # invocation entirely, and `--bun` still forces the Bun runtime, which is
+      # the only thing this job exists to check.
+      - run: bun run --bun test
         working-directory: sdk/typescript/packages/cloud
