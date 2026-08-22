@@ -97,42 +97,6 @@ pub fn idempotency_key(run: &str, segment: u64, step: u64, node: &str, input_has
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn canonical_json_sorts_object_keys() {
-        let a = json!({ "b": 1, "a": 2, "c": { "y": 1, "x": 2 } });
-        assert_eq!(canonical_json(&a), r#"{"a":2,"b":1,"c":{"x":2,"y":1}}"#);
-    }
-
-    #[test]
-    fn canonical_json_is_key_order_independent() {
-        let a = json!({ "x": 1, "y": [1, 2, { "p": 1, "q": 2 }] });
-        let b = json!({ "y": [1, 2, { "q": 2, "p": 1 }], "x": 1 });
-        assert_eq!(canonical_json(&a), canonical_json(&b));
-    }
-
-    #[test]
-    fn content_hash_is_stable_and_order_independent() {
-        let a = json!({ "run": "r1", "segment": 0, "step": 3 });
-        let b = json!({ "step": 3, "run": "r1", "segment": 0 });
-        let h = content_hash(&a);
-        assert_eq!(h, content_hash(&b));
-        assert_eq!(h.len(), 64); // sha256 hex
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn content_hash_differs_on_value_change() {
-        let a = json!({ "step": 3 });
-        let b = json!({ "step": 4 });
-        assert_ne!(content_hash(&a), content_hash(&b));
-    }
-}
-
 /// The idempotency key for the NEXT occurrence of `node_id` in this run.
 ///
 /// Both enforcement transports call this: `Worker::execute_item` for the
@@ -183,4 +147,40 @@ pub async fn derive_idempotency_key(
         node_id,
         &content_hash(&current_state),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn canonical_json_sorts_object_keys() {
+        let a = json!({ "b": 1, "a": 2, "c": { "y": 1, "x": 2 } });
+        assert_eq!(canonical_json(&a), r#"{"a":2,"b":1,"c":{"x":2,"y":1}}"#);
+    }
+
+    #[test]
+    fn canonical_json_is_key_order_independent() {
+        let a = json!({ "x": 1, "y": [1, 2, { "p": 1, "q": 2 }] });
+        let b = json!({ "y": [1, 2, { "q": 2, "p": 1 }], "x": 1 });
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+    }
+
+    #[test]
+    fn content_hash_is_stable_and_order_independent() {
+        let a = json!({ "run": "r1", "segment": 0, "step": 3 });
+        let b = json!({ "step": 3, "run": "r1", "segment": 0 });
+        let h = content_hash(&a);
+        assert_eq!(h, content_hash(&b));
+        assert_eq!(h.len(), 64); // sha256 hex
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn content_hash_differs_on_value_change() {
+        let a = json!({ "step": 3 });
+        let b = json!({ "step": 4 });
+        assert_ne!(content_hash(&a), content_hash(&b));
+    }
 }

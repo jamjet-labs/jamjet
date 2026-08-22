@@ -17,7 +17,6 @@ use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
 use jamjet_state::approvals::NodeApprovalStatus;
 use jamjet_state::backend::{StateBackend, StateBackendError, WorkItem, WorkItemId};
 use jamjet_state::budget::BudgetState;
-use jamjet_state::content_hash;
 use jamjet_state::event::EventKind;
 use jamjet_state::spill_bytes;
 use jamjet_state::{artifact_threshold, materialize, start_next_segment};
@@ -1636,6 +1635,7 @@ mod tests {
     use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
     use chrono::Utc;
     use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+    use jamjet_state::content_hash;
     use jamjet_state::{
         backend::{StateBackend, WorkItem, WorkflowDefinition},
         event::EventKind,
