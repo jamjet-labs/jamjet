@@ -1454,6 +1454,20 @@ async fn complete_work_item(
     // execution never finished — permanently, since the fold is a replay of the
     // log. `commit_turn` is the primitive the in-process worker already uses for
     // exactly this, and it is fence-guarded, so a stale worker writes nothing.
+    // A lease fence is a MINTED token (`term * 2^32 + epoch`), so it is always
+    // positive. Zero is what a never-claimed row carries and what a defaulted or
+    // forged body sends, so it must never reach a fenced settle — treat it as
+    // absent rather than as a fence that happens to match every pending item.
+    if body.lease_fence.is_some_and(|f| f <= 0) {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "completed": false,
+                "reason": "stale or invalid lease fence",
+            })),
+        ));
+    }
+
     let committed_atomically = match (
         body.lease_fence,
         body.execution_id.as_deref(),
@@ -1519,7 +1533,12 @@ async fn complete_work_item(
         }
     }
 
-    if let Some(exec_id_str) = &body.execution_id {
+    // Gated on BOTH coordinates, matching the terminal event. Refreshing the read
+    // model when no `NodeCompleted` was emitted would let the column drift in a
+    // way the event log cannot explain — and the log is what the materializer
+    // rebuilds from, so the two would simply disagree with no way to tell which
+    // is right.
+    if let (Some(exec_id_str), Some(_)) = (&body.execution_id, &body.node_id) {
         let execution_id = parse_execution_id(exec_id_str)?;
         // Denormalised read-model refresh, best effort by design: the
         // authoritative state is the event log plus the snapshot `commit_turn`

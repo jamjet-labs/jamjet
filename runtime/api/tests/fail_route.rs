@@ -552,3 +552,90 @@ async fn replaying_a_completion_does_not_double_emit() {
         "exactly one NodeCompleted, not one per delivery"
     );
 }
+
+/// `lease_fence: 0` must not complete a work item nobody ever claimed.
+///
+/// Pending rows carry `lease_fence = 0` (migration 0004), and `commit_turn`'s
+/// fenced settle matched on `id` + `lease_fence` with no `status = 'claimed'`
+/// guard — so a forged or defaulted zero fence matched a never-claimed item and
+/// completed it, emitting a terminal event for work that never ran.
+///
+/// Routing /complete through `commit_turn` is what made that reachable from the
+/// HTTP boundary, so the guard belongs both there and here.
+#[tokio::test]
+async fn a_zero_fence_cannot_complete_an_unclaimed_item() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let execution_id = ExecutionId::new();
+    let now = chrono::Utc::now();
+    backend
+        .create_execution(WorkflowExecution {
+            execution_id: execution_id.clone(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: json!({}),
+            current_state: json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        })
+        .await
+        .unwrap();
+
+    // Enqueued and NEVER claimed: lease_fence is still 0.
+    let item_id = Uuid::new_v4();
+    backend
+        .enqueue_work_item(WorkItem {
+            id: item_id,
+            execution_id: execution_id.clone(),
+            node_id: "n1".into(),
+            queue_type: "python_tool".into(),
+            payload: json!({"node_id": "n1"}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: DEFAULT_TENANT.into(),
+        })
+        .await
+        .unwrap();
+
+    let state = make_state(backend.clone());
+    let (status, _) = post_complete(
+        &state,
+        item_id,
+        json!({
+            "execution_id": execution_id.to_string(),
+            "node_id": "n1",
+            "output": {"forged": true},
+            "state_patch": {},
+            "lease_fence": 0,
+        }),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a zero fence must not complete an item nobody claimed"
+    );
+    assert_eq!(
+        node_completed_count(&events(&backend, &execution_id).await),
+        0,
+        "no terminal event may be emitted for work that never ran"
+    );
+    // And the item is still there to be claimed properly.
+    assert!(
+        backend
+            .claim_work_item("real-worker", &["python_tool"])
+            .await
+            .unwrap()
+            .is_some(),
+        "the item must remain claimable — a forged completion must not consume it"
+    );
+}
