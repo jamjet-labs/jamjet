@@ -29,6 +29,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # A tag that disagrees with the workspace version publishes the OLD version
+      # numbers, and `cargo publish` treats an already-published crate as a skip —
+      # so the run goes green having released nothing. Refuse first.
+      - name: Tag must match the workspace version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#crates-v}"
+          declared=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "tag=$tag workspace=$declared"
+          if [ "$tag" != "$declared" ]; then
+            echo "::error::version mismatch — tag $tag, workspace $declared"
+            exit 1
+          fi
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

@@ -31,6 +31,21 @@ jobs:
         with:
           python-version: "3.12"
 
+      # A tag that disagrees with pyproject.toml builds the OLD version and then
+      # fails at upload against a version PyPI already has — or worse, looks like
+      # it worked. Refuse before anything is built.
+      - name: Tag must match the declared version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#python-sdk-v}"
+          declared=$(python -c "import tomllib;print(tomllib.load(open('sdk/python/pyproject.toml','rb'))['project']['version'])")
+          init=$(python -c "import re;print(re.search(r'__version__ = \"([^\"]+)\"', open('sdk/python/jamjet/__init__.py').read()).group(1))")
+          echo "tag=$tag pyproject=$declared __init__=$init"
+          if [ "$tag" != "$declared" ] || [ "$declared" != "$init" ]; then
+            echo "::error::version mismatch — tag $tag, pyproject $declared, __init__ $init"
+            exit 1
+          fi
+
       - name: Install build
         run: pip install build
 

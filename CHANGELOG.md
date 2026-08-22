@@ -11,6 +11,52 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## 0.5.0 - 2026-08-22
+
+Durability and enforcement hardening across the engine seam. Everything below is
+about the boundary where an external worker meets the engine — the path that
+carries every ADK tool call, since `python_tool` and `java_tool` nodes run with
+no in-process worker.
+
+### Fixed
+
+- **A worker-reported tool failure no longer strands its workflow.** `POST /work-items/:id/fail`
+  wrote a status no sweep selects and emitted nothing, so the scheduler kept the node
+  scheduled and the execution never reached a terminal state. It is now fenced and
+  emits `NodeFailed` / `RetryScheduled` with real retry semantics.
+- **`/work-items/:id/complete` settles and emits in one transaction.** It was four
+  disjoint operations; a crash between the settle and the append wedged the execution
+  permanently.
+- **A forged zero lease fence can no longer complete an unclaimed item.** `commit_turn`
+  had no `status = 'claimed'` guard and pending rows carry `lease_fence = 0`.
+- **Duplicate completions closed on the external HTTP path**, which was unfenced while
+  the in-process path was not.
+- **Approval-hold settles are fenced**, and a zombie `NodeStarted` from a worker whose
+  lease was stolen no longer wedges a run forever.
+- **Claim-side lease expiry consumes an attempt** and the reclaim writes are guarded, so
+  an item cannot retry indefinitely without counting.
+- **Fail closed when a tenant record is unreadable** rather than resolving to allow.
+- **A provider-only allowlist entry matches on the durable path**, so `["anthropic"]`
+  means the same thing in-process and durable.
+- **NaN cost no longer slips past a budget ceiling.**
+
+### Added
+
+- **Reserve-before-fire.** An idempotency key is reserved before its effect fires, with
+  a lease-like TTL; a worker that loses the race retries once, then polls for the
+  winner's result.
+- **Idempotency keys for the external tool tier.** The claim derives and hands out the
+  key, the worker echoes it on completion, and the effect is recorded against it — so
+  the replay guard covers both transports rather than the in-process one only. Both
+  paths derive the key through one shared function.
+- **`java_tool` queue and `JavaFn` node**, enabling durable Java tool execution.
+
+### Changed
+
+- Workspace crates move to 0.5.0 together; sibling dependencies are pinned exactly.
+
+---
+
 ## 0.10.2 - 2026-06-12
 
 ### Fixed

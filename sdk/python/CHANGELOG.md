@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.12.0 — 2026-08-22
+
+Enforcement and exactly-once correctness. The ADK's governance knobs were
+enforceable on paper but reachable around in practice; this closes that, and
+fixes three defaults that quietly meant the opposite of what they read.
+
+### Fixed
+
+- **Tool policy and approval are now enforced on ADK agent dispatch.** `blocked_tools`
+  and `require_approval_for` were evaluated on ordinary tool nodes but not on the
+  agent's own dispatch node, so an ADK agent's tool calls bypassed both. An approval
+  is bound to a content hash of `(name, arguments)`, so it cannot be replayed against
+  a different payload.
+- **A spent budget refuses to fire.** Previously a run that had already exhausted its
+  budget could still make one more model call.
+- **`max_cost_usd` no longer defaults to `1.0`.** The default doubled as the "unset"
+  sentinel, so asking for a `$1.00` ceiling was indistinguishable from asking for
+  nothing and was silently dropped. The default is now `None` — no implicit ceiling —
+  and the governance knobs track explicitly-set values separately.
+- **The model allowlist globs in-process, matching the durable engine.** `["*"]` — the
+  natural way to write "allow everything" — denied every model in-process while being
+  accepted durable-side, and a provider-only entry like `["anthropic"]` was the mirror
+  image. Both transports now share one matcher, pinned by a parity table.
+- **`Team` no longer overrides a governance value a sub-agent set explicitly.** It
+  compared values rather than tracking what was set, so a sub-agent that deliberately
+  chose the coordinator's default had that choice overwritten.
+
+### Added
+
+- **External tool effects carry an idempotency key.** `complete_work_item` accepts and
+  echoes the key the claim hands out, so the engine records the result and a re-run
+  replays it instead of firing the tool a second time. Without it nothing was recorded
+  and every replay re-fired — on the transport ADK agents actually take, since
+  `python_tool` nodes run with no in-process worker.
+
 ## 0.11.0 — 2026-06-29
 
 The full ADK feature set. A plain `Agent` is now durable and governed by default, with first-class sessions, memory, multi-agent teams, deploy, and a five-minute dev loop.
