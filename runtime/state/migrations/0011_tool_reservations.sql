@@ -14,8 +14,14 @@
 -- `expires_at` is what stops the reservation becoming a new permanent wedge. A
 -- worker that dies mid-tool leaves its row behind; without expiry the key would
 -- be unrunnable forever, which is worse than the double-fire it replaced.
+-- Keyed by (tenant_id, idempotency_key), NOT by the key alone. A global primary
+-- key lets one tenant's reservation collide with another's: the scoped upsert
+-- conflicts on a row it cannot see, affects zero rows, and its tenant-filtered
+-- lookup then finds nothing — which reads as "free" and hands out a key someone
+-- else holds. Tenant is part of the identity of a reservation, as it is for
+-- every other row here.
 CREATE TABLE IF NOT EXISTS tool_reservations (
-    idempotency_key TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL,
     execution_id    TEXT NOT NULL,
     node_id         TEXT NOT NULL,
     -- Diagnostics: which worker holds it, and under which lease.
@@ -23,7 +29,8 @@ CREATE TABLE IF NOT EXISTS tool_reservations (
     lease_fence     INTEGER NOT NULL,
     expires_at      TEXT NOT NULL,
     tenant_id       TEXT NOT NULL DEFAULT 'default',
-    reserved_at     TEXT NOT NULL
+    reserved_at     TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, idempotency_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tool_reservations_execution ON tool_reservations(execution_id);

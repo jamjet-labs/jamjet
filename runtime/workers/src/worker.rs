@@ -338,10 +338,25 @@ impl Worker {
                             // are not hypothetical: a retry crash window, an
                             // approval-hold resurrection, or the public
                             // POST /work-items can all produce them.
-                            if let Some(outcome) = self
+                            // Bind the result BEFORE `?`: the heartbeat is
+                            // already running, and every other early return in
+                            // this function aborts it first. Propagating straight
+                            // out would leave a detached task renewing the lease
+                            // forever, so the item could never be reclaimed —
+                            // turning a contended key into a permanent wedge,
+                            // which is strictly worse than the double-fire the
+                            // reservation prevents.
+                            let claimed = match self
                                 .await_or_claim_effect(&key, &execution_id, &node_id, lease_fence)
-                                .await?
+                                .await
                             {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    heartbeat.abort();
+                                    return Err(e);
+                                }
+                            };
+                            if let Some(outcome) = claimed {
                                 // Someone else ran it and we read their result.
                                 info!(
                                     execution_id = %execution_id,

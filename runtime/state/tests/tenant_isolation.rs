@@ -673,3 +673,54 @@ async fn scoped_claim_side_expiry_consumes_attempts() {
         "an item that has spent its attempts must not be handed out again"
     );
 }
+
+/// One tenant's reservation must never be handed to another.
+///
+/// The reservation table originally had a GLOBAL `idempotency_key` primary key.
+/// A scoped upsert then conflicted on a row it could not see, affected zero
+/// rows, and its tenant-filtered lookup found nothing — which the code read as
+/// "free" and returned `Acquired`. Tenant B was told it owned a key tenant A
+/// held, and would have run the effect.
+///
+/// Both halves are asserted: B is refused, and A can still take its own key in
+/// the first place.
+#[tokio::test]
+async fn a_reservation_is_scoped_to_its_tenant() {
+    let db = open_test_db().await;
+    register_tenant(&db, "alpha", "Alpha").await;
+    register_tenant(&db, "beta", "Beta").await;
+    let a = db.for_tenant(TenantId::from("alpha"));
+    let b = db.for_tenant(TenantId::from("beta"));
+
+    let eid_a = ExecutionId::new();
+    let eid_b = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    assert_eq!(
+        a.reserve_tool_effect("shared-key", &eid_a, "n1", "worker-A", 1, ttl)
+            .await
+            .unwrap(),
+        jamjet_state::backend::ReserveOutcome::Acquired
+    );
+
+    // Beta asks for the same key string. It is a DIFFERENT reservation, so it
+    // must be grantable — the key is scoped, not globally exclusive.
+    assert_eq!(
+        b.reserve_tool_effect("shared-key", &eid_b, "n1", "worker-B", 1, ttl)
+            .await
+            .unwrap(),
+        jamjet_state::backend::ReserveOutcome::Acquired,
+        "a key is scoped per tenant; beta's reservation is not alpha's"
+    );
+
+    // ...and within a tenant it still excludes a second worker.
+    assert!(
+        matches!(
+            b.reserve_tool_effect("shared-key", &eid_b, "n1", "worker-C", 2, ttl)
+                .await
+                .unwrap(),
+            jamjet_state::backend::ReserveOutcome::Held { .. }
+        ),
+        "beta's own key must still be exclusive within beta"
+    );
+}

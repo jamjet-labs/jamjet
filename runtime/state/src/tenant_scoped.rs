@@ -791,7 +791,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             "INSERT INTO tool_reservations \
                  (idempotency_key, execution_id, node_id, owner, lease_fence, expires_at, tenant_id, reserved_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(idempotency_key) DO UPDATE SET \
+             ON CONFLICT(tenant_id, idempotency_key) DO UPDATE SET \
                  owner = excluded.owner, \
                  lease_fence = excluded.lease_fence, \
                  expires_at = excluded.expires_at, \
@@ -832,7 +832,15 @@ impl StateBackend for TenantScopedSqliteBackend {
                 owner: r.try_get::<String, _>("owner").map_err(map_db_err)?,
                 expires_at: r.try_get::<String, _>("expires_at").map_err(map_db_err)?,
             }),
-            None => Ok(ReserveOutcome::Acquired),
+            // The upsert was blocked, so SOMETHING holds this key. If the row
+            // is not visible here, that is not evidence the key is free — it was
+            // the reasoning behind an earlier `Acquired` return, and it was a
+            // fail-open: a scoped lookup cannot see a row another tenant owns, so
+            // the caller was handed a key someone else held. Refuse instead.
+            None => Ok(ReserveOutcome::Held {
+                owner: "unknown".to_string(),
+                expires_at: now_s.clone(),
+            }),
         }
     }
 
