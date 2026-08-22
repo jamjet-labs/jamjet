@@ -3,11 +3,10 @@
 import asyncio
 import re
 import warnings
-from collections.abc import Iterable
 
 import pytest
 
-from jamjet import Agent, task, tool
+from jamjet import Agent, ApprovalNotEnforceableError, task, tool
 from jamjet.agents.agent import AgentResult
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -155,11 +154,16 @@ def _agent_with_approval_required() -> Agent:
     )
 
 
-def _approval_warning(record: Iterable[warnings.WarningMessage]) -> str:
-    """The one approval warning out of everything run() emits (audit warns too)."""
-    matches = [w for w in record if "approval_required" in str(w.message)]
-    assert len(matches) == 1, f"expected exactly one approval warning, got {len(matches)}"
-    return str(matches[0].message)
+def _approval_refusal(agent: Agent) -> str:
+    """The message run() refuses with when approval_required is set.
+
+    It raises rather than warning: a UserWarning prints once per location and is
+    dropped by `-W ignore`, PYTHONWARNINGS or a pytest config, so the old
+    behaviour was to announce the gap to nobody and then run every tool ungated.
+    """
+    with pytest.raises(ApprovalNotEnforceableError) as excinfo:
+        asyncio.run(agent.run("hi"))
+    return str(excinfo.value)
 
 
 # "worker" is allowed in the copy — "before any worker receives the payload" is
@@ -177,32 +181,26 @@ _WORKER_CREDITED = re.compile(
 )
 
 
-class TestApprovalWarningCopy:
-    def test_in_process_run_warning_does_not_promise_enforcement_here(self):
-        """run() must warn without implying the in-process path is enforced."""
-        agent = _agent_with_approval_required()
-        with pytest.warns(UserWarning) as record:
-            asyncio.run(agent.run("hi"))
-        message = _approval_warning(record)
-        assert "does not enforce approval gates" in message
-        # The durable path is now genuinely enforced (C1), but this warning is on
+class TestApprovalRefusalCopy:
+    def test_in_process_run_does_not_promise_enforcement_here(self):
+        """run() must refuse without implying the in-process path is enforced."""
+        message = _approval_refusal(_agent_with_approval_required())
+        assert "cannot hold a run at a gate" in message
+        # The durable path is genuinely enforced (C1), but this message is about
         # the in-process path and must not read as a guarantee about this call.
         assert "fail-closed" not in message
 
-    def test_in_process_run_warning_points_at_the_real_enforcement_point(self):
+    def test_in_process_run_points_at_the_real_enforcement_point(self):
         """The redirect must name where enforcement lives, accurately.
 
         Server-side, before the payload leaves the engine — that is what makes
         the durable claim true even for a stale or hostile external tool worker.
         """
-        agent = _agent_with_approval_required()
-        with pytest.warns(UserWarning) as record:
-            asyncio.run(agent.run("hi"))
-        message = _approval_warning(record)
+        message = _approval_refusal(_agent_with_approval_required())
         assert "run_durable" in message
         assert "before any worker" in message
 
-    def test_in_process_run_warning_never_credits_the_worker(self):
+    def test_in_process_run_never_credits_the_worker(self):
         """The durable guarantee belongs to the engine, never to the worker.
 
         Crediting the worker is not just imprecise, it inverts the property:
@@ -210,12 +208,21 @@ class TestApprovalWarningCopy:
         decision is made before it sees the payload. Copy that reads "the worker
         enforces it" describes a system where a stale worker build could opt out.
         """
-        agent = _agent_with_approval_required()
-        with pytest.warns(UserWarning) as record:
-            asyncio.run(agent.run("hi"))
-        message = _approval_warning(record)
+        message = _approval_refusal(_agent_with_approval_required())
         hit = _WORKER_CREDITED.search(message)
-        assert hit is None, f"warning credits the worker with enforcing: {hit.group(0)!r}"
+        assert hit is None, f"the refusal credits the worker with enforcing: {hit.group(0)!r}"
+
+    def test_it_refuses_rather_than_running_ungated(self):
+        """The property the message copy exists to serve.
+
+        Before this, the same agent warned and then executed every tool with no
+        gate — the knob read as configured and did nothing.
+        """
+        agent = _agent_with_approval_required()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # the old signal died here
+            with pytest.raises(ApprovalNotEnforceableError):
+                asyncio.run(agent.run("hi"))
 
 
 # ── @task tests ───────────────────────────────────────────────────────────────

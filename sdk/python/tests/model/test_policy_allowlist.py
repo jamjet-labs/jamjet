@@ -228,8 +228,13 @@ class TestUnknownNamedPolicyFails:
 # ---------------------------------------------------------------------------
 
 
-class TestApprovalRequiredInProcessWarning:
-    """approval_required must never silently no-op on agent.run()."""
+class TestApprovalRequiredInProcessRefusal:
+    """approval_required must never silently no-op on agent.run().
+
+    It now REFUSES rather than warning. A UserWarning prints once per location
+    and is dropped by `-W ignore` / PYTHONWARNINGS / a pytest config, so the old
+    behaviour announced the gap to nobody and then ran every tool ungated.
+    """
 
     @pytest.fixture
     def dummy_tool(self):
@@ -242,11 +247,12 @@ class TestApprovalRequiredInProcessWarning:
 
         return noop
 
-    def test_approval_required_true_warns_on_run(self, dummy_tool):
-        """approval_required=True on agent.run() emits a UserWarning."""
+    def test_approval_required_true_refuses_on_run(self, dummy_tool):
+        """approval_required=True on agent.run() raises before anything runs."""
         import asyncio
         from unittest.mock import AsyncMock, patch
 
+        from jamjet import ApprovalNotEnforceableError
         from jamjet.agents.agent import Agent
         from jamjet.runtime.local import LocalRuntime
 
@@ -257,32 +263,27 @@ class TestApprovalRequiredInProcessWarning:
             approval_required=True,
         )
 
-        # Mock LocalRuntime.execute so we don't need a real model.
-        fake_result = AsyncMock(
-            output="ok",
-            tool_calls=[],
-            duration_ms=1,
-        )
+        # Patched so the refusal is proven to come BEFORE any execution: if the
+        # gate ever moved after the runtime call, this mock would record a call.
+        fake_result = AsyncMock(output="ok", tool_calls=[], duration_ms=1)
 
         async def _run():
-            with patch.object(LocalRuntime, "execute", return_value=fake_result):
-                with warnings.catch_warnings(record=True) as w:
-                    warnings.simplefilter("always")
+            with patch.object(LocalRuntime, "execute", return_value=fake_result) as ex:
+                with pytest.raises(ApprovalNotEnforceableError) as excinfo:
                     await agent.run("test prompt")
-            return w
+                assert ex.call_count == 0, "refused too late; the run had already started"
+            return str(excinfo.value)
 
-        caught = asyncio.run(_run())
-        user_warnings = [x for x in caught if issubclass(x.category, UserWarning)]
-        assert len(user_warnings) >= 1
-        msg = str(user_warnings[0].message)
+        msg = asyncio.run(_run())
         assert "approval_required" in msg
-        assert "in-process" in msg.lower() or "run_durable" in msg
+        assert "run_durable" in msg
 
-    def test_approval_required_list_warns_on_run(self, dummy_tool):
-        """approval_required=[...] on agent.run() emits a UserWarning."""
+    def test_approval_required_list_refuses_on_run(self, dummy_tool):
+        """approval_required=["delete_*"] on agent.run() raises before anything runs."""
         import asyncio
         from unittest.mock import AsyncMock, patch
 
+        from jamjet import ApprovalNotEnforceableError
         from jamjet.agents.agent import Agent
         from jamjet.runtime.local import LocalRuntime
 
@@ -293,22 +294,20 @@ class TestApprovalRequiredInProcessWarning:
             approval_required=["delete_*"],
         )
 
-        fake_result = AsyncMock(
-            output="ok",
-            tool_calls=[],
-            duration_ms=1,
-        )
+        # Patched so the refusal is proven to come BEFORE any execution: if the
+        # gate ever moved after the runtime call, this mock would record a call.
+        fake_result = AsyncMock(output="ok", tool_calls=[], duration_ms=1)
 
         async def _run():
-            with patch.object(LocalRuntime, "execute", return_value=fake_result):
-                with warnings.catch_warnings(record=True) as w:
-                    warnings.simplefilter("always")
-                    await agent.run("test")
-            return w
+            with patch.object(LocalRuntime, "execute", return_value=fake_result) as ex:
+                with pytest.raises(ApprovalNotEnforceableError) as excinfo:
+                    await agent.run("test prompt")
+                assert ex.call_count == 0, "refused too late; the run had already started"
+            return str(excinfo.value)
 
-        caught = asyncio.run(_run())
-        user_warnings = [x for x in caught if issubclass(x.category, UserWarning)]
-        assert len(user_warnings) >= 1
+        msg = asyncio.run(_run())
+        assert "approval_required" in msg
+        assert "run_durable" in msg
 
     def test_approval_required_false_does_not_warn(self, dummy_tool):
         """approval_required=False (default) -> NO warning on agent.run()."""

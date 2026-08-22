@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Changed (breaking)
+
+- **`approval_required` now raises on `agent.run()` instead of warning.** It emitted a
+  `UserWarning` and then ran every tool ungated, so the knob read as configured and did
+  nothing. A warning cannot carry that: Python prints a given one once per location, and
+  `-W ignore`, `PYTHONWARNINGS` or a pytest config drop it entirely — the caller who most
+  needed the signal was the least likely to see it. `run()` executes tools with no policy
+  engine between the model and the call, so a gate can be neither evaluated nor held
+  there; it now refuses with `ApprovalNotEnforceableError` and points at `run_durable`,
+  where the engine decides before any worker receives the payload. To run without gates
+  deliberately, drop `approval_required`.
+
+### Fixed
+
+- **`blocked_tools` is enforced on `agent.run()`.** It was enforced only on the durable
+  path, so a tool the policy forbids ran normally in-process — silently, without even the
+  warning `approval_required` gave. `blocked_tools` is a *tool* control, so the seam
+  middleware chain could never carry it: that chain sits at the *model* boundary and
+  enforces budget, allowlist and PII. Blocked tools are now dropped before the strategy
+  runner sees them, which makes them neither offered to the model nor dispatchable, and
+  patterns are globbed with the same matcher the engine uses. Both paths resolve the
+  effective policy through one shared function, so an `Agent(...)` cannot mean one thing
+  in-process and another durable.
+
 ## 0.12.0 — 2026-08-22
 
 Enforcement and exactly-once correctness. The ADK's governance knobs were

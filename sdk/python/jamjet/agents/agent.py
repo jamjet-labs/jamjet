@@ -31,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-import warnings
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -41,6 +40,17 @@ from jamjet.agents.session import Session, SessionStore, persist_session_turn, s
 from jamjet.compiler.strategies import StrategyLimits
 from jamjet.runtime.local import LocalRuntime
 from jamjet.tools.decorators import ToolDefinition
+
+
+class ApprovalNotEnforceableError(RuntimeError):
+    """Raised when ``approval_required`` is set but the chosen path cannot gate.
+
+    ``agent.run()`` executes tools in-process with no policy engine between the
+    model and the call, so a gate can be neither evaluated nor held. Raising is
+    the fail-closed answer: an approval gate that silently does not exist is
+    worse than a run that does not start.
+    """
+
 
 if TYPE_CHECKING:
     from jamjet.deploy import DeployResult
@@ -572,19 +582,23 @@ class Agent:
         # a stale or hostile worker build.  Do not restate any of it as a
         # property of the code below: nothing here inherits it.
         #
-        # Fail LOUD rather than silently no-op so the developer knows approval
-        # won't fire here.  See follow-up F-t3-inprocess-approval for full
-        # in-process enforcement.
+        # Fail CLOSED. This used to warn and then run every tool ungated, which
+        # is the worst of both: `approval_required` reads as configured, no error
+        # is raised, and nothing is gated. A warning cannot carry that — Python
+        # prints a given one once per location, and `-W ignore`, PYTHONWARNINGS
+        # or a pytest config drops it entirely — so the caller who most needs to
+        # know is the one least likely to see it.
+        #
+        # Refusing is safe in the direction that matters: an approval gate that
+        # does not exist is worse than a run that does not start.
         ar = self.governance.approval_required
         if ar is not False and ar != []:
-            warnings.warn(
-                f"Agent {self.name!r}: approval_required is set but agent.run() uses "
-                "the in-process path, which does not enforce approval gates. "
-                "Use agent.run_durable(), where the engine evaluates every tool call "
-                "against policy server-side, before any worker receives the payload. "
-                "Follow-up: F-t3-inprocess-approval.",
-                UserWarning,
-                stacklevel=2,
+            raise ApprovalNotEnforceableError(
+                f"Agent {self.name!r}: approval_required is set, but agent.run() uses "
+                "the in-process path, which cannot hold a run at a gate. Use "
+                "agent.run_durable(), where the engine evaluates every tool call "
+                "against policy before any worker receives the payload. To run "
+                "without gates deliberately, drop approval_required."
             )
 
         # T4-2/T4-3: resolve session + memory and build the seed messages.  The

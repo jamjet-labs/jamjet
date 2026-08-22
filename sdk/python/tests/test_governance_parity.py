@@ -24,7 +24,10 @@ knob              in-process (agent.run)      durable (compile_agent_to_ir)
 budget=           BudgetExceededError (deny)  cost_budget_usd / token_budget
 policy= allowlist ModelDeniedError    (deny)  policy.model_allowlist
 pii=              redacted before backend     data_policy
-approval_required UserWarning (fail-LOUD)     policy.require_approval_for
+approval_required ApprovalNotEnforceable    policy.require_approval_for
+                  Error (fail-CLOSED)
+policy= blocked   tool dropped before the    policy.blocked_tools
+                  model is offered it
 ================  ==========================  ===============================
 
 Run:
@@ -43,7 +46,7 @@ from typing import Any
 
 import pytest
 
-from jamjet import Agent, tool
+from jamjet import Agent, ApprovalNotEnforceableError, tool
 from jamjet.agents.audit import AuditSigner, ChainError, resolve_signer, verify_chain
 from jamjet.agents.governance import Budget, normalize_governance
 from jamjet.compiler.agent_ir import compile_agent_to_ir
@@ -318,18 +321,26 @@ class TestPiiParity:
 
 
 # ===========================================================================
-# 6. APPROVAL_REQUIRED PARITY — in-process fails LOUD (UserWarning), durable IR
-#    carries require_approval_for.  It NEVER silently no-ops.
+# 6. APPROVAL_REQUIRED PARITY — in-process fails CLOSED, durable IR carries
+#    require_approval_for.  It NEVER silently no-ops.
+#
+#    This used to WARN and then run every tool ungated, which is the worst
+#    outcome available: the knob reads as configured, no error is raised, and
+#    nothing is gated.  A warning cannot carry that weight — Python prints a
+#    given one once per location, and `-W ignore` / PYTHONWARNINGS / a pytest
+#    config drop it entirely, so the caller who most needs to know is the one
+#    least likely to see it.
 # ===========================================================================
 
 
 class TestApprovalParity:
-    def test_inprocess_run_warns_never_silent(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """approval_required on agent.run() emits a UserWarning (fail-LOUD).
+    def test_inprocess_run_refuses_rather_than_running_ungated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """approval_required on agent.run() raises instead of running ungated.
 
-        The in-process strategy runner cannot enforce tool-level approval gates
-        (F-t3-inprocess-approval); rather than silently no-op, it warns and points
-        the developer at run_durable().
+        The in-process runner calls tools directly with no policy engine between
+        the model and the call, so a gate can be neither evaluated nor held. The
+        only honest options are refuse or silently proceed, and refusing is safe
+        in the direction that matters.
         """
         _install_backend(monkeypatch)
         agent = Agent(
@@ -339,15 +350,32 @@ class TestApprovalParity:
             strategy="react",
             approval_required=["delete_*"],
         )
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with pytest.raises(ApprovalNotEnforceableError) as excinfo:
             asyncio.run(agent.run("q"))
-        approval = [w for w in caught if issubclass(w.category, UserWarning) and "approval_required" in str(w.message)]
-        assert len(approval) >= 1
-        assert "run_durable" in str(approval[0].message)
+        assert "run_durable" in str(excinfo.value), "the error must name the path that does gate"
 
-    def test_no_approval_no_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The dual: a plain agent does NOT emit a spurious approval warning."""
+    def test_a_warning_filter_cannot_suppress_the_refusal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The reason this is an exception and not a warning.
+
+        `-W ignore` is ordinary in CI and in application logging setups. Under it
+        the old UserWarning vanished and every tool ran ungated, so the caller who
+        most needed the signal was the least likely to receive it.
+        """
+        _install_backend(monkeypatch)
+        agent = Agent(
+            "a",
+            model="anthropic/claude-sonnet-4-6",
+            tools=[search],
+            strategy="react",
+            approval_required=True,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pytest.raises(ApprovalNotEnforceableError):
+                asyncio.run(agent.run("q"))
+
+    def test_no_approval_runs_normally(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The dual: a plain agent is not refused, and warns about nothing."""
         _install_backend(monkeypatch)
         agent = Agent("a", model="anthropic/claude-sonnet-4-6", tools=[search], strategy="react")
         with warnings.catch_warnings(record=True) as caught:
@@ -498,6 +526,7 @@ class TestNoKnobSilentlyNoOps:
             asyncio.run(agent.run("q"))
 
     def test_approval_does_not_silently_noop_inprocess(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """It refuses. It used to warn and then run every tool ungated."""
         _install_backend(monkeypatch)
         agent = Agent(
             "n",
@@ -506,10 +535,22 @@ class TestNoKnobSilentlyNoOps:
             strategy="react",
             approval_required=True,
         )
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with pytest.raises(ApprovalNotEnforceableError):
             asyncio.run(agent.run("q"))
-        assert any("approval_required" in str(w.message) for w in caught)
+
+    def test_blocked_tools_does_not_silently_noop_inprocess(self) -> None:
+        """The knob that had no signal at all — not even a warning."""
+        from jamjet.runtime.local.executor import LocalRuntime
+
+        agent = Agent(
+            "n",
+            model="anthropic/claude-sonnet-4-6",
+            tools=[search],
+            strategy="react",
+            policy={"blocked_tools": ["search"]},
+        )
+        filtered = LocalRuntime._apply_blocked_tools(agent.compile(), agent.governance)
+        assert [t.name for t in filtered.tools] == []
 
     def test_every_knob_compiles_into_the_durable_ir(self) -> None:
         """One fully-governed agent -> every knob lands in the durable IR."""
@@ -667,3 +708,104 @@ class TestStreamGovernanceParity:
         flat = json.dumps(backend.seen.messages, default=str)
         assert "a@b.com" not in flat
         assert "[REDACTED:EMAIL]" in flat
+
+
+# ===========================================================================
+# 7. BLOCKED_TOOLS PARITY — the tool the policy forbids is unreachable
+#    in-process, exactly as the engine refuses it durable.
+#
+#    blocked_tools is a TOOL control, so the seam middleware chain could never
+#    carry it: that chain sits at the MODEL boundary and enforces budget,
+#    allowlist and PII. Nothing enforced blocked_tools on agent.run(), so a
+#    forbidden tool ran normally in-process while being refused on the durable
+#    path — silently, without even the warning approval_required used to give.
+# ===========================================================================
+
+
+@tool
+def send_email(to: str) -> str:
+    """Send an email."""
+    return f"sent to {to}"
+
+
+class TestBlockedToolsParity:
+    def _agent(self, **kw: object) -> Agent:
+        return Agent(
+            "a",
+            model="anthropic/claude-sonnet-4-6",
+            tools=[search, send_email],
+            strategy="react",
+            **kw,  # type: ignore[arg-type]
+        )
+
+    def test_a_blocked_tool_is_not_offered_to_the_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Dropped before the runner sees it.
+
+        Every strategy builds its dispatch table from ``spec.tools``
+        (``resolve_tool_map``), so removing it there makes the tool both
+        un-offered and un-dispatchable in one place — a model cannot call what it
+        was never shown, and cannot reach it if it asks anyway.
+        """
+        from jamjet.runtime.local.executor import LocalRuntime
+
+        agent = self._agent(policy={"blocked_tools": ["send_*"]})
+        spec = agent.compile()
+        assert {t.name for t in spec.tools} == {"search", "send_email"}
+
+        filtered = LocalRuntime._apply_blocked_tools(spec, agent.governance)
+        assert {t.name for t in filtered.tools} == {"search"}, "a policy-blocked tool must not survive into the runner"
+
+    def test_patterns_are_globs_matching_the_engine(self) -> None:
+        """Same matcher as ``glob_match`` in runtime/policy/src/lib.rs.
+
+        A literal-only comparison here would make ``send_*`` mean nothing
+        in-process while blocking durable — the divergence class of #121/#123.
+        """
+        from jamjet.runtime.local.executor import LocalRuntime
+
+        for pattern, blocked in [("send_*", True), ("send_email", True), ("send", False), ("*", True)]:
+            agent = self._agent(policy={"blocked_tools": [pattern]})
+            filtered = LocalRuntime._apply_blocked_tools(agent.compile(), agent.governance)
+            names = {t.name for t in filtered.tools}
+            assert ("send_email" not in names) is blocked, f"{pattern!r} should block={blocked}"
+
+    def test_no_policy_leaves_every_tool_reachable(self) -> None:
+        """The dual: enforcement must not quietly drop tools nobody blocked."""
+        from jamjet.runtime.local.executor import LocalRuntime
+
+        agent = self._agent()
+        spec = agent.compile()
+        assert LocalRuntime._apply_blocked_tools(spec, agent.governance) is spec
+
+    def test_durable_ir_carries_the_same_blocked_list(self) -> None:
+        agent = self._agent(policy={"blocked_tools": ["send_*"]})
+        ir = compile_agent_to_ir(agent, "q")
+        assert ir["policy"]["blocked_tools"] == ["send_*"]
+
+    def test_run_actually_applies_the_filter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Through agent.run(), not the helper in isolation.
+
+        The helper being correct proves nothing if nothing calls it. Deleting the
+        `_apply_blocked_tools` line from `_run_agent` left every other test in this
+        class green, which is the "guard present, never wired" failure this suite
+        exists to catch — so this one goes through the real path and inspects what
+        the provider was actually offered.
+        """
+        lm = sys.modules["litellm"]
+        original = lm.acompletion
+        offered: list[list[str]] = []
+
+        async def _acompletion(model: str, messages: list, tools: list | None = None, **kw: object) -> object:
+            offered.append([t["function"]["name"] for t in (tools or [])])
+            return await original(model=model, messages=messages, tools=tools, **kw)
+
+        monkeypatch.setattr(lm, "acompletion", _acompletion)
+        monkeypatch.setattr(lm, "completion_cost", lambda completion_response=None, **kw: 0.0)
+
+        agent = self._agent(policy={"blocked_tools": ["send_*"]})
+        asyncio.run(agent.run("q"))
+
+        assert offered, "the model was never called, so this asserts nothing"
+        for names in offered:
+            assert "send_email" not in names, "a blocked tool reached the provider"
+            assert "search" in names, "an unblocked tool must still be offered"
