@@ -36,7 +36,7 @@ from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from jamjet.agents.governance import Budget, GovernanceConfig, normalize_governance
+from jamjet.agents.governance import UNSET, Budget, GovernanceConfig, _Unset, normalize_governance
 from jamjet.agents.session import Session, SessionStore, persist_session_turn, seed_messages_for_run
 from jamjet.compiler.strategies import StrategyLimits
 from jamjet.runtime.local import LocalRuntime
@@ -88,12 +88,19 @@ class Agent:
         timeout_seconds: int = 300,
         on_limit_exceeded: Callable[[str | None, str, Any, Any], str | None] | None = None,
         # Governance knobs (T3-1).  T3-2..6 read self.governance to enforce.
-        policy: str | dict | None = None,
-        approval_required: bool | list[str] = False,
-        budget: Budget | float | int | dict | None = None,
-        pii: bool = True,
-        audit: bool = True,
-        receipts: bool = True,
+        #
+        # Each defaults to UNSET rather than to its documented value, so
+        # `normalize_governance` can record WHICH knobs the caller actually
+        # passed. `Team` inherits its default only into a sub-agent that set
+        # nothing, and that cannot be inferred by comparing values: an agent
+        # deliberately asking for `pii=True` is identical, by value, to one that
+        # said nothing — and used to have its choice silently replaced.
+        policy: str | dict | None | _Unset = UNSET,
+        approval_required: bool | list[str] | _Unset = UNSET,
+        budget: Budget | float | int | dict | None | _Unset = UNSET,
+        pii: bool | _Unset = UNSET,
+        audit: bool | _Unset = UNSET,
+        receipts: bool | _Unset = UNSET,
         # Optional sink for AgentBoundary receipts (T3-4).  When set, every
         # minted receipt is also shipped here (e.g. a JSONL writer); the receipt
         # is always attached to the run result regardless.  Defaults to None so
@@ -170,8 +177,8 @@ class Agent:
         # into GovernanceConfig.budget.cost_usd so the governance layer inherits
         # the same ceiling without requiring callers to set both.  T3-2 will
         # reconcile and document the authoritative enforcement point.
-        _effective_budget: Budget | float | int | dict | None = budget
-        if _effective_budget is None and max_cost_usd is not None:
+        _effective_budget: Budget | float | int | dict | None | _Unset = budget
+        if (_effective_budget is UNSET or _effective_budget is None) and max_cost_usd is not None:
             # Explicitly provided -> carry it forward as the budget cap. The test
             # is `is not None`, never a comparison against the default: comparing
             # against 1.0 is what made an explicit $1.00 ceiling vanish.
