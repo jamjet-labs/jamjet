@@ -392,4 +392,44 @@ mod tests {
             PolicyDecision::Allow
         ));
     }
+
+    /// The mirror of `PARITY_TABLE` in
+    /// `sdk/python/tests/middleware/test_model_allowlist_parity.py`.
+    ///
+    /// The SAME allowlist is evaluated by the Python seam for an in-process run
+    /// and here for a durable one. A row that changes on one side and not the
+    /// other means one policy now behaves two ways depending on transport, which
+    /// is the class of bug this table exists to catch. Keep the two in step.
+    #[test]
+    fn model_allowlist_parity_table() {
+        const OPUS: &str = "anthropic/claude-opus-4-8";
+        let cases: &[(&str, &str, bool)] = &[
+            ("anthropic", OPUS, true),
+            ("openai", OPUS, false),
+            ("anthropic/*", OPUS, true),
+            ("openai/*", OPUS, false),
+            ("anthropic/claude-opus-4-8", OPUS, true),
+            ("anthropic/claude-haiku-4-5", OPUS, false),
+            ("*", OPUS, true),
+            ("anthropi?", OPUS, true),
+            ("anthropi??", OPUS, false),
+        ];
+        for (pattern, model, expected) in cases {
+            assert_eq!(
+                model_matches(pattern, model),
+                *expected,
+                "{pattern:?} vs {model:?} must be {expected}"
+            );
+        }
+    }
+
+    /// `[seq]` is a literal here, not a character class. Python's matcher is
+    /// hand-written rather than `fnmatch` for exactly this reason.
+    #[test]
+    fn a_character_class_is_literal_not_a_class() {
+        assert!(!model_matches(
+            "anthropic/[abc]laude-opus-4-8",
+            "anthropic/claude-opus-4-8"
+        ));
+    }
 }
