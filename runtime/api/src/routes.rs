@@ -1261,14 +1261,27 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
         .and_then(|node| node.get("kind"))
     {
         // The node id selects both the policy set and the dispatch marker, so a
-        // node that is not in the IR has neither and cannot be evaluated.
+        // node whose kind cannot be read has neither and cannot be evaluated.
+        //
+        // This arm covers three shapes at once — no such node, `nodes` not an
+        // object, node present without a `kind` — so it does not claim to know
+        // which. Saying "node not found" would send an on-call reader looking
+        // for a missing node when the IR may simply be malformed.
         None => {
-            return fail_closed(backend, wi, format!("node {} not found in IR", wi.node_id)).await;
+            return fail_closed(
+                backend,
+                wi,
+                format!("no readable kind for node {} in IR", wi.node_id),
+            )
+            .await;
         }
         Some(raw) => match serde_json::from_value(raw.clone()) {
             Ok(kind) => kind,
+            // Distinct from the full-graph parse below, which keeps the worker's
+            // wording. Naming which parse failed is the difference between
+            // "this node's kind is malformed" and "the whole workflow is".
             Err(e) => {
-                return fail_closed(backend, wi, format!("failed to load IR: {e}")).await;
+                return fail_closed(backend, wi, format!("failed to load node kind: {e}")).await;
             }
         },
     };

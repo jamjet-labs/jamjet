@@ -1632,7 +1632,6 @@ async fn a_dispatch_node_is_gated_even_when_the_item_claims_another_queue() {
     assert_withheld(&resp);
     // ...and it must not simply come back on the next poll.
     assert_withheld(&claim(&state, "model").await);
-    let _ = id;
 }
 
 /// The unblocked case still comes back, so the gate is not simply refusing.
