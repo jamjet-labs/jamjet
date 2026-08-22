@@ -366,3 +366,142 @@ async fn tokens_carry_tenant_id() {
     let validated = scoped.validate_token(&plaintext).await.unwrap().unwrap();
     assert_eq!(validated.tenant_id, "acme");
 }
+
+// ── Fenced failure, tenant-scoped ────────────────────────────────────────────
+
+/// The tenant-scoped dead-letter row must store the execution id in the SAME
+/// format every other row uses: the bare UUID from `execution_id_str`, not
+/// `ExecutionId`'s `Display`, which renders `exec_<simple>`.
+///
+/// Getting this wrong is silent. The insert succeeds, the item is correctly
+/// dead-lettered, and every assertion about status passes — but the row joins to
+/// nothing, so an operator listing an execution's dead-lettered work finds an
+/// empty result and concludes nothing failed. Caught in review on #118, which is
+/// why the assertion is on the STORED STRING rather than on a round-trip that
+/// would format both sides the same way and agree with itself.
+#[tokio::test]
+async fn scoped_dead_letter_stores_the_bare_execution_uuid() {
+    let db = open_test_db().await;
+    register_tenant(&db, "alpha", "Alpha").await;
+    let tenant = db.for_tenant(TenantId::from("alpha"));
+
+    let exec = sample_execution("wf-dl");
+    let execution_id = exec.execution_id.clone();
+    tenant.create_execution(exec).await.unwrap();
+
+    let item_id = uuid::Uuid::new_v4();
+    tenant
+        .enqueue_work_item(jamjet_state::WorkItem {
+            id: item_id,
+            execution_id: execution_id.clone(),
+            node_id: "node-dl".to_string(),
+            queue_type: "general".to_string(),
+            payload: json!({}),
+            // One attempt short of the cap, so failing it exhausts the budget
+            // and takes the dead-letter branch.
+            attempt: 2,
+            max_attempts: 3,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "alpha".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let claimed = tenant
+        .claim_work_item("worker-dl", &["general"])
+        .await
+        .unwrap()
+        .expect("the item must be claimable");
+
+    let outcome = tenant
+        .fail_work_item_fenced(item_id, claimed.lease_fence, "tool exploded")
+        .await
+        .unwrap()
+        .expect("a matching fence must settle the item");
+    assert!(
+        matches!(
+            outcome,
+            jamjet_state::backend::FailOutcome::Exhausted { .. }
+        ),
+        "attempt 3 of 3 is spent, so this must dead-letter"
+    );
+
+    let stored: String =
+        sqlx::query_scalar("SELECT execution_id FROM dead_letter_items WHERE id = ?")
+            .bind(item_id.to_string())
+            .fetch_one(&db.pool())
+            .await
+            .expect("the dead-letter row must exist");
+
+    assert_eq!(
+        stored,
+        execution_id.0.to_string(),
+        "the dead-letter row must store the bare UUID, like every other \
+         execution_id column; Display would write exec_<simple> and join to nothing"
+    );
+    assert_ne!(
+        stored,
+        execution_id.to_string(),
+        "Display is the wrong format here — this assertion is the regression guard"
+    );
+}
+
+/// A tenant must not be able to fail another tenant's work item, even holding a
+/// correct id and fence.
+#[tokio::test]
+async fn scoped_fail_cannot_reach_another_tenants_item() {
+    let db = open_test_db().await;
+    register_tenant(&db, "alpha", "Alpha").await;
+    register_tenant(&db, "beta", "Beta").await;
+    let tenant_a = db.for_tenant(TenantId::from("alpha"));
+    let tenant_b = db.for_tenant(TenantId::from("beta"));
+
+    let exec = sample_execution("wf-x");
+    let execution_id = exec.execution_id.clone();
+    tenant_a.create_execution(exec).await.unwrap();
+
+    let item_id = uuid::Uuid::new_v4();
+    tenant_a
+        .enqueue_work_item(jamjet_state::WorkItem {
+            id: item_id,
+            execution_id,
+            node_id: "node-x".to_string(),
+            queue_type: "general".to_string(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "alpha".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let claimed = tenant_a
+        .claim_work_item("worker-a", &["general"])
+        .await
+        .unwrap()
+        .expect("claimable");
+
+    // Beta knows the id and the real fence and still cannot touch it.
+    let cross = tenant_b
+        .fail_work_item_fenced(item_id, claimed.lease_fence, "not yours")
+        .await
+        .unwrap();
+    assert!(
+        cross.is_none(),
+        "a scoped backend must never settle another tenant's item"
+    );
+
+    // Alpha still can, which proves the refusal was tenancy and not a bad fence.
+    assert!(tenant_a
+        .fail_work_item_fenced(item_id, claimed.lease_fence, "mine")
+        .await
+        .unwrap()
+        .is_some());
+}

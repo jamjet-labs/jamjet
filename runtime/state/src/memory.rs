@@ -4,8 +4,8 @@
 //! quick prototyping where durability is not needed.
 
 use crate::backend::{
-    ApiToken, BackendResult, ReclaimResult, StateBackend, StateBackendError, WorkItem, WorkItemId,
-    WorkflowDefinition,
+    ApiToken, BackendResult, FailOutcome, ReclaimResult, StateBackend, StateBackendError, WorkItem,
+    WorkItemId, WorkflowDefinition,
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
@@ -613,6 +613,61 @@ impl StateBackend for InMemoryBackend {
             }
             None => Err(StateBackendError::NotFound(item_id.to_string())),
         }
+    }
+
+    async fn fail_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        let Some(mut entry) = self.work_items.get_mut(&item_id) else {
+            return Ok(None);
+        };
+        // Same guard as `complete_work_item_fenced`: the fence AND still-claimed
+        // (`worker_id.is_some()`). Fence alone would let a forged `lease_fence: 0`
+        // match a never-claimed pending item, and would accept a stale fence after
+        // a reclaim, since reclaim clears `worker_id` but leaves `lease_fence`.
+        if entry.worker_id.is_none() || entry.lease_fence != lease_fence {
+            return Ok(None);
+        }
+
+        let new_attempt = entry.attempt + 1;
+        entry.attempt = new_attempt;
+        entry.worker_id = None;
+        entry.lease_expires_at = None;
+        if let Some(obj) = entry.payload.as_object_mut() {
+            obj.insert(
+                "last_error".into(),
+                serde_json::Value::String(error.to_string()),
+            );
+        }
+        // Bump the epoch so any re-claim mints a strictly greater fence than the
+        // token the failing worker still holds.
+        let next = self
+            .lease_epochs
+            .get(&item_id)
+            .map(|e| *e.value())
+            .unwrap_or(0)
+            + 1;
+        self.lease_epochs.insert(item_id, next);
+
+        let item = entry.clone();
+        let exhausted = new_attempt >= item.max_attempts;
+        drop(entry);
+
+        if exhausted {
+            // Mirror SQLite: a dead-lettered item leaves the live queue entirely,
+            // so it can never be claimed again.
+            self.work_items.remove(&item_id);
+            return Ok(Some(FailOutcome::Exhausted {
+                item: Box::new(item),
+            }));
+        }
+        Ok(Some(FailOutcome::Retryable {
+            delay_ms: (1u64 << new_attempt.min(6)) * 1000,
+            item: Box::new(item),
+        }))
     }
 
     async fn park_work_item(

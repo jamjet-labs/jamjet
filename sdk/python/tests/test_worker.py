@@ -92,8 +92,8 @@ class _StubClient:
             }
         )
 
-    async def fail_work_item(self, item_id: str, error: str) -> None:
-        self.fail_calls.append({"item_id": item_id, "error": error})
+    async def fail_work_item(self, item_id: str, error: str, lease_fence: int = 0) -> None:
+        self.fail_calls.append({"item_id": item_id, "error": error, "lease_fence": lease_fence})
 
     async def heartbeat_work_item(self, item_id: str, worker_id: str, lease_fence: int = 0) -> None:
         self.heartbeat_calls.append({"item_id": item_id, "lease_fence": lease_fence})
@@ -208,6 +208,24 @@ async def test_worker_posts_fail_on_handler_exception() -> None:
     assert call["item_id"] == "wi-002"
     assert "intentional failure" in call["error"]
     assert len(stub.complete_calls) == 0, "complete must not be called on failure"
+
+
+async def test_worker_echoes_lease_fence_on_fail() -> None:
+    """The fence is echoed on FAILURE too, not just on completion.
+
+    Without it the runtime takes its legacy path: the item is settled but no
+    NodeFailed is appended, so the node stays scheduled and the execution never
+    reaches a terminal state. Echoing the fence is what buys retry, backoff and
+    dead-letter semantics for a tool that raised.
+    """
+    boom_fenced = dict(_BOOM_ITEM, id="wi-007", lease_fence=4_294_967_297)
+    stub = _StubClient(claimed_item=boom_fenced)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+
+    assert len(stub.fail_calls) == 1
+    assert stub.fail_calls[0]["lease_fence"] == 4_294_967_297, (
+        "the claim's fence must reach /fail, or the runtime cannot tell this worker still owns the item"
+    )
 
 
 async def test_worker_once_empty_queue_is_noop() -> None:

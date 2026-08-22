@@ -243,8 +243,42 @@ pub trait StateBackend: Send + Sync {
         lease_fence: i64,
     ) -> BackendResult<bool>;
 
-    /// Mark a work item as failed. The scheduler will decide whether to retry.
+    /// Mark a work item as failed by writing the terminal `'failed'` status.
+    ///
+    /// WARNING — this settles the item and NOTHING ELSE. No `NodeFailed` is
+    /// appended, and no sweep ever selects `status = 'failed'`, so the scheduler
+    /// fold keeps the node in `scheduled` and the execution never reaches a
+    /// terminal state. It is the right call only where the caller emits the
+    /// terminal event itself.
+    ///
+    /// For a worker reporting that its node failed, use
+    /// [`Self::fail_work_item_fenced`], which applies the same retry and
+    /// dead-letter semantics as lease reclamation and tells the caller which
+    /// events to emit.
     async fn fail_work_item(&self, item_id: WorkItemId, error: &str) -> BackendResult<()>;
+
+    /// Fence-guarded failure of a claimed work item, with retry semantics.
+    ///
+    /// The failure counterpart of [`Self::complete_work_item_fenced`], and the
+    /// per-item counterpart of [`Self::reclaim_expired_leases`]: it applies the
+    /// SAME attempt/backoff/dead-letter rules that reclamation applies to a lease
+    /// that expired, so a worker that reports a failure and a worker that dies
+    /// holding the item converge on identical state and identical events.
+    ///
+    /// Returns `Ok(None)` — never an error — when the fence does not match or the
+    /// item is no longer `claimed`, exactly like `complete_work_item_fenced`, so a
+    /// reclaimed or replayed worker cannot fail an item it no longer owns or
+    /// double-emit its terminal event.
+    ///
+    /// The returned [`FailOutcome`] carries the updated item so the caller can
+    /// emit `NodeFailed` (and `RetryScheduled`) with the right attempt number
+    /// without re-reading it.
+    async fn fail_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>>;
 
     /// Atomically settle a work item, append the terminal event, and optionally
     /// compute and write a snapshot from the committed state, all in ONE
@@ -458,4 +492,29 @@ pub struct ReclaimResult {
     pub retryable: Vec<WorkItem>,
     /// Items that exhausted all attempts and were moved to dead-letter.
     pub exhausted: Vec<WorkItem>,
+}
+
+/// What a fenced failure did to the item, and the item as it now stands.
+///
+/// The caller emits the terminal events from this, so the variants mirror the
+/// two arms of [`ReclaimResult`] deliberately: a worker-reported failure and an
+/// expired lease must leave the same event trail, or the scheduler fold learns a
+/// different story depending on how the node died.
+#[derive(Debug, Clone)]
+pub enum FailOutcome {
+    /// Attempts remain: the item is back to `pending` with an incremented
+    /// attempt and a backoff, and a fresh lease epoch. Emit
+    /// `NodeFailed { retryable: true }` then `RetryScheduled`.
+    Retryable {
+        /// The item with its NEW attempt number.
+        item: Box<WorkItem>,
+        /// Backoff applied before the item becomes claimable again.
+        delay_ms: u64,
+    },
+    /// Attempts are spent: the item is dead-lettered. Emit
+    /// `NodeFailed { retryable: false }` and nothing else.
+    Exhausted {
+        /// The item with its FINAL attempt number.
+        item: Box<WorkItem>,
+    },
 }

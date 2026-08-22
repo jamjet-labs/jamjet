@@ -6,8 +6,8 @@
 //! that item's execution.
 
 use crate::backend::{
-    ApiToken, BackendResult, ReclaimResult, StateBackend, StateBackendError, WorkItem, WorkItemId,
-    WorkflowDefinition,
+    ApiToken, BackendResult, FailOutcome, ReclaimResult, StateBackend, StateBackendError, WorkItem,
+    WorkItemId, WorkflowDefinition,
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
@@ -1038,6 +1038,123 @@ impl StateBackend for TenantScopedSqliteBackend {
         .map_err(map_db_err)?
         .rows_affected();
         Ok(rows_affected > 0)
+    }
+
+    #[instrument(skip(self, error), fields(tenant = %self.tenant_id, item_id = %item_id, fence = lease_fence))]
+    async fn fail_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        let id_str = item_id.to_string();
+
+        // BEGIN IMMEDIATE: read-decide-write in one write transaction, so a
+        // concurrent reclaim cannot land between the attempt count we read and the
+        // settle we base on it. See the untenanted backend for the full note.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_db_err)?;
+
+        // `tenant_id` is on every statement below, not just the read: a scoped
+        // backend must never settle another tenant's item even if an id and fence
+        // were somehow guessed.
+        let Some(row) = sqlx::query(
+            "SELECT * FROM work_items \
+             WHERE id = ? AND tenant_id = ? AND lease_fence = ? AND status = 'claimed'",
+        )
+        .bind(&id_str)
+        .bind(&self.tenant_id.0)
+        .bind(lease_fence)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        else {
+            return Ok(None);
+        };
+
+        let item = row_to_work_item(&row)?;
+        let new_attempt = item.attempt + 1;
+
+        if new_attempt >= item.max_attempts {
+            let dead_lettered_at = Utc::now().to_rfc3339();
+            let rows = sqlx::query(
+                "UPDATE work_items SET status = 'dead_lettered', attempt = ?, lease_expires_at = NULL, worker_id = NULL \
+                 WHERE id = ? AND tenant_id = ? AND lease_fence = ? AND status = 'claimed'",
+            )
+            .bind(new_attempt as i64)
+            .bind(&id_str)
+            .bind(&self.tenant_id.0)
+            .bind(lease_fence)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            .rows_affected();
+            if rows == 0 {
+                return Ok(None);
+            }
+
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO dead_letter_items
+                   (id, execution_id, node_id, queue_type, payload_json, attempt, last_error, created_at, dead_lettered_at, tenant_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&id_str)
+            // `execution_id_str`, NOT `to_string()`: Display formats an
+            // ExecutionId as `exec_<simple>`, while every execution_id column
+            // stores the bare UUID. Display here would write a dead-letter row
+            // that joins to nothing and hides the item from per-execution queries.
+            .bind(execution_id_str(&item.execution_id))
+            .bind(&item.node_id)
+            .bind(&item.queue_type)
+            .bind(serde_json::to_string(&item.payload)?)
+            .bind(new_attempt as i64)
+            .bind(error)
+            .bind(item.created_at.to_rfc3339())
+            .bind(dead_lettered_at)
+            .bind(&self.tenant_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+
+            tx.commit().await.map_err(map_db_err)?;
+            let mut exhausted = item;
+            exhausted.attempt = new_attempt;
+            return Ok(Some(FailOutcome::Exhausted {
+                item: Box::new(exhausted),
+            }));
+        }
+
+        let backoff_secs = 1u64 << new_attempt.min(6);
+        let retry_after =
+            (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
+        let rows = sqlx::query(
+            "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, \
+             retry_after = ?, lease_epoch = lease_epoch + 1 \
+             WHERE id = ? AND tenant_id = ? AND lease_fence = ? AND status = 'claimed'",
+        )
+        .bind(new_attempt as i64)
+        .bind(&retry_after)
+        .bind(&id_str)
+        .bind(&self.tenant_id.0)
+        .bind(lease_fence)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+        if rows == 0 {
+            return Ok(None);
+        }
+
+        tx.commit().await.map_err(map_db_err)?;
+        let mut retried = item;
+        retried.attempt = new_attempt;
+        Ok(Some(FailOutcome::Retryable {
+            item: Box::new(retried),
+            delay_ms: backoff_secs * 1000,
+        }))
     }
 
     #[instrument(skip(self, error), fields(tenant = %self.tenant_id, item_id = %item_id))]

@@ -1883,7 +1883,21 @@ async def _worker_loop(
                 console.print(f"[green]Completed[/green] id={item_id} node=[bold]{node_id}[/bold] {duration_ms}ms")
             except Exception as exc:
                 console.print(f"[red]Failed[/red] node={node_id}: {exc}")
-                await client.fail_work_item(item_id, str(exc))
+                try:
+                    # Echo the fence here for the same reason completion does: it
+                    # proves the lease is still ours. It also buys the retry and
+                    # dead-letter semantics — without it the runtime settles the
+                    # item, emits no NodeFailed, and the execution never finishes.
+                    await client.fail_work_item(item_id, str(exc), lease_fence=lease_fence)
+                except Exception as fail_exc:
+                    # 409: the lease was reclaimed while this node was failing, so
+                    # a new claimant owns the item. Reporting our failure would
+                    # kill work that is currently running under a newer fence.
+                    status = getattr(getattr(fail_exc, "response", None), "status_code", None)
+                    if status == 409:
+                        console.print(f"[yellow]Failure report rejected; lease lost[/yellow] id={item_id}")
+                    else:
+                        raise
             finally:
                 hb_task.cancel()
 

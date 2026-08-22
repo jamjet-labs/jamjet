@@ -947,6 +947,18 @@ mod tests {
             self.inner.fail_work_item(item_id, error).await
         }
 
+        async fn fail_work_item_fenced(
+            &self,
+            item_id: jamjet_state::backend::WorkItemId,
+            lease_fence: i64,
+            error: &str,
+        ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::backend::FailOutcome>>
+        {
+            self.inner
+                .fail_work_item_fenced(item_id, lease_fence, error)
+                .await
+        }
+
         async fn commit_turn(
             &self,
             item_id: jamjet_state::backend::WorkItemId,
