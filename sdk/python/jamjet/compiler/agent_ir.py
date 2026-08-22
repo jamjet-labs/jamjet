@@ -96,6 +96,19 @@ _DEFAULT_DATA_POLICY_IR: dict[str, Any] = {
 }
 
 
+def effective_policy(gov: GovernanceConfig) -> dict[str, Any] | None:
+    """The policy rules *gov* resolves to, or ``None`` when it declares none.
+
+    Shared deliberately. The durable path compiles this into the IR for the engine
+    to enforce, and the in-process path (``agent.run``) reads the same result to
+    enforce ``blocked_tools`` locally. Two resolvers would let the same
+    ``Agent(...)`` declaration mean different things depending on which path
+    happened to run it — the divergence class of #121 and #123, which surfaces in
+    production because development usually stays in-process.
+    """
+    return _compile_agent_policy_ir(gov)
+
+
 def _compile_agent_policy_ir(gov: GovernanceConfig) -> dict[str, Any] | None:
     """Build a PolicySetIr dict from *gov*, or ``None`` when no policy rules are needed.
 

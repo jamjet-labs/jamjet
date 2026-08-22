@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Changed (breaking)
+
+- **`approval_required` now raises on `agent.run()` instead of warning.** It emitted a
+  `UserWarning` and then ran every tool ungated, so the knob read as configured and did
+  nothing. A warning cannot carry that: Python prints a given one once per location, and
+  `-W ignore`, `PYTHONWARNINGS` or a pytest config drop it entirely — the caller who most
+  needed the signal was the least likely to see it. `run()` executes tools with no policy
+  engine between the model and the call, so a gate can be neither evaluated nor held
+  there; it now refuses with `ApprovalNotEnforceableError` and points at `run_durable`,
+  where the engine decides before any worker receives the payload. To run without gates
+  deliberately, drop `approval_required`.
+
+### Fixed
+
+- **`blocked_tools` is enforced on `agent.run()`.** It was enforced only on the durable
+  path, so a tool the policy forbids ran normally in-process — silently, without even the
+  warning `approval_required` gave. `blocked_tools` is a *tool* control, so the seam
+  middleware chain could never carry it: that chain sits at the *model* boundary and
+  enforces budget, allowlist and PII. Blocked tools are now dropped before the strategy
+  runner sees them, which makes them neither offered to the model nor dispatchable, and
+  patterns are globbed with the same matcher the engine uses. Both paths resolve the
+  effective policy through one shared function, so an `Agent(...)` cannot mean one thing
+  in-process and another durable.
+
 ## 0.12.0 — 2026-08-22
 
 Enforcement and exactly-once correctness. The ADK's governance knobs were
@@ -42,6 +68,7 @@ The full ADK feature set. A plain `Agent` is now durable and governed by default
 ### Added
 
 - Governance on by default. `Agent(policy=, approval_required=, budget=, pii=, audit=, receipts=)`: a model allowlist, fail-closed budget caps, PII redaction at the model seam, a signed hash-chained audit record per action, and an AgentBoundary receipt per turn. Enforced on both `run()` and `run_durable()`.
+  (Corrected later: approval was **not** enforced on `run()` — it warned and ran ungated. See the Unreleased entry above.)
 - Sessions and memory. `Session` + a persistent `SessionStore` continue a conversation thread across runs and restarts; `memory=` wires the Engram bridge with an automatic, governed retrieve/record loop keyed by the session.
 - Team multi-agent API: `Sequential`, `Parallel` (with `MergeStrategy`), `Team` (coordinator), and `Loop`. Each sub-agent runs as its own governed durable execution; `run()` / `run_durable()` return a `TeamResult` with per-agent isolation.
 - `agent.deploy(runtime="local" | "self-host" | "cloud" | "<url>")` and `Team.deploy(...)`: ship the same compiled IR to any runtime over the durable engine. Artifacts API (`POST/GET /artifacts`).

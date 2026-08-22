@@ -31,12 +31,18 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-import warnings
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from jamjet.agents.governance import UNSET, Budget, GovernanceConfig, _Unset, normalize_governance
+from jamjet.agents.governance import (
+    UNSET,
+    Budget,
+    GovernanceConfig,
+    _Unset,
+    normalize_governance,
+    require_enforceable_approval,
+)
 from jamjet.agents.session import Session, SessionStore, persist_session_turn, seed_messages_for_run
 from jamjet.compiler.strategies import StrategyLimits
 from jamjet.runtime.local import LocalRuntime
@@ -572,20 +578,12 @@ class Agent:
         # a stale or hostile worker build.  Do not restate any of it as a
         # property of the code below: nothing here inherits it.
         #
-        # Fail LOUD rather than silently no-op so the developer knows approval
-        # won't fire here.  See follow-up F-t3-inprocess-approval for full
-        # in-process enforcement.
-        ar = self.governance.approval_required
-        if ar is not False and ar != []:
-            warnings.warn(
-                f"Agent {self.name!r}: approval_required is set but agent.run() uses "
-                "the in-process path, which does not enforce approval gates. "
-                "Use agent.run_durable(), where the engine evaluates every tool call "
-                "against policy server-side, before any worker receives the payload. "
-                "Follow-up: F-t3-inprocess-approval.",
-                UserWarning,
-                stacklevel=2,
-            )
+        # Fail CLOSED, early, so a caller sees the refusal before any session or
+        # audit setup happens. The authoritative check is the identical one at
+        # the executor chokepoint (`_run_agent`), which also covers callers who
+        # reach LocalRuntime.execute() directly — one function, two call sites,
+        # so the two cannot drift.
+        require_enforceable_approval(self.governance, where=f"Agent {self.name!r}.run()")
 
         # T4-2/T4-3: resolve session + memory and build the seed messages.  The
         # seed carries the session thread (T4-2) plus, when memory is on, the

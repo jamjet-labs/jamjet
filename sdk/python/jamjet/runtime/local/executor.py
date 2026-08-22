@@ -112,6 +112,25 @@ class LocalRuntime:
         adapter = get_adapter(spec.llm, governance)
         runner = get_strategy_runner(spec.strategy.name)
         tool_calls_log: list[dict[str, Any]] = []
+
+        # blocked_tools is a TOOL control, so the seam adapter above cannot carry
+        # it: that chain sits at the MODEL boundary and enforces budget /
+        # allowlist / PII. Nothing enforced blocked_tools here, so a tool the
+        # policy forbids ran normally on agent.run() while being refused on
+        # run_durable() — silently, without even the warning approval_required
+        # gets.
+        #
+        # Dropping the tool before the runner sees it closes both halves at once:
+        # every strategy builds its dispatch table from `spec.tools`
+        # (`resolve_tool_map`), so a blocked tool is neither offered to the model
+        # nor resolvable if one is asked for anyway.
+        # The chokepoint for BOTH tool controls. LocalRuntime is public, so a
+        # gate that lived only in Agent.run() left `LocalRuntime.execute(...,
+        # governance=...)` running approval-gated agents ungated.
+        from jamjet.agents.governance import require_enforceable_approval
+
+        require_enforceable_approval(governance, where="LocalRuntime in-process run")
+        spec = self._apply_blocked_tools(spec, governance)
         openai_tools = [self._tool_to_openai_schema(t) for t in spec.tools]
         prompt = input if isinstance(input, str) else json.dumps(input)
         output = await runner(
@@ -222,6 +241,30 @@ class LocalRuntime:
             duration_ms=duration_ms,
         )
         return output, [record], [], []
+
+    @staticmethod
+    def _apply_blocked_tools(spec: Any, governance: Any | None) -> Any:
+        """Return *spec* with policy-blocked tools removed.
+
+        Patterns are globs matched with the same matcher the engine uses
+        (`glob_match` in `runtime/policy/src/lib.rs`), and the policy is resolved
+        with the same function the durable path compiles into the IR, so a given
+        `Agent(...)` cannot mean one thing in-process and another durable.
+        """
+        if governance is None:
+            return spec
+        from jamjet.compiler.agent_ir import effective_policy
+        from jamjet.model.middleware import _glob_match
+
+        policy = effective_policy(governance)
+        patterns = list((policy or {}).get("blocked_tools") or [])
+        if not patterns:
+            return spec
+
+        kept = [t for t in spec.tools if not any(_glob_match(pat, t.name) for pat in patterns)]
+        if len(kept) == len(spec.tools):
+            return spec
+        return spec.model_copy(update={"tools": kept})
 
     async def _run_workflow(
         self,

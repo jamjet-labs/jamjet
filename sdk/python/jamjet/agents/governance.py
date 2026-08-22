@@ -86,7 +86,9 @@ class GovernanceConfig:
                      ``["delete_*", "send_*"]``).
         Enforced engine-side on the DURABLE path (``agent.run_durable``) only.
         The in-process ``agent.run()`` path has no policy engine in its loop and
-        CANNOT enforce a gate; it warns loudly instead (F-t3-inprocess-approval).
+        CANNOT enforce a gate: it refuses with ``ApprovalNotEnforceableError``
+        rather than running ungated. ``run_durable()`` is the enforceable path,
+        where the engine decides before any worker receives the payload.
         The mechanism — and why it holds even against an untrusted worker — is
         documented once, at the warning site in :meth:`jamjet.Agent.run`.
     budget
@@ -223,3 +225,41 @@ def _parse_approval_required(value: ApprovalRequired) -> ApprovalRequired:
             raise TypeError("approval_required list entries must be strings (tool-name globs)")
         return list(value)
     raise TypeError(f"approval_required must be bool or list[str] — got {type(value).__name__!r}")
+
+
+class ApprovalNotEnforceableError(RuntimeError):
+    """Raised when an approval gate is declared on a path that cannot hold a run.
+
+    The in-process path executes tools directly, with no policy engine between
+    the model and the call, so a gate can be neither evaluated nor held there.
+    Raising is the fail-closed answer: an approval gate that silently does not
+    exist is worse than a run that does not start.
+    """
+
+
+def require_enforceable_approval(governance: object | None, *, where: str) -> None:
+    """Refuse if *governance* declares an approval gate this path cannot honour.
+
+    Keyed on the RESOLVED policy rather than on ``approval_required`` alone,
+    because the same control has two spellings: ``approval_required=[...]`` and
+    ``policy={"require_approval_for": [...]}``. Checking only the first left the
+    second running ungated — the same half-fix this function exists to prevent.
+
+    Called at the executor chokepoint, so it also covers callers who reach
+    ``LocalRuntime.execute(..., governance=...)`` directly instead of going
+    through ``Agent.run()``.
+    """
+    if governance is None:
+        return
+    from jamjet.compiler.agent_ir import effective_policy
+
+    policy = effective_policy(governance)  # type: ignore[arg-type]
+    if not (policy or {}).get("require_approval_for"):
+        return
+    raise ApprovalNotEnforceableError(
+        f"{where}: an approval gate is declared (require_approval_for="
+        f"{(policy or {}).get('require_approval_for')!r}), but the in-process path "
+        "cannot hold a run at a gate. Use run_durable(), where the engine evaluates "
+        "every tool call against policy before any worker receives the payload. To "
+        "run without gates deliberately, remove the approval rules."
+    )
