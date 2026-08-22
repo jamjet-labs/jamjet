@@ -70,6 +70,7 @@ from jamjet.team import Loop, Parallel, Sequential, Team, TeamResult
 from jamjet.tools.decorators import tool
 from jamjet.workflow.workflow import Workflow
 from jamjet.decorators import DurableAgent, workflow  # noqa: F401, E402
+from jamjet.agents.governance import ApprovalNotEnforceableError  # noqa: F401, E402
 from jamjet.gate import PolicyDeniedError, gate, stderr_emitter  # noqa: F401, E402
 # isort: on
 
@@ -104,6 +105,7 @@ __all__ = [
     "ToolSpec",
     "Workflow",
     "WorkflowSpec",
+    "ApprovalNotEnforceableError",
     "PolicyDeniedError",
     "durable",
     "durable_run",
@@ -132,4 +134,4 @@ def __dir__() -> list[str]:  # noqa: ANN201
     return list(set(globals()) | set(__all__))
 
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"

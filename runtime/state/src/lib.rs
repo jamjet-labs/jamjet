@@ -24,12 +24,14 @@ pub use artifact::{
     DEFAULT_SPILL_THRESHOLD,
 };
 pub use backend::{
-    ApiToken, ApprovalProjectionRow, BackendResult, ReclaimResult, StateBackend, StateBackendError,
-    WorkItem, WorkItemId, WorkflowDefinition,
+    ApiToken, ApprovalProjectionRow, BackendResult, FailOutcome, ReclaimResult, ReserveOutcome,
+    StateBackend, StateBackendError, WorkItem, WorkItemId, WorkflowDefinition,
 };
-pub use budget::BudgetState;
+pub use budget::{BudgetState, BudgetTrip};
 pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};
-pub use hashing::{canonical_json, content_hash, sha256_hex};
+pub use hashing::{
+    canonical_json, content_hash, derive_idempotency_key, idempotency_key, sha256_hex,
+};
 pub use materializer::{
     apply_events, apply_events_seeded, materialize, should_snapshot, MaterializedState,
 };

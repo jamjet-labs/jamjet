@@ -722,3 +722,250 @@ async fn set_store_term_at_least_monotonic_in_memory() {
     assert_eq!(db.set_store_term_at_least(4), 7); // lower is a no-op
     assert_eq!(db.set_store_term_at_least(9), 9);
 }
+
+// ── Work-item lifecycle: attempts and the reclaim race ───────────────────────
+
+/// A node that reliably kills its worker must EXHAUST its attempts, not loop.
+///
+/// `claim_work_item` expires stale leases itself, and that fast path races the
+/// scheduler's reclaim sweep — the only other place attempts increment — and
+/// normally wins, because it runs on every poll while the sweep runs on an
+/// interval. When it reset the item without incrementing, the item came back at
+/// attempt 0 forever: max_attempts unreachable, dead-letter never entered, loop
+/// unbounded. This walks the exact loop and asserts it terminates.
+#[tokio::test]
+async fn claim_side_lease_expiry_consumes_attempts() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let eid = ExecutionId::new();
+    db.create_execution(sample_execution(&eid)).await.unwrap();
+    let mut item = sample_item(&eid);
+    item.max_attempts = 3;
+    let item_id = item.id;
+    db.enqueue_work_item(item).await.unwrap();
+
+    // Attempt 0: claim, then die without settling.
+    let first = db
+        .claim_work_item("worker-dies", &["model"])
+        .await
+        .unwrap()
+        .expect("first claim");
+    assert_eq!(first.attempt, 0);
+    db.force_lease_expired_for_test(item_id).await.unwrap();
+
+    // Attempt 1: the claim-side expiry must have consumed an attempt.
+    let second = db
+        .claim_work_item("worker-dies", &["model"])
+        .await
+        .unwrap()
+        .expect("second claim");
+    assert_eq!(
+        second.attempt, 1,
+        "the claim-side lease expiry must consume an attempt, or the node loops forever"
+    );
+    db.force_lease_expired_for_test(item_id).await.unwrap();
+
+    // Attempt 2 is the last one under max_attempts = 3.
+    let third = db
+        .claim_work_item("worker-dies", &["model"])
+        .await
+        .unwrap()
+        .expect("third claim");
+    assert_eq!(third.attempt, 2);
+    db.force_lease_expired_for_test(item_id).await.unwrap();
+
+    // Budget spent: the fast path must NOT resurrect it. The item stays
+    // 'claimed' with an expired lease, which is exactly what the reclaim sweep
+    // selects — so the sweep dead-letters it, WITH the NodeFailed only the
+    // sweep's caller can emit.
+    let fourth = db.claim_work_item("worker-dies", &["model"]).await.unwrap();
+    assert!(
+        fourth.is_none(),
+        "an item that has spent its attempts must not be handed out again"
+    );
+
+    let reclaimed = db.reclaim_expired_leases().await.unwrap();
+    assert_eq!(
+        reclaimed.exhausted.len(),
+        1,
+        "the sweep must dead-letter it so a NodeFailed is emitted"
+    );
+    assert!(reclaimed.retryable.is_empty());
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The reclaim sweep must never resurrect an item settled under it.
+///
+/// The sweep does ONE SELECT for every expired item, then UPDATEs them one at a
+/// time. A worker that commits inside that loop used to have its COMPLETED item
+/// flipped back to pending by an unguarded `WHERE id = ?`, then re-claimed and
+/// re-run at a shifted step ordinal — a different idempotency key, so the replay
+/// guard did not catch it and the side effect fired twice.
+///
+/// Opening the window deterministically takes volume: a settle done BEFORE the
+/// call also changes `status`, which the sweep\'s own SELECT then filters out, so
+/// nothing races. With many expired items the update loop is long enough for a
+/// concurrent settle to land inside it, against a row the SELECT already
+/// captured. Verified to fail against the unguarded UPDATE before being kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reclaim_cannot_resurrect_an_item_settled_under_it() {
+    const ITEMS: usize = 400;
+
+    let path = temp_db_path();
+    let db = std::sync::Arc::new(open_db(&path).await);
+    let eid = ExecutionId::new();
+    db.create_execution(sample_execution(&eid)).await.unwrap();
+
+    // Every item is expired and claimed, so the sweep captures all of them.
+    let mut ids = Vec::with_capacity(ITEMS);
+    for _ in 0..ITEMS {
+        let item = sample_item(&eid);
+        let id = item.id;
+        db.enqueue_work_item(item).await.unwrap();
+        ids.push(id);
+    }
+    let mut fences = Vec::with_capacity(ITEMS);
+    for _ in 0..ITEMS {
+        let c = db
+            .claim_work_item("worker-slow", &["model"])
+            .await
+            .unwrap()
+            .expect("claim");
+        fences.push((c.id, c.lease_fence));
+        db.force_lease_expired_for_test(c.id).await.unwrap();
+    }
+
+    // Settle the LAST items the sweep will reach, while it is still working
+    // through the earlier ones.
+    let victims: Vec<(uuid::Uuid, i64)> = fences.iter().rev().take(40).copied().collect();
+    let settler = {
+        let db = db.clone();
+        let victims = victims.clone();
+        tokio::spawn(async move {
+            let mut settled = Vec::new();
+            for (id, fence) in victims {
+                if db.complete_work_item_fenced(id, fence).await.unwrap() {
+                    settled.push(id);
+                }
+            }
+            settled
+        })
+    };
+
+    let reclaimed = db.reclaim_expired_leases().await.unwrap();
+    let settled = settler.await.unwrap();
+
+    // Whatever the interleaving, an item whose completion won its fence is
+    // finished: it must not be back in the queue, and must not be reported as
+    // reclaimed, because the caller emits NodeFailed from those lists.
+    let reported: std::collections::HashSet<uuid::Uuid> = reclaimed
+        .retryable
+        .iter()
+        .chain(reclaimed.exhausted.iter())
+        .map(|i| i.id)
+        .collect();
+    for id in &settled {
+        assert!(
+            !reported.contains(id),
+            "a COMPLETED item was reported as reclaimed ({id}) — its node \
+             succeeded, and the caller will now emit NodeFailed for it"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(&db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "completed",
+            "a COMPLETED item was resurrected to {status:?} ({id}) — it will be \
+             re-claimed and fire its side effect a second time"
+        );
+    }
+    assert!(
+        !settled.is_empty(),
+        "the race never opened; the test proved nothing"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── Stale fences after a requeue ─────────────────────────────────────────────
+
+/// A worker that just failed its item must not be able to park the requeue.
+///
+/// `fail_work_item_fenced`'s retryable branch puts the item back to `pending`.
+/// It used to leave `lease_fence` at the failing worker's value, and
+/// `park_work_item` matched on `id` + `lease_fence` with no status guard — so
+/// the worker that had just lost the item could park it, overwriting the
+/// `attempt` and `retry_after` of an attempt that is no longer its own.
+///
+/// Two independent guards now close it: the requeue clears the fence (as
+/// `park_work_item` itself always did), and park requires the item to still be
+/// claimed.
+#[tokio::test]
+async fn a_failed_worker_cannot_park_its_requeued_item() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let eid = ExecutionId::new();
+    db.create_execution(sample_execution(&eid)).await.unwrap();
+    let item = sample_item(&eid);
+    let item_id = item.id;
+    db.enqueue_work_item(item).await.unwrap();
+
+    let claimed = db
+        .claim_work_item("worker-A", &["model"])
+        .await
+        .unwrap()
+        .expect("claim");
+
+    // The worker reports a failure; attempts remain, so the item is requeued.
+    let outcome = db
+        .fail_work_item_fenced(item_id, claimed.lease_fence, "boom")
+        .await
+        .unwrap()
+        .expect("the fence matched, so it settles");
+    assert!(matches!(
+        outcome,
+        jamjet_state::backend::FailOutcome::Retryable { .. }
+    ));
+
+    // Same worker, same (now stale) fence, tries to park what it no longer owns.
+    let parked = db
+        .park_work_item(
+            item_id,
+            claimed.lease_fence,
+            "2030-01-01T00:00:00+00:00",
+            99,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !parked,
+        "a worker that already failed this item must not park the requeue — it \
+         would overwrite the attempt and retry_after of an attempt that is not its own"
+    );
+
+    // And the requeued attempt is intact. Asserted on the row rather than by
+    // re-claiming: the retryable branch sets a backoff, so the item is
+    // deliberately NOT claimable yet, and a claim here would test the backoff
+    // instead of the clobber.
+    let (status, attempt, fence): (String, i64, i64) =
+        sqlx::query_as("SELECT status, attempt, lease_fence FROM work_items WHERE id = ?")
+            .bind(item_id.to_string())
+            .fetch_one(&db.pool())
+            .await
+            .unwrap();
+    assert_eq!(status, "pending", "the item is requeued");
+    assert_eq!(
+        attempt, 1,
+        "the failed attempt was consumed once — a successful park would have \
+         overwritten this with its own next_attempt"
+    );
+    assert_eq!(
+        fence, 0,
+        "the requeue must clear the stale fence, exactly as park_work_item does"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}

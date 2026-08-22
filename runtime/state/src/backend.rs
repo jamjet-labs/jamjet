@@ -182,6 +182,59 @@ pub trait StateBackend: Send + Sync {
     /// `NodeCompleted` with `idempotency_key = Some(k)`.
     async fn get_tool_effect(&self, key: &str) -> BackendResult<Option<serde_json::Value>>;
 
+    /// Claim an idempotency key BEFORE running the effect it names.
+    ///
+    /// [`Self::get_tool_effect`] can only answer "did this already run to
+    /// COMPLETION". Between two live work items for the same node both read
+    /// `None` and both fire, so the side effect happens twice — check-then-fire.
+    /// This is the reservation the spec calls load-bearing: whoever wins runs the
+    /// effect, and everyone else waits for its result instead of repeating it.
+    ///
+    /// Atomic and fail-safe by construction: it is a single conditional upsert,
+    /// so there is no window between testing for a holder and becoming one.
+    ///
+    /// `ttl` is what keeps a reservation from becoming a WORSE failure than the
+    /// double-fire it prevents. A worker that dies mid-tool leaves its row
+    /// behind; expiry is what lets the next worker take the key over instead of
+    /// the node being unrunnable forever. An expired reservation is therefore
+    /// acquirable, and this returns [`ReserveOutcome::Acquired`] for it.
+    ///
+    /// Reservations are consulted ONLY when no committed effect exists, so a row
+    /// left behind after a successful commit blocks nothing — the caller finds
+    /// the recorded result first and replays it.
+    async fn reserve_tool_effect(
+        &self,
+        key: &str,
+        execution_id: &ExecutionId,
+        node_id: &str,
+        owner: &str,
+        lease_fence: i64,
+        ttl: std::time::Duration,
+    ) -> BackendResult<ReserveOutcome>;
+
+    /// Give up a reservation this worker holds, without having recorded a result.
+    ///
+    /// A reservation left standing is not a correctness problem — it is
+    /// reentrant for its holder, and it lapses on its TTL — but until then a
+    /// DIFFERENT worker that picks the node up must wait it out. Releasing on a
+    /// path that ends without committing (a park, a failure) turns that wait
+    /// from minutes into nothing.
+    ///
+    /// Guarded by owner AND lease fence, because the owner alone is not enough.
+    /// Worker ids are configurable and reused, and `reserve_tool_effect` is
+    /// reentrant for the same owner — it REPLACES the reservation with the newer
+    /// lease. So an older attempt from the same worker id finishing late would
+    /// otherwise delete the NEWER attempt's reservation and let a third worker
+    /// acquire a key that is actively held. The fence is what distinguishes the
+    /// two attempts. A non-matching owner or fence is a silent no-op, like every
+    /// other fenced write here.
+    async fn release_tool_reservation(
+        &self,
+        key: &str,
+        owner: &str,
+        lease_fence: i64,
+    ) -> BackendResult<()>;
+
     // ── Content-addressed artifact store ─────────────────────────────────────
 
     /// Store bytes in the CAS, keyed by their SHA-256 hash.
@@ -243,8 +296,42 @@ pub trait StateBackend: Send + Sync {
         lease_fence: i64,
     ) -> BackendResult<bool>;
 
-    /// Mark a work item as failed. The scheduler will decide whether to retry.
+    /// Mark a work item as failed by writing the terminal `'failed'` status.
+    ///
+    /// WARNING — this settles the item and NOTHING ELSE. No `NodeFailed` is
+    /// appended, and no sweep ever selects `status = 'failed'`, so the scheduler
+    /// fold keeps the node in `scheduled` and the execution never reaches a
+    /// terminal state. It is the right call only where the caller emits the
+    /// terminal event itself.
+    ///
+    /// For a worker reporting that its node failed, use
+    /// [`Self::fail_work_item_fenced`], which applies the same retry and
+    /// dead-letter semantics as lease reclamation and tells the caller which
+    /// events to emit.
     async fn fail_work_item(&self, item_id: WorkItemId, error: &str) -> BackendResult<()>;
+
+    /// Fence-guarded failure of a claimed work item, with retry semantics.
+    ///
+    /// The failure counterpart of [`Self::complete_work_item_fenced`], and the
+    /// per-item counterpart of [`Self::reclaim_expired_leases`]: it applies the
+    /// SAME attempt/backoff/dead-letter rules that reclamation applies to a lease
+    /// that expired, so a worker that reports a failure and a worker that dies
+    /// holding the item converge on identical state and identical events.
+    ///
+    /// Returns `Ok(None)` — never an error — when the fence does not match or the
+    /// item is no longer `claimed`, exactly like `complete_work_item_fenced`, so a
+    /// reclaimed or replayed worker cannot fail an item it no longer owns or
+    /// double-emit its terminal event.
+    ///
+    /// The returned [`FailOutcome`] carries the updated item so the caller can
+    /// emit `NodeFailed` (and `RetryScheduled`) with the right attempt number
+    /// without re-reading it.
+    async fn fail_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>>;
 
     /// Atomically settle a work item, append the terminal event, and optionally
     /// compute and write a snapshot from the committed state, all in ONE
@@ -458,4 +545,41 @@ pub struct ReclaimResult {
     pub retryable: Vec<WorkItem>,
     /// Items that exhausted all attempts and were moved to dead-letter.
     pub exhausted: Vec<WorkItem>,
+}
+
+/// The result of trying to claim an idempotency key before firing its effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReserveOutcome {
+    /// The key is ours: no live reservation existed, or the previous holder's
+    /// TTL had lapsed and we took it over. Run the effect.
+    Acquired,
+    /// Another worker holds a LIVE reservation. Do NOT run the effect — wait for
+    /// its result instead. `expires_at` is when the claim lapses, which bounds
+    /// how long waiting can be worthwhile.
+    Held { owner: String, expires_at: String },
+}
+
+/// What a fenced failure did to the item, and the item as it now stands.
+///
+/// The caller emits the terminal events from this, so the variants mirror the
+/// two arms of [`ReclaimResult`] deliberately: a worker-reported failure and an
+/// expired lease must leave the same event trail, or the scheduler fold learns a
+/// different story depending on how the node died.
+#[derive(Debug, Clone)]
+pub enum FailOutcome {
+    /// Attempts remain: the item is back to `pending` with an incremented
+    /// attempt and a backoff, and a fresh lease epoch. Emit
+    /// `NodeFailed { retryable: true }` then `RetryScheduled`.
+    Retryable {
+        /// The item with its NEW attempt number.
+        item: Box<WorkItem>,
+        /// Backoff applied before the item becomes claimable again.
+        delay_ms: u64,
+    },
+    /// Attempts are spent: the item is dead-lettered. Emit
+    /// `NodeFailed { retryable: false }` and nothing else.
+    Exhausted {
+        /// The item with its FINAL attempt number.
+        item: Box<WorkItem>,
+    },
 }

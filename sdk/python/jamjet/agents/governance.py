@@ -11,6 +11,7 @@ No enforcement happens here; enforcement is added in later tasks.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
@@ -44,6 +45,31 @@ PolicyRef = str | dict | None
 ApprovalRequired = bool | list[str]
 
 
+class _Unset:
+    """Sentinel for "this governance knob was not passed".
+
+    A plain default cannot express it. `pii` defaults to `True`, so an agent that
+    explicitly asks for `pii=True` is indistinguishable from one that said nothing
+    — and `Team` used exactly that comparison to decide whether a sub-agent had
+    opted out of inheriting the team default. An explicit choice that happens to
+    equal the default was therefore silently overridden, including being turned
+    OFF by a team default of `pii=False`.
+    """
+
+    _instance = None
+
+    def __new__(cls) -> _Unset:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<unset>"
+
+
+UNSET = _Unset()
+
+
 @dataclass(frozen=True)
 class GovernanceConfig:
     """Immutable governance configuration attached to every Agent.
@@ -58,6 +84,13 @@ class GovernanceConfig:
         ``True``   – every tool call requires approval.
         ``list``   – tool-name globs that require approval (e.g.
                      ``["delete_*", "send_*"]``).
+        Enforced engine-side on the DURABLE path (``agent.run_durable``) only.
+        The in-process ``agent.run()`` path has no policy engine in its loop and
+        CANNOT enforce a gate: it refuses with ``ApprovalNotEnforceableError``
+        rather than running ungated. ``run_durable()`` is the enforceable path,
+        where the engine decides before any worker receives the payload.
+        The mechanism — and why it holds even against an untrusted worker — is
+        documented once, at the warning site in :meth:`jamjet.Agent.run`.
     budget
         Optional per-run spending cap.  ``None`` when uncapped.
     pii
@@ -88,6 +121,17 @@ class GovernanceConfig:
     pii: bool = True
     audit: bool = True
     receipts: bool = True
+    #: Names of the knobs the caller passed EXPLICITLY, whatever value they gave.
+    #:
+    #: Provenance, not value. `Team` inherits its default only into a sub-agent
+    #: that set nothing, and "set nothing" cannot be inferred by comparing values:
+    #: an agent that deliberately passed `pii=True` looks identical to one that
+    #: passed nothing at all.
+    #:
+    #: `compare=False` so it never affects equality — two configs with the same
+    #: values remain equal regardless of how they were reached — and `repr=False`
+    #: to keep it out of user-facing output.
+    explicit: frozenset[str] = dataclasses.field(default_factory=frozenset, compare=False, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +141,12 @@ class GovernanceConfig:
 
 def normalize_governance(
     *,
-    policy: PolicyRef = None,
-    approval_required: ApprovalRequired = False,
-    budget: Budget | float | int | dict | None = None,
-    pii: bool = True,
-    audit: bool = True,
-    receipts: bool = True,
+    policy: PolicyRef | _Unset = UNSET,
+    approval_required: ApprovalRequired | _Unset = UNSET,
+    budget: Budget | float | int | dict | None | _Unset = UNSET,
+    pii: bool | _Unset = UNSET,
+    audit: bool | _Unset = UNSET,
+    receipts: bool | _Unset = UNSET,
 ) -> GovernanceConfig:
     """Parse and validate governance kwargs into a frozen :class:`GovernanceConfig`.
 
@@ -118,16 +162,34 @@ def normalize_governance(
     * ``bool``        -> stored directly
     * ``list[str]``   -> stored directly (each entry is a tool-name glob)
     """
-    resolved_budget = _parse_budget(budget)
-    resolved_approval = _parse_approval_required(approval_required)
+    explicit = frozenset(
+        name
+        for name, value in (
+            ("policy", policy),
+            ("approval_required", approval_required),
+            ("budget", budget),
+            ("pii", pii),
+            ("audit", audit),
+            ("receipts", receipts),
+        )
+        if not isinstance(value, _Unset)
+    )
+
+    # Substitute the documented defaults for anything not passed. Resolved field
+    # by field rather than through a dict so each keeps its own type — a
+    # dict[str, object] would erase them and every call below would need a cast.
+    resolved_policy: PolicyRef = None if isinstance(policy, _Unset) else policy
+    resolved_approval_in: ApprovalRequired = False if isinstance(approval_required, _Unset) else approval_required
+    resolved_budget_in: Budget | float | int | dict | None = None if isinstance(budget, _Unset) else budget
 
     return GovernanceConfig(
-        policy=policy,
-        approval_required=resolved_approval,
-        budget=resolved_budget,
-        pii=pii,
-        audit=audit,
-        receipts=receipts,
+        policy=resolved_policy,
+        approval_required=_parse_approval_required(resolved_approval_in),
+        budget=_parse_budget(resolved_budget_in),
+        pii=True if isinstance(pii, _Unset) else bool(pii),
+        audit=True if isinstance(audit, _Unset) else bool(audit),
+        receipts=True if isinstance(receipts, _Unset) else bool(receipts),
+        explicit=explicit,
     )
 
 
@@ -163,3 +225,41 @@ def _parse_approval_required(value: ApprovalRequired) -> ApprovalRequired:
             raise TypeError("approval_required list entries must be strings (tool-name globs)")
         return list(value)
     raise TypeError(f"approval_required must be bool or list[str] — got {type(value).__name__!r}")
+
+
+class ApprovalNotEnforceableError(RuntimeError):
+    """Raised when an approval gate is declared on a path that cannot hold a run.
+
+    The in-process path executes tools directly, with no policy engine between
+    the model and the call, so a gate can be neither evaluated nor held there.
+    Raising is the fail-closed answer: an approval gate that silently does not
+    exist is worse than a run that does not start.
+    """
+
+
+def require_enforceable_approval(governance: object | None, *, where: str) -> None:
+    """Refuse if *governance* declares an approval gate this path cannot honour.
+
+    Keyed on the RESOLVED policy rather than on ``approval_required`` alone,
+    because the same control has two spellings: ``approval_required=[...]`` and
+    ``policy={"require_approval_for": [...]}``. Checking only the first left the
+    second running ungated — the same half-fix this function exists to prevent.
+
+    Called at the executor chokepoint, so it also covers callers who reach
+    ``LocalRuntime.execute(..., governance=...)`` directly instead of going
+    through ``Agent.run()``.
+    """
+    if governance is None:
+        return
+    from jamjet.compiler.agent_ir import effective_policy
+
+    policy = effective_policy(governance)  # type: ignore[arg-type]
+    if not (policy or {}).get("require_approval_for"):
+        return
+    raise ApprovalNotEnforceableError(
+        f"{where}: an approval gate is declared (require_approval_for="
+        f"{(policy or {}).get('require_approval_for')!r}), but the in-process path "
+        "cannot hold a run at a gate. Use run_durable(), where the engine evaluates "
+        "every tool call against policy before any worker receives the payload. To "
+        "run without gates deliberately, remove the approval rules."
+    )

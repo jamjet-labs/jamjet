@@ -9,6 +9,69 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Dropped `hyper 0.14` and `h2 0.3.x` from the tree** (RUSTSEC-2026-0258, h2 unbounded
+  empty DATA frames). The OTLP stack moved from opentelemetry 0.22 / tonic 0.11 to
+  opentelemetry 0.32 / tonic 0.14, which was the only thing holding the pre-1.x hyper
+  line in. The `cargo audit` suppression is removed, and the unused workspace `tonic`
+  dependency is gone with it.
+
+  The suppression's own risk note was too generous: it read the advisory as not
+  flagging the `h2 0.4.15` used by the inbound-facing servers, but the advisory patches
+  at `>= 0.4.16` with no unaffected range, so those were in scope too. The tree now
+  resolves `h2 0.4.18`.
+
+  CI's tripwire is replaced rather than deleted: it used to police the *exception*, and
+  now asserts the *fix* — `h2 0.3.x` and `hyper 0.14` must stay out of the tree, so a
+  future dependency bump cannot quietly bring the line back.
+
+---
+
+## 0.5.0 - 2026-08-22
+
+Durability and enforcement hardening across the engine seam. Everything below is
+about the boundary where an external worker meets the engine — the path that
+carries every ADK tool call, since `python_tool` and `java_tool` nodes run with
+no in-process worker.
+
+### Fixed
+
+- **A worker-reported tool failure no longer strands its workflow.** `POST /work-items/:id/fail`
+  wrote a status no sweep selects and emitted nothing, so the scheduler kept the node
+  scheduled and the execution never reached a terminal state. It is now fenced and
+  emits `NodeFailed` / `RetryScheduled` with real retry semantics.
+- **`/work-items/:id/complete` settles and emits in one transaction.** It was four
+  disjoint operations; a crash between the settle and the append wedged the execution
+  permanently.
+- **A forged zero lease fence can no longer complete an unclaimed item.** `commit_turn`
+  had no `status = 'claimed'` guard and pending rows carry `lease_fence = 0`.
+- **Duplicate completions closed on the external HTTP path**, which was unfenced while
+  the in-process path was not.
+- **Approval-hold settles are fenced**, and a zombie `NodeStarted` from a worker whose
+  lease was stolen no longer wedges a run forever.
+- **Claim-side lease expiry consumes an attempt** and the reclaim writes are guarded, so
+  an item cannot retry indefinitely without counting.
+- **Fail closed when a tenant record is unreadable** rather than resolving to allow.
+- **A provider-only allowlist entry matches on the durable path**, so `["anthropic"]`
+  means the same thing in-process and durable.
+- **NaN cost no longer slips past a budget ceiling.**
+
+### Added
+
+- **Reserve-before-fire.** An idempotency key is reserved before its effect fires, with
+  a lease-like TTL; a worker that loses the race retries once, then polls for the
+  winner's result.
+- **Idempotency keys for the external tool tier.** The claim derives and hands out the
+  key, the worker echoes it on completion, and the effect is recorded against it — so
+  the replay guard covers both transports rather than the in-process one only. Both
+  paths derive the key through one shared function.
+- **`java_tool` queue and `JavaFn` node**, enabling durable Java tool execution.
+
+### Changed
+
+- Workspace crates move to 0.5.0 together; sibling dependencies are pinned exactly.
+
 ---
 
 ## 0.10.2 - 2026-06-12

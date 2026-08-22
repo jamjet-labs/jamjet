@@ -13,7 +13,7 @@ use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::tenant::{Tenant, TenantStatus};
 use jamjet_state::{
     backend::{StateBackend, WorkItem},
-    Event, EventKind, InMemoryBackend, SqliteBackend, TenantId,
+    Event, EventKind, InMemoryBackend, ReserveOutcome, SqliteBackend, TenantId,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -582,5 +582,330 @@ async fn tenant_scoped_tool_effect_round_trip() {
     assert!(
         other.is_none(),
         "tenant-b must not see tenant-a's tool_effect"
+    );
+}
+
+// ── Reserve-before-fire (spec Move 4b) ───────────────────────────────────────
+
+/// Two workers racing for one idempotency key: exactly one may fire.
+///
+/// `get_tool_effect` only answers "did this run to COMPLETION", so before the
+/// reservation existed both workers read `None` and both ran the effect. That is
+/// check-then-fire, and duplicate live items for one node are producible today
+/// (retry crash window, approval-hold resurrection, public POST /work-items).
+#[tokio::test]
+async fn only_one_worker_can_claim_an_idempotency_key() {
+    let db = open_test_db().await;
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    let first = db
+        .reserve_tool_effect("k1", &eid, "n1", "worker-A", 1, ttl)
+        .await
+        .unwrap();
+    assert_eq!(first, ReserveOutcome::Acquired);
+
+    let second = db
+        .reserve_tool_effect("k1", &eid, "n1", "worker-B", 2, ttl)
+        .await
+        .unwrap();
+    match second {
+        ReserveOutcome::Held { owner, .. } => assert_eq!(owner, "worker-A"),
+        ReserveOutcome::Acquired => {
+            panic!("two workers acquired the same key — the effect will fire twice")
+        }
+    }
+}
+
+/// The reservation is REENTRANT for its own holder.
+///
+/// It exists to exclude a SECOND worker, not to lock a worker out of its own
+/// node. A retry is the same logical attempt: the item is re-claimed by the same
+/// worker and runs again, and a node that fails WITHOUT recording a tool effect
+/// leaves its reservation standing. Blocking the holder would stall every such
+/// retry for the whole TTL.
+///
+/// This was originally written to assert the opposite, and the engine's own
+/// continue-as-new retry tests caught it — they deadlocked against a reservation
+/// their own worker held.
+#[tokio::test]
+async fn a_reservation_is_reentrant_for_its_holder() {
+    let db = open_test_db().await;
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    assert_eq!(
+        db.reserve_tool_effect("k2", &eid, "n1", "worker-A", 1, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired
+    );
+    assert_eq!(
+        db.reserve_tool_effect("k2", &eid, "n1", "worker-A", 2, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired,
+        "the holder must be able to retry its own node"
+    );
+    assert!(matches!(
+        db.reserve_tool_effect("k2", &eid, "n1", "worker-B", 3, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Held { .. }
+    ));
+}
+
+/// An EXPIRED reservation must be takeable, or a worker that dies mid-tool
+/// leaves the key unrunnable forever — a worse failure than the double-fire the
+/// reservation replaced.
+#[tokio::test]
+async fn an_expired_reservation_can_be_taken_over() {
+    let db = open_test_db().await;
+    let eid = ExecutionId::new();
+
+    // A TTL of zero is already lapsed by the time the next call reads it.
+    assert_eq!(
+        db.reserve_tool_effect(
+            "k3",
+            &eid,
+            "n1",
+            "worker-dead",
+            1,
+            std::time::Duration::ZERO
+        )
+        .await
+        .unwrap(),
+        ReserveOutcome::Acquired
+    );
+
+    let taken = db
+        .reserve_tool_effect(
+            "k3",
+            &eid,
+            "n1",
+            "worker-B",
+            2,
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        taken,
+        ReserveOutcome::Acquired,
+        "a lapsed reservation must be reclaimable, or a dead worker wedges the key"
+    );
+
+    // And having taken it, B now holds it against everyone else.
+    assert!(matches!(
+        db.reserve_tool_effect(
+            "k3",
+            &eid,
+            "n1",
+            "worker-C",
+            3,
+            std::time::Duration::from_secs(300)
+        )
+        .await
+        .unwrap(),
+        ReserveOutcome::Held { .. }
+    ));
+}
+
+/// Different keys never contend — the reservation is per idempotency key, not a
+/// global lock on the node or the execution.
+#[tokio::test]
+async fn distinct_keys_do_not_contend() {
+    let db = open_test_db().await;
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    for key in ["a", "b", "c"] {
+        assert_eq!(
+            db.reserve_tool_effect(key, &eid, "n1", "worker-A", 1, ttl)
+                .await
+                .unwrap(),
+            ReserveOutcome::Acquired,
+            "key {key} should not have contended"
+        );
+    }
+}
+
+/// The in-memory backend must reserve identically.
+///
+/// Memory-only coverage is how the SQLite-vs-memory divergence class hides (the
+/// claim-side lease expiry existed only in SQLite for exactly that reason), and
+/// the inverse is just as bad: a dev/test backend that hands the same key to two
+/// workers makes every double-fire test pass while proving nothing.
+#[tokio::test]
+async fn the_in_memory_backend_reserves_identically() {
+    let db = InMemoryBackend::new();
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    assert_eq!(
+        db.reserve_tool_effect("k", &eid, "n1", "worker-A", 1, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired
+    );
+    match db
+        .reserve_tool_effect("k", &eid, "n1", "worker-B", 2, ttl)
+        .await
+        .unwrap()
+    {
+        ReserveOutcome::Held { owner, .. } => assert_eq!(owner, "worker-A"),
+        ReserveOutcome::Acquired => panic!("in-memory handed the same key to two workers"),
+    }
+
+    // Expiry behaves the same way.
+    assert_eq!(
+        db.reserve_tool_effect("gone", &eid, "n1", "dead", 1, std::time::Duration::ZERO)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired
+    );
+    assert_eq!(
+        db.reserve_tool_effect("gone", &eid, "n1", "worker-B", 2, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired,
+        "a lapsed in-memory reservation must also be reclaimable"
+    );
+}
+
+/// Concurrency, not just sequence: 32 workers race for one key and exactly one
+/// may win. A sequential test cannot distinguish a real atomic claim from a
+/// get-then-insert that simply has not been raced yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn exactly_one_of_many_concurrent_claimants_wins() {
+    let db = std::sync::Arc::new(open_test_db().await);
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    let mut handles = Vec::new();
+    for i in 0..32 {
+        let db = db.clone();
+        let eid = eid.clone();
+        handles.push(tokio::spawn(async move {
+            matches!(
+                db.reserve_tool_effect("hot", &eid, "n1", &format!("worker-{i}"), i, ttl)
+                    .await
+                    .unwrap(),
+                ReserveOutcome::Acquired
+            )
+        }));
+    }
+
+    let mut winners = 0;
+    for h in handles {
+        if h.await.unwrap() {
+            winners += 1;
+        }
+    }
+    assert_eq!(
+        winners, 1,
+        "exactly one worker may fire the effect; {winners} were told the key was theirs"
+    );
+}
+
+/// A released reservation is immediately available to another worker.
+///
+/// Parking or failing ends an attempt WITHOUT recording an effect, so the
+/// reservation must not outlive it. It is reentrant for its holder and lapses on
+/// its TTL either way, but until then a DIFFERENT worker picking the node up
+/// would wait out the remaining TTL for a key nobody is working on.
+#[tokio::test]
+async fn releasing_a_reservation_frees_it_immediately() {
+    let db = open_test_db().await;
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    assert_eq!(
+        db.reserve_tool_effect("rel", &eid, "n1", "worker-A", 1, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired
+    );
+    assert!(matches!(
+        db.reserve_tool_effect("rel", &eid, "n1", "worker-B", 2, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Held { .. }
+    ));
+
+    db.release_tool_reservation("rel", "worker-A", 1)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.reserve_tool_effect("rel", &eid, "n1", "worker-B", 2, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired,
+        "a released key must be takeable at once, not after the TTL"
+    );
+}
+
+/// Only the holder may release. A worker whose lease was stolen must not be able
+/// to free the key for the worker that took over — that would hand a live
+/// reservation to a third party.
+#[tokio::test]
+async fn a_non_holder_cannot_release_someone_elses_reservation() {
+    let db = open_test_db().await;
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    db.reserve_tool_effect("guarded", &eid, "n1", "worker-A", 1, ttl)
+        .await
+        .unwrap();
+
+    // A stale worker tries to free it.
+    db.release_tool_reservation("guarded", "worker-stale", 1)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            db.reserve_tool_effect("guarded", &eid, "n1", "worker-C", 3, ttl)
+                .await
+                .unwrap(),
+            ReserveOutcome::Held { .. }
+        ),
+        "a non-holder's release must be a no-op — A still owns this key"
+    );
+}
+
+/// The in-memory backend must release identically, or every worker test runs
+/// against different semantics from production.
+#[tokio::test]
+async fn the_in_memory_backend_releases_identically() {
+    let db = InMemoryBackend::new();
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    db.reserve_tool_effect("m", &eid, "n1", "worker-A", 1, ttl)
+        .await
+        .unwrap();
+    db.release_tool_reservation("m", "worker-stale", 1)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            db.reserve_tool_effect("m", &eid, "n1", "worker-B", 2, ttl)
+                .await
+                .unwrap(),
+            ReserveOutcome::Held { .. }
+        ),
+        "a non-holder's release must be a no-op in memory too"
+    );
+
+    db.release_tool_reservation("m", "worker-A", 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.reserve_tool_effect("m", &eid, "n1", "worker-B", 2, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired
     );
 }

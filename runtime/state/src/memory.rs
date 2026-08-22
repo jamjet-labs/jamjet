@@ -4,8 +4,8 @@
 //! quick prototyping where durability is not needed.
 
 use crate::backend::{
-    ApiToken, BackendResult, ReclaimResult, StateBackend, StateBackendError, WorkItem, WorkItemId,
-    WorkflowDefinition,
+    ApiToken, BackendResult, FailOutcome, ReclaimResult, ReserveOutcome, StateBackend,
+    StateBackendError, WorkItem, WorkItemId, WorkflowDefinition,
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
@@ -41,6 +41,8 @@ pub struct InMemoryBackend {
     /// Idempotency cache: idempotency_key -> result_json.
     /// Mirrors the `tool_effects` table in the SQLite backends.
     tool_effects: DashMap<String, serde_json::Value>,
+    /// Reservations: idempotency key -> (owner, lease_fence, expires_at).
+    tool_reservations: DashMap<String, (String, i64, chrono::DateTime<Utc>)>,
     /// Projected approval read-model. Key = (execution_id as String, node_id).
     proj_approvals: DashMap<(String, String), crate::backend::ApprovalProjectionRow>,
     /// Projector checkpoints. Key = (projection_name, execution_id as String).
@@ -64,6 +66,7 @@ impl InMemoryBackend {
             lease_epochs: DashMap::new(),
             store_term: AtomicI64::new(0),
             tool_effects: DashMap::new(),
+            tool_reservations: DashMap::new(),
             proj_approvals: DashMap::new(),
             projector_checkpoints: DashMap::new(),
             artifacts: DashMap::new(),
@@ -331,6 +334,62 @@ impl StateBackend for InMemoryBackend {
     }
 
     // ── Idempotency cache ─────────────────────────────────────────────────
+
+    async fn release_tool_reservation(
+        &self,
+        key: &str,
+        owner: &str,
+        _lease_fence: i64,
+    ) -> BackendResult<()> {
+        // Owner-guarded remove: `remove_if` holds the shard lock across the
+        // predicate, so a stale worker cannot free a key another worker took over
+        // in the gap between checking and removing.
+        self.tool_reservations
+            .remove_if(&key.to_string(), |_k, (holder, fence, _)| {
+                holder == owner && *fence == _lease_fence
+            });
+        Ok(())
+    }
+
+    async fn reserve_tool_effect(
+        &self,
+        key: &str,
+        _execution_id: &ExecutionId,
+        _node_id: &str,
+        owner: &str,
+        lease_fence: i64,
+        ttl: std::time::Duration,
+    ) -> BackendResult<ReserveOutcome> {
+        let now = Utc::now();
+        let expires_at =
+            now + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::minutes(5));
+
+        // `entry` holds the shard lock across the whole test-and-set, which is
+        // what makes this atomic in the same way the SQL upsert is. A get-then-
+        // insert would reopen the exact race the reservation exists to close.
+        use dashmap::mapref::entry::Entry;
+        match self.tool_reservations.entry(key.to_string()) {
+            Entry::Vacant(v) => {
+                v.insert((owner.to_string(), lease_fence, expires_at));
+                Ok(ReserveOutcome::Acquired)
+            }
+            Entry::Occupied(mut o) => {
+                let (holder, _, holder_expiry) = o.get().clone();
+                if holder == owner || holder_expiry <= now {
+                    // Reentrant for the holder, or lapsed and presumed dead.
+                    // Either way the reservation is REPLACED, so it now carries
+                    // the newer fence — which is what makes a late release from
+                    // the older attempt a no-op.
+                    o.insert((owner.to_string(), lease_fence, expires_at));
+                    return Ok(ReserveOutcome::Acquired);
+                }
+                Ok(ReserveOutcome::Held {
+                    owner: holder,
+                    expires_at: holder_expiry.to_rfc3339(),
+                })
+            }
+        }
+    }
 
     async fn get_tool_effect(&self, key: &str) -> BackendResult<Option<serde_json::Value>> {
         Ok(self.tool_effects.get(key).map(|r| r.value().clone()))
@@ -613,6 +672,61 @@ impl StateBackend for InMemoryBackend {
             }
             None => Err(StateBackendError::NotFound(item_id.to_string())),
         }
+    }
+
+    async fn fail_work_item_fenced(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        let Some(mut entry) = self.work_items.get_mut(&item_id) else {
+            return Ok(None);
+        };
+        // Same guard as `complete_work_item_fenced`: the fence AND still-claimed
+        // (`worker_id.is_some()`). Fence alone would let a forged `lease_fence: 0`
+        // match a never-claimed pending item, and would accept a stale fence after
+        // a reclaim, since reclaim clears `worker_id` but leaves `lease_fence`.
+        if entry.worker_id.is_none() || entry.lease_fence != lease_fence {
+            return Ok(None);
+        }
+
+        let new_attempt = entry.attempt + 1;
+        entry.attempt = new_attempt;
+        entry.worker_id = None;
+        entry.lease_expires_at = None;
+        if let Some(obj) = entry.payload.as_object_mut() {
+            obj.insert(
+                "last_error".into(),
+                serde_json::Value::String(error.to_string()),
+            );
+        }
+        // Bump the epoch so any re-claim mints a strictly greater fence than the
+        // token the failing worker still holds.
+        let next = self
+            .lease_epochs
+            .get(&item_id)
+            .map(|e| *e.value())
+            .unwrap_or(0)
+            + 1;
+        self.lease_epochs.insert(item_id, next);
+
+        let item = entry.clone();
+        let exhausted = new_attempt >= item.max_attempts;
+        drop(entry);
+
+        if exhausted {
+            // Mirror SQLite: a dead-lettered item leaves the live queue entirely,
+            // so it can never be claimed again.
+            self.work_items.remove(&item_id);
+            return Ok(Some(FailOutcome::Exhausted {
+                item: Box::new(item),
+            }));
+        }
+        Ok(Some(FailOutcome::Retryable {
+            delay_ms: (1u64 << new_attempt.min(6)) * 1000,
+            item: Box::new(item),
+        }))
     }
 
     async fn park_work_item(

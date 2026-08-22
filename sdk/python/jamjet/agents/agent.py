@@ -31,12 +31,18 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-import warnings
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from jamjet.agents.governance import Budget, GovernanceConfig, normalize_governance
+from jamjet.agents.governance import (
+    UNSET,
+    Budget,
+    GovernanceConfig,
+    _Unset,
+    normalize_governance,
+    require_enforceable_approval,
+)
 from jamjet.agents.session import Session, SessionStore, persist_session_turn, seed_messages_for_run
 from jamjet.compiler.strategies import StrategyLimits
 from jamjet.runtime.local import LocalRuntime
@@ -51,6 +57,12 @@ if TYPE_CHECKING:
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "limit_exceeded"})
 # How often run_durable polls get_execution while waiting for a terminal state.
 _POLL_INTERVAL_SECONDS = 0.5
+# StrategyLimits requires a concrete cost figure and validates it > 0, so an
+# omitted ``max_cost_usd`` still needs one for the strategy runners' iteration
+# budget. This is ONLY that placeholder — it is deliberately not folded into
+# GovernanceConfig.budget, so omitting the argument still means "no enforced
+# ceiling", exactly as before.
+_DEFAULT_STRATEGY_MAX_COST_USD = 1.0
 
 
 class Agent:
@@ -73,16 +85,28 @@ class Agent:
         instructions: str = "",
         strategy: str = "plan-and-execute",
         max_iterations: int = 10,
-        max_cost_usd: float = 1.0,
+        # None, not 1.0. The old default doubled as the "not set" sentinel — the
+        # budget was folded in only when the value differed from 1.0 — so a caller
+        # who explicitly asked for a $1.00 ceiling got NO ceiling, silently, which
+        # is the one number a reader of the old signature was most likely to type.
+        # `None` cannot collide with a ceiling anyone means.
+        max_cost_usd: float | None = None,
         timeout_seconds: int = 300,
         on_limit_exceeded: Callable[[str | None, str, Any, Any], str | None] | None = None,
         # Governance knobs (T3-1).  T3-2..6 read self.governance to enforce.
-        policy: str | dict | None = None,
-        approval_required: bool | list[str] = False,
-        budget: Budget | float | int | dict | None = None,
-        pii: bool = True,
-        audit: bool = True,
-        receipts: bool = True,
+        #
+        # Each defaults to UNSET rather than to its documented value, so
+        # `normalize_governance` can record WHICH knobs the caller actually
+        # passed. `Team` inherits its default only into a sub-agent that set
+        # nothing, and that cannot be inferred by comparing values: an agent
+        # deliberately asking for `pii=True` is identical, by value, to one that
+        # said nothing — and used to have its choice silently replaced.
+        policy: str | dict | None | _Unset = UNSET,
+        approval_required: bool | list[str] | _Unset = UNSET,
+        budget: Budget | float | int | dict | None | _Unset = UNSET,
+        pii: bool | _Unset = UNSET,
+        audit: bool | _Unset = UNSET,
+        receipts: bool | _Unset = UNSET,
         # Optional sink for AgentBoundary receipts (T3-4).  When set, every
         # minted receipt is also shipped here (e.g. a JSONL writer); the receipt
         # is always attached to the run result regardless.  Defaults to None so
@@ -142,7 +166,10 @@ class Agent:
 
         self.limits = StrategyLimits(
             max_iterations=max_iterations,
-            max_cost_usd=max_cost_usd,
+            # StrategyLimits requires a concrete float (it validates > 0), and the
+            # strategy runners' iteration budget has always used 1.0 when nothing
+            # was passed. Keep that; only the GOVERNANCE fold below changes.
+            max_cost_usd=(_DEFAULT_STRATEGY_MAX_COST_USD if max_cost_usd is None else max_cost_usd),
             timeout_seconds=timeout_seconds,
         )
 
@@ -156,9 +183,11 @@ class Agent:
         # into GovernanceConfig.budget.cost_usd so the governance layer inherits
         # the same ceiling without requiring callers to set both.  T3-2 will
         # reconcile and document the authoritative enforcement point.
-        _effective_budget: Budget | float | int | dict | None = budget
-        if _effective_budget is None and max_cost_usd != 1.0:
-            # Non-default max_cost_usd -> carry it forward as the budget cap.
+        _effective_budget: Budget | float | int | dict | None | _Unset = budget
+        if (_effective_budget is UNSET or _effective_budget is None) and max_cost_usd is not None:
+            # Explicitly provided -> carry it forward as the budget cap. The test
+            # is `is not None`, never a comparison against the default: comparing
+            # against 1.0 is what made an explicit $1.00 ceiling vanish.
             _effective_budget = max_cost_usd
 
         self.governance: GovernanceConfig = normalize_governance(
@@ -537,22 +566,24 @@ class Agent:
                      from scratch — existing behaviour unchanged.
         """
         # T3-6: approval_required parity — the in-process path cannot enforce
-        # tool-level approval gates (the @gate mechanism is opt-in per function;
-        # the durable Rust engine enforces require_approval_for via the IR).
-        # Fail LOUD rather than silently no-op so the developer knows approval
-        # won't fire here.  See follow-up F-t3-inprocess-approval for full
-        # in-process enforcement.
-        ar = self.governance.approval_required
-        if ar is not False and ar != []:
-            warnings.warn(
-                f"Agent {self.name!r}: approval_required is set but agent.run() uses "
-                "the in-process path, which does not enforce approval gates. "
-                "Use agent.run_durable() — the durable IR carries "
-                "require_approval_for and the Rust engine enforces it fail-closed. "
-                "Follow-up: F-t3-inprocess-approval.",
-                UserWarning,
-                stacklevel=2,
-            )
+        # tool-level approval gates (the @gate mechanism is opt-in per function).
+        # The loop below calls tools directly with no policy engine in it, so an
+        # approval gate can be neither evaluated nor held here.
+        #
+        # run_durable() IS enforced — but by the ENGINE, and not by this SDK.
+        # ADK dispatch nodes run on the `python_tool` queue, which has no
+        # in-process worker; the guard on POST /work-items/claim decides a
+        # dispatch node's pending tool calls, so a gated call's payload never
+        # reaches the external worker at all.  That is why it holds even against
+        # a stale or hostile worker build.  Do not restate any of it as a
+        # property of the code below: nothing here inherits it.
+        #
+        # Fail CLOSED, early, so a caller sees the refusal before any session or
+        # audit setup happens. The authoritative check is the identical one at
+        # the executor chokepoint (`_run_agent`), which also covers callers who
+        # reach LocalRuntime.execute() directly — one function, two call sites,
+        # so the two cannot drift.
+        require_enforceable_approval(self.governance, where=f"Agent {self.name!r}.run()")
 
         # T4-2/T4-3: resolve session + memory and build the seed messages.  The
         # seed carries the session thread (T4-2) plus, when memory is on, the

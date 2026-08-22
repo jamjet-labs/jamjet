@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege for the whole workflow. Every job here reads the repo, builds,
+# and reports — none of them writes to it, so none needs the default write-capable
+# token. Declared once at the top rather than per job, so a job added later
+# inherits the floor instead of silently getting write.
+#
+# Publishing is unaffected: the release workflows are separate files and keep
+# their own `id-token: write` for OIDC.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -63,7 +73,7 @@ jobs:
         working-directory: sdk/python
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install uv
@@ -84,7 +94,7 @@ jobs:
         working-directory: sdk/python
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install uv
@@ -127,9 +137,28 @@ jobs:
         run: |
           # --deny unsound: fail on CVEs/unsound advisories (not on unmaintained warnings)
           # --ignore RUSTSEC-2023-0071: rsa Marvin Attack — no upstream fix available yet;
-          #   we use rsa only as a transitive dep of tonic, not for key operations.
+          #   we use rsa only as a transitive dep of sqlx, not for key operations.
+          #   This is the ONLY suppression. RUSTSEC-2026-0258 was dropped in #115 when
+          #   the OTLP stack moved to opentelemetry 0.32 / tonic 0.14, taking hyper 0.14
+          #   and h2 0.3.x out of the tree.
           cargo audit --deny unsound \
             --ignore RUSTSEC-2023-0071
+
+      # Guard the fix rather than the exception: the vulnerable line must not
+      # return through a future dependency bump. `cargo audit` alone would not
+      # catch a REINTRODUCED hyper 0.14 while some other crate still satisfied
+      # the advisory, and h2 0.3.x arriving anywhere is a regression regardless.
+      - name: Assert the pre-1.x hyper line stays out of the tree
+        working-directory: runtime
+        run: |
+          for spec in "h2@0.3" "hyper@0.14"; do
+            if cargo tree --workspace --invert "$spec" 2>/dev/null | grep -q .; then
+              echo "::error::$spec is back in the dependency tree (see #115)."
+              cargo tree --workspace --invert "$spec"
+              exit 1
+            fi
+          done
+          echo "clean: no h2 0.3.x, no hyper 0.14"
 
   python-audit:
     name: Python dependency audit
@@ -139,7 +168,7 @@ jobs:
         working-directory: sdk/python
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install --upgrade pip
@@ -196,7 +225,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install build

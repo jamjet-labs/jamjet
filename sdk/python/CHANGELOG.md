@@ -1,5 +1,66 @@
 # Changelog
 
+## Unreleased
+
+### Changed (breaking)
+
+- **`approval_required` now raises on `agent.run()` instead of warning.** It emitted a
+  `UserWarning` and then ran every tool ungated, so the knob read as configured and did
+  nothing. A warning cannot carry that: Python prints a given one once per location, and
+  `-W ignore`, `PYTHONWARNINGS` or a pytest config drop it entirely — the caller who most
+  needed the signal was the least likely to see it. `run()` executes tools with no policy
+  engine between the model and the call, so a gate can be neither evaluated nor held
+  there; it now refuses with `ApprovalNotEnforceableError` and points at `run_durable`,
+  where the engine decides before any worker receives the payload. To run without gates
+  deliberately, drop `approval_required`.
+
+### Fixed
+
+- **`blocked_tools` is enforced on `agent.run()`.** It was enforced only on the durable
+  path, so a tool the policy forbids ran normally in-process — silently, without even the
+  warning `approval_required` gave. `blocked_tools` is a *tool* control, so the seam
+  middleware chain could never carry it: that chain sits at the *model* boundary and
+  enforces budget, allowlist and PII. Blocked tools are now dropped before the strategy
+  runner sees them, which makes them neither offered to the model nor dispatchable, and
+  patterns are globbed with the same matcher the engine uses. Both paths resolve the
+  effective policy through one shared function, so an `Agent(...)` cannot mean one thing
+  in-process and another durable.
+
+## 0.12.0 — 2026-08-22
+
+Enforcement and exactly-once correctness. The ADK's governance knobs were
+enforceable on paper but reachable around in practice; this closes that, and
+fixes three defaults that quietly meant the opposite of what they read.
+
+### Fixed
+
+- **Tool policy and approval are now enforced on ADK agent dispatch.** `blocked_tools`
+  and `require_approval_for` were evaluated on ordinary tool nodes but not on the
+  agent's own dispatch node, so an ADK agent's tool calls bypassed both. An approval
+  is bound to a content hash of `(name, arguments)`, so it cannot be replayed against
+  a different payload.
+- **A spent budget refuses to fire.** Previously a run that had already exhausted its
+  budget could still make one more model call.
+- **`max_cost_usd` no longer defaults to `1.0`.** The default doubled as the "unset"
+  sentinel, so asking for a `$1.00` ceiling was indistinguishable from asking for
+  nothing and was silently dropped. The default is now `None` — no implicit ceiling —
+  and the governance knobs track explicitly-set values separately.
+- **The model allowlist globs in-process, matching the durable engine.** `["*"]` — the
+  natural way to write "allow everything" — denied every model in-process while being
+  accepted durable-side, and a provider-only entry like `["anthropic"]` was the mirror
+  image. Both transports now share one matcher, pinned by a parity table.
+- **`Team` no longer overrides a governance value a sub-agent set explicitly.** It
+  compared values rather than tracking what was set, so a sub-agent that deliberately
+  chose the coordinator's default had that choice overwritten.
+
+### Added
+
+- **External tool effects carry an idempotency key.** `complete_work_item` accepts and
+  echoes the key the claim hands out, so the engine records the result and a re-run
+  replays it instead of firing the tool a second time. Without it nothing was recorded
+  and every replay re-fired — on the transport ADK agents actually take, since
+  `python_tool` nodes run with no in-process worker.
+
 ## 0.11.0 — 2026-06-29
 
 The full ADK feature set. A plain `Agent` is now durable and governed by default, with first-class sessions, memory, multi-agent teams, deploy, and a five-minute dev loop.
@@ -7,6 +68,7 @@ The full ADK feature set. A plain `Agent` is now durable and governed by default
 ### Added
 
 - Governance on by default. `Agent(policy=, approval_required=, budget=, pii=, audit=, receipts=)`: a model allowlist, fail-closed budget caps, PII redaction at the model seam, a signed hash-chained audit record per action, and an AgentBoundary receipt per turn. Enforced on both `run()` and `run_durable()`.
+  (Corrected later: approval was **not** enforced on `run()` — it warned and ran ungated. See the Unreleased entry above.)
 - Sessions and memory. `Session` + a persistent `SessionStore` continue a conversation thread across runs and restarts; `memory=` wires the Engram bridge with an automatic, governed retrieve/record loop keyed by the session.
 - Team multi-agent API: `Sequential`, `Parallel` (with `MergeStrategy`), `Team` (coordinator), and `Loop`. Each sub-agent runs as its own governed durable execution; `run()` / `run_durable()` return a `TeamResult` with per-agent isolation.
 - `agent.deploy(runtime="local" | "self-host" | "cloud" | "<url>")` and `Team.deploy(...)`: ship the same compiled IR to any runtime over the durable engine. Artifacts API (`POST/GET /artifacts`).

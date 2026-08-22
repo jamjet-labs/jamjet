@@ -229,9 +229,10 @@ def _resolve_team_governance(governance: GovernanceConfig | dict | None) -> Gove
     raise TypeError(f"governance must be a GovernanceConfig, dict, or None — got {type(governance).__name__!r}")
 
 
-# The all-default sentinel: a sub-agent whose governance equals this set NO
-# explicit governance knob, so a team default may be inherited into it.
-_DEFAULT_GOVERNANCE = GovernanceConfig()
+# Provenance, not value. A sub-agent "set no explicit knob" only if
+# `governance.explicit` is empty — comparing against an all-default
+# GovernanceConfig cannot tell an agent that deliberately passed `pii=True` from
+# one that passed nothing, and wholesale-replaced the former's governance.
 
 
 def _apply_governance_default(agents: list[Agent], team_governance: GovernanceConfig | None) -> None:
@@ -252,7 +253,7 @@ def _apply_governance_default(agents: list[Agent], team_governance: GovernanceCo
     if team_governance is None:
         return
     for agent in agents:
-        if agent.governance == _DEFAULT_GOVERNANCE:
+        if not agent.governance.explicit:
             agent.governance = team_governance
 
 

@@ -166,6 +166,27 @@ def test_three_tool_dispatch_nodes_with_resolver_map():
         assert kind["input"]["messages"] == "$state.messages"
 
 
+def test_tool_dispatch_nodes_are_marked_for_policy():
+    """Every tool-dispatch node must carry agent_tool_dispatch=True.
+
+    Without the marker the Rust worker treats the node as an opaque python_fn
+    and enforces no tool policy on it (review finding C1).
+    """
+    ir = compile_agent_to_ir(_agent(), "hi", max_turns=3)
+    dispatch_nodes = [node for node in ir["nodes"].values() if node["kind"].get("function") == "dispatch_tool_calls"]
+    assert len(dispatch_nodes) == 3
+    for node in dispatch_nodes:
+        assert node["kind"]["agent_tool_dispatch"] is True
+
+
+def test_model_nodes_are_not_marked_as_tool_dispatch():
+    """The marker must be narrow: only the dispatch nodes carry it."""
+    ir = compile_agent_to_ir(_agent(), "hi", max_turns=3)
+    for node in ir["nodes"].values():
+        if node["kind"].get("function") != "dispatch_tool_calls":
+            assert node["kind"].get("agent_tool_dispatch") in (None, False)
+
+
 # ── Edges / loop topology ─────────────────────────────────────────────────────
 
 

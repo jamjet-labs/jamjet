@@ -356,6 +356,11 @@ class AgentEvalRunner:
                 instructions=self.instructions,
                 strategy=strategy,
                 max_iterations=10,
+                # NOW LOAD-BEARING. This was written as a limit but silently did
+                # nothing, because 1.0 was also the "not set" sentinel. It is a
+                # real per-case ceiling now, which is what it always said. A
+                # single eval case sits well under a dollar; raise it here if a
+                # suite genuinely needs more, rather than removing the cap.
                 max_cost_usd=1.0,
                 timeout_seconds=int(self.timeout_s),
             )

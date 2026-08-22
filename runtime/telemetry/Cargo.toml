@@ -18,3 +18,6 @@ opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

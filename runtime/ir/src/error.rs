@@ -26,6 +26,9 @@ pub enum IrError {
     #[error("condition node '{node}' branch target '{target}' has no matching out-edge")]
     BranchTargetMissingOutEdge { node: String, target: String },
 
+    #[error("node '{0}' dispatches ADK agent tool calls but is not marked agent_tool_dispatch, so tool policy would not be enforced for it")]
+    UnmarkedAgentToolDispatch(String),
+
     #[error("node '{0}' is unreachable from the start node")]
     UnreachableNode(String),
 

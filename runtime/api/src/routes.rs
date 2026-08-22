@@ -22,9 +22,11 @@ use chrono::Utc;
 use jamjet_agents::{AgentCard, AgentFilter, AgentStatus};
 use jamjet_audit::backend::AuditQuery;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
-use jamjet_state::{Tenant, TenantId, TenantStatus, WorkItem, WorkflowDefinition};
+use jamjet_state::{FailOutcome, Tenant, TenantId, TenantStatus, WorkItem, WorkflowDefinition};
+use jamjet_worker::DispatchGuardOutcome;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Build the Axum router with all API routes.
@@ -172,7 +174,19 @@ async fn create_workflow(
     // (Reference resolution is deliberately left to the runtime: models/tools are
     // resolved against the worker registry, not the IR maps, so we validate the
     // shape here, not `validate_workflow`'s ref rules.)
-    serde_json::from_value::<jamjet_ir::WorkflowIr>(body.ir.clone())
+    let parsed = serde_json::from_value::<jamjet_ir::WorkflowIr>(body.ir.clone())
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+
+    // ONE rule from `validate_workflow` runs here, deliberately, while the ref
+    // rules above do not. An unmarked ADK tool-dispatch node is not a reference
+    // problem the runtime can resolve later — it is a policy-enforcement hole,
+    // and registration is the only place it is detectable. An IR compiled by a
+    // pre-marker SDK deserializes with `agent_tool_dispatch: false`, so the
+    // claim route treats it as an ordinary `python_fn` and hands out a whole
+    // turn's model-chosen tool calls with no tool policy evaluated at all.
+    // Storing it would bake that hole in permanently; rejecting it makes the
+    // version skew loud at the one moment the operator can act on it.
+    jamjet_ir::validate_agent_tool_dispatch(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let backend = state.backend_for(&tenant_id);
@@ -1011,6 +1025,24 @@ struct ClaimWorkItemRequest {
     queue_types: Vec<String>,
 }
 
+/// The claim response for "you get nothing".
+///
+/// A refusal MUST be byte-identical to an empty queue. The external worker is
+/// untrusted for the enforcement decision, so it must not be able to tell
+/// "policy blocked this" from "nothing to do" — otherwise the claim endpoint
+/// becomes an oracle for which tools a tenant's policy forbids.
+fn nothing_to_claim() -> Json<Value> {
+    Json(json!({ "claimed": false }))
+}
+
+/// Whether a claimed item may be handed to the caller.
+enum ClaimGate {
+    /// Hand back the payload.
+    Release,
+    /// Refuse. The item has already been settled as its outcome requires.
+    Withhold,
+}
+
 /// `POST /work-items/claim` — claim the next available work item.
 async fn claim_work_item(
     State(state): State<AppState>,
@@ -1022,23 +1054,403 @@ async fn claim_work_item(
     let item = backend
         .claim_work_item(&body.worker_id, &queue_refs)
         .await?;
-    match item {
-        Some(wi) => Ok(Json(json!({
-            "claimed": true,
-            "work_item": {
-                "id": wi.id.to_string(),
-                "execution_id": wi.execution_id.to_string(),
-                "node_id": wi.node_id,
-                "queue_type": wi.queue_type,
-                "payload": wi.payload,
-                "attempt": wi.attempt,
-                // The lease fence the external worker echoes on complete so the
-                // engine can prove the lease is still held (exactly-once-COMMIT).
-                "lease_fence": wi.lease_fence,
-            }
-        }))),
-        None => Ok(Json(json!({ "claimed": false }))),
+    let Some(wi) = item else {
+        return Ok(nothing_to_claim());
+    };
+
+    // Enforcement lives HERE, not only in the in-process worker: `python_tool`
+    // and `java_tool` are registered with zero in-process workers, so an ADK
+    // agent's tool-dispatch node reaches production down this route and never
+    // through `Worker::execute_item`. See `gate_claimed_item`.
+    if matches!(
+        gate_claimed_item(backend.as_ref(), &wi).await,
+        ClaimGate::Withhold
+    ) {
+        return Ok(nothing_to_claim());
     }
+
+    // The idempotency key for THIS node occurrence, computed here because claim
+    // time is fire time for the external tier — the moment the payload leaves
+    // the engine is the moment the effect becomes possible.
+    //
+    // Without it, an external tool's result was recorded with
+    // `idempotency_key: None`, so nothing ever landed in `tool_effects` and the
+    // replay guard covered the in-process tier only. Re-running a node re-fired
+    // the tool, on the transport ADK nodes actually take.
+    //
+    // Best effort: if the state needed to compute it cannot be read, the item is
+    // still handed out. That is the behaviour this route had all along, and
+    // withholding real work because a replay OPTIMISATION could not be prepared
+    // would trade a live queue for a hygiene property.
+    let idem_key = compute_idempotency_key(backend.as_ref(), &wi).await;
+
+    Ok(Json(json!({
+        "claimed": true,
+        "work_item": {
+            "id": wi.id.to_string(),
+            "execution_id": wi.execution_id.to_string(),
+            "node_id": wi.node_id,
+            "queue_type": wi.queue_type,
+            "payload": wi.payload,
+            "attempt": wi.attempt,
+            // The lease fence the external worker echoes on complete so the
+            // engine can prove the lease is still held (exactly-once-COMMIT).
+            "lease_fence": wi.lease_fence,
+            // Echoed on complete so the result is recorded against it and a
+            // re-run replays instead of re-firing the tool.
+            "idempotency_key": idem_key,
+        }
+    })))
+}
+
+/// The idempotency key for a claimed item, or `None` if it cannot be computed.
+///
+/// Delegates to `jamjet_state::derive_idempotency_key`, the SAME function
+/// `Worker::execute_item` uses, so the in-process and external transports
+/// cannot drift into filing effects under different keys.
+async fn compute_idempotency_key(
+    backend: &dyn jamjet_state::backend::StateBackend,
+    wi: &WorkItem,
+) -> Option<String> {
+    jamjet_state::derive_idempotency_key(backend, &wi.execution_id, &wi.node_id)
+        .await
+        .ok()
+}
+
+/// Run the shared agent-dispatch guard over a freshly claimed item.
+///
+/// An ADK agent compiles a whole turn's model-chosen tool calls into ONE
+/// `python_fn` / `java_fn` node, so the tool names are invisible to the ordinary
+/// node-kind policy path (review finding C1). The decision itself lives in
+/// `jamjet_worker::dispatch_guard` so this route and the in-process worker
+/// enforce the IDENTICAL policy; this function owns only the settle, which is
+/// transport-specific. Nothing here re-implements a policy rule — a second copy
+/// would drift, and a drifted copy of an enforcement rule is a hole.
+///
+/// Enforcement is server-side on purpose: the external worker is untrusted, so
+/// a stale or hostile `jamjet worker` build cannot opt out of it.
+///
+/// KNOWN LIMIT — duplicate approval requests. `guard_dispatch`'s `NotRequested`
+/// arm reads "is there an open request?" and then appends one, with no
+/// compare-and-set between. Two claims that reach it concurrently for the SAME
+/// node can each append, and because `node_approval_status` resets to `Pending`
+/// on every new request, a human's settled decision would refer to a superseded
+/// request and could never stick.
+///
+/// This is NOT serialised here, deliberately. `claim_work_item` is atomic, so
+/// one work item goes to exactly one caller; reaching the race needs two
+/// distinct work items for the same node, which is the same exposure the
+/// in-process worker already has (a lease serialises one ITEM, not one NODE).
+/// A process-local mutex would not serialise the multiple `jamjet-server`
+/// processes a real deployment runs, so it would buy nothing but false
+/// confidence. Closing it properly needs an "append iff no open request for this
+/// node" primitive on `StateBackend`, which is a backend change, not a route
+/// change. Fail-closed holds either way: both racers return `Held`, so nothing
+/// runs unapproved.
+///
+/// `Held` also conflates "awaiting a decision" with "a human rejected this".
+/// That distinction is deliberately unobservable here — every refusal is the
+/// same `{"claimed": false}` — so acting on it would create exactly the signal
+/// the uniform response exists to deny the caller.
+async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkItem) -> ClaimGate {
+    // AUTHORITY. The coordinates that select the policy chain come from the
+    // EXECUTION record, never from the payload.
+    //
+    // `POST /work-items` copies a caller-supplied `payload` and `node_id`
+    // verbatim into the queue behind the same write role as this route. If the
+    // payload chose the workflow, that caller could point a `python_tool` item
+    // at an unpoliced workflow and drop the workflow layer out of the chain, or
+    // omit the version and have v1.0.0's rules evaluated against a v2.0.0
+    // execution. The execution record is engine-written, so it is the only
+    // trustworthy answer to "which policy governs this item".
+    let execution = match backend.get_execution(&wi.execution_id).await {
+        // Infrastructure — see the `get_workflow` Err arm below.
+        Err(e) => {
+            warn!(
+                execution_id = %wi.execution_id,
+                node_id = %wi.node_id,
+                error = %e,
+                "claim: execution lookup failed; withholding the payload"
+            );
+            return ClaimGate::Withhold;
+        }
+        Ok(None) => {
+            return fail_closed(backend, wi, "execution not found".to_string()).await;
+        }
+        Ok(Some(e)) => e,
+    };
+    let workflow_id = execution.workflow_id.as_str();
+    let workflow_version = execution.workflow_version.as_str();
+
+    // Tripwire. `Worker::execute_item` still resolves its IR from the payload
+    // (`parse_payload`), so a payload that disagrees with its own execution
+    // would make the two enforcement seams evaluate different policy for the
+    // same item. There is no legitimate producer of that shape — the scheduler
+    // builds every payload from these very coordinates
+    // (`runtime/scheduler/src/runner.rs`) — so a disagreement means one of the
+    // two is lying and we cannot tell which. Refuse rather than pick.
+    //
+    // Absent coordinates are NOT a mismatch: nothing is claimed, so nothing can
+    // conflict, and the execution's values are used regardless. There is no
+    // default here to exploit — the old `unwrap_or("unknown")` /
+    // `unwrap_or("1.0.0")` fallbacks are gone.
+    let payload_disagrees = |key: &str, authoritative: &str| {
+        wi.payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|claimed| claimed != authoritative)
+    };
+    if payload_disagrees("workflow_id", workflow_id)
+        || payload_disagrees("workflow_version", workflow_version)
+    {
+        return fail_closed(
+            backend,
+            wi,
+            format!(
+                "work item payload coordinates disagree with execution {workflow_id} \
+                 v{workflow_version}"
+            ),
+        )
+        .await;
+    }
+
+    let ir_value = match backend.get_workflow(workflow_id, workflow_version).await {
+        // Infrastructure, not a decision: the engine could not read its own
+        // catalogue. Settle NOTHING — failing the item would kill work that was
+        // never evaluated, and completing it would silently drop it. The lease
+        // expires, the reclaimer requeues, and the next claim decides properly.
+        Err(e) => {
+            warn!(
+                execution_id = %wi.execution_id,
+                node_id = %wi.node_id,
+                error = %e,
+                "claim: workflow lookup failed; withholding the payload"
+            );
+            return ClaimGate::Withhold;
+        }
+        // Permanent, and identical to the worker's `ExecutorError::Fatal` for
+        // the same condition. Fail closed: without the IR the
+        // `agent_tool_dispatch` marker cannot be read, so whether this item
+        // needs policy evaluation is UNKNOWN. Handing it out would make "point
+        // the payload at a workflow that does not exist" a complete bypass.
+        Ok(None) => {
+            return fail_closed(
+                backend,
+                wi,
+                format!("workflow {workflow_id} v{workflow_version} not found"),
+            )
+            .await;
+        }
+        Ok(Some(def)) => def.ir,
+    };
+
+    // Read ONLY this node's kind first. Deciding "is this a dispatch node" needs
+    // one node; `guard_dispatch` needs the whole graph, but it only runs for the
+    // dispatch nodes. Every model / tool / retrieval / general claim used to pay
+    // a full `WorkflowIr` deserialization to reach a check that hands it straight
+    // back, on the hot path every external worker polls.
+    //
+    // NOT gated on `wi.queue_type`, which is the obvious version of this and is
+    // unsafe: `POST /work-items` copies a caller-supplied `queue_type` verbatim,
+    // so enqueueing a dispatch node as `queue_type: "model"` would skip policy
+    // evaluation entirely. The node's KIND comes from the engine-written
+    // catalogue and cannot be forged that way. See #116.
+    let kind: jamjet_core::NodeKind = match ir_value
+        .get("nodes")
+        .and_then(|nodes| nodes.get(&wi.node_id))
+        .and_then(|node| node.get("kind"))
+    {
+        // The node id selects both the policy set and the dispatch marker, so a
+        // node whose kind cannot be read has neither and cannot be evaluated.
+        //
+        // This arm covers three shapes at once — no such node, `nodes` not an
+        // object, node present without a `kind` — so it does not claim to know
+        // which. Saying "node not found" would send an on-call reader looking
+        // for a missing node when the IR may simply be malformed.
+        None => {
+            return fail_closed(
+                backend,
+                wi,
+                format!("no readable kind for node {} in IR", wi.node_id),
+            )
+            .await;
+        }
+        Some(raw) => match serde_json::from_value(raw.clone()) {
+            Ok(kind) => kind,
+            // Distinct from the full-graph parse below, which keeps the worker's
+            // wording. Naming which parse failed is the difference between
+            // "this node's kind is malformed" and "the whole workflow is".
+            Err(e) => {
+                return fail_closed(backend, wi, format!("failed to load node kind: {e}")).await;
+            }
+        },
+    };
+
+    // NARROWNESS. This route serves every queue. Everything that is not an agent
+    // tool dispatch — every model node, tool node, condition, ordinary python_fn
+    // — leaves here having had zero POLICY evaluation, and is returned exactly
+    // as before.
+    //
+    // Not free, though: reaching this line already cost `get_execution`,
+    // `get_workflow` and a full `WorkflowIr` parse, and this is the hot path
+    // every external worker polls. Those lookups are what make the decision
+    // trustworthy — the execution record is the only engine-written answer to
+    // "which policy governs this item" — so they cannot simply move below this
+    // check. A `wi.queue_type` gate above them would skip the whole function for
+    // queues that can never hold a dispatch node, but it would also skip the
+    // coordinate tripwire and the execution-not-found fail-closed for those
+    // queues, which is a behaviour change and not one to make inside a security
+    // fix. Tracked in #116.
+    if !jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&kind) {
+        return ClaimGate::Release;
+    }
+
+    // A dispatch node: now the whole graph is genuinely needed, because the
+    // policy chain `guard_dispatch` evaluates is workflow-wide.
+    let ir = match serde_json::from_value::<jamjet_ir::WorkflowIr>(ir_value) {
+        Ok(ir) => ir,
+        Err(e) => {
+            return fail_closed(backend, wi, format!("failed to load IR: {e}")).await;
+        }
+    };
+    let Some(node_def) = ir.node(&wi.node_id) else {
+        return fail_closed(backend, wi, format!("node {} not found in IR", wi.node_id)).await;
+    };
+
+    let input = jamjet_worker::dispatch_guard::payload_input(&wi.payload);
+    match jamjet_worker::dispatch_guard::guard_dispatch(
+        backend,
+        &wi.execution_id,
+        &wi.node_id,
+        &wi.tenant_id,
+        &ir,
+        node_def,
+        &input,
+    )
+    .await
+    {
+        DispatchGuardOutcome::Allow => ClaimGate::Release,
+
+        // The guard already recorded the `PolicyViolation`. Failing the item is
+        // what stops a blocked dispatch from being re-claimed forever: on a
+        // durable backend `fail_work_item` is terminal.
+        //
+        // KNOWN ASYMMETRY — this seam and the worker seam disagree on
+        // terminality, and this is the outcome of EVERY successful enforcement
+        // here, not an edge case.
+        //
+        // `SqliteBackend::fail_work_item` sets `status = 'failed'`
+        // unconditionally, so the reclaimer never returns the item and NOTHING
+        // emits `NodeFailed`. The execution therefore stays `Running` with the
+        // node still in the scheduler fold's `scheduled` set — it stalls rather
+        // than going terminal. `Worker::execute_item` does emit the terminal
+        // event, via the fenced `commit_turn`, so the same policy denial ends
+        // the execution on the in-process path and hangs it here.
+        //
+        // Safety is unaffected: the tool does not run and the denial is on the
+        // Prove surface either way. Closing the gap means emitting a
+        // fence-committed terminal event from the claim route, which is a
+        // scheduler-interaction change and is deliberately NOT done inside this
+        // security fix. It needs its own task.
+        DispatchGuardOutcome::Blocked { reason } => {
+            warn!(
+                execution_id = %wi.execution_id,
+                node_id = %wi.node_id,
+                %reason,
+                "claim: policy blocked an agent tool dispatch"
+            );
+            settle(
+                backend
+                    .fail_work_item(wi.id, &format!("policy blocked: {reason}"))
+                    .await,
+                wi,
+            )
+        }
+
+        // An outstanding `ToolApprovalRequired` exists for the node. Settle the
+        // item cleanly so its lease never expires into the retry path; the node
+        // stays parked in the scheduler fold's `scheduled` set until a human
+        // decides.
+        //
+        // Fenced, unlike the worker's plain `complete_work_item`: we hold a
+        // fence minted by the claim we just made, so we can prove the lease is
+        // still ours. A lost fence means something else already settled or
+        // reclaimed the item, which is not ours to overwrite — and the payload
+        // is withheld either way.
+        DispatchGuardOutcome::Held { gated } => {
+            info!(
+                execution_id = %wi.execution_id,
+                node_id = %wi.node_id,
+                gated = ?gated,
+                "claim: agent tool dispatch awaiting approval"
+            );
+            match backend
+                .complete_work_item_fenced(wi.id, wi.lease_fence)
+                .await
+            {
+                Ok(true) => ClaimGate::Withhold,
+                Ok(false) => {
+                    warn!(
+                        execution_id = %wi.execution_id,
+                        node_id = %wi.node_id,
+                        "claim: lease fence lost while settling a held work item"
+                    );
+                    ClaimGate::Withhold
+                }
+                Err(e) => settle(Err(e), wi),
+            }
+        }
+
+        // NOT a denial — no policy was ever consulted, so nothing is audited and
+        // nothing is settled. See the `Err` arm above for why leaving the lease
+        // alone is the right infrastructure-failure behaviour.
+        DispatchGuardOutcome::Unavailable { reason } => {
+            warn!(
+                execution_id = %wi.execution_id,
+                node_id = %wi.node_id,
+                %reason,
+                "claim: could not decide an agent tool dispatch; withholding the payload"
+            );
+            ClaimGate::Withhold
+        }
+    }
+}
+
+/// Terminally fail an item the engine cannot evaluate, and withhold it.
+///
+/// No `PolicyViolation` is recorded: these are structural failures (missing
+/// workflow, unparseable IR, unknown node), not policy denials, and auditing
+/// them as denials would put a refusal on the Prove surface that no policy made.
+/// The worker treats the identical conditions as `ExecutorError::Fatal`.
+async fn fail_closed(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+    reason: String,
+) -> ClaimGate {
+    warn!(
+        execution_id = %wi.execution_id,
+        node_id = %wi.node_id,
+        %reason,
+        "claim: cannot evaluate policy for this item; withholding the payload"
+    );
+    settle(backend.fail_work_item(wi.id, &reason).await, wi)
+}
+
+/// Withhold regardless of whether the settle landed.
+///
+/// A settle that fails leaves the item leased until the lease expires, which is
+/// a liveness cost, never a safety one: the payload is withheld either way.
+/// Fail closed, never open.
+fn settle(result: jamjet_state::backend::BackendResult<()>, wi: &WorkItem) -> ClaimGate {
+    if let Err(e) = result {
+        warn!(
+            execution_id = %wi.execution_id,
+            node_id = %wi.node_id,
+            error = %e,
+            "claim: failed to settle a withheld work item"
+        );
+    }
+    ClaimGate::Withhold
 }
 
 #[derive(Deserialize)]
@@ -1057,6 +1469,15 @@ struct CompleteWorkItemRequest {
     /// (backward-compat for callers not yet echoing the fence).
     #[serde(default)]
     lease_fence: Option<i64>,
+    /// Idempotency key echoed from the claim response.
+    ///
+    /// With it, `commit_turn` records the result in `tool_effects` in the same
+    /// transaction, so a re-run of this node replays the recorded output instead
+    /// of firing the tool again. Without it nothing is recorded and the replay
+    /// guard simply does not cover this node — which was the case for EVERY
+    /// external tool effect until now.
+    #[serde(default)]
+    idempotency_key: Option<String>,
     // ── GenAI telemetry (forwarded from the python_tool worker or other callers) ──
     /// AI provider system (e.g. "anthropic", "openai").
     #[serde(default)]
@@ -1086,38 +1507,14 @@ async fn complete_work_item(
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
 
-    // Settle the work item. When the worker echoes its lease fence, the settle is
-    // fence-gated: a stale / forged fence (reclaimed or replayed worker) is
-    // rejected with 409 and we emit NO terminal event, so a lost lease can never
-    // duplicate a NodeCompleted. When the fence is absent, fall back to the legacy
-    // unfenced settle-by-id (backward-compat for callers not yet echoing it).
-    match body.lease_fence {
-        Some(fence) => {
-            let settled = backend.complete_work_item_fenced(item_id, fence).await?;
-            if !settled {
-                return Ok((
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "completed": false,
-                        "reason": "stale or invalid lease fence",
-                    })),
-                ));
-            }
-        }
-        None => {
-            backend.complete_work_item(item_id).await?;
-        }
-    }
-
-    // Emit NodeCompleted event if execution_id and node_id are provided.
-    if let (Some(exec_id_str), Some(node_id)) = (&body.execution_id, &body.node_id) {
-        let execution_id = parse_execution_id(exec_id_str)?;
-        let seq = backend.latest_sequence(&execution_id).await? + 1;
-        let event = jamjet_state::Event::new(
+    let node_completed = |execution_id: &ExecutionId| {
+        jamjet_state::Event::new(
             execution_id.clone(),
-            seq,
+            // Sequence is assigned inside `commit_turn`'s transaction; this
+            // placeholder is never the number that lands.
+            0,
             jamjet_state::EventKind::NodeCompleted {
-                node_id: node_id.clone(),
+                node_id: body.node_id.clone().unwrap_or_default(),
                 output: body.output.clone(),
                 state_patch: body.state_patch.clone(),
                 duration_ms: body.duration_ms,
@@ -1128,12 +1525,128 @@ async fn complete_work_item(
                 finish_reason: body.finish_reason.clone(),
                 cost_usd: None,
                 provenance: None,
-                idempotency_key: None,
+                idempotency_key: body.idempotency_key.clone(),
             },
-        );
-        backend.append_event(event).await?;
+        )
+    };
 
-        // Apply state_patch to the execution's current_state.
+    // Settle AND emit in ONE transaction.
+    //
+    // These used to be separate statements: settle the item, then append the
+    // NodeCompleted. A crash in that window left the item settled with no
+    // terminal event, so the scheduler fold kept the node in `scheduled` and the
+    // execution never finished — permanently, since the fold is a replay of the
+    // log. `commit_turn` is the primitive the in-process worker already uses for
+    // exactly this, and it is fence-guarded, so a stale worker writes nothing.
+    // A lease fence is a MINTED token (`term * 2^32 + epoch`), so it is always
+    // positive. Zero is what a never-claimed row carries and what a defaulted or
+    // forged body sends, so it must never reach a fenced settle — treat it as
+    // absent rather than as a fence that happens to match every pending item.
+    if body.lease_fence.is_some_and(|f| f <= 0) {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "completed": false,
+                "reason": "stale or invalid lease fence",
+            })),
+        ));
+    }
+
+    // Every key this engine mints is `content_hash`'s output: 64 lowercase hex
+    // characters. Anything else was never issued here, so an effect recorded
+    // under it is a row no reader can ever derive — junk that looks like a
+    // recorded effect and silently covers nothing.
+    //
+    // This is a shape check, not proof of provenance: a well-formed key from a
+    // DIFFERENT claim still passes. Binding the key to the claimed item is #130.
+    if let Some(key) = body.idempotency_key.as_deref() {
+        if key.len() != 64
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(ApiError::BadRequest(
+                "idempotency_key must be 64 lowercase hex characters".to_string(),
+            ));
+        }
+    }
+
+    let committed_atomically = match (
+        body.lease_fence,
+        body.execution_id.as_deref(),
+        body.node_id.as_deref(),
+    ) {
+        (Some(fence), Some(exec_id_str), Some(_)) => {
+            let execution_id = parse_execution_id(exec_id_str)?;
+            match backend
+                .commit_turn(item_id, fence, node_completed(&execution_id), true)
+                .await
+            {
+                Ok(_) => true,
+                Err(jamjet_state::StateBackendError::FenceLost(_)) => {
+                    return Ok((
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "completed": false,
+                            "reason": "stale or invalid lease fence",
+                        })),
+                    ));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // Fenced, but with no coordinates to build a terminal event from. Settle
+        // only — the same shape as before, and still fence-guarded.
+        (Some(fence), _, _) => {
+            let settled = backend.complete_work_item_fenced(item_id, fence).await?;
+            if !settled {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "completed": false,
+                        "reason": "stale or invalid lease fence",
+                    })),
+                ));
+            }
+            false
+        }
+        // Legacy unfenced path, deprecated. Kept so callers that predate the
+        // fence keep working, but it cannot be made atomic: `commit_turn` is
+        // fence-guarded by construction, and without a fence we cannot show the
+        // item is ours to settle.
+        (None, _, _) => {
+            warn!(
+                work_item_id = %id,
+                "complete: unfenced legacy path — settle and terminal event are \
+                 not atomic; echo lease_fence to make them one transaction"
+            );
+            backend.complete_work_item(item_id).await?;
+            false
+        }
+    };
+
+    // The unfenced and no-coordinate paths still emit separately.
+    if !committed_atomically {
+        if let (Some(exec_id_str), Some(_)) = (&body.execution_id, &body.node_id) {
+            let execution_id = parse_execution_id(exec_id_str)?;
+            let seq = backend.latest_sequence(&execution_id).await? + 1;
+            let mut event = node_completed(&execution_id);
+            event.sequence = seq;
+            backend.append_event(event).await?;
+        }
+    }
+
+    // Gated on BOTH coordinates, matching the terminal event. Refreshing the read
+    // model when no `NodeCompleted` was emitted would let the column drift in a
+    // way the event log cannot explain — and the log is what the materializer
+    // rebuilds from, so the two would simply disagree with no way to tell which
+    // is right.
+    if let (Some(exec_id_str), Some(_)) = (&body.execution_id, &body.node_id) {
+        let execution_id = parse_execution_id(exec_id_str)?;
+        // Denormalised read-model refresh, best effort by design: the
+        // authoritative state is the event log plus the snapshot `commit_turn`
+        // wrote inside the transaction, and the materializer recomputes from
+        // those. Losing this write costs a stale convenience column, not state.
         if let Ok(Some(mut exec)) = backend.get_execution(&execution_id).await {
             if let Some(state_obj) = exec.current_state.as_object_mut() {
                 if let Some(patch_obj) = body.state_patch.as_object() {
@@ -1215,20 +1728,135 @@ async fn enqueue_work_item(
 #[derive(Deserialize)]
 struct FailWorkItemRequest {
     error: String,
+    /// Lease fence echoed from the claim response. Gates the failure on still
+    /// holding the lease, exactly as `/complete` does.
+    ///
+    /// Absent means the legacy unfenced path: the item is settled `'failed'` and
+    /// NO event is emitted, which strands the node. It is kept only so callers
+    /// that predate the fence keep working, and it is deprecated — a caller that
+    /// echoes the fence gets retry semantics and a terminal event instead.
+    #[serde(default)]
+    lease_fence: Option<i64>,
 }
 
-/// `POST /work-items/:id/fail` — mark a work item as failed.
+/// `POST /work-items/:id/fail` — a worker reports that its node failed.
+///
+/// The fenced path applies the SAME retry, backoff and dead-letter rules that
+/// lease reclamation applies, and emits the SAME events, so a node whose worker
+/// reported a failure and a node whose worker died converge on one state machine.
+///
+/// Before this, the whole endpoint was `fail_work_item` and nothing else: no
+/// fence, so any caller holding an id could settle someone else's item, and no
+/// event, so the scheduler fold kept the node in `scheduled` while the row sat in
+/// a `'failed'` status that no sweep ever selects. Every legitimate tool failure
+/// stranded its execution as `Running`, permanently.
 async fn fail_work_item(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
     Json(body): Json<FailWorkItemRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let item_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
-    backend.fail_work_item(item_id, &body.error).await?;
-    Ok(Json(json!({ "failed": true, "work_item_id": id })))
+
+    let Some(fence) = body.lease_fence else {
+        // Legacy unfenced path, deprecated. Preserved verbatim so existing
+        // callers do not break, and deliberately NOT given the new event
+        // emission: without a fence we cannot show the item was ours to fail, and
+        // emitting a terminal event on an item another worker may now hold is
+        // worse than the stranding this path already causes.
+        warn!(
+            work_item_id = %id,
+            "fail: unfenced legacy path — the node will be stranded; echo lease_fence to get retry semantics"
+        );
+        backend.fail_work_item(item_id, &body.error).await?;
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "failed": true,
+                "work_item_id": id,
+                "retryable": false,
+                "warning": "unfenced fail: no NodeFailed emitted and the node is not rescheduled; echo lease_fence",
+            })),
+        ));
+    };
+
+    let Some(outcome) = backend
+        .fail_work_item_fenced(item_id, fence, &body.error)
+        .await?
+    else {
+        // Someone else owns it now — reclaimed, already settled, or a forged
+        // fence. Emit nothing: the holder decides this item's fate.
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "failed": false,
+                "work_item_id": id,
+                "reason": "stale or invalid lease fence",
+            })),
+        ));
+    };
+
+    // Emit exactly what `SchedulerRunner::reclaim_expired_leases` emits for the
+    // same transition, so the fold cannot tell the two apart.
+    let (item, retryable, delay_ms) = match &outcome {
+        FailOutcome::Retryable { item, delay_ms } => (item, true, Some(*delay_ms)),
+        FailOutcome::Exhausted { item } => (item, false, None),
+    };
+
+    let seq = backend.latest_sequence(&item.execution_id).await? + 1;
+    backend
+        .append_event(jamjet_state::Event::new(
+            item.execution_id.clone(),
+            seq,
+            jamjet_state::EventKind::NodeFailed {
+                node_id: item.node_id.clone(),
+                error: body.error.clone(),
+                // Retryable reports the attempt that just failed; exhausted
+                // reports the final count. Mirrors the reclaimer's arithmetic.
+                attempt: if retryable {
+                    item.attempt.saturating_sub(1)
+                } else {
+                    item.attempt
+                },
+                retryable,
+            },
+        ))
+        .await?;
+
+    if let Some(delay_ms) = delay_ms {
+        let seq = backend.latest_sequence(&item.execution_id).await? + 1;
+        backend
+            .append_event(jamjet_state::Event::new(
+                item.execution_id.clone(),
+                seq,
+                jamjet_state::EventKind::RetryScheduled {
+                    node_id: item.node_id.clone(),
+                    attempt: item.attempt,
+                    delay_ms,
+                },
+            ))
+            .await?;
+    }
+
+    warn!(
+        execution_id = %item.execution_id,
+        node_id = %item.node_id,
+        attempt = item.attempt,
+        retryable,
+        "fail: worker reported a node failure"
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "failed": true,
+            "work_item_id": id,
+            "retryable": retryable,
+            "attempt": item.attempt,
+        })),
+    ))
 }
 
 #[derive(Deserialize)]

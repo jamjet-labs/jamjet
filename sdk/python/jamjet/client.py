@@ -288,6 +288,7 @@ class JamjetClient:
         gen_ai_model: str | None = None,
         finish_reason: str | None = None,
         lease_fence: int | None = None,
+        idempotency_key: str | None = None,
     ) -> None:
         """Mark a work item as completed and emit a NodeCompleted event.
 
@@ -311,17 +312,40 @@ class JamjetClient:
             body["finish_reason"] = finish_reason
         if lease_fence:
             body["lease_fence"] = lease_fence
+        if idempotency_key is not None:
+            # Echoed from the claim so the engine records this result against it.
+            # Without it nothing lands in tool_effects and a re-run fires the tool
+            # again — the replay guard covers the in-process path only.
+            #
+            # `is not None`, not a truthiness check: the caller echoes whatever the
+            # claim handed out, and silently dropping a falsy-but-present value
+            # would turn a malformed key into "no key" — the failure mode this
+            # whole change exists to remove, and invisible at the call site.
+            body["idempotency_key"] = idempotency_key
         r = await self._client.post(
             f"/work-items/{item_id}/complete",
             json=body,
         )
         r.raise_for_status()
 
-    async def fail_work_item(self, item_id: str, error: str) -> None:
-        """Mark a work item as failed."""
+    async def fail_work_item(self, item_id: str, error: str, lease_fence: int = 0) -> None:
+        """Report that this work item's node failed.
+
+        Echo ``lease_fence`` from the claim. With it, the runtime applies the
+        same retry / backoff / dead-letter rules an expired lease gets, and
+        appends ``NodeFailed`` so the execution can actually reach a terminal
+        state. Without it the runtime takes the legacy path, which settles the
+        item but emits nothing — leaving the node scheduled forever.
+
+        A 409 means the fence no longer matches: another worker owns this item,
+        and this one must not narrate its failure.
+        """
+        body: dict[str, Any] = {"error": error}
+        if lease_fence:
+            body["lease_fence"] = lease_fence
         r = await self._client.post(
             f"/work-items/{item_id}/fail",
-            json={"error": error},
+            json=body,
         )
         r.raise_for_status()
 

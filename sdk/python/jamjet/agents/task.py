@@ -37,7 +37,11 @@ def task(
     tools: list[Callable[..., Any]] | None = None,
     strategy: str = "plan-and-execute",
     max_iterations: int = 10,
-    max_cost_usd: float = 1.0,
+    # Mirrors ``Agent``: None means "not set", so omitting it leaves no enforced
+    # ceiling. Defaulting to 1.0 here would forward an EXPLICIT 1.0 to Agent,
+    # which now honours explicit values — silently capping every @task agent at a
+    # dollar, a cap none of them had before.
+    max_cost_usd: float | None = None,
     timeout_seconds: int = 300,
 ) -> Any:
     """

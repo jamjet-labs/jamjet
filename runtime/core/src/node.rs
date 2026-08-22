@@ -53,6 +53,16 @@ pub enum NodeKind {
         module: String,
         function: String,
         output_schema: String,
+        /// True when this node is an ADK agent tool-dispatch node, i.e. it runs a
+        /// whole turn's model-chosen tool calls in one shot.
+        ///
+        /// Policy for these nodes cannot be derived from the static node kind:
+        /// the tool names only exist in runtime state. The worker instead
+        /// evaluates the frozen pending calls carried in the work-item payload.
+        /// `#[serde(default)]` so IRs compiled before this field existed
+        /// deserialize to `false` and behave exactly as they did before.
+        #[serde(default)]
+        agent_tool_dispatch: bool,
     },
 
     /// Arbitrary Java method executed by an external Java tool-worker.
@@ -65,6 +75,11 @@ pub enum NodeKind {
         class_name: String,
         method: String,
         output_schema: String,
+        /// See [`NodeKind::PythonFn::agent_tool_dispatch`]. The Java tool-worker
+        /// receives identical payload enrichment, so it has the identical
+        /// enforcement gap and needs the identical marker.
+        #[serde(default)]
+        agent_tool_dispatch: bool,
     },
 
     /// Router — evaluates expressions and branches.
@@ -420,6 +435,7 @@ mod tests {
             class_name: "com.example.tools.WeatherTool".into(),
             method: "getWeather".into(),
             output_schema: "schemas.Weather".into(),
+            agent_tool_dispatch: false,
         };
         let json = serde_json::to_string(&node).unwrap();
         let deserialized: NodeKind = serde_json::from_str(&json).unwrap();
@@ -439,6 +455,7 @@ mod tests {
             class_name: "com.example.tools.WeatherTool".into(),
             method: "getWeather".into(),
             output_schema: String::new(),
+            agent_tool_dispatch: false,
         };
         // Mirrors PythonFn -> PythonTool: JavaFn routes to its own durable queue.
         assert_eq!(node.queue_type(), QueueType::JavaTool);
@@ -449,6 +466,82 @@ mod tests {
             "java_tool",
             "QueueType::JavaTool must serialize to the \"java_tool\" queue string"
         );
+    }
+
+    #[test]
+    fn python_fn_without_dispatch_flag_defaults_to_false() {
+        // An IR persisted before this field existed must deserialize unchanged.
+        let json = serde_json::json!({
+            "type": "python_fn",
+            "module": "m",
+            "function": "f",
+            "output_schema": ""
+        });
+        let kind: NodeKind =
+            serde_json::from_value(json).expect("legacy python_fn must deserialize");
+        match kind {
+            NodeKind::PythonFn {
+                agent_tool_dispatch,
+                ..
+            } => assert!(!agent_tool_dispatch),
+            other => panic!("expected PythonFn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn python_fn_dispatch_flag_round_trips() {
+        let json = serde_json::json!({
+            "type": "python_fn",
+            "module": "m",
+            "function": "f",
+            "output_schema": "",
+            "agent_tool_dispatch": true
+        });
+        let kind: NodeKind = serde_json::from_value(json).expect("python_fn must deserialize");
+        match kind {
+            NodeKind::PythonFn {
+                agent_tool_dispatch,
+                ..
+            } => assert!(agent_tool_dispatch),
+            other => panic!("expected PythonFn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn java_fn_without_dispatch_flag_defaults_to_false() {
+        let json = serde_json::json!({
+            "type": "java_fn",
+            "class_name": "C",
+            "method": "m",
+            "output_schema": ""
+        });
+        let kind: NodeKind = serde_json::from_value(json).expect("legacy java_fn must deserialize");
+        match kind {
+            NodeKind::JavaFn {
+                agent_tool_dispatch,
+                ..
+            } => assert!(!agent_tool_dispatch),
+            other => panic!("expected JavaFn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn java_fn_dispatch_flag_round_trips() {
+        let json = serde_json::json!({
+            "type": "java_fn",
+            "class_name": "C",
+            "method": "m",
+            "output_schema": "",
+            "agent_tool_dispatch": true
+        });
+        let kind: NodeKind = serde_json::from_value(json).expect("java_fn must deserialize");
+        match kind {
+            NodeKind::JavaFn {
+                agent_tool_dispatch,
+                ..
+            } => assert!(agent_tool_dispatch),
+            other => panic!("expected JavaFn, got {other:?}"),
+        }
     }
 
     #[test]

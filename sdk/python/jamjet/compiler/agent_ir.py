@@ -96,6 +96,19 @@ _DEFAULT_DATA_POLICY_IR: dict[str, Any] = {
 }
 
 
+def effective_policy(gov: GovernanceConfig) -> dict[str, Any] | None:
+    """The policy rules *gov* resolves to, or ``None`` when it declares none.
+
+    Shared deliberately. The durable path compiles this into the IR for the engine
+    to enforce, and the in-process path (``agent.run``) reads the same result to
+    enforce ``blocked_tools`` locally. Two resolvers would let the same
+    ``Agent(...)`` declaration mean different things depending on which path
+    happened to run it — the divergence class of #121 and #123, which surfaces in
+    production because development usually stays in-process.
+    """
+    return _compile_agent_policy_ir(gov)
+
+
 def _compile_agent_policy_ir(gov: GovernanceConfig) -> dict[str, Any] | None:
     """Build a PolicySetIr dict from *gov*, or ``None`` when no policy rules are needed.
 
@@ -303,6 +316,12 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
                 "module": _DISPATCH_MODULE,
                 "function": _DISPATCH_FUNCTION,
                 "output_schema": "",
+                # Tells the engine this python_fn runs a whole turn's
+                # model-chosen tool calls, so tool policy and approval must be
+                # evaluated against the pending calls in the work-item payload
+                # rather than against this node's (nameless) static kind.  Where
+                # that evaluation happens, and why: `Agent.run`.
+                "agent_tool_dispatch": True,
                 # Descriptor of the data the dispatch coroutine consumes. The
                 # engine passes the full accumulated state to PythonFn nodes
                 # (no per-node input mapping), so `dispatch_tool_calls` reads
@@ -372,9 +391,13 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
     }
 
     # ── Governance IR fields (T3-5) ────────────────────────────────────────────
-    # Emit policy / budget / data_policy from the agent's GovernanceConfig so the
-    # Rust engine enforces them fail-closed (enforcement already exists in
-    # workers/src/worker.rs; this is the compile-side wiring that turns it on).
+    # Emit policy / budget / data_policy from the agent's GovernanceConfig — the
+    # compile-side wiring that turns the engine's own enforcement on.  Honest
+    # scope, per field: `policy` is enforced engine-side (where, and why it holds
+    # against an untrusted worker: `Agent.run`); `budget` is checked by the
+    # engine AFTER each node, so a single node can overshoot the cap;
+    # `data_policy` is metadata, NOT an enforcement point — see
+    # `_compile_governance_ir` above.
     # These are merged BEFORE content-versioning so the cache key changes when
     # governance config changes (a different budget or policy must NOT reuse a
     # cached graph compiled without those constraints).

@@ -159,3 +159,72 @@ async def test_parallel_first_merge_consolidated() -> None:
         [scripted_agent("a", output="winner"), scripted_agent("b", output="loser")], merge=First()
     ).run("in")
     assert result.output == "winner"
+
+
+# ── Team governance inheritance is provenance-based, not value-based ──────────
+
+
+def _gov_agent(name: str, **governance: object):
+    """A minimal agent carrying whatever governance knobs the test passes."""
+    from jamjet import Agent, tool
+
+    @tool
+    def echo(x: str) -> str:
+        return x
+
+    return Agent(name, model="anthropic/claude-sonnet-4-6", tools=[echo], **governance)
+
+
+def test_an_explicit_knob_equal_to_the_default_is_not_overridden() -> None:
+    """`Team` must not replace governance a sub-agent deliberately chose.
+
+    Inheritance used to be decided by comparing the sub-agent's config against an
+    all-default `GovernanceConfig`. An agent that explicitly asked for `pii=True`
+    — the default value — was indistinguishable from one that asked for nothing,
+    so its governance was replaced wholesale. With a team default of `pii=False`
+    that turned an explicitly requested protection OFF, which the function's own
+    docstring promises never happens.
+    """
+    silent = _gov_agent("silent")
+    explicit = _gov_agent("explicit", pii=True)
+    coordinator = _gov_agent("coordinator")
+
+    Team(
+        agents=[silent, explicit],
+        coordinator=coordinator,
+        governance={"pii": False},
+    )
+
+    assert silent.governance.pii is False, "a sub-agent that set nothing must inherit the team default"
+    assert explicit.governance.pii is True, (
+        "an EXPLICIT pii=True must survive a team default of pii=False — "
+        "explicit beats inherited, whatever the value happens to equal"
+    )
+
+
+def test_provenance_is_recorded_without_changing_equality() -> None:
+    """`explicit` is metadata: it must not make two equal configs unequal.
+
+    Equality is used elsewhere to mean "same governance", and provenance is a
+    different question from value.
+    """
+    silent = _gov_agent("silent")
+    explicit = _gov_agent("explicit", pii=True)
+
+    assert silent.governance.explicit == frozenset()
+    assert explicit.governance.explicit == frozenset({"pii"})
+    assert silent.governance == explicit.governance, "same values must stay equal regardless of how they were reached"
+
+
+def test_every_governance_knob_is_tracked() -> None:
+    """Each knob must record itself, or inheritance silently reverts for it."""
+    for knob, value in (
+        ("policy", "strict"),
+        ("approval_required", True),
+        ("budget", 2.0),
+        ("pii", True),
+        ("audit", True),
+        ("receipts", True),
+    ):
+        agent = _gov_agent(f"a_{knob}", **{knob: value})
+        assert knob in agent.governance.explicit, f"{knob} was not recorded as explicit"
