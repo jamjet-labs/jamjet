@@ -64,7 +64,7 @@ impl PolicyEvaluator {
                 let allowed = policy.model_allowlist.iter().any(|pattern| {
                     ctx.model_ref
                         .as_deref()
-                        .map(|m| glob_match(pattern, m))
+                        .map(|m| model_matches(pattern, m))
                         .unwrap_or(false)
                 });
                 if !allowed {
@@ -104,6 +104,34 @@ impl PolicyEvaluator {
 
         PolicyDecision::Allow
     }
+}
+
+/// Does `pattern` allow the model reference `model`?
+///
+/// Model refs are provider-routed strings — `anthropic/claude-opus-4-8`. The
+/// Python seam (`ModelAllowlistMiddleware`) allows an entry that matches EITHER
+/// the provider OR the full string, and the built-in `"strict"` policy relies on
+/// that: its allowlist is the single entry `"anthropic"`.
+///
+/// Glob-matching the full ref alone cannot express that. `"anthropic"` carries no
+/// wildcard, so it compares exactly, and `"anthropic" != "anthropic/claude-…"`.
+/// The result was that `policy="strict"` — the one built-in policy whose whole
+/// job is "Anthropic only" — blocked EVERY model on the durable path while
+/// working fine in-process. Same policy, opposite behaviour per transport.
+///
+/// So a pattern with no `/` is also tried against the provider segment. This is
+/// purely additive: it can only turn a Block into an Allow, and only for patterns
+/// the Python seam already allows, so no call that used to be permitted becomes
+/// denied. Patterns that name a full ref or carry globs are unaffected.
+fn model_matches(pattern: &str, model: &str) -> bool {
+    if glob_match(pattern, model) {
+        return true;
+    }
+    if pattern.contains('/') {
+        return false;
+    }
+    let provider = model.split_once('/').map(|(p, _)| p).unwrap_or(model);
+    glob_match(pattern, provider)
 }
 
 // ── Glob matching ──────────────────────────────────────────────────────────
@@ -279,5 +307,89 @@ mod tests {
         assert!(glob_match("foo?", "foob"));
         assert!(!glob_match("foo?", "foo"));
         assert!(!glob_match("foo?", "fooba"));
+    }
+
+    // ── Model allowlist: Python/Rust parity ──────────────────────────────────
+
+    fn model_ctx(model: &str) -> EvaluationContext {
+        EvaluationContext {
+            node_id: "n1".into(),
+            node_kind_tag: "model".into(),
+            tool_name: None,
+            model_ref: Some(model.into()),
+        }
+    }
+
+    /// The exact allowlist the built-in `"strict"` policy emits, against the
+    /// exact model the ADK docs and site use.
+    ///
+    /// This blocked on the durable path while passing in-process: `"anthropic"`
+    /// has no wildcard, so glob-matching it against the FULL ref compared it
+    /// literally to `"anthropic/claude-opus-4-8"`. The one built-in policy whose
+    /// job is "Anthropic only" denied every Anthropic model.
+    #[test]
+    fn strict_allows_anthropic_models_on_the_durable_path() {
+        let p = policy(&[], &[], &["anthropic"]);
+        assert!(
+            matches!(
+                PolicyEvaluator.evaluate(&model_ctx("anthropic/claude-opus-4-8"), &[&p]),
+                PolicyDecision::Allow
+            ),
+            "policy=\"strict\" must allow Anthropic models, or it means the \
+             opposite of what it says on the durable path"
+        );
+    }
+
+    /// A provider entry must still DENY another provider — the additive rule
+    /// must not turn the allowlist into an allow-all.
+    #[test]
+    fn a_provider_entry_still_denies_other_providers() {
+        let p = policy(&[], &[], &["anthropic"]);
+        assert!(matches!(
+            PolicyEvaluator.evaluate(&model_ctx("openai/gpt-4o"), &[&p]),
+            PolicyDecision::Block { .. }
+        ));
+    }
+
+    /// A pattern naming a full ref keeps full-ref semantics: it must not be
+    /// reinterpreted as a provider and widen to that provider's whole catalogue.
+    #[test]
+    fn a_full_ref_pattern_does_not_widen_to_the_provider() {
+        let p = policy(&[], &[], &["anthropic/claude-opus-4-8"]);
+        assert!(matches!(
+            PolicyEvaluator.evaluate(&model_ctx("anthropic/claude-opus-4-8"), &[&p]),
+            PolicyDecision::Allow
+        ));
+        assert!(
+            matches!(
+                PolicyEvaluator.evaluate(&model_ctx("anthropic/claude-haiku-4-5"), &[&p]),
+                PolicyDecision::Block { .. }
+            ),
+            "pinning one model must not silently allow the provider's whole catalogue"
+        );
+    }
+
+    /// Explicit provider globs keep working unchanged.
+    #[test]
+    fn provider_globs_still_match_the_full_ref() {
+        let p = policy(&[], &[], &["anthropic/*"]);
+        assert!(matches!(
+            PolicyEvaluator.evaluate(&model_ctx("anthropic/claude-opus-4-8"), &[&p]),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            PolicyEvaluator.evaluate(&model_ctx("openai/gpt-4o"), &[&p]),
+            PolicyDecision::Block { .. }
+        ));
+    }
+
+    /// A bare ref with no provider segment still matches exactly.
+    #[test]
+    fn a_ref_without_a_provider_segment_matches_exactly() {
+        let p = policy(&[], &[], &["gpt-4o"]);
+        assert!(matches!(
+            PolicyEvaluator.evaluate(&model_ctx("gpt-4o"), &[&p]),
+            PolicyDecision::Allow
+        ));
     }
 }
