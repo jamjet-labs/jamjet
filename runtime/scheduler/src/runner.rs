@@ -721,7 +721,21 @@ impl ExecProgress {
                 self.held.remove(node_id);
             }
             EventKind::NodeScheduled { node_id, .. } | EventKind::NodeStarted { node_id, .. } => {
-                self.scheduled.insert(node_id.clone());
+                // A node that already reached a terminal outcome must NOT go back
+                // to `scheduled`. `NodeStarted` is appended before any fence
+                // check, so a zombie worker can emit one AFTER the real worker's
+                // `NodeCompleted`. Re-inserting there wedges the execution
+                // permanently: the node sits in `scheduled` forever, so the
+                // execution never goes terminal, and because the fold is a replay
+                // of the log the same order produces the same wedge on every
+                // refold — it does not heal.
+                //
+                // Completion is terminal in this fold (nothing ever removes from
+                // `completed`), so a start after it is never legitimate and
+                // ignoring it cannot drop real work.
+                if !self.completed.contains(node_id) && !self.terminal_failed.contains(node_id) {
+                    self.scheduled.insert(node_id.clone());
+                }
             }
             EventKind::NodeCancelled { node_id } => {
                 self.completed.insert(node_id.clone());
@@ -1101,6 +1115,106 @@ mod tests {
             progress.apply(&Event::new(exec_id.clone(), (i + 1) as i64, kind));
         }
         progress
+    }
+
+    /// A zombie worker's `NodeStarted` must not resurrect a completed node.
+    ///
+    /// `NodeStarted` is appended before any fence check, so a worker whose lease
+    /// was stolen can still emit one — and it lands AFTER the real worker's
+    /// `NodeCompleted`. Re-inserting into `scheduled` there wedges the execution
+    /// permanently: the node never leaves `scheduled`, so the execution never
+    /// goes terminal, and since the fold is a replay of the log the same order
+    /// reproduces the same wedge on every refold. It does not heal.
+    #[test]
+    fn a_zombie_node_started_does_not_resurrect_a_completed_node() {
+        let progress = fold_events(vec![
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
+            EventKind::NodeStarted {
+                node_id: "a".into(),
+                worker_id: "worker-A".into(),
+                attempt: 0,
+            },
+            node_completed("a", serde_json::json!({})),
+            // Worker A lost its lease; worker B re-claimed and completed above.
+            // A's late NodeStarted arrives now.
+            EventKind::NodeStarted {
+                node_id: "a".into(),
+                worker_id: "worker-zombie".into(),
+                attempt: 0,
+            },
+        ]);
+        assert!(
+            progress.completed.contains("a"),
+            "the node completed and must stay completed"
+        );
+        assert!(
+            !progress.scheduled.contains("a"),
+            "a late NodeStarted must not put a COMPLETED node back in `scheduled` \
+             — the execution would never reach a terminal state, on this fold and \
+             on every replay of the same log"
+        );
+    }
+
+    /// The same guard for a terminally-failed node.
+    #[test]
+    fn a_late_node_started_does_not_resurrect_a_terminally_failed_node() {
+        let progress = fold_events(vec![
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
+            EventKind::NodeFailed {
+                node_id: "a".into(),
+                error: "dead".into(),
+                attempt: 3,
+                retryable: false,
+            },
+            EventKind::NodeStarted {
+                node_id: "a".into(),
+                worker_id: "worker-zombie".into(),
+                attempt: 0,
+            },
+        ]);
+        assert!(progress.terminal_failed.contains("a"));
+        assert!(
+            !progress.scheduled.contains("a"),
+            "a terminally-failed node must not return to `scheduled`"
+        );
+    }
+
+    /// The guard must not break a legitimate retry: a node that failed
+    /// RETRYABLY is not terminal, so its next start must still schedule it.
+    #[test]
+    fn a_retry_after_a_retryable_failure_still_schedules() {
+        let progress = fold_events(vec![
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
+            EventKind::NodeFailed {
+                node_id: "a".into(),
+                error: "transient".into(),
+                attempt: 0,
+                retryable: true,
+            },
+            EventKind::RetryScheduled {
+                node_id: "a".into(),
+                attempt: 1,
+                delay_ms: 1000,
+            },
+            EventKind::NodeStarted {
+                node_id: "a".into(),
+                worker_id: "worker-B".into(),
+                attempt: 1,
+            },
+        ]);
+        assert!(
+            progress.scheduled.contains("a"),
+            "a retry is not a resurrection — the node must still be scheduled"
+        );
     }
 
     #[test]

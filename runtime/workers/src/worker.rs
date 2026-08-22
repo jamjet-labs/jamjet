@@ -197,6 +197,7 @@ impl Worker {
                         .check_policy(
                             &execution_id,
                             item_id,
+                            lease_fence,
                             &node_id,
                             &tenant_id,
                             kind,
@@ -224,7 +225,14 @@ impl Worker {
 
                     // Autonomy check.
                     if let Some(r) = self
-                        .check_autonomy(&execution_id, item_id, &node_id, kind, &budget)
+                        .check_autonomy(
+                            &execution_id,
+                            item_id,
+                            lease_fence,
+                            &node_id,
+                            kind,
+                            &budget,
+                        )
                         .await
                     {
                         heartbeat.abort();
@@ -663,6 +671,7 @@ impl Worker {
         execution_id: &ExecutionId,
         node_id: &str,
         item_id: WorkItemId,
+        lease_fence: i64,
         tool_name: String,
         approver: String,
         context: serde_json::Value,
@@ -686,10 +695,28 @@ impl Worker {
             NodeApprovalStatus::Pending(_) | NodeApprovalStatus::Rejected { .. } => {
                 // Already requested (or decided rejected — scheduler owns the
                 // failure). Settle the item; emit nothing.
-                if let Err(e) = self.backend.complete_work_item(item_id).await {
-                    return Some(Err(format!("failed to settle held work item: {e}").into()));
+                // FENCED, not a plain settle. The claim-side lease expiry can
+                // requeue an item this worker still believes it owns, so a
+                // second worker may hold it by now — an unfenced settle would
+                // complete work that is currently running under a newer fence.
+                // A lost fence is not an error: the item is simply not ours, so
+                // leave it to its owner and stop.
+                match self
+                    .backend
+                    .complete_work_item_fenced(item_id, lease_fence)
+                    .await
+                {
+                    Ok(true) => Some(Ok(())),
+                    Ok(false) => {
+                        warn!(
+                            execution_id = %execution_id,
+                            node_id,
+                            "lease fence lost while settling a held item — another worker owns it"
+                        );
+                        Some(Ok(()))
+                    }
+                    Err(e) => Some(Err(format!("failed to settle held work item: {e}").into())),
                 }
-                Some(Ok(()))
             }
             NodeApprovalStatus::NotRequested => {
                 info!(execution_id = %execution_id, node_id, %approver, "Node requires approval");
@@ -722,10 +749,28 @@ impl Worker {
                     )
                     .into()));
                 }
-                if let Err(e) = self.backend.complete_work_item(item_id).await {
-                    return Some(Err(format!("failed to settle held work item: {e}").into()));
+                // FENCED, not a plain settle. The claim-side lease expiry can
+                // requeue an item this worker still believes it owns, so a
+                // second worker may hold it by now — an unfenced settle would
+                // complete work that is currently running under a newer fence.
+                // A lost fence is not an error: the item is simply not ours, so
+                // leave it to its owner and stop.
+                match self
+                    .backend
+                    .complete_work_item_fenced(item_id, lease_fence)
+                    .await
+                {
+                    Ok(true) => Some(Ok(())),
+                    Ok(false) => {
+                        warn!(
+                            execution_id = %execution_id,
+                            node_id,
+                            "lease fence lost while settling a held item — another worker owns it"
+                        );
+                        Some(Ok(()))
+                    }
+                    Err(e) => Some(Err(format!("failed to settle held work item: {e}").into())),
                 }
-                Some(Ok(()))
             }
         }
     }
@@ -737,6 +782,7 @@ impl Worker {
         &self,
         execution_id: &ExecutionId,
         item_id: WorkItemId,
+        lease_fence: i64,
         node_id: &str,
         tenant_id: &str,
         kind: &NodeKind,
@@ -778,8 +824,22 @@ impl Worker {
                 // never re-dispatched); the fold's `held` set only gates which
                 // decision events are acted on.
                 DispatchGuardOutcome::Held { .. } => {
-                    match self.backend.complete_work_item(item_id).await {
-                        Ok(()) => Some(Ok(())),
+                    // Fenced for the same reason the claim route fences its
+                    // settle: this worker may no longer hold the lease.
+                    match self
+                        .backend
+                        .complete_work_item_fenced(item_id, lease_fence)
+                        .await
+                    {
+                        Ok(true) => Some(Ok(())),
+                        Ok(false) => {
+                            warn!(
+                                execution_id = %execution_id,
+                                node_id,
+                                "lease fence lost while settling a held dispatch — another worker owns it"
+                            );
+                            Some(Ok(()))
+                        }
                         Err(e) => Some(Err(format!("failed to settle held work item: {e}").into())),
                     }
                 }
@@ -852,6 +912,7 @@ impl Worker {
                     execution_id,
                     node_id,
                     item_id,
+                    lease_fence,
                     tool_name,
                     approver,
                     serde_json::json!({ "node_id": node_id }),
@@ -867,6 +928,7 @@ impl Worker {
         &self,
         execution_id: &ExecutionId,
         item_id: WorkItemId,
+        lease_fence: i64,
         node_id: &str,
         kind: &NodeKind,
         budget: &BudgetState,
@@ -918,6 +980,7 @@ impl Worker {
                     execution_id,
                     node_id,
                     item_id,
+                    lease_fence,
                     tool_name,
                     "human".to_string(),
                     serde_json::json!({ "agent_ref": agent_ref }),
@@ -3495,6 +3558,115 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
             "a ToolApprovalRequired must be recorded"
+        );
+    }
+
+    /// A worker that lost its lease must not settle the held item.
+    ///
+    /// The approval-hold path used a plain `complete_work_item`, which settles by
+    /// id alone. Combined with the claim-side lease expiry — which can requeue an
+    /// item this worker still believes it owns — that let a stale worker complete
+    /// an item a NEWER worker is actively running, so the live claimant's work
+    /// was settled out from under it.
+    ///
+    /// The HTTP claim route already fenced its equivalent settle; this is the
+    /// in-process path catching up.
+    #[tokio::test]
+    async fn a_stale_worker_does_not_settle_a_held_item_it_no_longer_owns() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "adk-wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: jamjet_core::workflow::WorkflowStatus::Running,
+                initial_input: serde_json::json!({}),
+                current_state: serde_json::json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        let ir = dispatch_ir_json("python_fn", true, &[], &["send_wire"]);
+        backend
+            .store_workflow(jamjet_state::backend::WorkflowDefinition {
+                workflow_id: "adk-wf".into(),
+                version: "1.0.0".into(),
+                ir,
+                created_at: now,
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        let item_id = uuid::Uuid::new_v4();
+        backend
+            .enqueue_work_item(jamjet_state::backend::WorkItem {
+                id: item_id,
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "default".into(),
+                payload: serde_json::json!({
+                    "workflow_id": "adk-wf",
+                    "workflow_version": "1.0.0",
+                    "input": {"tool_calls": [one_call("send_wire")]}
+                }),
+                attempt: 0,
+                max_attempts: 3,
+                created_at: now,
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+
+        // Worker A claims, then loses the lease.
+        let item_a = backend
+            .claim_work_item("worker-A", &["default"])
+            .await
+            .unwrap()
+            .expect("claimable");
+        backend
+            .fail_work_item(item_a.id, "lease stolen for test")
+            .await
+            .unwrap();
+
+        // Worker B takes it with a strictly greater fence.
+        let item_b = backend
+            .claim_work_item("worker-B", &["default"])
+            .await
+            .unwrap()
+            .expect("re-claimable");
+        assert!(item_b.lease_fence > item_a.lease_fence);
+
+        // Worker A now runs its stale item. The node is approval-gated, so it
+        // reaches the hold-and-settle path with a fence that is no longer valid.
+        let exec = CountingDispatchExecutor::default();
+        let worker = Worker::new(
+            "worker-A".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("python_fn", Arc::new(exec.clone()))
+        .register_executor("java_fn", Arc::new(exec));
+        let _ = worker.execute_item(item_a).await;
+
+        // B still owns it. An unfenced settle would have completed B's item.
+        let stolen = backend
+            .complete_work_item_fenced(item_b.id, item_b.lease_fence)
+            .await
+            .unwrap();
+        assert!(
+            stolen,
+            "worker B must still own the item — a stale worker settled it out \
+             from under the live claimant"
         );
     }
 
