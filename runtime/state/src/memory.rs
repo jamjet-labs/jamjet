@@ -41,8 +41,8 @@ pub struct InMemoryBackend {
     /// Idempotency cache: idempotency_key -> result_json.
     /// Mirrors the `tool_effects` table in the SQLite backends.
     tool_effects: DashMap<String, serde_json::Value>,
-    /// Reservations: idempotency key -> (owner, expires_at).
-    tool_reservations: DashMap<String, (String, chrono::DateTime<Utc>)>,
+    /// Reservations: idempotency key -> (owner, lease_fence, expires_at).
+    tool_reservations: DashMap<String, (String, i64, chrono::DateTime<Utc>)>,
     /// Projected approval read-model. Key = (execution_id as String, node_id).
     proj_approvals: DashMap<(String, String), crate::backend::ApprovalProjectionRow>,
     /// Projector checkpoints. Key = (projection_name, execution_id as String).
@@ -335,12 +335,19 @@ impl StateBackend for InMemoryBackend {
 
     // ── Idempotency cache ─────────────────────────────────────────────────
 
-    async fn release_tool_reservation(&self, key: &str, owner: &str) -> BackendResult<()> {
+    async fn release_tool_reservation(
+        &self,
+        key: &str,
+        owner: &str,
+        _lease_fence: i64,
+    ) -> BackendResult<()> {
         // Owner-guarded remove: `remove_if` holds the shard lock across the
         // predicate, so a stale worker cannot free a key another worker took over
         // in the gap between checking and removing.
         self.tool_reservations
-            .remove_if(&key.to_string(), |_k, (holder, _)| holder == owner);
+            .remove_if(&key.to_string(), |_k, (holder, fence, _)| {
+                holder == owner && *fence == _lease_fence
+            });
         Ok(())
     }
 
@@ -350,7 +357,7 @@ impl StateBackend for InMemoryBackend {
         _execution_id: &ExecutionId,
         _node_id: &str,
         owner: &str,
-        _lease_fence: i64,
+        lease_fence: i64,
         ttl: std::time::Duration,
     ) -> BackendResult<ReserveOutcome> {
         let now = Utc::now();
@@ -363,14 +370,17 @@ impl StateBackend for InMemoryBackend {
         use dashmap::mapref::entry::Entry;
         match self.tool_reservations.entry(key.to_string()) {
             Entry::Vacant(v) => {
-                v.insert((owner.to_string(), expires_at));
+                v.insert((owner.to_string(), lease_fence, expires_at));
                 Ok(ReserveOutcome::Acquired)
             }
             Entry::Occupied(mut o) => {
-                let (holder, holder_expiry) = o.get().clone();
+                let (holder, _, holder_expiry) = o.get().clone();
                 if holder == owner || holder_expiry <= now {
-                    // Lapsed: the holder is presumed dead, so take it over.
-                    o.insert((owner.to_string(), expires_at));
+                    // Reentrant for the holder, or lapsed and presumed dead.
+                    // Either way the reservation is REPLACED, so it now carries
+                    // the newer fence — which is what makes a late release from
+                    // the older attempt a no-op.
+                    o.insert((owner.to_string(), lease_fence, expires_at));
                     return Ok(ReserveOutcome::Acquired);
                 }
                 Ok(ReserveOutcome::Held {

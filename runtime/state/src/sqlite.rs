@@ -844,13 +844,27 @@ impl StateBackend for SqliteBackend {
     // ── Idempotency cache ─────────────────────────────────────────────────
 
     #[instrument(skip(self), fields(key = key, owner = owner))]
-    async fn release_tool_reservation(&self, key: &str, owner: &str) -> BackendResult<()> {
-        sqlx::query("DELETE FROM tool_reservations WHERE idempotency_key = ? AND owner = ?")
-            .bind(key)
-            .bind(owner)
-            .execute(&self.pool)
-            .await
-            .map_err(map_db_err)?;
+    async fn release_tool_reservation(
+        &self,
+        key: &str,
+        owner: &str,
+        lease_fence: i64,
+    ) -> BackendResult<()> {
+        // `tenant_id` is part of the key here, so it must be part of the delete.
+        // This backend writes its rows as 'default'; without the filter a default
+        // release could remove a TENANT-scoped row that happens to share the key
+        // and owner — the same cross-tenant shape the reservation PK was fixed
+        // for.
+        sqlx::query(
+            "DELETE FROM tool_reservations \
+             WHERE idempotency_key = ? AND owner = ? AND lease_fence = ? AND tenant_id = 'default'",
+        )
+        .bind(key)
+        .bind(owner)
+        .bind(lease_fence)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?;
         Ok(())
     }
     #[instrument(skip(self), fields(key = key, owner = owner))]

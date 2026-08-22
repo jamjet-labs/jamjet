@@ -833,7 +833,7 @@ async fn releasing_a_reservation_frees_it_immediately() {
         ReserveOutcome::Held { .. }
     ));
 
-    db.release_tool_reservation("rel", "worker-A")
+    db.release_tool_reservation("rel", "worker-A", 1)
         .await
         .unwrap();
 
@@ -860,7 +860,7 @@ async fn a_non_holder_cannot_release_someone_elses_reservation() {
         .unwrap();
 
     // A stale worker tries to free it.
-    db.release_tool_reservation("guarded", "worker-stale")
+    db.release_tool_reservation("guarded", "worker-stale", 1)
         .await
         .unwrap();
 
@@ -886,7 +886,7 @@ async fn the_in_memory_backend_releases_identically() {
     db.reserve_tool_effect("m", &eid, "n1", "worker-A", 1, ttl)
         .await
         .unwrap();
-    db.release_tool_reservation("m", "worker-stale")
+    db.release_tool_reservation("m", "worker-stale", 1)
         .await
         .unwrap();
     assert!(
@@ -899,7 +899,9 @@ async fn the_in_memory_backend_releases_identically() {
         "a non-holder's release must be a no-op in memory too"
     );
 
-    db.release_tool_reservation("m", "worker-A").await.unwrap();
+    db.release_tool_reservation("m", "worker-A", 1)
+        .await
+        .unwrap();
     assert_eq!(
         db.reserve_tool_effect("m", &eid, "n1", "worker-B", 2, ttl)
             .await

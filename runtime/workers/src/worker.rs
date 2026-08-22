@@ -631,27 +631,6 @@ impl Worker {
                         + chrono::Duration::seconds(retry_after_secs as i64))
                     .to_rfc3339();
 
-                    // Parking ends this attempt WITHOUT recording an effect, so
-                    // the reservation this worker took must not outlive it. It is
-                    // reentrant for us and lapses on its TTL either way, but a
-                    // DIFFERENT worker picking the node up after the backoff
-                    // would otherwise wait out the remaining TTL for a key nobody
-                    // is working on. Owner-guarded, so a stale worker cannot free
-                    // a key that has already been taken over.
-                    if let Some(k) = computed_key.as_deref() {
-                        if let Err(e) = self
-                            .backend
-                            .release_tool_reservation(k, &self.worker_id)
-                            .await
-                        {
-                            warn!(
-                                execution_id = %execution_id,
-                                node_id = %node_id,
-                                "could not release the reservation on park; it will lapse on its TTL: {e}"
-                            );
-                        }
-                    }
-
                     // Fence-guarded reset to pending with retry_after backoff.
                     // Park first; only append NodeParked if the park actually succeeds.
                     // A stale-fence park (Ok(false)) must NOT produce a false audit record.
@@ -661,6 +640,36 @@ impl Worker {
                         .await
                     {
                         Ok(true) => {
+                            // Park landed, so this attempt is over WITHOUT having
+                            // recorded an effect: give the key back. Ordering
+                            // matters — releasing BEFORE the park would free the
+                            // key even when the park is rejected on a stale
+                            // fence, letting another item acquire it while this
+                            // one is still claimed.
+                            //
+                            // Guarded by owner AND fence: `reserve_tool_effect`
+                            // is reentrant for the same worker id and REPLACES
+                            // the reservation with the newer lease, so an older
+                            // attempt finishing late would otherwise delete the
+                            // newer attempt's claim.
+                            //
+                            // Latency, not correctness: the reservation lapses on
+                            // its TTL regardless, which is why a failure here is
+                            // logged and swallowed rather than failing the node.
+                            if let Some(k) = computed_key.as_deref() {
+                                if let Err(e) = self
+                                    .backend
+                                    .release_tool_reservation(k, &self.worker_id, lease_fence)
+                                    .await
+                                {
+                                    warn!(
+                                        execution_id = %execution_id,
+                                        node_id = %node_id,
+                                        "could not release the reservation on park; it will lapse on its TTL: {e}"
+                                    );
+                                }
+                            }
+
                             // Park succeeded — now record the audit event.
                             let seq = match self.backend.latest_sequence(&execution_id).await {
                                 Ok(s) => s + 1,
@@ -2085,6 +2094,88 @@ mod tests {
     ///
     /// The in-memory backend does not enforce the `retry_after` not-before window,
     /// so the item is immediately re-claimable in this test.
+    /// A parked node gives its idempotency key back.
+    ///
+    /// Asserted at the WORKER level on purpose: the backend-level release tests
+    /// exercise `release_tool_reservation` directly, so a regression that removed
+    /// or misplaced the call in `execute_item` would leave them all green while
+    /// the key stayed held for the whole five-minute TTL.
+    ///
+    /// Verified by taking the key afterwards as a DIFFERENT worker — the holder
+    /// could re-take it either way, since reservations are reentrant, so
+    /// re-reserving as the same worker would prove nothing.
+    #[tokio::test]
+    async fn parking_releases_the_idempotency_key() {
+        let (backend, eid) = setup_backend().await;
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor(
+            "tool",
+            Arc::new(RateLimitingExecutor {
+                retry_after_secs: 5,
+            }),
+        );
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+        worker.execute_item(item).await.unwrap();
+
+        // The park happened...
+        assert!(
+            backend
+                .get_events(&eid)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::NodeParked { .. })),
+            "precondition: the node must have parked"
+        );
+
+        // ...and it left no reservation standing. Reconstruct the key the worker
+        // computed: content_hash({run, segment, step, node, input_hash}) with
+        // step = 0, since a parked node never completed.
+        let current_state = backend
+            .get_execution(&eid)
+            .await
+            .unwrap()
+            .map(|e| e.current_state)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let key = jamjet_state::content_hash(&serde_json::json!({
+            "run": eid.to_string(),
+            "segment": 0,
+            "step": 0,
+            "node": "n1",
+            // The field is "input", not "input_hash" — see the key construction
+            // in `execute_item`. Getting it wrong here does not fail loudly: it
+            // reserves a key nobody ever took, so the assertion below passes for
+            // the wrong reason. This test was briefly doing exactly that.
+            "input": jamjet_state::content_hash(&current_state),
+        }));
+
+        assert_eq!(
+            backend
+                .reserve_tool_effect(
+                    &key,
+                    &eid,
+                    "n1",
+                    "another-worker",
+                    99,
+                    std::time::Duration::from_secs(300)
+                )
+                .await
+                .unwrap(),
+            jamjet_state::ReserveOutcome::Acquired,
+            "a parked node must release its key — another worker had to wait out \
+             the whole TTL for work nobody was doing"
+        );
+    }
+
     #[tokio::test]
     async fn park_on_rate_limit_under_max_attempts() {
         let (backend, eid) = setup_backend().await; // item: attempt=0, max_attempts=3

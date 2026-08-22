@@ -202,12 +202,13 @@ impl StateBackend for FailingGetEvents {
 
     async fn release_tool_reservation(
         &self,
-
         key: &str,
-
         owner: &str,
+        lease_fence: i64,
     ) -> jamjet_state::backend::BackendResult<()> {
-        self.inner.release_tool_reservation(key, owner).await
+        self.inner
+            .release_tool_reservation(key, owner, lease_fence)
+            .await
     }
 
     async fn reserve_tool_effect(
