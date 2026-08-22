@@ -182,6 +182,36 @@ pub trait StateBackend: Send + Sync {
     /// `NodeCompleted` with `idempotency_key = Some(k)`.
     async fn get_tool_effect(&self, key: &str) -> BackendResult<Option<serde_json::Value>>;
 
+    /// Claim an idempotency key BEFORE running the effect it names.
+    ///
+    /// [`Self::get_tool_effect`] can only answer "did this already run to
+    /// COMPLETION". Between two live work items for the same node both read
+    /// `None` and both fire, so the side effect happens twice — check-then-fire.
+    /// This is the reservation the spec calls load-bearing: whoever wins runs the
+    /// effect, and everyone else waits for its result instead of repeating it.
+    ///
+    /// Atomic and fail-safe by construction: it is a single conditional upsert,
+    /// so there is no window between testing for a holder and becoming one.
+    ///
+    /// `ttl` is what keeps a reservation from becoming a WORSE failure than the
+    /// double-fire it prevents. A worker that dies mid-tool leaves its row
+    /// behind; expiry is what lets the next worker take the key over instead of
+    /// the node being unrunnable forever. An expired reservation is therefore
+    /// acquirable, and this returns [`ReserveOutcome::Acquired`] for it.
+    ///
+    /// Reservations are consulted ONLY when no committed effect exists, so a row
+    /// left behind after a successful commit blocks nothing — the caller finds
+    /// the recorded result first and replays it.
+    async fn reserve_tool_effect(
+        &self,
+        key: &str,
+        execution_id: &ExecutionId,
+        node_id: &str,
+        owner: &str,
+        lease_fence: i64,
+        ttl: std::time::Duration,
+    ) -> BackendResult<ReserveOutcome>;
+
     // ── Content-addressed artifact store ─────────────────────────────────────
 
     /// Store bytes in the CAS, keyed by their SHA-256 hash.
@@ -492,6 +522,18 @@ pub struct ReclaimResult {
     pub retryable: Vec<WorkItem>,
     /// Items that exhausted all attempts and were moved to dead-letter.
     pub exhausted: Vec<WorkItem>,
+}
+
+/// The result of trying to claim an idempotency key before firing its effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReserveOutcome {
+    /// The key is ours: no live reservation existed, or the previous holder's
+    /// TTL had lapsed and we took it over. Run the effect.
+    Acquired,
+    /// Another worker holds a LIVE reservation. Do NOT run the effect — wait for
+    /// its result instead. `expires_at` is when the claim lapses, which bounds
+    /// how long waiting can be worthwhile.
+    Held { owner: String, expires_at: String },
 }
 
 /// What a fenced failure did to the item, and the item as it now stands.

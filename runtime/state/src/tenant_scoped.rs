@@ -6,8 +6,8 @@
 //! that item's execution.
 
 use crate::backend::{
-    ApiToken, BackendResult, FailOutcome, ReclaimResult, StateBackend, StateBackendError, WorkItem,
-    WorkItemId, WorkflowDefinition,
+    ApiToken, BackendResult, FailOutcome, ReclaimResult, ReserveOutcome, StateBackend,
+    StateBackendError, WorkItem, WorkItemId, WorkflowDefinition,
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
@@ -766,6 +766,83 @@ impl StateBackend for TenantScopedSqliteBackend {
     }
 
     // ── Idempotency cache ─────────────────────────────────────────────────
+
+    #[instrument(skip(self), fields(tenant = %self.tenant_id, key = key, owner = owner))]
+    async fn reserve_tool_effect(
+        &self,
+        key: &str,
+        execution_id: &ExecutionId,
+        node_id: &str,
+        owner: &str,
+        lease_fence: i64,
+        ttl: std::time::Duration,
+    ) -> BackendResult<ReserveOutcome> {
+        let now = Utc::now();
+        let now_s = now.to_rfc3339();
+        let expires_at = (now
+            + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::minutes(5)))
+        .to_rfc3339();
+
+        // See the untenanted backend for why this is one statement. `tenant_id`
+        // is written on the row, but the KEY is the conflict target: an
+        // idempotency key already encodes its execution, so two tenants cannot
+        // collide on one without colliding on the execution first.
+        let rows = sqlx::query(
+            "INSERT INTO tool_reservations \
+                 (idempotency_key, execution_id, node_id, owner, lease_fence, expires_at, tenant_id, reserved_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(tenant_id, idempotency_key) DO UPDATE SET \
+                 owner = excluded.owner, \
+                 lease_fence = excluded.lease_fence, \
+                 expires_at = excluded.expires_at, \
+                 reserved_at = excluded.reserved_at \
+             WHERE tool_reservations.expires_at <= ? OR tool_reservations.owner = ?",
+        )
+        .bind(key)
+        .bind(execution_id_str(execution_id))
+        .bind(node_id)
+        .bind(owner)
+        .bind(lease_fence)
+        .bind(&expires_at)
+        .bind(&self.tenant_id.0)
+        .bind(&now_s)
+        .bind(&now_s)
+        .bind(owner)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+
+        if rows > 0 {
+            return Ok(ReserveOutcome::Acquired);
+        }
+
+        let row = sqlx::query(
+            "SELECT owner, expires_at FROM tool_reservations \
+             WHERE idempotency_key = ? AND tenant_id = ?",
+        )
+        .bind(key)
+        .bind(&self.tenant_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+
+        match row {
+            Some(r) => Ok(ReserveOutcome::Held {
+                owner: r.try_get::<String, _>("owner").map_err(map_db_err)?,
+                expires_at: r.try_get::<String, _>("expires_at").map_err(map_db_err)?,
+            }),
+            // The upsert was blocked, so SOMETHING holds this key. If the row
+            // is not visible here, that is not evidence the key is free — it was
+            // the reasoning behind an earlier `Acquired` return, and it was a
+            // fail-open: a scoped lookup cannot see a row another tenant owns, so
+            // the caller was handed a key someone else held. Refuse instead.
+            None => Ok(ReserveOutcome::Held {
+                owner: "unknown".to_string(),
+                expires_at: now_s.clone(),
+            }),
+        }
+    }
 
     async fn get_tool_effect(&self, key: &str) -> BackendResult<Option<serde_json::Value>> {
         let row = sqlx::query(

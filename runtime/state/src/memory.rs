@@ -4,8 +4,8 @@
 //! quick prototyping where durability is not needed.
 
 use crate::backend::{
-    ApiToken, BackendResult, FailOutcome, ReclaimResult, StateBackend, StateBackendError, WorkItem,
-    WorkItemId, WorkflowDefinition,
+    ApiToken, BackendResult, FailOutcome, ReclaimResult, ReserveOutcome, StateBackend,
+    StateBackendError, WorkItem, WorkItemId, WorkflowDefinition,
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
@@ -41,6 +41,8 @@ pub struct InMemoryBackend {
     /// Idempotency cache: idempotency_key -> result_json.
     /// Mirrors the `tool_effects` table in the SQLite backends.
     tool_effects: DashMap<String, serde_json::Value>,
+    /// Reservations: idempotency key -> (owner, expires_at).
+    tool_reservations: DashMap<String, (String, chrono::DateTime<Utc>)>,
     /// Projected approval read-model. Key = (execution_id as String, node_id).
     proj_approvals: DashMap<(String, String), crate::backend::ApprovalProjectionRow>,
     /// Projector checkpoints. Key = (projection_name, execution_id as String).
@@ -64,6 +66,7 @@ impl InMemoryBackend {
             lease_epochs: DashMap::new(),
             store_term: AtomicI64::new(0),
             tool_effects: DashMap::new(),
+            tool_reservations: DashMap::new(),
             proj_approvals: DashMap::new(),
             projector_checkpoints: DashMap::new(),
             artifacts: DashMap::new(),
@@ -331,6 +334,43 @@ impl StateBackend for InMemoryBackend {
     }
 
     // ── Idempotency cache ─────────────────────────────────────────────────
+
+    async fn reserve_tool_effect(
+        &self,
+        key: &str,
+        _execution_id: &ExecutionId,
+        _node_id: &str,
+        owner: &str,
+        _lease_fence: i64,
+        ttl: std::time::Duration,
+    ) -> BackendResult<ReserveOutcome> {
+        let now = Utc::now();
+        let expires_at =
+            now + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::minutes(5));
+
+        // `entry` holds the shard lock across the whole test-and-set, which is
+        // what makes this atomic in the same way the SQL upsert is. A get-then-
+        // insert would reopen the exact race the reservation exists to close.
+        use dashmap::mapref::entry::Entry;
+        match self.tool_reservations.entry(key.to_string()) {
+            Entry::Vacant(v) => {
+                v.insert((owner.to_string(), expires_at));
+                Ok(ReserveOutcome::Acquired)
+            }
+            Entry::Occupied(mut o) => {
+                let (holder, holder_expiry) = o.get().clone();
+                if holder == owner || holder_expiry <= now {
+                    // Lapsed: the holder is presumed dead, so take it over.
+                    o.insert((owner.to_string(), expires_at));
+                    return Ok(ReserveOutcome::Acquired);
+                }
+                Ok(ReserveOutcome::Held {
+                    owner: holder,
+                    expires_at: holder_expiry.to_rfc3339(),
+                })
+            }
+        }
+    }
 
     async fn get_tool_effect(&self, key: &str) -> BackendResult<Option<serde_json::Value>> {
         Ok(self.tool_effects.get(key).map(|r| r.value().clone()))

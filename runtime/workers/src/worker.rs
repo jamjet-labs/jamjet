@@ -40,6 +40,40 @@ pub struct Worker {
     executors: HashMap<String, Arc<dyn NodeExecutor>>,
 }
 
+/// Rebuild an [`ExecutionResult`] from a recorded `tool_effects` row.
+///
+/// Shared by BOTH replay paths — the one that finds a committed result up front,
+/// and the one that waited for another worker to produce it. They must
+/// reconstruct identically, or "replayed" would mean something different
+/// depending on which path got there.
+fn replayed_result(rec: &serde_json::Value) -> ExecutionResult {
+    ExecutionResult {
+        output: rec
+            .get("output")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        state_patch: rec
+            .get("state_patch")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        duration_ms: rec.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+        gen_ai_system: rec
+            .get("gen_ai_system")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        gen_ai_model: rec
+            .get("gen_ai_model")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        input_tokens: rec.get("input_tokens").and_then(|v| v.as_u64()),
+        output_tokens: rec.get("output_tokens").and_then(|v| v.as_u64()),
+        finish_reason: rec
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    }
+}
+
 impl Worker {
     pub fn new(
         worker_id: String,
@@ -292,84 +326,95 @@ impl Worker {
                                 %key,
                                 "Replaying recorded result; executor skipped"
                             );
-                            Ok(ExecutionResult {
-                                output: rec
-                                    .get("output")
-                                    .cloned()
-                                    .unwrap_or_else(|| serde_json::json!({})),
-                                state_patch: rec
-                                    .get("state_patch")
-                                    .cloned()
-                                    .unwrap_or_else(|| serde_json::json!({})),
-                                duration_ms: rec
-                                    .get("duration_ms")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
-                                gen_ai_system: rec
-                                    .get("gen_ai_system")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string),
-                                gen_ai_model: rec
-                                    .get("gen_ai_model")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string),
-                                input_tokens: rec.get("input_tokens").and_then(|v| v.as_u64()),
-                                output_tokens: rec.get("output_tokens").and_then(|v| v.as_u64()),
-                                finish_reason: rec
-                                    .get("finish_reason")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string),
-                            })
+                            Ok(replayed_result(&rec))
                         }
                         None => {
-                            // No recorded result — fire the executor.
-                            match self.executors.get(&kind_tag) {
-                                Some(executor) if kind_tag == "agent_tool" => {
-                                    let (tx, mut rx) =
-                                        tokio::sync::mpsc::channel::<serde_json::Value>(64);
-                                    let backend = Arc::clone(&self.backend);
-                                    let eid = execution_id.clone();
-                                    let receiver_handle = tokio::spawn(async move {
-                                        while let Some(event) = rx.recv().await {
-                                            backend
-                                                .patch_append_array(
-                                                    &eid,
-                                                    "agent_tool_events",
-                                                    event,
-                                                )
-                                                .await
-                                                .map_err(|e| {
-                                                    format!("patch_append_array failed: {e}")
-                                                })?;
-                                        }
-                                        Ok::<(), String>(())
-                                    });
-                                    let result = executor.execute_streaming(&item, tx).await;
-                                    match receiver_handle.await {
-                                        Ok(Err(e)) => Err(ExecutorError::Fatal(e)),
-                                        Err(e) => Err(ExecutorError::Fatal(format!(
-                                            "Receiver task panicked: {e}"
-                                        ))),
-                                        Ok(Ok(())) => result,
-                                    }
+                            // No recorded result. Before firing, CLAIM the key.
+                            //
+                            // `get_tool_effect` above only answers "did this
+                            // already run to completion". Two live items for one
+                            // node both read None and both fire, and the effect
+                            // happens twice — check-then-fire. Duplicate items
+                            // are not hypothetical: a retry crash window, an
+                            // approval-hold resurrection, or the public
+                            // POST /work-items can all produce them.
+                            // Bind the result BEFORE `?`: the heartbeat is
+                            // already running, and every other early return in
+                            // this function aborts it first. Propagating straight
+                            // out would leave a detached task renewing the lease
+                            // forever, so the item could never be reclaimed —
+                            // turning a contended key into a permanent wedge,
+                            // which is strictly worse than the double-fire the
+                            // reservation prevents.
+                            let claimed = match self
+                                .await_or_claim_effect(&key, &execution_id, &node_id, lease_fence)
+                                .await
+                            {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    heartbeat.abort();
+                                    return Err(e);
                                 }
-                                Some(executor) => executor.execute(&item).await,
-                                None => {
-                                    info!(
-                                        node_id = %node_id,
-                                        kind = %kind_tag,
-                                        "No executor; using stub"
-                                    );
-                                    Ok(ExecutionResult {
-                                        output: serde_json::json!({}),
-                                        state_patch: serde_json::json!({}),
-                                        duration_ms: start.elapsed().as_millis() as u64,
-                                        gen_ai_system: None,
-                                        gen_ai_model: None,
-                                        input_tokens: None,
-                                        output_tokens: None,
-                                        finish_reason: None,
-                                    })
+                            };
+                            if let Some(outcome) = claimed {
+                                // Someone else ran it and we read their result.
+                                info!(
+                                    execution_id = %execution_id,
+                                    node_id = %node_id,
+                                    %key,
+                                    "Replaying another worker's recorded result; executor skipped"
+                                );
+                                Ok(replayed_result(&outcome))
+                            } else {
+                                // The key is ours — fire the executor.
+                                match self.executors.get(&kind_tag) {
+                                    Some(executor) if kind_tag == "agent_tool" => {
+                                        let (tx, mut rx) =
+                                            tokio::sync::mpsc::channel::<serde_json::Value>(64);
+                                        let backend = Arc::clone(&self.backend);
+                                        let eid = execution_id.clone();
+                                        let receiver_handle = tokio::spawn(async move {
+                                            while let Some(event) = rx.recv().await {
+                                                backend
+                                                    .patch_append_array(
+                                                        &eid,
+                                                        "agent_tool_events",
+                                                        event,
+                                                    )
+                                                    .await
+                                                    .map_err(|e| {
+                                                        format!("patch_append_array failed: {e}")
+                                                    })?;
+                                            }
+                                            Ok::<(), String>(())
+                                        });
+                                        let result = executor.execute_streaming(&item, tx).await;
+                                        match receiver_handle.await {
+                                            Ok(Err(e)) => Err(ExecutorError::Fatal(e)),
+                                            Err(e) => Err(ExecutorError::Fatal(format!(
+                                                "Receiver task panicked: {e}"
+                                            ))),
+                                            Ok(Ok(())) => result,
+                                        }
+                                    }
+                                    Some(executor) => executor.execute(&item).await,
+                                    None => {
+                                        info!(
+                                            node_id = %node_id,
+                                            kind = %kind_tag,
+                                            "No executor; using stub"
+                                        );
+                                        Ok(ExecutionResult {
+                                            output: serde_json::json!({}),
+                                            state_patch: serde_json::json!({}),
+                                            duration_ms: start.elapsed().as_millis() as u64,
+                                            gen_ai_system: None,
+                                            gen_ai_model: None,
+                                            input_tokens: None,
+                                            output_tokens: None,
+                                            finish_reason: None,
+                                        })
+                                    }
                                 }
                             }
                         }
@@ -773,6 +818,94 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// How long a reservation is honoured before it is presumed dead.
+    ///
+    /// Only ever consulted when the reserving worker did NOT commit — a normal
+    /// run records its effect and every later reader replays that instead. So
+    /// this is the "worker died mid-tool" recovery window, and it is generous on
+    /// purpose: expiring sooner than a slow-but-alive tool would reintroduce the
+    /// double-fire the reservation exists to prevent.
+    const RESERVATION_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// How long to wait for the winner's result before giving the item back.
+    const RESULT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+    const RESULT_POLL_ATTEMPTS: u32 = 40; // 10s
+
+    /// Claim `key`, or return the winner's already-committed result.
+    ///
+    /// `Ok(None)` means the key is OURS and the caller must run the effect.
+    /// `Ok(Some(result))` means someone else ran it and this is their recorded
+    /// output, to be replayed rather than repeated.
+    ///
+    /// Losing the race is retried ONCE before waiting, because the overwhelmingly
+    /// common reason to lose is that the winner finished microseconds ago: the
+    /// retry re-reads the committed effect and takes the fast path. Only a
+    /// genuinely concurrent run reaches the poll.
+    ///
+    /// Giving up is deliberate and safe. Returning an error hands the item back
+    /// to the normal retry machinery, and the reservation's TTL guarantees a
+    /// later attempt can take the key over — so a dead winner delays the node
+    /// rather than stranding it.
+    async fn await_or_claim_effect(
+        &self,
+        key: &str,
+        execution_id: &ExecutionId,
+        node_id: &str,
+        lease_fence: i64,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        for attempt in 0..2 {
+            match self
+                .backend
+                .reserve_tool_effect(
+                    key,
+                    execution_id,
+                    node_id,
+                    &self.worker_id,
+                    lease_fence,
+                    Self::RESERVATION_TTL,
+                )
+                .await?
+            {
+                jamjet_state::ReserveOutcome::Acquired => return Ok(None),
+                jamjet_state::ReserveOutcome::Held { owner, expires_at } => {
+                    // The winner may have committed between our read and our
+                    // claim. Check before deciding to wait.
+                    if let Some(rec) = self.backend.get_tool_effect(key).await? {
+                        return Ok(Some(rec));
+                    }
+                    if attempt == 0 {
+                        continue; // the one retry
+                    }
+                    warn!(
+                        execution_id = %execution_id,
+                        node_id,
+                        %key,
+                        %owner,
+                        %expires_at,
+                        "idempotency key reserved by another worker — awaiting its result \
+                         instead of running the effect twice"
+                    );
+                }
+            }
+        }
+
+        for _ in 0..Self::RESULT_POLL_ATTEMPTS {
+            tokio::time::sleep(Self::RESULT_POLL_INTERVAL).await;
+            if let Some(rec) = self.backend.get_tool_effect(key).await? {
+                return Ok(Some(rec));
+            }
+        }
+
+        // Hand the item back rather than firing. The TTL is what makes this safe
+        // to give up on: a later attempt takes the key over once the holder
+        // lapses, so the node is delayed, never stranded.
+        Err(format!(
+            "idempotency key {key} is held by another worker and no result appeared; \
+             retrying rather than running the effect twice"
+        )
+        .into())
     }
 
     // ── Policy check ──────────────────────────────────────────────────────────
