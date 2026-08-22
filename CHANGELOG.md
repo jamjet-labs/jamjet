@@ -9,6 +9,23 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Dropped `hyper 0.14` and `h2 0.3.x` from the tree** (RUSTSEC-2026-0258, h2 unbounded
+  empty DATA frames). The OTLP stack moved from opentelemetry 0.22 / tonic 0.11 to
+  opentelemetry 0.32 / tonic 0.14, which was the only thing holding the pre-1.x hyper
+  line in. The `cargo audit` suppression is removed, and the unused workspace `tonic`
+  dependency is gone with it.
+
+  The suppression's own risk note was too generous: it read the advisory as not
+  flagging the `h2 0.4.15` used by the inbound-facing servers, but the advisory patches
+  at `>= 0.4.16` with no unaffected range, so those were in scope too. The tree now
+  resolves `h2 0.4.18`.
+
+  CI's tripwire is replaced rather than deleted: it used to police the *exception*, and
+  now asserts the *fix* — `h2 0.3.x` and `hyper 0.14` must stay out of the tree, so a
+  future dependency bump cannot quietly bring the line back.
+
 ---
 
 ## 0.5.0 - 2026-08-22

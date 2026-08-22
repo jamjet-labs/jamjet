@@ -46,7 +46,6 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres",
 
 # HTTP / gRPC
 axum = { version = "0.7", features = ["json", "macros"] }
-tonic = "0.11"
 hyper = { version = "1", features = ["full"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
@@ -57,10 +56,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # Tracing / telemetry
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-opentelemetry = "0.22"
-opentelemetry-otlp = { version = "0.15", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"] }
-tracing-opentelemetry = "0.23"
+opentelemetry = "0.32"
+opentelemetry-otlp = { version = "0.32", features = ["metrics", "grpc-tonic"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.33"
 
 # Error handling
 thiserror = "1"
