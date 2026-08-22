@@ -1464,7 +1464,8 @@ impl StateBackend for SqliteBackend {
         // 1) Fenced settle. Zero rows => stale fence => fail closed, emit nothing.
         let rows = if set_completed_at {
             sqlx::query(
-                "UPDATE work_items SET status = ?, completed_at = ?, lease_expires_at = NULL WHERE id = ? AND lease_fence = ?",
+                "UPDATE work_items SET status = ?, completed_at = ?, lease_expires_at = NULL \
+                 WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
             )
             .bind(status)
             .bind(&now)
@@ -1476,7 +1477,8 @@ impl StateBackend for SqliteBackend {
             .rows_affected()
         } else {
             sqlx::query(
-                "UPDATE work_items SET status = ?, completed_at = NULL, lease_expires_at = NULL, worker_id = NULL WHERE id = ? AND lease_fence = ?",
+                "UPDATE work_items SET status = ?, completed_at = NULL, lease_expires_at = NULL, worker_id = NULL \
+                 WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
             )
             .bind(status)
             .bind(&id_str)

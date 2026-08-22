@@ -430,3 +430,212 @@ async fn the_unfenced_legacy_path_still_settles_but_warns() {
         "the legacy path emits nothing — that is exactly why it is deprecated"
     );
 }
+
+// ── /complete: the settle and the terminal event are ONE transaction ─────────
+
+async fn post_complete(state: &AppState, id: Uuid, body: Value) -> (StatusCode, Value) {
+    let resp = build_router_with_opts(state.clone(), true)
+        .oneshot(
+            Request::post(format!("/work-items/{id}/complete"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+fn node_completed_count(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+        .count()
+}
+
+/// A fenced completion settles the item AND emits `NodeCompleted` together.
+///
+/// These used to be separate statements. A crash in the window left the item
+/// settled with no terminal event, so the scheduler fold kept the node in
+/// `scheduled` and the execution never finished — permanently, because the fold
+/// replays the log and reproduces the same gap every time.
+#[tokio::test]
+async fn a_fenced_completion_settles_and_emits_together() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let (execution_id, id, fence) = seed_and_claim(&backend, 3, 0).await;
+    let state = make_state(backend.clone());
+
+    let (status, body) = post_complete(
+        &state,
+        id,
+        json!({
+            "execution_id": execution_id.to_string(),
+            "node_id": "n1",
+            "output": {"ok": true},
+            "state_patch": {"ok": true},
+            "duration_ms": 5,
+            "lease_fence": fence,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["completed"], json!(true));
+    assert_eq!(
+        node_completed_count(&events(&backend, &execution_id).await),
+        1,
+        "a completion must leave exactly one NodeCompleted — without it the node \
+         stays scheduled and the execution never reaches a terminal state"
+    );
+}
+
+/// A stale fence completes nothing and emits nothing.
+#[tokio::test]
+async fn a_stale_fence_completion_is_refused_and_emits_nothing() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let (execution_id, id, fence) = seed_and_claim(&backend, 3, 0).await;
+    let state = make_state(backend.clone());
+
+    let (status, _) = post_complete(
+        &state,
+        id,
+        json!({
+            "execution_id": execution_id.to_string(),
+            "node_id": "n1",
+            "output": {},
+            "state_patch": {},
+            "lease_fence": fence + 9,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        node_completed_count(&events(&backend, &execution_id).await),
+        0,
+        "a rejected completion must not emit a terminal event for work it did not settle"
+    );
+}
+
+/// Replaying a completion must not emit a second `NodeCompleted`.
+///
+/// The fence is consumed by the first settle, so the replay finds nothing of its
+/// own to commit — a duplicate terminal event would corrupt the fold.
+#[tokio::test]
+async fn replaying_a_completion_does_not_double_emit() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let (execution_id, id, fence) = seed_and_claim(&backend, 3, 0).await;
+    let state = make_state(backend.clone());
+
+    let payload = json!({
+        "execution_id": execution_id.to_string(),
+        "node_id": "n1",
+        "output": {},
+        "state_patch": {},
+        "lease_fence": fence,
+    });
+
+    let (first, _) = post_complete(&state, id, payload.clone()).await;
+    assert_eq!(first, StatusCode::OK);
+    let (second, _) = post_complete(&state, id, payload).await;
+    assert_eq!(
+        second,
+        StatusCode::CONFLICT,
+        "the replay no longer holds the lease"
+    );
+
+    assert_eq!(
+        node_completed_count(&events(&backend, &execution_id).await),
+        1,
+        "exactly one NodeCompleted, not one per delivery"
+    );
+}
+
+/// `lease_fence: 0` must not complete a work item nobody ever claimed.
+///
+/// Pending rows carry `lease_fence = 0` (migration 0004), and `commit_turn`'s
+/// fenced settle matched on `id` + `lease_fence` with no `status = 'claimed'`
+/// guard — so a forged or defaulted zero fence matched a never-claimed item and
+/// completed it, emitting a terminal event for work that never ran.
+///
+/// Routing /complete through `commit_turn` is what made that reachable from the
+/// HTTP boundary, so the guard belongs both there and here.
+#[tokio::test]
+async fn a_zero_fence_cannot_complete_an_unclaimed_item() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let execution_id = ExecutionId::new();
+    let now = chrono::Utc::now();
+    backend
+        .create_execution(WorkflowExecution {
+            execution_id: execution_id.clone(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: json!({}),
+            current_state: json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        })
+        .await
+        .unwrap();
+
+    // Enqueued and NEVER claimed: lease_fence is still 0.
+    let item_id = Uuid::new_v4();
+    backend
+        .enqueue_work_item(WorkItem {
+            id: item_id,
+            execution_id: execution_id.clone(),
+            node_id: "n1".into(),
+            queue_type: "python_tool".into(),
+            payload: json!({"node_id": "n1"}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: DEFAULT_TENANT.into(),
+        })
+        .await
+        .unwrap();
+
+    let state = make_state(backend.clone());
+    let (status, _) = post_complete(
+        &state,
+        item_id,
+        json!({
+            "execution_id": execution_id.to_string(),
+            "node_id": "n1",
+            "output": {"forged": true},
+            "state_patch": {},
+            "lease_fence": 0,
+        }),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a zero fence must not complete an item nobody claimed"
+    );
+    assert_eq!(
+        node_completed_count(&events(&backend, &execution_id).await),
+        0,
+        "no terminal event may be emitted for work that never ran"
+    );
+    // And the item is still there to be claimed properly.
+    assert!(
+        backend
+            .claim_work_item("real-worker", &["python_tool"])
+            .await
+            .unwrap()
+            .is_some(),
+        "the item must remain claimable — a forged completion must not consume it"
+    );
+}

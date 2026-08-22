@@ -1423,38 +1423,14 @@ async fn complete_work_item(
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
 
-    // Settle the work item. When the worker echoes its lease fence, the settle is
-    // fence-gated: a stale / forged fence (reclaimed or replayed worker) is
-    // rejected with 409 and we emit NO terminal event, so a lost lease can never
-    // duplicate a NodeCompleted. When the fence is absent, fall back to the legacy
-    // unfenced settle-by-id (backward-compat for callers not yet echoing it).
-    match body.lease_fence {
-        Some(fence) => {
-            let settled = backend.complete_work_item_fenced(item_id, fence).await?;
-            if !settled {
-                return Ok((
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "completed": false,
-                        "reason": "stale or invalid lease fence",
-                    })),
-                ));
-            }
-        }
-        None => {
-            backend.complete_work_item(item_id).await?;
-        }
-    }
-
-    // Emit NodeCompleted event if execution_id and node_id are provided.
-    if let (Some(exec_id_str), Some(node_id)) = (&body.execution_id, &body.node_id) {
-        let execution_id = parse_execution_id(exec_id_str)?;
-        let seq = backend.latest_sequence(&execution_id).await? + 1;
-        let event = jamjet_state::Event::new(
+    let node_completed = |execution_id: &ExecutionId| {
+        jamjet_state::Event::new(
             execution_id.clone(),
-            seq,
+            // Sequence is assigned inside `commit_turn`'s transaction; this
+            // placeholder is never the number that lands.
+            0,
             jamjet_state::EventKind::NodeCompleted {
-                node_id: node_id.clone(),
+                node_id: body.node_id.clone().unwrap_or_default(),
                 output: body.output.clone(),
                 state_patch: body.state_patch.clone(),
                 duration_ms: body.duration_ms,
@@ -1467,10 +1443,107 @@ async fn complete_work_item(
                 provenance: None,
                 idempotency_key: None,
             },
-        );
-        backend.append_event(event).await?;
+        )
+    };
 
-        // Apply state_patch to the execution's current_state.
+    // Settle AND emit in ONE transaction.
+    //
+    // These used to be separate statements: settle the item, then append the
+    // NodeCompleted. A crash in that window left the item settled with no
+    // terminal event, so the scheduler fold kept the node in `scheduled` and the
+    // execution never finished — permanently, since the fold is a replay of the
+    // log. `commit_turn` is the primitive the in-process worker already uses for
+    // exactly this, and it is fence-guarded, so a stale worker writes nothing.
+    // A lease fence is a MINTED token (`term * 2^32 + epoch`), so it is always
+    // positive. Zero is what a never-claimed row carries and what a defaulted or
+    // forged body sends, so it must never reach a fenced settle — treat it as
+    // absent rather than as a fence that happens to match every pending item.
+    if body.lease_fence.is_some_and(|f| f <= 0) {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "completed": false,
+                "reason": "stale or invalid lease fence",
+            })),
+        ));
+    }
+
+    let committed_atomically = match (
+        body.lease_fence,
+        body.execution_id.as_deref(),
+        body.node_id.as_deref(),
+    ) {
+        (Some(fence), Some(exec_id_str), Some(_)) => {
+            let execution_id = parse_execution_id(exec_id_str)?;
+            match backend
+                .commit_turn(item_id, fence, node_completed(&execution_id), true)
+                .await
+            {
+                Ok(_) => true,
+                Err(jamjet_state::StateBackendError::FenceLost(_)) => {
+                    return Ok((
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "completed": false,
+                            "reason": "stale or invalid lease fence",
+                        })),
+                    ));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // Fenced, but with no coordinates to build a terminal event from. Settle
+        // only — the same shape as before, and still fence-guarded.
+        (Some(fence), _, _) => {
+            let settled = backend.complete_work_item_fenced(item_id, fence).await?;
+            if !settled {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "completed": false,
+                        "reason": "stale or invalid lease fence",
+                    })),
+                ));
+            }
+            false
+        }
+        // Legacy unfenced path, deprecated. Kept so callers that predate the
+        // fence keep working, but it cannot be made atomic: `commit_turn` is
+        // fence-guarded by construction, and without a fence we cannot show the
+        // item is ours to settle.
+        (None, _, _) => {
+            warn!(
+                work_item_id = %id,
+                "complete: unfenced legacy path — settle and terminal event are \
+                 not atomic; echo lease_fence to make them one transaction"
+            );
+            backend.complete_work_item(item_id).await?;
+            false
+        }
+    };
+
+    // The unfenced and no-coordinate paths still emit separately.
+    if !committed_atomically {
+        if let (Some(exec_id_str), Some(_)) = (&body.execution_id, &body.node_id) {
+            let execution_id = parse_execution_id(exec_id_str)?;
+            let seq = backend.latest_sequence(&execution_id).await? + 1;
+            let mut event = node_completed(&execution_id);
+            event.sequence = seq;
+            backend.append_event(event).await?;
+        }
+    }
+
+    // Gated on BOTH coordinates, matching the terminal event. Refreshing the read
+    // model when no `NodeCompleted` was emitted would let the column drift in a
+    // way the event log cannot explain — and the log is what the materializer
+    // rebuilds from, so the two would simply disagree with no way to tell which
+    // is right.
+    if let (Some(exec_id_str), Some(_)) = (&body.execution_id, &body.node_id) {
+        let execution_id = parse_execution_id(exec_id_str)?;
+        // Denormalised read-model refresh, best effort by design: the
+        // authoritative state is the event log plus the snapshot `commit_turn`
+        // wrote inside the transaction, and the materializer recomputes from
+        // those. Losing this write costs a stale convenience column, not state.
         if let Ok(Some(mut exec)) = backend.get_execution(&execution_id).await {
             if let Some(state_obj) = exec.current_state.as_object_mut() {
                 if let Some(patch_obj) = body.state_patch.as_object() {
