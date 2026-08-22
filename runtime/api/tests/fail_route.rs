@@ -860,3 +860,73 @@ async fn a_later_segment_derives_a_different_key() {
          effect"
     );
 }
+
+/// A key the engine never minted is refused, not filed.
+///
+/// Every key it issues is `content_hash`'s output — 64 lowercase hex characters.
+/// Anything else records an effect under a string no reader can ever derive:
+/// junk that looks like a recorded effect while covering nothing.
+#[tokio::test]
+async fn a_malformed_idempotency_key_is_refused() {
+    let upper = "A".repeat(64);
+    let not_hex = "g".repeat(64);
+    let too_long = "a".repeat(65);
+    let cases = [
+        ("", "empty"),
+        ("abc123", "too short"),
+        (upper.as_str(), "uppercase hex"),
+        (not_hex.as_str(), "not hex"),
+        (too_long.as_str(), "too long"),
+    ];
+
+    for (key, why) in cases {
+        let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+        let (execution_id, id) = seed_unclaimed(&backend).await;
+        let state = make_state(backend.clone());
+        let claim = claim_via_route(&state).await;
+        let fence = claim["work_item"]["lease_fence"].as_i64().unwrap();
+
+        let (status, _) = post_complete(
+            &state,
+            id,
+            json!({
+                "execution_id": execution_id.to_string(),
+                "node_id": "n1",
+                "output": {},
+                "state_patch": {},
+                "lease_fence": fence,
+                "idempotency_key": key,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a {why} key must be refused, not filed as an effect"
+        );
+    }
+
+    // ...and the well-formed one the claim actually handed out still works.
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let (execution_id, id) = seed_unclaimed(&backend).await;
+    let state = make_state(backend.clone());
+    let claim = claim_via_route(&state).await;
+    let (status, _) = post_complete(
+        &state,
+        id,
+        json!({
+            "execution_id": execution_id.to_string(),
+            "node_id": "n1",
+            "output": {},
+            "state_patch": {},
+            "lease_fence": claim["work_item"]["lease_fence"].as_i64().unwrap(),
+            "idempotency_key": claim["work_item"]["idempotency_key"].as_str().unwrap(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the engine's own key must be accepted"
+    );
+}

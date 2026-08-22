@@ -1509,14 +1509,23 @@ async fn complete_work_item(
         ));
     }
 
-    // An empty key is never something this engine issued — every key it mints is
-    // a sha256 hex digest. Recording an effect under "" would file a row no
-    // reader can ever derive, so reject it rather than accumulate junk that
-    // looks like a recorded effect.
-    if body.idempotency_key.as_deref().is_some_and(str::is_empty) {
-        return Err(ApiError::BadRequest(
-            "idempotency_key must not be empty".to_string(),
-        ));
+    // Every key this engine mints is `content_hash`'s output: 64 lowercase hex
+    // characters. Anything else was never issued here, so an effect recorded
+    // under it is a row no reader can ever derive — junk that looks like a
+    // recorded effect and silently covers nothing.
+    //
+    // This is a shape check, not proof of provenance: a well-formed key from a
+    // DIFFERENT claim still passes. Binding the key to the claimed item is #130.
+    if let Some(key) = body.idempotency_key.as_deref() {
+        if key.len() != 64
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(ApiError::BadRequest(
+                "idempotency_key must be 64 lowercase hex characters".to_string(),
+            ));
+        }
     }
 
     let committed_atomically = match (
