@@ -13,9 +13,12 @@ No live runtime is required; a _StubClient records all outbound calls.
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 
 from jamjet.cli.main import _worker_loop  # noqa: E402
+from jamjet.client import JamjetClient
 
 # ── Test handler functions ────────────────────────────────────────────────────
 
@@ -78,6 +81,7 @@ class _StubClient:
         gen_ai_model: str | None = None,
         finish_reason: str | None = None,
         lease_fence: int | None = None,
+        idempotency_key: str | None = None,
     ) -> None:
         self.complete_calls.append(
             {
@@ -89,6 +93,7 @@ class _StubClient:
                 "gen_ai_model": gen_ai_model,
                 "finish_reason": finish_reason,
                 "lease_fence": lease_fence,
+                "idempotency_key": idempotency_key,
             }
         )
 
@@ -383,3 +388,69 @@ async def test_worker_dispatch_tool_calls_return_reaches_state() -> None:
     assert msgs[3]["content"] == "echo:hi", "the resolved tool's result must be carried forward"
     # output mirrors the same dict (the worker coerces a dict return as-is).
     assert call["output"]["messages"] == msgs
+
+
+async def test_worker_echoes_idempotency_key_on_complete() -> None:
+    """The claim's idempotency key must reach /complete.
+
+    Without it the engine records the result with `idempotency_key: None`,
+    nothing lands in `tool_effects`, and the replay guard does not cover this
+    node at all — so a re-run fires the tool a second time. That was the state of
+    every external tool effect before this was threaded through.
+    """
+    item = dict(_ADD_ITEM, id="wi-008", idempotency_key="abc123")
+    stub = _StubClient(claimed_item=item)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+
+    assert len(stub.complete_calls) == 1
+    assert stub.complete_calls[0]["idempotency_key"] == "abc123", (
+        "the claim's key must reach the engine, or the effect is recorded under nothing and the tool re-fires on replay"
+    )
+
+
+async def test_worker_tolerates_a_claim_without_an_idempotency_key() -> None:
+    """An older engine omits the field; the worker must still complete.
+
+    Forwarded as None, which is exactly the pre-existing behaviour: no recorded
+    effect, no replay protection, but a working queue.
+    """
+    stub = _StubClient(claimed_item=_ADD_ITEM)
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+
+    assert len(stub.complete_calls) == 1
+    assert stub.complete_calls[0]["idempotency_key"] is None
+
+
+async def test_client_sends_a_present_key_even_when_falsy() -> None:
+    """The client echoes what the claim handed it, rather than judging it.
+
+    A truthiness check would turn a falsy-but-present key into "no key" — the
+    exact failure this change removes, and invisible at the call site. Rejecting
+    a malformed key is the engine's job, and it does (HTTP 400); silently
+    dropping it here would hide the bug instead.
+    """
+    sent: dict[str, Any] = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+    class _HTTP:
+        async def post(self, url: str, json: dict[str, Any]) -> _Resp:
+            sent.update(json)
+            return _Resp()
+
+    client = JamjetClient.__new__(JamjetClient)
+    client._client = _HTTP()  # type: ignore[attr-defined]
+
+    await client.complete_work_item(
+        "item-1",
+        execution_id="exec-1",
+        node_id="n1",
+        output={},
+        state_patch={},
+        duration_ms=1,
+        idempotency_key="",
+    )
+    assert "idempotency_key" in sent, "a present key must be sent, not judged for truthiness"
+    assert sent["idempotency_key"] == ""

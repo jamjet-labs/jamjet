@@ -29,7 +29,9 @@ pub use backend::{
 };
 pub use budget::{BudgetState, BudgetTrip};
 pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};
-pub use hashing::{canonical_json, content_hash, sha256_hex};
+pub use hashing::{
+    canonical_json, content_hash, derive_idempotency_key, idempotency_key, sha256_hex,
+};
 pub use materializer::{
     apply_events, apply_events_seeded, materialize, should_snapshot, MaterializedState,
 };

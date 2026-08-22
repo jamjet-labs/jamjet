@@ -290,30 +290,17 @@ impl Worker {
                     // nodes a sibling's state_patch landing between fire and replay changes
                     // current_state and thus the key, so zero-outbound replay is exact for linear
                     // runs in v1 (parallel-sibling replay exactness is a follow-up, see F-2c-3). [I2]
-                    let events_for_key = self.backend.get_events(&execution_id).await?;
-                    let step = events_for_key
-                        .iter()
-                        .filter(|e| {
-                            matches!(
-                                &e.kind,
-                                EventKind::NodeCompleted { node_id: nid, .. } if nid == &node_id
-                            )
-                        })
-                        .count() as u64;
-                    let current_state = self
-                        .backend
-                        .get_execution(&execution_id)
-                        .await?
-                        .map(|e| e.current_state)
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    let input_hash = content_hash(&current_state);
-                    let key = content_hash(&serde_json::json!({
-                        "run": execution_id.to_string(),
-                        "segment": 0,
-                        "step": step,
-                        "node": node_id,
-                        "input": input_hash,
-                    }));
+                    // Shared with the claim route: one function derives the
+                    // key for BOTH transports, so `step` and the input hash
+                    // cannot drift between them. Two copies that disagreed
+                    // would leave the replay guard filing effects under a key
+                    // no reader asks for.
+                    let key = jamjet_state::derive_idempotency_key(
+                        self.backend.as_ref(),
+                        &execution_id,
+                        &node_id,
+                    )
+                    .await?;
                     computed_key = Some(key.clone());
 
                     // Replay-or-fire: if a result was already committed for this key,

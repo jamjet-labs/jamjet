@@ -53,5 +53,21 @@ jobs:
           cache-dependency-path: sdk/typescript/pnpm-lock.yaml
       - uses: oven-sh/setup-bun@v2
       - run: pnpm install --frozen-lockfile
-      - run: bun --bun pnpm test
+      # Build first: the smoke check imports the emitted bundle, which is what a
+      # Bun user actually installs.
+      - run: pnpm build
+      # A plain Bun script, not `vitest` under `--bun`.
+      #
+      # This step used to be `bun --bun pnpm test`. Bun resolves the first
+      # argument as a package.json script or a node_modules/.bin entry, and
+      # pnpm/action-setup v6 installs pnpm globally instead, so it died with
+      # `Script not found "pnpm"` on every commit from 2026-05-13 onward.
+      #
+      # Fixing the invocation revealed why it was worth fixing: vitest under the
+      # Bun runtime cannot resolve zod's named export, so every suite failed on
+      # `z.object`. That is a property of vitest's module runner, not of this
+      # SDK — it says nothing about whether the package works for a Bun user,
+      # which is the only question this job exists to answer. So ask that
+      # question directly.
+      - run: bun run scripts/bun-smoke.ts
         working-directory: sdk/typescript/packages/cloud
