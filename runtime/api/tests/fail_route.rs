@@ -430,3 +430,125 @@ async fn the_unfenced_legacy_path_still_settles_but_warns() {
         "the legacy path emits nothing — that is exactly why it is deprecated"
     );
 }
+
+// ── /complete: the settle and the terminal event are ONE transaction ─────────
+
+async fn post_complete(state: &AppState, id: Uuid, body: Value) -> (StatusCode, Value) {
+    let resp = build_router_with_opts(state.clone(), true)
+        .oneshot(
+            Request::post(format!("/work-items/{id}/complete"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+fn node_completed_count(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+        .count()
+}
+
+/// A fenced completion settles the item AND emits `NodeCompleted` together.
+///
+/// These used to be separate statements. A crash in the window left the item
+/// settled with no terminal event, so the scheduler fold kept the node in
+/// `scheduled` and the execution never finished — permanently, because the fold
+/// replays the log and reproduces the same gap every time.
+#[tokio::test]
+async fn a_fenced_completion_settles_and_emits_together() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let (execution_id, id, fence) = seed_and_claim(&backend, 3, 0).await;
+    let state = make_state(backend.clone());
+
+    let (status, body) = post_complete(
+        &state,
+        id,
+        json!({
+            "execution_id": execution_id.to_string(),
+            "node_id": "n1",
+            "output": {"ok": true},
+            "state_patch": {"ok": true},
+            "duration_ms": 5,
+            "lease_fence": fence,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["completed"], json!(true));
+    assert_eq!(
+        node_completed_count(&events(&backend, &execution_id).await),
+        1,
+        "a completion must leave exactly one NodeCompleted — without it the node \
+         stays scheduled and the execution never reaches a terminal state"
+    );
+}
+
+/// A stale fence completes nothing and emits nothing.
+#[tokio::test]
+async fn a_stale_fence_completion_is_refused_and_emits_nothing() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let (execution_id, id, fence) = seed_and_claim(&backend, 3, 0).await;
+    let state = make_state(backend.clone());
+
+    let (status, _) = post_complete(
+        &state,
+        id,
+        json!({
+            "execution_id": execution_id.to_string(),
+            "node_id": "n1",
+            "output": {},
+            "state_patch": {},
+            "lease_fence": fence + 9,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        node_completed_count(&events(&backend, &execution_id).await),
+        0,
+        "a rejected completion must not emit a terminal event for work it did not settle"
+    );
+}
+
+/// Replaying a completion must not emit a second `NodeCompleted`.
+///
+/// The fence is consumed by the first settle, so the replay finds nothing of its
+/// own to commit — a duplicate terminal event would corrupt the fold.
+#[tokio::test]
+async fn replaying_a_completion_does_not_double_emit() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let (execution_id, id, fence) = seed_and_claim(&backend, 3, 0).await;
+    let state = make_state(backend.clone());
+
+    let payload = json!({
+        "execution_id": execution_id.to_string(),
+        "node_id": "n1",
+        "output": {},
+        "state_patch": {},
+        "lease_fence": fence,
+    });
+
+    let (first, _) = post_complete(&state, id, payload.clone()).await;
+    assert_eq!(first, StatusCode::OK);
+    let (second, _) = post_complete(&state, id, payload).await;
+    assert_eq!(
+        second,
+        StatusCode::CONFLICT,
+        "the replay no longer holds the lease"
+    );
+
+    assert_eq!(
+        node_completed_count(&events(&backend, &execution_id).await),
+        1,
+        "exactly one NodeCompleted, not one per delivery"
+    );
+}
