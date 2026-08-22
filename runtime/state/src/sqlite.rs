@@ -974,7 +974,7 @@ impl StateBackend for SqliteBackend {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "UPDATE work_items SET status = 'pending', worker_id = NULL, lease_expires_at = NULL, \
-             lease_epoch = lease_epoch + 1, attempt = attempt + 1 \
+             lease_epoch = lease_epoch + 1, lease_fence = 0, attempt = attempt + 1 \
              WHERE status = 'claimed' AND lease_expires_at < ? AND attempt + 1 < max_attempts",
         )
         .bind(&now)
@@ -1239,7 +1239,7 @@ impl StateBackend for SqliteBackend {
             (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
         let rows = sqlx::query(
             "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, \
-             retry_after = ?, lease_epoch = lease_epoch + 1 \
+             retry_after = ?, lease_epoch = lease_epoch + 1, lease_fence = 0 \
              WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
         )
         .bind(new_attempt as i64)
@@ -1280,7 +1280,7 @@ impl StateBackend for SqliteBackend {
             "UPDATE work_items \
              SET status = 'pending', retry_after = ?, attempt = ?, worker_id = NULL, \
                  lease_expires_at = NULL, lease_epoch = lease_epoch + 1, lease_fence = 0 \
-             WHERE id = ? AND lease_fence = ?",
+             WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
         )
         .bind(retry_after)
         .bind(next_attempt as i64)
@@ -1688,7 +1688,7 @@ impl StateBackend for SqliteBackend {
                 // and runs its side effect again.
                 let rows = sqlx::query(
                     "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, \
-                     retry_after = ?, lease_epoch = lease_epoch + 1 \
+                     retry_after = ?, lease_epoch = lease_epoch + 1, lease_fence = 0 \
                      WHERE id = ? AND status = 'claimed'",
                 )
                 .bind(new_attempt as i64)

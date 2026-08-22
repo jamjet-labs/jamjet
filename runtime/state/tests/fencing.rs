@@ -889,3 +889,83 @@ async fn reclaim_cannot_resurrect_an_item_settled_under_it() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+// ── Stale fences after a requeue ─────────────────────────────────────────────
+
+/// A worker that just failed its item must not be able to park the requeue.
+///
+/// `fail_work_item_fenced`'s retryable branch puts the item back to `pending`.
+/// It used to leave `lease_fence` at the failing worker's value, and
+/// `park_work_item` matched on `id` + `lease_fence` with no status guard — so
+/// the worker that had just lost the item could park it, overwriting the
+/// `attempt` and `retry_after` of an attempt that is no longer its own.
+///
+/// Two independent guards now close it: the requeue clears the fence (as
+/// `park_work_item` itself always did), and park requires the item to still be
+/// claimed.
+#[tokio::test]
+async fn a_failed_worker_cannot_park_its_requeued_item() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let eid = ExecutionId::new();
+    db.create_execution(sample_execution(&eid)).await.unwrap();
+    let item = sample_item(&eid);
+    let item_id = item.id;
+    db.enqueue_work_item(item).await.unwrap();
+
+    let claimed = db
+        .claim_work_item("worker-A", &["model"])
+        .await
+        .unwrap()
+        .expect("claim");
+
+    // The worker reports a failure; attempts remain, so the item is requeued.
+    let outcome = db
+        .fail_work_item_fenced(item_id, claimed.lease_fence, "boom")
+        .await
+        .unwrap()
+        .expect("the fence matched, so it settles");
+    assert!(matches!(
+        outcome,
+        jamjet_state::backend::FailOutcome::Retryable { .. }
+    ));
+
+    // Same worker, same (now stale) fence, tries to park what it no longer owns.
+    let parked = db
+        .park_work_item(
+            item_id,
+            claimed.lease_fence,
+            "2030-01-01T00:00:00+00:00",
+            99,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !parked,
+        "a worker that already failed this item must not park the requeue — it \
+         would overwrite the attempt and retry_after of an attempt that is not its own"
+    );
+
+    // And the requeued attempt is intact. Asserted on the row rather than by
+    // re-claiming: the retryable branch sets a backoff, so the item is
+    // deliberately NOT claimable yet, and a claim here would test the backoff
+    // instead of the clobber.
+    let (status, attempt, fence): (String, i64, i64) =
+        sqlx::query_as("SELECT status, attempt, lease_fence FROM work_items WHERE id = ?")
+            .bind(item_id.to_string())
+            .fetch_one(&db.pool())
+            .await
+            .unwrap();
+    assert_eq!(status, "pending", "the item is requeued");
+    assert_eq!(
+        attempt, 1,
+        "the failed attempt was consumed once — a successful park would have \
+         overwritten this with its own next_attempt"
+    );
+    assert_eq!(
+        fence, 0,
+        "the requeue must clear the stale fence, exactly as park_work_item does"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
