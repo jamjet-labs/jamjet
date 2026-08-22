@@ -312,10 +312,15 @@ class JamjetClient:
             body["finish_reason"] = finish_reason
         if lease_fence:
             body["lease_fence"] = lease_fence
-        if idempotency_key:
+        if idempotency_key is not None:
             # Echoed from the claim so the engine records this result against it.
             # Without it nothing lands in tool_effects and a re-run fires the tool
             # again — the replay guard covers the in-process path only.
+            #
+            # `is not None`, not a truthiness check: the caller echoes whatever the
+            # claim handed out, and silently dropping a falsy-but-present value
+            # would turn a malformed key into "no key" — the failure mode this
+            # whole change exists to remove, and invisible at the call site.
             body["idempotency_key"] = idempotency_key
         r = await self._client.post(
             f"/work-items/{item_id}/complete",

@@ -822,3 +822,41 @@ async fn the_claim_route_key_matches_the_shared_formula() {
          shape is now unreadable and its tool will re-fire on replay"
     );
 }
+
+/// Two segments of one run derive DIFFERENT keys for the same node.
+///
+/// `derive_idempotency_key` hashes a constant `segment: 0`, which looks like a
+/// dropped field. It is safe only because `start_next_segment` gives each
+/// continuation its own execution id (`{parent}:{n}`), so `run` separates the
+/// segments by itself. If that ever stopped being true, segment 2 would replay
+/// segment 1's tool output for the same node — this test fails first.
+#[tokio::test]
+async fn a_later_segment_derives_a_different_key() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let (first, _) = seed_unclaimed(&backend).await;
+
+    // The id a continuation of `first` would be given.
+    let second = jamjet_state::segment::segment_execution_id(&first, 1);
+    assert_ne!(
+        first.to_string(),
+        second.to_string(),
+        "each segment must get its own execution id, or the key's constant \
+         `segment: 0` stops being safe"
+    );
+
+    let key_of = |run: &ExecutionId| {
+        jamjet_state::idempotency_key(
+            &run.to_string(),
+            0,
+            0,
+            "n1",
+            &jamjet_state::content_hash(&json!({})),
+        )
+    };
+    assert_ne!(
+        key_of(&first),
+        key_of(&second),
+        "the same node in a later segment must not reuse the earlier segment's \
+         effect"
+    );
+}

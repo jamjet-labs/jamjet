@@ -1509,6 +1509,16 @@ async fn complete_work_item(
         ));
     }
 
+    // An empty key is never something this engine issued — every key it mints is
+    // a sha256 hex digest. Recording an effect under "" would file a row no
+    // reader can ever derive, so reject it rather than accumulate junk that
+    // looks like a recorded effect.
+    if body.idempotency_key.as_deref().is_some_and(str::is_empty) {
+        return Err(ApiError::BadRequest(
+            "idempotency_key must not be empty".to_string(),
+        ));
+    }
+
     let committed_atomically = match (
         body.lease_fence,
         body.execution_id.as_deref(),

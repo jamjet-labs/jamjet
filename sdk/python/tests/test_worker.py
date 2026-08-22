@@ -13,9 +13,12 @@ No live runtime is required; a _StubClient records all outbound calls.
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 
 from jamjet.cli.main import _worker_loop  # noqa: E402
+from jamjet.client import JamjetClient
 
 # ── Test handler functions ────────────────────────────────────────────────────
 
@@ -416,3 +419,38 @@ async def test_worker_tolerates_a_claim_without_an_idempotency_key() -> None:
 
     assert len(stub.complete_calls) == 1
     assert stub.complete_calls[0]["idempotency_key"] is None
+
+
+async def test_client_sends_a_present_key_even_when_falsy() -> None:
+    """The client echoes what the claim handed it, rather than judging it.
+
+    A truthiness check would turn a falsy-but-present key into "no key" — the
+    exact failure this change removes, and invisible at the call site. Rejecting
+    a malformed key is the engine's job, and it does (HTTP 400); silently
+    dropping it here would hide the bug instead.
+    """
+    sent: dict[str, Any] = {}
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+    class _HTTP:
+        async def post(self, url: str, json: dict[str, Any]) -> _Resp:
+            sent.update(json)
+            return _Resp()
+
+    client = JamjetClient.__new__(JamjetClient)
+    client._client = _HTTP()  # type: ignore[attr-defined]
+
+    await client.complete_work_item(
+        "item-1",
+        execution_id="exec-1",
+        node_id="n1",
+        output={},
+        state_patch={},
+        duration_ms=1,
+        idempotency_key="",
+    )
+    assert "idempotency_key" in sent, "a present key must be sent, not judged for truthiness"
+    assert sent["idempotency_key"] == ""

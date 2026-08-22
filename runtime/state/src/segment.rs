@@ -81,6 +81,21 @@ const SEGMENT_NS: Uuid = Uuid::from_u128(0x6a8e_f5c3_d3a4_4b9c_8b2e_4f5d_6e7a_8c
 /// The `ExecutionId` of the newly created (or pre-existing idempotent) segment.
 // Nine parameters are required by the plan interface; suppressing the lint rather
 // than breaking the caller signature with a builder/struct at this stage.
+
+/// The DETERMINISTIC execution id of segment `n` of the run rooted at `parent_id`.
+///
+/// Deterministic so a re-run after a crash always targets the same child row,
+/// rather than forking the chain with a second random child.
+///
+/// Also the reason `derive_idempotency_key` can hash a constant `segment`: every
+/// segment has its own id, so the `run` component separates them by itself.
+pub fn segment_execution_id(parent_id: &ExecutionId, next_segment_number: u32) -> ExecutionId {
+    ExecutionId(Uuid::new_v5(
+        &SEGMENT_NS,
+        format!("{}:{}", parent_id.0, next_segment_number).as_bytes(),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn start_next_segment(
     backend: &dyn StateBackend,
@@ -93,14 +108,7 @@ pub async fn start_next_segment(
     queue_type: &str,
     tenant_id: &str,
 ) -> BackendResult<ExecutionId> {
-    // Derive a DETERMINISTIC child id from the parent id + segment number.
-    // This guarantees that a re-run after a crash always targets the same
-    // child row, preventing a second random child from forking the chain.
-    let child_uuid = Uuid::new_v5(
-        &SEGMENT_NS,
-        format!("{}:{}", parent_id.0, next_segment_number).as_bytes(),
-    );
-    let new_id = ExecutionId(child_uuid);
+    let new_id = segment_execution_id(parent_id, next_segment_number);
 
     // Idempotency guard: if the child execution row already exists, a prior
     // create_segment_atomic committed successfully — the row exists if and

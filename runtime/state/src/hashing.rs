@@ -146,6 +146,16 @@ mod tests {
 /// same occurrence hashes the same and a genuine second visit (a loop) does
 /// not. `input_hash` covers the accumulated state the node will read, so a
 /// node whose input changed is a different effect.
+///
+/// `segment` is passed as 0 deliberately, NOT because the segment is unknown.
+/// `start_next_segment` derives each continuation's execution id from
+/// `{parent}:{n}` (`runtime/state/src/segment.rs`), so every segment already
+/// has a distinct id and `run` alone separates them — passing
+/// `segment_number` here would add a component that `run` fully determines.
+/// The field stays in the hashed shape because the key is persisted: changing
+/// what is hashed makes every effect recorded under the old shape unreadable,
+/// and its tool re-fires. `a_later_segment_derives_a_different_key` pins the
+/// separation that makes the constant safe.
 pub async fn derive_idempotency_key(
     backend: &dyn crate::backend::StateBackend,
     execution_id: &jamjet_core::workflow::ExecutionId,
