@@ -1287,6 +1287,26 @@ impl StateBackend for FailFirstGetEvents {
             .await
     }
 
+    async fn reserve_tool_effect(
+        &self,
+
+        key: &str,
+
+        execution_id: &ExecutionId,
+
+        node_id: &str,
+
+        owner: &str,
+
+        lease_fence: i64,
+
+        ttl: std::time::Duration,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::backend::ReserveOutcome> {
+        self.inner
+            .reserve_tool_effect(key, execution_id, node_id, owner, lease_fence, ttl)
+            .await
+    }
+
     async fn get_tool_effect(
         &self,
         key: &str,

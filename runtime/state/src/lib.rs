@@ -24,8 +24,8 @@ pub use artifact::{
     DEFAULT_SPILL_THRESHOLD,
 };
 pub use backend::{
-    ApiToken, ApprovalProjectionRow, BackendResult, FailOutcome, ReclaimResult, StateBackend,
-    StateBackendError, WorkItem, WorkItemId, WorkflowDefinition,
+    ApiToken, ApprovalProjectionRow, BackendResult, FailOutcome, ReclaimResult, ReserveOutcome,
+    StateBackend, StateBackendError, WorkItem, WorkItemId, WorkflowDefinition,
 };
 pub use budget::{BudgetState, BudgetTrip};
 pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};
