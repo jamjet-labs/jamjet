@@ -807,3 +807,105 @@ async fn exactly_one_of_many_concurrent_claimants_wins() {
         "exactly one worker may fire the effect; {winners} were told the key was theirs"
     );
 }
+
+/// A released reservation is immediately available to another worker.
+///
+/// Parking or failing ends an attempt WITHOUT recording an effect, so the
+/// reservation must not outlive it. It is reentrant for its holder and lapses on
+/// its TTL either way, but until then a DIFFERENT worker picking the node up
+/// would wait out the remaining TTL for a key nobody is working on.
+#[tokio::test]
+async fn releasing_a_reservation_frees_it_immediately() {
+    let db = open_test_db().await;
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    assert_eq!(
+        db.reserve_tool_effect("rel", &eid, "n1", "worker-A", 1, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired
+    );
+    assert!(matches!(
+        db.reserve_tool_effect("rel", &eid, "n1", "worker-B", 2, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Held { .. }
+    ));
+
+    db.release_tool_reservation("rel", "worker-A", 1)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.reserve_tool_effect("rel", &eid, "n1", "worker-B", 2, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired,
+        "a released key must be takeable at once, not after the TTL"
+    );
+}
+
+/// Only the holder may release. A worker whose lease was stolen must not be able
+/// to free the key for the worker that took over — that would hand a live
+/// reservation to a third party.
+#[tokio::test]
+async fn a_non_holder_cannot_release_someone_elses_reservation() {
+    let db = open_test_db().await;
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    db.reserve_tool_effect("guarded", &eid, "n1", "worker-A", 1, ttl)
+        .await
+        .unwrap();
+
+    // A stale worker tries to free it.
+    db.release_tool_reservation("guarded", "worker-stale", 1)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            db.reserve_tool_effect("guarded", &eid, "n1", "worker-C", 3, ttl)
+                .await
+                .unwrap(),
+            ReserveOutcome::Held { .. }
+        ),
+        "a non-holder's release must be a no-op — A still owns this key"
+    );
+}
+
+/// The in-memory backend must release identically, or every worker test runs
+/// against different semantics from production.
+#[tokio::test]
+async fn the_in_memory_backend_releases_identically() {
+    let db = InMemoryBackend::new();
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    db.reserve_tool_effect("m", &eid, "n1", "worker-A", 1, ttl)
+        .await
+        .unwrap();
+    db.release_tool_reservation("m", "worker-stale", 1)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            db.reserve_tool_effect("m", &eid, "n1", "worker-B", 2, ttl)
+                .await
+                .unwrap(),
+            ReserveOutcome::Held { .. }
+        ),
+        "a non-holder's release must be a no-op in memory too"
+    );
+
+    db.release_tool_reservation("m", "worker-A", 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.reserve_tool_effect("m", &eid, "n1", "worker-B", 2, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired
+    );
+}

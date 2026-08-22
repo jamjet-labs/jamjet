@@ -212,6 +212,29 @@ pub trait StateBackend: Send + Sync {
         ttl: std::time::Duration,
     ) -> BackendResult<ReserveOutcome>;
 
+    /// Give up a reservation this worker holds, without having recorded a result.
+    ///
+    /// A reservation left standing is not a correctness problem — it is
+    /// reentrant for its holder, and it lapses on its TTL — but until then a
+    /// DIFFERENT worker that picks the node up must wait it out. Releasing on a
+    /// path that ends without committing (a park, a failure) turns that wait
+    /// from minutes into nothing.
+    ///
+    /// Guarded by owner AND lease fence, because the owner alone is not enough.
+    /// Worker ids are configurable and reused, and `reserve_tool_effect` is
+    /// reentrant for the same owner — it REPLACES the reservation with the newer
+    /// lease. So an older attempt from the same worker id finishing late would
+    /// otherwise delete the NEWER attempt's reservation and let a third worker
+    /// acquire a key that is actively held. The fence is what distinguishes the
+    /// two attempts. A non-matching owner or fence is a silent no-op, like every
+    /// other fenced write here.
+    async fn release_tool_reservation(
+        &self,
+        key: &str,
+        owner: &str,
+        lease_fence: i64,
+    ) -> BackendResult<()>;
+
     // ── Content-addressed artifact store ─────────────────────────────────────
 
     /// Store bytes in the CAS, keyed by their SHA-256 hash.

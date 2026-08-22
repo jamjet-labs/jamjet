@@ -767,6 +767,26 @@ impl StateBackend for TenantScopedSqliteBackend {
 
     // ── Idempotency cache ─────────────────────────────────────────────────
 
+    #[instrument(skip(self), fields(key = key, owner = owner))]
+    async fn release_tool_reservation(
+        &self,
+        key: &str,
+        owner: &str,
+        lease_fence: i64,
+    ) -> BackendResult<()> {
+        sqlx::query(
+            "DELETE FROM tool_reservations \
+             WHERE idempotency_key = ? AND owner = ? AND lease_fence = ? AND tenant_id = ?",
+        )
+        .bind(key)
+        .bind(owner)
+        .bind(lease_fence)
+        .bind(&self.tenant_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        Ok(())
+    }
     #[instrument(skip(self), fields(tenant = %self.tenant_id, key = key, owner = owner))]
     async fn reserve_tool_effect(
         &self,
