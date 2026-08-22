@@ -374,6 +374,50 @@ class TestApprovalParity:
             with pytest.raises(ApprovalNotEnforceableError):
                 asyncio.run(agent.run("q"))
 
+    def test_the_other_spelling_of_the_same_control_also_refuses(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``policy={"require_approval_for": [...]}`` is the same gate.
+
+        The first version of this fix keyed on ``governance.approval_required``
+        alone, so declaring the gate through ``policy=`` sailed straight past it
+        and ran ungated — a half-fix of the very bug being fixed. The check now
+        reads the RESOLVED policy, which is where both spellings converge.
+        """
+        _install_backend(monkeypatch)
+        agent = Agent(
+            "a",
+            model="anthropic/claude-sonnet-4-6",
+            tools=[search],
+            strategy="react",
+            policy={"require_approval_for": ["payments.*"]},
+        )
+        with pytest.raises(ApprovalNotEnforceableError):
+            asyncio.run(agent.run("q"))
+
+    def test_the_runtime_cannot_be_used_to_skip_the_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """LocalRuntime is public, so the gate cannot live only in Agent.run().
+
+        Calling the runtime directly with the same governance used to get the old
+        behaviour back: approval configured, tools ungated.
+        """
+        _install_backend(monkeypatch)
+        from jamjet.runtime.local import LocalRuntime
+
+        agent = Agent(
+            "a",
+            model="anthropic/claude-sonnet-4-6",
+            tools=[search],
+            strategy="react",
+            approval_required=True,
+        )
+        with pytest.raises(ApprovalNotEnforceableError):
+            asyncio.run(LocalRuntime().execute(agent.compile(), "q", governance=agent.governance))
+
+    def test_a_policy_without_approval_rules_still_runs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The dual: refusing must key on approval rules, not on having a policy."""
+        _install_backend(monkeypatch)
+        agent = Agent("a", model="anthropic/claude-sonnet-4-6", tools=[search], strategy="react", policy="strict")
+        asyncio.run(agent.run("q"))
+
     def test_no_approval_runs_normally(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The dual: a plain agent is not refused, and warns about nothing."""
         _install_backend(monkeypatch)

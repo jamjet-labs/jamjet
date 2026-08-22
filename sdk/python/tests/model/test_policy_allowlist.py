@@ -275,7 +275,11 @@ class TestApprovalRequiredInProcessRefusal:
             return str(excinfo.value)
 
         msg = asyncio.run(_run())
-        assert "approval_required" in msg
+        # The message names the RESOLVED rule, not the knob that spelled it:
+        # approval_required=... and policy={"require_approval_for": ...} both
+        # arrive here, and only one of them is literally "approval_required".
+        assert "approval gate is declared" in msg
+        assert "require_approval_for" in msg
         assert "run_durable" in msg
 
     def test_approval_required_list_refuses_on_run(self, dummy_tool):
@@ -306,7 +310,11 @@ class TestApprovalRequiredInProcessRefusal:
             return str(excinfo.value)
 
         msg = asyncio.run(_run())
-        assert "approval_required" in msg
+        # The message names the RESOLVED rule, not the knob that spelled it:
+        # approval_required=... and policy={"require_approval_for": ...} both
+        # arrive here, and only one of them is literally "approval_required".
+        assert "approval gate is declared" in msg
+        assert "require_approval_for" in msg
         assert "run_durable" in msg
 
     def test_approval_required_false_does_not_warn(self, dummy_tool):

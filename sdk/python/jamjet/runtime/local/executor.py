@@ -124,6 +124,12 @@ class LocalRuntime:
         # every strategy builds its dispatch table from `spec.tools`
         # (`resolve_tool_map`), so a blocked tool is neither offered to the model
         # nor resolvable if one is asked for anyway.
+        # The chokepoint for BOTH tool controls. LocalRuntime is public, so a
+        # gate that lived only in Agent.run() left `LocalRuntime.execute(...,
+        # governance=...)` running approval-gated agents ungated.
+        from jamjet.agents.governance import require_enforceable_approval
+
+        require_enforceable_approval(governance, where="LocalRuntime in-process run")
         spec = self._apply_blocked_tools(spec, governance)
         openai_tools = [self._tool_to_openai_schema(t) for t in spec.tools]
         prompt = input if isinstance(input, str) else json.dumps(input)
