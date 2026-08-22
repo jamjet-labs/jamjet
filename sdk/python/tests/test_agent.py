@@ -105,6 +105,34 @@ class TestAgent:
         assert agent.limits.max_cost_usd == 0.5
         assert agent.limits.timeout_seconds == 60
 
+    def test_explicit_one_dollar_ceiling_is_enforced(self):
+        """The old default (1.0) doubled as the "not set" sentinel.
+
+        The fold ran only when ``max_cost_usd != 1.0``, so a caller who
+        explicitly asked for a $1.00 ceiling got NO ceiling — silently, and for
+        the one figure a reader of the signature was most likely to copy. The
+        sentinel is ``None`` now, so an explicit value is always honoured.
+        """
+        agent = Agent("dollar", model="gpt-5.2", tools=[search], max_cost_usd=1.0)
+        assert agent.governance.budget is not None, (
+            "an explicitly requested $1.00 ceiling must be enforced, not swallowed by a sentinel collision"
+        )
+        assert agent.governance.budget.cost_usd == 1.0
+
+    def test_omitting_max_cost_usd_leaves_no_governance_ceiling(self):
+        """Omitting it still means no enforced ceiling — unchanged behaviour.
+
+        The strategy runners still get a concrete figure for their iteration
+        budget; only the governance fold is gated on the argument being given.
+        """
+        agent = Agent("nocap", model="gpt-5.2", tools=[search])
+        assert agent.governance.budget is None
+        assert agent.limits.max_cost_usd == 1.0
+
+    def test_budget_takes_precedence_over_max_cost_usd(self):
+        agent = Agent("both", model="gpt-5.2", tools=[search], max_cost_usd=5.0, budget=2.0)
+        assert agent.governance.budget.cost_usd == 2.0
+
 
 # ── approval_required warning copy ────────────────────────────────────────────
 #

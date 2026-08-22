@@ -51,6 +51,12 @@ if TYPE_CHECKING:
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "limit_exceeded"})
 # How often run_durable polls get_execution while waiting for a terminal state.
 _POLL_INTERVAL_SECONDS = 0.5
+# StrategyLimits requires a concrete cost figure and validates it > 0, so an
+# omitted ``max_cost_usd`` still needs one for the strategy runners' iteration
+# budget. This is ONLY that placeholder — it is deliberately not folded into
+# GovernanceConfig.budget, so omitting the argument still means "no enforced
+# ceiling", exactly as before.
+_DEFAULT_STRATEGY_MAX_COST_USD = 1.0
 
 
 class Agent:
@@ -73,7 +79,12 @@ class Agent:
         instructions: str = "",
         strategy: str = "plan-and-execute",
         max_iterations: int = 10,
-        max_cost_usd: float = 1.0,
+        # None, not 1.0. The old default doubled as the "not set" sentinel — the
+        # budget was folded in only when the value differed from 1.0 — so a caller
+        # who explicitly asked for a $1.00 ceiling got NO ceiling, silently, which
+        # is the one number a reader of the old signature was most likely to type.
+        # `None` cannot collide with a ceiling anyone means.
+        max_cost_usd: float | None = None,
         timeout_seconds: int = 300,
         on_limit_exceeded: Callable[[str | None, str, Any, Any], str | None] | None = None,
         # Governance knobs (T3-1).  T3-2..6 read self.governance to enforce.
@@ -142,7 +153,10 @@ class Agent:
 
         self.limits = StrategyLimits(
             max_iterations=max_iterations,
-            max_cost_usd=max_cost_usd,
+            # StrategyLimits requires a concrete float (it validates > 0), and the
+            # strategy runners' iteration budget has always used 1.0 when nothing
+            # was passed. Keep that; only the GOVERNANCE fold below changes.
+            max_cost_usd=(_DEFAULT_STRATEGY_MAX_COST_USD if max_cost_usd is None else max_cost_usd),
             timeout_seconds=timeout_seconds,
         )
 
@@ -157,8 +171,10 @@ class Agent:
         # the same ceiling without requiring callers to set both.  T3-2 will
         # reconcile and document the authoritative enforcement point.
         _effective_budget: Budget | float | int | dict | None = budget
-        if _effective_budget is None and max_cost_usd != 1.0:
-            # Non-default max_cost_usd -> carry it forward as the budget cap.
+        if _effective_budget is None and max_cost_usd is not None:
+            # Explicitly provided -> carry it forward as the budget cap. The test
+            # is `is not None`, never a comparison against the default: comparing
+            # against 1.0 is what made an explicit $1.00 ceiling vanish.
             _effective_budget = max_cost_usd
 
         self.governance: GovernanceConfig = normalize_governance(
