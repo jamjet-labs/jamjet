@@ -887,8 +887,17 @@ impl StateBackend for TenantScopedSqliteBackend {
         // Expire stale leases for this tenant; bump lease_epoch so a re-claim
         // mints a strictly greater fence than any zombie worker's stale token.
         sqlx::query(
-            "UPDATE work_items SET status = 'pending', worker_id = NULL, lease_expires_at = NULL, lease_epoch = lease_epoch + 1 \
-             WHERE status = 'claimed' AND lease_expires_at < ? AND tenant_id = ?",
+            // `attempt + 1` and the max_attempts bound mirror the untenanted
+            // backend: without the increment a node that reliably kills its
+            // worker is resurrected forever at attempt 0, because this fast path
+            // out-races the reclaim sweep that is the only other place attempts
+            // move. An item whose budget is spent stays 'claimed' with an expired
+            // lease, which is exactly what the sweep selects, so it dead-letters
+            // there WITH the NodeFailed only the sweep's caller emits.
+            "UPDATE work_items SET status = 'pending', worker_id = NULL, lease_expires_at = NULL, \
+             lease_epoch = lease_epoch + 1, lease_fence = 0, attempt = attempt + 1 \
+             WHERE status = 'claimed' AND lease_expires_at < ? AND tenant_id = ? \
+               AND attempt + 1 < max_attempts",
         )
         .bind(&now)
         .bind(&self.tenant_id.0)
@@ -1132,7 +1141,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
         let rows = sqlx::query(
             "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, \
-             retry_after = ?, lease_epoch = lease_epoch + 1 \
+             retry_after = ?, lease_epoch = lease_epoch + 1, lease_fence = 0 \
              WHERE id = ? AND tenant_id = ? AND lease_fence = ? AND status = 'claimed'",
         )
         .bind(new_attempt as i64)
@@ -1192,7 +1201,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             "UPDATE work_items \
              SET status = 'pending', retry_after = ?, attempt = ?, worker_id = NULL, \
                  lease_expires_at = NULL, lease_epoch = lease_epoch + 1, lease_fence = 0 \
-             WHERE id = ? AND lease_fence = ? AND tenant_id = ?",
+             WHERE id = ? AND lease_fence = ? AND tenant_id = ? AND status = 'claimed'",
         )
         .bind(retry_after)
         .bind(next_attempt as i64)
@@ -1548,6 +1557,35 @@ impl StateBackend for TenantScopedSqliteBackend {
 
             if new_attempt >= item.max_attempts {
                 let dead_lettered_at = Utc::now().to_rfc3339();
+                // Settle FIRST, guarded, then record — the same shape the
+                // untenanted backend uses. `AND status = 'claimed'` is what makes
+                // it safe: the SELECT above ran in its own statement, so a worker
+                // can settle between the two, and an unguarded UPDATE would flip
+                // a COMPLETED item back into the queue, where it is re-claimed and
+                // re-run at a shifted step ordinal — a different idempotency key,
+                // so the side effect fires twice. `tenant_id` belongs on the write
+                // as well as the read, so a scoped backend can never settle
+                // another tenant's row. Settling before the insert is what keeps a
+                // lost race from leaving an orphan dead-letter row describing a
+                // node that actually succeeded.
+                let rows = sqlx::query(
+                    "UPDATE work_items SET status = 'dead_lettered', attempt = ?, lease_expires_at = NULL, worker_id = NULL \
+                     WHERE id = ? AND tenant_id = ? AND status = 'claimed'",
+                )
+                .bind(new_attempt as i64)
+                .bind(&id_str)
+                .bind(&self.tenant_id.0)
+                .execute(&self.pool)
+                .await
+                .map_err(map_db_err)?
+                .rows_affected();
+                if rows == 0 {
+                    // Settled under us. Do NOT report it: the caller emits
+                    // NodeFailed from this list, and a terminal event for a node
+                    // that actually completed is worse than a missed sweep.
+                    continue;
+                }
+
                 sqlx::query(
                     r#"INSERT OR IGNORE INTO dead_letter_items
                        (id, execution_id, node_id, queue_type, payload_json, attempt, last_error, created_at, dead_lettered_at, tenant_id)
@@ -1567,13 +1605,6 @@ impl StateBackend for TenantScopedSqliteBackend {
                 .await
                 .map_err(map_db_err)?;
 
-                sqlx::query("UPDATE work_items SET status = 'dead_lettered', attempt = ?, lease_expires_at = NULL, worker_id = NULL WHERE id = ?")
-                    .bind(new_attempt as i64)
-                    .bind(&id_str)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(map_db_err)?;
-
                 let mut exhausted_item = item;
                 exhausted_item.attempt = new_attempt;
                 result.exhausted.push(exhausted_item);
@@ -1582,15 +1613,27 @@ impl StateBackend for TenantScopedSqliteBackend {
                 let retry_after =
                     (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
 
-                sqlx::query(
-                    "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, retry_after = ?, lease_epoch = lease_epoch + 1 WHERE id = ?",
+                // Same guards as the exhausted branch, and for the sharper
+                // reason: requeueing a COMPLETED item is exactly the
+                // double-execution path. `lease_fence = 0` clears the stale
+                // token so the worker that just lost this item cannot park over
+                // the requeued attempt.
+                let rows = sqlx::query(
+                    "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, lease_expires_at = NULL, \
+                     retry_after = ?, lease_epoch = lease_epoch + 1, lease_fence = 0 \
+                     WHERE id = ? AND tenant_id = ? AND status = 'claimed'",
                 )
                 .bind(new_attempt as i64)
                 .bind(&retry_after)
                 .bind(&id_str)
+                .bind(&self.tenant_id.0)
                 .execute(&self.pool)
                 .await
-                .map_err(map_db_err)?;
+                .map_err(map_db_err)?
+                .rows_affected();
+                if rows == 0 {
+                    continue;
+                }
 
                 let mut retry_item = item;
                 retry_item.attempt = new_attempt;

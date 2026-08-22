@@ -505,3 +505,171 @@ async fn scoped_fail_cannot_reach_another_tenants_item() {
         .unwrap()
         .is_some());
 }
+
+// ── The tenant-scoped backend must match the untenanted one ──────────────────
+
+/// The tenant-scoped `reclaim_expired_leases` must not resurrect a settled item.
+///
+/// This is the same duplicate-execution bug fixed for the untenanted backend,
+/// which was fixed in ONE of the two copies: the scoped reclaim kept
+/// `WHERE id = ?` with no `status` guard and no `tenant_id` on the write. A
+/// worker committing inside the sweep's update loop had its COMPLETED item
+/// flipped back to pending, re-claimed, and re-run.
+///
+/// Needs volume for the same reason as its untenanted twin: a settle done
+/// BEFORE the call also changes `status`, which the sweep's own SELECT filters
+/// out, so nothing races. Verified to fail against the unguarded UPDATE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scoped_reclaim_cannot_resurrect_a_settled_item() {
+    const ITEMS: usize = 400;
+
+    let db = std::sync::Arc::new(open_test_db().await);
+    register_tenant(&db, "alpha", "Alpha").await;
+    let tenant = std::sync::Arc::new(db.for_tenant(TenantId::from("alpha")));
+
+    let exec = sample_execution("wf-race");
+    let execution_id = exec.execution_id.clone();
+    tenant.create_execution(exec).await.unwrap();
+
+    for _ in 0..ITEMS {
+        tenant
+            .enqueue_work_item(jamjet_state::WorkItem {
+                id: uuid::Uuid::new_v4(),
+                execution_id: execution_id.clone(),
+                node_id: "n1".to_string(),
+                queue_type: "general".to_string(),
+                payload: json!({}),
+                attempt: 0,
+                max_attempts: 3,
+                created_at: Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                lease_fence: 0,
+                tenant_id: "alpha".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut claimed = Vec::with_capacity(ITEMS);
+    for _ in 0..ITEMS {
+        let c = tenant
+            .claim_work_item("worker-slow", &["general"])
+            .await
+            .unwrap()
+            .expect("claim");
+        claimed.push((c.id, c.lease_fence));
+    }
+    // Expire every lease so the sweep captures all of them.
+    sqlx::query("UPDATE work_items SET lease_expires_at = '2020-01-01T00:00:00+00:00'")
+        .execute(&db.pool())
+        .await
+        .unwrap();
+
+    // Settle the LAST items the sweep will reach, while it works through the rest.
+    let victims: Vec<(uuid::Uuid, i64)> = claimed.iter().rev().take(40).copied().collect();
+    let settler = {
+        let tenant = tenant.clone();
+        tokio::spawn(async move {
+            let mut settled = Vec::new();
+            for (id, fence) in victims {
+                if tenant.complete_work_item_fenced(id, fence).await.unwrap() {
+                    settled.push(id);
+                }
+            }
+            settled
+        })
+    };
+
+    let reclaimed = tenant.reclaim_expired_leases().await.unwrap();
+    let settled = settler.await.unwrap();
+
+    let reported: std::collections::HashSet<uuid::Uuid> = reclaimed
+        .retryable
+        .iter()
+        .chain(reclaimed.exhausted.iter())
+        .map(|i| i.id)
+        .collect();
+    for id in &settled {
+        assert!(
+            !reported.contains(id),
+            "a COMPLETED item was reported as reclaimed ({id}) — the caller will \
+             emit NodeFailed for a node that succeeded"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(&db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "completed",
+            "a COMPLETED item was resurrected to {status:?} ({id}) — it will re-run \
+             and fire its side effect twice"
+        );
+    }
+    assert!(
+        !settled.is_empty(),
+        "the race never opened; the test proved nothing"
+    );
+}
+
+/// The scoped claim path must consume attempts too, or a node that kills its
+/// worker loops forever — the same infinite-retry bug fixed for the untenanted
+/// backend, in the copy that was missed.
+#[tokio::test]
+async fn scoped_claim_side_expiry_consumes_attempts() {
+    let db = open_test_db().await;
+    register_tenant(&db, "alpha", "Alpha").await;
+    let tenant = db.for_tenant(TenantId::from("alpha"));
+
+    let exec = sample_execution("wf-attempts");
+    let execution_id = exec.execution_id.clone();
+    tenant.create_execution(exec).await.unwrap();
+
+    let item_id = uuid::Uuid::new_v4();
+    tenant
+        .enqueue_work_item(jamjet_state::WorkItem {
+            id: item_id,
+            execution_id,
+            node_id: "n1".to_string(),
+            queue_type: "general".to_string(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "alpha".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let Some(c) = tenant.claim_work_item("dies", &["general"]).await.unwrap() else {
+            break;
+        };
+        seen.push(c.attempt);
+        sqlx::query(
+            "UPDATE work_items SET lease_expires_at = '2020-01-01T00:00:00+00:00' WHERE id = ?",
+        )
+        .bind(item_id.to_string())
+        .execute(&db.pool())
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        seen,
+        vec![0, 1, 2],
+        "each claim-side expiry must consume exactly one attempt"
+    );
+    assert!(
+        tenant
+            .claim_work_item("dies", &["general"])
+            .await
+            .unwrap()
+            .is_none(),
+        "an item that has spent its attempts must not be handed out again"
+    );
+}
