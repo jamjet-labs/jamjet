@@ -849,13 +849,37 @@ impl Worker {
         let ctx = EvaluationContext::from_node_kind(node_id, kind);
 
         // Load tenant policy (sits between global and workflow in the chain).
-        let tenant_policy_set = self
+        //
+        // `Ok(None)` — this tenant has no policy — and `Err` — we could not find
+        // out — must NOT collapse together, which is what `.ok().flatten()` did.
+        // Swallowing the error makes an unreadable tenant record look like an
+        // absent policy: when the tenant layer is the only one carrying a rule
+        // for this node, `sets` empties and the node runs having been evaluated
+        // against a policy set that is missing rules which DO exist.
+        //
+        // Failing the node instead means a transient tenant-read blip costs a
+        // retry rather than an unenforced rule. That is the right trade for an
+        // enforcement path: the alternative is enforcing a chain you already know
+        // is incomplete. The agent-dispatch branch above made the same choice.
+        let tenant_policy_set = match self
             .backend
             .get_tenant(&jamjet_state::TenantId::from(tenant_id))
             .await
-            .ok()
-            .flatten()
-            .and_then(|t| t.policy_set());
+        {
+            Ok(tenant) => tenant.and_then(|t| t.policy_set()),
+            Err(e) => {
+                warn!(
+                    execution_id = %execution_id,
+                    node_id,
+                    "tenant policy unreadable — failing the node rather than \
+                     enforcing an incomplete policy chain"
+                );
+                return Some(Err(format!(
+                    "tenant policy unavailable; refusing to run unpoliced: {e}"
+                )
+                .into()));
+            }
+        };
 
         // Build policy chain: tenant -> workflow -> node (least-specific to most-specific).
         // The evaluator iterates in reverse, so node rules take priority.
@@ -3558,6 +3582,105 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
             "a ToolApprovalRequired must be recorded"
+        );
+    }
+
+    /// An unreadable tenant record must fail the node, not silently drop the
+    /// tenant policy layer.
+    ///
+    /// `.ok().flatten()` collapsed "this tenant has no policy" with "we could not
+    /// find out". When the tenant layer is the only one carrying a rule for the
+    /// node, that empties the policy chain and the node RUNS, evaluated against a
+    /// set that is missing rules which do exist — a blocked tool executing on a
+    /// transient backend blip.
+    ///
+    /// This is the ordinary (non-dispatch) branch. The agent-dispatch branch was
+    /// fixed earlier; this is the copy that was left behind.
+    #[tokio::test]
+    async fn an_unreadable_tenant_fails_the_node_on_the_ordinary_path() {
+        use crate::test_support::FailingGetEvents;
+
+        let backend = Arc::new(FailingGetEvents::failing_tenant());
+        let eid = ExecutionId::new();
+        let now = Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: jamjet_core::workflow::WorkflowStatus::Running,
+                initial_input: serde_json::json!({}),
+                current_state: serde_json::json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+
+        // An ORDINARY python_fn (not an ADK dispatch), with a workflow policy so
+        // the chain is non-empty and the tenant read is actually reached.
+        let ir = ordinary_python_fn_ir_json(&["send_wire"]);
+        backend
+            .store_workflow(jamjet_state::backend::WorkflowDefinition {
+                workflow_id: "adk-wf".into(),
+                version: "1.0.0".into(),
+                ir,
+                created_at: now,
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        backend
+            .enqueue_work_item(jamjet_state::backend::WorkItem {
+                id: uuid::Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "default".into(),
+                payload: serde_json::json!({
+                    "workflow_id": "adk-wf",
+                    "workflow_version": "1.0.0",
+                    "input": {}
+                }),
+                attempt: 0,
+                max_attempts: 3,
+                created_at: now,
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+
+        let exec = CountingDispatchExecutor::default();
+        let counter = exec.calls.clone();
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("python_fn", Arc::new(exec));
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("claimable");
+        let result = worker.execute_item(item).await;
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the node must NOT run while its policy chain is known-incomplete"
+        );
+        let err = result.expect_err("an unreadable tenant must fail the node");
+        assert!(
+            err.to_string().contains("tenant policy unavailable"),
+            "the reason must name the unreadable tenant; got {err}"
         );
     }
 

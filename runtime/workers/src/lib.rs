@@ -12,6 +12,9 @@ pub mod executor;
 pub mod executors;
 pub mod heartbeat;
 pub mod pool;
+#[cfg(test)]
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod worker;
 
 pub use dispatch_guard::{guard_dispatch, DispatchGuardOutcome};
