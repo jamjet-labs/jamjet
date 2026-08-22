@@ -844,6 +844,16 @@ impl StateBackend for SqliteBackend {
     // ── Idempotency cache ─────────────────────────────────────────────────
 
     #[instrument(skip(self), fields(key = key, owner = owner))]
+    async fn release_tool_reservation(&self, key: &str, owner: &str) -> BackendResult<()> {
+        sqlx::query("DELETE FROM tool_reservations WHERE idempotency_key = ? AND owner = ?")
+            .bind(key)
+            .bind(owner)
+            .execute(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+    #[instrument(skip(self), fields(key = key, owner = owner))]
     async fn reserve_tool_effect(
         &self,
         key: &str,

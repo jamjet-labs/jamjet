@@ -631,6 +631,27 @@ impl Worker {
                         + chrono::Duration::seconds(retry_after_secs as i64))
                     .to_rfc3339();
 
+                    // Parking ends this attempt WITHOUT recording an effect, so
+                    // the reservation this worker took must not outlive it. It is
+                    // reentrant for us and lapses on its TTL either way, but a
+                    // DIFFERENT worker picking the node up after the backoff
+                    // would otherwise wait out the remaining TTL for a key nobody
+                    // is working on. Owner-guarded, so a stale worker cannot free
+                    // a key that has already been taken over.
+                    if let Some(k) = computed_key.as_deref() {
+                        if let Err(e) = self
+                            .backend
+                            .release_tool_reservation(k, &self.worker_id)
+                            .await
+                        {
+                            warn!(
+                                execution_id = %execution_id,
+                                node_id = %node_id,
+                                "could not release the reservation on park; it will lapse on its TTL: {e}"
+                            );
+                        }
+                    }
+
                     // Fence-guarded reset to pending with retry_after backoff.
                     // Park first; only append NodeParked if the park actually succeeds.
                     // A stale-fence park (Ok(false)) must NOT produce a false audit record.

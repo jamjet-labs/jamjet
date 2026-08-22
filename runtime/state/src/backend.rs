@@ -202,6 +202,20 @@ pub trait StateBackend: Send + Sync {
     /// Reservations are consulted ONLY when no committed effect exists, so a row
     /// left behind after a successful commit blocks nothing — the caller finds
     /// the recorded result first and replays it.
+    /// Give up a reservation this worker holds, without having recorded a result.
+    ///
+    /// A reservation left standing is not a correctness problem — it is
+    /// reentrant for its holder, and it lapses on its TTL — but until then a
+    /// DIFFERENT worker that picks the node up must wait it out. Releasing on a
+    /// path that ends without committing (a park, a failure) turns that wait
+    /// from minutes into nothing.
+    ///
+    /// Owner-guarded: releasing is a claim about ownership, so a worker whose
+    /// lease was stolen must not be able to free the key for the worker that
+    /// took over. A non-matching owner is a silent no-op, like every other fenced
+    /// write here.
+    async fn release_tool_reservation(&self, key: &str, owner: &str) -> BackendResult<()>;
+
     async fn reserve_tool_effect(
         &self,
         key: &str,

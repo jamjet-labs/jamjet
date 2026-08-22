@@ -335,6 +335,15 @@ impl StateBackend for InMemoryBackend {
 
     // ── Idempotency cache ─────────────────────────────────────────────────
 
+    async fn release_tool_reservation(&self, key: &str, owner: &str) -> BackendResult<()> {
+        // Owner-guarded remove: `remove_if` holds the shard lock across the
+        // predicate, so a stale worker cannot free a key another worker took over
+        // in the gap between checking and removing.
+        self.tool_reservations
+            .remove_if(&key.to_string(), |_k, (holder, _)| holder == owner);
+        Ok(())
+    }
+
     async fn reserve_tool_effect(
         &self,
         key: &str,
