@@ -1,3 +1,4 @@
+use crate::dispatch_guard::{self, DispatchGuardOutcome};
 use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use crate::heartbeat::spawn_heartbeat;
 use chrono::Utc;
@@ -201,7 +202,20 @@ impl Worker {
                             kind,
                             node_def,
                             &ir,
+                            &item.payload,
                         )
+                        .await
+                    {
+                        heartbeat.abort();
+                        return r;
+                    }
+
+                    // Budget check BEFORE execution — never fire on a spent budget.
+                    // The post-execution check trips only after the call is paid
+                    // for, so without this a rollover child inherits pinned
+                    // counters and buys one more call per segment (C2).
+                    if let Some(r) = self
+                        .check_budget_before_execution(&execution_id, &node_id, &ir, &budget)
                         .await
                     {
                         heartbeat.abort();
@@ -728,7 +742,50 @@ impl Worker {
         kind: &NodeKind,
         node_def: &NodeDef,
         ir: &WorkflowIr,
+        payload: &serde_json::Value,
     ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        // ADK agent dispatch nodes hide their tool names behind a single
+        // python_fn / java_fn, so a node-kind context carries no tool_name and
+        // every blocked_tools / require_approval_for rule silently misses (C1).
+        // The decision lives in `dispatch_guard` so the HTTP claim route — the
+        // transport ADK nodes actually take in production — runs the identical
+        // logic. This branch owns only the SETTLE, which is worker-specific.
+        if dispatch_guard::is_agent_tool_dispatch(kind) {
+            let input = dispatch_guard::payload_input(payload);
+            return match dispatch_guard::guard_dispatch(
+                self.backend.as_ref(),
+                execution_id,
+                node_id,
+                tenant_id,
+                ir,
+                node_def,
+                &input,
+            )
+            .await
+            {
+                DispatchGuardOutcome::Allow => None,
+                DispatchGuardOutcome::Blocked { reason } => {
+                    Some(Err(format!("policy blocked: {reason}").into()))
+                }
+                // Not a denial: the decision could not be made or recorded, so
+                // the node fails and is retried rather than being audited as
+                // blocked. Same shape as a block to the scheduler, deliberately
+                // different on the Prove surface.
+                DispatchGuardOutcome::Unavailable { reason } => Some(Err(reason.into())),
+                // Settle the item cleanly so the lease never expires into the
+                // retry/dead-letter path. The node stays parked because it
+                // remains in the scheduler fold's `scheduled` set (so it is
+                // never re-dispatched); the fold's `held` set only gates which
+                // decision events are acted on.
+                DispatchGuardOutcome::Held { .. } => {
+                    match self.backend.complete_work_item(item_id).await {
+                        Ok(()) => Some(Ok(())),
+                        Err(e) => Some(Err(format!("failed to settle held work item: {e}").into())),
+                    }
+                }
+            };
+        }
+
         let ctx = EvaluationContext::from_node_kind(node_id, kind);
 
         // Load tenant policy (sits between global and workflow in the chain).
@@ -762,7 +819,7 @@ impl Worker {
             PolicyDecision::Allow => None,
 
             PolicyDecision::Block { reason } => {
-                let policy_scope = self.identify_policy_scope(
+                let policy_scope = dispatch_guard::identify_policy_scope(
                     &ctx,
                     tenant_policy_set.as_ref(),
                     ir.policy.as_ref(),
@@ -802,37 +859,6 @@ impl Worker {
                 .await
             }
         }
-    }
-
-    /// Determine which policy scope triggered a non-Allow decision.
-    ///
-    /// Checks each scope individually from most-specific (node) to least-specific
-    /// (tenant), returning the name of the first scope that produces a non-Allow
-    /// decision.
-    fn identify_policy_scope(
-        &self,
-        ctx: &EvaluationContext,
-        tenant_policy: Option<&jamjet_ir::workflow::PolicySetIr>,
-        workflow_policy: Option<&jamjet_ir::workflow::PolicySetIr>,
-        node_policy: Option<&jamjet_ir::workflow::PolicySetIr>,
-    ) -> String {
-        // Check most-specific first (same order as evaluator's reverse iteration).
-        if let Some(p) = node_policy {
-            if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
-                return "node".to_string();
-            }
-        }
-        if let Some(p) = workflow_policy {
-            if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
-                return "workflow".to_string();
-            }
-        }
-        if let Some(p) = tenant_policy {
-            if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
-                return "tenant".to_string();
-            }
-        }
-        "unknown".to_string()
     }
 
     // ── Autonomy check ────────────────────────────────────────────────────────
@@ -987,6 +1013,89 @@ impl Worker {
             .flatten()
             .map(|s| BudgetState::from_snapshot_state(&s.state))
             .unwrap_or_default()
+    }
+
+    /// Refuse to fire when the budget is already spent.
+    ///
+    /// `check_budget_after_execution` only trips once the call has been made and
+    /// paid for. This pre-check is what makes a spent budget refuse the *next*
+    /// call instead of buying it first.
+    ///
+    /// SCOPE — this is half of C2, and the half it is not closes elsewhere.
+    /// Because the post-execution check is `>` and a tripping turn is DISCARDED
+    /// rather than committed, committed counters normally settle strictly BELOW
+    /// the ceiling. This guard's `>=` therefore catches the case where a turn
+    /// lands exactly ON the ceiling, not the ordinary rollover chain: a
+    /// `continue_as_new` child inherits under-ceiling counters, passes this
+    /// guard, and buys one more discarded call per segment. Stopping that chain
+    /// means not rolling over on a budget trip at all, which is a separate change
+    /// to the rollover branch in `execute_item`.
+    ///
+    /// Deliberately kind-agnostic: budget accounting follows the tokens an
+    /// executor reports, not the node kind, so a kind allowlist would leak — the
+    /// budget fixture in this file trips on a `tool` node.
+    ///
+    /// SEMANTIC CHANGE: under `>=`, a ceiling of literally zero (`total_tokens:
+    /// 0`, `cost_budget_usd: 0.0`) now refuses every node up front, where it
+    /// previously allowed exactly one call before tripping. "Spend nothing" now
+    /// means nothing.
+    ///
+    /// Returns `Some(Err(..))` to refuse, `None` to let the node fire.
+    async fn check_budget_before_execution(
+        &self,
+        execution_id: &ExecutionId,
+        node_id: &str,
+        ir: &WorkflowIr,
+        budget: &BudgetState,
+    ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        let trip = budget.exhausted(ir.token_budget.as_ref(), ir.cost_budget_usd)?;
+        warn!(
+            execution_id = %execution_id,
+            node_id,
+            kind = %trip.kind,
+            limit = trip.limit,
+            current = trip.current,
+            "Budget already exhausted; refusing to fire"
+        );
+
+        // The audit record is best-effort; the refusal is not. A backend read
+        // failure here must never downgrade into letting the node fire, so the
+        // sequence lookup is `if let Ok` rather than `?`.
+        if let Ok(latest) = self.backend.latest_sequence(execution_id).await {
+            // A cost trip carries dollars, which do not survive the u64 cast that
+            // TokenBudgetExceeded's limit/current fields require: a $0.50 ceiling
+            // would be recorded as 0. Report it on the cost event instead, exactly
+            // as the post-execution path does. Token ceilings are u32 in the IR,
+            // so their f64 -> u64 roundtrip is lossless.
+            let kind = if trip.kind == "cost_usd" {
+                EventKind::CostBudgetExceeded {
+                    node_id: node_id.to_string(),
+                    limit_usd: trip.limit,
+                    current_usd: trip.current,
+                }
+            } else {
+                EventKind::TokenBudgetExceeded {
+                    node_id: node_id.to_string(),
+                    kind: trip.kind.clone(),
+                    limit: trip.limit as u64,
+                    current: trip.current as u64,
+                }
+            };
+            let _ = self
+                .backend
+                .append_event(jamjet_state::Event::new(
+                    execution_id.clone(),
+                    latest + 1,
+                    kind,
+                ))
+                .await;
+        }
+
+        Some(Err(format!(
+            "budget exhausted before execution: {} {} >= {}",
+            trip.kind, trip.current, trip.limit
+        )
+        .into()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2161,7 +2270,9 @@ mod tests {
 
     // ── Continue-as-new tests (Task 2g-3) ────────────────────────────────────
 
-    /// Returns 1 input token -- triggers any IR with token_budget.total_tokens: 0.
+    /// Returns 2 input tokens -- exceeds `budget_ceiling_ir_json`'s
+    /// `total_tokens: 1` ceiling on the post-execution `>` check, while leaving a
+    /// fresh execution genuinely under the ceiling for the pre-execution `>=` check.
     struct BudgetTriggerExecutor;
 
     #[async_trait::async_trait]
@@ -2176,7 +2287,7 @@ mod tests {
                 duration_ms: 1,
                 gen_ai_system: None,
                 gen_ai_model: None,
-                input_tokens: Some(1), // triggers total_tokens budget check
+                input_tokens: Some(2), // exceeds the total_tokens: 1 ceiling
                 output_tokens: None,
                 finish_reason: None,
             })
@@ -2190,7 +2301,11 @@ mod tests {
             "state_schema": "{}",
             "start_node": "n1",
             "continue_as_new": continue_as_new,
-            "token_budget": { "total_tokens": 0 }, // any >0 tokens exceeds this
+            // A ceiling of 1, not 0: the executor's 2 tokens exceed it after the
+            // fact, but a FRESH execution (0 tokens) is genuinely under it, so the
+            // pre-execution `>=` guard lets the first turn fire. A zero ceiling
+            // would read as already-exhausted before anything ran.
+            "token_budget": { "total_tokens": 1 },
             "nodes": {
                 "n1": {
                     "id": "n1",
@@ -2627,6 +2742,232 @@ mod tests {
         );
     }
 
+    // ── Pre-execution budget guard tests (C2) ─────────────────────────────────
+
+    /// Counts every executor invocation. A refused node must leave it at 0 —
+    /// that count IS the money, so it is the assertion that matters.
+    struct CountingBudgetExecutor {
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for CountingBudgetExecutor {
+        async fn execute(
+            &self,
+            _item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ExecutionResult {
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({}),
+                duration_ms: 1,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: Some(2),
+                output_tokens: None,
+                finish_reason: None,
+            })
+        }
+    }
+
+    /// Seed the execution's latest snapshot with an already-spent `__budget`.
+    ///
+    /// This is exactly the state a continue-as-new child inherits: the parent's
+    /// counters, carried forward by `materialize`, sitting at the ceiling with the
+    /// same ceiling still in the same IR.
+    async fn seed_spent_budget(backend: &InMemoryBackend, eid: &ExecutionId, input_tokens: u64) {
+        let budget = BudgetState {
+            total_input_tokens: input_tokens,
+            ..Default::default()
+        };
+        let mut state = serde_json::json!({ "counter": 5 });
+        budget.patch_into_snapshot_state(&mut state);
+        backend
+            .write_snapshot(jamjet_state::Snapshot::new(eid.clone(), 0, state))
+            .await
+            .expect("seed snapshot must write");
+    }
+
+    /// The guard is wired into `execute_item` ahead of every executor dispatch:
+    /// an execution whose counters already sit at the ceiling makes ZERO executor
+    /// calls. That count is the whole point — it is the money.
+    ///
+    /// This does NOT prove the `continue_as_new` chain terminates. It cannot: the
+    /// chain's carried counters land strictly BELOW the ceiling (the post-check is
+    /// `>`, the tripping turn is discarded), so the seeded state here is reached
+    /// by a turn landing exactly on the ceiling, not by the chain. Terminating the
+    /// chain means not rolling over on a trip, which lives in the rollover branch.
+    ///
+    /// Driven with `continue_as_new: true` so a regression that lets the node fire
+    /// shows up as the runaway itself: without the guard this returns `Ok(())`,
+    /// having paid for one call, discarded it, and rolled over.
+    #[tokio::test]
+    async fn exhausted_budget_makes_no_executor_call() {
+        let (backend, eid) = setup_budget_backend(true).await;
+        // The fixture node is a TOOL node, not a model node. That is deliberate:
+        // budget accounting follows the tokens an executor reports, not the node
+        // kind, so a `Model | Agent` allowlist in the guard would silently let
+        // this through and this assertion would still pass while the count did not.
+        let ir: WorkflowIr =
+            serde_json::from_value(budget_ceiling_ir_json(true)).expect("fixture IR must parse");
+        assert_eq!(
+            node_kind_tag(&ir.node("n1").expect("n1 exists").kind),
+            "tool",
+            "fixture node must be a tool node for the kind-agnostic claim to bite"
+        );
+
+        // Ceiling is total_tokens: 1; 1 input token means the counters sit exactly
+        // on it, which is the state a turn landing on the ceiling commits.
+        seed_spent_budget(&backend, &eid, 1).await;
+
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor(
+            "tool",
+            Arc::new(CountingBudgetExecutor {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+
+        let result = worker.execute_item(item).await;
+        assert!(
+            result.is_err(),
+            "an exhausted budget must refuse the node, not run it: {result:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "C2: an exhausted budget must not pay for one more call"
+        );
+
+        // The refusal is on the record, and it names the ceiling that tripped.
+        let events = backend.get_events(&eid).await.unwrap();
+        let trip = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::TokenBudgetExceeded {
+                    kind,
+                    limit,
+                    current,
+                    ..
+                } => Some((kind.clone(), *limit, *current)),
+                _ => None,
+            })
+            .expect("refusal must emit TokenBudgetExceeded");
+        assert_eq!(trip, ("total_tokens".to_string(), 1, 1));
+
+        // And it must NOT roll over: rolling over on an exhausted budget is the
+        // runaway itself, since the child inherits the same spent counters.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }))
+                .count(),
+            0,
+            "C2: a refused node must not roll over into another segment"
+        );
+    }
+
+    /// A fresh budget under the ceiling fires normally — the guard must not be a
+    /// blanket stop.
+    #[tokio::test]
+    async fn budget_under_the_ceiling_fires() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        );
+        let ir: WorkflowIr =
+            serde_json::from_value(budget_ceiling_ir_json(false)).expect("fixture IR must parse");
+        let refused = worker
+            .check_budget_before_execution(&ExecutionId::new(), "n1", &ir, &BudgetState::default())
+            .await;
+        assert!(refused.is_none(), "a fresh budget must not be refused");
+    }
+
+    /// No budget configured means the guard never fires, however large the counters.
+    #[tokio::test]
+    async fn no_budget_configured_never_refuses() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        );
+        let mut ir_json = budget_ceiling_ir_json(false);
+        ir_json["token_budget"] = serde_json::Value::Null;
+        let ir: WorkflowIr = serde_json::from_value(ir_json).expect("IR must parse");
+        let huge = BudgetState {
+            total_input_tokens: 10_000_000,
+            ..Default::default()
+        };
+        let refused = worker
+            .check_budget_before_execution(&ExecutionId::new(), "n1", &ir, &huge)
+            .await;
+        assert!(refused.is_none());
+    }
+
+    /// A spent COST budget reports as `CostBudgetExceeded`, matching the
+    /// post-execution path. Routing it through `TokenBudgetExceeded` would cast
+    /// the dollar limit to u64 and record a $0.50 ceiling as `limit: 0`.
+    #[tokio::test]
+    async fn exhausted_cost_budget_reports_dollars_not_truncated_tokens() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        );
+        let mut ir_json = budget_ceiling_ir_json(false);
+        ir_json["token_budget"] = serde_json::Value::Null;
+        ir_json["cost_budget_usd"] = serde_json::json!(0.5);
+        let ir: WorkflowIr = serde_json::from_value(ir_json).expect("IR must parse");
+        let spent = BudgetState {
+            total_cost_usd: 0.5,
+            ..Default::default()
+        };
+
+        let refused = worker
+            .check_budget_before_execution(&eid, "n1", &ir, &spent)
+            .await;
+        assert!(
+            refused.expect("a spent cost budget must refuse").is_err(),
+            "refusal must be an Err"
+        );
+
+        let events = backend.get_events(&eid).await.unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::TokenBudgetExceeded { .. })),
+            "a cost trip must not be recorded as a token trip"
+        );
+        let cost = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::CostBudgetExceeded {
+                    limit_usd,
+                    current_usd,
+                    ..
+                } => Some((*limit_usd, *current_usd)),
+                _ => None,
+            })
+            .expect("cost refusal must emit CostBudgetExceeded");
+        assert_eq!(cost, (0.5, 0.5), "dollar amounts must survive intact");
+    }
+
     // ── Artifact spill tests ──────────────────────────────────────────────────
 
     /// Stub executor that returns a fixed `output` value and an empty
@@ -2860,5 +3201,648 @@ mod tests {
             *event_output, small_output,
             "inline output must equal the original value"
         );
+    }
+
+    // ── C1: agent tool-dispatch policy enforcement ────────────────────────────
+
+    /// Records every tool dispatch so a test can prove one never happened.
+    #[derive(Clone, Default)]
+    struct CountingDispatchExecutor {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for CountingDispatchExecutor {
+        async fn execute(&self, _item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ExecutionResult {
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({}),
+                duration_ms: 0,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+            })
+        }
+    }
+
+    /// IR with a single marked agent tool-dispatch node under a workflow policy.
+    fn dispatch_ir_json(
+        kind_type: &str,
+        marked: bool,
+        blocked: &[&str],
+        approval: &[&str],
+    ) -> serde_json::Value {
+        let kind = if kind_type == "java_fn" {
+            serde_json::json!({
+                "type": "java_fn",
+                "class_name": "C",
+                "method": "dispatch",
+                "output_schema": "",
+                "agent_tool_dispatch": marked
+            })
+        } else {
+            serde_json::json!({
+                "type": "python_fn",
+                "module": "jamjet.agents.tool_runtime",
+                "function": "dispatch_tool_calls",
+                "output_schema": "",
+                "agent_tool_dispatch": marked
+            })
+        };
+        serde_json::json!({
+            "workflow_id": "adk-wf",
+            "version": "1.0.0",
+            "state_schema": "{}",
+            "start_node": "n1",
+            "nodes": { "n1": { "id": "n1", "kind": kind } },
+            "edges": [],
+            "retry_policies": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {},
+            "policy": {
+                "blocked_tools": blocked,
+                "require_approval_for": approval,
+                "model_allowlist": []
+            }
+        })
+    }
+
+    /// A policed `python_fn` that is a real application function, not the ADK
+    /// dispatch coroutine — the narrowness fixture.
+    fn ordinary_python_fn_ir_json(blocked: &[&str]) -> serde_json::Value {
+        let mut ir = dispatch_ir_json("python_fn", false, blocked, &[]);
+        ir["nodes"]["n1"]["kind"]["module"] = serde_json::json!("my_app.tasks");
+        ir["nodes"]["n1"]["kind"]["function"] = serde_json::json!("resize_image");
+        ir
+    }
+
+    /// Drive one marked dispatch node and return (result, events, dispatch count).
+    ///
+    /// `seed` events are appended before the item is claimed, which is how a test
+    /// stages an already-settled approval for the node.
+    async fn run_dispatch_node_seeded(
+        ir: serde_json::Value,
+        input: serde_json::Value,
+        seed: Vec<EventKind>,
+    ) -> (
+        Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        Vec<jamjet_state::Event>,
+        usize,
+    ) {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "adk-wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: serde_json::json!({}),
+                current_state: serde_json::json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        backend
+            .store_workflow(WorkflowDefinition {
+                workflow_id: "adk-wf".into(),
+                version: "1.0.0".into(),
+                ir,
+                created_at: now,
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        for kind in seed {
+            // InMemoryBackend assigns the sequence itself, so 0 is a placeholder.
+            backend
+                .append_event(jamjet_state::Event::new(eid.clone(), 0, kind))
+                .await
+                .unwrap();
+        }
+        backend
+            .enqueue_work_item(WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "default".into(),
+                payload: serde_json::json!({
+                    "workflow_id": "adk-wf",
+                    "workflow_version": "1.0.0",
+                    "input": input
+                }),
+                attempt: 0,
+                max_attempts: 1,
+                created_at: now,
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+
+        let exec = CountingDispatchExecutor::default();
+        let counter = exec.calls.clone();
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("python_fn", Arc::new(exec.clone()))
+        .register_executor("java_fn", Arc::new(exec));
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+        let result = worker.execute_item(item).await;
+        let events = backend.get_events(&eid).await.unwrap();
+        let count = counter.load(std::sync::atomic::Ordering::SeqCst);
+        (result, events, count)
+    }
+
+    async fn run_dispatch_node(
+        ir: serde_json::Value,
+        input: serde_json::Value,
+    ) -> (
+        Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        Vec<jamjet_state::Event>,
+        usize,
+    ) {
+        run_dispatch_node_seeded(ir, input, Vec::new()).await
+    }
+
+    fn one_call(name: &str) -> serde_json::Value {
+        serde_json::json!({"id": "c1", "name": name, "arguments": {}})
+    }
+
+    /// Pin WHICH guard denied. `is_err()` alone is satisfied by any failure,
+    /// including an unrelated IR-load or backend error, so a fail-closed test
+    /// that only asserts `is_err()` can pass without the guard ever running.
+    fn assert_denied_because(
+        result: Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        needle: &str,
+    ) {
+        let err = result
+            .err()
+            .map(|e| e.to_string())
+            .expect("the node must be denied");
+        assert!(
+            err.contains(needle),
+            "expected the denial reason to contain {needle:?}; got {err:?}"
+        );
+    }
+
+    fn has_policy_violation(events: &[jamjet_state::Event], rule_needle: &str) -> bool {
+        events.iter().any(|e| match &e.kind {
+            EventKind::PolicyViolation { rule, decision, .. } => {
+                rule.contains(rule_needle) && decision == "blocked"
+            }
+            _ => false,
+        })
+    }
+
+    /// The availability dual of the whole feature, and the most common
+    /// production shape: an ADK agent calling a permitted tool while a real
+    /// policy is in force. An implementation that denied on `Allow` would pass
+    /// every deny test in this module but fail here.
+    #[tokio::test]
+    async fn allowed_tool_in_marked_dispatch_runs() {
+        let (result, events, count) = run_dispatch_node(
+            // A non-trivial policy that simply does not name `read_file`, so the
+            // Allow arm is reached through real rule evaluation rather than
+            // through the `sets.is_empty()` short-circuit.
+            dispatch_ir_json("python_fn", true, &["send_wire"], &["wire_batch"]),
+            serde_json::json!({"tool_calls": [one_call("read_file")]}),
+        )
+        .await;
+        assert!(result.is_ok(), "a permitted tool must run; got {result:?}");
+        assert_eq!(count, 1, "the permitted dispatch must execute exactly once");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::PolicyViolation { .. })),
+            "a permitted dispatch must record no PolicyViolation"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
+            "a permitted dispatch must not be held for approval"
+        );
+    }
+
+    /// `Some(vec![])` (genuinely nothing to run) must stay distinct from `None`
+    /// (unreadable) at THIS seam, not only inside `pending_tool_calls`. A single
+    /// `unwrap_or_default` on that Option would erase the difference in the
+    /// other direction and turn every unreadable payload into an allow.
+    #[tokio::test]
+    async fn empty_tool_call_list_is_allowed_not_unreadable() {
+        let (result, _, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": []}),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "an empty call list is nothing to run, not unreadable; got {result:?}"
+        );
+        assert_eq!(count, 1, "the node itself must still run");
+    }
+
+    /// C1 core: a blocked tool must never execute.
+    #[tokio::test]
+    async fn blocked_tool_in_dispatch_never_executes() {
+        let (result, events, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+        )
+        .await;
+        assert_eq!(count, 0, "the blocked tool dispatch must not run");
+        assert_denied_because(result, "matches blocked pattern 'send_wire'");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::PolicyViolation { .. })),
+            "a PolicyViolation must be recorded"
+        );
+    }
+
+    /// C1 core: an approval-gated tool must hold, not fire.
+    #[tokio::test]
+    async fn approval_gated_tool_in_dispatch_holds_and_never_executes() {
+        let (_, events, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &[], &["send_wire"]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+        )
+        .await;
+        assert_eq!(count, 0, "a gated tool dispatch must not run");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
+            "a ToolApprovalRequired must be recorded"
+        );
+    }
+
+    /// One gated call holds the whole batch; none of the three run.
+    #[tokio::test]
+    async fn one_gated_call_holds_the_whole_batch() {
+        let (_, events, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &[], &["send_wire"]),
+            serde_json::json!({"tool_calls": [
+                one_call("read_file"), one_call("send_wire"), one_call("log")
+            ]}),
+        )
+        .await;
+        assert_eq!(count, 0, "no call in a held batch may run");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })));
+    }
+
+    /// Fail closed: unreadable pending calls must block, not pass — and the
+    /// refusal must be visible to audit like any other policy denial.
+    #[tokio::test]
+    async fn unreadable_tool_calls_block() {
+        let (result, events, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": "not-an-array"}),
+        )
+        .await;
+        assert_eq!(count, 0);
+        assert_denied_because(result, "agent dispatch tool calls unreadable");
+        assert!(
+            has_policy_violation(&events, "agent dispatch tool calls unreadable"),
+            "a fail-closed refusal must still record a PolicyViolation"
+        );
+    }
+
+    /// Fail closed: a call we cannot name is a call we cannot police.
+    #[tokio::test]
+    async fn nameless_call_blocks() {
+        let (result, events, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": [{"id": "c1", "arguments": {}}]}),
+        )
+        .await;
+        assert_eq!(count, 0);
+        assert_denied_because(result, "agent dispatch tool calls unreadable");
+        assert!(has_policy_violation(
+            &events,
+            "agent dispatch tool calls unreadable"
+        ));
+    }
+
+    /// Fail closed: the payload's `input` is where the frozen calls live. Reading
+    /// the whole payload instead would make both call keys absent and read as
+    /// "nothing to run", allowing every tool through while looking like a
+    /// correct allow. A missing `input` must therefore block, not allow.
+    #[tokio::test]
+    async fn missing_payload_input_blocks() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "adk-wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: serde_json::json!({}),
+                current_state: serde_json::json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        backend
+            .store_workflow(WorkflowDefinition {
+                workflow_id: "adk-wf".into(),
+                version: "1.0.0".into(),
+                ir: dispatch_ir_json("python_fn", true, &["send_wire"], &[]),
+                created_at: now,
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        backend
+            .enqueue_work_item(WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "default".into(),
+                // No "input" key at all, but a top-level tool_calls decoy: if the
+                // worker read the whole payload this would be readable and allow.
+                payload: serde_json::json!({
+                    "workflow_id": "adk-wf",
+                    "workflow_version": "1.0.0",
+                    "tool_calls": []
+                }),
+                attempt: 0,
+                max_attempts: 1,
+                created_at: now,
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+
+        let exec = CountingDispatchExecutor::default();
+        let counter = exec.calls.clone();
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("python_fn", Arc::new(exec));
+
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+        let result = worker.execute_item(item).await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_denied_because(result, "agent dispatch tool calls unreadable");
+    }
+
+    /// Narrowness: an ordinary python_fn is unaffected by the new branch.
+    ///
+    /// "Ordinary" means the coordinates too. A node at
+    /// `jamjet.agents.tool_runtime::dispatch_tool_calls` is an agent dispatch
+    /// whether or not it carries the marker — see
+    /// `unmarked_adk_dispatch_is_still_enforced` below — so this fixture uses a
+    /// genuine application function. Using the dispatch coordinates here would
+    /// assert the fail-open instead of narrowness.
+    #[tokio::test]
+    async fn unmarked_python_fn_is_unaffected() {
+        let (result, _, count) = run_dispatch_node(
+            ordinary_python_fn_ir_json(&["send_wire"]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+        )
+        .await;
+        assert_eq!(count, 1, "a non-ADK python_fn must still run");
+        assert!(result.is_ok());
+    }
+
+    /// An IR stored before the marker existed deserializes to `false`, and only
+    /// the registration route re-validates. Enforcement therefore keys on the
+    /// dispatch coordinates as well, so a pre-marker workflow is still policed
+    /// on the in-process path.
+    #[tokio::test]
+    async fn unmarked_adk_dispatch_is_still_enforced() {
+        let (result, _, count) = run_dispatch_node(
+            dispatch_ir_json("python_fn", false, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+        )
+        .await;
+        assert_eq!(count, 0, "the blocked tool must never dispatch");
+        assert_denied_because(result, "send_wire");
+    }
+
+    /// The approval must be bound to the calls it authorises.
+    #[tokio::test]
+    async fn approval_context_carries_resolved_calls_and_hash() {
+        let (_, events, _) = run_dispatch_node(
+            dispatch_ir_json("python_fn", true, &[], &["send_wire"]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+        )
+        .await;
+        let ctx = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ToolApprovalRequired { context, .. } => Some(context.clone()),
+                _ => None,
+            })
+            .expect("ToolApprovalRequired must exist");
+        assert_eq!(ctx["gated_tools"][0], "send_wire");
+        assert!(
+            ctx["calls_hash"].as_str().is_some_and(|h| !h.is_empty()),
+            "the approval must be bound to a hash of the resolved calls"
+        );
+    }
+
+    /// The Java dispatch arm has the identical hole and the identical fix.
+    #[tokio::test]
+    async fn blocked_tool_in_java_dispatch_never_executes() {
+        let (result, _, count) = run_dispatch_node(
+            dispatch_ir_json("java_fn", true, &["send_wire"], &[]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+        )
+        .await;
+        assert_eq!(count, 0, "the blocked Java tool dispatch must not run");
+        assert_denied_because(result, "matches blocked pattern 'send_wire'");
+    }
+
+    /// The exact `calls_json` shape the enforcement hashes. Both the recorded
+    /// approval context and the re-fire check must hash this same shape, or the
+    /// binding never matches and an approved node can never proceed.
+    fn calls_json_for(names: &[&str]) -> serde_json::Value {
+        serde_json::json!(names
+            .iter()
+            .map(|n| serde_json::json!({"name": n, "arguments": {}}))
+            .collect::<Vec<_>>())
+    }
+
+    /// An approval authorises a specific set of calls, not the node forever.
+    #[tokio::test]
+    async fn approval_does_not_authorise_a_different_call_set() {
+        // The node was already approved for `read_file`. It now re-fires with
+        // `send_wire` pending — a different call set, so the settled approval
+        // must not carry over.
+        let approved_hash = content_hash(&calls_json_for(&["read_file"]));
+        let (result, events, count) = run_dispatch_node_seeded(
+            dispatch_ir_json("python_fn", true, &[], &["send_wire", "read_file"]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+            vec![
+                EventKind::ToolApprovalRequired {
+                    node_id: "n1".into(),
+                    tool_name: "read_file".into(),
+                    approver: "human".into(),
+                    context: serde_json::json!({
+                        "node_id": "n1",
+                        "gated_tools": ["read_file"],
+                        "calls": calls_json_for(&["read_file"]),
+                        "calls_hash": approved_hash,
+                    }),
+                },
+                EventKind::ApprovalReceived {
+                    node_id: "n1".into(),
+                    user_id: "approver".into(),
+                    decision: jamjet_state::event::ApprovalDecision::Approved,
+                    comment: None,
+                    state_patch: None,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(
+            count, 0,
+            "an approval for one call set must not release a different one"
+        );
+        assert_denied_because(result, "approved tool calls do not match pending calls");
+        assert!(
+            has_policy_violation(&events, "approved tool calls do not match pending calls"),
+            "the approval-binding denial is the highest-value audit record here \
+             and must reach the event log"
+        );
+    }
+
+    /// The approved hash must come from the LATEST request for the node, and an
+    /// absent hash on that request must block.
+    ///
+    /// `node_approval_status` resets to Pending on every new
+    /// `ToolApprovalRequired`, so an `Approved` status always refers to the
+    /// latest request. A lookup that scans backwards for the first event
+    /// *yielding a hash* — rather than for the latest matching event — walks
+    /// straight past a hash-less latest request and inherits the hash of an
+    /// older, already-superseded one. That is a fail-open: an approval settled
+    /// against an unbound request would authorise the older request's calls.
+    ///
+    /// Latent while no in-tree producer writes a hash-less request for a marked
+    /// dispatch node; live the moment a second writer (the claim route) exists.
+    #[tokio::test]
+    async fn hashless_latest_request_does_not_inherit_an_older_hash() {
+        // The pending calls deliberately MATCH the OLD request's hash. A lookup
+        // that skipped back to it would find a match and allow, so this test
+        // only passes when the lookup stops at the latest (hash-less) request.
+        let old_hash = content_hash(&calls_json_for(&["read_file"]));
+        let (result, events, count) = run_dispatch_node_seeded(
+            dispatch_ir_json("python_fn", true, &[], &["read_file"]),
+            serde_json::json!({"tool_calls": [one_call("read_file")]}),
+            vec![
+                // Older request: carries a hash for exactly these calls.
+                EventKind::ToolApprovalRequired {
+                    node_id: "n1".into(),
+                    tool_name: "read_file".into(),
+                    approver: "human".into(),
+                    context: serde_json::json!({
+                        "node_id": "n1",
+                        "gated_tools": ["read_file"],
+                        "calls": calls_json_for(&["read_file"]),
+                        "calls_hash": old_hash,
+                    }),
+                },
+                // Newer request: supersedes the one above and carries NO hash.
+                EventKind::ToolApprovalRequired {
+                    node_id: "n1".into(),
+                    tool_name: "read_file".into(),
+                    approver: "human".into(),
+                    context: serde_json::json!({"node_id": "n1"}),
+                },
+                // The approval settles the NEWER, unbound request.
+                EventKind::ApprovalReceived {
+                    node_id: "n1".into(),
+                    user_id: "approver".into(),
+                    decision: jamjet_state::event::ApprovalDecision::Approved,
+                    comment: None,
+                    state_patch: None,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(
+            count, 0,
+            "an approval settled against an unbound request must authorise nothing"
+        );
+        assert_denied_because(result, "approved tool calls do not match pending calls");
+        assert!(has_policy_violation(
+            &events,
+            "approved tool calls do not match pending calls"
+        ));
+    }
+
+    /// The dual: the approval DOES release the exact call set it authorised.
+    /// Without this, the binding check could be satisfied by blocking always.
+    #[tokio::test]
+    async fn approval_releases_the_call_set_it_authorised() {
+        let approved_hash = content_hash(&calls_json_for(&["send_wire"]));
+        let (result, _, count) = run_dispatch_node_seeded(
+            dispatch_ir_json("python_fn", true, &[], &["send_wire"]),
+            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
+            vec![
+                EventKind::ToolApprovalRequired {
+                    node_id: "n1".into(),
+                    tool_name: "send_wire".into(),
+                    approver: "human".into(),
+                    context: serde_json::json!({
+                        "node_id": "n1",
+                        "gated_tools": ["send_wire"],
+                        "calls": calls_json_for(&["send_wire"]),
+                        "calls_hash": approved_hash,
+                    }),
+                },
+                EventKind::ApprovalReceived {
+                    node_id: "n1".into(),
+                    user_id: "approver".into(),
+                    decision: jamjet_state::event::ApprovalDecision::Approved,
+                    comment: None,
+                    state_patch: None,
+                },
+            ],
+        )
+        .await;
+        assert!(result.is_ok(), "an approved, matching call set must run");
+        assert_eq!(count, 1, "the approved dispatch must execute exactly once");
     }
 }

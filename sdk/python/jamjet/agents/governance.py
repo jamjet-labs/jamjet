@@ -58,6 +58,11 @@ class GovernanceConfig:
         ``True``   – every tool call requires approval.
         ``list``   – tool-name globs that require approval (e.g.
                      ``["delete_*", "send_*"]``).
+        Enforced engine-side on the DURABLE path (``agent.run_durable``) only.
+        The in-process ``agent.run()`` path has no policy engine in its loop and
+        CANNOT enforce a gate; it warns loudly instead (F-t3-inprocess-approval).
+        The mechanism — and why it holds even against an untrusted worker — is
+        documented once, at the warning site in :meth:`jamjet.Agent.run`.
     budget
         Optional per-run spending cap.  ``None`` when uncapped.
     pii

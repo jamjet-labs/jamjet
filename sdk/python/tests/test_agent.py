@@ -1,6 +1,9 @@
 """Tests for the Agent and @task syntactic sugar."""
 
 import asyncio
+import re
+import warnings
+from collections.abc import Iterable
 
 import pytest
 
@@ -101,6 +104,90 @@ class TestAgent:
         assert agent.limits.max_iterations == 5
         assert agent.limits.max_cost_usd == 0.5
         assert agent.limits.timeout_seconds == 60
+
+
+# ── approval_required warning copy ────────────────────────────────────────────
+#
+# The warning on agent.run() is security guidance, so its wording is under test.
+# It has to say two things and no more: (a) THIS call is not enforced, and (b)
+# where enforcement actually lives. The durable path is genuinely enforced now,
+# but by the engine server-side — the guard on the work-item claim route runs
+# before the external tool worker ever receives the payload — not by the SDK.
+# The old copy promised "the Rust engine enforces it fail-closed" while
+# sitting on the unenforced in-process path, which reads as a guarantee about
+# the call the developer just made.
+
+
+def _agent_with_approval_required() -> Agent:
+    return Agent(
+        "approval_copy",
+        model="gpt-5.2",
+        tools=[search],
+        approval_required=True,
+    )
+
+
+def _approval_warning(record: Iterable[warnings.WarningMessage]) -> str:
+    """The one approval warning out of everything run() emits (audit warns too)."""
+    matches = [w for w in record if "approval_required" in str(w.message)]
+    assert len(matches) == 1, f"expected exactly one approval warning, got {len(matches)}"
+    return str(matches[0].message)
+
+
+# "worker" is allowed in the copy — "before any worker receives the payload" is
+# the whole point. What is banned is the worker appearing as the SUBJECT of the
+# enforcing, in either voice ("the worker enforces it" / "enforced by the tool
+# worker"). Matched as a class rather than as one literal: the reword that
+# actually happened on this branch said "Tells the Rust worker ... policy must be
+# evaluated", which no single banned phrase would have caught. `[^.]` keeps each
+# match inside one sentence so an innocent "worker" cannot pair with an enforcing
+# verb from the next one.
+_ENFORCE = r"(?:enforc|evaluat|check|block|gate|decid|den|held|hold)\w*"
+_WORKER_CREDITED = re.compile(
+    rf"\bworkers?\b[^.]{{0,40}}?{_ENFORCE}|{_ENFORCE}[^.]{{0,40}}?\bby\b[^.]{{0,20}}?\bworkers?\b",
+    re.IGNORECASE,
+)
+
+
+class TestApprovalWarningCopy:
+    def test_in_process_run_warning_does_not_promise_enforcement_here(self):
+        """run() must warn without implying the in-process path is enforced."""
+        agent = _agent_with_approval_required()
+        with pytest.warns(UserWarning) as record:
+            asyncio.run(agent.run("hi"))
+        message = _approval_warning(record)
+        assert "does not enforce approval gates" in message
+        # The durable path is now genuinely enforced (C1), but this warning is on
+        # the in-process path and must not read as a guarantee about this call.
+        assert "fail-closed" not in message
+
+    def test_in_process_run_warning_points_at_the_real_enforcement_point(self):
+        """The redirect must name where enforcement lives, accurately.
+
+        Server-side, before the payload leaves the engine — that is what makes
+        the durable claim true even for a stale or hostile external tool worker.
+        """
+        agent = _agent_with_approval_required()
+        with pytest.warns(UserWarning) as record:
+            asyncio.run(agent.run("hi"))
+        message = _approval_warning(record)
+        assert "run_durable" in message
+        assert "before any worker" in message
+
+    def test_in_process_run_warning_never_credits_the_worker(self):
+        """The durable guarantee belongs to the engine, never to the worker.
+
+        Crediting the worker is not just imprecise, it inverts the property:
+        enforcement holds BECAUSE the external worker is untrusted and the
+        decision is made before it sees the payload. Copy that reads "the worker
+        enforces it" describes a system where a stale worker build could opt out.
+        """
+        agent = _agent_with_approval_required()
+        with pytest.warns(UserWarning) as record:
+            asyncio.run(agent.run("hi"))
+        message = _approval_warning(record)
+        hit = _WORKER_CREDITED.search(message)
+        assert hit is None, f"warning credits the worker with enforcing: {hit.group(0)!r}"
 
 
 # ── @task tests ───────────────────────────────────────────────────────────────

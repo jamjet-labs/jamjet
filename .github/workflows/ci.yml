@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege for the whole workflow. Every job here reads the repo, builds,
+# and reports — none of them writes to it, so none needs the default write-capable
+# token. Declared once at the top rather than per job, so a job added later
+# inherits the floor instead of silently getting write.
+#
+# Publishing is unaffected: the release workflows are separate files and keep
+# their own `id-token: write` for OIDC.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -128,8 +138,44 @@ jobs:
           # --deny unsound: fail on CVEs/unsound advisories (not on unmaintained warnings)
           # --ignore RUSTSEC-2023-0071: rsa Marvin Attack — no upstream fix available yet;
           #   we use rsa only as a transitive dep of tonic, not for key operations.
+          # --ignore RUSTSEC-2026-0258: h2 unbounded empty DATA frames (h2 0.3.27).
+          #   The fix is h2 >=0.4.16, which means moving off hyper 0.14 entirely.
+          #   The vulnerable copy reaches us ONLY as
+          #   jamjet-telemetry -> opentelemetry-otlp 0.15 -> tonic 0.11 -> hyper 0.14,
+          #   i.e. the OTLP exporter, which is an outbound client: reaching it needs a
+          #   hostile collector we already trust with our telemetry, not an inbound
+          #   request. Every server that accepts untrusted traffic — jamjet-api and the
+          #   a2a server — is on axum 0.7 -> hyper 1.x -> h2 0.4.15, which this advisory
+          #   does not flag. Tracked for the opentelemetry/tonic upgrade in #115;
+          #   re-evaluate when that lands.
           cargo audit --deny unsound \
-            --ignore RUSTSEC-2023-0071
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2026-0258
+
+      - name: Assert the h2 advisory exception still holds
+        working-directory: runtime
+        run: |
+          # --ignore is project-wide, so it would keep suppressing RUSTSEC-2026-0258
+          # if the vulnerable h2 ever appeared somewhere that actually matters. The
+          # exception above is justified by WHERE h2 0.3.x sits, so assert that,
+          # rather than trusting a comment to stay true.
+          TREE="$(cargo tree --workspace --invert h2@0.3.27 2>/dev/null || true)"
+          if [ -z "$TREE" ]; then
+            echo "h2 0.3.x is gone — drop --ignore RUSTSEC-2026-0258 (see #115)."
+            exit 1
+          fi
+          if ! grep -q 'opentelemetry-otlp' <<<"$TREE"; then
+            echo "The RUSTSEC-2026-0258 exception is stale: h2 0.3.x no longer"
+            echo "reaches us via the OTLP exporter. Re-assess before ignoring it."
+            echo "$TREE"
+            exit 1
+          fi
+          if grep -qE 'jamjet-a2a|axum v0\.7' <<<"$TREE"; then
+            echo "The RUSTSEC-2026-0258 exception is UNSAFE: the vulnerable h2 is"
+            echo "now reachable from a server that accepts inbound traffic."
+            echo "$TREE"
+            exit 1
+          fi
 
   python-audit:
     name: Python dependency audit

@@ -10,6 +10,7 @@
 //! - Circuit breaker for agents in error loops
 
 pub mod autonomy;
+pub mod dispatch;
 pub mod engine;
 pub mod redaction;
 
