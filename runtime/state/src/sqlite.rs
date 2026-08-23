@@ -1184,6 +1184,28 @@ impl StateBackend for SqliteBackend {
         Ok(())
     }
 
+    async fn count_node_completions(
+        &self,
+        execution_id: &ExecutionId,
+        node_id: &str,
+    ) -> BackendResult<u64> {
+        // `EventKind` is `#[serde(tag = "type", rename_all = "snake_case")]`, so a
+        // NodeCompleted stores `"type":"node_completed"` alongside its `node_id`.
+        // Counting in SQL avoids shipping every event's output payload back just
+        // to length-check a filter.
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE execution_id = ? \
+             AND json_extract(kind_json, '$.type') = 'node_completed' \
+             AND json_extract(kind_json, '$.node_id') = ?",
+        )
+        .bind(execution_id_str(execution_id))
+        .bind(node_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        Ok(n as u64)
+    }
+
     #[instrument(skip(self), fields(item_id = %item_id))]
     async fn get_work_item(&self, item_id: WorkItemId) -> BackendResult<Option<WorkItem>> {
         let row = sqlx::query("SELECT * FROM work_items WHERE id = ?")
