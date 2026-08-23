@@ -11,6 +11,24 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **The tool-effect idempotency key is derived by the engine, not taken from the request
+  body** (#130). `POST /work-items/:id/complete` persisted the caller's
+  `idempotency_key` verbatim, so a worker holding item B's lease could complete B while
+  echoing item A's key: the backend filed B's output under A, and a later replay for A
+  returned a result A never produced. The key is now derived from the coordinates the
+  engine recorded for the item — `StateBackend::get_work_item` was added so the route
+  can ask rather than believe the body, and the tenant-scoped backend filters that
+  lookup by tenant.
+
+  A worker that omits the field now gets replay coverage anyway, since the engine
+  derives it either way.
+
+  Derivation runs before `commit_turn` appends the `NodeCompleted`, so a linear run
+  reproduces the claim's key exactly. A node running beside a sibling whose
+  `state_patch` landed in between derives a different key and loses replay exactness —
+  already v1's documented posture (`F-2c-3`), and why a mismatch warns rather than
+  failing the completion.
+
 - **Dropped `hyper 0.14` and `h2 0.3.x` from the tree** (RUSTSEC-2026-0258, h2 unbounded
   empty DATA frames). The OTLP stack moved from opentelemetry 0.22 / tonic 0.11 to
   opentelemetry 0.32 / tonic 0.14, which was the only thing holding the pre-1.x hyper

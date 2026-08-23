@@ -277,6 +277,16 @@ pub trait StateBackend: Send + Sync {
         lease_fence: i64,
     ) -> BackendResult<()>;
 
+    /// The work item as the ENGINE recorded it, or `None` if there is no such
+    /// item (for this tenant, on a tenant-scoped backend).
+    ///
+    /// Exists so a route can answer "which execution and node is this item"
+    /// without believing the request body. `POST /work-items/:id/complete`
+    /// derives the tool-effect idempotency key from these coordinates: taking
+    /// them from the body would let a caller holding one item's lease file its
+    /// output under another item's key.
+    async fn get_work_item(&self, item_id: WorkItemId) -> BackendResult<Option<WorkItem>>;
+
     /// Mark a work item as completed and release the lease.
     async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()>;
 

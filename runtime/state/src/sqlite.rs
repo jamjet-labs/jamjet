@@ -1185,6 +1185,15 @@ impl StateBackend for SqliteBackend {
     }
 
     #[instrument(skip(self), fields(item_id = %item_id))]
+    async fn get_work_item(&self, item_id: WorkItemId) -> BackendResult<Option<WorkItem>> {
+        let row = sqlx::query("SELECT * FROM work_items WHERE id = ?")
+            .bind(item_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+        row.map(|r| row_to_work_item(&r)).transpose()
+    }
+
     async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
         let id_str = item_id.to_string();
         let completed_at = Utc::now().to_rfc3339();

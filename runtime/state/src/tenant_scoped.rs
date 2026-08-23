@@ -1099,6 +1099,19 @@ impl StateBackend for TenantScopedSqliteBackend {
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id, item_id = %item_id))]
+    async fn get_work_item(&self, item_id: WorkItemId) -> BackendResult<Option<WorkItem>> {
+        // Tenant-filtered. An unfiltered lookup here would let one tenant read
+        // another's item coordinates, and the caller derives an idempotency key
+        // from them — the same cross-tenant shape as the reservation PK bug.
+        let row = sqlx::query("SELECT * FROM work_items WHERE id = ? AND tenant_id = ?")
+            .bind(item_id.to_string())
+            .bind(&self.tenant_id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+        row.map(|r| row_to_work_item(&r)).transpose()
+    }
+
     async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
         let id_str = item_id.to_string();
         let completed_at = Utc::now().to_rfc3339();

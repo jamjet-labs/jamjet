@@ -1507,6 +1507,49 @@ async fn complete_work_item(
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
 
+    // AUTHORITY. The idempotency key is derived from the coordinates the ENGINE
+    // recorded for this item, never from the request body.
+    //
+    // The body's key used to be persisted verbatim, so a worker holding item B's
+    // lease could complete B while echoing item A's key: the backend filed B's
+    // output under A, and a later replay for A returned the wrong result. Body
+    // coordinates are no better — they are the same caller's word.
+    //
+    // Derived here rather than trusted from the claim because `derive` runs
+    // BEFORE `commit_turn` appends this NodeCompleted, so the step count and the
+    // accumulated state are the same ones the claim saw. For a LINEAR run that
+    // reproduces the claim's key exactly. For a node running beside a sibling
+    // whose `state_patch` landed in between, it does not — that node loses replay
+    // exactness, which is already v1's documented posture (`F-2c-3` in
+    // `runtime/workers/src/worker.rs`), and is why a mismatch is not an error.
+    //
+    // Best effort: if the item cannot be read, no effect is recorded. A missing
+    // replay entry costs a re-fire; a wrong one costs the wrong answer.
+    let derived_key: Option<String> = match backend.get_work_item(item_id).await {
+        Ok(Some(wi)) => {
+            jamjet_state::derive_idempotency_key(backend.as_ref(), &wi.execution_id, &wi.node_id)
+                .await
+                .ok()
+        }
+        Ok(None) => None,
+        Err(e) => {
+            warn!(work_item_id = %id, error = %e, "complete: could not read the work item; recording no effect");
+            None
+        }
+    };
+
+    if let (Some(sent), Some(derived)) = (body.idempotency_key.as_deref(), derived_key.as_deref()) {
+        if sent != derived {
+            // Not an error: a parallel sibling legitimately moves the key. Worth
+            // saying out loud, because the other cause is a caller filing under
+            // someone else's key, and that used to succeed silently.
+            warn!(
+                work_item_id = %id,
+                "complete: the echoed idempotency_key differs from the engine-derived one;                  recording under the derived key"
+            );
+        }
+    }
+
     let node_completed = |execution_id: &ExecutionId| {
         jamjet_state::Event::new(
             execution_id.clone(),
@@ -1525,7 +1568,7 @@ async fn complete_work_item(
                 finish_reason: body.finish_reason.clone(),
                 cost_usd: None,
                 provenance: None,
-                idempotency_key: body.idempotency_key.clone(),
+                idempotency_key: derived_key.clone(),
             },
         )
     };

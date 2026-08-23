@@ -930,3 +930,105 @@ async fn a_malformed_idempotency_key_is_refused() {
         "the engine's own key must be accepted"
     );
 }
+
+// ── #130: the effect key is the engine's, not the caller's ──────────────────
+
+/// A worker cannot file its output under another item's key.
+///
+/// The body's `idempotency_key` used to be persisted verbatim, so a worker
+/// holding item B's lease could complete B while echoing item A's key. The
+/// backend filed B's output under A, and a later replay for A returned the wrong
+/// result — a worker poisoning a node it never ran.
+#[tokio::test]
+async fn a_forged_idempotency_key_is_not_the_one_recorded() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+
+    // Item A: never completed. Its key is the one the attacker wants to poison.
+    let (exec_a, _id_a) = seed_unclaimed(&backend).await;
+    let victim_key = jamjet_state::derive_idempotency_key(backend.as_ref(), &exec_a, "n1")
+        .await
+        .expect("derive victim key");
+
+    // Item B: a different execution, which this caller legitimately holds.
+    let (exec_b, id_b) = seed_unclaimed(&backend).await;
+    let state = make_state(backend.clone());
+    let claim = claim_via_route(&state).await;
+    let fence = claim["work_item"]["lease_fence"].as_i64().unwrap();
+
+    let (status, _) = post_complete(
+        &state,
+        id_b,
+        json!({
+            "execution_id": exec_b.to_string(),
+            "node_id": "n1",
+            "output": {"stolen": true},
+            "state_patch": {},
+            "lease_fence": fence,
+            // Item A's key, echoed while completing item B.
+            "idempotency_key": victim_key,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the completion itself must still succeed"
+    );
+
+    assert!(
+        backend
+            .get_tool_effect(&victim_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "item B's output was filed under item A's key — a replay of A would now \
+         return a result A never produced"
+    );
+
+    // ...and B's own effect IS recorded, under the key the engine derived.
+    let own_key = claim["work_item"]["idempotency_key"].as_str().unwrap();
+    let recorded = backend
+        .get_tool_effect(own_key)
+        .await
+        .unwrap()
+        .expect("the item's own effect must still be recorded");
+    assert_eq!(recorded["output"]["stolen"], json!(true));
+}
+
+/// Omitting the key entirely no longer means "record nothing".
+///
+/// The engine derives it either way, so a worker that never learned to echo the
+/// field still gets replay coverage.
+#[tokio::test]
+async fn an_absent_key_no_longer_costs_the_effect() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let (execution_id, id) = seed_unclaimed(&backend).await;
+    let state = make_state(backend.clone());
+    let claim = claim_via_route(&state).await;
+    let expected = claim["work_item"]["idempotency_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, _) = post_complete(
+        &state,
+        id,
+        json!({
+            "execution_id": execution_id.to_string(),
+            "node_id": "n1",
+            "output": {"answer": 7},
+            "state_patch": {},
+            "lease_fence": claim["work_item"]["lease_fence"].as_i64().unwrap(),
+            // no idempotency_key at all
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let recorded = backend
+        .get_tool_effect(&expected)
+        .await
+        .unwrap()
+        .expect("the engine derives the key, so an absent field costs nothing");
+    assert_eq!(recorded["output"]["answer"], json!(7));
+}
