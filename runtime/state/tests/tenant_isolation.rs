@@ -724,3 +724,54 @@ async fn a_reservation_is_scoped_to_its_tenant() {
         "beta's own key must still be exclusive within beta"
     );
 }
+
+/// `get_work_item` must not read across tenants.
+///
+/// The complete route derives a tool-effect idempotency key from the
+/// coordinates this returns. An unfiltered lookup would let one tenant's worker
+/// resolve another tenant's item and file an effect under a key derived from it
+/// — the same cross-tenant shape as the reservation primary-key bug, where a
+/// globally-scoped row read as free to a tenant-filtered caller.
+#[tokio::test]
+async fn get_work_item_is_scoped_to_the_tenant() {
+    let db = open_test_db().await;
+    register_tenant(&db, "alpha", "Alpha").await;
+    register_tenant(&db, "bravo", "Bravo").await;
+
+    let tenant_a = db.for_tenant(TenantId::from("alpha"));
+    let tenant_b = db.for_tenant(TenantId::from("bravo"));
+
+    let exec_a = sample_execution("wf-a");
+    let exec_id = exec_a.execution_id.clone();
+    tenant_a.create_execution(exec_a).await.unwrap();
+
+    let item_id = uuid::Uuid::new_v4();
+    tenant_a
+        .enqueue_work_item(jamjet_state::WorkItem {
+            id: item_id,
+            execution_id: exec_id,
+            node_id: "node-1".to_string(),
+            queue_type: "general".to_string(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "alpha".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let own = tenant_a.get_work_item(item_id).await.unwrap();
+    assert!(own.is_some(), "a tenant must be able to read its own item");
+    assert_eq!(own.unwrap().node_id, "node-1");
+
+    let cross = tenant_b.get_work_item(item_id).await.unwrap();
+    assert!(
+        cross.is_none(),
+        "tenant bravo read alpha's work item — the coordinates an idempotency \
+         key is derived from must not cross tenants"
+    );
+}

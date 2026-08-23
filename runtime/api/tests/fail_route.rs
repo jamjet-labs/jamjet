@@ -861,13 +861,14 @@ async fn a_later_segment_derives_a_different_key() {
     );
 }
 
-/// A key the engine never minted is refused, not filed.
+/// A key the engine never minted is ignored, not filed — and does not fail the run.
 ///
-/// Every key it issues is `content_hash`'s output — 64 lowercase hex characters.
-/// Anything else records an effect under a string no reader can ever derive:
-/// junk that looks like a recorded effect while covering nothing.
+/// This used to return 400. That was right while the value was persisted, but
+/// the engine now derives its own key, so rejecting a malformed echo would fail
+/// a real completion over a field nothing reads. The property that mattered
+/// survives: junk never becomes a recorded effect.
 #[tokio::test]
-async fn a_malformed_idempotency_key_is_refused() {
+async fn a_malformed_idempotency_key_is_ignored_not_filed() {
     let upper = "A".repeat(64);
     let not_hex = "g".repeat(64);
     let too_long = "a".repeat(65);
@@ -884,7 +885,10 @@ async fn a_malformed_idempotency_key_is_refused() {
         let (execution_id, id) = seed_unclaimed(&backend).await;
         let state = make_state(backend.clone());
         let claim = claim_via_route(&state).await;
-        let fence = claim["work_item"]["lease_fence"].as_i64().unwrap();
+        let derived = claim["work_item"]["idempotency_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let (status, _) = post_complete(
             &state,
@@ -892,41 +896,199 @@ async fn a_malformed_idempotency_key_is_refused() {
             json!({
                 "execution_id": execution_id.to_string(),
                 "node_id": "n1",
-                "output": {},
+                "output": {"ok": true},
                 "state_patch": {},
-                "lease_fence": fence,
+                "lease_fence": claim["work_item"]["lease_fence"].as_i64().unwrap(),
                 "idempotency_key": key,
             }),
         )
         .await;
         assert_eq!(
             status,
-            StatusCode::BAD_REQUEST,
-            "a {why} key must be refused, not filed as an effect"
+            StatusCode::OK,
+            "a {why} echoed key must not fail the completion — the engine ignores it"
+        );
+
+        assert!(
+            backend.get_tool_effect(key).await.unwrap().is_none(),
+            "a {why} key was filed as an effect"
+        );
+        assert!(
+            backend.get_tool_effect(&derived).await.unwrap().is_some(),
+            "the effect must still land under the engine's own key"
         );
     }
+}
 
-    // ...and the well-formed one the claim actually handed out still works.
+// ── #130: the effect key is the engine's, not the caller's ──────────────────
+
+/// A worker cannot file its output under another item's key.
+///
+/// The body's `idempotency_key` used to be persisted verbatim, so a worker
+/// holding item B's lease could complete B while echoing item A's key. The
+/// backend filed B's output under A, and a later replay for A returned the wrong
+/// result — a worker poisoning a node it never ran.
+#[tokio::test]
+async fn a_forged_idempotency_key_is_not_the_one_recorded() {
     let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
-    let (execution_id, id) = seed_unclaimed(&backend).await;
+
+    // ORDER MATTERS. Item B is seeded and claimed FIRST, while it is the only
+    // claimable item: `InMemoryBackend::claim_work_item` iterates a `DashMap`, so
+    // with two items pending the route could hand back A and the test would
+    // complete B with A's fence — passing or failing depending on hash order.
+    let (exec_b, id_b) = seed_unclaimed(&backend).await;
     let state = make_state(backend.clone());
     let claim = claim_via_route(&state).await;
+    assert_eq!(
+        claim["work_item"]["execution_id"].as_str().unwrap(),
+        exec_b.to_string(),
+        "the claim must be the item this test believes it holds"
+    );
+
+    // Only now the victim: item A, never completed, whose key is the one the
+    // caller will try to file under.
+    let (exec_a, _id_a) = seed_unclaimed(&backend).await;
+    let victim_key = jamjet_state::derive_idempotency_key(backend.as_ref(), &exec_a, "n1")
+        .await
+        .expect("derive victim key");
+    let fence = claim["work_item"]["lease_fence"].as_i64().unwrap();
+
     let (status, _) = post_complete(
         &state,
-        id,
+        id_b,
         json!({
-            "execution_id": execution_id.to_string(),
+            "execution_id": exec_b.to_string(),
             "node_id": "n1",
-            "output": {},
+            "output": {"stolen": true},
             "state_patch": {},
-            "lease_fence": claim["work_item"]["lease_fence"].as_i64().unwrap(),
-            "idempotency_key": claim["work_item"]["idempotency_key"].as_str().unwrap(),
+            "lease_fence": fence,
+            // Item A's key, echoed while completing item B.
+            "idempotency_key": victim_key,
         }),
     )
     .await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "the engine's own key must be accepted"
+        "the completion itself must still succeed"
+    );
+
+    assert!(
+        backend
+            .get_tool_effect(&victim_key)
+            .await
+            .unwrap()
+            .is_none(),
+        "item B's output was filed under item A's key — a replay of A would now \
+         return a result A never produced"
+    );
+
+    // ...and B's own effect IS recorded, under the key the engine derived.
+    let own_key = claim["work_item"]["idempotency_key"].as_str().unwrap();
+    let recorded = backend
+        .get_tool_effect(own_key)
+        .await
+        .unwrap()
+        .expect("the item's own effect must still be recorded");
+    assert_eq!(recorded["output"]["stolen"], json!(true));
+}
+
+/// Omitting the key entirely no longer means "record nothing".
+///
+/// The engine derives it either way, so a worker that never learned to echo the
+/// field still gets replay coverage.
+#[tokio::test]
+async fn an_absent_key_no_longer_costs_the_effect() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let (execution_id, id) = seed_unclaimed(&backend).await;
+    let state = make_state(backend.clone());
+    let claim = claim_via_route(&state).await;
+    let expected = claim["work_item"]["idempotency_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, _) = post_complete(
+        &state,
+        id,
+        json!({
+            "execution_id": execution_id.to_string(),
+            "node_id": "n1",
+            "output": {"answer": 7},
+            "state_patch": {},
+            "lease_fence": claim["work_item"]["lease_fence"].as_i64().unwrap(),
+            // no idempotency_key at all
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let recorded = backend
+        .get_tool_effect(&expected)
+        .await
+        .unwrap()
+        .expect("the engine derives the key, so an absent field costs nothing");
+    assert_eq!(recorded["output"]["answer"], json!(7));
+}
+
+/// A forged `execution_id` cannot append a terminal event to another run.
+///
+/// `commit_turn` settles by `item_id` + `lease_fence`, but appends the event
+/// under `terminal_event.execution_id`. While that came from the request body, a
+/// worker holding item B's lease could settle B and write its `NodeCompleted`
+/// into any execution it named — corrupting a different run's log and the
+/// snapshot rebuilt from it. Worse than the key confusion, and reachable with a
+/// perfectly valid fence.
+#[tokio::test]
+async fn a_forged_execution_id_cannot_write_into_another_run() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+
+    // The item this caller legitimately holds — claimed while it is the only one.
+    let (exec_b, id_b) = seed_unclaimed(&backend).await;
+    let state = make_state(backend.clone());
+    let claim = claim_via_route(&state).await;
+    let fence = claim["work_item"]["lease_fence"].as_i64().unwrap();
+
+    // A bystander run the caller has no lease on.
+    let (victim, _) = seed_unclaimed(&backend).await;
+    let before = backend.get_events(&victim).await.unwrap().len();
+
+    let (status, _) = post_complete(
+        &state,
+        id_b,
+        json!({
+            // Someone else's execution, with a fence that is genuinely ours.
+            "execution_id": victim.to_string(),
+            "node_id": "n1",
+            "output": {"trespass": true},
+            "state_patch": {"poisoned": true},
+            "lease_fence": fence,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "our own item must still settle");
+
+    assert_eq!(
+        backend.get_events(&victim).await.unwrap().len(),
+        before,
+        "a NodeCompleted was appended to a run the caller holds no lease on"
+    );
+    let victim_state = backend
+        .get_execution(&victim)
+        .await
+        .unwrap()
+        .map(|e| e.current_state)
+        .unwrap();
+    assert!(
+        victim_state.get("poisoned").is_none(),
+        "the caller's state_patch reached another run's current_state"
+    );
+
+    // ...and the event landed on the run that actually owns the item.
+    let ours = backend.get_events(&exec_b).await.unwrap();
+    assert!(
+        ours.iter()
+            .any(|e| matches!(&e.kind, EventKind::NodeCompleted { .. })),
+        "our own terminal event went missing"
     );
 }

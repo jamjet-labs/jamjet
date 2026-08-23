@@ -277,6 +277,42 @@ pub trait StateBackend: Send + Sync {
         lease_fence: i64,
     ) -> BackendResult<()>;
 
+    /// How many times this node has already completed in this execution.
+    ///
+    /// The `step` component of a tool-effect idempotency key. The default
+    /// materialises the whole log and counts, which is correct everywhere and
+    /// what every backend did before; SQL backends override it so the claim path
+    /// stops transferring and deserializing every event body to reach a number.
+    ///
+    /// An override MUST return exactly what the default returns. The key is a
+    /// persisted identity, so a count that is off by one — or that silently
+    /// returns 0 because a JSON predicate stopped matching — changes every key
+    /// and re-fires every in-flight tool. `count_node_completions_matches_the_scan`
+    /// pins the two against each other.
+    async fn count_node_completions(
+        &self,
+        execution_id: &ExecutionId,
+        node_id: &str,
+    ) -> BackendResult<u64> {
+        let events = self.get_events(execution_id).await?;
+        Ok(events
+            .iter()
+            .filter(|e| {
+                matches!(&e.kind, crate::event::EventKind::NodeCompleted { node_id: nid, .. } if nid == node_id)
+            })
+            .count() as u64)
+    }
+
+    /// The work item as the ENGINE recorded it, or `None` if there is no such
+    /// item (for this tenant, on a tenant-scoped backend).
+    ///
+    /// Exists so a route can answer "which execution and node is this item"
+    /// without believing the request body. `POST /work-items/:id/complete`
+    /// derives the tool-effect idempotency key from these coordinates: taking
+    /// them from the body would let a caller holding one item's lease file its
+    /// output under another item's key.
+    async fn get_work_item(&self, item_id: WorkItemId) -> BackendResult<Option<WorkItem>>;
+
     /// Mark a work item as completed and release the lease.
     async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()>;
 

@@ -486,6 +486,10 @@ impl StateBackend for InMemoryBackend {
         }
     }
 
+    async fn get_work_item(&self, item_id: WorkItemId) -> BackendResult<Option<WorkItem>> {
+        Ok(self.work_items.get(&item_id).map(|r| r.value().clone()))
+    }
+
     async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
         self.work_items.remove(&item_id);
         Ok(())

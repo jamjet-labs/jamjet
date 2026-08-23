@@ -279,6 +279,13 @@ impl StateBackend for FailingGetEvents {
             .await
     }
 
+    async fn get_work_item(
+        &self,
+        item_id: jamjet_state::backend::WorkItemId,
+    ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::backend::WorkItem>> {
+        self.inner.get_work_item(item_id).await
+    }
+
     async fn complete_work_item(
         &self,
         item_id: jamjet_state::backend::WorkItemId,

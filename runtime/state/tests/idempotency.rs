@@ -909,3 +909,137 @@ async fn the_in_memory_backend_releases_identically() {
         ReserveOutcome::Acquired
     );
 }
+
+// ── #131: counting in SQL must equal counting by scan ───────────────────────
+
+/// The SQL `COUNT` must return exactly what materialising and filtering returns.
+///
+/// `step` is a component of a PERSISTED identity. A count that is off by one, or
+/// that silently returns 0 because the JSON predicate stopped matching the serde
+/// representation, changes every idempotency key ever derived — which orphans
+/// every recorded effect and re-fires every in-flight tool. Nothing else in the
+/// system would report that; the keys would simply stop matching.
+///
+/// So the optimisation is pinned against the thing it replaced, over a log that
+/// contains the shapes most likely to break the predicate: other event types,
+/// the same event type on a different node, and repeats.
+#[tokio::test]
+async fn count_node_completions_matches_the_scan() {
+    // BOTH SQL backends carry their own copy of this query, and `for_tenant`
+    // returns the scoped one — so exercising only that would leave the plain
+    // backend's copy unpinned. Mutating the query in one file and watching the
+    // other file's test stay green is exactly how a half-fix survives.
+    let db = SqliteBackend::open("sqlite::memory:").await.unwrap();
+    let scoped = db.for_tenant(jamjet_state::tenant::TenantId::default());
+    check_count_parity(&scoped).await;
+
+    let plain = SqliteBackend::open("sqlite::memory:").await.unwrap();
+    check_count_parity(&plain).await;
+}
+
+async fn check_count_parity(backend: &dyn StateBackend) {
+    let execution_id = ExecutionId::new();
+    let now = chrono::Utc::now();
+    backend
+        .create_execution(WorkflowExecution {
+            execution_id: execution_id.clone(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: json!({}),
+            current_state: json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        })
+        .await
+        .unwrap();
+
+    let completed = |node: &str| EventKind::NodeCompleted {
+        node_id: node.into(),
+        output: json!({"big": "payload".repeat(50)}),
+        state_patch: json!({}),
+        duration_ms: 1,
+        gen_ai_system: None,
+        gen_ai_model: None,
+        input_tokens: None,
+        output_tokens: None,
+        finish_reason: None,
+        cost_usd: None,
+        provenance: None,
+        idempotency_key: None,
+    };
+
+    let kinds = vec![
+        EventKind::NodeScheduled {
+            node_id: "n1".into(),
+            queue_type: "general".into(),
+        },
+        completed("n1"),
+        EventKind::NodeStarted {
+            node_id: "n1".into(),
+            worker_id: "w".into(),
+            attempt: 0,
+        },
+        completed("other"), // same type, different node
+        completed("n1"),
+        EventKind::NodeScheduled {
+            node_id: "other".into(),
+            queue_type: "general".into(),
+        },
+    ];
+    for (i, kind) in kinds.into_iter().enumerate() {
+        backend
+            .append_event(Event::new(execution_id.clone(), (i + 1) as i64, kind))
+            .await
+            .unwrap();
+    }
+
+    for node in ["n1", "other", "never-ran"] {
+        let scanned = backend
+            .get_events(&execution_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(
+                |e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == node),
+            )
+            .count() as u64;
+        let counted = backend
+            .count_node_completions(&execution_id, node)
+            .await
+            .unwrap();
+        assert_eq!(
+            counted, scanned,
+            "SQL count disagreed with the scan for {node:?} — every idempotency key \
+             derived from this execution would change"
+        );
+    }
+
+    // Spelled out, so a predicate that matches nothing cannot pass by agreeing
+    // with a scan that also broke.
+    assert_eq!(
+        backend
+            .count_node_completions(&execution_id, "n1")
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        backend
+            .count_node_completions(&execution_id, "other")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .count_node_completions(&execution_id, "never-ran")
+            .await
+            .unwrap(),
+        0
+    );
+}

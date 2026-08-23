@@ -10,7 +10,7 @@ use jamjet_agents::InMemoryAgentRegistry;
 use jamjet_api::{routes::build_router_with_opts, state::AppState};
 use jamjet_audit::{AuditEnricher, NoopAuditBackend};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
-use jamjet_state::backend::StateBackend;
+use jamjet_state::backend::{StateBackend, WorkItem};
 use jamjet_state::event::EventKind;
 use jamjet_state::{Event, InMemoryBackend};
 use serde_json::Value;
@@ -81,7 +81,28 @@ async fn complete_work_item_threads_gen_ai_fields() {
         .expect("append WorkflowStarted");
 
     // POST /work-items/:id/complete with all five GenAI telemetry fields.
+    // The item must actually exist: `/complete` takes the terminal event's
+    // coordinates from the item the ENGINE recorded, so a made-up id now settles
+    // nothing and emits nothing. That is the point — otherwise inventing an id
+    // would let a caller append a NodeCompleted to any execution it named.
     let work_item_id = Uuid::new_v4();
+    backend
+        .enqueue_work_item(WorkItem {
+            id: work_item_id,
+            execution_id: execution_id.clone(),
+            node_id: "genai-node".into(),
+            queue_type: "general".into(),
+            payload: serde_json::json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: jamjet_state::DEFAULT_TENANT.into(),
+        })
+        .await
+        .expect("enqueue_work_item");
     let body = serde_json::json!({
         "execution_id": execution_id.to_string(),
         "node_id": "genai-node",
@@ -199,7 +220,28 @@ async fn complete_work_item_without_gen_ai_fields_keeps_backward_compat() {
         .await
         .expect("append WorkflowStarted");
 
+    // The item must actually exist: `/complete` takes the terminal event's
+    // coordinates from the item the ENGINE recorded, so a made-up id now settles
+    // nothing and emits nothing. That is the point — otherwise inventing an id
+    // would let a caller append a NodeCompleted to any execution it named.
     let work_item_id = Uuid::new_v4();
+    backend
+        .enqueue_work_item(WorkItem {
+            id: work_item_id,
+            execution_id: execution_id.clone(),
+            node_id: "compat-node".into(),
+            queue_type: "general".into(),
+            payload: serde_json::json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: jamjet_state::DEFAULT_TENANT.into(),
+        })
+        .await
+        .expect("enqueue_work_item");
     // Old-style body with no GenAI fields.
     let body = serde_json::json!({
         "execution_id": execution_id.to_string(),

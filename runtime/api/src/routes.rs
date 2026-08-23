@@ -1507,14 +1507,60 @@ async fn complete_work_item(
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
 
-    let node_completed = |execution_id: &ExecutionId| {
+    // AUTHORITY. The idempotency key is derived from the coordinates the ENGINE
+    // recorded for this item, never from the request body.
+    //
+    // The body's key used to be persisted verbatim, so a worker holding item B's
+    // lease could complete B while echoing item A's key: the backend filed B's
+    // output under A, and a later replay for A returned the wrong result. Body
+    // coordinates are no better — they are the same caller's word.
+    //
+    // Derived here rather than trusted from the claim because `derive` runs
+    // BEFORE `commit_turn` appends this NodeCompleted, so the step count and the
+    // accumulated state are the same ones the claim saw. For a LINEAR run that
+    // reproduces the claim's key exactly. For a node running beside a sibling
+    // whose `state_patch` landed in between, it does not — that node loses replay
+    // exactness, which is already v1's documented posture (`F-2c-3` in
+    // `runtime/workers/src/worker.rs`), and is why a mismatch is not an error.
+    //
+    // Best effort: if the item cannot be read, no effect is recorded. A missing
+    // replay entry costs a re-fire; a wrong one costs the wrong answer.
+    let recorded = match backend.get_work_item(item_id).await {
+        Ok(item) => item,
+        Err(e) => {
+            warn!(work_item_id = %id, error = %e, "complete: could not read the work item");
+            None
+        }
+    };
+    let derived_key: Option<String> = match &recorded {
+        Some(wi) => {
+            jamjet_state::derive_idempotency_key(backend.as_ref(), &wi.execution_id, &wi.node_id)
+                .await
+                .ok()
+        }
+        None => None,
+    };
+
+    if let (Some(sent), Some(derived)) = (body.idempotency_key.as_deref(), derived_key.as_deref()) {
+        if sent != derived {
+            // Not an error: a parallel sibling legitimately moves the key. Worth
+            // saying out loud, because the other cause is a caller filing under
+            // someone else's key, and that used to succeed silently.
+            warn!(
+                work_item_id = %id,
+                "complete: the echoed idempotency_key differs from the engine-derived one;                  recording under the derived key"
+            );
+        }
+    }
+
+    let node_completed = |execution_id: &ExecutionId, node_id: &str| {
         jamjet_state::Event::new(
             execution_id.clone(),
             // Sequence is assigned inside `commit_turn`'s transaction; this
             // placeholder is never the number that lands.
             0,
             jamjet_state::EventKind::NodeCompleted {
-                node_id: body.node_id.clone().unwrap_or_default(),
+                node_id: node_id.to_string(),
                 output: body.output.clone(),
                 state_patch: body.state_patch.clone(),
                 duration_ms: body.duration_ms,
@@ -1525,7 +1571,7 @@ async fn complete_work_item(
                 finish_reason: body.finish_reason.clone(),
                 cost_usd: None,
                 provenance: None,
-                idempotency_key: body.idempotency_key.clone(),
+                idempotency_key: derived_key.clone(),
             },
         )
     };
@@ -1552,34 +1598,32 @@ async fn complete_work_item(
         ));
     }
 
-    // Every key this engine mints is `content_hash`'s output: 64 lowercase hex
-    // characters. Anything else was never issued here, so an effect recorded
-    // under it is a row no reader can ever derive — junk that looks like a
-    // recorded effect and silently covers nothing.
-    //
-    // This is a shape check, not proof of provenance: a well-formed key from a
-    // DIFFERENT claim still passes. Binding the key to the claimed item is #130.
-    if let Some(key) = body.idempotency_key.as_deref() {
-        if key.len() != 64
-            || !key
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(ApiError::BadRequest(
-                "idempotency_key must be 64 lowercase hex characters".to_string(),
-            ));
-        }
-    }
+    // No format check on `body.idempotency_key`. It earned one while that value
+    // was persisted; now that the engine derives its own, rejecting a malformed
+    // echo would fail a completion over a field nothing reads — losing real work
+    // to protect a value already ignored.
 
-    let committed_atomically = match (
-        body.lease_fence,
-        body.execution_id.as_deref(),
-        body.node_id.as_deref(),
-    ) {
-        (Some(fence), Some(exec_id_str), Some(_)) => {
-            let execution_id = parse_execution_id(exec_id_str)?;
+    // AUTHORITY, again. The terminal event's coordinates come from the item the
+    // ENGINE recorded, never from the body.
+    //
+    // `commit_turn` settles by `item_id` + `lease_fence` but appends the event
+    // under `terminal_event.execution_id`. Taking that from the request let a
+    // worker holding item B's lease settle B while appending its NodeCompleted
+    // to any execution it named — corrupting a different run's log and snapshot,
+    // which is worse than the key confusion this change set out to fix.
+    //
+    // No item, no event: without trustworthy coordinates the only honest options
+    // are settle-quietly or write into a run we cannot vouch for.
+    let committed_atomically = match (body.lease_fence, recorded.as_ref()) {
+        (Some(fence), Some(wi)) => {
+            let execution_id = wi.execution_id.clone();
             match backend
-                .commit_turn(item_id, fence, node_completed(&execution_id), true)
+                .commit_turn(
+                    item_id,
+                    fence,
+                    node_completed(&execution_id, &wi.node_id),
+                    true,
+                )
                 .await
             {
                 Ok(_) => true,
@@ -1595,9 +1639,9 @@ async fn complete_work_item(
                 Err(e) => return Err(e.into()),
             }
         }
-        // Fenced, but with no coordinates to build a terminal event from. Settle
-        // only — the same shape as before, and still fence-guarded.
-        (Some(fence), _, _) => {
+        // Fenced, but the item could not be read, so there are no coordinates we
+        // trust. Settle only — the same shape as before, and still fence-guarded.
+        (Some(fence), None) => {
             let settled = backend.complete_work_item_fenced(item_id, fence).await?;
             if !settled {
                 return Ok((
@@ -1614,7 +1658,7 @@ async fn complete_work_item(
         // fence keep working, but it cannot be made atomic: `commit_turn` is
         // fence-guarded by construction, and without a fence we cannot show the
         // item is ours to settle.
-        (None, _, _) => {
+        (None, _) => {
             warn!(
                 work_item_id = %id,
                 "complete: unfenced legacy path — settle and terminal event are \
@@ -1625,12 +1669,12 @@ async fn complete_work_item(
         }
     };
 
-    // The unfenced and no-coordinate paths still emit separately.
+    // The unfenced path still emits separately, and still only with coordinates
+    // the engine vouches for.
     if !committed_atomically {
-        if let (Some(exec_id_str), Some(_)) = (&body.execution_id, &body.node_id) {
-            let execution_id = parse_execution_id(exec_id_str)?;
-            let seq = backend.latest_sequence(&execution_id).await? + 1;
-            let mut event = node_completed(&execution_id);
+        if let Some(wi) = recorded.as_ref() {
+            let seq = backend.latest_sequence(&wi.execution_id).await? + 1;
+            let mut event = node_completed(&wi.execution_id, &wi.node_id);
             event.sequence = seq;
             backend.append_event(event).await?;
         }
@@ -1641,8 +1685,8 @@ async fn complete_work_item(
     // way the event log cannot explain — and the log is what the materializer
     // rebuilds from, so the two would simply disagree with no way to tell which
     // is right.
-    if let (Some(exec_id_str), Some(_)) = (&body.execution_id, &body.node_id) {
-        let execution_id = parse_execution_id(exec_id_str)?;
+    if let Some(wi) = recorded.as_ref() {
+        let execution_id = wi.execution_id.clone();
         // Denormalised read-model refresh, best effort by design: the
         // authoritative state is the event log plus the snapshot `commit_turn`
         // wrote inside the transaction, and the materializer recomputes from

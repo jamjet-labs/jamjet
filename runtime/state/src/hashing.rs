@@ -125,16 +125,9 @@ pub async fn derive_idempotency_key(
     execution_id: &jamjet_core::workflow::ExecutionId,
     node_id: &str,
 ) -> crate::backend::BackendResult<String> {
-    let events = backend.get_events(execution_id).await?;
-    let step = events
-        .iter()
-        .filter(|e| {
-            matches!(
-                &e.kind,
-                crate::event::EventKind::NodeCompleted { node_id: nid, .. } if nid == node_id
-            )
-        })
-        .count() as u64;
+    let step = backend
+        .count_node_completions(execution_id, node_id)
+        .await?;
     let current_state = backend
         .get_execution(execution_id)
         .await?
