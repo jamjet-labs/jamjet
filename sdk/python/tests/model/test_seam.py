@@ -152,7 +152,7 @@ async def test_empty_generator_middleware_is_rejected_too():
     # instead of the materialized list lets `(mw for mw in [])` through as a
     # silent ungoverned chain.
     with pytest.raises(ValueError) as exc:
-        Model(middleware=(mw for mw in []), backend=FakeBackend())  # type: ignore[arg-type]
+        Model(middleware=(mw for mw in []), backend=FakeBackend())
     assert "ungoverned=True" in str(exc.value)
 
 

@@ -6,7 +6,7 @@ User code never calls a provider directly. The seam runs the middleware chain
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import replace
 from typing import Any
 
@@ -36,7 +36,7 @@ class Model:
     def __init__(
         self,
         *,
-        middleware: list[ModelMiddleware] | None = None,
+        middleware: Iterable[ModelMiddleware] | None = None,
         backend: Any | None = None,
         ungoverned: bool = False,
     ) -> None:
