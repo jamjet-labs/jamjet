@@ -8,9 +8,15 @@ from jamjet.model.types import ModelRequest, ModelResponse, StreamChunk, parse_m
 class FakeBackend:
     def __init__(self):
         self.completed: list[ModelRequest] = []
+        # Snapshot the payload AS THE PROVIDER SAW IT. Appending the request
+        # alone stores it by reference, and PII redaction mutates messages in
+        # place, so a later read would show post-call state and could not tell
+        # "redacted before the call" from "redacted after it".
+        self.sent_text: list[str] = []
 
     async def complete(self, request):
         self.completed.append(request)
+        self.sent_text.append(str(request.messages))
         return ModelResponse(message=object(), input_tokens=1, output_tokens=2)
 
     async def stream(self, request):
@@ -93,7 +99,7 @@ def _pii_req():
 
 
 def _sent_text(backend):
-    return str(backend.completed[0].messages)
+    return backend.sent_text[0]
 
 
 async def test_bare_model_redacts_pii_before_the_backend_sees_it():
@@ -148,3 +154,25 @@ async def test_empty_generator_middleware_is_rejected_too():
     with pytest.raises(ValueError) as exc:
         Model(middleware=(mw for mw in []), backend=FakeBackend())  # type: ignore[arg-type]
     assert "ungoverned=True" in str(exc.value)
+
+
+async def test_non_middleware_chain_elements_are_rejected_at_construction():
+    # Model(middleware="pii") used to iterate the string into ['p','i','i'] and
+    # Model(middleware=[object()]) used to construct fine, both failing later
+    # with a bare AttributeError at the provider boundary instead of here.
+    for bad in ("pii", [object()], [DenyMiddleware(), object()]):
+        with pytest.raises(TypeError) as exc:
+            Model(middleware=bad, backend=FakeBackend())  # type: ignore[arg-type]
+        assert "ModelMiddleware" in str(exc.value)
+
+
+async def test_a_degenerate_default_chain_is_rejected_too(monkeypatch):
+    # The emptiness guard used to live only on the caller-supplied branch, so a
+    # default_model_middleware() that returned nothing produced a silent
+    # ungoverned Model() with no error. In-tree it always returns three, so
+    # this is defense in depth against a shadowed or patched symbol.
+    import jamjet.model.defaults as defaults
+
+    monkeypatch.setattr(defaults, "default_model_middleware", lambda *a, **k: [])
+    with pytest.raises(ValueError):
+        Model(backend=FakeBackend())

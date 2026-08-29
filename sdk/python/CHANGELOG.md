@@ -24,9 +24,28 @@
   `ValueError` rather than quietly meaning the same thing; `Model(ungoverned=True)` is
   the way to ask for no chain, and it has to be asked for by name.
 
-  Scope of what this closes: with no `GovernanceConfig` the default chain is an allow-all
-  allowlist, PII redaction, a no-op budget and metering. So it closes a PII-leak and
-  unmetered-spend default. It does not add model restriction where no policy exists.
+  Scope, stated narrowly: with no `GovernanceConfig` the default chain is an allow-all
+  allowlist, PII redaction, a no-op budget and a metering recorder. So what it closes is
+  a PII-leak default. It does not add model restriction where no policy exists, and the
+  metering half is bookkeeping rather than enforcement: `MeteringMiddleware` is built with
+  no sink, and nothing in the package reads `.records`, so spend is recorded into the
+  instance and discarded with it.
+
+  `stream()` runs only the `before` chain, so a streamed call through a bare `Model()` is
+  redacted but not metered, and an all-streaming workload will not trip a budget. That
+  asymmetry predates this change and is unchanged by it.
+
+  Two behaviour changes for anyone who was constructing a bare `Model()` on purpose.
+  Redaction rewrites `ModelRequest.messages` in place, so the caller's own request object
+  comes back redacted. And redaction is fail-closed on content it cannot traverse, so a
+  call carrying provider SDK objects inside `tool_calls` now raises
+  `ModelDeniedError(code="pii_unredactable_content")` where it previously succeeded; the
+  JSON-shaped form of the same conversation is unaffected. `Model(ungoverned=True)`
+  restores the old behaviour exactly.
+
+  `Model(middleware=...)` now also rejects non-`ModelMiddleware` elements with `TypeError`
+  at construction. Previously `Model(middleware="pii")` iterated the string into
+  `['p','i','i']` and failed later with a bare `AttributeError` at the provider boundary.
 
 ### Fixed
 

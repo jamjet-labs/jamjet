@@ -15,13 +15,22 @@ from jamjet.model.types import ModelRequest, ModelResponse, StreamChunk
 
 
 class Model:
-    """The governed seam.
+    """The seam, governed by default.
 
     Omitting ``middleware`` builds the default chain
-    (:func:`jamjet.model.defaults.default_model_middleware`), so a bare
-    ``Model()`` redacts PII and meters spend rather than reaching the provider
-    raw. Running with no middleware at all is available, but it has to be asked
-    for by name: ``Model(ungoverned=True)``.
+    (:func:`jamjet.model.defaults.default_model_middleware`): PII redaction and
+    a metering recorder, plus an allowlist and a budget that stay no-ops until a
+    ``GovernanceConfig`` supplies them.  ``Model(ungoverned=True)`` opts out.
+
+    Two limits, so this reads as the safe default it is rather than an
+    enforcement guarantee:
+
+    * ``stream()`` runs only the ``before`` chain, so a streamed call is
+      redacted but NOT metered and cannot trip a budget.  See ``stream``.
+    * Any non-empty chain of ``ModelMiddleware`` is accepted, whatever it does.
+      A caller-supplied no-op chain is as ungoverned as ``ungoverned=True``
+      without saying so.  The default protects the caller who does not think
+      about middleware; it does not constrain one who does.
     """
 
     def __init__(
@@ -52,12 +61,24 @@ class Model:
             # truthy, so checking the argument would let `(mw for mw in [])`
             # through as a silent ungoverned chain.
             chain = list(middleware)
-            if not chain:
-                raise ValueError(
-                    "Model(middleware=[]) would run the seam ungoverned: no PII "
-                    "redaction, no metering, no budget. Pass ungoverned=True to mean "
-                    "that deliberately, or omit `middleware` for the default chain."
+            bad = [mw for mw in chain if not isinstance(mw, ModelMiddleware)]
+            if bad:
+                # Without this, Model(middleware="pii") iterates into
+                # ['p','i','i'] and the failure surfaces as a bare
+                # AttributeError at the provider boundary instead of here.
+                raise TypeError(
+                    "Model(middleware=...) takes ModelMiddleware objects; got "
+                    f"{', '.join(type(mw).__name__ for mw in bad)}."
                 )
+
+        if not chain and not ungoverned:
+            # Also covers the default path, so the invariant holds however the
+            # chain was built rather than only on the caller-supplied branch.
+            raise ValueError(
+                "Model(middleware=[]) would run the seam ungoverned: no PII "
+                "redaction, no metering, no budget. Pass ungoverned=True to mean "
+                "that deliberately, or omit `middleware` for the default chain."
+            )
         self._middleware: list[ModelMiddleware] = chain
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
