@@ -434,8 +434,11 @@ async def test_complete_route_model_denied_is_non_200(monkeypatch: pytest.Monkey
 def test_get_model_has_governed_middleware() -> None:
     """The real _get_model() constructs a Model with the default middleware chain.
 
-    This test would FAIL against the old bare ``Model()`` construction (no middleware)
-    and PASSES once ``default_model_middleware()`` is wired in.
+    Once ``Model()`` began defaulting to ``default_model_middleware()``, a bare
+    ``Model()`` here would pass this test too, so it no longer distinguishes the
+    bug it was written for. It is kept as a pin on the sidecar's own wiring: it
+    still fails if this call site is changed to ``Model(ungoverned=True)`` or to
+    a chain missing the allowlist, budget or metering.
     """
     from jamjet.model.budget import BudgetMiddleware
     from jamjet.model.metering import MeteringMiddleware
