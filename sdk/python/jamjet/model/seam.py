@@ -47,14 +47,17 @@ class Model:
             from jamjet.model.defaults import default_model_middleware
 
             chain = default_model_middleware()
-        elif not middleware:
-            raise ValueError(
-                "Model(middleware=[]) would run the seam ungoverned: no PII "
-                "redaction, no metering, no budget. Pass ungoverned=True to mean "
-                "that deliberately, or omit `middleware` for the default chain."
-            )
         else:
+            # Materialize BEFORE the emptiness check: an exhausted iterator is
+            # truthy, so checking the argument would let `(mw for mw in [])`
+            # through as a silent ungoverned chain.
             chain = list(middleware)
+            if not chain:
+                raise ValueError(
+                    "Model(middleware=[]) would run the seam ungoverned: no PII "
+                    "redaction, no metering, no budget. Pass ungoverned=True to mean "
+                    "that deliberately, or omit `middleware` for the default chain."
+                )
         self._middleware: list[ModelMiddleware] = chain
 
     async def complete(self, request: ModelRequest) -> ModelResponse:

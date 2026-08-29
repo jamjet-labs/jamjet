@@ -139,3 +139,12 @@ async def test_ungoverned_gives_an_empty_chain():
 async def test_ungoverned_with_explicit_middleware_is_rejected():
     with pytest.raises(ValueError):
         Model(middleware=[DenyMiddleware()], backend=FakeBackend(), ungoverned=True)
+
+
+async def test_empty_generator_middleware_is_rejected_too():
+    # An exhausted iterator is truthy, so an emptiness check on the argument
+    # instead of the materialized list lets `(mw for mw in [])` through as a
+    # silent ungoverned chain.
+    with pytest.raises(ValueError) as exc:
+        Model(middleware=(mw for mw in []), backend=FakeBackend())  # type: ignore[arg-type]
+    assert "ungoverned=True" in str(exc.value)
