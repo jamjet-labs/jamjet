@@ -14,6 +14,20 @@
   where the engine decides before any worker receives the payload. To run without gates
   deliberately, drop `approval_required`.
 
+- **`Model()` builds the default governed chain instead of an empty one.** Constructing
+  the seam with no `middleware` produced an empty chain, so the call reached the provider
+  with no PII redaction, no metering and no budget, one line below a module docstring
+  calling it "the single governed path for every model call". Every in-tree call site
+  already passed `default_model_middleware()`, so this was never a live hole in JamJet's
+  own paths. It was the public default, and the trap was the next caller who wrote
+  `Model()` and reasonably assumed the seam governed. `Model(middleware=[])` now raises
+  `ValueError` rather than quietly meaning the same thing; `Model(ungoverned=True)` is
+  the way to ask for no chain, and it has to be asked for by name.
+
+  Scope of what this closes: with no `GovernanceConfig` the default chain is an allow-all
+  allowlist, PII redaction, a no-op budget and metering. So it closes a PII-leak and
+  unmetered-spend default. It does not add model restriction where no policy exists.
+
 ### Fixed
 
 - **`blocked_tools` is enforced on `agent.run()`.** It was enforced only on the durable

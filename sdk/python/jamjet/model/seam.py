@@ -15,18 +15,47 @@ from jamjet.model.types import ModelRequest, ModelResponse, StreamChunk
 
 
 class Model:
+    """The governed seam.
+
+    Omitting ``middleware`` builds the default chain
+    (:func:`jamjet.model.defaults.default_model_middleware`), so a bare
+    ``Model()`` redacts PII and meters spend rather than reaching the provider
+    raw. Running with no middleware at all is available, but it has to be asked
+    for by name: ``Model(ungoverned=True)``.
+    """
+
     def __init__(
         self,
         *,
         middleware: list[ModelMiddleware] | None = None,
         backend: Any | None = None,
+        ungoverned: bool = False,
     ) -> None:
         if backend is None:
             from jamjet.model.litellm_backend import LiteLLMBackend
 
             backend = LiteLLMBackend()
         self._backend = backend
-        self._middleware: list[ModelMiddleware] = list(middleware or [])
+
+        if ungoverned and middleware is not None:
+            raise ValueError("Model(ungoverned=True) takes no middleware. Pass a chain, or ask for no chain, not both.")
+
+        chain: list[ModelMiddleware]
+        if ungoverned:
+            chain = []
+        elif middleware is None:
+            from jamjet.model.defaults import default_model_middleware
+
+            chain = default_model_middleware()
+        elif not middleware:
+            raise ValueError(
+                "Model(middleware=[]) would run the seam ungoverned: no PII "
+                "redaction, no metering, no budget. Pass ungoverned=True to mean "
+                "that deliberately, or omit `middleware` for the default chain."
+            )
+        else:
+            chain = list(middleware)
+        self._middleware: list[ModelMiddleware] = chain
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         for mw in self._middleware:

@@ -73,3 +73,69 @@ async def test_stream_denied_yields_nothing():
     model = Model(middleware=[DenyMiddleware()], backend=backend)
     with pytest.raises(ModelDeniedError):
         _ = [c async for c in model.stream(_req())]
+
+
+# --- Model() defaults to the governed chain -------------------------------
+#
+# A bare ``Model()`` used to build an EMPTY middleware chain, so it reached the
+# provider with no PII redaction, no metering and no budget. The seam's own
+# docstring calls it "the single governed path for every model call"; these
+# tests hold it to that, and keep the escape hatch explicit.
+
+_EMAIL = "alice@example.com"
+
+
+def _pii_req():
+    return ModelRequest(
+        ref=parse_model_ref("anthropic/claude-opus-4-8"),
+        messages=[{"role": "user", "content": f"email me at {_EMAIL}"}],
+    )
+
+
+def _sent_text(backend):
+    return str(backend.completed[0].messages)
+
+
+async def test_bare_model_redacts_pii_before_the_backend_sees_it():
+    backend = FakeBackend()
+    await Model(backend=backend).complete(_pii_req())
+    assert _EMAIL not in _sent_text(backend)
+    assert "[REDACTED:EMAIL]" in _sent_text(backend)
+
+
+async def test_bare_model_meters_the_completion():
+    from jamjet.model.metering import MeteringMiddleware
+
+    model = Model(backend=FakeBackend())
+    await model.complete(_pii_req())
+    meters = [mw for mw in model._middleware if isinstance(mw, MeteringMiddleware)]
+    assert len(meters) == 1
+    assert [(r.provider, r.input_tokens, r.output_tokens) for r in meters[0].records] == [("anthropic", 1, 2)]
+
+
+async def test_explicit_middleware_is_not_silently_wrapped_in_the_default_chain():
+    backend = FakeBackend()
+    log: list[str] = []
+    model = Model(middleware=[RecordingMiddleware(log, "1")], backend=backend)
+    await model.complete(_pii_req())
+    assert log == ["before:1", "after:1"]
+    assert _EMAIL in _sent_text(backend)  # caller's chain, verbatim, nothing appended
+
+
+async def test_empty_middleware_list_is_rejected():
+    with pytest.raises(ValueError) as exc:
+        Model(middleware=[], backend=FakeBackend())
+    assert "ungoverned=True" in str(exc.value)
+
+
+async def test_ungoverned_gives_an_empty_chain():
+    backend = FakeBackend()
+    model = Model(backend=backend, ungoverned=True)
+    assert model._middleware == []
+    await model.complete(_pii_req())
+    assert _EMAIL in _sent_text(backend)  # the escape hatch really does bypass
+
+
+async def test_ungoverned_with_explicit_middleware_is_rejected():
+    with pytest.raises(ValueError):
+        Model(middleware=[DenyMiddleware()], backend=FakeBackend(), ungoverned=True)
