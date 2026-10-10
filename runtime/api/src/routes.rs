@@ -22,6 +22,7 @@ use chrono::Utc;
 use jamjet_agents::{AgentCard, AgentFilter, AgentStatus};
 use jamjet_audit::backend::AuditQuery;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+use jamjet_ir::workflow::NodeDef;
 use jamjet_state::{FailOutcome, Tenant, TenantId, TenantStatus, WorkItem, WorkflowDefinition};
 use jamjet_worker::DispatchGuardOutcome;
 use serde::Deserialize;
@@ -73,7 +74,18 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         .route("/agents/:id/deactivate", post(deactivate_agent))
         .route("/agents/:id/heartbeat", post(agent_heartbeat))
         // Work items (worker protocol)
-        .route("/work-items", post(enqueue_work_item))
+        // Operator-only outside dev mode: the engine is the only legitimate
+        // producer of work items, and a hand-enqueued item for a gated node was
+        // the first step of the worker-protocol bypass (review C1).
+        .route(
+            "/work-items",
+            if dev_mode {
+                post(enqueue_work_item)
+            } else {
+                post(enqueue_work_item)
+                    .layer(middleware::from_fn(crate::auth::require_operator_role))
+            },
+        )
         .route("/work-items/claim", post(claim_work_item))
         .route("/work-items/:id/complete", post(complete_work_item))
         .route("/work-items/:id/fail", post(fail_work_item))
@@ -1183,9 +1195,10 @@ async fn claim_work_item(
     };
 
     // Enforcement lives HERE, not only in the in-process worker: `python_tool`
-    // and `java_tool` are registered with zero in-process workers, so an ADK
-    // agent's tool-dispatch node reaches production down this route and never
-    // through `Worker::execute_item`. See `gate_claimed_item`.
+    // and `java_tool` are registered with zero in-process workers, and this
+    // route serves every queue name, the in-process ones included. So any node
+    // can reach a worker down this route without passing through
+    // `Worker::execute_item`. See `gate_claimed_item`.
     if matches!(
         gate_claimed_item(backend.as_ref(), &wi).await,
         ClaimGate::Withhold
@@ -1244,14 +1257,13 @@ async fn compute_idempotency_key(
         .ok()
 }
 
-/// Run the shared agent-dispatch guard over a freshly claimed item.
+/// Run the shared policy and approval guard over a freshly claimed item, for
+/// every node kind.
 ///
-/// An ADK agent compiles a whole turn's model-chosen tool calls into ONE
-/// `python_fn` / `java_fn` node, so the tool names are invisible to the ordinary
-/// node-kind policy path (review finding C1). The decision itself lives in
-/// `jamjet_worker::dispatch_guard` so this route and the in-process worker
-/// enforce the IDENTICAL policy; this function owns only the settle, which is
-/// transport-specific. Nothing here re-implements a policy rule — a second copy
+/// The decision lives in `jamjet_worker::node_guard::guard_item` (agent tool
+/// dispatch nodes are delegated from there to `dispatch_guard`), so this route
+/// and the in-process worker enforce the IDENTICAL policy; this function owns
+/// only the settle, which is transport-specific. Nothing here re-implements a policy rule — a second copy
 /// would drift, and a drifted copy of an enforcement rule is a hole.
 ///
 /// Enforcement is server-side on purpose: the external worker is untrusted, so
@@ -1413,46 +1425,45 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
         },
     };
 
-    // NARROWNESS. This route serves every queue. Everything that is not an agent
-    // tool dispatch — every model node, tool node, condition, ordinary python_fn
-    // — leaves here having had zero POLICY evaluation, and is returned exactly
-    // as before.
+    // EVERY node kind is evaluated here, on every queue. This route used to
+    // release everything but agent tool dispatch nodes with zero policy
+    // evaluation, so an approval-gated or blocked tool node claimed over HTTP
+    // ran unchecked, and the run's own initiator could use that to get past
+    // separation of duties (approval-integrity review, C1). The decision is
+    // `node_guard::guard_item`, the same function `Worker::execute_item` runs.
     //
-    // Not free, though: reaching this line already cost `get_execution`,
-    // `get_workflow` and a full `WorkflowIr` parse, and this is the hot path
-    // every external worker polls. Those lookups are what make the decision
-    // trustworthy — the execution record is the only engine-written answer to
-    // "which policy governs this item" — so they cannot simply move below this
-    // check. A `wi.queue_type` gate above them would skip the whole function for
-    // queues that can never hold a dispatch node, but it would also skip the
-    // coordinate tripwire and the execution-not-found fail-closed for those
-    // queues, which is a behaviour change and not one to make inside a security
-    // fix. Tracked in #116.
-    if !jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&kind) {
-        return ClaimGate::Release;
-    }
+    // A dispatch node needs the whole graph parsed (its failure wording is the
+    // worker's); every other node needs only its own definition and the
+    // workflow-level policy, so the hot path still skips the full parse.
+    let (workflow_policy, node_def): (Option<jamjet_ir::workflow::PolicySetIr>, NodeDef) =
+        if jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&kind) {
+            let ir = match serde_json::from_value::<jamjet_ir::WorkflowIr>(ir_value) {
+                Ok(ir) => ir,
+                Err(e) => {
+                    return fail_closed(backend, wi, format!("failed to load IR: {e}")).await;
+                }
+            };
+            let Some(node_def) = ir.node(&wi.node_id).cloned() else {
+                return fail_closed(backend, wi, format!("node {} not found in IR", wi.node_id))
+                    .await;
+            };
+            (ir.policy, node_def)
+        } else {
+            match guard_inputs_from_raw(&ir_value, &wi.node_id) {
+                Ok(inputs) => inputs,
+                Err(reason) => return fail_closed(backend, wi, reason).await,
+            }
+        };
 
-    // A dispatch node: now the whole graph is genuinely needed, because the
-    // policy chain `guard_dispatch` evaluates is workflow-wide.
-    let ir = match serde_json::from_value::<jamjet_ir::WorkflowIr>(ir_value) {
-        Ok(ir) => ir,
-        Err(e) => {
-            return fail_closed(backend, wi, format!("failed to load IR: {e}")).await;
-        }
-    };
-    let Some(node_def) = ir.node(&wi.node_id) else {
-        return fail_closed(backend, wi, format!("node {} not found in IR", wi.node_id)).await;
-    };
-
-    let input = jamjet_worker::dispatch_guard::payload_input(&wi.payload);
-    match jamjet_worker::dispatch_guard::guard_dispatch(
+    match jamjet_worker::node_guard::guard_item(
         backend,
+        jamjet_worker::node_guard::GuardMode::Fire,
         &wi.execution_id,
         &wi.node_id,
         &wi.tenant_id,
-        &ir,
-        node_def,
-        &input,
+        workflow_policy.as_ref(),
+        &node_def,
+        &wi.payload,
     )
     .await
     {
@@ -1484,7 +1495,7 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
                 execution_id = %wi.execution_id,
                 node_id = %wi.node_id,
                 %reason,
-                "claim: policy blocked an agent tool dispatch"
+                "claim: policy blocked this node"
             );
             settle(
                 backend
@@ -1509,7 +1520,7 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
                 execution_id = %wi.execution_id,
                 node_id = %wi.node_id,
                 gated = ?gated,
-                "claim: agent tool dispatch awaiting approval"
+                "claim: node awaiting approval"
             );
             match backend
                 .complete_work_item_fenced(wi.id, wi.lease_fence)
@@ -1536,10 +1547,86 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
                 execution_id = %wi.execution_id,
                 node_id = %wi.node_id,
                 %reason,
-                "claim: could not decide an agent tool dispatch; withholding the payload"
+                "claim: could not decide policy for this node; withholding the payload"
             );
             ClaimGate::Withhold
         }
+    }
+}
+
+/// The workflow-level policy and one node's definition, read from stored IR
+/// without deserializing the whole graph. `Err` carries the fail-closed reason.
+fn guard_inputs_from_raw(
+    ir_value: &Value,
+    node_id: &str,
+) -> Result<(Option<jamjet_ir::workflow::PolicySetIr>, NodeDef), String> {
+    let raw_node = ir_value
+        .get("nodes")
+        .and_then(|nodes| nodes.get(node_id))
+        .ok_or_else(|| format!("node {node_id} not found in IR"))?;
+    let node_def: NodeDef = serde_json::from_value(raw_node.clone())
+        .map_err(|e| format!("failed to load node definition: {e}"))?;
+    let workflow_policy = match ir_value.get("policy") {
+        None | Some(Value::Null) => None,
+        Some(raw) => Some(
+            serde_json::from_value(raw.clone())
+                .map_err(|e| format!("failed to load workflow policy: {e}"))?,
+        ),
+    };
+    Ok((workflow_policy, node_def))
+}
+
+/// Whether a worker's result for `wi` may be recorded: the claim gate's
+/// decision in `GuardMode::Complete`. `Err` carries the status and reason.
+///
+/// Every input comes from engine-written records (the execution's workflow
+/// coordinates, the stored IR, the item as enqueued), never from the body.
+/// Unreadable state refuses with 503 rather than recording on a guess.
+async fn completion_gate(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+) -> Result<(), (StatusCode, String)> {
+    let unavailable = |e: String| (StatusCode::SERVICE_UNAVAILABLE, e);
+    let refused = |e: String| (StatusCode::CONFLICT, e);
+    let execution = backend
+        .get_execution(&wi.execution_id)
+        .await
+        .map_err(|e| unavailable(format!("execution unreadable: {e}")))?
+        .ok_or_else(|| refused("execution not found".to_string()))?;
+    let def = backend
+        .get_workflow(&execution.workflow_id, &execution.workflow_version)
+        .await
+        .map_err(|e| unavailable(format!("workflow unreadable: {e}")))?
+        .ok_or_else(|| {
+            refused(format!(
+                "workflow {} v{} not found",
+                execution.workflow_id, execution.workflow_version
+            ))
+        })?;
+    let (workflow_policy, node_def) =
+        guard_inputs_from_raw(&def.ir, &wi.node_id).map_err(refused)?;
+    match jamjet_worker::node_guard::guard_item(
+        backend,
+        jamjet_worker::node_guard::GuardMode::Complete,
+        &wi.execution_id,
+        &wi.node_id,
+        &wi.tenant_id,
+        workflow_policy.as_ref(),
+        &node_def,
+        &wi.payload,
+    )
+    .await
+    {
+        DispatchGuardOutcome::Allow => Ok(()),
+        DispatchGuardOutcome::Blocked { reason } => {
+            Err(refused(format!("policy blocked: {reason}")))
+        }
+        DispatchGuardOutcome::Held { .. } => Err(refused(
+            "node requires an approval that does not cover this occurrence; \
+             a result can be recorded only for an approved action"
+                .to_string(),
+        )),
+        DispatchGuardOutcome::Unavailable { reason } => Err(unavailable(reason)),
     }
 }
 
@@ -1750,6 +1837,24 @@ async fn complete_work_item(
     // fence before it touches anything, so neither a retried completion of a
     // settled item nor a forged fence can settle an item (I1). The holder's
     // own item is withdrawn so an expiring lease cannot resurrect it.
+    // APPROVAL, at completion. The claim gate decides whether a node may FIRE;
+    // this decides whether a result for it may be RECORDED. Without it the
+    // legacy unfenced path below appends `NodeCompleted` for any item id, never
+    // claimed through the gate, and the scheduler then treats the gated node as
+    // having run (approval-integrity review, C1). The same rules as the claim
+    // gate (`node_guard::guard_item`), read-only: a gated node completes only
+    // under an approval for its current occurrence. No event is written on a
+    // refusal and the item is left alone.
+    if let Some(wi) = recorded.as_ref() {
+        if let Err((status, reason)) = completion_gate(backend.as_ref(), wi).await {
+            warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, %reason, "complete: refused");
+            return Ok((
+                status,
+                Json(json!({ "completed": false, "reason": reason })),
+            ));
+        }
+    }
+
     let committed_atomically = match (body.lease_fence, recorded.as_ref()) {
         (Some(fence), Some(wi)) => {
             let execution_id = wi.execution_id.clone();

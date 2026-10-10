@@ -1,6 +1,7 @@
-use crate::dispatch_guard::{self, DispatchGuardOutcome};
+use crate::dispatch_guard::DispatchGuardOutcome;
 use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use crate::heartbeat::spawn_heartbeat;
+use crate::node_guard;
 use chrono::Utc;
 
 /// Cap a provider-supplied Retry-After so an untrusted/huge value can't overflow
@@ -13,8 +14,6 @@ use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::workflow::{NodeDef, WorkflowIr};
 use jamjet_policy::autonomy::{AutonomyContext, AutonomyDecision, AutonomyEnforcer};
 use jamjet_policy::engine::node_kind_tag;
-use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
-use jamjet_state::approvals::NodeApprovalStatus;
 use jamjet_state::backend::{StateBackend, StateBackendError, WorkItem, WorkItemId};
 use jamjet_state::budget::BudgetState;
 use jamjet_state::event::EventKind;
@@ -233,7 +232,6 @@ impl Worker {
                             lease_fence,
                             &node_id,
                             &tenant_id,
-                            kind,
                             node_def,
                             &ir,
                             &item.payload,
@@ -737,6 +735,8 @@ impl Worker {
     ///
     /// Every read that the decision depends on fails CLOSED: an error means the
     /// node does not run.
+    /// The decision itself is `node_guard::require_approval`, shared with the
+    /// HTTP claim route; this method only settles the item.
     #[allow(clippy::too_many_arguments)]
     async fn hold_for_approval(
         &self,
@@ -748,109 +748,40 @@ impl Worker {
         approver: String,
         context: serde_json::Value,
     ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-        let events = match self.backend.get_events(execution_id).await {
-            Ok(events) => events,
-            Err(e) => {
-                // Fail closed: never run an approval-gated node blind.
-                return Some(Err(format!(
-                    "approval state unavailable; refusing to run unapproved: {e}"
-                )
-                .into()));
+        let outcome = node_guard::require_approval(
+            self.backend.as_ref(),
+            execution_id,
+            node_id,
+            tool_name,
+            approver,
+            context,
+        )
+        .await;
+        self.settle_outcome(execution_id, node_id, item_id, lease_fence, outcome)
+            .await
+    }
+
+    /// Turn a guard decision into the worker's lifecycle answer: `None` to run,
+    /// `Some(Err)` to fail the attempt, `Some(Ok)` once a held item is settled.
+    async fn settle_outcome(
+        &self,
+        execution_id: &ExecutionId,
+        node_id: &str,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        outcome: node_guard::GuardOutcome,
+    ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        match outcome {
+            DispatchGuardOutcome::Allow => None,
+            DispatchGuardOutcome::Blocked { reason } => {
+                Some(Err(format!("policy blocked: {reason}").into()))
             }
-        };
-
-        let status = jamjet_state::approvals::node_approval_status(&events, node_id);
-        match &status {
-            NodeApprovalStatus::Pending(_) | NodeApprovalStatus::Rejected { .. } => {
-                // Already requested (or decided rejected — scheduler owns the
-                // failure). Settle the item; emit nothing.
-                self.settle_held(execution_id, node_id, item_id, lease_fence)
-                    .await
-            }
-            NodeApprovalStatus::Approved { .. } | NodeApprovalStatus::NotRequested => {
-                // The digest of the action this item would perform right now.
-                let current = match jamjet_state::approvals::derive_action_digest(
-                    self.backend.as_ref(),
-                    execution_id,
-                    node_id,
-                )
-                .await
-                {
-                    Ok(d) => d,
-                    Err(e) => {
-                        return Some(Err(format!(
-                            "approval binding unavailable; refusing to run unapproved: {e}"
-                        )
-                        .into()))
-                    }
-                };
-
-                if jamjet_state::approvals::approval_covers(&status, &current) {
-                    info!(execution_id = %execution_id, node_id, "Approval satisfied — proceeding");
-                    return None;
-                }
-
-                if let NodeApprovalStatus::Approved {
-                    approved_digest, ..
-                } = &status
-                {
-                    warn!(
-                        execution_id = %execution_id,
-                        node_id,
-                        approved_digest = approved_digest.as_deref().unwrap_or("<none: legacy approval>"),
-                        current_digest = %current,
-                        "approval does not cover this action (state changed, a later visit of the \
-                         node, or a legacy approval without a digest) — requesting a fresh approval"
-                    );
-                } else {
-                    info!(execution_id = %execution_id, node_id, %approver, "Node requires approval");
-                }
-
-                let mut context = context;
-                match context.as_object_mut() {
-                    Some(obj) => {
-                        obj.insert(
-                            jamjet_state::approvals::ACTION_DIGEST_KEY.to_string(),
-                            serde_json::Value::String(current),
-                        );
-                    }
-                    None => {
-                        context = serde_json::json!({
-                            "context": context,
-                            jamjet_state::approvals::ACTION_DIGEST_KEY: current,
-                        });
-                    }
-                }
-
-                let seq = match self.backend.latest_sequence(execution_id).await {
-                    Ok(s) => s + 1,
-                    Err(e) => {
-                        return Some(Err(format!(
-                            "approval required but could not be recorded: {e}"
-                        )
-                        .into()))
-                    }
-                };
-                if let Err(e) = self
-                    .backend
-                    .append_event(jamjet_state::Event::new(
-                        execution_id.clone(),
-                        seq,
-                        EventKind::ToolApprovalRequired {
-                            node_id: node_id.to_string(),
-                            tool_name,
-                            approver,
-                            context,
-                        },
-                    ))
-                    .await
-                {
-                    // Fail closed.
-                    return Some(Err(format!(
-                        "approval required but could not be recorded: {e}"
-                    )
-                    .into()));
-                }
+            // Not a denial: the decision could not be made or recorded, so the
+            // node fails and is retried rather than being audited as blocked.
+            DispatchGuardOutcome::Unavailable { reason } => Some(Err(reason.into())),
+            // Settle cleanly so the lease never expires into the retry path.
+            // The node stays parked in the scheduler fold's `scheduled` set.
+            DispatchGuardOutcome::Held { .. } => {
                 self.settle_held(execution_id, node_id, item_id, lease_fence)
                     .await
             }
@@ -977,6 +908,10 @@ impl Worker {
 
     // ── Policy check ──────────────────────────────────────────────────────────
 
+    /// Policy and approval gate for one item, for every node kind. The
+    /// decision is `node_guard::guard_item`, the same function the HTTP claim
+    /// route runs, so the two transports cannot enforce different rules; this
+    /// method owns only the settle.
     #[allow(clippy::too_many_arguments)]
     async fn check_policy(
         &self,
@@ -985,165 +920,23 @@ impl Worker {
         lease_fence: i64,
         node_id: &str,
         tenant_id: &str,
-        kind: &NodeKind,
         node_def: &NodeDef,
         ir: &WorkflowIr,
         payload: &serde_json::Value,
     ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-        // ADK agent dispatch nodes hide their tool names behind a single
-        // python_fn / java_fn, so a node-kind context carries no tool_name and
-        // every blocked_tools / require_approval_for rule silently misses (C1).
-        // The decision lives in `dispatch_guard` so the HTTP claim route — the
-        // transport ADK nodes actually take in production — runs the identical
-        // logic. This branch owns only the SETTLE, which is worker-specific.
-        if dispatch_guard::is_agent_tool_dispatch(kind) {
-            let input = dispatch_guard::payload_input(payload);
-            return match dispatch_guard::guard_dispatch(
-                self.backend.as_ref(),
-                execution_id,
-                node_id,
-                tenant_id,
-                ir,
-                node_def,
-                &input,
-            )
+        let outcome = node_guard::guard_item(
+            self.backend.as_ref(),
+            node_guard::GuardMode::Fire,
+            execution_id,
+            node_id,
+            tenant_id,
+            ir.policy.as_ref(),
+            node_def,
+            payload,
+        )
+        .await;
+        self.settle_outcome(execution_id, node_id, item_id, lease_fence, outcome)
             .await
-            {
-                DispatchGuardOutcome::Allow => None,
-                DispatchGuardOutcome::Blocked { reason } => {
-                    Some(Err(format!("policy blocked: {reason}").into()))
-                }
-                // Not a denial: the decision could not be made or recorded, so
-                // the node fails and is retried rather than being audited as
-                // blocked. Same shape as a block to the scheduler, deliberately
-                // different on the Prove surface.
-                DispatchGuardOutcome::Unavailable { reason } => Some(Err(reason.into())),
-                // Settle the item cleanly so the lease never expires into the
-                // retry/dead-letter path. The node stays parked because it
-                // remains in the scheduler fold's `scheduled` set (so it is
-                // never re-dispatched); the fold's `held` set only gates which
-                // decision events are acted on.
-                DispatchGuardOutcome::Held { .. } => {
-                    // Fenced for the same reason the claim route fences its
-                    // settle: this worker may no longer hold the lease.
-                    match self
-                        .backend
-                        .complete_work_item_fenced(item_id, lease_fence)
-                        .await
-                    {
-                        Ok(true) => Some(Ok(())),
-                        Ok(false) => {
-                            warn!(
-                                execution_id = %execution_id,
-                                node_id,
-                                "lease fence lost while settling a held dispatch — another worker owns it"
-                            );
-                            Some(Ok(()))
-                        }
-                        Err(e) => Some(Err(format!("failed to settle held work item: {e}").into())),
-                    }
-                }
-            };
-        }
-
-        let ctx = EvaluationContext::from_node_kind(node_id, kind);
-
-        // Load tenant policy (sits between global and workflow in the chain).
-        //
-        // `Ok(None)` — this tenant has no policy — and `Err` — we could not find
-        // out — must NOT collapse together, which is what `.ok().flatten()` did.
-        // Swallowing the error makes an unreadable tenant record look like an
-        // absent policy: when the tenant layer is the only one carrying a rule
-        // for this node, `sets` empties and the node runs having been evaluated
-        // against a policy set that is missing rules which DO exist.
-        //
-        // Failing the node instead means a transient tenant-read blip costs a
-        // retry rather than an unenforced rule. That is the right trade for an
-        // enforcement path: the alternative is enforcing a chain you already know
-        // is incomplete. The agent-dispatch branch above made the same choice.
-        let tenant_policy_set = match self
-            .backend
-            .get_tenant(&jamjet_state::TenantId::from(tenant_id))
-            .await
-        {
-            Ok(tenant) => tenant.and_then(|t| t.policy_set()),
-            Err(e) => {
-                warn!(
-                    execution_id = %execution_id,
-                    node_id,
-                    "tenant policy unreadable — failing the node rather than \
-                     enforcing an incomplete policy chain"
-                );
-                return Some(Err(format!(
-                    "tenant policy unavailable; refusing to run unpoliced: {e}"
-                )
-                .into()));
-            }
-        };
-
-        // Build policy chain: tenant -> workflow -> node (least-specific to most-specific).
-        // The evaluator iterates in reverse, so node rules take priority.
-        let mut sets: Vec<&jamjet_ir::workflow::PolicySetIr> = Vec::new();
-        if let Some(ref tp) = tenant_policy_set {
-            sets.push(tp);
-        }
-        if let Some(p) = &ir.policy {
-            sets.push(p);
-        }
-        if let Some(p) = &node_def.policy {
-            sets.push(p);
-        }
-        if sets.is_empty() {
-            return None;
-        }
-
-        let decision = PolicyEvaluator.evaluate(&ctx, &sets);
-
-        match decision {
-            PolicyDecision::Allow => None,
-
-            PolicyDecision::Block { reason } => {
-                let policy_scope = dispatch_guard::identify_policy_scope(
-                    &ctx,
-                    tenant_policy_set.as_ref(),
-                    ir.policy.as_ref(),
-                    node_def.policy.as_ref(),
-                );
-                warn!(execution_id = %execution_id, node_id, %reason, %policy_scope, "Policy blocked node");
-                // Best-effort audit. The block is enforced regardless of whether
-                // recording the violation succeeds: fail closed, never open.
-                if let Ok(latest) = self.backend.latest_sequence(execution_id).await {
-                    let _ = self
-                        .backend
-                        .append_event(jamjet_state::Event::new(
-                            execution_id.clone(),
-                            latest + 1,
-                            EventKind::PolicyViolation {
-                                node_id: node_id.to_string(),
-                                rule: reason.clone(),
-                                decision: "blocked".to_string(),
-                                policy_scope,
-                            },
-                        ))
-                        .await;
-                }
-                Some(Err(format!("policy blocked: {reason}").into()))
-            }
-
-            PolicyDecision::RequireApproval { approver } => {
-                let tool_name = ctx.tool_name.unwrap_or_else(|| node_id.to_string());
-                self.hold_for_approval(
-                    execution_id,
-                    node_id,
-                    item_id,
-                    lease_fence,
-                    tool_name,
-                    approver,
-                    serde_json::json!({ "node_id": node_id }),
-                )
-                .await
-            }
-        }
     }
 
     // ── Autonomy check ────────────────────────────────────────────────────────

@@ -100,6 +100,35 @@ pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStat
 /// Context key under which a hold records the digest of the action it parks.
 pub const ACTION_DIGEST_KEY: &str = "action_digest";
 
+/// Context key under which a hold records which occurrence of the node it is
+/// for: the node's completion count when the request was made.
+pub const ACTION_STEP_KEY: &str = "action_step";
+
+/// The request the node's current decision answered: its latest
+/// `ToolApprovalRequired`, if the node has a decision. `None` while the latest
+/// request is still pending or there has never been one.
+pub fn answered_request(events: &[Event], node_id: &str) -> Option<PendingApproval> {
+    match node_approval_status(events, node_id) {
+        NodeApprovalStatus::Approved { .. } | NodeApprovalStatus::Rejected { .. } => {}
+        _ => return None,
+    }
+    events.iter().rev().find_map(|e| match &e.kind {
+        EventKind::ToolApprovalRequired {
+            node_id: n,
+            tool_name,
+            approver,
+            context,
+        } if n == node_id => Some(PendingApproval {
+            node_id: n.clone(),
+            tool_name: tool_name.clone(),
+            approver: approver.clone(),
+            context: context.clone(),
+            sequence: e.sequence,
+        }),
+        _ => None,
+    })
+}
+
 /// The digest an approval of a plain node is bound to.
 ///
 /// Covers the run, the node, which occurrence of the node this is (`step`, the

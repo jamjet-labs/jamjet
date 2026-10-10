@@ -1,0 +1,331 @@
+//! The one policy and approval decision for a work item, for every node kind.
+//!
+//! Two transports hand a node's work to something that performs it: the
+//! in-process worker (`Worker::execute_item`) and the HTTP worker protocol
+//! (`POST /work-items/claim`). Until 2026-10 only the worker evaluated policy
+//! for ordinary nodes; the claim route evaluated it only for agent tool
+//! dispatch nodes and released everything else, so an approval-gated tool node
+//! claimed over HTTP ran with no approval, and the run's own initiator could
+//! use that to get past separation of duties. Both transports now call
+//! [`guard_item`]; there is no second copy of the rules to drift.
+//!
+//! Like [`crate::dispatch_guard`], this module DECIDES and leaves the audit
+//! trail; it never settles the work item. Settling is transport-specific.
+//!
+//! [`GuardMode::Complete`] answers a different question with the same rules:
+//! may a worker's reported result for this node be recorded? It never writes.
+
+use crate::dispatch_guard::{self, DispatchGuardOutcome};
+use jamjet_core::workflow::ExecutionId;
+use jamjet_ir::workflow::{NodeDef, PolicySetIr};
+use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
+use jamjet_state::approvals::{
+    answered_request, approval_covers, derive_action_digest, node_approval_status,
+    NodeApprovalStatus, ACTION_DIGEST_KEY, ACTION_STEP_KEY,
+};
+use jamjet_state::backend::StateBackend;
+use jamjet_state::event::EventKind;
+use jamjet_state::Event;
+use serde_json::Value;
+use tracing::{info, warn};
+
+/// The decision for one work item. Same shape for every node kind, so a
+/// caller settles dispatch and ordinary nodes the same way.
+pub type GuardOutcome = DispatchGuardOutcome;
+
+/// Which question the guard answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardMode {
+    /// May this node FIRE now? Records a `PolicyViolation` on a block and
+    /// appends a `ToolApprovalRequired` when an approval is needed and none
+    /// covers the action. Used at claim time by both transports.
+    Fire,
+    /// May a worker's result for this node be RECORDED? Read-only: nothing is
+    /// appended, because a refused completion is not a new policy event and
+    /// must not create approval requests a worker could farm.
+    ///
+    /// An approval counts here if it answered a request for the node's CURRENT
+    /// occurrence (the request's recorded `step` equals the node's completion
+    /// count), not only if its digest still equals the current one. The action
+    /// was authorised at claim time; a sibling that commits between that claim
+    /// and this completion moves the digest but not the authorisation, and
+    /// refusing then would strand an effect that already happened and re-fire
+    /// it after a second approval. What this mode must refuse is a completion
+    /// with no approval for this occurrence at all (pending, rejected, never
+    /// requested, or an approval of an earlier visit), and it does.
+    Complete,
+}
+
+/// Decide whether `node_def` may fire (or, in `Complete` mode, whether its
+/// result may be recorded), evaluating the tenant -> workflow -> node policy
+/// chain and, for an approval-gated node, the approval bound to the action.
+///
+/// `workflow_policy` is the IR's workflow-level policy and `payload` the work
+/// item's payload as the engine recorded it (agent tool dispatch nodes are
+/// decided over the calls in `payload["input"]`).
+#[allow(clippy::too_many_arguments)]
+pub async fn guard_item(
+    backend: &dyn StateBackend,
+    mode: GuardMode,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    tenant_id: &str,
+    workflow_policy: Option<&PolicySetIr>,
+    node_def: &NodeDef,
+    payload: &Value,
+) -> GuardOutcome {
+    if dispatch_guard::is_agent_tool_dispatch(&node_def.kind) {
+        let input = dispatch_guard::payload_input(payload);
+        return dispatch_guard::guard_dispatch_in(
+            backend,
+            mode,
+            execution_id,
+            node_id,
+            tenant_id,
+            workflow_policy,
+            node_def,
+            &input,
+        )
+        .await;
+    }
+
+    // `Ok(None)` (no tenant policy) and `Err` (could not find out) must not
+    // collapse: an unreadable tenant would otherwise read as an absent policy
+    // and drop that layer's rules.
+    let tenant_policy_set = match backend
+        .get_tenant(&jamjet_state::TenantId::from(tenant_id))
+        .await
+    {
+        Ok(tenant) => tenant.and_then(|t| t.policy_set()),
+        Err(e) => {
+            warn!(
+                execution_id = %execution_id,
+                node_id,
+                "tenant policy unreadable — refusing to decide on an incomplete policy chain"
+            );
+            return GuardOutcome::Unavailable {
+                reason: format!("tenant policy unavailable; refusing to run unpoliced: {e}"),
+            };
+        }
+    };
+
+    // tenant -> workflow -> node; the evaluator iterates in reverse, so the
+    // most specific layer wins.
+    let mut sets: Vec<&PolicySetIr> = Vec::new();
+    if let Some(ref tp) = tenant_policy_set {
+        sets.push(tp);
+    }
+    if let Some(p) = workflow_policy {
+        sets.push(p);
+    }
+    if let Some(p) = &node_def.policy {
+        sets.push(p);
+    }
+    if sets.is_empty() {
+        return GuardOutcome::Allow;
+    }
+
+    let ctx = EvaluationContext::from_node_kind(node_id, &node_def.kind);
+    match PolicyEvaluator.evaluate(&ctx, &sets) {
+        PolicyDecision::Allow => GuardOutcome::Allow,
+
+        PolicyDecision::Block { reason } => {
+            if mode == GuardMode::Fire {
+                let policy_scope = dispatch_guard::identify_policy_scope(
+                    &ctx,
+                    tenant_policy_set.as_ref(),
+                    workflow_policy,
+                    node_def.policy.as_ref(),
+                );
+                warn!(execution_id = %execution_id, node_id, %reason, %policy_scope, "Policy blocked node");
+                // Best effort: the block stands whether or not this lands.
+                dispatch_guard::record_policy_violation(
+                    backend,
+                    execution_id,
+                    node_id,
+                    reason.clone(),
+                    policy_scope,
+                )
+                .await;
+            }
+            GuardOutcome::Blocked { reason }
+        }
+
+        PolicyDecision::RequireApproval { approver } => {
+            let tool_name = ctx.tool_name.unwrap_or_else(|| node_id.to_string());
+            match mode {
+                GuardMode::Fire => {
+                    require_approval(
+                        backend,
+                        execution_id,
+                        node_id,
+                        tool_name,
+                        approver,
+                        serde_json::json!({ "node_id": node_id }),
+                    )
+                    .await
+                }
+                GuardMode::Complete => {
+                    completion_covered(backend, execution_id, node_id, tool_name).await
+                }
+            }
+        }
+    }
+}
+
+/// The approval half of the decision, for a node that needs one: `Allow` if an
+/// approval covers the action this node would perform now, otherwise `Held`
+/// with an outstanding request (an existing one, or one appended here bound to
+/// the current action digest). Reads that the decision depends on fail CLOSED
+/// as `Unavailable`.
+///
+/// Shared by the policy path above and the worker's autonomy path, so both
+/// request and match approvals identically.
+pub async fn require_approval(
+    backend: &dyn StateBackend,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    tool_name: String,
+    approver: String,
+    context: Value,
+) -> GuardOutcome {
+    let gated = vec![tool_name.clone()];
+    let events = match backend.get_events(execution_id).await {
+        Ok(events) => events,
+        Err(e) => {
+            return GuardOutcome::Unavailable {
+                reason: format!("approval state unavailable; refusing to run unapproved: {e}"),
+            }
+        }
+    };
+
+    let status = node_approval_status(&events, node_id);
+    if matches!(
+        status,
+        NodeApprovalStatus::Pending(_) | NodeApprovalStatus::Rejected { .. }
+    ) {
+        // Already requested, or decided rejected (the scheduler owns the
+        // failure). Hold; emit nothing.
+        return GuardOutcome::Held { gated };
+    }
+
+    // Approved or NotRequested: what would this item do right now?
+    let step = match backend.count_node_completions(execution_id, node_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            return GuardOutcome::Unavailable {
+                reason: format!("approval binding unavailable; refusing to run unapproved: {e}"),
+            }
+        }
+    };
+    let current = match derive_action_digest(backend, execution_id, node_id).await {
+        Ok(d) => d,
+        Err(e) => {
+            return GuardOutcome::Unavailable {
+                reason: format!("approval binding unavailable; refusing to run unapproved: {e}"),
+            }
+        }
+    };
+
+    if approval_covers(&status, &current) {
+        info!(execution_id = %execution_id, node_id, "Approval satisfied — proceeding");
+        return GuardOutcome::Allow;
+    }
+
+    if let NodeApprovalStatus::Approved {
+        approved_digest, ..
+    } = &status
+    {
+        warn!(
+            execution_id = %execution_id,
+            node_id,
+            approved_digest = approved_digest.as_deref().unwrap_or("<none: legacy approval>"),
+            current_digest = %current,
+            "approval does not cover this action (state changed, a later visit of the \
+             node, or a legacy approval without a digest) — requesting a fresh approval"
+        );
+    } else {
+        info!(execution_id = %execution_id, node_id, %approver, "Node requires approval");
+    }
+
+    let mut context = context;
+    if !context.is_object() {
+        context = serde_json::json!({ "context": context });
+    }
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert(ACTION_DIGEST_KEY.to_string(), Value::String(current));
+        // The occurrence this request is for. `GuardMode::Complete` reads it.
+        obj.insert(ACTION_STEP_KEY.to_string(), Value::from(step));
+    }
+
+    // KNOWN LIMIT, unchanged: read-then-append with no compare-and-set, so two
+    // concurrent claims for two items of one node can both append. Fail closed
+    // either way: both return Held. See `dispatch_guard::guard_dispatch`.
+    let seq = match backend.latest_sequence(execution_id).await {
+        Ok(s) => s + 1,
+        Err(e) => {
+            return GuardOutcome::Unavailable {
+                reason: format!("approval required but could not be recorded: {e}"),
+            }
+        }
+    };
+    if let Err(e) = backend
+        .append_event(Event::new(
+            execution_id.clone(),
+            seq,
+            EventKind::ToolApprovalRequired {
+                node_id: node_id.to_string(),
+                tool_name,
+                approver,
+                context,
+            },
+        ))
+        .await
+    {
+        // An unrecorded request is an invisible hold: fail closed.
+        return GuardOutcome::Unavailable {
+            reason: format!("approval required but could not be recorded: {e}"),
+        };
+    }
+    GuardOutcome::Held { gated }
+}
+
+/// `GuardMode::Complete` for an approval-gated node: `Allow` only if the
+/// node's approval answered a request for its current occurrence.
+async fn completion_covered(
+    backend: &dyn StateBackend,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    tool_name: String,
+) -> GuardOutcome {
+    let gated = vec![tool_name];
+    let unavailable = |e: jamjet_state::backend::StateBackendError| GuardOutcome::Unavailable {
+        reason: format!("approval state unavailable; refusing to record an unapproved result: {e}"),
+    };
+    let events = match backend.get_events(execution_id).await {
+        Ok(events) => events,
+        Err(e) => return unavailable(e),
+    };
+    let status = node_approval_status(&events, node_id);
+    if !matches!(status, NodeApprovalStatus::Approved { .. }) {
+        return GuardOutcome::Held { gated };
+    }
+    let Some(request) = answered_request(&events, node_id) else {
+        return GuardOutcome::Held { gated };
+    };
+    let step = match backend.count_node_completions(execution_id, node_id).await {
+        Ok(s) => s,
+        Err(e) => return unavailable(e),
+    };
+    match request.context.get(ACTION_STEP_KEY).and_then(Value::as_u64) {
+        Some(requested_step) if requested_step == step => GuardOutcome::Allow,
+        Some(_) => GuardOutcome::Held { gated },
+        // A request recorded before the step was: only an exact digest match
+        // proves it is this occurrence.
+        None => match derive_action_digest(backend, execution_id, node_id).await {
+            Ok(current) if approval_covers(&status, &current) => GuardOutcome::Allow,
+            Ok(_) => GuardOutcome::Held { gated },
+            Err(e) => unavailable(e),
+        },
+    }
+}

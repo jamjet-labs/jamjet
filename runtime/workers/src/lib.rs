@@ -11,6 +11,7 @@ pub mod dispatch_guard;
 pub mod executor;
 pub mod executors;
 pub mod heartbeat;
+pub mod node_guard;
 pub mod pool;
 #[cfg(test)]
 #[cfg(test)]

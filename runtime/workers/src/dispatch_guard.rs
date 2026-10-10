@@ -16,6 +16,7 @@
 //! `WorkItemId` — those are worker lifecycle concerns, and depending on them
 //! would re-couple the decision to one transport.
 
+use crate::node_guard::GuardMode;
 use jamjet_core::node::NodeKind;
 use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::workflow::{NodeDef, PolicySetIr, WorkflowIr};
@@ -137,6 +138,37 @@ pub async fn guard_dispatch(
     node_def: &NodeDef,
     payload_input: &Value,
 ) -> DispatchGuardOutcome {
+    guard_dispatch_in(
+        backend,
+        GuardMode::Fire,
+        execution_id,
+        node_id,
+        tenant_id,
+        ir.policy.as_ref(),
+        node_def,
+        payload_input,
+    )
+    .await
+}
+
+/// [`guard_dispatch`] in either [`GuardMode`]. Only the workflow-level policy
+/// of the IR is consulted, so a caller need not parse the whole graph.
+///
+/// In `GuardMode::Complete` nothing is written: no `PolicyViolation`, no
+/// approval request. A completion is allowed only if the batch is allowed
+/// outright or an approval of exactly these calls is on file.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn guard_dispatch_in(
+    backend: &dyn StateBackend,
+    mode: GuardMode,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    tenant_id: &str,
+    workflow_policy: Option<&PolicySetIr>,
+    node_def: &NodeDef,
+    payload_input: &Value,
+) -> DispatchGuardOutcome {
+    let fire = mode == GuardMode::Fire;
     // Load tenant policy (sits between global and workflow in the chain).
     //
     // `Ok(None)` — this tenant has no policy — and `Err` — we could not find out
@@ -170,7 +202,7 @@ pub async fn guard_dispatch(
     if let Some(ref tp) = tenant_policy_set {
         sets.push(tp);
     }
-    if let Some(p) = &ir.policy {
+    if let Some(p) = workflow_policy {
         sets.push(p);
     }
     if let Some(p) = &node_def.policy {
@@ -196,14 +228,16 @@ pub async fn guard_dispatch(
             // A fail-closed refusal is a policy denial and must reach the audit
             // surface like any other. Scope is "unknown" because the engine's
             // fail-closed rule denied here, not a policy layer.
-            record_policy_violation(
-                backend,
-                execution_id,
-                node_id,
-                rule.clone(),
-                "unknown".to_string(),
-            )
-            .await;
+            if fire {
+                record_policy_violation(
+                    backend,
+                    execution_id,
+                    node_id,
+                    rule.clone(),
+                    "unknown".to_string(),
+                )
+                .await;
+            }
             return DispatchGuardOutcome::Blocked { reason: rule };
         }
     };
@@ -219,12 +253,20 @@ pub async fn guard_dispatch(
             let policy_scope = identify_policy_scope(
                 &tool_ctx(node_id, &tool_name),
                 tenant_policy_set.as_ref(),
-                ir.policy.as_ref(),
+                workflow_policy,
                 node_def.policy.as_ref(),
             );
             warn!(execution_id = %execution_id, node_id, %tool_name, %reason, %policy_scope, "Policy blocked agent tool call");
-            record_policy_violation(backend, execution_id, node_id, reason.clone(), policy_scope)
+            if fire {
+                record_policy_violation(
+                    backend,
+                    execution_id,
+                    node_id,
+                    reason.clone(),
+                    policy_scope,
+                )
                 .await;
+            }
             DispatchGuardOutcome::Blocked { reason }
         }
 
@@ -290,19 +332,21 @@ pub async fn guard_dispatch(
                                 identify_policy_scope(
                                     &tool_ctx(node_id, tool),
                                     tenant_policy_set.as_ref(),
-                                    ir.policy.as_ref(),
+                                    workflow_policy,
                                     node_def.policy.as_ref(),
                                 )
                             })
                             .unwrap_or_else(|| "unknown".to_string());
-                        record_policy_violation(
-                            backend,
-                            execution_id,
-                            node_id,
-                            APPROVAL_MISMATCH.to_string(),
-                            policy_scope,
-                        )
-                        .await;
+                        if fire {
+                            record_policy_violation(
+                                backend,
+                                execution_id,
+                                node_id,
+                                APPROVAL_MISMATCH.to_string(),
+                                policy_scope,
+                            )
+                            .await;
+                        }
                         return DispatchGuardOutcome::Blocked {
                             reason: APPROVAL_MISMATCH.to_string(),
                         };
@@ -316,6 +360,9 @@ pub async fn guard_dispatch(
                 NodeApprovalStatus::Pending(_) | NodeApprovalStatus::Rejected { .. } => {
                     DispatchGuardOutcome::Held { gated }
                 }
+
+                // Completing a batch nobody approved: refuse, append nothing.
+                NodeApprovalStatus::NotRequested if !fire => DispatchGuardOutcome::Held { gated },
 
                 NodeApprovalStatus::NotRequested => {
                     // KNOWN LIMIT: reading `NotRequested` and then appending the
@@ -466,7 +513,7 @@ fn latest_request_calls_hash(events: &[Event], node_id: &str) -> Option<String> 
 /// consequence is materially worse — duplicate outstanding approval requests,
 /// which can stop a human decision from ever settling. See the KNOWN LIMIT note
 /// there before concluding the route path is only cosmetically affected.
-async fn record_policy_violation(
+pub(crate) async fn record_policy_violation(
     backend: &dyn StateBackend,
     execution_id: &ExecutionId,
     node_id: &str,

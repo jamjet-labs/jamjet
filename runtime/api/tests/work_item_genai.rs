@@ -36,6 +36,37 @@ fn make_state(backend: Arc<InMemoryBackend>) -> AppState {
     }
 }
 
+/// Register a one-node workflow whose node is `node_id`. Completion is gated on
+/// the node's policy, so the engine must be able to read its definition; an
+/// item whose workflow does not exist is refused like it is at claim time.
+async fn store_one_node_workflow(
+    backend: &dyn jamjet_state::backend::StateBackend,
+    workflow_id: &str,
+    version: &str,
+    node_id: &str,
+) {
+    backend
+        .store_workflow(jamjet_state::backend::WorkflowDefinition {
+            workflow_id: workflow_id.into(),
+            version: version.into(),
+            ir: serde_json::json!({
+                "workflow_id": workflow_id,
+                "version": version,
+                "start_node": node_id,
+                "nodes": { node_id: {
+                    "id": node_id,
+                    "kind": { "type": "python_fn", "module": "m", "function": "f", "output_schema": "" },
+                    "retry_policy": null, "node_timeout_secs": null, "description": null, "labels": {}
+                } },
+                "edges": []
+            }),
+            created_at: chrono::Utc::now(),
+            tenant_id: "default".into(),
+        })
+        .await
+        .expect("store_workflow");
+}
+
 async fn body_json(body: Body) -> Value {
     let bytes = body.collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
@@ -50,6 +81,7 @@ async fn complete_work_item_threads_gen_ai_fields() {
     // Seed an execution so `latest_sequence` has something to increment from.
     let execution_id = ExecutionId::new();
     let now = chrono::Utc::now();
+    store_one_node_workflow(backend.as_ref(), "wf-genai", "0.1.0", "genai-node").await;
     backend
         .create_execution(WorkflowExecution {
             execution_id: execution_id.clone(),
@@ -191,6 +223,7 @@ async fn complete_work_item_without_gen_ai_fields_keeps_backward_compat() {
 
     let execution_id = ExecutionId::new();
     let now = chrono::Utc::now();
+    store_one_node_workflow(backend.as_ref(), "wf-compat", "0.1.0", "compat-node").await;
     backend
         .create_execution(WorkflowExecution {
             execution_id: execution_id.clone(),
