@@ -102,8 +102,12 @@ fn handler_ref(entry: &Value) -> Option<String> {
     // another spelling of a module; ordinary private modules (`app._tools`)
     // are allowed. The Python dispatcher independently refuses any entry that
     // is not the called tool's own `module:qualname`.
-    if function.split('.').any(|seg| seg.is_empty() || seg.starts_with('_'))
-        || module.split('.').any(|seg| seg.is_empty() || seg.starts_with("__"))
+    if function
+        .split('.')
+        .any(|seg| seg.is_empty() || seg.starts_with('_'))
+        || module
+            .split('.')
+            .any(|seg| seg.is_empty() || seg.starts_with("__"))
     {
         return None;
     }

@@ -548,7 +548,11 @@ async fn an_underscore_attribute_path_in_the_tools_map_blocks() {
         set_tenant_policy(&env, &["send_wire"], &[]).await;
         register_dispatcher(&env).await;
         let (_, eid) = start(&env, "wf-adk", lookup_call(json!({ "lookup": entry }))).await;
-        assert_eq!(claim(&env).await, json!({ "claimed": false }), "{label}: {entry}");
+        assert_eq!(
+            claim(&env).await,
+            json!({ "claimed": false }),
+            "{label}: {entry}"
+        );
         let events = env.backend.get_events(&eid).await.unwrap();
         assert!(
             events.iter().any(|e| matches!(&e.kind, EventKind::PolicyViolation { rule, .. } if rule.contains("tools entry"))),
@@ -563,6 +567,11 @@ async fn an_ordinary_or_private_module_path_is_accepted() {
     let env = env().await;
     set_tenant_policy(&env, &["send_wire"], &[]).await;
     register_dispatcher(&env).await;
-    start(&env, "wf-adk", lookup_call(json!({ "lookup": "myapp._tools:lookup_rate" }))).await;
+    start(
+        &env,
+        "wf-adk",
+        lookup_call(json!({ "lookup": "myapp._tools:lookup_rate" })),
+    )
+    .await;
     assert_eq!(claim(&env).await["claimed"], true);
 }
