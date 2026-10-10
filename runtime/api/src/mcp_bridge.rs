@@ -456,7 +456,9 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     path: Some("/mcp/tools/jamjet_approve".to_string()),
                     ..Default::default()
                 };
-                s.enricher.enrich_and_append(&event, Some(&audit_ctx)).await;
+                if let Err(e) = s.enricher.try_enrich_and_append(&event, Some(&audit_ctx)).await {
+                    jamjet_state::approvals::record_seal_gap(backend.as_ref(), &event, e).await;
+                }
 
                 Ok(vec![McpContent::Text {
                     text: json!({"execution_id": id_str, "node_id": resolved_node, "accepted": true})

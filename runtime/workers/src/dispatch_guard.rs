@@ -1336,11 +1336,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl jamjet_state::approvals::ApprovalSealer for CapturingSealer {
-        async fn seal_approval_record(&self, event: &Event, tenant_id: &str) {
+        async fn seal_approval_record(&self, event: &Event, tenant_id: &str) -> Result<(), String> {
             self.0
                 .lock()
                 .unwrap()
                 .push((event.clone(), tenant_id.to_string()));
+            Ok(())
         }
     }
 

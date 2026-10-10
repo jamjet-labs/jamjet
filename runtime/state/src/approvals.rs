@@ -445,15 +445,18 @@ pub fn pending_approvals(events: &[Event]) -> Vec<PendingApproval> {
 /// undoes or blocks the record it describes.
 #[async_trait::async_trait]
 pub trait ApprovalSealer: Send + Sync {
-    /// Seal `event` (with its assigned sequence) for `tenant_id`.
-    async fn seal_approval_record(&self, event: &Event, tenant_id: &str);
+    /// Seal `event` (with its assigned sequence) for `tenant_id`. `Err` when
+    /// no audit entry was written; the caller records the gap.
+    async fn seal_approval_record(&self, event: &Event, tenant_id: &str) -> Result<(), String>;
 }
 
 /// Seal an approval record the engine has just appended: a request, an
 /// expiry or an escalation. Every place the engine appends one calls this,
 /// with the sequence the backend assigned, which the sealed entry carries.
-/// `None` seals nothing (a component built without an audit log).
+/// `None` seals nothing (a component built without an audit log). A failed
+/// seal is recorded in the run's log with [`record_seal_gap`].
 pub async fn seal_appended(
+    backend: &dyn crate::backend::StateBackend,
     sealer: Option<&dyn ApprovalSealer>,
     mut event: Event,
     appended: EventSequence,
@@ -461,7 +464,46 @@ pub async fn seal_appended(
 ) {
     if let Some(sealer) = sealer {
         event.sequence = appended;
-        sealer.seal_approval_record(&event, tenant_id).await;
+        if let Err(error) = sealer.seal_approval_record(&event, tenant_id).await {
+            record_seal_gap(backend, &event, error).await;
+        }
+    }
+}
+
+/// Record in the run's own log that `event` has no audit entry
+/// (`AuditSealFailed`). The signed chain cannot show a missing entry:
+/// `verify_chain` checks the entries it is given, so an event never sealed
+/// is invisible to it. This record is what makes the gap findable (compare
+/// the log with the audit entries). Best effort: if this append fails too,
+/// the gap is only in the process log.
+pub async fn record_seal_gap(
+    backend: &dyn crate::backend::StateBackend,
+    event: &Event,
+    error: String,
+) {
+    let event_type = serde_json::to_value(&event.kind)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_string());
+    tracing::error!(
+        execution_id = %event.execution_id,
+        sequence = event.sequence,
+        %event_type,
+        %error,
+        "event not sealed into the audit chain; recording the gap"
+    );
+    let gap = Event::new(
+        event.execution_id.clone(),
+        0,
+        EventKind::AuditSealFailed {
+            event_id: event.id,
+            sequence: event.sequence,
+            event_type,
+            error,
+        },
+    );
+    if let Err(e) = backend.append_event(gap).await {
+        tracing::error!(execution_id = %event.execution_id, "could not record the audit gap either: {e}");
     }
 }
 

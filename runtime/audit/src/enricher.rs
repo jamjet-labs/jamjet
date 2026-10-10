@@ -72,6 +72,9 @@ pub struct AuditEnricher {
     /// Serializes the read-head -> seal -> append -> advance-head sequence so
     /// concurrent appends form a single linear chain.
     chain: tokio::sync::Mutex<ChainHead>,
+    /// How many entries failed to be written since start: a metric for audit
+    /// gaps, which `verify_chain` cannot detect.
+    seal_failures: std::sync::atomic::AtomicU64,
 }
 
 impl AuditEnricher {
@@ -89,7 +92,15 @@ impl AuditEnricher {
             backend,
             signer,
             chain: tokio::sync::Mutex::new(ChainHead::default()),
+            seal_failures: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// How many audit entries failed to be written since this enricher was
+    /// built. Each one is an event with no audit entry: a gap
+    /// `verify_chain` cannot see.
+    pub fn seal_failures(&self) -> u64 {
+        self.seal_failures.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The `entry_hash` of the most recent entry already in the log, used to
@@ -108,6 +119,28 @@ impl AuditEnricher {
     /// Call this after every `StateBackend::append_event` call, passing
     /// the HTTP request context if available.
     pub async fn enrich_and_append(&self, event: &Event, ctx: Option<&RequestContext>) {
+        if let Err(e) = self.try_enrich_and_append(event, ctx).await {
+            warn!("Failed to write audit log entry: {e}");
+        }
+    }
+
+    /// [`enrich_and_append`](Self::enrich_and_append), reporting a failure to
+    /// the caller (who can record the gap) instead of only logging it. Every
+    /// failure is also counted in [`seal_failures`](Self::seal_failures).
+    pub async fn try_enrich_and_append(
+        &self,
+        event: &Event,
+        ctx: Option<&RequestContext>,
+    ) -> Result<(), String> {
+        let out = self.seal_entry(event, ctx).await;
+        if out.is_err() {
+            self.seal_failures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        out
+    }
+
+    async fn seal_entry(&self, event: &Event, ctx: Option<&RequestContext>) -> Result<(), String> {
         let default_ctx = RequestContext {
             actor_id: "system".to_string(),
             actor_type: ActorType::System,
@@ -119,10 +152,7 @@ impl AuditEnricher {
         let event_type = extract_event_type(&event.kind);
         let raw_event = match serde_json::to_value(&event.kind) {
             Ok(v) => v,
-            Err(e) => {
-                warn!("Failed to serialize event for audit log: {e}");
-                return;
-            }
+            Err(e) => return Err(format!("event does not serialize for the audit log: {e}")),
         };
 
         let actor_id = derive_actor_id(&event.kind, &ctx.actor_id);
@@ -190,8 +220,11 @@ impl AuditEnricher {
         match self.backend.append(entry).await {
             // Advance the head only after a durable append, so a failed write
             // never leaves a gap that the next entry would link straight past.
-            Ok(()) => chain.head = sealed_hash,
-            Err(e) => warn!("Failed to write audit log entry: {e}"),
+            Ok(()) => {
+                chain.head = sealed_hash;
+                Ok(())
+            }
+            Err(e) => Err(format!("audit log write failed: {e}")),
         }
     }
 }
@@ -201,9 +234,9 @@ impl jamjet_state::approvals::ApprovalSealer for AuditEnricher {
     /// Seal an engine-written approval record (request, expiry, escalation)
     /// into the same chain as the decisions, as a system actor of the run's
     /// tenant.
-    async fn seal_approval_record(&self, event: &Event, tenant_id: &str) {
+    async fn seal_approval_record(&self, event: &Event, tenant_id: &str) -> Result<(), String> {
         let ctx = RequestContext::system_for_tenant("system", tenant_id);
-        self.enrich_and_append(event, Some(&ctx)).await;
+        self.try_enrich_and_append(event, Some(&ctx)).await
     }
 }
 

@@ -319,3 +319,93 @@ async fn expiries_and_escalations_are_sealed() {
         Err(ChainError::HashMismatch { index: 2 })
     );
 }
+
+/// An audit log that refuses every write.
+struct FailingAuditBackend;
+
+#[async_trait]
+impl AuditBackend for FailingAuditBackend {
+    async fn append(&self, _entry: AuditLogEntry) -> Result<(), AuditError> {
+        Err(AuditError::Database("disk full".into()))
+    }
+    async fn query(&self, _q: &AuditQuery) -> Result<Vec<AuditLogEntry>, AuditError> {
+        Ok(vec![])
+    }
+    async fn count(&self, _q: &AuditQuery) -> Result<u64, AuditError> {
+        Ok(0)
+    }
+}
+
+/// Review M-7: a seal that fails leaves no audit entry, and `verify_chain`
+/// cannot see an entry that was never written. The gap is recorded in the
+/// run's own event log (`audit_seal_failed`, naming the unsealed event) and
+/// counted on the enricher, so it can be found.
+#[tokio::test]
+async fn a_failed_seal_is_recorded_as_a_gap() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let audit: Arc<dyn AuditBackend> = Arc::new(FailingAuditBackend);
+    let enricher = Arc::new(AuditEnricher::with_signer(
+        audit.clone(),
+        AuditSigner::new(b"k".to_vec()),
+    ));
+    let b = backend.clone();
+    let state = AppState {
+        backend: backend.clone() as Arc<dyn StateBackend>,
+        backend_for_fn: Arc::new(move |_t: &jamjet_state::TenantId| {
+            b.clone() as Arc<dyn StateBackend>
+        }),
+        agents: Arc::new(InMemoryAgentRegistry::new()),
+        audit,
+        enricher: enricher.clone(),
+        protocols: jamjet_api::state::default_protocol_registry(),
+        cron_store: None,
+        approval_policy: Default::default(),
+    };
+    let app = build_router_with_opts(state, false);
+    let (alice, _) = backend.create_token("alice", "developer").await.unwrap();
+    let (st, body) = call(&app, "POST", "/workflows", &alice, json!({ "ir": ir() })).await;
+    assert!(st.is_success(), "{body}");
+    let (st, body) = call(
+        &app,
+        "POST",
+        "/executions",
+        &alice,
+        json!({ "workflow_id": "wf-sealed", "workflow_version": "0.1.0", "input": {} }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    let id = body["execution_id"].as_str().unwrap();
+    let eid = ExecutionId(uuid::Uuid::parse_str(id.strip_prefix("exec_").unwrap()).unwrap());
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/work-items/claim",
+        &alice,
+        json!({ "worker_id": "w", "queue_types": ["python_tool"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let events = backend.get_events(&eid).await.unwrap();
+    let request = events
+        .iter()
+        .find(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. }))
+        .expect("the request is recorded even though its seal failed");
+    let gap = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::AuditSealFailed {
+                event_id,
+                sequence,
+                event_type,
+                error,
+            } => Some((*event_id, *sequence, event_type.clone(), error.clone())),
+            _ => None,
+        })
+        .expect("the failed seal is recorded in the run's log");
+    assert_eq!(gap.0, request.id);
+    assert_eq!(gap.1, request.sequence);
+    assert_eq!(gap.2, "tool_approval_required");
+    assert!(gap.3.contains("disk full"), "{}", gap.3);
+    assert_eq!(enricher.seal_failures(), 1);
+}

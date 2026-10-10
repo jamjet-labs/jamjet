@@ -370,7 +370,7 @@ pub(crate) async fn record_request(
         .append_event(request.clone())
         .await
         .map_err(|e| format!("approval required but could not be recorded: {e}"))?;
-    jamjet_state::approvals::seal_appended(sealer, request, appended, tenant_id).await;
+    jamjet_state::approvals::seal_appended(backend, sealer, request, appended, tenant_id).await;
     Ok(())
 }
 

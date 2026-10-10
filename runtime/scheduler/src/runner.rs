@@ -233,22 +233,31 @@ impl Scheduler {
     /// under the run's own tenant, read from its execution row. The scheduler
     /// runs unscoped, so it never assumes a tenant: if the run's tenant cannot
     /// be read, the record is not sealed under another tenant's name, and the
-    /// gap is logged.
+    /// gap is recorded in the run's log (`AuditSealFailed`).
     async fn seal(&self, event: jamjet_state::Event, appended: jamjet_state::EventSequence) {
         let Some(sealer) = self.sealer.as_deref() else {
             return;
         };
         match self.backend.execution_tenant(&event.execution_id).await {
             Ok(Some(tenant)) => {
-                jamjet_state::approvals::seal_appended(Some(sealer), event, appended, &tenant.0)
-                    .await;
+                jamjet_state::approvals::seal_appended(
+                    self.backend.as_ref(),
+                    Some(sealer),
+                    event,
+                    appended,
+                    &tenant.0,
+                )
+                .await;
             }
             other => {
-                warn!(
-                    execution_id = %event.execution_id,
-                    sequence = appended,
-                    "approval record not sealed: the run's tenant could not be read ({other:?})"
-                );
+                let mut event = event;
+                event.sequence = appended;
+                jamjet_state::approvals::record_seal_gap(
+                    self.backend.as_ref(),
+                    &event,
+                    format!("the run's tenant could not be read ({other:?})"),
+                )
+                .await;
             }
         }
     }

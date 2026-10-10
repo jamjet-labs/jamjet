@@ -695,7 +695,13 @@ async fn approve_execution(
         path: Some(format!("/executions/{id}/approve")),
         ..Default::default()
     };
-    state.enricher.enrich_and_append(&event, Some(&ctx)).await;
+    if let Err(e) = state
+        .enricher
+        .try_enrich_and_append(&event, Some(&ctx))
+        .await
+    {
+        jamjet_state::approvals::record_seal_gap(backend.as_ref(), &event, e).await;
+    }
 
     Ok(Json(
         json!({ "execution_id": id, "node_id": node_id, "accepted": true }),

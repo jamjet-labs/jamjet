@@ -230,7 +230,11 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pool and the scheduler take the server's `AuditEnricher` (`with_sealer`) through the
   new `ApprovalSealer` trait. Every record is sealed under the run's own tenant; the
   scheduler reads it from the execution row through the new
-  `StateBackend::execution_tenant` (a trait method a custom backend must implement).
+  `StateBackend::execution_tenant` (a trait method a custom backend must implement). A
+  seal that fails is recorded in the run's log as `audit_seal_failed` (naming the
+  unsealed event) and counted (`AuditEnricher::seal_failures`), since `verify_chain`
+  cannot see an entry that was never written. `ApprovalSealer::seal_approval_record`
+  returns a `Result`.
 
 - **Clients can approve what they reviewed.** `jamjet approvals` prints each pending
   request's digest, what it covers and the exact approve command (`--show-basis` prints

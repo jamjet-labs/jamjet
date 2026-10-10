@@ -309,6 +309,22 @@ pub enum EventKind {
         expires_at: DateTime<Utc>,
     },
 
+    /// An event of this run could not be sealed into the signed audit chain
+    /// (the audit write failed, or its tenant could not be read). The event
+    /// itself is durable; this marks the gap so it can be found, since
+    /// `verify_chain` cannot see an entry that was never written. Changes no
+    /// state.
+    AuditSealFailed {
+        /// The `Event.id` of the unsealed event.
+        event_id: Uuid,
+        /// Its sequence in this run's log.
+        sequence: i64,
+        /// Its `type` tag (e.g. `tool_approval_required`).
+        event_type: String,
+        /// Why the seal failed.
+        error: String,
+    },
+
     // ── Reasoning strategy lifecycle (§14.5) ─────────────────────────────
     /// Emitted when a reasoning strategy begins execution.
     StrategyStarted {

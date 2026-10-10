@@ -327,8 +327,17 @@ deadline. So are `approval_expired` (actor `system:deadline`) and
 different action, fails chain verification at that entry, exactly as editing a
 decision does.
 
-Sealing follows the durable write of the event and is best effort: a failed
-audit write is logged and does not undo the request. Every record is sealed
+Sealing follows the durable write of the event and never undoes it. If the
+audit write fails, the run's own event log gets an `audit_seal_failed` event
+naming the unsealed event (its id, sequence and type) and why, and the
+server's enricher counts the failure.
+
+What chain verification can and cannot see: `verify_chain` checks the
+entries it is given, so it detects an edited entry, a re-ordered or inserted
+one, a broken link and a forged or stripped signature. It cannot see an
+entry that was never written (a failed seal), or entries removed from the
+end of the log. To find gaps, compare the run's event log with its audit
+entries; `audit_seal_failed` marks every gap the engine knows about. Every record is sealed
 under the run's own tenant (the scheduler reads it from the run's execution
 row), so `GET /audit` shows a tenant its own requests, expiries and
 escalations and no other tenant's.
