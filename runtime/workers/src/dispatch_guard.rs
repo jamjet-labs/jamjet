@@ -310,125 +310,181 @@ pub(crate) async fn guard_dispatch_in(
                 }
             };
 
-            match jamjet_state::approvals::node_approval_status(&events, node_id) {
-                NodeApprovalStatus::Approved { .. } => {
-                    // An existing approval authorised one specific call set. If
-                    // the pending calls differ, the approval must not carry over
-                    // — otherwise a settled approval authorises whatever happens
-                    // to be pending when the node re-fires.
-                    let approved_hash = latest_request_calls_hash(&events, node_id);
-                    if approved_hash.as_deref() != Some(current_hash.as_str()) {
-                        warn!(
-                            execution_id = %execution_id,
-                            node_id,
-                            "approved call set does not match pending calls — refusing"
-                        );
-                        // The highest-value audit record here: an approval was on
-                        // file but did not authorise these calls. The approval
-                        // requirement came from an identifiable layer, so name it.
-                        let policy_scope = gated
-                            .first()
-                            .map(|tool| {
-                                identify_policy_scope(
-                                    &tool_ctx(node_id, tool),
-                                    tenant_policy_set.as_ref(),
-                                    workflow_policy,
-                                    node_def.policy.as_ref(),
-                                )
-                            })
-                            .unwrap_or_else(|| "unknown".to_string());
-                        if fire {
-                            record_policy_violation(
-                                backend,
-                                execution_id,
-                                node_id,
-                                APPROVAL_MISMATCH.to_string(),
-                                policy_scope,
+            let status = jamjet_state::approvals::node_approval_status(&events, node_id);
+
+            // Already requested (or decided rejected: the scheduler owns the
+            // failure). Hold; emit nothing.
+            if matches!(
+                status,
+                NodeApprovalStatus::Pending(_) | NodeApprovalStatus::Rejected { .. }
+            ) {
+                return DispatchGuardOutcome::Held { gated };
+            }
+
+            if matches!(status, NodeApprovalStatus::Approved { .. }) {
+                // An existing approval authorised one specific call set. If
+                // the pending calls differ, the approval must not carry over
+                // — otherwise a settled approval authorises whatever happens
+                // to be pending when the node re-fires.
+                let approved_hash = latest_request_calls_hash(&events, node_id);
+                if approved_hash.as_deref() != Some(current_hash.as_str()) {
+                    warn!(
+                        execution_id = %execution_id,
+                        node_id,
+                        "approved call set does not match pending calls — refusing"
+                    );
+                    // The highest-value audit record here: an approval was on
+                    // file but did not authorise these calls. The approval
+                    // requirement came from an identifiable layer, so name it.
+                    let policy_scope = gated
+                        .first()
+                        .map(|tool| {
+                            identify_policy_scope(
+                                &tool_ctx(node_id, tool),
+                                tenant_policy_set.as_ref(),
+                                workflow_policy,
+                                node_def.policy.as_ref(),
                             )
-                            .await;
-                        }
-                        return DispatchGuardOutcome::Blocked {
-                            reason: APPROVAL_MISMATCH.to_string(),
-                        };
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    if fire {
+                        record_policy_violation(
+                            backend,
+                            execution_id,
+                            node_id,
+                            APPROVAL_MISMATCH.to_string(),
+                            policy_scope,
+                        )
+                        .await;
                     }
-                    info!(execution_id = %execution_id, node_id, "Approval satisfied — proceeding");
-                    DispatchGuardOutcome::Allow
-                }
-
-                // Already requested (or decided rejected — the scheduler owns
-                // the failure). Hold; emit nothing.
-                NodeApprovalStatus::Pending(_) | NodeApprovalStatus::Rejected { .. } => {
-                    DispatchGuardOutcome::Held { gated }
-                }
-
-                // Completing a batch nobody approved: refuse, append nothing.
-                NodeApprovalStatus::NotRequested if !fire => DispatchGuardOutcome::Held { gated },
-
-                NodeApprovalStatus::NotRequested => {
-                    // KNOWN LIMIT: reading `NotRequested` and then appending the
-                    // request is a read-modify-write with no compare-and-set,
-                    // the same shape as `record_policy_violation` below — but
-                    // NOT the same consequence, so do not carry that note's
-                    // "cosmetic" reading over to here.
-                    //
-                    // Under a lease exactly one worker holds a work item, so the
-                    // worker path is safe. On the HTTP claim route, two
-                    // concurrent claims for the same node can each read
-                    // `NotRequested` from their own snapshot and each append a
-                    // `ToolApprovalRequired`. The damage is a DUPLICATE
-                    // OUTSTANDING APPROVAL REQUEST, not a colliding sequence
-                    // number: `node_approval_status` resets to `Pending` on every
-                    // new request, so a human's settled decision would refer to a
-                    // request that has already been superseded and could never
-                    // stick. That is precisely the invariant
-                    // `an_already_pending_node_is_held_without_a_duplicate_request`
-                    // exists to protect, and today it holds only because a lease
-                    // keeps the writer single.
-                    //
-                    // The backend trait offers no conditional/CAS append, so this
-                    // cannot be closed here — it needs a primitive that makes
-                    // "append iff no open request for this node" atomic, and the
-                    // route path must supply it. Fail-closed is preserved either
-                    // way: both racers return `Held`, so nothing runs unapproved.
-                    info!(execution_id = %execution_id, node_id, %approver, "Node requires approval");
-                    // `gated` carries tool NAMES only: two calls to the same
-                    // gated tool render as ["send_wire", "send_wire"] with no
-                    // discriminator. `calls` is what identifies them.
-                    let context = serde_json::json!({
-                        "node_id": node_id,
-                        "gated_tools": gated,
-                        "calls": calls_json,
-                        "calls_hash": current_hash,
-                    });
-                    let seq = match backend.latest_sequence(execution_id).await {
-                        Ok(s) => s + 1,
-                        Err(e) => {
-                            return DispatchGuardOutcome::Unavailable {
-                                reason: format!("approval required but could not be recorded: {e}"),
-                            }
-                        }
+                    return DispatchGuardOutcome::Blocked {
+                        reason: APPROVAL_MISMATCH.to_string(),
                     };
-                    if let Err(e) = backend
-                        .append_event(Event::new(
-                            execution_id.clone(),
-                            seq,
-                            EventKind::ToolApprovalRequired {
-                                node_id: node_id.to_string(),
-                                tool_name: gated.join(", "),
-                                approver,
-                                context,
-                            },
-                        ))
-                        .await
-                    {
-                        // Fail closed: an unrecorded request is an invisible hold.
-                        return DispatchGuardOutcome::Unavailable {
-                            reason: format!("approval required but could not be recorded: {e}"),
-                        };
-                    }
-                    DispatchGuardOutcome::Held { gated }
                 }
             }
+
+            // The full binding, from the shared basis: run, occurrence step,
+            // node definition and the bound calls. The calls alone used to be
+            // the whole binding, so a dispatch node that completed and was
+            // dispatched again with the same calls (a loop, a re-enqueue) fired
+            // on the first approval, and an approval survived a change to the
+            // node's definition.
+            let definition = match crate::node_guard::node_definition(node_def) {
+                Ok(d) => d,
+                Err(reason) => return DispatchGuardOutcome::Unavailable { reason },
+            };
+            let bound = serde_json::json!({ "calls": calls_json });
+            let basis = match jamjet_state::approvals::action_basis(
+                backend,
+                execution_id,
+                node_id,
+                &definition,
+                &bound,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    return DispatchGuardOutcome::Unavailable {
+                        reason: format!(
+                            "approval binding unavailable; refusing to run unapproved: {e}"
+                        ),
+                    }
+                }
+            };
+            let current_digest = basis.digest(node_id);
+
+            if jamjet_state::approvals::approval_covers(&status, &current_digest) {
+                info!(execution_id = %execution_id, node_id, "Approval satisfied — proceeding");
+                return DispatchGuardOutcome::Allow;
+            }
+
+            // Completing a batch nobody approved for this occurrence: refuse,
+            // append nothing.
+            if !fire {
+                return DispatchGuardOutcome::Held { gated };
+            }
+
+            if matches!(status, NodeApprovalStatus::Approved { .. }) {
+                // The calls match, but the approval is for another occurrence
+                // or definition, or is a legacy one bound to the calls alone.
+                // Not a denial: ask again for this exact action.
+                warn!(
+                    execution_id = %execution_id,
+                    node_id,
+                    current_digest = %current_digest,
+                    "approval does not cover this dispatch (a later occurrence, another \
+                     definition, or a legacy approval) — requesting a fresh approval"
+                );
+            } else {
+                info!(execution_id = %execution_id, node_id, %approver, "Node requires approval");
+            }
+
+            // KNOWN LIMIT: reading the status and then appending the request is
+            // a read-modify-write with no compare-and-set, the same shape as
+            // `record_policy_violation` below — but NOT the same consequence,
+            // so do not carry that note's "cosmetic" reading over to here.
+            //
+            // Under a lease exactly one worker holds a work item, so the worker
+            // path is safe. On the HTTP claim route, two concurrent claims for
+            // the same node can each read `NotRequested` from their own
+            // snapshot and each append a `ToolApprovalRequired`. The damage is
+            // a DUPLICATE OUTSTANDING APPROVAL REQUEST, not a colliding
+            // sequence number: `node_approval_status` resets to `Pending` on
+            // every new request, so a human's settled decision would refer to
+            // a request that has already been superseded and could never
+            // stick. That is precisely the invariant
+            // `an_already_pending_node_is_held_without_a_duplicate_request`
+            // exists to protect, and today it holds only because a lease keeps
+            // the writer single.
+            //
+            // The backend trait offers no conditional/CAS append, so this
+            // cannot be closed here — it needs a primitive that makes "append
+            // iff no open request for this node" atomic, and the route path
+            // must supply it. Fail-closed is preserved either way: both racers
+            // return `Held`, so nothing runs unapproved.
+            //
+            // `gated` carries tool NAMES only: two calls to the same gated tool
+            // render as ["send_wire", "send_wire"] with no discriminator.
+            // `calls` is what identifies them.
+            let context = serde_json::json!({
+                "node_id": node_id,
+                "gated_tools": gated,
+                "calls": calls_json,
+                "calls_hash": current_hash,
+                jamjet_state::approvals::ACTION_DIGEST_KEY: current_digest,
+                jamjet_state::approvals::ACTION_DEFINITION_KEY: definition,
+                jamjet_state::approvals::ACTION_STEP_KEY: basis.step,
+                jamjet_state::approvals::ACTION_BASIS_KEY:
+                    crate::node_guard::basis_preview(&basis.payload, basis.step, node_def),
+            });
+            let seq = match backend.latest_sequence(execution_id).await {
+                Ok(s) => s + 1,
+                Err(e) => {
+                    return DispatchGuardOutcome::Unavailable {
+                        reason: format!("approval required but could not be recorded: {e}"),
+                    }
+                }
+            };
+            if let Err(e) = backend
+                .append_event(Event::new(
+                    execution_id.clone(),
+                    seq,
+                    EventKind::ToolApprovalRequired {
+                        node_id: node_id.to_string(),
+                        tool_name: gated.join(", "),
+                        approver,
+                        context,
+                    },
+                ))
+                .await
+            {
+                // Fail closed: an unrecorded request is an invisible hold.
+                return DispatchGuardOutcome::Unavailable {
+                    reason: format!("approval required but could not be recorded: {e}"),
+                };
+            }
+            DispatchGuardOutcome::Held { gated }
         }
     }
 }
@@ -687,6 +743,26 @@ mod tests {
                 "n1",
                 "default",
                 ir,
+                node_def,
+                input,
+            )
+            .await
+        }
+
+        /// The same decision in `GuardMode::Complete`: may a result be recorded?
+        async fn guard_complete(
+            &self,
+            ir: &WorkflowIr,
+            input: &serde_json::Value,
+        ) -> DispatchGuardOutcome {
+            let node_def = ir.node("n1").expect("node n1 must exist");
+            guard_dispatch_in(
+                self.backend.as_ref(),
+                GuardMode::Complete,
+                &self.execution_id,
+                "n1",
+                "default",
+                ir.policy.as_ref(),
                 node_def,
                 input,
             )
@@ -1176,29 +1252,6 @@ mod tests {
         );
     }
 
-    /// The dual of the binding check: an approval DOES release the exact call
-    /// set it authorised. Without this, blocking always would satisfy the check.
-    #[tokio::test]
-    async fn an_approval_releases_the_call_set_it_authorised() {
-        let f = Fixture::new();
-        let hash = content_hash(&calls_json_for(&["send_wire"]));
-        f.seed(vec![
-            request_for(&["send_wire"], Some(hash)),
-            approved("n1"),
-        ])
-        .await;
-        let outcome = f
-            .guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"]))
-            .await;
-        assert_eq!(outcome, DispatchGuardOutcome::Allow);
-        assert_eq!(
-            f.requests().await.len(),
-            1,
-            "an approved node is not re-requested"
-        );
-        assert!(f.violations().await.is_empty());
-    }
-
     /// An approval authorises a specific set of calls, not the node forever.
     #[tokio::test]
     async fn an_approval_does_not_authorise_a_different_call_set() {
@@ -1260,6 +1313,197 @@ mod tests {
             }
         );
         assert_eq!(f.violations().await.len(), 1);
+    }
+
+    // ── Dispatch approvals bind run, occurrence and definition ──────────────
+    //
+    // A dispatch approval used to bind only `calls_hash` (names and arguments).
+    // A re-enqueued or looped dispatch node with the same calls fired again on
+    // the old approval, and an approval survived a change to the node's
+    // definition. The request now also carries the shared `action_digest`
+    // (run, occurrence step, definition, and the calls), and only an approval
+    // of that digest releases the batch.
+
+    /// An approval as the approve route records it: bound to `digest`.
+    fn approved_digest(node_id: &str, digest: &str) -> EventKind {
+        serde_json::from_value(json!({
+            "type": "approval_received",
+            "node_id": node_id,
+            "user_id": "approver",
+            "decision": "approved",
+            "comment": null,
+            "state_patch": null,
+            "approved_digest": digest,
+        }))
+        .unwrap()
+    }
+
+    fn completed(node_id: &str) -> EventKind {
+        serde_json::from_value(json!({
+            "type": "node_completed",
+            "node_id": node_id,
+            "output": {},
+            "state_patch": {},
+            "duration_ms": 0,
+        }))
+        .unwrap()
+    }
+
+    /// Hold once, then approve exactly the recorded request. Returns its digest.
+    async fn hold_and_approve(f: &Fixture, ir: &WorkflowIr, input: &serde_json::Value) -> String {
+        assert!(matches!(
+            f.guard(ir, input).await,
+            DispatchGuardOutcome::Held { .. }
+        ));
+        let digest = f.requests().await.last().unwrap().2["action_digest"]
+            .as_str()
+            .expect("a dispatch request carries an action_digest")
+            .to_string();
+        f.seed(vec![approved_digest("n1", &digest)]).await;
+        digest
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_request_records_the_full_binding() {
+        let f = Fixture::new();
+        f.guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"]))
+            .await;
+        let (_, _, ctx) = f.requests().await.pop().unwrap();
+        assert!(ctx["calls_hash"].is_string(), "{ctx}");
+        assert!(ctx["action_digest"].is_string(), "{ctx}");
+        assert!(ctx["action_definition"].is_string(), "{ctx}");
+        assert_eq!(ctx["action_step"], 0, "{ctx}");
+        assert_eq!(
+            ctx["action_basis"]["payload"]["calls"],
+            calls_json_for(&["send_wire"]),
+            "{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approval_of_the_bound_dispatch_releases_it() {
+        let f = Fixture::new();
+        let ir = ir(&[], &["send_wire"]);
+        hold_and_approve(&f, &ir, &input_for(&["send_wire"])).await;
+        assert_eq!(
+            f.guard(&ir, &input_for(&["send_wire"])).await,
+            DispatchGuardOutcome::Allow
+        );
+        assert_eq!(f.requests().await.len(), 1);
+    }
+
+    /// The node completed and is dispatched again with the same calls (a loop,
+    /// or any re-enqueue). The first occurrence's approval must not replay.
+    #[tokio::test]
+    async fn an_approval_of_an_earlier_occurrence_does_not_release_a_later_one() {
+        let f = Fixture::new();
+        let ir = ir(&[], &["send_wire"]);
+        hold_and_approve(&f, &ir, &input_for(&["send_wire"])).await;
+        f.seed(vec![completed("n1")]).await;
+
+        let outcome = f.guard(&ir, &input_for(&["send_wire"])).await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        let requests = f.requests().await;
+        assert_eq!(requests.len(), 2, "the later occurrence asks again");
+        assert_eq!(requests[1].2["action_step"], 1);
+    }
+
+    /// Same run, occurrence and calls, but the node is not the one reviewed.
+    #[tokio::test]
+    async fn an_approval_of_another_definition_does_not_release() {
+        let f = Fixture::new();
+        hold_and_approve(&f, &ir(&[], &["send_wire"]), &input_for(&["send_wire"])).await;
+        let mut other = ir(&[], &["send_wire"]);
+        other.nodes.get_mut("n1").unwrap().description = Some("not what was reviewed".into());
+
+        let outcome = f.guard(&other, &input_for(&["send_wire"])).await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(f.requests().await.len(), 2);
+    }
+
+    /// The reviewer's case: a dispatch node approved for these calls completed,
+    /// and an item for it with the same calls arrives again. Binding only the
+    /// calls let it fire a second time on the first approval.
+    #[tokio::test]
+    async fn a_completed_dispatch_does_not_fire_again_on_its_approval() {
+        let f = Fixture::new();
+        let hash = content_hash(&calls_json_for(&["send_wire"]));
+        f.seed(vec![
+            request_for(&["send_wire"], Some(hash)),
+            approved("n1"),
+            completed("n1"),
+        ])
+        .await;
+        let outcome = f
+            .guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"]))
+            .await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// A result for a gated batch is recorded only under an approval that
+    /// covers this exact dispatch, and checking writes nothing.
+    #[tokio::test]
+    async fn a_dispatch_result_is_recorded_only_under_a_covering_approval() {
+        let f = Fixture::new();
+        let ir = ir(&[], &["send_wire"]);
+        let input = input_for(&["send_wire"]);
+
+        // Never requested: refused, nothing appended.
+        assert!(matches!(
+            f.guard_complete(&ir, &input).await,
+            DispatchGuardOutcome::Held { .. }
+        ));
+        assert!(f.events().await.is_empty());
+
+        // Approved for this occurrence: recorded.
+        hold_and_approve(&f, &ir, &input).await;
+        assert_eq!(
+            f.guard_complete(&ir, &input).await,
+            DispatchGuardOutcome::Allow
+        );
+
+        // A later occurrence under the same approval: refused, still no write.
+        f.seed(vec![completed("n1")]).await;
+        let before = f.events().await.len();
+        assert!(matches!(
+            f.guard_complete(&ir, &input).await,
+            DispatchGuardOutcome::Held { .. }
+        ));
+        assert_eq!(f.events().await.len(), before);
+    }
+
+    /// A request recorded before the full binding (calls_hash only), approved
+    /// with no digest, authorises nothing by itself: the node asks again.
+    #[tokio::test]
+    async fn a_legacy_dispatch_approval_asks_again() {
+        let f = Fixture::new();
+        let hash = content_hash(&calls_json_for(&["send_wire"]));
+        f.seed(vec![
+            request_for(&["send_wire"], Some(hash)),
+            approved("n1"),
+        ])
+        .await;
+        let outcome = f
+            .guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"]))
+            .await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(f.requests().await.len(), 2);
+        assert!(
+            f.violations().await.is_empty(),
+            "asking again is not a denial"
+        );
     }
 
     // ── Narrowness ────────────────────────────────────────────────────────────

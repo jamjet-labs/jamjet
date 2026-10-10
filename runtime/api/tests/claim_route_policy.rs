@@ -899,44 +899,62 @@ async fn an_item_whose_execution_is_missing_is_not_handed_out() {
 #[tokio::test]
 async fn a_matching_approval_releases_the_payload() {
     let backend = memory();
+    let payload = dispatch_payload(calls_input(&["send_wire"]));
     let (execution_id, _) = seed(
         &backend,
         dispatch_ir(true, &[], &["send_wire"]),
         "python_tool",
-        dispatch_payload(calls_input(&["send_wire"])),
+        payload.clone(),
     )
     .await;
+    // The first claim holds the batch and records the request, bound to the
+    // run, occurrence, definition and calls.
+    assert_withheld(&claim(&make_state(backend.clone()), "python_tool").await);
+    let digest = backend
+        .get_events(&execution_id)
+        .await
+        .unwrap()
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ToolApprovalRequired { context, .. } => {
+                context["action_digest"].as_str().map(String::from)
+            }
+            _ => None,
+        })
+        .expect("the request carries an action_digest");
+    // Approved as the approve route records it, then dispatched again.
     append(
         &backend,
         &execution_id,
-        EventKind::ToolApprovalRequired {
-            node_id: "n1".into(),
-            tool_name: "send_wire".into(),
-            approver: "human".into(),
-            context: json!({
-                "node_id": "n1",
-                "gated_tools": ["send_wire"],
-                "calls": [{"name": "send_wire", "arguments": {}}],
-                "calls_hash": calls_hash_for(&["send_wire"]),
-            }),
-        },
+        serde_json::from_value(json!({
+            "type": "approval_received",
+            "node_id": "n1",
+            "user_id": "risk-officer",
+            "decision": "approved",
+            "comment": null,
+            "state_patch": null,
+            "approved_digest": digest,
+        }))
+        .unwrap(),
     )
     .await;
-    append(
-        &backend,
-        &execution_id,
-        EventKind::ApprovalReceived {
+    backend
+        .enqueue_work_item(WorkItem {
+            id: Uuid::new_v4(),
+            execution_id: execution_id.clone(),
             node_id: "n1".into(),
-            user_id: "risk-officer".into(),
-            decision: ApprovalDecision::Approved,
-            comment: None,
-            state_patch: None,
-            principal: None,
-            approved_digest: None,
-            request_sequence: None,
-        },
-    )
-    .await;
+            queue_type: "python_tool".into(),
+            payload,
+            attempt: 0,
+            max_attempts: 3,
+            created_at: chrono::Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: DEFAULT_TENANT.into(),
+        })
+        .await
+        .unwrap();
 
     let resp = claim(&make_state(backend.clone()), "python_tool").await;
     assert_handed_out(&resp, "n1");

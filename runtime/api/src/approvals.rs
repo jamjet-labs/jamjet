@@ -257,7 +257,8 @@ pub async fn submit_approval(
     };
     let request_digest = request.action_digest().map(str::to_owned);
     // What the request binds: its action digest, or for an agent tool dispatch
-    // its `calls_hash`. A legacy request binds nothing.
+    // its `calls_hash` if it predates dispatch digests. A legacy request binds
+    // nothing.
     let binding = request.binding();
 
     // Outside dev mode an approval must say which request it answers, so it
@@ -284,7 +285,9 @@ pub async fn submit_approval(
     // What an approval authorises: exactly the requested action. If the state
     // has moved since the request, the worker finds a different digest at
     // resume and requests afresh. Requests with no digest (agent tool
-    // dispatch, bound by `calls_hash` instead, or legacy requests) record none.
+    // dispatch requests from before dispatch digests, bound by `calls_hash`
+    // only, and other legacy requests) record none, and authorise nothing by
+    // themselves: the guard asks again for the bound action.
     let approved_digest = match (&submission.decision, request_digest) {
         (ApprovalDecision::Approved, Some(requested)) => Some(requested),
         _ => None,

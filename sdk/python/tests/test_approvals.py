@@ -262,6 +262,35 @@ def test_approvals_shows_the_calls_hash_of_a_dispatch_request() -> None:
     assert "calls: send_wire" in result.output
 
 
+def test_approvals_names_the_calls_a_bound_dispatch_digest_covers() -> None:
+    pending = [
+        {
+            "node_id": "agent",
+            "tool_name": "send_wire",
+            "approver": "human",
+            "context": {
+                "calls_hash": "h-123",
+                "action_digest": DIGEST,
+                "action_basis": {
+                    "payload": {"calls": [{"name": "send_wire", "arguments": {}}]},
+                    "payload_truncated": False,
+                    "payload_bytes": 50,
+                    "step": 1,
+                },
+            },
+            "sequence": 5,
+        }
+    ]
+    fake = _approvals_client(pending, [])
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
+    assert result.exit_code == 0, result.output
+    assert f"--action-digest {DIGEST}" in result.output
+    assert "step 1; calls: send_wire" in result.output
+
+
 def test_approvals_says_when_a_request_binds_nothing() -> None:
     pending = [{"node_id": "old", "tool_name": "t", "approver": "human", "context": {}, "sequence": 2}]
     fake = _approvals_client(pending, [])

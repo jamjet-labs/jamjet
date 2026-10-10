@@ -28,6 +28,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     decision must echo the pending request's `action_digest` (or `calls_hash` for an
     agent tool dispatch): missing is 400, stale is 409. The pending listing shows the
     payload and node the digest covers (`action_basis.payload`).
+  - An agent tool dispatch approval binds the run, the occurrence and the node
+    definition as well as the tool calls: its request carries an `action_digest`
+    built by the same function as every other node's. A dispatch node that
+    completed and is dispatched again with the same calls asks again instead of
+    firing on the first approval. A dispatch approval from before this release
+    (bound to `calls_hash` only) authorises nothing by itself; the node asks again.
   - A decision carrying a `state_patch` is refused with 400. The edit never reached
     the executed action, so recording it was a false record.
   - The worker protocol evaluates the same policy and approval rules as the

@@ -2554,7 +2554,11 @@ def _approval_covers(context: dict[str, Any]) -> str:
     if isinstance(basis, dict):
         parts = [f"step {basis.get('step', '?')}"]
         payload = basis.get("payload")
-        if basis.get("payload_truncated"):
+        calls = payload.get("calls") if isinstance(payload, dict) else None
+        if isinstance(calls, list):
+            names = ", ".join(str(c.get("name", "?")) for c in calls if isinstance(c, dict))
+            parts.append(f"calls: {names or '(none)'}")
+        elif basis.get("payload_truncated"):
             parts.append(f"payload {basis.get('payload_bytes', '?')} bytes, too large to show")
         elif isinstance(payload, dict):
             data = payload.get("input", payload.get("state"))

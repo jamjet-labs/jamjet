@@ -77,7 +77,10 @@ Rules the runtime enforces:
   `JAMJET_DEV_MODE`). A missing digest is a 400. A digest that no longer matches
   the pending request is a 409: the request was replaced (the state changed, or
   this is a later visit of the node), so re-read the listing and decide again.
-  For an agent tool dispatch, echo the request's `calls_hash` instead.
+  An agent tool dispatch request carries an `action_digest` too: it binds the
+  run, the occurrence, the node's definition and the tool calls (names and
+  arguments). A dispatch request recorded before this release carries only a
+  `calls_hash`; echo that, and the node asks again for a bound approval.
 - **If the node's input changes after you approve**, the node does not run on
   your approval. The engine builds each dispatch from the run's state at that
   moment; if the payload is not the one you approved, it asks again with a

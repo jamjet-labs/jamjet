@@ -28,9 +28,10 @@ impl PendingApproval {
         self.context.get(ACTION_DIGEST_KEY).and_then(|d| d.as_str())
     }
 
-    /// What this request binds, for a decider to echo: the `action_digest`,
-    /// or for an agent tool dispatch request the `calls_hash` its guard
-    /// checks. `None` for a legacy request that binds nothing.
+    /// What this request binds, for a decider to echo: the `action_digest`
+    /// (every request made since dispatch requests were bound to it), or for
+    /// an older agent tool dispatch request the `calls_hash` it carried.
+    /// `None` for a legacy request that binds nothing.
     pub fn binding(&self) -> Option<&str> {
         self.action_digest()
             .or_else(|| self.context.get(CALLS_HASH_KEY).and_then(|d| d.as_str()))

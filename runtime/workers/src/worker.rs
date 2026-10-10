@@ -3509,15 +3509,8 @@ mod tests {
     ///
     /// `seed` events are appended before the item is claimed, which is how a test
     /// stages an already-settled approval for the node.
-    async fn run_dispatch_node_seeded(
-        ir: serde_json::Value,
-        input: serde_json::Value,
-        seed: Vec<EventKind>,
-    ) -> (
-        Result<(), Box<dyn std::error::Error + Send + Sync>>,
-        Vec<jamjet_state::Event>,
-        usize,
-    ) {
+    /// A run of the dispatch workflow `ir`, with nothing dispatched yet.
+    async fn dispatch_setup(ir: serde_json::Value) -> (Arc<InMemoryBackend>, ExecutionId) {
         let backend = Arc::new(InMemoryBackend::new());
         let eid = ExecutionId::new();
         let now = Utc::now();
@@ -3548,13 +3541,16 @@ mod tests {
             })
             .await
             .unwrap();
-        for kind in seed {
-            // InMemoryBackend assigns the sequence itself, so 0 is a placeholder.
-            backend
-                .append_event(jamjet_state::Event::new(eid.clone(), 0, kind))
-                .await
-                .unwrap();
-        }
+        (backend, eid)
+    }
+
+    /// Enqueue, claim and run one item for the dispatch node `n1`. Returns the
+    /// worker's result and how many times the executor ran.
+    async fn dispatch_run_once(
+        backend: &Arc<InMemoryBackend>,
+        eid: &ExecutionId,
+        input: serde_json::Value,
+    ) -> (Result<(), Box<dyn std::error::Error + Send + Sync>>, usize) {
         backend
             .enqueue_work_item(WorkItem {
                 id: Uuid::new_v4(),
@@ -3568,7 +3564,7 @@ mod tests {
                 }),
                 attempt: 0,
                 max_attempts: 1,
-                created_at: now,
+                created_at: Utc::now(),
                 lease_expires_at: None,
                 worker_id: None,
                 tenant_id: "default".into(),
@@ -3593,8 +3589,28 @@ mod tests {
             .unwrap()
             .expect("item must be claimable");
         let result = worker.execute_item(item).await;
+        (result, counter.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    async fn run_dispatch_node_seeded(
+        ir: serde_json::Value,
+        input: serde_json::Value,
+        seed: Vec<EventKind>,
+    ) -> (
+        Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        Vec<jamjet_state::Event>,
+        usize,
+    ) {
+        let (backend, eid) = dispatch_setup(ir).await;
+        for kind in seed {
+            // InMemoryBackend assigns the sequence itself, so 0 is a placeholder.
+            backend
+                .append_event(jamjet_state::Event::new(eid.clone(), 0, kind))
+                .await
+                .unwrap();
+        }
+        let (result, count) = dispatch_run_once(&backend, &eid, input).await;
         let events = backend.get_events(&eid).await.unwrap();
-        let count = counter.load(std::sync::atomic::Ordering::SeqCst);
         (result, events, count)
     }
 
@@ -4274,37 +4290,43 @@ mod tests {
 
     /// The dual: the approval DOES release the exact call set it authorised.
     /// Without this, the binding check could be satisfied by blocking always.
+    /// The approval is the one the approve route records: bound to the
+    /// request's `action_digest` (run, occurrence, definition, calls).
     #[tokio::test]
     async fn approval_releases_the_call_set_it_authorised() {
-        let approved_hash = content_hash(&calls_json_for(&["send_wire"]));
-        let (result, _, count) = run_dispatch_node_seeded(
-            dispatch_ir_json("python_fn", true, &[], &["send_wire"]),
-            serde_json::json!({"tool_calls": [one_call("send_wire")]}),
-            vec![
-                EventKind::ToolApprovalRequired {
-                    node_id: "n1".into(),
-                    tool_name: "send_wire".into(),
-                    approver: "human".into(),
-                    context: serde_json::json!({
-                        "node_id": "n1",
-                        "gated_tools": ["send_wire"],
-                        "calls": calls_json_for(&["send_wire"]),
-                        "calls_hash": approved_hash,
-                    }),
-                },
-                EventKind::ApprovalReceived {
-                    node_id: "n1".into(),
-                    user_id: "approver".into(),
-                    decision: jamjet_state::event::ApprovalDecision::Approved,
-                    comment: None,
-                    state_patch: None,
-                    principal: None,
-                    approved_digest: None,
-                    request_sequence: None,
-                },
-            ],
-        )
-        .await;
+        let (backend, eid) =
+            dispatch_setup(dispatch_ir_json("python_fn", true, &[], &["send_wire"])).await;
+        let input = serde_json::json!({"tool_calls": [one_call("send_wire")]});
+        let (_, count) = dispatch_run_once(&backend, &eid, input.clone()).await;
+        assert_eq!(count, 0, "held for approval first");
+        let digest = backend
+            .get_events(&eid)
+            .await
+            .unwrap()
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ToolApprovalRequired { context, .. } => {
+                    context["action_digest"].as_str().map(String::from)
+                }
+                _ => None,
+            })
+            .expect("the request carries an action_digest");
+        let approval: EventKind = serde_json::from_value(serde_json::json!({
+            "type": "approval_received",
+            "node_id": "n1",
+            "user_id": "approver",
+            "decision": "approved",
+            "comment": null,
+            "state_patch": null,
+            "approved_digest": digest,
+        }))
+        .unwrap();
+        backend
+            .append_event(jamjet_state::Event::new(eid.clone(), 0, approval))
+            .await
+            .unwrap();
+
+        let (result, count) = dispatch_run_once(&backend, &eid, input).await;
         assert!(result.is_ok(), "an approved, matching call set must run");
         assert_eq!(count, 1, "the approved dispatch must execute exactly once");
     }

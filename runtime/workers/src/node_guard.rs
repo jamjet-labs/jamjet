@@ -353,7 +353,7 @@ async fn completion_covered(
 /// The [`definition_hash`] of `node_def` as registered. Serializing a
 /// `NodeDef` does not fail in practice; if it ever did, the decision fails
 /// closed rather than binding an approval to nothing.
-fn node_definition(node_def: &NodeDef) -> Result<String, String> {
+pub(crate) fn node_definition(node_def: &NodeDef) -> Result<String, String> {
     serde_json::to_value(node_def)
         .map(|v| definition_hash(&v))
         .map_err(|e| format!("node definition unreadable; refusing to run unapproved: {e}"))
@@ -363,7 +363,7 @@ fn node_definition(node_def: &NodeDef) -> Result<String, String> {
 /// `input` included (dropped and flagged above [`ACTION_BASIS_STATE_CAP`]
 /// serialized bytes), the occurrence, and a summary of the node definition
 /// (id, kind with its module, function or tool, description and own policy).
-fn basis_preview(payload: &Value, step: u64, node_def: &NodeDef) -> Value {
+pub(crate) fn basis_preview(payload: &Value, step: u64, node_def: &NodeDef) -> Value {
     let payload_bytes = serde_json::to_string(payload).map(|s| s.len()).unwrap_or(0);
     let truncated = payload_bytes > ACTION_BASIS_STATE_CAP;
     serde_json::json!({
