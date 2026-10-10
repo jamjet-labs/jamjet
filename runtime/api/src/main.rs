@@ -207,17 +207,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // In dev mode (or when JAMJET_EMBED_CRON is set), run the cron scheduler in
-    // process so YAML-declared schedules fire. It POSTs to this server's own
-    // /executions endpoint. Production should run a dedicated cron process.
+    // process so YAML-declared schedules fire. It starts runs in-process with
+    // the `system:cron` principal as initiator (it used to POST to this
+    // server's own /executions with no token, a 401 outside dev mode).
+    // Production should run a dedicated cron process.
     if (config.dev_mode || std::env::var("JAMJET_EMBED_CRON").is_ok())
         && storage_backend != "memory"
     {
-        let host = if config.bind == "0.0.0.0" {
-            "127.0.0.1".to_string()
-        } else {
-            config.bind.clone()
-        };
-        let self_url = format!("http://{}:{}", host, config.port);
         let database_url = std::env::var("DATABASE_URL")
             .ok()
             .or_else(|| config.database_url.clone())
@@ -231,9 +227,12 @@ async fn main() -> anyhow::Result<()> {
             });
         match jamjet_state::SqliteBackend::open(&database_url).await {
             Ok(b) => {
-                let cron = jamjet_timers::CronScheduler::new(b.pool(), self_url);
+                let launcher = std::sync::Arc::new(jamjet_api::cron::InProcessCronLauncher::new(
+                    state.clone(),
+                ));
+                let cron = jamjet_timers::CronScheduler::with_launcher(b.pool(), launcher);
                 tokio::spawn(cron.run());
-                info!("Cron scheduler started (dev mode)");
+                info!("Cron scheduler started (in-process launcher)");
             }
             Err(e) => tracing::warn!(error = %e, "cron scheduler: failed to open pool; skipping"),
         }

@@ -102,3 +102,44 @@ pub async fn delete_cron(
     store.delete(&name).await.map_err(ApiError::Internal)?;
     Ok(Json(json!({ "name": name, "deleted": true })))
 }
+
+/// The initiator recorded on runs the embedded cron scheduler starts.
+///
+/// A system principal, not a token: API token principals are `token:<id>`, so
+/// no human token can ever equal it, and separation of duties lets any
+/// reviewer approve a cron run while still having an initiator to check.
+pub const CRON_PRINCIPAL: &str = "system:cron";
+
+/// Starts cron runs inside the server through the same code as
+/// `POST /executions`, with [`CRON_PRINCIPAL`] as initiator.
+///
+/// The embedded scheduler used to POST to the server's own `/executions`
+/// with no token, which outside dev mode is a 401, so `JAMJET_EMBED_CRON`
+/// never started a run on an authenticated server. Cron jobs are global in
+/// this version, so runs start in the default tenant (see `list_cron`).
+pub struct InProcessCronLauncher {
+    state: AppState,
+}
+
+impl InProcessCronLauncher {
+    pub fn new(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait::async_trait]
+impl jamjet_timers::CronLauncher for InProcessCronLauncher {
+    async fn start(&self, job: &CronJob) -> Result<(), String> {
+        crate::routes::start_run(
+            &self.state,
+            &TenantId::default(),
+            job.workflow_id.clone(),
+            Some(job.workflow_version.clone()),
+            job.input.clone(),
+            Some(CRON_PRINCIPAL.to_string()),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+}

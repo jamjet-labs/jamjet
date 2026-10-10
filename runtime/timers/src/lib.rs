@@ -337,65 +337,99 @@ fn row_to_cron(row: &sqlx::sqlite::SqliteRow) -> Result<CronJob, String> {
 
 // ── Cron scheduler ────────────────────────────────────────────────────────────
 
-/// Runs due cron jobs by POSTing to the JamJet runtime API.
+/// Starts the workflow run for a due cron job.
+///
+/// The scheduler decides WHEN; a launcher decides HOW a run starts. The
+/// embedded scheduler uses an in-process launcher (the API crate's), which
+/// starts runs with a system principal as initiator; [`HttpCronLauncher`] is
+/// the original transport, for a cron process outside the server.
+#[async_trait::async_trait]
+pub trait CronLauncher: Send + Sync {
+    async fn start(&self, job: &CronJob) -> Result<(), String>;
+}
+
+/// Starts runs by POSTing to a JamJet runtime's `/executions`, with no token.
+/// Outside dev mode that route requires a Bearer token, so this launcher only
+/// works against a dev-mode server.
+pub struct HttpCronLauncher {
+    client: reqwest::Client,
+    api_url: String,
+}
+
+impl HttpCronLauncher {
+    pub fn new(api_url: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_url: api_url.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CronLauncher for HttpCronLauncher {
+    async fn start(&self, job: &CronJob) -> Result<(), String> {
+        let body = serde_json::json!({
+            "workflow_id": job.workflow_id,
+            "workflow_version": job.workflow_version,
+            "input": job.input,
+        });
+        let r = self
+            .client
+            .post(format!("{}/executions", self.api_url))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("cron API error: {e}"))?;
+        if r.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("cron workflow start failed: {}", r.status()))
+        }
+    }
+}
+
+/// Runs due cron jobs through a [`CronLauncher`].
 pub struct CronScheduler {
     store: CronStore,
-    /// Base URL of the JamJet API (e.g. `http://localhost:7700`).
-    api_url: String,
+    launcher: std::sync::Arc<dyn CronLauncher>,
     poll_interval: Duration,
 }
 
 impl CronScheduler {
+    /// A scheduler that starts runs over HTTP at `api_url` (see
+    /// [`HttpCronLauncher`] for its auth limit).
     pub fn new(pool: SqlitePool, api_url: impl Into<String>) -> Self {
+        Self::with_launcher(pool, std::sync::Arc::new(HttpCronLauncher::new(api_url)))
+    }
+
+    /// A scheduler that starts runs through `launcher`.
+    pub fn with_launcher(pool: SqlitePool, launcher: std::sync::Arc<dyn CronLauncher>) -> Self {
         Self {
             store: CronStore::new(pool),
-            api_url: api_url.into(),
+            launcher,
             poll_interval: Duration::from_secs(10),
         }
     }
 
     pub async fn run(self) {
-        info!(api = %self.api_url, "CronScheduler started");
-        let client = reqwest::Client::new();
+        info!("CronScheduler started");
         loop {
-            if let Err(e) = self.tick(&client).await {
+            if let Err(e) = self.tick().await {
                 warn!(error = %e, "CronScheduler tick error");
             }
             tokio::time::sleep(self.poll_interval).await;
         }
     }
 
-    async fn tick(&self, client: &reqwest::Client) -> Result<(), String> {
+    /// Start every due job once and advance its schedule.
+    pub async fn tick(&self) -> Result<(), String> {
         let due = self.store.list_due().await?;
         for job in due {
             info!(cron_job = %job.name, workflow = %job.workflow_id, "Cron job firing");
 
-            // POST /executions to start the workflow.
-            let body = serde_json::json!({
-                "workflow_id": job.workflow_id,
-                "workflow_version": job.workflow_version,
-                "input": job.input,
-            });
-
-            match client
-                .post(format!("{}/executions", self.api_url))
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(r) if r.status().is_success() => {
-                    info!(cron_job = %job.name, "Cron workflow started");
-                }
-                Ok(r) => {
-                    warn!(
-                        cron_job = %job.name,
-                        status = %r.status(),
-                        "Cron workflow start failed"
-                    );
-                }
-                Err(e) => {
-                    warn!(cron_job = %job.name, error = %e, "Cron API error");
-                }
+            match self.launcher.start(&job).await {
+                Ok(()) => info!(cron_job = %job.name, "Cron workflow started"),
+                Err(e) => warn!(cron_job = %job.name, error = %e, "Cron workflow start failed"),
             }
 
             // Compute next_run_at.

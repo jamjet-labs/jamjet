@@ -277,14 +277,42 @@ async fn start_execution(
     token: Option<Extension<jamjet_state::ApiToken>>,
     Json(body): Json<StartExecutionRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let backend = state.backend_for(&tenant_id);
-    let version = body.workflow_version.unwrap_or_else(|| "1.0.0".into());
+    // Who started the run, for separation of duties at approval time. Only the
+    // authenticated token counts; dev mode has none.
+    let initiated_by = token
+        .as_ref()
+        .map(|Extension(t)| crate::auth::principal_of(t));
+    start_run(
+        &state,
+        &tenant_id,
+        body.workflow_id,
+        body.workflow_version,
+        body.input,
+        initiated_by,
+    )
+    .await
+}
+
+/// Start one run of `workflow_id`: the execution record, `WorkflowStarted`
+/// (with `initiated_by`) and the start node's work item. Shared by
+/// `POST /executions` and the in-process cron launcher, so a cron run is
+/// started exactly like an API one, with a system principal as its initiator.
+pub async fn start_run(
+    state: &AppState,
+    tenant_id: &TenantId,
+    workflow_id: String,
+    workflow_version: Option<String>,
+    input: Value,
+    initiated_by: Option<String>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let backend = state.backend_for(tenant_id);
+    let version = workflow_version.unwrap_or_else(|| "1.0.0".into());
 
     // Verify the workflow definition exists (within this tenant).
     let def = backend
-        .get_workflow(&body.workflow_id, &version)
+        .get_workflow(&workflow_id, &version)
         .await?
-        .ok_or_else(|| ApiError::NotFound(format!("workflow {} v{}", body.workflow_id, version)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("workflow {} v{}", workflow_id, version)))?;
 
     // Determine the start node from the IR.
     let start_node = def
@@ -295,10 +323,9 @@ async fn start_execution(
         .to_string();
 
     let now = Utc::now();
-    let input = body.input;
     let execution = WorkflowExecution {
         execution_id: ExecutionId::new(),
-        workflow_id: body.workflow_id.clone(),
+        workflow_id: workflow_id.clone(),
         workflow_version: version.clone(),
         status: WorkflowStatus::Running,
         initial_input: input.clone(),
@@ -318,14 +345,10 @@ async fn start_execution(
         execution_id.clone(),
         1,
         jamjet_state::EventKind::WorkflowStarted {
-            workflow_id: body.workflow_id.clone(),
+            workflow_id: workflow_id.clone(),
             workflow_version: version.clone(),
             initial_input: input.clone(),
-            // Who started the run, for separation of duties at approval
-            // time. Only the authenticated token counts; dev mode has none.
-            initiated_by: token
-                .as_ref()
-                .map(|Extension(t)| crate::auth::principal_of(t)),
+            initiated_by,
         },
     );
     backend.append_event(event).await?;
@@ -337,13 +360,13 @@ async fn start_execution(
     let ir: jamjet_ir::WorkflowIr = serde_json::from_value(def.ir.clone()).map_err(|e| {
         ApiError::Internal(format!(
             "stored IR for workflow {} v{} is not loadable: {e}",
-            body.workflow_id, version
+            workflow_id, version
         ))
     })?;
     let start_def = ir.nodes.get(&start_node).ok_or_else(|| {
         ApiError::BadRequest(format!(
             "workflow {} v{} names start node '{}' which does not exist",
-            body.workflow_id, version, start_node
+            workflow_id, version, start_node
         ))
     })?;
     let queue_type = serde_json::to_value(start_def.kind.queue_type())
@@ -356,7 +379,7 @@ async fn start_execution(
         &start_node,
         start_def,
         &initial_state,
-        &body.workflow_id,
+        &workflow_id,
         &version,
     );
     let max_attempts = jamjet_scheduler::max_attempts_for(start_def.retry_policy.as_deref());
