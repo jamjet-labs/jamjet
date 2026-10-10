@@ -110,6 +110,18 @@ impl InMemoryBackend {
 }
 
 impl InMemoryBackend {
+    /// Append `event` to its execution's log, assigning its sequence WHILE
+    /// holding the log's lock. Taking the sequence first let a plain append
+    /// reserve N, a conditional append land N+1 ahead of it, and N be pushed
+    /// after, out of order and unseen by the condition that admitted N+1.
+    fn push_event(&self, mut event: Event) -> EventSequence {
+        let mut log = self.events.entry(event.execution_id.clone()).or_default();
+        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        event.sequence = seq;
+        log.push(event);
+        seq
+    }
+
     /// The rows that start a run (see `StateBackend::start_execution_atomic`).
     /// The in-memory backend has no transactions, so the order is what makes
     /// the step atomic to its readers. The scheduler finds runs through the
@@ -231,7 +243,7 @@ impl StateBackend for InMemoryBackend {
 
     async fn finish_execution(
         &self,
-        mut event: Event,
+        event: Event,
         status: WorkflowStatus,
     ) -> BackendResult<crate::backend::ExecutionFinish> {
         use crate::backend::ExecutionFinish;
@@ -251,12 +263,7 @@ impl StateBackend for InMemoryBackend {
         }
         entry.status = status;
         entry.updated_at = Utc::now();
-        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
-        event.sequence = seq;
-        self.events
-            .entry(event.execution_id.clone())
-            .or_default()
-            .push(event);
+        let seq = self.push_event(event);
         drop(entry);
         Ok(ExecutionFinish::Finished(seq))
     }
@@ -355,14 +362,8 @@ impl StateBackend for InMemoryBackend {
 
     // ── Event log ────────────────────────────────────────────────────
 
-    async fn append_event(&self, mut event: Event) -> BackendResult<EventSequence> {
-        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
-        event.sequence = seq;
-        self.events
-            .entry(event.execution_id.clone())
-            .or_default()
-            .push(event);
-        Ok(seq)
+    async fn append_event(&self, event: Event) -> BackendResult<EventSequence> {
+        Ok(self.push_event(event))
     }
 
     async fn get_events(&self, execution_id: &ExecutionId) -> BackendResult<Vec<Event>> {
@@ -793,7 +794,6 @@ impl StateBackend for InMemoryBackend {
             _ => return Err(StateBackendError::FenceLost(item_id.to_string())),
         }
         self.work_items.remove(&item_id);
-        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
         let eid = terminal_event.execution_id.clone();
 
         // Extract idempotency info BEFORE moving terminal_event into the event vec.
@@ -827,9 +827,7 @@ impl StateBackend for InMemoryBackend {
             None
         };
 
-        let mut ev = terminal_event;
-        ev.sequence = seq;
-        self.events.entry(eid.clone()).or_default().push(ev);
+        let seq = self.push_event(terminal_event);
 
         // Record the idempotency effect if one was extracted above.
         if let Some((key, result_json)) = idem_effect {

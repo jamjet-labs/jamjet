@@ -217,3 +217,45 @@ async fn execution_tenant_is_the_rows_tenant_and_is_scoped() {
         None
     );
 }
+
+/// Review M-5: on the in-memory backend an event's position in its log and
+/// its sequence agree under concurrent appends. The sequence used to be taken
+/// before the log's lock, so two appends could push out of order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn memory_log_order_matches_sequence_order_under_concurrency() {
+    let b = Arc::new(InMemoryBackend::new());
+    let id = ExecutionId::new();
+    b.create_execution(exec(&id)).await.unwrap();
+    let mut tasks = Vec::new();
+    for t in 0..8 {
+        let b = b.clone();
+        let id = id.clone();
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..2000 {
+                if t % 2 == 0 {
+                    b.append_event(Event::new(id.clone(), 0, request()))
+                        .await
+                        .unwrap();
+                } else {
+                    let always = |_: &[Event]| true;
+                    b.append_event_if(Event::new(id.clone(), 0, request()), &always)
+                        .await
+                        .unwrap();
+                }
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let log = b.get_events(&id).await.unwrap();
+    assert_eq!(log.len(), 16_000);
+    let out_of_order = log
+        .windows(2)
+        .filter(|w| w[0].sequence >= w[1].sequence)
+        .count();
+    assert_eq!(
+        out_of_order, 0,
+        "{out_of_order} adjacent pairs out of sequence order"
+    );
+}
