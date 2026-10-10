@@ -31,6 +31,9 @@ pub struct ApprovalSubmission {
     /// must equal the pending request's digest, or the decision is refused as
     /// stale (the request it was made against has been superseded).
     pub action_digest: Option<String>,
+    /// The transport runs without authentication (dev mode). Outside it, an
+    /// `Approved` decision must echo the request's binding.
+    pub dev_mode: bool,
 }
 
 /// Install-wide approval rules, read once at startup into `AppState`.
@@ -68,6 +71,9 @@ pub enum SubmitError {
     SelfApproval,
     /// The echoed `action_digest` is not the pending request's digest.
     StaleDigest,
+    /// Outside dev mode, an `Approved` decision on a request that binds an
+    /// action did not echo the binding it was made against.
+    DigestRequired,
     /// A decision carried a `state_patch`. Approval edits are not supported:
     /// the executor builds node payloads from the scheduler's own state, which
     /// never applies an approval's patch, so recording "approved as edited"
@@ -100,6 +106,12 @@ impl std::fmt::Display for SubmitError {
             Self::StaleDigest => write!(
                 f,
                 "action_digest does not match the pending request; re-read the pending approval and decide again"
+            ),
+            Self::DigestRequired => write!(
+                f,
+                "action_digest is required to approve: echo the action_digest (or, for an \
+                 agent tool dispatch, the calls_hash) from the context of the pending \
+                 approval you reviewed, as listed by GET /executions/{{id}}/approvals"
             ),
             Self::EditsUnsupported => write!(
                 f,
@@ -203,11 +215,27 @@ pub async fn submit_approval(
         return Err(SubmitError::NodeNotPending(node_id));
     };
     let request_digest = request.action_digest().map(str::to_owned);
+    // What the request binds: its action digest, or for an agent tool dispatch
+    // its `calls_hash`. A legacy request binds nothing.
+    let binding = request.binding();
 
-    // A decider that echoes the digest it was shown is refused if the request
-    // has since been superseded. A request without a digest can never match.
+    // Outside dev mode an approval must say which request it answers, so it
+    // can never land on a request that replaced the one the reviewer saw.
+    // Rejections need no echo: refusing to act is never the risk. A legacy
+    // request binds nothing, so there is nothing to echo; approving it
+    // authorises nothing by itself (the worker asks again with a digest).
+    if !submission.dev_mode
+        && matches!(submission.decision, ApprovalDecision::Approved)
+        && binding.is_some()
+        && submission.action_digest.is_none()
+    {
+        return Err(SubmitError::DigestRequired);
+    }
+
+    // A decider that echoes the binding it was shown is refused if the request
+    // has since been superseded. A request without a binding can never match.
     if let Some(echoed) = submission.action_digest.as_deref() {
-        if request_digest.as_deref() != Some(echoed) {
+        if binding != Some(echoed) {
             return Err(SubmitError::StaleDigest);
         }
     }

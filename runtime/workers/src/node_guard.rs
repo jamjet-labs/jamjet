@@ -20,8 +20,9 @@ use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::workflow::{NodeDef, PolicySetIr};
 use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
 use jamjet_state::approvals::{
-    answered_request, approval_covers, definition_hash, derive_action_digest, node_approval_status,
-    NodeApprovalStatus, ACTION_DEFINITION_KEY, ACTION_DIGEST_KEY, ACTION_STEP_KEY,
+    action_basis, answered_request, approval_covers, definition_hash, derive_action_digest,
+    node_approval_status, NodeApprovalStatus, ACTION_BASIS_KEY, ACTION_BASIS_STATE_CAP,
+    ACTION_DEFINITION_KEY, ACTION_DIGEST_KEY, ACTION_STEP_KEY,
 };
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::EventKind;
@@ -212,26 +213,19 @@ pub async fn require_approval(
     }
 
     // Approved or NotRequested: what would this item do right now?
-    let step = match backend.count_node_completions(execution_id, node_id).await {
-        Ok(s) => s,
-        Err(e) => {
-            return GuardOutcome::Unavailable {
-                reason: format!("approval binding unavailable; refusing to run unapproved: {e}"),
-            }
-        }
-    };
     let definition = match node_definition(node_def) {
         Ok(d) => d,
         Err(reason) => return GuardOutcome::Unavailable { reason },
     };
-    let current = match derive_action_digest(backend, execution_id, node_id, &definition).await {
-        Ok(d) => d,
+    let basis = match action_basis(backend, execution_id, node_id, &definition).await {
+        Ok(b) => b,
         Err(e) => {
             return GuardOutcome::Unavailable {
                 reason: format!("approval binding unavailable; refusing to run unapproved: {e}"),
             }
         }
     };
+    let current = basis.digest(node_id);
 
     if approval_covers(&status, &current) {
         info!(execution_id = %execution_id, node_id, "Approval satisfied — proceeding");
@@ -262,7 +256,13 @@ pub async fn require_approval(
         obj.insert(ACTION_DIGEST_KEY.to_string(), Value::String(current));
         obj.insert(ACTION_DEFINITION_KEY.to_string(), Value::String(definition));
         // The occurrence this request is for. `GuardMode::Complete` reads it.
-        obj.insert(ACTION_STEP_KEY.to_string(), Value::from(step));
+        obj.insert(ACTION_STEP_KEY.to_string(), Value::from(basis.step));
+        // What the reviewer is approving: the state the digest covers and the
+        // node it would run. Shown in the pending listing.
+        obj.insert(
+            ACTION_BASIS_KEY.to_string(),
+            basis_preview(&basis.state, basis.step, node_def),
+        );
     }
 
     // KNOWN LIMIT, unchanged: read-then-append with no compare-and-set, so two
@@ -350,4 +350,25 @@ fn node_definition(node_def: &NodeDef) -> Result<String, String> {
     serde_json::to_value(node_def)
         .map(|v| definition_hash(&v))
         .map_err(|e| format!("node definition unreadable; refusing to run unapproved: {e}"))
+}
+
+/// The reviewer's view of what a request binds: the state (dropped and
+/// flagged above [`ACTION_BASIS_STATE_CAP`] serialized bytes), the occurrence,
+/// and a summary of the node definition (id, kind with its module, function or
+/// tool, description and own policy).
+fn basis_preview(state: &Value, step: u64, node_def: &NodeDef) -> Value {
+    let state_bytes = serde_json::to_string(state).map(|s| s.len()).unwrap_or(0);
+    let truncated = state_bytes > ACTION_BASIS_STATE_CAP;
+    serde_json::json!({
+        "state": if truncated { Value::Null } else { state.clone() },
+        "state_truncated": truncated,
+        "state_bytes": state_bytes,
+        "step": step,
+        "node": {
+            "id": node_def.id,
+            "kind": node_def.kind,
+            "description": node_def.description,
+            "policy": node_def.policy,
+        },
+    })
 }

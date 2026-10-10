@@ -150,8 +150,17 @@ class JamjetClient:
         node_id: str | None = None,
         comment: str | None = None,
         state_patch: dict[str, Any] | None = None,
+        action_digest: str | None = None,
     ) -> dict[str, Any]:
         """Record a decision on a pending approval.
+
+        ``action_digest`` is the ``action_digest`` (or, for an agent tool
+        dispatch, the ``calls_hash``) from the ``context`` of the pending
+        approval you reviewed, as returned by :meth:`list_approvals`. Outside
+        dev mode the runtime requires it to approve, and refuses the decision
+        with 409 if that request has since been replaced. Pass the value you
+        actually showed the reviewer: fetching the current digest and approving
+        in one step would approve whatever is pending, unseen.
 
         ``state_patch`` is kept for compatibility only. The runtime refuses a
         decision that carries one with HTTP 400 (approval edits are not
@@ -165,6 +174,8 @@ class JamjetClient:
             body["comment"] = comment
         if state_patch:
             body["state_patch"] = state_patch
+        if action_digest:
+            body["action_digest"] = action_digest
         r = await self._client.post(f"/executions/{execution_id}/approve", json=body)
         r.raise_for_status()
         return r.json()

@@ -157,6 +157,7 @@ async fn inject_dev_tenant(
 ) -> axum::response::Response {
     req.extensions_mut()
         .insert(TenantId::from("default".to_string()));
+    req.extensions_mut().insert(crate::auth::DevMode);
     next.run(req).await
 }
 
@@ -540,9 +541,10 @@ struct ApproveRequest {
     comment: Option<String>,
     /// Refused with 400 when non-null: approval edits are not supported.
     state_patch: Option<Value>,
-    /// Optional echo of the pending request's `action_digest` (from
-    /// `GET /executions/:id/approvals`). A mismatch is a 409: the decider was
-    /// looking at a superseded request.
+    /// Echo of the pending request's `action_digest` (or `calls_hash` for an
+    /// agent tool dispatch), from `GET /executions/:id/approvals`. Required on
+    /// an `approved` decision outside dev mode (400 without it); a mismatch is
+    /// a 409: the decider was looking at a superseded request.
     #[serde(default)]
     action_digest: Option<String>,
 }
@@ -560,6 +562,7 @@ async fn approve_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     token: Option<Extension<jamjet_state::ApiToken>>,
+    dev_mode: Option<Extension<crate::auth::DevMode>>,
     Path(id): Path<String>,
     Json(body): Json<ApproveRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -589,6 +592,7 @@ async fn approve_execution(
             comment: body.comment,
             state_patch: body.state_patch,
             action_digest: body.action_digest,
+            dev_mode: dev_mode.is_some(),
         },
         state.approval_policy,
     )
@@ -600,7 +604,8 @@ async fn approve_execution(
         | crate::approvals::SubmitError::NodeNotPending(_)
         | crate::approvals::SubmitError::ExecutionTerminal(_)
         | crate::approvals::SubmitError::StaleDigest => ApiError::Conflict(e.to_string()),
-        crate::approvals::SubmitError::EditsUnsupported => ApiError::BadRequest(e.to_string()),
+        crate::approvals::SubmitError::EditsUnsupported
+        | crate::approvals::SubmitError::DigestRequired => ApiError::BadRequest(e.to_string()),
         crate::approvals::SubmitError::Backend(msg) => ApiError::Internal(msg),
     })?;
 

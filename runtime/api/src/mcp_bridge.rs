@@ -411,7 +411,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     },
                     "action_digest": {
                         "type": "string",
-                        "description": "Optional. The action_digest from the pending approval's context that you reviewed. If the pending request has been superseded the decision is refused, so you never approve an action you did not see."
+                        "description": "The action_digest (or, for an agent tool dispatch, the calls_hash) from the context of the pending approval you reviewed. Required to approve outside dev mode. If the pending request has been superseded the decision is refused, so you never approve an action you did not see."
                     },
                     "tenant_id": {
                         "type": "string",
@@ -483,6 +483,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         comment,
                         state_patch,
                         action_digest,
+                        dev_mode,
                     },
                     s.approval_policy,
                 )

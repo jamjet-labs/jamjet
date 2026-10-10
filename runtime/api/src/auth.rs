@@ -112,6 +112,14 @@ pub async fn require_auth(
     }
 }
 
+/// Request extension present only on the dev-mode router (no auth layer).
+///
+/// Handlers that relax a rule in dev mode check for THIS marker, never for
+/// "no token in the extensions": a missing token outside dev mode is a
+/// misconfiguration to refuse, not permission to relax.
+#[derive(Debug, Clone, Copy)]
+pub struct DevMode;
+
 // ── RBAC middleware ───────────────────────────────────────────────────────────
 
 /// Route template of the approval decision endpoint, the one write a reviewer

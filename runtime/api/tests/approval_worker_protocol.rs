@@ -127,6 +127,10 @@ fn parse_eid(s: &str) -> ExecutionId {
 
 /// Alice registers the workflow and starts the run, so she is its initiator.
 async fn start(env: &Env, policy: Value) -> (String, ExecutionId) {
+    start_with(env, policy, json!({ "amount": 10 })).await
+}
+
+async fn start_with(env: &Env, policy: Value, input: Value) -> (String, ExecutionId) {
     let (st, body) = send(
         &env.app,
         "/workflows",
@@ -139,7 +143,7 @@ async fn start(env: &Env, policy: Value) -> (String, ExecutionId) {
         &env.app,
         "/executions",
         &env.alice,
-        json!({ "workflow_id": "wf-gate", "workflow_version": "0.1.0", "input": { "amount": 10 } }),
+        json!({ "workflow_id": "wf-gate", "workflow_version": "0.1.0", "input": input }),
     )
     .await;
     assert_eq!(st, StatusCode::CREATED, "{body}");
@@ -502,4 +506,198 @@ async fn completing_an_ungated_item_still_works() {
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(gate_completions(&events(&env, &eid).await), 1);
+}
+
+// ── Approving what you saw (approval-integrity round 2, I2) ─────────────────
+//
+// Outside dev mode an `approved` decision must echo the binding of the pending
+// request it answers (its `action_digest`, or `calls_hash` for an agent tool
+// dispatch), so a reviewer never approves a request that replaced the one on
+// their screen. And the pending listing shows what is bound: the state the node
+// will run on and the node's definition.
+
+async fn get(env: &Env, uri: &str, token: &str) -> (StatusCode, Value) {
+    let resp = env
+        .app
+        .clone()
+        .oneshot(
+            Request::get(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Start a gated run and let the claim gate request approval.
+async fn held_run(env: &Env, input: Value) -> (String, ExecutionId, Value) {
+    let (id, eid) = start_with(env, approval_policy(), input).await;
+    assert_eq!(claim(env, &env.alice).await["claimed"], false);
+    let (st, view) = get(env, &format!("/executions/{id}/approvals"), &env.bob).await;
+    assert_eq!(st, StatusCode::OK, "{view}");
+    let pending = view["pending"][0].clone();
+    assert_eq!(pending["node_id"], "gate", "{view}");
+    (id, eid, pending)
+}
+
+fn decisions(ev: &[Event]) -> usize {
+    ev.iter()
+        .filter(|e| matches!(e.kind, EventKind::ApprovalReceived { .. }))
+        .count()
+}
+
+#[tokio::test]
+async fn an_approval_without_the_digest_is_refused_outside_dev_mode() {
+    let env = env().await;
+    let (id, eid, pending) = held_run(&env, json!({ "amount": 10 })).await;
+
+    let (st, body) = send(
+        &env.app,
+        &format!("/executions/{id}/approve"),
+        &env.bob,
+        json!({ "decision": "approved", "node_id": "gate" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("action_digest"), "{body}");
+    assert_eq!(decisions(&events(&env, &eid).await), 0);
+
+    let (st, body) = send(
+        &env.app,
+        &format!("/executions/{id}/approve"),
+        &env.bob,
+        json!({
+            "decision": "approved",
+            "node_id": "gate",
+            "action_digest": pending["context"]["action_digest"],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn a_rejection_needs_no_digest() {
+    let env = env().await;
+    let (id, _eid, _) = held_run(&env, json!({ "amount": 10 })).await;
+    let (st, body) = send(
+        &env.app,
+        &format!("/executions/{id}/approve"),
+        &env.bob,
+        json!({ "decision": "rejected", "node_id": "gate" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn the_mcp_bridge_requires_the_digest_outside_dev_mode() {
+    let env = env().await;
+    let (id, eid, _) = held_run(&env, json!({ "amount": 10 })).await;
+    let (st, resp) = send(
+        &env.app,
+        "/mcp",
+        &env.bob,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "jamjet_approve", "arguments": {
+                "execution_id": id, "decision": "approved", "node_id": "gate",
+            } },
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{resp}");
+    assert_eq!(resp["result"]["isError"], true, "{resp}");
+    assert_eq!(decisions(&events(&env, &eid).await), 0);
+}
+
+/// An agent tool dispatch request binds `calls_hash`; echoing it is how a
+/// reviewer approves one, and omitting it is refused like a missing digest.
+#[tokio::test]
+async fn a_dispatch_request_is_approved_by_echoing_its_calls_hash() {
+    let env = env().await;
+    let (id, eid) = start(&env, approval_policy()).await;
+    let seq = env.backend.latest_sequence(&eid).await.unwrap() + 1;
+    env.backend
+        .append_event(Event::new(
+            eid.clone(),
+            seq,
+            EventKind::ToolApprovalRequired {
+                node_id: "gate".into(),
+                tool_name: "send_wire".into(),
+                approver: "human".into(),
+                context: json!({ "node_id": "gate", "calls_hash": "h-123" }),
+            },
+        ))
+        .await
+        .unwrap();
+    let approve = |digest: Option<&str>| {
+        let mut body = json!({ "decision": "approved", "node_id": "gate" });
+        if let Some(d) = digest {
+            body["action_digest"] = json!(d);
+        }
+        body
+    };
+    let uri = format!("/executions/{id}/approve");
+    let (st, body) = send(&env.app, &uri, &env.bob, approve(None)).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    let (st, body) = send(&env.app, &uri, &env.bob, approve(Some("h-other"))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{body}");
+    let (st, body) = send(&env.app, &uri, &env.bob, approve(Some("h-123"))).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+}
+
+/// A request recorded before bindings existed binds nothing, so there is
+/// nothing to echo. Approving it is allowed: it authorises nothing by itself
+/// (the worker asks again with a digest), and refusing would strand runs that
+/// were parked before an upgrade.
+#[tokio::test]
+async fn a_legacy_request_without_a_binding_can_still_be_answered() {
+    let env = env().await;
+    let (id, eid) = start(&env, approval_policy()).await;
+    park(&env, &eid).await;
+    let (st, body) = send(
+        &env.app,
+        &format!("/executions/{id}/approve"),
+        &env.bob,
+        json!({ "decision": "approved", "node_id": "gate" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn the_pending_listing_shows_the_bound_state_and_node() {
+    let env = env().await;
+    let (_id, _eid, pending) = held_run(&env, json!({ "amount": 10 })).await;
+    let basis = &pending["context"]["action_basis"];
+    assert_eq!(basis["state"]["amount"], 10, "{pending}");
+    assert_eq!(basis["state_truncated"], false, "{pending}");
+    assert_eq!(basis["step"], 0, "{pending}");
+    assert_eq!(
+        basis["node"]["kind"]["tool_ref"], "payments.transfer",
+        "{pending}"
+    );
+    assert!(pending["context"]["action_digest"].is_string());
+}
+
+#[tokio::test]
+async fn a_large_bound_state_is_truncated_in_the_listing_not_in_the_digest() {
+    let env = env().await;
+    let big = "x".repeat(64 * 1024);
+    let (_id, _eid, pending) = held_run(&env, json!({ "blob": big })).await;
+    let basis = &pending["context"]["action_basis"];
+    assert_eq!(basis["state_truncated"], true, "{basis}");
+    assert!(
+        basis["state"].is_null(),
+        "the preview is dropped, not cut mid-value"
+    );
+    assert!(basis["state_bytes"].as_u64().unwrap() > 64 * 1024);
 }

@@ -2605,6 +2605,12 @@ def approve(
     decision: str = typer.Option(..., "--decision", "-d", help="approved or rejected"),
     node_id: str | None = typer.Option(None, "--node-id", help="Node to approve (inferred when one is pending)"),
     comment: str | None = typer.Option(None, "--comment", "-c", help="Optional comment"),
+    action_digest: str | None = typer.Option(
+        None,
+        "--action-digest",
+        help="action_digest (or calls_hash) of the pending approval you reviewed, from "
+        "`jamjet approvals`. Required to approve on a runtime with auth enabled.",
+    ),
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
 ) -> None:
     """Approve or reject a pending HITL gate on an execution."""
@@ -2624,6 +2630,7 @@ def approve(
                     decision,
                     node_id=node_id,
                     comment=comment,
+                    action_digest=action_digest,
                 )
             except httpx.HTTPStatusError as exc:
                 try:

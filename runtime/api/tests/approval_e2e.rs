@@ -223,6 +223,8 @@ impl Harness {
                 comment: comment.map(String::from),
                 state_patch: None,
                 action_digest: None,
+                // The harness drives the engine with no auth layer.
+                dev_mode: true,
             },
             Default::default(),
         )

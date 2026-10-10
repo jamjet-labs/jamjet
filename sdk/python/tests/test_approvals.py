@@ -78,6 +78,22 @@ async def test_approve_with_state_patch_surfaces_the_runtime_refusal() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_approve_sends_the_action_digest_it_was_given() -> None:
+    """approve() passes the reviewed digest through, and omits it when absent."""
+    route = respx.post(f"{BASE}/executions/exec-1/approve").respond(
+        200, json={"execution_id": "exec-1", "node_id": "gated", "accepted": True}
+    )
+
+    async with JamjetClient(base_url=BASE) as c:
+        await c.approve("exec-1", "approved", node_id="gated", action_digest="d-1")
+        await c.approve("exec-1", "rejected", node_id="gated")
+
+    assert json.loads(route.calls[0].request.content)["action_digest"] == "d-1"
+    assert "action_digest" not in json.loads(route.calls[1].request.content)
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_list_approvals_returns_parsed_dict() -> None:
     """list_approvals() GETs /executions/{id}/approvals and returns the body."""
     payload = {
@@ -241,3 +257,16 @@ def test_approve_invalid_decision_fails_cleanly() -> None:
     # Should mention the invalid value or expected values
     output = result.output + (result.stderr or "")
     assert "maybe" in output or "approved" in output or "rejected" in output
+
+
+def test_approve_passes_the_action_digest_option_through() -> None:
+    """jamjet approve --action-digest D sends D to the client."""
+    fake = _approve_client({"execution_id": "exec-1", "node_id": "gated", "accepted": True})
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(
+            app, ["approve", "exec-1", "--decision", "approved", "--action-digest", "d-1"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert fake.approve.call_args.kwargs.get("action_digest") == "d-1"

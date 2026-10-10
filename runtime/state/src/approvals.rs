@@ -27,6 +27,14 @@ impl PendingApproval {
     pub fn action_digest(&self) -> Option<&str> {
         self.context.get(ACTION_DIGEST_KEY).and_then(|d| d.as_str())
     }
+
+    /// What this request binds, for a decider to echo: the `action_digest`,
+    /// or for an agent tool dispatch request the `calls_hash` its guard
+    /// checks. `None` for a legacy request that binds nothing.
+    pub fn binding(&self) -> Option<&str> {
+        self.action_digest()
+            .or_else(|| self.context.get(CALLS_HASH_KEY).and_then(|d| d.as_str()))
+    }
 }
 
 /// Approval status of a single node, derived from the event log.
@@ -99,6 +107,19 @@ pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStat
 
 /// Context key under which a hold records the digest of the action it parks.
 pub const ACTION_DIGEST_KEY: &str = "action_digest";
+
+/// Context key under which an agent tool dispatch hold records the hash of the
+/// calls it parks (`workers::dispatch_guard`).
+pub const CALLS_HASH_KEY: &str = "calls_hash";
+
+/// Context key under which a hold records what it binds, for a reviewer: the
+/// state the node will run on (size-capped), the occurrence and the node.
+pub const ACTION_BASIS_KEY: &str = "action_basis";
+
+/// Largest serialized state shown in [`ACTION_BASIS_KEY`]. Above it the
+/// preview is dropped (never cut mid-value) and flagged; the digest still
+/// covers the whole state.
+pub const ACTION_BASIS_STATE_CAP: usize = 16 * 1024;
 
 /// Context key under which a hold records which occurrence of the node it is
 /// for: the node's completion count when the request was made.
