@@ -427,6 +427,7 @@ mod tests {
                         labels: HashMap::new(),
                         policy: None,
                         data_policy: None,
+                        agent_ref: None,
                     },
                 )
             })
@@ -462,6 +463,7 @@ mod tests {
             cost_budget_usd: None,
             on_budget_exceeded: None,
             data_policy: None,
+            agent_ref: None,
             continue_as_new: false,
         }
     }
@@ -693,6 +695,7 @@ mod tests {
                 labels: HashMap::new(),
                 policy: None,
                 data_policy: None,
+                agent_ref: None,
             },
         );
         ir.edges.push(EdgeDef {

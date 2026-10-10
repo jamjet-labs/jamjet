@@ -252,3 +252,21 @@ fn an_mcp_tool_node_is_named_by_its_tool() {
         Some("delete_table")
     );
 }
+
+/// A `finalizer` node runs the tool its `tool_ref` names (claimed off the
+/// `tool` queue), so it is named by that tool. It had no name, so no
+/// `blocked_tools` pattern and no agent `allowed_tools` list could see it.
+#[test]
+fn a_finalizer_node_is_named_by_its_tool() {
+    let fin = NodeKind::Finalizer {
+        tool_ref: "send_wire".into(),
+        run_on: jamjet_core::node::FinalizerTrigger::Always,
+    };
+    assert!(blocked(&decide("x", &fin, &block(&["send_*"]))));
+    assert_eq!(
+        EvaluationContext::from_node_kind("x", &fin)
+            .tool_name
+            .as_deref(),
+        Some("send_wire")
+    );
+}

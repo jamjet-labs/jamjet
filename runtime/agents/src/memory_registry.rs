@@ -11,12 +11,16 @@ use uuid::Uuid;
 
 pub struct InMemoryAgentRegistry {
     agents: DashMap<AgentId, Agent>,
+    /// Serialises `register`, so the URI uniqueness check and the insert
+    /// cannot interleave.
+    register_lock: std::sync::Mutex<()>,
 }
 
 impl InMemoryAgentRegistry {
     pub fn new() -> Self {
         Self {
             agents: DashMap::new(),
+            register_lock: std::sync::Mutex::new(()),
         }
     }
 }
@@ -30,6 +34,20 @@ impl Default for InMemoryAgentRegistry {
 #[async_trait]
 impl AgentRegistry for InMemoryAgentRegistry {
     async fn register(&self, card: AgentCard) -> Result<AgentId, String> {
+        // One agent per URI, as the SQLite registry's UNIQUE constraint
+        // enforces. A second card under the same URI would make `get_by_uri`
+        // pick either one, so the card whose `allowed_tools` restricts a node
+        // could be shadowed by a later, laxer one.
+        let _guard = self
+            .register_lock
+            .lock()
+            .map_err(|_| "agent registry lock poisoned".to_string())?;
+        if self.agents.iter().any(|r| r.value().card.uri == card.uri) {
+            return Err(format!(
+                "an agent is already registered at uri {}",
+                card.uri
+            ));
+        }
         let id = Uuid::new_v4();
         let now = Utc::now();
         let agent = Agent {

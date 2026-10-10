@@ -1006,6 +1006,10 @@ impl Worker {
             node_def,
             payload,
             self.sealer.as_deref(),
+            node_guard::AgentScope {
+                workflow_agent: ir.agent_ref.as_deref(),
+                registry: self.agents.as_deref(),
+            },
         )
         .await;
         self.settle_outcome(

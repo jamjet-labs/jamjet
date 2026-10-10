@@ -84,13 +84,19 @@ pub enum AutonomyLevel {
     FullyAutonomous,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Every field is optional (RFC-005), so a card may carry only the
+/// constraints it sets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AutonomyConstraints {
     pub max_iterations: Option<u32>,
     pub max_tool_calls: Option<u32>,
     pub token_budget: Option<u64>,
     pub cost_budget_usd: Option<f64>,
-    /// Glob patterns for allowed tools (e.g. "search_*")
+    /// Glob patterns for the tools this agent may use (e.g. "search_*").
+    /// Enforced on every node attributed to the agent (`agent_ref` in the
+    /// workflow IR) by `jamjet_worker::node_guard`; empty means no
+    /// restriction. See `jamjet_policy::allowed_tools`.
     pub allowed_tools: Vec<String>,
     /// Glob patterns for blocked tools (e.g. "delete_*")
     pub blocked_tools: Vec<String>,

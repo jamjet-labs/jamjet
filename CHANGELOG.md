@@ -288,6 +288,43 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `audit_seal_failed` or `run_stalled` at all, so do not roll back past this release on
   a store a newer build has written.
 
+- **An agent's `allowed_tools` is enforced.** The Agent Card's
+  `constraints.allowed_tools` (RFC-005) was stored and never checked, while the security
+  guide said the runtime enforced it. A workflow or node now names the agent it acts for
+  with `agent_ref` (the card's `uri`) in its IR, and the shared guard that both
+  transports run (`POST /work-items/claim` and the in-process worker, and the
+  completion gate) refuses any node whose tool is not on that agent's list. The refusal
+  is a `PolicyViolation` with scope `agent` and a rule starting `agent allowed_tools`,
+  and the node fails like any other policy block.
+  - What is matched: an `mcp_tool` node's tool, a `tool` node's tool, an `a2a_task`
+    skill, an `agent` node's agent, a function node's handler (as written or in dotted
+    form, never its node id). For an ADK agent's tool dispatch, each call's name and
+    the code its `tools` entry resolves to must both be on the list; the code is
+    matched by its `module:function` or the function's own name, so `["search_web"]`
+    allows the compiler's `search_web -> app.tools:search_web` and refuses a call named
+    `search_web` that resolves to anything else. A tool registered under a custom name
+    needs its function listed too. Model and condition nodes are not tool uses.
+  - A `finalizer` node is now named by its `tool_ref`, for policy too: it runs that
+    tool, and had no name, so neither `blocked_tools` nor `require_approval_for` could
+    match it.
+  - An absent or empty list restricts nothing. The card cannot tell "not set" from
+    "set to nothing", and stored cards carry `[]` meaning "not set". To refuse every
+    tool, use a policy `blocked_tools: ["*"]`.
+  - It is an additional restriction: tenant, workflow and node policy still apply,
+    and a policy that allows a tool does not override the list. A node acting for two
+    agents (workflow and node `agent_ref`) must be on both lists.
+  - Fails closed: a node acting for an agent that is not registered, or run by a
+    worker with no agent registry, is refused; an unreadable registry holds the node
+    without recording a denial. `WorkerPool::with_agents` hands the registry to every
+    worker, and the server now does so for its embedded workers, which also turns on
+    their autonomy limit checks for `agent` nodes.
+  - `AutonomyConstraints` fields are all optional on input now, so a card can carry
+    only `allowed_tools`. The in-memory agent registry refuses a second card at a URI
+    already registered, as the SQLite registry already did, so a later card cannot
+    shadow the one that restricts a node.
+  - Not enforced yet: the card's own `blocked_tools`, `require_approval_for` and
+    `allowed_delegations`. Use policy `blocked_tools` and `require_approval_for`.
+
 ### Fixed
 
 - **Runtime: an unmatched API request is a JSON 404, not the web UI.** The SPA

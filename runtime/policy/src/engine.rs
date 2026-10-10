@@ -6,7 +6,7 @@ use jamjet_core::node::NodeKind;
 impl EvaluationContext {
     /// Derive an `EvaluationContext` from a `NodeKind`.
     ///
-    /// Extracts the tool name (for tool/mcp_tool/a2a_task nodes, and the
+    /// Extracts the tool name (for tool/finalizer/mcp_tool/a2a_task nodes, and the
     /// handler reference for python_fn `module:function`, java_fn
     /// `class/method` and external_fn `queue/handler` nodes) and the model
     /// reference (for model nodes) so the policy engine can apply rules.
@@ -42,7 +42,8 @@ fn extract_names(kind: &NodeKind) -> (Option<String>, Option<String>) {
     };
     let kind_tag = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match kind_tag {
-        "tool" => {
+        // A finalizer runs the tool its `tool_ref` names.
+        "tool" | "finalizer" => {
             let tool = v
                 .get("tool_ref")
                 .and_then(|t| t.as_str())

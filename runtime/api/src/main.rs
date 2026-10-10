@@ -200,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         );
         let pool = jamjet_worker::default_pool(state.backend.clone())
             .with_sealer(state.enricher.clone())
+            .with_agents(state.agents.clone())
             .with_executor(
                 "model",
                 Arc::new(jamjet_worker::ModelNodeExecutor::new(

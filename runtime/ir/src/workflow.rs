@@ -62,6 +62,12 @@ pub struct WorkflowIr {
     /// Data handling policy (PII redaction + retention controls).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_policy: Option<DataPolicyIr>,
+    /// The registered agent (its Agent Card `uri`) this workflow acts for.
+    /// Every node is then held to that card's `constraints.allowed_tools`, in
+    /// addition to the policy chain. Unregistered or unreadable: the node is
+    /// refused (see `jamjet_worker::node_guard`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_ref: Option<String>,
 }
 
 impl WorkflowIr {
@@ -119,6 +125,11 @@ pub struct NodeDef {
     /// Node-level data policy override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_policy: Option<DataPolicyIr>,
+    /// The registered agent (its Agent Card `uri`) this node acts for, in
+    /// addition to the workflow's `agent_ref`: the node must be allowed by
+    /// the `allowed_tools` of every agent it is attributed to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_ref: Option<String>,
 }
 
 /// A directed edge between two nodes.
@@ -422,6 +433,7 @@ mod tests {
             on_budget_exceeded: None,
             continue_as_new: false,
             data_policy: None,
+            agent_ref: None,
             state_schema: "schemas.TestState".into(),
             start_node: "start".into(),
             nodes: HashMap::new(),

@@ -16,6 +16,8 @@
 //! may a worker's reported result for this node be recorded? It never writes.
 
 use crate::dispatch_guard::{self, DispatchGuardOutcome};
+use jamjet_agents::AgentRegistry;
+use jamjet_core::node::NodeKind;
 use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::workflow::{ApprovalDeadline, NodeDef, PolicySetIr};
 use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
@@ -58,6 +60,26 @@ pub enum GuardMode {
     Complete,
 }
 
+/// The agents a node acts for, and where their cards are read.
+///
+/// A node is attributed to the workflow's `agent_ref` and to its own; it must
+/// be allowed by the `allowed_tools` of each. `registry` is `None` when the
+/// runtime has none, which refuses every attributed node rather than skipping
+/// the check.
+#[derive(Clone, Copy, Default)]
+pub struct AgentScope<'a> {
+    /// The workflow-level `agent_ref` (`WorkflowIr::agent_ref`).
+    pub workflow_agent: Option<&'a str>,
+    pub registry: Option<&'a dyn AgentRegistry>,
+}
+
+/// The policy scope recorded on a `PolicyViolation` raised by an agent's
+/// `allowed_tools`.
+pub const AGENT_SCOPE: &str = "agent";
+
+/// Every rule recorded for an `allowed_tools` refusal starts with this.
+pub const ALLOWED_TOOLS_RULE: &str = "agent allowed_tools";
+
 /// Decide whether `node_def` may fire (or, in `Complete` mode, whether its
 /// result may be recorded), evaluating the tenant -> workflow -> node policy
 /// chain and, for an approval-gated node, the approval bound to the action.
@@ -74,6 +96,10 @@ pub enum GuardMode {
 /// names were never checked and an empty call list allowed it outright; the
 /// dispatch flag is author-controlled, which made that a bypass of any gate
 /// (round-3 review, C1).
+///
+/// Before any of that, a node attributed to an agent (`agents`) must be
+/// allowed by that agent's `allowed_tools`; see [`agent_allowed_tools`]. It is
+/// an additional restriction: the policy chain still has to allow the node.
 #[allow(clippy::too_many_arguments)]
 pub async fn guard_item(
     backend: &dyn StateBackend,
@@ -85,7 +111,23 @@ pub async fn guard_item(
     node_def: &NodeDef,
     payload: &Value,
     sealer: Option<&dyn ApprovalSealer>,
+    agents: AgentScope<'_>,
 ) -> GuardOutcome {
+    // First, so a node the agent may not use never raises an approval request
+    // and is refused even when no policy applies.
+    if let Some(refused) = agent_allowed_tools(
+        backend,
+        mode,
+        execution_id,
+        node_id,
+        node_def,
+        payload,
+        agents,
+    )
+    .await
+    {
+        return refused;
+    }
     let is_dispatch = dispatch_guard::is_agent_tool_dispatch(&node_def.kind);
     // The per-call guard for a dispatch node. `node_approved`: an approval of
     // the node's full payload is on file and covers this item. The calls are
@@ -224,6 +266,147 @@ pub async fn guard_item(
             }
         }
     }
+}
+
+/// The `allowed_tools` half of the decision: `None` when every agent the node
+/// is attributed to allows it (or it is attributed to none), otherwise the
+/// refusal.
+///
+/// Fails closed. An attributed node is refused (`Blocked`, recorded with scope
+/// [`AGENT_SCOPE`] on a firing check) when the runtime has no agent registry
+/// or the agent is not registered, and held back (`Unavailable`, nothing
+/// recorded) when the registry cannot be read. An agent whose list is empty is
+/// no restriction (`jamjet_policy::allowed_tools`).
+///
+/// What is matched: an agent tool dispatch node's pending calls (name and
+/// resolved handler), read from the same payload the dispatch consumes; every
+/// other node's own tool name. A node marked as a dispatch but not at the ADK
+/// dispatcher's own coordinates is matched on both, because the marker is the
+/// author's to set: without that, marking any function node as a dispatch
+/// would exempt its own code.
+async fn agent_allowed_tools(
+    backend: &dyn StateBackend,
+    mode: GuardMode,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    node_def: &NodeDef,
+    payload: &Value,
+    agents: AgentScope<'_>,
+) -> Option<GuardOutcome> {
+    let mut refs: Vec<&str> = Vec::new();
+    for r in agents
+        .workflow_agent
+        .into_iter()
+        .chain(node_def.agent_ref.as_deref())
+    {
+        if !refs.contains(&r) {
+            refs.push(r);
+        }
+    }
+    let first = *refs.first()?;
+
+    let refuse = |rule: String| async move {
+        warn!(execution_id = %execution_id, node_id, %rule, "agent allowed_tools refused node");
+        if mode == GuardMode::Fire {
+            dispatch_guard::record_policy_violation(
+                backend,
+                execution_id,
+                node_id,
+                rule.clone(),
+                AGENT_SCOPE.to_string(),
+            )
+            .await;
+        }
+        Some(GuardOutcome::Blocked { reason: rule })
+    };
+
+    let Some(registry) = agents.registry else {
+        return refuse(format!(
+            "{ALLOWED_TOOLS_RULE}: node acts for agent '{first}', but this runtime has no \
+             agent registry to read its allowed_tools"
+        ))
+        .await;
+    };
+
+    // Only the ADK dispatcher itself is exempt from matching its own name.
+    let calls_only = match &node_def.kind {
+        NodeKind::PythonFn {
+            module, function, ..
+        } => {
+            dispatch_guard::is_agent_tool_dispatch(&node_def.kind)
+                && jamjet_ir::is_adk_dispatch_coordinates(module, function)
+        }
+        _ => false,
+    };
+    let is_dispatch = dispatch_guard::is_agent_tool_dispatch(&node_def.kind);
+
+    for agent_ref in refs {
+        let card = match registry.get_by_uri(agent_ref).await {
+            Ok(Some(agent)) => agent.card,
+            Ok(None) => {
+                return refuse(format!(
+                    "{ALLOWED_TOOLS_RULE}: agent '{agent_ref}' is not registered, so its \
+                     allowed_tools cannot be checked"
+                ))
+                .await;
+            }
+            Err(e) => {
+                warn!(execution_id = %execution_id, node_id, agent_ref, "agent registry unreadable");
+                return Some(GuardOutcome::Unavailable {
+                    reason: format!(
+                        "agent registry unavailable; refusing to run without checking the \
+                         allowed_tools of agent '{agent_ref}': {e}"
+                    ),
+                });
+            }
+        };
+        let allowed: &[String] = card
+            .constraints
+            .as_ref()
+            .map(|c| c.allowed_tools.as_slice())
+            .unwrap_or(&[]);
+        if allowed.is_empty() {
+            continue;
+        }
+
+        if !calls_only {
+            let ctx = EvaluationContext::from_node_kind(node_id, &node_def.kind);
+            if let Err(tool) = jamjet_policy::allowed_tools::node_allowed(&ctx, allowed) {
+                return refuse(format!(
+                    "{ALLOWED_TOOLS_RULE}: tool '{tool}' is not allowed for agent '{agent_ref}'"
+                ))
+                .await;
+            }
+        }
+        if is_dispatch {
+            let input = dispatch_guard::payload_input(payload);
+            let calls = match jamjet_policy::dispatch::read_pending_tool_calls(&input) {
+                Ok(calls) => calls,
+                Err(cause) => return refuse(dispatch_guard::unreadable_rule(cause)).await,
+            };
+            for call in &calls {
+                use jamjet_policy::allowed_tools::CallRefused;
+                match jamjet_policy::allowed_tools::call_allowed(call, allowed) {
+                    Ok(()) => {}
+                    Err(CallRefused::Name(tool)) => {
+                        return refuse(format!(
+                            "{ALLOWED_TOOLS_RULE}: tool '{tool}' is not allowed for agent \
+                             '{agent_ref}'"
+                        ))
+                        .await;
+                    }
+                    Err(CallRefused::Handler { name, handler }) => {
+                        return refuse(format!(
+                            "{ALLOWED_TOOLS_RULE}: tool '{name}' resolves to '{handler}', which \
+                             is not allowed for agent '{agent_ref}'"
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The approval half of the decision, for a node that needs one: `Allow` if an

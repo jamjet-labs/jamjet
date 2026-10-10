@@ -78,7 +78,7 @@ pub enum UnreadableCalls {
 
 /// The last segment of a `module:function.attr` reference's function path:
 /// `send_wire` for `bank.wires:send_wire`, `send` for `payments:transfer.send`.
-fn handler_function_name(handler: &str) -> &str {
+pub(crate) fn handler_function_name(handler: &str) -> &str {
     let function = handler.split_once(':').map_or(handler, |(_, f)| f);
     function.rsplit('.').next().unwrap_or(function)
 }

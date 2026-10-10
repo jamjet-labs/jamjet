@@ -44,6 +44,7 @@ pub struct WorkerPool {
     groups: Vec<WorkerGroupConfig>,
     executors: Vec<(String, Arc<dyn NodeExecutor>)>,
     sealer: Option<Arc<dyn jamjet_state::approvals::ApprovalSealer>>,
+    agents: Option<Arc<dyn jamjet_agents::AgentRegistry>>,
 }
 
 impl WorkerPool {
@@ -53,7 +54,16 @@ impl WorkerPool {
             groups: Vec::new(),
             executors: Vec::new(),
             sealer: None,
+            agents: None,
         }
+    }
+
+    /// The agent registry every worker reads Agent Cards from: autonomy
+    /// limits, and the `allowed_tools` of the agent a node acts for. Without
+    /// one, a node attributed to an agent is refused.
+    pub fn with_agents(mut self, agents: Arc<dyn jamjet_agents::AgentRegistry>) -> Self {
+        self.agents = Some(agents);
+        self
     }
 
     /// Seal the approval requests every worker raises into the audit chain.
@@ -94,6 +104,9 @@ impl WorkerPool {
                 let mut worker = Worker::new(worker_id.clone(), backend, queue_types);
                 if let Some(sealer) = &self.sealer {
                     worker = worker.with_sealer(Arc::clone(sealer));
+                }
+                if let Some(agents) = &self.agents {
+                    worker = worker.with_agents(Arc::clone(agents));
                 }
                 for (kind, executor) in &executors {
                     worker = worker.register_executor(kind.clone(), Arc::clone(executor));

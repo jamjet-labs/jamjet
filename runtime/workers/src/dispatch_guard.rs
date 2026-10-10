@@ -593,7 +593,7 @@ fn tool_ctx(node_id: &str, tool_name: &str) -> EvaluationContext {
 /// phrase cannot drift on one cause and quietly stop matching: the decision is
 /// identical for all of them, so anything keyed on the family must keep
 /// matching, while the Prove surface gains the cause.
-fn unreadable_rule(cause: UnreadableCalls) -> String {
+pub(crate) fn unreadable_rule(cause: UnreadableCalls) -> String {
     let detail = match cause {
         UnreadableCalls::NotAnObject => "input is not an object",
         UnreadableCalls::NotAList => "the call list is not an array",
@@ -1369,6 +1369,7 @@ mod tests {
             node_def,
             &json!({ "input": input_for(&["send_wire"]) }),
             Some(&sealer),
+            Default::default(),
         )
         .await;
         assert!(

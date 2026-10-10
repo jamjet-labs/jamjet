@@ -25,6 +25,24 @@ agents:
       require_approval_for: [publish, external_api_write]
 ```
 
+### Enforcing `allowed_tools`
+
+The runtime holds a node to an agent's `allowed_tools` when the node acts for that agent: the workflow IR's top-level `agent_ref`, or a node's own `agent_ref`, names the card's `uri`. A node acting for two agents must be on both lists.
+
+```json
+{
+  "workflow_id": "research",
+  "agent_ref": "jamjet://acme/research-analyst",
+  "nodes": { "search": { "id": "search", "agent_ref": "jamjet://acme/research-analyst", "kind": { "type": "mcp_tool", "server": "web", "tool": "search_web", "input_mapping": {}, "output_schema": "" } } }
+}
+```
+
+- Matched: an `mcp_tool`, `tool` or `finalizer` node's tool, an `a2a_task` skill, an `agent` node's agent, a function node's handler (`module:function`, never its node id). Model and condition nodes are not tool uses.
+- ADK tool calls: each call's name and the code it resolves to must both be listed. The code is matched by `module:function` or by the function's name, so a tool keeps working with just its name unless it is registered under a name different from its function's.
+- An absent or empty list restricts nothing. To refuse every tool, use a policy `blocked_tools: ["*"]`.
+- Policy still applies on top: a tool on the list can still be blocked or approval-gated.
+- Not enforced yet: the card's `blocked_tools`, `require_approval_for` and `allowed_delegations`. Use policy for the first two.
+
 ---
 
 ## Autonomy Levels

@@ -9,6 +9,7 @@
 //! - `guided` / `bounded_autonomous` / `fully_autonomous` levels
 //! - Circuit breaker for agents in error loops
 
+pub mod allowed_tools;
 pub mod autonomy;
 pub mod dispatch;
 pub mod engine;
@@ -101,7 +102,7 @@ impl EvaluationContext {
 
 /// A handler pattern in canonical dotted form: `:` and `/` become `.`, so a
 /// pattern in either spelling matches [`EvaluationContext::canonical_handler`].
-fn canonical_pattern(pattern: &str) -> String {
+pub(crate) fn canonical_pattern(pattern: &str) -> String {
     pattern.replace([':', '/'], ".")
 }
 
@@ -199,7 +200,7 @@ fn model_matches(pattern: &str, model: &str) -> bool {
 
 /// Minimal glob matcher supporting `*` (any chars) and `?` (single char).
 /// Operates on ASCII byte sequences — sufficient for tool names and model refs.
-fn glob_match(pattern: &str, value: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let v: Vec<char> = value.chars().collect();
     glob_match_inner(&p, &v)

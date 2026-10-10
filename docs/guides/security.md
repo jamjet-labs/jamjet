@@ -125,7 +125,11 @@ tools:
     permissions: [write, privileged]  # requires privileged worker
 ```
 
-Agents with `allowed_tools` constraints in their autonomy config cannot invoke tools outside that list — enforced at the runtime level, not just in prompts.
+An agent's `allowed_tools` (in its Agent Card's `constraints`) is enforced by the runtime, not just in prompts, on every node that acts for the agent: a workflow or node whose IR sets `agent_ref` to the card's `uri`. Such a node runs only if its tool is on the list. For an ADK agent's tool calls, both the name the model called and the code the call resolves to must be on it. A refused node fails with a policy violation recorded under scope `agent`, on both the HTTP claim route and the in-process worker. An absent or empty list restricts nothing, and a node that acts for no agent is not checked against any card. The list is an additional restriction: tenant, workflow and node policy still apply. A node acting for an agent that is not registered is refused.
+
+```json
+{ "workflow_id": "research", "agent_ref": "jamjet://acme/researcher", "nodes": { ... } }
+```
 
 ---
 

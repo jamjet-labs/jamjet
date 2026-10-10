@@ -1384,7 +1384,13 @@ async fn claim_work_item(
     // can reach a worker down this route without passing through
     // `Worker::execute_item`. See `gate_claimed_item`.
     if matches!(
-        gate_claimed_item(backend.as_ref(), &wi, state.enricher.as_ref()).await,
+        gate_claimed_item(
+            backend.as_ref(),
+            &wi,
+            state.enricher.as_ref(),
+            state.agents.as_ref()
+        )
+        .await,
         ClaimGate::Withhold
     ) {
         return Ok(nothing_to_claim());
@@ -1479,6 +1485,7 @@ async fn gate_claimed_item(
     backend: &dyn jamjet_state::StateBackend,
     wi: &WorkItem,
     sealer: &dyn jamjet_state::approvals::ApprovalSealer,
+    agents: &dyn jamjet_agents::AgentRegistry,
 ) -> ClaimGate {
     // AUTHORITY. The coordinates that select the policy chain come from the
     // EXECUTION record, never from the payload.
@@ -1637,25 +1644,31 @@ async fn gate_claimed_item(
     // A dispatch node needs the whole graph parsed (its failure wording is the
     // worker's); every other node needs only its own definition and the
     // workflow-level policy, so the hot path still skips the full parse.
-    let (workflow_policy, node_def): (Option<jamjet_ir::workflow::PolicySetIr>, NodeDef) =
-        if jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&kind) {
-            let ir = match serde_json::from_value::<jamjet_ir::WorkflowIr>(ir_value) {
-                Ok(ir) => ir,
-                Err(e) => {
-                    return fail_closed(backend, wi, format!("failed to load IR: {e}")).await;
-                }
-            };
-            let Some(node_def) = ir.node(&wi.node_id).cloned() else {
-                return fail_closed(backend, wi, format!("node {} not found in IR", wi.node_id))
-                    .await;
-            };
-            (ir.policy, node_def)
-        } else {
-            match guard_inputs_from_raw(&ir_value, &wi.node_id) {
-                Ok(inputs) => inputs,
-                Err(reason) => return fail_closed(backend, wi, reason).await,
+    let GuardInputs {
+        workflow_policy,
+        workflow_agent,
+        node_def,
+    } = if jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&kind) {
+        let ir = match serde_json::from_value::<jamjet_ir::WorkflowIr>(ir_value) {
+            Ok(ir) => ir,
+            Err(e) => {
+                return fail_closed(backend, wi, format!("failed to load IR: {e}")).await;
             }
         };
+        let Some(node_def) = ir.node(&wi.node_id).cloned() else {
+            return fail_closed(backend, wi, format!("node {} not found in IR", wi.node_id)).await;
+        };
+        GuardInputs {
+            workflow_policy: ir.policy,
+            workflow_agent: ir.agent_ref,
+            node_def,
+        }
+    } else {
+        match guard_inputs_from_raw(&ir_value, &wi.node_id) {
+            Ok(inputs) => inputs,
+            Err(reason) => return fail_closed(backend, wi, reason).await,
+        }
+    };
 
     match jamjet_worker::node_guard::guard_item(
         backend,
@@ -1669,6 +1682,10 @@ async fn gate_claimed_item(
         // A request raised here is sealed into the audit chain, like one the
         // in-process worker raises.
         Some(sealer),
+        jamjet_worker::node_guard::AgentScope {
+            workflow_agent: workflow_agent.as_deref(),
+            registry: Some(agents),
+        },
     )
     .await
     {
@@ -1741,12 +1758,18 @@ async fn gate_claimed_item(
     }
 }
 
-/// The workflow-level policy and one node's definition, read from stored IR
-/// without deserializing the whole graph. `Err` carries the fail-closed reason.
-fn guard_inputs_from_raw(
-    ir_value: &Value,
-    node_id: &str,
-) -> Result<(Option<jamjet_ir::workflow::PolicySetIr>, NodeDef), String> {
+/// What the shared guard reads from a workflow's IR for one node.
+struct GuardInputs {
+    workflow_policy: Option<jamjet_ir::workflow::PolicySetIr>,
+    /// `WorkflowIr::agent_ref`.
+    workflow_agent: Option<String>,
+    node_def: NodeDef,
+}
+
+/// The workflow-level policy and agent, and one node's definition, read from
+/// stored IR without deserializing the whole graph. `Err` carries the
+/// fail-closed reason.
+fn guard_inputs_from_raw(ir_value: &Value, node_id: &str) -> Result<GuardInputs, String> {
     let raw_node = ir_value
         .get("nodes")
         .and_then(|nodes| nodes.get(node_id))
@@ -1760,7 +1783,20 @@ fn guard_inputs_from_raw(
                 .map_err(|e| format!("failed to load workflow policy: {e}"))?,
         ),
     };
-    Ok((workflow_policy, node_def))
+    // A present but unreadable `agent_ref` must not read as "no agent": that
+    // would drop the agent's allowed_tools.
+    let workflow_agent = match ir_value.get("agent_ref") {
+        None | Some(Value::Null) => None,
+        Some(raw) => Some(
+            serde_json::from_value(raw.clone())
+                .map_err(|e| format!("failed to load workflow agent_ref: {e}"))?,
+        ),
+    };
+    Ok(GuardInputs {
+        workflow_policy,
+        workflow_agent,
+        node_def,
+    })
 }
 
 /// Whether a worker's result for `wi` may be recorded: the claim gate's
@@ -1772,6 +1808,7 @@ fn guard_inputs_from_raw(
 async fn completion_gate(
     backend: &dyn jamjet_state::StateBackend,
     wi: &WorkItem,
+    agents: &dyn jamjet_agents::AgentRegistry,
 ) -> Result<(), (StatusCode, String)> {
     let unavailable = |e: String| (StatusCode::SERVICE_UNAVAILABLE, e);
     let refused = |e: String| (StatusCode::CONFLICT, e);
@@ -1790,8 +1827,11 @@ async fn completion_gate(
                 execution.workflow_id, execution.workflow_version
             ))
         })?;
-    let (workflow_policy, node_def) =
-        guard_inputs_from_raw(&def.ir, &wi.node_id).map_err(refused)?;
+    let GuardInputs {
+        workflow_policy,
+        workflow_agent,
+        node_def,
+    } = guard_inputs_from_raw(&def.ir, &wi.node_id).map_err(refused)?;
     match jamjet_worker::node_guard::guard_item(
         backend,
         jamjet_worker::node_guard::GuardMode::Complete,
@@ -1803,6 +1843,10 @@ async fn completion_gate(
         &wi.payload,
         // Complete mode never raises a request.
         None,
+        jamjet_worker::node_guard::AgentScope {
+            workflow_agent: workflow_agent.as_deref(),
+            registry: Some(agents),
+        },
     )
     .await
     {
@@ -2086,7 +2130,9 @@ async fn complete_work_item(
     // under an approval for its current occurrence. No event is written on a
     // refusal and the item is left alone.
     if let Some(wi) = recorded.as_ref() {
-        if let Err((status, reason)) = completion_gate(backend.as_ref(), wi).await {
+        if let Err((status, reason)) =
+            completion_gate(backend.as_ref(), wi, state.agents.as_ref()).await
+        {
             warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, %reason, "complete: refused");
             return Ok((
                 status,
