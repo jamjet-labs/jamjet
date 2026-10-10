@@ -1239,6 +1239,12 @@ async fn update_tenant(
         .map(serde_json::from_value)
         .transpose()
         .map_err(|e| ApiError::BadRequest(format!("invalid limits: {e}")))?;
+    // The policy is parsed strictly before it is stored: a malformed one
+    // would otherwise refuse every node of the tenant at run time.
+    if let Some(policy) = &body.policy {
+        jamjet_state::tenant::parse_tenant_policy(policy)
+            .map_err(|e| ApiError::BadRequest(format!("invalid policy: {e}")))?;
+    }
 
     let updated = Tenant {
         id: tid.clone(),

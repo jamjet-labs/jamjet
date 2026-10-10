@@ -112,7 +112,19 @@ pub async fn guard_item(
         .get_tenant(&jamjet_state::TenantId::from(tenant_id))
         .await
     {
-        Ok(tenant) => tenant.and_then(|t| t.policy_set()),
+        Ok(tenant) => match dispatch_guard::unparseable_tenant_policy(
+            backend,
+            mode == GuardMode::Fire,
+            execution_id,
+            node_id,
+            tenant_id,
+            tenant.map(|t| t.policy_set()),
+        )
+        .await
+        {
+            Ok(set) => set,
+            Err(blocked) => return blocked,
+        },
         Err(e) => {
             warn!(
                 execution_id = %execution_id,

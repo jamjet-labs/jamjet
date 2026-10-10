@@ -185,7 +185,19 @@ pub(crate) async fn guard_dispatch_in(
         .get_tenant(&jamjet_state::TenantId::from(tenant_id))
         .await
     {
-        Ok(tenant) => tenant.and_then(|t| t.policy_set()),
+        Ok(tenant) => match unparseable_tenant_policy(
+            backend,
+            fire,
+            execution_id,
+            node_id,
+            tenant_id,
+            tenant.map(|t| t.policy_set()),
+        )
+        .await
+        {
+            Ok(set) => set,
+            Err(blocked) => return blocked,
+        },
         Err(e) => {
             warn!(
                 execution_id = %execution_id,
@@ -501,6 +513,43 @@ pub(crate) async fn guard_dispatch_in(
                 };
             }
             DispatchGuardOutcome::Held { gated }
+        }
+    }
+}
+
+/// A stored tenant policy that does not parse refuses the node: it used to
+/// read as "no tenant policy" and silently drop that layer's rules. A block,
+/// not `Unavailable`: the condition is permanent until an operator fixes the
+/// policy, so retrying would only repeat it. The denial is recorded (on a
+/// firing check) with scope `tenant`, and its rule names the fix.
+pub(crate) async fn unparseable_tenant_policy(
+    backend: &dyn StateBackend,
+    fire: bool,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    tenant_id: &str,
+    parsed: Option<Result<Option<PolicySetIr>, String>>,
+) -> Result<Option<PolicySetIr>, DispatchGuardOutcome> {
+    match parsed {
+        None => Ok(None),
+        Some(Ok(set)) => Ok(set),
+        Some(Err(cause)) => {
+            let reason = format!(
+                "tenant policy for tenant {tenant_id} cannot be read ({cause}); every node is \
+                 refused until it is fixed with PUT /tenants/{tenant_id}"
+            );
+            warn!(execution_id = %execution_id, node_id, %reason, "refusing node");
+            if fire {
+                record_policy_violation(
+                    backend,
+                    execution_id,
+                    node_id,
+                    reason.clone(),
+                    "tenant".to_string(),
+                )
+                .await;
+            }
+            Err(DispatchGuardOutcome::Blocked { reason })
         }
     }
 }
