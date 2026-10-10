@@ -236,6 +236,18 @@ impl StateBackend for CancelAfterRead {
             .await
     }
 
+    async fn start_execution_atomic(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+    ) -> jamjet_state::backend::BackendResult<()> {
+        self.inner
+            .start_execution_atomic(execution, started_event, scheduled_event, work_item)
+            .await
+    }
+
     async fn release_tool_reservation(
         &self,
         key: &str,

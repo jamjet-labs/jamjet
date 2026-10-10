@@ -291,6 +291,13 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A started Java workflow does not execute its steps on the runtime: they are queued
   for a `python_tool` worker, and there is no Java worker. A new CI job runs the
   client against a runtime built from the same commit.
+- **A run's start node is scheduled once.** Starting a run was four writes (the
+  execution row, `WorkflowStarted`, the start node's `NodeScheduled`, its work item),
+  and a scheduler tick landing between the first and third saw a live run with its
+  start node unscheduled and scheduled it again, so the start node ran twice under
+  load. The four are now one write, `StateBackend::start_execution_atomic`, on every
+  backend (a new trait method: a custom backend must implement it). A run whose start
+  node does not exist is now refused before anything is written.
 
 ---
 

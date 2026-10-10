@@ -320,7 +320,8 @@ async fn start_execution(
 }
 
 /// Start one run of `workflow_id`: the execution record, `WorkflowStarted`
-/// (with `initiated_by`) and the start node's work item. The ONE start path,
+/// (with `initiated_by`), the start node's `NodeScheduled` and its work item,
+/// written in one atomic step. The ONE start path,
 /// shared by `POST /executions`, the MCP bridge's `jamjet_run_workflow` and the
 /// in-process cron launcher (whose runs take the job's creator as initiator),
 /// so the start item, its payload and the initiator cannot diverge by
@@ -371,20 +372,13 @@ pub async fn start_run(
         segment_number: 0,
     };
     let execution_id = execution.execution_id.clone();
-    backend.create_execution(execution).await?;
 
-    // Append WorkflowStarted event.
-    let event = jamjet_state::Event::new(
-        execution_id.clone(),
-        1,
-        jamjet_state::EventKind::WorkflowStarted {
-            workflow_id: workflow_id.clone(),
-            workflow_version: version.clone(),
-            initial_input: input.clone(),
-            initiated_by,
-        },
-    );
-    backend.append_event(event).await?;
+    let started = jamjet_state::EventKind::WorkflowStarted {
+        workflow_id: workflow_id.clone(),
+        workflow_version: version.clone(),
+        initial_input: input.clone(),
+        initiated_by,
+    };
 
     // Immediately enqueue the start node as a work item, built by the same
     // payload builder the scheduler uses for every later node. Until 2026-09-06
@@ -416,15 +410,10 @@ pub async fn start_run(
         &version,
     );
     let max_attempts = jamjet_scheduler::max_attempts_for(start_def.retry_policy.as_deref());
-    let sched_event = jamjet_state::Event::new(
-        execution_id.clone(),
-        2,
-        jamjet_state::EventKind::NodeScheduled {
-            node_id: start_node.clone(),
-            queue_type: queue_type.clone(),
-        },
-    );
-    backend.append_event(sched_event).await?;
+    let scheduled = jamjet_state::EventKind::NodeScheduled {
+        node_id: start_node.clone(),
+        queue_type: queue_type.clone(),
+    };
 
     let work_item = WorkItem {
         id: Uuid::new_v4(),
@@ -440,7 +429,12 @@ pub async fn start_run(
         lease_fence: 0,
         tenant_id: tenant_id.0.clone(),
     };
-    backend.enqueue_work_item(work_item).await?;
+    // ONE write for the run's start (see `start_execution_atomic`): a
+    // scheduler tick between separate writes found the run live with its
+    // start node unscheduled and scheduled it a second time.
+    backend
+        .start_execution_atomic(execution, started, scheduled, work_item)
+        .await?;
 
     Ok((
         StatusCode::CREATED,

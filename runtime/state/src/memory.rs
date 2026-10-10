@@ -109,6 +109,46 @@ impl InMemoryBackend {
     }
 }
 
+impl InMemoryBackend {
+    /// The rows that start a run (see `StateBackend::start_execution_atomic`).
+    /// The in-memory backend has no transactions, so the order is what makes
+    /// the step atomic to its readers. The scheduler finds runs through the
+    /// execution row (`list_executions`), so the snapshot and events land
+    /// before it: once a tick can see the run, its `NodeScheduled` is there. A
+    /// worker finds the work item, so the item lands after the row: a claimed
+    /// start item always has its execution.
+    fn create_run(
+        &self,
+        execution: WorkflowExecution,
+        seed_snapshot: Option<Snapshot>,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+    ) {
+        let exec_id = execution.execution_id.clone();
+        if let Some(snap) = seed_snapshot {
+            self.snapshots
+                .entry(exec_id.clone())
+                .or_default()
+                .push(snap);
+        }
+        {
+            let mut events = self.events.entry(exec_id.clone()).or_default();
+            for kind in [started_event, scheduled_event] {
+                events.push(Event {
+                    id: Uuid::new_v4(),
+                    execution_id: exec_id.clone(),
+                    sequence: self.next_sequence.fetch_add(1, Ordering::SeqCst),
+                    kind,
+                    created_at: Utc::now(),
+                });
+            }
+        }
+        self.executions.insert(exec_id, execution);
+        self.work_items.insert(work_item.id, work_item);
+    }
+}
+
 impl Default for InMemoryBackend {
     fn default() -> Self {
         Self::new()
@@ -341,44 +381,24 @@ impl StateBackend for InMemoryBackend {
         scheduled_event: EventKind,
         work_item: WorkItem,
     ) -> BackendResult<()> {
-        // In-memory has no ACID crash-durability, but we replicate the write
-        // order of the SQLite impl so behavior is consistent in tests.
-        let exec_id = execution.execution_id.clone();
+        self.create_run(
+            execution,
+            Some(seed_snapshot),
+            started_event,
+            scheduled_event,
+            work_item,
+        );
+        Ok(())
+    }
 
-        // 1. Execution row.
-        self.executions.insert(exec_id.clone(), execution);
-
-        // 2. Seed snapshot.
-        self.snapshots
-            .entry(exec_id.clone())
-            .or_default()
-            .push(seed_snapshot);
-
-        // 3. WorkflowStarted — replicates append_event's fetch_add for sequence.
-        let seq1 = self.next_sequence.fetch_add(1, Ordering::SeqCst);
-        let ev1 = Event {
-            id: Uuid::new_v4(),
-            execution_id: exec_id.clone(),
-            sequence: seq1,
-            kind: started_event,
-            created_at: Utc::now(),
-        };
-        self.events.entry(exec_id.clone()).or_default().push(ev1);
-
-        // 4. NodeScheduled.
-        let seq2 = self.next_sequence.fetch_add(1, Ordering::SeqCst);
-        let ev2 = Event {
-            id: Uuid::new_v4(),
-            execution_id: exec_id.clone(),
-            sequence: seq2,
-            kind: scheduled_event,
-            created_at: Utc::now(),
-        };
-        self.events.entry(exec_id.clone()).or_default().push(ev2);
-
-        // 5. Start-node work item.
-        self.work_items.insert(work_item.id, work_item);
-
+    async fn start_execution_atomic(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+    ) -> BackendResult<()> {
+        self.create_run(execution, None, started_event, scheduled_event, work_item);
         Ok(())
     }
 

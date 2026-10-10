@@ -958,156 +958,35 @@ impl StateBackend for SqliteBackend {
         scheduled_event: EventKind,
         work_item: WorkItem,
     ) -> BackendResult<()> {
-        // Serialize all data before opening the transaction (avoids holding
-        // the write lock while doing JSON serialization).
-        let exec_id_str = execution_id_str(&execution.execution_id);
-        let exec_status = status_to_str(&execution.status);
-        let initial_input_json = serde_json::to_string(&execution.initial_input)?;
-        let current_state_json = serde_json::to_string(&execution.current_state)?;
-        let exec_started_at = execution.started_at.to_rfc3339();
-        let exec_updated_at = execution.updated_at.to_rfc3339();
-        let exec_completed_at = execution.completed_at.map(|dt| dt.to_rfc3339());
-        let parent_id = execution.parent_execution_id.as_ref().map(execution_id_str);
-        let segment_number = execution.segment_number as i64;
-
-        let snap_id = seed_snapshot.id.to_string();
-        let snap_state_json = serde_json::to_string(&seed_snapshot.state)?;
-        let snap_created_at = seed_snapshot.created_at.to_rfc3339();
-        let snap_status_str = status_to_str(&seed_snapshot.status);
-        let snap_completed_json = serde_json::to_string(&seed_snapshot.completed_nodes)?;
-        let snap_active_json = serde_json::to_string(&seed_snapshot.active_nodes)?;
-
-        let ev1_id = Uuid::new_v4().to_string();
-        let ev1_kind_json = serde_json::to_string(&started_event)?;
-        let ev1_created_at = Utc::now().to_rfc3339();
-
-        let ev2_id = Uuid::new_v4().to_string();
-        let ev2_kind_json = serde_json::to_string(&scheduled_event)?;
-        let ev2_created_at = Utc::now().to_rfc3339();
-
-        let wi_id = work_item.id.to_string();
-        let wi_exec_id = execution_id_str(&work_item.execution_id);
-        let wi_payload_json = serde_json::to_string(&work_item.payload)?;
-        let wi_created_at = work_item.created_at.to_rfc3339();
-
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(map_db_err)?;
-
-        // 1. Execution row.
-        sqlx::query(
-            r#"INSERT INTO workflow_executions
-               (execution_id, workflow_id, workflow_version, status, initial_input, current_state,
-                started_at, updated_at, completed_at, parent_execution_id, segment_number)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        create_run_in(
+            &self.pool,
+            None,
+            execution,
+            Some(seed_snapshot),
+            started_event,
+            scheduled_event,
+            work_item,
         )
-        .bind(&exec_id_str)
-        .bind(&execution.workflow_id)
-        .bind(&execution.workflow_version)
-        .bind(exec_status)
-        .bind(&initial_input_json)
-        .bind(&current_state_json)
-        .bind(&exec_started_at)
-        .bind(&exec_updated_at)
-        .bind(exec_completed_at.as_deref())
-        .bind(parent_id.as_deref())
-        .bind(segment_number)
-        .execute(&mut *tx)
         .await
-        .map_err(map_db_err)?;
+    }
 
-        // 2. Seed snapshot.
-        sqlx::query(
-            r#"INSERT OR REPLACE INTO snapshots
-               (id, execution_id, at_sequence, state_json, created_at, status,
-                completed_nodes_json, active_nodes_json, last_sequence)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+    async fn start_execution_atomic(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+    ) -> BackendResult<()> {
+        create_run_in(
+            &self.pool,
+            None,
+            execution,
+            None,
+            started_event,
+            scheduled_event,
+            work_item,
         )
-        .bind(&snap_id)
-        .bind(&exec_id_str)
-        .bind(seed_snapshot.at_sequence)
-        .bind(&snap_state_json)
-        .bind(&snap_created_at)
-        .bind(snap_status_str)
-        .bind(&snap_completed_json)
-        .bind(&snap_active_json)
-        .bind(seed_snapshot.last_sequence)
-        .execute(&mut *tx)
         .await
-        .map_err(map_db_err)?;
-
-        // 3. WorkflowStarted at seq 1. Replicate append_event's SELECT MAX+1 logic
-        //    inside the txn so sequence assignment is correct even if this method is
-        //    ever called on a non-fresh execution.
-        let seq1_row = sqlx::query(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
-        )
-        .bind(&exec_id_str)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_db_err)?;
-        let seq1: i64 = seq1_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
-
-        sqlx::query(
-            r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at)
-               VALUES (?, ?, ?, ?, ?)"#,
-        )
-        .bind(&ev1_id)
-        .bind(&exec_id_str)
-        .bind(seq1)
-        .bind(&ev1_kind_json)
-        .bind(&ev1_created_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_db_err)?;
-
-        // 4. NodeScheduled at seq 2 (MAX is now 1 after the insertion above).
-        let seq2_row = sqlx::query(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
-        )
-        .bind(&exec_id_str)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_db_err)?;
-        let seq2: i64 = seq2_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
-
-        sqlx::query(
-            r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at)
-               VALUES (?, ?, ?, ?, ?)"#,
-        )
-        .bind(&ev2_id)
-        .bind(&exec_id_str)
-        .bind(seq2)
-        .bind(&ev2_kind_json)
-        .bind(&ev2_created_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_db_err)?;
-
-        // 5. Start-node work item. Rolls back (with execution + snapshot + events)
-        //    on any failure — no partial child is ever left behind.
-        sqlx::query(
-            r#"INSERT INTO work_items
-               (id, execution_id, node_id, queue_type, payload_json, attempt, max_attempts,
-                status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)"#,
-        )
-        .bind(&wi_id)
-        .bind(&wi_exec_id)
-        .bind(&work_item.node_id)
-        .bind(&work_item.queue_type)
-        .bind(&wi_payload_json)
-        .bind(work_item.attempt as i64)
-        .bind(work_item.max_attempts as i64)
-        .bind(&wi_created_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_db_err)?;
-
-        tx.commit().await.map_err(map_db_err)?;
-        Ok(())
     }
 
     #[instrument(skip(self), fields(execution_id = %execution_id))]
@@ -2368,6 +2247,148 @@ impl StateBackend for SqliteBackend {
 }
 
 pub(crate) use crate::backend::DEFAULT_LEASE_SECS;
+
+/// The rows that start a run, in ONE `BEGIN IMMEDIATE` transaction, for both
+/// SQLite backends: the execution row, an optional seed snapshot (a
+/// continuation segment has one, a fresh run does not), `WorkflowStarted`,
+/// the start node's `NodeScheduled` and its work item. A reader sees all of
+/// them or none: a scheduler tick that saw the execution live before its
+/// `NodeScheduled` scheduled the start node a second time. A failure rolls
+/// everything back, so no partial run is left behind. `tenant_id` stamps
+/// every row; `None` leaves the columns at their default.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_run_in(
+    pool: &SqlitePool,
+    tenant_id: Option<&str>,
+    execution: WorkflowExecution,
+    seed_snapshot: Option<Snapshot>,
+    started_event: EventKind,
+    scheduled_event: EventKind,
+    work_item: WorkItem,
+) -> BackendResult<()> {
+    // Serialize everything before taking the write lock.
+    let exec_id_str = execution_id_str(&execution.execution_id);
+    let exec_status = status_to_str(&execution.status);
+    let initial_input_json = serde_json::to_string(&execution.initial_input)?;
+    let current_state_json = serde_json::to_string(&execution.current_state)?;
+    let exec_started_at = execution.started_at.to_rfc3339();
+    let exec_updated_at = execution.updated_at.to_rfc3339();
+    let exec_completed_at = execution.completed_at.map(|dt| dt.to_rfc3339());
+    let parent_id = execution.parent_execution_id.as_ref().map(execution_id_str);
+    let segment_number = execution.segment_number as i64;
+    let wi_payload_json = serde_json::to_string(&work_item.payload)?;
+    let wi_created_at = work_item.created_at.to_rfc3339();
+    // A trailing `tenant_id` column when the caller is tenant-scoped.
+    let (tcol, tval) = match tenant_id {
+        Some(_) => (", tenant_id", ", ?"),
+        None => ("", ""),
+    };
+
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(map_db_err)?;
+
+    // 1. Execution row.
+    let sql = format!(
+        "INSERT INTO workflow_executions \
+         (execution_id, workflow_id, workflow_version, status, initial_input, current_state, \
+          started_at, updated_at, completed_at, parent_execution_id, segment_number{tcol}) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{tval})"
+    );
+    let mut q = sqlx::query(&sql)
+        .bind(&exec_id_str)
+        .bind(&execution.workflow_id)
+        .bind(&execution.workflow_version)
+        .bind(exec_status)
+        .bind(&initial_input_json)
+        .bind(&current_state_json)
+        .bind(&exec_started_at)
+        .bind(&exec_updated_at)
+        .bind(exec_completed_at.as_deref())
+        .bind(parent_id.as_deref())
+        .bind(segment_number);
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    q.execute(&mut *tx).await.map_err(map_db_err)?;
+
+    // 2. Seed snapshot, for a continuation segment.
+    if let Some(snap) = seed_snapshot {
+        let sql = format!(
+            "INSERT OR REPLACE INTO snapshots \
+             (id, execution_id, at_sequence, state_json, created_at, status, \
+              completed_nodes_json, active_nodes_json, last_sequence{tcol}) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{tval})"
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(snap.id.to_string())
+            .bind(&exec_id_str)
+            .bind(snap.at_sequence)
+            .bind(serde_json::to_string(&snap.state)?)
+            .bind(snap.created_at.to_rfc3339())
+            .bind(status_to_str(&snap.status))
+            .bind(serde_json::to_string(&snap.completed_nodes)?)
+            .bind(serde_json::to_string(&snap.active_nodes)?)
+            .bind(snap.last_sequence);
+        if let Some(t) = tenant_id {
+            q = q.bind(t);
+        }
+        q.execute(&mut *tx).await.map_err(map_db_err)?;
+    }
+
+    // 3-4. WorkflowStarted, then NodeScheduled. The sequence is assigned like
+    //      `append_event` does, inside the transaction.
+    for kind in [started_event, scheduled_event] {
+        let seq: i64 = sqlx::query(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
+        )
+        .bind(&exec_id_str)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        .try_get::<i64, _>("seq")
+        .map_err(map_db_err)?;
+        let sql = format!(
+            "INSERT INTO events (id, execution_id, sequence, kind_json, created_at{tcol}) \
+             VALUES (?, ?, ?, ?, ?{tval})"
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(Uuid::new_v4().to_string())
+            .bind(&exec_id_str)
+            .bind(seq)
+            .bind(serde_json::to_string(&kind)?)
+            .bind(Utc::now().to_rfc3339());
+        if let Some(t) = tenant_id {
+            q = q.bind(t);
+        }
+        q.execute(&mut *tx).await.map_err(map_db_err)?;
+    }
+
+    // 5. Start-node work item.
+    let sql = format!(
+        "INSERT INTO work_items \
+         (id, execution_id, node_id, queue_type, payload_json, attempt, max_attempts, \
+          status, created_at{tcol}) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?{tval})"
+    );
+    let mut q = sqlx::query(&sql)
+        .bind(work_item.id.to_string())
+        .bind(execution_id_str(&work_item.execution_id))
+        .bind(&work_item.node_id)
+        .bind(&work_item.queue_type)
+        .bind(&wi_payload_json)
+        .bind(work_item.attempt as i64)
+        .bind(work_item.max_attempts as i64)
+        .bind(&wi_created_at);
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    q.execute(&mut *tx).await.map_err(map_db_err)?;
+
+    tx.commit().await.map_err(map_db_err)?;
+    Ok(())
+}
 
 /// [`StateBackend::finish_execution`] for both SQLite backends: the terminal
 /// check, the status update and the event insert in one `BEGIN IMMEDIATE`

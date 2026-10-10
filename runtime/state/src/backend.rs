@@ -217,6 +217,24 @@ pub trait StateBackend: Send + Sync {
         work_item: WorkItem,
     ) -> BackendResult<()>;
 
+    /// Start a fresh run in one atomic step: the execution row, its
+    /// `WorkflowStarted`, the start node's `NodeScheduled` and the start node's
+    /// work item. A reader sees all four or none.
+    ///
+    /// Written apart, a scheduler tick landing after the execution row and
+    /// before `NodeScheduled` found a running execution whose start node (a
+    /// root of the graph) had not been scheduled, and scheduled it too: the
+    /// start node ran twice. [`create_segment_atomic`](Self::create_segment_atomic)
+    /// is the same step for a continuation segment, which also has a seed
+    /// snapshot. The execution id MUST be fresh.
+    async fn start_execution_atomic(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+    ) -> BackendResult<()>;
+
     // ── Idempotency cache (tool_effects) ─────────────────────────────────────
 
     /// Look up a previously recorded node result by its idempotency key.

@@ -11,6 +11,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+pub mod hooked;
+
 pub fn make_state(backend: Arc<dyn StateBackend>) -> AppState {
     let backend_for_fn = backend.clone();
     let audit: Arc<dyn jamjet_audit::AuditBackend> = Arc::new(NoopAuditBackend);

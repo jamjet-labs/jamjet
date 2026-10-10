@@ -89,9 +89,11 @@ impl Scheduler {
     }
 
     /// A single scheduler tick: reclaim expired leases, then find all running
-    /// executions and dispatch any newly runnable nodes.
+    /// executions and dispatch any newly runnable nodes. Public so a test can
+    /// drive the scheduler deterministically between two writes of another
+    /// component; [`run`](Self::run) is the production loop.
     #[instrument(skip(self))]
-    async fn tick(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn tick(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 1. Reclaim expired leases (worker crashes / stalls).
         self.reclaim_expired_leases().await.unwrap_or_else(|e| {
             warn!("Failed to reclaim expired leases: {e}");
