@@ -554,8 +554,9 @@ struct ApproveRequest {
 /// IDENTITY. With auth on, the approver is the authenticated API token: the
 /// recorded `user_id` is the token's name and `principal` is `token:<id>`. The
 /// body's `user_id` is IGNORED in that mode, because a caller-chosen name on an
-/// approval is a forgery primitive. Only dev mode (no auth layer, so no token in
-/// the extensions) records the body's `user_id`, with no principal.
+/// approval is a forgery primitive. Only dev mode (the dev-mode router's
+/// `DevMode` marker, checked explicitly) records the body's `user_id`, with no
+/// principal. No token and no marker is refused with 401.
 ///
 /// ROLE. `reviewer` and above may call this route; see `require_write_role`.
 async fn approve_execution(
@@ -575,9 +576,13 @@ async fn approve_execution(
         other => return Err(ApiError::BadRequest(format!("unknown decision: {other}"))),
     };
 
-    let (user_id, principal) = match &token {
-        Some(Extension(t)) => (t.name.clone(), Some(crate::auth::principal_of(t))),
-        None => (body.user_id.unwrap_or_else(|| "anonymous".into()), None),
+    let (user_id, principal) = match (&token, &dev_mode) {
+        (Some(Extension(t)), _) => (t.name.clone(), Some(crate::auth::principal_of(t))),
+        // Only the dev-mode router records a caller-chosen name.
+        (None, Some(_)) => (body.user_id.unwrap_or_else(|| "anonymous".into()), None),
+        // No token and not dev mode: the auth layer is missing. Refuse rather
+        // than record an unauthenticated approval under the body's name.
+        (None, None) => return Err(ApiError::Unauthorized),
     };
     let actor_id = principal.clone().unwrap_or_else(|| user_id.clone());
 
@@ -2468,6 +2473,85 @@ mod tests {
     use jamjet_state::InMemoryBackend;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    /// The approve handler records a caller-chosen `user_id` only on the
+    /// dev-mode router. Reached with neither a token nor the dev-mode marker
+    /// (an auth layer missing by misconfiguration), it refuses rather than
+    /// recording an unauthenticated approval under a name from the body.
+    #[tokio::test]
+    async fn approve_without_a_token_outside_dev_mode_is_refused() {
+        let state = tenant_routing_state();
+        let tenant = TenantId::default();
+        let backend = state.backend_for(&tenant);
+        let eid = ExecutionId::new();
+        // Started by someone, so separation of duties is not what refuses.
+        backend
+            .append_event(jamjet_state::Event::new(
+                eid.clone(),
+                1,
+                jamjet_state::EventKind::WorkflowStarted {
+                    workflow_id: "wf".into(),
+                    workflow_version: "0.1.0".into(),
+                    initial_input: json!({}),
+                    initiated_by: Some("token:someone".into()),
+                },
+            ))
+            .await
+            .unwrap();
+        backend
+            .append_event(jamjet_state::Event::new(
+                eid.clone(),
+                2,
+                jamjet_state::EventKind::ToolApprovalRequired {
+                    node_id: "gate".into(),
+                    tool_name: "t".into(),
+                    approver: "human".into(),
+                    context: json!({ "node_id": "gate" }),
+                },
+            ))
+            .await
+            .unwrap();
+        let body = || ApproveRequest {
+            decision: "approved".into(),
+            node_id: Some("gate".into()),
+            user_id: Some("mallory".into()),
+            comment: None,
+            state_patch: None,
+            action_digest: None,
+        };
+
+        let refused = approve_execution(
+            State(state.clone()),
+            Extension(tenant.clone()),
+            None,
+            None,
+            Path(eid.to_string()),
+            Json(body()),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(ApiError::Unauthorized)),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(
+            backend.get_events(&eid).await.unwrap().len(),
+            2,
+            "nothing appended"
+        );
+
+        // The dev-mode router's marker is what permits the body's name.
+        let accepted = approve_execution(
+            State(state),
+            Extension(tenant),
+            None,
+            Some(Extension(crate::auth::DevMode)),
+            Path(eid.to_string()),
+            Json(body()),
+        )
+        .await;
+        assert!(accepted.is_ok(), "{:?}", accepted.err());
+    }
 
     /// Build an `AppState` whose `backend_for` returns a DISTINCT in-memory
     /// backend per tenant id (created on first use). This lets a test prove the
