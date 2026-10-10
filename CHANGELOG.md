@@ -87,7 +87,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     a run fails where it used to complete. Check `blocked_tools` patterns against
     your function node ids before upgrading. Python and Java handlers also
     match in canonical dotted form, so `payments.transfer:send` and
-    `payments:transfer.send` are one name. A pattern still binds a name, not code: a
+    `payments:transfer.send` are one name. This also widens existing patterns,
+    toward refusing: the module/function boundary disappears, so
+    `blocked_tools: ["db:drop*"]` now also blocks `db.dropdown:load`, and
+    `myapp.payments:*` covers every submodule (`myapp.payments.audit:log`). Since a
+    block fails the run, review handler patterns before upgrading. A pattern still
+    binds a name, not code: a
     re-export reaches the same function under another path, so only a catch-all
     binds an author who writes their own IR.
   - `mcp_tool` nodes are now matched on their tool. The policy engine read a
