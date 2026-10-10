@@ -150,7 +150,10 @@ relying on patterns alone.
   tool the model chose. The run's `tools` map cannot choose other code: the
   dispatcher accepts an entry only when it names the `@tool` registered under
   the called name and is that tool's own `module:qualname`, and refuses the call
-  otherwise. The engine also matches each call on the handler its entry names
+  otherwise. To check an entry that is not the registered tool's, the
+  dispatcher imports the module it names, which runs that module's top-level
+  code (any module importable on the worker) before the call is refused; a tool
+  name that import overwrites is put back. The engine also matches each call on the handler its entry names
   (as written, in dotted form, and by function name), binds the handler into a
   per-call approval (the listing shows it), and blocks the batch on an entry
   that is not a `module:function` string or whose path has a `_`-prefixed

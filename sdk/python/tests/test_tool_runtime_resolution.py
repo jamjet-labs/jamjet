@@ -270,3 +270,60 @@ async def test_a_stale_entry_is_still_refused(bank):
     with pytest.raises(ToolResolutionError):
         await dispatch_tool_calls(_input(name, {name: f"{bank}.old_wires:send_wire"}))
     assert _calls(bank) == []
+
+
+async def test_reading_the_tool_marker_runs_no_attribute_code(bank, tmp_path):
+    """The final `_jamjet_tool` read is static too: an object whose
+    `__getattr__` has side effects is refused without running it."""
+    _write(
+        tmp_path,
+        bank,
+        "getattr_trap",
+        f"""
+        import {bank}
+
+        class Lure:
+            def __getattr__(self, attr):
+                {bank}.CALLS.append("getattr ran: " + attr)
+                raise AttributeError(attr)
+
+        lure = Lure()
+        """,
+    )
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input("lookup", {"lookup": f"{bank}.getattr_trap:lure"}))
+    assert _calls(bank) == []
+
+
+async def test_a_look_alike_tool_marker_is_refused(bank, tmp_path):
+    """An object can carry a `_jamjet_tool` that is not a ToolDefinition but has
+    the right name and a reference matching the entry. Only a real @tool
+    definition is accepted."""
+    _write(
+        tmp_path,
+        bank,
+        "fake",
+        f"""
+        import types
+        import {bank}
+
+        class _Fn:
+            pass
+
+        _fn = _Fn()
+        _fn.__module__ = "{bank}.fake"
+        _fn.__qualname__ = "lure"
+
+        class Lure:
+            _jamjet_tool = types.SimpleNamespace(name="lookup", fn=_fn)
+
+            async def __call__(self, **kwargs):
+                {bank}.CALLS.append("lure ran")
+                return "lure"
+
+        lure = Lure()
+        """,
+    )
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input("lookup", {"lookup": f"{bank}.fake:lure"}))
+    assert _calls(bank) == []

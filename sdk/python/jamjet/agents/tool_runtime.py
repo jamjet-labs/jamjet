@@ -136,14 +136,20 @@ def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]
     run's state, which whoever starts the run seeds. An entry is accepted only
     when the object it names is itself a ``@tool`` registered under this call's
     name, and the entry is exactly that tool's own ``module:qualname`` (what
-    the SDK compiler writes). The path is walked with
-    :func:`inspect.getattr_static`, so no descriptor or attribute magic runs.
+    the SDK compiler writes).
+
+    When the tool registered under the called name is not the one the entry
+    names, the entry's MODULE is imported to find what it names, which runs
+    that module's top-level code before anything is refused (any module
+    importable on the worker). Nothing else runs: the path and the final
+    ``_jamjet_tool`` marker are read with :func:`inspect.getattr_static`, so
+    no descriptor, property or ``__getattr__`` code runs.
     Anything else, such as an attribute path (``mod:send_wire.__call__``), a
     re-export under another name, or an entry pointing a tool name at other
     code, raises :class:`ToolResolutionError` and nothing runs. A call with no
     entry resolves through the registry by name.
     """
-    from jamjet.tools.decorators import _TOOL_REGISTRY, get_tool  # noqa: PLC0415 - avoid import cycle
+    from jamjet.tools.decorators import _TOOL_REGISTRY, ToolDefinition, get_tool  # noqa: PLC0415 - avoid import cycle
 
     if not name:
         raise ToolResolutionError("a tool call has no name")
@@ -182,8 +188,8 @@ def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]
         obj = inspect.getattr_static(obj, part, None)
         if obj is None:
             raise ToolResolutionError(f"tool {name!r}: tools map entry {ref!r} names nothing")
-    defn = getattr(obj, "_jamjet_tool", None)
-    if defn is None or defn.name != name or _registered_ref(defn) != ref:
+    defn = inspect.getattr_static(obj, "_jamjet_tool", None)
+    if not isinstance(defn, ToolDefinition) or defn.name != name or _registered_ref(defn) != ref:
         raise ToolResolutionError(
             f"tool {name!r}: tools map entry {ref!r} is not the registered @tool {name!r}'s own reference"
         )
