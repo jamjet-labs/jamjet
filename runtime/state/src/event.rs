@@ -447,6 +447,18 @@ pub enum EventKind {
         /// The execution_id of the new segment (as a string).
         next_execution_id: String,
     },
+
+    /// An event kind this build does not know, written by a later release.
+    /// Read instead of failing the whole log, and ignored by every fold. Its
+    /// fields are dropped, and re-serializing it writes only
+    /// `{"type": "unknown"}`.
+    ///
+    /// CAUTION: ignoring is the safe reading only for kinds that do not
+    /// restrict anything. A later kind that revokes or denies (an approval
+    /// revocation, say) would be ignored by an older build reading it. Do not
+    /// run an older build against a log a newer build has written.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The principal an expired approval request is rejected by.

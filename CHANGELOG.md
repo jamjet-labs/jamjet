@@ -276,6 +276,15 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now asserts the *fix* — `h2 0.3.x` and `hyper 0.14` must stay out of the tree, so a
   future dependency bump cannot quietly bring the line back.
 
+- **Event kinds from a later release read as `unknown`.** `EventKind` gains a
+  `#[serde(other)]` `Unknown` variant that every fold ignores, so a log holding a kind
+  this build does not know still loads. Downgrade note: a build from before this
+  release cannot read a log that holds `approval_expired`, `approval_escalated` or
+  `audit_seal_failed` (the whole log fails to load), so do not roll back past this
+  release on a store a newer build has written. Even with `Unknown`, an older build
+  ignores what it does not know; a future kind that restricts (a revocation, say)
+  would be ignored by it, so the same advice holds for later releases.
+
 ### Fixed
 
 - **Runtime: an unmatched API request is a JSON 404, not the web UI.** The SPA
