@@ -61,7 +61,19 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     pattern matches one of these names, `["*"]` in particular, now gates or blocks
     these nodes where it used to let them through.
   - A registered workflow version is immutable: an identical re-register is a 200
-    no-op, a different IR under the same version is a 409.
+    no-op, a different IR under the same version is a 409. Identity is the
+    canonical content hash, so key order and whitespace do not matter.
+    For anything that re-registers its workflows at boot (PAS does): an edited
+    graph under an unchanged version now fails boot with 409, where before the
+    new IR silently replaced the old one. The first boot after upgrading also
+    fails if the database already holds a copy of an unchanged version that
+    differs from what the code now builds (a past edit made without a version
+    bump). Remedy: bump the workflow's version, which is the supported fix and
+    keeps runs of the old version readable; or, if no run of that version still
+    needs its old definition, delete the stale row
+    (`DELETE FROM workflow_definitions WHERE tenant_id = ? AND workflow_id = ? AND version = ?`;
+    PAS runs in the `default` tenant)
+    and boot again.
   - The embedded cron scheduler starts runs in-process instead of POSTing to
     `/executions` without a token, which failed with 401 outside dev mode. A cron
     job records the token that created it (`created_by`, migration 0013), and its
