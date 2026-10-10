@@ -123,6 +123,14 @@ class ToolResolutionError(LookupError):
     """
 
 
+def _tool_callable(defn: Any) -> Callable[..., Any]:
+    """What a resolved call runs: the registered ``@tool`` wrapper (which holds
+    the replay intercept), the same object on every resolution path. A
+    decorator stacked outside ``@tool`` is not part of the registered tool and
+    does not run on any path."""
+    return defn.wrapper if defn.wrapper is not None else defn.fn
+
+
 def _registered_ref(defn: Any) -> str:
     """The registered tool's own ``module:qualname``, as the SDK compiler
     writes it into the run's ``tools`` map (``agent_ir._tools_map``)."""
@@ -159,7 +167,7 @@ def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]
         defn = get_tool(name)
         if defn is None:
             raise ToolResolutionError(f"tool {name!r} not found in the @tool registry")
-        return defn.fn
+        return _tool_callable(defn)
 
     if not isinstance(ref, str) or ":" not in ref:
         raise ToolResolutionError(f"tools map entry for {name!r} is not a module:function reference")
@@ -172,7 +180,7 @@ def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]
     # is the one the entry names.
     registered = get_tool(name)
     if registered is not None and _registered_ref(registered) == ref:
-        return registered.fn
+        return _tool_callable(registered)
 
     # Otherwise the entry's module is imported to find what it names. Importing
     # runs its @tool decorators, which would overwrite any tool already
@@ -197,7 +205,7 @@ def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]
         raise ToolResolutionError(
             f"tool {name!r}: tools map entry {ref!r} is not the registered @tool {name!r}'s own reference"
         )
-    return obj
+    return _tool_callable(defn)
 
 
 def _stringify(result: Any) -> str:

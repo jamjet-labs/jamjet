@@ -343,3 +343,16 @@ async def test_a_null_entry_for_a_registered_tool_is_refused(bank):
     with pytest.raises(ToolResolutionError):
         await dispatch_tool_calls(_input(name, {name: None}))
     assert _calls(bank) == []
+
+
+async def test_both_paths_run_the_same_registered_callable(bank):
+    """With or without a verified entry, the call runs the registered @tool
+    wrapper, so the replay intercept applies either way."""
+    from jamjet.agents.tool_runtime import _resolve_tool
+
+    __import__(f"{bank}.wires")
+    name = f"send_wire_{bank}"
+    by_name = _resolve_tool(name, {})
+    by_entry = _resolve_tool(name, {name: f"{bank}.wires:send_wire"})
+    assert by_name is by_entry
+    assert getattr(by_name, "_jamjet_tool").name == name, "the @tool wrapper, not the raw function"

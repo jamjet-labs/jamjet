@@ -48,6 +48,10 @@ class ToolDefinition:
         self.output_schema = output_schema
         self.description = description or (fn.__doc__ or "").strip()
         self.permissions = permissions or []
+        # The callable `@tool` returns (with the replay intercept), set by the
+        # decorator. Dispatch runs this, never the raw `fn`, whichever way a
+        # call is resolved.
+        self.wrapper: Callable[..., Any] | None = None
 
     def __repr__(self) -> str:
         return f"Tool(name={self.name!r})"
@@ -141,6 +145,7 @@ def tool(
             return await fn(*args, **kwargs)
 
         wrapper._jamjet_tool = defn  # type: ignore[attr-defined]
+        defn.wrapper = wrapper
         return wrapper  # type: ignore[return-value]
 
     if func is not None:
