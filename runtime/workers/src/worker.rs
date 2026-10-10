@@ -4431,6 +4431,82 @@ mod tests {
         );
     }
 
+    /// A sibling that completes in-process writes the engine's `__budget`
+    /// bookkeeping into state. That is not a change to what the gated node
+    /// would do, so it must not void the approval: on a busy parallel branch
+    /// it would otherwise re-request forever.
+    #[tokio::test]
+    async fn engine_bookkeeping_after_approval_does_not_force_a_re_request() {
+        let (backend, eid, worker, exec) = gated_setup().await;
+        hold_and_approve(&backend, &eid, &worker).await;
+
+        append(
+            &backend,
+            &eid,
+            EventKind::NodeCompleted {
+                node_id: "sibling".into(),
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({
+                    "__budget": { "total_input_tokens": 512, "tool_call_count": 3 }
+                }),
+                duration_ms: 0,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+                idempotency_key: None,
+            },
+        )
+        .await;
+        run_n1(&backend, &eid, &worker).await;
+
+        assert_eq!(
+            fired(&exec),
+            1,
+            "budget bookkeeping is not a change to the action"
+        );
+        assert_eq!(
+            request_digests(&backend, &eid).await.len(),
+            1,
+            "no re-request"
+        );
+    }
+
+    /// The exclusion is exactly the engine's keys, not every `__` key: user
+    /// state may use the prefix, and a change to it still voids the approval.
+    #[tokio::test]
+    async fn a_user_key_with_the_engine_prefix_still_forces_a_re_request() {
+        let (backend, eid, worker, exec) = gated_setup().await;
+        hold_and_approve(&backend, &eid, &worker).await;
+
+        append(
+            &backend,
+            &eid,
+            EventKind::NodeCompleted {
+                node_id: "sibling".into(),
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({ "__limits": {} }),
+                duration_ms: 0,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+                idempotency_key: None,
+            },
+        )
+        .await;
+        run_n1(&backend, &eid, &worker).await;
+
+        assert_eq!(fired(&exec), 0);
+        assert_eq!(request_digests(&backend, &eid).await.len(), 2);
+    }
+
     #[tokio::test]
     async fn a_second_visit_needs_a_new_approval() {
         let (backend, eid, worker, exec) = gated_setup().await;

@@ -168,3 +168,28 @@ fn an_old_approval_received_parses_with_no_binding() {
         "{v}"
     );
 }
+
+#[test]
+fn engine_state_keys_cover_the_budget_writer() {
+    // The digest excludes exactly ENGINE_STATE_KEYS. If the engine's budget
+    // writer ever puts another key into state, it must be listed, or every
+    // sibling completion would void waiting approvals again.
+    let mut state = json!({});
+    jamjet_state::BudgetState::default().patch_into_snapshot_state(&mut state);
+    for key in state.as_object().unwrap().keys() {
+        assert!(
+            jamjet_state::approvals::ENGINE_STATE_KEYS.contains(&key.as_str()),
+            "engine-written key {key} is not excluded from the digest"
+        );
+    }
+}
+
+#[test]
+fn only_the_engine_keys_are_left_out_of_what_is_bound() {
+    use jamjet_state::approvals::action_state;
+    let state = json!({ "__budget": { "spent": 1 }, "__limits": {}, "amount": 10 });
+    assert_eq!(
+        action_state(&state),
+        json!({ "__limits": {}, "amount": 10 })
+    );
+}

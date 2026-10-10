@@ -215,8 +215,35 @@ impl ActionBasis {
     }
 }
 
+/// State keys the ENGINE itself writes, excluded from the action digest.
+///
+/// Every in-process completion writes the execution's budget bookkeeping
+/// (`BudgetState::patch_into_snapshot_state`, key `"__budget"`) into state.
+/// If the digest covered it, any sibling finishing while a gated node waited
+/// would void the node's approval, and a node on a busy parallel branch could
+/// re-request forever. These keys describe the engine's accounting, not the
+/// action, so they are left out.
+///
+/// EXACTLY the engine's keys: not every `"__"`-prefixed key, because user state
+/// may use that prefix and a change to it must still void an approval. A new
+/// engine-written key goes here, and `engine_state_keys_cover_the_budget_writer`
+/// fails if the budget writer starts writing one that is not listed.
+pub const ENGINE_STATE_KEYS: &[&str] = &["__budget"];
+
+/// `state` without the [`ENGINE_STATE_KEYS`]: what an approval binds.
+pub fn action_state(state: &serde_json::Value) -> serde_json::Value {
+    let mut state = state.clone();
+    if let Some(obj) = state.as_object_mut() {
+        for key in ENGINE_STATE_KEYS {
+            obj.remove(*key);
+        }
+    }
+    state
+}
+
 /// Read the [`ActionBasis`] for the next occurrence of `node_id`: the node's
-/// completion count and the materialized state. `definition` is the node's
+/// completion count and the materialized state without the
+/// [`ENGINE_STATE_KEYS`]. `definition` is the node's
 /// [`definition_hash`]. Errors propagate: a caller on the enforcement path
 /// must treat them as "cannot prove this is approved".
 pub async fn action_basis(
@@ -228,9 +255,11 @@ pub async fn action_basis(
     let step = backend
         .count_node_completions(execution_id, node_id)
         .await?;
-    let state = crate::materializer::materialize(backend, execution_id)
-        .await?
-        .current_state;
+    let state = action_state(
+        &crate::materializer::materialize(backend, execution_id)
+            .await?
+            .current_state,
+    );
     Ok(ActionBasis {
         run: execution_id.to_string(),
         step,
