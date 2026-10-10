@@ -389,6 +389,33 @@ impl Scheduler {
             .unwrap()
             .insert(execution_id.clone(), progress.clone());
 
+        // FAIL CLOSED on a log this build cannot fully read. An event of an
+        // unknown kind may revoke, deny or redirect anything, so the run is
+        // not advanced past it: nothing is dispatched, failed, skipped,
+        // expired or completed. The stall is recorded once, durably, so it is
+        // visible in the run's events.
+        if progress.unreadable {
+            if !progress.stall_recorded {
+                let event = jamjet_state::Event::new(
+                    execution_id.clone(),
+                    0,
+                    EventKind::RunStalled {
+                        reason: jamjet_state::approvals::UNREADABLE_LOG_REASON.to_string(),
+                    },
+                );
+                let once = |log: &[jamjet_state::Event]| {
+                    !log.iter()
+                        .any(|e| matches!(e.kind, EventKind::RunStalled { .. }))
+                };
+                if let jamjet_state::ConditionalAppend::Appended(_) =
+                    self.backend.append_event_if(event, &once).await?
+                {
+                    warn!(execution_id = %execution_id, "Run stalled: its log holds event kinds this build cannot read");
+                }
+            }
+            return Ok(());
+        }
+
         // Approval deadlines. Only an execution holding a node on a request
         // that carries a deadline can have one to expire or escalate (any key
         // present, even an unreadable one, counts: that fails closed in the
@@ -713,6 +740,11 @@ struct ExecProgress {
     /// `escalate_at` in its context). Only a run holding one of these is swept,
     /// so a run with no deadlines never has its log read for the sweep.
     deadline_requests: HashSet<NodeId>,
+    /// The log holds an event kind this build cannot read. The scheduler does
+    /// not advance such a run (no dispatch, no failure, no completion).
+    unreadable: bool,
+    /// A `RunStalled` is already in the log, so it is not recorded again.
+    stall_recorded: bool,
     /// Rejected approvals awaiting their `NodeFailed` emission, node -> reason.
     /// Cleared when the corresponding `NodeFailed{retryable: false}` folds in.
     /// Note: a rejected node stays in `scheduled` (consuming a concurrency slot)
@@ -884,6 +916,8 @@ impl ExecProgress {
                     }
                 }
             }
+            EventKind::Unknown => self.unreadable = true,
+            EventKind::RunStalled { .. } => self.stall_recorded = true,
             EventKind::ApprovalExpired {
                 node_id,
                 request_sequence,

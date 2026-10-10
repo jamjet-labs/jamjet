@@ -93,13 +93,29 @@ pub enum NodeApprovalStatus {
         comment: Option<String>,
         sequence: EventSequence,
     },
+    /// The log holds an event kind this build cannot read
+    /// (`EventKind::Unknown`). Its kind and node are unknown, so it could be a
+    /// revocation or a denial of this node's approval, whatever its position:
+    /// any one in the run's log makes every node's status indeterminate.
+    /// Treated as not approved: nothing is released and no decision accepted.
+    Indeterminate,
 }
+
+/// Why an approval decision cannot be made on a log holding an event kind
+/// this build cannot read.
+pub const UNREADABLE_LOG_REASON: &str = "the run's event log contains event kinds this build \
+     cannot read (written by a newer release); approval state cannot be determined, so \
+     nothing is released or decided; upgrade the engine";
 
 /// Fold events (must be in sequence order) into the status of `node_id`.
 pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStatus {
     let mut status = NodeApprovalStatus::NotRequested;
+    // Any unreadable event makes the status indeterminate. Its node cannot be
+    // read, so it may bear on this one, and a later request does not clear it.
+    let mut unreadable = false;
     for event in events {
         match &event.kind {
+            EventKind::Unknown => unreadable = true,
             EventKind::ToolApprovalRequired {
                 node_id: n,
                 tool_name,
@@ -158,7 +174,15 @@ pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStat
             _ => {}
         }
     }
+    if unreadable {
+        return NodeApprovalStatus::Indeterminate;
+    }
     status
+}
+
+/// Whether the log holds an event kind this build cannot read.
+pub fn has_unreadable_events(events: &[Event]) -> bool {
+    events.iter().any(|e| matches!(e.kind, EventKind::Unknown))
 }
 
 /// The comment an expiry is recorded with in the approval state.
@@ -1031,5 +1055,30 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn an_unreadable_event_makes_approval_state_indeterminate() {
+        let events = vec![
+            required(1, "a"),
+            received(2, "a", ApprovalDecision::Approved),
+            ev(3, EventKind::Unknown),
+        ];
+        assert!(matches!(
+            node_approval_status(&events, "a"),
+            NodeApprovalStatus::Indeterminate
+        ));
+        assert!(!approval_covers(
+            &node_approval_status(&events, "a"),
+            "anything"
+        ));
+        // Before a request too: a later request does not clear it.
+        let events = vec![ev(1, EventKind::Unknown), required(2, "a")];
+        assert!(matches!(
+            node_approval_status(&events, "a"),
+            NodeApprovalStatus::Indeterminate
+        ));
+        // The listing still reads the log.
+        assert_eq!(pending_approvals(&events).len(), 1);
     }
 }

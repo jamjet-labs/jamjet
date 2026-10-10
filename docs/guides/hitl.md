@@ -310,6 +310,18 @@ Limits worth knowing:
 
 ---
 
+## Event Kinds a Build Cannot Read
+
+A run's log can hold an event a newer release wrote. This build reads it as
+`unknown`, so the log still loads and the event still lists, but it does not
+guess what it meant: it could be a revocation or a denial. Every approval in
+that run is treated as not covering anything, no request is raised, a
+decision is refused (409, "event log contains event kinds this build cannot
+read"), and the scheduler stops advancing the run and records `run_stalled`
+once. Upgrade the engine to continue the run.
+
+---
+
 ## Audit Log
 
 Every human decision is recorded:

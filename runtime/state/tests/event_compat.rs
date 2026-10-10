@@ -64,8 +64,8 @@ fn a_principal_round_trips_and_none_is_not_written() {
 }
 
 /// Review M-8: an event kind a later release adds deserializes as `Unknown`
-/// instead of failing the whole log, and the approval fold ignores it. A
-/// SQLite log holding one still loads.
+/// instead of failing the whole log, and the approval fold fails closed on
+/// it. A SQLite log holding one still loads.
 #[tokio::test]
 async fn an_event_kind_from_a_later_release_reads_as_unknown() {
     use jamjet_state::approvals::{node_approval_status, NodeApprovalStatus};
@@ -90,9 +90,10 @@ async fn an_event_kind_from_a_later_release_reads_as_unknown() {
         ),
         Event::new(id.clone(), 2, kind),
     ];
+    // It is not ignored: approval state over it is indeterminate (fail closed).
     assert!(matches!(
         node_approval_status(&events, "gate"),
-        NodeApprovalStatus::Pending(_)
+        NodeApprovalStatus::Indeterminate
     ));
 
     let mut p = std::env::temp_dir();

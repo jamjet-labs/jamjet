@@ -276,14 +276,17 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now asserts the *fix* — `h2 0.3.x` and `hyper 0.14` must stay out of the tree, so a
   future dependency bump cannot quietly bring the line back.
 
-- **Event kinds from a later release read as `unknown`.** `EventKind` gains a
-  `#[serde(other)]` `Unknown` variant that every fold ignores, so a log holding a kind
-  this build does not know still loads. Downgrade note: a build from before this
-  release cannot read a log that holds `approval_expired`, `approval_escalated` or
-  `audit_seal_failed` (the whole log fails to load), so do not roll back past this
-  release on a store a newer build has written. Even with `Unknown`, an older build
-  ignores what it does not know; a future kind that restricts (a revocation, say)
-  would be ignored by it, so the same advice holds for later releases.
+- **A log holding an event kind this build cannot read fails closed.** `EventKind`
+  gains a `#[serde(other)]` `Unknown` variant, so such a log still loads and lists
+  (`GET /executions/:id/events` shows the event as `unknown`). Nothing acts on it: the
+  approval state of every node in that run is indeterminate, so no approval covers
+  anything, no request is raised and no decision is accepted (409, "event log contains
+  event kinds this build cannot read"), and the scheduler does not advance the run,
+  recording `run_stalled` once. Downgrade note: an older build refuses to act on a log
+  a newer build wrote rather than ignoring what it cannot read. Builds from before
+  this release cannot load a log holding `approval_expired`, `approval_escalated`,
+  `audit_seal_failed` or `run_stalled` at all, so do not roll back past this release on
+  a store a newer build has written.
 
 ### Fixed
 

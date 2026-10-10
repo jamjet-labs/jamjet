@@ -344,6 +344,12 @@ pub(crate) async fn guard_dispatch_in(
 
             let status = jamjet_state::approvals::node_approval_status(&events, node_id);
 
+            if matches!(status, NodeApprovalStatus::Indeterminate) {
+                return DispatchGuardOutcome::Unavailable {
+                    reason: jamjet_state::approvals::UNREADABLE_LOG_REASON.to_string(),
+                };
+            }
+
             // Already requested (or decided rejected: the scheduler owns the
             // failure). Hold; emit nothing.
             if matches!(
@@ -1561,6 +1567,29 @@ mod tests {
             DispatchGuardOutcome::Allow
         );
         assert_eq!(f.requests().await.len(), 1);
+    }
+
+    /// An event kind this build cannot read, after the approval: the
+    /// dispatch is not released and no new request is raised.
+    #[tokio::test]
+    async fn an_unreadable_event_withholds_an_approved_dispatch() {
+        let f = Fixture::new();
+        let ir = ir(&[], &["send_wire"]);
+        hold_and_approve(&f, &ir, &input_for(&["send_wire"])).await;
+        f.backend
+            .append_event(Event::new(f.execution_id.clone(), 0, EventKind::Unknown))
+            .await
+            .unwrap();
+        let outcome = f.guard(&ir, &input_for(&["send_wire"])).await;
+        assert!(
+            matches!(&outcome, DispatchGuardOutcome::Unavailable { reason } if reason.contains("cannot read")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            f.requests().await.len(),
+            1,
+            "no new request over an unreadable log"
+        );
     }
 
     /// The node completed and is dispatched again with the same calls (a loop,

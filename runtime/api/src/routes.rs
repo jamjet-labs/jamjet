@@ -673,6 +673,7 @@ async fn approve_execution(
         | crate::approvals::SubmitError::ExecutionTerminal(_)
         | crate::approvals::SubmitError::Expired(_)
         | crate::approvals::SubmitError::Superseded(_)
+        | crate::approvals::SubmitError::UnreadableLog
         | crate::approvals::SubmitError::StaleDigest => ApiError::Conflict(e.to_string()),
         crate::approvals::SubmitError::EditsUnsupported
         | crate::approvals::SubmitError::DigestRequired => ApiError::BadRequest(e.to_string()),

@@ -325,6 +325,14 @@ pub enum EventKind {
         error: String,
     },
 
+    /// The scheduler stopped advancing this run: its log holds an event kind
+    /// this build cannot read (`Unknown`), so it cannot tell what the run may
+    /// do next. Recorded once; the run stays as it is until a build that
+    /// reads the whole log takes over.
+    RunStalled {
+        reason: String,
+    },
+
     // ── Reasoning strategy lifecycle (§14.5) ─────────────────────────────
     /// Emitted when a reasoning strategy begins execution.
     StrategyStarted {
@@ -449,14 +457,13 @@ pub enum EventKind {
     },
 
     /// An event kind this build does not know, written by a later release.
-    /// Read instead of failing the whole log, and ignored by every fold. Its
-    /// fields are dropped, and re-serializing it writes only
-    /// `{"type": "unknown"}`.
-    ///
-    /// CAUTION: ignoring is the safe reading only for kinds that do not
-    /// restrict anything. A later kind that revokes or denies (an approval
-    /// revocation, say) would be ignored by an older build reading it. Do not
-    /// run an older build against a log a newer build has written.
+    /// Read instead of failing the whole log, so the log still loads and
+    /// lists (its fields are dropped; re-serializing it writes only
+    /// `{"type": "unknown"}`). It is NOT ignored where it could matter: it may
+    /// be a revocation or a denial, so every fold that decides coverage or
+    /// permission fails closed on it. The approval fold reports
+    /// `NodeApprovalStatus::Indeterminate` (nothing released, no decision
+    /// accepted) and the scheduler does not advance the run (`RunStalled`).
     #[serde(other)]
     Unknown,
 }

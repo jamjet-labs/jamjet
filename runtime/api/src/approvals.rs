@@ -91,6 +91,9 @@ pub enum SubmitError {
     /// `system:deadline`) or past `expires_at` and about to be. Nothing is
     /// recorded.
     Expired(String),
+    /// The log holds event kinds this build cannot read, so approval state
+    /// cannot be determined. Nothing is recorded.
+    UnreadableLog,
     /// The request was decided, expired or replaced between this decision's
     /// read and its append. Nothing is recorded.
     Superseded(String),
@@ -151,6 +154,9 @@ impl std::fmt::Display for SubmitError {
                 "the approval request for node '{n}' expired at its deadline and can no longer \
                  be decided; it was rejected by system:deadline"
             ),
+            Self::UnreadableLog => {
+                write!(f, "{}", jamjet_state::approvals::UNREADABLE_LOG_REASON)
+            }
             Self::Superseded(n) => write!(
                 f,
                 "the approval request for node '{n}' was decided, expired or replaced while \
@@ -221,6 +227,11 @@ pub async fn submit_approval(
         .get_events(execution_id)
         .await
         .map_err(|e| SubmitError::Backend(e.to_string()))?;
+    // Fail closed on a log this build cannot fully read: an unreadable event
+    // may have revoked or decided what the listing still shows as pending.
+    if jamjet_state::approvals::has_unreadable_events(&events) {
+        return Err(SubmitError::UnreadableLog);
+    }
     let pending = pending_approvals(&events);
 
     let node_id = match submission.node_id.filter(|n| !n.is_empty()) {

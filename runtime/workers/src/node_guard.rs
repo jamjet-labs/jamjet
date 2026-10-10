@@ -265,6 +265,13 @@ pub async fn require_approval(
     };
 
     let status = node_approval_status(&events, node_id);
+    if matches!(status, NodeApprovalStatus::Indeterminate) {
+        // Fail closed: never release, never raise a request over a log this
+        // build cannot fully read.
+        return GuardOutcome::Unavailable {
+            reason: jamjet_state::approvals::UNREADABLE_LOG_REASON.to_string(),
+        };
+    }
     if matches!(
         status,
         NodeApprovalStatus::Pending(_) | NodeApprovalStatus::Rejected { .. }
