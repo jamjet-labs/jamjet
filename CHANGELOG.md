@@ -123,6 +123,11 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     runs take that token as initiator, so the creator cannot approve them. Jobs
     created before this upgrade have no creator; their runs cannot be approved
     outside dev mode until the job is recreated.
+  - `jamjet-timers` public API changes (a breaking release for that crate, so the
+    next crates.io publish needs a major-compatible bump, 0.5 to 0.6):
+    `CronStore::delete` now takes `(tenant_id, name)` and `CronStore::disable` takes
+    the job id; `CronStore::list_for_tenant` is new; `CronJob` gains `created_by`
+    and `tenant_id`; `HttpCronLauncher` and `CronScheduler::new` are removed.
   - The unused HTTP cron launcher (`HttpCronLauncher`, `CronScheduler::new`) is
     removed. It POSTed `/executions` with no token, so it failed outside dev mode,
     and giving it a token would have made that service the initiator of every cron
