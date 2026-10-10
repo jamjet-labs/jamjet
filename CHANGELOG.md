@@ -67,7 +67,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `class/method`, `queue/handler`) and the node id. Before, these kinds had no
     name, so no pattern matched them. Behaviour change: an existing policy whose
     pattern matches one of these names, `["*"]` in particular, now gates or blocks
-    these nodes where it used to let them through. Python and Java handlers also
+    these nodes where it used to let them through. The node id counts as a name,
+    so a `blocked_tools` pattern written for tools can now hit a function node:
+    `blocked_tools: ["delete_*"]` blocks a `python_fn` node with id
+    `delete_temp_files`. Because a blocked node now fails its run (see below), such
+    a run fails where it used to complete. Check `blocked_tools` patterns against
+    your function node ids before upgrading. Python and Java handlers also
     match in canonical dotted form, so `payments.transfer:send` and
     `payments:transfer.send` are one name. A pattern still binds a name, not code: a
     re-export reaches the same function under another path, so only a catch-all
