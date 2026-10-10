@@ -691,6 +691,9 @@ struct ExecProgress {
     /// dispatcher won't re-enqueue it). `held` only gates which
     /// `ApprovalReceived` decisions are acted on.
     held: HashSet<NodeId>,
+    /// The sequence of each node's latest `ToolApprovalRequired`: an
+    /// `ApprovalExpired` resolves a hold only when it names that request.
+    held_request: HashMap<NodeId, jamjet_state::EventSequence>,
     /// Rejected approvals awaiting their `NodeFailed` emission, node -> reason.
     /// Cleared when the corresponding `NodeFailed{retryable: false}` folds in.
     /// Note: a rejected node stays in `scheduled` (consuming a concurrency slot)
@@ -820,6 +823,7 @@ impl ExecProgress {
             }
             EventKind::ToolApprovalRequired { node_id, .. } => {
                 self.held.insert(node_id.clone());
+                self.held_request.insert(node_id.clone(), event.sequence);
             }
             EventKind::ApprovalReceived {
                 node_id,
@@ -850,14 +854,17 @@ impl ExecProgress {
             }
             EventKind::ApprovalExpired {
                 node_id,
+                request_sequence,
                 expires_at,
                 principal,
-                ..
             } => {
                 // An expiry is a rejection by `system:deadline` (the sweep
                 // records it only while the request is pending): the node
-                // fails exactly as on a human rejection.
-                if self.held.remove(node_id) {
+                // fails exactly as on a human rejection. Only for the
+                // request it names, like the approvals folds and the projector.
+                if self.held_request.get(node_id) == Some(request_sequence)
+                    && self.held.remove(node_id)
+                {
                     self.rejected.insert(
                         node_id.clone(),
                         format!(
@@ -1413,6 +1420,46 @@ mod tests {
         let reason = progress.rejected.get("a").expect("rejected entry");
         assert!(reason.contains("alice"));
         assert!(reason.contains("too risky"));
+    }
+
+    fn request(node: &str) -> EventKind {
+        EventKind::ToolApprovalRequired {
+            node_id: node.into(),
+            tool_name: "t".into(),
+            approver: "human".into(),
+            context: serde_json::json!({}),
+        }
+    }
+
+    fn expiry_of(request_sequence: i64) -> EventKind {
+        EventKind::ApprovalExpired {
+            node_id: "a".into(),
+            request_sequence,
+            expires_at: chrono::Utc::now(),
+            principal: "system:deadline".into(),
+        }
+    }
+
+    /// Review M-4: like the approvals folds and the projector, the scheduler
+    /// fold acts on an expiry only for the request it names. Sequences are the
+    /// 1-based positions `fold_events` assigns.
+    #[test]
+    fn an_expiry_fails_the_node_only_for_its_own_request() {
+        let progress = fold_events(vec![request("a"), expiry_of(1)]);
+        assert!(!progress.held.contains("a"));
+        assert!(progress
+            .rejected
+            .get("a")
+            .unwrap()
+            .contains("system:deadline"));
+
+        // Expiry of the superseded request at 1; the request at 2 is pending.
+        let progress = fold_events(vec![request("a"), request("a"), expiry_of(1)]);
+        assert!(
+            progress.held.contains("a"),
+            "the newer request is still held"
+        );
+        assert!(!progress.rejected.contains_key("a"));
     }
 
     #[test]
