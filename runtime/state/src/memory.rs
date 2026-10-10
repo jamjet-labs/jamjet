@@ -252,6 +252,33 @@ impl StateBackend for InMemoryBackend {
         Ok(ExecutionFinish::Finished(seq))
     }
 
+    async fn append_event_if(
+        &self,
+        mut event: Event,
+        condition: &crate::backend::EventCondition,
+    ) -> BackendResult<crate::backend::ConditionalAppend> {
+        use crate::backend::ConditionalAppend;
+        // Hold the execution's entry, then its log, across the check and the
+        // push: the same lock order as `finish_execution`, so a termination
+        // or another conditional append cannot land in between.
+        let Some(entry) = self.executions.get_mut(&event.execution_id) else {
+            return Err(StateBackendError::NotFound(event.execution_id.to_string()));
+        };
+        if entry.status.is_terminal() {
+            return Ok(ConditionalAppend::ExecutionTerminal(entry.status.clone()));
+        }
+        let mut log = self.events.entry(event.execution_id.clone()).or_default();
+        if !condition(log.as_slice()) {
+            return Ok(ConditionalAppend::Refused);
+        }
+        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        event.sequence = seq;
+        log.push(event);
+        drop(log);
+        drop(entry);
+        Ok(ConditionalAppend::Appended(seq))
+    }
+
     async fn update_execution_current_state(
         &self,
         id: &ExecutionId,

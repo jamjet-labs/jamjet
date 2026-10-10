@@ -641,6 +641,15 @@ impl StateBackend for TenantScopedSqliteBackend {
         crate::sqlite::finish_execution_in(&self.pool, Some(&self.tenant_id.0), event, status).await
     }
 
+    async fn append_event_if(
+        &self,
+        event: Event,
+        condition: &crate::backend::EventCondition,
+    ) -> BackendResult<crate::backend::ConditionalAppend> {
+        crate::sqlite::append_event_if_in(&self.pool, Some(&self.tenant_id.0), event, condition)
+            .await
+    }
+
     #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %id))]
     async fn update_execution_status(
         &self,

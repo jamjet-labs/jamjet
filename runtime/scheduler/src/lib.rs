@@ -14,4 +14,4 @@ pub mod strategy_bridge;
 
 pub use payload::{build_work_item_payload, max_attempts_for};
 pub use projector::Projector;
-pub use runner::{Scheduler, SchedulerConfig};
+pub use runner::{DeadlineSweep, Scheduler, SchedulerConfig};

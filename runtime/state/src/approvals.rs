@@ -6,9 +6,10 @@
 //! scheduler tests. Events are the only persistent state: a node is pending
 //! iff its latest `ToolApprovalRequired` has no later `ApprovalReceived`.
 
-use crate::event::{ApprovalDecision, EventKind};
+use crate::event::{ApprovalDecision, EventKind, DEADLINE_PRINCIPAL};
 use crate::hashing::content_hash;
 use crate::{Event, EventSequence};
+use chrono::{DateTime, Utc};
 use jamjet_core::workflow::ExecutionId;
 use serde::Serialize;
 
@@ -20,9 +21,46 @@ pub struct PendingApproval {
     pub approver: String,
     pub context: serde_json::Value,
     pub sequence: EventSequence,
+    /// When the request expires, as recorded in its context (UTC, RFC 3339).
+    /// Absent when its policy set no deadline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// When the request escalates, as recorded in its context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalate_at: Option<String>,
 }
 
 impl PendingApproval {
+    /// The pending view of the request recorded at `sequence`.
+    pub fn from_request(
+        node_id: &str,
+        tool_name: &str,
+        approver: &str,
+        context: &serde_json::Value,
+        sequence: EventSequence,
+    ) -> Self {
+        let shown = |key: &str| {
+            context.get(key).map(|v| match v.as_str() {
+                Some(s) => s.to_string(),
+                None => v.to_string(),
+            })
+        };
+        Self {
+            node_id: node_id.to_string(),
+            tool_name: tool_name.to_string(),
+            approver: approver.to_string(),
+            context: context.clone(),
+            sequence,
+            expires_at: shown(EXPIRES_AT_KEY),
+            escalate_at: shown(ESCALATE_AT_KEY),
+        }
+    }
+
+    /// The request's deadline, read from its context.
+    pub fn deadline(&self) -> RequestDeadline {
+        RequestDeadline::of(&self.context)
+    }
+
     /// The `action_digest` the request was made for, if it carries one.
     pub fn action_digest(&self) -> Option<&str> {
         self.context.get(ACTION_DIGEST_KEY).and_then(|d| d.as_str())
@@ -68,13 +106,13 @@ pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStat
                 approver,
                 context,
             } if n == node_id => {
-                status = NodeApprovalStatus::Pending(PendingApproval {
-                    node_id: n.clone(),
-                    tool_name: tool_name.clone(),
-                    approver: approver.clone(),
-                    context: context.clone(),
-                    sequence: event.sequence,
-                });
+                status = NodeApprovalStatus::Pending(PendingApproval::from_request(
+                    n,
+                    tool_name,
+                    approver,
+                    context,
+                    event.sequence,
+                ));
             }
             EventKind::ApprovalReceived {
                 node_id: n,
@@ -100,10 +138,35 @@ pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStat
                     };
                 }
             }
+            // An expiry is a rejection by `system:deadline`, of the request
+            // it names. One naming any other request resolves nothing.
+            EventKind::ApprovalExpired {
+                node_id: n,
+                request_sequence,
+                expires_at,
+                ..
+            } if n == node_id => {
+                if matches!(&status, NodeApprovalStatus::Pending(p) if p.sequence == *request_sequence)
+                {
+                    status = NodeApprovalStatus::Rejected {
+                        user_id: DEADLINE_PRINCIPAL.to_string(),
+                        comment: Some(expiry_comment(expires_at)),
+                        sequence: event.sequence,
+                    };
+                }
+            }
             _ => {}
         }
     }
     status
+}
+
+/// The comment an expiry is recorded with in the approval state.
+pub fn expiry_comment(expires_at: &DateTime<Utc>) -> String {
+    format!(
+        "approval request expired undecided at its deadline {}",
+        expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    )
 }
 
 /// Context key under which a hold records the digest of the action it parks.
@@ -141,13 +204,9 @@ pub fn answered_request(events: &[Event], node_id: &str) -> Option<PendingApprov
             tool_name,
             approver,
             context,
-        } if n == node_id => Some(PendingApproval {
-            node_id: n.clone(),
-            tool_name: tool_name.clone(),
-            approver: approver.clone(),
-            context: context.clone(),
-            sequence: e.sequence,
-        }),
+        } if n == node_id => Some(PendingApproval::from_request(
+            n, tool_name, approver, context, e.sequence,
+        )),
         _ => None,
     })
 }
@@ -339,14 +398,27 @@ pub fn pending_approvals(events: &[Event]) -> Vec<PendingApproval> {
             } => {
                 by_node.insert(
                     node_id.clone(),
-                    Some(PendingApproval {
-                        node_id: node_id.clone(),
-                        tool_name: tool_name.clone(),
-                        approver: approver.clone(),
-                        context: context.clone(),
-                        sequence: event.sequence,
-                    }),
+                    Some(PendingApproval::from_request(
+                        node_id,
+                        tool_name,
+                        approver,
+                        context,
+                        event.sequence,
+                    )),
                 );
+            }
+            // Same rule as `node_approval_status`: an expiry resolves only the
+            // request it names.
+            EventKind::ApprovalExpired {
+                node_id,
+                request_sequence,
+                ..
+            } => {
+                if let Some(slot) = by_node.get_mut(node_id) {
+                    if slot.as_ref().map(|p| p.sequence) == Some(*request_sequence) {
+                        *slot = None;
+                    }
+                }
             }
             EventKind::ApprovalReceived { node_id, .. } => {
                 // Intentional asymmetry: node_approval_status returns NotRequested for a
@@ -360,6 +432,206 @@ pub fn pending_approvals(events: &[Event]) -> Vec<PendingApproval> {
         }
     }
     by_node.into_values().flatten().collect()
+}
+
+/// Context key under which a request records when it expires: UTC, RFC 3339.
+pub const EXPIRES_AT_KEY: &str = "expires_at";
+
+/// Context key under which a request records when it escalates.
+pub const ESCALATE_AT_KEY: &str = "escalate_at";
+
+/// How a deadline is written into a request's context: UTC, millisecond
+/// precision, `Z`.
+pub fn format_deadline(at: &DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Record `deadline`, counted from `now`, in a request's `context`:
+/// [`EXPIRES_AT_KEY`], and [`ESCALATE_AT_KEY`] when it escalates. `Err` if a
+/// time cannot be represented, which a validated deadline never hits; the
+/// caller must then refuse to raise the request rather than raise it with no
+/// deadline.
+pub fn stamp_deadline(
+    context: &mut serde_json::Map<String, serde_json::Value>,
+    deadline: &jamjet_ir::workflow::ApprovalDeadline,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let after = |secs: u64| {
+        i64::try_from(secs)
+            .ok()
+            .and_then(chrono::Duration::try_seconds)
+            .and_then(|d| now.checked_add_signed(d))
+            .ok_or_else(|| format!("approval deadline of {secs}s cannot be represented"))
+    };
+    let expires_at = after(deadline.timeout_secs)?;
+    context.insert(
+        EXPIRES_AT_KEY.to_string(),
+        serde_json::Value::String(format_deadline(&expires_at)),
+    );
+    if let Some(secs) = deadline.escalate_after_secs {
+        let escalate_at = after(secs)?;
+        context.insert(
+            ESCALATE_AT_KEY.to_string(),
+            serde_json::Value::String(format_deadline(&escalate_at)),
+        );
+    }
+    Ok(())
+}
+
+/// One recorded time of a request's deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadlineTime {
+    /// The request records none.
+    Unset,
+    /// The request records this time.
+    At(DateTime<Utc>),
+    /// The request records something that is not a time. Only the engine
+    /// writes these, so this is corruption or tampering, and it is read as
+    /// already passed: a deadline nobody can read must not keep a request open.
+    Unreadable,
+}
+
+impl DeadlineTime {
+    fn read(context: &serde_json::Value, key: &str) -> Self {
+        match context.get(key) {
+            None => DeadlineTime::Unset,
+            Some(v) => match v
+                .as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            {
+                Some(t) => DeadlineTime::At(t.with_timezone(&Utc)),
+                None => DeadlineTime::Unreadable,
+            },
+        }
+    }
+
+    /// Whether this time has come at `now`. A time is reached AT its instant
+    /// (`now >= at`), so a decision and a sweep at exactly the deadline agree
+    /// that it has passed. `Unset` never passes; `Unreadable` always has.
+    pub fn passed(&self, now: DateTime<Utc>) -> bool {
+        match self {
+            DeadlineTime::Unset => false,
+            DeadlineTime::At(at) => now >= *at,
+            DeadlineTime::Unreadable => true,
+        }
+    }
+}
+
+/// A request's deadline as its context records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestDeadline {
+    pub expires_at: DeadlineTime,
+    pub escalate_at: DeadlineTime,
+}
+
+impl RequestDeadline {
+    /// Read the deadline a request's `context` records.
+    pub fn of(context: &serde_json::Value) -> Self {
+        Self {
+            expires_at: DeadlineTime::read(context, EXPIRES_AT_KEY),
+            escalate_at: DeadlineTime::read(context, ESCALATE_AT_KEY),
+        }
+    }
+
+    /// Whether the request has expired at `now`. A decision is refused then,
+    /// whether or not a sweep has recorded the expiry yet.
+    pub fn expired(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.passed(now)
+    }
+}
+
+/// What a deadline sweep should record for one pending request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeadlineAction {
+    /// Record `ApprovalExpired` for the request at `request_sequence`.
+    /// `expires_at` is the recorded deadline, or the sweep's own time when the
+    /// recorded one is unreadable.
+    Expire {
+        node_id: String,
+        request_sequence: EventSequence,
+        expires_at: DateTime<Utc>,
+    },
+    /// Record `ApprovalEscalated` for the request at `request_sequence`.
+    Escalate {
+        node_id: String,
+        request_sequence: EventSequence,
+        escalate_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    },
+}
+
+/// What a sweep at `now` should record for this log: an expiry for every
+/// pending request whose deadline has passed, and otherwise an escalation for
+/// one whose escalation time has passed and that has not escalated yet. A
+/// request past both is expired, not escalated: there is nothing left to
+/// escalate. Never an approval.
+///
+/// This decides from one read; the sweep appends each action with
+/// [`still_pending`] (and, for an escalation, [`not_escalated`]) as the
+/// append's condition, so an action this read found due cannot land beside a
+/// decision or a newer request recorded since.
+pub fn due_deadline_actions(events: &[Event], now: DateTime<Utc>) -> Vec<DeadlineAction> {
+    let mut actions = Vec::new();
+    for p in pending_approvals(events) {
+        let d = p.deadline();
+        if d.expired(now) {
+            let expires_at = match d.expires_at {
+                DeadlineTime::At(at) => at,
+                _ => now,
+            };
+            actions.push(DeadlineAction::Expire {
+                node_id: p.node_id.clone(),
+                request_sequence: p.sequence,
+                expires_at,
+            });
+        } else if let (DeadlineTime::At(expires_at), true) =
+            (d.expires_at, d.escalate_at.passed(now))
+        {
+            if not_escalated(events, &p.node_id, p.sequence) {
+                let escalate_at = match d.escalate_at {
+                    DeadlineTime::At(at) => at,
+                    _ => now,
+                };
+                actions.push(DeadlineAction::Escalate {
+                    node_id: p.node_id.clone(),
+                    request_sequence: p.sequence,
+                    escalate_at,
+                    expires_at,
+                });
+            }
+        }
+    }
+    actions
+}
+
+/// Whether `node_id`'s approval is pending on exactly the request recorded at
+/// `request_sequence`: no decision, no expiry and no newer request since. The
+/// condition every append that resolves or escalates a request is made under.
+pub fn still_pending(events: &[Event], node_id: &str, request_sequence: EventSequence) -> bool {
+    matches!(
+        node_approval_status(events, node_id),
+        NodeApprovalStatus::Pending(p) if p.sequence == request_sequence
+    )
+}
+
+/// Whether the request at `request_sequence` has not been escalated yet.
+pub fn not_escalated(events: &[Event], node_id: &str, request_sequence: EventSequence) -> bool {
+    !events.iter().any(|e| {
+        matches!(&e.kind, EventKind::ApprovalEscalated { node_id: n, request_sequence: r, .. }
+            if n == node_id && *r == request_sequence)
+    })
+}
+
+/// Whether `node_id`'s latest request was resolved by its deadline: the
+/// request a late decision is refused for.
+pub fn expired_by_deadline(events: &[Event], node_id: &str) -> bool {
+    let Some(request) = answered_request(events, node_id) else {
+        return false;
+    };
+    events.iter().any(|e| {
+        matches!(&e.kind, EventKind::ApprovalExpired { node_id: n, request_sequence, .. }
+            if n == node_id && *request_sequence == request.sequence)
+    })
 }
 
 #[cfg(test)]
@@ -502,5 +774,162 @@ mod tests {
         let pending = pending_approvals(&events);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].node_id, "b");
+    }
+
+    fn request_with(seq: u64, node: &str, ctx: serde_json::Value) -> Event {
+        ev(
+            seq,
+            EventKind::ToolApprovalRequired {
+                node_id: node.into(),
+                tool_name: format!("tool_{node}"),
+                approver: "human".into(),
+                context: ctx,
+            },
+        )
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn expiry(seq: u64, node: &str, request_sequence: i64) -> Event {
+        ev(
+            seq,
+            EventKind::ApprovalExpired {
+                node_id: node.into(),
+                request_sequence,
+                expires_at: at("2026-01-01T00:00:00Z"),
+                principal: DEADLINE_PRINCIPAL.into(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_deadline_is_reached_at_its_instant() {
+        let t = at("2026-01-01T00:00:00Z");
+        let d = DeadlineTime::At(t);
+        assert!(!d.passed(t - chrono::Duration::milliseconds(1)));
+        assert!(d.passed(t), "at the deadline it has passed");
+        assert!(d.passed(t + chrono::Duration::milliseconds(1)));
+        assert!(!DeadlineTime::Unset.passed(t + chrono::Duration::days(10_000)));
+        assert!(DeadlineTime::Unreadable.passed(t - chrono::Duration::days(10_000)));
+    }
+
+    #[test]
+    fn an_unreadable_deadline_reads_as_passed() {
+        for bad in [
+            serde_json::json!({ "expires_at": "tomorrow" }),
+            serde_json::json!({ "expires_at": 1767225600 }),
+            serde_json::json!({ "expires_at": null }),
+        ] {
+            assert_eq!(
+                RequestDeadline::of(&bad).expires_at,
+                DeadlineTime::Unreadable,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            RequestDeadline::of(&serde_json::json!({})).expires_at,
+            DeadlineTime::Unset
+        );
+    }
+
+    #[test]
+    fn a_stamped_deadline_reads_back() {
+        let now = at("2026-01-01T00:00:00Z");
+        let mut ctx = serde_json::Map::new();
+        stamp_deadline(
+            &mut ctx,
+            &jamjet_ir::workflow::ApprovalDeadline {
+                timeout_secs: 600,
+                escalate_after_secs: Some(60),
+            },
+            now,
+        )
+        .unwrap();
+        let d = RequestDeadline::of(&serde_json::Value::Object(ctx.clone()));
+        assert_eq!(
+            d.expires_at,
+            DeadlineTime::At(now + chrono::Duration::seconds(600))
+        );
+        assert_eq!(
+            d.escalate_at,
+            DeadlineTime::At(now + chrono::Duration::seconds(60))
+        );
+        assert_eq!(ctx["expires_at"], "2026-01-01T00:10:00.000Z");
+    }
+
+    #[test]
+    fn an_expiry_rejects_the_request_it_names() {
+        let events = vec![required(1, "a"), expiry(2, "a", 1)];
+        match node_approval_status(&events, "a") {
+            NodeApprovalStatus::Rejected { user_id, .. } => assert_eq!(user_id, DEADLINE_PRINCIPAL),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert!(pending_approvals(&events).is_empty());
+        assert!(expired_by_deadline(&events, "a"));
+        assert!(!still_pending(&events, "a", 1));
+    }
+
+    /// An expiry naming an older request resolves nothing: the newer request
+    /// stays pending, in both folds.
+    #[test]
+    fn an_expiry_of_a_superseded_request_resolves_nothing() {
+        let events = vec![required(1, "a"), required(2, "a"), expiry(3, "a", 1)];
+        assert!(matches!(
+            node_approval_status(&events, "a"),
+            NodeApprovalStatus::Pending(p) if p.sequence == 2
+        ));
+        assert_eq!(pending_approvals(&events).len(), 1);
+        assert!(still_pending(&events, "a", 2));
+        assert!(!expired_by_deadline(&events, "a"));
+    }
+
+    #[test]
+    fn a_human_rejection_is_not_an_expiry() {
+        let events = vec![
+            required(1, "a"),
+            received(2, "a", ApprovalDecision::Rejected),
+        ];
+        assert!(!expired_by_deadline(&events, "a"));
+    }
+
+    #[test]
+    fn due_actions_expire_before_they_escalate_and_escalate_once() {
+        let ctx = serde_json::json!({
+            "expires_at": "2026-01-01T00:10:00.000Z",
+            "escalate_at": "2026-01-01T00:01:00.000Z",
+        });
+        let events = vec![request_with(1, "a", ctx)];
+        assert!(due_deadline_actions(&events, at("2026-01-01T00:00:59Z")).is_empty());
+        let esc = due_deadline_actions(&events, at("2026-01-01T00:01:00Z"));
+        assert!(matches!(
+            esc.as_slice(),
+            [DeadlineAction::Escalate {
+                request_sequence: 1,
+                ..
+            }]
+        ));
+        let mut escalated = events.clone();
+        escalated.push(ev(
+            2,
+            EventKind::ApprovalEscalated {
+                node_id: "a".into(),
+                request_sequence: 1,
+                escalate_at: at("2026-01-01T00:01:00Z"),
+                expires_at: at("2026-01-01T00:10:00Z"),
+            },
+        ));
+        assert!(due_deadline_actions(&escalated, at("2026-01-01T00:05:00Z")).is_empty());
+        assert!(!not_escalated(&escalated, "a", 1));
+        // Past both: expire only.
+        let both = due_deadline_actions(&events, at("2026-01-01T00:10:00Z"));
+        assert!(matches!(
+            both.as_slice(),
+            [DeadlineAction::Expire {
+                request_sequence: 1,
+                ..
+            }]
+        ));
     }
 }

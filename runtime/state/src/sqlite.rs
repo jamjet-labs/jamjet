@@ -712,6 +712,14 @@ impl StateBackend for SqliteBackend {
         finish_execution_in(&self.pool, None, event, status).await
     }
 
+    async fn append_event_if(
+        &self,
+        event: Event,
+        condition: &crate::backend::EventCondition,
+    ) -> BackendResult<crate::backend::ConditionalAppend> {
+        append_event_if_in(&self.pool, None, event, condition).await
+    }
+
     #[instrument(skip(self), fields(execution_id = %id, status = ?status))]
     async fn update_execution_status(
         &self,
@@ -2483,6 +2491,88 @@ pub(crate) async fn finish_execution_in(
     insert.execute(&mut *tx).await.map_err(map_db_err)?;
     tx.commit().await.map_err(map_db_err)?;
     Ok(ExecutionFinish::Finished(sequence))
+}
+
+/// [`StateBackend::append_event_if`] for both SQLite backends: the liveness
+/// check, the read of the log, the condition and the insert in one
+/// `BEGIN IMMEDIATE` transaction, so no other writer can land between the
+/// read the condition saw and the append. `tenant_id` scopes the execution
+/// and stamps the event row. The log is read whole, across tenants, once the
+/// execution is known to be the caller's: a condition that says "nothing has
+/// resolved this request" must see every row that could have.
+pub(crate) async fn append_event_if_in(
+    pool: &SqlitePool,
+    tenant_id: Option<&str>,
+    event: Event,
+    condition: &crate::backend::EventCondition,
+) -> BackendResult<crate::backend::ConditionalAppend> {
+    use crate::backend::ConditionalAppend;
+    let execution_id = execution_id_str(&event.execution_id);
+    let kind_json = serde_json::to_string(&event.kind)?;
+    let tenant_clause = if tenant_id.is_some() {
+        " AND tenant_id = ?"
+    } else {
+        ""
+    };
+
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(map_db_err)?;
+
+    let select =
+        format!("SELECT status FROM workflow_executions WHERE execution_id = ?{tenant_clause}");
+    let mut q = sqlx::query(&select).bind(&execution_id);
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    let Some(row) = q.fetch_optional(&mut *tx).await.map_err(map_db_err)? else {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Err(StateBackendError::NotFound(execution_id));
+    };
+    let status = str_to_status(row.try_get::<&str, _>("status").map_err(map_db_err)?)?;
+    if status.is_terminal() {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Ok(ConditionalAppend::ExecutionTerminal(status));
+    }
+
+    let rows = sqlx::query("SELECT * FROM events WHERE execution_id = ? ORDER BY sequence ASC")
+        .bind(&execution_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+    let log = rows
+        .iter()
+        .map(row_to_event)
+        .collect::<BackendResult<Vec<_>>>()?;
+    if !condition(&log) {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Ok(ConditionalAppend::Refused);
+    }
+    let sequence = log.last().map_or(0, |e| e.sequence) + 1;
+
+    let insert = format!(
+        "INSERT INTO events (id, execution_id, sequence, kind_json, created_at{}) \
+         VALUES (?, ?, ?, ?, ?{})",
+        if tenant_id.is_some() {
+            ", tenant_id"
+        } else {
+            ""
+        },
+        if tenant_id.is_some() { ", ?" } else { "" },
+    );
+    let mut q = sqlx::query(&insert)
+        .bind(event.id.to_string())
+        .bind(&execution_id)
+        .bind(sequence)
+        .bind(&kind_json)
+        .bind(event.created_at.to_rfc3339());
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    q.execute(&mut *tx).await.map_err(map_db_err)?;
+    tx.commit().await.map_err(map_db_err)?;
+    Ok(ConditionalAppend::Appended(sequence))
 }
 
 /// The execution's status when it is terminal, read on the caller's

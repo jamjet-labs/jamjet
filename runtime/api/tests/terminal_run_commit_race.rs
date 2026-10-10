@@ -248,6 +248,14 @@ impl StateBackend for CancelAfterRead {
             .await
     }
 
+    async fn append_event_if(
+        &self,
+        event: jamjet_state::Event,
+        condition: &jamjet_state::backend::EventCondition,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::ConditionalAppend> {
+        self.inner.append_event_if(event, condition).await
+    }
+
     async fn release_tool_reservation(
         &self,
         key: &str,

@@ -43,6 +43,12 @@ pub enum IrError {
     #[error("node '{0}' dispatches ADK agent tool calls but is not marked agent_tool_dispatch, so tool policy would not be enforced for it")]
     UnmarkedAgentToolDispatch(String),
 
+    #[error("{scope} policy has an invalid approval deadline: {reason}")]
+    InvalidApprovalDeadline { scope: String, reason: String },
+
+    #[error("timeouts.approval_timeout is retired and was never enforced; set approval_timeout_secs (and optionally escalate_after_secs) in the tenant, workflow or node policy instead")]
+    RetiredApprovalTimeout,
+
     #[error("node id {0:?} is not allowed: a node id is 1 to 128 ASCII letters, digits, '_', '.' or '-'")]
     InvalidNodeId(String),
 

@@ -30,7 +30,46 @@ pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_condition_expressions(ir)?;
     validate_external_queues(ir)?;
     validate_node_ids(ir)?;
+    validate_approval_deadlines(ir)?;
     Ok(())
+}
+
+/// The workflow policy and every node policy set a deadline the engine can
+/// honour (see `PolicySetIr::validate_approval_deadline`).
+pub fn validate_approval_deadlines(ir: &WorkflowIr) -> IrResult<()> {
+    if let Some(p) = &ir.policy {
+        p.validate_approval_deadline()
+            .map_err(|reason| IrError::InvalidApprovalDeadline {
+                scope: "workflow".to_string(),
+                reason,
+            })?;
+    }
+    let mut ids: Vec<&String> = ir.nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        if let Some(p) = &ir.nodes[id].policy {
+            p.validate_approval_deadline()
+                .map_err(|reason| IrError::InvalidApprovalDeadline {
+                    scope: format!("node '{id}'"),
+                    reason,
+                })?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a non-null `timeouts.approval_timeout` in a raw IR document.
+///
+/// The key was declared on `TimeoutConfig` and never read: a workflow that
+/// set it believed its approvals expired, and they waited forever. The
+/// setting is now `approval_timeout_secs` on a policy. The parsed IR no
+/// longer has the field, so this checks the document as sent. A null, which
+/// the SDK compilers write, is accepted.
+pub fn refuse_retired_timeouts(raw: &serde_json::Value) -> IrResult<()> {
+    match raw.get("timeouts").and_then(|t| t.get("approval_timeout")) {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(_) => Err(IrError::RetiredApprovalTimeout),
+    }
 }
 
 /// The longest node id.

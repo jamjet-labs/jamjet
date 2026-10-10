@@ -7,7 +7,8 @@
 
 use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use jamjet_state::approvals::{
-    node_approval_status, pending_approvals, run_initiator, NodeApprovalStatus,
+    expired_by_deadline, node_approval_status, pending_approvals, run_initiator, still_pending,
+    NodeApprovalStatus,
 };
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::{ApprovalDecision, EventKind};
@@ -86,6 +87,13 @@ pub enum SubmitError {
     /// never applies an approval's patch, so recording "approved as edited"
     /// would be a false record of what ran.
     EditsUnsupported,
+    /// The request reached its deadline: it is expired (rejected by
+    /// `system:deadline`) or past `expires_at` and about to be. Nothing is
+    /// recorded.
+    Expired(String),
+    /// The request was decided, expired or replaced between this decision's
+    /// read and its append. Nothing is recorded.
+    Superseded(String),
     Backend(String),
 }
 
@@ -137,6 +145,17 @@ impl std::fmt::Display for SubmitError {
                 f,
                 "the decision has no authenticated principal; outside dev mode every \
                  approval decision must come from an API token"
+            ),
+            Self::Expired(n) => write!(
+                f,
+                "the approval request for node '{n}' expired at its deadline and can no longer \
+                 be decided; it was rejected by system:deadline"
+            ),
+            Self::Superseded(n) => write!(
+                f,
+                "the approval request for node '{n}' was decided, expired or replaced while \
+                 this decision was being made; nothing was recorded, re-read the pending \
+                 approvals"
             ),
             Self::Backend(e) => write!(f, "backend error: {e}"),
         }
@@ -207,6 +226,9 @@ pub async fn submit_approval(
     let node_id = match submission.node_id.filter(|n| !n.is_empty()) {
         Some(n) => {
             if !pending.iter().any(|p| p.node_id == n) {
+                if expired_by_deadline(&events, &n) {
+                    return Err(SubmitError::Expired(n));
+                }
                 return Err(SubmitError::NodeNotPending(n));
             }
             n
@@ -255,6 +277,12 @@ pub async fn submit_approval(
     let Some(request) = pending.iter().find(|p| p.node_id == node_id) else {
         return Err(SubmitError::NodeNotPending(node_id));
     };
+    // DEADLINE. A request past its `expires_at` is refused whether or not
+    // the sweep has recorded the expiry yet: the deadline decides, not the
+    // sweep's timing. An unreadable deadline counts as passed.
+    if request.deadline().expired(chrono::Utc::now()) {
+        return Err(SubmitError::Expired(node_id));
+    }
     let request_digest = request.action_digest().map(str::to_owned);
     // What the request binds: its action digest, or for an agent tool dispatch
     // its `calls_hash` if it predates dispatch digests. A legacy request binds
@@ -294,16 +322,13 @@ pub async fn submit_approval(
     };
     let request_sequence = Some(request.sequence);
 
-    let seq = backend
-        .latest_sequence(execution_id)
-        .await
-        .map_err(|e| SubmitError::Backend(e.to_string()))?
-        + 1;
-    // TOCTOU: a concurrent approve may have already appended a decision; the
-    // scheduler fold's held.remove gate makes the second event a no-op.
+    // ONE step from "still pending on this request" to the append: the
+    // deadline sweep and any concurrent decision append under the same
+    // condition, so exactly one outcome lands for a request. The sequence is
+    // assigned by the backend.
     let event = Event::new(
         execution_id.clone(),
-        seq,
+        0,
         EventKind::ApprovalReceived {
             node_id: node_id.clone(),
             user_id: submission.user_id,
@@ -316,10 +341,33 @@ pub async fn submit_approval(
             request_sequence,
         },
     );
-    backend
-        .append_event(event.clone())
+    let answered = request.sequence;
+    let condition_node = node_id.clone();
+    let condition = move |log: &[Event]| still_pending(log, &condition_node, answered);
+    let event = match backend
+        .append_event_if(event.clone(), &condition)
         .await
-        .map_err(|e| SubmitError::Backend(e.to_string()))?;
+        .map_err(|e| SubmitError::Backend(e.to_string()))?
+    {
+        jamjet_state::ConditionalAppend::Appended(seq) => Event {
+            sequence: seq,
+            ..event
+        },
+        jamjet_state::ConditionalAppend::Refused => {
+            let latest = backend
+                .get_events(execution_id)
+                .await
+                .map_err(|e| SubmitError::Backend(e.to_string()))?;
+            return Err(if expired_by_deadline(&latest, &node_id) {
+                SubmitError::Expired(node_id)
+            } else {
+                SubmitError::Superseded(node_id)
+            });
+        }
+        jamjet_state::ConditionalAppend::ExecutionTerminal(status) => {
+            return Err(SubmitError::ExecutionTerminal(format!("{status:?}")));
+        }
+    };
 
     // Preserve the legacy paused -> running flip. Uses the pre-append status
     // read; errors propagate rather than silently skipping the flip.

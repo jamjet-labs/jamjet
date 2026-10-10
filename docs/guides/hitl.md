@@ -207,6 +207,70 @@ Limits worth knowing:
 
 ---
 
+## Approval Deadlines
+
+A policy can give the approval requests it raises a deadline:
+
+```json
+{
+  "require_approval_for": ["payments.*"],
+  "approval_timeout_secs": 3600,
+  "escalate_after_secs": 900
+}
+```
+
+- `approval_timeout_secs` (1 second to 1 year): how long a request stays
+  open. When it passes, the scheduler records `approval_expired` and treats it
+  exactly as a rejection by `system:deadline`: the node fails the way a
+  rejected node does, and so does the run. An expiry never approves anything.
+- `escalate_after_secs` (optional, at least 1 and less than the timeout, and
+  only next to a timeout in the same policy): if the request is still pending
+  then, the scheduler records `approval_escalated` once. It changes nothing
+  about the request; it is the hook point for an external notifier (Slack,
+  email) to watch for.
+- Both can be set in the tenant, workflow or node policy. The most specific
+  level that sets `approval_timeout_secs` wins, and its own
+  `escalate_after_secs` comes with it (a node deadline with no escalation does
+  not inherit the workflow's escalation). A node can therefore lengthen a
+  tenant's deadline but not remove it.
+- Invalid values are refused at registration (400) and at `PUT /tenants`
+  (400). `timeouts.approval_timeout` is retired: it was never read, so a run
+  under it never expired. A non-null value is refused at registration.
+
+A request raised under a deadline records it in its context as UTC times,
+`expires_at` and (when set) `escalate_at`; the pending listing shows both on
+each entry. A request raised with no deadline behaves as before: it waits
+until someone decides it.
+
+Rules the runtime enforces:
+
+- **A decision after the deadline is refused (409) and records nothing**,
+  whether or not the sweep has recorded the expiry yet. The deadline is
+  reached at its instant: a decision at exactly `expires_at` is late.
+- **One outcome per request.** A decision and an expiry each append only while
+  the request is still the node's pending one, checked in the same step as the
+  append. If the sweep expires a request while a decision is in flight, the
+  decision gets 409; if the decision lands first, the sweep records nothing.
+  A sweep that runs again, or on another scheduler, records nothing twice.
+- **An unreadable deadline counts as passed.** Only the engine writes
+  `expires_at`; a value that is not a time is treated as expired, never as
+  open forever.
+
+Limits worth knowing:
+
+- The sweep runs on the scheduler tick (every 500 ms by default) for running
+  executions that hold a node for approval, so an expiry is recorded within a
+  tick of the deadline and the node fails on the next. A run that is not
+  `running` (paused) is not swept until it runs again; a decision on it is
+  still refused after the deadline.
+- Deadlines are computed from the clock of the process that raised the
+  request and checked against the clock of the one that sweeps or decides.
+  Keep their clocks in sync.
+- A hold raised by an agent's autonomy limit, not by a policy, has no
+  deadline.
+
+---
+
 ## Audit Log
 
 Every human decision is recorded:

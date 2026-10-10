@@ -18,6 +18,9 @@ pub enum Write {
     EnqueueWorkItem(ExecutionId),
     FinishExecution(ExecutionId),
     StartExecution(ExecutionId),
+    /// A full read of an execution's log (after it returned).
+    GetEvents(ExecutionId),
+    AppendEventIf(ExecutionId),
 }
 
 #[async_trait::async_trait]
@@ -49,7 +52,11 @@ impl StateBackend for HookedBackend {
         &self,
         execution_id: &ExecutionId,
     ) -> jamjet_state::backend::BackendResult<Vec<Event>> {
-        self.inner.get_events(execution_id).await
+        let events = self.inner.get_events(execution_id).await?;
+        self.hook
+            .after(Write::GetEvents(execution_id.clone()))
+            .await;
+        Ok(events)
     }
 
     async fn store_workflow(
@@ -202,6 +209,17 @@ impl StateBackend for HookedBackend {
             .await?;
         self.hook.after(Write::StartExecution(execution_id)).await;
         Ok(())
+    }
+
+    async fn append_event_if(
+        &self,
+        event: jamjet_state::Event,
+        condition: &jamjet_state::backend::EventCondition,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::ConditionalAppend> {
+        let execution_id = event.execution_id.clone();
+        let out = self.inner.append_event_if(event, condition).await?;
+        self.hook.after(Write::AppendEventIf(execution_id)).await;
+        Ok(out)
     }
 
     async fn release_tool_reservation(

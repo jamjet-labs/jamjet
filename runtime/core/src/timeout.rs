@@ -2,6 +2,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::time::Duration;
 
 /// Timeout configuration for a workflow execution.
+///
+/// Approval deadlines are not here: they are policy (`approval_timeout_secs`
+/// and `escalate_after_secs` on a tenant, workflow or node policy). The
+/// `approval_timeout` key this struct used to declare was never read, and
+/// registration refuses a non-null one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeoutConfig {
     /// Maximum time a single node may run before being killed and failed.
@@ -26,13 +31,6 @@ pub struct TimeoutConfig {
         deserialize_with = "de_duration"
     )]
     pub heartbeat_interval: Duration,
-    /// Maximum time a human_approval node waits before routing to fallback or failing.
-    #[serde(
-        default,
-        serialize_with = "ser_opt_duration",
-        deserialize_with = "de_opt_duration"
-    )]
-    pub approval_timeout: Option<Duration>,
 }
 
 fn default_heartbeat() -> Duration {
@@ -45,7 +43,6 @@ impl Default for TimeoutConfig {
             node_timeout: Some(Duration::from_secs(300)), // 5 min
             workflow_timeout: None,
             heartbeat_interval: default_heartbeat(),
-            approval_timeout: None,
         }
     }
 }

@@ -202,6 +202,21 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     starts no run (a warning is logged at each due time), unless the opt-out is
     set, in which case it runs in `default`.
 
+- **Approval requests can expire.** A tenant, workflow or node policy may set
+  `approval_timeout_secs` (1 s to 1 year) and `escalate_after_secs` (shorter, same
+  policy). The most specific level with a timeout wins, with its own escalation. A
+  request records `expires_at` and `escalate_at` (UTC) in its context, and the pending
+  listing shows them. When a request expires, the scheduler records `approval_expired`
+  and treats it as a rejection by `system:deadline`: the node and the run fail as on a
+  rejection; nothing is ever approved by a deadline. At `escalate_at` it records
+  `approval_escalated` once, for notifiers. A decision after the deadline is 409 and
+  records nothing. A decision and the expiry of one request cannot both land: each
+  appends through the new `StateBackend::append_event_if` (a trait method a custom
+  backend must implement) under the condition that the request is still pending.
+  Invalid deadlines are refused at registration and at `PUT /tenants`. The dead
+  `timeouts.approval_timeout` field is removed and a non-null value is refused at
+  registration, since nothing ever enforced it.
+
 - **Clients can approve what they reviewed.** `jamjet approvals` prints each pending
   request's digest, what it covers and the exact approve command (`--show-basis` prints
   the bound payload). The command is printed alone on its line with every argument

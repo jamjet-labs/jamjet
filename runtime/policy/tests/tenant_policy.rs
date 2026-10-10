@@ -13,16 +13,19 @@ fn tenant_policy_blocks_tool_overriding_global() {
         blocked_tools: vec![],
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let tenant = PolicySetIr {
         blocked_tools: vec!["dangerous_tool".into()],
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let workflow = PolicySetIr {
         blocked_tools: vec![],
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let ev = PolicyEvaluator;
     let ctx = EvaluationContext {
@@ -44,11 +47,13 @@ fn tenant_block_with_node_approval_override() {
         blocked_tools: vec!["tool_a".into()],
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let node = PolicySetIr {
         blocked_tools: vec![],
         require_approval_for: vec!["tool_a".into()],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let ev = PolicyEvaluator;
     let ctx = EvaluationContext {
@@ -82,21 +87,25 @@ fn four_scope_chain_tenant_between_global_and_workflow() {
         blocked_tools: vec![],
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let tenant = PolicySetIr {
         blocked_tools: vec!["delete_*".into()],
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let workflow = PolicySetIr {
         blocked_tools: vec![],
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let node = PolicySetIr {
         blocked_tools: vec![],
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let ev = PolicyEvaluator;
     let ctx = EvaluationContext {
@@ -118,11 +127,13 @@ fn workflow_overrides_tenant_block_with_approval() {
         blocked_tools: vec!["deploy_*".into()],
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let workflow = PolicySetIr {
         blocked_tools: vec![],
         require_approval_for: vec!["deploy_*".into()],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let ev = PolicyEvaluator;
     let ctx = EvaluationContext {
@@ -142,11 +153,13 @@ fn tenant_model_allowlist_blocks_unallowed_model() {
         blocked_tools: vec![],
         require_approval_for: vec![],
         model_allowlist: vec!["claude-*".into()],
+        ..Default::default()
     };
     let workflow = PolicySetIr {
         blocked_tools: vec![],
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let ev = PolicyEvaluator;
     let ctx = EvaluationContext {
@@ -167,11 +180,13 @@ fn empty_tenant_policy_allows_everything() {
         blocked_tools: vec![],
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let workflow = PolicySetIr {
         blocked_tools: vec![],
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     };
     let ev = PolicyEvaluator;
     let ctx = EvaluationContext {

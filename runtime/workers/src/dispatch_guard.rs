@@ -475,7 +475,14 @@ pub(crate) async fn guard_dispatch_in(
             // `gated` carries tool NAMES only: two calls to the same gated tool
             // render as ["send_wire", "send_wire"] with no discriminator.
             // `calls` is what identifies them.
-            let context = serde_json::json!({
+            let deadline =
+                match crate::node_guard::deadline_or_block(backend, execution_id, node_id, &sets)
+                    .await
+                {
+                    Ok(d) => d,
+                    Err(blocked) => return blocked,
+                };
+            let mut context = serde_json::json!({
                 "node_id": node_id,
                 "gated_tools": gated,
                 "calls": calls_json,
@@ -486,6 +493,15 @@ pub(crate) async fn guard_dispatch_in(
                 jamjet_state::approvals::ACTION_BASIS_KEY:
                     crate::node_guard::basis_preview(&basis.payload, basis.step, node_def),
             });
+            if let (Some(deadline), Some(obj)) = (&deadline, context.as_object_mut()) {
+                if let Err(e) =
+                    jamjet_state::approvals::stamp_deadline(obj, deadline, chrono::Utc::now())
+                {
+                    return DispatchGuardOutcome::Unavailable {
+                        reason: format!("approval required but its deadline could not be set: {e}"),
+                    };
+                }
+            }
             let seq = match backend.latest_sequence(execution_id).await {
                 Ok(s) => s + 1,
                 Err(e) => {
@@ -1281,6 +1297,41 @@ mod tests {
             context["calls_hash"],
             json!(content_hash(&calls_json_for(&["read_file", "send_wire"]))),
             "the hash must cover the same shape the re-fire check recomputes"
+        );
+    }
+
+    /// A per-call dispatch request carries the deadline its policy sets, like
+    /// every other request: the dispatch guard raises its own requests.
+    #[tokio::test]
+    async fn a_dispatch_request_records_its_deadline() {
+        let f = Fixture::new();
+        let mut policy = policy_json(&[], &["send_wire"]);
+        policy["approval_timeout_secs"] = json!(600);
+        policy["escalate_after_secs"] = json!(60);
+        let before = chrono::Utc::now();
+        f.guard(&ir_with(Some(policy)), &input_for(&["send_wire"]))
+            .await;
+        let requests = f.requests().await;
+        let deadline = jamjet_state::approvals::RequestDeadline::of(&requests[0].2);
+        let jamjet_state::approvals::DeadlineTime::At(expires_at) = deadline.expires_at else {
+            panic!("no expires_at: {}", requests[0].2);
+        };
+        let off = (expires_at - (before + chrono::Duration::seconds(600))).num_seconds();
+        assert!((0..=5).contains(&off), "expires_at {expires_at}");
+        assert!(matches!(
+            deadline.escalate_at,
+            jamjet_state::approvals::DeadlineTime::At(_)
+        ));
+
+        // No deadline in the policy: none on the request.
+        let g = Fixture::new();
+        g.guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"]))
+            .await;
+        let requests = g.requests().await;
+        assert!(
+            requests[0].2.get("expires_at").is_none(),
+            "{}",
+            requests[0].2
         );
     }
 

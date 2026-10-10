@@ -122,6 +122,96 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Expire and escalate this execution's pending approval requests whose
+    /// deadlines have passed at `now`.
+    ///
+    /// For each pending request: past its `expires_at`, record
+    /// `ApprovalExpired` (a rejection by `system:deadline`; the next tick
+    /// fails the node as for any rejection); otherwise past its `escalate_at`
+    /// and not escalated yet, record `ApprovalEscalated`. Never an approval.
+    ///
+    /// Each event is appended with `append_event_if`, under the condition that
+    /// the request is still the node's pending one (and, for an escalation,
+    /// not escalated yet), checked in the same step as the append. A human
+    /// decision appends under the same condition, so a decision and an expiry
+    /// of one request cannot both land, and a replayed or concurrent sweep
+    /// records nothing twice.
+    ///
+    /// `now` is the sweep's clock: the loop passes `Utc::now()`; a test passes
+    /// the moment it wants to examine.
+    pub async fn sweep_approval_deadlines(
+        &self,
+        execution_id: &ExecutionId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<DeadlineSweep, Box<dyn std::error::Error + Send + Sync>> {
+        use jamjet_state::approvals::{
+            due_deadline_actions, not_escalated, still_pending, DeadlineAction,
+        };
+        use jamjet_state::ConditionalAppend;
+
+        let events = self.backend.get_events(execution_id).await?;
+        let mut sweep = DeadlineSweep::default();
+        for action in due_deadline_actions(&events, now) {
+            match action {
+                DeadlineAction::Expire {
+                    node_id,
+                    request_sequence,
+                    expires_at,
+                } => {
+                    let node = node_id.clone();
+                    let event = jamjet_state::Event::new(
+                        execution_id.clone(),
+                        0,
+                        EventKind::ApprovalExpired {
+                            node_id: node_id.clone(),
+                            request_sequence,
+                            expires_at,
+                            principal: jamjet_state::event::DEADLINE_PRINCIPAL.to_string(),
+                        },
+                    );
+                    let condition = move |log: &[jamjet_state::Event]| {
+                        still_pending(log, &node, request_sequence)
+                    };
+                    if let ConditionalAppend::Appended(_) =
+                        self.backend.append_event_if(event, &condition).await?
+                    {
+                        info!(execution_id = %execution_id, node_id = %node_id, %expires_at, "Approval request expired — rejected by system:deadline");
+                        sweep.expired.push(node_id);
+                    }
+                }
+                DeadlineAction::Escalate {
+                    node_id,
+                    request_sequence,
+                    escalate_at,
+                    expires_at,
+                } => {
+                    let node = node_id.clone();
+                    let event = jamjet_state::Event::new(
+                        execution_id.clone(),
+                        0,
+                        EventKind::ApprovalEscalated {
+                            node_id: node_id.clone(),
+                            request_sequence,
+                            escalate_at,
+                            expires_at,
+                        },
+                    );
+                    let condition = move |log: &[jamjet_state::Event]| {
+                        still_pending(log, &node, request_sequence)
+                            && not_escalated(log, &node, request_sequence)
+                    };
+                    if let ConditionalAppend::Appended(_) =
+                        self.backend.append_event_if(event, &condition).await?
+                    {
+                        info!(execution_id = %execution_id, node_id = %node_id, %escalate_at, "Approval request escalated");
+                        sweep.escalated.push(node_id);
+                    }
+                }
+            }
+        }
+        Ok(sweep)
+    }
+
     /// Reclaim expired work item leases and emit appropriate events.
     async fn reclaim_expired_leases(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let reclaimed = self.backend.reclaim_expired_leases().await?;
@@ -248,6 +338,22 @@ impl Scheduler {
             .lock()
             .unwrap()
             .insert(execution_id.clone(), progress.clone());
+
+        // Approval deadlines. Only an execution holding a node for approval
+        // can have a request to expire or escalate; the sweep reads the log
+        // and appends under its own condition, so it needs nothing from
+        // `progress` but this trigger. What it records is folded on the next
+        // tick (an expiry then fails the node below, like a rejection).
+        // A failed sweep leaves the request open until a later tick retries:
+        // late, never approved.
+        if !progress.held.is_empty() {
+            if let Err(e) = self
+                .sweep_approval_deadlines(execution_id, chrono::Utc::now())
+                .await
+            {
+                warn!(execution_id = %execution_id, "Approval deadline sweep failed: {e}");
+            }
+        }
 
         // Fail nodes whose approval was rejected. Guarded by terminal_failed so
         // the emission fires exactly once: the next tick folds the NodeFailed,
@@ -514,6 +620,15 @@ impl Scheduler {
     }
 }
 
+/// What one deadline sweep of an execution recorded.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeadlineSweep {
+    /// Nodes whose request expired.
+    pub expired: Vec<String>,
+    /// Nodes whose request escalated.
+    pub escalated: Vec<String>,
+}
+
 /// Incrementally-folded scheduling state for a single execution.
 ///
 /// Rebuilt lazily from the event log: each scheduler tick reads only events with
@@ -690,6 +805,25 @@ impl ExecProgress {
                             self.rejected.insert(node_id.clone(), reason);
                         }
                     }
+                }
+            }
+            EventKind::ApprovalExpired {
+                node_id,
+                expires_at,
+                principal,
+                ..
+            } => {
+                // An expiry is a rejection by `system:deadline` (the sweep
+                // records it only while the request is pending): the node
+                // fails exactly as on a human rejection.
+                if self.held.remove(node_id) {
+                    self.rejected.insert(
+                        node_id.clone(),
+                        format!(
+                            "approval rejected by {principal}: {}",
+                            jamjet_state::approvals::expiry_comment(expires_at)
+                        ),
+                    );
                 }
             }
             EventKind::WorkflowStarted {

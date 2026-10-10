@@ -755,6 +755,7 @@ impl Worker {
         approver: String,
         context: serde_json::Value,
     ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        // An autonomy hold is not raised by a policy, so it has no deadline.
         let outcome = node_guard::require_approval(
             self.backend.as_ref(),
             execution_id,
@@ -764,6 +765,7 @@ impl Worker {
             tool_name,
             approver,
             context,
+            None,
         )
         .await;
         self.settle_outcome(

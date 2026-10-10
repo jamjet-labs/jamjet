@@ -42,6 +42,7 @@ fn hospital_global_policy() -> PolicySetIr {
             "claude-sonnet-4-6".to_string(),
             "claude-haiku-4-5-20251001".to_string(),
         ],
+        ..Default::default()
     }
 }
 
@@ -55,6 +56,7 @@ fn intake_workflow_policy() -> PolicySetIr {
             "schedule_surgery".to_string(), // surgery scheduling is workflow-specific
         ],
         model_allowlist: vec![], // defer to global allowlist
+        ..Default::default()
     }
 }
 
@@ -67,6 +69,7 @@ fn triage_node_policy() -> PolicySetIr {
             "claude-sonnet-4-6".to_string(),
             "ft-triage-v3".to_string(), // custom fine-tuned model allowed HERE ONLY
         ],
+        ..Default::default()
     }
 }
 

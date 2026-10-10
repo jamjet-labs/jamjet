@@ -247,6 +247,13 @@ async fn create_workflow(
     // Node ids are printed into commands a reviewer pastes into a shell.
     jamjet_ir::validate_node_ids(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // An approval deadline the engine cannot honour, or the retired
+    // `timeouts.approval_timeout` (which nothing read, so a run under it never
+    // expired), is refused rather than stored.
+    jamjet_ir::validate_approval_deadlines(&parsed)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    jamjet_ir::refuse_retired_timeouts(&body.ir)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let backend = state.backend_for(&tenant_id);
 
@@ -660,6 +667,8 @@ async fn approve_execution(
         crate::approvals::SubmitError::NoPending
         | crate::approvals::SubmitError::NodeNotPending(_)
         | crate::approvals::SubmitError::ExecutionTerminal(_)
+        | crate::approvals::SubmitError::Expired(_)
+        | crate::approvals::SubmitError::Superseded(_)
         | crate::approvals::SubmitError::StaleDigest => ApiError::Conflict(e.to_string()),
         crate::approvals::SubmitError::EditsUnsupported
         | crate::approvals::SubmitError::DigestRequired => ApiError::BadRequest(e.to_string()),
@@ -722,13 +731,23 @@ async fn list_approvals_for_execution(
         for row in &rows {
             match row.status.as_str() {
                 "pending" => {
-                    pending.push(serde_json::json!({
+                    let mut item = serde_json::json!({
                         "node_id":   row.node_id,
                         "tool_name": row.tool_name,
                         "approver":  row.approver,
                         "context":   row.context,
                         "sequence":  row.last_sequence,
-                    }));
+                    });
+                    // The deadline, as the event-log path shows it.
+                    for key in [
+                        jamjet_state::approvals::EXPIRES_AT_KEY,
+                        jamjet_state::approvals::ESCALATE_AT_KEY,
+                    ] {
+                        if let Some(v) = row.context.as_ref().and_then(|c| c.get(key)) {
+                            item[key] = v.clone();
+                        }
+                    }
+                    pending.push(item);
                 }
                 "approved" => {
                     decided.push(serde_json::json!({
@@ -1239,8 +1258,9 @@ async fn update_tenant(
         jamjet_state::tenant::parse_tenant_policy(policy).map_err(|e| {
             ApiError::BadRequest(format!(
                 "invalid policy: {e}. Send an object with blocked_tools, \
-                     require_approval_for and model_allowlist; {{}} clears the policy, and a \
-                     null or missing policy keeps the stored one"
+                     require_approval_for, model_allowlist and optionally \
+                     approval_timeout_secs and escalate_after_secs; {{}} clears the policy, \
+                     and a null or missing policy keeps the stored one"
             ))
         })?;
     }
@@ -2695,6 +2715,25 @@ mod tests {
         let tenant = TenantId::default();
         let backend = state.backend_for(&tenant);
         let eid = ExecutionId::new();
+        // A live run: a decision is recorded only on one.
+        let now = Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "wf".into(),
+                workflow_version: "0.1.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: json!({}),
+                current_state: json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
         // Started by someone, so separation of duties is not what refuses.
         backend
             .append_event(jamjet_state::Event::new(

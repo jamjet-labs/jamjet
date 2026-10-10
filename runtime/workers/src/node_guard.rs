@@ -17,12 +17,12 @@
 
 use crate::dispatch_guard::{self, DispatchGuardOutcome};
 use jamjet_core::workflow::ExecutionId;
-use jamjet_ir::workflow::{NodeDef, PolicySetIr};
+use jamjet_ir::workflow::{ApprovalDeadline, NodeDef, PolicySetIr};
 use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
 use jamjet_state::approvals::{
     action_basis, answered_request, approval_covers, definition_hash, derive_action_digest,
-    node_approval_status, NodeApprovalStatus, ACTION_BASIS_KEY, ACTION_BASIS_STATE_CAP,
-    ACTION_DEFINITION_KEY, ACTION_DIGEST_KEY, ACTION_STEP_KEY,
+    node_approval_status, stamp_deadline, NodeApprovalStatus, ACTION_BASIS_KEY,
+    ACTION_BASIS_STATE_CAP, ACTION_DEFINITION_KEY, ACTION_DIGEST_KEY, ACTION_STEP_KEY,
 };
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::EventKind;
@@ -184,6 +184,17 @@ pub async fn guard_item(
             let tool_name = ctx.tool_name.unwrap_or_else(|| node_id.to_string());
             let outcome = match mode {
                 GuardMode::Fire => {
+                    // The request's deadline comes from the same chain that
+                    // gated the node. A chain whose deadline is invalid (only
+                    // reachable past registration and `PUT /tenants`) refuses
+                    // the node: raising the request with no deadline would
+                    // leave it open forever under a policy that says it
+                    // expires.
+                    let deadline =
+                        match deadline_or_block(backend, execution_id, node_id, &sets).await {
+                            Ok(d) => d,
+                            Err(blocked) => return blocked,
+                        };
                     require_approval(
                         backend,
                         execution_id,
@@ -193,6 +204,7 @@ pub async fn guard_item(
                         tool_name,
                         approver,
                         serde_json::json!({ "node_id": node_id }),
+                        deadline,
                     )
                     .await
                 }
@@ -218,6 +230,10 @@ pub async fn guard_item(
 ///
 /// Shared by the policy path above and the worker's autonomy path, so both
 /// request and match approvals identically.
+///
+/// `deadline`: the request, if one is raised here, records when it expires
+/// and escalates (see `approvals::stamp_deadline`); `None` raises it with no
+/// deadline.
 #[allow(clippy::too_many_arguments)]
 pub async fn require_approval(
     backend: &dyn StateBackend,
@@ -228,6 +244,7 @@ pub async fn require_approval(
     tool_name: String,
     approver: String,
     context: Value,
+    deadline: Option<ApprovalDeadline>,
 ) -> GuardOutcome {
     let gated = vec![tool_name.clone()];
     let events = match backend.get_events(execution_id).await {
@@ -301,6 +318,14 @@ pub async fn require_approval(
             ACTION_BASIS_KEY.to_string(),
             basis_preview(&basis.payload, basis.step, node_def),
         );
+        if let Some(deadline) = &deadline {
+            if let Err(e) = stamp_deadline(obj, deadline, chrono::Utc::now()) {
+                // Never raise a request without the deadline its policy set.
+                return GuardOutcome::Unavailable {
+                    reason: format!("approval required but its deadline could not be set: {e}"),
+                };
+            }
+        }
     }
 
     // KNOWN LIMIT, unchanged: read-then-append with no compare-and-set, so two
@@ -333,6 +358,36 @@ pub async fn require_approval(
         };
     }
     GuardOutcome::Held { gated }
+}
+
+/// The deadline a request raised under `sets` carries, or the refusal when
+/// the chain's deadline settings are invalid (recorded as a violation, like an
+/// unparseable tenant policy). Shared with the agent tool dispatch guard.
+pub(crate) async fn deadline_or_block(
+    backend: &dyn StateBackend,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    sets: &[&PolicySetIr],
+) -> Result<Option<ApprovalDeadline>, GuardOutcome> {
+    match ApprovalDeadline::resolve(sets) {
+        Ok(d) => Ok(d),
+        Err(cause) => {
+            let reason = format!(
+                "approval deadline policy is invalid ({cause}); the node is refused until \
+                 the policy is fixed"
+            );
+            warn!(execution_id = %execution_id, node_id, %reason, "refusing node");
+            dispatch_guard::record_policy_violation(
+                backend,
+                execution_id,
+                node_id,
+                reason.clone(),
+                "unknown".to_string(),
+            )
+            .await;
+            Err(GuardOutcome::Blocked { reason })
+        }
+    }
 }
 
 /// `GuardMode::Complete` for an approval-gated node: `Allow` only if the

@@ -24,10 +24,10 @@ pub use artifact::{
     DEFAULT_SPILL_THRESHOLD,
 };
 pub use backend::{
-    granted_lease_secs, ApiToken, ApprovalProjectionRow, BackendResult, ExecutionFinish,
-    FailOutcome, LeaseRenewal, ReclaimResult, ReserveOutcome, StateBackend, StateBackendError,
-    TurnCommit, WorkItem, WorkItemId, WorkflowDefinition, DEFAULT_LEASE_SECS, MAX_LEASE_SECS,
-    MIN_LEASE_SECS,
+    granted_lease_secs, ApiToken, ApprovalProjectionRow, BackendResult, ConditionalAppend,
+    ExecutionFinish, FailOutcome, LeaseRenewal, ReclaimResult, ReserveOutcome, StateBackend,
+    StateBackendError, TurnCommit, WorkItem, WorkItemId, WorkflowDefinition, DEFAULT_LEASE_SECS,
+    MAX_LEASE_SECS, MIN_LEASE_SECS,
 };
 pub use budget::{BudgetState, BudgetTrip};
 pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};

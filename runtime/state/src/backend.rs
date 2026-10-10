@@ -150,6 +150,26 @@ pub trait StateBackend: Send + Sync {
         status: WorkflowStatus,
     ) -> BackendResult<ExecutionFinish>;
 
+    /// Append `event` only if `condition` holds for the execution's whole
+    /// event log, read in the same step as the append, and the execution is
+    /// live. The event's sequence is assigned here.
+    ///
+    /// The compare-and-set the approval loop needs: a human decision and the
+    /// deadline sweep each resolve a request only while it is still pending
+    /// (`approvals::still_pending`). Read and appended apart, a decision and
+    /// an expiry of one request could both land and the record would hold two
+    /// outcomes. Under this method exactly one does; the other is
+    /// [`ConditionalAppend::Refused`] and writes nothing.
+    ///
+    /// `condition` must be a pure function of the log. A terminal execution
+    /// is [`ConditionalAppend::ExecutionTerminal`] and an unknown one
+    /// `NotFound`; nothing is written either way.
+    async fn append_event_if(
+        &self,
+        event: Event,
+        condition: &crate::backend::EventCondition,
+    ) -> BackendResult<ConditionalAppend>;
+
     /// Update the current_state of a workflow execution (apply state patches).
     async fn update_execution_current_state(
         &self,
@@ -741,6 +761,21 @@ pub enum ExecutionFinish {
     Finished(EventSequence),
     /// The execution was already terminal: nothing was written.
     AlreadyTerminal(WorkflowStatus),
+}
+
+/// The condition [`StateBackend::append_event_if`] appends under: a pure
+/// function of an execution's whole event log.
+pub type EventCondition = dyn for<'e> Fn(&'e [Event]) -> bool + Send + Sync;
+
+/// What [`StateBackend::append_event_if`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalAppend {
+    /// The condition held: the event landed at this sequence.
+    Appended(EventSequence),
+    /// The condition did not hold: nothing was written.
+    Refused,
+    /// The execution is terminal: nothing was written.
+    ExecutionTerminal(WorkflowStatus),
 }
 
 /// What [`StateBackend::commit_turn_unless_terminal`] did.

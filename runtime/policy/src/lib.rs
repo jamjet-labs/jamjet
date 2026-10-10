@@ -228,6 +228,7 @@ mod tests {
             blocked_tools: blocked.iter().map(|s| s.to_string()).collect(),
             require_approval_for: require_approval.iter().map(|s| s.to_string()).collect(),
             model_allowlist: allowlist.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 

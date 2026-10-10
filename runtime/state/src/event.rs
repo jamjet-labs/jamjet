@@ -282,6 +282,32 @@ pub enum EventKind {
         approver: String,
         context: serde_json::Value,
     },
+    /// The request at `request_sequence` reached its deadline undecided. A
+    /// rejection by [`DEADLINE_PRINCIPAL`]: the node fails as on a rejection,
+    /// and a later decision is refused. Appended by the scheduler's deadline
+    /// sweep only while that request is still pending, in the same step that
+    /// checks it, so it never lands beside a human decision of that request.
+    ApprovalExpired {
+        node_id: NodeId,
+        /// Sequence of the `ToolApprovalRequired` that expired.
+        request_sequence: i64,
+        /// The deadline the request carried (`context.expires_at`).
+        expires_at: DateTime<Utc>,
+        /// Always [`DEADLINE_PRINCIPAL`].
+        principal: String,
+    },
+    /// The request at `request_sequence` is still pending at its
+    /// `escalate_at`. Recorded once per request, for external notifiers (the
+    /// hook point for Slack or email routing); it changes no approval state.
+    ApprovalEscalated {
+        node_id: NodeId,
+        /// Sequence of the `ToolApprovalRequired` that escalated.
+        request_sequence: i64,
+        /// When it was due to escalate (`context.escalate_at`).
+        escalate_at: DateTime<Utc>,
+        /// When it will expire (`context.expires_at`).
+        expires_at: DateTime<Utc>,
+    },
 
     // ── Reasoning strategy lifecycle (§14.5) ─────────────────────────────
     /// Emitted when a reasoning strategy begins execution.
@@ -407,6 +433,9 @@ pub enum EventKind {
     },
 }
 
+/// The principal an expired approval request is rejected by.
+pub const DEADLINE_PRINCIPAL: &str = "system:deadline";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
@@ -438,6 +467,8 @@ impl EventKind {
             | Self::EscalationRequired { node_id, .. }
             | Self::PolicyViolation { node_id, .. }
             | Self::ToolApprovalRequired { node_id, .. }
+            | Self::ApprovalExpired { node_id, .. }
+            | Self::ApprovalEscalated { node_id, .. }
             | Self::ChildWorkflowStarted { node_id, .. }
             | Self::ChildWorkflowCompleted { node_id, .. }
             | Self::ChildWorkflowFailed { node_id, .. }

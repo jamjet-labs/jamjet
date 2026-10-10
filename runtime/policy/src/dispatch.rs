@@ -312,6 +312,7 @@ mod tests {
             blocked_tools: blocked.iter().map(|s| s.to_string()).collect(),
             require_approval_for: approval.iter().map(|s| s.to_string()).collect(),
             model_allowlist: vec![],
+            ..Default::default()
         }
     }
 

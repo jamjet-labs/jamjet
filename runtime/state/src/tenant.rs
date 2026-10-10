@@ -92,8 +92,13 @@ impl TenantStatus {
 
 /// The fields a tenant policy may have. Anything else is refused: a misspelt
 /// field (`blocked_tool`) would otherwise be dropped and its rules lost.
-pub const TENANT_POLICY_FIELDS: &[&str] =
-    &["blocked_tools", "require_approval_for", "model_allowlist"];
+pub const TENANT_POLICY_FIELDS: &[&str] = &[
+    "blocked_tools",
+    "require_approval_for",
+    "model_allowlist",
+    "approval_timeout_secs",
+    "escalate_after_secs",
+];
 
 /// Parse a tenant policy strictly: `null` is no policy; otherwise it must be an
 /// object with only [`TENANT_POLICY_FIELDS`], each of the right type.
@@ -115,9 +120,16 @@ pub fn parse_tenant_policy(
             TENANT_POLICY_FIELDS.join(", ")
         ));
     }
-    serde_json::from_value(value.clone())
-        .map(Some)
-        .map_err(|e| format!("tenant policy does not parse: {e}"))
+    let policy: jamjet_ir::workflow::PolicySetIr = serde_json::from_value(value.clone())
+        .map_err(|e| format!("tenant policy does not parse: {e}"))?;
+    // A deadline the engine cannot honour is refused here, and a stored one
+    // refuses every node of the tenant (as any unparseable policy does)
+    // rather than being dropped: dropping it would leave requests open
+    // forever under a policy that says they expire.
+    policy
+        .validate_approval_deadline()
+        .map_err(|e| format!("tenant policy has an invalid approval deadline: {e}"))?;
+    Ok(Some(policy))
 }
 
 impl Tenant {
@@ -160,7 +172,13 @@ mod policy_field_tests {
     /// it blocks every node of the tenant. Pin them together.
     #[test]
     fn tenant_policy_fields_are_exactly_policy_set_ir_fields() {
-        let ir = serde_json::to_value(jamjet_ir::workflow::PolicySetIr::default()).unwrap();
+        // Every field set, so none is skipped when serialized.
+        let full = jamjet_ir::workflow::PolicySetIr {
+            approval_timeout_secs: Some(1),
+            escalate_after_secs: Some(1),
+            ..Default::default()
+        };
+        let ir = serde_json::to_value(full).unwrap();
         let mut from_ir: Vec<&str> = ir.as_object().unwrap().keys().map(String::as_str).collect();
         let mut declared: Vec<&str> = TENANT_POLICY_FIELDS.to_vec();
         from_ir.sort_unstable();

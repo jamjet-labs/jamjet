@@ -212,6 +212,36 @@ impl Projector {
                     }
                     // else: orphan or already-decided → ignore.
                 }
+                // An expiry is a rejection by `system:deadline` of the request
+                // it names: only a node pending on exactly that request moves.
+                EventKind::ApprovalExpired {
+                    node_id,
+                    request_sequence,
+                    expires_at,
+                    principal,
+                } => {
+                    let pending_on_it = node_map
+                        .get(node_id)
+                        .map(|r| r.status == "pending" && r.last_sequence == *request_sequence)
+                        .unwrap_or(false);
+                    if pending_on_it {
+                        touched.insert(node_id.clone());
+                        node_map.insert(
+                            node_id.clone(),
+                            ApprovalProjectionRow {
+                                execution_id: execution_id.clone(),
+                                node_id: node_id.clone(),
+                                status: "rejected".into(),
+                                user_id: Some(principal.clone()),
+                                comment: Some(jamjet_state::approvals::expiry_comment(expires_at)),
+                                last_sequence: event.sequence,
+                                tool_name: None,
+                                approver: None,
+                                context: None,
+                            },
+                        );
+                    }
+                }
                 _ => {
                     // Non-approval event: ignored for content, but the cursor
                     // still advances to batch_max below so it is not re-scanned.
@@ -1188,5 +1218,56 @@ mod tests {
             matches!(&events[1].kind, EventKind::ApprovalReceived { node_id, .. } if node_id == "nodeA"),
             "second event after sort must be ApprovalReceived"
         );
+    }
+
+    fn ev_expired(exec: &ExecutionId, node: &str, request_sequence: i64) -> Event {
+        Event::new(
+            exec.clone(),
+            0,
+            EventKind::ApprovalExpired {
+                node_id: node.into(),
+                request_sequence,
+                expires_at: Utc::now(),
+                principal: "system:deadline".into(),
+            },
+        )
+    }
+
+    /// An expiry projects as a rejection by `system:deadline`, and only for
+    /// the request it names.
+    #[tokio::test]
+    async fn an_expiry_projects_as_a_rejection_of_the_request_it_names() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let exec = ExecutionId::new();
+        backend
+            .create_execution(running_execution(&exec))
+            .await
+            .unwrap();
+        let first = backend
+            .append_event(ev_tool_approval_required(&exec, "a"))
+            .await
+            .unwrap();
+        let second = backend
+            .append_event(ev_tool_approval_required(&exec, "a"))
+            .await
+            .unwrap();
+        // Names the superseded request: no effect.
+        backend
+            .append_event(ev_expired(&exec, "a", first))
+            .await
+            .unwrap();
+        let projector = Projector::new(backend.clone());
+        projector.tick().await.unwrap();
+        let rows = backend.get_approval_projection(&exec).await.unwrap();
+        assert_eq!(rows[0].status, "pending");
+
+        backend
+            .append_event(ev_expired(&exec, "a", second))
+            .await
+            .unwrap();
+        projector.tick().await.unwrap();
+        let rows = backend.get_approval_projection(&exec).await.unwrap();
+        assert_eq!(rows[0].status, "rejected");
+        assert_eq!(rows[0].user_id.as_deref(), Some("system:deadline"));
     }
 }

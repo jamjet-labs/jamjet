@@ -13,6 +13,7 @@ fn approve(patterns: &[&str]) -> PolicySetIr {
         blocked_tools: vec![],
         require_approval_for: patterns.iter().map(|s| s.to_string()).collect(),
         model_allowlist: vec![],
+        ..Default::default()
     }
 }
 
@@ -21,6 +22,7 @@ fn block(patterns: &[&str]) -> PolicySetIr {
         blocked_tools: patterns.iter().map(|s| s.to_string()).collect(),
         require_approval_for: vec![],
         model_allowlist: vec![],
+        ..Default::default()
     }
 }
 
