@@ -337,6 +337,14 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     including a node no policy gates; for an ADK dispatch the approval covers the whole
     batch. Both are additional to tenant, workflow and node policy. A node that picks
     its target at run time is treated as named by any non-empty card list.
+  - The card's `allowed_delegations` is enforced at the same step. A delegation is an
+    `agent` node (its `agent_ref`), an `agent_tool` with an explicit target (that URI)
+    or an `a2a_task` (its `remote_agent` name as the IR writes it, not the URL it maps
+    to); the target must match a pattern on a non-empty list, or the node is refused
+    with a rule starting `agent allowed_delegations`. A coordinator, agent discovery or
+    `auto` agent tool picks its target at run time and is refused under a list. An
+    empty list restricts nothing. A subgraph runs a child workflow, not an agent, and
+    is not checked.
   - Known limits: the agent's status is not consulted (a deactivated agent's nodes run
     under its list). Cards are global, not per tenant, and the first card registered at
     a URI wins, including one registered through `POST /agents/discover`; this engine

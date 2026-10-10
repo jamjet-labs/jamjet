@@ -84,6 +84,36 @@ pub const ALLOWED_TOOLS_RULE: &str = "agent allowed_tools";
 /// with this.
 pub const BLOCKED_TOOLS_RULE: &str = "agent blocked_tools";
 
+/// Every rule recorded for a refusal by a card's `allowed_delegations` starts
+/// with this.
+pub const ALLOWED_DELEGATIONS_RULE: &str = "agent allowed_delegations";
+
+/// Whom a node delegates to, if it delegates: `Some(Some(target))` for an
+/// `agent` node (its `agent_ref`), an `agent_tool` with an explicit target
+/// (that URI) and an `a2a_task` (its `remote_agent` name, as the IR names it);
+/// `Some(None)` for a node that picks its target at run time (`coordinator`,
+/// `agent_discovery`, an `auto` agent tool); `None` for every other node.
+/// A subgraph runs a child workflow, not an agent, and is not a delegation.
+#[allow(deprecated)]
+fn delegation_target(kind: &NodeKind) -> Option<Option<&str>> {
+    use jamjet_core::agent_tool::AgentTarget;
+    match kind {
+        NodeKind::Agent { agent_ref, .. } => Some(Some(agent_ref)),
+        NodeKind::AgentTool {
+            agent: AgentTarget::Explicit(uri),
+            ..
+        } => Some(Some(uri)),
+        NodeKind::A2aTask { remote_agent, .. } => Some(Some(remote_agent)),
+        NodeKind::AgentTool {
+            agent: AgentTarget::Auto,
+            ..
+        }
+        | NodeKind::Coordinator { .. }
+        | NodeKind::AgentDiscovery { .. } => Some(None),
+        _ => None,
+    }
+}
+
 /// Decide whether `node_def` may fire (or, in `Complete` mode, whether its
 /// result may be recorded), evaluating the tenant -> workflow -> node policy
 /// chain and, for an approval-gated node, the approval bound to the action.
@@ -398,6 +428,38 @@ async fn agent_card(
             c.blocked_tools.as_slice(),
             c.require_approval_for.as_slice(),
         );
+
+        // Delegation: the target as the node names it must be on a
+        // non-empty `allowed_delegations` (glob patterns, matched as
+        // written). A node that picks its target at run time cannot be
+        // checked and is refused under a list.
+        if !c.allowed_delegations.is_empty() {
+            match delegation_target(&node_def.kind) {
+                Some(Some(target)) => {
+                    if !c
+                        .allowed_delegations
+                        .iter()
+                        .any(|p| jamjet_policy::glob_matches(p, target))
+                    {
+                        return refuse(format!(
+                            "{ALLOWED_DELEGATIONS_RULE}: agent '{agent_ref}' may not delegate \
+                             to '{target}'"
+                        ))
+                        .await;
+                    }
+                }
+                Some(None) => {
+                    return refuse(format!(
+                        "{ALLOWED_DELEGATIONS_RULE}: agent '{agent_ref}' has a delegation list, \
+                         and a {} node picks its target at run time",
+                        ctx.node_kind_tag
+                    ))
+                    .await;
+                }
+                None => {}
+            }
+        }
+
         if allowed.is_empty() && blocked.is_empty() && gated.is_empty() {
             continue;
         }

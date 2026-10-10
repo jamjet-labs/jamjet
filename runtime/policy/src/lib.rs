@@ -200,6 +200,12 @@ fn model_matches(pattern: &str, model: &str) -> bool {
 
 /// Minimal glob matcher supporting `*` (any chars) and `?` (single char).
 /// Operates on ASCII byte sequences — sufficient for tool names and model refs.
+/// [`glob_match`] for callers outside this crate: `*` any run of characters,
+/// `?` one character, everything else literal.
+pub fn glob_matches(pattern: &str, value: &str) -> bool {
+    glob_match(pattern, value)
+}
+
 pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let v: Vec<char> = value.chars().collect();

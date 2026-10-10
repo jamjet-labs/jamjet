@@ -240,7 +240,9 @@ async fn fire(state: &AppState, tb: &support::TestBackend, transport: Transport)
             .register_executor("mcp_tool", Arc::new(exec.clone()))
             .register_executor("python_fn", Arc::new(exec.clone()))
             .register_executor("agent_tool", Arc::new(exec.clone()))
-            .register_executor("coordinator", Arc::new(exec.clone()));
+            .register_executor("coordinator", Arc::new(exec.clone()))
+            .register_executor("agent", Arc::new(exec.clone()))
+            .register_executor("a2a_task", Arc::new(exec.clone()));
             let _ = worker.poll_and_execute().await;
             exec.0.load(Ordering::SeqCst) > 0
         }
@@ -1127,5 +1129,119 @@ async fn an_approved_card_gate_fires() {
                 "{ctx}: the approved node did not fire"
             );
         }
+    }
+}
+
+// ── allowed_delegations ─────────────────────────────────────────────────────
+
+fn agent_node(target: &str) -> Value {
+    json!({ "type": "agent", "agent_ref": target, "input_mapping": {}, "output_schema": "" })
+}
+
+fn a2a_task(remote: &str) -> Value {
+    json!({
+        "type": "a2a_task", "remote_agent": remote, "skill": "s", "input_mapping": {},
+        "output_schema": "", "stream": false, "on_input_required": null, "timeout_secs": null
+    })
+}
+
+fn delegating(to: &[&str]) -> Value {
+    card_with(AGENT, json!({ "allowed_delegations": to }))
+}
+
+#[tokio::test]
+async fn a_delegation_to_an_unlisted_agent_is_refused() {
+    for (kind, target) in [
+        (agent_node("jamjet://acme/payer"), "jamjet://acme/payer"),
+        (
+            agent_tool(json!({ "explicit": "https://evil.example/payer" })),
+            "https://evil.example/payer",
+        ),
+        (a2a_task("payer"), "payer"),
+    ] {
+        for (ctx, o) in each(|wf| {
+            (
+                vec![delegating(&["jamjet://acme/helper", "helper"])],
+                ir(&wf, kind.clone(), Some(AGENT), None, None),
+                json!({}),
+            )
+        })
+        .await
+        {
+            assert_refused(&o, target, &ctx);
+            assert!(
+                o.violations
+                    .iter()
+                    .any(|(r, _)| r.starts_with("agent allowed_delegations")),
+                "{ctx}: {:?}",
+                o.violations
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_delegation_to_a_listed_agent_runs() {
+    for kind in [
+        agent_node("jamjet://acme/helper"),
+        agent_tool(json!({ "explicit": "jamjet://acme/helper" })),
+        a2a_task("helper"),
+    ] {
+        for (ctx, o) in each(|wf| {
+            (
+                vec![delegating(&["jamjet://acme/helper", "helper"])],
+                ir(&wf, kind.clone(), Some(AGENT), None, None),
+                json!({}),
+            )
+        })
+        .await
+        {
+            assert!(o.ran, "{ctx}: {kind}: {:?}", o.violations);
+        }
+    }
+}
+
+/// A node that chooses whom to call at run time cannot be checked against
+/// a delegation list, so it is refused under one.
+#[tokio::test]
+async fn a_run_time_delegation_is_refused_under_a_list() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![delegating(&["jamjet://acme/helper"])],
+            ir(
+                &wf,
+                json!({ "type": "coordinator", "task": "t", "required_skills": [], "output_key": "o" }),
+                Some(AGENT),
+                None,
+                None,
+            ),
+            json!({}),
+        )
+    })
+    .await
+    {
+        assert_refused(&o, "coordinator", &ctx);
+    }
+}
+
+/// An empty delegation list restricts nothing.
+#[tokio::test]
+async fn an_empty_delegation_list_restricts_nothing() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![delegating(&[])],
+            ir(
+                &wf,
+                agent_node("jamjet://acme/payer"),
+                Some(AGENT),
+                None,
+                None,
+            ),
+            json!({}),
+        )
+    })
+    .await
+    {
+        assert!(o.ran, "{ctx}: {:?}", o.violations);
     }
 }
