@@ -186,11 +186,16 @@ async fn a_job_in_another_tenant_is_separate_from_this_one() {
     assert_eq!(listed["cron_jobs"].as_array().unwrap().len(), 1, "{listed}");
     assert_eq!(listed["cron_jobs"][0]["input"]["to"], "vendor");
 
-    // Each job's run starts in its own tenant.
+    // The default job runs in default. The other tenant's job starts no run
+    // at all: the engine is single-tenant, so the launcher refuses it, exactly
+    // as the API refuses that tenant's tokens.
     register_in_acme(&env).await;
     fire_due_jobs(&env).await;
     assert_eq!(run_inputs(&env, "default").await, vec![json!("vendor")]);
-    assert_eq!(run_inputs(&env, "acme").await, vec![json!("mallory")]);
+    assert!(
+        run_inputs(&env, "acme").await.is_empty(),
+        "a non-default job ran"
+    );
 
     // Deleting by name deletes only the caller's tenant's job.
     let (st, body) = call(&env.app, "DELETE", "/cron/nightly", &env.alice, None).await;

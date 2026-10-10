@@ -164,6 +164,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     old behaviour, where such a token acts in `default`; it gives no isolation.
     Upgrade note: a deployment that inserted non-default tokens by hand gets 403
     for them until it sets that variable or moves the tokens to `default`.
+    The embedded cron launcher follows the same rule: a job in any other tenant
+    starts no run (a warning is logged at each due time), unless the opt-out is
+    set, in which case it runs in `default`.
 
 - **Clients can approve what they reviewed.** `jamjet approvals` prints each pending
   request's digest, what it covers and the exact approve command (`--show-basis` prints

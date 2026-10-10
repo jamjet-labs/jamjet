@@ -152,6 +152,23 @@ impl InProcessCronLauncher {
     }
 }
 
+/// The tenant a cron job's run starts in, under the single-tenant rule the API
+/// applies to tokens (`auth::admit_token`): `default` jobs run in `default`;
+/// any other tenant's job is refused, because the engine cannot keep that
+/// tenant's run separate, unless the `JAMJET_TENANT_TOKENS_AS_DEFAULT` opt-out
+/// is on, in which case it runs in `default`. A refused job stays scheduled
+/// and is refused again at each due time; the scheduler logs it.
+pub fn cron_run_tenant(job_tenant: &str, as_default: bool) -> Result<TenantId, String> {
+    if job_tenant == jamjet_state::DEFAULT_TENANT || as_default {
+        return Ok(TenantId::default());
+    }
+    Err(format!(
+        "cron job in tenant {job_tenant} not started: this runtime is single-tenant and \
+         runs every workflow in tenant default (set {}=1 to run it in default)",
+        crate::auth::TENANT_TOKENS_AS_DEFAULT_ENV
+    ))
+}
+
 #[async_trait::async_trait]
 impl jamjet_timers::CronLauncher for InProcessCronLauncher {
     async fn start(&self, job: &CronJob) -> Result<(), String> {
@@ -160,9 +177,13 @@ impl jamjet_timers::CronLauncher for InProcessCronLauncher {
             created_by = job.created_by.as_deref().unwrap_or("<unknown>"),
             "starting cron run in-process"
         );
+        let tenant = cron_run_tenant(&job.tenant_id, crate::auth::tenant_tokens_as_default())
+            .inspect_err(
+                |e| tracing::warn!(cron_job = %job.name, tenant = %job.tenant_id, "{e}"),
+            )?;
         crate::routes::start_run(
             &self.state,
-            &TenantId::from(job.tenant_id.as_str()),
+            &tenant,
             job.workflow_id.clone(),
             Some(job.workflow_version.clone()),
             job.input.clone(),
@@ -171,5 +192,30 @@ impl jamjet_timers::CronLauncher for InProcessCronLauncher {
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::*;
+
+    #[test]
+    fn a_default_job_runs_in_default() {
+        assert_eq!(
+            cron_run_tenant("default", false).unwrap(),
+            TenantId::default()
+        );
+    }
+
+    #[test]
+    fn another_tenants_job_is_refused() {
+        let err = cron_run_tenant("acme", false).unwrap_err();
+        assert!(err.contains("single-tenant"), "{err}");
+    }
+
+    /// With the opt-out, such a job runs in `default`, never in its own tenant.
+    #[test]
+    fn the_opt_out_runs_it_in_default() {
+        assert_eq!(cron_run_tenant("acme", true).unwrap(), TenantId::default());
     }
 }
