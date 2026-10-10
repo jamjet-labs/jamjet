@@ -204,3 +204,69 @@ async def test_a_refused_call_cannot_re_point_a_tool_name_for_later_calls(bank, 
         await dispatch_tool_calls(_input("zzz", {"zzz": f"{bank}.other:exfil"}))
     await dispatch_tool_calls(_input(name, {}))
     assert _calls(bank) == ["mallory"], "the import re-pointed the tool name"
+
+
+async def test_a_tool_defined_in_a_function_resolves(bank, tmp_path):
+    """The compiler writes `fn.__qualname__`, so a factory-made tool's entry is
+    `mod:make.<locals>.tool`. It cannot be walked, but it is the registered
+    tool's own reference, so it resolves."""
+    _write(
+        tmp_path,
+        bank,
+        "factory",
+        f"""
+        import {bank}
+        from jamjet.tools.decorators import tool
+
+        def make():
+            @tool(name="made_{bank}")
+            async def made(to: str) -> str:
+                {bank}.CALLS.append("made:" + to)
+                return "made"
+            return made
+        """,
+    )
+    made = __import__(f"{bank}.factory", fromlist=["make"]).make()
+    from jamjet.agents.tool_runtime import _registered_ref
+    from jamjet.tools.decorators import get_tool
+
+    name = f"made_{bank}"
+    ref = _registered_ref(get_tool(name))
+    assert "<locals>" in ref
+    await dispatch_tool_calls(_input(name, {name: ref}))
+    assert _calls(bank) == ["made:mallory"]
+    assert made is not None
+
+
+async def test_a_staticmethod_over_a_tool_resolves(bank, tmp_path):
+    _write(
+        tmp_path,
+        bank,
+        "klass",
+        f"""
+        import {bank}
+        from jamjet.tools.decorators import tool
+
+        class Tools:
+            @staticmethod
+            @tool(name="static_{bank}")
+            async def sm(to: str) -> str:
+                {bank}.CALLS.append("static:" + to)
+                return "static"
+        """,
+    )
+    __import__(f"{bank}.klass")
+    name = f"static_{bank}"
+    await dispatch_tool_calls(_input(name, {name: f"{bank}.klass:Tools.sm"}))
+    assert _calls(bank) == ["static:mallory"]
+
+
+async def test_a_stale_entry_is_still_refused(bank):
+    """A tool whose module was renamed after the map was written: the entry is
+    not the registered tool's reference and its module is gone, so it is
+    refused. Listed in the CHANGELOG as a behaviour change."""
+    __import__(f"{bank}.wires")
+    name = f"send_wire_{bank}"
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input(name, {name: f"{bank}.old_wires:send_wire"}))
+    assert _calls(bank) == []

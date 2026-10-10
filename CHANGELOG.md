@@ -50,13 +50,24 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (`send_wire.__call__`), or a module segment starting with `__`. This is
     defence in depth: a pattern still binds a name, not code, and only a catch-all
     binds an author who writes their own IR.
-  - Behaviour changes for ADK users: SDK-started runs carry the compiler's `tools`
-    map, so their calls are now also matched on handler and function name
-    (`blocked_tools: ["delete"]` blocks a tool `archive` whose function is
-    `delete`; `payments.*` catches tools defined in `payments.tools`). A tool whose
-    function name starts with `_` is refused when the map names it; rename it. A
-    tool defined in `__main__` cannot be verified by a worker and is refused; define
-    tools in an importable module, as the examples do.
+  - Behaviour changes for ADK users:
+    - SDK-started runs carry the compiler's `tools` map, so their calls are now also
+      matched on handler and function name (`blocked_tools: ["delete"]` blocks a
+      tool `archive` whose function is `delete`; `payments.*` catches tools defined
+      in `payments.tools`).
+    - A `tools` entry must name a `@tool`. A plain function in the map, or a path to
+      a tool under another name (a re-export, an alias, an attribute such as
+      `.__call__`), is refused.
+    - A stale entry is refused rather than silently replaced by the registry: after a
+      tool module is renamed, recompile the agent so its map matches.
+    - A tool whose function name starts with `_` is refused by the engine when the
+      map names it; rename it.
+    - A tool defined in `__main__` is refused; define tools in an importable module,
+      as the examples do.
+    - Tools defined inside a function (a factory or closure) and `@staticmethod`
+      over `@tool` resolve when the tool is registered in the worker (the factory
+      has run, or the class's module has been imported); otherwise their entry
+      cannot be walked and is refused.
   - A decision carrying a `state_patch` is refused with 400. The edit never reached
     the executed action, so recording it was a false record.
   - The worker protocol evaluates the same policy and approval rules as the
