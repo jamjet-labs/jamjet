@@ -42,7 +42,7 @@ The runtime holds a node to an agent's `allowed_tools` when the node acts for th
 - The agent's status is not consulted, and cards are global: the first card registered at a URI is the one enforced.
 - An absent or empty list restricts nothing. To refuse every tool, use a policy `blocked_tools: ["*"]`.
 - Policy still applies on top: a tool on the list can still be blocked or approval-gated.
-- Not enforced yet: the card's `blocked_tools`, `require_approval_for` and `allowed_delegations`. Use policy for the first two.
+- The card's `blocked_tools` and `require_approval_for` apply to the same nodes and match the same way. A card block wins over the card's `allowed_tools`; a card gate holds the node for an ordinary approval, with the policy chain's deadline.
 
 ---
 

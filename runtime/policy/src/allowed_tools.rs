@@ -102,6 +102,49 @@ pub fn node_allowed(ctx: &EvaluationContext, allowed: &[String]) -> Result<(), S
     }
 }
 
+/// The name under which one of `patterns` names `ctx`'s node, for a card's
+/// `blocked_tools` and `require_approval_for`. Matched like `allowed_tools`
+/// (tool name; a code-backed node's handler, bare names against the
+/// function's own name). A node that picks its target at run time is
+/// treated as named by any non-empty list: nothing shows it is not.
+pub fn node_named_by(ctx: &EvaluationContext, patterns: &[String]) -> Option<String> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let Some(name) = ctx.tool_name.as_deref() else {
+        return RUN_TIME_TARGET_TAGS
+            .contains(&ctx.node_kind_tag.as_str())
+            .then(|| format!("{} (target chosen at run time)", ctx.node_kind_tag));
+    };
+    let code = FUNCTION_KIND_TAGS.contains(&ctx.node_kind_tag.as_str())
+        || ctx.node_kind_tag == PYTHON_REF_TAG;
+    let hit = if code {
+        handler_listed(ctx, name, patterns)
+    } else {
+        listed(patterns, name)
+    };
+    hit.then(|| name.to_string())
+}
+
+/// The identity of `call` one of `patterns` names: its name, or the handler
+/// its `tools` entry resolves to.
+pub fn call_named_by(call: &PendingToolCall, patterns: &[String]) -> Option<String> {
+    if patterns.is_empty() {
+        return None;
+    }
+    if listed(patterns, &call.name) {
+        return Some(call.name.clone());
+    }
+    let handler = call.handler.as_ref()?;
+    let as_ref = EvaluationContext {
+        node_id: String::new(),
+        node_kind_tag: PYTHON_REF_TAG.to_string(),
+        tool_name: Some(handler.clone()),
+        model_ref: None,
+    };
+    handler_listed(&as_ref, handler, patterns).then(|| handler.clone())
+}
+
 /// Why a dispatch call is not on the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallRefused {
@@ -271,6 +314,50 @@ mod tests {
             );
             assert!(node_allowed(&ctx(tag, "n", None), &[]).is_ok(), "{tag}");
         }
+    }
+
+    #[test]
+    fn a_block_or_gate_list_names_a_call_by_its_name_or_its_code() {
+        let p = list(&["send_wire"]);
+        assert_eq!(
+            call_named_by(&call("send_wire", None), &p),
+            Some("send_wire".into())
+        );
+        // Another name for the same code.
+        assert_eq!(
+            call_named_by(&call("pay", Some("bank.wires:send_wire")), &p),
+            Some("bank.wires:send_wire".into())
+        );
+        assert_eq!(call_named_by(&call("search", Some("app:search")), &p), None);
+        assert_eq!(call_named_by(&call("send_wire", None), &[]), None);
+        // A bare name does not reach across a module path.
+        assert_eq!(
+            call_named_by(
+                &call("x", Some("send_wire_utils:noop")),
+                &list(&["send_wire*"])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_block_or_gate_list_names_a_node() {
+        let p = list(&["send_*"]);
+        assert_eq!(
+            node_named_by(&ctx("mcp_tool", "n", Some("send_wire")), &p),
+            Some("send_wire".into())
+        );
+        assert_eq!(
+            node_named_by(&ctx("python_fn", "n", Some("bank.wires:send_wire")), &p),
+            Some("bank.wires:send_wire".into())
+        );
+        assert_eq!(
+            node_named_by(&ctx("python_fn", "send_x", Some("app:noop")), &p),
+            None
+        );
+        assert_eq!(node_named_by(&ctx("model", "n", None), &p), None);
+        assert!(node_named_by(&ctx("coordinator", "n", None), &p).is_some());
+        assert!(node_named_by(&ctx("coordinator", "n", None), &[]).is_none());
     }
 
     #[test]

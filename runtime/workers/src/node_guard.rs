@@ -80,6 +80,10 @@ pub const AGENT_SCOPE: &str = "agent";
 /// Every rule recorded for an `allowed_tools` refusal starts with this.
 pub const ALLOWED_TOOLS_RULE: &str = "agent allowed_tools";
 
+/// Every rule recorded for a refusal by a card's own `blocked_tools` starts
+/// with this.
+pub const BLOCKED_TOOLS_RULE: &str = "agent blocked_tools";
+
 /// Decide whether `node_def` may fire (or, in `Complete` mode, whether its
 /// result may be recorded), evaluating the tenant -> workflow -> node policy
 /// chain and, for an approval-gated node, the approval bound to the action.
@@ -97,9 +101,12 @@ pub const ALLOWED_TOOLS_RULE: &str = "agent allowed_tools";
 /// dispatch flag is author-controlled, which made that a bypass of any gate
 /// (round-3 review, C1).
 ///
-/// Before any of that, a node attributed to an agent (`agents`) must be
-/// allowed by that agent's `allowed_tools`; see [`agent_allowed_tools`]. It is
-/// an additional restriction: the policy chain still has to allow the node.
+/// Before any of that, a node attributed to an agent (`agents`) is held to
+/// that agent's card: its `allowed_tools`, `blocked_tools` and
+/// `require_approval_for`; see [`agent_card`]. These are additional
+/// restrictions: the policy chain still has to allow the node, and a card
+/// gate holds a node the chain would allow, through the same approval path
+/// (same digest binding, the chain's deadline).
 #[allow(clippy::too_many_arguments)]
 pub async fn guard_item(
     backend: &dyn StateBackend,
@@ -115,7 +122,7 @@ pub async fn guard_item(
 ) -> GuardOutcome {
     // First, so a node the agent may not use never raises an approval request
     // and is refused even when no policy applies.
-    if let Some(refused) = agent_allowed_tools(
+    let card_gate = match agent_card(
         backend,
         mode,
         execution_id,
@@ -126,8 +133,9 @@ pub async fn guard_item(
     )
     .await
     {
-        return refused;
-    }
+        Ok(gate) => gate,
+        Err(refused) => return refused,
+    };
     let is_dispatch = dispatch_guard::is_agent_tool_dispatch(&node_def.kind);
     // The per-call guard for a dispatch node. `node_approved`: an approval of
     // the node's full payload is on file and covers this item. The calls are
@@ -194,12 +202,21 @@ pub async fn guard_item(
     if let Some(p) = &node_def.policy {
         sets.push(p);
     }
-    if sets.is_empty() {
-        return GuardOutcome::Allow;
-    }
-
     let ctx = EvaluationContext::from_node_kind(node_id, &node_def.kind);
-    match PolicyEvaluator.evaluate(&ctx, &sets) {
+    let decision = if sets.is_empty() {
+        PolicyDecision::Allow
+    } else {
+        PolicyEvaluator.evaluate(&ctx, &sets)
+    };
+    // A card gate turns an allow into an approval; a block stays a block, and
+    // a chain gate is already one.
+    let decision = match (decision, &card_gate) {
+        (PolicyDecision::Allow, Some(_)) => PolicyDecision::RequireApproval {
+            approver: "human".to_string(),
+        },
+        (d, _) => d,
+    };
+    match decision {
         PolicyDecision::Allow if is_dispatch => per_call(false).await,
         PolicyDecision::Allow => GuardOutcome::Allow,
 
@@ -226,7 +243,10 @@ pub async fn guard_item(
         }
 
         PolicyDecision::RequireApproval { approver } => {
-            let tool_name = ctx.tool_name.unwrap_or_else(|| node_id.to_string());
+            let tool_name = card_gate
+                .clone()
+                .or(ctx.tool_name)
+                .unwrap_or_else(|| node_id.to_string());
             let outcome = match mode {
                 GuardMode::Fire => {
                     // The request's deadline comes from the same chain that
@@ -268,23 +288,27 @@ pub async fn guard_item(
     }
 }
 
-/// The `allowed_tools` half of the decision: `None` when every agent the node
-/// is attributed to allows it (or it is attributed to none), otherwise the
-/// refusal.
+/// The agent card half of the decision. `Ok(None)`: every agent the node
+/// acts for allows it outright (or it acts for none). `Ok(Some(name))`: some
+/// card's `require_approval_for` names it (as `name`), so the node must be
+/// approved. `Err`: the refusal.
 ///
 /// Fails closed. An attributed node is refused (`Blocked`, recorded with scope
 /// [`AGENT_SCOPE`] on a firing check) when the runtime has no agent registry
 /// or the agent is not registered, and held back (`Unavailable`, nothing
-/// recorded) when the registry cannot be read. An agent whose list is empty is
-/// no restriction (`jamjet_policy::allowed_tools`).
+/// recorded) when the registry cannot be read. Empty lists restrict nothing
+/// (`jamjet_policy::allowed_tools`).
 ///
-/// What is matched: an agent tool dispatch node's pending calls (name and
-/// resolved handler), read from the same payload the dispatch consumes; every
-/// other node's own tool name. A node marked as a dispatch but not at the ADK
-/// dispatcher's own coordinates is matched on both, because the marker is the
-/// author's to set: without that, marking any function node as a dispatch
-/// would exempt its own code.
-async fn agent_allowed_tools(
+/// Per card, in order: `allowed_tools` (a node not on a non-empty list is
+/// refused), `blocked_tools` (a node named by it is refused, even if also on
+/// `allowed_tools`), `require_approval_for` (a node named by it needs an
+/// approval). All three match the same identities: an agent tool dispatch
+/// node's pending calls (name and resolved handler), read from the same
+/// payload the dispatch consumes; every other node's own tool name. A node
+/// marked as a dispatch but not at the ADK dispatcher's own coordinates is
+/// matched on both, because the marker is the author's to set: without that,
+/// marking any function node as a dispatch would exempt its own code.
+async fn agent_card(
     backend: &dyn StateBackend,
     mode: GuardMode,
     execution_id: &ExecutionId,
@@ -292,7 +316,9 @@ async fn agent_allowed_tools(
     node_def: &NodeDef,
     payload: &Value,
     agents: AgentScope<'_>,
-) -> Option<GuardOutcome> {
+) -> Result<Option<String>, GuardOutcome> {
+    use jamjet_policy::allowed_tools::{call_allowed, call_named_by, node_named_by, CallRefused};
+
     let mut refs: Vec<&str> = Vec::new();
     for r in agents
         .workflow_agent
@@ -303,10 +329,12 @@ async fn agent_allowed_tools(
             refs.push(r);
         }
     }
-    let first = *refs.first()?;
+    let Some(&first) = refs.first() else {
+        return Ok(None);
+    };
 
     let refuse = |rule: String| async move {
-        warn!(execution_id = %execution_id, node_id, %rule, "agent allowed_tools refused node");
+        warn!(execution_id = %execution_id, node_id, %rule, "agent card refused node");
         if mode == GuardMode::Fire {
             dispatch_guard::record_policy_violation(
                 backend,
@@ -317,13 +345,13 @@ async fn agent_allowed_tools(
             )
             .await;
         }
-        Some(GuardOutcome::Blocked { reason: rule })
+        Err(GuardOutcome::Blocked { reason: rule })
     };
 
     let Some(registry) = agents.registry else {
         return refuse(format!(
             "{ALLOWED_TOOLS_RULE}: node acts for agent '{first}', but this runtime has no \
-             agent registry to read its allowed_tools"
+             agent registry to read its card"
         ))
         .await;
     };
@@ -339,6 +367,8 @@ async fn agent_allowed_tools(
         _ => false,
     };
     let is_dispatch = dispatch_guard::is_agent_tool_dispatch(&node_def.kind);
+    let ctx = EvaluationContext::from_node_kind(node_id, &node_def.kind);
+    let mut gate: Option<String> = None;
 
     for agent_ref in refs {
         let card = match registry.get_by_uri(agent_ref).await {
@@ -346,36 +376,47 @@ async fn agent_allowed_tools(
             Ok(None) => {
                 return refuse(format!(
                     "{ALLOWED_TOOLS_RULE}: agent '{agent_ref}' is not registered, so its \
-                     allowed_tools cannot be checked"
+                     card cannot be checked"
                 ))
                 .await;
             }
             Err(e) => {
                 warn!(execution_id = %execution_id, node_id, agent_ref, "agent registry unreadable");
-                return Some(GuardOutcome::Unavailable {
+                return Err(GuardOutcome::Unavailable {
                     reason: format!(
                         "agent registry unavailable; refusing to run without checking the \
-                         allowed_tools of agent '{agent_ref}': {e}"
+                         card of agent '{agent_ref}': {e}"
                     ),
                 });
             }
         };
-        let allowed: &[String] = card
-            .constraints
-            .as_ref()
-            .map(|c| c.allowed_tools.as_slice())
-            .unwrap_or(&[]);
-        if allowed.is_empty() {
+        let Some(c) = card.constraints.as_ref() else {
+            continue;
+        };
+        let (allowed, blocked, gated) = (
+            c.allowed_tools.as_slice(),
+            c.blocked_tools.as_slice(),
+            c.require_approval_for.as_slice(),
+        );
+        if allowed.is_empty() && blocked.is_empty() && gated.is_empty() {
             continue;
         }
 
         if !calls_only {
-            let ctx = EvaluationContext::from_node_kind(node_id, &node_def.kind);
             if let Err(tool) = jamjet_policy::allowed_tools::node_allowed(&ctx, allowed) {
                 return refuse(format!(
                     "{ALLOWED_TOOLS_RULE}: tool '{tool}' is not allowed for agent '{agent_ref}'"
                 ))
                 .await;
+            }
+            if let Some(tool) = node_named_by(&ctx, blocked) {
+                return refuse(format!(
+                    "{BLOCKED_TOOLS_RULE}: tool '{tool}' is blocked for agent '{agent_ref}'"
+                ))
+                .await;
+            }
+            if gate.is_none() {
+                gate = node_named_by(&ctx, gated);
             }
         }
         if is_dispatch {
@@ -385,8 +426,7 @@ async fn agent_allowed_tools(
                 Err(cause) => return refuse(dispatch_guard::unreadable_rule(cause)).await,
             };
             for call in &calls {
-                use jamjet_policy::allowed_tools::CallRefused;
-                match jamjet_policy::allowed_tools::call_allowed(call, allowed) {
+                match call_allowed(call, allowed) {
                     Ok(()) => {}
                     Err(CallRefused::Name(tool)) => {
                         return refuse(format!(
@@ -403,10 +443,19 @@ async fn agent_allowed_tools(
                         .await;
                     }
                 }
+                if let Some(tool) = call_named_by(call, blocked) {
+                    return refuse(format!(
+                        "{BLOCKED_TOOLS_RULE}: tool '{tool}' is blocked for agent '{agent_ref}'"
+                    ))
+                    .await;
+                }
+                if gate.is_none() {
+                    gate = call_named_by(call, gated);
+                }
             }
         }
     }
-    None
+    Ok(gate)
 }
 
 /// The approval half of the decision, for a node that needs one: `Allow` if an

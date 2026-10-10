@@ -328,8 +328,15 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     only `allowed_tools`. The in-memory agent registry refuses a second card at a URI
     already registered, as the SQLite registry already did, so a later card cannot
     shadow the one that restricts a node.
-  - Not enforced yet: the card's own `blocked_tools`, `require_approval_for` and
-    `allowed_delegations`. Use policy `blocked_tools` and `require_approval_for`.
+  - The card's own `blocked_tools` and `require_approval_for` are enforced at the same
+    step, matched the same way (a call by its name or its resolved code; bare names
+    against a function's own name). A card block refuses the node even if the tool is
+    on the card's `allowed_tools`, and records a violation with scope `agent` and a rule
+    starting `agent blocked_tools`. A card gate holds the node through the ordinary
+    approval request (bound to the action digest, with the policy chain's deadline),
+    including a node no policy gates; for an ADK dispatch the approval covers the whole
+    batch. Both are additional to tenant, workflow and node policy. A node that picks
+    its target at run time is treated as named by any non-empty card list.
   - Known limits: the agent's status is not consulted (a deactivated agent's nodes run
     under its list). Cards are global, not per tenant, and the first card registered at
     a URI wins, including one registered through `POST /agents/discover`; this engine

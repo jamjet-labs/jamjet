@@ -142,6 +142,9 @@ struct Outcome {
     ran: bool,
     /// `(rule, policy_scope)` of every `PolicyViolation`.
     violations: Vec<(String, String)>,
+    /// The context of every `ToolApprovalRequired`.
+    requests: Vec<Value>,
+    eid: ExecutionId,
 }
 
 /// A state over `tb`, with an agent registry of the same kind.
@@ -164,6 +167,17 @@ async fn run(
     ir: Value,
     input: Value,
 ) -> Outcome {
+    run_in(tb, transport, cards, ir, input).await.1
+}
+
+/// [`run`], keeping the state for a later step.
+async fn run_in(
+    tb: &support::TestBackend,
+    transport: Transport,
+    cards: &[Value],
+    ir: Value,
+    input: Value,
+) -> (AppState, Outcome) {
     let state = state_for(tb).await;
     for c in cards {
         let (st, body) = support::post(&state, "/agents", c.clone()).await;
@@ -196,8 +210,16 @@ async fn run(
     };
     let eid =
         ExecutionId(uuid::Uuid::parse_str(eid.strip_prefix("exec_").unwrap_or(&eid)).unwrap());
+    let ran = fire(&state, tb, transport).await;
+    let o = observe(tb, &eid, ran).await;
+    (state, o)
+}
+
+/// Take the next item off the queue over `transport`: true if it was handed
+/// out (claim) or executed (worker).
+async fn fire(state: &AppState, tb: &support::TestBackend, transport: Transport) -> bool {
     let queues = ["python_tool", "tool", "general"];
-    let ran = match transport {
+    match transport {
         Transport::Claim => {
             let (_, claimed) = support::post(
                 &state,
@@ -222,21 +244,33 @@ async fn run(
             let _ = worker.poll_and_execute().await;
             exec.0.load(Ordering::SeqCst) > 0
         }
-    };
-    let violations = tb
-        .dyn_backend()
-        .get_events(&eid)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter_map(|e| match e.kind {
+    }
+}
+
+async fn observe(tb: &support::TestBackend, eid: &ExecutionId, ran: bool) -> Outcome {
+    let events = tb.dyn_backend().get_events(eid).await.unwrap();
+    let violations = events
+        .iter()
+        .filter_map(|e| match &e.kind {
             EventKind::PolicyViolation {
                 rule, policy_scope, ..
-            } => Some((rule, policy_scope)),
+            } => Some((rule.clone(), policy_scope.clone())),
             _ => None,
         })
         .collect();
-    Outcome { ran, violations }
+    let requests = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ToolApprovalRequired { context, .. } => Some(context.clone()),
+            _ => None,
+        })
+        .collect();
+    Outcome {
+        ran,
+        violations,
+        requests,
+        eid: eid.clone(),
+    }
 }
 
 fn assert_refused(o: &Outcome, needle: &str, ctx: &str) {
@@ -244,10 +278,10 @@ fn assert_refused(o: &Outcome, needle: &str, ctx: &str) {
     assert!(
         o.violations
             .iter()
-            .any(|(rule, scope)| rule.starts_with("agent allowed_tools")
+            .any(|(rule, scope)| rule.starts_with("agent ")
                 && rule.contains(needle)
                 && scope == "agent"),
-        "{ctx}: no agent allowed_tools violation naming {needle}: {:?}",
+        "{ctx}: no agent card violation naming {needle}: {:?}",
         o.violations
     );
 }
@@ -899,5 +933,199 @@ async fn a_result_for_an_unlisted_dispatch_call_is_not_recorded() {
             "{}",
             tb.name()
         );
+    }
+}
+
+// ── The card's own blocked_tools and require_approval_for ──────────────────
+
+fn card_with(uri: &str, constraints: Value) -> Value {
+    let mut c = card(uri, &[]);
+    c["constraints"] = constraints;
+    c
+}
+
+#[tokio::test]
+async fn a_card_block_refuses_a_node() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card_with(AGENT, json!({ "blocked_tools": ["send_*"] }))],
+            ir(&wf, mcp_tool("send_wire"), Some(AGENT), None, None),
+            json!({}),
+        )
+    })
+    .await
+    {
+        assert_refused(&o, "send_wire", &ctx);
+        assert!(
+            o.violations
+                .iter()
+                .any(|(r, _)| r.starts_with("agent blocked_tools")),
+            "{ctx}: {:?}",
+            o.violations
+        );
+    }
+}
+
+/// A call is blocked under another name when its code is blocked.
+#[tokio::test]
+async fn a_card_block_catches_a_call_by_its_code() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card_with(AGENT, json!({ "blocked_tools": ["send_wire"] }))],
+            ir(&wf, adk_dispatch(), Some(AGENT), None, None),
+            calls(&[("pay", Some("bank.wires:send_wire"))]),
+        )
+    })
+    .await
+    {
+        assert_refused(&o, "bank.wires:send_wire", &ctx);
+    }
+}
+
+/// A block wins over the agent's own allow list.
+#[tokio::test]
+async fn a_card_block_wins_over_its_allow_list() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card_with(
+                AGENT,
+                json!({ "allowed_tools": ["send_*"], "blocked_tools": ["send_wire"] }),
+            )],
+            ir(&wf, mcp_tool("send_wire"), Some(AGENT), None, None),
+            json!({}),
+        )
+    })
+    .await
+    {
+        assert_refused(&o, "send_wire", &ctx);
+    }
+}
+
+/// Control: a card block names nothing else.
+#[tokio::test]
+async fn a_card_block_leaves_other_tools_alone() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card_with(AGENT, json!({ "blocked_tools": ["send_*"] }))],
+            ir(&wf, mcp_tool("search_web"), Some(AGENT), None, None),
+            json!({}),
+        )
+    })
+    .await
+    {
+        assert!(o.ran, "{ctx}: {:?}", o.violations);
+    }
+}
+
+/// A card gate holds the node behind the ordinary approval request: bound to
+/// the action digest, with the policy chain's deadline, and no denial.
+#[tokio::test]
+async fn a_card_gate_holds_the_node_for_approval() {
+    let policy = json!({
+        "blocked_tools": [], "require_approval_for": [], "model_allowlist": [],
+        "approval_timeout_secs": 3600
+    });
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card_with(
+                AGENT,
+                json!({ "require_approval_for": ["send_*"] }),
+            )],
+            ir(
+                &wf,
+                mcp_tool("send_wire"),
+                Some(AGENT),
+                None,
+                Some(policy.clone()),
+            ),
+            json!({}),
+        )
+    })
+    .await
+    {
+        assert!(!o.ran, "{ctx}: the gated node ran");
+        assert!(o.violations.is_empty(), "{ctx}: {:?}", o.violations);
+        assert_eq!(o.requests.len(), 1, "{ctx}");
+        let req = &o.requests[0];
+        assert!(req["action_digest"].is_string(), "{ctx}: {req}");
+        assert!(
+            req["expires_at"].is_string(),
+            "{ctx}: the chain's deadline: {req}"
+        );
+    }
+}
+
+/// A card gate on a dispatch call holds the batch.
+#[tokio::test]
+async fn a_card_gate_holds_a_dispatch_call() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card_with(
+                AGENT,
+                json!({ "require_approval_for": ["send_wire"] }),
+            )],
+            ir(&wf, adk_dispatch(), Some(AGENT), None, None),
+            calls(&[("pay", Some("bank.wires:send_wire"))]),
+        )
+    })
+    .await
+    {
+        assert!(!o.ran, "{ctx}");
+        assert_eq!(o.requests.len(), 1, "{ctx}: {:?}", o.violations);
+    }
+}
+
+/// Approving the request releases the action it was raised for, on both
+/// transports.
+#[tokio::test]
+async fn an_approved_card_gate_fires() {
+    for t in TRANSPORTS {
+        for tb in support::backends().await {
+            let ctx = format!("{} over {t:?}", tb.name());
+            let wf = format!("wf-gate-{}-{t:?}", tb.name()).to_lowercase();
+            let ir_v = ir(&wf, mcp_tool("send_wire"), Some(AGENT), None, None);
+            let (state, o) = run_in(
+                &tb,
+                t,
+                &[card_with(
+                    AGENT,
+                    json!({ "require_approval_for": ["send_*"] }),
+                )],
+                ir_v.clone(),
+                json!({}),
+            )
+            .await;
+            assert!(!o.ran, "{ctx}");
+            let digest = o.requests[0]["action_digest"].as_str().unwrap().to_string();
+            let eid = format!("exec_{}", o.eid.0);
+            let (st, body) = support::post(
+                &state,
+                &format!("/executions/{eid}/approve"),
+                json!({ "decision": "approved", "node_id": "n1", "action_digest": digest }),
+            )
+            .await;
+            assert!(st.is_success(), "{ctx}: approve: {st} {body}");
+            // Re-dispatch the node as the scheduler would.
+            let ir_t: jamjet_ir::WorkflowIr = serde_json::from_value(ir_v).unwrap();
+            let payload = jamjet_scheduler::build_work_item_payload(
+                &ir_t,
+                "n1",
+                ir_t.node("n1").unwrap(),
+                &serde_json::Map::new(),
+                &wf,
+                "0.1.0",
+            );
+            let (st, body) = support::post(
+                &state,
+                "/work-items",
+                json!({ "execution_id": eid, "node_id": "n1", "queue_type": "tool", "payload": payload }),
+            )
+            .await;
+            assert!(st.is_success(), "{ctx}: enqueue: {st} {body}");
+            assert!(
+                fire(&state, &tb, t).await,
+                "{ctx}: the approved node did not fire"
+            );
+        }
     }
 }
