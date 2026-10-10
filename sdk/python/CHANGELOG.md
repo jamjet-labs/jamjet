@@ -11,7 +11,8 @@
   `public_key_from_did_document` reads the key the runtime publishes in
   `/.well-known/did.json`. Load the export with `load_entries`, which keeps each number
   as the runtime wrote it; a float parsed and printed again can change spelling and fail
-  the hash.
+  the hash. Small-order or non-canonical keys, small-order signature `R` values and
+  fields Rust would not read (wrong JSON types, non-canonical UUIDs or hex) are refused.
 
 - **Approval deadlines in compiled policies.** A YAML workflow or node `policy:` and an
   `Agent(policy={...})` dict may set `approval_timeout_secs` and `escalate_after_secs`.

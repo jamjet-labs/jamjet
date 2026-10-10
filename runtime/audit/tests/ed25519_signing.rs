@@ -397,3 +397,47 @@ fn the_signature_label_is_checked() {
     assert!(!v.verify(hash, &format!("{}:{hex_sig}", s.kid().unwrap())));
     assert!(!v.verify(hash, &format!("ED25519:{}:{hex_sig}", s.kid().unwrap())));
 }
+
+/// A signature whose R is a small-order point verifies under the plain
+/// Ed25519 equation when made with the private key (S = k*a, R = identity),
+/// but proves nothing about R. Strict verification refuses it. Made with
+/// `SEED_HEX` over the statement for entry hash "aa" * 32 (review T1).
+#[test]
+fn a_small_order_r_is_refused() {
+    let s = signer();
+    let sig = format!(
+        "ed25519:{}:{}",
+        s.kid().unwrap(),
+        "0100000000000000000000000000000000000000000000000000000000000000\
+         38e5e01276466c089c0f2f58e5d5953165d544e2984f7d026cbd3cf0704d9102"
+    );
+    let hash = "aa".repeat(32);
+    assert!(!verifier_for(&s).verify(hash.as_bytes(), &sig));
+    assert!(!s.verify(hash.as_bytes(), &sig));
+}
+
+/// A key file others can read is used, with a warning (review M4).
+#[cfg(unix)]
+#[test]
+fn a_key_file_others_can_read_is_warned_about() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut path = std::env::temp_dir();
+    path.push(format!("jamjet_audit_key_{}", Uuid::new_v4().simple()));
+    std::fs::write(&path, SEED_HEX).unwrap();
+    let check = |mode: u32| {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        with_env(
+            &[
+                (SIGNING_MODE_ENV, "ed25519"),
+                (ED25519_KEY_FILE_ENV, path.to_str().unwrap()),
+            ],
+            || logged(AuditSigner::from_env),
+        )
+    };
+    let (s, log) = check(0o644);
+    assert_eq!(s.mode(), "ed25519");
+    assert!(log.contains("readable by other users"), "{log}");
+    let (_, log) = check(0o600);
+    assert!(!log.contains("readable by other users"), "{log}");
+    std::fs::remove_file(&path).unwrap();
+}

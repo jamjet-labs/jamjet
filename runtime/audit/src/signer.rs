@@ -296,6 +296,7 @@ impl AuditSigner {
                 seed?
             }
             (None, Some(path)) => {
+                warn_if_others_can_read(&path);
                 let mut text = std::fs::read_to_string(&path)
                     .map_err(|e| KeyError::Unreadable(format!("{path}: {}", e.kind())))?;
                 let seed = parse_seed(&text, ED25519_KEY_FILE_ENV);
@@ -443,6 +444,26 @@ impl AuditSigner {
             Key::Ed25519Verifying { key, kid } => verify_ed25519(key, kid, data, signature),
         }
     }
+}
+
+/// The key is still used: refusing would leave the log unsigned, which is
+/// worse. The path is logged, never the contents.
+fn warn_if_others_can_read(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.permissions().mode() & 0o077 != 0 {
+                warn!(
+                    path,
+                    "the Ed25519 audit key file is readable by other users; restrict it \
+                     to the runtime's user (chmod 600)"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn verify_ed25519(key: &VerifyingKey, kid: &str, data: &[u8], signature: &str) -> bool {

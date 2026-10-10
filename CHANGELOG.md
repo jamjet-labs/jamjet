@@ -347,7 +347,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   signature covers a JCS statement naming the entry hash, the key id and
   `jamjet.audit.entry/v1`. HMAC stays the default and is unchanged; a bad Ed25519 key
   leaves entries unsigned rather than falling back to HMAC, and the key is never logged
-  or served. See docs/guides/security.md, "Signing the audit log".
+  or served. Prefer the key file: an inline key stays in the environment child
+  processes inherit, and a key file others can read draws a warning. An entry verifies
+  only under the key that signed it, so keep old public keys after a rotation. See
+  docs/guides/security.md, "Signing the audit log".
 
 ### Fixed
 

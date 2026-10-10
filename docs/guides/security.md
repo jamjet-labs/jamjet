@@ -162,7 +162,7 @@ export JAMJET_AUDIT_SIGNING_MODE=ed25519
 export JAMJET_AUDIT_ED25519_KEY_FILE=$PWD/audit-ed25519.key
 ```
 
-A missing or malformed key leaves entries unsigned, with a warning; it never falls back to HMAC. The key is not logged, and only the public key leaves the process: it is published in `/.well-known/did.json` as the verification method `#audit-key` (a JWK, `kty: OKP`, `crv: Ed25519`). Existing HMAC deployments need no change.
+A missing or malformed key leaves entries unsigned, with a warning; it never falls back to HMAC. Prefer the key file: a key in `JAMJET_AUDIT_ED25519_KEY` stays in the process environment, which child processes the runtime starts (an MCP stdio server, for example) inherit. The runtime warns if the key file is readable by other users. The key is not logged, and only the public key leaves the process: it is published in `/.well-known/did.json` as the verification method `#audit-key` (a JWK, `kty: OKP`, `crv: Ed25519`). Existing HMAC deployments need no change.
 
 Each entry is signed on its own, not a chain head at intervals. The chain spans every tenant, so one tenant's slice of the log is not contiguous, and a per-entry signature is the only one a reader of that slice can check.
 
@@ -176,9 +176,13 @@ base = "http://localhost:7700"
 headers = {}  # {"Authorization": "Bearer <token>"} outside dev mode
 public_key = public_key_from_did_document(httpx.get(f"{base}/.well-known/did.json").json())
 entries = load_entries(httpx.get(f"{base}/audit", params={"limit": 200}, headers=headers).text)
+# One tenant (this engine's only mode): the export is one unbroken run of the chain.
+# For one tenant's entries of a log shared by several, use linked=False instead.
 verify_entries(chain_order(entries), public_key)  # raises ChainError on the first bad entry
 print(f"{len(entries)} entries verified")
 ```
+
+An entry verifies only under the key that signed it. The DID document publishes the current key, so after rotating the key (or switching from HMAC) keep the old public keys and verify older entries with them; HMAC-signed entries need the HMAC key. The verifier refuses a small-order or non-canonical public key, and a signature whose `R` is of small order, as the runtime does.
 
 In Rust, `AuditSigner::ed25519_verifier(&public_key)` with `jamjet_audit::verify_chain` (or `verify_entry` for a non-contiguous slice) does the same.
 

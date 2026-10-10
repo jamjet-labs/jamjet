@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
@@ -54,6 +55,22 @@ from typing import Any
 SIG_SPEC = "jamjet.audit.entry/v1"
 SIG_PREFIX = "ed25519:"
 _FIELD_SEP = b"\x1f"
+_P = 2**255 - 19
+# Encodings of the points of order dividing 8, sign bit cleared (libsodium's
+# blocklist). A key or an R among them proves nothing; the runtime refuses
+# both (ed25519-dalek `verify_strict`), and so must this verifier, since
+# OpenSSL accepts them.
+_SMALL_ORDER = frozenset(
+    bytes.fromhex(h)
+    for h in (
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    )
+)
+_HEX128 = re.compile(r"[0-9a-f]{128}")
 
 
 class ChainError(Exception):
@@ -61,7 +78,8 @@ class ChainError(Exception):
 
     ``index`` is the entry's position in the list passed in; ``reason`` is one of
     ``"unsealed"``, ``"unsigned"``, ``"broken_link"``, ``"hash_mismatch"``,
-    ``"bad_signature"``, ``"wrong_key"`` and ``"malformed"``.
+    ``"bad_signature"``, ``"wrong_key"`` and ``"malformed"`` (a field Rust would
+    not read: wrong JSON type, or a UUID not in lowercase hyphenated form).
     """
 
     def __init__(self, index: int, reason: str, detail: str = "") -> None:
@@ -138,9 +156,46 @@ def _rfc3339(ts: str) -> str:
     return ts[:-1] + "+00:00" if ts.endswith("Z") else ts
 
 
-def _text(entry: Mapping[str, Any], key: str) -> str:
-    v = entry.get(key)
-    return "" if v is None else str(v)
+def _weak_point(b: bytes) -> bool:
+    """A small-order point, or an encoding whose y is not reduced mod p."""
+    cleared = b[:31] + bytes([b[31] & 0x7F])
+    return cleared in _SMALL_ORDER or int.from_bytes(cleared, "little") >= _P
+
+
+def _check_public_key(public_key: bytes) -> None:
+    if len(public_key) != 32:
+        raise ValueError("an Ed25519 public key is 32 bytes")
+    if _weak_point(public_key):
+        raise ValueError("not a usable Ed25519 public key (small order or non-canonical)")
+
+
+def _uuid(entry: Mapping[str, Any], key: str) -> bytes:
+    value = entry[key]
+    if not isinstance(value, str) or str(uuid.UUID(value)) != value:
+        raise ValueError(f"{key} is not a lowercase hyphenated UUID")
+    return uuid.UUID(value).bytes
+
+
+def _int(entry: Mapping[str, Any], key: str) -> int:
+    value = entry[key]
+    # Numbers arrive as _Number (their JSON text); an integer has digits only.
+    if not isinstance(value, _Number) or not re.fullmatch(r"-?[0-9]+", value):
+        raise ValueError(f"{key} is not a JSON integer")
+    return int(value)
+
+
+def _text(entry: Mapping[str, Any], key: str, *, optional: bool = True) -> str:
+    """A string field; an absent optional one is "". Anything that is not a
+    JSON string (a number, a list, a null where Rust needs a string) is
+    malformed."""
+    if key not in entry or (optional and entry[key] is None):
+        if optional:
+            return ""
+        raise ValueError(f"{key} is missing")
+    v = entry[key]
+    if not isinstance(v, str) or isinstance(v, _Number):
+        raise ValueError(f"{key} is not a string")
+    return v
 
 
 def entry_content_hash(entry: Mapping[str, Any], prev_hash: str | None) -> str:
@@ -151,20 +206,28 @@ def entry_content_hash(entry: Mapping[str, Any], prev_hash: str | None) -> str:
         h.update(b)
         h.update(_FIELD_SEP)
 
-    field(uuid.UUID(entry["id"]).bytes)
-    field(uuid.UUID(entry["event_id"]).bytes)
-    field(_text(entry, "execution_id").encode())
-    field(int(entry["sequence"]).to_bytes(8, "little", signed=True))
-    field(_text(entry, "event_type").encode())
-    field(_text(entry, "actor_id").encode())
-    field(_text(entry, "actor_type").encode())
+    field(_uuid(entry, "id"))
+    field(_uuid(entry, "event_id"))
+    field(_text(entry, "execution_id", optional=False).encode())
+    field(_int(entry, "sequence").to_bytes(8, "little", signed=True))
+    field(_text(entry, "event_type", optional=False).encode())
+    field(_text(entry, "actor_id", optional=False).encode())
+    field(_text(entry, "actor_type", optional=False).encode())
     for key in ("tool_call_hash", "policy_decision", "http_request_id", "http_method", "http_path", "ip_address"):
         field(_text(entry, key).encode())
-    field(_rfc3339(entry["created_at"]).encode())
+    field(_rfc3339(_text(entry, "created_at", optional=False)).encode())
     field(_serde_json(entry["raw_event"]).encode())
-    field(_text(entry, "tenant_id").encode() if entry.get("tenant_id") is not None else b"default")
-    field(_rfc3339(entry["expires_at"]).encode() if entry.get("expires_at") else b"")
-    field(b"\x01" if entry.get("redacted") else b"\x00")
+    # Rust defaults a missing tenant_id to "default"; a null is not a string.
+    if "tenant_id" in entry:
+        field(_text(entry, "tenant_id", optional=False).encode())
+    else:
+        field(b"default")
+    expires = _text(entry, "expires_at")
+    field(_rfc3339(expires).encode() if expires else b"")
+    redacted = entry.get("redacted", False)
+    if not isinstance(redacted, bool):
+        raise ValueError("redacted is not a boolean")
+    field(b"\x01" if redacted else b"\x00")
     field((prev_hash or "").encode())
     return h.hexdigest()
 
@@ -193,11 +256,10 @@ def _verify_signature(public_key: bytes, kid: str, entry_hash: str, signature: s
     sig_kid, sig_hex = parts
     if sig_kid != kid:
         return "wrong_key"
-    try:
-        raw = bytes.fromhex(sig_hex)
-    except ValueError:
+    if not _HEX128.fullmatch(sig_hex):
         return "bad_signature"
-    if len(raw) != 64:
+    raw = bytes.fromhex(sig_hex)
+    if _weak_point(raw[:32]):
         return "bad_signature"
     try:
         Ed25519PublicKey.from_public_bytes(public_key).verify(raw, signing_statement(entry_hash, kid))
@@ -215,8 +277,7 @@ def verify_entries(entries: Sequence[Mapping[str, Any]], public_key: bytes, *, l
     :func:`chain_order`). The chain spans every tenant, so a single tenant's
     slice of a shared log is not contiguous: verify it with ``linked=False``.
     """
-    if len(public_key) != 32:
-        raise ValueError("an Ed25519 public key is 32 bytes")
+    _check_public_key(public_key)
     kid = key_id(public_key)
     prev: str | None = None
     for index, entry in enumerate(entries):
@@ -280,7 +341,6 @@ def public_key_from_did_document(doc: Mapping[str, Any]) -> bytes:
             raise ValueError("the audit key is not an Ed25519 JWK")
         x = jwk["x"]
         raw = base64.urlsafe_b64decode(x + "=" * (-len(x) % 4))
-        if len(raw) != 32:
-            raise ValueError("the audit key is not 32 bytes")
+        _check_public_key(raw)
         return raw
     raise ValueError("the DID document publishes no audit key (is the runtime in ed25519 mode?)")

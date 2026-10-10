@@ -187,3 +187,84 @@ def test_a_valid_signature_without_its_prefix_is_refused():
     with pytest.raises(ChainError) as e:
         verify_entries(bad, pk)
     assert e.value.reason == "bad_signature"
+
+
+_SEED = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+_L = 2**252 + 27742317777372353535851937790883648493
+_IDENTITY = bytes([1]) + bytes(31)
+
+
+def _small_order_r_signature(entry_hash: str, kid: str, pk: bytes) -> str:
+    """S = k*a with R the identity: valid under the plain Ed25519 equation,
+    made with the vector's private key (review I3/T1)."""
+    import hashlib
+
+    from jamjet.runtime_audit import signing_statement
+
+    h = bytearray(hashlib.sha512(_SEED).digest()[:32])
+    h[0] &= 248
+    h[31] &= 127
+    h[31] |= 64
+    a = int.from_bytes(h, "little")
+    msg = signing_statement(entry_hash, kid)
+    k = int.from_bytes(hashlib.sha512(_IDENTITY + pk + msg).digest(), "little") % _L
+    s = (k * a) % _L
+    return f"ed25519:{kid}:" + (_IDENTITY + s.to_bytes(32, "little")).hex()
+
+
+def test_a_small_order_r_is_refused():
+    entries, pk, kid = _vector()
+    bad = copy.deepcopy(entries)
+    bad[0]["signature"] = _small_order_r_signature(bad[0]["entry_hash"], kid, pk)
+    with pytest.raises(ChainError) as e:
+        verify_entries(bad, pk)
+    assert e.value.reason == "bad_signature"
+
+
+def test_a_small_order_public_key_is_refused():
+    entries, _, _ = _vector()
+    bad = copy.deepcopy(entries)
+    forged = f"ed25519:{key_id(_IDENTITY)}:" + (_IDENTITY + bytes(32)).hex()
+    for e in bad:
+        e["signature"] = forged
+    with pytest.raises(ValueError):
+        verify_entries(bad, _IDENTITY)
+    x = base64.urlsafe_b64encode(_IDENTITY).rstrip(b"=").decode()
+    doc = {"verificationMethod": [{"id": "d#audit-key", "publicKeyJwk": {"kty": "OKP", "crv": "Ed25519", "x": x}}]}
+    with pytest.raises(ValueError):
+        public_key_from_did_document(doc)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sequence", "1"),
+        ("sequence", True),
+        ("redacted", 0),
+        ("redacted", []),
+        ("tenant_id", None),
+        ("id", "urn:uuid:A1A1A1A1-A1A1-A1A1-A1A1-A1A1A1A1A1A1"),
+        ("id", "A1A1A1A1-A1A1-A1A1-A1A1-A1A1A1A1A1A1"),
+        ("event_id", "{01010101010101010101010101010101}"),
+    ],
+)
+def test_a_retyped_field_is_malformed(field, value):
+    """Rust would not read these; a verified entry must be one it would
+    (review M3)."""
+    entries, pk, _ = _vector()
+    bad = copy.deepcopy(entries)
+    bad[0][field] = value
+    with pytest.raises(ChainError) as e:
+        verify_entries(bad, pk)
+    assert e.value.reason == "malformed"
+
+
+@pytest.mark.parametrize("mangle", [str.upper, lambda h: h[:10] + " " + h[10:]])
+def test_signature_hex_must_be_canonical(mangle):
+    entries, pk, _ = _vector()
+    bad = copy.deepcopy(entries)
+    prefix, _, hexsig = bad[0]["signature"].rpartition(":")
+    bad[0]["signature"] = f"{prefix}:{mangle(hexsig)}"
+    with pytest.raises(ChainError) as e:
+        verify_entries(bad, pk)
+    assert e.value.reason == "bad_signature"
