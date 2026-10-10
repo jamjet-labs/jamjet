@@ -65,7 +65,9 @@ curl -X POST http://localhost:7700/executions/exec_01abc/approve \
   -d '{"decision": "rejected", "comment": "Report needs more citations"}'
 ```
 
-From the CLI: `jamjet approvals exec_01abc`, then
+From the CLI: `jamjet approvals exec_01abc` prints, for each pending request,
+what its digest covers and the exact `jamjet approve ... --action-digest <digest>`
+command; add `--show-basis` to print the full payload the digest binds. Then
 `jamjet approve exec_01abc --decision approved --action-digest <digest>`. From
 Python: `await client.approve(execution_id, "approved", action_digest=digest)`.
 

@@ -2542,12 +2542,50 @@ def _effect_size_label(d: float) -> str:
 # ── approvals ─────────────────────────────────────────────────────────────────
 
 
+def _approval_binding(context: dict[str, Any]) -> str | None:
+    """The value `jamjet approve --action-digest` must echo for a pending request:
+    its action digest, or for an agent tool dispatch its calls hash."""
+    return context.get("action_digest") or context.get("calls_hash")
+
+
+def _approval_covers(context: dict[str, Any]) -> str:
+    """One line on what a pending request's binding covers."""
+    basis = context.get("action_basis")
+    if isinstance(basis, dict):
+        parts = [f"step {basis.get('step', '?')}"]
+        payload = basis.get("payload")
+        if basis.get("payload_truncated"):
+            parts.append(f"payload {basis.get('payload_bytes', '?')} bytes, too large to show")
+        elif isinstance(payload, dict):
+            data = payload.get("input", payload.get("state"))
+            if isinstance(data, dict):
+                keys = ", ".join(sorted(data)) or "(empty)"
+                parts.append(f"input keys: {keys}")
+            parts.append(f"payload {basis.get('payload_bytes', '?')} bytes")
+        return "; ".join(parts)
+    calls = context.get("calls")
+    if context.get("calls_hash") and isinstance(calls, list):
+        names = ", ".join(str(c.get("name", "?")) for c in calls if isinstance(c, dict))
+        return f"calls: {names or '(none)'}"
+    return "-"
+
+
 @app.command()
 def approvals(
     execution_id: str = typer.Argument(..., help="Execution ID (exec_...)"),
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+    show_basis: bool = typer.Option(
+        False,
+        "--show-basis",
+        help="Print the full action basis each pending digest covers (the payload the node runs on).",
+    ),
 ) -> None:
-    """List pending and decided approvals for an execution."""
+    """List pending and decided approvals for an execution.
+
+    Each pending request shows the digest to approve it with and what that
+    digest covers. Review the basis (`--show-basis`) before approving: the
+    approval authorises exactly that payload, that occurrence and that node.
+    """
 
     async def _approvals() -> None:
         async with _client(runtime) as c:
@@ -2574,6 +2612,44 @@ def approvals(
                     str(entry.get("sequence", "")),
                 )
             console.print(t)
+            # Digests are printed outside the table, whole and unwrapped: they
+            # must be copied exactly, and a table column would truncate them.
+            for entry in pending:
+                context = entry.get("context") or {}
+                node = entry.get("node_id", "-")
+                binding = _approval_binding(context)
+                console.print(
+                    f"{node}: covers {_approval_covers(context)}",
+                    soft_wrap=True,
+                    markup=False,
+                    highlight=False,
+                )
+                if binding:
+                    console.print(
+                        f"{node}: jamjet approve {execution_id} --decision approved "
+                        f"--node-id {node} --action-digest {binding}",
+                        soft_wrap=True,
+                        markup=False,
+                        highlight=False,
+                    )
+                else:
+                    console.print(
+                        f"{node}: no digest (a request from before digests were recorded; "
+                        "approving it authorises nothing, the node asks again)",
+                        soft_wrap=True,
+                        markup=False,
+                        highlight=False,
+                    )
+                if show_basis:
+                    basis = context.get("action_basis")
+                    if basis is None and context.get("calls_hash"):
+                        basis = {"calls": context.get("calls"), "gated_tools": context.get("gated_tools")}
+                    console.print(
+                        json.dumps(basis, indent=2, sort_keys=True),
+                        soft_wrap=True,
+                        markup=False,
+                        highlight=False,
+                    )
 
         if decided:
             d = Table(title="Decided")

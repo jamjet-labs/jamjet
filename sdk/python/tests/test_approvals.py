@@ -182,6 +182,97 @@ def test_approvals_shows_empty_state_message() -> None:
     assert result.output.strip() != ""
 
 
+DIGEST = "ab" * 32
+
+
+def _bound_pending() -> list:
+    return [
+        {
+            "node_id": "gated",
+            "tool_name": "myapp.payments:transfer",
+            "approver": "human",
+            "context": {
+                "node_id": "gated",
+                "action_digest": DIGEST,
+                "action_step": 0,
+                "action_basis": {
+                    "payload": {"module": "myapp.payments", "input": {"amount": 10}},
+                    "payload_truncated": False,
+                    "payload_bytes": 58,
+                    "step": 0,
+                    "node": {"id": "gated"},
+                },
+            },
+            "sequence": 3,
+        }
+    ]
+
+
+def test_approvals_shows_the_full_digest_to_echo() -> None:
+    """The listing prints the digest `jamjet approve --action-digest` needs, whole."""
+    fake = _approvals_client(_bound_pending(), [])
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
+    assert result.exit_code == 0, result.output
+    assert DIGEST in result.output
+    assert f"--action-digest {DIGEST}" in result.output.replace("\n", " ")
+
+
+def test_approvals_summarises_what_the_digest_covers() -> None:
+    fake = _approvals_client(_bound_pending(), [])
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
+    assert result.exit_code == 0, result.output
+    assert "step 0" in result.output
+    assert "input keys: amount" in result.output
+
+
+def test_approvals_show_basis_prints_the_bound_payload() -> None:
+    fake = _approvals_client(_bound_pending(), [])
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1", "--show-basis"])
+
+    assert result.exit_code == 0, result.output
+    assert '"amount": 10' in result.output
+    assert '"module": "myapp.payments"' in result.output
+
+
+def test_approvals_shows_the_calls_hash_of_a_dispatch_request() -> None:
+    pending = [
+        {
+            "node_id": "agent",
+            "tool_name": "send_wire",
+            "approver": "human",
+            "context": {"node_id": "agent", "calls_hash": "h-123", "calls": [{"name": "send_wire", "arguments": {}}]},
+            "sequence": 4,
+        }
+    ]
+    fake = _approvals_client(pending, [])
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
+    assert result.exit_code == 0, result.output
+    assert "--action-digest h-123" in result.output
+    assert "calls: send_wire" in result.output
+
+
+def test_approvals_says_when_a_request_binds_nothing() -> None:
+    pending = [{"node_id": "old", "tool_name": "t", "approver": "human", "context": {}, "sequence": 2}]
+    fake = _approvals_client(pending, [])
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
+    assert result.exit_code == 0, result.output
+    assert "no digest" in result.output
+
+
 # ---------------------------------------------------------------------------
 # CLI tests — jamjet approve
 # ---------------------------------------------------------------------------
@@ -264,9 +355,7 @@ def test_approve_passes_the_action_digest_option_through() -> None:
     fake = _approve_client({"execution_id": "exec-1", "node_id": "gated", "accepted": True})
 
     with patch("jamjet.cli.main._client", return_value=fake):
-        result = runner.invoke(
-            app, ["approve", "exec-1", "--decision", "approved", "--action-digest", "d-1"]
-        )
+        result = runner.invoke(app, ["approve", "exec-1", "--decision", "approved", "--action-digest", "d-1"])
 
     assert result.exit_code == 0, result.output
     assert fake.approve.call_args.kwargs.get("action_digest") == "d-1"
