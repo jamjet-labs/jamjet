@@ -40,6 +40,25 @@ pub struct EvaluationContext {
     pub model_ref: Option<String>,
 }
 
+/// Node kinds whose code is named by a handler reference, not a tool. For these
+/// the node id is a policy name too.
+pub const FUNCTION_KIND_TAGS: &[&str] = &["python_fn", "java_fn", "external_fn"];
+
+impl EvaluationContext {
+    /// Every name `blocked_tools` and `require_approval_for` patterns are
+    /// matched against: the tool name, and for code-backed kinds
+    /// ([`FUNCTION_KIND_TAGS`]) also the node id. A pattern applies if it
+    /// matches any of them. Other kinds are not matched on their node id, so
+    /// existing tool policies keep their meaning.
+    pub fn policy_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.tool_name.iter().map(String::as_str).collect();
+        if FUNCTION_KIND_TAGS.contains(&self.node_kind_tag.as_str()) {
+            names.push(self.node_id.as_str());
+        }
+        names
+    }
+}
+
 // ── PolicyEvaluator ────────────────────────────────────────────────────────
 
 /// Merges policy sets from most-general (global) to most-specific (node) and
@@ -79,25 +98,21 @@ impl PolicyEvaluator {
                 return PolicyDecision::Allow;
             }
 
-            // 2. Blocked tools check.
-            if let Some(tool_name) = &ctx.tool_name {
-                for pattern in &policy.blocked_tools {
-                    if glob_match(pattern, tool_name) {
-                        return PolicyDecision::Block {
-                            reason: format!(
-                                "tool '{tool_name}' matches blocked pattern '{pattern}'"
-                            ),
-                        };
-                    }
+            // 2. Blocked tools check, then 3. require-approval, over every
+            // name the node answers to.
+            let names = ctx.policy_names();
+            for pattern in &policy.blocked_tools {
+                if let Some(name) = names.iter().find(|n| glob_match(pattern, n)) {
+                    return PolicyDecision::Block {
+                        reason: format!("tool '{name}' matches blocked pattern '{pattern}'"),
+                    };
                 }
-
-                // 3. Require-approval check.
-                for pattern in &policy.require_approval_for {
-                    if glob_match(pattern, tool_name) {
-                        return PolicyDecision::RequireApproval {
-                            approver: "human".to_string(),
-                        };
-                    }
+            }
+            for pattern in &policy.require_approval_for {
+                if names.iter().any(|n| glob_match(pattern, n)) {
+                    return PolicyDecision::RequireApproval {
+                        approver: "human".to_string(),
+                    };
                 }
             }
         }

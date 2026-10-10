@@ -6,7 +6,9 @@ use jamjet_core::node::NodeKind;
 impl EvaluationContext {
     /// Derive an `EvaluationContext` from a `NodeKind`.
     ///
-    /// Extracts the tool name (for tool/mcp_tool/a2a_task nodes) and model
+    /// Extracts the tool name (for tool/mcp_tool/a2a_task nodes, and the
+    /// handler reference for python_fn `module:function`, java_fn
+    /// `class/method` and external_fn `queue/handler` nodes) and the model
     /// reference (for model nodes) so the policy engine can apply rules.
     pub fn from_node_kind(node_id: &str, kind: &NodeKind) -> Self {
         let kind_tag = node_kind_tag(kind);
@@ -67,6 +69,25 @@ fn extract_names(kind: &NodeKind) -> (Option<String>, Option<String>) {
                 .and_then(|t| t.as_str())
                 .map(|s| s.to_string());
             (None, model)
+        }
+        // Code-backed kinds have no tool name of their own. Their handler
+        // reference stands in for one, so `require_approval_for` and
+        // `blocked_tools` can name the code a node runs. The node id is a
+        // second name for these kinds (see `EvaluationContext::policy_names`).
+        "python_fn" => {
+            let module = v.get("module").and_then(|t| t.as_str()).unwrap_or("");
+            let function = v.get("function").and_then(|t| t.as_str()).unwrap_or("");
+            (Some(format!("{module}:{function}")), None)
+        }
+        "java_fn" => {
+            let class = v.get("class_name").and_then(|t| t.as_str()).unwrap_or("");
+            let method = v.get("method").and_then(|t| t.as_str()).unwrap_or("");
+            (Some(format!("{class}/{method}")), None)
+        }
+        "external_fn" => {
+            let queue = v.get("queue").and_then(|t| t.as_str()).unwrap_or("");
+            let handler = v.get("handler").and_then(|t| t.as_str()).unwrap_or("");
+            (Some(format!("{queue}/{handler}")), None)
         }
         "agent" => {
             // agent nodes reference a registered agent — the agent ref acts as the "tool" name

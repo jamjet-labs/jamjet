@@ -27,7 +27,7 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     state and node the digest covers.
   - A decision carrying a `state_patch` is refused with 400. The edit never reached
     the executed action, so recording it was a false record.
-  - The worker protocol enforces the same policy and approval rules as the
+  - The worker protocol evaluates the same policy and approval rules as the
     in-process worker, for every node kind: a gated or blocked node is withheld from
     `POST /work-items/claim`, and `POST /work-items/:id/complete` refuses a result
     for a gated node with no approval for its current occurrence. `POST /work-items`
@@ -36,6 +36,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     change only the tenant of their own token. Before this, any developer could
     `PUT /tenants/:id` and drop a tenant-level approval gate. The route/role table
     is in docs/guides/security.md.
+  - `python_fn`, `java_fn` and `external_fn` nodes can now be gated and blocked.
+    Their policy names are the handler reference (`module:function`,
+    `class/method`, `queue/handler`) and the node id. Before, these kinds had no
+    name, so no pattern matched them. Behaviour change: an existing policy whose
+    pattern matches one of these names, `["*"]` in particular, now gates or blocks
+    these nodes where it used to let them through.
   - A registered workflow version is immutable: an identical re-register is a 200
     no-op, a different IR under the same version is a 409.
   - The embedded cron scheduler starts runs in-process instead of POSTing to

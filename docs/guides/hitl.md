@@ -103,6 +103,34 @@ Rules the runtime enforces:
 - **A workflow version is immutable.** Re-registering the same IR is a no-op;
   a different IR under the same version is a 409. Register a new version.
 
+What a policy can gate:
+
+- `require_approval_for` and `blocked_tools` are glob patterns matched against a
+  node's names. A `tool` node is named by its `tool_ref`, an `mcp_tool` node by
+  its tool, an `a2a_task` node by its skill and an `agent` node by its agent.
+  Code-backed nodes have two names, their handler reference and their node id:
+  `python_fn` is `module:function`, `java_fn` is `class/method` and
+  `external_fn` is `queue/handler`. A pattern applies if it matches either, so
+  `["*"]` gates every one of these kinds. An agent tool dispatch is matched per
+  call, on each tool the model chose.
+- Other kinds (condition, human_approval, wait, eval, coordinator, memory
+  retrieval) have no name a pattern can match, and a model node is governed by
+  `model_allowlist` only.
+- Workflow and node policies live in IR a developer registers, and a developer
+  can register a new version without the gate. A gate that must bind the
+  developers who start runs belongs in the tenant policy, which only an operator
+  can change (see the route table in the security guide).
+
+What an approval proves, and what it does not:
+
+- It proves a reviewer other than the initiator agreed to the action shown in
+  `action_basis`, before the action ran.
+- It does not vouch for the result. An external worker reports the result of
+  an approved node (`output` and `state_patch`) with its own token, and worker
+  tokens are developer tokens, the same role that starts runs. The integrity of
+  the result rests on who holds worker credentials. Give workers their own
+  tokens, distinct from the tokens of the people who start runs.
+
 Limits worth knowing:
 
 - An approval covers the action including its retries. A retry, or a lease that
