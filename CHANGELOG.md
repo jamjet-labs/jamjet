@@ -63,6 +63,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     pass a tenant `["*"]` gate. Every node's own names are now checked first,
     dispatch nodes included; a dispatcher matched by a gate is held with an approval
     of its full payload even when it has no calls, and that approval covers its calls.
+  - Tenant policy now applies to nodes the embedded workers run on SQLite. The base
+    SQLite backend, which the scheduler and the embedded pool use, could not read a
+    tenant record, so a tenant's `blocked_tools`, `require_approval_for` and
+    `model_allowlist` never applied to in-process kinds (`tool`, `mcp_tool`,
+    `a2a_task`, `model`, `agent`), while the claim route applied them. Behaviour
+    change: a tenant policy that matches such a node now holds or blocks it.
   - A node blocked by policy fails its run. Both transports settle the item and
     record `NodeFailed { retryable: false }` in one fenced commit, so the scheduler
     fails the run on its next tick. Before, a block on `POST /work-items/claim` left

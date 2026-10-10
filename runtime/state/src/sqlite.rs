@@ -2049,6 +2049,35 @@ impl StateBackend for SqliteBackend {
         Ok((token, info))
     }
 
+    /// The tenant record, policy included. The base backend is what the
+    /// scheduler and the embedded workers run on; without this they read the
+    /// trait default ("no such tenant"), so tenant policy never applied to an
+    /// in-process node while the claim route, on a tenant-scoped backend,
+    /// applied it. Reads only: tenant writes go through the scoped backend.
+    async fn get_tenant(
+        &self,
+        id: &crate::tenant::TenantId,
+    ) -> BackendResult<Option<crate::tenant::Tenant>> {
+        let row = sqlx::query("SELECT * FROM tenants WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+        row.as_ref()
+            .map(crate::tenant_scoped::row_to_tenant)
+            .transpose()
+    }
+
+    async fn list_tenants(&self) -> BackendResult<Vec<crate::tenant::Tenant>> {
+        let rows = sqlx::query("SELECT * FROM tenants ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+        rows.iter()
+            .map(crate::tenant_scoped::row_to_tenant)
+            .collect()
+    }
+
     async fn validate_token(&self, token: &str) -> BackendResult<Option<ApiToken>> {
         use sha2::{Digest, Sha256};
 

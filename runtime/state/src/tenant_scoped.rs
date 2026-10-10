@@ -2405,7 +2405,7 @@ fn parse_datetime_flexible(s: &str) -> BackendResult<DateTime<Utc>> {
     )))
 }
 
-fn row_to_tenant(row: &sqlx::sqlite::SqliteRow) -> BackendResult<Tenant> {
+pub(crate) fn row_to_tenant(row: &sqlx::sqlite::SqliteRow) -> BackendResult<Tenant> {
     let policy: Option<serde_json::Value> = row
         .try_get::<Option<&str>, _>("policy_json")
         .map_err(map_db_err)?
