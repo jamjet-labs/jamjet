@@ -63,7 +63,8 @@ have to carry the tenant first, and none does yet:
 - workflow lookup and its caches in the scheduler and the in-process worker (keyed by
   workflow id and version only, so two tenants' versions collide);
 - execution and work-item creation on the base backend, and segment rollover;
-- tenant policy on the base backend the in-process workers use;
+- tenant policy for work items after the start node (they are in `default`, so default's
+  tenant policy applies to them);
 - the agent registry (global today).
 
 The tenant policy is the one policy layer a developer cannot rewrite: workflow and node
