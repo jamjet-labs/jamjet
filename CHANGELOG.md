@@ -88,6 +88,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `tool_name` field the kind does not have, so no `blocked_tools` or
     `require_approval_for` pattern ever applied to an `mcp_tool` node. Behaviour
     change: an existing pattern that names an MCP tool now gates or blocks it.
+  - Node ids must be 1 to 128 ASCII letters, digits, `_`, `.` or `-`; `POST /workflows`
+    refuses any other (400). Node ids are author-chosen and are printed into the
+    approve command a reviewer pastes. Behaviour change for IR with other ids; every
+    id the SDK compilers generate, and every example in this repo, already conforms.
   - A registered workflow version is immutable: an identical re-register is a 200
     no-op, a different IR under the same version is a 409. Identity is the
     canonical content hash, so key order and whitespace do not matter.
@@ -131,8 +135,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Clients can approve what they reviewed.** `jamjet approvals` prints each pending
   request's digest, what it covers and the exact approve command (`--show-basis` prints
-  the bound payload). The Java SDK's `approve` overload that takes an action digest is
-  listed under the Java SDK changes below.
+  the bound payload). The command is printed alone on its line with every argument
+  shell-quoted, and is omitted for a value holding control characters, so it is safe to
+  paste. The Java SDK's `approve` overload that takes an action digest is listed under
+  the Java SDK changes below.
 
 - **The tool-effect idempotency key is derived by the engine, not taken from the request
   body** (#130). `POST /work-items/:id/complete` persisted the caller's

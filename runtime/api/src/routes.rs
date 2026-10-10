@@ -244,6 +244,9 @@ async fn create_workflow(
     // cannot run them, or to none at all.
     jamjet_ir::validate_external_queues(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // Node ids are printed into commands a reviewer pastes into a shell.
+    jamjet_ir::validate_node_ids(&parsed)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let backend = state.backend_for(&tenant_id);
 
