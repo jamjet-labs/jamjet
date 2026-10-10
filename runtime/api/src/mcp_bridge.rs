@@ -433,7 +433,8 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     .get("comment")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let caller = resolve_caller(&ctx, &args, dev_mode, Role::Developer)?;
+                // Reviewer and above may decide, matching the REST route.
+                let caller = resolve_caller(&ctx, &args, dev_mode, Role::Reviewer)?;
                 let tenant_id = caller.tenant.clone();
 
                 let decision = match decision_str {
@@ -445,6 +446,14 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
 
+                // The approver is the authenticated token, never a
+                // client-chosen string. Dev mode has no token.
+                let (user_id, principal) = match &caller.token {
+                    Some(t) => (t.name.clone(), Some(crate::auth::principal_of(t))),
+                    None => ("mcp-client".to_string(), None),
+                };
+                let actor_id = principal.clone().unwrap_or_else(|| user_id.clone());
+
                 let (resolved_node, event) = crate::approvals::submit_approval(
                     &backend,
                     &eid,
@@ -454,13 +463,8 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         } else {
                             Some(node_id)
                         },
-                        // The approver is the authenticated token, never a
-                        // client-chosen string. Dev mode has no token.
-                        user_id: caller
-                            .token
-                            .as_ref()
-                            .map(|t| t.name.clone())
-                            .unwrap_or_else(|| "mcp-client".into()),
+                        user_id,
+                        principal,
                         decision,
                         comment,
                         state_patch: None,
@@ -473,6 +477,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 // mirroring the REST approve path: best-effort, after the
                 // durable event write, off the worker's fenced commit path.
                 let audit_ctx = jamjet_audit::RequestContext {
+                    actor_id,
                     actor_type: jamjet_audit::ActorType::Human,
                     tenant_id: tenant_id.0.clone(),
                     method: Some("POST".to_string()),

@@ -315,6 +315,7 @@ mod tests {
                 decision,
                 comment: None,
                 state_patch: None,
+                principal: None,
             },
         )
     }
@@ -809,6 +810,7 @@ mod tests {
                     decision: ApprovalDecision::Rejected,
                     comment: Some("exceeds limit".into()),
                     state_patch: None,
+                    principal: None,
                 },
             ))
             .await
@@ -1142,6 +1144,7 @@ mod tests {
                 decision: ApprovalDecision::Approved,
                 comment: None,
                 state_patch: None,
+                principal: None,
             },
         );
         let required_second = StateEvent::new(

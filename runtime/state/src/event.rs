@@ -160,10 +160,17 @@ pub enum EventKind {
     },
     ApprovalReceived {
         node_id: NodeId,
+        /// Display name of the approver. With auth on, the API token's name; in
+        /// dev mode, whatever the caller supplied.
         user_id: String,
         decision: ApprovalDecision,
         comment: Option<String>,
         state_patch: Option<serde_json::Value>,
+        /// Authenticated identity behind the decision, `"token:<ApiToken.id>"`.
+        /// `None` in dev mode (no auth) and on events written before it existed.
+        /// Unlike `user_id` it is unique and not caller-chosen.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal: Option<String>,
     },
 
     // ── Timers ────────────────────────────────────────────────────────────

@@ -473,6 +473,7 @@ async fn projection_driven_approvals_endpoint() {
                 decision: ApprovalDecision::Rejected,
                 comment: Some("exceeds limit".into()),
                 state_patch: None,
+                principal: None,
             },
         ))
         .await

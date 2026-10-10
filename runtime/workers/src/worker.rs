@@ -4254,6 +4254,7 @@ mod tests {
                     decision: jamjet_state::event::ApprovalDecision::Approved,
                     comment: None,
                     state_patch: None,
+                    principal: None,
                 },
             ],
         )
@@ -4319,6 +4320,7 @@ mod tests {
                     decision: jamjet_state::event::ApprovalDecision::Approved,
                     comment: None,
                     state_patch: None,
+                    principal: None,
                 },
             ],
         )
@@ -4360,6 +4362,7 @@ mod tests {
                     decision: jamjet_state::event::ApprovalDecision::Approved,
                     comment: None,
                     state_patch: None,
+                    principal: None,
                 },
             ],
         )

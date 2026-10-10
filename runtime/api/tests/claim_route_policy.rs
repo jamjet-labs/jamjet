@@ -930,6 +930,7 @@ async fn a_matching_approval_releases_the_payload() {
             decision: ApprovalDecision::Approved,
             comment: None,
             state_patch: None,
+            principal: None,
         },
     )
     .await;
@@ -981,6 +982,7 @@ async fn an_approval_for_a_different_call_set_does_not_release_the_payload() {
             decision: ApprovalDecision::Approved,
             comment: None,
             state_patch: None,
+            principal: None,
         },
     )
     .await;

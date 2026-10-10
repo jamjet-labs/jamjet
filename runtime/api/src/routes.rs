@@ -52,7 +52,7 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         .route("/executions/:id", get(get_execution))
         .route("/executions/:id/cancel", post(cancel_execution))
         .route("/executions/:id/events", get(list_events))
-        .route("/executions/:id/approve", post(approve_execution))
+        .route(crate::auth::APPROVE_ROUTE, post(approve_execution))
         .route(
             "/executions/:id/approvals",
             get(list_approvals_for_execution),
@@ -502,9 +502,19 @@ struct ApproveRequest {
     state_patch: Option<Value>,
 }
 
+/// `POST /executions/:id/approve` — record a decision on a pending approval.
+///
+/// IDENTITY. With auth on, the approver is the authenticated API token: the
+/// recorded `user_id` is the token's name and `principal` is `token:<id>`. The
+/// body's `user_id` is IGNORED in that mode, because a caller-chosen name on an
+/// approval is a forgery primitive. Only dev mode (no auth layer, so no token in
+/// the extensions) records the body's `user_id`, with no principal.
+///
+/// ROLE. `reviewer` and above may call this route; see `require_write_role`.
 async fn approve_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
+    token: Option<Extension<jamjet_state::ApiToken>>,
     Path(id): Path<String>,
     Json(body): Json<ApproveRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -517,12 +527,19 @@ async fn approve_execution(
         other => return Err(ApiError::BadRequest(format!("unknown decision: {other}"))),
     };
 
+    let (user_id, principal) = match &token {
+        Some(Extension(t)) => (t.name.clone(), Some(crate::auth::principal_of(t))),
+        None => (body.user_id.unwrap_or_else(|| "anonymous".into()), None),
+    };
+    let actor_id = principal.clone().unwrap_or_else(|| user_id.clone());
+
     let (node_id, event) = crate::approvals::submit_approval(
         &backend,
         &execution_id,
         crate::approvals::ApprovalSubmission {
             node_id: body.node_id,
-            user_id: body.user_id.unwrap_or_else(|| "anonymous".into()),
+            user_id,
+            principal,
             decision,
             comment: body.comment,
             state_patch: body.state_patch,
@@ -546,6 +563,7 @@ async fn approve_execution(
     // routed through the enricher (that needs the enricher threaded into the
     // worker pool); tracked as F-t3-audit-emit.
     let ctx = jamjet_audit::RequestContext {
+        actor_id,
         actor_type: jamjet_audit::ActorType::Human,
         tenant_id: tenant_id.0.clone(),
         method: Some("POST".to_string()),

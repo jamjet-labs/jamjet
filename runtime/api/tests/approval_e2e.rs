@@ -224,6 +224,7 @@ impl Harness {
                     decision,
                     comment: comment.map(String::from),
                     state_patch: None,
+                    principal: None,
                 },
             ))
             .await

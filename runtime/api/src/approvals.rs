@@ -14,7 +14,11 @@ use std::sync::Arc;
 
 pub struct ApprovalSubmission {
     pub node_id: Option<String>,
+    /// Display name recorded as the approver.
     pub user_id: String,
+    /// Authenticated identity (`"token:<id>"`), or `None` in dev mode. Callers
+    /// derive it from the transport's auth, never from request content.
+    pub principal: Option<String>,
     pub decision: ApprovalDecision,
     pub comment: Option<String>,
     pub state_patch: Option<serde_json::Value>,
@@ -129,6 +133,7 @@ pub async fn submit_approval(
             decision: submission.decision,
             comment: submission.comment,
             state_patch: submission.state_patch,
+            principal: submission.principal,
         },
     );
     backend

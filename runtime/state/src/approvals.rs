@@ -150,6 +150,7 @@ mod tests {
                 decision,
                 comment: Some("note".into()),
                 state_patch: None,
+                principal: None,
             },
         )
     }

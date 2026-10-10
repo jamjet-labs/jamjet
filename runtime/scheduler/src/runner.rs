@@ -1197,6 +1197,7 @@ mod tests {
                 decision: jamjet_state::event::ApprovalDecision::Approved,
                 comment: None,
                 state_patch: None,
+                principal: None,
             },
         ]);
         assert!(!progress.held.contains("a"));
@@ -1224,6 +1225,7 @@ mod tests {
                 decision: jamjet_state::event::ApprovalDecision::Rejected,
                 comment: Some("too risky".into()),
                 state_patch: None,
+                principal: None,
             },
         ]);
         assert!(!progress.held.contains("a"));
@@ -1247,6 +1249,7 @@ mod tests {
                 decision: jamjet_state::event::ApprovalDecision::Rejected,
                 comment: None,
                 state_patch: None,
+                principal: None,
             },
             EventKind::NodeFailed {
                 node_id: "a".into(),
@@ -1267,6 +1270,7 @@ mod tests {
             decision: jamjet_state::event::ApprovalDecision::Approved,
             comment: None,
             state_patch: None,
+            principal: None,
         }]);
         assert!(progress.held.is_empty());
         assert!(progress.rejected.is_empty());
@@ -1307,6 +1311,7 @@ mod tests {
                 decision: jamjet_state::event::ApprovalDecision::Rejected,
                 comment: Some("nope".into()),
                 state_patch: None,
+                principal: None,
             },
         )
         .await;
@@ -1400,6 +1405,7 @@ mod tests {
                 decision: jamjet_state::event::ApprovalDecision::Approved,
                 comment: None,
                 state_patch: None,
+                principal: None,
             },
         ]);
         assert!(
@@ -1443,6 +1449,7 @@ mod tests {
                 decision: jamjet_state::event::ApprovalDecision::Rejected,
                 comment: Some("no".into()),
                 state_patch: None,
+                principal: None,
             },
         ]);
         let reason = progress.rejected.get("a").expect("rejected entry for a");

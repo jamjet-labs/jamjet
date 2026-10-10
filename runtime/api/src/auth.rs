@@ -9,7 +9,7 @@
 //! |------------|----------------|------------|----------------|
 //! | operator   | ✓              | ✓          | ✓              |
 //! | developer  | ✓              | ✓          | ✗              |
-//! | reviewer   | ✗              | ✓          | ✗              |
+//! | reviewer   | approve only   | ✓          | ✗              |
 //! | viewer     | ✗              | ✓          | ✗              |
 //!
 //! Routes are tagged with a minimum `RequiredRole`. The RBAC check happens
@@ -17,7 +17,7 @@
 
 use axum::{
     body::Body,
-    extract::{Extension, State},
+    extract::{Extension, MatchedPath, State},
     http::{Method, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Json, Response},
@@ -50,6 +50,13 @@ impl Role {
     /// True if this role can write (mutate) workflow/execution state.
     pub fn can_write(&self) -> bool {
         matches!(self, Self::Operator | Self::Developer)
+    }
+
+    /// True if this role can decide a pending approval. Reviewing is the
+    /// reviewer role's whole purpose, so it may approve or reject even though
+    /// it may not otherwise write.
+    pub fn can_approve(&self) -> bool {
+        *self >= Self::Reviewer
     }
 
     /// True if this role can perform admin operations (token management).
@@ -107,8 +114,23 @@ pub async fn require_auth(
 
 // ── RBAC middleware ───────────────────────────────────────────────────────────
 
+/// Route template of the approval decision endpoint, the one write a reviewer
+/// may make. Must match the `.route(...)` string in `routes.rs`.
+pub const APPROVE_ROUTE: &str = "/executions/:id/approve";
+
+/// The audit/approval principal for an authenticated token: `token:<id>`.
+/// The id, not the name: names are operator-chosen and need not be unique.
+pub fn principal_of(token: &ApiToken) -> String {
+    format!("token:{}", token.id)
+}
+
 /// RBAC middleware: enforces write-permission check for mutating HTTP methods
 /// (POST, PUT, PATCH, DELETE). Read-only methods (GET, HEAD) are always allowed.
+///
+/// One exemption: `POST` on [`APPROVE_ROUTE`] needs only [`Role::can_approve`].
+/// It is matched on the router's matched-path TEMPLATE, not on the raw URI, so
+/// no other route (`/executions/:id/cancel`, `POST /executions`, ...) can reach
+/// it by spelling. No matched path means no exemption.
 ///
 /// Assumes `require_auth` ran first and `ApiToken` is in extensions.
 pub async fn require_write_role(req: Request<Body>, next: Next) -> Response {
@@ -124,7 +146,24 @@ pub async fn require_write_role(req: Request<Body>, next: Next) -> Response {
             .map(|t| Role::parse_role(&t.role))
             .unwrap_or(Role::Viewer);
 
-        if !role.can_write() {
+        let is_approve = req.method() == Method::POST
+            && req
+                .extensions()
+                .get::<MatchedPath>()
+                .is_some_and(|p| p.as_str() == APPROVE_ROUTE);
+
+        if is_approve {
+            if !role.can_approve() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "insufficient role — reviewer, developer or operator required",
+                        "required": "reviewer",
+                    })),
+                )
+                    .into_response();
+            }
+        } else if !role.can_write() {
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({

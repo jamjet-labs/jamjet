@@ -229,6 +229,12 @@ fn extract_event_type(kind: &EventKind) -> String {
 
 fn derive_actor_id(kind: &EventKind, default: &str) -> String {
     match kind {
+        // The authenticated principal when there is one; the display name is
+        // operator-chosen and not unique. Dev-mode approvals have only the name.
+        EventKind::ApprovalReceived {
+            principal: Some(principal),
+            ..
+        } => principal.clone(),
         EventKind::ApprovalReceived { user_id, .. } => user_id.clone(),
         EventKind::NodeStarted { worker_id, .. } => worker_id.clone(),
         _ => default.to_string(),
