@@ -105,7 +105,9 @@ Rules the runtime enforces:
   and `token:<id>`; a `user_id` in the body is ignored when auth is on.
 - **Workers cannot skip the gate.** A node that needs approval is withheld from
   `POST /work-items/claim` until an approval covers it, and
-  `POST /work-items/:id/complete` refuses a result for it otherwise.
+  `POST /work-items/:id/complete` refuses a result for it otherwise. Outside
+  dev mode the result of a gated node must echo the `lease_fence` from its
+  claim; the legacy unfenced completion is refused for it (409).
   `POST /work-items` (hand-enqueueing an item) is operator-only.
 - **A workflow version is immutable.** Re-registering the same IR is a no-op;
   a different IR under the same version is a 409. Register a new version.

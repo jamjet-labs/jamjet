@@ -803,3 +803,139 @@ async fn a_legacy_request_is_matched_at_completion_on_the_item_payload() {
         );
     }
 }
+
+/// The legacy unfenced completion cannot show the item was claimed through the
+/// gate, so outside dev mode it is refused for a gated node even when an
+/// approval covers the occurrence. The fenced completion still works.
+#[tokio::test]
+async fn an_approved_gated_node_cannot_be_completed_without_a_fence() {
+    let env = env().await;
+    let (id, eid, pending) = held_run(&env, json!({ "amount": 10 })).await;
+    let (st, body) = send(
+        &env.app,
+        &format!("/executions/{id}/approve"),
+        &env.bob,
+        json!({ "decision": "approved", "node_id": "gate", "action_digest": pending["context"]["action_digest"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let (st, _) = send(
+        &env.app,
+        "/work-items",
+        &env.ops,
+        json!({
+            "execution_id": id,
+            "node_id": "gate",
+            "queue_type": "tool",
+            "payload": { "workflow_id": "wf-gate", "workflow_version": "0.1.0", "node_id": "gate" },
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let released = claim(&env, &env.alice).await;
+    assert_eq!(released["claimed"], true, "{released}");
+    let item = released["work_item"]["id"].as_str().unwrap();
+
+    let (st, body) = send(
+        &env.app,
+        &format!("/work-items/{item}/complete"),
+        &env.alice,
+        json!({ "output": {}, "state_patch": {} }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{body}");
+    assert_eq!(gate_completions(&events(&env, &eid).await), 0);
+
+    let (st, body) = send(
+        &env.app,
+        &format!("/work-items/{item}/complete"),
+        &env.alice,
+        json!({ "output": {}, "state_patch": {}, "lease_fence": released["work_item"]["lease_fence"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(gate_completions(&events(&env, &eid).await), 1);
+}
+
+/// The refusal is for gated nodes only: an ungated node's legacy unfenced
+/// completion still records its result.
+#[tokio::test]
+async fn an_ungated_node_can_still_be_completed_without_a_fence() {
+    let env = env().await;
+    let (_id, eid) = start(&env, json!(null)).await;
+    let released = claim(&env, &env.alice).await;
+    assert_eq!(released["claimed"], true, "{released}");
+    let item = released["work_item"]["id"].as_str().unwrap();
+    let (st, body) = send(
+        &env.app,
+        &format!("/work-items/{item}/complete"),
+        &env.alice,
+        json!({ "output": {}, "state_patch": {} }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(gate_completions(&events(&env, &eid).await), 1);
+}
+
+/// Dev mode keeps the legacy unfenced completion for an approved gated node.
+#[tokio::test]
+async fn dev_mode_still_accepts_an_unfenced_completion_of_an_approved_node() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let state = support::make_state(backend.clone() as Arc<dyn StateBackend>);
+    let app = build_router_with_opts(state, true);
+    let (st, body) = send(
+        &app,
+        "/workflows",
+        "",
+        json!({ "ir": gated_ir(approval_policy()) }),
+    )
+    .await;
+    assert!(st.is_success(), "{st} {body}");
+    let (st, body) = send(
+        &app,
+        "/executions",
+        "",
+        json!({ "workflow_id": "wf-gate", "workflow_version": "0.1.0", "input": { "amount": 10 } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    let id = body["execution_id"].as_str().unwrap().to_string();
+    let eid = parse_eid(&id);
+    let claim_body = json!({ "worker_id": "w", "queue_types": QUEUES });
+    let (_, first) = send(&app, "/work-items/claim", "", claim_body.clone()).await;
+    assert_eq!(first["claimed"], false, "{first}");
+    let (st, body) = send(
+        &app,
+        &format!("/executions/{id}/approve"),
+        "",
+        json!({ "decision": "approved", "node_id": "gate" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let (st, _) = send(
+        &app,
+        "/work-items",
+        "",
+        json!({
+            "execution_id": id,
+            "node_id": "gate",
+            "queue_type": "tool",
+            "payload": { "workflow_id": "wf-gate", "workflow_version": "0.1.0", "node_id": "gate" },
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (_, released) = send(&app, "/work-items/claim", "", claim_body).await;
+    assert_eq!(released["claimed"], true, "{released}");
+    let item = released["work_item"]["id"].as_str().unwrap();
+    let (st, body) = send(
+        &app,
+        &format!("/work-items/{item}/complete"),
+        "",
+        json!({ "output": {}, "state_patch": {} }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let ev = backend.get_events(&eid).await.unwrap();
+    assert_eq!(gate_completions(&ev), 1);
+}

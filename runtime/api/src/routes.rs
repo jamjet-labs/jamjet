@@ -1889,6 +1889,7 @@ async fn complete_work_item(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
+    dev: Option<Extension<crate::auth::DevMode>>,
     Json(body): Json<CompleteWorkItemRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let item_id = Uuid::parse_str(&id)
@@ -2082,6 +2083,30 @@ async fn complete_work_item(
         // fence-guarded by construction, and without a fence we cannot show the
         // item is ours to settle.
         (None, _) => {
+            // A gated node's result needs the fence outside dev mode. Without
+            // one nothing shows this item went through the claim gate that
+            // checked the approval against its payload: the holder of any item
+            // id for an approved node could record a result after the input
+            // moved. The completion gate above has already refused a gated node
+            // with no approval for this occurrence, so a node that got here
+            // with any approval history was gated.
+            if dev.is_none() {
+                if let Some(wi) = recorded.as_ref() {
+                    let events = backend.get_events(&wi.execution_id).await?;
+                    if !matches!(
+                        jamjet_state::approvals::node_approval_status(&events, &wi.node_id),
+                        jamjet_state::approvals::NodeApprovalStatus::NotRequested
+                    ) {
+                        let reason = "an approval-gated node's result must echo the lease_fence \
+                                      from its claim";
+                        warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, "complete: refused, {reason}");
+                        return Ok((
+                            StatusCode::CONFLICT,
+                            Json(json!({ "completed": false, "reason": reason })),
+                        ));
+                    }
+                }
+            }
             // Without a fence nothing shows the item is the caller's, so a
             // terminal run's item is refused and left alone; its lease lapses
             // and the claim path settles it.
