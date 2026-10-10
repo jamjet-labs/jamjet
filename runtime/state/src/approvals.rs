@@ -113,12 +113,13 @@ pub const ACTION_DIGEST_KEY: &str = "action_digest";
 pub const CALLS_HASH_KEY: &str = "calls_hash";
 
 /// Context key under which a hold records what it binds, for a reviewer: the
-/// state the node will run on (size-capped), the occurrence and the node.
+/// payload the node will be dispatched with (size-capped), the occurrence and
+/// the node.
 pub const ACTION_BASIS_KEY: &str = "action_basis";
 
-/// Largest serialized state shown in [`ACTION_BASIS_KEY`]. Above it the
+/// Largest serialized payload shown in [`ACTION_BASIS_KEY`]. Above it the
 /// preview is dropped (never cut mid-value) and flagged; the digest still
-/// covers the whole state.
+/// covers the whole payload.
 pub const ACTION_BASIS_STATE_CAP: usize = 16 * 1024;
 
 /// Context key under which a hold records which occurrence of the node it is
@@ -154,33 +155,36 @@ pub fn answered_request(events: &[Event], node_id: &str) -> Option<PendingApprov
 ///
 /// Covers the run, the node, which occurrence of the node this is (`step`, the
 /// number of times it has already completed), the node's DEFINITION (see
-/// [`definition_hash`]) and the full materialized state the node would fire
-/// on. So an approval stops covering the action when the state changes after
-/// the request (a sibling commits, an approver's patch lands somewhere else),
-/// when the node is visited again (a loop or any re-enqueue of a completed
-/// node): `step` differs, so the old approval cannot be replayed, and when the
-/// node's definition is not the one that was reviewed (a different module,
-/// function, tool or policy under the same node id).
+/// [`definition_hash`]) and the work item PAYLOAD the node is dispatched with
+/// (see [`action_payload`]): the exact bytes the executor or external worker
+/// receives, its `input` included. So an approval stops covering the action
+/// when the input changes after the request (a sibling commits, an upstream
+/// node writes), when the node is visited again (a loop or any re-enqueue of
+/// a completed node): `step` differs, so the old approval cannot be replayed,
+/// when the node's definition is not the one that was reviewed, and when an
+/// item for the node carries any payload other than the reviewed one.
 ///
-/// Domain-separated from the idempotency key (`hashing::idempotency_key`):
-/// that key is persisted with a fixed shape and hashes the denormalised
-/// `current_state` column, which neither in-process completions nor approval
-/// patches update. This digest hashes the MATERIALIZED state (event fold), the
-/// state an approval's `state_patch` actually changes.
+/// The payload, not the materialized state: the scheduler builds
+/// `payload.input` with a shallow top-level fold of the run's state, the
+/// materializer deep-merges (RFC 7396), and the two disagree on nested
+/// objects and null-valued keys. Binding the materialized state showed and
+/// approved one input while the node ran on another (review I1).
+///
+/// Domain-separated from the idempotency key (`hashing::idempotency_key`).
 pub fn action_digest(
     run: &str,
     step: u64,
     node: &str,
     definition: &str,
-    state: &serde_json::Value,
+    payload: &serde_json::Value,
 ) -> String {
     content_hash(&serde_json::json!({
-        "domain": "jamjet.approval.action.v2",
+        "domain": "jamjet.approval.action.v3",
         "run": run,
         "step": step,
         "node": node,
         "definition": definition,
-        "state": content_hash(state),
+        "payload": content_hash(payload),
     }))
 }
 
@@ -198,20 +202,21 @@ pub fn definition_hash(node_def: &serde_json::Value) -> String {
     }))
 }
 
-/// What a digest computation needs from the backend, read once, plus the
-/// definition hash the caller supplies.
+/// What an approval of one node occurrence binds: read once, shared by every
+/// caller that decides or shows it.
 #[derive(Debug, Clone)]
 pub struct ActionBasis {
     pub run: String,
     pub step: u64,
     pub definition: String,
-    pub state: serde_json::Value,
+    /// The dispatched payload, as [`action_payload`] returns it.
+    pub payload: serde_json::Value,
 }
 
 impl ActionBasis {
     /// The digest of firing `node` on this basis.
     pub fn digest(&self, node: &str) -> String {
-        action_digest(&self.run, self.step, node, &self.definition, &self.state)
+        action_digest(&self.run, self.step, node, &self.definition, &self.payload)
     }
 }
 
@@ -241,43 +246,62 @@ pub fn action_state(state: &serde_json::Value) -> serde_json::Value {
     state
 }
 
-/// Read the [`ActionBasis`] for the next occurrence of `node_id`: the node's
-/// completion count and the materialized state without the
-/// [`ENGINE_STATE_KEYS`]. `definition` is the node's
-/// [`definition_hash`]. Errors propagate: a caller on the enforcement path
-/// must treat them as "cannot prove this is approved".
+/// The part of a work item's payload an approval binds: the payload exactly
+/// as the engine dispatched it, minus the [`ENGINE_STATE_KEYS`] in the state
+/// it carries (`input` for function nodes, `state` for condition nodes).
+pub fn action_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let mut payload = payload.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        for key in ["input", "state"] {
+            if let Some(v) = obj.get_mut(key) {
+                *v = action_state(v);
+            }
+        }
+    }
+    payload
+}
+
+/// Read the [`ActionBasis`] for the next occurrence of `node_id`, dispatched
+/// with `payload` (the work item's payload): the node's completion count and
+/// [`action_payload`]. `definition` is the node's [`definition_hash`].
+///
+/// The ONE derivation of the basis. The in-process worker, the claim route,
+/// the completion check and the pending listing all go through it, so the
+/// action a reviewer approves, the one the gate compares and the one that runs
+/// are the same bytes. Errors propagate: a caller on the enforcement path must
+/// treat them as "cannot prove this is approved".
 pub async fn action_basis(
     backend: &dyn crate::backend::StateBackend,
     execution_id: &ExecutionId,
     node_id: &str,
     definition: &str,
+    payload: &serde_json::Value,
 ) -> crate::backend::BackendResult<ActionBasis> {
     let step = backend
         .count_node_completions(execution_id, node_id)
         .await?;
-    let state = action_state(
-        &crate::materializer::materialize(backend, execution_id)
-            .await?
-            .current_state,
-    );
     Ok(ActionBasis {
         run: execution_id.to_string(),
         step,
         definition: definition.to_string(),
-        state,
+        payload: action_payload(payload),
     })
 }
 
-/// [`action_digest`] for the next occurrence of `node_id`, read from the backend.
+/// [`action_digest`] for the next occurrence of `node_id` dispatched with
+/// `payload`, read from the backend.
 pub async fn derive_action_digest(
     backend: &dyn crate::backend::StateBackend,
     execution_id: &ExecutionId,
     node_id: &str,
     definition: &str,
+    payload: &serde_json::Value,
 ) -> crate::backend::BackendResult<String> {
-    Ok(action_basis(backend, execution_id, node_id, definition)
-        .await?
-        .digest(node_id))
+    Ok(
+        action_basis(backend, execution_id, node_id, definition, payload)
+            .await?
+            .digest(node_id),
+    )
 }
 
 /// Whether an approval status authorises firing an action whose digest is

@@ -161,6 +161,7 @@ pub async fn guard_item(
                         execution_id,
                         node_id,
                         node_def,
+                        payload,
                         tool_name,
                         approver,
                         serde_json::json!({ "node_id": node_id }),
@@ -168,7 +169,8 @@ pub async fn guard_item(
                     .await
                 }
                 GuardMode::Complete => {
-                    completion_covered(backend, execution_id, node_id, node_def, tool_name).await
+                    completion_covered(backend, execution_id, node_id, node_def, payload, tool_name)
+                        .await
                 }
             }
         }
@@ -176,18 +178,21 @@ pub async fn guard_item(
 }
 
 /// The approval half of the decision, for a node that needs one: `Allow` if an
-/// approval covers the action this node would perform now, otherwise `Held`
+/// approval covers the action this item would perform (this node, this
+/// occurrence, dispatched with `payload`), otherwise `Held`
 /// with an outstanding request (an existing one, or one appended here bound to
 /// the current action digest). Reads that the decision depends on fail CLOSED
 /// as `Unavailable`.
 ///
 /// Shared by the policy path above and the worker's autonomy path, so both
 /// request and match approvals identically.
+#[allow(clippy::too_many_arguments)]
 pub async fn require_approval(
     backend: &dyn StateBackend,
     execution_id: &ExecutionId,
     node_id: &str,
     node_def: &NodeDef,
+    payload: &Value,
     tool_name: String,
     approver: String,
     context: Value,
@@ -217,7 +222,7 @@ pub async fn require_approval(
         Ok(d) => d,
         Err(reason) => return GuardOutcome::Unavailable { reason },
     };
-    let basis = match action_basis(backend, execution_id, node_id, &definition).await {
+    let basis = match action_basis(backend, execution_id, node_id, &definition, payload).await {
         Ok(b) => b,
         Err(e) => {
             return GuardOutcome::Unavailable {
@@ -257,11 +262,12 @@ pub async fn require_approval(
         obj.insert(ACTION_DEFINITION_KEY.to_string(), Value::String(definition));
         // The occurrence this request is for. `GuardMode::Complete` reads it.
         obj.insert(ACTION_STEP_KEY.to_string(), Value::from(basis.step));
-        // What the reviewer is approving: the state the digest covers and the
-        // node it would run. Shown in the pending listing.
+        // What the reviewer is approving: the payload the digest covers (the
+        // input the node is dispatched with) and the node it would run. Shown
+        // in the pending listing.
         obj.insert(
             ACTION_BASIS_KEY.to_string(),
-            basis_preview(&basis.state, basis.step, node_def),
+            basis_preview(&basis.payload, basis.step, node_def),
         );
     }
 
@@ -304,6 +310,7 @@ async fn completion_covered(
     execution_id: &ExecutionId,
     node_id: &str,
     node_def: &NodeDef,
+    payload: &Value,
     tool_name: String,
 ) -> GuardOutcome {
     let gated = vec![tool_name];
@@ -332,7 +339,7 @@ async fn completion_covered(
         // proves it is this occurrence.
         None => match match node_definition(node_def) {
             Ok(definition) => {
-                derive_action_digest(backend, execution_id, node_id, &definition).await
+                derive_action_digest(backend, execution_id, node_id, &definition, payload).await
             }
             Err(reason) => return GuardOutcome::Unavailable { reason },
         } {
@@ -352,17 +359,17 @@ fn node_definition(node_def: &NodeDef) -> Result<String, String> {
         .map_err(|e| format!("node definition unreadable; refusing to run unapproved: {e}"))
 }
 
-/// The reviewer's view of what a request binds: the state (dropped and
-/// flagged above [`ACTION_BASIS_STATE_CAP`] serialized bytes), the occurrence,
-/// and a summary of the node definition (id, kind with its module, function or
-/// tool, description and own policy).
-fn basis_preview(state: &Value, step: u64, node_def: &NodeDef) -> Value {
-    let state_bytes = serde_json::to_string(state).map(|s| s.len()).unwrap_or(0);
-    let truncated = state_bytes > ACTION_BASIS_STATE_CAP;
+/// The reviewer's view of what a request binds: the dispatched payload, its
+/// `input` included (dropped and flagged above [`ACTION_BASIS_STATE_CAP`]
+/// serialized bytes), the occurrence, and a summary of the node definition
+/// (id, kind with its module, function or tool, description and own policy).
+fn basis_preview(payload: &Value, step: u64, node_def: &NodeDef) -> Value {
+    let payload_bytes = serde_json::to_string(payload).map(|s| s.len()).unwrap_or(0);
+    let truncated = payload_bytes > ACTION_BASIS_STATE_CAP;
     serde_json::json!({
-        "state": if truncated { Value::Null } else { state.clone() },
-        "state_truncated": truncated,
-        "state_bytes": state_bytes,
+        "payload": if truncated { Value::Null } else { payload.clone() },
+        "payload_truncated": truncated,
+        "payload_bytes": payload_bytes,
         "step": step,
         "node": {
             "id": node_def.id,

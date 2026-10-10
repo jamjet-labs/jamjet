@@ -20,11 +20,14 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     initiator (started in dev mode, or before this release) cannot be approved
     outside dev mode. `JAMJET_ALLOW_SELF_APPROVAL=1` turns both checks off.
     Separation of duties distinguishes tokens, not people: issue one token per human.
-  - An approval covers one action: run, node occurrence, node definition and state.
-    If any of those change, the node asks again. Outside dev mode an `approved`
+  - An approval covers one action: run, node occurrence, node definition and the
+    payload the node is dispatched with (its `input`, for function nodes). If any of
+    those change, the node asks again. The payload, not the run's materialized
+    state: the two disagree on nested objects, so binding the state showed the
+    reviewer one input while the node ran on another. Outside dev mode an `approved`
     decision must echo the pending request's `action_digest` (or `calls_hash` for an
     agent tool dispatch): missing is 400, stale is 409. The pending listing shows the
-    state and node the digest covers.
+    payload and node the digest covers (`action_basis.payload`).
   - A decision carrying a `state_patch` is refused with 400. The edit never reached
     the executed action, so recording it was a false record.
   - The worker protocol evaluates the same policy and approval rules as the

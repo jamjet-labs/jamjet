@@ -76,6 +76,21 @@ fn gated_ir() -> serde_json::Value {
     })
 }
 
+/// The start item's payload exactly as `POST /executions` and the scheduler
+/// build it. An approval binds the dispatched payload, so a hand-made payload
+/// would not be the one the scheduler re-dispatches after the approval.
+fn engine_payload() -> serde_json::Value {
+    let ir: jamjet_ir::WorkflowIr = serde_json::from_value(gated_ir()).unwrap();
+    jamjet_scheduler::build_work_item_payload(
+        &ir,
+        "gated",
+        &ir.nodes["gated"],
+        &serde_json::Map::new(),
+        "e2e-approval",
+        "0.1.0",
+    )
+}
+
 struct Harness {
     backend: Arc<dyn StateBackend>,
     execution_id: ExecutionId,
@@ -153,10 +168,7 @@ async fn start() -> Harness {
             execution_id: execution_id.clone(),
             node_id: "gated".into(),
             queue_type: "general".into(),
-            payload: serde_json::json!({
-                "workflow_id": "e2e-approval",
-                "workflow_version": "0.1.0",
-            }),
+            payload: engine_payload(),
             attempt: 0,
             max_attempts: 3,
             created_at: now,
@@ -293,10 +305,7 @@ async fn gated_node_parks_without_dead_lettering() {
             execution_id: h.execution_id.clone(),
             node_id: "gated".into(),
             queue_type: "general".into(),
-            payload: serde_json::json!({
-                "workflow_id": "e2e-approval",
-                "workflow_version": "0.1.0",
-            }),
+            payload: engine_payload(),
             attempt: 1,
             max_attempts: 3,
             created_at: chrono::Utc::now(),
@@ -483,22 +492,20 @@ async fn a_legacy_approval_re_requests_and_a_bound_one_then_runs() {
     h.shutdown().await;
 }
 
-/// The state changes between the decision and the resume. The approval does
-/// not cover the new state: no fire, a fresh request.
+/// The run's state changes between the decision and the resume, but not in a
+/// way that reaches this node: a tool node is dispatched without the run's
+/// state, so its payload, and therefore the action, is unchanged. The approval
+/// still covers it: it fires once, with no second request. (A change that does
+/// reach a node's input voids the approval: `approval_binds_payload.rs`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn state_changed_after_approval_re_requests_end_to_end() {
+async fn a_state_change_outside_the_payload_keeps_the_approval_end_to_end() {
     let _serial = SERIAL.lock().await;
     init_tracing();
     let h = start().await;
 
     assert!(h.wait_for(|ev| holds(ev) == 1, 30).await);
-    // Record the decision, then move the state before the worker can resume:
-    // append both in one go, the approval first.
     h.approve(ApprovalDecision::Approved, None).await;
     let seq = h.backend.latest_sequence(&h.execution_id).await.unwrap() + 1;
-    // Same instant as the decision from the worker's point of view only if it
-    // has not resumed yet; assert below tolerates either order by checking the
-    // invariant that matters: the node never fires on state nobody approved.
     h.backend
         .append_event(Event::new(
             h.execution_id.clone(),
@@ -521,28 +528,12 @@ async fn state_changed_after_approval_re_requests_end_to_end() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let events = h.backend.get_events(&h.execution_id).await.unwrap();
-    // Either the worker resumed before the sibling landed (fired on the
-    // approved state, one completion, one request) or after (no fire, a second
-    // request). Firing AND the state having moved first is the bug.
-    let sibling_at = events
-        .iter()
-        .position(
-            |e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == "sibling"),
-        )
-        .unwrap();
-    let fired_after_move = events
-        .iter()
-        .skip(sibling_at)
-        .any(|e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == "gated"));
     assert!(
-        !fired_after_move,
-        "the gated node fired on a state nobody approved"
+        h.wait_for(|ev| gated_completions(ev) == 1, 30).await,
+        "the approved, unchanged action fires"
     );
-    if gated_completions(&events) == 0 {
-        assert_eq!(holds(&events), 2, "no fire means a fresh request");
-    }
+    let events = h.backend.get_events(&h.execution_id).await.unwrap();
+    assert_eq!(holds(&events), 1, "no second request");
 
     h.shutdown().await;
 }

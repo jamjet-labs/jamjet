@@ -40,11 +40,13 @@ jamjet inspect exec_01abc
 ## Approving via API
 
 An approval is bound to one exact action: the run, which occurrence of the
-node, the node's definition as registered, and the state the node will run on.
-List the pending approvals first. Each one carries an `action_digest` in its
-`context`, next to an `action_basis` that shows what the digest covers (the
-state, the occurrence and the node). Approve by echoing the digest of the
-request you reviewed:
+node, the node's definition as registered, and the payload the node is
+dispatched with. The payload is what the executor or external worker receives;
+for a `python_fn`, `java_fn` or `external_fn` node its `input` is the state the
+function is called with. List the pending approvals first. Each one carries an
+`action_digest` in its `context`, next to an `action_basis` that shows what the
+digest covers (the payload, the occurrence and the node). Approve by echoing
+the digest of the request you reviewed:
 
 ```bash
 # What is waiting, and what exactly it would do
@@ -74,9 +76,12 @@ Rules the runtime enforces:
   the pending request is a 409: the request was replaced (the state changed, or
   this is a later visit of the node), so re-read the listing and decide again.
   For an agent tool dispatch, echo the request's `calls_hash` instead.
-- **If the state changes after you approve**, the node does not run on your
-  approval. It asks again with a fresh request for the new state. Engine
-  bookkeeping (`__budget`) does not count as a change.
+- **If the node's input changes after you approve**, the node does not run on
+  your approval. The engine builds each dispatch from the run's state at that
+  moment; if the payload is not the one you approved, it asks again with a
+  fresh request. A state change that does not reach the payload is not a change
+  to the action: a `tool` node, for example, is dispatched without the run's
+  state. Engine bookkeeping (`__budget`) does not count as a change.
 - **Approval edits are not supported.** A decision carrying a `state_patch` is
   refused with 400. To change what runs, reject and re-run with different input.
 - **Separation of duties.** The token that started a run cannot approve it
@@ -139,9 +144,12 @@ Limits worth knowing:
 - The decision records the sequence of the request it answers, but status is
   resolved from the latest request. A decision that races a re-request fails
   safe: its digest does not match, and the node asks again.
-- The digest is computed over the run's state as seen in the `default` tenant.
-  Every token is minted in `default` today; per-tenant state views are not
-  threaded through yet.
+- An external worker that reads the run's state through the API, instead of
+  using its payload, acts on something the approval does not cover.
+- The start item of a new segment (after a segment rollover) is enqueued with a
+  minimal payload, not the one the scheduler builds. A gated start node of a
+  later segment therefore asks for approval twice: once for that item, and
+  again for the scheduler's dispatch after the first approval.
 
 ---
 

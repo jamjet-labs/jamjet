@@ -262,6 +262,7 @@ impl Worker {
                             lease_fence,
                             &node_id,
                             node_def,
+                            &item.payload,
                             kind,
                             &budget,
                         )
@@ -720,7 +721,7 @@ impl Worker {
     /// to execute (`None`), only when the latest request was `Approved` AND the
     /// approval's `approved_digest` equals the action digest computed NOW
     /// (`approvals::derive_action_digest`: run, occurrence step, node,
-    /// materialized state). An approval therefore covers exactly the action
+    /// definition, dispatched payload). An approval therefore covers exactly the action
     /// that was reviewed: if the state changed after the decision, or this is a
     /// later visit of the node (a loop or any re-enqueue), or the approval is a
     /// legacy one with no digest, it does not cover this action, and the node
@@ -744,6 +745,7 @@ impl Worker {
         execution_id: &ExecutionId,
         node_id: &str,
         node_def: &NodeDef,
+        payload: &serde_json::Value,
         item_id: WorkItemId,
         lease_fence: i64,
         tool_name: String,
@@ -755,6 +757,7 @@ impl Worker {
             execution_id,
             node_id,
             node_def,
+            payload,
             tool_name,
             approver,
             context,
@@ -952,6 +955,7 @@ impl Worker {
         lease_fence: i64,
         node_id: &str,
         node_def: &NodeDef,
+        payload: &serde_json::Value,
         kind: &NodeKind,
         budget: &BudgetState,
     ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
@@ -1002,6 +1006,7 @@ impl Worker {
                     execution_id,
                     node_id,
                     node_def,
+                    payload,
                     item_id,
                     lease_fence,
                     tool_name,
@@ -4233,7 +4238,7 @@ mod tests {
     // approval the node fired on whatever state existed by then, and a node
     // visited again saw the old `Approved` status and fired with no new
     // approval. The hold now records `action_digest` (run, occurrence step,
-    // node, materialized state) and the resume fires only if the approval's
+    // node, definition, dispatched payload) and the resume fires only if the approval's
     // `approved_digest` equals the digest recomputed now.
 
     /// One tool node `n1` gated by a node-level `require_approval_for`.
@@ -4286,7 +4291,29 @@ mod tests {
 
     /// Enqueue, claim and run one item for `n1`.
     async fn run_n1(backend: &Arc<InMemoryBackend>, eid: &ExecutionId, worker: &Worker) {
-        backend.enqueue_work_item(sample_item(eid)).await.unwrap();
+        run_n1_on(backend, eid, worker, None).await
+    }
+
+    /// The payload the engine would dispatch `n1` with, carrying `input`.
+    fn n1_payload(input: Option<serde_json::Value>) -> serde_json::Value {
+        let mut payload = sample_item(&ExecutionId::new()).payload;
+        if let Some(input) = input {
+            payload["input"] = input;
+        }
+        payload
+    }
+
+    /// [`run_n1`] with an item dispatched with `input`, as the scheduler
+    /// builds it from the run's state at dispatch time.
+    async fn run_n1_on(
+        backend: &Arc<InMemoryBackend>,
+        eid: &ExecutionId,
+        worker: &Worker,
+        input: Option<serde_json::Value>,
+    ) {
+        let mut item = sample_item(eid);
+        item.payload = n1_payload(input);
+        backend.enqueue_work_item(item).await.unwrap();
         let item = backend
             .claim_work_item("test-worker", &["default"])
             .await
@@ -4354,7 +4381,17 @@ mod tests {
         eid: &ExecutionId,
         worker: &Worker,
     ) -> String {
-        run_n1(backend, eid, worker).await;
+        hold_and_approve_on(backend, eid, worker, None).await
+    }
+
+    /// [`hold_and_approve`] for an item dispatched with `input`.
+    async fn hold_and_approve_on(
+        backend: &Arc<InMemoryBackend>,
+        eid: &ExecutionId,
+        worker: &Worker,
+        input: Option<serde_json::Value>,
+    ) -> String {
+        run_n1_on(backend, eid, worker, input).await;
         let digest = request_digests(backend, eid).await[0]
             .clone()
             .expect("the hold must carry an action_digest");
@@ -4390,36 +4427,31 @@ mod tests {
         );
     }
 
+    /// The scheduler builds each item's payload from the run's state when it
+    /// dispatches it. A state change after the decision that reaches the
+    /// node's input reaches its payload, so the approval no longer covers it.
     #[tokio::test]
-    async fn state_mutated_after_approval_does_not_fire_and_re_requests() {
+    async fn an_input_changed_after_approval_does_not_fire_and_re_requests() {
         let (backend, eid, worker, exec) = gated_setup().await;
-        let approved = hold_and_approve(&backend, &eid, &worker).await;
-
-        // A sibling commits a state change after the human decided.
-        append(
+        let approved = hold_and_approve_on(
             &backend,
             &eid,
-            EventKind::NodeCompleted {
-                node_id: "sibling".into(),
-                output: serde_json::json!({}),
-                state_patch: serde_json::json!({ "amount": 1_000_000 }),
-                duration_ms: 0,
-                gen_ai_system: None,
-                gen_ai_model: None,
-                input_tokens: None,
-                output_tokens: None,
-                finish_reason: None,
-                cost_usd: None,
-                provenance: None,
-                idempotency_key: None,
-            },
+            &worker,
+            Some(serde_json::json!({ "amount": 10 })),
         )
         .await;
-        run_n1(&backend, &eid, &worker).await;
 
-        assert_eq!(fired(&exec), 0, "the approval did not cover this state");
+        run_n1_on(
+            &backend,
+            &eid,
+            &worker,
+            Some(serde_json::json!({ "amount": 1_000_000 })),
+        )
+        .await;
+
+        assert_eq!(fired(&exec), 0, "the approval did not cover this input");
         let digests = request_digests(&backend, &eid).await;
-        assert_eq!(digests.len(), 2, "a fresh request for the new state");
+        assert_eq!(digests.len(), 2, "a fresh request for the new input");
         assert_ne!(digests[1].as_deref(), Some(approved.as_str()));
         assert!(
             backend
@@ -4431,24 +4463,26 @@ mod tests {
         );
     }
 
-    /// A sibling that completes in-process writes the engine's `__budget`
-    /// bookkeeping into state. That is not a change to what the gated node
-    /// would do, so it must not void the approval: on a busy parallel branch
-    /// it would otherwise re-request forever.
+    /// The approval binds what the node is dispatched with, not the run's
+    /// whole state: a sibling's write that does not reach this node's payload
+    /// is not a change to this action.
     #[tokio::test]
-    async fn engine_bookkeeping_after_approval_does_not_force_a_re_request() {
+    async fn a_state_change_outside_the_payload_does_not_void_the_approval() {
         let (backend, eid, worker, exec) = gated_setup().await;
-        hold_and_approve(&backend, &eid, &worker).await;
-
+        hold_and_approve_on(
+            &backend,
+            &eid,
+            &worker,
+            Some(serde_json::json!({ "amount": 10 })),
+        )
+        .await;
         append(
             &backend,
             &eid,
             EventKind::NodeCompleted {
                 node_id: "sibling".into(),
                 output: serde_json::json!({}),
-                state_patch: serde_json::json!({
-                    "__budget": { "total_input_tokens": 512, "tool_call_count": 3 }
-                }),
+                state_patch: serde_json::json!({ "unrelated": true }),
                 duration_ms: 0,
                 gen_ai_system: None,
                 gen_ai_model: None,
@@ -4461,7 +4495,46 @@ mod tests {
             },
         )
         .await;
-        run_n1(&backend, &eid, &worker).await;
+
+        run_n1_on(
+            &backend,
+            &eid,
+            &worker,
+            Some(serde_json::json!({ "amount": 10 })),
+        )
+        .await;
+
+        assert_eq!(fired(&exec), 1);
+        assert_eq!(request_digests(&backend, &eid).await.len(), 1);
+    }
+
+    /// A sibling that completes in-process writes the engine's `__budget`
+    /// bookkeeping into state. That is not a change to what the gated node
+    /// would do, so it must not void the approval: on a busy parallel branch
+    /// it would otherwise re-request forever.
+    #[tokio::test]
+    async fn engine_bookkeeping_after_approval_does_not_force_a_re_request() {
+        let (backend, eid, worker, exec) = gated_setup().await;
+        hold_and_approve_on(
+            &backend,
+            &eid,
+            &worker,
+            Some(serde_json::json!({ "amount": 10 })),
+        )
+        .await;
+
+        // The sibling's bookkeeping lands in the state the next dispatch is
+        // built from, so it is in this item's input.
+        run_n1_on(
+            &backend,
+            &eid,
+            &worker,
+            Some(serde_json::json!({
+                "amount": 10,
+                "__budget": { "total_input_tokens": 512, "tool_call_count": 3 }
+            })),
+        )
+        .await;
 
         assert_eq!(
             fired(&exec),
@@ -4480,28 +4553,21 @@ mod tests {
     #[tokio::test]
     async fn a_user_key_with_the_engine_prefix_still_forces_a_re_request() {
         let (backend, eid, worker, exec) = gated_setup().await;
-        hold_and_approve(&backend, &eid, &worker).await;
-
-        append(
+        hold_and_approve_on(
             &backend,
             &eid,
-            EventKind::NodeCompleted {
-                node_id: "sibling".into(),
-                output: serde_json::json!({}),
-                state_patch: serde_json::json!({ "__limits": {} }),
-                duration_ms: 0,
-                gen_ai_system: None,
-                gen_ai_model: None,
-                input_tokens: None,
-                output_tokens: None,
-                finish_reason: None,
-                cost_usd: None,
-                provenance: None,
-                idempotency_key: None,
-            },
+            &worker,
+            Some(serde_json::json!({ "amount": 10 })),
         )
         .await;
-        run_n1(&backend, &eid, &worker).await;
+
+        run_n1_on(
+            &backend,
+            &eid,
+            &worker,
+            Some(serde_json::json!({ "amount": 10, "__limits": {} })),
+        )
+        .await;
 
         assert_eq!(fired(&exec), 0);
         assert_eq!(request_digests(&backend, &eid).await.len(), 2);
@@ -4535,6 +4601,7 @@ mod tests {
             &eid,
             "n1",
             &n1_definition(),
+            &n1_payload(None),
         )
         .await
         .unwrap();
@@ -4644,6 +4711,7 @@ mod tests {
             &eid,
             "n1",
             &jamjet_state::approvals::definition_hash(&other),
+            &n1_payload(None),
         )
         .await
         .unwrap();
@@ -4659,11 +4727,12 @@ mod tests {
         assert_eq!(request_digests(&backend, &eid).await.len(), 2);
     }
 
-    /// The digest cannot be computed (materialize fails): the node must not
-    /// run, and no request is recorded for an action nobody can describe.
-    async fn run_gated_on_failing_materialize(approve_first: bool) -> (usize, usize, bool) {
+    /// The digest cannot be computed (the node's occurrence count is
+    /// unreadable): the node must not run, and no request is recorded for an
+    /// action nobody can describe.
+    async fn run_gated_on_failing_step_count(approve_first: bool) -> (usize, usize, bool) {
         use crate::test_support::FailingGetEvents;
-        let backend = Arc::new(FailingGetEvents::failing_materialize());
+        let backend = Arc::new(FailingGetEvents::failing_step_count());
         let eid = ExecutionId::new();
         backend
             .create_execution(sample_execution(&eid))
@@ -4727,16 +4796,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreadable_state_never_fires_an_approved_node() {
-        let (fired, requests, errored) = run_gated_on_failing_materialize(true).await;
+    async fn an_unreadable_occurrence_never_fires_an_approved_node() {
+        let (fired, requests, errored) = run_gated_on_failing_step_count(true).await;
         assert_eq!(fired, 0, "fail closed: no digest, no fire");
         assert_eq!(requests, 1, "nothing new recorded");
         assert!(errored, "the item fails and retries rather than settling");
     }
 
     #[tokio::test]
-    async fn an_unreadable_state_records_no_request() {
-        let (fired, requests, errored) = run_gated_on_failing_materialize(false).await;
+    async fn an_unreadable_occurrence_records_no_request() {
+        let (fired, requests, errored) = run_gated_on_failing_step_count(false).await;
         assert_eq!(fired, 0);
         assert_eq!(requests, 0, "no request without a digest");
         assert!(errored);

@@ -346,6 +346,7 @@ async fn an_external_claim_of_a_gated_node_is_held_until_approved() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
+    // Same payload as the engine dispatched: the approval binds it.
     let (st, _) = send(
         &env.app,
         "/work-items",
@@ -354,7 +355,7 @@ async fn an_external_claim_of_a_gated_node_is_held_until_approved() {
             "execution_id": id,
             "node_id": "gate",
             "queue_type": "tool",
-            "payload": { "workflow_id": "wf-gate", "workflow_version": "0.1.0" },
+            "payload": { "workflow_id": "wf-gate", "workflow_version": "0.1.0", "node_id": "gate" },
         }),
     )
     .await;
@@ -674,12 +675,18 @@ async fn a_legacy_request_without_a_binding_can_still_be_answered() {
 }
 
 #[tokio::test]
-async fn the_pending_listing_shows_the_bound_state_and_node() {
+async fn the_pending_listing_shows_the_bound_payload_and_node() {
     let env = env().await;
     let (_id, _eid, pending) = held_run(&env, json!({ "amount": 10 })).await;
     let basis = &pending["context"]["action_basis"];
-    assert_eq!(basis["state"]["amount"], 10, "{pending}");
-    assert_eq!(basis["state_truncated"], false, "{pending}");
+    // A tool node is dispatched without the run's state: its payload names the
+    // workflow and the node, and that is exactly what the approval binds.
+    assert_eq!(
+        basis["payload"],
+        json!({ "workflow_id": "wf-gate", "workflow_version": "0.1.0", "node_id": "gate" }),
+        "{pending}"
+    );
+    assert_eq!(basis["payload_truncated"], false, "{pending}");
     assert_eq!(basis["step"], 0, "{pending}");
     assert_eq!(
         basis["node"]["kind"]["tool_ref"], "payments.transfer",
@@ -689,15 +696,110 @@ async fn the_pending_listing_shows_the_bound_state_and_node() {
 }
 
 #[tokio::test]
-async fn a_large_bound_state_is_truncated_in_the_listing_not_in_the_digest() {
+async fn a_large_bound_payload_is_truncated_in_the_listing_not_in_the_digest() {
     let env = env().await;
+    // A python_fn node is dispatched with the run's state as its input, so a
+    // large state makes a large payload.
+    let mut ir = gated_ir(
+        json!({ "blocked_tools": [], "require_approval_for": ["*"], "model_allowlist": [] }),
+    );
+    ir["workflow_id"] = json!("wf-gate-py");
+    ir["nodes"]["gate"]["kind"] = json!({
+        "type": "python_fn", "module": "myapp.payments", "function": "transfer", "output_schema": ""
+    });
+    let (st, body) = send(&env.app, "/workflows", &env.alice, json!({ "ir": ir })).await;
+    assert!(st.is_success(), "{st} {body}");
     let big = "x".repeat(64 * 1024);
-    let (_id, _eid, pending) = held_run(&env, json!({ "blob": big })).await;
-    let basis = &pending["context"]["action_basis"];
-    assert_eq!(basis["state_truncated"], true, "{basis}");
+    let (st, body) = send(
+        &env.app,
+        "/executions",
+        &env.alice,
+        json!({ "workflow_id": "wf-gate-py", "workflow_version": "0.1.0", "input": { "blob": big } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    let id = body["execution_id"].as_str().unwrap().to_string();
+    assert_eq!(claim(&env, &env.alice).await["claimed"], false);
+    let (st, view) = get(&env, &format!("/executions/{id}/approvals"), &env.bob).await;
+    assert_eq!(st, StatusCode::OK, "{view}");
+    let basis = &view["pending"][0]["context"]["action_basis"];
+    assert_eq!(basis["payload_truncated"], true, "{basis}");
     assert!(
-        basis["state"].is_null(),
+        basis["payload"].is_null(),
         "the preview is dropped, not cut mid-value"
     );
-    assert!(basis["state_bytes"].as_u64().unwrap() > 64 * 1024);
+    assert!(basis["payload_bytes"].as_u64().unwrap() > 64 * 1024);
+}
+
+/// A request recorded before requests carried their occurrence step is matched
+/// at completion by exact digest, and the digest covers the item's payload: an
+/// approval of this payload lets the result be recorded, an approval of any
+/// other payload does not.
+#[tokio::test]
+async fn a_legacy_request_is_matched_at_completion_on_the_item_payload() {
+    for (covers_this_payload, expected) in [(true, StatusCode::OK), (false, StatusCode::CONFLICT)] {
+        let env = env().await;
+        let (_id, eid) = start(&env, approval_policy()).await;
+        let item = env
+            .backend
+            .claim_work_item_with_lease("in-process", &["tool"], None)
+            .await
+            .unwrap()
+            .expect("the start item");
+        let node_def: jamjet_ir::workflow::NodeDef =
+            serde_json::from_value(gated_ir(approval_policy())["nodes"]["gate"].clone()).unwrap();
+        let definition =
+            jamjet_state::approvals::definition_hash(&serde_json::to_value(&node_def).unwrap());
+        let bound_payload = if covers_this_payload {
+            item.payload.clone()
+        } else {
+            json!({ "workflow_id": "wf-gate", "workflow_version": "0.1.0", "node_id": "gate", "input": { "amount": 1 } })
+        };
+        let digest = jamjet_state::approvals::derive_action_digest(
+            env.backend.as_ref(),
+            &eid,
+            "gate",
+            &definition,
+            &bound_payload,
+        )
+        .await
+        .unwrap();
+        for kind in [
+            EventKind::ToolApprovalRequired {
+                node_id: "gate".into(),
+                tool_name: "payments.transfer".into(),
+                approver: "human".into(),
+                // No `action_step`: the shape before occurrences were recorded.
+                context: json!({ "node_id": "gate", "action_digest": digest }),
+            },
+            serde_json::from_value(json!({
+                "type": "approval_received",
+                "node_id": "gate",
+                "user_id": "bob",
+                "decision": "approved",
+                "comment": null,
+                "state_patch": null,
+                "approved_digest": digest,
+            }))
+            .unwrap(),
+        ] {
+            let seq = env.backend.latest_sequence(&eid).await.unwrap() + 1;
+            env.backend
+                .append_event(Event::new(eid.clone(), seq, kind))
+                .await
+                .unwrap();
+        }
+
+        let (st, resp) = send(
+            &env.app,
+            &format!("/work-items/{}/complete", item.id),
+            &env.alice,
+            json!({ "output": {}, "state_patch": {}, "lease_fence": item.lease_fence }),
+        )
+        .await;
+        assert_eq!(
+            st, expected,
+            "covers_this_payload={covers_this_payload}: {resp}"
+        );
+    }
 }

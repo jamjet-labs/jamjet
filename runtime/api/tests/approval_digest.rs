@@ -107,9 +107,15 @@ async fn held(backend: &Arc<InMemoryBackend>, with_digest: bool) -> (ExecutionId
         })
         .await
         .unwrap();
-    let digest = derive_action_digest(backend.as_ref(), &eid, "gate", DEF)
-        .await
-        .unwrap();
+    let digest = derive_action_digest(
+        backend.as_ref(),
+        &eid,
+        "gate",
+        DEF,
+        &json!({ "input": { "amount": 10 } }),
+    )
+    .await
+    .unwrap();
     let mut context = json!({ "node_id": "gate" });
     if with_digest {
         context["action_digest"] = json!(digest);
