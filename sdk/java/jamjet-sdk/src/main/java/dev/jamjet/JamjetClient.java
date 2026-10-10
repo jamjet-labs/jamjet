@@ -188,7 +188,8 @@ public final class JamjetClient implements AutoCloseable {
      * @param decision      "approved" or "rejected"
      * @param nodeId        the node the decision is for; may be {@code null} when only
      *                      one approval is pending
-     * @param actionDigest  the reviewed request's {@code action_digest}; may be
+     * @param actionDigest  the reviewed request's {@code action_digest} (or
+     *                      {@code calls_hash} for an agent tool dispatch); may be
      *                      {@code null} for a rejection
      * @param comment       optional human comment
      */

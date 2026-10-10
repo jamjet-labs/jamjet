@@ -60,6 +60,11 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     created before this upgrade have no creator; their runs cannot be approved
     outside dev mode until the job is recreated.
 
+- **Clients can approve what they reviewed.** `jamjet approvals` prints each pending
+  request's digest, what it covers and the exact approve command (`--show-basis` prints
+  the bound payload). The Java SDK's `approve` overload that takes an action digest is
+  listed under the Java SDK changes below.
+
 - **The tool-effect idempotency key is derived by the engine, not taken from the request
   body** (#130). `POST /work-items/:id/complete` persisted the caller's
   `idempotency_key` verbatim, so a worker holding item B's lease could complete B while
