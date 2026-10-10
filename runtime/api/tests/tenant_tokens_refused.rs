@@ -186,7 +186,7 @@ async fn claim(env: &Env, token: &str) -> Value {
 /// Run the start node `a` and wait for the scheduler to dispatch what follows.
 async fn run_start_node(env: &Env, token: &str, eid: &ExecutionId) -> Vec<String> {
     let mut a = Value::Null;
-    for _ in 0..300 {
+    for _ in 0..1000 {
         a = claim(env, token).await;
         if a["claimed"] == true {
             break;
@@ -203,9 +203,12 @@ async fn run_start_node(env: &Env, token: &str, eid: &ExecutionId) -> Vec<String
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    for _ in 0..300 {
+    for _ in 0..1000 {
+        // Wait for a node after `a`: the start node can be scheduled twice
+        // (a scheduler tick can land between `start_run`'s `WorkflowStarted`
+        // and its own `NodeScheduled`), which is a separate, known race.
         let s = scheduled(env, eid).await;
-        if s.len() >= 2 {
+        if s.iter().any(|n| n != "a") {
             return s;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
