@@ -900,7 +900,19 @@ async fn escalate_routes_the_step_to_an_approval() {
             )),
             "{ctx}"
         );
+        // A duplicate item while the request is pending is held without a
+        // second record of the stop.
+        assert!(!run.step(t, DONE).await, "{ctx}");
         assert_eq!(run.limits().await.len(), 1, "{ctx}");
+        assert_eq!(
+            run.events()
+                .await
+                .iter()
+                .filter(|k| matches!(k, EventKind::EscalationRequired { .. }))
+                .count(),
+            1,
+            "{ctx}"
+        );
         assert!(
             run.failed_for_good().await.is_none(),
             "{ctx}: failed instead of escalating"
@@ -1078,6 +1090,10 @@ struct RaceAdmission {
     inner: Arc<dyn StateBackend>,
     armed: AtomicBool,
     eid: Mutex<Option<ExecutionId>>,
+    /// The agents the racing step charges.
+    agents: Vec<String>,
+    /// The approval the racing step used, if any.
+    approval_sequence: Mutex<Option<i64>>,
 }
 
 #[async_trait]
@@ -1087,15 +1103,17 @@ impl AfterWrite for RaceAdmission {
             if Some(&eid) == self.eid.lock().unwrap().as_ref()
                 && self.armed.swap(false, Ordering::SeqCst)
             {
+                let approval_sequence = *self.approval_sequence.lock().unwrap();
                 self.inner
                     .append_event(jamjet_state::Event::new(
                         eid,
                         0,
                         EventKind::AgentStepAdmitted {
-                            node_id: "n1".into(),
+                            node_id: "other".into(),
                             work_item_id: None,
-                            agents: vec![AGENT.into()],
+                            agents: self.agents.clone(),
                             tool_calls: 1,
+                            approval_sequence,
                         },
                     ))
                     .await
@@ -1115,6 +1133,8 @@ async fn two_claims_cannot_both_take_the_last_step() {
             inner: inner.clone(),
             armed: AtomicBool::new(false),
             eid: Mutex::new(None),
+            agents: vec![AGENT.into()],
+            approval_sequence: Mutex::new(None),
         });
         let hooked: Arc<dyn StateBackend> =
             Arc::new(HookedBackend::new(inner.clone(), hook.clone()));
@@ -1131,5 +1151,255 @@ async fn two_claims_cannot_both_take_the_last_step() {
         let ran = run.step(t, DONE).await;
         assert!(!ran, "{ctx}: both claims took the last step");
         assert_eq!(run.admitted().await, 1, "{ctx}: only the racing step");
+    }
+}
+
+// ── escalation approvals are single-use ─────────────────────────────────────
+
+async fn approve_latest(run: &Run, ctx: &str) {
+    let digest = run
+        .events()
+        .await
+        .into_iter()
+        .rev()
+        .find_map(|k| match k {
+            EventKind::ToolApprovalRequired { context, .. } => {
+                Some(context["action_digest"].clone())
+            }
+            _ => None,
+        })
+        .expect("a request");
+    let (st, body) = support::post(
+        &run.state,
+        &format!("/executions/{}/approve", run.eid_path()),
+        json!({ "decision": "approved", "node_id": "n1", "action_digest": digest }),
+    )
+    .await;
+    assert!(st.is_success(), "{ctx}: approve: {st} {body}");
+}
+
+async fn requests(run: &Run) -> Vec<Value> {
+    run.events()
+        .await
+        .into_iter()
+        .filter_map(|k| match k {
+            EventKind::ToolApprovalRequired { context, .. } => Some(context),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An approval releases ONE step past the limit. A step that fails does not
+/// advance the node's occurrence, so its retry carries the same digest; it
+/// must still ask again, or one approval would release every retry (and
+/// silence the circuit breaker).
+#[tokio::test]
+async fn one_escalation_approval_releases_one_step_even_when_it_fails() {
+    for (ctx, tb, t, wf) in each().await {
+        let mut run = start(
+            &tb,
+            &[card(json!({
+                "max_iterations": 1,
+                "max_consecutive_errors": 10,
+                "on_limit_exceeded": "escalate_to_human"
+            }))],
+            ir(&wf, mcp_tool(), Some(AGENT), None, None),
+            json!({}),
+        )
+        .await;
+        assert!(run.step(t, DONE).await, "{ctx}");
+        assert!(!run.step(t, DONE).await, "{ctx}");
+        approve_latest(&run, &ctx).await;
+        assert!(run.step(t, Act::Fail).await, "{ctx}: the approved step");
+        assert!(
+            !run.step(t, Act::Fail).await,
+            "{ctx}: a retry ran on the same approval"
+        );
+        assert_eq!(requests(&run).await.len(), 2, "{ctx}: no fresh request");
+        assert_eq!(run.admitted().await, 2, "{ctx}");
+    }
+}
+
+/// An approval given before the limit was reached (a policy gate's, which
+/// showed the reviewer no limit) does not release a step past the limit:
+/// the step asks again, with the limit in the request.
+#[tokio::test]
+async fn an_approval_granted_before_the_limit_does_not_cover_it() {
+    for (ctx, tb, t, wf) in each().await {
+        let mut run = start(
+            &tb,
+            &[card(
+                json!({ "max_iterations": 1, "on_limit_exceeded": "escalate_to_human" }),
+            )],
+            ir(
+                &wf,
+                mcp_tool(),
+                Some(AGENT),
+                None,
+                Some(json!({ "require_approval_for": ["search_web"] })),
+            ),
+            json!({}),
+        )
+        .await;
+        assert!(!run.step(t, DONE).await, "{ctx}: policy gate");
+        assert!(
+            requests(&run).await[0].get("autonomy_limit").is_none(),
+            "{ctx}"
+        );
+        // A parallel branch of the same agent takes its last step.
+        run.backend
+            .append_event(jamjet_state::Event::new(
+                run.eid.clone(),
+                0,
+                EventKind::AgentStepAdmitted {
+                    node_id: "other".into(),
+                    work_item_id: None,
+                    agents: vec![AGENT.into()],
+                    tool_calls: 1,
+                    approval_sequence: None,
+                },
+            ))
+            .await
+            .unwrap();
+        approve_latest(&run, &ctx).await;
+        assert!(
+            !run.step(t, DONE).await,
+            "{ctx}: ran past the limit unasked"
+        );
+        let reqs = requests(&run).await;
+        assert_eq!(reqs.len(), 2, "{ctx}");
+        assert_eq!(
+            reqs[1]["autonomy_limit"]["limit_type"],
+            json!("max_iterations"),
+            "{ctx}"
+        );
+    }
+}
+
+/// An approved escalation for one agent does not excuse another agent's
+/// `fail` limit reached while the step was being decided.
+#[tokio::test]
+async fn an_approved_escalation_still_rechecks_failing_cards() {
+    const OTHER: &str = "jamjet://acme/reviewer";
+    for (ctx, tb, t, wf) in each().await {
+        let inner = tb.dyn_backend();
+        let hook = Arc::new(RaceAdmission {
+            inner: inner.clone(),
+            armed: AtomicBool::new(false),
+            eid: Mutex::new(None),
+            agents: vec![OTHER.into()],
+            approval_sequence: Mutex::new(None),
+        });
+        let hooked: Arc<dyn StateBackend> =
+            Arc::new(HookedBackend::new(inner.clone(), hook.clone()));
+        let mut other = card(json!({ "max_iterations": 2 }));
+        other["id"] = json!(OTHER);
+        other["uri"] = json!(OTHER);
+        let mut run = start_on(
+            &tb,
+            hooked,
+            &[
+                card(json!({ "max_iterations": 1, "on_limit_exceeded": "escalate_to_human" })),
+                other,
+            ],
+            ir(&wf, mcp_tool(), Some(AGENT), Some(OTHER), None),
+            json!({}),
+        )
+        .await;
+        assert!(run.step(t, DONE).await, "{ctx}");
+        assert!(!run.step(t, DONE).await, "{ctx}: escalated");
+        approve_latest(&run, &ctx).await;
+        *hook.eid.lock().unwrap() = Some(run.eid.clone());
+        hook.armed.store(true, Ordering::SeqCst);
+        assert!(
+            !run.step(t, DONE).await,
+            "{ctx}: ran although the other card's limit was reached"
+        );
+    }
+}
+
+/// One admitted item backs one result. SQLite's legacy unfenced completion
+/// settles an already-settled item again; the second result must not be
+/// recorded, or it would end a newer step of the node and reset the breaker.
+#[tokio::test]
+async fn one_admission_backs_one_result() {
+    for tb in support::backends().await {
+        let run = start(
+            &tb,
+            &[card(json!({ "max_iterations": 5 }))],
+            ir("wf-one", mcp_tool(), Some(AGENT), None, None),
+            json!({}),
+        )
+        .await;
+        let (_, claimed) = support::post(
+            &run.state,
+            "/work-items/claim",
+            json!({ "worker_id": "w", "queue_types": QUEUES }),
+        )
+        .await;
+        let id = claimed["work_item"]["id"].as_str().unwrap().to_string();
+        for _ in 0..3 {
+            let _ = support::post(
+                &run.state,
+                &format!("/work-items/{id}/complete"),
+                json!({ "output": {}, "state_patch": {} }),
+            )
+            .await;
+        }
+        let completed = run
+            .events()
+            .await
+            .iter()
+            .filter(|k| matches!(k, EventKind::NodeCompleted { .. }))
+            .count();
+        assert_eq!(completed, 1, "{}", tb.name());
+    }
+}
+
+/// Two items holding the same approved escalation: only one may use it, also
+/// when the other uses it between this one's check and its record.
+#[tokio::test]
+async fn an_escalation_approval_cannot_be_used_twice_in_a_race() {
+    for (ctx, tb, t, wf) in each().await {
+        let inner = tb.dyn_backend();
+        let hook = Arc::new(RaceAdmission {
+            inner: inner.clone(),
+            armed: AtomicBool::new(false),
+            eid: Mutex::new(None),
+            agents: vec![AGENT.into()],
+            approval_sequence: Mutex::new(None),
+        });
+        let hooked: Arc<dyn StateBackend> =
+            Arc::new(HookedBackend::new(inner.clone(), hook.clone()));
+        let mut run = start_on(
+            &tb,
+            hooked,
+            &[card(
+                json!({ "max_iterations": 1, "on_limit_exceeded": "escalate_to_human" }),
+            )],
+            ir(&wf, mcp_tool(), Some(AGENT), None, None),
+            json!({}),
+        )
+        .await;
+        assert!(run.step(t, DONE).await, "{ctx}");
+        assert!(!run.step(t, DONE).await, "{ctx}");
+        approve_latest(&run, &ctx).await;
+        let seq = run
+            .backend
+            .get_events(&run.eid)
+            .await
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. }))
+            .unwrap()
+            .sequence;
+        *hook.approval_sequence.lock().unwrap() = Some(seq);
+        *hook.eid.lock().unwrap() = Some(run.eid.clone());
+        hook.armed.store(true, Ordering::SeqCst);
+        assert!(
+            !run.step(t, DONE).await,
+            "{ctx}: the approval was used twice"
+        );
     }
 }

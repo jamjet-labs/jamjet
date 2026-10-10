@@ -1761,13 +1761,14 @@ def workers(
 def _reported_usage(output: dict[str, Any]) -> dict[str, Any]:
     """Token usage and cost a node reports in its output, for the engine to
     charge to the agent the node acts for. Only values that are a spend are
-    forwarded: non-negative integers for tokens, a non-negative finite number
+    forwarded: non-negative integers below 2**64 for tokens (the engine reads
+    a u64 and refuses the whole result otherwise), a non-negative finite number
     for cost (a negative cost would refund an agent's budget, and the engine
     refuses one). Booleans are not numbers here."""
     usage: dict[str, Any] = {}
     for key in ("input_tokens", "output_tokens"):
         v = output.get(key)
-        if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2**64:
             usage[key] = v
     cost = output.get("cost_usd")
     if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:

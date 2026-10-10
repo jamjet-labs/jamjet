@@ -205,6 +205,44 @@ fn first_stop(
     escalation
 }
 
+/// Whether any agent whose card says `fail` stops `step`. An approved
+/// escalation releases a step past an escalating card's limit, never past a
+/// failing card's.
+fn fail_stop(ledger: &Ledger, agents: &Agents, step: Step, now: DateTime<Utc>) -> bool {
+    agents.iter().any(|(agent, constraints)| {
+        let on_limit = constraints
+            .as_ref()
+            .and_then(|c| c.on_limit_exceeded)
+            .unwrap_or_default();
+        on_limit == OnLimitExceeded::Fail
+            && autonomy::check(constraints.as_ref(), &ledger.usage(agent, now), step)
+                != AutonomyDecision::Proceed
+    })
+}
+
+/// The answered request of `node_id` that can release one step past an
+/// agent's limit, by sequence: approved, raised for that limit (its context
+/// carries `autonomy_limit`, so the reviewer saw it), and not used by an
+/// earlier step. `None` when there is none.
+pub(crate) fn unused_escalation(events: &[Event], node_id: &str) -> Option<i64> {
+    use jamjet_state::approvals::{answered_request, node_approval_status, NodeApprovalStatus};
+    if !matches!(
+        node_approval_status(events, node_id),
+        NodeApprovalStatus::Approved { .. }
+    ) {
+        return None;
+    }
+    let request = answered_request(events, node_id)?;
+    request.context.get(ESCALATION_KEY)?;
+    let used = events.iter().any(|e| {
+        matches!(&e.kind, EventKind::AgentStepAdmitted { approval_sequence: Some(s), .. } if *s == request.sequence)
+    });
+    (!used).then_some(request.sequence)
+}
+
+/// The key under which an escalation request's context shows the limit.
+pub(crate) const ESCALATION_KEY: &str = "autonomy_limit";
+
 /// An over-limit step whose card escalates: it may fire only under an
 /// approval of that step.
 #[derive(Debug, Clone)]
@@ -413,8 +451,30 @@ pub(crate) async fn admit(
         now,
         escalation,
     } = plan;
-    let approved = escalation.is_some();
+    // An escalated step fires only on the approval that released it, read
+    // now, and re-checked in the append below.
+    let approval_sequence = match &escalation {
+        None => None,
+        Some(_) => match backend.get_events(execution_id).await {
+            Ok(events) => match unused_escalation(&events, node_id) {
+                Some(seq) => Some(seq),
+                None => {
+                    return GuardOutcome::Unavailable {
+                        reason: "the approval releasing this step past the agent's limit was \
+                                 used or withdrawn; deciding again on the next attempt"
+                            .to_string(),
+                    }
+                }
+            },
+            Err(e) => {
+                return GuardOutcome::Unavailable {
+                    reason: format!("agent steps unreadable: {e}"),
+                }
+            }
+        },
+    };
     let names = agents.iter().map(|(a, _)| a.clone()).collect();
+    let node = node_id.to_string();
     let event = Event::new(
         execution_id.clone(),
         0,
@@ -423,14 +483,24 @@ pub(crate) async fn admit(
             work_item_id,
             agents: names,
             tool_calls: step.tool_calls,
+            approval_sequence,
         },
     );
     let still_allowed = move |log: &[Event]| -> bool {
-        if approved {
-            return true;
-        }
         let mut ledger = earlier.clone();
-        ledger.apply_segment(log).is_ok() && first_stop(&ledger, &agents, step, now).is_none()
+        if ledger.apply_segment(log).is_err() {
+            return false;
+        }
+        match approval_sequence {
+            // Every limit still allows it.
+            None => first_stop(&ledger, &agents, step, now).is_none(),
+            // Past an escalating card's limit on that one approval, still
+            // unused, and no failing card's limit reached meanwhile.
+            Some(seq) => {
+                unused_escalation(log, &node) == Some(seq)
+                    && !fail_stop(&ledger, &agents, step, now)
+            }
+        }
     };
     match backend.append_event_if(event, &still_allowed).await {
         Ok(ConditionalAppend::Appended(_)) => GuardOutcome::Allow,
@@ -471,9 +541,30 @@ pub(crate) async fn completion_admitted(
         .map_err(|e| GuardOutcome::Unavailable {
             reason: format!("agent steps unreadable; refusing to record the result: {e}"),
         })?;
-    let admitted = events.iter().any(|e| {
+    // The item's step must still be open: each admission of the node from
+    // the item's latest one on is ended by one result, so a step whose
+    // result is already recorded backs no second one.
+    let admitted = match events.iter().rposition(|e| {
         matches!(&e.kind, EventKind::AgentStepAdmitted { work_item_id: Some(id), .. } if *id == item)
-    });
+    }) {
+        None => false,
+        Some(at) => {
+            let node = events[at].kind.node_id().unwrap_or_default();
+            let (mut opened, mut ended) = (0usize, 0usize);
+            for e in &events[at..] {
+                match &e.kind {
+                    EventKind::AgentStepAdmitted { node_id, .. } if node_id == node => opened += 1,
+                    EventKind::NodeCompleted { node_id, .. } | EventKind::NodeFailed { node_id, .. }
+                        if node_id == node =>
+                    {
+                        ended += 1
+                    }
+                    _ => {}
+                }
+            }
+            ended < opened
+        }
+    };
     if admitted {
         Ok(())
     } else {

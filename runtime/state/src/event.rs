@@ -278,6 +278,11 @@ pub enum EventKind {
         /// Tool calls this step makes: one for a node that uses a tool, the
         /// number of calls in an agent tool dispatch batch.
         tool_calls: u32,
+        /// For a step past a limit released by a human (`escalate_to_human`):
+        /// the sequence of the approval request it used. Each request
+        /// releases one step.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_sequence: Option<i64>,
     },
     EscalationRequired {
         node_id: NodeId,

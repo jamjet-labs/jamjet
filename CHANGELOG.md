@@ -381,7 +381,7 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `autonomy_limit_reached` or `circuit_breaker_tripped`. New card field
     `on_limit_exceeded: escalate_to_human` holds the node for an ordinary approval
     instead (same digest binding, the policy chain's deadline, the limit shown under
-    `autonomy_limit`), one approval per step past the limit. `escalate_to_supervisor`
+    `autonomy_limit`). Each approval of such a request releases one step: a retry of a failed step or a duplicate item asks again, and an approval given for another gate before the limit was reached does not count. `escalate_to_supervisor`
     is not implemented and a card that asks for it is refused.
   - `POST /work-items/:id/complete` accepts `cost_usd` (a negative or non-finite one is
     400), and records a result for a node acting for an agent only for an item the claim

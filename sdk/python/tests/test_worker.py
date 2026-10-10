@@ -63,7 +63,7 @@ async def _with_bad_usage(input: dict) -> dict:
 
 
 async def _with_bool_cost(input: dict) -> dict:
-    return {"result": "answer", "cost_usd": True}
+    return {"result": "answer", "cost_usd": True, "input_tokens": 2**64}
 
 
 @tool(name="echo")
@@ -325,6 +325,7 @@ async def test_worker_drops_usage_that_is_not_a_spend() -> None:
     stub = _StubClient(claimed_item=_usage_item("_with_bool_cost"))
     await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
     assert stub.complete_calls[0]["cost_usd"] is None
+    assert stub.complete_calls[0]["input_tokens"] is None
 
 
 _DISPATCH_ITEM: dict = {

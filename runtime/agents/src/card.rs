@@ -130,7 +130,8 @@ pub enum OnLimitExceeded {
     Fail,
     /// Hold the node for a human approval of that one step, through the
     /// ordinary approval path (bound to the action, with the policy chain's
-    /// deadline). Every further step past the limit needs its own approval.
+    /// deadline). Each approval releases one step, once: a retry, a duplicate
+    /// item or the next step past the limit needs its own.
     EscalateToHuman,
 }
 

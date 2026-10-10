@@ -246,6 +246,19 @@ pub async fn guard_item(
         }
     };
     let escalation = plan.as_ref().and_then(|p| p.escalation.clone());
+    // Where the log stood before deciding: an escalation's stop is recorded
+    // only when this decision raised a new request for it.
+    let before = match &escalation {
+        Some(_) => match backend.latest_sequence(execution_id).await {
+            Ok(seq) => Some(seq),
+            Err(e) => {
+                return GuardOutcome::Unavailable {
+                    reason: format!("run log unreadable: {e}"),
+                }
+            }
+        },
+        None => None,
+    };
 
     let outcome = guard_policy(
         backend,
@@ -262,17 +275,28 @@ pub async fn guard_item(
     )
     .await;
 
-    if let Some(e) = &escalation {
+    if let (Some(e), Some(before)) = (&escalation, before) {
         if matches!(outcome, GuardOutcome::Held { .. }) {
-            agent_limits::record_stop(
-                backend,
-                execution_id,
-                node_id,
-                &e.agent,
-                &e.decision,
-                Some("human_approval"),
-            )
-            .await;
+            let raised = backend
+                .get_events_since(execution_id, before)
+                .await
+                .map(|evs| {
+                    evs.iter().any(|ev| {
+                        matches!(&ev.kind, EventKind::ToolApprovalRequired { node_id: n, .. } if n == node_id)
+                    })
+                })
+                .unwrap_or(true);
+            if raised {
+                agent_limits::record_stop(
+                    backend,
+                    execution_id,
+                    node_id,
+                    &e.agent,
+                    &e.decision,
+                    Some("human_approval"),
+                )
+                .await;
+            }
         }
     }
     match (outcome, plan) {
@@ -438,16 +462,17 @@ async fn guard_policy(
                         payload,
                         tool_name,
                         approver,
-                        match escalation {
-                            Some(e) => serde_json::json!({
-                                "node_id": node_id,
-                                "autonomy_limit": e.context(),
-                            }),
-                            None => serde_json::json!({ "node_id": node_id }),
+                        {
+                            let mut c = serde_json::json!({ "node_id": node_id });
+                            if let Some(e) = escalation {
+                                c[crate::agent_limits::ESCALATION_KEY] = e.context();
+                            }
+                            c
                         },
                         deadline,
                         tenant_id,
                         sealer,
+                        escalation.is_some(),
                     )
                     .await
                 }
@@ -758,6 +783,7 @@ pub async fn require_approval(
     deadline: Option<ApprovalDeadline>,
     tenant_id: &str,
     sealer: Option<&dyn ApprovalSealer>,
+    escalation: bool,
 ) -> GuardOutcome {
     let gated = vec![tool_name.clone()];
     let events = match backend.get_events(execution_id).await {
@@ -801,7 +827,12 @@ pub async fn require_approval(
     };
     let current = basis.digest(node_id);
 
-    if approval_covers(&status, &current) {
+    // A step past an agent's limit needs an approval of a request that
+    // showed the limit, and each such approval releases one step: a failed
+    // step's retry has the same digest, and must ask again.
+    let covers = approval_covers(&status, &current)
+        && (!escalation || crate::agent_limits::unused_escalation(&events, node_id).is_some());
+    if covers {
         info!(execution_id = %execution_id, node_id, "Approval satisfied — proceeding");
         return GuardOutcome::Allow;
     }
