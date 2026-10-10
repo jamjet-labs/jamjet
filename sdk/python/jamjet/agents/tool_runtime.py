@@ -33,6 +33,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -116,6 +117,9 @@ def _coerce_arguments(arguments: Any) -> Any:
     return arguments if arguments is not None else {}
 
 
+_REGISTRY_LOCK = threading.RLock()
+
+
 class ToolResolutionError(LookupError):
     """A tool call that cannot be resolved to the registered tool of that name.
 
@@ -188,35 +192,41 @@ def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]
     # call with no entry would run the import's tool. Any name the import
     # overwrote is put back; names it added stay only if the entry is
     # accepted.
-    snapshot = dict(_TOOL_REGISTRY)
-    accepted = False
-    try:
+    # One resolution at a time from snapshot to restore. Without this, a
+    # resolution on another thread (several event loops, or to_thread) could
+    # snapshot while this one's import has overwritten a name, and "restore"
+    # that overwrite after this one put the name back. Re-entrant, so a module
+    # whose import dispatches a tool call does not deadlock.
+    with _REGISTRY_LOCK:
+        snapshot = dict(_TOOL_REGISTRY)
+        accepted = False
         try:
-            obj: Any = importlib.import_module(module_path)
-        except (ImportError, TypeError, ValueError) as exc:
-            raise ToolResolutionError(
-                f"tool {name!r}: tools map entry {ref!r} cannot be imported to verify it"
-            ) from exc
-        for part in fn_path.split("."):
-            obj = inspect.getattr_static(obj, part, None)
-            if obj is None:
-                raise ToolResolutionError(f"tool {name!r}: tools map entry {ref!r} names nothing")
-        defn = inspect.getattr_static(obj, "_jamjet_tool", None)
-        if not isinstance(defn, ToolDefinition) or defn.name != name or _registered_ref(defn) != ref:
-            raise ToolResolutionError(
-                f"tool {name!r}: tools map entry {ref!r} is not the registered @tool {name!r}'s own reference"
-            )
-        accepted = True
-    finally:
-        for existing_name, existing in snapshot.items():
-            if _TOOL_REGISTRY.get(existing_name) is not existing:
-                _TOOL_REGISTRY[existing_name] = existing
-        if not accepted:
-            # A refused entry's import must not leave new tool names behind
-            # either: a later call naming one with no entry would run code
-            # only that import made reachable.
-            for new_name in [n for n in _TOOL_REGISTRY if n not in snapshot]:
-                del _TOOL_REGISTRY[new_name]
+            try:
+                obj: Any = importlib.import_module(module_path)
+            except (ImportError, TypeError, ValueError) as exc:
+                raise ToolResolutionError(
+                    f"tool {name!r}: tools map entry {ref!r} cannot be imported to verify it"
+                ) from exc
+            for part in fn_path.split("."):
+                obj = inspect.getattr_static(obj, part, None)
+                if obj is None:
+                    raise ToolResolutionError(f"tool {name!r}: tools map entry {ref!r} names nothing")
+            defn = inspect.getattr_static(obj, "_jamjet_tool", None)
+            if not isinstance(defn, ToolDefinition) or defn.name != name or _registered_ref(defn) != ref:
+                raise ToolResolutionError(
+                    f"tool {name!r}: tools map entry {ref!r} is not the registered @tool {name!r}'s own reference"
+                )
+            accepted = True
+        finally:
+            for existing_name, existing in snapshot.items():
+                if _TOOL_REGISTRY.get(existing_name) is not existing:
+                    _TOOL_REGISTRY[existing_name] = existing
+            if not accepted:
+                # A refused entry's import must not leave new tool names behind
+                # either: a later call naming one with no entry would run code
+                # only that import made reachable.
+                for new_name in [n for n in _TOOL_REGISTRY if n not in snapshot]:
+                    del _TOOL_REGISTRY[new_name]
     return _tool_callable(defn)
 
 
