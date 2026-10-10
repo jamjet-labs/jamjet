@@ -32,6 +32,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `POST /work-items/claim`, and `POST /work-items/:id/complete` refuses a result
     for a gated node with no approval for its current occurrence. `POST /work-items`
     is operator-only.
+  - The tenant routes are operator-only, reads included, and an operator can read or
+    change only the tenant of their own token. Before this, any developer could
+    `PUT /tenants/:id` and drop a tenant-level approval gate. The route/role table
+    is in docs/guides/security.md.
   - A registered workflow version is immutable: an identical re-register is a 200
     no-op, a different IR under the same version is a 409.
   - The embedded cron scheduler starts runs in-process as `system:cron` instead of

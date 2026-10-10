@@ -92,9 +92,18 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         .route("/work-items/:id/heartbeat", post(heartbeat_work_item))
         // Admin
         .route("/workers", get(list_workers))
-        // Tenant management (operator-only)
-        .route("/tenants", post(create_tenant).get(list_tenants))
-        .route("/tenants/:id", get(get_tenant).put(update_tenant))
+        // Tenant management. Operator-only outside dev mode, reads included: the
+        // tenant policy is the one layer a developer cannot rewrite, so it is the
+        // only one that can bind the developer who starts a run (review C1). The
+        // handlers also confine an operator to the tenant of their token.
+        .route(
+            "/tenants",
+            operator_only(post(create_tenant).get(list_tenants), dev_mode),
+        )
+        .route(
+            "/tenants/:id",
+            operator_only(get(get_tenant).put(update_tenant), dev_mode),
+        )
         // Audit log — immutable, append-only
         .route("/audit", get(list_audit_log))
         // Coordinator decisions and agent search
@@ -146,6 +155,20 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
         .with_state(state)
         .merge(mcp_bridge)
         .fallback(crate::static_files::serve_spa)
+}
+
+/// Put `route` behind [`crate::auth::require_operator_role`] outside dev mode.
+/// The layer extracts the token, so a request that reaches it without one is
+/// refused rather than let through.
+fn operator_only(
+    route: axum::routing::MethodRouter<AppState>,
+    dev_mode: bool,
+) -> axum::routing::MethodRouter<AppState> {
+    if dev_mode {
+        route
+    } else {
+        route.layer(middleware::from_fn(crate::auth::require_operator_role))
+    }
 }
 
 // ── Dev-mode middleware ──────────────────────────────────────────────────────
@@ -1089,6 +1112,28 @@ struct CreateTenantRequest {
     name: String,
 }
 
+/// The tenant an operator may administer: their token's tenant. Dev mode has
+/// no tokens and no tenants to protect, so it is unrestricted there. Outside
+/// dev mode a request with no token is refused, never treated as unscoped.
+fn tenant_in_scope(
+    target: &str,
+    caller: Option<&jamjet_state::ApiToken>,
+    dev: Option<&crate::auth::DevMode>,
+) -> Result<(), ApiError> {
+    if dev.is_some() {
+        return Ok(());
+    }
+    match caller {
+        Some(token) if token.tenant_id == target => Ok(()),
+        Some(_) => Err(ApiError::Forbidden(format!(
+            "tenant {target} is not the tenant of this token"
+        ))),
+        None => Err(ApiError::Forbidden(
+            "tenant administration needs an operator token".into(),
+        )),
+    }
+}
+
 async fn create_tenant(
     State(state): State<AppState>,
     Json(body): Json<CreateTenantRequest>,
@@ -1109,16 +1154,38 @@ async fn create_tenant(
     Ok((StatusCode::CREATED, Json(json!({ "tenant_id": body.id }))))
 }
 
-async fn list_tenants(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn list_tenants(
+    State(state): State<AppState>,
+    caller: Option<Extension<jamjet_state::ApiToken>>,
+    dev: Option<Extension<crate::auth::DevMode>>,
+) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&TenantId::default());
     let tenants = backend.list_tenants().await?;
+    let tenants: Vec<Tenant> = tenants
+        .into_iter()
+        .filter(|t| {
+            tenant_in_scope(
+                t.id.as_str(),
+                caller.as_ref().map(|c| &c.0),
+                dev.as_ref().map(|d| &d.0),
+            )
+            .is_ok()
+        })
+        .collect();
     Ok(Json(json!({ "tenants": tenants })))
 }
 
 async fn get_tenant(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    caller: Option<Extension<jamjet_state::ApiToken>>,
+    dev: Option<Extension<crate::auth::DevMode>>,
 ) -> Result<Json<Value>, ApiError> {
+    tenant_in_scope(
+        &id,
+        caller.as_ref().map(|c| &c.0),
+        dev.as_ref().map(|d| &d.0),
+    )?;
     let backend = state.backend_for(&TenantId::default());
     let tenant = backend
         .get_tenant(&TenantId::from(id.as_str()))
@@ -1140,8 +1207,15 @@ struct UpdateTenantRequest {
 async fn update_tenant(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    caller: Option<Extension<jamjet_state::ApiToken>>,
+    dev: Option<Extension<crate::auth::DevMode>>,
     Json(body): Json<UpdateTenantRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    tenant_in_scope(
+        &id,
+        caller.as_ref().map(|c| &c.0),
+        dev.as_ref().map(|d| &d.0),
+    )?;
     let backend = state.backend_for(&TenantId::default());
     let tid = TenantId::from(id.as_str());
     let existing = backend
@@ -2485,6 +2559,33 @@ fn parse_execution_id(s: &str) -> Result<ExecutionId, ApiError> {
     let uuid = uuid::Uuid::parse_str(hex)
         .map_err(|_| ApiError::BadRequest(format!("invalid execution id: {s}")))?;
     Ok(ExecutionId(uuid))
+}
+
+#[cfg(test)]
+mod tenant_scope_tests {
+    use super::*;
+
+    fn token(tenant: &str) -> jamjet_state::ApiToken {
+        jamjet_state::ApiToken {
+            id: "t1".into(),
+            name: "ops".into(),
+            role: "operator".into(),
+            created_at: Utc::now(),
+            expires_at: None,
+            tenant_id: tenant.into(),
+        }
+    }
+
+    /// The router puts a token in front of every tenant handler, so the
+    /// no-token arm is only reachable if that layer is ever lost. It must
+    /// refuse, not read as "unscoped".
+    #[test]
+    fn no_token_outside_dev_mode_is_refused() {
+        assert!(tenant_in_scope("default", None, None).is_err());
+        assert!(tenant_in_scope("default", None, Some(&crate::auth::DevMode)).is_ok());
+        assert!(tenant_in_scope("default", Some(&token("default")), None).is_ok());
+        assert!(tenant_in_scope("acme", Some(&token("default")), None).is_err());
+    }
 }
 
 #[cfg(test)]
