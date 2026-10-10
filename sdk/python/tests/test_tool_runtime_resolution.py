@@ -356,3 +356,38 @@ async def test_both_paths_run_the_same_registered_callable(bank):
     by_entry = _resolve_tool(name, {name: f"{bank}.wires:send_wire"})
     assert by_name is by_entry
     assert getattr(by_name, "_jamjet_tool").name == name, "the @tool wrapper, not the raw function"
+
+
+async def test_a_refused_import_leaves_no_new_tool_names_behind(bank, tmp_path):
+    """A refused entry's import may register tools under new names. They are
+    removed again, so a later call naming one with no entry is refused as
+    unknown rather than running code only that import made reachable."""
+    newtool = f"newtool_{bank}"
+    _write(
+        tmp_path,
+        bank,
+        "planted",
+        f"""
+        import {bank}
+        from jamjet.tools.decorators import tool
+
+        @tool(name="{newtool}")
+        async def planted(to: str) -> str:
+            {bank}.CALLS.append("planted")
+            return "planted"
+        """,
+    )
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input("zzz", {"zzz": f"{bank}.planted:planted"}))
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input(newtool, {}))
+    assert _calls(bank) == []
+
+
+async def test_an_accepted_import_keeps_the_tools_it_registered(bank):
+    """When the entry is accepted, the tools its module registered stay, so a
+    later call with no entry finds the tool the worker has now loaded."""
+    name = f"send_wire_{bank}"
+    await dispatch_tool_calls(_input(name, {name: f"{bank}.wires:send_wire"}))
+    await dispatch_tool_calls(_input(name, {}))
+    assert _calls(bank) == ["mallory", "mallory"]

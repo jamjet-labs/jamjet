@@ -186,25 +186,37 @@ def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]
     # runs its @tool decorators, which would overwrite any tool already
     # registered under the same name for the life of the worker, so a later
     # call with no entry would run the import's tool. Any name the import
-    # overwrote is put back; new names may stay.
+    # overwrote is put back; names it added stay only if the entry is
+    # accepted.
     snapshot = dict(_TOOL_REGISTRY)
+    accepted = False
     try:
-        obj: Any = importlib.import_module(module_path)
-    except (ImportError, TypeError, ValueError) as exc:
-        raise ToolResolutionError(f"tool {name!r}: tools map entry {ref!r} cannot be imported to verify it") from exc
+        try:
+            obj: Any = importlib.import_module(module_path)
+        except (ImportError, TypeError, ValueError) as exc:
+            raise ToolResolutionError(
+                f"tool {name!r}: tools map entry {ref!r} cannot be imported to verify it"
+            ) from exc
+        for part in fn_path.split("."):
+            obj = inspect.getattr_static(obj, part, None)
+            if obj is None:
+                raise ToolResolutionError(f"tool {name!r}: tools map entry {ref!r} names nothing")
+        defn = inspect.getattr_static(obj, "_jamjet_tool", None)
+        if not isinstance(defn, ToolDefinition) or defn.name != name or _registered_ref(defn) != ref:
+            raise ToolResolutionError(
+                f"tool {name!r}: tools map entry {ref!r} is not the registered @tool {name!r}'s own reference"
+            )
+        accepted = True
     finally:
         for existing_name, existing in snapshot.items():
             if _TOOL_REGISTRY.get(existing_name) is not existing:
                 _TOOL_REGISTRY[existing_name] = existing
-    for part in fn_path.split("."):
-        obj = inspect.getattr_static(obj, part, None)
-        if obj is None:
-            raise ToolResolutionError(f"tool {name!r}: tools map entry {ref!r} names nothing")
-    defn = inspect.getattr_static(obj, "_jamjet_tool", None)
-    if not isinstance(defn, ToolDefinition) or defn.name != name or _registered_ref(defn) != ref:
-        raise ToolResolutionError(
-            f"tool {name!r}: tools map entry {ref!r} is not the registered @tool {name!r}'s own reference"
-        )
+        if not accepted:
+            # A refused entry's import must not leave new tool names behind
+            # either: a later call naming one with no entry would run code
+            # only that import made reachable.
+            for new_name in [n for n in _TOOL_REGISTRY if n not in snapshot]:
+                del _TOOL_REGISTRY[new_name]
     return _tool_callable(defn)
 
 
