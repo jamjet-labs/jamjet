@@ -20,7 +20,7 @@ import java.util.concurrent.Callable;
  * <p>Usage:
  * <pre>
  * jamjet health                       # check runtime health
- * jamjet run &lt;workflow-id&gt; [input.json]  # start a workflow execution
+ * jamjet run &lt;workflow-id&gt; [input.json] [--workflow-version V]  # start a workflow execution
  * jamjet validate &lt;workflow.json&gt;     # validate a workflow IR file
  * jamjet dev                          # print dev server instructions
  * </pre>
@@ -115,6 +115,12 @@ public class JamjetCli implements Callable<Integer> {
         @Parameters(index = "1", arity = "0..1", description = "Path to input JSON file")
         Path inputFile;
 
+        @Option(names = "--workflow-version",
+                description = "Workflow version to run. The runtime defaults to 1.0.0, while a "
+                        + "workflow built with the Java Workflow builder defaults to 0.1.0, so pass "
+                        + "its version (ir.version()) for those.")
+        String workflowVersion;
+
         @Override
         public Integer call() {
             try (var client = parent.buildClient()) {
@@ -126,7 +132,7 @@ public class JamjetCli implements Callable<Integer> {
                 } else {
                     input = Map.of();
                 }
-                var result = client.startExecution(workflowId, input);
+                var result = client.startExecution(workflowId, workflowVersion, input);
                 printJson(result);
                 return 0;
             } catch (Exception e) {

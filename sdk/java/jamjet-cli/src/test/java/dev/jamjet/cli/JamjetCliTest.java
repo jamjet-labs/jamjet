@@ -22,6 +22,7 @@ class JamjetCliTest {
     private String url;
     private volatile int replyStatus;
     private volatile String replyBody;
+    private volatile String lastRequestBody;
 
     private final ByteArrayOutputStream out = new ByteArrayOutputStream();
     private final ByteArrayOutputStream err = new ByteArrayOutputStream();
@@ -32,7 +33,7 @@ class JamjetCliTest {
     void start() throws IOException {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", exchange -> {
-            exchange.getRequestBody().readAllBytes();
+            lastRequestBody = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
             var bytes = replyBody.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().add("Content-Type", "application/json");
             exchange.sendResponseHeaders(replyStatus, bytes.length == 0 ? -1 : bytes.length);
@@ -68,6 +69,26 @@ class JamjetCliTest {
         assertTrue(expected != null && !expected.isBlank(), "surefire must pass jamjet.expectedVersion");
         assertEquals(0, run("-V"));
         assertEquals("jamjet " + expected, out.toString(StandardCharsets.UTF_8).strip());
+    }
+
+    @Test
+    void runSendsTheWorkflowVersionWhenGiven() throws Exception {
+        // Java-built workflows default to 0.1.0; the runtime defaults to 1.0.0.
+        replyStatus = 201;
+        replyBody = "{\"execution_id\":\"exec_1\"}";
+        assertEquals(0, run("-u", url, "run", "research", "--workflow-version", "0.1.0"));
+        var sent = new com.fasterxml.jackson.databind.ObjectMapper().readTree(lastRequestBody);
+        assertEquals("research", sent.get("workflow_id").asText());
+        assertEquals("0.1.0", sent.get("workflow_version").asText(), lastRequestBody);
+    }
+
+    @Test
+    void runOmitsTheWorkflowVersionByDefault() throws Exception {
+        replyStatus = 201;
+        replyBody = "{\"execution_id\":\"exec_1\"}";
+        assertEquals(0, run("-u", url, "run", "research"));
+        var sent = new com.fasterxml.jackson.databind.ObjectMapper().readTree(lastRequestBody);
+        assertTrue(sent.get("workflow_version") == null, lastRequestBody);
     }
 
     @Test

@@ -224,9 +224,9 @@ client.cancelExecution(executionId);
 
 The runtime has no route that lists workflow definitions, so `listWorkflows()` is deprecated and throws `UnsupportedOperationException` without calling the runtime.
 
-`startExecution(workflowId, input)` without a version runs version `1.0.0`. Pass the version you registered when it differs, as above.
+Pass the version, as above. `startExecution(workflowId, input)` sends none, and the runtime then runs version `1.0.0`, but the `Workflow` builder defaults to `0.1.0`. For a builder workflow that keeps the default, the two-argument call answers 404 (`workflow research v1.0.0`).
 
-A compiled Java workflow registers and starts, but the runtime schedules each step as a work item for an external worker. Step lambdas only run in-process, through `wf.run(...)`.
+A compiled Java workflow registers and starts, but its steps do not run on the runtime. The runtime queues each step as a `python_tool` work item, and there is no Java worker to claim it; a Python worker would claim it and fail to import the step. Step lambdas only run in-process, through `wf.run(...)`.
 
 ### Human approval
 
@@ -326,8 +326,12 @@ The Java CLI (`jamjet-cli` module) provides command-line access:
 # Check runtime health
 jamjet health
 
-# Start an execution of version 1.0.0 of a registered workflow
+# Start an execution of a registered workflow (version 1.0.0 unless given)
 jamjet run <workflow-id> [input.json]
+jamjet run research input.json --workflow-version 0.1.0   # a Workflow-builder default
+
+# Print the CLI version
+jamjet -V
 
 # Validate IR file (uses full IrValidator)
 jamjet validate workflow.json

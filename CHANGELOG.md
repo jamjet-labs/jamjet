@@ -85,9 +85,14 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - The `User-Agent` is `jamjet-java-sdk/<version>` again, with the version Maven
     stamped into the build, and `jamjet -V` prints that version too (it said `0.1.0`).
 
-  `jamjet-cli` picks these up, so `jamjet run`, `jamjet executions` and
-  `jamjet agents` now work. A new CI job runs the client against a runtime built
-  from the same commit.
+  `jamjet-cli` picks these up, so `jamjet executions` and `jamjet agents` now reach
+  the runtime, and `jamjet run` starts an execution of a registered workflow. `run`
+  gains `--workflow-version`: without it the runtime runs version `1.0.0`, but the
+  Java `Workflow` builder defaults to `0.1.0`, so a builder workflow needs
+  `--workflow-version 0.1.0` (or `startExecution(id, ir.version(), input)` in code).
+  A started Java workflow does not execute its steps on the runtime: they are queued
+  for a `python_tool` worker, and there is no Java worker. A new CI job runs the
+  client against a runtime built from the same commit.
 
 ---
 

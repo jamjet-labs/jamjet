@@ -100,7 +100,13 @@ public final class JamjetClient implements AutoCloseable {
     // ── Executions ────────────────────────────────────────────────────────────
 
     /**
-     * Start an execution of the workflow's default version ({@code 1.0.0} on the runtime).
+     * Start an execution without naming a version, so the runtime runs version
+     * {@code 1.0.0}.
+     *
+     * <p>A workflow built with {@link dev.jamjet.workflow.Workflow}'s builder defaults to
+     * version {@code 0.1.0}, so this overload answers 404 for it unless the builder set
+     * {@code 1.0.0}. Use {@link #startExecution(String, String, Map)} with
+     * {@code ir.version()} for those.
      *
      * <p>Sends {@code POST /executions} with {@code {"workflow_id", "input"}}; the
      * runtime answers 201 with {@code {"execution_id"}}.
@@ -113,7 +119,8 @@ public final class JamjetClient implements AutoCloseable {
      * Start an execution of a specific workflow version.
      *
      * @param workflowId       the registered workflow ID
-     * @param workflowVersion  the version to run, or {@code null} for the runtime default
+     * @param workflowVersion  the version to run, such as {@code ir.version()}, or {@code null}
+     *                         for the runtime default ({@code 1.0.0})
      * @param input            the initial input
      */
     public Map<String, Object> startExecution(
