@@ -41,8 +41,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `send_wire.__call__`, or through a re-export). `jamjet.agents.tool_runtime` now
     accepts a `tools` entry only when it names a `@tool` registered under the
     called name and is exactly that tool's own `module:qualname` (what the SDK
-    compiler writes); anything else is refused and nothing runs. A call with no
-    entry resolves through the `@tool` registry by name.
+    compiler writes); anything else is refused and nothing runs. An entry may
+    still select a same-named `@tool` from another importable module, but never
+    code the engine did not see: the engine matches the call on that handler and
+    binds it into the approval. A call with no entry resolves through the `@tool`
+    registry by name. Checking an entry may import its module (running its
+    top-level code); a refused entry leaves the registry as it found it.
   - The engine also matches each call on the handler its `tools` entry names (as
     written and in dotted form) and on that function's own name, binds the handler
     into a per-call approval, and blocks the batch when an entry is not a

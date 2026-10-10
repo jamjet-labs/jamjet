@@ -147,13 +147,20 @@ relying on patterns alone.
   with `agent_tool_dispatch: true`) is checked on its own names first: a gate
   there holds the node with an approval of its full payload, which covers the
   calls in it, even when there are no calls. Then each call is matched on the
-  tool the model chose. The run's `tools` map cannot choose other code: the
-  dispatcher accepts an entry only when it names the `@tool` registered under
-  the called name and is that tool's own `module:qualname`, and refuses the call
-  otherwise. To check an entry that is not the registered tool's, the
-  dispatcher imports the module it names, which runs that module's top-level
-  code (any module importable on the worker) before the call is refused; a tool
-  name that import overwrites is put back. The engine also matches each call on the handler its entry names
+  tool the model chose. The run's `tools` map can choose only among `@tool`s
+  named like the call: the dispatcher accepts an entry only when it names a
+  `@tool` registered under the called name and is that tool's own
+  `module:qualname`, and refuses the call otherwise. Such an entry may select a
+  same-named `@tool` from another importable module rather than the one the
+  worker registered first. That is not code the engine did not see: the engine
+  matches the call on the handler the entry names and binds that handler into a
+  per-call approval (`evaluate_dispatch` in `runtime/policy/src/dispatch.rs`,
+  and the bound calls in `runtime/workers/src/dispatch_guard.rs`), so policy and
+  the approval both see the code that runs. To check an entry, the dispatcher
+  may import the module it names, which runs that module's top-level code (any
+  module importable on the worker) before the call is refused; a tool name that
+  import overwrites is put back, and names it adds are removed if the entry is
+  refused. The engine also matches each call on the handler its entry names
   (as written, in dotted form, and by function name), binds the handler into a
   per-call approval (the listing shows it), and blocks the batch on an entry
   that is not a `module:function` string or whose path has a `_`-prefixed
