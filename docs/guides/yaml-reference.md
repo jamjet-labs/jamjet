@@ -194,6 +194,8 @@ agents:
             token_env: PARTNER_API_KEY
 ```
 
+`autonomy` and `constraints` mirror the Agent Card's fields. The runtime reads them from the card registered with `POST /agents`, not from this file, and enforces only some of them: see [What each constraint does](agent-model-guide.md#what-each-constraint-does).
+
 ---
 
 ## `models.yaml`

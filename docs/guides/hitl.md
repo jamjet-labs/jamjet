@@ -305,8 +305,10 @@ Limits worth knowing:
 - Deadlines are computed from the clock of the process that raised the
   request and checked against the clock of the one that sweeps or decides.
   Keep their clocks in sync.
-- A hold raised by an agent's autonomy limit, not by a policy, has no
-  deadline.
+- A hold raised by an agent card's `require_approval_for` takes the
+  deadline of the policy chain (tenant, workflow, node), like any other
+  request; a card has no deadline settings of its own. The autonomy path's
+  approval hold (guided mode) is not reachable today, so it raises none.
 
 ---
 

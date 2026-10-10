@@ -25,6 +25,18 @@ agents:
       require_approval_for: [publish, external_api_write]
 ```
 
+The runtime reads these settings from the Agent Card registered with `POST /agents` (`JamjetClient.register_agent` in the Python SDK), where they sit under `autonomy` and `constraints`. Nothing in this repository compiles an `agents.yaml` file into a card yet; the file above shows the card's fields.
+
+### What each constraint does
+
+| Constraint | Enforced | Where |
+|------------|----------|-------|
+| `allowed_tools`, `blocked_tools`, `require_approval_for` | Yes | Every node that acts for the agent (`agent_ref`), on the HTTP claim route, the in-process worker and the completion gate. See below. |
+| `allowed_delegations` | Yes | Same nodes: `agent`, `agent_tool` and `a2a_task` targets. See below. |
+| `token_budget`, `cost_budget_usd` | Partly | Only for a `bounded_autonomous` card, only on an `agent` node that calls it (the card of the agent being called, not `agent_ref`), and only in the in-process worker, not on the claim route. Compared with the run's accumulated token and cost totals; at or over the limit the node does not run and `autonomy_limit_reached` and `escalation_required` events are recorded (see Budget Enforcement below). |
+| `max_iterations`, `max_tool_calls` | No, in effect | Read in the same place as the budgets, but compared with counters the runtime never increments, so a limit above 0 never trips (a limit of 0 always does). |
+| `time_budget_secs` | No | Stored, never read. |
+
 ### Enforcing `allowed_tools`
 
 The runtime holds a node to an agent's `allowed_tools` when the node acts for that agent: the workflow IR's top-level `agent_ref`, or a node's own `agent_ref`, names the card's `uri`. A node acting for two agents must be on both lists.
@@ -51,12 +63,14 @@ From the Python SDK, `Agent("researcher", ..., agent_ref="jamjet://acme/research
 
 ## Autonomy Levels
 
-| Level | What it means |
-|-------|--------------|
-| `deterministic` | Follows the workflow graph exactly — no self-direction |
-| `guided` | Follows the graph, but chooses how to approach each node (default) |
-| `bounded_autonomous` | Self-directs within iteration, token, and cost budgets |
-| `fully_autonomous` | Operates freely within guardrails — requires explicit policy approval |
+| Level | What it means | What the runtime enforces for it |
+|-------|--------------|------|
+| `deterministic` | Follows the workflow graph exactly, no self-direction | Nothing beyond the card's tool and delegation lists |
+| `guided` | Follows the graph, but chooses how to approach each node (default) | Nothing beyond the card's tool and delegation lists |
+| `bounded_autonomous` | Self-directs within iteration, token, and cost budgets | The token and cost budgets, as described in the table above |
+| `fully_autonomous` | Operates freely within guardrails | Nothing beyond the card's tool and delegation lists |
+
+The tool and delegation lists apply at every level. A circuit breaker for repeated errors is defined for every level, but the runtime does not count consecutive errors, so it never trips.
 
 ---
 
@@ -117,9 +131,8 @@ When an `agent` node runs, JamJet invokes the referenced agent with the given in
 
 ## Budget Enforcement
 
-When a `bounded_autonomous` agent hits a budget limit:
-1. A `budget_exceeded` event is emitted
-2. The workflow routes to the configured escalation handler:
-   - `human_approval` node — a human decides what to do
-   - supervisor agent node — a supervisor agent takes over
-   - `fail` — the workflow fails with a clear error
+When an `agent` node calls a `bounded_autonomous` agent whose card's `token_budget` or `cost_budget_usd` the run has already reached (in-process worker only):
+1. `autonomy_limit_reached` and `escalation_required` (target `human_approval`) events are recorded
+2. The node does not run. The worker leaves the item to its lease, so it is retried, and refused again, until its attempts run out. Nothing routes to a human or a supervisor agent automatically.
+
+A workflow-level `token_budget` or `cost_budget_usd` in the IR is a separate check that applies to every node.

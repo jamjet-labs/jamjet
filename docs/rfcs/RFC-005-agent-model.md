@@ -76,11 +76,13 @@ interface AutonomyConstraints {
   cost_budget_usd?: number;
   allowed_tools?: string[];       // glob patterns
   blocked_tools?: string[];       // glob patterns
-  allowed_delegations?: string[]; // agent ids
+  allowed_delegations?: string[]; // glob patterns over delegation targets
   require_approval_for?: string[];
   time_budget?: Duration;
 }
 ```
+
+Implementation status (2026-10): the card stores `time_budget` as `time_budget_secs`. Which constraints the runtime enforces, and where, is listed in the [Agent Model Guide](../guides/agent-model-guide.md#what-each-constraint-does).
 
 ### 3. Agent Lifecycle
 

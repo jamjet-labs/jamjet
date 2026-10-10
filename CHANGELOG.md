@@ -352,6 +352,14 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     whoever registers workflows. Attribution does not carry into a subgraph's child
     workflow. In the Python SDK, `Agent(agent_ref=...)` and YAML `agent_ref:` (workflow)
     / `acts_for:` (node) set it.
+  - The docs now say what the rest of the card does, because several pages claimed more
+    than the runtime does: `token_budget` and `cost_budget_usd` are checked only for a
+    `bounded_autonomous` card on an `agent` node calling it, in the in-process worker;
+    `max_iterations` and `max_tool_calls` are compared with counters the runtime never
+    increments, so they do not trip; `time_budget_secs` is never read; the error circuit
+    breaker never trips; nothing routes an autonomy escalation to a human or a
+    supervisor; and no tool compiles an `agents.yaml` into a card. See "What each
+    constraint does" in docs/guides/agent-model-guide.md.
 
 - **The audit log can be signed with Ed25519, so a third party can verify it.** HMAC
   signing uses one shared key, so anyone who can verify the log can also forge it. With

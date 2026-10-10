@@ -103,4 +103,6 @@ A2A delegation is durable — JamJet tracks the remote task state and resumes co
 | `deterministic` | Strict graph execution — agent does exactly what the graph says |
 | `guided` | Agent follows the graph but chooses how to approach each step (default) |
 | `bounded_autonomous` | Agent can self-direct within budget/iteration constraints |
-| `fully_autonomous` | Agent operates freely within guardrails (requires explicit policy) |
+| `fully_autonomous` | Agent operates freely within guardrails |
+
+The level is a declaration. What the runtime enforces of it, and of the card's constraints, is listed in the [Agent Model Guide](agent-model-guide.md#what-each-constraint-does).
