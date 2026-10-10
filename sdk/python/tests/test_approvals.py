@@ -291,6 +291,36 @@ def test_approvals_names_the_calls_a_bound_dispatch_digest_covers() -> None:
     assert "step 1; calls: send_wire({})" in result.output
 
 
+def test_approvals_shows_the_handler_a_call_resolves_to() -> None:
+    """A dispatch call named `lookup` can resolve to other code through the
+    run's tools map; the reviewer must see which."""
+    pending = [
+        {
+            "node_id": "agent",
+            "tool_name": "lookup",
+            "approver": "human",
+            "context": {
+                "calls_hash": "h-1",
+                "action_digest": DIGEST,
+                "action_basis": {
+                    "payload": {"calls": [{"name": "lookup", "arguments": {}, "handler": "bank.wires:send_wire"}]},
+                    "payload_truncated": False,
+                    "payload_bytes": 80,
+                    "step": 0,
+                },
+            },
+            "sequence": 5,
+        }
+    ]
+    fake = _approvals_client(pending, [])
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
+    assert result.exit_code == 0, result.output
+    assert "calls: lookup -> bank.wires:send_wire({})" in result.output
+
+
 def test_approvals_escapes_control_characters_from_the_run() -> None:
     """Node ids, tool names, input keys and values come from whoever started the
     run. Printed raw, an ESC sequence could erase or rewrite the reviewer's

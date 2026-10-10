@@ -17,6 +17,11 @@ use serde_json::Value;
 pub struct PendingToolCall {
     pub name: String,
     pub arguments: Value,
+    /// The `module:function` the dispatcher will import for this call: the
+    /// run's `tools[name]` entry. `None` when the map has no entry, in which
+    /// case the dispatcher resolves the name through its `@tool` registry and
+    /// the name is the call's identity.
+    pub handler: Option<String>,
 }
 
 /// The longest tool name that may reach the matcher.
@@ -62,6 +67,32 @@ pub enum UnreadableCalls {
     NameTooLong,
     /// The call list holds more than [`MAX_PENDING_CALLS`] entries.
     TooManyCalls,
+    /// `tools`, the map the dispatcher resolves call names through, is present
+    /// but not a JSON object.
+    ToolsMapNotAnObject,
+    /// A called tool's `tools` entry is not a readable `module:function`
+    /// string (or exceeds [`MAX_TOOL_NAME_LEN`]), so the code it would run
+    /// cannot be named.
+    UnresolvableHandler,
+}
+
+/// The last segment of a `module:function.attr` reference's function path:
+/// `send_wire` for `bank.wires:send_wire`, `send` for `payments:transfer.send`.
+fn handler_function_name(handler: &str) -> &str {
+    let function = handler.split_once(':').map_or(handler, |(_, f)| f);
+    function.rsplit('.').next().unwrap_or(function)
+}
+
+/// The `module:function` a `tools` map entry names, if it is a well-formed
+/// reference: a string with a non-empty module and function, within the
+/// length bound.
+fn handler_ref(entry: &Value) -> Option<String> {
+    let s = entry.as_str()?;
+    if s.chars().count() > MAX_TOOL_NAME_LEN {
+        return None;
+    }
+    let (module, function) = s.split_once(':')?;
+    (!module.is_empty() && !function.is_empty()).then(|| s.to_string())
 }
 
 /// Read the tool calls a marked agent-dispatch node will execute from its
@@ -95,6 +126,15 @@ pub fn read_pending_tool_calls(input: &Value) -> Result<Vec<PendingToolCall>, Un
     };
 
     let arr = raw.as_array().ok_or(UnreadableCalls::NotAList)?;
+
+    // The map the dispatcher resolves call names through
+    // (`tool_runtime._resolve_tool`). Absent or null: every call resolves
+    // through the registry by name.
+    let tools = match obj.get("tools") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(map)) => Some(map),
+        Some(_) => return Err(UnreadableCalls::ToolsMapNotAnObject),
+    };
     // Bound the batch before reading it, so an oversized list cannot force an
     // unbounded number of glob evaluations downstream.
     if arr.len() > MAX_PENDING_CALLS {
@@ -116,9 +156,17 @@ pub fn read_pending_tool_calls(input: &Value) -> Result<Vec<PendingToolCall>, Un
         if name.chars().count() > MAX_TOOL_NAME_LEN {
             return Err(UnreadableCalls::NameTooLong);
         }
+        let handler = match tools.and_then(|t| t.get(name)) {
+            None => None,
+            Some(entry) => Some(handler_ref(entry).ok_or(UnreadableCalls::UnresolvableHandler)?),
+        };
         let name = name.to_string();
         let arguments = call.get("arguments").cloned().unwrap_or(Value::Null);
-        out.push(PendingToolCall { name, arguments });
+        out.push(PendingToolCall {
+            name,
+            arguments,
+            handler,
+        });
     }
     Ok(out)
 }
@@ -173,18 +221,54 @@ pub fn evaluate_dispatch(
             tool_name: Some(call.name.clone()),
             model_ref: None,
         };
-        match ev.evaluate(&ctx, policy_sets) {
-            PolicyDecision::Block { reason } => {
-                return DispatchDecision::Block {
-                    tool_name: call.name.clone(),
-                    reason,
+        // The code the call resolves to, when the run's `tools` map names it.
+        // A call is matched on its name AND on that handler: the name alone
+        // let a blocked tool run under another name.
+        // Two names for it: the reference itself (literal and canonical
+        // dotted form) and its function's own name, which is what a registry
+        // tool is called by default, so `["send_wire"]` catches a call that
+        // resolves to `bank.wires:send_wire` whatever the call is named.
+        let mut handler_ctxs: Vec<EvaluationContext> = Vec::new();
+        if let Some(h) = &call.handler {
+            handler_ctxs.push(EvaluationContext {
+                node_id: node_id.to_string(),
+                node_kind_tag: crate::PYTHON_REF_TAG.to_string(),
+                tool_name: Some(h.clone()),
+                model_ref: None,
+            });
+            handler_ctxs.push(EvaluationContext {
+                node_id: node_id.to_string(),
+                node_kind_tag: "tool".to_string(),
+                tool_name: Some(handler_function_name(h).to_string()),
+                model_ref: None,
+            });
+        }
+        let decisions = std::iter::once((call.name.clone(), ev.evaluate(&ctx, policy_sets))).chain(
+            handler_ctxs.iter().map(|h| {
+                (
+                    h.tool_name.clone().unwrap_or_default(),
+                    ev.evaluate(h, policy_sets),
+                )
+            }),
+        );
+        let mut needs_approval = None;
+        for (matched, decision) in decisions {
+            match decision {
+                PolicyDecision::Block { reason } => {
+                    return DispatchDecision::Block {
+                        tool_name: matched,
+                        reason,
+                    }
                 }
+                PolicyDecision::RequireApproval { approver: a } => {
+                    needs_approval.get_or_insert(a);
+                }
+                PolicyDecision::Allow => {}
             }
-            PolicyDecision::RequireApproval { approver: a } => {
-                gated.push(call.name.clone());
-                approver.get_or_insert(a);
-            }
-            PolicyDecision::Allow => {}
+        }
+        if let Some(a) = needs_approval {
+            gated.push(call.name.clone());
+            approver.get_or_insert(a);
         }
     }
 
@@ -218,6 +302,7 @@ mod tests {
             .map(|n| PendingToolCall {
                 name: n.to_string(),
                 arguments: json!({}),
+                handler: None,
             })
             .collect()
     }

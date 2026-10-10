@@ -285,7 +285,8 @@ pub(crate) async fn guard_dispatch_in(
             // (approval-loop hardening: decision not bound to resolved params).
             //
             // COVERAGE: the bound material is `name` + `arguments` per call, in
-            // order, and nothing else. Every other field a producer may carry on
+            // order, plus the `handler` a call resolves to through the run's
+            // `tools` map when it has one, and nothing else. Every other field a producer may carry on
             // a raw call — `id` above all, plus any provider-specific extras —
             // is deliberately UNBOUND, so a re-fire that differs only in call id
             // still matches the approval. Widening this to the raw call objects
@@ -293,7 +294,13 @@ pub(crate) async fn guard_dispatch_in(
             // would make benign re-issues fail the check.
             let calls_json = serde_json::json!(calls
                 .iter()
-                .map(|c| serde_json::json!({"name": c.name, "arguments": c.arguments}))
+                .map(|c| match &c.handler {
+                    // The resolved handler is bound too: the same name and
+                    // arguments can run different code through the map.
+                    Some(h) =>
+                        serde_json::json!({"name": c.name, "arguments": c.arguments, "handler": h}),
+                    None => serde_json::json!({"name": c.name, "arguments": c.arguments}),
+                })
                 .collect::<Vec<_>>());
             let current_hash = content_hash(&calls_json);
 
@@ -527,6 +534,10 @@ fn unreadable_rule(cause: UnreadableCalls) -> String {
         UnreadableCalls::UnnamedCall => "a call has no readable name",
         UnreadableCalls::NameTooLong => "a call name exceeds the length bound",
         UnreadableCalls::TooManyCalls => "the call list exceeds the batch bound",
+        UnreadableCalls::ToolsMapNotAnObject => "the tools map is not an object",
+        UnreadableCalls::UnresolvableHandler => {
+            "a called tool's tools entry is not a module:function reference"
+        }
     };
     format!("{UNREADABLE}: {detail}")
 }

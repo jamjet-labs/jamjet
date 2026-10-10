@@ -147,8 +147,13 @@ relying on patterns alone.
   with `agent_tool_dispatch: true`) is checked on its own names first: a gate
   there holds the node with an approval of its full payload, which covers the
   calls in it, even when there are no calls. Then each call is matched on the
-  tool the model chose; a blocked call is blocked even after the node was
-  approved. The `agent_tool_dispatch` flag is accepted only on the ADK
+  tool the model chose, and also on the code it resolves to: the dispatcher
+  imports `tools[name]` from the run's state when that entry exists, so a call
+  named `lookup` with `tools: {"lookup": "bank.wires:send_wire"}` is matched as
+  `bank.wires:send_wire` (and its dotted form) and as `send_wire`. A per-call
+  approval binds that resolved handler too, and the listing shows it. A `tools`
+  entry that is not a `module:function` string blocks the batch. A blocked call
+  is blocked even after the node was approved. The `agent_tool_dispatch` flag is accepted only on the ADK
   dispatcher; registering it on any other node is refused.
 - **A pattern binds a name, not code.** The node id and the handler reference
   are chosen by whoever writes the IR, and a function is reachable under other

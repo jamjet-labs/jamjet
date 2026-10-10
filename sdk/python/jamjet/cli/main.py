@@ -2593,8 +2593,15 @@ def _approval_binding(context: dict[str, Any]) -> str | None:
     return context.get("action_digest") or context.get("calls_hash")
 
 
+def _call_label(call: dict[str, Any]) -> str:
+    """A call's name, and the code it resolves to when the run's tools map names it."""
+    name = _safe(call.get("name", "?"))
+    handler = call.get("handler")
+    return f"{name} -> {_safe(handler)}" if handler else name
+
+
 def _calls_summary(calls: list[Any]) -> str:
-    rendered = [f"{_safe(c.get('name', '?'))}({_short(c.get('arguments', {}))})" for c in calls if isinstance(c, dict)]
+    rendered = [f"{_call_label(c)}({_short(c.get('arguments', {}))})" for c in calls if isinstance(c, dict)]
     line = ", ".join(rendered) or "(none)"
     return line if len(line) <= 240 else line[:239] + "…"
 

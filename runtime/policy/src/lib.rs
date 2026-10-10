@@ -44,6 +44,12 @@ pub struct EvaluationContext {
 /// the node id is a policy name too.
 pub const FUNCTION_KIND_TAGS: &[&str] = &["python_fn", "java_fn", "external_fn"];
 
+/// The evaluation tag for a Python `module:function` reference that is not a
+/// node: the handler an agent tool call resolves to through the run's `tools`
+/// map. Matched like a `python_fn` handler (literal and canonical dotted form),
+/// but with no node id as a second name.
+pub const PYTHON_REF_TAG: &str = "python_ref";
+
 impl EvaluationContext {
     /// Every name `blocked_tools` and `require_approval_for` patterns are
     /// matched against: the tool name, and for code-backed kinds
@@ -71,7 +77,7 @@ impl EvaluationContext {
     pub fn canonical_handler(&self) -> Option<String> {
         let name = self.tool_name.as_deref()?;
         match self.node_kind_tag.as_str() {
-            "python_fn" => Some(name.replace(':', ".")),
+            "python_fn" | PYTHON_REF_TAG => Some(name.replace(':', ".")),
             "java_fn" => Some(name.replace('/', ".")),
             _ => None,
         }

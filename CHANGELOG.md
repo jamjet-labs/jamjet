@@ -34,6 +34,13 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     completed and is dispatched again with the same calls asks again instead of
     firing on the first approval. A dispatch approval from before this release
     (bound to `calls_hash` only) authorises nothing by itself; the node asks again.
+  - Agent tool calls are matched on the code they resolve to. The ADK dispatcher
+    imports a call's handler from the run's `tools` map when it has an entry, and
+    the run's state is the initiator's to seed, so per-call policy that matched
+    only the call's name let a blocked tool run under another name. A call is now
+    matched on its name, on its resolved `module:function` (and dotted form) and on
+    that function's own name; a per-call approval binds the handler, and a `tools`
+    entry that is not a `module:function` string blocks the batch.
   - A decision carrying a `state_patch` is refused with 400. The edit never reached
     the executed action, so recording it was a false record.
   - The worker protocol evaluates the same policy and approval rules as the
