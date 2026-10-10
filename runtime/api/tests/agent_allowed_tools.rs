@@ -216,7 +216,9 @@ async fn run(
             )
             .with_agents(state.agents.clone())
             .register_executor("mcp_tool", Arc::new(exec.clone()))
-            .register_executor("python_fn", Arc::new(exec.clone()));
+            .register_executor("python_fn", Arc::new(exec.clone()))
+            .register_executor("agent_tool", Arc::new(exec.clone()))
+            .register_executor("coordinator", Arc::new(exec.clone()));
             let _ = worker.poll_and_execute().await;
             exec.0.load(Ordering::SeqCst) > 0
         }
@@ -745,5 +747,157 @@ async fn an_unlisted_finalizer_tool_is_refused() {
     .await
     {
         assert_refused(&o, "send_wire", &ctx);
+    }
+}
+
+fn agent_tool(target: Value) -> Value {
+    json!({ "type": "agent_tool", "agent": target, "output_key": "o", "timeout_ms": null, "budget": null })
+}
+
+/// An `agent_tool` node calls another agent as a tool: it is matched on the
+/// agent it names (review I1).
+#[tokio::test]
+async fn an_unlisted_agent_tool_is_refused() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card(AGENT, &["search_*"])],
+            ir(
+                &wf,
+                agent_tool(json!({ "explicit": "https://evil.example/wire-agent" })),
+                Some(AGENT),
+                None,
+                None,
+            ),
+            json!({}),
+        )
+    })
+    .await
+    {
+        assert_refused(&o, "https://evil.example/wire-agent", &ctx);
+    }
+}
+
+/// Control: a listed agent runs.
+#[tokio::test]
+async fn a_listed_agent_tool_runs() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card(AGENT, &["https://ok.example/*"])],
+            ir(
+                &wf,
+                agent_tool(json!({ "explicit": "https://ok.example/search-agent" })),
+                Some(AGENT),
+                None,
+                None,
+            ),
+            json!({}),
+        )
+    })
+    .await
+    {
+        assert!(o.ran, "{ctx}: {:?}", o.violations);
+    }
+}
+
+/// A node that picks what to call at run time has no name to check, so a
+/// restricted agent cannot run it.
+#[tokio::test]
+async fn a_coordinator_under_a_list_is_refused() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card(AGENT, &["search_*"])],
+            ir(
+                &wf,
+                json!({ "type": "coordinator", "task": "t", "required_skills": [], "output_key": "o" }),
+                Some(AGENT),
+                None,
+                None,
+            ),
+            json!({}),
+        )
+    })
+    .await
+    {
+        assert_refused(&o, "coordinator", &ctx);
+    }
+}
+
+/// A name pattern does not reach across a module path (review M1): under
+/// `read_*`, a call named `read_doc` that resolves to
+/// `read_utils:delete_everything` is refused, and one that resolves to a
+/// function named `read_doc` runs.
+#[tokio::test]
+async fn a_name_pattern_does_not_cross_a_module_path() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card(AGENT, &["read_*"])],
+            ir(&wf, adk_dispatch(), Some(AGENT), None, None),
+            calls(&[("read_doc", Some("read_utils:delete_everything"))]),
+        )
+    })
+    .await
+    {
+        assert_refused(&o, "read_utils:delete_everything", &ctx);
+    }
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card(AGENT, &["read_*"])],
+            ir(&wf, adk_dispatch(), Some(AGENT), None, None),
+            calls(&[("read_doc", Some("app.tools:read_doc"))]),
+        )
+    })
+    .await
+    {
+        assert!(o.ran, "{ctx}: {:?}", o.violations);
+    }
+}
+
+/// The completion gate checks a dispatch node's calls too (review T3).
+#[tokio::test]
+async fn a_result_for_an_unlisted_dispatch_call_is_not_recorded() {
+    for tb in support::backends().await {
+        let state = state_for(&tb).await;
+        let (st, _) = support::post(&state, "/agents", card(AGENT, &["search_web"])).await;
+        assert!(st.is_success());
+        let eid = support::register_and_start(
+            &state,
+            ir(
+                "wf-complete-dispatch",
+                adk_dispatch(),
+                Some(AGENT),
+                None,
+                None,
+            ),
+            calls(&[("send_wire", Some("bank.wires:send_wire"))]),
+        )
+        .await;
+        let item = tb
+            .dyn_backend()
+            .claim_work_item_with_lease("in-process", &["python_tool"], None)
+            .await
+            .unwrap()
+            .expect("the start item");
+        let (st, body) = support::post(
+            &state,
+            &format!("/work-items/{}/complete", item.id),
+            json!({ "output": {}, "state_patch": {}, "lease_fence": item.lease_fence }),
+        )
+        .await;
+        assert_eq!(
+            st,
+            axum::http::StatusCode::CONFLICT,
+            "{}: {body}",
+            tb.name()
+        );
+        let eid =
+            ExecutionId(uuid::Uuid::parse_str(eid.strip_prefix("exec_").unwrap_or(&eid)).unwrap());
+        let events = tb.dyn_backend().get_events(&eid).await.unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::NodeCompleted { .. })),
+            "{}",
+            tb.name()
+        );
     }
 }

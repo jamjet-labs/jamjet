@@ -22,43 +22,84 @@
 //!   run any code.
 //! - An agent tool dispatch call has two identities, the name the model
 //!   called and the code its `tools` entry resolves to. Both must be allowed.
-//!   The code is allowed if a pattern matches the handler reference or that
-//!   function's own name (the name a `@tool` gets by default), so
+//!   The code is allowed if a path pattern matches the handler reference or a
+//!   bare name pattern matches that function's own name (the name a `@tool`
+//!   gets by default; a bare name never reaches across a module path), so
 //!   `["search_web"]` allows a tool `search_web` whose function is
 //!   `app.tools:search_web`, and refuses a call named `search_web` whose entry
 //!   resolves to `bank.wires:send_wire`.
 //! - A node with no tool name (a model, a condition) is not a tool use, and the
 //!   list does not apply to it.
 
-use crate::dispatch::{handler_function_name, PendingToolCall};
-use crate::{glob_match, EvaluationContext, PYTHON_REF_TAG};
+use crate::dispatch::PendingToolCall;
+use crate::{glob_match, EvaluationContext, FUNCTION_KIND_TAGS, PYTHON_REF_TAG};
+
+/// Kinds that run something they choose at run time (a coordinator, agent
+/// discovery, an `auto` agent tool). There is no name to check, so a
+/// restricted agent cannot run them.
+pub const RUN_TIME_TARGET_TAGS: &[&str] = &["coordinator", "agent_discovery", "agent_tool"];
 
 /// Whether `name` is matched by one of `patterns`, as written.
 fn listed(patterns: &[String], name: &str) -> bool {
     patterns.iter().any(|p| glob_match(p, name))
 }
 
+/// A pattern that names a path (`app.tools:*`, `bank.wires.send_wire`,
+/// `Payments/transfer`) rather than a bare name.
+fn is_path_pattern(pattern: &str) -> bool {
+    pattern.contains([':', '.', '/'])
+}
+
+/// The function's own name at the end of a handler reference.
+fn function_name(handler: &str) -> &str {
+    handler.rsplit([':', '.', '/']).next().unwrap_or(handler)
+}
+
+/// Whether a handler reference (code-backed node or resolved call) is on the
+/// list. A path pattern is matched against the reference as written and in
+/// canonical dotted form; a bare name pattern only against the function's own
+/// name, so `read_*` cannot reach across a module path to
+/// `read_utils:delete_everything`.
+fn handler_listed(ctx: &EvaluationContext, handler: &str, allowed: &[String]) -> bool {
+    let canonical = ctx.canonical_handler();
+    allowed.iter().any(|p| {
+        if is_path_pattern(p) {
+            glob_match(p, handler)
+                || canonical
+                    .as_deref()
+                    .is_some_and(|c| glob_match(&crate::canonical_pattern(p), c))
+        } else {
+            glob_match(p, function_name(handler))
+        }
+    })
+}
+
 /// Whether `ctx`'s tool may run under `allowed`. `Err` names the tool that is
-/// not on the list. An empty list and a node with no tool name are `Ok`.
+/// not on the list. An empty list and a node with no tool name are `Ok`,
+/// except a node that picks its target at run time
+/// ([`RUN_TIME_TARGET_TAGS`]), which is refused under a list.
 pub fn node_allowed(ctx: &EvaluationContext, allowed: &[String]) -> Result<(), String> {
     if allowed.is_empty() {
         return Ok(());
     }
     let Some(name) = ctx.tool_name.as_deref() else {
+        if RUN_TIME_TARGET_TAGS.contains(&ctx.node_kind_tag.as_str()) {
+            return Err(format!("{} (target chosen at run time)", ctx.node_kind_tag));
+        }
         return Ok(());
     };
-    if listed(allowed, name) {
-        return Ok(());
+    let code = FUNCTION_KIND_TAGS.contains(&ctx.node_kind_tag.as_str())
+        || ctx.node_kind_tag == PYTHON_REF_TAG;
+    let ok = if code {
+        handler_listed(ctx, name, allowed)
+    } else {
+        listed(allowed, name)
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(name.to_string())
     }
-    if let Some(canonical) = ctx.canonical_handler() {
-        if allowed
-            .iter()
-            .any(|p| glob_match(&crate::canonical_pattern(p), &canonical))
-        {
-            return Ok(());
-        }
-    }
-    Err(name.to_string())
 }
 
 /// Why a dispatch call is not on the list.
@@ -89,7 +130,7 @@ pub fn call_allowed(call: &PendingToolCall, allowed: &[String]) -> Result<(), Ca
         tool_name: Some(handler.clone()),
         model_ref: None,
     };
-    if node_allowed(&as_ref, allowed).is_ok() || listed(allowed, handler_function_name(handler)) {
+    if handler_listed(&as_ref, handler, allowed) {
         return Ok(());
     }
     Err(CallRefused::Handler {
@@ -191,6 +232,45 @@ mod tests {
             ),
             Err(CallRefused::Name("send_wire".into()))
         );
+    }
+
+    #[test]
+    fn a_name_pattern_matches_a_function_name_not_a_path() {
+        let allowed = list(&["read_*"]);
+        assert!(call_allowed(
+            &call("read_doc", Some("read_utils:delete_everything")),
+            &allowed
+        )
+        .is_err());
+        assert!(call_allowed(&call("read_doc", Some("app.tools:read_doc")), &allowed).is_ok());
+        for kind in [
+            ("python_fn", "read_utils:delete_everything"),
+            ("java_fn", "read_utils.Admin/deleteAll"),
+            ("external_fn", "read_q/delete_everything"),
+        ] {
+            assert!(
+                node_allowed(&ctx(kind.0, "n", Some(kind.1)), &allowed).is_err(),
+                "{kind:?}"
+            );
+        }
+        assert!(node_allowed(&ctx("python_fn", "n", Some("app.tools:read_doc")), &allowed).is_ok());
+        // A path pattern still names the path.
+        assert!(node_allowed(
+            &ctx("python_fn", "n", Some("read_utils:delete_everything")),
+            &list(&["read_utils:*"])
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_node_that_picks_its_target_at_run_time_is_refused() {
+        for tag in ["coordinator", "agent_discovery", "agent_tool"] {
+            assert!(
+                node_allowed(&ctx(tag, "n", None), &list(&["*"])).is_err(),
+                "{tag}"
+            );
+            assert!(node_allowed(&ctx(tag, "n", None), &[]).is_ok(), "{tag}");
+        }
     }
 
     #[test]

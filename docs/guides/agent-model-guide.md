@@ -37,8 +37,9 @@ The runtime holds a node to an agent's `allowed_tools` when the node acts for th
 }
 ```
 
-- Matched: an `mcp_tool`, `tool` or `finalizer` node's tool, an `a2a_task` skill, an `agent` node's agent, a function node's handler (`module:function`, never its node id). Model and condition nodes are not tool uses.
-- ADK tool calls: each call's name and the code it resolves to must both be listed. The code is matched by `module:function` or by the function's name, so a tool keeps working with just its name unless it is registered under a name different from its function's.
+- Matched: an `mcp_tool`, `tool` or `finalizer` node's tool, an `a2a_task` skill, an `agent` node's agent, an `agent_tool` node's explicit agent, a function node's handler (`module:function`, never its node id). Nodes that choose their target at run time (`coordinator`, `agent_discovery`, an `auto` agent tool) are refused under a list. Model and condition nodes are not tool uses.
+- ADK tool calls: each call's name and the code it resolves to must both be listed. A path pattern (`app.tools:*`) matches the code's `module:function`; a bare name pattern matches only the function's own name. A tool keeps working with just its name unless it is registered under a name different from its function's. The code is known only when the run's `tools` map has an entry for the call; without one, the call is matched on its name.
+- The agent's status is not consulted, and cards are global: the first card registered at a URI is the one enforced.
 - An absent or empty list restricts nothing. To refuse every tool, use a policy `blocked_tools: ["*"]`.
 - Policy still applies on top: a tool on the list can still be blocked or approval-gated.
 - Not enforced yet: the card's `blocked_tools`, `require_approval_for` and `allowed_delegations`. Use policy for the first two.

@@ -270,3 +270,14 @@ fn a_finalizer_node_is_named_by_its_tool() {
         Some("send_wire")
     );
 }
+
+/// An `agent_tool` node with an explicit target is named by that agent.
+#[test]
+fn an_agent_tool_node_is_named_by_its_agent() {
+    let at: NodeKind = serde_json::from_value(serde_json::json!({
+        "type": "agent_tool", "agent": { "explicit": "https://x.example/wire" },
+        "output_key": "o", "timeout_ms": null, "budget": null
+    }))
+    .unwrap();
+    assert!(blocked(&decide("x", &at, &block(&["https://x.example/*"]))));
+}

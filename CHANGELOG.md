@@ -296,14 +296,20 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   completion gate) refuses any node whose tool is not on that agent's list. The refusal
   is a `PolicyViolation` with scope `agent` and a rule starting `agent allowed_tools`,
   and the node fails like any other policy block.
-  - What is matched: an `mcp_tool` node's tool, a `tool` node's tool, an `a2a_task`
-    skill, an `agent` node's agent, a function node's handler (as written or in dotted
-    form, never its node id). For an ADK agent's tool dispatch, each call's name and
-    the code its `tools` entry resolves to must both be on the list; the code is
-    matched by its `module:function` or the function's own name, so `["search_web"]`
-    allows the compiler's `search_web -> app.tools:search_web` and refuses a call named
-    `search_web` that resolves to anything else. A tool registered under a custom name
-    needs its function listed too. Model and condition nodes are not tool uses.
+  - What is matched: an `mcp_tool`, `tool` or `finalizer` node's tool, an `a2a_task`
+    skill, an `agent` node's agent, an `agent_tool` node's explicit agent, and a
+    function node's handler, never its node id. For an ADK agent's tool dispatch, each
+    call's name and the code its `tools` entry resolves to must both be on the list. A
+    pattern with a path in it (`app.tools:*`, `bank.wires.send_wire`) is matched against
+    the handler as written and in dotted form; a bare name pattern only against the
+    function's own name, so `read_*` does not reach `read_utils:delete_everything`.
+    `["search_web"]` allows the compiler's `search_web -> app.tools:search_web` and
+    refuses a call named `search_web` whose code is a function with another name. A
+    tool registered under a custom name needs its function listed too, but only while
+    the run's `tools` map has an entry for it: whoever starts the run seeds that map,
+    and a call with no entry is matched on its name alone. Nodes that choose their
+    target at run time (`coordinator`, `agent_discovery`, an `auto` agent tool) are
+    refused under a list. Model and condition nodes are not tool uses.
   - A `finalizer` node is now named by its `tool_ref`, for policy too: it runs that
     tool, and had no name, so neither `blocked_tools` nor `require_approval_for` could
     match it.
@@ -324,6 +330,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     shadow the one that restricts a node.
   - Not enforced yet: the card's own `blocked_tools`, `require_approval_for` and
     `allowed_delegations`. Use policy `blocked_tools` and `require_approval_for`.
+  - Known limits: the agent's status is not consulted (a deactivated agent's nodes run
+    under its list). Cards are global, not per tenant, and the first card registered at
+    a URI wins, including one registered through `POST /agents/discover`; this engine
+    accepts only the `default` tenant, so whoever can register agents is as trusted as
+    whoever registers workflows. Attribution does not carry into a subgraph's child
+    workflow. The Python SDK has no option to set `agent_ref` yet.
 
 - **The audit log can be signed with Ed25519, so a third party can verify it.** HMAC
   signing uses one shared key, so anyone who can verify the log can also forge it. With
