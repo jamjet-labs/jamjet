@@ -1709,6 +1709,7 @@ async fn gate_claimed_item(
             remote_agents: Some(&remote_agents),
             registry: Some(agents),
         },
+        Some(wi.id),
     )
     .await
     {
@@ -1882,6 +1883,7 @@ async fn completion_gate(
             remote_agents: Some(&remote_agents),
             registry: Some(agents),
         },
+        Some(wi.id),
     )
     .await
     {
@@ -2017,6 +2019,10 @@ struct CompleteWorkItemRequest {
     /// Finish reason (e.g. "stop", "length", "tool_calls").
     #[serde(default)]
     finish_reason: Option<String>,
+    /// Estimated USD cost of this node, as the worker reports it. Counted
+    /// toward an agent card's `cost_budget_usd`.
+    #[serde(default)]
+    cost_usd: Option<f64>,
 }
 
 /// `POST /work-items/:id/complete` — mark a work item as completed and emit NodeCompleted event.
@@ -2081,6 +2087,14 @@ async fn complete_work_item(
     // write. The budget enforcer reads them back, and the approval digest
     // leaves them out as engine-written, so a reported value would be a budget
     // reset and a change to later nodes' input that no approval covers.
+    // A reported cost is summed into agent cost budgets, so it must be a
+    // spend: a negative one would refund the budget.
+    if body.cost_usd.is_some_and(|c| !(c.is_finite() && c >= 0.0)) {
+        return Err(ApiError::BadRequest(
+            "cost_usd must be a non-negative number".to_string(),
+        ));
+    }
+
     let state_patch = jamjet_state::approvals::action_state(&body.state_patch);
     if state_patch != body.state_patch {
         warn!(work_item_id = %id, "complete: dropped engine bookkeeping keys from the reported state_patch");
@@ -2102,7 +2116,7 @@ async fn complete_work_item(
                 input_tokens: body.input_tokens,
                 output_tokens: body.output_tokens,
                 finish_reason: body.finish_reason.clone(),
-                cost_usd: None,
+                cost_usd: body.cost_usd,
                 provenance: None,
                 idempotency_key: derived_key.clone(),
             },

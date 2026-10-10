@@ -105,6 +105,33 @@ pub struct AutonomyConstraints {
     /// Operations that require explicit approval before execution.
     pub require_approval_for: Vec<String>,
     pub time_budget_secs: Option<u64>,
+    /// Consecutive failed steps of this agent before its circuit breaker
+    /// trips. Absent means [`DEFAULT_MAX_CONSECUTIVE_ERRORS`].
+    pub max_consecutive_errors: Option<u32>,
+    /// What happens when a limit is reached or the circuit breaker trips.
+    /// Absent means [`OnLimitExceeded::Fail`].
+    pub on_limit_exceeded: Option<OnLimitExceeded>,
+}
+
+/// The circuit breaker's threshold when a card sets none.
+pub const DEFAULT_MAX_CONSECUTIVE_ERRORS: u32 = 3;
+
+/// What the runtime does with a node that would take an agent past one of
+/// its limits (or past a tripped circuit breaker).
+///
+/// RFC-005 also names `escalate_to_supervisor`. Nothing implements it, so it
+/// is not accepted: a card that asks for it fails to register rather than
+/// being silently treated as `fail`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnLimitExceeded {
+    /// Refuse the node and fail it for good.
+    #[default]
+    Fail,
+    /// Hold the node for a human approval of that one step, through the
+    /// ordinary approval path (bound to the action, with the policy chain's
+    /// deadline). Every further step past the limit needs its own approval.
+    EscalateToHuman,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

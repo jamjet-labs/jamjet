@@ -103,7 +103,7 @@ agent:
 | `bounded_autonomous` | Self-directs within iteration, token, cost limits | Configurable |
 | `fully_autonomous` | Free operation with guardrails only | Requires explicit policy |
 
-What the runtime enforces of the level and its constraints is listed in the [Agent Model Guide](../guides/agent-model-guide.md#what-each-constraint-does). In short: a card's tool and delegation lists apply to every node that acts for the agent, at every level; for a `bounded_autonomous` card, an `agent` node calling it is refused (with `autonomy_limit_reached` and `escalation_required` events) once the run reaches the card's token or cost budget, in the in-process worker only. Iteration and tool-call limits are not counted, and nothing routes an escalation to a supervisor agent or a human approval node.
+What the runtime enforces of the level and its constraints is listed in the [Agent Model Guide](../guides/agent-model-guide.md#what-each-constraint-does). In short: a card's tool and delegation lists and its limits (iterations, tool calls, tokens, cost, time and consecutive errors) apply to every node that acts for the agent, at every level, on both worker transports, counted from the run's event log. On a limit the node fails, or, with `on_limit_exceeded: escalate_to_human`, is held for a human approval. Nothing routes an escalation to a supervisor agent.
 
 ---
 

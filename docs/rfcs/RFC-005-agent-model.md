@@ -82,7 +82,7 @@ interface AutonomyConstraints {
 }
 ```
 
-Implementation status (2026-10): the card stores `time_budget` as `time_budget_secs`. Which constraints the runtime enforces, and where, is listed in the [Agent Model Guide](../guides/agent-model-guide.md#what-each-constraint-does).
+Implementation status (2026-10): the card stores `time_budget` as `time_budget_secs`, and adds `max_consecutive_errors` (the circuit breaker's threshold, default 3) and `on_limit_exceeded` (`fail` or `escalate_to_human`). Which constraints the runtime enforces, and where, is listed in the [Agent Model Guide](../guides/agent-model-guide.md#what-each-constraint-does).
 
 ### 3. Agent Lifecycle
 
@@ -156,6 +156,8 @@ When any constraint is exceeded:
    - `escalate_to_human` — raises a human approval interrupt
    - `escalate_to_supervisor` — delegates to a configured supervisor agent
    - `fail` — marks the node/workflow as failed
+
+Implementation status (2026-10): the counts are folded from the run's event log per agent, not kept per execution, and the handler is the card's `on_limit_exceeded`. A node over a limit records `autonomy_limit_reached` or `circuit_breaker_tripped`; `fail` fails it, `escalate_to_human` holds it for an approval. `escalate_to_supervisor` is not implemented. See the [Agent Model Guide](../guides/agent-model-guide.md#autonomy-limits).
 
 ### 6. Hot Reload
 

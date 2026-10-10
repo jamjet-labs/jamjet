@@ -20,6 +20,9 @@ agents:
       max_tool_calls: 50
       token_budget: 100000
       cost_budget_usd: 5.00
+      time_budget_secs: 600
+      max_consecutive_errors: 3
+      on_limit_exceeded: escalate_to_human
       allowed_tools: [search_web, read_document, analyze_data]
       blocked_tools: ["delete_*", "write_to_production_*"]
       require_approval_for: [publish, external_api_write]
@@ -33,9 +36,8 @@ The runtime reads these settings from the Agent Card registered with `POST /agen
 |------------|----------|-------|
 | `allowed_tools`, `blocked_tools`, `require_approval_for` | Yes | Every node that acts for the agent (`agent_ref`), on the HTTP claim route, the in-process worker and the completion gate. See below. |
 | `allowed_delegations` | Yes | Same nodes: `agent`, `agent_tool` and `a2a_task` targets. See below. |
-| `token_budget`, `cost_budget_usd` | Partly | Only for a `bounded_autonomous` card, only on an `agent` node that calls it (the card named by that node's own `agent_ref` field, which says whom it calls, not the workflow's attribution), and only in the in-process worker, not on the claim route. Compared with the run's token and cost totals as the in-process worker accumulates them (results reported through the HTTP worker protocol add nothing); at or over the limit, or when the registry cannot be read, the node does not run and `autonomy_limit_reached` and `escalation_required` events are recorded (see Budget Enforcement below). |
-| `max_iterations`, `max_tool_calls` | No, in effect | Read in the same place as the budgets, but compared with counters the runtime never increments, so a limit above 0 never trips (a limit of 0 always does). |
-| `time_budget_secs` | No | Stored, never read. |
+| `max_iterations`, `max_tool_calls`, `token_budget`, `cost_budget_usd`, `time_budget_secs`, `max_consecutive_errors` | Yes | Every node that acts for the agent, and an `agent` node calling it, at every autonomy level, on the HTTP claim route and the in-process worker. Counted from the run's event log. See [Autonomy limits](#autonomy-limits). |
+| `on_limit_exceeded` | Yes | `fail` (default) or `escalate_to_human`. See [Autonomy limits](#autonomy-limits). |
 
 ### Enforcing `allowed_tools`
 
@@ -65,12 +67,12 @@ From the Python SDK, `Agent("researcher", ..., agent_ref="jamjet://acme/research
 
 | Level | What it means | What the runtime enforces for it |
 |-------|--------------|------|
-| `deterministic` | Follows the workflow graph exactly, no self-direction | Nothing beyond the card's tool and delegation lists |
-| `guided` | Follows the graph, but chooses how to approach each node (default) | Nothing beyond the card's tool and delegation lists |
-| `bounded_autonomous` | Self-directs within iteration, token, and cost budgets | The token and cost budgets, as described in the table above |
-| `fully_autonomous` | Operates freely within guardrails | Nothing beyond the card's tool and delegation lists |
+| `deterministic` | Follows the workflow graph exactly, no self-direction | The card's lists and limits |
+| `guided` | Follows the graph, but chooses how to approach each node (default) | The card's lists and limits |
+| `bounded_autonomous` | Self-directs within iteration, token, and cost budgets | The card's lists and limits |
+| `fully_autonomous` | Operates freely within guardrails | The card's lists and limits |
 
-The tool and delegation lists apply at every level. A circuit breaker for repeated errors is defined for every level, but the runtime does not count consecutive errors, so it never trips.
+The level does not change what is enforced: every level gets the tool and delegation lists and every limit the card declares, and the circuit breaker applies even to a card that declares no constraints. Guided mode does not hold every tool call for approval; name the tools in `require_approval_for` for that.
 
 ---
 
@@ -129,10 +131,29 @@ When an `agent` node runs, JamJet invokes the referenced agent with the given in
 
 ---
 
-## Budget Enforcement
+## Autonomy limits
 
-When an `agent` node calls a `bounded_autonomous` agent whose card's `token_budget` or `cost_budget_usd` the run has already reached (in-process worker only):
-1. `autonomy_limit_reached` and `escalation_required` (target `human_approval`) events are recorded
-2. The node does not run. The worker leaves the item to its lease, so it is retried, and refused again, until its attempts run out. Nothing routes to a human or a supervisor agent automatically.
+A node that acts for an agent (the workflow's `agent_ref`, or the node's own) is one step of that agent. So is an `agent` node, for the agent it calls; that agent's tool and delegation lists do not apply to the node, only its limits. When the runtime lets such a node fire, it records an `agent_step_admitted` event naming the agents and the tool calls the step makes. Every limit is checked before the step fires, against what the agent used in the run so far, all of it read from the run's event log:
+
+| Limit | What is counted | Refused when |
+|-------|-----------------|--------------|
+| `max_iterations` | Steps admitted, retries included | The agent has taken that many steps |
+| `max_tool_calls` | One per step whose node uses a tool (`tool`, `mcp_tool`, `finalizer`, `a2a_task`, `agent`, `agent_tool`, function nodes, and nodes that pick a target at run time), plus each call of an ADK dispatch batch. Model and condition steps count none | This step's calls would take the total past the limit (a step that makes no call is not limited) |
+| `token_budget` | `input_tokens + output_tokens` on the agent's completed steps | The total is at or over the budget |
+| `cost_budget_usd` | `cost_usd` on the agent's completed steps | The total is at or over the budget |
+| `time_budget_secs` | Wall-clock time since the agent's first step in the run | That long has passed |
+| `max_consecutive_errors` (default 3) | The agent's failed steps since its last completed step | That many in a row have failed |
+
+- Counted over the whole run: a continue-as-new segment and an engine restart keep the counts. A node's output or `state_patch` cannot change them.
+- A limit of 0 refuses the first step (for `time_budget_secs`, the second).
+- Token and cost totals grow only when a step reports. The step that crosses a budget is not refused (its usage is unknown until it finishes), so a total can end above the budget by that step's usage. A time budget is checked when a step starts; a running step is not interrupted.
+- Usage is what the step reports. The in-process model executor reports tokens. No executor in this runtime reports a cost, so cost is counted only when a worker reports `cost_usd` on `POST /work-items/:id/complete` (the Python worker forwards `input_tokens`, `output_tokens` and `cost_usd` from a node's output); with nothing reported, the cost total stays 0 and a budget above 0 never trips. A worker that under-reports, or reports a failed call as completed, is believed.
+- Only steps admitted while the guard records them count. A step running when the runtime is upgraded to this release has no record and adds nothing.
+- Two claims cannot both take the last step: the step is recorded in the same compare-and-set that checks the limits.
+- Over HTTP, a result for a node acting for an agent is recorded only for a work item the claim route admitted (409 otherwise).
+
+On a limit, with `on_limit_exceeded: fail` (the default), the node is refused and fails for good, which fails the run. The runtime records `autonomy_limit_reached` (`limit_type` is `max_iterations`, `max_tool_calls`, `token_budget`, `cost_budget` or `time_budget`) or `circuit_breaker_tripped`, and the node's `node_failed` error names the agent and the limit (it contains `agent autonomy`).
+
+With `on_limit_exceeded: escalate_to_human`, the node is held for an ordinary approval instead: the request is bound to the action like any other (the same digest), carries the policy chain's deadline, and shows the limit under `autonomy_limit` in its context. `autonomy_limit_reached` (or `circuit_breaker_tripped`) and `escalation_required` (target `human_approval`) are recorded. An approval releases that one step; the next step past the limit asks again. A rejection or an expired request fails the node. If a node acts for several agents and one card says `fail`, the node is refused. RFC-005's `escalate_to_supervisor` is not implemented, and a card that sets it is refused at registration.
 
 A workflow-level `token_budget` or `cost_budget_usd` in the IR is a separate check, made by the in-process worker for the nodes it runs; the HTTP claim route does not make it.

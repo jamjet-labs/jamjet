@@ -1395,6 +1395,7 @@ mod tests {
             &json!({ "input": input_for(&["send_wire"]) }),
             Some(&sealer),
             Default::default(),
+            None,
         )
         .await;
         assert!(

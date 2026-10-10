@@ -356,14 +356,47 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     whoever registers workflows. Attribution does not carry into a subgraph's child
     workflow. In the Python SDK, `Agent(agent_ref=...)` and YAML `agent_ref:` (workflow)
     / `acts_for:` (node) set it.
-  - The docs now say what the rest of the card does, because several pages claimed more
-    than the runtime does: `token_budget` and `cost_budget_usd` are checked only for a
-    `bounded_autonomous` card on an `agent` node calling it, in the in-process worker;
-    `max_iterations` and `max_tool_calls` are compared with counters the runtime never
-    increments, so a limit above 0 never trips (a limit of 0 always does); `time_budget_secs` is never read; the error circuit
-    breaker never trips; nothing routes an autonomy escalation to a human or a
-    supervisor; and no tool compiles an `agents.yaml` into a card. See "What each
-    constraint does" in docs/guides/agent-model-guide.md.
+  - The card's limits are enforced too: see the next entry.
+
+- **An agent's autonomy limits are enforced.** `max_iterations` and `max_tool_calls`
+  were compared with counters nothing incremented, `time_budget_secs` was never read,
+  the circuit breaker never tripped, and `token_budget` and `cost_budget_usd` were
+  checked only for a `bounded_autonomous` card on an `agent` node in the in-process
+  worker. Every limit is now checked at the shared guard, at every autonomy level, on
+  the HTTP claim route and the in-process worker, for every node acting for the agent
+  and for an `agent` node calling it.
+  - The counts come from the run's event log, not from in-memory or snapshot counters:
+    each admitted step is recorded as a new `agent_step_admitted` event (its agents and
+    tool calls), and tokens, cost and failures are read from the step's `node_completed`
+    / `node_failed`. They survive a restart and a continue-as-new rollover, and a node's
+    `state_patch` cannot reset them. The step is recorded in a compare-and-set that
+    re-checks the limits, so two claims cannot both take the last step.
+  - An iteration is a step: a node acting for the agent that was let fire, retries
+    included. A tool call is one per step whose node uses a tool, plus each call of an
+    ADK dispatch batch; model steps count none. The time budget runs from the agent's
+    first step in the run. The circuit breaker counts the agent's failed steps since its
+    last completed one (new card field `max_consecutive_errors`, default 3) and applies
+    even to a card with no constraints.
+  - On a limit the node is refused and fails for good, recording
+    `autonomy_limit_reached` or `circuit_breaker_tripped`. New card field
+    `on_limit_exceeded: escalate_to_human` holds the node for an ordinary approval
+    instead (same digest binding, the policy chain's deadline, the limit shown under
+    `autonomy_limit`), one approval per step past the limit. `escalate_to_supervisor`
+    is not implemented and a card that asks for it is refused.
+  - `POST /work-items/:id/complete` accepts `cost_usd` (a negative or non-finite one is
+    400), and records a result for a node acting for an agent only for an item the claim
+    route admitted (409 otherwise). The Python worker forwards `input_tokens`,
+    `output_tokens` and `cost_usd` from a node's output, and `JamjetClient.complete_work_item`
+    takes them. No executor in this runtime computes a cost, so a cost budget counts
+    only what workers report.
+  - Behaviour changes to plan for: a card that never tripped can now refuse nodes,
+    including through the default circuit breaker; an item claimed by an earlier build
+    for a node acting for an agent cannot be completed over HTTP (its lease lapses and
+    the node is claimed again); the worker no longer runs its own autonomy check, and
+    `BudgetState`'s iteration, tool call and error counters are documented as unused.
+    A build that predates this release reads `agent_step_admitted` as an unknown event
+    and stops advancing the run, so do not roll back past it on a store it has written.
+    See "Autonomy limits" in docs/guides/agent-model-guide.md.
 
 - **The audit log can be signed with Ed25519, so a third party can verify it.** HMAC
   signing uses one shared key, so anyone who can verify the log can also forge it. With

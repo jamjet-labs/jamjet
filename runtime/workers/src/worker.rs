@@ -9,10 +9,8 @@ use chrono::Utc;
 const MAX_RETRY_AFTER_SECS: u64 = 3_600;
 
 use jamjet_agents::AgentRegistry;
-use jamjet_core::node::NodeKind;
 use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::workflow::{NodeDef, WorkflowIr};
-use jamjet_policy::autonomy::{AutonomyContext, AutonomyDecision, AutonomyEnforcer};
 use jamjet_policy::engine::node_kind_tag;
 use jamjet_state::backend::{StateBackend, StateBackendError, WorkItem, WorkItemId};
 use jamjet_state::budget::BudgetState;
@@ -261,26 +259,6 @@ impl Worker {
                     // counters and buys one more call per segment (C2).
                     if let Some(r) = self
                         .check_budget_before_execution(&execution_id, &node_id, &ir, &budget)
-                        .await
-                    {
-                        heartbeat.abort();
-                        return r;
-                    }
-
-                    // Autonomy check.
-                    if let Some(r) = self
-                        .check_autonomy(
-                            &execution_id,
-                            item_id,
-                            lease_fence,
-                            attempt,
-                            &node_id,
-                            &tenant_id,
-                            node_def,
-                            &item.payload,
-                            kind,
-                            &budget,
-                        )
                         .await
                     {
                         heartbeat.abort();
@@ -728,73 +706,6 @@ impl Worker {
         Ok(())
     }
 
-    // ── Approval hold helper ──────────────────────────────────────────────────
-
-    /// Park a node pending human approval (or let it run if already approved).
-    ///
-    /// Consults the event log. The gate is satisfied, and the caller proceeds
-    /// to execute (`None`), only when the latest request was `Approved` AND the
-    /// approval's `approved_digest` equals the action digest computed NOW
-    /// (`approvals::derive_action_digest`: run, occurrence step, node,
-    /// definition, dispatched payload). An approval therefore covers exactly the action
-    /// that was reviewed: if the state changed after the decision, or this is a
-    /// later visit of the node (a loop or any re-enqueue), or the approval is a
-    /// legacy one with no digest, it does not cover this action, and the node
-    /// asks again with a fresh request, settled exactly like a first request.
-    ///
-    /// Otherwise ensure exactly one outstanding `ToolApprovalRequired` exists
-    /// and settle the work item cleanly so the lease never expires into the
-    /// retry/dead-letter path. The node stays parked because it remains in the
-    /// scheduler fold's `scheduled` set (so it is never re-dispatched); the
-    /// fold's `held` set only gates which decision events are acted on.
-    /// The helper requires the FULL event log because a partial fold could
-    /// misreport NotRequested for an already-approved node.
-    ///
-    /// Every read that the decision depends on fails CLOSED: an error means the
-    /// node does not run.
-    /// The decision itself is `node_guard::require_approval`, shared with the
-    /// HTTP claim route; this method only settles the item.
-    #[allow(clippy::too_many_arguments)]
-    async fn hold_for_approval(
-        &self,
-        execution_id: &ExecutionId,
-        node_id: &str,
-        node_def: &NodeDef,
-        payload: &serde_json::Value,
-        item_id: WorkItemId,
-        lease_fence: i64,
-        attempt: u32,
-        tool_name: String,
-        approver: String,
-        context: serde_json::Value,
-        tenant_id: &str,
-    ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-        // An autonomy hold is not raised by a policy, so it has no deadline.
-        let outcome = node_guard::require_approval(
-            self.backend.as_ref(),
-            execution_id,
-            node_id,
-            node_def,
-            payload,
-            tool_name,
-            approver,
-            context,
-            None,
-            tenant_id,
-            self.sealer.as_deref(),
-        )
-        .await;
-        self.settle_outcome(
-            execution_id,
-            node_id,
-            item_id,
-            lease_fence,
-            attempt,
-            outcome,
-        )
-        .await
-    }
-
     /// Turn a guard decision into the worker's lifecycle answer: `None` to run,
     /// `Some(Err)` to fail the attempt, `Some(Ok)` once the item is settled
     /// (held, or failed for good on a policy block).
@@ -1011,6 +922,7 @@ impl Worker {
                 remote_agents: Some(&ir.remote_agents),
                 registry: self.agents.as_deref(),
             },
+            Some(item_id),
         )
         .await;
         self.settle_outcome(
@@ -1022,187 +934,6 @@ impl Worker {
             outcome,
         )
         .await
-    }
-
-    // ── Autonomy check ────────────────────────────────────────────────────────
-
-    #[allow(clippy::too_many_arguments)]
-    async fn check_autonomy(
-        &self,
-        execution_id: &ExecutionId,
-        item_id: WorkItemId,
-        lease_fence: i64,
-        attempt: u32,
-        node_id: &str,
-        tenant_id: &str,
-        node_def: &NodeDef,
-        payload: &serde_json::Value,
-        kind: &NodeKind,
-        budget: &BudgetState,
-    ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-        let kind_tag = node_kind_tag(kind);
-        if kind_tag != "agent" {
-            return None;
-        }
-        let agents = self.agents.as_ref()?;
-
-        let agent_ref = serde_json::to_value(kind)
-            .ok()
-            .and_then(|v| {
-                v.get("agent_ref")
-                    .and_then(|a| a.as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| node_id.to_string());
-
-        // An unregistered callee has no card to enforce. An unreadable
-        // registry refuses: the item is left to its lease and retried, never
-        // run on a guess (the event appends below are best effort for the
-        // same reason, and never decide whether the node runs).
-        let agent = match agents.get_by_uri(&agent_ref).await {
-            Ok(Some(a)) => a,
-            Ok(None) => return None,
-            Err(e) => {
-                warn!(execution_id = %execution_id, node_id, %agent_ref, "agent registry unreadable; refusing the agent node");
-                return Some(Err(format!("agent registry unavailable: {e}").into()));
-            }
-        };
-        let card = agent.card;
-
-        let ctx = AutonomyContext {
-            agent_ref: agent_ref.clone(),
-            autonomy_level: card.autonomy.clone(),
-            constraints: card.constraints.clone(),
-            current_iterations: budget.iteration_count,
-            current_tool_calls: budget.tool_call_count,
-            current_cost_usd: budget.total_cost_usd,
-            current_tokens: budget.total_tokens(),
-            consecutive_errors: budget.consecutive_error_count,
-            circuit_breaker_threshold: 3,
-        };
-
-        let decision = AutonomyEnforcer.check(&ctx, None);
-
-        match decision {
-            AutonomyDecision::Proceed => None,
-
-            // Currently unreachable at runtime: `AutonomyEnforcer.check` above
-            // is called with `tool_name: None` (pre-existing), so it never
-            // returns RequireToolApproval. The wiring is in place for when
-            // pending tool names are threaded through.
-            AutonomyDecision::RequireToolApproval { tool_name } => {
-                self.hold_for_approval(
-                    execution_id,
-                    node_id,
-                    node_def,
-                    payload,
-                    item_id,
-                    lease_fence,
-                    attempt,
-                    tool_name,
-                    "human".to_string(),
-                    serde_json::json!({ "agent_ref": agent_ref }),
-                    tenant_id,
-                )
-                .await
-            }
-
-            AutonomyDecision::EscalateLimit {
-                limit_type,
-                limit_value,
-                actual_value,
-                escalation_target,
-            } => {
-                warn!(execution_id = %execution_id, node_id, %limit_type, "Autonomy limit reached");
-                let seq = self
-                    .backend
-                    .latest_sequence(execution_id)
-                    .await
-                    .unwrap_or(0)
-                    + 1;
-                let _ = self
-                    .backend
-                    .append_event(jamjet_state::Event::new(
-                        execution_id.clone(),
-                        seq,
-                        EventKind::AutonomyLimitReached {
-                            node_id: node_id.to_string(),
-                            agent_ref: agent_ref.clone(),
-                            limit_type: limit_type.clone(),
-                            limit_value,
-                            actual_value,
-                        },
-                    ))
-                    .await;
-                let seq = self
-                    .backend
-                    .latest_sequence(execution_id)
-                    .await
-                    .unwrap_or(0)
-                    + 1;
-                let _ = self
-                    .backend
-                    .append_event(jamjet_state::Event::new(
-                        execution_id.clone(),
-                        seq,
-                        EventKind::EscalationRequired {
-                            node_id: node_id.to_string(),
-                            agent_ref,
-                            reason: format!("autonomy_limit:{limit_type}"),
-                            escalation_target: escalation_target.as_str(),
-                        },
-                    ))
-                    .await;
-                Some(Err(format!("autonomy limit: {limit_type}").into()))
-            }
-
-            AutonomyDecision::TripCircuitBreaker {
-                consecutive_errors,
-                threshold,
-                escalation_target,
-            } => {
-                warn!(execution_id = %execution_id, node_id, consecutive_errors, "Circuit breaker tripped");
-                let seq = self
-                    .backend
-                    .latest_sequence(execution_id)
-                    .await
-                    .unwrap_or(0)
-                    + 1;
-                let _ = self
-                    .backend
-                    .append_event(jamjet_state::Event::new(
-                        execution_id.clone(),
-                        seq,
-                        EventKind::CircuitBreakerTripped {
-                            node_id: node_id.to_string(),
-                            agent_ref: agent_ref.clone(),
-                            consecutive_errors,
-                            threshold,
-                        },
-                    ))
-                    .await;
-                let seq = self
-                    .backend
-                    .latest_sequence(execution_id)
-                    .await
-                    .unwrap_or(0)
-                    + 1;
-                let _ = self
-                    .backend
-                    .append_event(jamjet_state::Event::new(
-                        execution_id.clone(),
-                        seq,
-                        EventKind::EscalationRequired {
-                            node_id: node_id.to_string(),
-                            agent_ref,
-                            reason: "circuit_breaker".to_string(),
-                            escalation_target: escalation_target.as_str(),
-                        },
-                    ))
-                    .await;
-                Some(Err("circuit breaker tripped".into()))
-            }
-        }
     }
 
     // ── Budget enforcement ────────────────────────────────────────────────────

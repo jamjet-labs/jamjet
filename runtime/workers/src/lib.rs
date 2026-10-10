@@ -7,6 +7,7 @@
 //! - Emit heartbeats to renew leases
 //! - Report results back via the state backend
 
+pub mod agent_limits;
 pub mod dispatch_guard;
 pub mod executor;
 pub mod executors;

@@ -246,7 +246,8 @@ pub enum EventKind {
     AutonomyLimitReached {
         node_id: NodeId,
         agent_ref: String,
-        /// "max_iterations" | "cost_budget" | "token_budget" | "max_tool_calls"
+        /// "max_iterations" | "max_tool_calls" | "token_budget" | "cost_budget"
+        /// | "time_budget"
         limit_type: String,
         limit_value: serde_json::Value,
         actual_value: serde_json::Value,
@@ -256,6 +257,27 @@ pub enum EventKind {
         agent_ref: String,
         consecutive_errors: u32,
         threshold: u32,
+    },
+    /// A node acting for one or more agents (`agent_ref`) was admitted to
+    /// fire: one step of each of `agents`, using `tool_calls` tool calls.
+    /// Appended by the shared guard (`node_guard`) on both transports, only
+    /// when every agent's limits allow the step (or an approval covers it),
+    /// in the same compare-and-set that checked them. The autonomy counters
+    /// (iterations, tool calls, time, and through the node's later
+    /// `NodeCompleted` / `NodeFailed`, tokens, cost and consecutive errors)
+    /// are folded from these, so they survive a restart and a rollover.
+    AgentStepAdmitted {
+        node_id: NodeId,
+        /// The work item that was admitted. A result reported over HTTP is
+        /// recorded only for an admitted item.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_item_id: Option<Uuid>,
+        /// Every agent the node acts for (the workflow's and the node's
+        /// `agent_ref`), each charged one step.
+        agents: Vec<String>,
+        /// Tool calls this step makes: one for a node that uses a tool, the
+        /// number of calls in an agent tool dispatch batch.
+        tool_calls: u32,
     },
     EscalationRequired {
         node_id: NodeId,
@@ -499,6 +521,7 @@ impl EventKind {
             | Self::CostBudgetExceeded { node_id, .. }
             | Self::AutonomyLimitReached { node_id, .. }
             | Self::CircuitBreakerTripped { node_id, .. }
+            | Self::AgentStepAdmitted { node_id, .. }
             | Self::EscalationRequired { node_id, .. }
             | Self::PolicyViolation { node_id, .. }
             | Self::ToolApprovalRequired { node_id, .. }

@@ -16,13 +16,17 @@ pub struct BudgetState {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cost_usd: f64,
-    /// Number of agent reasoning iterations across all agent nodes.
+    /// Not maintained by the runtime and not read by any enforcement. An
+    /// agent card's limits (iterations, tool calls, consecutive errors) are
+    /// folded from the event log instead (`jamjet_worker::agent_limits`), so
+    /// nothing a node writes into its state can reset them. Kept so stored
+    /// snapshots keep their shape.
     pub iteration_count: u32,
-    /// Number of tool calls across all nodes.
+    /// Not maintained or read; see `iteration_count`.
     pub tool_call_count: u32,
-    /// Consecutive error count for circuit-breaker logic.
+    /// Not maintained or read; see `iteration_count`.
     pub consecutive_error_count: u32,
-    /// True once the circuit breaker has fired for this execution.
+    /// Not maintained or read; see `iteration_count`.
     pub circuit_breaker_tripped: bool,
 }
 
