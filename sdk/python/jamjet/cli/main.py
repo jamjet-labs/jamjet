@@ -2580,9 +2580,14 @@ def _short(value: Any, limit: int = 40) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _bounded(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _summary(data: dict[str, Any], limit: int = 240) -> str:
-    """`key=value, ...` for a dict, each value and the whole line bounded."""
-    parts = [f"{_safe(k)}={_short(v)}" for k, v in sorted(data.items())]
+    """`key=value, ...` for a dict, each key, each value and the whole line
+    bounded, so no one key or value can fill the line and hide the rest."""
+    parts = [f"{_bounded(_safe(k), 32)}={_short(v)}" for k, v in sorted(data.items())]
     line = ", ".join(parts) or "(empty)"
     return line if len(line) <= limit else line[: limit - 1] + "…"
 

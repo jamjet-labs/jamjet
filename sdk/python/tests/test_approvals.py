@@ -565,3 +565,20 @@ def test_approve_output_escapes_what_the_server_returns() -> None:
     assert result.exit_code == 1
     assert "\x1b" not in result.output and "\x07" not in result.output
     assert "refused [red]x\\x1b]0;t\\x07" in result.output
+
+
+def test_a_long_key_cannot_push_the_values_out_of_the_summary() -> None:
+    """Keys are bounded like values, so a long key cannot fill the covers line
+    and hide what follows it."""
+    pending = _bound_pending()
+    pending[0]["context"]["action_basis"]["payload"]["input"] = {
+        "a" + "k" * 600: 1,
+        "to": "mallory",
+    }
+    fake = _approvals_client(pending, [])
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
+    assert result.exit_code == 0, result.output
+    assert 'to="mallory"' in result.output
