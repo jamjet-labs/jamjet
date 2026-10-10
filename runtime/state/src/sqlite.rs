@@ -2056,7 +2056,7 @@ impl StateBackend for SqliteBackend {
         let now = Utc::now().to_rfc3339();
 
         let row = sqlx::query(
-            r#"SELECT id, name, role, created_at, expires_at
+            r#"SELECT id, name, role, created_at, expires_at, tenant_id
                FROM api_tokens
                WHERE token_hash = ?
                  AND revoked_at IS NULL
@@ -2080,9 +2080,9 @@ impl StateBackend for SqliteBackend {
             .map_err(map_db_err)?;
 
         let expires_at: Option<String> = row.get("expires_at");
-        let tenant_id: String = row
-            .try_get("tenant_id")
-            .unwrap_or_else(|_| crate::tenant::DEFAULT_TENANT.to_string());
+        // The token's own tenant. Not defaulted on a read error: a token
+        // silently moved into `default` would act on that tenant's data.
+        let tenant_id: String = row.try_get("tenant_id").map_err(map_db_err)?;
         let info = ApiToken {
             id,
             name: row.get("name"),

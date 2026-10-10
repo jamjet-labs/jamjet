@@ -776,3 +776,20 @@ async fn get_work_item_is_scoped_to_the_tenant() {
          key is derived from must not cross tenants"
     );
 }
+
+/// A token belongs to the tenant recorded on its row. The base SQLite backend,
+/// which `require_auth` validates against, did not select the column and
+/// silently answered `default` for every token, so no request could act in
+/// any other tenant and tenant scoping keyed on the token meant nothing.
+#[tokio::test]
+async fn a_token_carries_the_tenant_on_its_row() {
+    let db = open_test_db().await;
+    register_tenant(&db, "acme", "Acme").await;
+    let (token, _) = db.create_token("mallory", "developer").await.unwrap();
+    sqlx::query("UPDATE api_tokens SET tenant_id = 'acme' WHERE name = 'mallory'")
+        .execute(&db.pool())
+        .await
+        .unwrap();
+    let info = db.validate_token(&token).await.unwrap().unwrap();
+    assert_eq!(info.tenant_id, "acme");
+}
