@@ -309,6 +309,59 @@ class JamjetClientRoutesTest {
     }
 
     @Test
+    void runtimeErrorFieldIsInTheMessage404() {
+        // The handler's own 404 explains itself; the user must see that text.
+        expect("POST", "/executions", "{\"error\":\"workflow research v1.0.0\"}");
+        replyStatus = 404;
+        var e = assertThrows(JamjetApiException.class, () -> client.startExecution("research", Map.of()));
+        assertEquals(404, e.statusCode());
+        assertEquals("JamJet API error 404 on /executions: workflow research v1.0.0", e.getMessage());
+        assertEquals("{\"error\":\"workflow research v1.0.0\"}", e.body());
+    }
+
+    @Test
+    void runtimeErrorFieldIsInTheMessage409() {
+        expect("POST", "/executions/exec_1/approve",
+                "{\"error\":\"approval for node review was already decided\"}");
+        replyStatus = 409;
+        var e = assertThrows(JamjetApiException.class,
+                () -> client.approve("exec_1", "approved", "review", "sha256:abc", null));
+        assertEquals(409, e.statusCode());
+        assertEquals("JamJet API error 409 on /executions/exec_1/approve: "
+                + "approval for node review was already decided", e.getMessage());
+    }
+
+    @Test
+    void nonJsonErrorBodyIsInTheMessageAndCapped() {
+        expect("GET", "/executions/exec_1", "x".repeat(2000));
+        replyStatus = 500;
+        replyContentType = "text/plain";
+        var e = assertThrows(JamjetApiException.class, () -> client.getExecution("exec_1"));
+        var prefix = "JamJet API error 500 on /executions/exec_1: ";
+        assertTrue(e.getMessage().startsWith(prefix + "xxxx"), e.getMessage());
+        assertTrue(e.getMessage().endsWith("... (truncated)"), e.getMessage());
+        assertTrue(e.getMessage().length() < prefix.length() + 600, "length " + e.getMessage().length());
+        assertEquals(2000, e.body().length(), "the full body stays on body()");
+    }
+
+    @Test
+    void emptyErrorBodyKeepsTheBareMessage() {
+        expect("GET", "/executions/exec_1", "");
+        replyStatus = 500;
+        var e = assertThrows(JamjetApiException.class, () -> client.getExecution("exec_1"));
+        assertEquals("JamJet API error 500 on /executions/exec_1", e.getMessage());
+    }
+
+    @Test
+    void authFailureCarriesTheRuntimeReason() {
+        expect("GET", "/executions/exec_1", "{\"error\":\"token expired\"}");
+        replyStatus = 401;
+        var e = assertThrows(dev.jamjet.client.JamjetAuthException.class, () -> client.getExecution("exec_1"));
+        assertEquals("JamJet authentication failed (401) on /executions/exec_1. Check your API token: token expired",
+                e.getMessage());
+    }
+
+    @Test
     void htmlReplyIsReportedAsWrongEndpoint() {
         // A runtime older than the JSON 404 fallback answers unknown paths with its
         // web UI's index.html and 200. That must not read as a JSON parse failure.

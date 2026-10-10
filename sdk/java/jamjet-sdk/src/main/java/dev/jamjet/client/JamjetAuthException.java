@@ -12,8 +12,8 @@ public final class JamjetAuthException extends RuntimeException {
     private final String path;
 
     public JamjetAuthException(int statusCode, String body, String path) {
-        super("JamJet authentication failed (" + statusCode + ") on " + path
-                + ". Check your API token.");
+        super(JamjetApiException.withDetail("JamJet authentication failed (" + statusCode + ") on " + path
+                + ". Check your API token", body));
         this.statusCode = statusCode;
         this.path = path;
     }

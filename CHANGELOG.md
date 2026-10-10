@@ -78,6 +78,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     reviewed action's digest.
   - IDs are percent-encoded as path segments, and an HTML reply is reported as a
     wrong base URL or path instead of a JSON parse failure.
+  - A failed call's exception message carries the runtime's reason (its `error`
+    field, or the raw body text, capped at 500 characters), so `jamjet` CLI errors
+    read `JamJet API error 404 on /executions: workflow research v1.0.0` instead of
+    stopping at the status. The full body is still on `JamjetApiException.body()`.
 
   `jamjet-cli` picks these up, so `jamjet run`, `jamjet executions` and
   `jamjet agents` now work. A new CI job runs the client against a runtime built
