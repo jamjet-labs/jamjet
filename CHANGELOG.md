@@ -53,8 +53,15 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and no audit. Any non-GET request, and any path under `/api/`, now gets
   `404 {"error": "not found", "hint": "..."}`, with a hint naming the real routes.
   A GET or HEAD page load still serves `index.html`, and no route was added.
-- **Web companion: fetch the runtime's real routes.** It requested `/api/executions`,
-  which the runtime has never served. It now uses the bare paths.
+- **Web companion: fetch the runtime's real routes and read their real shapes.** It
+  requested `/api/executions`, which the runtime has never served, so every fetch got
+  HTML and the list read "No executions". It now uses the bare paths, and its types
+  match what the runtime sends: executions carry `execution_id` (not `id`), the event
+  routes answer `{"events": [...]}`, and the coordinator and agent-tool event fields
+  follow `runtime/state/src/event.rs`. A response of the wrong shape becomes a query
+  error, and each pane has an error boundary, so a render error shows a message in
+  that pane instead of a blank page. In auth mode the companion still sends no token
+  and shows the 401.
 - **Java SDK (`jamjet-sdk` 0.5.1): `JamjetClient` now drives the runtime.** Every call
   went to `/api/v1/...`, which the runtime has never served, so only `health()`
   worked. All calls now use the runtime's routes, and several request shapes were

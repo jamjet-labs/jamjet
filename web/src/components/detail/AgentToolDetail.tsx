@@ -1,4 +1,4 @@
-import type { Event, AgentToolInvokedEvent, AgentToolCompletedEvent, AgentToolProgressEvent, AgentTurnEvent } from '@/api/types'
+import type { Event, AgentToolInvokedEvent, AgentToolCompletedEvent, AgentToolProgressEvent, AgentToolTurnEvent } from '@/api/types'
 
 interface AgentToolDetailProps {
   nodeId: string
@@ -9,7 +9,7 @@ type Mode = 'sync' | 'streaming' | 'conversational'
 
 function detectMode(nodeEvents: Event[]): Mode {
   const hasProgress = nodeEvents.some((e) => e.kind.type === 'agent_tool_progress')
-  const hasTurn = nodeEvents.some((e) => e.kind.type === 'agent_turn')
+  const hasTurn = nodeEvents.some((e) => e.kind.type === 'agent_tool_turn')
   if (hasTurn) return 'conversational'
   if (hasProgress) return 'streaming'
   return 'sync'
@@ -18,9 +18,10 @@ function detectMode(nodeEvents: Event[]): Mode {
 function detectProtocol(nodeEvents: Event[]): string {
   const invoked = nodeEvents.find((e) => e.kind.type === 'agent_tool_invoked')
   if (!invoked) return 'local'
-  const tool = (invoked.kind as AgentToolInvokedEvent).tool ?? ''
-  if (tool.startsWith('a2a://')) return 'a2a'
-  if (tool.startsWith('mcp://')) return 'mcp'
+  const { protocol, agent_uri: uri = '' } = invoked.kind as AgentToolInvokedEvent
+  if (protocol) return protocol
+  if (uri.startsWith('a2a://')) return 'a2a'
+  if (uri.startsWith('mcp://')) return 'mcp'
   return 'local'
 }
 
@@ -62,7 +63,7 @@ function SyncView({ nodeEvents }: { nodeEvents: Event[] }) {
             Request
           </summary>
           <div className="mt-1">
-            <JsonBlock value={(invoked.kind as AgentToolInvokedEvent).input} />
+            <JsonBlock value={{ input_hash: (invoked.kind as AgentToolInvokedEvent).input_hash }} />
           </div>
         </details>
       )}
@@ -99,7 +100,7 @@ function StreamingView({ nodeEvents }: { nodeEvents: Event[] }) {
               <span className="text-zinc-600 font-mono text-xs shrink-0">
                 {new Date(e.created_at).toISOString().slice(11, 23)}
               </span>
-              <JsonBlock value={(e.kind as AgentToolProgressEvent).progress} />
+              <JsonBlock value={(e.kind as AgentToolProgressEvent).partial_output_summary} />
             </div>
           ))}
         </div>
@@ -120,7 +121,7 @@ function StreamingView({ nodeEvents }: { nodeEvents: Event[] }) {
 
 function ConversationalView({ nodeEvents }: { nodeEvents: Event[] }) {
   const turns = nodeEvents
-    .filter((e) => e.kind.type === 'agent_turn')
+    .filter((e) => e.kind.type === 'agent_tool_turn')
     .sort((a, b) => a.sequence - b.sequence)
 
   return (
@@ -133,8 +134,8 @@ function ConversationalView({ nodeEvents }: { nodeEvents: Event[] }) {
           <p className="text-zinc-600 text-xs italic">No turn events</p>
         )}
         {turns.map((e) => {
-          const turn = e.kind as AgentTurnEvent
-          const isOutbound = turn.turn % 2 === 1
+          const turn = e.kind as AgentToolTurnEvent
+          const isOutbound = turn.direction === 'outbound'
           return (
             <div
               key={e.id}
@@ -148,9 +149,9 @@ function ConversationalView({ nodeEvents }: { nodeEvents: Event[] }) {
                 }`}
               >
                 <div className="text-zinc-500 text-[10px] mb-1">
-                  {isOutbound ? 'outbound' : 'inbound'} · turn {turn.turn}
+                  {turn.direction} · turn {turn.turn_number}
                 </div>
-                <div className="whitespace-pre-wrap">{turn.content}</div>
+                <div className="whitespace-pre-wrap">{turn.content_summary}</div>
               </div>
             </div>
           )
@@ -172,9 +173,9 @@ export function AgentToolDetail({ nodeId, events }: AgentToolDetailProps) {
       'agent_tool_invoked',
       'agent_tool_completed',
       'agent_tool_progress',
-      'agent_turn',
-      'agent_terminated',
-      'agent_failed',
+      'agent_tool_turn',
+      'agent_tool_terminated',
+      'agent_tool_failed',
     ].includes(e.kind.type) || nodeEvents.some((ne) => ne.id === e.id)
   )
 
@@ -190,7 +191,7 @@ export function AgentToolDetail({ nodeId, events }: AgentToolDetailProps) {
   const protocol = detectProtocol(relevantEvents)
 
   const invoked = relevantEvents.find((e) => e.kind.type === 'agent_tool_invoked')
-  const agentUri = invoked ? (invoked.kind as AgentToolInvokedEvent).tool : null
+  const agentUri = invoked ? (invoked.kind as AgentToolInvokedEvent).agent_uri : null
 
   return (
     <div className="space-y-4">

@@ -1,29 +1,33 @@
-import type { Execution } from '@/api/types'
+import type { Execution, ExecutionStatus } from '@/api/types'
 import { useExecutions } from '@/hooks/useExecution'
 import { useInspectorStore } from '@/store/inspector'
 
 // ─── Status config ────────────────────────────────────────────────────────────
 
-const STATUS_DOT: Record<Execution['status'], string> = {
+const STATUS_DOT: Record<ExecutionStatus, string> = {
   completed: 'bg-emerald-500',
   running: 'bg-blue-500',
+  paused: 'bg-amber-500',
   failed: 'bg-red-500',
   pending: 'bg-zinc-500',
   cancelled: 'bg-yellow-500',
+  limit_exceeded: 'bg-orange-500',
 }
 
-const STATUS_LABEL: Record<Execution['status'], string> = {
+const STATUS_LABEL: Record<ExecutionStatus, string> = {
   completed: 'Completed',
   running: 'Running',
+  paused: 'Paused',
   failed: 'Failed',
   pending: 'Pending',
   cancelled: 'Cancelled',
+  limit_exceeded: 'Limit exceeded',
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function ExecutionList() {
-  const { data, isLoading } = useExecutions()
+  const { data, isLoading, isError, error } = useExecutions()
   const executions: Execution[] = data?.executions ?? []
   const { selectedExecutionId, setExecution } = useInspectorStore()
 
@@ -40,16 +44,23 @@ export function ExecutionList() {
           <div className="px-3 py-4 text-xs text-zinc-500">Loading…</div>
         )}
 
-        {!isLoading && executions.length === 0 && (
+        {isError && (
+          <div className="px-3 py-4 text-xs text-red-400 break-words">
+            Could not load executions: {error instanceof Error ? error.message : String(error)}
+          </div>
+        )}
+
+        {!isLoading && !isError && executions.length === 0 && (
           <div className="px-3 py-4 text-xs text-zinc-500">No executions</div>
         )}
 
         {executions.map((ex) => {
-          const isSelected = ex.id === selectedExecutionId
+          const id = ex.execution_id
+          const isSelected = id === selectedExecutionId
           return (
             <button
-              key={ex.id}
-              onClick={() => setExecution(ex.id)}
+              key={id}
+              onClick={() => setExecution(id)}
               className={[
                 'w-full text-left px-3 py-2 flex flex-col gap-0.5 hover:bg-zinc-800/60 transition-colors',
                 isSelected ? 'bg-zinc-800' : '',
@@ -59,15 +70,15 @@ export function ExecutionList() {
             >
               {/* Truncated ID in monospace */}
               <span className="font-mono text-xs text-zinc-200 truncate">
-                {ex.id.length > 18 ? ex.id.slice(0, 8) + '…' + ex.id.slice(-6) : ex.id}
+                {id.length > 18 ? id.slice(0, 8) + '…' + id.slice(-6) : id}
               </span>
 
               {/* Status row */}
               <span className="flex items-center gap-1.5">
                 <span
-                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${STATUS_DOT[ex.status]}`}
+                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${STATUS_DOT[ex.status] ?? 'bg-zinc-500'}`}
                 />
-                <span className="text-xs text-zinc-400">{STATUS_LABEL[ex.status]}</span>
+                <span className="text-xs text-zinc-400">{STATUS_LABEL[ex.status] ?? ex.status}</span>
               </span>
             </button>
           )

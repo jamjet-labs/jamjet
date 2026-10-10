@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import { ExecutionList } from './ExecutionList'
+import { ErrorBoundary } from './ErrorBoundary'
 
 interface ShellProps {
   graph: ReactNode
@@ -24,7 +25,9 @@ export function Shell({ graph, detail, timeline, toolbar }: ShellProps) {
       <div className="flex flex-1 overflow-hidden">
         {/* Left sidebar — execution list */}
         <aside className="w-56 shrink-0 border-r border-zinc-800 flex flex-col overflow-hidden">
-          <ExecutionList />
+          <ErrorBoundary label="execution list">
+            <ExecutionList />
+          </ErrorBoundary>
         </aside>
 
         {/* Main content area */}

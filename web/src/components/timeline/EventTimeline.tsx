@@ -10,6 +10,7 @@ const ALL_EVENT_TYPES: string[] = [
   'workflow_started',
   'workflow_completed',
   'workflow_failed',
+  'workflow_cancelled',
   'node_scheduled',
   'node_started',
   'node_completed',
@@ -20,9 +21,9 @@ const ALL_EVENT_TYPES: string[] = [
   'agent_tool_invoked',
   'agent_tool_completed',
   'agent_tool_progress',
-  'agent_turn',
-  'agent_terminated',
-  'agent_failed',
+  'agent_tool_turn',
+  'agent_tool_terminated',
+  'agent_tool_failed',
 ]
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -37,7 +38,7 @@ function badgeClass(type: string): string {
   if (type === 'node_completed') {
     return 'bg-emerald-900 text-emerald-300 border border-emerald-700'
   }
-  if (type === 'node_failed' || type === 'workflow_failed' || type === 'agent_failed') {
+  if (type === 'node_failed' || type === 'workflow_failed' || type === 'agent_tool_failed') {
     return 'bg-red-900 text-red-300 border border-red-700'
   }
   // workflow_* and node_* (other)
@@ -80,7 +81,7 @@ function extractSummary(kind: EventKind): string {
     }
     case 'agent_tool_invoked': {
       const mode = typeof k['mode'] === 'string' ? k['mode'] : 'invoke'
-      const uri = typeof k['agent_uri'] === 'string' ? k['agent_uri'] : String(k['tool'] ?? '?')
+      const uri = typeof k['agent_uri'] === 'string' ? k['agent_uri'] : '?'
       return `${mode} → ${uri}`
     }
     case 'agent_tool_completed': {

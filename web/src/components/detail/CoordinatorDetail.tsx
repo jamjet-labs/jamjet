@@ -27,7 +27,7 @@ function DiscoverySection({ event }: { event: CoordinatorDiscoveryEvent }) {
         {event.candidates.length === 0 && (
           <p className="text-zinc-600 text-xs italic">No candidates discovered</p>
         )}
-        {event.candidates.map((uri) => (
+        {event.candidates.map(({ uri }) => (
           <div key={uri} className="flex items-center gap-2 py-1 border-b border-zinc-800 last:border-0">
             <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
             <span className="font-mono text-xs text-zinc-300 break-all">{uri}</span>
@@ -138,7 +138,7 @@ function DecisionSection({
           <span className="w-2 h-2 mt-1 rounded-full bg-emerald-400 shrink-0" />
           <div>
             <div className="text-[10px] text-zinc-500 mb-0.5">Selected</div>
-            <div className="font-mono text-xs text-zinc-100">{event.selected}</div>
+            <div className="font-mono text-xs text-zinc-100">{event.selected ?? 'none'}</div>
           </div>
         </div>
 
@@ -205,10 +205,10 @@ export function CoordinatorDetail({ nodeId, events }: CoordinatorDetailProps) {
 
       {discoveryEvent && <DiscoverySection event={discoveryEvent} />}
 
-      {scoringEvent && <ScoringSection scores={scoringEvent.scores} />}
+      {scoringEvent && <ScoringSection scores={scoringEvent.rankings} />}
 
       {decisionEvent && (
-        <DecisionSection event={decisionEvent} scores={scoringEvent?.scores ?? []} />
+        <DecisionSection event={decisionEvent} scores={scoringEvent?.rankings ?? []} />
       )}
     </div>
   )

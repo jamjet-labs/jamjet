@@ -156,7 +156,7 @@ function extractNodeType(events: Event[], nodeId: string): string {
   if (
     nodeEventTypes.has('agent_tool_invoked') ||
     nodeEventTypes.has('agent_tool_completed') ||
-    nodeEventTypes.has('agent_turn')
+    nodeEventTypes.has('agent_tool_turn')
   ) {
     return 'agent_tool'
   }
