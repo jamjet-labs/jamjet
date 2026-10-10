@@ -222,7 +222,7 @@ async fn fire(state: &AppState, tb: &support::TestBackend, transport: Transport)
     match transport {
         Transport::Claim => {
             let (_, claimed) = support::post(
-                &state,
+                state,
                 "/work-items/claim",
                 json!({ "worker_id": "w", "queue_types": queues }),
             )
