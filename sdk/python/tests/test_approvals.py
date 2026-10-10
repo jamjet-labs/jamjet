@@ -540,3 +540,28 @@ def test_the_printed_approve_command_round_trips() -> None:
     kwargs = fake.approve.call_args.kwargs
     assert kwargs.get("node_id") == "-step.v2", fake.approve.call_args
     assert kwargs.get("action_digest") == DIGEST
+
+
+def test_approve_output_escapes_what_the_server_returns() -> None:
+    """The node id and an error message come back from the server and can
+    carry run-supplied text: shown escaped, never applied as markup."""
+    fake = _approve_client({"execution_id": "exec-1", "node_id": "[bold]n\x1b[2K", "accepted": True})
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approve", "exec-1", "--decision", "approved", "--action-digest", "d"])
+    assert result.exit_code == 0, result.output
+    assert "\x1b" not in result.output
+    assert "[bold]n\\x1b[2K" in result.output
+
+    import httpx
+
+    request = httpx.Request("POST", "http://x/executions/exec-1/approve")
+    response = httpx.Response(403, json={"error": "refused [red]x\x1b]0;t\x07"}, request=request)
+    failing = AsyncMock()
+    failing.approve = AsyncMock(side_effect=httpx.HTTPStatusError("403", request=request, response=response))
+    failing.__aenter__ = AsyncMock(return_value=failing)
+    failing.__aexit__ = AsyncMock(return_value=None)
+    with patch("jamjet.cli.main._client", return_value=failing):
+        result = runner.invoke(app, ["approve", "exec-1", "--decision", "approved", "--action-digest", "d"])
+    assert result.exit_code == 1
+    assert "\x1b" not in result.output and "\x07" not in result.output
+    assert "refused [red]x\\x1b]0;t\\x07" in result.output

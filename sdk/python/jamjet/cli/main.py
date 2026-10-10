@@ -2810,13 +2810,21 @@ def approve(
                     msg = exc.response.json().get("error") or exc.response.text
                 except Exception:
                     msg = exc.response.text
-                console.print(f"[red]Error:[/red] {msg}")
+                # The message can quote run-supplied text (a node id): escaped,
+                # and never read as markup.
+                console.print("Error:", style="red", end=" ")
+                console.print(_safe(msg), markup=False, highlight=False, soft_wrap=True)
                 raise typer.Exit(1) from exc
 
-        resolved = result.get("node_id", "?")
+        resolved = _safe(result.get("node_id", "?"))
         accepted = result.get("accepted", decision == "approved")
-        status_str = "[green]approved[/green]" if accepted else "[red]rejected[/red]"
-        console.print(f"{status_str}  node=[bold]{resolved}[/bold]  execution={execution_id}")
+        console.print("approved" if accepted else "rejected", style="green" if accepted else "red", end="  ")
+        console.print(
+            f"node={resolved}  execution={_safe(execution_id)}",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
 
     asyncio.run(_approve())
 
