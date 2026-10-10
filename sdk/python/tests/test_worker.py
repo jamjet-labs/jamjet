@@ -20,6 +20,7 @@ import httpx
 
 from jamjet.cli.main import _worker_loop  # noqa: E402
 from jamjet.client import JamjetClient
+from jamjet.tools.decorators import tool
 
 # ── Test handler functions ────────────────────────────────────────────────────
 
@@ -51,8 +52,10 @@ async def _with_genai(input: dict) -> dict:
     }
 
 
-def _echo_tool(text: str) -> str:
-    """A plain @tool-style handler resolved by dispatch_tool_calls' tools map."""
+@tool(name="echo")
+async def echo_tool(text: str) -> str:
+    """A @tool resolved by dispatch_tool_calls through the tools map, which
+    accepts only a registered tool's own module:qualname."""
     return f"echo:{text}"
 
 
@@ -290,7 +293,7 @@ _DISPATCH_ITEM: dict = {
             "last_model_tool_calls": [
                 {"id": "call_1", "name": "echo", "arguments": {"text": "hi"}},
             ],
-            "tools": {"echo": f"{__name__}:_echo_tool"},
+            "tools": {"echo": f"{__name__}:echo_tool"},
         },
     },
     "lease_fence": 0,

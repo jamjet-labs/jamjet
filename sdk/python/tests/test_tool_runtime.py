@@ -11,16 +11,20 @@ import json
 
 import pytest
 
-from jamjet.agents.tool_runtime import dispatch_tool_calls
+from jamjet.agents.tool_runtime import ToolResolutionError, dispatch_tool_calls
 from jamjet.tools.decorators import tool
 
 
-# Fake tools resolved via the {name: "module:function"} map. `__name__` is the
-# live, importable name of this test module (already in sys.modules).
+# Tools resolved via the {name: "module:qualname"} map. `__name__` is the live,
+# importable name of this test module (already in sys.modules). A map entry is
+# accepted only for a @tool registered under the called name whose own
+# reference it is, which is what the SDK compiler writes.
+@tool(name="echo")
 async def echo_tool(text: str) -> str:
     return f"echo: {text}"
 
 
+@tool(name="add")
 async def add_tool(a: int, b: int) -> int:
     return a + b
 
@@ -123,22 +127,22 @@ async def test_registry_fallback_when_not_in_map():
     assert result["messages"][1]["content"] == "registry: v"
 
 
-async def test_registry_fallback_when_map_ref_is_stale():
-    """A present-but-non-importable map ref must not mask the @tool registry: the
-    bad ref fails to import, then the name resolves via the registry."""
-    result = await dispatch_tool_calls(
-        {
-            "messages": [],
-            "tool_calls": [{"id": "c1", "name": "registry_tool", "arguments": {"value": "v"}}],
-            # Stale ref: the module/attr no longer exists, but the @tool is registered.
-            "tools": {"registry_tool": "jamjet._gone_module:registry_tool"},
-        }
-    )
-    assert result["messages"][1]["content"] == "registry: v"
+async def test_an_unverifiable_map_ref_is_refused_not_replaced():
+    """A map entry that cannot be verified is refused. It used to fall back to
+    the registry silently, so a call could resolve to code nobody named."""
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(
+            {
+                "messages": [],
+                "tool_calls": [{"id": "c1", "name": "registry_tool", "arguments": {"value": "v"}}],
+                # Stale ref: the module no longer exists.
+                "tools": {"registry_tool": "jamjet._gone_module:registry_tool"},
+            }
+        )
 
 
 async def test_unknown_tool_raises():
-    with pytest.raises(KeyError, match="nope"):
+    with pytest.raises(ToolResolutionError, match="nope"):
         await dispatch_tool_calls(
             {
                 "messages": [],
