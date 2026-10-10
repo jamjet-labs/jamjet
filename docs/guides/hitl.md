@@ -117,16 +117,39 @@ Rules the runtime enforces:
 
 What a policy can gate:
 
-- `require_approval_for` and `blocked_tools` are glob patterns matched against a
-  node's names. A `tool` node is named by its `tool_ref`, an `mcp_tool` node by
-  its tool, an `a2a_task` node by its skill and an `agent` node by its agent.
-  Code-backed nodes have two names, their handler reference and their node id:
-  `python_fn` is `module:function`, `java_fn` is `class/method` and
-  `external_fn` is `queue/handler`. A pattern applies if it matches either, so
-  `["*"]` gates every one of these kinds. Python and Java handlers are also
-  matched in canonical dotted form: `payments.transfer:send` and
-  `payments:transfer.send` both read `payments.transfer.send`, and a pattern in
-  either spelling matches both.
+`require_approval_for` and `blocked_tools` are glob patterns matched against a
+node's names. An approval binds the node's dispatched payload (plus the run,
+the occurrence and the node definition), so what it covers depends on what the
+payload carries.
+
+| Node kind | Names a pattern matches | What the payload (and so an approval) carries |
+|-----------|-------------------------|-----------------------------------------------|
+| `python_fn` | `module:function` (also in dotted form `module.function`), and the node id | the run's state, as `input` |
+| `java_fn` | `class/method` (also `class.method`), and the node id | the run's state, as `input` |
+| `external_fn` | `queue/handler`, and the node id | the run's state, as `input` |
+| `tool` | its `tool_ref` | no state |
+| `mcp_tool` | its `tool` | no state |
+| `a2a_task` | its `skill` | no state |
+| `agent` | its `agent_ref` | no state |
+| `model` | none: governed by `model_allowlist` only | the conversation (`messages`) and the resolved model settings |
+| `condition` | none | the run's state, as `state` |
+| `agent_tool`, `agent_discovery`, `coordinator`, `eval`, `human_approval`, `wait`, `parallel`, `join`, `subgraph`, `memory_retrieval`, `policy`, `finalizer`, `limit_exceeded` | none | no state |
+
+Kinds with no name cannot be gated or blocked by a pattern. `agent_tool` and
+`agent_discovery` make network calls in-process, so keep that in mind when
+relying on patterns alone.
+
+- A pattern applies if it matches any of a node's names, so `["*"]` gates every
+  named kind. Python and Java handlers also match in canonical dotted form:
+  `payments.transfer:send` and `payments:transfer.send` both read
+  `payments.transfer.send`, and a pattern in either spelling matches both.
+- **An agent tool dispatch node** (`jamjet.agents.tool_runtime:dispatch_tool_calls`
+  with `agent_tool_dispatch: true`) is checked on its own names first: a gate
+  there holds the node with an approval of its full payload, which covers the
+  calls in it, even when there are no calls. Then each call is matched on the
+  tool the model chose; a blocked call is blocked even after the node was
+  approved. The `agent_tool_dispatch` flag is accepted only on the ADK
+  dispatcher; registering it on any other node is refused.
 - **A pattern binds a name, not code.** The node id and the handler reference
   are chosen by whoever writes the IR, and a function is reachable under other
   names: a module that re-exports it (`myapp.api:send`) runs the same code
@@ -134,16 +157,7 @@ What a policy can gate:
   `payments.*` stops honest mistakes, not an author who writes their own IR.
   Only a catch-all binds that author. Where it matters, set the tenant policy
   to `require_approval_for: ["*"]` and keep precision elsewhere (in which tools
-  your workers expose), rather than relying on a narrow pattern. An agent tool dispatch node is checked
-  on its own names first (`jamjet.agents.tool_runtime:dispatch_tool_calls` and
-  its node id): a gate there holds the node with an approval of its full
-  payload, which covers the calls in it, even when there are no calls. Then each
-  call is matched on the tool the model chose; a blocked call is blocked even
-  after the node was approved. The `agent_tool_dispatch` flag is accepted only
-  on the ADK dispatcher; registering it on any other node is refused.
-- Other kinds (condition, human_approval, wait, eval, coordinator, memory
-  retrieval) have no name a pattern can match, and a model node is governed by
-  `model_allowlist` only.
+  your workers expose), rather than relying on a narrow pattern.
 - Workflow and node policies live in IR a developer registers, and a developer
   can register a new version without the gate. A gate that must bind the
   developers who start runs belongs in the tenant policy, which only an operator
