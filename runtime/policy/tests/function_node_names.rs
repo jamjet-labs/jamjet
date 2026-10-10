@@ -157,3 +157,76 @@ fn the_tool_name_of_a_function_node_is_its_handler_reference() {
     let ctx = EvaluationContext::from_node_kind("pay", &external_fn());
     assert_eq!(ctx.tool_name.as_deref(), Some("pas-control/transfer"));
 }
+
+fn python_at(module: &str, function: &str) -> NodeKind {
+    NodeKind::PythonFn {
+        module: module.into(),
+        function: function.into(),
+        output_schema: String::new(),
+        agent_tool_dispatch: false,
+    }
+}
+
+/// The Python worker resolves `function` as a dotted attribute chain, so
+/// `payments.transfer:send` and `payments:transfer.send` run the same code. A
+/// pattern in either spelling must catch both (round-3 review, I2).
+#[test]
+fn a_handler_pattern_matches_every_spelling_of_the_same_dotted_path() {
+    let spellings = [("payments.transfer", "send"), ("payments", "transfer.send")];
+    let patterns = [
+        "payments.transfer:send",
+        "payments:transfer.send",
+        "payments.transfer:*",
+        "payments.*:send",
+        "payments.transfer.send",
+    ];
+    for (module, function) in spellings {
+        for pattern in patterns {
+            assert!(
+                gated(&decide(
+                    "x",
+                    &python_at(module, function),
+                    &approve(&[pattern])
+                )),
+                "{pattern} must gate {module}:{function}"
+            );
+            assert!(
+                blocked(&decide(
+                    "x",
+                    &python_at(module, function),
+                    &block(&[pattern])
+                )),
+                "{pattern} must block {module}:{function}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_java_handler_pattern_matches_the_dotted_form() {
+    for pattern in [
+        "com.acme.Payments/transfer",
+        "com.acme.Payments.transfer",
+        "com.acme.*.transfer",
+    ] {
+        assert!(
+            gated(&decide("x", &java_fn(), &approve(&[pattern]))),
+            "{pattern}"
+        );
+    }
+}
+
+/// Canonical forms apply only to code-backed kinds: a colon pattern does not
+/// start matching tool names it never matched.
+#[test]
+fn canonical_matching_does_not_widen_tool_patterns() {
+    let tool = NodeKind::Tool {
+        tool_ref: "payments.transfer".into(),
+        input_mapping: Default::default(),
+        output_schema: String::new(),
+    };
+    assert!(matches!(
+        decide("x", &tool, &approve(&["payments:transfer"])),
+        PolicyDecision::Allow
+    ));
+}

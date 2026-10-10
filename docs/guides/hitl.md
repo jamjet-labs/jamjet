@@ -123,7 +123,18 @@ What a policy can gate:
   Code-backed nodes have two names, their handler reference and their node id:
   `python_fn` is `module:function`, `java_fn` is `class/method` and
   `external_fn` is `queue/handler`. A pattern applies if it matches either, so
-  `["*"]` gates every one of these kinds. An agent tool dispatch node is checked
+  `["*"]` gates every one of these kinds. Python and Java handlers are also
+  matched in canonical dotted form: `payments.transfer:send` and
+  `payments:transfer.send` both read `payments.transfer.send`, and a pattern in
+  either spelling matches both.
+- **A pattern binds a name, not code.** The node id and the handler reference
+  are chosen by whoever writes the IR, and a function is reachable under other
+  names: a module that re-exports it (`myapp.api:send`) runs the same code
+  under a path no narrow pattern mentions. So a narrow pattern such as
+  `payments.*` stops honest mistakes, not an author who writes their own IR.
+  Only a catch-all binds that author. Where it matters, set the tenant policy
+  to `require_approval_for: ["*"]` and keep precision elsewhere (in which tools
+  your workers expose), rather than relying on a narrow pattern. An agent tool dispatch node is checked
   on its own names first (`jamjet.agents.tool_runtime:dispatch_tool_calls` and
   its node id): a gate there holds the node with an approval of its full
   payload, which covers the calls in it, even when there are no calls. Then each

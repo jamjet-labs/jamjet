@@ -66,7 +66,11 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `class/method`, `queue/handler`) and the node id. Before, these kinds had no
     name, so no pattern matched them. Behaviour change: an existing policy whose
     pattern matches one of these names, `["*"]` in particular, now gates or blocks
-    these nodes where it used to let them through.
+    these nodes where it used to let them through. Python and Java handlers also
+    match in canonical dotted form, so `payments.transfer:send` and
+    `payments:transfer.send` are one name. A pattern still binds a name, not code: a
+    re-export reaches the same function under another path, so only a catch-all
+    binds an author who writes their own IR.
   - A registered workflow version is immutable: an identical re-register is a 200
     no-op, a different IR under the same version is a 409. Identity is the
     canonical content hash, so key order and whitespace do not matter.

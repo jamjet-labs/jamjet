@@ -55,7 +55,10 @@ none of this.
 The tenant policy is the one policy layer a developer cannot rewrite: workflow and node
 policies live in IR that a developer registers, and a developer can always register a
 new version. Put approval gates that must bind the people who start runs at tenant
-level.
+level, and make them catch-alls (`require_approval_for: ["*"]`): a pattern matches a
+name the IR author chose, and the same function can be reached under another name
+(a re-export or alias), so a narrow tenant pattern does not bind an author who writes
+their own IR.
 
 ---
 
