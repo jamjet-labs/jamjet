@@ -48,6 +48,13 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A worker's reported `state_patch` cannot write the engine's bookkeeping key
     `__budget`; `POST /work-items/:id/complete` drops it. It was a way to reset a
     run's budget and to change later nodes' input outside any approval.
+  - `agent_tool_dispatch: true` is refused at `POST /workflows` on any node that is
+    not the ADK dispatcher (`jamjet.agents.tool_runtime:dispatch_tool_calls`), and on
+    every `java_fn`. The flag used to send a node's policy straight to the per-call
+    guard, so an author could flag an ordinary function, present no tool calls, and
+    pass a tenant `["*"]` gate. Every node's own names are now checked first,
+    dispatch nodes included; a dispatcher matched by a gate is held with an approval
+    of its full payload even when it has no calls, and that approval covers its calls.
   - A node blocked by policy fails its run. Both transports settle the item and
     record `NodeFailed { retryable: false }` in one fenced commit, so the scheduler
     fails the run on its next tick. Before, a block on `POST /work-items/claim` left

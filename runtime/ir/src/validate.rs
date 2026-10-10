@@ -64,20 +64,47 @@ pub fn is_adk_dispatch_coordinates(module: &str, function: &str) -> bool {
 /// Public, and callable independently of [`validate_workflow`], because the
 /// `POST /workflows` route needs exactly this rule without the ref rules it
 /// deliberately skips (see `runtime/api/src/routes.rs`).
+///
+/// And the other direction: the flag is refused on any node that is not the
+/// ADK dispatcher. A flagged node's policy used to be decided over the tool
+/// calls in its input alone, so an author could put the flag on an ordinary
+/// function and present no calls; the flag is author-controlled, so it is
+/// accepted only where it is true. `java_fn` has no ADK dispatcher, so the flag
+/// is refused on every `java_fn`.
 pub fn validate_agent_tool_dispatch(ir: &WorkflowIr) -> IrResult<()> {
     use jamjet_core::node::NodeKind;
 
     for (id, node) in &ir.nodes {
-        if let NodeKind::PythonFn {
-            module,
-            function,
-            agent_tool_dispatch,
-            ..
-        } = &node.kind
-        {
-            if is_adk_dispatch_coordinates(module, function) && !agent_tool_dispatch {
-                return Err(IrError::UnmarkedAgentToolDispatch(id.clone()));
+        match &node.kind {
+            NodeKind::PythonFn {
+                module,
+                function,
+                agent_tool_dispatch,
+                ..
+            } => {
+                let is_dispatcher = is_adk_dispatch_coordinates(module, function);
+                if is_dispatcher && !agent_tool_dispatch {
+                    return Err(IrError::UnmarkedAgentToolDispatch(id.clone()));
+                }
+                if *agent_tool_dispatch && !is_dispatcher {
+                    return Err(IrError::MisplacedAgentToolDispatch(
+                        id.clone(),
+                        format!("python_fn {module}:{function}"),
+                    ));
+                }
             }
+            NodeKind::JavaFn {
+                class_name,
+                method,
+                agent_tool_dispatch: true,
+                ..
+            } => {
+                return Err(IrError::MisplacedAgentToolDispatch(
+                    id.clone(),
+                    format!("java_fn {class_name}/{method}"),
+                ));
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -525,6 +552,41 @@ mod tests {
             "agent_tool_dispatch": true
         }));
         assert!(validate_workflow(&ir).is_ok());
+    }
+
+    /// The flag is author-controlled, so it is accepted only on the ADK
+    /// dispatcher: on any other function it would route the node's policy to
+    /// the per-call guard (round-3 review, C1).
+    #[test]
+    fn the_dispatch_flag_on_another_python_fn_is_rejected() {
+        let ir = ir_with_kind(serde_json::json!({
+            "type": "python_fn",
+            "module": "payments.transfer",
+            "function": "send",
+            "output_schema": "",
+            "agent_tool_dispatch": true
+        }));
+        let err = validate_agent_tool_dispatch(&ir).expect_err("must reject the misplaced flag");
+        assert!(
+            matches!(err, IrError::MisplacedAgentToolDispatch(..)),
+            "{err}"
+        );
+        assert!(format!("{err}").contains("agent_tool_dispatch"));
+    }
+
+    #[test]
+    fn the_dispatch_flag_on_a_java_fn_is_rejected() {
+        let ir = ir_with_kind(serde_json::json!({
+            "type": "java_fn",
+            "class_name": "com.acme.Payments",
+            "method": "send",
+            "output_schema": "",
+            "agent_tool_dispatch": true
+        }));
+        assert!(matches!(
+            validate_agent_tool_dispatch(&ir),
+            Err(IrError::MisplacedAgentToolDispatch(..))
+        ));
     }
 
     #[test]

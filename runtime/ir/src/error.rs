@@ -43,6 +43,9 @@ pub enum IrError {
     #[error("node '{0}' dispatches ADK agent tool calls but is not marked agent_tool_dispatch, so tool policy would not be enforced for it")]
     UnmarkedAgentToolDispatch(String),
 
+    #[error("node '{0}' sets agent_tool_dispatch but is not the ADK tool dispatcher ({1}); the flag is reserved for jamjet.agents.tool_runtime:dispatch_tool_calls")]
+    MisplacedAgentToolDispatch(String, String),
+
     #[error("node '{0}' is unreachable from the start node")]
     UnreachableNode(String),
 

@@ -123,8 +123,13 @@ What a policy can gate:
   Code-backed nodes have two names, their handler reference and their node id:
   `python_fn` is `module:function`, `java_fn` is `class/method` and
   `external_fn` is `queue/handler`. A pattern applies if it matches either, so
-  `["*"]` gates every one of these kinds. An agent tool dispatch is matched per
-  call, on each tool the model chose.
+  `["*"]` gates every one of these kinds. An agent tool dispatch node is checked
+  on its own names first (`jamjet.agents.tool_runtime:dispatch_tool_calls` and
+  its node id): a gate there holds the node with an approval of its full
+  payload, which covers the calls in it, even when there are no calls. Then each
+  call is matched on the tool the model chose; a blocked call is blocked even
+  after the node was approved. The `agent_tool_dispatch` flag is accepted only
+  on the ADK dispatcher; registering it on any other node is refused.
 - Other kinds (condition, human_approval, wait, eval, coordinator, memory
   retrieval) have no name a pattern can match, and a model node is governed by
   `model_allowlist` only.

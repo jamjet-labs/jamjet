@@ -147,6 +147,7 @@ pub async fn guard_dispatch(
         ir.policy.as_ref(),
         node_def,
         payload_input,
+        false,
     )
     .await
 }
@@ -167,6 +168,7 @@ pub(crate) async fn guard_dispatch_in(
     workflow_policy: Option<&PolicySetIr>,
     node_def: &NodeDef,
     payload_input: &Value,
+    node_approved: bool,
 ) -> DispatchGuardOutcome {
     let fire = mode == GuardMode::Fire;
     // Load tenant policy (sits between global and workflow in the chain).
@@ -268,6 +270,13 @@ pub(crate) async fn guard_dispatch_in(
                 .await;
             }
             DispatchGuardOutcome::Blocked { reason }
+        }
+
+        // The node's own gate was approved over its full payload, which
+        // contains these calls: that approval covers them.
+        DispatchDecision::RequireApproval { .. } if node_approved => {
+            info!(execution_id = %execution_id, node_id, "Calls covered by the node's approval — proceeding");
+            DispatchGuardOutcome::Allow
         }
 
         DispatchDecision::RequireApproval { approver, gated } => {
@@ -765,6 +774,7 @@ mod tests {
                 ir.policy.as_ref(),
                 node_def,
                 input,
+                false,
             )
             .await
         }

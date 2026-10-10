@@ -62,8 +62,17 @@ pub enum GuardMode {
 /// chain and, for an approval-gated node, the approval bound to the action.
 ///
 /// `workflow_policy` is the IR's workflow-level policy and `payload` the work
-/// item's payload as the engine recorded it (agent tool dispatch nodes are
-/// decided over the calls in `payload["input"]`).
+/// item's payload as the engine recorded it.
+///
+/// The node's OWN names (handler reference and node id, see
+/// `EvaluationContext::policy_names`) are evaluated first, for every kind,
+/// agent tool dispatch nodes included. A block on them blocks; a gate on them
+/// holds the node with an approval bound to the full payload. Only then is a
+/// dispatch node's per-call guard applied to the calls in `payload["input"]`.
+/// A dispatch node used to skip straight to the per-call guard, so its own
+/// names were never checked and an empty call list allowed it outright; the
+/// dispatch flag is author-controlled, which made that a bypass of any gate
+/// (round-3 review, C1).
 #[allow(clippy::too_many_arguments)]
 pub async fn guard_item(
     backend: &dyn StateBackend,
@@ -75,9 +84,14 @@ pub async fn guard_item(
     node_def: &NodeDef,
     payload: &Value,
 ) -> GuardOutcome {
-    if dispatch_guard::is_agent_tool_dispatch(&node_def.kind) {
+    let is_dispatch = dispatch_guard::is_agent_tool_dispatch(&node_def.kind);
+    // The per-call guard for a dispatch node. `node_approved`: an approval of
+    // the node's full payload is on file and covers this item. The calls are
+    // part of that payload, so they need no approval of their own; per-call
+    // blocks still apply.
+    let per_call = |node_approved: bool| async move {
         let input = dispatch_guard::payload_input(payload);
-        return dispatch_guard::guard_dispatch_in(
+        dispatch_guard::guard_dispatch_in(
             backend,
             mode,
             execution_id,
@@ -86,9 +100,10 @@ pub async fn guard_item(
             workflow_policy,
             node_def,
             &input,
+            node_approved,
         )
-        .await;
-    }
+        .await
+    };
 
     // `Ok(None)` (no tenant policy) and `Err` (could not find out) must not
     // collapse: an unreadable tenant would otherwise read as an absent policy
@@ -128,6 +143,7 @@ pub async fn guard_item(
 
     let ctx = EvaluationContext::from_node_kind(node_id, &node_def.kind);
     match PolicyEvaluator.evaluate(&ctx, &sets) {
+        PolicyDecision::Allow if is_dispatch => per_call(false).await,
         PolicyDecision::Allow => GuardOutcome::Allow,
 
         PolicyDecision::Block { reason } => {
@@ -154,7 +170,7 @@ pub async fn guard_item(
 
         PolicyDecision::RequireApproval { approver } => {
             let tool_name = ctx.tool_name.unwrap_or_else(|| node_id.to_string());
-            match mode {
+            let outcome = match mode {
                 GuardMode::Fire => {
                     require_approval(
                         backend,
@@ -172,6 +188,10 @@ pub async fn guard_item(
                     completion_covered(backend, execution_id, node_id, node_def, payload, tool_name)
                         .await
                 }
+            };
+            match outcome {
+                GuardOutcome::Allow if is_dispatch => per_call(true).await,
+                other => other,
             }
         }
     }
