@@ -228,7 +228,7 @@ def test_approvals_summarises_what_the_digest_covers() -> None:
 
     assert result.exit_code == 0, result.output
     assert "step 0" in result.output
-    assert "input keys: amount" in result.output
+    assert "input: amount=10" in result.output
 
 
 def test_approvals_show_basis_prints_the_bound_payload() -> None:
@@ -288,7 +288,61 @@ def test_approvals_names_the_calls_a_bound_dispatch_digest_covers() -> None:
 
     assert result.exit_code == 0, result.output
     assert f"--action-digest {DIGEST}" in result.output
-    assert "step 1; calls: send_wire" in result.output
+    assert "step 1; calls: send_wire({})" in result.output
+
+
+def test_approvals_escapes_control_characters_from_the_run() -> None:
+    """Node ids, tool names, input keys and values come from whoever started the
+    run. Printed raw, an ESC sequence could erase or rewrite the reviewer's
+    lines, and a bidi override could reorder them."""
+    pending = [
+        {
+            "node_id": "gate\x1b[2K",
+            "tool_name": "[bold]t\x07",
+            "approver": "human",
+            "context": {
+                "action_digest": DIGEST,
+                "action_basis": {
+                    "payload": {"input": {"a\x1b[1A\x1b[2KFAKE": "x\u202eevil"}},
+                    "payload_truncated": False,
+                    "payload_bytes": 40,
+                    "step": 0,
+                },
+            },
+            "sequence": 3,
+        }
+    ]
+    decided = [{"node_id": "old", "status": "approved", "user_id": "u\x1b]0;t\x07", "comment": "c\x9bX", "sequence": 1}]
+    fake = _approvals_client(pending, decided)
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
+    assert result.exit_code == 0, result.output
+    for raw in ("\x1b", "\x07", "\u202e", "\x9b"):
+        assert raw not in result.output, repr(raw)
+    assert "\\x1b" in result.output
+    assert "\\u202e" in result.output
+    assert "[bold]t" in result.output, "markup in a field is printed, not applied"
+
+
+def test_approvals_shows_bounded_values_not_only_keys() -> None:
+    pending = _bound_pending()
+    pending[0]["context"]["action_basis"]["payload"]["input"] = {
+        "amount": 10,
+        "to": "vendor",
+        "blob": "x" * 500,
+    }
+    fake = _approvals_client(pending, [])
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
+    assert result.exit_code == 0, result.output
+    assert "amount=10" in result.output
+    assert 'to="vendor"' in result.output
+    assert "x" * 100 not in result.output, "a long value is cut"
+    assert "…" in result.output
 
 
 def test_approvals_says_when_a_request_binds_nothing() -> None:
