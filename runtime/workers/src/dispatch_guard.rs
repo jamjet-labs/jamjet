@@ -536,7 +536,8 @@ pub(crate) async fn unparseable_tenant_policy(
         Some(Err(cause)) => {
             let reason = format!(
                 "tenant policy for tenant {tenant_id} cannot be read ({cause}); every node is \
-                 refused until it is fixed with PUT /tenants/{tenant_id}"
+                 refused until it is fixed with PUT /tenants/{tenant_id} (send a corrected \
+                 policy, or {{\"policy\": {{}}}} to clear it; a null policy keeps the stored one)"
             );
             warn!(execution_id = %execution_id, node_id, %reason, "refusing node");
             if fire {

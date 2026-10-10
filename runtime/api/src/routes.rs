@@ -1242,8 +1242,13 @@ async fn update_tenant(
     // The policy is parsed strictly before it is stored: a malformed one
     // would otherwise refuse every node of the tenant at run time.
     if let Some(policy) = &body.policy {
-        jamjet_state::tenant::parse_tenant_policy(policy)
-            .map_err(|e| ApiError::BadRequest(format!("invalid policy: {e}")))?;
+        jamjet_state::tenant::parse_tenant_policy(policy).map_err(|e| {
+            ApiError::BadRequest(format!(
+                "invalid policy: {e}. Send an object with blocked_tools, \
+                     require_approval_for and model_allowlist; {{}} clears the policy, and a \
+                     null or missing policy keeps the stored one"
+            ))
+        })?;
     }
 
     let updated = Tenant {

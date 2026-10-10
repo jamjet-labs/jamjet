@@ -255,3 +255,82 @@ async fn a_stored_malformed_policy_refuses_nodes_in_process() {
         events.iter().map(|e| &e.kind).collect::<Vec<_>>()
     );
 }
+
+/// `{"policy": {}}` clears a stored policy; `{"policy": null}` (or no field)
+/// keeps it. The refusal and the 400 say so, since an operator fixing a
+/// malformed policy is told to use PUT.
+#[tokio::test]
+async fn an_empty_policy_clears_and_null_keeps_and_the_messages_say_so() {
+    let env = env().await;
+    store_malformed_policy(&env).await;
+    let eid = start(&env).await;
+    let (_, body) = call(
+        &env.app,
+        "POST",
+        "/work-items/claim",
+        &env.alice,
+        json!({ "worker_id": "w", "queue_types": ["tool"] }),
+    )
+    .await;
+    assert_eq!(body, json!({ "claimed": false }));
+    let rule = env
+        .backend
+        .get_events(&eid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e.kind {
+            EventKind::PolicyViolation { rule, .. } => Some(rule),
+            _ => None,
+        })
+        .unwrap();
+    assert!(rule.contains(r#"{"policy": {}}"#), "{rule}");
+
+    let (st, body) = call(
+        &env.app,
+        "PUT",
+        "/tenants/default",
+        &env.ops,
+        json!({ "policy": "nope" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(body.to_string().contains("clears"), "{body}");
+
+    let (st, _) = call(
+        &env.app,
+        "PUT",
+        "/tenants/default",
+        &env.ops,
+        json!({ "policy": null }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let kept = env
+        .backend
+        .get_tenant(&TenantId::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(kept.policy.is_some(), "null keeps the stored policy");
+
+    let (st, _) = call(
+        &env.app,
+        "PUT",
+        "/tenants/default",
+        &env.ops,
+        json!({ "policy": {} }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let cleared = env
+        .backend
+        .get_tenant(&TenantId::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(cleared
+        .policy_set()
+        .unwrap()
+        .is_none_or(|p| p.blocked_tools.is_empty() && p.require_approval_for.is_empty()));
+}
