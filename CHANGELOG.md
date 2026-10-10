@@ -334,13 +334,17 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     on the card's `allowed_tools`, and records a violation with scope `agent` and a rule
     starting `agent blocked_tools`. A card gate holds the node through the ordinary
     approval request (bound to the action digest, with the policy chain's deadline),
-    including a node no policy gates; for an ADK dispatch the approval covers the whole
-    batch. Both are additional to tenant, workflow and node policy. A node that picks
-    its target at run time is treated as named by any non-empty card list.
+    including a node no policy gates. For an ADK dispatch, gated calls go through the
+    per-call request a chain gate raises: it lists every gated call (card and chain) with
+    its arguments and binds them, and a chain block on any call in the batch refuses it
+    before anyone is asked. Both are additional to tenant, workflow and node policy. A
+    node that picks its target at run time is treated as named by any non-empty card
+    list: a card block list refuses it, a card gate list gates it.
   - The card's `allowed_delegations` is enforced at the same step. A delegation is an
     `agent` node (its `agent_ref`), an `agent_tool` with an explicit target (that URI)
-    or an `a2a_task` (its `remote_agent` name as the IR writes it, not the URL it maps
-    to); the target must match a pattern on a non-empty list, or the node is refused
+    or an `a2a_task` (the URL its `remote_agent` maps to in the workflow's
+    `remote_agents`, since the author writes both the name and the mapping; a name with
+    no entry is refused); the target must match a pattern on a non-empty list, or the node is refused
     with a rule starting `agent allowed_delegations`. A coordinator, agent discovery or
     `auto` agent tool picks its target at run time and is refused under a list. An
     empty list restricts nothing. A subgraph runs a child workflow, not an agent, and
@@ -356,7 +360,7 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     than the runtime does: `token_budget` and `cost_budget_usd` are checked only for a
     `bounded_autonomous` card on an `agent` node calling it, in the in-process worker;
     `max_iterations` and `max_tool_calls` are compared with counters the runtime never
-    increments, so they do not trip; `time_budget_secs` is never read; the error circuit
+    increments, so a limit above 0 never trips (a limit of 0 always does); `time_budget_secs` is never read; the error circuit
     breaker never trips; nothing routes an autonomy escalation to a human or a
     supervisor; and no tool compiles an `agents.yaml` into a card. See "What each
     constraint does" in docs/guides/agent-model-guide.md.

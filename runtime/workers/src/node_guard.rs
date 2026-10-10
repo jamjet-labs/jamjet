@@ -70,6 +70,11 @@ pub enum GuardMode {
 pub struct AgentScope<'a> {
     /// The workflow-level `agent_ref` (`WorkflowIr::agent_ref`).
     pub workflow_agent: Option<&'a str>,
+    /// The workflow's `remote_agents` (`WorkflowIr::remote_agents`): an
+    /// `a2a_task` is checked against `allowed_delegations` by the URL its
+    /// `remote_agent` maps to. `None` refuses any `a2a_task` under a list.
+    pub remote_agents:
+        Option<&'a std::collections::HashMap<String, jamjet_ir::workflow::RemoteAgentConfig>>,
     pub registry: Option<&'a dyn AgentRegistry>,
 }
 
@@ -88,30 +93,62 @@ pub const BLOCKED_TOOLS_RULE: &str = "agent blocked_tools";
 /// with this.
 pub const ALLOWED_DELEGATIONS_RULE: &str = "agent allowed_delegations";
 
-/// Whom a node delegates to, if it delegates: `Some(Some(target))` for an
-/// `agent` node (its `agent_ref`), an `agent_tool` with an explicit target
-/// (that URI) and an `a2a_task` (its `remote_agent` name, as the IR names it);
-/// `Some(None)` for a node that picks its target at run time (`coordinator`,
-/// `agent_discovery`, an `auto` agent tool); `None` for every other node.
-/// A subgraph runs a child workflow, not an agent, and is not a delegation.
+/// Whom a node delegates to, if it delegates.
+enum Delegation<'a> {
+    /// The target, as the node or its workflow names it.
+    To(&'a str),
+    /// The target is chosen at run time (`coordinator`, `agent_discovery`, an
+    /// `auto` agent tool), so nothing can be checked.
+    RunTime,
+    /// An `a2a_task` whose `remote_agent` has no entry in the workflow's
+    /// `remote_agents`, so the URL it calls is unknown.
+    Unresolved(&'a str),
+}
+
+/// `Some` for an `agent` node (its `agent_ref`), an `agent_tool` with an
+/// explicit target (that URI), an `a2a_task` (the URL its `remote_agent`
+/// maps to in the workflow's `remote_agents`: the author writes both the name
+/// and the mapping, so the name alone proves nothing), and the run-time
+/// kinds. `None` for every other node: a subgraph runs a child workflow, not
+/// an agent.
 #[allow(deprecated)]
-fn delegation_target(kind: &NodeKind) -> Option<Option<&str>> {
+fn delegation_target<'a>(
+    kind: &'a NodeKind,
+    remote_agents: Option<
+        &'a std::collections::HashMap<String, jamjet_ir::workflow::RemoteAgentConfig>,
+    >,
+) -> Option<Delegation<'a>> {
     use jamjet_core::agent_tool::AgentTarget;
     match kind {
-        NodeKind::Agent { agent_ref, .. } => Some(Some(agent_ref)),
+        NodeKind::Agent { agent_ref, .. } => Some(Delegation::To(agent_ref)),
         NodeKind::AgentTool {
             agent: AgentTarget::Explicit(uri),
             ..
-        } => Some(Some(uri)),
-        NodeKind::A2aTask { remote_agent, .. } => Some(Some(remote_agent)),
+        } => Some(Delegation::To(uri)),
+        NodeKind::A2aTask { remote_agent, .. } => {
+            Some(match remote_agents.and_then(|m| m.get(remote_agent)) {
+                Some(config) => Delegation::To(&config.url),
+                None => Delegation::Unresolved(remote_agent),
+            })
+        }
         NodeKind::AgentTool {
             agent: AgentTarget::Auto,
             ..
         }
         | NodeKind::Coordinator { .. }
-        | NodeKind::AgentDiscovery { .. } => Some(None),
+        | NodeKind::AgentDiscovery { .. } => Some(Delegation::RunTime),
         _ => None,
     }
+}
+
+/// What an agent card's `require_approval_for` gates.
+#[derive(Debug, Clone, Default)]
+struct CardGate {
+    /// The node's own tool, gated: approve the node over its full payload.
+    node: Option<String>,
+    /// Names of an agent tool dispatch's calls that are gated: raised through
+    /// the dispatch guard's per-call request, alongside any chain gates.
+    calls: Vec<String>,
 }
 
 /// Decide whether `node_def` may fire (or, in `Complete` mode, whether its
@@ -152,7 +189,7 @@ pub async fn guard_item(
 ) -> GuardOutcome {
     // First, so a node the agent may not use never raises an approval request
     // and is refused even when no policy applies.
-    let card_gate = match agent_card(
+    let card = match agent_card(
         backend,
         mode,
         execution_id,
@@ -166,11 +203,14 @@ pub async fn guard_item(
         Ok(gate) => gate,
         Err(refused) => return refused,
     };
+    let card_calls = card.calls.clone();
+    let card_gate = card.node;
     let is_dispatch = dispatch_guard::is_agent_tool_dispatch(&node_def.kind);
     // The per-call guard for a dispatch node. `node_approved`: an approval of
     // the node's full payload is on file and covers this item. The calls are
     // part of that payload, so they need no approval of their own; per-call
     // blocks still apply.
+    let card_calls = &card_calls;
     let per_call = |node_approved: bool| async move {
         let input = dispatch_guard::payload_input(payload);
         dispatch_guard::guard_dispatch_in(
@@ -184,6 +224,7 @@ pub async fn guard_item(
             &input,
             node_approved,
             sealer,
+            card_calls,
         )
         .await
     };
@@ -346,7 +387,7 @@ async fn agent_card(
     node_def: &NodeDef,
     payload: &Value,
     agents: AgentScope<'_>,
-) -> Result<Option<String>, GuardOutcome> {
+) -> Result<CardGate, GuardOutcome> {
     use jamjet_policy::allowed_tools::{call_allowed, call_named_by, node_named_by, CallRefused};
 
     let mut refs: Vec<&str> = Vec::new();
@@ -360,7 +401,7 @@ async fn agent_card(
         }
     }
     let Some(&first) = refs.first() else {
-        return Ok(None);
+        return Ok(CardGate::default());
     };
 
     let refuse = |rule: String| async move {
@@ -398,7 +439,7 @@ async fn agent_card(
     };
     let is_dispatch = dispatch_guard::is_agent_tool_dispatch(&node_def.kind);
     let ctx = EvaluationContext::from_node_kind(node_id, &node_def.kind);
-    let mut gate: Option<String> = None;
+    let mut gate = CardGate::default();
 
     for agent_ref in refs {
         let card = match registry.get_by_uri(agent_ref).await {
@@ -434,8 +475,8 @@ async fn agent_card(
         // written). A node that picks its target at run time cannot be
         // checked and is refused under a list.
         if !c.allowed_delegations.is_empty() {
-            match delegation_target(&node_def.kind) {
-                Some(Some(target)) => {
+            match delegation_target(&node_def.kind, agents.remote_agents) {
+                Some(Delegation::To(target)) => {
                     if !c
                         .allowed_delegations
                         .iter()
@@ -448,7 +489,15 @@ async fn agent_card(
                         .await;
                     }
                 }
-                Some(None) => {
+                Some(Delegation::Unresolved(name)) => {
+                    return refuse(format!(
+                        "{ALLOWED_DELEGATIONS_RULE}: agent '{agent_ref}' has a delegation list, \
+                         and remote agent '{name}' is not in the workflow's remote_agents, so \
+                         the URL it calls is unknown"
+                    ))
+                    .await;
+                }
+                Some(Delegation::RunTime) => {
                     return refuse(format!(
                         "{ALLOWED_DELEGATIONS_RULE}: agent '{agent_ref}' has a delegation list, \
                          and a {} node picks its target at run time",
@@ -477,8 +526,8 @@ async fn agent_card(
                 ))
                 .await;
             }
-            if gate.is_none() {
-                gate = node_named_by(&ctx, gated);
+            if gate.node.is_none() {
+                gate.node = node_named_by(&ctx, gated);
             }
         }
         if is_dispatch {
@@ -511,8 +560,8 @@ async fn agent_card(
                     ))
                     .await;
                 }
-                if gate.is_none() {
-                    gate = call_named_by(call, gated);
+                if call_named_by(call, gated).is_some() && !gate.calls.contains(&call.name) {
+                    gate.calls.push(call.name.clone());
                 }
             }
         }

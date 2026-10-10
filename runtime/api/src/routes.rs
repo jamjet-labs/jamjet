@@ -1667,6 +1667,7 @@ async fn gate_claimed_item(
     let GuardInputs {
         workflow_policy,
         workflow_agent,
+        remote_agents,
         node_def,
     } = if jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&kind) {
         let ir = match serde_json::from_value::<jamjet_ir::WorkflowIr>(ir_value) {
@@ -1681,6 +1682,7 @@ async fn gate_claimed_item(
         GuardInputs {
             workflow_policy: ir.policy,
             workflow_agent: ir.agent_ref,
+            remote_agents: ir.remote_agents,
             node_def,
         }
     } else {
@@ -1704,6 +1706,7 @@ async fn gate_claimed_item(
         Some(sealer),
         jamjet_worker::node_guard::AgentScope {
             workflow_agent: workflow_agent.as_deref(),
+            remote_agents: Some(&remote_agents),
             registry: Some(agents),
         },
     )
@@ -1783,6 +1786,8 @@ struct GuardInputs {
     workflow_policy: Option<jamjet_ir::workflow::PolicySetIr>,
     /// `WorkflowIr::agent_ref`.
     workflow_agent: Option<String>,
+    /// `WorkflowIr::remote_agents`.
+    remote_agents: std::collections::HashMap<String, jamjet_ir::workflow::RemoteAgentConfig>,
     node_def: NodeDef,
 }
 
@@ -1812,9 +1817,17 @@ fn guard_inputs_from_raw(ir_value: &Value, node_id: &str) -> Result<GuardInputs,
                 .map_err(|e| format!("failed to load workflow agent_ref: {e}"))?,
         ),
     };
+    // An a2a_task is checked by the URL its name maps to here; an unreadable
+    // map must not read as "no remote agents" (that refuses, but say why).
+    let remote_agents = match ir_value.get("remote_agents") {
+        None | Some(Value::Null) => Default::default(),
+        Some(raw) => serde_json::from_value(raw.clone())
+            .map_err(|e| format!("failed to load workflow remote_agents: {e}"))?,
+    };
     Ok(GuardInputs {
         workflow_policy,
         workflow_agent,
+        remote_agents,
         node_def,
     })
 }
@@ -1850,6 +1863,7 @@ async fn completion_gate(
     let GuardInputs {
         workflow_policy,
         workflow_agent,
+        remote_agents,
         node_def,
     } = guard_inputs_from_raw(&def.ir, &wi.node_id).map_err(refused)?;
     match jamjet_worker::node_guard::guard_item(
@@ -1865,6 +1879,7 @@ async fn completion_gate(
         None,
         jamjet_worker::node_guard::AgentScope {
             workflow_agent: workflow_agent.as_deref(),
+            remote_agents: Some(&remote_agents),
             registry: Some(agents),
         },
     )

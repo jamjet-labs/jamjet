@@ -1185,7 +1185,6 @@ async fn a_delegation_to_a_listed_agent_runs() {
     for kind in [
         agent_node("jamjet://acme/helper"),
         agent_tool(json!({ "explicit": "jamjet://acme/helper" })),
-        a2a_task("helper"),
     ] {
         for (ctx, o) in each(|wf| {
             (
@@ -1335,5 +1334,396 @@ async fn the_sdk_compiled_agent_is_held_to_its_card() {
                 }
             }
         }
+    }
+}
+
+// ── Second review: card gates, chain gates and blocks in one batch ─────────
+
+fn chain(blocked: &[&str], gated: &[&str]) -> Value {
+    json!({ "blocked_tools": blocked, "require_approval_for": gated, "model_allowlist": [] })
+}
+
+fn dispatch_input(calls_v: Value, extra: &[(&str, Value)]) -> Value {
+    let mut tools = serde_json::Map::new();
+    for c in calls_v.as_array().unwrap() {
+        if let Some(h) = c.get("handler") {
+            tools.insert(c["name"].as_str().unwrap().to_string(), h.clone());
+        }
+    }
+    let calls_v: Vec<Value> = calls_v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| json!({ "id": "c", "name": c["name"], "arguments": c.get("arguments").cloned().unwrap_or(json!({})) }))
+        .collect();
+    let mut input = json!({ "tool_calls": calls_v, "tools": tools });
+    for (k, v) in extra {
+        input[*k] = v.clone();
+    }
+    input
+}
+
+/// R1: a call the chain blocks is refused before any approval is asked for,
+/// even when the card gates another call in the batch.
+#[tokio::test]
+async fn a_chain_blocked_call_is_refused_not_gated_by_a_card() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card_with(
+                AGENT,
+                json!({ "require_approval_for": ["search"] }),
+            )],
+            ir(
+                &wf,
+                adk_dispatch(),
+                Some(AGENT),
+                None,
+                Some(chain(&["send_wire"], &[])),
+            ),
+            calls(&[
+                ("search", Some("app.tools:search")),
+                ("pay", Some("bank.wires:send_wire")),
+            ]),
+        )
+    })
+    .await
+    {
+        assert!(!o.ran, "{ctx}");
+        assert!(
+            o.requests.is_empty(),
+            "{ctx}: an approval was asked for a blocked call"
+        );
+        assert!(
+            !o.violations.is_empty(),
+            "{ctx}: the block was not recorded"
+        );
+    }
+}
+
+/// R3: the request a card gate raises names every gated call, the chain's
+/// included.
+#[tokio::test]
+async fn a_card_gate_request_names_every_gated_call() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card_with(
+                AGENT,
+                json!({ "require_approval_for": ["search"] }),
+            )],
+            ir(
+                &wf,
+                adk_dispatch(),
+                Some(AGENT),
+                None,
+                Some(chain(&[], &["send_wire"])),
+            ),
+            calls(&[
+                ("search", Some("app.tools:search")),
+                ("pay", Some("bank.wires:send_wire")),
+            ]),
+        )
+    })
+    .await
+    {
+        assert_eq!(o.requests.len(), 1, "{ctx}");
+        let gated = &o.requests[0]["gated_tools"];
+        assert!(
+            gated
+                .as_array()
+                .is_some_and(|g| g.contains(&json!("search")) && g.contains(&json!("pay"))),
+            "{ctx}: {gated}"
+        );
+    }
+}
+
+/// R2: the approver sees the calls and their arguments, even when the
+/// payload is too large to preview.
+#[tokio::test]
+async fn a_card_gate_request_shows_the_calls_of_a_large_payload() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card_with(AGENT, json!({ "require_approval_for": ["send_wire"] }))],
+            ir(&wf, adk_dispatch(), Some(AGENT), None, None),
+            dispatch_input(
+                json!([{ "name": "pay", "handler": "bank.wires:send_wire", "arguments": { "to": "ATTACKER-IBAN" } }]),
+                &[("messages", json!("x".repeat(20_000)))],
+            ),
+        )
+    })
+    .await
+    {
+        assert_eq!(o.requests.len(), 1, "{ctx}");
+        assert!(
+            o.requests[0]["calls"].to_string().contains("ATTACKER-IBAN"),
+            "{ctx}: the approver cannot see the call"
+        );
+    }
+}
+
+/// An approved card-gated dispatch fires, on both transports.
+#[tokio::test]
+async fn an_approved_card_gated_dispatch_fires() {
+    let input = calls(&[("pay", Some("bank.wires:send_wire"))]);
+    for t in TRANSPORTS {
+        for tb in support::backends().await {
+            let ctx = format!("{} over {t:?}", tb.name());
+            let wf = format!("wf-dgate-{}-{t:?}", tb.name()).to_lowercase();
+            let ir_v = ir(&wf, adk_dispatch(), Some(AGENT), None, None);
+            let (state, o) = run_in(
+                &tb,
+                t,
+                &[card_with(
+                    AGENT,
+                    json!({ "require_approval_for": ["send_wire"] }),
+                )],
+                ir_v.clone(),
+                input.clone(),
+            )
+            .await;
+            assert!(!o.ran, "{ctx}");
+            let digest = o.requests[0]["action_digest"].as_str().unwrap().to_string();
+            let eid = format!("exec_{}", o.eid.0);
+            let (st, body) = support::post(
+                &state,
+                &format!("/executions/{eid}/approve"),
+                json!({ "decision": "approved", "node_id": "n1", "action_digest": digest }),
+            )
+            .await;
+            assert!(st.is_success(), "{ctx}: approve: {st} {body}");
+            let ir_t: jamjet_ir::WorkflowIr = serde_json::from_value(ir_v).unwrap();
+            let payload = jamjet_scheduler::build_work_item_payload(
+                &ir_t,
+                "n1",
+                ir_t.node("n1").unwrap(),
+                input.as_object().unwrap(),
+                &wf,
+                "0.1.0",
+            );
+            let (st, body) = support::post(
+                &state,
+                "/work-items",
+                json!({ "execution_id": eid, "node_id": "n1", "queue_type": "python_tool", "payload": payload }),
+            )
+            .await;
+            assert!(st.is_success(), "{ctx}: enqueue: {st} {body}");
+            assert!(
+                fire(&state, &tb, t).await,
+                "{ctx}: the approved dispatch did not fire"
+            );
+        }
+    }
+}
+
+/// R4: every node that picks its delegate at run time is refused under a
+/// delegation list.
+#[tokio::test]
+async fn every_run_time_delegation_is_refused_under_a_list() {
+    for kind in [
+        json!({ "type": "agent_discovery", "skill": "s", "protocol": null, "output_binding": "o" }),
+        agent_tool(json!("auto")),
+    ] {
+        for (ctx, o) in each(|wf| {
+            (
+                vec![delegating(&["jamjet://acme/helper"])],
+                ir(&wf, kind.clone(), Some(AGENT), None, None),
+                json!({}),
+            )
+        })
+        .await
+        {
+            assert!(!o.ran, "{ctx}: {kind}");
+            assert!(
+                o.violations
+                    .iter()
+                    .any(|(r, _)| r.starts_with("agent allowed_delegations")),
+                "{ctx}: {kind}: {:?}",
+                o.violations
+            );
+        }
+    }
+}
+
+/// R5: a chain block wins over a card gate on the same node.
+#[tokio::test]
+async fn a_chain_block_wins_over_a_card_gate() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![card_with(
+                AGENT,
+                json!({ "require_approval_for": ["send_*"] }),
+            )],
+            ir(
+                &wf,
+                mcp_tool("send_wire"),
+                Some(AGENT),
+                None,
+                Some(chain(&["send_wire"], &[])),
+            ),
+            json!({}),
+        )
+    })
+    .await
+    {
+        assert!(!o.ran, "{ctx}");
+        assert!(o.requests.is_empty(), "{ctx}");
+        assert!(
+            o.violations.iter().any(|(_, scope)| scope == "workflow"),
+            "{ctx}: {:?}",
+            o.violations
+        );
+    }
+}
+
+/// R6: a result for a card-gated node nobody approved is not recorded.
+#[tokio::test]
+async fn completing_an_unapproved_card_gated_node_is_refused() {
+    for tb in support::backends().await {
+        let state = state_for(&tb).await;
+        let (st, _) = support::post(
+            &state,
+            "/agents",
+            card_with(AGENT, json!({ "require_approval_for": ["send_*"] })),
+        )
+        .await;
+        assert!(st.is_success());
+        support::register_and_start(
+            &state,
+            ir(
+                "wf-gate-complete",
+                mcp_tool("send_wire"),
+                Some(AGENT),
+                None,
+                None,
+            ),
+            json!({}),
+        )
+        .await;
+        let item = tb
+            .dyn_backend()
+            .claim_work_item_with_lease("in-process", &["tool"], None)
+            .await
+            .unwrap()
+            .expect("the start item");
+        let (st, body) = support::post(
+            &state,
+            &format!("/work-items/{}/complete", item.id),
+            json!({ "output": {}, "state_patch": {}, "lease_fence": item.lease_fence }),
+        )
+        .await;
+        assert_eq!(
+            st,
+            axum::http::StatusCode::CONFLICT,
+            "{}: {body}",
+            tb.name()
+        );
+    }
+}
+
+fn with_remote(mut ir_v: Value, name: &str, url: &str) -> Value {
+    ir_v["remote_agents"] = json!({ name: { "url": url, "agent_card_path": null, "auth": null } });
+    ir_v
+}
+
+/// I3: an a2a_task is checked by the URL it calls, which the IR maps the name
+/// to, not by the name alone.
+#[tokio::test]
+async fn an_a2a_delegation_is_checked_by_its_url() {
+    for (url, expect) in [
+        ("https://partner.example/a2a", true),
+        ("https://evil.example/a2a", false),
+    ] {
+        for (ctx, o) in each(|wf| {
+            (
+                vec![delegating(&["https://partner.example/*", "partner"])],
+                with_remote(
+                    ir(&wf, a2a_task("partner"), Some(AGENT), None, None),
+                    "partner",
+                    url,
+                ),
+                json!({}),
+            )
+        })
+        .await
+        {
+            if expect {
+                assert!(o.ran, "{ctx}: {url}: {:?}", o.violations);
+            } else {
+                assert_refused(&o, url, &ctx);
+            }
+        }
+    }
+}
+
+struct BrokenRegistry;
+
+#[async_trait]
+impl AgentRegistry for BrokenRegistry {
+    async fn register(&self, _: jamjet_agents::AgentCard) -> Result<uuid::Uuid, String> {
+        Err("down".into())
+    }
+    async fn get(&self, _: uuid::Uuid) -> Result<Option<jamjet_agents::registry::Agent>, String> {
+        Err("down".into())
+    }
+    async fn get_by_uri(&self, _: &str) -> Result<Option<jamjet_agents::registry::Agent>, String> {
+        Err("down".into())
+    }
+    async fn find(
+        &self,
+        _: jamjet_agents::AgentFilter,
+    ) -> Result<Vec<jamjet_agents::registry::Agent>, String> {
+        Err("down".into())
+    }
+    async fn update_status(
+        &self,
+        _: uuid::Uuid,
+        _: jamjet_agents::AgentStatus,
+    ) -> Result<(), String> {
+        Err("down".into())
+    }
+    async fn heartbeat(&self, _: uuid::Uuid) -> Result<(), String> {
+        Err("down".into())
+    }
+    async fn discover_remote(&self, _: &str) -> Result<jamjet_agents::registry::Agent, String> {
+        Err("down".into())
+    }
+}
+
+/// The autonomy check fails closed: an `agent` node whose callee's card
+/// cannot be read does not run.
+#[tokio::test]
+async fn an_agent_node_with_an_unreadable_card_does_not_run() {
+    for tb in support::backends().await {
+        let mut state = support::make_state(tb.dyn_backend());
+        state.agents = Arc::new(BrokenRegistry);
+        support::register_and_start(
+            &state,
+            ir(
+                "wf-autonomy",
+                agent_node("jamjet://acme/helper"),
+                None,
+                None,
+                None,
+            ),
+            json!({}),
+        )
+        .await;
+        assert!(!fire(&state, &tb, Transport::Worker).await, "{}", tb.name());
+    }
+}
+
+/// A listed remote agent name with no URL in the workflow is refused: the
+/// URL it would call is unknown.
+#[tokio::test]
+async fn an_a2a_name_without_a_url_is_refused() {
+    for (ctx, o) in each(|wf| {
+        (
+            vec![delegating(&["partner"])],
+            ir(&wf, a2a_task("partner"), Some(AGENT), None, None),
+            json!({}),
+        )
+    })
+    .await
+    {
+        assert_refused(&o, "not in the workflow's remote_agents", &ctx);
     }
 }

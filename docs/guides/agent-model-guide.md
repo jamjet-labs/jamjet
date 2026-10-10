@@ -33,7 +33,7 @@ The runtime reads these settings from the Agent Card registered with `POST /agen
 |------------|----------|-------|
 | `allowed_tools`, `blocked_tools`, `require_approval_for` | Yes | Every node that acts for the agent (`agent_ref`), on the HTTP claim route, the in-process worker and the completion gate. See below. |
 | `allowed_delegations` | Yes | Same nodes: `agent`, `agent_tool` and `a2a_task` targets. See below. |
-| `token_budget`, `cost_budget_usd` | Partly | Only for a `bounded_autonomous` card, only on an `agent` node that calls it (the card of the agent being called, not `agent_ref`), and only in the in-process worker, not on the claim route. Compared with the run's accumulated token and cost totals; at or over the limit the node does not run and `autonomy_limit_reached` and `escalation_required` events are recorded (see Budget Enforcement below). |
+| `token_budget`, `cost_budget_usd` | Partly | Only for a `bounded_autonomous` card, only on an `agent` node that calls it (the card named by that node's own `agent_ref` field, which says whom it calls, not the workflow's attribution), and only in the in-process worker, not on the claim route. Compared with the run's token and cost totals as the in-process worker accumulates them (results reported through the HTTP worker protocol add nothing); at or over the limit, or when the registry cannot be read, the node does not run and `autonomy_limit_reached` and `escalation_required` events are recorded (see Budget Enforcement below). |
 | `max_iterations`, `max_tool_calls` | No, in effect | Read in the same place as the budgets, but compared with counters the runtime never increments, so a limit above 0 never trips (a limit of 0 always does). |
 | `time_budget_secs` | No | Stored, never read. |
 
@@ -56,8 +56,8 @@ From the Python SDK, `Agent("researcher", ..., agent_ref="jamjet://acme/research
 - The agent's status is not consulted, and cards are global: the first card registered at a URI is the one enforced.
 - An absent or empty list restricts nothing. To refuse every tool, use a policy `blocked_tools: ["*"]`.
 - Policy still applies on top: a tool on the list can still be blocked or approval-gated.
-- `allowed_delegations` restricts whom the agent delegates to: an `agent` node's `agent_ref`, an `agent_tool` node's explicit target, or an `a2a_task` node's `remote_agent` name, matched as glob patterns. A node that picks its target at run time is refused under a list; an empty list restricts nothing. Subgraphs are not delegations.
-- The card's `blocked_tools` and `require_approval_for` apply to the same nodes and match the same way. A card block wins over the card's `allowed_tools`; a card gate holds the node for an ordinary approval, with the policy chain's deadline.
+- `allowed_delegations` restricts whom the agent delegates to: an `agent` node's `agent_ref`, an `agent_tool` node's explicit target, or the URL an `a2a_task` node's `remote_agent` maps to in the workflow's `remote_agents` (a name with no entry is refused), matched as glob patterns. A node that picks its target at run time is refused under a list; an empty list restricts nothing. Subgraphs are not delegations.
+- The card's `blocked_tools` and `require_approval_for` apply to the same nodes and match the same way. A card block wins over the card's `allowed_tools`; a card gate holds the node for an ordinary approval, with the policy chain's deadline. For an ADK dispatch, the request lists every gated call with its arguments, and a call the policy chain blocks refuses the batch first. A node that picks its target at run time (coordinator, agent discovery, `auto` agent tool) is refused by any non-empty card block list and gated by any non-empty card gate list.
 
 ---
 
@@ -135,4 +135,4 @@ When an `agent` node calls a `bounded_autonomous` agent whose card's `token_budg
 1. `autonomy_limit_reached` and `escalation_required` (target `human_approval`) events are recorded
 2. The node does not run. The worker leaves the item to its lease, so it is retried, and refused again, until its attempts run out. Nothing routes to a human or a supervisor agent automatically.
 
-A workflow-level `token_budget` or `cost_budget_usd` in the IR is a separate check that applies to every node.
+A workflow-level `token_budget` or `cost_budget_usd` in the IR is a separate check, made by the in-process worker for the nodes it runs; the HTTP claim route does not make it.

@@ -190,6 +190,11 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
         }
         # `acts_for`, not `agent_ref`: on a node, `agent_ref` already names the
         # agent an `agent` node calls.
+        if node_type != "agent" and "agent_ref" in node_data:
+            raise ValueError(
+                f"node '{node_id}': agent_ref names the agent an `agent` node calls; "
+                "to say which agent this node acts for, use acts_for"
+            )
         node_agent = agent_ref(node_data.get("acts_for"), location=f"node '{node_id}' acts_for")
         if node_agent is not None:
             nodes[node_id]["agent_ref"] = node_agent

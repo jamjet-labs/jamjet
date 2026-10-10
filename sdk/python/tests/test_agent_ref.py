@@ -165,3 +165,20 @@ agent:
         }
     )
     assert bundle.workflows[0]["agent_ref"] == AGENT
+
+
+def test_yaml_agent_ref_on_a_non_agent_node_is_refused():
+    """It would read as attribution and be silently dropped (review 2)."""
+    with pytest.raises(ValueError, match="acts_for"):
+        compile_yaml(
+            f"""
+workflow:
+  id: wf
+nodes:
+  s:
+    type: tool
+    tool_ref: x
+    agent_ref: {AGENT}
+    next: end
+"""
+        )

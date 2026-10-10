@@ -1008,6 +1008,7 @@ impl Worker {
             self.sealer.as_deref(),
             node_guard::AgentScope {
                 workflow_agent: ir.agent_ref.as_deref(),
+                remote_agents: Some(&ir.remote_agents),
                 registry: self.agents.as_deref(),
             },
         )
@@ -1054,9 +1055,17 @@ impl Worker {
             })
             .unwrap_or_else(|| node_id.to_string());
 
+        // An unregistered callee has no card to enforce. An unreadable
+        // registry refuses: the item is left to its lease and retried, never
+        // run on a guess (the event appends below are best effort for the
+        // same reason, and never decide whether the node runs).
         let agent = match agents.get_by_uri(&agent_ref).await {
             Ok(Some(a)) => a,
-            _ => return None,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!(execution_id = %execution_id, node_id, %agent_ref, "agent registry unreadable; refusing the agent node");
+                return Some(Err(format!("agent registry unavailable: {e}").into()));
+            }
         };
         let card = agent.card;
 
@@ -1105,7 +1114,12 @@ impl Worker {
                 escalation_target,
             } => {
                 warn!(execution_id = %execution_id, node_id, %limit_type, "Autonomy limit reached");
-                let seq = self.backend.latest_sequence(execution_id).await.ok()? + 1;
+                let seq = self
+                    .backend
+                    .latest_sequence(execution_id)
+                    .await
+                    .unwrap_or(0)
+                    + 1;
                 let _ = self
                     .backend
                     .append_event(jamjet_state::Event::new(
@@ -1120,7 +1134,12 @@ impl Worker {
                         },
                     ))
                     .await;
-                let seq = self.backend.latest_sequence(execution_id).await.ok()? + 1;
+                let seq = self
+                    .backend
+                    .latest_sequence(execution_id)
+                    .await
+                    .unwrap_or(0)
+                    + 1;
                 let _ = self
                     .backend
                     .append_event(jamjet_state::Event::new(
@@ -1143,7 +1162,12 @@ impl Worker {
                 escalation_target,
             } => {
                 warn!(execution_id = %execution_id, node_id, consecutive_errors, "Circuit breaker tripped");
-                let seq = self.backend.latest_sequence(execution_id).await.ok()? + 1;
+                let seq = self
+                    .backend
+                    .latest_sequence(execution_id)
+                    .await
+                    .unwrap_or(0)
+                    + 1;
                 let _ = self
                     .backend
                     .append_event(jamjet_state::Event::new(
@@ -1157,7 +1181,12 @@ impl Worker {
                         },
                     ))
                     .await;
-                let seq = self.backend.latest_sequence(execution_id).await.ok()? + 1;
+                let seq = self
+                    .backend
+                    .latest_sequence(execution_id)
+                    .await
+                    .unwrap_or(0)
+                    + 1;
                 let _ = self
                     .backend
                     .append_event(jamjet_state::Event::new(
