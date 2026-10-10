@@ -150,3 +150,21 @@ pub struct TenantLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_cost_per_month_usd: Option<f64>,
 }
+
+#[cfg(test)]
+mod policy_field_tests {
+    use super::*;
+
+    /// `TENANT_POLICY_FIELDS` re-declares `PolicySetIr`'s fields. If they drift,
+    /// a new policy field is refused at `PUT /tenants` and a stored policy using
+    /// it blocks every node of the tenant. Pin them together.
+    #[test]
+    fn tenant_policy_fields_are_exactly_policy_set_ir_fields() {
+        let ir = serde_json::to_value(jamjet_ir::workflow::PolicySetIr::default()).unwrap();
+        let mut from_ir: Vec<&str> = ir.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut declared: Vec<&str> = TENANT_POLICY_FIELDS.to_vec();
+        from_ir.sort_unstable();
+        declared.sort_unstable();
+        assert_eq!(declared, from_ir);
+    }
+}
