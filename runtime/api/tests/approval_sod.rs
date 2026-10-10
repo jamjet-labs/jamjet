@@ -402,3 +402,91 @@ async fn the_opt_out_allows_approving_a_run_with_no_initiator() {
         StatusCode::OK
     );
 }
+
+/// Outside dev mode a decision with no authenticated principal is refused
+/// outright, whatever the self-approval policy. Both transports always supply
+/// one, so this is unreachable today; it must stay refused if a new caller
+/// forgets, rather than fall through to "nobody to compare, allow".
+#[tokio::test]
+async fn a_decision_without_a_principal_is_refused_outside_dev_mode() {
+    use jamjet_api::approvals::{submit_approval, ApprovalPolicy, ApprovalSubmission, SubmitError};
+    use jamjet_state::event::ApprovalDecision;
+    for (decision, allow_self_approval) in [
+        (ApprovalDecision::Approved, false),
+        (ApprovalDecision::Approved, true),
+        (ApprovalDecision::Rejected, false),
+    ] {
+        let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = chrono::Utc::now();
+        backend
+            .create_execution(jamjet_core::workflow::WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "wf".into(),
+                workflow_version: "0.1.0".into(),
+                status: jamjet_core::workflow::WorkflowStatus::Running,
+                initial_input: json!({}),
+                current_state: json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        for (seq, kind) in [
+            EventKind::WorkflowStarted {
+                workflow_id: "wf".into(),
+                workflow_version: "0.1.0".into(),
+                initial_input: json!({}),
+                initiated_by: Some("token:alice".into()),
+            },
+            EventKind::ToolApprovalRequired {
+                node_id: "gate".into(),
+                tool_name: "t".into(),
+                approver: "human".into(),
+                context: json!({ "node_id": "gate" }),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            backend
+                .append_event(Event::new(eid.clone(), seq as i64 + 1, kind))
+                .await
+                .unwrap();
+        }
+        let result = submit_approval(
+            &backend,
+            &eid,
+            ApprovalSubmission {
+                node_id: Some("gate".into()),
+                user_id: "nobody".into(),
+                principal: None,
+                decision: decision.clone(),
+                comment: None,
+                state_patch: None,
+                action_digest: None,
+                dev_mode: false,
+            },
+            ApprovalPolicy {
+                allow_self_approval,
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(SubmitError::PrincipalMissing)),
+            "{decision:?} allow_self_approval={allow_self_approval}: {result:?}"
+        );
+        let decided = backend
+            .get_events(&eid)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::ApprovalReceived { .. }))
+            .count();
+        assert_eq!(decided, 0);
+    }
+}

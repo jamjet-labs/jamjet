@@ -77,6 +77,10 @@ pub enum SubmitError {
     /// Outside dev mode, an `Approved` decision on a request that binds an
     /// action did not echo the binding it was made against.
     DigestRequired,
+    /// Outside dev mode, the decision carries no authenticated principal. Both
+    /// transports always supply one there, so this is a misconfigured caller:
+    /// an unattributable decision is never recorded.
+    PrincipalMissing,
     /// A decision carried a `state_patch`. Approval edits are not supported:
     /// the executor builds node payloads from the scheduler's own state, which
     /// never applies an approval's patch, so recording "approved as edited"
@@ -128,6 +132,11 @@ impl std::fmt::Display for SubmitError {
                 "approval edits are not supported: a decision cannot carry a state_patch, \
                  because the action would not run on the edited state; approve or reject \
                  the action as requested"
+            ),
+            Self::PrincipalMissing => write!(
+                f,
+                "the decision has no authenticated principal; outside dev mode every \
+                 approval decision must come from an API token"
             ),
             Self::Backend(e) => write!(f, "backend error: {e}"),
         }
@@ -212,6 +221,13 @@ pub async fn submit_approval(
             }
         },
     };
+
+    // IDENTITY. Outside dev mode every decision is attributable. With no
+    // principal, separation of duties has nothing to compare and would fall
+    // through to "allow"; refuse instead, whatever the self-approval policy.
+    if !submission.dev_mode && submission.principal.is_none() {
+        return Err(SubmitError::PrincipalMissing);
+    }
 
     // SEPARATION OF DUTIES is per TOKEN, not per person. Operators mint
     // tokens (there is no REST route for it), so one human holding two tokens,
