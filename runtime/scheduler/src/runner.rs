@@ -380,14 +380,20 @@ impl Scheduler {
             .unwrap()
             .insert(execution_id.clone(), progress.clone());
 
-        // Approval deadlines. Only an execution holding a node for approval
-        // can have a request to expire or escalate; the sweep reads the log
+        // Approval deadlines. Only an execution holding a node on a request
+        // that carries a deadline can have one to expire or escalate (any key
+        // present, even an unreadable one, counts: that fails closed in the
+        // sweep). Runs with no deadlines are never read here. The sweep reads the log
         // and appends under its own condition, so it needs nothing from
         // `progress` but this trigger. What it records is folded on the next
         // tick (an expiry then fails the node below, like a rejection).
         // A failed sweep leaves the request open until a later tick retries:
         // late, never approved.
-        if !progress.held.is_empty() {
+        if progress
+            .held
+            .iter()
+            .any(|n| progress.deadline_requests.contains(n))
+        {
             if let Err(e) = self
                 .sweep_approval_deadlines(execution_id, chrono::Utc::now())
                 .await
@@ -694,6 +700,10 @@ struct ExecProgress {
     /// The sequence of each node's latest `ToolApprovalRequired`: an
     /// `ApprovalExpired` resolves a hold only when it names that request.
     held_request: HashMap<NodeId, jamjet_state::EventSequence>,
+    /// Nodes whose latest request carries a deadline (`expires_at` or
+    /// `escalate_at` in its context). Only a run holding one of these is swept,
+    /// so a run with no deadlines never has its log read for the sweep.
+    deadline_requests: HashSet<NodeId>,
     /// Rejected approvals awaiting their `NodeFailed` emission, node -> reason.
     /// Cleared when the corresponding `NodeFailed{retryable: false}` folds in.
     /// Note: a rejected node stays in `scheduled` (consuming a concurrency slot)
@@ -821,9 +831,22 @@ impl ExecProgress {
                 // future `retry_after`; a worker picks it up when ready.
                 // No change to self.scheduled here.
             }
-            EventKind::ToolApprovalRequired { node_id, .. } => {
+            EventKind::ToolApprovalRequired {
+                node_id, context, ..
+            } => {
                 self.held.insert(node_id.clone());
                 self.held_request.insert(node_id.clone(), event.sequence);
+                let has_deadline = [
+                    jamjet_state::approvals::EXPIRES_AT_KEY,
+                    jamjet_state::approvals::ESCALATE_AT_KEY,
+                ]
+                .iter()
+                .any(|k| context.get(*k).is_some());
+                if has_deadline {
+                    self.deadline_requests.insert(node_id.clone());
+                } else {
+                    self.deadline_requests.remove(node_id);
+                }
             }
             EventKind::ApprovalReceived {
                 node_id,

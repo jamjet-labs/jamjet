@@ -958,6 +958,43 @@ async fn the_scheduler_tick_runs_the_sweep() {
     }
 }
 
+/// Counts full reads of a run's log.
+#[derive(Default)]
+struct CountReads(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl AfterWrite for CountReads {
+    async fn after(&self, write: Write) {
+        if let Write::GetEvents(_) = write {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Review M-6: the tick reads a run's whole log for the deadline sweep only
+/// when the run holds a request that carries a deadline. A run held on a
+/// request with no deadline is not swept.
+#[tokio::test]
+async fn only_a_run_with_a_deadline_is_swept() {
+    for (policy, want_sweep) in [
+        (gate(json!({})), false),
+        (gate(json!({ "approval_timeout_secs": 600 })), true),
+    ] {
+        let env = envs().await.remove(0);
+        let eid = start_and_request(&env, ir(Value::Null, policy.clone())).await;
+        assert!(!request_context(&events(&env, &eid).await).is_null());
+        let reads = Arc::new(CountReads::default());
+        let counted: Arc<dyn StateBackend> =
+            Arc::new(HookedBackend::new(env.backend.clone(), reads.clone()));
+        let scheduler = Scheduler::new(counted);
+        for _ in 0..3 {
+            scheduler.tick().await.unwrap();
+        }
+        let n = reads.0.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(n > 0, want_sweep, "{policy}: {n} full log reads in 3 ticks");
+    }
+}
+
 async fn memory_env_with_tenant_policy(policy: Value) -> Env {
     let backend = Arc::new(InMemoryBackend::new());
     let now = Utc::now();

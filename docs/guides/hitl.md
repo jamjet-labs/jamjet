@@ -297,7 +297,8 @@ Rules the runtime enforces:
 Limits worth knowing:
 
 - The sweep runs on the scheduler tick (every 500 ms by default) for running
-  executions that hold a node for approval, so an expiry is recorded within a
+  executions that hold a node on a request carrying a deadline (a run with
+  no deadlines is never read for it), so an expiry is recorded within a
   tick of the deadline and the node fails on the next. A run that is not
   `running` (paused) is not swept until it runs again; a decision on it is
   still refused after the deadline.
