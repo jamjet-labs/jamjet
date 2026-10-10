@@ -151,6 +151,13 @@ class JamjetClient:
         comment: str | None = None,
         state_patch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Record a decision on a pending approval.
+
+        ``state_patch`` is kept for compatibility only. The runtime refuses a
+        decision that carries one with HTTP 400 (approval edits are not
+        supported: the action would not run on the edited state), and this
+        method raises ``httpx.HTTPStatusError`` for it like any other refusal.
+        """
         body: dict[str, Any] = {"decision": decision}
         if node_id:
             body["node_id"] = node_id

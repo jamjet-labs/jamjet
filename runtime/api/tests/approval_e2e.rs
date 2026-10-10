@@ -212,15 +212,6 @@ impl Harness {
     /// REST route and the MCP bridge call), so the recorded approval carries
     /// the digest binding exactly as in production.
     async fn approve(&self, decision: ApprovalDecision, comment: Option<&str>) {
-        self.approve_with(decision, comment, None).await
-    }
-
-    async fn approve_with(
-        &self,
-        decision: ApprovalDecision,
-        comment: Option<&str>,
-        state_patch: Option<serde_json::Value>,
-    ) {
         jamjet_api::approvals::submit_approval(
             &self.backend,
             &self.execution_id,
@@ -230,7 +221,7 @@ impl Harness {
                 principal: None,
                 decision,
                 comment: comment.map(String::from),
-                state_patch,
+                state_patch: None,
                 action_digest: None,
             },
             Default::default(),
@@ -449,47 +440,6 @@ fn gated_completions(ev: &[Event]) -> usize {
             |e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == "gated"),
         )
         .count()
-}
-
-/// The approver edits state while approving. The patch is applied by the
-/// materializer as soon as the approval is in the log, BEFORE the worker
-/// resumes, so the digest the worker recomputes is the patched one and the
-/// node fires exactly once, without a second request.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_patched_approval_fires_once_on_the_patched_state() {
-    let _serial = SERIAL.lock().await;
-    init_tracing();
-    let h = start().await;
-
-    assert!(h.wait_for(|ev| holds(ev) == 1, 30).await);
-    h.approve_with(
-        ApprovalDecision::Approved,
-        None,
-        Some(serde_json::json!({ "memo": "approved with edit" })),
-    )
-    .await;
-
-    assert!(
-        h.wait_for(
-            |ev| ev
-                .iter()
-                .any(|e| matches!(e.kind, EventKind::WorkflowCompleted { .. })),
-            30
-        )
-        .await,
-        "a patched approval must resume, not re-request forever"
-    );
-    let events = h.backend.get_events(&h.execution_id).await.unwrap();
-    assert_eq!(gated_completions(&events), 1, "fired exactly once");
-    assert_eq!(holds(&events), 1, "no second request");
-    // NOT asserted: that the patch survives into the final state. It does not,
-    // and did not before this change: the scheduler fold ignores an approval's
-    // state_patch, so `WorkflowCompleted.final_state` (which the materializer
-    // adopts wholesale) and every later node's payload lack it. Tracked as a
-    // follow-up; the binding above is over the materialized state the approver
-    // reviewed and patched.
-
-    h.shutdown().await;
 }
 
 /// An approval with no digest (written before digests existed) does not

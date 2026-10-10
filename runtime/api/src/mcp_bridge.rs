@@ -443,6 +443,10 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     Some(Value::String(d)) => Some(d.clone()),
                     Some(_) => return Err("action_digest must be a string".into()),
                 };
+                // Forwarded so the shared submission refuses it exactly as the
+                // REST route does; silently dropping it would let a client
+                // believe its edit was recorded.
+                let state_patch = args.get("state_patch").cloned();
                 // Reviewer and above may decide, matching the REST route.
                 let caller = resolve_caller(&ctx, &args, dev_mode, Role::Reviewer)?;
                 let tenant_id = caller.tenant.clone();
@@ -477,7 +481,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         principal,
                         decision,
                         comment,
-                        state_patch: None,
+                        state_patch,
                         action_digest,
                     },
                     s.approval_policy,

@@ -192,14 +192,6 @@ impl ActionBasis {
     pub fn digest(&self, node: &str) -> String {
         action_digest(&self.run, self.step, node, &self.definition, &self.state)
     }
-
-    /// The digest of firing `node` after `patch` is merged into the state, with
-    /// the materializer's own merge.
-    pub fn digest_with_patch(&self, node: &str, patch: &serde_json::Value) -> String {
-        let mut state = self.state.clone();
-        crate::materializer::json_merge_patch(&mut state, patch);
-        action_digest(&self.run, self.step, node, &self.definition, &state)
-    }
 }
 
 /// Read the [`ActionBasis`] for the next occurrence of `node_id`: the node's

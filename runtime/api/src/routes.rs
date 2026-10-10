@@ -538,6 +538,7 @@ struct ApproveRequest {
     node_id: Option<String>,
     user_id: Option<String>,
     comment: Option<String>,
+    /// Refused with 400 when non-null: approval edits are not supported.
     state_patch: Option<Value>,
     /// Optional echo of the pending request's `action_digest` (from
     /// `GET /executions/:id/approvals`). A mismatch is a 409: the decider was
@@ -598,8 +599,8 @@ async fn approve_execution(
         crate::approvals::SubmitError::NoPending
         | crate::approvals::SubmitError::NodeNotPending(_)
         | crate::approvals::SubmitError::ExecutionTerminal(_)
-        | crate::approvals::SubmitError::StaleDigest
-        | crate::approvals::SubmitError::StateMoved => ApiError::Conflict(e.to_string()),
+        | crate::approvals::SubmitError::StaleDigest => ApiError::Conflict(e.to_string()),
+        crate::approvals::SubmitError::EditsUnsupported => ApiError::BadRequest(e.to_string()),
         crate::approvals::SubmitError::Backend(msg) => ApiError::Internal(msg),
     })?;
 

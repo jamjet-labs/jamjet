@@ -3,8 +3,8 @@
 //! The hold records `action_digest` in the request context. A decision may
 //! echo it back (stale view -> 409), and the recorded `ApprovalReceived`
 //! carries `approved_digest` (what the worker will accept at resume) and
-//! `request_sequence` (which request it answers). An approver's `state_patch`
-//! is only accepted against the state that was reviewed.
+//! `request_sequence` (which request it answers). A decision carrying a
+//! `state_patch` is refused: approval edits are not supported.
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -14,7 +14,7 @@ use jamjet_agents::InMemoryAgentRegistry;
 use jamjet_api::{routes::build_router_with_opts, state::AppState};
 use jamjet_audit::{AuditBackend, AuditEnricher, AuditError, AuditLogEntry, AuditQuery};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
-use jamjet_state::approvals::{action_basis, derive_action_digest};
+use jamjet_state::approvals::derive_action_digest;
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::EventKind;
 use jamjet_state::{Event, InMemoryBackend};
@@ -159,23 +159,6 @@ async fn decisions(backend: &Arc<InMemoryBackend>, eid: &ExecutionId) -> Vec<Val
         .collect()
 }
 
-fn sibling_commits(patch: Value) -> EventKind {
-    EventKind::NodeCompleted {
-        node_id: "sibling".into(),
-        output: json!({}),
-        state_patch: patch,
-        duration_ms: 0,
-        gen_ai_system: None,
-        gen_ai_model: None,
-        input_tokens: None,
-        output_tokens: None,
-        finish_reason: None,
-        cost_usd: None,
-        provenance: None,
-        idempotency_key: None,
-    }
-}
-
 #[tokio::test]
 async fn an_approval_records_the_requested_digest_and_request_sequence() {
     let env = env();
@@ -266,60 +249,6 @@ async fn a_digestless_request_records_no_approved_digest() {
 }
 
 #[tokio::test]
-async fn a_patch_against_a_moved_state_is_409_and_appends_nothing() {
-    let env = env();
-    let (eid, _, _) = held(&env.backend, true).await;
-    append(
-        &env.backend,
-        &eid,
-        sibling_commits(json!({ "amount": 1_000_000 })),
-    )
-    .await;
-
-    let (status, body) = post(
-        &env.app,
-        &format!("/executions/{eid}/approve"),
-        json!({ "decision": "approved", "state_patch": { "memo": "ok" } }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(decisions(&env.backend, &eid).await.is_empty());
-}
-
-#[tokio::test]
-async fn a_patched_approval_binds_the_patched_state_and_the_worker_will_match_it() {
-    let env = env();
-    let (eid, requested, _) = held(&env.backend, true).await;
-    let expected = action_basis(env.backend.as_ref(), &eid, "gate", DEF)
-        .await
-        .unwrap()
-        .digest_with_patch("gate", &json!({ "amount": 5 }));
-
-    let (status, body) = post(
-        &env.app,
-        &format!("/executions/{eid}/approve"),
-        json!({ "decision": "approved", "state_patch": { "amount": 5 } }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let d = decisions(&env.backend, &eid).await;
-    assert_eq!(d[0]["approved_digest"], expected);
-    assert_ne!(expected, requested, "the patch changes what is approved");
-    // TIMING: the approval's state_patch is applied by the materializer fold as
-    // soon as the event is in the log, so the digest the worker recomputes at
-    // resume is the patched one. Otherwise a patched approval would re-request
-    // forever.
-    assert_eq!(
-        derive_action_digest(env.backend.as_ref(), &eid, "gate", DEF)
-            .await
-            .unwrap(),
-        expected
-    );
-}
-
-#[tokio::test]
 async fn a_rejection_records_its_request_but_no_digest() {
     let env = env();
     let (eid, _, req_seq) = held(&env.backend, true).await;
@@ -403,4 +332,101 @@ async fn a_stale_digest_through_the_mcp_bridge_is_refused() {
 
     assert_eq!(resp["result"]["isError"], true, "{resp}");
     assert!(decisions(&env.backend, &eid).await.is_empty());
+}
+
+// ── Approval edits are refused (approval-integrity round 2, I1) ─────────────
+//
+// The executor never sees an approval's `state_patch`: the scheduler builds
+// node payloads from its own fold, which ignores `ApprovalReceived`. Recording
+// "approved as edited" was therefore a false record of what ran. Any non-null
+// patch is refused on approve AND reject, on REST and MCP, before anything is
+// appended.
+
+#[tokio::test]
+async fn an_approval_with_a_state_patch_is_refused() {
+    let env = env();
+    let (eid, _, _) = held(&env.backend, true).await;
+    let (status, body) = post(
+        &env.app,
+        &format!("/executions/{eid}/approve"),
+        json!({ "decision": "approved", "state_patch": { "amount": 5 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("not supported"),
+        "the refusal says why: {body}"
+    );
+    assert!(decisions(&env.backend, &eid).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_rejection_with_a_state_patch_is_refused() {
+    let env = env();
+    let (eid, _, _) = held(&env.backend, true).await;
+    let (status, body) = post(
+        &env.app,
+        &format!("/executions/{eid}/approve"),
+        json!({ "decision": "rejected", "state_patch": { "amount": 5 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(decisions(&env.backend, &eid).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_null_state_patch_is_not_an_edit() {
+    let env = env();
+    let (eid, _, _) = held(&env.backend, true).await;
+    let (status, body) = post(
+        &env.app,
+        &format!("/executions/{eid}/approve"),
+        json!({ "decision": "approved", "state_patch": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(decisions(&env.backend, &eid).await.len(), 1);
+}
+
+#[tokio::test]
+async fn the_mcp_bridge_refuses_a_state_patch_too() {
+    let env = env();
+    let (eid, _, _) = held(&env.backend, true).await;
+    let (status, resp) = post(
+        &env.app,
+        "/mcp",
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "jamjet_approve", "arguments": {
+                "execution_id": eid.to_string(),
+                "decision": "approved",
+                "state_patch": { "amount": 5 },
+            } },
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["result"]["isError"], true, "{resp}");
+    assert!(decisions(&env.backend, &eid).await.is_empty());
+}
+
+#[tokio::test]
+async fn the_mcp_bridge_accepts_a_null_state_patch() {
+    let env = env();
+    let (eid, _, _) = held(&env.backend, true).await;
+    let (_, resp) = post(
+        &env.app,
+        "/mcp",
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "jamjet_approve", "arguments": {
+                "execution_id": eid.to_string(),
+                "decision": "approved",
+                "state_patch": null,
+            } },
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    assert_eq!(decisions(&env.backend, &eid).await.len(), 1);
 }

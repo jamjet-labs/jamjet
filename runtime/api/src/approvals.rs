@@ -7,7 +7,7 @@
 
 use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use jamjet_state::approvals::{
-    action_basis, node_approval_status, pending_approvals, run_initiator, NodeApprovalStatus,
+    node_approval_status, pending_approvals, run_initiator, NodeApprovalStatus,
 };
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::{ApprovalDecision, EventKind};
@@ -23,6 +23,9 @@ pub struct ApprovalSubmission {
     pub principal: Option<String>,
     pub decision: ApprovalDecision,
     pub comment: Option<String>,
+    /// Always refused when non-null: see [`SubmitError::EditsUnsupported`].
+    /// Carried so both transports refuse it in one place rather than one of
+    /// them dropping it silently.
     pub state_patch: Option<serde_json::Value>,
     /// The `action_digest` the decider was shown, echoed back. When present it
     /// must equal the pending request's digest, or the decision is refused as
@@ -65,9 +68,11 @@ pub enum SubmitError {
     SelfApproval,
     /// The echoed `action_digest` is not the pending request's digest.
     StaleDigest,
-    /// A `state_patch` was supplied but the state moved since the request, so
-    /// the patch would apply to a state the approver never saw.
-    StateMoved,
+    /// A decision carried a `state_patch`. Approval edits are not supported:
+    /// the executor builds node payloads from the scheduler's own state, which
+    /// never applies an approval's patch, so recording "approved as edited"
+    /// would be a false record of what ran.
+    EditsUnsupported,
     Backend(String),
 }
 
@@ -96,11 +101,11 @@ impl std::fmt::Display for SubmitError {
                 f,
                 "action_digest does not match the pending request; re-read the pending approval and decide again"
             ),
-            Self::StateMoved => write!(
+            Self::EditsUnsupported => write!(
                 f,
-                "execution state changed since this approval was requested, so the state_patch \
-                 cannot be applied to what was reviewed; approve without a patch (the node will \
-                 request a fresh approval for the new state) or reject"
+                "approval edits are not supported: a decision cannot carry a state_patch, \
+                 because the action would not run on the edited state; approve or reject \
+                 the action as requested"
             ),
             Self::Backend(e) => write!(f, "backend error: {e}"),
         }
@@ -126,6 +131,15 @@ pub async fn submit_approval(
     submission: ApprovalSubmission,
     policy: ApprovalPolicy,
 ) -> Result<(String, Event), SubmitError> {
+    // No edits, on either decision, before anything is read or written.
+    if submission
+        .state_patch
+        .as_ref()
+        .is_some_and(|p| !p.is_null())
+    {
+        return Err(SubmitError::EditsUnsupported);
+    }
+
     // Refuse decisions on terminal executions up front. The event-derived
     // pending list can still show an undecided request after a cancellation
     // (the fold intentionally ignores decisions for unheld nodes), so without
@@ -198,36 +212,12 @@ pub async fn submit_approval(
         }
     }
 
-    // What an approval authorises. Without a patch: exactly the requested
-    // action. With a patch: the requested action after the patch is merged, but
-    // only if the state is still the one the request was made for. Otherwise
-    // the patch would land on a state nobody reviewed. If the state moved and
-    // there is no patch, the approval is recorded for the requested digest and
-    // the worker, finding a different digest at resume, requests afresh.
-    // Requests with no digest (agent tool dispatch, bound by `calls_hash`
-    // instead, or legacy requests) record none.
+    // What an approval authorises: exactly the requested action. If the state
+    // has moved since the request, the worker finds a different digest at
+    // resume and requests afresh. Requests with no digest (agent tool
+    // dispatch, bound by `calls_hash` instead, or legacy requests) record none.
     let approved_digest = match (&submission.decision, request_digest) {
-        (ApprovalDecision::Approved, Some(requested)) => match &submission.state_patch {
-            None => Some(requested),
-            Some(patch) => {
-                // The definition the request was bound to. A request without
-                // one cannot prove which node body the patch would apply to.
-                let Some(definition) = request
-                    .context
-                    .get(jamjet_state::approvals::ACTION_DEFINITION_KEY)
-                    .and_then(|d| d.as_str())
-                else {
-                    return Err(SubmitError::StateMoved);
-                };
-                let basis = action_basis(backend.as_ref(), execution_id, &node_id, definition)
-                    .await
-                    .map_err(|e| SubmitError::Backend(e.to_string()))?;
-                if basis.digest(&node_id) != requested {
-                    return Err(SubmitError::StateMoved);
-                }
-                Some(basis.digest_with_patch(&node_id, patch))
-            }
-        },
+        (ApprovalDecision::Approved, Some(requested)) => Some(requested),
         _ => None,
     };
     let request_sequence = Some(request.sequence);
@@ -247,7 +237,8 @@ pub async fn submit_approval(
             user_id: submission.user_id,
             decision: submission.decision,
             comment: submission.comment,
-            state_patch: submission.state_patch,
+            // Refused above when non-null; never recorded.
+            state_patch: None,
             principal: submission.principal,
             approved_digest,
             request_sequence,

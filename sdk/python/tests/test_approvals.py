@@ -60,6 +60,24 @@ async def test_approve_omits_node_id_when_not_given() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_approve_with_state_patch_surfaces_the_runtime_refusal() -> None:
+    """The runtime refuses approval edits with 400; approve() raises it."""
+    route = respx.post(f"{BASE}/executions/exec-1/approve").respond(
+        400,
+        json={"error": "approval edits are not supported: a decision cannot carry a state_patch"},
+    )
+
+    async with JamjetClient(base_url=BASE) as c:
+        with pytest.raises(httpx.HTTPStatusError) as exc:
+            await c.approve("exec-1", "approved", state_patch={"amount": 5})
+
+    assert exc.value.response.status_code == 400
+    body = json.loads(route.calls[0].request.content)
+    assert body["state_patch"] == {"amount": 5}
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_list_approvals_returns_parsed_dict() -> None:
     """list_approvals() GETs /executions/{id}/approvals and returns the body."""
     payload = {
