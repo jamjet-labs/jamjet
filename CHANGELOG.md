@@ -39,6 +39,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     change only the tenant of their own token. Before this, any developer could
     `PUT /tenants/:id` and drop a tenant-level approval gate. The route/role table
     is in docs/guides/security.md.
+  - A node blocked by policy fails its run. Both transports settle the item and
+    record `NodeFailed { retryable: false }` in one fenced commit, so the scheduler
+    fails the run on its next tick. Before, a block on `POST /work-items/claim` left
+    the run `Running` forever, and the in-process worker retried the blocked node
+    until its attempts ran out, recording a violation each time. A node whose IR the
+    engine cannot evaluate is failed the same way.
   - `python_fn`, `java_fn` and `external_fn` nodes can now be gated and blocked.
     Their policy names are the handler reference (`module:function`,
     `class/method`, `queue/handler`) and the node id. Before, these kinds had no

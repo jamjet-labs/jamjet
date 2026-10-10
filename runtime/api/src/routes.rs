@@ -1450,8 +1450,17 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
             );
             return ClaimGate::Withhold;
         }
+        // No run to fail: settle the orphan item and withhold it.
         Ok(None) => {
-            return fail_closed(backend, wi, "execution not found".to_string()).await;
+            warn!(
+                execution_id = %wi.execution_id,
+                node_id = %wi.node_id,
+                "claim: execution not found; withholding the payload"
+            );
+            return settle(
+                backend.fail_work_item(wi.id, "execution not found").await,
+                wi,
+            );
         }
         Ok(Some(e)) => e,
     };
@@ -1479,15 +1488,20 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
     if payload_disagrees("workflow_id", workflow_id)
         || payload_disagrees("workflow_version", workflow_version)
     {
-        return fail_closed(
-            backend,
-            wi,
-            format!(
-                "work item payload coordinates disagree with execution {workflow_id} \
-                 v{workflow_version}"
-            ),
-        )
-        .await;
+        // Only a hand-enqueued item can disagree with its execution, so this
+        // item is not the engine's: settle and withhold it, but do NOT fail the
+        // node, which would fail the legitimate run over a stray item.
+        let reason = format!(
+            "work item payload coordinates disagree with execution {workflow_id} \
+             v{workflow_version}"
+        );
+        warn!(
+            execution_id = %wi.execution_id,
+            node_id = %wi.node_id,
+            %reason,
+            "claim: withholding a work item that is not the engine's"
+        );
+        return settle(backend.fail_work_item(wi.id, &reason).await, wi);
     }
 
     let ir_value = match backend.get_workflow(workflow_id, workflow_version).await {
@@ -1606,27 +1620,14 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
     {
         DispatchGuardOutcome::Allow => ClaimGate::Release,
 
-        // The guard already recorded the `PolicyViolation`. Failing the item is
-        // what stops a blocked dispatch from being re-claimed forever: on a
-        // durable backend `fail_work_item` is terminal.
-        //
-        // KNOWN ASYMMETRY — this seam and the worker seam disagree on
-        // terminality, and this is the outcome of EVERY successful enforcement
-        // here, not an edge case.
-        //
-        // `SqliteBackend::fail_work_item` sets `status = 'failed'`
-        // unconditionally, so the reclaimer never returns the item and NOTHING
-        // emits `NodeFailed`. The execution therefore stays `Running` with the
-        // node still in the scheduler fold's `scheduled` set — it stalls rather
-        // than going terminal. `Worker::execute_item` does emit the terminal
-        // event, via the fenced `commit_turn`, so the same policy denial ends
-        // the execution on the in-process path and hangs it here.
-        //
-        // Safety is unaffected: the tool does not run and the denial is on the
-        // Prove surface either way. Closing the gap means emitting a
-        // fence-committed terminal event from the claim route, which is a
-        // scheduler-interaction change and is deliberately NOT done inside this
-        // security fix. It needs its own task.
+        // The guard already recorded the `PolicyViolation`. A block is a
+        // decision a retry cannot change, so the node fails for good: the item
+        // is settled and `NodeFailed { retryable: false }` appended in one
+        // fenced commit, exactly what the in-process worker records for the
+        // same block, and the scheduler fails the run on its next tick. (This
+        // arm used to settle the item as `failed` and emit nothing, which left
+        // the node in the fold's `scheduled` set and the run `Running`
+        // forever.)
         DispatchGuardOutcome::Blocked { reason } => {
             warn!(
                 execution_id = %wi.execution_id,
@@ -1634,12 +1635,7 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
                 %reason,
                 "claim: policy blocked this node"
             );
-            settle(
-                backend
-                    .fail_work_item(wi.id, &format!("policy blocked: {reason}"))
-                    .await,
-                wi,
-            )
+            fail_node(backend, wi, format!("policy blocked: {reason}")).await
         }
 
         // An outstanding `ToolApprovalRequired` exists for the node. Settle the
@@ -1784,7 +1780,48 @@ async fn fail_closed(
         %reason,
         "claim: cannot evaluate policy for this item; withholding the payload"
     );
-    settle(backend.fail_work_item(wi.id, &reason).await, wi)
+    fail_node(backend, wi, reason).await
+}
+
+/// Fail a withheld item's node for good: settle the item and append
+/// `NodeFailed { retryable: false }` in ONE fenced commit, so the scheduler
+/// fails the run instead of leaving it `Running` with the node still
+/// scheduled. For permanent refusals only (a policy block, an IR the engine
+/// cannot evaluate), never for an infrastructure error a retry could fix.
+///
+/// The payload is withheld whatever happens here. A lost fence means the item
+/// is not ours to settle; any other error leaves the lease to expire and the
+/// next claim decides again.
+async fn fail_node(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+    reason: String,
+) -> ClaimGate {
+    let terminal = jamjet_state::Event::new(
+        wi.execution_id.clone(),
+        0,
+        jamjet_state::EventKind::NodeFailed {
+            node_id: wi.node_id.clone(),
+            error: reason,
+            attempt: wi.attempt,
+            retryable: false,
+        },
+    );
+    match backend
+        .commit_turn_unless_terminal(wi.id, wi.lease_fence, terminal, false)
+        .await
+    {
+        Ok(_) => ClaimGate::Withhold,
+        Err(jamjet_state::StateBackendError::FenceLost(_)) => {
+            warn!(
+                execution_id = %wi.execution_id,
+                node_id = %wi.node_id,
+                "claim: lease fence lost while failing a withheld work item"
+            );
+            ClaimGate::Withhold
+        }
+        Err(e) => settle(Err(e), wi),
+    }
 }
 
 /// Withhold regardless of whether the settle landed.

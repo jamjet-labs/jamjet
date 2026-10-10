@@ -230,6 +230,7 @@ impl Worker {
                             &execution_id,
                             item_id,
                             lease_fence,
+                            attempt,
                             &node_id,
                             &tenant_id,
                             node_def,
@@ -260,6 +261,7 @@ impl Worker {
                             &execution_id,
                             item_id,
                             lease_fence,
+                            attempt,
                             &node_id,
                             node_def,
                             &item.payload,
@@ -748,6 +750,7 @@ impl Worker {
         payload: &serde_json::Value,
         item_id: WorkItemId,
         lease_fence: i64,
+        attempt: u32,
         tool_name: String,
         approver: String,
         context: serde_json::Value,
@@ -763,24 +766,63 @@ impl Worker {
             context,
         )
         .await;
-        self.settle_outcome(execution_id, node_id, item_id, lease_fence, outcome)
-            .await
+        self.settle_outcome(
+            execution_id,
+            node_id,
+            item_id,
+            lease_fence,
+            attempt,
+            outcome,
+        )
+        .await
     }
 
     /// Turn a guard decision into the worker's lifecycle answer: `None` to run,
-    /// `Some(Err)` to fail the attempt, `Some(Ok)` once a held item is settled.
+    /// `Some(Err)` to fail the attempt, `Some(Ok)` once the item is settled
+    /// (held, or failed for good on a policy block).
     async fn settle_outcome(
         &self,
         execution_id: &ExecutionId,
         node_id: &str,
         item_id: WorkItemId,
         lease_fence: i64,
+        attempt: u32,
         outcome: node_guard::GuardOutcome,
     ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
         match outcome {
             DispatchGuardOutcome::Allow => None,
+            // A block is a decision, not a fault: retrying cannot change it.
+            // Settle the item and record a terminal `NodeFailed` in one fenced
+            // commit, as a non-retryable executor failure does, so the
+            // scheduler fails the run on its next tick. Returning an error here
+            // used to leave the item leased until expiry, then retried it to
+            // exhaustion, recording a violation on every attempt.
             DispatchGuardOutcome::Blocked { reason } => {
-                Some(Err(format!("policy blocked: {reason}").into()))
+                let terminal = jamjet_state::Event::new(
+                    execution_id.clone(),
+                    0,
+                    EventKind::NodeFailed {
+                        node_id: node_id.to_string(),
+                        error: format!("policy blocked: {reason}"),
+                        attempt,
+                        retryable: false,
+                    },
+                );
+                match self
+                    .backend
+                    .commit_turn(item_id, lease_fence, terminal, false)
+                    .await
+                {
+                    Ok(_) => {
+                        warn!(execution_id = %execution_id, node_id, %reason, "Node failed: policy blocked");
+                        Some(Ok(()))
+                    }
+                    Err(StateBackendError::FenceLost(_)) => {
+                        warn!(execution_id = %execution_id, node_id, "Fence lost on policy-block commit; abandoning");
+                        Some(Ok(()))
+                    }
+                    Err(e) => Some(Err(Box::new(e))),
+                }
             }
             // Not a denial: the decision could not be made or recorded, so the
             // node fails and is retried rather than being audited as blocked.
@@ -924,6 +966,7 @@ impl Worker {
         execution_id: &ExecutionId,
         item_id: WorkItemId,
         lease_fence: i64,
+        attempt: u32,
         node_id: &str,
         tenant_id: &str,
         node_def: &NodeDef,
@@ -941,8 +984,15 @@ impl Worker {
             payload,
         )
         .await;
-        self.settle_outcome(execution_id, node_id, item_id, lease_fence, outcome)
-            .await
+        self.settle_outcome(
+            execution_id,
+            node_id,
+            item_id,
+            lease_fence,
+            attempt,
+            outcome,
+        )
+        .await
     }
 
     // ── Autonomy check ────────────────────────────────────────────────────────
@@ -953,6 +1003,7 @@ impl Worker {
         execution_id: &ExecutionId,
         item_id: WorkItemId,
         lease_fence: i64,
+        attempt: u32,
         node_id: &str,
         node_def: &NodeDef,
         payload: &serde_json::Value,
@@ -1009,6 +1060,7 @@ impl Worker {
                     payload,
                     item_id,
                     lease_fence,
+                    attempt,
                     tool_name,
                     "human".to_string(),
                     serde_json::json!({ "agent_ref": agent_ref }),
@@ -3564,17 +3616,33 @@ mod tests {
     /// Pin WHICH guard denied. `is_err()` alone is satisfied by any failure,
     /// including an unrelated IR-load or backend error, so a fail-closed test
     /// that only asserts `is_err()` can pass without the guard ever running.
+    ///
+    /// A denial is either an error (the decision could not be made, so the
+    /// attempt fails and retries) or, for a policy block, a settled item with a
+    /// terminal `NodeFailed` carrying the reason (a block cannot be retried
+    /// away, so the node fails for good and the run fails).
     fn assert_denied_because(
         result: Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        events: &[jamjet_state::Event],
         needle: &str,
     ) {
-        let err = result
-            .err()
-            .map(|e| e.to_string())
-            .expect("the node must be denied");
+        let reason = match result {
+            Err(e) => e.to_string(),
+            Ok(()) => events
+                .iter()
+                .find_map(|e| match &e.kind {
+                    EventKind::NodeFailed {
+                        error,
+                        retryable: false,
+                        ..
+                    } => Some(error.clone()),
+                    _ => None,
+                })
+                .expect("the node must be denied"),
+        };
         assert!(
-            err.contains(needle),
-            "expected the denial reason to contain {needle:?}; got {err:?}"
+            reason.contains(needle),
+            "expected the denial reason to contain {needle:?}; got {reason:?}"
         );
     }
 
@@ -3644,7 +3712,7 @@ mod tests {
         )
         .await;
         assert_eq!(count, 0, "the blocked tool dispatch must not run");
-        assert_denied_because(result, "matches blocked pattern 'send_wire'");
+        assert_denied_because(result, &events, "matches blocked pattern 'send_wire'");
         assert!(
             events
                 .iter()
@@ -3901,7 +3969,7 @@ mod tests {
         )
         .await;
         assert_eq!(count, 0);
-        assert_denied_because(result, "agent dispatch tool calls unreadable");
+        assert_denied_because(result, &events, "agent dispatch tool calls unreadable");
         assert!(
             has_policy_violation(&events, "agent dispatch tool calls unreadable"),
             "a fail-closed refusal must still record a PolicyViolation"
@@ -3917,7 +3985,7 @@ mod tests {
         )
         .await;
         assert_eq!(count, 0);
-        assert_denied_because(result, "agent dispatch tool calls unreadable");
+        assert_denied_because(result, &events, "agent dispatch tool calls unreadable");
         assert!(has_policy_violation(
             &events,
             "agent dispatch tool calls unreadable"
@@ -3999,8 +4067,9 @@ mod tests {
             .unwrap()
             .expect("item must be claimable");
         let result = worker.execute_item(item).await;
+        let events = backend.get_events(&eid).await.unwrap();
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_denied_because(result, "agent dispatch tool calls unreadable");
+        assert_denied_because(result, &events, "agent dispatch tool calls unreadable");
     }
 
     /// Narrowness: an ordinary python_fn is unaffected by the new branch.
@@ -4028,13 +4097,13 @@ mod tests {
     /// on the in-process path.
     #[tokio::test]
     async fn unmarked_adk_dispatch_is_still_enforced() {
-        let (result, _, count) = run_dispatch_node(
+        let (result, events, count) = run_dispatch_node(
             dispatch_ir_json("python_fn", false, &["send_wire"], &[]),
             serde_json::json!({"tool_calls": [one_call("send_wire")]}),
         )
         .await;
         assert_eq!(count, 0, "the blocked tool must never dispatch");
-        assert_denied_because(result, "send_wire");
+        assert_denied_because(result, &events, "send_wire");
     }
 
     /// The approval must be bound to the calls it authorises.
@@ -4062,13 +4131,13 @@ mod tests {
     /// The Java dispatch arm has the identical hole and the identical fix.
     #[tokio::test]
     async fn blocked_tool_in_java_dispatch_never_executes() {
-        let (result, _, count) = run_dispatch_node(
+        let (result, events, count) = run_dispatch_node(
             dispatch_ir_json("java_fn", true, &["send_wire"], &[]),
             serde_json::json!({"tool_calls": [one_call("send_wire")]}),
         )
         .await;
         assert_eq!(count, 0, "the blocked Java tool dispatch must not run");
-        assert_denied_because(result, "matches blocked pattern 'send_wire'");
+        assert_denied_because(result, &events, "matches blocked pattern 'send_wire'");
     }
 
     /// The exact `calls_json` shape the enforcement hashes. Both the recorded
@@ -4120,7 +4189,11 @@ mod tests {
             count, 0,
             "an approval for one call set must not release a different one"
         );
-        assert_denied_because(result, "approved tool calls do not match pending calls");
+        assert_denied_because(
+            result,
+            &events,
+            "approved tool calls do not match pending calls",
+        );
         assert!(
             has_policy_violation(&events, "approved tool calls do not match pending calls"),
             "the approval-binding denial is the highest-value audit record here \
@@ -4188,7 +4261,11 @@ mod tests {
             count, 0,
             "an approval settled against an unbound request must authorise nothing"
         );
-        assert_denied_because(result, "approved tool calls do not match pending calls");
+        assert_denied_because(
+            result,
+            &events,
+            "approved tool calls do not match pending calls",
+        );
         assert!(has_policy_violation(
             &events,
             "approved tool calls do not match pending calls"
