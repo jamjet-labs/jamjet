@@ -234,7 +234,13 @@ pub async fn submit_approval(
             n
         }
         None => match pending.as_slice() {
-            [] => return Err(SubmitError::NoPending),
+            // Nothing pending: if the run's latest request expired, say so.
+            [] => {
+                return Err(match latest_requested_node(&events) {
+                    Some(n) if expired_by_deadline(&events, &n) => SubmitError::Expired(n),
+                    _ => SubmitError::NoPending,
+                })
+            }
             [only] => only.node_id.clone(),
             many => {
                 return Err(SubmitError::MultiplePending(
@@ -279,7 +285,10 @@ pub async fn submit_approval(
     };
     // DEADLINE. A request past its `expires_at` is refused whether or not
     // the sweep has recorded the expiry yet: the deadline decides, not the
-    // sweep's timing. An unreadable deadline counts as passed.
+    // sweep's timing. An unreadable deadline counts as passed. This runs
+    // BEFORE the digest rules on purpose: a late approval with no digest, or
+    // a stale one, is answered 409 Expired (the request can no longer be
+    // decided at all) rather than 400 DigestRequired or 409 StaleDigest.
     if request.deadline().expired(chrono::Utc::now()) {
         return Err(SubmitError::Expired(node_id));
     }
@@ -388,6 +397,14 @@ pub async fn submit_approval(
     }
 
     Ok((node_id, event))
+}
+
+/// The node of the run's latest approval request, if any.
+fn latest_requested_node(events: &[Event]) -> Option<String> {
+    events.iter().rev().find_map(|e| match &e.kind {
+        EventKind::ToolApprovalRequired { node_id, .. } => Some(node_id.clone()),
+        _ => None,
+    })
 }
 
 /// Pending + decided approval view for `GET /executions/:id/approvals`.

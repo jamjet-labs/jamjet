@@ -281,7 +281,10 @@ Rules the runtime enforces:
   reached at its instant: a decision at exactly `expires_at` is late. It is
   checked again in the same step as the append, under the store's write lock,
   so a decision checked in time whose write is delayed past the deadline (a
-  lock wait, a pause) is refused too.
+  lock wait, a pause) is refused too. The deadline is checked before the digest
+  rules, so a late approval with no digest or a stale one is also 409
+  "expired" rather than 400 or a stale-digest 409, and a decision naming no
+  node on a run whose latest request expired says it expired.
 - **One outcome per request.** A decision and an expiry each append only while
   the request is still the node's pending one, checked in the same step as the
   append. If the sweep expires a request while a decision is in flight, the

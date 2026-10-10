@@ -440,6 +440,44 @@ async fn a_decision_after_the_deadline_is_refused_and_records_nothing() {
     }
 }
 
+/// Review M-3: with no node named and the run's only request expired, the
+/// answer is Expired, not "nothing pending". A late approval with no digest
+/// is Expired too: the deadline is checked before the digest rules.
+#[tokio::test]
+async fn a_late_decision_without_a_node_or_digest_says_expired() {
+    for env in envs().await {
+        let eid = start_and_request(
+            &env,
+            ir(Value::Null, gate(json!({ "approval_timeout_secs": 600 }))),
+        )
+        .await;
+        Scheduler::new(env.backend.clone())
+            .sweep_approval_deadlines(&eid, Utc::now() + Duration::days(1))
+            .await
+            .unwrap();
+        for body in [
+            json!({ "decision": "approved" }),
+            json!({ "decision": "rejected" }),
+            json!({ "decision": "approved", "node_id": "pay" }),
+        ] {
+            let (st, resp) = call(
+                &env.app,
+                "POST",
+                &format!("/executions/{}/approve", exec_path(&eid)),
+                &env.bob,
+                body.clone(),
+            )
+            .await;
+            assert_eq!(st, StatusCode::CONFLICT, "{}: {body}: {resp}", env.name);
+            assert!(
+                resp.to_string().contains("expired at its deadline"),
+                "{}: {body}: {resp}",
+                env.name
+            );
+        }
+    }
+}
+
 /// A request whose deadline has passed is refused even before any sweep has
 /// expired it: the deadline, not the sweep's timing, decides.
 #[tokio::test]
