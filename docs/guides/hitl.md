@@ -219,6 +219,33 @@ A policy can give the approval requests it raises a deadline:
 }
 ```
 
+From the SDKs, the same keys go in a YAML `policy:` block (workflow or node
+level) or in an agent's policy dict; the Python compiler checks them as the
+runtime does and emits them only when set:
+
+```yaml
+nodes:
+  send_wire:
+    type: tool
+    tool_ref: payments.send_wire
+    policy:
+      require_approval_for: ["*"]
+      approval_timeout_secs: 3600
+      escalate_after_secs: 900
+```
+
+```python
+agent = Agent(
+    "payments",
+    model="claude-sonnet-4-5",
+    tools=[send_wire],
+    policy={"require_approval_for": ["send_*"], "approval_timeout_secs": 3600},
+)
+```
+
+The tenant level is set with `PUT /tenants/:id` (operators only). The Java
+builder has no policy support yet; use IR or the tenant policy.
+
 - `approval_timeout_secs` (1 second to 1 year): how long a request stays
   open. When it passes, the scheduler records `approval_expired` and treats it
   exactly as a rejection by `system:deadline`: the node fails the way a

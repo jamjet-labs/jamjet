@@ -506,7 +506,53 @@ def _parse_timeout(timeout: str | int | None) -> int | None:
 
 
 # Known keys for the PolicySetIr struct (runtime/ir/src/workflow.rs).
-_POLICY_KNOWN_KEYS = frozenset({"blocked_tools", "require_approval_for", "model_allowlist"})
+_POLICY_KNOWN_KEYS = frozenset(
+    {
+        "blocked_tools",
+        "require_approval_for",
+        "model_allowlist",
+        "approval_timeout_secs",
+        "escalate_after_secs",
+    }
+)
+
+# The longest approval deadline the runtime accepts (MAX_APPROVAL_TIMEOUT_SECS).
+MAX_APPROVAL_TIMEOUT_SECS = 365 * 24 * 60 * 60
+
+
+def compile_approval_deadline(raw: dict[str, Any], *, location: str = "policy") -> dict[str, int]:
+    """The deadline keys of a policy, checked as the runtime checks them.
+
+    ``approval_timeout_secs`` is a whole number of seconds from 1 to one year;
+    ``escalate_after_secs`` needs a timeout in the same policy and is at least 1
+    and less than it. Returns only the keys that are set: the runtime binds an
+    approval to the node's serialized definition, so an unset deadline must not
+    add keys. Raises ``ValueError`` otherwise, so a bad deadline fails at compile
+    time rather than at registration.
+    """
+    out: dict[str, int] = {}
+    for key in ("approval_timeout_secs", "escalate_after_secs"):
+        if raw.get(key) is None:
+            continue
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{location}: {key} must be a whole number of seconds, got {value!r}")
+        out[key] = value
+    timeout = out.get("approval_timeout_secs")
+    escalate = out.get("escalate_after_secs")
+    if timeout is not None and not 1 <= timeout <= MAX_APPROVAL_TIMEOUT_SECS:
+        raise ValueError(
+            f"{location}: approval_timeout_secs must be between 1 and {MAX_APPROVAL_TIMEOUT_SECS}, got {timeout}"
+        )
+    if escalate is not None:
+        if timeout is None:
+            raise ValueError(f"{location}: escalate_after_secs needs approval_timeout_secs in the same policy")
+        if not 1 <= escalate < timeout:
+            raise ValueError(
+                f"{location}: escalate_after_secs must be at least 1 and less than "
+                f"approval_timeout_secs ({timeout}), got {escalate}"
+            )
+    return out
 
 
 def _compile_policy(raw: Any, *, location: str = "policy") -> dict[str, Any] | None:
@@ -532,4 +578,5 @@ def _compile_policy(raw: Any, *, location: str = "policy") -> dict[str, Any] | N
         "blocked_tools": list(raw.get("blocked_tools") or []),
         "require_approval_for": list(raw.get("require_approval_for") or []),
         "model_allowlist": list(raw.get("model_allowlist") or []),
+        **compile_approval_deadline(raw, location=location),
     }

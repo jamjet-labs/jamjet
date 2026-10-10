@@ -165,10 +165,19 @@ def _compile_agent_policy_ir(gov: GovernanceConfig) -> dict[str, Any] | None:
                 seen.add(glob)
         require = merged
 
+    # Approval deadlines (approval_timeout_secs / escalate_after_secs), checked
+    # as the runtime checks them and emitted only when set.
+    deadline: dict[str, int] = {}
+    if isinstance(gov.policy, dict):
+        from jamjet.workflow.ir_compiler import compile_approval_deadline
+
+        deadline = compile_approval_deadline(gov.policy, location="agent policy")
+
     return {
         "blocked_tools": blocked,
         "require_approval_for": require,
         "model_allowlist": allowlist,
+        **deadline,
     }
 
 

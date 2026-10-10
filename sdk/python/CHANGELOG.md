@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **Approval deadlines in compiled policies.** A YAML workflow or node `policy:` and an
+  `Agent(policy={...})` dict may set `approval_timeout_secs` and `escalate_after_secs`.
+  The compiler checks them as the runtime does (1 s to one year; escalation needs a
+  timeout in the same policy and must be shorter) and emits them only when set. They
+  were refused as unknown keys (YAML) or dropped (Agent).
+
 ### Changed (breaking)
 
 - **`approval_required` now raises on `agent.run()` instead of warning.** It emitted a
