@@ -228,11 +228,14 @@ A policy can give the approval requests it raises a deadline:
   then, the scheduler records `approval_escalated` once. It changes nothing
   about the request; it is the hook point for an external notifier (Slack,
   email) to watch for.
-- Both can be set in the tenant, workflow or node policy. The most specific
-  level that sets `approval_timeout_secs` wins, and its own
-  `escalate_after_secs` comes with it (a node deadline with no escalation does
-  not inherit the workflow's escalation). A node can therefore lengthen a
-  tenant's deadline but not remove it.
+- Both can be set in the tenant, workflow or node policy, and every level is
+  a ceiling: the shortest `approval_timeout_secs` any level sets applies, and
+  so does the shortest `escalate_after_secs`. A workflow or node policy can
+  only shorten the tenant's deadline or bring its escalation forward; a
+  one-year node policy neither lengthens a tenant's one-hour deadline nor
+  drops its escalation. If the shortest escalation would not come before the
+  shortest timeout, the escalation is dropped (and logged), never the timeout
+  extended.
 - Invalid values are refused at registration (400) and at `PUT /tenants`
   (400). `timeouts.approval_timeout` is retired: it was never read, so a run
   under it never expired. A non-null value is refused at registration.

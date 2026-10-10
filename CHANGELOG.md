@@ -204,8 +204,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Approval requests can expire.** A tenant, workflow or node policy may set
   `approval_timeout_secs` (1 s to 1 year) and `escalate_after_secs` (shorter, same
-  policy). The most specific level with a timeout wins, with its own escalation. A
-  request records `expires_at` and `escalate_at` (UTC) in its context, and the pending
+  policy). Every level is a ceiling: the shortest timeout and the shortest escalation
+  any of tenant, workflow and node sets apply, so a workflow or node can only shorten
+  the tenant's deadline (an escalation that would not come first is dropped and
+  logged; the timeout is never extended). A request records `expires_at` and `escalate_at` (UTC) in its context, and the pending
   listing shows them. When a request expires, the scheduler records `approval_expired`
   and treats it as a rejection by `system:deadline`: the node and the run fail as on a
   rejection; nothing is ever approved by a deadline. At `escalate_at` it records

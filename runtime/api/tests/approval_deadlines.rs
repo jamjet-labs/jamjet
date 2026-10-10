@@ -938,45 +938,76 @@ async fn memory_env_with_tenant_policy(policy: Value) -> Env {
     env_on("memory", backend as Arc<dyn StateBackend>).await
 }
 
+/// Review I-2: the tenant's deadline is a ceiling. Every level that sets a
+/// timeout is a limit and the shortest wins; the same for escalation, which
+/// is dropped (never the timeout extended) when it would not come first. A
+/// workflow or node policy can only shorten.
 #[tokio::test]
-async fn the_most_specific_deadline_wins() {
-    let tenant = json!({ "require_approval_for": ["*"], "approval_timeout_secs": 100 });
-    let workflow = json!({ "approval_timeout_secs": 200, "escalate_after_secs": 20 });
-    for (node, want_expiry, want_escalate) in [
-        // The node's own deadline wins over the workflow's and the tenant's,
-        // and brings its own (absent) escalation with it.
-        (json!({ "approval_timeout_secs": 300 }), 300, None),
-        // No node deadline: the workflow's applies, with its escalation.
-        (json!({}), 200, Some(20)),
+async fn a_lower_level_can_only_shorten_the_deadline() {
+    let one_year = 31_536_000u64;
+    for (tenant, workflow, node, want_expiry, want_escalate) in [
+        // A one-year node policy neither lengthens the tenant's deadline nor
+        // drops its escalation.
+        (
+            json!({ "require_approval_for": ["*"], "approval_timeout_secs": 100, "escalate_after_secs": 10 }),
+            Value::Null,
+            json!({ "approval_timeout_secs": one_year }),
+            100,
+            Some(10),
+        ),
+        (
+            json!({ "require_approval_for": ["*"], "approval_timeout_secs": 100, "escalate_after_secs": 10 }),
+            json!({ "approval_timeout_secs": one_year, "escalate_after_secs": one_year - 1 }),
+            Value::Null,
+            100,
+            Some(10),
+        ),
+        // A lower level shortens: the shortest timeout and the shortest
+        // escalation apply.
+        (
+            json!({ "require_approval_for": ["*"], "approval_timeout_secs": 100 }),
+            json!({ "approval_timeout_secs": 200, "escalate_after_secs": 20 }),
+            json!({ "approval_timeout_secs": 50 }),
+            50,
+            Some(20),
+        ),
+        // The shortest escalation would not come before the shortest timeout:
+        // the escalation is dropped, the timeout stays.
+        (
+            json!({ "require_approval_for": ["*"], "approval_timeout_secs": 100, "escalate_after_secs": 90 }),
+            Value::Null,
+            json!({ "approval_timeout_secs": 30 }),
+            30,
+            None,
+        ),
+        // Only the tenant sets one.
+        (
+            json!({ "require_approval_for": ["*"], "approval_timeout_secs": 100 }),
+            Value::Null,
+            Value::Null,
+            100,
+            None,
+        ),
     ] {
         let env = memory_env_with_tenant_policy(tenant.clone()).await;
         let before = Utc::now();
         let eid = start_and_request(&env, ir(workflow.clone(), node.clone())).await;
         let ctx = request_context(&events(&env, &eid).await);
+        let case = format!("tenant {tenant} / workflow {workflow} / node {node}");
         close_to(
             ts(&ctx, "expires_at"),
             before + Duration::seconds(want_expiry),
-            &format!("expires_at for node policy {node}"),
+            &format!("expires_at for {case}"),
         );
         match want_escalate {
             Some(s) => close_to(
                 ts(&ctx, "escalate_at"),
                 before + Duration::seconds(s),
-                "escalate_at",
+                &format!("escalate_at for {case}"),
             ),
-            None => assert!(ctx.get("escalate_at").is_none(), "{ctx}"),
+            None => assert!(ctx.get("escalate_at").is_none(), "{case}: {ctx}"),
         }
     }
-    // Only the tenant sets one.
-    let env = memory_env_with_tenant_policy(tenant).await;
-    let before = Utc::now();
-    let eid = start_and_request(&env, ir(Value::Null, Value::Null)).await;
-    let ctx = request_context(&events(&env, &eid).await);
-    close_to(
-        ts(&ctx, "expires_at"),
-        before + Duration::seconds(100),
-        "tenant expires_at",
-    );
 }
 
 #[tokio::test]

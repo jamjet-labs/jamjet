@@ -384,7 +384,19 @@ pub(crate) async fn deadline_or_block(
     sets: &[&PolicySetIr],
 ) -> Result<Option<ApprovalDeadline>, GuardOutcome> {
     match ApprovalDeadline::resolve(sets) {
-        Ok(d) => Ok(d),
+        Ok(r) => {
+            if let Some(dropped) = r.dropped_escalation_secs {
+                warn!(
+                    execution_id = %execution_id,
+                    node_id,
+                    escalate_after_secs = dropped,
+                    timeout_secs = r.deadline.map(|d| d.timeout_secs),
+                    "approval escalation dropped: it would not come before the effective \
+                     deadline (the timeout is never extended to fit it)"
+                );
+            }
+            Ok(r.deadline)
+        }
         Err(cause) => {
             let reason = format!(
                 "approval deadline policy is invalid ({cause}); the node is refused until \
