@@ -40,7 +40,7 @@ none of this.
 | `GET /health`, `GET /.well-known/did.json` | none | public |
 | any other `GET` | `viewer` | except the tenant routes below |
 | `POST /workflows` | `developer` | a version is immutable once registered |
-| `POST /cron`, `DELETE /cron/:name` | `developer` | the job records its creator, who becomes the initiator of every run it starts |
+| `POST /cron`, `DELETE /cron/:name` | `developer` | jobs belong to the token's tenant (`GET /cron` lists only those, and a name is unique per tenant); the job records its creator, who becomes the initiator of every run it starts, in the job's tenant |
 | `POST /executions`, `POST /executions/:id/cancel`, `POST /executions/:id/external-event` | `developer` | the starting token is the run's initiator |
 | `POST /executions/:id/approve` | `reviewer` | never the run's initiator |
 | `POST /artifacts` | `developer` | |

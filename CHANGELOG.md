@@ -87,6 +87,13 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     runs take that token as initiator, so the creator cannot approve them. Jobs
     created before this upgrade have no creator; their runs cannot be approved
     outside dev mode until the job is recreated.
+  - Cron jobs belong to a tenant. `POST`, `GET` and `DELETE /cron` act on the
+    caller's tenant only, a job name is unique per tenant (migration 0013 rebuilds
+    `cron_jobs` with `UNIQUE (tenant_id, name)`), and a job's runs start in its own
+    tenant. Before, jobs were global: any tenant could list them with their input,
+    and replace or delete one by name, and every run started in `default`.
+  - On SQLite a token now acts in the tenant recorded on its row. Token
+    validation never read the column and put every token in `default`.
 
 - **Clients can approve what they reviewed.** `jamjet approvals` prints each pending
   request's digest, what it covers and the exact approve command (`--show-basis` prints

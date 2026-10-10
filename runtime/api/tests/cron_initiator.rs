@@ -54,6 +54,7 @@ async fn a_job_with_no_recorded_creator_starts_a_run_nobody_can_approve() {
             next_run_at: now - chrono::Duration::minutes(1),
             created_at: now,
             created_by: None,
+            tenant_id: "default".into(),
         })
         .await
         .unwrap();

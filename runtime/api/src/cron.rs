@@ -86,6 +86,9 @@ pub async fn create_cron(
         next_run_at,
         created_at: Utc::now(),
         created_by,
+        // The caller's tenant: the job is listed, replaced and deleted only
+        // there, and its runs start there.
+        tenant_id: tenant_id.as_str().to_string(),
     };
     store.upsert(&job).await.map_err(ApiError::Internal)?;
 
@@ -95,27 +98,34 @@ pub async fn create_cron(
     ))
 }
 
-/// `GET /cron` — list all cron jobs.
+/// `GET /cron` — the caller's tenant's cron jobs.
 ///
-/// NOTE: cron jobs are GLOBAL, not tenant-scoped, in this version. The embedded
-/// cron scheduler is dev-only (a single `default` tenant) and the `cron_jobs`
-/// table has no tenant column, so listing returns all jobs. Tenant-scoped cron
-/// (a `tenant_id` column, filtered listing, and tenant context threaded through
-/// the scheduler to `/executions`) is part of the deferred runtime
-/// tenant-threading work.
-pub async fn list_cron(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+/// Jobs are keyed by `(tenant_id, name)`. They used to be global: any tenant
+/// could list every job with its input and creator, and replace or delete one
+/// by name.
+pub async fn list_cron(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+) -> Result<Json<Value>, ApiError> {
     let store = store(&state)?;
-    let jobs = store.list_all().await.map_err(ApiError::Internal)?;
+    let jobs = store
+        .list_for_tenant(tenant_id.as_str())
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(json!({ "cron_jobs": jobs })))
 }
 
-/// `DELETE /cron/:name` — remove a cron job.
+/// `DELETE /cron/:name` — remove the caller's tenant's cron job of that name.
 pub async fn delete_cron(
     State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let store = store(&state)?;
-    store.delete(&name).await.map_err(ApiError::Internal)?;
+    store
+        .delete(tenant_id.as_str(), &name)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(json!({ "name": name, "deleted": true })))
 }
 
@@ -124,8 +134,8 @@ pub async fn delete_cron(
 ///
 /// The embedded scheduler used to POST to the server's own `/executions`
 /// with no token, which outside dev mode is a 401, so `JAMJET_EMBED_CRON`
-/// never started a run on an authenticated server. Cron jobs are global in
-/// this version, so runs start in the default tenant (see `list_cron`).
+/// never started a run on an authenticated server. Each run starts in the
+/// job's own tenant, under that tenant's policy.
 ///
 /// The initiator is [`CronJob::created_by`], never a system principal: a
 /// system initiator would let the person who scheduled the run approve it.
@@ -152,7 +162,7 @@ impl jamjet_timers::CronLauncher for InProcessCronLauncher {
         );
         crate::routes::start_run(
             &self.state,
-            &TenantId::default(),
+            &TenantId::from(job.tenant_id.as_str()),
             job.workflow_id.clone(),
             Some(job.workflow_version.clone()),
             job.input.clone(),

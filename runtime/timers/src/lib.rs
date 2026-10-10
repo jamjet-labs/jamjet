@@ -52,6 +52,15 @@ pub struct CronJob {
     /// mode.
     #[serde(default)]
     pub created_by: Option<String>,
+    /// The tenant the job belongs to. Jobs are keyed by `(tenant_id, name)`,
+    /// listed and deleted within the caller's tenant, and start their runs in
+    /// this tenant.
+    #[serde(default = "default_tenant")]
+    pub tenant_id: String,
+}
+
+fn default_tenant() -> String {
+    "default".to_string()
 }
 
 // ── Timer store ───────────────────────────────────────────────────────────────
@@ -241,12 +250,13 @@ impl CronStore {
         Self { pool }
     }
 
-    /// Create or update a cron job.
+    /// Create or replace a cron job. A job is identified by its tenant and
+    /// name: replacing one never touches another tenant's job of that name.
     pub async fn upsert(&self, job: &CronJob) -> Result<(), String> {
         sqlx::query(
             r#"INSERT OR REPLACE INTO cron_jobs
-               (id, name, cron_expression, workflow_id, workflow_version, input_json, enabled, next_run_at, created_at, created_by)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               (id, name, cron_expression, workflow_id, workflow_version, input_json, enabled, next_run_at, created_at, created_by, tenant_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(job.id.to_string())
         .bind(&job.name)
@@ -258,6 +268,7 @@ impl CronStore {
         .bind(job.next_run_at.to_rfc3339())
         .bind(job.created_at.to_rfc3339())
         .bind(job.created_by.as_deref())
+        .bind(&job.tenant_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("upsert cron job: {e}"))?;
@@ -292,16 +303,27 @@ impl CronStore {
     }
 
     /// Disable a cron job.
-    pub async fn disable(&self, name: &str) -> Result<(), String> {
-        sqlx::query("UPDATE cron_jobs SET enabled = 0 WHERE name = ?")
-            .bind(name)
+    pub async fn disable(&self, id: Uuid) -> Result<(), String> {
+        sqlx::query("UPDATE cron_jobs SET enabled = 0 WHERE id = ?")
+            .bind(id.to_string())
             .execute(&self.pool)
             .await
             .map_err(|e| format!("disable cron: {e}"))?;
         Ok(())
     }
 
-    /// List all cron jobs regardless of enabled/due state.
+    /// One tenant's cron jobs, regardless of enabled/due state.
+    pub async fn list_for_tenant(&self, tenant_id: &str) -> Result<Vec<CronJob>, String> {
+        let rows = sqlx::query("SELECT * FROM cron_jobs WHERE tenant_id = ? ORDER BY name ASC")
+            .bind(tenant_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("list cron jobs: {e}"))?;
+        rows.iter().map(row_to_cron).collect()
+    }
+
+    /// Every tenant's cron jobs, regardless of enabled/due state. For the
+    /// engine and for tests; an API caller sees [`Self::list_for_tenant`].
     pub async fn list_all(&self) -> Result<Vec<CronJob>, String> {
         let rows = sqlx::query("SELECT * FROM cron_jobs ORDER BY name ASC")
             .fetch_all(&self.pool)
@@ -310,9 +332,10 @@ impl CronStore {
         rows.iter().map(row_to_cron).collect()
     }
 
-    /// Permanently remove a cron job by name.
-    pub async fn delete(&self, name: &str) -> Result<(), String> {
-        sqlx::query("DELETE FROM cron_jobs WHERE name = ?")
+    /// Permanently remove one tenant's cron job by name.
+    pub async fn delete(&self, tenant_id: &str, name: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM cron_jobs WHERE tenant_id = ? AND name = ?")
+            .bind(tenant_id)
             .bind(name)
             .execute(&self.pool)
             .await
@@ -343,6 +366,9 @@ fn row_to_cron(row: &sqlx::sqlite::SqliteRow) -> Result<CronJob, String> {
         created_by: row
             .try_get::<Option<String>, _>("created_by")
             .map_err(|e| format!("cron created_by: {e}"))?,
+        tenant_id: row
+            .try_get::<String, _>("tenant_id")
+            .map_err(|e| format!("cron tenant_id: {e}"))?,
     })
 }
 
@@ -450,7 +476,7 @@ impl CronScheduler {
                 }
                 Err(e) => {
                     warn!(cron_job = %job.name, error = %e, "Bad cron expression — disabling");
-                    self.store.disable(&job.name).await?;
+                    self.store.disable(job.id).await?;
                 }
             }
         }
@@ -620,6 +646,7 @@ mod tests {
             next_run_at: Utc::now() - chrono::Duration::minutes(1),
             created_at: Utc::now(),
             created_by: None,
+            tenant_id: "default".into(),
         }
     }
 
@@ -635,10 +662,43 @@ mod tests {
         let due = store.list_due().await.unwrap();
         assert_eq!(due.len(), 2); // both are past-due
 
-        store.delete("a").await.unwrap();
+        store.delete("default", "a").await.unwrap();
         let all = store.list_all().await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].name, "b");
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A job is keyed by tenant and name: the same name in two tenants is two
+    /// jobs, a replace stays in its tenant, and a delete removes only its own.
+    #[tokio::test]
+    async fn jobs_are_keyed_by_tenant_and_name() {
+        let (store, db) = temp_store().await;
+        sqlx::query(
+            "INSERT INTO tenants (id, name, status, created_at, updated_at) \
+             VALUES ('acme', 'Acme', 'active', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let mut ours = sample_job("nightly");
+        ours.input = serde_json::json!({ "to": "vendor" });
+        let mut theirs = sample_job("nightly");
+        theirs.tenant_id = "acme".into();
+        theirs.input = serde_json::json!({ "to": "mallory" });
+        store.upsert(&ours).await.unwrap();
+        store.upsert(&theirs).await.unwrap();
+
+        let default = store.list_for_tenant("default").await.unwrap();
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].input["to"], "vendor");
+        assert_eq!(store.list_for_tenant("acme").await.unwrap().len(), 1);
+
+        store.delete("acme", "nightly").await.unwrap();
+        let default = store.list_for_tenant("default").await.unwrap();
+        assert_eq!(default.len(), 1, "another tenant's delete left this job");
+        assert!(store.list_for_tenant("acme").await.unwrap().is_empty());
 
         let _ = std::fs::remove_file(&db);
     }

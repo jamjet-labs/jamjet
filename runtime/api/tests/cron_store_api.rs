@@ -23,6 +23,7 @@ async fn cron_store_roundtrip() {
             next_run_at: next,
             created_at: chrono::Utc::now(),
             created_by: Some("token:t1".into()),
+            tenant_id: "default".into(),
         })
         .await
         .unwrap();
