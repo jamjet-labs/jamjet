@@ -230,3 +230,23 @@ fn canonical_matching_does_not_widen_tool_patterns() {
         PolicyDecision::Allow
     ));
 }
+
+/// An `mcp_tool` node is named by its `tool`. The name lookup read a
+/// `tool_name` field the kind does not have, so no pattern ever matched one.
+#[test]
+fn an_mcp_tool_node_is_named_by_its_tool() {
+    let mcp = NodeKind::McpTool {
+        server: "db".into(),
+        tool: "delete_table".into(),
+        input_mapping: Default::default(),
+        output_schema: String::new(),
+    };
+    assert!(blocked(&decide("x", &mcp, &block(&["delete_*"]))));
+    assert!(gated(&decide("x", &mcp, &approve(&["delete_table"]))));
+    assert_eq!(
+        EvaluationContext::from_node_kind("x", &mcp)
+            .tool_name
+            .as_deref(),
+        Some("delete_table")
+    );
+}

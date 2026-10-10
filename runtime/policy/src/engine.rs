@@ -49,9 +49,12 @@ fn extract_names(kind: &NodeKind) -> (Option<String>, Option<String>) {
                 .map(|s| s.to_string());
             (tool, None)
         }
+        // The kind's field is `tool`. This read `tool_name`, which the kind
+        // does not have, so an mcp_tool node had no name and no pattern
+        // could gate or block it.
         "mcp_tool" => {
             let tool = v
-                .get("tool_name")
+                .get("tool")
                 .and_then(|t| t.as_str())
                 .map(|s| s.to_string());
             (tool, None)

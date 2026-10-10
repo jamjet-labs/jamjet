@@ -72,6 +72,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `payments:transfer.send` are one name. A pattern still binds a name, not code: a
     re-export reaches the same function under another path, so only a catch-all
     binds an author who writes their own IR.
+  - `mcp_tool` nodes are now matched on their tool. The policy engine read a
+    `tool_name` field the kind does not have, so no `blocked_tools` or
+    `require_approval_for` pattern ever applied to an `mcp_tool` node. Behaviour
+    change: an existing pattern that names an MCP tool now gates or blocks it.
   - A registered workflow version is immutable: an identical re-register is a 200
     no-op, a different IR under the same version is a 409. Identity is the
     canonical content hash, so key order and whitespace do not matter.
