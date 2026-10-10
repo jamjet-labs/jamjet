@@ -115,8 +115,8 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `tool_name` field the kind does not have, so no `blocked_tools` or
     `require_approval_for` pattern ever applied to an `mcp_tool` node. Behaviour
     change: an existing pattern that names an MCP tool now gates or blocks it.
-  - Node ids must be 1 to 128 ASCII letters, digits, `_`, `.` or `-`; `POST /workflows`
-    refuses any other (400). Node ids are author-chosen and are printed into the
+  - Node ids must be 1 to 128 ASCII letters, digits, `_`, `.` or `-`, and a node's `id`
+    must equal its key in `nodes`; `POST /workflows` refuses anything else (400). Node ids are author-chosen and are printed into the
     approve command a reviewer pastes. Behaviour change for IR with other ids; every
     id the SDK compilers generate, and every example in this repo, already conforms.
   - A registered workflow version is immutable: an identical re-register is a 200

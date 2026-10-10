@@ -58,6 +58,15 @@ pub fn validate_node_ids(ir: &WorkflowIr) -> IrResult<()> {
                 return Err(IrError::InvalidNodeId(id.to_string()));
             }
         }
+        // The key routes the node; the id is what the approval basis shows.
+        // `POST /workflows` does not run `validate_workflow`, so the two are
+        // held equal here.
+        if key != &node.id {
+            return Err(IrError::NodeIdMismatch {
+                key: key.clone(),
+                id: node.id.clone(),
+            });
+        }
     }
     Ok(())
 }
