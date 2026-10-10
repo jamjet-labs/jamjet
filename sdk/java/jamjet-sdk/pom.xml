@@ -95,4 +95,45 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+          Contract test against a real JamJet runtime (RuntimeContractIT). Off by default
+          so unit runs need no server. Start `JAMJET_DEV_MODE=true jamjet-server`, then:
+            mvn -P runtime-contract verify -Dgpg.skip -Djamjet.runtime.url=http://127.0.0.1:7700
+        -->
+        <profile>
+            <id>runtime-contract</id>
+            <properties>
+                <jamjet.runtime.url>http://127.0.0.1:7700</jamjet.runtime.url>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <version>${maven-failsafe-plugin.version}</version>
+                        <configuration>
+                            <useModulePath>false</useModulePath>
+                            <includes>
+                                <include>**/*IT.java</include>
+                            </includes>
+                            <failIfNoTests>true</failIfNoTests>
+                            <systemPropertyVariables>
+                                <jamjet.runtime.url>${jamjet.runtime.url}</jamjet.runtime.url>
+                            </systemPropertyVariables>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <goals>
+                                    <goal>integration-test</goal>
+                                    <goal>verify</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
