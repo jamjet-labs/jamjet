@@ -1942,6 +1942,15 @@ async fn complete_work_item(
         }
     }
 
+    // The engine's own bookkeeping keys (`__budget`) are never a worker's to
+    // write. The budget enforcer reads them back, and the approval digest
+    // leaves them out as engine-written, so a reported value would be a budget
+    // reset and a change to later nodes' input that no approval covers.
+    let state_patch = jamjet_state::approvals::action_state(&body.state_patch);
+    if state_patch != body.state_patch {
+        warn!(work_item_id = %id, "complete: dropped engine bookkeeping keys from the reported state_patch");
+    }
+
     let node_completed = |execution_id: &ExecutionId, node_id: &str| {
         jamjet_state::Event::new(
             execution_id.clone(),
@@ -1951,7 +1960,7 @@ async fn complete_work_item(
             jamjet_state::EventKind::NodeCompleted {
                 node_id: node_id.to_string(),
                 output: body.output.clone(),
-                state_patch: body.state_patch.clone(),
+                state_patch: state_patch.clone(),
                 duration_ms: body.duration_ms,
                 gen_ai_system: body.gen_ai_system.clone(),
                 gen_ai_model: body.gen_ai_model.clone(),
@@ -2156,7 +2165,7 @@ async fn complete_work_item(
         // those. Losing this write costs a stale convenience column, not state.
         if let Ok(Some(mut exec)) = backend.get_execution(&execution_id).await {
             if let Some(state_obj) = exec.current_state.as_object_mut() {
-                if let Some(patch_obj) = body.state_patch.as_object() {
+                if let Some(patch_obj) = state_patch.as_object() {
                     for (k, v) in patch_obj {
                         state_obj.insert(k.clone(), v.clone());
                     }

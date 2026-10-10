@@ -39,6 +39,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     change only the tenant of their own token. Before this, any developer could
     `PUT /tenants/:id` and drop a tenant-level approval gate. The route/role table
     is in docs/guides/security.md.
+  - A worker's reported `state_patch` cannot write the engine's bookkeeping key
+    `__budget`; `POST /work-items/:id/complete` drops it. It was a way to reset a
+    run's budget and to change later nodes' input outside any approval.
   - A node blocked by policy fails its run. Both transports settle the item and
     record `NodeFailed { retryable: false }` in one fenced commit, so the scheduler
     fails the run on its next tick. Before, a block on `POST /work-items/claim` left

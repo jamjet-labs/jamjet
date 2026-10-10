@@ -939,3 +939,52 @@ async fn dev_mode_still_accepts_an_unfenced_completion_of_an_approved_node() {
     let ev = backend.get_events(&eid).await.unwrap();
     assert_eq!(gate_completions(&ev), 1);
 }
+
+/// `__budget` is the engine's bookkeeping, left out of the approval digest and
+/// read back by the budget enforcer. A worker's reported `state_patch` must
+/// not write it: that would be a hidden change to what later nodes receive and
+/// a way to reset the run's budget.
+#[tokio::test]
+async fn an_external_result_cannot_write_engine_bookkeeping() {
+    let env = env().await;
+    let (_id, eid) = start(&env, json!(null)).await;
+    let released = claim(&env, &env.alice).await;
+    assert_eq!(released["claimed"], true, "{released}");
+    let item = released["work_item"]["id"].as_str().unwrap();
+    let (st, body) = send(
+        &env.app,
+        &format!("/work-items/{item}/complete"),
+        &env.alice,
+        json!({
+            "output": {},
+            "state_patch": { "amount": 11, "__budget": { "total_cost_usd": 0.0, "tool_call_count": 0 } },
+            "lease_fence": released["work_item"]["lease_fence"],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let patch = events(&env, &eid)
+        .await
+        .into_iter()
+        .find_map(|e| match e.kind {
+            EventKind::NodeCompleted { state_patch, .. } => Some(state_patch),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        patch,
+        json!({ "amount": 11 }),
+        "the engine key is dropped, the rest kept"
+    );
+    let state = jamjet_state::materialize(env.backend.as_ref(), &eid)
+        .await
+        .unwrap()
+        .current_state;
+    assert!(state.get("__budget").is_none(), "{state}");
+    let exec = env.backend.get_execution(&eid).await.unwrap().unwrap();
+    assert!(
+        exec.current_state.get("__budget").is_none(),
+        "{}",
+        exec.current_state
+    );
+}
