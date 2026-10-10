@@ -229,18 +229,28 @@ impl Scheduler {
         Ok(sweep)
     }
 
-    /// Seal an expiry or escalation the sweep appended into the audit chain.
-    /// The scheduler runs on the unscoped backend and does not know a run's
-    /// tenant, so it seals under the default tenant (the same limit as every
-    /// other scheduler write).
+    /// Seal an expiry or escalation the sweep appended into the audit chain,
+    /// under the run's own tenant, read from its execution row. The scheduler
+    /// runs unscoped, so it never assumes a tenant: if the run's tenant cannot
+    /// be read, the record is not sealed under another tenant's name, and the
+    /// gap is logged.
     async fn seal(&self, event: jamjet_state::Event, appended: jamjet_state::EventSequence) {
-        jamjet_state::approvals::seal_appended(
-            self.sealer.as_deref(),
-            event,
-            appended,
-            jamjet_state::DEFAULT_TENANT,
-        )
-        .await;
+        let Some(sealer) = self.sealer.as_deref() else {
+            return;
+        };
+        match self.backend.execution_tenant(&event.execution_id).await {
+            Ok(Some(tenant)) => {
+                jamjet_state::approvals::seal_appended(Some(sealer), event, appended, &tenant.0)
+                    .await;
+            }
+            other => {
+                warn!(
+                    execution_id = %event.execution_id,
+                    sequence = appended,
+                    "approval record not sealed: the run's tenant could not be read ({other:?})"
+                );
+            }
+        }
     }
 
     /// Reclaim expired work item leases and emit appropriate events.

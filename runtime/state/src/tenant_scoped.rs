@@ -650,6 +650,10 @@ impl StateBackend for TenantScopedSqliteBackend {
             .await
     }
 
+    async fn execution_tenant(&self, id: &ExecutionId) -> BackendResult<Option<TenantId>> {
+        crate::sqlite::execution_tenant_in(&self.pool, Some(&self.tenant_id.0), id).await
+    }
+
     #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %id))]
     async fn update_execution_status(
         &self,

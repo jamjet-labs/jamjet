@@ -228,6 +228,13 @@ impl StateBackend for HookedBackend {
         Ok(out)
     }
 
+    async fn execution_tenant(
+        &self,
+        id: &ExecutionId,
+    ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::TenantId>> {
+        self.inner.execution_tenant(id).await
+    }
+
     async fn release_tool_reservation(
         &self,
         key: &str,

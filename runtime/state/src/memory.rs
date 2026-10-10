@@ -205,6 +205,15 @@ impl StateBackend for InMemoryBackend {
         Ok(self.executions.get(id).map(|r| r.value().clone()))
     }
 
+    async fn execution_tenant(&self, id: &ExecutionId) -> BackendResult<Option<TenantId>> {
+        // The in-memory backend is single-tenant: the server hands the same
+        // instance to every tenant and records no tenant on a run.
+        Ok(self
+            .executions
+            .contains_key(id)
+            .then(|| TenantId::from(crate::tenant::DEFAULT_TENANT)))
+    }
+
     async fn update_execution_status(
         &self,
         id: &ExecutionId,

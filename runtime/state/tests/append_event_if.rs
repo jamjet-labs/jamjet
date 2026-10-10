@@ -171,3 +171,49 @@ async fn the_condition_sees_writes_made_after_the_callers_read() {
         assert_eq!(out, ConditionalAppend::Refused, "{name}");
     }
 }
+
+/// `execution_tenant` reads the run's tenant from its execution row, and a
+/// tenant-scoped view answers only for its own runs.
+#[tokio::test]
+async fn execution_tenant_is_the_rows_tenant_and_is_scoped() {
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "jamjet_exec_tenant_{}.db",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let base = SqliteBackend::open(&format!("sqlite://{}", p.display()))
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    for t in ["acme", "other"] {
+        base.for_tenant(TenantId::from(t.to_string()))
+            .create_tenant(Tenant {
+                id: TenantId::from(t.to_string()),
+                name: t.into(),
+                status: TenantStatus::Active,
+                policy: None,
+                limits: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+    }
+    let acme = base.for_tenant(TenantId::from("acme".to_string()));
+    let other = base.for_tenant(TenantId::from("other".to_string()));
+    let id = ExecutionId::new();
+    acme.create_execution(exec(&id)).await.unwrap();
+    assert_eq!(
+        base.execution_tenant(&id).await.unwrap(),
+        Some(TenantId::from("acme".to_string()))
+    );
+    assert_eq!(
+        acme.execution_tenant(&id).await.unwrap(),
+        Some(TenantId::from("acme".to_string()))
+    );
+    assert_eq!(other.execution_tenant(&id).await.unwrap(), None);
+    assert_eq!(
+        base.execution_tenant(&ExecutionId::new()).await.unwrap(),
+        None
+    );
+}

@@ -295,9 +295,10 @@ different action, fails chain verification at that entry, exactly as editing a
 decision does.
 
 Sealing follows the durable write of the event and is best effort: a failed
-audit write is logged and does not undo the request. The scheduler does not
-know a run's tenant, so expiries and escalations are sealed under the
-`default` tenant.
+audit write is logged and does not undo the request. Every record is sealed
+under the run's own tenant (the scheduler reads it from the run's execution
+row), so `GET /audit` shows a tenant its own requests, expiries and
+escalations and no other tenant's.
 
 ```bash
 jamjet events exec_01abc --type approval_received

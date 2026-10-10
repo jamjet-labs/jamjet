@@ -121,6 +121,13 @@ pub trait StateBackend: Send + Sync {
     /// Load a workflow execution by id.
     async fn get_execution(&self, id: &ExecutionId) -> BackendResult<Option<WorkflowExecution>>;
 
+    /// The tenant an execution belongs to, from its execution row: the one
+    /// authoritative record of a run's tenant. `None` for an unknown
+    /// execution (or, on a tenant-scoped backend, one of another tenant).
+    /// Components that run unscoped (the scheduler) use it to attribute what
+    /// they record about a run, such as the audit entries of its expiries.
+    async fn execution_tenant(&self, id: &ExecutionId) -> BackendResult<Option<TenantId>>;
+
     /// Update the status of a workflow execution.
     async fn update_execution_status(
         &self,

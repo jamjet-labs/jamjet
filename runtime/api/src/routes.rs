@@ -2714,6 +2714,132 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    /// Review I-3: the expiries and escalations the scheduler seals belong to
+    /// the run's own tenant. `GET /audit` shows them to that tenant and not
+    /// to `default`.
+    #[tokio::test]
+    async fn swept_expiries_and_escalations_are_audited_under_the_runs_tenant() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("jamjet_seal_tenant_{}.db", Uuid::new_v4().simple()));
+        let url = format!("sqlite://{}", path.display());
+        let base = Arc::new(jamjet_state::SqliteBackend::open(&url).await.unwrap());
+        let acme = TenantId::from("acme".to_string());
+        let scoped: Arc<dyn jamjet_state::StateBackend> = Arc::new(base.for_tenant(acme.clone()));
+        let now = Utc::now();
+        scoped
+            .create_tenant(jamjet_state::Tenant {
+                id: acme.clone(),
+                name: "acme".into(),
+                status: jamjet_state::TenantStatus::Active,
+                policy: None,
+                limits: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let audit_backend = jamjet_audit::SqliteAuditBackend::open(&url).await.unwrap();
+        audit_backend.migrate().await.unwrap();
+        let audit: Arc<dyn jamjet_audit::AuditBackend> = Arc::new(audit_backend);
+        let enricher = Arc::new(AuditEnricher::with_signer(
+            Arc::clone(&audit),
+            jamjet_audit::AuditSigner::new(b"tenant-seal-key".to_vec()),
+        ));
+
+        // A run of tenant acme with a request that has passed both times.
+        let eid = ExecutionId::new();
+        scoped
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "wf".into(),
+                workflow_version: "0.1.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: json!({}),
+                current_state: json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        scoped
+            .append_event(jamjet_state::Event::new(
+                eid.clone(),
+                0,
+                jamjet_state::EventKind::ToolApprovalRequired {
+                    node_id: "gate".into(),
+                    tool_name: "t".into(),
+                    approver: "human".into(),
+                    context: json!({
+                        "expires_at": jamjet_state::approvals::format_deadline(&(now + chrono::Duration::seconds(600))),
+                        "escalate_at": jamjet_state::approvals::format_deadline(&(now + chrono::Duration::seconds(60))),
+                    }),
+                },
+            ))
+            .await
+            .unwrap();
+        // The scheduler runs on the unscoped backend, as in the server.
+        let scheduler =
+            jamjet_scheduler::Scheduler::new(base.clone() as Arc<dyn jamjet_state::StateBackend>)
+                .with_sealer(enricher.clone());
+        scheduler
+            .sweep_approval_deadlines(&eid, now + chrono::Duration::seconds(120))
+            .await
+            .unwrap();
+        scheduler
+            .sweep_approval_deadlines(&eid, now + chrono::Duration::seconds(700))
+            .await
+            .unwrap();
+
+        let b = base.clone();
+        let state = AppState {
+            backend: base.clone() as Arc<dyn jamjet_state::StateBackend>,
+            backend_for_fn: Arc::new(move |t: &TenantId| {
+                Arc::new(b.for_tenant(t.clone())) as Arc<dyn jamjet_state::StateBackend>
+            }),
+            agents: Arc::new(InMemoryAgentRegistry::new()),
+            audit,
+            enricher,
+            protocols: crate::state::default_protocol_registry(),
+            cron_store: None,
+            approval_policy: Default::default(),
+        };
+        let listed = |tenant: TenantId| {
+            let state = state.clone();
+            async move {
+                let Json(v) = list_audit_log(
+                    State(state),
+                    Extension(tenant),
+                    Query(AuditQueryParams {
+                        execution_id: None,
+                        actor_id: None,
+                        event_type: None,
+                        limit: 200,
+                        offset: 0,
+                    }),
+                )
+                .await
+                .unwrap();
+                v["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["event_type"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let mut for_acme = listed(acme).await;
+        for_acme.sort();
+        assert_eq!(for_acme, ["approval_escalated", "approval_expired"]);
+        assert!(
+            listed(TenantId::default()).await.is_empty(),
+            "the default tenant sees none of acme's records"
+        );
+    }
+
     /// The approve handler records a caller-chosen `user_id` only on the
     /// dev-mode router. Reached with neither a token nor the dev-mode marker
     /// (an auth layer missing by misconfiguration), it refuses rather than

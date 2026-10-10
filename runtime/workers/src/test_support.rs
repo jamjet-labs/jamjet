@@ -257,6 +257,13 @@ impl StateBackend for FailingGetEvents {
         self.inner.append_event_if(event, condition).await
     }
 
+    async fn execution_tenant(
+        &self,
+        id: &ExecutionId,
+    ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::TenantId>> {
+        self.inner.execution_tenant(id).await
+    }
+
     async fn release_tool_reservation(
         &self,
         key: &str,

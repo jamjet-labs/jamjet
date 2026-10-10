@@ -720,6 +720,13 @@ impl StateBackend for SqliteBackend {
         append_event_if_in(&self.pool, None, event, condition).await
     }
 
+    async fn execution_tenant(
+        &self,
+        id: &ExecutionId,
+    ) -> BackendResult<Option<crate::tenant::TenantId>> {
+        execution_tenant_in(&self.pool, None, id).await
+    }
+
     #[instrument(skip(self), fields(execution_id = %id, status = ?status))]
     async fn update_execution_status(
         &self,
@@ -2491,6 +2498,33 @@ pub(crate) async fn finish_execution_in(
     insert.execute(&mut *tx).await.map_err(map_db_err)?;
     tx.commit().await.map_err(map_db_err)?;
     Ok(ExecutionFinish::Finished(sequence))
+}
+
+/// [`StateBackend::execution_tenant`] for both SQLite backends: the
+/// execution row's `tenant_id`, scoped to `tenant_id` when given.
+pub(crate) async fn execution_tenant_in(
+    pool: &SqlitePool,
+    tenant_id: Option<&str>,
+    id: &ExecutionId,
+) -> BackendResult<Option<crate::tenant::TenantId>> {
+    let tenant_clause = if tenant_id.is_some() {
+        " AND tenant_id = ?"
+    } else {
+        ""
+    };
+    let select =
+        format!("SELECT tenant_id FROM workflow_executions WHERE execution_id = ?{tenant_clause}");
+    let mut q = sqlx::query(&select).bind(execution_id_str(id));
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    let row = q.fetch_optional(pool).await.map_err(map_db_err)?;
+    row.map(|r| {
+        r.try_get::<String, _>("tenant_id")
+            .map(crate::tenant::TenantId::from)
+            .map_err(map_db_err)
+    })
+    .transpose()
 }
 
 /// [`StateBackend::append_event_if`] for both SQLite backends: the liveness

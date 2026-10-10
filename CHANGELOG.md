@@ -226,7 +226,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hash-chained audit log with its action digest and deadline. Requests are recorded
   through one helper shared by both guards and both transports; the in-process worker
   pool and the scheduler take the server's `AuditEnricher` (`with_sealer`) through the
-  new `ApprovalSealer` trait.
+  new `ApprovalSealer` trait. Every record is sealed under the run's own tenant; the
+  scheduler reads it from the execution row through the new
+  `StateBackend::execution_tenant` (a trait method a custom backend must implement).
 
 - **Clients can approve what they reviewed.** `jamjet approvals` prints each pending
   request's digest, what it covers and the exact approve command (`--show-basis` prints
