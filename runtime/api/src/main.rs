@@ -162,6 +162,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Tokens of any tenant but `default` are refused: the engine is
+    // single-tenant. The opt-out is read here, once, and logged.
+    if jamjet_api::auth::tenant_tokens_as_default() {
+        tracing::warn!(
+            "{}=1: tokens of other tenants act in tenant default. This gives no isolation.",
+            jamjet_api::auth::TENANT_TOKENS_AS_DEFAULT_ENV
+        );
+    }
+
     // Spawn the scheduler as a background task — auto-chains nodes after completion.
     let scheduler = jamjet_scheduler::Scheduler::new(state.backend.clone());
     tokio::spawn(async move { scheduler.run().await });

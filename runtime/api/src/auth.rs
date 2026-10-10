@@ -93,6 +93,13 @@ pub async fn require_auth(
 
     match auth.backend.validate_token(&token).await {
         Ok(Some(info)) => {
+            let info = match admit_token(info, tenant_tokens_as_default()) {
+                Ok(info) => info,
+                Err(refusal) => {
+                    return (StatusCode::FORBIDDEN, Json(json!({ "error": refusal })))
+                        .into_response();
+                }
+            };
             // Inject tenant context from the token.
             let tenant_id = TenantId::from(info.tenant_id.clone());
             req.extensions_mut().insert(tenant_id);
@@ -110,6 +117,50 @@ pub async fn require_auth(
         )
             .into_response(),
     }
+}
+
+// ── Single-tenant engine ─────────────────────────────────────────────────────
+
+/// Why a token of any tenant but `default` is refused.
+pub const SINGLE_TENANT_REFUSAL: &str = "multi-tenant tokens are not supported by this runtime \
+     yet; the engine runs every workflow in tenant default";
+
+/// The opt-out: `JAMJET_TENANT_TOKENS_AS_DEFAULT=1` makes such a token act in
+/// `default`, as every token did before tokens carried their tenant. It gives
+/// NO isolation: the token sees and changes the default tenant's data.
+pub const TENANT_TOKENS_AS_DEFAULT_ENV: &str = "JAMJET_TENANT_TOKENS_AS_DEFAULT";
+
+static TENANT_TOKENS_AS_DEFAULT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether the opt-out is on. Read from the environment once, at the first
+/// call; `main` makes that call at startup and logs a warning when it is on.
+pub fn tenant_tokens_as_default() -> bool {
+    *TENANT_TOKENS_AS_DEFAULT.get_or_init(|| {
+        std::env::var(TENANT_TOKENS_AS_DEFAULT_ENV)
+            .map(|v| matches!(v.as_str(), "1" | "true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Admit a validated token, or refuse it with [`SINGLE_TENANT_REFUSAL`].
+///
+/// The API layer is tenant-scoped, but the engine under it is not: the
+/// scheduler, the in-process workers, workflow lookup and its cache, work-item
+/// creation, segment rollover and the agent registry all run in `default`. A
+/// token in another tenant could register a workflow version that default's
+/// runs were then scheduled from, and its own runs lost their tenant (and its
+/// tenant policy) after the start node. Until the engine carries the tenant,
+/// only `default` tokens are admitted; `as_default` admits the others as
+/// `default` instead.
+pub fn admit_token(mut token: ApiToken, as_default: bool) -> Result<ApiToken, &'static str> {
+    if token.tenant_id == jamjet_state::DEFAULT_TENANT {
+        return Ok(token);
+    }
+    if as_default {
+        token.tenant_id = jamjet_state::DEFAULT_TENANT.to_string();
+        return Ok(token);
+    }
+    Err(SINGLE_TENANT_REFUSAL)
 }
 
 /// Request extension present only on the dev-mode router (no auth layer).
@@ -213,4 +264,46 @@ fn extract_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
         .to_str()
         .ok()?;
     value.strip_prefix("Bearer ").map(str::to_string)
+}
+
+#[cfg(test)]
+mod admit_tests {
+    use super::*;
+
+    fn token(tenant: &str) -> ApiToken {
+        ApiToken {
+            id: "t1".into(),
+            name: "n".into(),
+            role: "developer".into(),
+            created_at: chrono::Utc::now(),
+            expires_at: None,
+            tenant_id: tenant.into(),
+        }
+    }
+
+    #[test]
+    fn a_default_tenant_token_is_admitted_unchanged() {
+        assert_eq!(
+            admit_token(token("default"), false).unwrap().tenant_id,
+            "default"
+        );
+    }
+
+    #[test]
+    fn another_tenants_token_is_refused() {
+        assert_eq!(
+            admit_token(token("acme"), false).unwrap_err(),
+            SINGLE_TENANT_REFUSAL
+        );
+    }
+
+    /// The opt-out admits it, but in `default`: never in its own tenant,
+    /// which the engine cannot keep separate.
+    #[test]
+    fn the_opt_out_admits_it_as_default() {
+        assert_eq!(
+            admit_token(token("acme"), true).unwrap().tenant_id,
+            "default"
+        );
+    }
 }

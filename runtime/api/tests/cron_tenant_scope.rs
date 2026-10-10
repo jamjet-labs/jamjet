@@ -5,6 +5,11 @@
 //! launcher started every run in `default`. A developer in tenant `acme` could
 //! read a default-tenant job, replace it by name with her own input, and have
 //! that input run in `default` on the next tick (round-3 review, I1).
+//!
+//! The API refuses tokens of any tenant but `default` while the engine is
+//! single-tenant (see `tenant_tokens_refused.rs`), so the other tenant's job
+//! is written at the store level here; the routes and the launcher are what
+//! is under test.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -26,7 +31,6 @@ struct Env {
     state: AppState,
     app: axum::Router,
     alice: String,
-    mallory: String,
 }
 
 /// SQLite with per-tenant backends, wired as `main.rs` wires them.
@@ -63,17 +67,11 @@ async fn env() -> Env {
     state.cron_store = Some(Arc::new(CronStore::new(sqlite.pool())));
     let app = build_router_with_opts(state.clone(), false);
     let (alice, _) = sqlite.create_token("alice", "developer").await.unwrap();
-    let (mallory, _) = sqlite.create_token("mallory", "developer").await.unwrap();
-    sqlx::query("UPDATE api_tokens SET tenant_id = 'acme' WHERE name = 'mallory'")
-        .execute(&sqlite.pool())
-        .await
-        .unwrap();
     Env {
         sqlite,
         state,
         app,
         alice,
-        mallory,
     }
 }
 
@@ -159,35 +157,60 @@ async fn run_inputs(env: &Env, tenant: &str) -> Vec<Value> {
         .collect()
 }
 
-/// The reviewer's demonstration, end to end.
+/// Another tenant's job of the same name, as the store would hold it.
+async fn acme_job(env: &Env) {
+    let store = CronStore::new(env.sqlite.pool());
+    let mut job = store.list_for_tenant("default").await.unwrap().remove(0);
+    job.id = uuid::Uuid::new_v4();
+    job.tenant_id = "acme".into();
+    job.input = json!({ "to": "mallory" });
+    job.created_by = Some("token:mallory".into());
+    store.upsert(&job).await.unwrap();
+}
+
+/// The reviewer's demonstration: a job of the same name in another tenant
+/// is neither shown nor replaced, deleted or run in place of this one.
 #[tokio::test]
-async fn a_developer_in_another_tenant_cannot_see_or_take_over_a_job() {
+async fn a_job_in_another_tenant_is_separate_from_this_one() {
     let env = env().await;
     register(&env, &env.alice).await;
-    register(&env, &env.mallory).await;
     assert_eq!(
         schedule(&env, &env.alice, "vendor").await,
         StatusCode::CREATED
     );
+    acme_job(&env).await;
 
-    // Mallory's listing does not show Alice's job.
-    let (st, listed) = call(&env.app, "GET", "/cron", &env.mallory, None).await;
+    // The default tenant's listing shows only its own job.
+    let (st, listed) = call(&env.app, "GET", "/cron", &env.alice, None).await;
     assert_eq!(st, StatusCode::OK, "{listed}");
-    assert_eq!(listed["cron_jobs"], json!([]), "{listed}");
+    assert_eq!(listed["cron_jobs"].as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed["cron_jobs"][0]["input"]["to"], "vendor");
 
-    // A job of the same name in her own tenant is hers, not Alice's.
-    assert_eq!(
-        schedule(&env, &env.mallory, "mallory").await,
-        StatusCode::CREATED
-    );
+    // Each job's run starts in its own tenant.
+    register_in_acme(&env).await;
     fire_due_jobs(&env).await;
     assert_eq!(run_inputs(&env, "default").await, vec![json!("vendor")]);
     assert_eq!(run_inputs(&env, "acme").await, vec![json!("mallory")]);
 
-    // Deleting by name deletes only her own.
-    let (st, body) = call(&env.app, "DELETE", "/cron/nightly", &env.mallory, None).await;
+    // Deleting by name deletes only the caller's tenant's job.
+    let (st, body) = call(&env.app, "DELETE", "/cron/nightly", &env.alice, None).await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    let (_, alices) = call(&env.app, "GET", "/cron", &env.alice, None).await;
-    assert_eq!(alices["cron_jobs"].as_array().unwrap().len(), 1, "{alices}");
-    assert_eq!(alices["cron_jobs"][0]["input"]["to"], "vendor");
+    let store = CronStore::new(env.sqlite.pool());
+    assert!(store.list_for_tenant("default").await.unwrap().is_empty());
+    assert_eq!(store.list_for_tenant("acme").await.unwrap().len(), 1);
+}
+
+/// The acme copy of the workflow, as the store would hold it.
+async fn register_in_acme(env: &Env) {
+    env.sqlite
+        .for_tenant(TenantId::from("acme"))
+        .store_workflow(jamjet_state::WorkflowDefinition {
+            workflow_id: "wf-pay".into(),
+            version: "0.1.0".into(),
+            ir: support::python_fn_start_ir("wf-pay"),
+            created_at: chrono::Utc::now(),
+            tenant_id: "acme".into(),
+        })
+        .await
+        .unwrap();
 }

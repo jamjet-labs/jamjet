@@ -110,8 +110,17 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `cron_jobs` with `UNIQUE (tenant_id, name)`), and a job's runs start in its own
     tenant. Before, jobs were global: any tenant could list them with their input,
     and replace or delete one by name, and every run started in `default`.
-  - On SQLite a token now acts in the tenant recorded on its row. Token
-    validation never read the column and put every token in `default`.
+  - The runtime is single-tenant, and now says so. On SQLite token validation
+    never read a token's tenant and put every token in `default`; it now reads
+    it, and a token of any other tenant is refused with 403 ("multi-tenant
+    tokens are not supported by this runtime yet"), on REST and MCP. The API
+    layer is tenant-scoped but the engine under it is not, so such a token could
+    register a workflow version that the default tenant's runs were scheduled
+    from, and its own runs lost their tenant and tenant policy after the start
+    node. `JAMJET_TENANT_TOKENS_AS_DEFAULT=1` (read once at startup) restores the
+    old behaviour, where such a token acts in `default`; it gives no isolation.
+    Upgrade note: a deployment that inserted non-default tokens by hand gets 403
+    for them until it sets that variable or moves the tokens to `default`.
 
 - **Clients can approve what they reviewed.** `jamjet approvals` prints each pending
   request's digest, what it covers and the exact approve command (`--show-basis` prints

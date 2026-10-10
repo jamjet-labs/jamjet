@@ -52,6 +52,20 @@ none of this.
 | `GET /tenants/:id`, `PUT /tenants/:id` | `operator` | only the token's own tenant (403 otherwise) |
 | `/mcp` | per tool | `viewer` for reads, `developer` to run, cancel or discover, `reviewer` to approve |
 
+**The runtime is single-tenant today.** The API layer scopes requests by the
+token's tenant, but the engine under it runs every workflow in tenant `default`.
+So a token of any other tenant is refused with 403, on REST and MCP.
+`JAMJET_TENANT_TOKENS_AS_DEFAULT=1` (read once at startup) lets such tokens act in
+`default` instead; that gives no isolation. To run tenants side by side, these would
+have to carry the tenant first, and none does yet:
+
+- the scheduler's work items (every item after the start node is enqueued in `default`);
+- workflow lookup and its caches in the scheduler and the in-process worker (keyed by
+  workflow id and version only, so two tenants' versions collide);
+- execution and work-item creation on the base backend, and segment rollover;
+- tenant policy on the base backend the in-process workers use;
+- the agent registry (global today).
+
 The tenant policy is the one policy layer a developer cannot rewrite: workflow and node
 policies live in IR that a developer registers, and a developer can always register a
 new version. Put approval gates that must bind the people who start runs at tenant

@@ -599,6 +599,10 @@ fn resolve_caller(
     let Some(token) = ctx.extensions.get::<ApiToken>().cloned() else {
         return Err("unauthenticated: a Bearer API token is required".into());
     };
+    // `require_auth` already refuses these; checked again so the bridge stays
+    // closed if it is ever mounted without that layer.
+    let token = crate::auth::admit_token(token, crate::auth::tenant_tokens_as_default())
+        .map_err(str::to_string)?;
     if Role::parse_role(&token.role) < need {
         return Err(format!(
             "insufficient role '{}' for this tool; {:?} or above required",
