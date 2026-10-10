@@ -62,6 +62,7 @@ fn env() -> Env {
         enricher: Arc::new(AuditEnricher::new(audit_dyn)),
         protocols: jamjet_api::state::default_protocol_registry(),
         cron_store: None,
+        approval_policy: Default::default(),
     };
     Env {
         backend,
@@ -96,6 +97,7 @@ async fn pending_execution(backend: &Arc<InMemoryBackend>) -> ExecutionId {
             workflow_id: "wf".into(),
             workflow_version: "0.1.0".into(),
             initial_input: json!({}),
+            initiated_by: None,
         },
         EventKind::ToolApprovalRequired {
             node_id: "gate".into(),

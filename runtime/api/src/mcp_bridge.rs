@@ -117,6 +117,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     workflow_id: workflow_id.clone(),
                     workflow_version: version.clone(),
                     initial_input: input.clone(),
+                    initiated_by: caller.token.as_ref().map(crate::auth::principal_of),
                 });
                 backend.append_event(event).await.map_err(|e| format!("{e}"))?;
 
@@ -469,6 +470,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         comment,
                         state_patch: None,
                     },
+                    s.approval_policy,
                 )
                 .await
                 .map_err(|e| e.to_string())?;

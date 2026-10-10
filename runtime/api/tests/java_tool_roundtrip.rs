@@ -39,6 +39,7 @@ fn make_state(backend: Arc<dyn StateBackend>) -> AppState {
         enricher,
         protocols: jamjet_api::state::default_protocol_registry(),
         cron_store: None,
+        approval_policy: Default::default(),
     }
 }
 
@@ -154,6 +155,7 @@ async fn java_tool_claim_complete_round_trip_advances_durably() {
                 workflow_id: "java-tool-e2e".into(),
                 workflow_version: "0.1.0".into(),
                 initial_input: serde_json::json!({}),
+                initiated_by: None,
             },
         ))
         .await
@@ -409,6 +411,7 @@ async fn seed_claimable_java_item(backend: &Arc<dyn StateBackend>) -> ExecutionI
                 workflow_id: "java-tool-fence".into(),
                 workflow_version: "0.1.0".into(),
                 initial_input: serde_json::json!({}),
+                initiated_by: None,
             },
         ))
         .await

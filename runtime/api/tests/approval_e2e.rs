@@ -131,6 +131,7 @@ async fn start() -> Harness {
                 workflow_id: "e2e-approval".into(),
                 workflow_version: "0.1.0".into(),
                 initial_input: serde_json::json!({}),
+                initiated_by: None,
             },
         ))
         .await

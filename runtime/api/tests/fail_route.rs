@@ -38,6 +38,7 @@ fn make_state(backend: Arc<dyn StateBackend>) -> AppState {
         enricher,
         protocols: jamjet_api::state::default_protocol_registry(),
         cron_store: None,
+        approval_policy: Default::default(),
     }
 }
 

@@ -1774,6 +1774,7 @@ mod tests {
                 ],
                 "tools": {"get_weather": "myapp.tools:get_weather"}
             }),
+            initiated_by: None,
         }]);
 
         assert_eq!(
@@ -1811,6 +1812,7 @@ mod tests {
                         {"role": "user", "content": "What is the weather in London?"}
                     ]
                 }),
+                initiated_by: None,
             },
         )
         .await;

@@ -107,6 +107,7 @@ async fn test_crash_recovery_from_event_log() {
                     workflow_id: "wf-crash-test".into(),
                     workflow_version: "1.0.0".into(),
                     initial_input: json!({ "x": 1 }),
+                    initiated_by: None,
                 },
             ),
             Event::new(

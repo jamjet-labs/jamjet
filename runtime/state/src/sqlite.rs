@@ -2778,6 +2778,7 @@ mod tests {
                 workflow_id: "test-wf".to_string(),
                 workflow_version: "1.0.0".to_string(),
                 initial_input: json!({"x": 1}),
+                initiated_by: None,
             },
         );
         db.append_event(event).await.unwrap();

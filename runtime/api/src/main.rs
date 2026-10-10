@@ -3,7 +3,7 @@ use jamjet_api::{config::ApiConfig, routes::build_router_with_opts, state::AppSt
 use jamjet_audit::{AuditEnricher, NoopAuditBackend, SqliteAuditBackend};
 use jamjet_state::{InMemoryBackend, SqliteBackend};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Parse a `JAMJET_STORE_TERM` value: a non-negative integer (the promotion
 /// generation). A present-but-invalid value is an error, not a silent no-op.
@@ -62,6 +62,12 @@ async fn main() -> anyhow::Result<()> {
         "Starting JamJet runtime"
     );
 
+    // Read once here, never per request from deep code.
+    let approval_policy = jamjet_api::approvals::ApprovalPolicy::from_env();
+    if approval_policy.allow_self_approval {
+        warn!("JAMJET_ALLOW_SELF_APPROVAL is set: the principal that starts a run may approve it");
+    }
+
     let state = if storage_backend == "memory" {
         info!("Using in-memory storage (ephemeral, no persistence)");
 
@@ -87,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
             enricher,
             protocols: jamjet_api::state::default_protocol_registry(),
             cron_store: None,
+            approval_policy,
         }
     } else {
         // Determine database URL: env > config > SQLite dev default
@@ -151,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
             enricher,
             protocols: jamjet_api::state::default_protocol_registry(),
             cron_store: Some(Arc::new(jamjet_timers::CronStore::new(sqlite.pool()))),
+            approval_policy,
         }
     };
 

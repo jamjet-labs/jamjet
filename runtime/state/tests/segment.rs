@@ -146,6 +146,7 @@ async fn sqlite_segment_boundary_event_is_materialize_noop() {
             workflow_id: "seg-wf".into(),
             workflow_version: "1.0.0".into(),
             initial_input: json!({ "counter": 0 }),
+            initiated_by: None,
         },
     ))
     .await
@@ -248,6 +249,7 @@ async fn memory_segment_boundary_event_is_materialize_noop() {
                 workflow_id: "seg-wf".into(),
                 workflow_version: "1.0.0".into(),
                 initial_input: json!({ "counter": 0 }),
+                initiated_by: None,
             },
         ))
         .await
@@ -755,6 +757,7 @@ async fn sqlite_inert_old_segment_does_not_leak() {
             workflow_id: "seg-wf".into(),
             workflow_version: "1.0.0".into(),
             initial_input: json!({ "counter": 0 }),
+            initiated_by: None,
         },
     ))
     .await
@@ -1305,6 +1308,7 @@ async fn sqlite_segment_atomic_rollback_on_work_item_conflict() {
         workflow_id: "seg-wf".into(),
         workflow_version: "1.0.0".into(),
         initial_input: carried.current_state.clone(),
+        initiated_by: None,
     };
     let scheduled = EventKind::NodeScheduled {
         node_id: "start".into(),

@@ -278,6 +278,7 @@ mod tests {
                     workflow_id: "wf".into(),
                     workflow_version: "1.0.0".into(),
                     initial_input: json!({}),
+                    initiated_by: None,
                 },
             ),
             make_event(

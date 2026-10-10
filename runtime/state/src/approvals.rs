@@ -83,6 +83,16 @@ pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStat
     status
 }
 
+/// The principal that started this run: the FIRST `WorkflowStarted`'s
+/// `initiated_by`. `None` for a dev-mode run, a run logged before initiators
+/// were recorded, or a log with no `WorkflowStarted`.
+pub fn run_initiator(events: &[Event]) -> Option<String> {
+    events.iter().find_map(|e| match &e.kind {
+        EventKind::WorkflowStarted { initiated_by, .. } => Some(initiated_by.clone()),
+        _ => None,
+    })?
+}
+
 /// All nodes whose latest `ToolApprovalRequired` is undecided.
 pub fn pending_approvals(events: &[Event]) -> Vec<PendingApproval> {
     use std::collections::BTreeMap;

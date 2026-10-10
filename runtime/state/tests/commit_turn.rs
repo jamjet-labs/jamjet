@@ -134,6 +134,7 @@ async fn test_materialize_equals_full_apply_after_snapshot() {
             workflow_id: "test-wf".into(),
             workflow_version: "1.0.0".into(),
             initial_input: initial.clone(),
+            initiated_by: None,
         },
         EventKind::NodeScheduled {
             node_id: "n1".into(),
@@ -721,6 +722,7 @@ async fn assert_resume_equivalence_for_backend(backend: &dyn StateBackend) {
             workflow_id: "xb-wf".into(),
             workflow_version: "1.0.0".into(),
             initial_input: initial.clone(),
+            initiated_by: None,
         },
         EventKind::NodeScheduled {
             node_id: "n1".into(),

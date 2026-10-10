@@ -232,6 +232,7 @@ async fn events_are_tenant_isolated() {
             workflow_id: "wf-a".to_string(),
             workflow_version: "1.0.0".to_string(),
             initial_input: json!({}),
+            initiated_by: None,
         },
     );
     tenant_a.append_event(event).await.unwrap();

@@ -6,7 +6,9 @@
 //! `GET /executions/:id/approvals`.
 
 use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
-use jamjet_state::approvals::{node_approval_status, pending_approvals, NodeApprovalStatus};
+use jamjet_state::approvals::{
+    node_approval_status, pending_approvals, run_initiator, NodeApprovalStatus,
+};
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::{ApprovalDecision, EventKind};
 use jamjet_state::Event;
@@ -24,6 +26,27 @@ pub struct ApprovalSubmission {
     pub state_patch: Option<serde_json::Value>,
 }
 
+/// Install-wide approval rules, read once at startup into `AppState`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApprovalPolicy {
+    /// Let the principal that started a run approve its actions. Off by
+    /// default; `JAMJET_ALLOW_SELF_APPROVAL=1` turns it on for single-operator
+    /// installs where there is nobody else to approve.
+    pub allow_self_approval: bool,
+}
+
+impl ApprovalPolicy {
+    /// Read `JAMJET_ALLOW_SELF_APPROVAL` (`1` or `true`). Anything else,
+    /// including unset or unparseable, enforces separation of duties.
+    pub fn from_env() -> Self {
+        Self {
+            allow_self_approval: std::env::var("JAMJET_ALLOW_SELF_APPROVAL")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum SubmitError {
     /// Nothing is waiting for approval on this execution.
@@ -34,6 +57,8 @@ pub enum SubmitError {
     NodeNotPending(String),
     /// The execution is already terminal; a decision can no longer change it.
     ExecutionTerminal(String),
+    /// The approving principal started this run (separation of duties).
+    SelfApproval,
     Backend(String),
 }
 
@@ -54,6 +79,10 @@ impl std::fmt::Display for SubmitError {
                 f,
                 "execution is {status}; approvals can no longer be decided"
             ),
+            Self::SelfApproval => write!(
+                f,
+                "separation of duties: the principal that started this run cannot approve it"
+            ),
             Self::Backend(e) => write!(f, "backend error: {e}"),
         }
     }
@@ -64,10 +93,19 @@ impl std::fmt::Display for SubmitError {
 /// Returns the resolved `node_id` and the `ApprovalReceived` event that was
 /// appended, so callers can seal it into the signed, hash-chained audit log
 /// (via `AuditEnricher::enrich_and_append`) after the durable event write.
+///
+/// Separation of duties: an `Approved` decision whose principal is the run's
+/// initiator (`WorkflowStarted.initiated_by`) is refused with
+/// [`SubmitError::SelfApproval`] and nothing is appended, unless
+/// `policy.allow_self_approval`. Rejections are never refused on this ground.
+/// Without a principal (dev mode) or without a recorded initiator (dev-mode
+/// runs, runs logged before initiators were recorded) there is nothing to
+/// compare and the check does not apply.
 pub async fn submit_approval(
     backend: &Arc<dyn StateBackend>,
     execution_id: &ExecutionId,
     submission: ApprovalSubmission,
+    policy: ApprovalPolicy,
 ) -> Result<(String, Event), SubmitError> {
     // Refuse decisions on terminal executions up front. The event-derived
     // pending list can still show an undecided request after a cancellation
@@ -116,6 +154,14 @@ pub async fn submit_approval(
             }
         },
     };
+
+    if matches!(submission.decision, ApprovalDecision::Approved) && !policy.allow_self_approval {
+        if let Some(principal) = submission.principal.as_deref() {
+            if run_initiator(&events).as_deref() == Some(principal) {
+                return Err(SubmitError::SelfApproval);
+            }
+        }
+    }
 
     let seq = backend
         .latest_sequence(execution_id)

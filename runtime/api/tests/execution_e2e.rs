@@ -96,6 +96,7 @@ async fn workflow_runs_to_completion() {
                 workflow_id: "e2e-completion".into(),
                 workflow_version: "0.1.0".into(),
                 initial_input: serde_json::json!({}),
+                initiated_by: None,
             },
         ))
         .await

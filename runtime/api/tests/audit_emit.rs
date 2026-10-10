@@ -68,6 +68,7 @@ fn make_state(audit: Arc<dyn AuditBackend>, signer: AuditSigner) -> AppState {
         enricher,
         protocols: jamjet_api::state::default_protocol_registry(),
         cron_store: None,
+        approval_policy: Default::default(),
     }
 }
 
@@ -99,6 +100,7 @@ async fn create_execution(backend: &Arc<dyn StateBackend>) -> ExecutionId {
                 workflow_id: "test-wf".into(),
                 workflow_version: "0.1.0".into(),
                 initial_input: serde_json::json!({}),
+                initiated_by: None,
             },
         ))
         .await

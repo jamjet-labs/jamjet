@@ -240,6 +240,7 @@ struct StartExecutionRequest {
 async fn start_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
+    token: Option<Extension<jamjet_state::ApiToken>>,
     Json(body): Json<StartExecutionRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let backend = state.backend_for(&tenant_id);
@@ -286,6 +287,11 @@ async fn start_execution(
             workflow_id: body.workflow_id.clone(),
             workflow_version: version.clone(),
             initial_input: input.clone(),
+            // Who started the run, for separation of duties at approval
+            // time. Only the authenticated token counts; dev mode has none.
+            initiated_by: token
+                .as_ref()
+                .map(|Extension(t)| crate::auth::principal_of(t)),
         },
     );
     backend.append_event(event).await?;
@@ -544,9 +550,11 @@ async fn approve_execution(
             comment: body.comment,
             state_patch: body.state_patch,
         },
+        state.approval_policy,
     )
     .await
     .map_err(|e| match e {
+        crate::approvals::SubmitError::SelfApproval => ApiError::Forbidden(e.to_string()),
         crate::approvals::SubmitError::MultiplePending(_) => ApiError::BadRequest(e.to_string()),
         crate::approvals::SubmitError::NoPending
         | crate::approvals::SubmitError::NodeNotPending(_)
@@ -2341,6 +2349,7 @@ mod tests {
             enricher,
             protocols: crate::state::default_protocol_registry(),
             cron_store: None,
+            approval_policy: Default::default(),
         }
     }
 

@@ -32,6 +32,7 @@ fn make_state(backend: Arc<InMemoryBackend>) -> AppState {
         enricher,
         protocols: jamjet_api::state::default_protocol_registry(),
         cron_store: None,
+        approval_policy: Default::default(),
     }
 }
 
@@ -75,6 +76,7 @@ async fn complete_work_item_threads_gen_ai_fields() {
                 workflow_id: "wf-genai".into(),
                 workflow_version: "0.1.0".into(),
                 initial_input: serde_json::json!({}),
+                initiated_by: None,
             },
         ))
         .await
@@ -215,6 +217,7 @@ async fn complete_work_item_without_gen_ai_fields_keeps_backward_compat() {
                 workflow_id: "wf-compat".into(),
                 workflow_version: "0.1.0".into(),
                 initial_input: serde_json::json!({}),
+                initiated_by: None,
             },
         ))
         .await

@@ -60,6 +60,11 @@ pub enum EventKind {
         workflow_id: String,
         workflow_version: String,
         initial_input: serde_json::Value,
+        /// Principal that started the run (`"token:<ApiToken.id>"`), used for
+        /// separation of duties on approvals. A continue-as-new segment carries
+        /// its run's initiator forward. `None` in dev mode and on old logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initiated_by: Option<String>,
     },
     WorkflowCompleted {
         final_state: serde_json::Value,

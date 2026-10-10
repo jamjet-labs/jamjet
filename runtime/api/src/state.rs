@@ -29,6 +29,8 @@ pub struct AppState {
     pub protocols: ProtocolRegistry,
     /// Cron job store — present only on the SQLite backend (local scheduling).
     pub cron_store: Option<std::sync::Arc<jamjet_timers::CronStore>>,
+    /// Approval rules (separation of duties), read once at startup.
+    pub approval_policy: crate::approvals::ApprovalPolicy,
 }
 
 impl AppState {

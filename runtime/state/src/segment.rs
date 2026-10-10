@@ -138,10 +138,17 @@ pub async fn start_next_segment(
     // Seed at at_sequence=0 (child sequence space). See Snapshot::seed_for_segment.
     let seed = Snapshot::seed_for_segment(new_id.clone(), &carried_state.current_state);
 
+    // A continuation is the same run, so it keeps the run's initiator: an
+    // approval in a later segment must face the same separation-of-duties check
+    // as one in the first. A read failure propagates (the rollover is retried)
+    // rather than starting a segment with the initiator silently dropped.
+    let initiated_by = crate::approvals::run_initiator(&backend.get_events(parent_id).await?);
+
     let started_event = EventKind::WorkflowStarted {
         workflow_id: workflow_id.to_string(),
         workflow_version: workflow_version.to_string(),
         initial_input: carried_state.current_state.clone(),
+        initiated_by,
     };
 
     let scheduled_event = EventKind::NodeScheduled {
