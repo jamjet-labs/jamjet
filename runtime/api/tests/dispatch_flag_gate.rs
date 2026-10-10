@@ -531,3 +531,38 @@ async fn a_call_with_no_map_entry_is_matched_on_its_name() {
     .await;
     assert_eq!(claim(&env).await["claimed"], true);
 }
+
+/// An attribute path past the function (`send_wire.__call__`) or a dunder
+/// module segment cannot be matched reliably, so the engine refuses it as
+/// unverifiable (round-5 review, I-1). Python refuses it too; this is the
+/// engine's own line.
+#[tokio::test]
+async fn an_underscore_attribute_path_in_the_tools_map_blocks() {
+    for (entry, label) in [
+        ("bank.wires:send_wire.__call__", "dunder attribute"),
+        ("bank.wires:send_wire.__wrapped__", "wrapped"),
+        ("bank.wires:_send_wire", "private function"),
+        ("bank.__init__:send_wire", "dunder module segment"),
+    ] {
+        let env = env().await;
+        set_tenant_policy(&env, &["send_wire"], &[]).await;
+        register_dispatcher(&env).await;
+        let (_, eid) = start(&env, "wf-adk", lookup_call(json!({ "lookup": entry }))).await;
+        assert_eq!(claim(&env).await, json!({ "claimed": false }), "{label}: {entry}");
+        let events = env.backend.get_events(&eid).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(&e.kind, EventKind::PolicyViolation { rule, .. } if rule.contains("tools entry"))),
+            "{label}: the refusal names the tools entry"
+        );
+    }
+}
+
+/// Control: an ordinary module path, including a private module, is accepted.
+#[tokio::test]
+async fn an_ordinary_or_private_module_path_is_accepted() {
+    let env = env().await;
+    set_tenant_policy(&env, &["send_wire"], &[]).await;
+    register_dispatcher(&env).await;
+    start(&env, "wf-adk", lookup_call(json!({ "lookup": "myapp._tools:lookup_rate" }))).await;
+    assert_eq!(claim(&env).await["claimed"], true);
+}

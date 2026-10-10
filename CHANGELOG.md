@@ -34,13 +34,29 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     completed and is dispatched again with the same calls asks again instead of
     firing on the first approval. A dispatch approval from before this release
     (bound to `calls_hash` only) authorises nothing by itself; the node asks again.
-  - Agent tool calls are matched on the code they resolve to. The ADK dispatcher
-    imports a call's handler from the run's `tools` map when it has an entry, and
-    the run's state is the initiator's to seed, so per-call policy that matched
-    only the call's name let a blocked tool run under another name. A call is now
-    matched on its name, on its resolved `module:function` (and dotted form) and on
-    that function's own name; a per-call approval binds the handler, and a `tools`
-    entry that is not a `module:function` string blocks the batch.
+  - The ADK dispatcher no longer takes the code it runs from run state. It used to
+    import whatever `module:function` the run's `tools` map named for a call and
+    follow any attribute path, and the run's state is the initiator's to seed, so
+    a call named `lookup` could run a blocked `send_wire` (directly, through
+    `send_wire.__call__`, or through a re-export). `jamjet.agents.tool_runtime` now
+    accepts a `tools` entry only when it names a `@tool` registered under the
+    called name and is exactly that tool's own `module:qualname` (what the SDK
+    compiler writes); anything else is refused and nothing runs. A call with no
+    entry resolves through the `@tool` registry by name.
+  - The engine also matches each call on the handler its `tools` entry names (as
+    written and in dotted form) and on that function's own name, binds the handler
+    into a per-call approval, and blocks the batch when an entry is not a
+    `module:function` string, has a function-path segment starting with `_`
+    (`send_wire.__call__`), or a module segment starting with `__`. This is
+    defence in depth: a pattern still binds a name, not code, and only a catch-all
+    binds an author who writes their own IR.
+  - Behaviour changes for ADK users: SDK-started runs carry the compiler's `tools`
+    map, so their calls are now also matched on handler and function name
+    (`blocked_tools: ["delete"]` blocks a tool `archive` whose function is
+    `delete`; `payments.*` catches tools defined in `payments.tools`). A tool whose
+    function name starts with `_` is refused when the map names it; rename it. A
+    tool defined in `__main__` cannot be verified by a worker and is refused; define
+    tools in an importable module, as the examples do.
   - A decision carrying a `state_patch` is refused with 400. The edit never reached
     the executed action, so recording it was a false record.
   - The worker protocol evaluates the same policy and approval rules as the

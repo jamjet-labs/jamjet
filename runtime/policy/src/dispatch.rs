@@ -92,7 +92,22 @@ fn handler_ref(entry: &Value) -> Option<String> {
         return None;
     }
     let (module, function) = s.split_once(':')?;
-    (!module.is_empty() && !function.is_empty()).then(|| s.to_string())
+    if module.is_empty() || function.is_empty() {
+        return None;
+    }
+    // Unverifiable paths. Past the function, an attribute chain reaches the
+    // same code under a path no name pattern covers (`send_wire.__call__`,
+    // `__wrapped__`, `__func__`), so any function-path segment starting with
+    // `_` is refused. A dunder module segment (`pkg.__init__`, `__main__`) is
+    // another spelling of a module; ordinary private modules (`app._tools`)
+    // are allowed. The Python dispatcher independently refuses any entry that
+    // is not the called tool's own `module:qualname`.
+    if function.split('.').any(|seg| seg.is_empty() || seg.starts_with('_'))
+        || module.split('.').any(|seg| seg.is_empty() || seg.starts_with("__"))
+    {
+        return None;
+    }
+    Some(s.to_string())
 }
 
 /// Read the tool calls a marked agent-dispatch node will execute from its

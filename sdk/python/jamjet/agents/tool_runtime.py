@@ -20,12 +20,12 @@ Input keys (read with fallbacks so this is unit-testable without the engine):
 * ``tool_calls`` | ``last_model_tool_calls`` — ``[{id, name, arguments}, ...]``
   (the Model executor / Track 2j-2 writes ``last_model_tool_calls`` to state)
 * ``assistant_content`` | ``last_model_output`` — the assistant content text
-* ``tools``                 — ``{name: "module:function"}`` resolver map
+* ``tools``                 — ``{name: "module:qualname"}`` map the compiler writes
 
-Each tool is resolved through the ``module:function`` map (imported on demand,
-mirroring the worker's own handler resolution) so the dispatch worker does not
-need the user's tool module pre-imported; the in-process ``@tool`` registry is a
-secondary fallback.
+A call resolves to the ``@tool`` registered under its name. A ``tools`` entry is
+used only to import the module that registers the tool, so the dispatch worker
+need not have imported it, and is accepted only when it is that tool's own
+``module:qualname``; otherwise the call is refused (see ``_resolve_tool``).
 """
 
 from __future__ import annotations
@@ -116,32 +116,61 @@ def _coerce_arguments(arguments: Any) -> Any:
     return arguments if arguments is not None else {}
 
 
-def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]:
-    """Resolve a tool name to a callable via the ``module:function`` map.
+class ToolResolutionError(LookupError):
+    """A tool call that cannot be resolved to the registered tool of that name.
 
-    Falls back to the in-process ``@tool`` registry both when the name is absent
-    from the map AND when a present-but-stale ref fails to import/resolve (useful
-    for in-process tests and dev, and resilient to a renamed/moved tool module).
+    Raised instead of running anything: the dispatch fails closed.
     """
-    ref = tools.get(name) if (name and isinstance(tools, dict)) else None
-    if ref:
-        try:
-            module_path, _, fn_path = ref.partition(":")
-            obj: Any = importlib.import_module(module_path)
-            for part in fn_path.split("."):
-                obj = getattr(obj, part)
-            return obj
-        except (ImportError, AttributeError):
-            # A stale/non-importable map ref must not mask the @tool registry
-            # fallback below — fall through and try the registry before raising.
-            pass
 
+
+def _registered_ref(defn: Any) -> str:
+    """The registered tool's own ``module:qualname``, as the SDK compiler
+    writes it into the run's ``tools`` map (``agent_ir._tools_map``)."""
+    return f"{defn.fn.__module__}:{defn.fn.__qualname__}"
+
+
+def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]:
+    """Resolve a tool call to a registered ``@tool`` of that name.
+
+    The run's ``tools`` map is NOT trusted to choose code: it is part of the
+    run's state, which whoever starts the run seeds. An entry is accepted only
+    when the object it names is itself a ``@tool`` registered under this call's
+    name, and the entry is exactly that tool's own ``module:qualname`` (what
+    the SDK compiler writes). The path is walked with
+    :func:`inspect.getattr_static`, so no descriptor or attribute magic runs.
+    Anything else, such as an attribute path (``mod:send_wire.__call__``), a
+    re-export under another name, or an entry pointing a tool name at other
+    code, raises :class:`ToolResolutionError` and nothing runs. A call with no
+    entry resolves through the registry by name.
+    """
     from jamjet.tools.decorators import get_tool  # noqa: PLC0415 - avoid import cycle
 
-    defn = get_tool(name) if name else None
-    if defn is None:
-        raise KeyError(f"tool {name!r} not found in tools map or @tool registry")
-    return defn.fn
+    if not name:
+        raise ToolResolutionError("a tool call has no name")
+    ref = tools.get(name) if isinstance(tools, dict) else None
+    if ref is None:
+        defn = get_tool(name)
+        if defn is None:
+            raise ToolResolutionError(f"tool {name!r} not found in the @tool registry")
+        return defn.fn
+
+    if not isinstance(ref, str) or ":" not in ref:
+        raise ToolResolutionError(f"tools map entry for {name!r} is not a module:function reference")
+    module_path, _, fn_path = ref.partition(":")
+    try:
+        obj: Any = importlib.import_module(module_path)
+    except ImportError as exc:
+        raise ToolResolutionError(f"tool {name!r}: tools map entry {ref!r} cannot be imported to verify it") from exc
+    for part in fn_path.split("."):
+        obj = inspect.getattr_static(obj, part, None)
+        if obj is None:
+            raise ToolResolutionError(f"tool {name!r}: tools map entry {ref!r} names nothing")
+    defn = getattr(obj, "_jamjet_tool", None)
+    if defn is None or defn.name != name or _registered_ref(defn) != ref:
+        raise ToolResolutionError(
+            f"tool {name!r}: tools map entry {ref!r} is not the registered @tool {name!r}'s own reference"
+        )
+    return obj
 
 
 def _stringify(result: Any) -> str:

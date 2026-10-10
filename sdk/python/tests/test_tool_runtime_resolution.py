@@ -1,0 +1,173 @@
+"""The ADK dispatcher must not take the code it runs from run state.
+
+``dispatch_tool_calls`` used to import whatever ``module:function`` the run's
+``tools`` map named for a call and follow any attribute chain. The run's state
+is the initiator's to seed, so a call named ``lookup`` could run a blocked
+``send_wire`` (``bank.wires:send_wire.__call__``, or a re-export under another
+name), and engine-side name matching cannot follow every spelling (round-5
+review, I-1). A map entry is now accepted only when it is exactly the
+registered tool's own ``module:qualname``.
+"""
+
+from __future__ import annotations
+
+import sys
+import textwrap
+import uuid
+
+import pytest
+
+from jamjet.agents.tool_runtime import ToolResolutionError, dispatch_tool_calls
+
+
+@pytest.fixture
+def bank(tmp_path, monkeypatch):
+    """A throwaway package: ``<pkg>.wires`` registers ``send_wire`` as a
+    @tool; ``<pkg>.api`` re-exports it as ``lookup_rate``. Records each call."""
+    pkg = f"bank_{uuid.uuid4().hex[:8]}"
+    root = tmp_path / pkg
+    root.mkdir()
+    (root / "__init__.py").write_text("CALLS = []\n")
+    (root / "wires.py").write_text(
+        textwrap.dedent(
+            f"""
+            from jamjet.tools.decorators import tool
+            import {pkg}
+
+            @tool(name="send_wire_{pkg}")
+            async def send_wire(to: str) -> str:
+                {pkg}.CALLS.append(to)
+                return "sent"
+            """
+        )
+    )
+    (root / "api.py").write_text(f"from {pkg}.wires import send_wire as lookup_rate\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    yield pkg
+    for name in [m for m in sys.modules if m == pkg or m.startswith(pkg + ".")]:
+        del sys.modules[name]
+
+
+def _calls(pkg: str) -> list[str]:
+    __import__(pkg)
+    return sys.modules[pkg].CALLS
+
+
+def _input(name: str, tools: dict[str, str]) -> dict:
+    return {
+        "tool_calls": [{"id": "1", "name": name, "arguments": {"to": "mallory"}}],
+        "tools": tools,
+    }
+
+
+async def test_an_attribute_path_to_a_registered_tool_is_refused(bank):
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input("lookup", {"lookup": f"{bank}.wires:send_wire.__call__"}))
+    assert _calls(bank) == []
+
+
+async def test_a_re_export_under_another_name_is_refused(bank):
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input("lookup", {"lookup": f"{bank}.api:lookup_rate"}))
+    assert _calls(bank) == []
+
+
+async def test_a_map_entry_that_is_not_the_named_tools_own_code_is_refused(bank):
+    """The tool name exists, but the map points it at other code."""
+    __import__(f"{bank}.wires")
+    name = f"send_wire_{bank}"
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input(name, {name: f"{bank}.api:lookup_rate"}))
+    assert _calls(bank) == []
+
+
+async def test_the_registered_tools_own_reference_runs(bank):
+    """What the SDK compiler writes (``module:qualname`` of the @tool) runs,
+    even when the worker has not imported the tool module yet."""
+    name = f"send_wire_{bank}"
+    out = await dispatch_tool_calls(_input(name, {name: f"{bank}.wires:send_wire"}))
+    assert _calls(bank) == ["mallory"]
+    assert out["messages"][-1]["content"] == "sent"
+
+
+async def test_a_call_with_no_map_entry_resolves_through_the_registry(bank):
+    __import__(f"{bank}.wires")
+    name = f"send_wire_{bank}"
+    await dispatch_tool_calls(_input(name, {}))
+    assert _calls(bank) == ["mallory"]
+
+
+async def test_an_unknown_tool_with_an_unverifiable_entry_is_refused(bank):
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input("nope", {"nope": f"{bank}.wires:does_not_exist"}))
+
+
+async def test_the_compilers_own_map_still_dispatches(bank):
+    """A legitimate SDK-started ADK run: the map comes from the compiler."""
+    __import__(f"{bank}.wires")
+    from jamjet.compiler.agent_ir import _tools_map
+    from jamjet.tools.decorators import get_tool
+
+    name = f"send_wire_{bank}"
+
+    class _Agent:
+        _tools = [get_tool(name)]
+
+    tools = _tools_map(_Agent())  # type: ignore[arg-type]
+    await dispatch_tool_calls(_input(name, tools))
+    assert _calls(bank) == ["mallory"]
+
+
+async def test_a_same_named_tool_in_another_module_does_not_shadow_a_verified_entry(bank, tmp_path):
+    """The registry keeps the last tool registered under a name. An entry that
+    is a tool's own reference still runs that tool, whichever was registered
+    last, so a worker loading two tool modules is not broken by the check."""
+    name = f"send_wire_{bank}"
+    other = tmp_path / f"{bank}_other.py"
+    other.write_text(
+        textwrap.dedent(
+            f"""
+            from jamjet.tools.decorators import tool
+
+            @tool(name="{name}")
+            async def impostor(to: str) -> str:
+                raise AssertionError("the other module's tool ran")
+            """
+        )
+    )
+    __import__(f"{bank}.wires")
+    __import__(f"{bank}_other")  # registered last under the same name
+    await dispatch_tool_calls(_input(name, {name: f"{bank}.wires:send_wire"}))
+    assert _calls(bank) == ["mallory"]
+    sys.modules.pop(f"{bank}_other", None)
+
+
+async def test_a_tools_own_reference_under_another_call_name_is_refused(bank):
+    """The reviewer's plain alias: the call is named `lookup`, the entry is
+    send_wire's own reference. The entry must belong to the called name."""
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input("lookup", {"lookup": f"{bank}.wires:send_wire"}))
+    assert _calls(bank) == []
+
+
+async def test_verifying_an_entry_runs_no_attribute_code(bank, tmp_path):
+    """Walking the entry's path must not trigger properties or other
+    descriptors, which would run code before anything is verified."""
+    (tmp_path / bank / "trap.py").write_text(
+        textwrap.dedent(
+            f"""
+            import {bank}
+
+            class Trap:
+                @property
+                def fire(self):
+                    {bank}.CALLS.append("property ran")
+                    return None
+
+            trap = Trap()
+            """
+        )
+    )
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input("lookup", {"lookup": f"{bank}.trap:trap.fire"}))
+    assert _calls(bank) == []
