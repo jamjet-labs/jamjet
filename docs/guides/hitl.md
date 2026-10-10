@@ -238,7 +238,9 @@ A policy can give the approval requests it raises a deadline:
   extended.
 - Invalid values are refused at registration (400) and at `PUT /tenants`
   (400). `timeouts.approval_timeout` is retired: it was never read, so a run
-  under it never expired. A non-null value is refused at registration.
+  under it never expired. A non-null value is refused when a new version is
+  registered; a version stored with it before still re-registers unchanged,
+  with no deadline.
 
 A request raised under a deadline records it in its context as UTC times,
 `expires_at` and (when set) `escalate_at`; the pending listing shows both on

@@ -1077,6 +1077,46 @@ async fn registration_refuses_the_retired_timeouts_approval_timeout() {
     assert!(st.is_success(), "{body}");
 }
 
+/// Review M-1: a version already registered with the retired key (before
+/// this release) re-registers idempotently, as deployments do on every boot;
+/// only a NEW registration carrying it is refused.
+#[tokio::test]
+async fn an_identical_reregistration_with_the_retired_key_is_idempotent() {
+    let env = envs().await.remove(0);
+    let mut old = ir(Value::Null, gate(json!({})));
+    old["timeouts"] = json!({ "approval_timeout": 600 });
+    env.backend
+        .store_workflow(jamjet_state::backend::WorkflowDefinition {
+            workflow_id: "wf-deadline".into(),
+            version: "0.1.0".into(),
+            ir: old.clone(),
+            created_at: Utc::now(),
+            tenant_id: "default".into(),
+        })
+        .await
+        .unwrap();
+    let (st, body) = call(
+        &env.app,
+        "POST",
+        "/workflows",
+        &env.alice,
+        json!({ "ir": old.clone() }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let mut next = old;
+    next["version"] = json!("0.2.0");
+    let (st, body) = call(
+        &env.app,
+        "POST",
+        "/workflows",
+        &env.alice,
+        json!({ "ir": next }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+}
+
 #[tokio::test]
 async fn a_tenant_policy_with_an_invalid_deadline_is_refused() {
     let env = memory_env_with_tenant_policy(json!({})).await;

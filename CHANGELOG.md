@@ -216,8 +216,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   appends through the new `StateBackend::append_event_if` (a trait method a custom
   backend must implement) under the condition that the request is still pending.
   Invalid deadlines are refused at registration and at `PUT /tenants`. The dead
-  `timeouts.approval_timeout` field is removed and a non-null value is refused at
-  registration, since nothing ever enforced it.
+  `timeouts.approval_timeout` field is removed and a non-null value is refused when a
+  NEW version is registered, since nothing ever enforced it; a version already stored
+  with it still re-registers idempotently (and still has no deadline: register a new
+  version with `approval_timeout_secs` to get one).
 
 - **Approval requests are sealed into the audit chain.** Only the decision was sealed;
   the request a worker or the claim route raised was in the event log alone, so what

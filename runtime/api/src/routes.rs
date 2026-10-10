@@ -247,12 +247,9 @@ async fn create_workflow(
     // Node ids are printed into commands a reviewer pastes into a shell.
     jamjet_ir::validate_node_ids(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
-    // An approval deadline the engine cannot honour, or the retired
-    // `timeouts.approval_timeout` (which nothing read, so a run under it never
-    // expired), is refused rather than stored.
+    // An approval deadline the engine cannot honour is refused rather than
+    // stored.
     jamjet_ir::validate_approval_deadlines(&parsed)
-        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
-    jamjet_ir::refuse_retired_timeouts(&body.ir)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let backend = state.backend_for(&tenant_id);
@@ -276,6 +273,13 @@ async fn create_workflow(
             Json(json!({ "workflow_id": workflow_id, "version": version })),
         ));
     }
+
+    // The retired `timeouts.approval_timeout` (nothing read it, so a run under
+    // it never expired) is refused for a NEW registration only, after the
+    // idempotent re-register above: a version stored with it before this
+    // release keeps re-registering on boot.
+    jamjet_ir::refuse_retired_timeouts(&body.ir)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let def = WorkflowDefinition {
         workflow_id: workflow_id.clone(),
