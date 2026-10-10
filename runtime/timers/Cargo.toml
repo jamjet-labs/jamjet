@@ -22,4 +22,3 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
-reqwest = { workspace = true }

@@ -92,6 +92,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     runs take that token as initiator, so the creator cannot approve them. Jobs
     created before this upgrade have no creator; their runs cannot be approved
     outside dev mode until the job is recreated.
+  - The unused HTTP cron launcher (`HttpCronLauncher`, `CronScheduler::new`) is
+    removed. It POSTed `/executions` with no token, so it failed outside dev mode,
+    and giving it a token would have made that service the initiator of every cron
+    run. Cron runs through the server's embedded scheduler.
   - Cron jobs belong to a tenant. `POST`, `GET` and `DELETE /cron` act on the
     caller's tenant only, a job name is unique per tenant (migration 0013 rebuilds
     `cron_jobs` with `UNIQUE (tenant_id, name)`), and a job's runs start in its own

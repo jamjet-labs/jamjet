@@ -207,10 +207,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // In dev mode (or when JAMJET_EMBED_CRON is set), run the cron scheduler in
-    // process so YAML-declared schedules fire. It starts runs in-process with
-    // the `system:cron` principal as initiator (it used to POST to this
-    // server's own /executions with no token, a 401 outside dev mode).
-    // Production should run a dedicated cron process.
+    // process so YAML-declared schedules fire. It starts each run in-process,
+    // in the job's tenant, with the job's creator as initiator. This is the
+    // supported way to run cron, in production too: there is no separate cron
+    // process, because one would need its own token and would become the
+    // initiator of every run it starts.
     if (config.dev_mode || std::env::var("JAMJET_EMBED_CRON").is_ok())
         && storage_backend != "memory"
     {

@@ -96,9 +96,9 @@ This example is honest about the current (0.9.0) runtime:
 - **Deferred:** tool calls (`tool:web_search`, `tool:ledger_query`) are surfaced
   to the agent by **name** in its prompt; they are validated at compile time but
   are not executed by the runtime yet. Sibling references (`agent:morning_briefing`)
-  are likewise validated but not invoked synchronously yet. The embedded cron
-  scheduler is dev-only and cron jobs are global (single-tenant); a dedicated
-  production cron process is a follow-up.
+  are likewise validated but not invoked synchronously yet. Cron runs through
+  the server's embedded scheduler (on in dev mode, or with `JAMJET_EMBED_CRON`
+  set); each job belongs to the tenant that created it.
 
 See the guide at https://docs.jamjet.dev/open-source/multi-agent-fleets for the
 full reference.
