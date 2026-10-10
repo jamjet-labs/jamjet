@@ -82,6 +82,14 @@ async fn assert_json_404(dev_mode: bool, method: Method, path: &str) {
         hint.contains("/executions"),
         "{method} {path}: hint must name the real routes, got {hint:?}"
     );
+    // Both JamJet Java clients that sent /api/v1 must be named, so a user of
+    // either one can tell the 404 is about their client.
+    for client in ["jamjet-sdk", "jamjet-spring-boot-starter"] {
+        assert!(
+            hint.contains(client),
+            "{method} {path}: hint must name {client}, got {hint:?}"
+        );
+    }
 }
 
 async fn assert_spa(method: Method, path: &str) {

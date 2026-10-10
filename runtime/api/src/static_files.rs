@@ -20,7 +20,9 @@ struct Assets;
 /// runtime has never served.
 const NOT_FOUND_HINT: &str = "no route matches this request. The JamJet runtime serves its \
 API at bare paths such as /workflows, /executions and /agents, with no /api or /api/v1 \
-prefix. If a JamJet client sent this, upgrade it (jamjet-sdk for Java 0.5.1 or later).";
+prefix. Two JamJet Java clients sent /api/v1: jamjet-sdk before 0.5.1 (upgrade it), and the \
+JamjetRuntimeClient in jamjet-spring-boot-starter 0.2.0 and earlier (no release of the starter \
+uses the bare paths yet; call them directly or through jamjet-sdk 0.5.1).";
 
 /// Whether an unmatched request may be answered with the SPA.
 ///
