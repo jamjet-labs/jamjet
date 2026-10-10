@@ -32,6 +32,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>Every step asserts a side effect the runtime reports back (the stored
  * workflow ID, the execution's status, the events it wrote), never only the
  * absence of an exception.
+ *
+ * <p>Auth is not covered here. In dev mode the runtime skips {@code require_auth}, and
+ * it has no route or flag that issues a token ({@code create_token} is reachable only
+ * from the state backend), so this run never presents a token for checking. The
+ * unit test {@code JamjetClientRoutesTest.apiTokenIsSentAsBearer} pins the header the
+ * client sends.
  */
 class RuntimeContractIT {
 
@@ -176,6 +182,8 @@ class RuntimeContractIT {
         assertEquals(404, e.statusCode(), e.body());
         // The handler's own 404 names the workflow; a route miss would not.
         assertTrue(e.body().contains(missing), e.body());
+        // And the user sees that reason in the message, not only on body().
+        assertTrue(e.getMessage().contains(missing), e.getMessage());
     }
 
     @Test

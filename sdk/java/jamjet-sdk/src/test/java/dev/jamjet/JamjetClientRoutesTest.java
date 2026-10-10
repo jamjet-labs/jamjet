@@ -34,7 +34,7 @@ class JamjetClientRoutesTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private record Recorded(String method, String path, String body, String userAgent) {}
+    private record Recorded(String method, String path, String body, String userAgent, String authorization) {}
 
     private HttpServer server;
     private JamjetClient client;
@@ -57,7 +57,8 @@ class JamjetClientRoutesTest {
             var method = exchange.getRequestMethod();
             synchronized (requests) {
                 requests.add(new Recorded(method, full, body,
-                        exchange.getRequestHeaders().getFirst("User-Agent")));
+                        exchange.getRequestHeaders().getFirst("User-Agent"),
+                        exchange.getRequestHeaders().getFirst("Authorization")));
             }
             byte[] out;
             int status;
@@ -300,6 +301,15 @@ class JamjetClientRoutesTest {
     }
 
     // ── Headers ──────────────────────────────────────────────────────────────
+
+    @Test
+    void apiTokenIsSentAsBearer() {
+        // The contract IT runs in dev mode, where the runtime ignores this header, so
+        // this is the only check that an auth-mode runtime would receive the token.
+        expect("GET", "/executions/exec_1", "{}");
+        client.getExecution("exec_1");
+        assertEquals("Bearer test-token", only().authorization());
+    }
 
     @Test
     void userAgentCarriesTheBuildVersion() {
