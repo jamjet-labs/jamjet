@@ -45,8 +45,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     change only the tenant of their own token. Before this, any developer could
     `PUT /tenants/:id` and drop a tenant-level approval gate. The route/role table
     is in docs/guides/security.md.
-  - A worker's reported `state_patch` cannot write the engine's bookkeeping key
-    `__budget`; `POST /work-items/:id/complete` drops it. It was a way to reset a
+  - Neither a run's initial input nor a worker's reported `state_patch` can write
+    the engine's bookkeeping key `__budget`; `start_run` (REST, MCP and cron) and
+    `POST /work-items/:id/complete` drop it. It was a way to reset a
     run's budget and to change later nodes' input outside any approval.
   - `agent_tool_dispatch: true` is refused at `POST /workflows` on any node that is
     not the ADK dispatcher (`jamjet.agents.tool_runtime:dispatch_tool_calls`), and on

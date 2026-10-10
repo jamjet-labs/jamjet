@@ -330,6 +330,11 @@ pub async fn start_run(
     input: Value,
     initiated_by: Option<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    // The engine's bookkeeping keys (`__budget`) are not the caller's to set.
+    // The budget enforcer reads them back, and the approval digest leaves
+    // them out as engine-written, so a seeded value would be a budget the
+    // engine never recorded and input no approval covers.
+    let input = jamjet_state::approvals::action_state(&input);
     let backend = state.backend_for(tenant_id);
     let version = workflow_version.unwrap_or_else(|| "1.0.0".into());
 
