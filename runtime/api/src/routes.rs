@@ -108,12 +108,23 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
     } else {
         api_routes
             .layer(middleware::from_fn(require_write_role))
-            .layer(middleware::from_fn_with_state(auth_state, require_auth))
+            .layer(middleware::from_fn_with_state(
+                auth_state.clone(),
+                require_auth,
+            ))
             .with_state(state.clone())
     };
 
-    // MCP bridge — unauthenticated, local-only.
-    let mcp_bridge = crate::mcp_bridge::build_mcp_bridge(state.clone());
+    // MCP bridge. Outside dev mode it sits behind the same Bearer token check as
+    // the REST API; each tool then takes its tenant and role from that token
+    // (see `mcp_bridge::resolve_caller`). `route_layer`, not `layer`, so the
+    // check covers the bridge's own routes and nothing it is merged with.
+    let mcp_bridge = crate::mcp_bridge::build_mcp_bridge(state.clone(), dev_mode);
+    let mcp_bridge = if dev_mode {
+        mcp_bridge
+    } else {
+        mcp_bridge.route_layer(middleware::from_fn_with_state(auth_state, require_auth))
+    };
 
     // Public routes — no auth required.
     Router::new()

@@ -17,5 +17,5 @@ pub mod types;
 pub use adapter::McpAdapter;
 pub use client::McpClient;
 pub use pool::McpClientPool;
-pub use server::{McpServer, McpServerConfig, RegisteredTool};
+pub use server::{McpServer, McpServerConfig, RegisteredTool, ToolCallContext};
 pub use transport::{HttpSseTransport, McpTransport, StdioTransport};

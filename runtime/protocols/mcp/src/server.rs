@@ -29,7 +29,56 @@ use tracing::{debug, info, warn};
 /// A registered tool with its definition and async handler.
 pub struct RegisteredTool {
     pub definition: McpTool,
-    pub handler: Box<dyn ToolFn>,
+    pub handler: Box<dyn ContextToolFn>,
+}
+
+/// Per-call context handed to a context-aware tool handler.
+///
+/// `extensions` are the HTTP request extensions of the JSON-RPC call. A host
+/// that mounts this router behind its own auth layer uses them to hand the
+/// authenticated caller to the tool, so identity comes from the transport and
+/// never from tool arguments a client can write.
+#[derive(Clone, Default)]
+pub struct ToolCallContext {
+    pub extensions: axum::http::Extensions,
+}
+
+/// A tool handler that also receives the [`ToolCallContext`].
+pub trait ContextToolFn: Send + Sync {
+    fn call(
+        &self,
+        arguments: Value,
+        ctx: ToolCallContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<McpContent>, String>> + Send>>;
+}
+
+impl<F, Fut> ContextToolFn for F
+where
+    F: Fn(Value, ToolCallContext) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<Vec<McpContent>, String>> + Send + 'static,
+{
+    fn call(
+        &self,
+        arguments: Value,
+        ctx: ToolCallContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<McpContent>, String>> + Send>>
+    {
+        Box::pin(self(arguments, ctx))
+    }
+}
+
+/// Adapts an argument-only [`ToolFn`] to [`ContextToolFn`] by ignoring the context.
+struct IgnoreContext<T>(T);
+
+impl<T: ToolFn> ContextToolFn for IgnoreContext<T> {
+    fn call(
+        &self,
+        arguments: Value,
+        _ctx: ToolCallContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<McpContent>, String>> + Send>>
+    {
+        self.0.call(arguments)
+    }
 }
 
 pub trait ToolFn: Send + Sync {
@@ -75,6 +124,7 @@ fn build_router(state: McpServerState) -> Router {
 
 async fn rpc_handler(
     State(state): State<McpServerState>,
+    extensions: axum::http::Extensions,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -121,7 +171,16 @@ async fn rpc_handler(
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
             match state.tools.get(name) {
-                Some(tool) => match tool.handler.call(args).await {
+                Some(tool) => match tool
+                    .handler
+                    .call(
+                        args,
+                        ToolCallContext {
+                            extensions: extensions.clone(),
+                        },
+                    )
+                    .await
+                {
                     Ok(content) => {
                         let resp = McpToolCallResponse {
                             content,
@@ -253,6 +312,24 @@ impl McpServer {
     pub fn register_tool<F, Fut>(mut self, definition: McpTool, handler: F) -> Self
     where
         F: Fn(Value) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Vec<McpContent>, String>> + Send + 'static,
+    {
+        let name = definition.name.clone();
+        self.tools.insert(
+            name,
+            Arc::new(RegisteredTool {
+                definition,
+                handler: Box::new(IgnoreContext(handler)),
+            }),
+        );
+        self
+    }
+
+    /// Register a tool whose handler also receives the per-call
+    /// [`ToolCallContext`] (the HTTP request extensions).
+    pub fn register_tool_with_context<F, Fut>(mut self, definition: McpTool, handler: F) -> Self
+    where
+        F: Fn(Value, ToolCallContext) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<Vec<McpContent>, String>> + Send + 'static,
     {
         let name = definition.name.clone();
