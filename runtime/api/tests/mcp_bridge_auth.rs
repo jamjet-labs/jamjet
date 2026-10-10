@@ -68,7 +68,8 @@ async fn pending_execution(backend: &Arc<InMemoryBackend>) -> ExecutionId {
                 workflow_id: "wf".into(),
                 workflow_version: "0.1.0".into(),
                 initial_input: json!({}),
-                initiated_by: None,
+                // A principal no test token has, so SoD is provable.
+                initiated_by: Some("token:the-initiator".into()),
             },
         ))
         .await

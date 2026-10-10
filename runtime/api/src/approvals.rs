@@ -69,6 +69,9 @@ pub enum SubmitError {
     ExecutionTerminal(String),
     /// The approving principal started this run (separation of duties).
     SelfApproval,
+    /// Outside dev mode, the run has no recorded initiator, so separation of
+    /// duties cannot be proven for an approval.
+    InitiatorUnknown,
     /// The echoed `action_digest` is not the pending request's digest.
     StaleDigest,
     /// Outside dev mode, an `Approved` decision on a request that binds an
@@ -103,6 +106,13 @@ impl std::fmt::Display for SubmitError {
                 f,
                 "separation of duties: the principal that started this run cannot approve it"
             ),
+            Self::InitiatorUnknown => write!(
+                f,
+                "separation of duties: this run has no recorded initiator (it predates \
+                 initiator recording or was started in dev mode), so an approval cannot be \
+                 shown to come from someone other than whoever started it; reject it, re-run \
+                 it, or set JAMJET_ALLOW_SELF_APPROVAL=1 to allow approvals without that check"
+            ),
             Self::StaleDigest => write!(
                 f,
                 "action_digest does not match the pending request; re-read the pending approval and decide again"
@@ -134,9 +144,12 @@ impl std::fmt::Display for SubmitError {
 /// initiator (`WorkflowStarted.initiated_by`) is refused with
 /// [`SubmitError::SelfApproval`] and nothing is appended, unless
 /// `policy.allow_self_approval`. Rejections are never refused on this ground.
-/// Without a principal (dev mode) or without a recorded initiator (dev-mode
-/// runs, runs logged before initiators were recorded) there is nothing to
-/// compare and the check does not apply.
+/// Outside dev mode, a run with no recorded initiator (dev-mode runs, runs
+/// logged before initiators were recorded) is refused with
+/// [`SubmitError::InitiatorUnknown`], since SoD cannot be proven for it. In
+/// dev mode there is no principal and the check does not apply.
+///
+/// SoD distinguishes TOKENS, not people: see the note in the body.
 pub async fn submit_approval(
     backend: &Arc<dyn StateBackend>,
     execution_id: &ExecutionId,
@@ -200,11 +213,23 @@ pub async fn submit_approval(
         },
     };
 
+    // SEPARATION OF DUTIES is per TOKEN, not per person. Operators mint
+    // tokens (there is no REST route for it), so one human holding two tokens,
+    // or a token re-minted after revocation, can approve a run they started.
+    // That is a deployment control: issue one token per human.
     if matches!(submission.decision, ApprovalDecision::Approved) && !policy.allow_self_approval {
-        if let Some(principal) = submission.principal.as_deref() {
-            if run_initiator(&events).as_deref() == Some(principal) {
+        match (run_initiator(&events), submission.principal.as_deref()) {
+            (Some(initiator), Some(principal)) if initiator == principal => {
                 return Err(SubmitError::SelfApproval);
             }
+            // No recorded initiator: the run predates initiator recording or
+            // was started in dev mode. Outside dev mode SoD cannot be proven,
+            // so refuse rather than treat the run as approvable by anyone,
+            // including whoever started it.
+            (None, _) if !submission.dev_mode => {
+                return Err(SubmitError::InitiatorUnknown);
+            }
+            _ => {}
         }
     }
 

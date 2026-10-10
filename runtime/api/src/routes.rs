@@ -598,7 +598,8 @@ async fn approve_execution(
     )
     .await
     .map_err(|e| match e {
-        crate::approvals::SubmitError::SelfApproval => ApiError::Forbidden(e.to_string()),
+        crate::approvals::SubmitError::SelfApproval
+        | crate::approvals::SubmitError::InitiatorUnknown => ApiError::Forbidden(e.to_string()),
         crate::approvals::SubmitError::MultiplePending(_) => ApiError::BadRequest(e.to_string()),
         crate::approvals::SubmitError::NoPending
         | crate::approvals::SubmitError::NodeNotPending(_)

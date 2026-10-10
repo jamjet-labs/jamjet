@@ -97,7 +97,9 @@ async fn pending_execution(backend: &Arc<InMemoryBackend>) -> ExecutionId {
             workflow_id: "wf".into(),
             workflow_version: "0.1.0".into(),
             initial_input: json!({}),
-            initiated_by: None,
+            // Started by someone other than any approver in these tests, so
+            // separation of duties holds and is provable.
+            initiated_by: Some("token:the-initiator".into()),
         },
         EventKind::ToolApprovalRequired {
             node_id: "gate".into(),

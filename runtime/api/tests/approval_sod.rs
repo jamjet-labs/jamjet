@@ -328,3 +328,77 @@ fn the_opt_out_is_off_unless_explicitly_set() {
     std::env::remove_var("JAMJET_ALLOW_SELF_APPROVAL");
     assert!(!jamjet_api::approvals::ApprovalPolicy::from_env().allow_self_approval);
 }
+
+// ── Runs with no recorded initiator (approval-integrity round 2, I3) ────────
+//
+// A run started in dev mode, or logged before initiators were recorded, has no
+// initiator, so separation of duties cannot be proven for it. Outside dev mode
+// an approval of such a run is refused unless the self-approval opt-out is set;
+// before this, the check was simply skipped and the run stayed self-approvable
+// for life.
+
+/// A run started on the dev-mode router (no initiator), then decided on the
+/// auth router against the same backend, as after a restart into auth mode.
+async fn run_without_initiator(backend: &Arc<InMemoryBackend>) -> ExecutionId {
+    store_workflow(backend).await;
+    let dev = build_router_with_opts(make_state(backend.clone()), true);
+    let eid = start_and_park(dev, backend, None).await;
+    assert!(started_json(backend, &eid)
+        .await
+        .get("initiated_by")
+        .is_none());
+    eid
+}
+
+#[tokio::test]
+async fn approving_a_run_with_no_initiator_is_refused_outside_dev_mode() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let eid = run_without_initiator(&backend).await;
+    let (bob, _) = backend.create_token("bob", "reviewer").await.unwrap();
+    let app = build_router_with_opts(make_state(backend.clone()), false);
+
+    let (status, body) = send(
+        app,
+        "POST",
+        &format!("/executions/{eid}/approve"),
+        Some(&bob),
+        json!({ "decision": "approved", "node_id": "gate" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let msg = body.to_string();
+    assert!(
+        msg.contains("JAMJET_ALLOW_SELF_APPROVAL"),
+        "names the escape hatch: {msg}"
+    );
+    assert!(msg.contains("initiator"), "says why: {msg}");
+    assert_eq!(decisions(&backend, &eid).await, 0);
+}
+
+#[tokio::test]
+async fn rejecting_a_run_with_no_initiator_is_allowed() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let eid = run_without_initiator(&backend).await;
+    let (bob, _) = backend.create_token("bob", "reviewer").await.unwrap();
+    let app = build_router_with_opts(make_state(backend.clone()), false);
+    assert_eq!(
+        approve(app, &eid, Some(&bob), "rejected").await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn the_opt_out_allows_approving_a_run_with_no_initiator() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let eid = run_without_initiator(&backend).await;
+    let (bob, _) = backend.create_token("bob", "reviewer").await.unwrap();
+    let mut state = make_state(backend.clone());
+    state.approval_policy = jamjet_api::approvals::ApprovalPolicy {
+        allow_self_approval: true,
+    };
+    let app = build_router_with_opts(state, false);
+    assert_eq!(
+        approve(app, &eid, Some(&bob), "approved").await,
+        StatusCode::OK
+    );
+}
