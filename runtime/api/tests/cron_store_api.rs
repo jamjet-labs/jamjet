@@ -22,6 +22,7 @@ async fn cron_store_roundtrip() {
             last_run_at: None,
             next_run_at: next,
             created_at: chrono::Utc::now(),
+            created_by: Some("token:t1".into()),
         })
         .await
         .unwrap();
@@ -29,6 +30,7 @@ async fn cron_store_roundtrip() {
     let all = store.list_all().await.unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].workflow_id, "researcher");
+    assert_eq!(all[0].created_by.as_deref(), Some("token:t1"));
 
     let _ = std::fs::remove_file(&db);
 }

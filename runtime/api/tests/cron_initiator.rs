@@ -1,15 +1,15 @@
-//! The embedded cron scheduler starts runs in-process, as `system:cron`.
+//! The embedded cron scheduler starts runs in-process.
 //!
 //! It used to POST to the server's own `/executions` with no token, which
 //! outside dev mode is a 401, so `JAMJET_EMBED_CRON` never started a run on an
-//! authenticated server. Runs it starts now record `system:cron` as their
-//! initiator: separation of duties has an initiator to check (a run with none
-//! is refused approval outside dev mode), and no human token can equal it.
+//! authenticated server. A run takes the job's creator as its initiator (see
+//! `cron_creator_sod.rs`). A job from before creators were recorded has none,
+//! so its runs have no initiator and cannot be approved outside dev mode.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use jamjet_api::cron::{InProcessCronLauncher, CRON_PRINCIPAL};
+use jamjet_api::cron::InProcessCronLauncher;
 use jamjet_api::routes::build_router_with_opts;
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::EventKind;
@@ -22,7 +22,7 @@ use tower::ServiceExt;
 mod support;
 
 #[tokio::test]
-async fn a_cron_run_is_started_in_process_by_the_system_principal() {
+async fn a_job_with_no_recorded_creator_starts_a_run_nobody_can_approve() {
     let mut path = std::env::temp_dir();
     path.push(format!("jamjet_cron_{}.db", uuid::Uuid::new_v4().simple()));
     let sqlite = Arc::new(
@@ -53,6 +53,7 @@ async fn a_cron_run_is_started_in_process_by_the_system_principal() {
             last_run_at: None,
             next_run_at: now - chrono::Duration::minutes(1),
             created_at: now,
+            created_by: None,
         })
         .await
         .unwrap();
@@ -70,12 +71,13 @@ async fn a_cron_run_is_started_in_process_by_the_system_principal() {
     let eid = runs[0].execution_id.clone();
     let events = backend.get_events(&eid).await.unwrap();
     assert_eq!(
-        jamjet_state::approvals::run_initiator(&events).as_deref(),
-        Some(CRON_PRINCIPAL)
+        jamjet_state::approvals::run_initiator(&events),
+        None,
+        "a pre-upgrade job has no creator to record"
     );
 
-    // A reviewer can approve a gate in a cron run: the initiator is known and
-    // is not the reviewer's token.
+    // With no initiator, separation of duties has nothing to compare, so the
+    // approval is refused outside dev mode (the unknown-initiator rule).
     let seq = backend.latest_sequence(&eid).await.unwrap() + 1;
     backend
         .append_event(Event::new(
@@ -105,7 +107,7 @@ async fn a_cron_run_is_started_in_process_by_the_system_principal() {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(
         status,
-        StatusCode::OK,
+        StatusCode::FORBIDDEN,
         "{}",
         String::from_utf8_lossy(&bytes)
     );

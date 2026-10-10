@@ -38,8 +38,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     is in docs/guides/security.md.
   - A registered workflow version is immutable: an identical re-register is a 200
     no-op, a different IR under the same version is a 409.
-  - The embedded cron scheduler starts runs in-process as `system:cron` instead of
-    POSTing to `/executions` without a token, which failed with 401 outside dev mode.
+  - The embedded cron scheduler starts runs in-process instead of POSTing to
+    `/executions` without a token, which failed with 401 outside dev mode. A cron
+    job records the token that created it (`created_by`, migration 0013), and its
+    runs take that token as initiator, so the creator cannot approve them. Jobs
+    created before this upgrade have no creator; their runs cannot be approved
+    outside dev mode until the job is recreated.
 
 - **The tool-effect idempotency key is derived by the engine, not taken from the request
   body** (#130). `POST /work-items/:id/complete` persisted the caller's

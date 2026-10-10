@@ -85,6 +85,12 @@ Rules the runtime enforces:
   outside dev mode, since nobody can show the approver is someone else.
   `JAMJET_ALLOW_SELF_APPROVAL=1` turns both checks off for single-operator
   installs.
+- **A cron job's creator is the initiator of its runs.** `POST /cron` records the
+  calling token as the job's `created_by`, and every run the job starts records
+  that token as its initiator, so whoever scheduled a run cannot approve it.
+  Replacing a job by name replaces its creator. Jobs created before this was
+  recorded, or in dev mode, start runs with no initiator, which cannot be
+  approved outside dev mode; recreate them with `POST /cron` to fix that.
 - **SoD distinguishes tokens, not people.** Tokens are minted by an operator, so
   one person holding two tokens can approve their own run. Issue one token per
   human.

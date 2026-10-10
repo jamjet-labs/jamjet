@@ -45,6 +45,13 @@ pub struct CronJob {
     pub last_run_at: Option<DateTime<Utc>>,
     pub next_run_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    /// The principal (`token:<id>`) that created the job. Every run the job
+    /// starts records it as initiator, so its creator cannot approve those
+    /// runs. `None` for jobs from before it was recorded and for dev-mode
+    /// jobs; their runs have no initiator and cannot be approved outside dev
+    /// mode.
+    #[serde(default)]
+    pub created_by: Option<String>,
 }
 
 // ── Timer store ───────────────────────────────────────────────────────────────
@@ -238,8 +245,8 @@ impl CronStore {
     pub async fn upsert(&self, job: &CronJob) -> Result<(), String> {
         sqlx::query(
             r#"INSERT OR REPLACE INTO cron_jobs
-               (id, name, cron_expression, workflow_id, workflow_version, input_json, enabled, next_run_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               (id, name, cron_expression, workflow_id, workflow_version, input_json, enabled, next_run_at, created_at, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(job.id.to_string())
         .bind(&job.name)
@@ -250,6 +257,7 @@ impl CronStore {
         .bind(job.enabled as i64)
         .bind(job.next_run_at.to_rfc3339())
         .bind(job.created_at.to_rfc3339())
+        .bind(job.created_by.as_deref())
         .execute(&self.pool)
         .await
         .map_err(|e| format!("upsert cron job: {e}"))?;
@@ -332,6 +340,9 @@ fn row_to_cron(row: &sqlx::sqlite::SqliteRow) -> Result<CronJob, String> {
             .transpose()?,
         next_run_at: parse_dt(row.get("next_run_at"))?,
         created_at: parse_dt(row.get("created_at"))?,
+        created_by: row
+            .try_get::<Option<String>, _>("created_by")
+            .map_err(|e| format!("cron created_by: {e}"))?,
     })
 }
 
@@ -608,6 +619,7 @@ mod tests {
             last_run_at: None,
             next_run_at: Utc::now() - chrono::Duration::minutes(1),
             created_at: Utc::now(),
+            created_by: None,
         }
     }
 
