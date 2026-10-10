@@ -143,7 +143,7 @@ def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]
     code, raises :class:`ToolResolutionError` and nothing runs. A call with no
     entry resolves through the registry by name.
     """
-    from jamjet.tools.decorators import get_tool  # noqa: PLC0415 - avoid import cycle
+    from jamjet.tools.decorators import _TOOL_REGISTRY, get_tool  # noqa: PLC0415 - avoid import cycle
 
     if not name:
         raise ToolResolutionError("a tool call has no name")
@@ -157,10 +157,27 @@ def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]
     if not isinstance(ref, str) or ":" not in ref:
         raise ToolResolutionError(f"tools map entry for {name!r} is not a module:function reference")
     module_path, _, fn_path = ref.partition(":")
+
+    # The common case, with no import: the tool registered under this name
+    # is the one the entry names.
+    registered = get_tool(name)
+    if registered is not None and _registered_ref(registered) == ref:
+        return registered.fn
+
+    # Otherwise the entry's module is imported to find what it names. Importing
+    # runs its @tool decorators, which would overwrite any tool already
+    # registered under the same name for the life of the worker, so a later
+    # call with no entry would run the import's tool. Any name the import
+    # overwrote is put back; new names may stay.
+    snapshot = dict(_TOOL_REGISTRY)
     try:
         obj: Any = importlib.import_module(module_path)
     except ImportError as exc:
         raise ToolResolutionError(f"tool {name!r}: tools map entry {ref!r} cannot be imported to verify it") from exc
+    finally:
+        for existing_name, existing in snapshot.items():
+            if _TOOL_REGISTRY.get(existing_name) is not existing:
+                _TOOL_REGISTRY[existing_name] = existing
     for part in fn_path.split("."):
         obj = inspect.getattr_static(obj, part, None)
         if obj is None:
