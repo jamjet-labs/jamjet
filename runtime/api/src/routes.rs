@@ -680,6 +680,13 @@ async fn list_approvals_for_execution(
                         "status":   "approved",
                         "user_id":  row.user_id,
                         "sequence": row.last_sequence,
+                        // Same field the event-log path reports.
+                        "approved_digest": row
+                            .context
+                            .as_ref()
+                            .and_then(|c| c.get("approved_digest"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
                     }));
                 }
                 "rejected" => {
