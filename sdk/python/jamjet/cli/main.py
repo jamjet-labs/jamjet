@@ -30,6 +30,7 @@ import asyncio
 import enum
 import importlib.metadata
 import json
+import re
 import sys
 import time
 from collections.abc import Mapping
@@ -2592,6 +2593,12 @@ def _summary(data: dict[str, Any], limit: int = 240) -> str:
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
+# The node id rule `POST /workflows` enforces. A workflow stored before that
+# rule may still have another id; no paste-ready command is printed for it,
+# because POSIX quoting does not protect every shell (fish among them).
+_NODE_ID_SAFE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+
+
 def _approve_command(execution_id: str, node_id: str, binding: str) -> str | None:
     """The `jamjet approve` line for one pending request, safe to paste.
 
@@ -2605,7 +2612,7 @@ def _approve_command(execution_id: str, node_id: str, binding: str) -> str | Non
     import shlex  # noqa: PLC0415
 
     values = (execution_id, node_id, binding)
-    if any(_safe(v) != str(v) for v in values):
+    if any(_safe(v) != str(v) for v in values) or not _NODE_ID_SAFE.fullmatch(node_id):
         return None
     args = [
         "jamjet",
@@ -2722,7 +2729,9 @@ def approvals(
                     console.print(
                         f"{node}: approve with"
                         if command
-                        else f"{node}: the node id or digest holds control characters; no command is printed for it",
+                        else f"{node}: the node id is not in the safe set [A-Za-z0-9_.-] or a value "
+                        "holds control characters, so no command is printed; approve it with "
+                        "the API or SDK, passing the node id exactly",
                         soft_wrap=True,
                         markup=False,
                         highlight=False,
