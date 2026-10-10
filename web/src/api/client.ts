@@ -1,8 +1,10 @@
 import type { Execution, Event, ScoringEntry } from './types'
 
-// In dev, Vite proxies /api → the Rust runtime (see vite.config.ts).
-// In production the SPA is served from the same origin as the runtime.
-const BASE = '/api'
+// The runtime serves its API at bare paths (/executions, ...), with no /api
+// prefix; an /api path gets a JSON 404. In dev, Vite proxies these paths to the
+// Rust runtime (see vite.config.ts). In production the SPA is served from the
+// same origin as the runtime.
+const BASE = ''
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`)
