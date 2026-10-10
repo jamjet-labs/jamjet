@@ -39,6 +39,7 @@ workflow:
   version: 0.1.0                    # semver
   state_schema: schemas.ResearchState  # Pydantic model for shared state
   start: search                     # entry node ID
+  agent_ref: jamjet://acme/researcher  # optional: the registered Agent Card this workflow acts for
 
 nodes:
   search:
@@ -48,6 +49,7 @@ nodes:
       query: "{{ state.question }}" # Jinja2 template expressions
     output_schema: schemas.SearchResult
     retry_policy: io_default        # named retry policy
+    acts_for: jamjet://acme/researcher  # optional: an Agent Card this node also acts for
     next: summarize                 # next node (or list for branching)
 
   summarize:
@@ -59,6 +61,8 @@ nodes:
     output_schema: schemas.Summary
     next: end                       # built-in terminal node
 ```
+
+`agent_ref` (workflow) and `acts_for` (node) compile to the IR's `agent_ref`. The engine then holds the node to the named card's `allowed_tools`, `blocked_tools`, `require_approval_for` and `allowed_delegations` (see the [Agent Model Guide](agent-model-guide.md#enforcing-allowed_tools)), and refuses it if no agent is registered at that `uri`. A node uses `acts_for` because `agent_ref` on an `agent` node already names the agent it calls.
 
 ---
 

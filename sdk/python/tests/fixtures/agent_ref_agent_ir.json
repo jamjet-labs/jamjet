@@ -1,0 +1,191 @@
+{
+  "ir": {
+    "agent_ref": "jamjet://acme/researcher",
+    "data_policy": {
+      "pii_detectors": [
+        "email",
+        "ssn",
+        "credit_card",
+        "phone",
+        "ip_address"
+      ],
+      "pii_fields": [],
+      "redaction_mode": "mask",
+      "retain_outputs": true,
+      "retain_prompts": false
+    },
+    "description": "Durable agent: researcher",
+    "edges": [
+      {
+        "condition": null,
+        "from": "__model_0__",
+        "to": "__tool_gate_0__"
+      },
+      {
+        "condition": "state.last_model_finish_reason == \"tool_calls\"",
+        "from": "__tool_gate_0__",
+        "to": "__tools_0__"
+      },
+      {
+        "condition": null,
+        "from": "__tool_gate_0__",
+        "to": "end"
+      },
+      {
+        "condition": null,
+        "from": "__tools_0__",
+        "to": "__model_1__"
+      },
+      {
+        "condition": null,
+        "from": "__model_1__",
+        "to": "end"
+      }
+    ],
+    "labels": {
+      "jamjet.agent.id": "researcher",
+      "jamjet.agent.loop": "true",
+      "jamjet.agent.max_turns": "1"
+    },
+    "mcp_servers": {},
+    "models": {},
+    "name": "researcher",
+    "nodes": {
+      "__model_0__": {
+        "description": "agent turn 0 \u2014 model call",
+        "id": "__model_0__",
+        "kind": {
+          "model_ref": "anthropic/claude-sonnet-4-6",
+          "output_schema": "",
+          "prompt_ref": "",
+          "system_prompt": null,
+          "tools": [
+            {
+              "function": {
+                "description": "Search the web.",
+                "name": "search_web",
+                "parameters": {
+                  "properties": {
+                    "query": "string"
+                  },
+                  "required": [
+                    "query"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            },
+            {
+              "function": {
+                "description": "Send money.",
+                "name": "send_wire",
+                "parameters": {
+                  "properties": {
+                    "to": "string"
+                  },
+                  "required": [
+                    "to"
+                  ],
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ],
+          "type": "model"
+        },
+        "labels": {
+          "jamjet.agent.loop": "model",
+          "jamjet.agent.turn": "0"
+        },
+        "node_timeout_secs": null,
+        "retry_policy": "llm_default"
+      },
+      "__model_1__": {
+        "description": "agent turn 1 \u2014 final answer (no tools)",
+        "id": "__model_1__",
+        "kind": {
+          "model_ref": "anthropic/claude-sonnet-4-6",
+          "output_schema": "",
+          "prompt_ref": "",
+          "system_prompt": null,
+          "tools": [],
+          "type": "model"
+        },
+        "labels": {
+          "jamjet.agent.final": "true",
+          "jamjet.agent.loop": "model",
+          "jamjet.agent.turn": "1"
+        },
+        "node_timeout_secs": null,
+        "retry_policy": "llm_default"
+      },
+      "__tool_gate_0__": {
+        "description": "agent turn 0 \u2014 tool-call gate",
+        "id": "__tool_gate_0__",
+        "kind": {
+          "branches": [
+            {
+              "condition": "state.last_model_finish_reason == \"tool_calls\"",
+              "target": "__tools_0__"
+            },
+            {
+              "condition": null,
+              "target": "end"
+            }
+          ],
+          "expression": "state.last_model_finish_reason == \"tool_calls\"",
+          "type": "condition"
+        },
+        "labels": {
+          "jamjet.agent.loop": "gate",
+          "jamjet.agent.turn": "0"
+        },
+        "node_timeout_secs": null,
+        "retry_policy": null
+      },
+      "__tools_0__": {
+        "description": "agent turn 0 \u2014 dispatch tool calls",
+        "id": "__tools_0__",
+        "kind": {
+          "agent_tool_dispatch": true,
+          "function": "dispatch_tool_calls",
+          "input": {
+            "assistant_content": "$state.last_model_output",
+            "messages": "$state.messages",
+            "tool_calls": "$state.last_model_tool_calls",
+            "tools": {
+              "search_web": "tests.test_agent_ref:search_web",
+              "send_wire": "tests.test_agent_ref:send_wire"
+            }
+          },
+          "module": "jamjet.agents.tool_runtime",
+          "output_schema": "",
+          "type": "python_fn"
+        },
+        "labels": {
+          "jamjet.agent.loop": "tools",
+          "jamjet.agent.turn": "0"
+        },
+        "node_timeout_secs": null,
+        "retry_policy": "no_retry"
+      }
+    },
+    "remote_agents": {},
+    "retry_policies": {},
+    "start_node": "__model_0__",
+    "state_schema": "",
+    "timeouts": {
+      "heartbeat_interval": 30,
+      "workflow_timeout": 300
+    },
+    "tools": {},
+    "version": "0.1.0+14635497f9b5",
+    "workflow_id": "researcher"
+  },
+  "tools": {
+    "search_web": "tests.test_agent_ref:search_web",
+    "send_wire": "tests.test_agent_ref:send_wire"
+  }
+}

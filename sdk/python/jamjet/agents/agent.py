@@ -128,7 +128,15 @@ class Agent:
         #   an AgentMemory-like -> used as-is (duck-typed, so a fake can be
         #                          injected in tests without a real Engram).
         memory: bool | AgentMemory | None = None,
+        # The `uri` of a registered Agent Card this agent acts as. The durable
+        # path (`run_durable`) emits it as the workflow's `agent_ref`, and the
+        # engine then holds every node to that card's `allowed_tools`,
+        # `blocked_tools`, `require_approval_for` and `allowed_delegations`.
+        agent_ref: str | None = None,
     ) -> None:
+        from jamjet.workflow.ir_compiler import agent_ref as _check_agent_ref  # noqa: PLC0415
+
+        self.agent_ref = _check_agent_ref(agent_ref, location=f"Agent {name!r}")
         self.name = name
         self.model = model
         self.instructions = instructions

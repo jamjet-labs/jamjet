@@ -350,7 +350,8 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     a URI wins, including one registered through `POST /agents/discover`; this engine
     accepts only the `default` tenant, so whoever can register agents is as trusted as
     whoever registers workflows. Attribution does not carry into a subgraph's child
-    workflow. The Python SDK has no option to set `agent_ref` yet.
+    workflow. In the Python SDK, `Agent(agent_ref=...)` and YAML `agent_ref:` (workflow)
+    / `acts_for:` (node) set it.
 
 - **The audit log can be signed with Ed25519, so a third party can verify it.** HMAC
   signing uses one shared key, so anyone who can verify the log can also forge it. With

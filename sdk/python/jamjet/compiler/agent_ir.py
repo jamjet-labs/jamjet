@@ -411,6 +411,11 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
     # governance config changes (a different budget or policy must NOT reuse a
     # cached graph compiled without those constraints).
     ir.update(_compile_governance_ir(agent))
+    # The registered agent this graph acts for: the engine holds every node to
+    # that Agent Card's constraints. Before versioning, so a graph compiled for
+    # one agent is never reused for another.
+    if agent.agent_ref is not None:
+        ir["agent_ref"] = agent.agent_ref
 
     # Content-version the IR: the runtime caches by (workflow_id, version)
     # immutably, so a changed agent (tools / instructions / max_turns / timeout

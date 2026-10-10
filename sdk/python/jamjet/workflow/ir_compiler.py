@@ -152,6 +152,17 @@ def compile_yaml(yaml_content: str) -> dict[str, Any]:
     return _compile_graph_yaml(data)
 
 
+def agent_ref(value: Any, *, location: str) -> str | None:
+    """An ``agent_ref`` (the ``uri`` of a registered Agent Card) as written, or
+    ``None`` when absent. The engine holds a workflow or node that names one to
+    that card's constraints, and refuses it if the agent is not registered."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{location}: agent_ref must be a non-empty string (an Agent Card uri)")
+    return value
+
+
 def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
     """Compile a graph-mode document (``workflow:`` header + ``nodes:``) to IR."""
     wf = data.get("workflow", {})
@@ -177,6 +188,11 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
             "labels": node_data.get("labels", {}),
             "policy": node_policy,
         }
+        # `acts_for`, not `agent_ref`: on a node, `agent_ref` already names the
+        # agent an `agent` node calls.
+        node_agent = agent_ref(node_data.get("acts_for"), location=f"node '{node_id}' acts_for")
+        if node_agent is not None:
+            nodes[node_id]["agent_ref"] = node_agent
 
         next_val = node_data.get("next")
         if isinstance(next_val, str):
@@ -197,8 +213,9 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
             edges.append({"from": node_id, "to": "end", "condition": None})
 
     workflow_policy = _compile_policy(data.get("policy"), location="workflow-level policy")
+    workflow_agent = agent_ref(wf.get("agent_ref"), location="workflow agent_ref")
 
-    return {
+    ir: dict[str, Any] = {
         "workflow_id": wf.get("id", "unknown"),
         "version": wf.get("version", "0.1.0"),
         "name": wf.get("name"),
@@ -216,6 +233,9 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
         "labels": wf.get("labels", {}),
         "policy": workflow_policy,
     }
+    if workflow_agent is not None:
+        ir["agent_ref"] = workflow_agent
+    return ir
 
 
 def _compile_agent_yaml(data: dict[str, Any]) -> dict[str, Any]:
@@ -298,7 +318,7 @@ def _compile_agent_yaml(data: dict[str, Any]) -> dict[str, Any]:
             "labels": node_def.get("labels", {}),
         }
 
-    return {
+    out: dict[str, Any] = {
         "workflow_id": agent_id,
         "version": version,
         "name": agent.get("name", agent_id),
@@ -322,6 +342,10 @@ def _compile_agent_yaml(data: dict[str, Any]) -> dict[str, Any]:
         },
         "strategy_metadata": strategy_meta,
     }
+    acts_as = agent_ref(agent.get("agent_ref"), location=f"agent '{agent_id}' agent_ref")
+    if acts_as is not None:
+        out["agent_ref"] = acts_as
+    return out
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

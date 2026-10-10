@@ -1245,3 +1245,95 @@ async fn an_empty_delegation_list_restricts_nothing() {
         assert!(o.ran, "{ctx}: {:?}", o.violations);
     }
 }
+
+// ── The SDK's agent_ref, end to end ─────────────────────────────────────────
+
+/// The IR the Python agent compiler emits for an `Agent(agent_ref=...)`
+/// (written by `sdk/python/tests/test_agent_ref.py`), registered as the SDK
+/// registers it, with the dispatch node re-dispatched carrying model-chosen
+/// calls. The card is enforced through the IR's `agent_ref` alone: nothing
+/// in this test attributes the node.
+#[tokio::test]
+async fn the_sdk_compiled_agent_is_held_to_its_card() {
+    let fixture: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../sdk/python/tests/fixtures/agent_ref_agent_ir.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let ir_v = fixture["ir"].clone();
+    assert_eq!(
+        ir_v["agent_ref"],
+        json!(AGENT),
+        "the SDK emitted no agent_ref"
+    );
+    let tools = fixture["tools"].clone();
+    let wf = ir_v["workflow_id"].as_str().unwrap().to_string();
+    let version = ir_v["version"].as_str().unwrap().to_string();
+    let ir_t: jamjet_ir::WorkflowIr = serde_json::from_value(ir_v.clone()).unwrap();
+    let dispatch = ir_t
+        .nodes
+        .values()
+        .find(|n| jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&n.kind))
+        .expect("a dispatch node")
+        .clone();
+
+    for (call, expect_run) in [("search_web", true), ("send_wire", false)] {
+        for t in TRANSPORTS {
+            for tb in support::backends().await {
+                let ctx = format!("{call} on {} over {t:?}", tb.name());
+                let state = state_for(&tb).await;
+                let (st, _) = support::post(&state, "/agents", card(AGENT, &["search_web"])).await;
+                assert!(st.is_success());
+                let (st, body) = support::post(&state, "/workflows", json!({ "ir": ir_v })).await;
+                assert!(st.is_success(), "{ctx}: register: {st} {body}");
+                let (st, body) = support::post(
+                    &state,
+                    "/executions",
+                    json!({ "workflow_id": wf, "workflow_version": version, "input": {} }),
+                )
+                .await;
+                assert!(st.is_success(), "{ctx}: start: {st} {body}");
+                let eid = body["execution_id"].as_str().unwrap().to_string();
+                // Drain the start (model) item so only the dispatch is queued.
+                let _ = tb
+                    .dyn_backend()
+                    .claim_work_item_with_lease("drain", &["model"], None)
+                    .await
+                    .unwrap();
+                let mut run_state = serde_json::Map::new();
+                run_state.insert(
+                    "last_model_tool_calls".into(),
+                    json!([{ "id": "c1", "name": call, "arguments": {} }]),
+                );
+                run_state.insert("tools".into(), tools.clone());
+                let payload = jamjet_scheduler::build_work_item_payload(
+                    &ir_t,
+                    &dispatch.id,
+                    &dispatch,
+                    &run_state,
+                    &wf,
+                    &version,
+                );
+                let (st, body) = support::post(
+                    &state,
+                    "/work-items",
+                    json!({ "execution_id": eid, "node_id": dispatch.id, "queue_type": "python_tool", "payload": payload }),
+                )
+                .await;
+                assert!(st.is_success(), "{ctx}: enqueue: {st} {body}");
+                let ran = fire(&state, &tb, t).await;
+                assert_eq!(ran, expect_run, "{ctx}");
+                if !expect_run {
+                    let eid = ExecutionId(
+                        uuid::Uuid::parse_str(eid.strip_prefix("exec_").unwrap_or(&eid)).unwrap(),
+                    );
+                    let o = observe(&tb, &eid, ran).await;
+                    assert_refused(&o, "send_wire", &ctx);
+                }
+            }
+        }
+    }
+}

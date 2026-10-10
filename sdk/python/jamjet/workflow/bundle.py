@@ -185,7 +185,10 @@ def _compile_agent_unit(
         }
 
     version = str(agent.get("version") or defaults.get("version") or "0.1.0")
-    return {
+    from jamjet.workflow.ir_compiler import agent_ref as _agent_ref
+
+    acts_as = _agent_ref(agent.get("agent_ref"), location=f"agent '{unit_id}' agent_ref")
+    ir: dict[str, Any] = {
         "workflow_id": unit_id,
         "version": version,
         "name": agent.get("name", unit_id),
@@ -212,6 +215,9 @@ def _compile_agent_unit(
         },
         "strategy_metadata": compiled["strategy_metadata"],
     }
+    if acts_as is not None:
+        ir["agent_ref"] = acts_as
+    return ir
 
 
 def _detect_cycle(graph: dict[str, list[str]]) -> list[str] | None:
@@ -280,7 +286,7 @@ def compile_bundle(data: dict[str, Any]) -> CompiledBundle:
     # Workflow units (explicit graphs) reuse the graph compiler with catalog access.
     for uid, wf in workflows.items():
         header = {"id": uid, "version": wf.get("version", defaults.get("version", "0.1.0"))}
-        for key in ("name", "description", "start", "state_schema", "labels"):
+        for key in ("name", "description", "start", "state_schema", "labels", "agent_ref"):
             if key in wf:
                 header[key] = wf[key]
         doc = {

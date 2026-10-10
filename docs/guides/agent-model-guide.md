@@ -29,6 +29,8 @@ agents:
 
 The runtime holds a node to an agent's `allowed_tools` when the node acts for that agent: the workflow IR's top-level `agent_ref`, or a node's own `agent_ref`, names the card's `uri`. A node acting for two agents must be on both lists.
 
+From the Python SDK, `Agent("researcher", ..., agent_ref="jamjet://acme/research-analyst")` emits the workflow's `agent_ref` on the durable path (`run_durable`); in YAML use `agent_ref:` in the `workflow:` header and `acts_for:` on a node.
+
 ```json
 {
   "workflow_id": "research",
