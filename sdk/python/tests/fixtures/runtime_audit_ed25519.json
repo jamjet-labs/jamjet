@@ -1,0 +1,109 @@
+{
+  "audit": {
+    "items": [
+      {
+        "actor_id": "token:7",
+        "actor_type": "system",
+        "created_at": "2026-10-03T04:00:01.123456789Z",
+        "entry_hash": "762ee357f00b00b73ae40a0c8eefa83fb1457408f54ac4e4193b964e77b676be",
+        "event_id": "01010101-0101-0101-0101-010101010101",
+        "event_type": "tool_approval_required",
+        "execution_id": "exec_00000000-0000-0000-0000-000000000001",
+        "id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+        "raw_event": {
+          "alpha": {
+            "a": null,
+            "b": [
+              1,
+              2.5,
+              -1.25e-7,
+              1e+16,
+              12345678901234567890
+            ]
+          },
+          "cost": 0.1,
+          "node_id": "n1",
+          "ok": true,
+          "text": "café ✓ \"quoted\" back\\slash \u0001 tab\t newline\n",
+          "type": "tool_approval_required",
+          "zeta": 1
+        },
+        "redacted": false,
+        "sequence": 1,
+        "signature": "ed25519:21fe31dfa154a261:78f1de6b428509ff95a5aa9537c0fba7cba7fecb462fa1501380f4c5848ea69beec1a43a3a72bb5ec97f6f38bb06ada61beb45bacae5d6a9e3b807579c1ed609",
+        "tenant_id": "default"
+      },
+      {
+        "actor_id": "token:7",
+        "actor_type": "system",
+        "created_at": "2026-10-03T04:00:02.123456789Z",
+        "entry_hash": "1050657fa59910e08d62c2f2ce52496b149b2a610ce6ea780e43d67badbc4878",
+        "event_id": "02020202-0202-0202-0202-020202020202",
+        "event_type": "tool_approval_required",
+        "execution_id": "exec_00000000-0000-0000-0000-000000000001",
+        "expires_at": "2027-01-15T08:00:00Z",
+        "id": "a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2",
+        "policy_decision": "require_approval",
+        "prev_hash": "762ee357f00b00b73ae40a0c8eefa83fb1457408f54ac4e4193b964e77b676be",
+        "raw_event": {
+          "alpha": {
+            "a": null,
+            "b": [
+              1,
+              2.5,
+              -1.25e-7,
+              1e+16,
+              12345678901234567890
+            ]
+          },
+          "cost": 0.1,
+          "node_id": "n1",
+          "ok": true,
+          "text": "café ✓ \"quoted\" back\\slash \u0001 tab\t newline\n",
+          "type": "tool_approval_required",
+          "zeta": 1
+        },
+        "redacted": true,
+        "sequence": 2,
+        "signature": "ed25519:21fe31dfa154a261:ccdc74383a030a66d3a277043681b0ece627360510387ffa8e2e178742cd8bf4c14c9cbda3f4e2a5732cf0dd13ada2b3289a4260bac50dd5cec54cfde4df0808",
+        "tenant_id": "default",
+        "tool_call_hash": "abc"
+      },
+      {
+        "actor_id": "token:7",
+        "actor_type": "system",
+        "created_at": "2026-10-03T04:00:03.123456789Z",
+        "entry_hash": "fc1a2599a669e8c61acaeb5169fae9d84bb79e258e943263d719cce65343dd96",
+        "event_id": "03030303-0303-0303-0303-030303030303",
+        "event_type": "tool_approval_required",
+        "execution_id": "exec_00000000-0000-0000-0000-000000000001",
+        "id": "a3a3a3a3-a3a3-a3a3-a3a3-a3a3a3a3a3a3",
+        "prev_hash": "1050657fa59910e08d62c2f2ce52496b149b2a610ce6ea780e43d67badbc4878",
+        "raw_event": {
+          "alpha": {
+            "a": null,
+            "b": [
+              1,
+              2.5,
+              -1.25e-7,
+              1e+16,
+              12345678901234567890
+            ]
+          },
+          "cost": 0.1,
+          "node_id": "n1",
+          "ok": true,
+          "text": "café ✓ \"quoted\" back\\slash \u0001 tab\t newline\n",
+          "type": "tool_approval_required",
+          "zeta": 1
+        },
+        "redacted": false,
+        "sequence": 3,
+        "signature": "ed25519:21fe31dfa154a261:5aeee03026145433693368d06688ef9a52c32f9b1e34fc3b25e3b9b39c6037971bc7fc368357997a8811c73277b78e43a43f3f5684c7ed6780b7812b1e421e07",
+        "tenant_id": "default"
+      }
+    ]
+  },
+  "kid": "21fe31dfa154a261",
+  "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+}

@@ -96,6 +96,12 @@ impl AuditEnricher {
         }
     }
 
+    /// The signer entries are sealed with. In Ed25519 mode its
+    /// [`AuditSigner::public_jwk`] is what a third party verifies with.
+    pub fn signer(&self) -> &AuditSigner {
+        &self.signer
+    }
+
     /// How many audit entries failed to be written since this enricher was
     /// built. Each one is an event with no audit entry: a gap
     /// `verify_chain` cannot see.

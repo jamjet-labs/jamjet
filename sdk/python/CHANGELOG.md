@@ -4,6 +4,15 @@
 
 ### Added
 
+- **`jamjet.runtime_audit`: verify the runtime's audit log offline.** With the runtime
+  in Ed25519 mode (`JAMJET_AUDIT_SIGNING_MODE=ed25519`), `verify_entries` checks each
+  entry of a `GET /audit` export against the public key alone: the recomputed entry hash,
+  the Ed25519 signature and, oldest first (`chain_order`), the links.
+  `public_key_from_did_document` reads the key the runtime publishes in
+  `/.well-known/did.json`. Load the export with `load_entries`, which keeps each number
+  as the runtime wrote it; a float parsed and printed again can change spelling and fail
+  the hash.
+
 - **Approval deadlines in compiled policies.** A YAML workflow or node `policy:` and an
   `Agent(policy={...})` dict may set `approval_timeout_secs` and `escalate_after_secs`.
   The compiler checks them as the runtime does (1 s to one year; escalation needs a

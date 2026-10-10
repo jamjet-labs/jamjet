@@ -325,6 +325,18 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Not enforced yet: the card's own `blocked_tools`, `require_approval_for` and
     `allowed_delegations`. Use policy `blocked_tools` and `require_approval_for`.
 
+- **The audit log can be signed with Ed25519, so a third party can verify it.** HMAC
+  signing uses one shared key, so anyone who can verify the log can also forge it. With
+  `JAMJET_AUDIT_SIGNING_MODE=ed25519` and a 32-byte seed in
+  `JAMJET_AUDIT_ED25519_KEY_FILE` (or `JAMJET_AUDIT_ED25519_KEY`), every entry is signed
+  with a key only the runtime holds, and the public key is published in
+  `/.well-known/did.json` (`#audit-key`). `jamjet.runtime_audit` in the Python SDK and
+  `AuditSigner::ed25519_verifier` in Rust verify a `GET /audit` export offline. The
+  signature covers a JCS statement naming the entry hash, the key id and
+  `jamjet.audit.entry/v1`. HMAC stays the default and is unchanged; a bad Ed25519 key
+  leaves entries unsigned rather than falling back to HMAC, and the key is never logged
+  or served. See docs/guides/security.md, "Signing the audit log".
+
 ### Fixed
 
 - **Runtime: an unmatched API request is a JSON 404, not the web UI.** The SPA

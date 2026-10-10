@@ -25,8 +25,13 @@ sqlx = { workspace = true }
 sha2 = { workspace = true }
 hmac = "0.12"
 hex = "0.4"
+# Ed25519 audit signing: third parties verify with the public key alone.
+ed25519-dalek = "2"
+base64 = "0.22"
+zeroize = "1"
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }

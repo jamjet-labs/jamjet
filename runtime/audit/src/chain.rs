@@ -40,6 +40,28 @@ impl ChainError {
     }
 }
 
+/// Verify one entry on its own: its content hash and its signature, without
+/// its link to a predecessor. For a slice of the log that is not contiguous,
+/// such as one tenant's entries of a chain shared by several.
+pub fn verify_entry(entry: &AuditLogEntry, signer: &AuditSigner) -> Result<(), ChainError> {
+    let index = 0;
+    let entry_hash = entry
+        .entry_hash
+        .as_deref()
+        .ok_or(ChainError::Unsealed { index })?;
+    let signature = entry
+        .signature
+        .as_deref()
+        .ok_or(ChainError::Unsigned { index })?;
+    if entry.content_hash(entry.prev_hash.as_deref()) != entry_hash {
+        return Err(ChainError::HashMismatch { index });
+    }
+    if !signer.verify(entry_hash.as_bytes(), signature) {
+        return Err(ChainError::BadSignature { index });
+    }
+    Ok(())
+}
+
 /// Verify a contiguous, ordered slice of sealed audit entries.
 ///
 /// `entries` must be in chain order (oldest first); the first entry is treated

@@ -1042,6 +1042,11 @@ async fn agent_heartbeat(
 /// Builds a `did:web` document from all active registered agents. Each active
 /// agent is listed as an A2A service endpoint. The DID host is derived from
 /// `JAMJET_PUBLIC_URL` (preferred) or `JAMJET_BIND`:`JAMJET_PORT`.
+///
+/// When the audit log is signed with Ed25519, the public key is published as
+/// the verification method `#audit-key` (a JWK, RFC 8037), referenced from
+/// `assertionMethod`: the key a third party checks the audit log's signatures
+/// with. Only the public key: nothing else of the signer is read here.
 async fn serve_did_document(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let agents = state
         .agents
@@ -1079,11 +1084,26 @@ async fn serve_did_document(State(state): State<AppState>) -> Result<Json<Value>
         })
         .collect();
 
-    Ok(Json(json!({
+    let mut doc = json!({
         "@context": ["https://www.w3.org/ns/did/v1"],
         "id": did_id,
         "service": services,
-    })))
+    });
+    if let Some(jwk) = state.enricher.signer().public_jwk() {
+        let key_id = format!("{did_id}#audit-key");
+        doc["@context"] = json!([
+            "https://www.w3.org/ns/did/v1",
+            "https://w3id.org/security/suites/jws-2020/v1"
+        ]);
+        doc["verificationMethod"] = json!([{
+            "id": key_id,
+            "type": "JsonWebKey2020",
+            "controller": did_id,
+            "publicKeyJwk": jwk,
+        }]);
+        doc["assertionMethod"] = json!([key_id]);
+    }
+    Ok(Json(doc))
 }
 
 // ── Audit log ────────────────────────────────────────────────────────────────

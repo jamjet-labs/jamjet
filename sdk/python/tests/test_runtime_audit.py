@@ -1,0 +1,189 @@
+"""Offline verification of the runtime's Ed25519-signed audit log.
+
+The vector is written by the Rust test
+``runtime/audit/tests/ed25519_signing.rs::the_cross_language_vector_is_current``
+in the shape ``GET /audit`` returns, so these tests check the Python verifier
+against what the runtime actually produces.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import json
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("cryptography")
+
+from jamjet.runtime_audit import (  # noqa: E402
+    ChainError,
+    chain_order,
+    key_id,
+    load_entries,
+    public_key_from_did_document,
+    verify_entries,
+)
+
+VECTOR = Path(__file__).parent / "fixtures" / "runtime_audit_ed25519.json"
+
+
+def _vector() -> tuple[list[dict], bytes, str]:
+    text = VECTOR.read_text()
+    doc = json.loads(text)
+    entries = load_entries(_items_text(text))
+    return entries, bytes.fromhex(doc["public_key_hex"]), doc["kid"]
+
+
+def _items_text(text: str) -> str:
+    # Hand the verifier the `{"items": [...]}` object as the runtime wrote it,
+    # number spellings included.
+    start = text.index('"audit": ') + len('"audit": ')
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    raise AssertionError("unbalanced vector")
+
+
+def test_the_runtime_chain_verifies_with_only_the_public_key():
+    entries, pk, kid = _vector()
+    assert key_id(pk) == kid
+    verify_entries(entries, pk)
+    verify_entries(entries, pk, linked=False)
+
+
+def test_a_tampered_event_fails():
+    entries, pk, _ = _vector()
+    bad = copy.deepcopy(entries)
+    bad[1]["raw_event"]["node_id"] = "n2"
+    with pytest.raises(ChainError) as e:
+        verify_entries(bad, pk)
+    assert (e.value.index, e.value.reason) == (1, "hash_mismatch")
+
+
+def test_a_tampered_timestamp_fails():
+    entries, pk, _ = _vector()
+    bad = copy.deepcopy(entries)
+    bad[0]["created_at"] = bad[0]["created_at"].replace(".123456789", ".123456788")
+    with pytest.raises(ChainError) as e:
+        verify_entries(bad, pk)
+    assert e.value.reason == "hash_mismatch"
+
+
+def test_a_tampered_signature_fails():
+    entries, pk, _ = _vector()
+    bad = copy.deepcopy(entries)
+    sig = bad[2]["signature"]
+    bad[2]["signature"] = sig[:-2] + ("00" if sig[-2:] != "00" else "11")
+    with pytest.raises(ChainError) as e:
+        verify_entries(bad, pk)
+    assert (e.value.index, e.value.reason) == (2, "bad_signature")
+
+
+def test_a_wrong_key_fails():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    entries, _, _ = _vector()
+    other = (
+        Ed25519PrivateKey.generate()
+        .public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    )
+    with pytest.raises(ChainError) as e:
+        verify_entries(entries, other)
+    assert e.value.reason == "wrong_key"
+
+
+def test_a_signature_relabelled_with_the_right_kid_still_fails():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    entries, _, _ = _vector()
+    other = (
+        Ed25519PrivateKey.generate()
+        .public_key()
+        .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    )
+    bad = copy.deepcopy(entries)
+    for e in bad:
+        e["signature"] = f"ed25519:{key_id(other)}:" + e["signature"].rsplit(":", 1)[1]
+    with pytest.raises(ChainError) as e:
+        verify_entries(bad, other)
+    assert e.value.reason == "bad_signature"
+
+
+def test_an_hmac_tag_is_not_accepted():
+    entries, pk, _ = _vector()
+    bad = copy.deepcopy(entries)
+    bad[0]["signature"] = "ab" * 32
+    with pytest.raises(ChainError) as e:
+        verify_entries(bad, pk)
+    assert e.value.reason == "bad_signature"
+
+
+def test_an_unsigned_entry_fails():
+    entries, pk, _ = _vector()
+    bad = copy.deepcopy(entries)
+    del bad[0]["signature"]
+    with pytest.raises(ChainError) as e:
+        verify_entries(bad, pk)
+    assert e.value.reason == "unsigned"
+
+
+def test_a_dropped_entry_breaks_the_link():
+    entries, pk, _ = _vector()
+    with pytest.raises(ChainError) as e:
+        verify_entries([entries[0], entries[2]], pk)
+    assert (e.value.index, e.value.reason) == (1, "broken_link")
+    # Each entry still stands on its own.
+    verify_entries([entries[0], entries[2]], pk, linked=False)
+
+
+def test_chain_order_restores_order_and_refuses_a_gap():
+    entries, pk, _ = _vector()
+    shuffled = [entries[2], entries[0], entries[1]]
+    verify_entries(chain_order(shuffled), pk)
+    with pytest.raises(ChainError):
+        chain_order([entries[0], entries[2]])
+
+
+def test_floats_parsed_as_python_floats_are_refused_not_misread():
+    _, pk, _ = _vector()
+    reparsed = json.loads(_items_text(VECTOR.read_text()))["items"]
+    with pytest.raises(ChainError) as e:
+        verify_entries(reparsed, pk)
+    assert e.value.reason == "malformed"
+
+
+def test_the_did_document_key_is_read():
+    _, pk, kid = _vector()
+    x = base64.urlsafe_b64encode(pk).rstrip(b"=").decode()
+    doc = {
+        "id": "did:web:localhost%3A7700",
+        "verificationMethod": [
+            {
+                "id": "did:web:localhost%3A7700#audit-key",
+                "type": "JsonWebKey2020",
+                "publicKeyJwk": {"kty": "OKP", "crv": "Ed25519", "x": x, "kid": kid},
+            }
+        ],
+    }
+    assert public_key_from_did_document(doc) == pk
+    with pytest.raises(ValueError):
+        public_key_from_did_document({"id": "did:web:x"})
+
+
+def test_a_valid_signature_without_its_prefix_is_refused():
+    entries, pk, _ = _vector()
+    bad = copy.deepcopy(entries)
+    bad[0]["signature"] = bad[0]["signature"][len("ed25519:") :]
+    with pytest.raises(ChainError) as e:
+        verify_entries(bad, pk)
+    assert e.value.reason == "bad_signature"

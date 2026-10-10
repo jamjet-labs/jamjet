@@ -54,3 +54,4 @@ tracing-subscriber = { workspace = true }
 # directly; `StateBackend` exposes no work-item read, and an indirect probe cannot
 # tell `fail_work_item` from `complete_work_item`.
 sqlx = { workspace = true }
+base64 = "0.22"

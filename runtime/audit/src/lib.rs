@@ -17,7 +17,7 @@ pub mod signer;
 pub mod sqlite;
 
 pub use backend::{AuditBackend, AuditError, AuditQuery};
-pub use chain::{verify_chain, ChainError};
+pub use chain::{verify_chain, verify_entry, ChainError};
 pub use enricher::{AuditEnricher, RequestContext};
 pub use entry::{ActorType, AuditLogEntry};
 pub use noop::NoopAuditBackend;
