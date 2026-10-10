@@ -246,7 +246,10 @@ Rules the runtime enforces:
 
 - **A decision after the deadline is refused (409) and records nothing**,
   whether or not the sweep has recorded the expiry yet. The deadline is
-  reached at its instant: a decision at exactly `expires_at` is late.
+  reached at its instant: a decision at exactly `expires_at` is late. It is
+  checked again in the same step as the append, under the store's write lock,
+  so a decision checked in time whose write is delayed past the deadline (a
+  lock wait, a pause) is refused too.
 - **One outcome per request.** A decision and an expiry each append only while
   the request is still the node's pending one, checked in the same step as the
   append. If the sweep expires a request while a decision is in flight, the

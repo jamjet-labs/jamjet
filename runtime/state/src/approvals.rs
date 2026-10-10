@@ -645,6 +645,33 @@ pub fn still_pending(events: &[Event], node_id: &str, request_sequence: EventSeq
     )
 }
 
+/// [`still_pending`], and the request's deadline has not passed at `now`.
+/// The condition a human decision is appended under: evaluated inside the
+/// append, under the backend's write lock, so a decision whose append is
+/// delayed past the deadline (a lock wait, a stall) is refused instead of
+/// landing late.
+pub fn still_open(
+    events: &[Event],
+    node_id: &str,
+    request_sequence: EventSequence,
+    now: DateTime<Utc>,
+) -> bool {
+    matches!(
+        node_approval_status(events, node_id),
+        NodeApprovalStatus::Pending(p)
+            if p.sequence == request_sequence && !p.deadline().expired(now)
+    )
+}
+
+/// Whether `node_id`'s pending request is past its deadline at `now`: pending
+/// but no longer decidable.
+pub fn pending_but_expired(events: &[Event], node_id: &str, now: DateTime<Utc>) -> bool {
+    matches!(
+        node_approval_status(events, node_id),
+        NodeApprovalStatus::Pending(p) if p.deadline().expired(now)
+    )
+}
+
 /// Whether the request at `request_sequence` has not been escalated yet.
 pub fn not_escalated(events: &[Event], node_id: &str, request_sequence: EventSequence) -> bool {
     !events.iter().any(|e| {

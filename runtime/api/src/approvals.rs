@@ -7,8 +7,8 @@
 
 use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use jamjet_state::approvals::{
-    expired_by_deadline, node_approval_status, pending_approvals, run_initiator, still_pending,
-    NodeApprovalStatus,
+    expired_by_deadline, node_approval_status, pending_approvals, pending_but_expired,
+    run_initiator, still_open, NodeApprovalStatus,
 };
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::{ApprovalDecision, EventKind};
@@ -343,7 +343,12 @@ pub async fn submit_approval(
     );
     let answered = request.sequence;
     let condition_node = node_id.clone();
-    let condition = move |log: &[Event]| still_pending(log, &condition_node, answered);
+    // The deadline is checked again HERE, inside the append under the
+    // backend's write lock, against the clock at that moment: a decision that
+    // passed the check above but whose append was delayed past the deadline
+    // is refused, never recorded late.
+    let condition =
+        move |log: &[Event]| still_open(log, &condition_node, answered, chrono::Utc::now());
     let event = match backend
         .append_event_if(event.clone(), &condition)
         .await
@@ -358,11 +363,15 @@ pub async fn submit_approval(
                 .get_events(execution_id)
                 .await
                 .map_err(|e| SubmitError::Backend(e.to_string()))?;
-            return Err(if expired_by_deadline(&latest, &node_id) {
-                SubmitError::Expired(node_id)
-            } else {
-                SubmitError::Superseded(node_id)
-            });
+            return Err(
+                if expired_by_deadline(&latest, &node_id)
+                    || pending_but_expired(&latest, &node_id, chrono::Utc::now())
+                {
+                    SubmitError::Expired(node_id)
+                } else {
+                    SubmitError::Superseded(node_id)
+                },
+            );
         }
         jamjet_state::ConditionalAppend::ExecutionTerminal(status) => {
             return Err(SubmitError::ExecutionTerminal(format!("{status:?}")));

@@ -655,6 +655,77 @@ async fn an_expiry_racing_a_decision_records_nothing() {
     }
 }
 
+/// Stalls the next conditional append of an armed run, as a lock wait or a
+/// GC pause would.
+struct StallBeforeAppend {
+    armed: Mutex<Option<(ExecutionId, std::time::Duration)>>,
+}
+
+#[async_trait::async_trait]
+impl AfterWrite for StallBeforeAppend {
+    async fn after(&self, write: Write) {
+        if let Write::BeforeAppendEventIf(eid) = write {
+            let armed = self.armed.lock().unwrap().take();
+            if let Some((a, d)) = armed {
+                if a == eid {
+                    tokio::time::sleep(d).await;
+                }
+            }
+        }
+    }
+}
+
+/// Review I-1 (ported probe): a decision checked 300 ms before the deadline
+/// whose append is delayed 700 ms lands after it. The deadline is checked
+/// again inside the append, under the write lock: the decision is refused as
+/// expired, nothing is recorded, and the sweep then expires the request.
+#[tokio::test]
+async fn a_decision_whose_append_is_delayed_past_the_deadline_is_refused() {
+    let mut failures = Vec::new();
+    for tb in support::backends().await {
+        let inner = tb.dyn_backend();
+        let hook = Arc::new(StallBeforeAppend {
+            armed: Mutex::new(None),
+        });
+        let hooked: Arc<dyn StateBackend> =
+            Arc::new(HookedBackend::new(inner.clone(), hook.clone()));
+        let env = env_on(tb.name(), hooked).await;
+        let eid = start_and_request(
+            &env,
+            ir(Value::Null, gate(json!({ "approval_timeout_secs": 1 }))),
+        )
+        .await;
+        let ctx = request_context(&events(&env, &eid).await);
+        let digest = ctx["action_digest"].as_str().unwrap().to_string();
+        let expires_at = ts(&ctx, "expires_at").unwrap();
+        let wait = (expires_at - Utc::now() - Duration::milliseconds(300))
+            .to_std()
+            .unwrap();
+        tokio::time::sleep(wait).await;
+        *hook.armed.lock().unwrap() = Some((eid.clone(), std::time::Duration::from_millis(700)));
+        let (st, body) = approve(&env, &eid, &digest).await;
+        assert!(Utc::now() > expires_at);
+        let evs = events(&env, &eid).await;
+        let late = count(&evs, received);
+        if late != 0
+            || st != StatusCode::CONFLICT
+            || !body.to_string().contains("expired at its deadline")
+        {
+            failures.push(format!(
+                "{}: status {st}, {late} decision(s) recorded after the deadline: {body}",
+                env.name
+            ));
+            continue;
+        }
+        Scheduler::new(env.backend.clone())
+            .sweep_approval_deadlines(&eid, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(count(&events(&env, &eid).await, expired), 1, "{}", env.name);
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 #[tokio::test]
 async fn a_decision_before_the_sweep_wins_and_the_sweep_records_nothing() {
     for env in envs().await {

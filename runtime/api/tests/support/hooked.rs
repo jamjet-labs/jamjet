@@ -21,6 +21,9 @@ pub enum Write {
     /// A full read of an execution's log (after it returned).
     GetEvents(ExecutionId),
     AppendEventIf(ExecutionId),
+    /// A conditional append is about to run (reported BEFORE it): where a
+    /// lock wait or a stall delays the append past the caller's own checks.
+    BeforeAppendEventIf(ExecutionId),
 }
 
 #[async_trait::async_trait]
@@ -217,6 +220,9 @@ impl StateBackend for HookedBackend {
         condition: &jamjet_state::backend::EventCondition,
     ) -> jamjet_state::backend::BackendResult<jamjet_state::ConditionalAppend> {
         let execution_id = event.execution_id.clone();
+        self.hook
+            .after(Write::BeforeAppendEventIf(execution_id.clone()))
+            .await;
         let out = self.inner.append_event_if(event, condition).await?;
         self.hook.after(Write::AppendEventIf(execution_id)).await;
         Ok(out)
