@@ -797,6 +797,11 @@ impl Worker {
             // scheduler fails the run on its next tick. Returning an error here
             // used to leave the item leased until expiry, then retried it to
             // exhaustion, recording a violation on every attempt.
+            //
+            // KNOWN, cosmetic: this is `commit_turn`, not
+            // `commit_turn_unless_terminal`, so a block decided while the run is
+            // being cancelled can append `NodeFailed` after `WorkflowCancelled`.
+            // Nothing runs either way; the run stays cancelled.
             DispatchGuardOutcome::Blocked { reason } => {
                 let terminal = jamjet_state::Event::new(
                     execution_id.clone(),
