@@ -11,6 +11,32 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **Approvals are bound to the approver, the run's initiator and the exact action.**
+  Behaviour changes to plan for when upgrading:
+  - The MCP bridge requires a Bearer token outside dev mode, for every method.
+  - The recorded approver is the API token (`token:<id>`), never a body `user_id`.
+    `reviewer` tokens may now approve.
+  - The token that started a run cannot approve it (403). A run with no recorded
+    initiator (started in dev mode, or before this release) cannot be approved
+    outside dev mode. `JAMJET_ALLOW_SELF_APPROVAL=1` turns both checks off.
+    Separation of duties distinguishes tokens, not people: issue one token per human.
+  - An approval covers one action: run, node occurrence, node definition and state.
+    If any of those change, the node asks again. Outside dev mode an `approved`
+    decision must echo the pending request's `action_digest` (or `calls_hash` for an
+    agent tool dispatch): missing is 400, stale is 409. The pending listing shows the
+    state and node the digest covers.
+  - A decision carrying a `state_patch` is refused with 400. The edit never reached
+    the executed action, so recording it was a false record.
+  - The worker protocol enforces the same policy and approval rules as the
+    in-process worker, for every node kind: a gated or blocked node is withheld from
+    `POST /work-items/claim`, and `POST /work-items/:id/complete` refuses a result
+    for a gated node with no approval for its current occurrence. `POST /work-items`
+    is operator-only.
+  - A registered workflow version is immutable: an identical re-register is a 200
+    no-op, a different IR under the same version is a 409.
+  - The embedded cron scheduler starts runs in-process as `system:cron` instead of
+    POSTing to `/executions` without a token, which failed with 401 outside dev mode.
+
 - **The tool-effect idempotency key is derived by the engine, not taken from the request
   body** (#130). `POST /work-items/:id/complete` persisted the caller's
   `idempotency_key` verbatim, so a worker holding item B's lease could complete B while
