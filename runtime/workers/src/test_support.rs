@@ -29,6 +29,7 @@ pub(crate) struct FailingGetEvents {
     inner: InMemoryBackend,
     fail_events: bool,
     fail_tenant: bool,
+    fail_since: bool,
 }
 
 impl FailingGetEvents {
@@ -37,6 +38,7 @@ impl FailingGetEvents {
             inner: InMemoryBackend::new(),
             fail_events: true,
             fail_tenant: false,
+            fail_since: false,
         }
     }
 
@@ -47,6 +49,19 @@ impl FailingGetEvents {
             inner: InMemoryBackend::new(),
             fail_events: false,
             fail_tenant: true,
+            fail_since: false,
+        }
+    }
+
+    /// Fail `get_events_since` instead, which is what `materialize` reads, so
+    /// the approval action digest cannot be computed while the full log
+    /// (`get_events`) still reads fine.
+    pub(crate) fn failing_materialize() -> Self {
+        Self {
+            inner: InMemoryBackend::new(),
+            fail_events: false,
+            fail_tenant: false,
+            fail_since: true,
         }
     }
 
@@ -163,6 +178,11 @@ impl StateBackend for FailingGetEvents {
         execution_id: &ExecutionId,
         since_sequence: jamjet_state::EventSequence,
     ) -> jamjet_state::backend::BackendResult<Vec<Event>> {
+        if self.fail_since {
+            return Err(jamjet_state::backend::StateBackendError::Database(
+                "injected: materialize unreadable".into(),
+            ));
+        }
         self.inner
             .get_events_since(execution_id, since_sequence)
             .await

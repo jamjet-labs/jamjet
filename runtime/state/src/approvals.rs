@@ -7,7 +7,9 @@
 //! iff its latest `ToolApprovalRequired` has no later `ApprovalReceived`.
 
 use crate::event::{ApprovalDecision, EventKind};
+use crate::hashing::content_hash;
 use crate::{Event, EventSequence};
+use jamjet_core::workflow::ExecutionId;
 use serde::Serialize;
 
 /// A `ToolApprovalRequired` that has not been decided yet.
@@ -20,6 +22,13 @@ pub struct PendingApproval {
     pub sequence: EventSequence,
 }
 
+impl PendingApproval {
+    /// The `action_digest` the request was made for, if it carries one.
+    pub fn action_digest(&self) -> Option<&str> {
+        self.context.get(ACTION_DIGEST_KEY).and_then(|d| d.as_str())
+    }
+}
+
 /// Approval status of a single node, derived from the event log.
 #[derive(Debug, Clone)]
 pub enum NodeApprovalStatus {
@@ -28,6 +37,9 @@ pub enum NodeApprovalStatus {
     Approved {
         user_id: String,
         sequence: EventSequence,
+        /// The action digest the approval authorises; `None` for a legacy
+        /// approval or one answering a request with no digest.
+        approved_digest: Option<String>,
     },
     Rejected {
         user_id: String,
@@ -60,6 +72,7 @@ pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStat
                 user_id,
                 decision,
                 comment,
+                approved_digest,
                 ..
             } if n == node_id => {
                 // A decision only resolves an outstanding request.
@@ -68,6 +81,7 @@ pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStat
                         ApprovalDecision::Approved => NodeApprovalStatus::Approved {
                             user_id: user_id.clone(),
                             sequence: event.sequence,
+                            approved_digest: approved_digest.clone(),
                         },
                         ApprovalDecision::Rejected => NodeApprovalStatus::Rejected {
                             user_id: user_id.clone(),
@@ -81,6 +95,99 @@ pub fn node_approval_status(events: &[Event], node_id: &str) -> NodeApprovalStat
         }
     }
     status
+}
+
+/// Context key under which a hold records the digest of the action it parks.
+pub const ACTION_DIGEST_KEY: &str = "action_digest";
+
+/// The digest an approval of a plain node is bound to.
+///
+/// Covers the run, the node, which occurrence of the node this is (`step`, the
+/// number of times it has already completed) and the full materialized state
+/// the node would fire on. So an approval stops covering the action when the
+/// state changes after the request (a sibling commits, an approver's patch
+/// lands somewhere else) and when the node is visited again (a loop or any
+/// re-enqueue of a completed node): `step` differs, so the old approval cannot
+/// be replayed.
+///
+/// Domain-separated from the idempotency key (`hashing::idempotency_key`):
+/// that key is persisted with a fixed shape and hashes the denormalised
+/// `current_state` column, which neither in-process completions nor approval
+/// patches update. This digest hashes the MATERIALIZED state (event fold), the
+/// state an approval's `state_patch` actually changes.
+pub fn action_digest(run: &str, step: u64, node: &str, state: &serde_json::Value) -> String {
+    content_hash(&serde_json::json!({
+        "domain": "jamjet.approval.action.v1",
+        "run": run,
+        "step": step,
+        "node": node,
+        "state": content_hash(state),
+    }))
+}
+
+/// What a digest computation needs from the backend, read once.
+#[derive(Debug, Clone)]
+pub struct ActionBasis {
+    pub run: String,
+    pub step: u64,
+    pub state: serde_json::Value,
+}
+
+impl ActionBasis {
+    /// The digest of firing `node` on this basis.
+    pub fn digest(&self, node: &str) -> String {
+        action_digest(&self.run, self.step, node, &self.state)
+    }
+
+    /// The digest of firing `node` after `patch` is merged into the state, with
+    /// the materializer's own merge.
+    pub fn digest_with_patch(&self, node: &str, patch: &serde_json::Value) -> String {
+        let mut state = self.state.clone();
+        crate::materializer::json_merge_patch(&mut state, patch);
+        action_digest(&self.run, self.step, node, &state)
+    }
+}
+
+/// Read the [`ActionBasis`] for the next occurrence of `node_id`: the node's
+/// completion count and the materialized state. Errors propagate: a caller on
+/// the enforcement path must treat them as "cannot prove this is approved".
+pub async fn action_basis(
+    backend: &dyn crate::backend::StateBackend,
+    execution_id: &ExecutionId,
+    node_id: &str,
+) -> crate::backend::BackendResult<ActionBasis> {
+    let step = backend
+        .count_node_completions(execution_id, node_id)
+        .await?;
+    let state = crate::materializer::materialize(backend, execution_id)
+        .await?
+        .current_state;
+    Ok(ActionBasis {
+        run: execution_id.to_string(),
+        step,
+        state,
+    })
+}
+
+/// [`action_digest`] for the next occurrence of `node_id`, read from the backend.
+pub async fn derive_action_digest(
+    backend: &dyn crate::backend::StateBackend,
+    execution_id: &ExecutionId,
+    node_id: &str,
+) -> crate::backend::BackendResult<String> {
+    Ok(action_basis(backend, execution_id, node_id)
+        .await?
+        .digest(node_id))
+}
+
+/// Whether an approval status authorises firing an action whose digest is
+/// `current`. Only an `Approved` whose `approved_digest` equals `current`
+/// does; a missing digest (legacy approval) never does.
+pub fn approval_covers(status: &NodeApprovalStatus, current: &str) -> bool {
+    matches!(
+        status,
+        NodeApprovalStatus::Approved { approved_digest: Some(d), .. } if d == current
+    )
 }
 
 /// The principal that started this run: the FIRST `WorkflowStarted`'s
@@ -161,6 +268,8 @@ mod tests {
                 comment: Some("note".into()),
                 state_patch: None,
                 principal: None,
+                approved_digest: None,
+                request_sequence: None,
             },
         )
     }

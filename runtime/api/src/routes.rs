@@ -506,6 +506,11 @@ struct ApproveRequest {
     user_id: Option<String>,
     comment: Option<String>,
     state_patch: Option<Value>,
+    /// Optional echo of the pending request's `action_digest` (from
+    /// `GET /executions/:id/approvals`). A mismatch is a 409: the decider was
+    /// looking at a superseded request.
+    #[serde(default)]
+    action_digest: Option<String>,
 }
 
 /// `POST /executions/:id/approve` — record a decision on a pending approval.
@@ -549,6 +554,7 @@ async fn approve_execution(
             decision,
             comment: body.comment,
             state_patch: body.state_patch,
+            action_digest: body.action_digest,
         },
         state.approval_policy,
     )
@@ -558,7 +564,9 @@ async fn approve_execution(
         crate::approvals::SubmitError::MultiplePending(_) => ApiError::BadRequest(e.to_string()),
         crate::approvals::SubmitError::NoPending
         | crate::approvals::SubmitError::NodeNotPending(_)
-        | crate::approvals::SubmitError::ExecutionTerminal(_) => ApiError::Conflict(e.to_string()),
+        | crate::approvals::SubmitError::ExecutionTerminal(_)
+        | crate::approvals::SubmitError::StaleDigest
+        | crate::approvals::SubmitError::StateMoved => ApiError::Conflict(e.to_string()),
         crate::approvals::SubmitError::Backend(msg) => ApiError::Internal(msg),
     })?;
 

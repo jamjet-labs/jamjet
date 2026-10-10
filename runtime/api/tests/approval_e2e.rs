@@ -208,28 +208,59 @@ impl Harness {
         }
     }
 
+    /// Decide through the real submission path (`submit_approval`, what the
+    /// REST route and the MCP bridge call), so the recorded approval carries
+    /// the digest binding exactly as in production.
     async fn approve(&self, decision: ApprovalDecision, comment: Option<&str>) {
+        self.approve_with(decision, comment, None).await
+    }
+
+    async fn approve_with(
+        &self,
+        decision: ApprovalDecision,
+        comment: Option<&str>,
+        state_patch: Option<serde_json::Value>,
+    ) {
+        jamjet_api::approvals::submit_approval(
+            &self.backend,
+            &self.execution_id,
+            jamjet_api::approvals::ApprovalSubmission {
+                node_id: Some("gated".into()),
+                user_id: "e2e-tester".into(),
+                principal: None,
+                decision,
+                comment: comment.map(String::from),
+                state_patch,
+                action_digest: None,
+            },
+            Default::default(),
+        )
+        .await
+        .expect("submit_approval");
+    }
+
+    /// An approval as a pre-digest writer would have appended it: no
+    /// `approved_digest`, so it does not cover any digest-bound action.
+    async fn approve_legacy(&self) {
         let seq = self
             .backend
             .latest_sequence(&self.execution_id)
             .await
             .unwrap()
             + 1;
+        let kind: EventKind = serde_json::from_value(serde_json::json!({
+            "type": "approval_received",
+            "node_id": "gated",
+            "user_id": "legacy",
+            "decision": "approved",
+            "comment": null,
+            "state_patch": null,
+        }))
+        .unwrap();
         self.backend
-            .append_event(Event::new(
-                self.execution_id.clone(),
-                seq,
-                EventKind::ApprovalReceived {
-                    node_id: "gated".into(),
-                    user_id: "e2e-tester".into(),
-                    decision,
-                    comment: comment.map(String::from),
-                    state_patch: None,
-                    principal: None,
-                },
-            ))
+            .append_event(Event::new(self.execution_id.clone(), seq, kind))
             .await
-            .expect("append ApprovalReceived");
+            .expect("append legacy ApprovalReceived");
     }
 
     async fn shutdown(self) {
@@ -402,6 +433,164 @@ async fn rejected_node_fails_workflow_with_reason() {
         ),
         "rejected node never executed"
     );
+
+    h.shutdown().await;
+}
+
+fn holds(ev: &[Event]) -> usize {
+    ev.iter()
+        .filter(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. }))
+        .count()
+}
+
+fn gated_completions(ev: &[Event]) -> usize {
+    ev.iter()
+        .filter(
+            |e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == "gated"),
+        )
+        .count()
+}
+
+/// The approver edits state while approving. The patch is applied by the
+/// materializer as soon as the approval is in the log, BEFORE the worker
+/// resumes, so the digest the worker recomputes is the patched one and the
+/// node fires exactly once, without a second request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_patched_approval_fires_once_on_the_patched_state() {
+    let _serial = SERIAL.lock().await;
+    init_tracing();
+    let h = start().await;
+
+    assert!(h.wait_for(|ev| holds(ev) == 1, 30).await);
+    h.approve_with(
+        ApprovalDecision::Approved,
+        None,
+        Some(serde_json::json!({ "memo": "approved with edit" })),
+    )
+    .await;
+
+    assert!(
+        h.wait_for(
+            |ev| ev
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::WorkflowCompleted { .. })),
+            30
+        )
+        .await,
+        "a patched approval must resume, not re-request forever"
+    );
+    let events = h.backend.get_events(&h.execution_id).await.unwrap();
+    assert_eq!(gated_completions(&events), 1, "fired exactly once");
+    assert_eq!(holds(&events), 1, "no second request");
+    // NOT asserted: that the patch survives into the final state. It does not,
+    // and did not before this change: the scheduler fold ignores an approval's
+    // state_patch, so `WorkflowCompleted.final_state` (which the materializer
+    // adopts wholesale) and every later node's payload lack it. Tracked as a
+    // follow-up; the binding above is over the materialized state the approver
+    // reviewed and patched.
+
+    h.shutdown().await;
+}
+
+/// An approval with no digest (written before digests existed) does not
+/// release a digest-bound node: it asks again, and only a bound approval of
+/// the new request lets it run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_approval_re_requests_and_a_bound_one_then_runs() {
+    let _serial = SERIAL.lock().await;
+    init_tracing();
+    let h = start().await;
+
+    assert!(h.wait_for(|ev| holds(ev) == 1, 30).await);
+    h.approve_legacy().await;
+
+    assert!(
+        h.wait_for(|ev| holds(ev) == 2, 30).await,
+        "the legacy approval must trigger a fresh request"
+    );
+    let events = h.backend.get_events(&h.execution_id).await.unwrap();
+    assert_eq!(
+        gated_completions(&events),
+        0,
+        "the legacy approval fired nothing"
+    );
+
+    h.approve(ApprovalDecision::Approved, None).await;
+    assert!(
+        h.wait_for(
+            |ev| ev
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::WorkflowCompleted { .. })),
+            30
+        )
+        .await
+    );
+    let events = h.backend.get_events(&h.execution_id).await.unwrap();
+    assert_eq!(gated_completions(&events), 1);
+
+    h.shutdown().await;
+}
+
+/// The state changes between the decision and the resume. The approval does
+/// not cover the new state: no fire, a fresh request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn state_changed_after_approval_re_requests_end_to_end() {
+    let _serial = SERIAL.lock().await;
+    init_tracing();
+    let h = start().await;
+
+    assert!(h.wait_for(|ev| holds(ev) == 1, 30).await);
+    // Record the decision, then move the state before the worker can resume:
+    // append both in one go, the approval first.
+    h.approve(ApprovalDecision::Approved, None).await;
+    let seq = h.backend.latest_sequence(&h.execution_id).await.unwrap() + 1;
+    // Same instant as the decision from the worker's point of view only if it
+    // has not resumed yet; assert below tolerates either order by checking the
+    // invariant that matters: the node never fires on state nobody approved.
+    h.backend
+        .append_event(Event::new(
+            h.execution_id.clone(),
+            seq,
+            EventKind::NodeCompleted {
+                node_id: "sibling".into(),
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({ "amount": 1_000_000 }),
+                duration_ms: 0,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+                idempotency_key: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let events = h.backend.get_events(&h.execution_id).await.unwrap();
+    // Either the worker resumed before the sibling landed (fired on the
+    // approved state, one completion, one request) or after (no fire, a second
+    // request). Firing AND the state having moved first is the bug.
+    let sibling_at = events
+        .iter()
+        .position(
+            |e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == "sibling"),
+        )
+        .unwrap();
+    let fired_after_move = events
+        .iter()
+        .skip(sibling_at)
+        .any(|e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == "gated"));
+    assert!(
+        !fired_after_move,
+        "the gated node fired on a state nobody approved"
+    );
+    if gated_completions(&events) == 0 {
+        assert_eq!(holds(&events), 2, "no fire means a fresh request");
+    }
 
     h.shutdown().await;
 }

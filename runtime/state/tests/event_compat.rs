@@ -36,6 +36,8 @@ fn a_principal_round_trips_and_none_is_not_written() {
         comment: None,
         state_patch: None,
         principal: Some("token:abc".into()),
+        approved_digest: None,
+        request_sequence: None,
     };
     let v = serde_json::to_value(&with).unwrap();
     assert_eq!(v["principal"], "token:abc");
@@ -51,6 +53,8 @@ fn a_principal_round_trips_and_none_is_not_written() {
         comment: None,
         state_patch: None,
         principal: None,
+        approved_digest: None,
+        request_sequence: None,
     };
     let v = serde_json::to_value(&without).unwrap();
     assert!(

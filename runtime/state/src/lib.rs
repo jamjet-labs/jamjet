@@ -35,7 +35,8 @@ pub use hashing::{
     canonical_json, content_hash, derive_idempotency_key, idempotency_key, sha256_hex,
 };
 pub use materializer::{
-    apply_events, apply_events_seeded, materialize, should_snapshot, MaterializedState,
+    apply_events, apply_events_seeded, json_merge_patch, materialize, should_snapshot,
+    MaterializedState,
 };
 pub use memory::InMemoryBackend;
 pub use segment::{segment_chain, start_next_segment};

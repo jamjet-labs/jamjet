@@ -316,6 +316,8 @@ mod tests {
                 comment: None,
                 state_patch: None,
                 principal: None,
+                approved_digest: None,
+                request_sequence: None,
             },
         )
     }
@@ -811,6 +813,8 @@ mod tests {
                     comment: Some("exceeds limit".into()),
                     state_patch: None,
                     principal: None,
+                    approved_digest: None,
+                    request_sequence: None,
                 },
             ))
             .await
@@ -1145,6 +1149,8 @@ mod tests {
                 comment: None,
                 state_patch: None,
                 principal: None,
+                approved_digest: None,
+                request_sequence: None,
             },
         );
         let required_second = StateEvent::new(

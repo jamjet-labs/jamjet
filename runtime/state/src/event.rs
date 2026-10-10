@@ -176,6 +176,18 @@ pub enum EventKind {
         /// Unlike `user_id` it is unique and not caller-chosen.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<String>,
+        /// The `action_digest` this approval authorises (see
+        /// `approvals::action_digest`). Equals the request's digest, or, when
+        /// the approver supplied a `state_patch`, the digest of the patched
+        /// state. The worker fires only if the digest it computes at resume
+        /// matches. `None` on rejections, on approvals of requests that carry
+        /// no digest, and on old logs; a `None` never authorises a digest-bound
+        /// node.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approved_digest: Option<String>,
+        /// Sequence of the `ToolApprovalRequired` this decision answers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_sequence: Option<i64>,
     },
 
     // ── Timers ────────────────────────────────────────────────────────────

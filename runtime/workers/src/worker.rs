@@ -717,16 +717,27 @@ impl Worker {
 
     /// Park a node pending human approval (or let it run if already approved).
     ///
-    /// Consults the event log: an `ApprovalReceived{Approved}` with no newer
-    /// `ToolApprovalRequired` means the gate is satisfied — return None so the
-    /// caller proceeds to execute. Otherwise ensure exactly one outstanding
-    /// `ToolApprovalRequired` exists and settle the work item cleanly so the
-    /// lease never expires into the retry/dead-letter path. The node stays
-    /// parked because it remains in the scheduler fold's `scheduled` set (so
-    /// it is never re-dispatched); the fold's `held` set only gates which
-    /// decision events are acted on.
+    /// Consults the event log. The gate is satisfied, and the caller proceeds
+    /// to execute (`None`), only when the latest request was `Approved` AND the
+    /// approval's `approved_digest` equals the action digest computed NOW
+    /// (`approvals::derive_action_digest`: run, occurrence step, node,
+    /// materialized state). An approval therefore covers exactly the action
+    /// that was reviewed: if the state changed after the decision, or this is a
+    /// later visit of the node (a loop or any re-enqueue), or the approval is a
+    /// legacy one with no digest, it does not cover this action, and the node
+    /// asks again with a fresh request, settled exactly like a first request.
+    ///
+    /// Otherwise ensure exactly one outstanding `ToolApprovalRequired` exists
+    /// and settle the work item cleanly so the lease never expires into the
+    /// retry/dead-letter path. The node stays parked because it remains in the
+    /// scheduler fold's `scheduled` set (so it is never re-dispatched); the
+    /// fold's `held` set only gates which decision events are acted on.
     /// The helper requires the FULL event log because a partial fold could
     /// misreport NotRequested for an already-approved node.
+    ///
+    /// Every read that the decision depends on fails CLOSED: an error means the
+    /// node does not run.
+    #[allow(clippy::too_many_arguments)]
     async fn hold_for_approval(
         &self,
         execution_id: &ExecutionId,
@@ -748,39 +759,69 @@ impl Worker {
             }
         };
 
-        match jamjet_state::approvals::node_approval_status(&events, node_id) {
-            NodeApprovalStatus::Approved { .. } => {
-                info!(execution_id = %execution_id, node_id, "Approval satisfied — proceeding");
-                None
-            }
+        let status = jamjet_state::approvals::node_approval_status(&events, node_id);
+        match &status {
             NodeApprovalStatus::Pending(_) | NodeApprovalStatus::Rejected { .. } => {
                 // Already requested (or decided rejected — scheduler owns the
                 // failure). Settle the item; emit nothing.
-                // FENCED, not a plain settle. The claim-side lease expiry can
-                // requeue an item this worker still believes it owns, so a
-                // second worker may hold it by now — an unfenced settle would
-                // complete work that is currently running under a newer fence.
-                // A lost fence is not an error: the item is simply not ours, so
-                // leave it to its owner and stop.
-                match self
-                    .backend
-                    .complete_work_item_fenced(item_id, lease_fence)
+                self.settle_held(execution_id, node_id, item_id, lease_fence)
                     .await
-                {
-                    Ok(true) => Some(Ok(())),
-                    Ok(false) => {
-                        warn!(
-                            execution_id = %execution_id,
-                            node_id,
-                            "lease fence lost while settling a held item — another worker owns it"
-                        );
-                        Some(Ok(()))
-                    }
-                    Err(e) => Some(Err(format!("failed to settle held work item: {e}").into())),
-                }
             }
-            NodeApprovalStatus::NotRequested => {
-                info!(execution_id = %execution_id, node_id, %approver, "Node requires approval");
+            NodeApprovalStatus::Approved { .. } | NodeApprovalStatus::NotRequested => {
+                // The digest of the action this item would perform right now.
+                let current = match jamjet_state::approvals::derive_action_digest(
+                    self.backend.as_ref(),
+                    execution_id,
+                    node_id,
+                )
+                .await
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return Some(Err(format!(
+                            "approval binding unavailable; refusing to run unapproved: {e}"
+                        )
+                        .into()))
+                    }
+                };
+
+                if jamjet_state::approvals::approval_covers(&status, &current) {
+                    info!(execution_id = %execution_id, node_id, "Approval satisfied — proceeding");
+                    return None;
+                }
+
+                if let NodeApprovalStatus::Approved {
+                    approved_digest, ..
+                } = &status
+                {
+                    warn!(
+                        execution_id = %execution_id,
+                        node_id,
+                        approved_digest = approved_digest.as_deref().unwrap_or("<none: legacy approval>"),
+                        current_digest = %current,
+                        "approval does not cover this action (state changed, a later visit of the \
+                         node, or a legacy approval without a digest) — requesting a fresh approval"
+                    );
+                } else {
+                    info!(execution_id = %execution_id, node_id, %approver, "Node requires approval");
+                }
+
+                let mut context = context;
+                match context.as_object_mut() {
+                    Some(obj) => {
+                        obj.insert(
+                            jamjet_state::approvals::ACTION_DIGEST_KEY.to_string(),
+                            serde_json::Value::String(current),
+                        );
+                    }
+                    None => {
+                        context = serde_json::json!({
+                            "context": context,
+                            jamjet_state::approvals::ACTION_DIGEST_KEY: current,
+                        });
+                    }
+                }
+
                 let seq = match self.backend.latest_sequence(execution_id).await {
                     Ok(s) => s + 1,
                     Err(e) => {
@@ -810,29 +851,39 @@ impl Worker {
                     )
                     .into()));
                 }
-                // FENCED, not a plain settle. The claim-side lease expiry can
-                // requeue an item this worker still believes it owns, so a
-                // second worker may hold it by now — an unfenced settle would
-                // complete work that is currently running under a newer fence.
-                // A lost fence is not an error: the item is simply not ours, so
-                // leave it to its owner and stop.
-                match self
-                    .backend
-                    .complete_work_item_fenced(item_id, lease_fence)
+                self.settle_held(execution_id, node_id, item_id, lease_fence)
                     .await
-                {
-                    Ok(true) => Some(Ok(())),
-                    Ok(false) => {
-                        warn!(
-                            execution_id = %execution_id,
-                            node_id,
-                            "lease fence lost while settling a held item — another worker owns it"
-                        );
-                        Some(Ok(()))
-                    }
-                    Err(e) => Some(Err(format!("failed to settle held work item: {e}").into())),
-                }
             }
+        }
+    }
+
+    /// Settle a held work item, FENCED, not a plain settle. The claim-side
+    /// lease expiry can requeue an item this worker still believes it owns, so
+    /// a second worker may hold it by now — an unfenced settle would complete
+    /// work that is currently running under a newer fence. A lost fence is not
+    /// an error: the item is simply not ours, so leave it to its owner and stop.
+    async fn settle_held(
+        &self,
+        execution_id: &ExecutionId,
+        node_id: &str,
+        item_id: WorkItemId,
+        lease_fence: i64,
+    ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        match self
+            .backend
+            .complete_work_item_fenced(item_id, lease_fence)
+            .await
+        {
+            Ok(true) => Some(Ok(())),
+            Ok(false) => {
+                warn!(
+                    execution_id = %execution_id,
+                    node_id,
+                    "lease fence lost while settling a held item — another worker owns it"
+                );
+                Some(Ok(()))
+            }
+            Err(e) => Some(Err(format!("failed to settle held work item: {e}").into())),
         }
     }
 
@@ -4255,6 +4306,8 @@ mod tests {
                     comment: None,
                     state_patch: None,
                     principal: None,
+                    approved_digest: None,
+                    request_sequence: None,
                 },
             ],
         )
@@ -4321,6 +4374,8 @@ mod tests {
                     comment: None,
                     state_patch: None,
                     principal: None,
+                    approved_digest: None,
+                    request_sequence: None,
                 },
             ],
         )
@@ -4363,11 +4418,392 @@ mod tests {
                     comment: None,
                     state_patch: None,
                     principal: None,
+                    approved_digest: None,
+                    request_sequence: None,
                 },
             ],
         )
         .await;
         assert!(result.is_ok(), "an approved, matching call set must run");
         assert_eq!(count, 1, "the approved dispatch must execute exactly once");
+    }
+
+    // ── Approval bound to the exact action (digest) ───────────────────────────
+    //
+    // A plain node's approval used to be bound only to `{node_id}`: after an
+    // approval the node fired on whatever state existed by then, and a node
+    // visited again saw the old `Approved` status and fired with no new
+    // approval. The hold now records `action_digest` (run, occurrence step,
+    // node, materialized state) and the resume fires only if the approval's
+    // `approved_digest` equals the digest recomputed now.
+
+    /// One tool node `n1` gated by a node-level `require_approval_for`.
+    fn gated_ir_json() -> serde_json::Value {
+        let mut ir = minimal_ir_json();
+        ir["nodes"]["n1"]["policy"] = serde_json::json!({
+            "blocked_tools": [],
+            "require_approval_for": ["stub"],
+            "model_allowlist": []
+        });
+        ir
+    }
+
+    async fn gated_setup() -> (
+        Arc<InMemoryBackend>,
+        ExecutionId,
+        Worker,
+        CountingDispatchExecutor,
+    ) {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        backend
+            .create_execution(sample_execution(&eid))
+            .await
+            .unwrap();
+        backend
+            .store_workflow(WorkflowDefinition {
+                workflow_id: "test-wf".into(),
+                version: "1.0.0".into(),
+                ir: gated_ir_json(),
+                created_at: Utc::now(),
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        let exec = CountingDispatchExecutor::default();
+        let worker =
+            make_worker(Arc::clone(&backend)).register_executor("tool", Arc::new(exec.clone()));
+        (backend, eid, worker, exec)
+    }
+
+    /// Enqueue, claim and run one item for `n1`.
+    async fn run_n1(backend: &Arc<InMemoryBackend>, eid: &ExecutionId, worker: &Worker) {
+        backend.enqueue_work_item(sample_item(eid)).await.unwrap();
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("claimable");
+        worker.execute_item(item).await.unwrap();
+    }
+
+    async fn append(backend: &Arc<InMemoryBackend>, eid: &ExecutionId, kind: EventKind) {
+        let seq = backend.latest_sequence(eid).await.unwrap() + 1;
+        backend
+            .append_event(jamjet_state::Event::new(eid.clone(), seq, kind))
+            .await
+            .unwrap();
+    }
+
+    /// An `ApprovalReceived` built from JSON, so `approved_digest` can be set
+    /// or left out exactly as a writer would.
+    fn approval(approved_digest: Option<&str>) -> EventKind {
+        let mut v = serde_json::json!({
+            "type": "approval_received",
+            "node_id": "n1",
+            "user_id": "approver",
+            "decision": "approved",
+            "comment": null,
+            "state_patch": null,
+        });
+        if let Some(d) = approved_digest {
+            v["approved_digest"] = serde_json::json!(d);
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// `action_digest` of every `ToolApprovalRequired` for `n1`, in order.
+    async fn request_digests(
+        backend: &Arc<InMemoryBackend>,
+        eid: &ExecutionId,
+    ) -> Vec<Option<String>> {
+        backend
+            .get_events(eid)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventKind::ToolApprovalRequired {
+                    node_id, context, ..
+                } if node_id == "n1" => Some(
+                    context
+                        .get("action_digest")
+                        .and_then(|d| d.as_str())
+                        .map(String::from),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fired(exec: &CountingDispatchExecutor) -> usize {
+        exec.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Hold `n1` once and approve exactly what was requested.
+    async fn hold_and_approve(
+        backend: &Arc<InMemoryBackend>,
+        eid: &ExecutionId,
+        worker: &Worker,
+    ) -> String {
+        run_n1(backend, eid, worker).await;
+        let digest = request_digests(backend, eid).await[0]
+            .clone()
+            .expect("the hold must carry an action_digest");
+        append(backend, eid, approval(Some(&digest))).await;
+        digest
+    }
+
+    #[tokio::test]
+    async fn the_hold_records_an_action_digest() {
+        let (backend, eid, worker, exec) = gated_setup().await;
+        run_n1(&backend, &eid, &worker).await;
+        let digests = request_digests(&backend, &eid).await;
+        assert_eq!(digests.len(), 1);
+        assert!(
+            digests[0].as_deref().is_some_and(|d| d.len() == 64),
+            "a sha256 hex action_digest in the request context: {digests:?}"
+        );
+        assert_eq!(fired(&exec), 0);
+    }
+
+    #[tokio::test]
+    async fn an_approval_for_the_requested_action_fires_once() {
+        let (backend, eid, worker, exec) = gated_setup().await;
+        hold_and_approve(&backend, &eid, &worker).await;
+
+        run_n1(&backend, &eid, &worker).await;
+
+        assert_eq!(fired(&exec), 1);
+        assert_eq!(
+            request_digests(&backend, &eid).await.len(),
+            1,
+            "no re-request"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_mutated_after_approval_does_not_fire_and_re_requests() {
+        let (backend, eid, worker, exec) = gated_setup().await;
+        let approved = hold_and_approve(&backend, &eid, &worker).await;
+
+        // A sibling commits a state change after the human decided.
+        append(
+            &backend,
+            &eid,
+            EventKind::NodeCompleted {
+                node_id: "sibling".into(),
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({ "amount": 1_000_000 }),
+                duration_ms: 0,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+                idempotency_key: None,
+            },
+        )
+        .await;
+        run_n1(&backend, &eid, &worker).await;
+
+        assert_eq!(fired(&exec), 0, "the approval did not cover this state");
+        let digests = request_digests(&backend, &eid).await;
+        assert_eq!(digests.len(), 2, "a fresh request for the new state");
+        assert_ne!(digests[1].as_deref(), Some(approved.as_str()));
+        assert!(
+            backend
+                .claim_work_item("test-worker", &["default"])
+                .await
+                .unwrap()
+                .is_none(),
+            "the re-requesting item was settled, not left leased or requeued"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_visit_needs_a_new_approval() {
+        let (backend, eid, worker, exec) = gated_setup().await;
+        hold_and_approve(&backend, &eid, &worker).await;
+        run_n1(&backend, &eid, &worker).await;
+        assert_eq!(fired(&exec), 1);
+
+        // The node is visited again (a loop, or any re-enqueue). Same state, but
+        // a later occurrence: the old approval must not replay.
+        run_n1(&backend, &eid, &worker).await;
+
+        assert_eq!(fired(&exec), 1, "no fire on the old approval");
+        assert_eq!(request_digests(&backend, &eid).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_second_visit_on_identical_state_still_needs_a_new_approval() {
+        // Isolates the occurrence component. In the test above the node's own
+        // completion also changes the state (budget bookkeeping), which would
+        // hide a digest that ignored the step. Here the completion is seeded
+        // with an empty patch, so ONLY the step differs between the approved
+        // occurrence and this one.
+        let (backend, eid, worker, exec) = gated_setup().await;
+        let first = jamjet_state::approvals::derive_action_digest(backend.as_ref(), &eid, "n1")
+            .await
+            .unwrap();
+        append(
+            &backend,
+            &eid,
+            EventKind::ToolApprovalRequired {
+                node_id: "n1".into(),
+                tool_name: "stub".into(),
+                approver: "human".into(),
+                context: serde_json::json!({ "node_id": "n1", "action_digest": first }),
+            },
+        )
+        .await;
+        append(&backend, &eid, approval(Some(&first))).await;
+        append(
+            &backend,
+            &eid,
+            EventKind::NodeCompleted {
+                node_id: "n1".into(),
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({}),
+                duration_ms: 0,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+                idempotency_key: None,
+            },
+        )
+        .await;
+        let state_now = jamjet_state::materialize(backend.as_ref(), &eid)
+            .await
+            .unwrap()
+            .current_state;
+        assert_eq!(
+            state_now,
+            serde_json::json!({}),
+            "precondition: state unchanged"
+        );
+
+        run_n1(&backend, &eid, &worker).await;
+
+        assert_eq!(
+            fired(&exec),
+            0,
+            "the first occurrence's approval must not replay"
+        );
+        assert_eq!(request_digests(&backend, &eid).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_approval_without_a_digest_re_requests() {
+        let (backend, eid, worker, exec) = gated_setup().await;
+        run_n1(&backend, &eid, &worker).await;
+        append(&backend, &eid, approval(None)).await;
+
+        run_n1(&backend, &eid, &worker).await;
+
+        assert_eq!(fired(&exec), 0);
+        assert_eq!(request_digests(&backend, &eid).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_approval_for_a_different_digest_re_requests() {
+        let (backend, eid, worker, exec) = gated_setup().await;
+        run_n1(&backend, &eid, &worker).await;
+        append(&backend, &eid, approval(Some(&"0".repeat(64)))).await;
+
+        run_n1(&backend, &eid, &worker).await;
+
+        assert_eq!(fired(&exec), 0);
+        assert_eq!(request_digests(&backend, &eid).await.len(), 2);
+    }
+
+    /// The digest cannot be computed (materialize fails): the node must not
+    /// run, and no request is recorded for an action nobody can describe.
+    async fn run_gated_on_failing_materialize(approve_first: bool) -> (usize, usize, bool) {
+        use crate::test_support::FailingGetEvents;
+        let backend = Arc::new(FailingGetEvents::failing_materialize());
+        let eid = ExecutionId::new();
+        backend
+            .create_execution(sample_execution(&eid))
+            .await
+            .unwrap();
+        backend
+            .store_workflow(WorkflowDefinition {
+                workflow_id: "test-wf".into(),
+                version: "1.0.0".into(),
+                ir: gated_ir_json(),
+                created_at: Utc::now(),
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        if approve_first {
+            for (seq, kind) in [
+                EventKind::ToolApprovalRequired {
+                    node_id: "n1".into(),
+                    tool_name: "stub".into(),
+                    approver: "human".into(),
+                    context: serde_json::json!({ "action_digest": "d" }),
+                },
+                approval(Some("d")),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                backend
+                    .append_event(jamjet_state::Event::new(eid.clone(), seq as i64 + 1, kind))
+                    .await
+                    .unwrap();
+            }
+        }
+        backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
+        let exec = CountingDispatchExecutor::default();
+        let counter = exec.calls.clone();
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("tool", Arc::new(exec));
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("claimable");
+        let result = worker.execute_item(item).await;
+        let requests = backend
+            .recorded(&eid)
+            .await
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. }))
+            .count();
+        (
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            requests,
+            result.is_err(),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_state_never_fires_an_approved_node() {
+        let (fired, requests, errored) = run_gated_on_failing_materialize(true).await;
+        assert_eq!(fired, 0, "fail closed: no digest, no fire");
+        assert_eq!(requests, 1, "nothing new recorded");
+        assert!(errored, "the item fails and retries rather than settling");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_state_records_no_request() {
+        let (fired, requests, errored) = run_gated_on_failing_materialize(false).await;
+        assert_eq!(fired, 0);
+        assert_eq!(requests, 0, "no request without a digest");
+        assert!(errored);
     }
 }

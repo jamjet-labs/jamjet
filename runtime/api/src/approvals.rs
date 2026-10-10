@@ -7,7 +7,7 @@
 
 use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use jamjet_state::approvals::{
-    node_approval_status, pending_approvals, run_initiator, NodeApprovalStatus,
+    action_basis, node_approval_status, pending_approvals, run_initiator, NodeApprovalStatus,
 };
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::{ApprovalDecision, EventKind};
@@ -24,6 +24,10 @@ pub struct ApprovalSubmission {
     pub decision: ApprovalDecision,
     pub comment: Option<String>,
     pub state_patch: Option<serde_json::Value>,
+    /// The `action_digest` the decider was shown, echoed back. When present it
+    /// must equal the pending request's digest, or the decision is refused as
+    /// stale (the request it was made against has been superseded).
+    pub action_digest: Option<String>,
 }
 
 /// Install-wide approval rules, read once at startup into `AppState`.
@@ -59,6 +63,11 @@ pub enum SubmitError {
     ExecutionTerminal(String),
     /// The approving principal started this run (separation of duties).
     SelfApproval,
+    /// The echoed `action_digest` is not the pending request's digest.
+    StaleDigest,
+    /// A `state_patch` was supplied but the state moved since the request, so
+    /// the patch would apply to a state the approver never saw.
+    StateMoved,
     Backend(String),
 }
 
@@ -82,6 +91,16 @@ impl std::fmt::Display for SubmitError {
             Self::SelfApproval => write!(
                 f,
                 "separation of duties: the principal that started this run cannot approve it"
+            ),
+            Self::StaleDigest => write!(
+                f,
+                "action_digest does not match the pending request; re-read the pending approval and decide again"
+            ),
+            Self::StateMoved => write!(
+                f,
+                "execution state changed since this approval was requested, so the state_patch \
+                 cannot be applied to what was reviewed; approve without a patch (the node will \
+                 request a fresh approval for the new state) or reject"
             ),
             Self::Backend(e) => write!(f, "backend error: {e}"),
         }
@@ -163,6 +182,47 @@ pub async fn submit_approval(
         }
     }
 
+    // BINDING. The decision answers one specific request: the latest pending
+    // `ToolApprovalRequired` for this node. `node_id` was validated against
+    // `pending` above, so the lookup cannot miss; it is still handled, closed.
+    let Some(request) = pending.iter().find(|p| p.node_id == node_id) else {
+        return Err(SubmitError::NodeNotPending(node_id));
+    };
+    let request_digest = request.action_digest().map(str::to_owned);
+
+    // A decider that echoes the digest it was shown is refused if the request
+    // has since been superseded. A request without a digest can never match.
+    if let Some(echoed) = submission.action_digest.as_deref() {
+        if request_digest.as_deref() != Some(echoed) {
+            return Err(SubmitError::StaleDigest);
+        }
+    }
+
+    // What an approval authorises. Without a patch: exactly the requested
+    // action. With a patch: the requested action after the patch is merged, but
+    // only if the state is still the one the request was made for. Otherwise
+    // the patch would land on a state nobody reviewed. If the state moved and
+    // there is no patch, the approval is recorded for the requested digest and
+    // the worker, finding a different digest at resume, requests afresh.
+    // Requests with no digest (agent tool dispatch, bound by `calls_hash`
+    // instead, or legacy requests) record none.
+    let approved_digest = match (&submission.decision, request_digest) {
+        (ApprovalDecision::Approved, Some(requested)) => match &submission.state_patch {
+            None => Some(requested),
+            Some(patch) => {
+                let basis = action_basis(backend.as_ref(), execution_id, &node_id)
+                    .await
+                    .map_err(|e| SubmitError::Backend(e.to_string()))?;
+                if basis.digest(&node_id) != requested {
+                    return Err(SubmitError::StateMoved);
+                }
+                Some(basis.digest_with_patch(&node_id, patch))
+            }
+        },
+        _ => None,
+    };
+    let request_sequence = Some(request.sequence);
+
     let seq = backend
         .latest_sequence(execution_id)
         .await
@@ -180,6 +240,8 @@ pub async fn submit_approval(
             comment: submission.comment,
             state_patch: submission.state_patch,
             principal: submission.principal,
+            approved_digest,
+            request_sequence,
         },
     );
     backend
@@ -218,11 +280,16 @@ pub fn approvals_view(events: &[Event]) -> serde_json::Value {
         .iter()
         .filter(|n| !pending.iter().any(|p| &p.node_id == *n))
         .map(|n| match node_approval_status(events, n) {
-            NodeApprovalStatus::Approved { user_id, sequence } => serde_json::json!({
+            NodeApprovalStatus::Approved {
+                user_id,
+                sequence,
+                approved_digest,
+            } => serde_json::json!({
                 "node_id": n,
                 "status": "approved",
                 "user_id": user_id,
                 "sequence": sequence,
+                "approved_digest": approved_digest,
             }),
             NodeApprovalStatus::Rejected {
                 user_id,

@@ -792,6 +792,8 @@ mod tests {
             comment: None,
             state_patch: None,
             principal: None,
+            approved_digest: None,
+            request_sequence: None,
         }
     }
 
@@ -803,6 +805,8 @@ mod tests {
             comment: None,
             state_patch: None,
             principal: None,
+            approved_digest: None,
+            request_sequence: None,
         }
     }
 

@@ -476,6 +476,8 @@ async fn projection_driven_approvals_endpoint() {
                 comment: Some("exceeds limit".into()),
                 state_patch: None,
                 principal: None,
+                approved_digest: None,
+                request_sequence: None,
             },
         ))
         .await

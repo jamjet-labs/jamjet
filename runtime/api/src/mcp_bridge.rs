@@ -409,6 +409,10 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         "type": "string",
                         "description": "Optional free-text comment explaining the decision. Recorded in the audit trail alongside the approval event."
                     },
+                    "action_digest": {
+                        "type": "string",
+                        "description": "Optional. The action_digest from the pending approval's context that you reviewed. If the pending request has been superseded the decision is refused, so you never approve an action you did not see."
+                    },
                     "tenant_id": {
                         "type": "string",
                         "description": "Tenant partition. Defaults to 'default'. Must match the tenant used when the execution was created. Outside dev mode the tenant is the API token's tenant and a different value is refused."
@@ -434,6 +438,11 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     .get("comment")
                     .and_then(|v| v.as_str())
                     .map(String::from);
+                let action_digest = match args.get("action_digest") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(d)) => Some(d.clone()),
+                    Some(_) => return Err("action_digest must be a string".into()),
+                };
                 // Reviewer and above may decide, matching the REST route.
                 let caller = resolve_caller(&ctx, &args, dev_mode, Role::Reviewer)?;
                 let tenant_id = caller.tenant.clone();
@@ -469,6 +478,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         decision,
                         comment,
                         state_patch: None,
+                        action_digest,
                     },
                     s.approval_policy,
                 )

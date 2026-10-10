@@ -932,6 +932,8 @@ async fn a_matching_approval_releases_the_payload() {
             comment: None,
             state_patch: None,
             principal: None,
+            approved_digest: None,
+            request_sequence: None,
         },
     )
     .await;
@@ -984,6 +986,8 @@ async fn an_approval_for_a_different_call_set_does_not_release_the_payload() {
             comment: None,
             state_patch: None,
             principal: None,
+            approved_digest: None,
+            request_sequence: None,
         },
     )
     .await;

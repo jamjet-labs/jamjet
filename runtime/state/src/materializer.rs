@@ -179,7 +179,12 @@ pub fn apply_events(
 /// - Object keys in the patch are merged recursively.
 /// - Patch values of `null` remove the key from the target.
 /// - Non-object patches replace the target entirely.
-fn json_merge_patch(target: &mut Value, patch: &Value) {
+///
+/// Public so an approval's `state_patch` can be previewed with the SAME merge
+/// the fold applies (see `approvals::approval_digest_for`); a second merge
+/// implementation could disagree with this one and bind an approval to a state
+/// the run never reaches.
+pub fn json_merge_patch(target: &mut Value, patch: &Value) {
     match patch {
         Value::Object(patch_map) => {
             if !target.is_object() {
