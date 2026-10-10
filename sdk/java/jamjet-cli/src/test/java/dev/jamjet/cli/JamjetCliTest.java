@@ -63,6 +63,14 @@ class JamjetCliTest {
     }
 
     @Test
+    void versionFlagPrintsTheBuildVersion() {
+        var expected = System.getProperty("jamjet.expectedVersion");
+        assertTrue(expected != null && !expected.isBlank(), "surefire must pass jamjet.expectedVersion");
+        assertEquals(0, run("-V"));
+        assertEquals("jamjet " + expected, out.toString(StandardCharsets.UTF_8).strip());
+    }
+
+    @Test
     void runPrintsTheRuntimeReasonOn404() {
         replyStatus = 404;
         replyBody = "{\"error\":\"workflow research v1.0.0\"}";

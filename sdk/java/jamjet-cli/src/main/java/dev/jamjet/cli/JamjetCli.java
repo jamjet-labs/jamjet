@@ -28,7 +28,7 @@ import java.util.concurrent.Callable;
 @Command(
         name = "jamjet",
         mixinStandardHelpOptions = true,
-        version = "0.1.0",
+        versionProvider = JamjetCli.BuildVersion.class,
         description = "JamJet runtime CLI",
         subcommands = {
                 JamjetCli.HealthCommand.class,
@@ -70,6 +70,15 @@ public class JamjetCli implements Callable<Integer> {
             System.out.println(MAPPER.writeValueAsString(obj));
         } catch (Exception e) {
             System.err.println("Failed to serialize response: " + e.getMessage());
+        }
+    }
+
+    /** Reports the version Maven stamped into this build, for {@code -V}. */
+    static final class BuildVersion implements CommandLine.IVersionProvider {
+        @Override
+        public String[] getVersion() {
+            return new String[] {"jamjet " + dev.jamjet.JamjetVersion.read(
+                    JamjetCli.class, "jamjet-cli-version.properties")};
         }
     }
 

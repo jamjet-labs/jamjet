@@ -82,6 +82,8 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     field, or the raw body text, capped at 500 characters), so `jamjet` CLI errors
     read `JamJet API error 404 on /executions: workflow research v1.0.0` instead of
     stopping at the status. The full body is still on `JamjetApiException.body()`.
+  - The `User-Agent` is `jamjet-java-sdk/<version>` again, with the version Maven
+    stamped into the build, and `jamjet -V` prints that version too (it said `0.1.0`).
 
   `jamjet-cli` picks these up, so `jamjet run`, `jamjet executions` and
   `jamjet agents` now work. A new CI job runs the client against a runtime built

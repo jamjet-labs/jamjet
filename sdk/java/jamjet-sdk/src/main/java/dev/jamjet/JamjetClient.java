@@ -308,7 +308,7 @@ public final class JamjetClient implements AutoCloseable {
         var builder = HttpRequest.newBuilder(uri)
                 .timeout(Duration.ofSeconds(config.timeoutSeconds()))
                 .header("Accept", "application/json")
-                .header("User-Agent", "jamjet-java-sdk");
+                .header("User-Agent", "jamjet-java-sdk/" + JamjetVersion.get());
         if (config.apiToken() != null && !config.apiToken().isBlank()) {
             builder.header("Authorization", "Bearer " + config.apiToken());
         }

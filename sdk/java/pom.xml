@@ -6,7 +6,7 @@
 
     <groupId>dev.jamjet</groupId>
     <artifactId>jamjet-parent</artifactId>
-    <version>0.5.0</version>
+    <version>0.5.1</version>
     <packaging>pom</packaging>
 
     <name>JamJet Java SDK — Parent</name>
@@ -111,6 +111,10 @@
                     <version>${maven-surefire-plugin.version}</version>
                     <configuration>
                         <useModulePath>false</useModulePath>
+                        <systemPropertyVariables>
+                            <!-- Tests compare what the code reports against the version being built. -->
+                            <jamjet.expectedVersion>${project.version}</jamjet.expectedVersion>
+                        </systemPropertyVariables>
                     </configuration>
                 </plugin>
                 <plugin>

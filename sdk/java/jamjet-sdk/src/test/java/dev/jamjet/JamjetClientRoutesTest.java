@@ -34,7 +34,7 @@ class JamjetClientRoutesTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private record Recorded(String method, String path, String body) {}
+    private record Recorded(String method, String path, String body, String userAgent) {}
 
     private HttpServer server;
     private JamjetClient client;
@@ -56,7 +56,8 @@ class JamjetClientRoutesTest {
             var full = rawQuery == null ? rawPath : rawPath + "?" + rawQuery;
             var method = exchange.getRequestMethod();
             synchronized (requests) {
-                requests.add(new Recorded(method, full, body));
+                requests.add(new Recorded(method, full, body,
+                        exchange.getRequestHeaders().getFirst("User-Agent")));
             }
             byte[] out;
             int status;
@@ -296,6 +297,17 @@ class JamjetClientRoutesTest {
         expect("GET", "/workers", "{\"workers\":[]}");
         client.listWorkers();
         assertRequest("GET", "/workers", null);
+    }
+
+    // ── Headers ──────────────────────────────────────────────────────────────
+
+    @Test
+    void userAgentCarriesTheBuildVersion() {
+        var expected = System.getProperty("jamjet.expectedVersion");
+        assertTrue(expected != null && !expected.isBlank(), "surefire must pass jamjet.expectedVersion");
+        expect("GET", "/health", "{\"status\":\"ok\"}");
+        client.health();
+        assertEquals("jamjet-java-sdk/" + expected, only().userAgent());
     }
 
     // ── Failure modes ────────────────────────────────────────────────────────
