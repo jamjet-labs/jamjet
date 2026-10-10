@@ -14,8 +14,11 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
+import java.net.URLEncoder;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
@@ -66,51 +69,139 @@ public final class JamjetClient implements AutoCloseable {
 
     // ── Workflows ─────────────────────────────────────────────────────────────
 
-    /** Create a workflow from a canonical IR map. */
+    /**
+     * Register a workflow definition from its canonical IR.
+     *
+     * <p>Sends {@code POST /workflows} with body {@code {"ir": ir}}. The IR must carry
+     * {@code workflow_id} and {@code version}; the runtime answers 201 with
+     * {@code {"workflow_id", "version"}} and 400 for IR it cannot load.
+     */
     public Map<String, Object> createWorkflow(Map<String, Object> ir) {
-        return post("/api/v1/workflows", ir);
+        var body = new LinkedHashMap<String, Object>();
+        body.put("ir", ir);
+        return post("/workflows", body);
     }
 
-    /** List all registered workflows. */
+    /**
+     * Not supported: the runtime has no route that lists workflow definitions.
+     *
+     * @throws UnsupportedOperationException always, without contacting the runtime
+     * @deprecated the runtime has no workflow list route. Keep the IDs you register
+     *             with {@link #createWorkflow(Map)}, or list executions with
+     *             {@link #listExecutions(String, int, int)}.
+     */
+    @Deprecated
     public List<Map<String, Object>> listWorkflows() {
-        return getList("/api/v1/workflows");
+        throw new UnsupportedOperationException(
+                "the JamJet runtime has no route that lists workflows (GET /workflows is not served); "
+                        + "keep the workflow IDs you register, or use listExecutions()");
     }
 
     // ── Executions ────────────────────────────────────────────────────────────
 
-    /** Start a new workflow execution. */
+    /**
+     * Start an execution of the workflow's default version ({@code 1.0.0} on the runtime).
+     *
+     * <p>Sends {@code POST /executions} with {@code {"workflow_id", "input"}}; the
+     * runtime answers 201 with {@code {"execution_id"}}.
+     */
     public Map<String, Object> startExecution(String workflowId, Map<String, Object> input) {
-        return post("/api/v1/workflows/" + workflowId + "/execute", input);
+        return startExecution(workflowId, null, input);
     }
 
-    /** Get execution status by ID. */
+    /**
+     * Start an execution of a specific workflow version.
+     *
+     * @param workflowId       the registered workflow ID
+     * @param workflowVersion  the version to run, or {@code null} for the runtime default
+     * @param input            the initial input
+     */
+    public Map<String, Object> startExecution(
+            String workflowId, String workflowVersion, Map<String, Object> input) {
+        var body = new LinkedHashMap<String, Object>();
+        body.put("workflow_id", workflowId);
+        if (workflowVersion != null) body.put("workflow_version", workflowVersion);
+        body.put("input", input == null ? Map.of() : input);
+        return post("/executions", body);
+    }
+
+    /** Get an execution by ID ({@code GET /executions/:id}). */
     public Map<String, Object> getExecution(String executionId) {
-        return get("/api/v1/executions/" + executionId);
+        return get("/executions/" + seg(executionId));
     }
 
-    /** List executions, optionally filtered by status. */
+    /**
+     * List executions, optionally filtered by status ({@code GET /executions}).
+     * The response is {@code {"executions": [...]}}.
+     */
     public Map<String, Object> listExecutions(String status, int limit, int offset) {
         var query = "?limit=" + limit + "&offset=" + offset;
         if (status != null && !status.isBlank()) {
-            query += "&status=" + status;
+            query += "&status=" + URLEncoder.encode(status, StandardCharsets.UTF_8);
         }
-        return get("/api/v1/executions" + query);
+        return get("/executions" + query);
     }
 
-    /** Cancel a running execution. */
+    /** Cancel a running execution ({@code POST /executions/:id/cancel}). */
     public Map<String, Object> cancelExecution(String executionId) {
-        return post("/api/v1/executions/" + executionId + "/cancel", Map.of());
+        return post("/executions/" + seg(executionId) + "/cancel", Map.of());
     }
 
-    /** Get the event stream for an execution. */
+    /**
+     * Get the event log for an execution ({@code GET /executions/:id/events}).
+     * The response is {@code {"events": [...]}}.
+     */
     public Map<String, Object> getEvents(String executionId) {
-        return get("/api/v1/executions/" + executionId + "/events");
+        return get("/executions/" + seg(executionId) + "/events");
     }
 
     // ── Human-in-the-Loop ─────────────────────────────────────────────────────
 
     /**
-     * Approve or reject a paused human-approval step.
+     * List the approvals of an execution ({@code GET /executions/:id/approvals}).
+     *
+     * <p>The response is {@code {"pending": [...], "decided": [...]}}. Each pending
+     * entry carries {@code node_id} and the {@code context} the reviewer is deciding
+     * on; pass that entry's {@code node_id} and {@code context.action_digest} to
+     * {@link #approve(String, String, String, String, String)}.
+     */
+    public Map<String, Object> getApprovals(String executionId) {
+        return get("/executions/" + seg(executionId) + "/approvals");
+    }
+
+    /**
+     * Approve or reject a pending approval, naming the node and the action reviewed.
+     *
+     * <p>Read the pending request with {@link #getApprovals(String)} first and echo its
+     * {@code node_id} and {@code context.action_digest}. Runtimes with approval
+     * integrity refuse an {@code approved} decision without a matching digest outside
+     * dev mode; older runtimes ignore the field.
+     *
+     * @param executionId   the execution ID
+     * @param decision      "approved" or "rejected"
+     * @param nodeId        the node the decision is for; may be {@code null} when only
+     *                      one approval is pending
+     * @param actionDigest  the reviewed request's {@code action_digest}; may be
+     *                      {@code null} for a rejection
+     * @param comment       optional human comment
+     */
+    public Map<String, Object> approve(
+            String executionId,
+            String decision,
+            String nodeId,
+            String actionDigest,
+            String comment) {
+        var body = new LinkedHashMap<String, Object>();
+        body.put("decision", decision);
+        if (nodeId != null) body.put("node_id", nodeId);
+        if (actionDigest != null) body.put("action_digest", actionDigest);
+        if (comment != null) body.put("comment", comment);
+        return post("/executions/" + seg(executionId) + "/approve", body);
+    }
+
+    /**
+     * Approve or reject the single pending approval of an execution
+     * ({@code POST /executions/:id/approve}).
      *
      * @param executionId   the execution ID
      * @param decision      "approved" or "rejected"
@@ -122,59 +213,64 @@ public final class JamjetClient implements AutoCloseable {
             String decision,
             String comment,
             Map<String, Object> statePatch) {
-        var body = new java.util.LinkedHashMap<String, Object>();
+        var body = new LinkedHashMap<String, Object>();
         body.put("decision", decision);
         if (comment != null) body.put("comment", comment);
         if (statePatch != null && !statePatch.isEmpty()) body.put("state_patch", statePatch);
-        return post("/api/v1/executions/" + executionId + "/approve", body);
+        return post("/executions/" + seg(executionId) + "/approve", body);
     }
 
-    /** Send an external event to a waiting correlation key. */
+    /**
+     * Deliver an external event to an execution waiting on a correlation key
+     * ({@code POST /executions/:id/external-event}).
+     */
     public Map<String, Object> sendExternalEvent(
             String executionId,
             String correlationKey,
             Map<String, Object> payload) {
-        var body = Map.of("correlation_key", correlationKey, "payload", payload);
-        return post("/api/v1/executions/" + executionId + "/events", body);
+        var body = new LinkedHashMap<String, Object>();
+        body.put("correlation_key", correlationKey);
+        body.put("payload", payload);
+        return post("/executions/" + seg(executionId) + "/external-event", body);
     }
 
     // ── Agents ────────────────────────────────────────────────────────────────
 
-    /** Register an agent card. */
+    /** Register an agent card ({@code POST /agents}). */
     public Map<String, Object> registerAgent(Map<String, Object> card) {
-        return post("/api/v1/agents", card);
+        return post("/agents", card);
     }
 
-    /** List all registered agents. */
+    /** List registered agents ({@code GET /agents}); the response is {@code {"agents": [...]}}. */
     public Map<String, Object> listAgents() {
-        return get("/api/v1/agents");
+        return get("/agents");
     }
 
-    /** Get agent by ID. */
+    /** Get an agent by ID ({@code GET /agents/:id}). */
     public Map<String, Object> getAgent(String agentId) {
-        return get("/api/v1/agents/" + agentId);
+        return get("/agents/" + seg(agentId));
     }
 
-    /** Activate an agent. */
+    /** Activate an agent ({@code POST /agents/:id/activate}). */
     public Map<String, Object> activateAgent(String agentId) {
-        return post("/api/v1/agents/" + agentId + "/activate", Map.of());
+        return post("/agents/" + seg(agentId) + "/activate", Map.of());
     }
 
-    /** Deactivate an agent. */
+    /** Deactivate an agent ({@code POST /agents/:id/deactivate}). */
     public Map<String, Object> deactivateAgent(String agentId) {
-        return post("/api/v1/agents/" + agentId + "/deactivate", Map.of());
+        return post("/agents/" + seg(agentId) + "/deactivate", Map.of());
     }
 
-    /** Discover and import a remote agent card from a URL. */
+    /** Fetch a remote Agent Card from a URL and register it ({@code POST /agents/discover}). */
     public Map<String, Object> discoverAgent(String url) {
-        return post("/api/v1/agents/discover", Map.of("url", url));
+        return post("/agents/discover", Map.of("url", url));
     }
 
     // ── Workers ───────────────────────────────────────────────────────────────
 
-    /** List all connected workers. */
+    /** List connected workers ({@code GET /workers}); the response is {@code {"workers": [...]}}. */
     public Map<String, Object> listWorkers() {
-        return get("/api/v1/workers");
+        return get("/workers");
     }
 
     // ── Internal HTTP helpers ─────────────────────────────────────────────────
@@ -185,10 +281,12 @@ public final class JamjetClient implements AutoCloseable {
         return (Map<String, Object>) send(req, path, new TypeReference<Map<String, Object>>() {});
     }
 
-    @SuppressWarnings("unchecked")
-    private List<Map<String, Object>> getList(String path) {
-        var req = buildRequest(path).GET().build();
-        return (List<Map<String, Object>>) send(req, path, new TypeReference<List<Map<String, Object>>>() {});
+    /** Percent-encode one path segment so an ID can never change the route. */
+    private static String seg(String value) {
+        if (value == null || value.isEmpty()) {
+            throw new IllegalArgumentException("path segment must not be empty");
+        }
+        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
     }
 
     @SuppressWarnings("unchecked")
@@ -210,7 +308,7 @@ public final class JamjetClient implements AutoCloseable {
         var builder = HttpRequest.newBuilder(uri)
                 .timeout(Duration.ofSeconds(config.timeoutSeconds()))
                 .header("Accept", "application/json")
-                .header("User-Agent", "jamjet-java-sdk/0.1.0");
+                .header("User-Agent", "jamjet-java-sdk");
         if (config.apiToken() != null && !config.apiToken().isBlank()) {
             builder.header("Authorization", "Bearer " + config.apiToken());
         }
@@ -234,6 +332,14 @@ public final class JamjetClient implements AutoCloseable {
 
             if (body == null || body.isBlank()) {
                 return null;
+            }
+            var contentType = response.headers().firstValue("Content-Type").orElse("");
+            if (contentType.startsWith("text/html")) {
+                // Runtimes before 0.5.1 answer any unknown path with their web UI's
+                // index.html and 200. Say so instead of failing to parse it as JSON.
+                throw new JamjetApiException(statusCode, body, path,
+                        "JamJet runtime answered " + path + " with an HTML page, not JSON: "
+                                + "the base URL or path is wrong (the runtime serves bare routes such as /executions)");
             }
             return mapper.readValue(body, typeRef);
         } catch (JamjetAuthException | JamjetApiException e) {
