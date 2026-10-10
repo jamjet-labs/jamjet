@@ -310,8 +310,16 @@ class JamjetClient:
         finish_reason: str | None = None,
         lease_fence: int | None = None,
         idempotency_key: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cost_usd: float | None = None,
     ) -> None:
         """Mark a work item as completed and emit a NodeCompleted event.
+
+        ``input_tokens``, ``output_tokens`` and ``cost_usd`` are recorded on
+        the event and count toward the token and cost budgets of the agent
+        the node acts for. ``cost_usd`` must be a non-negative number (the
+        runtime answers 400 otherwise).
 
         When ``lease_fence`` is provided (and non-zero), it is echoed back so the
         runtime can prove this worker still holds the lease: a stale fence (the
@@ -331,6 +339,12 @@ class JamjetClient:
             body["gen_ai_model"] = gen_ai_model
         if finish_reason is not None:
             body["finish_reason"] = finish_reason
+        if input_tokens is not None:
+            body["input_tokens"] = input_tokens
+        if output_tokens is not None:
+            body["output_tokens"] = output_tokens
+        if cost_usd is not None:
+            body["cost_usd"] = cost_usd
         if lease_fence:
             body["lease_fence"] = lease_fence
         if idempotency_key is not None:

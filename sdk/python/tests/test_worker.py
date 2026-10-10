@@ -52,6 +52,20 @@ async def _with_genai(input: dict) -> dict:
     }
 
 
+async def _with_usage(input: dict) -> dict:
+    """Return output that reports token usage and cost, plus values the
+    worker must not forward (negative, non-numeric, boolean)."""
+    return {"result": "answer", "input_tokens": 12, "output_tokens": 3, "cost_usd": 0.25}
+
+
+async def _with_bad_usage(input: dict) -> dict:
+    return {"result": "answer", "input_tokens": True, "output_tokens": "3", "cost_usd": -1.0}
+
+
+async def _with_bool_cost(input: dict) -> dict:
+    return {"result": "answer", "cost_usd": True}
+
+
 @tool(name="echo")
 async def echo_tool(text: str) -> str:
     """A @tool resolved by dispatch_tool_calls through the tools map, which
@@ -86,9 +100,15 @@ class _StubClient:
         finish_reason: str | None = None,
         lease_fence: int | None = None,
         idempotency_key: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cost_usd: float | None = None,
     ) -> None:
         self.complete_calls.append(
             {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": cost_usd,
                 "item_id": item_id,
                 "execution_id": execution_id,
                 "node_id": node_id,
@@ -272,6 +292,39 @@ async def test_worker_forwards_gen_ai_fields() -> None:
     assert call["finish_reason"] == "stop"
     # The full output dict (including GenAI fields) is still forwarded as-is.
     assert call["output"]["result"] == "answer"
+
+
+def _usage_item(function: str) -> dict:
+    return {
+        "id": "wi-usage",
+        "execution_id": "exec_usage",
+        "node_id": "n1",
+        "queue_type": "python_tool",
+        "payload": {"module": "tests.test_worker", "function": function, "input": {}},
+    }
+
+
+async def test_worker_forwards_usage_for_agent_budgets() -> None:
+    """Token usage and cost a tool reports reach the engine, which charges
+    them to an agent card's token and cost budgets."""
+    stub = _StubClient(claimed_item=_usage_item("_with_usage"))
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+    call = stub.complete_calls[0]
+    assert call["input_tokens"] == 12
+    assert call["output_tokens"] == 3
+    assert call["cost_usd"] == 0.25
+
+
+async def test_worker_drops_usage_that_is_not_a_spend() -> None:
+    stub = _StubClient(claimed_item=_usage_item("_with_bad_usage"))
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+    call = stub.complete_calls[0]
+    assert call["input_tokens"] is None
+    assert call["output_tokens"] is None
+    assert call["cost_usd"] is None
+    stub = _StubClient(claimed_item=_usage_item("_with_bool_cost"))
+    await _worker_loop(stub, "test-worker", ["python_tool"], once=True)
+    assert stub.complete_calls[0]["cost_usd"] is None
 
 
 _DISPATCH_ITEM: dict = {
@@ -623,3 +676,29 @@ def test_worker_cli_refuses_a_lease_outside_the_engine_bounds(monkeypatch: Any) 
     result = CliRunner().invoke(cli.app, ["worker", "--once", "--lease-secs", "600"])
     assert result.exit_code == 0, result.output
     assert started == [600]
+
+
+async def test_client_sends_usage_on_complete() -> None:
+    """`JamjetClient.complete_work_item` puts usage on the body the engine
+    records on `node_completed`, and leaves out what it was not given."""
+    import json as _json
+
+    from jamjet.client import JamjetClient
+
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(_json.loads(request.content))
+        return httpx.Response(200, json={"completed": True})
+
+    client = JamjetClient("http://runtime")
+    client._client = httpx.AsyncClient(base_url="http://runtime", transport=httpx.MockTransport(handler))
+    await client.complete_work_item(
+        "wi", None, None, {}, {}, input_tokens=12, output_tokens=3, cost_usd=0.25, lease_fence=7
+    )
+    await client.complete_work_item("wi", None, None, {}, {}, lease_fence=7)
+    assert bodies[0]["input_tokens"] == 12
+    assert bodies[0]["output_tokens"] == 3
+    assert bodies[0]["cost_usd"] == 0.25
+    for key in ("input_tokens", "output_tokens", "cost_usd"):
+        assert key not in bodies[1]
