@@ -90,7 +90,18 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     tenant record, so a tenant's `blocked_tools`, `require_approval_for` and
     `model_allowlist` never applied to in-process kinds (`tool`, `mcp_tool`,
     `a2a_task`, `model`, `agent`), while the claim route applied them. Behaviour
-    change: a tenant policy that matches such a node now holds or blocks it.
+    changes for a SQLite deployment with embedded workers and a policy on its
+    `default` tenant row:
+    - `model_allowlist` now applies to in-process model nodes, so a model outside it
+      fails the node (and the run);
+    - `require_approval_for: ["*"]` now holds every in-process `tool`, `mcp_tool`,
+      `a2a_task` and `agent` node; runs started by a cron job with no recorded
+      creator have no initiator, so those holds can never be approved outside dev
+      mode;
+    - a `default` row whose policy (or timestamp) cannot be read now refuses every
+      node: a policy that does not parse blocks it (see above), and a row the
+      backend cannot read at all leaves every node unavailable to retry until the
+      row is fixed.
   - A node blocked by policy fails its run. Both transports settle the item and
     record `NodeFailed { retryable: false }` in one fenced commit, so the scheduler
     fails the run on its next tick. Before, a block on `POST /work-items/claim` left
