@@ -6,12 +6,12 @@
 use crate::auth::Role;
 use crate::state::AppState;
 use axum::Router;
-use chrono::Utc;
+
 use jamjet_agents::{AgentFilter, AgentStatus};
-use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use jamjet_mcp::server::{McpServer, ToolCallContext};
 use jamjet_mcp::types::{McpContent, McpTool};
-use jamjet_state::{ApiToken, Event, EventKind, TenantId, WorkItem};
+use jamjet_state::{ApiToken, Event, EventKind, TenantId};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -82,70 +82,25 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 let caller = resolve_caller(&ctx, &args, dev_mode, Role::Developer)?;
                 let tenant_id = caller.tenant.clone();
 
-                let backend = s.backend_for(&tenant_id);
-
-                let def = backend
-                    .get_workflow(&workflow_id, &version)
-                    .await
-                    .map_err(|e| format!("failed to get workflow: {e}"))?
-                    .ok_or_else(|| format!("workflow {} v{} not found", workflow_id, version))?;
-
-                let start_node = def.ir.get("start_node")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("start")
-                    .to_string();
-
-                let now = Utc::now();
-                let execution = WorkflowExecution {
-                    execution_id: ExecutionId::new(),
-                    workflow_id: workflow_id.clone(),
-                    workflow_version: version.clone(),
-                    status: WorkflowStatus::Running,
-                    initial_input: input.clone(),
-                    current_state: input.clone(),
-                    started_at: now,
-                    updated_at: now,
-                    completed_at: None,
-                    session_type: None,
-                    parent_execution_id: None,
-                    segment_number: 0,
-                };
-                let eid = execution.execution_id.clone();
-                backend.create_execution(execution).await.map_err(|e| format!("{e}"))?;
-
-                let event = Event::new(eid.clone(), 1, EventKind::WorkflowStarted {
-                    workflow_id: workflow_id.clone(),
-                    workflow_version: version.clone(),
-                    initial_input: input.clone(),
-                    initiated_by: caller.token.as_ref().map(crate::auth::principal_of),
-                });
-                backend.append_event(event).await.map_err(|e| format!("{e}"))?;
-
-                let queue_type = "general".to_string();
-                let sched_event = Event::new(eid.clone(), 2, EventKind::NodeScheduled {
-                    node_id: start_node.clone(),
-                    queue_type: queue_type.clone(),
-                });
-                backend.append_event(sched_event).await.map_err(|e| format!("{e}"))?;
-
-                let work_item = WorkItem {
-                    id: Uuid::new_v4(),
-                    execution_id: eid.clone(),
-                    node_id: start_node,
-                    queue_type,
-                    payload: json!({"workflow_id": workflow_id, "workflow_version": version}),
-                    attempt: 0,
-                    max_attempts: 3,
-                    created_at: now,
-                    lease_expires_at: None,
-                    worker_id: None,
-                    lease_fence: 0,
-                    tenant_id: tenant_id.0.clone(),
-                };
-                backend.enqueue_work_item(work_item).await.map_err(|e| format!("{e}"))?;
+                // The same start path as `POST /executions`: one execution
+                // record, `WorkflowStarted` with this token as initiator, and
+                // the start item built and routed by the scheduler's own payload
+                // builder. A second copy here once enqueued a bare payload on
+                // `general` whatever the start node's kind.
+                let initiated_by = caller.token.as_ref().map(crate::auth::principal_of);
+                let (_, axum::Json(started)) = crate::routes::start_run(
+                    &s,
+                    &tenant_id,
+                    workflow_id,
+                    Some(version),
+                    input,
+                    initiated_by,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
 
                 Ok(vec![McpContent::Text {
-                    text: json!({"execution_id": eid.to_string()}).to_string(),
+                    text: json!({"execution_id": started["execution_id"]}).to_string(),
                 }])
             }
         },

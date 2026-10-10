@@ -317,9 +317,11 @@ async fn start_execution(
 }
 
 /// Start one run of `workflow_id`: the execution record, `WorkflowStarted`
-/// (with `initiated_by`) and the start node's work item. Shared by
-/// `POST /executions` and the in-process cron launcher, so a cron run is
-/// started exactly like an API one, with a system principal as its initiator.
+/// (with `initiated_by`) and the start node's work item. The ONE start path,
+/// shared by `POST /executions`, the MCP bridge's `jamjet_run_workflow` and the
+/// in-process cron launcher (whose runs take the job's creator as initiator),
+/// so the start item, its payload and the initiator cannot diverge by
+/// transport.
 pub async fn start_run(
     state: &AppState,
     tenant_id: &TenantId,
