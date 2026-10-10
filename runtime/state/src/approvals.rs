@@ -132,40 +132,65 @@ pub fn answered_request(events: &[Event], node_id: &str) -> Option<PendingApprov
 /// The digest an approval of a plain node is bound to.
 ///
 /// Covers the run, the node, which occurrence of the node this is (`step`, the
-/// number of times it has already completed) and the full materialized state
-/// the node would fire on. So an approval stops covering the action when the
-/// state changes after the request (a sibling commits, an approver's patch
-/// lands somewhere else) and when the node is visited again (a loop or any
-/// re-enqueue of a completed node): `step` differs, so the old approval cannot
-/// be replayed.
+/// number of times it has already completed), the node's DEFINITION (see
+/// [`definition_hash`]) and the full materialized state the node would fire
+/// on. So an approval stops covering the action when the state changes after
+/// the request (a sibling commits, an approver's patch lands somewhere else),
+/// when the node is visited again (a loop or any re-enqueue of a completed
+/// node): `step` differs, so the old approval cannot be replayed, and when the
+/// node's definition is not the one that was reviewed (a different module,
+/// function, tool or policy under the same node id).
 ///
 /// Domain-separated from the idempotency key (`hashing::idempotency_key`):
 /// that key is persisted with a fixed shape and hashes the denormalised
 /// `current_state` column, which neither in-process completions nor approval
 /// patches update. This digest hashes the MATERIALIZED state (event fold), the
 /// state an approval's `state_patch` actually changes.
-pub fn action_digest(run: &str, step: u64, node: &str, state: &serde_json::Value) -> String {
+pub fn action_digest(
+    run: &str,
+    step: u64,
+    node: &str,
+    definition: &str,
+    state: &serde_json::Value,
+) -> String {
     content_hash(&serde_json::json!({
-        "domain": "jamjet.approval.action.v1",
+        "domain": "jamjet.approval.action.v2",
         "run": run,
         "step": step,
         "node": node,
+        "definition": definition,
         "state": content_hash(state),
     }))
 }
 
-/// What a digest computation needs from the backend, read once.
+/// Context key under which a hold records the [`definition_hash`] of the node
+/// it parks, so a reviewer (and the approve route) can see what was bound.
+pub const ACTION_DEFINITION_KEY: &str = "action_definition";
+
+/// The hash of one node's definition as registered (the IR's `NodeDef`
+/// serialized to JSON, its own policy included), in canonical JSON. Bound
+/// into [`action_digest`] so an approval never covers a different node body.
+pub fn definition_hash(node_def: &serde_json::Value) -> String {
+    content_hash(&serde_json::json!({
+        "domain": "jamjet.approval.node.v1",
+        "node": node_def,
+    }))
+}
+
+/// What a digest computation needs from the backend, read once, plus the
+/// definition hash the caller supplies.
 #[derive(Debug, Clone)]
 pub struct ActionBasis {
     pub run: String,
     pub step: u64,
+    pub definition: String,
     pub state: serde_json::Value,
 }
 
 impl ActionBasis {
     /// The digest of firing `node` on this basis.
     pub fn digest(&self, node: &str) -> String {
-        action_digest(&self.run, self.step, node, &self.state)
+        action_digest(&self.run, self.step, node, &self.definition, &self.state)
     }
 
     /// The digest of firing `node` after `patch` is merged into the state, with
@@ -173,17 +198,19 @@ impl ActionBasis {
     pub fn digest_with_patch(&self, node: &str, patch: &serde_json::Value) -> String {
         let mut state = self.state.clone();
         crate::materializer::json_merge_patch(&mut state, patch);
-        action_digest(&self.run, self.step, node, &state)
+        action_digest(&self.run, self.step, node, &self.definition, &state)
     }
 }
 
 /// Read the [`ActionBasis`] for the next occurrence of `node_id`: the node's
-/// completion count and the materialized state. Errors propagate: a caller on
-/// the enforcement path must treat them as "cannot prove this is approved".
+/// completion count and the materialized state. `definition` is the node's
+/// [`definition_hash`]. Errors propagate: a caller on the enforcement path
+/// must treat them as "cannot prove this is approved".
 pub async fn action_basis(
     backend: &dyn crate::backend::StateBackend,
     execution_id: &ExecutionId,
     node_id: &str,
+    definition: &str,
 ) -> crate::backend::BackendResult<ActionBasis> {
     let step = backend
         .count_node_completions(execution_id, node_id)
@@ -194,6 +221,7 @@ pub async fn action_basis(
     Ok(ActionBasis {
         run: execution_id.to_string(),
         step,
+        definition: definition.to_string(),
         state,
     })
 }
@@ -203,8 +231,9 @@ pub async fn derive_action_digest(
     backend: &dyn crate::backend::StateBackend,
     execution_id: &ExecutionId,
     node_id: &str,
+    definition: &str,
 ) -> crate::backend::BackendResult<String> {
-    Ok(action_basis(backend, execution_id, node_id)
+    Ok(action_basis(backend, execution_id, node_id, definition)
         .await?
         .digest(node_id))
 }

@@ -10,38 +10,62 @@ use serde_json::json;
 
 #[test]
 fn every_component_changes_the_digest() {
-    let base = action_digest("run", 0, "gate", &json!({ "amount": 10 }));
+    let base = action_digest("run", 0, "gate", "def", &json!({ "amount": 10 }));
     assert_eq!(
         base,
-        action_digest("run", 0, "gate", &json!({ "amount": 10 }))
+        action_digest("run", 0, "gate", "def", &json!({ "amount": 10 }))
     );
     assert_ne!(
         base,
-        action_digest("other", 0, "gate", &json!({ "amount": 10 })),
+        action_digest("other", 0, "gate", "def", &json!({ "amount": 10 })),
         "run"
     );
     assert_ne!(
         base,
-        action_digest("run", 1, "gate", &json!({ "amount": 10 })),
+        action_digest("run", 1, "gate", "def", &json!({ "amount": 10 })),
         "step (loop)"
     );
     assert_ne!(
         base,
-        action_digest("run", 0, "other", &json!({ "amount": 10 })),
+        action_digest("run", 0, "other", "def", &json!({ "amount": 10 })),
         "node"
     );
     assert_ne!(
         base,
-        action_digest("run", 0, "gate", &json!({ "amount": 11 })),
+        action_digest("run", 0, "gate", "def", &json!({ "amount": 11 })),
         "state"
     );
+    assert_ne!(
+        base,
+        action_digest("run", 0, "gate", "other-def", &json!({ "amount": 10 })),
+        "definition (a different node body under the same id)"
+    );
+}
+
+#[test]
+fn the_definition_hash_covers_the_node_body_and_its_policy() {
+    use jamjet_state::approvals::definition_hash;
+    let node = json!({ "id": "gate", "kind": { "type": "tool", "tool_ref": "payments.transfer" } });
+    let base = definition_hash(&node);
+    let mut other_tool = node.clone();
+    other_tool["kind"]["tool_ref"] = json!("payments.refund");
+    assert_ne!(base, definition_hash(&other_tool), "tool");
+    let mut with_policy = node.clone();
+    with_policy["policy"] = json!({ "require_approval_for": ["payments.*"] });
+    assert_ne!(base, definition_hash(&with_policy), "policy");
+    // Canonical: key order does not matter.
+    let reordered: serde_json::Value = serde_json::from_str(
+        r#"{ "kind": { "tool_ref": "payments.transfer", "type": "tool" }, "id": "gate" }"#,
+    )
+    .unwrap();
+    assert_eq!(base, definition_hash(&reordered));
 }
 
 #[test]
 fn the_digest_is_not_the_idempotency_key() {
     // Domain separation: same coordinates, different purpose, different hash.
     let state = json!({});
-    let digest = action_digest("run", 0, "gate", &state);
+    let digest = action_digest("run", 0, "gate", "def", &state);
     let key =
         jamjet_state::idempotency_key("run", 0, 0, "gate", &jamjet_state::content_hash(&state));
     assert_ne!(digest, key);

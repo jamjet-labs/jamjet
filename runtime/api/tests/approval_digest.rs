@@ -71,6 +71,10 @@ fn env() -> Env {
     }
 }
 
+/// The definition hash the simulated hold binds (the worker computes it from
+/// the node's IR; these route tests only need it to be consistent).
+const DEF: &str = "test-definition";
+
 async fn append(backend: &Arc<InMemoryBackend>, eid: &ExecutionId, kind: EventKind) -> i64 {
     let seq = backend.latest_sequence(eid).await.unwrap() + 1;
     backend
@@ -103,12 +107,13 @@ async fn held(backend: &Arc<InMemoryBackend>, with_digest: bool) -> (ExecutionId
         })
         .await
         .unwrap();
-    let digest = derive_action_digest(backend.as_ref(), &eid, "gate")
+    let digest = derive_action_digest(backend.as_ref(), &eid, "gate", DEF)
         .await
         .unwrap();
     let mut context = json!({ "node_id": "gate" });
     if with_digest {
         context["action_digest"] = json!(digest);
+        context["action_definition"] = json!(DEF);
     }
     let seq = append(
         backend,
@@ -286,7 +291,7 @@ async fn a_patch_against_a_moved_state_is_409_and_appends_nothing() {
 async fn a_patched_approval_binds_the_patched_state_and_the_worker_will_match_it() {
     let env = env();
     let (eid, requested, _) = held(&env.backend, true).await;
-    let expected = action_basis(env.backend.as_ref(), &eid, "gate")
+    let expected = action_basis(env.backend.as_ref(), &eid, "gate", DEF)
         .await
         .unwrap()
         .digest_with_patch("gate", &json!({ "amount": 5 }));
@@ -307,7 +312,7 @@ async fn a_patched_approval_binds_the_patched_state_and_the_worker_will_match_it
     // resume is the patched one. Otherwise a patched approval would re-request
     // forever.
     assert_eq!(
-        derive_action_digest(env.backend.as_ref(), &eid, "gate")
+        derive_action_digest(env.backend.as_ref(), &eid, "gate", DEF)
             .await
             .unwrap(),
         expected

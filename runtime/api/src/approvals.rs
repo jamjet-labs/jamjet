@@ -210,7 +210,16 @@ pub async fn submit_approval(
         (ApprovalDecision::Approved, Some(requested)) => match &submission.state_patch {
             None => Some(requested),
             Some(patch) => {
-                let basis = action_basis(backend.as_ref(), execution_id, &node_id)
+                // The definition the request was bound to. A request without
+                // one cannot prove which node body the patch would apply to.
+                let Some(definition) = request
+                    .context
+                    .get(jamjet_state::approvals::ACTION_DEFINITION_KEY)
+                    .and_then(|d| d.as_str())
+                else {
+                    return Err(SubmitError::StateMoved);
+                };
+                let basis = action_basis(backend.as_ref(), execution_id, &node_id, definition)
                     .await
                     .map_err(|e| SubmitError::Backend(e.to_string()))?;
                 if basis.digest(&node_id) != requested {

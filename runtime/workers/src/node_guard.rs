@@ -20,8 +20,8 @@ use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::workflow::{NodeDef, PolicySetIr};
 use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
 use jamjet_state::approvals::{
-    answered_request, approval_covers, derive_action_digest, node_approval_status,
-    NodeApprovalStatus, ACTION_DIGEST_KEY, ACTION_STEP_KEY,
+    answered_request, approval_covers, definition_hash, derive_action_digest, node_approval_status,
+    NodeApprovalStatus, ACTION_DEFINITION_KEY, ACTION_DIGEST_KEY, ACTION_STEP_KEY,
 };
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::EventKind;
@@ -159,6 +159,7 @@ pub async fn guard_item(
                         backend,
                         execution_id,
                         node_id,
+                        node_def,
                         tool_name,
                         approver,
                         serde_json::json!({ "node_id": node_id }),
@@ -166,7 +167,7 @@ pub async fn guard_item(
                     .await
                 }
                 GuardMode::Complete => {
-                    completion_covered(backend, execution_id, node_id, tool_name).await
+                    completion_covered(backend, execution_id, node_id, node_def, tool_name).await
                 }
             }
         }
@@ -185,6 +186,7 @@ pub async fn require_approval(
     backend: &dyn StateBackend,
     execution_id: &ExecutionId,
     node_id: &str,
+    node_def: &NodeDef,
     tool_name: String,
     approver: String,
     context: Value,
@@ -218,7 +220,11 @@ pub async fn require_approval(
             }
         }
     };
-    let current = match derive_action_digest(backend, execution_id, node_id).await {
+    let definition = match node_definition(node_def) {
+        Ok(d) => d,
+        Err(reason) => return GuardOutcome::Unavailable { reason },
+    };
+    let current = match derive_action_digest(backend, execution_id, node_id, &definition).await {
         Ok(d) => d,
         Err(e) => {
             return GuardOutcome::Unavailable {
@@ -254,6 +260,7 @@ pub async fn require_approval(
     }
     if let Some(obj) = context.as_object_mut() {
         obj.insert(ACTION_DIGEST_KEY.to_string(), Value::String(current));
+        obj.insert(ACTION_DEFINITION_KEY.to_string(), Value::String(definition));
         // The occurrence this request is for. `GuardMode::Complete` reads it.
         obj.insert(ACTION_STEP_KEY.to_string(), Value::from(step));
     }
@@ -296,6 +303,7 @@ async fn completion_covered(
     backend: &dyn StateBackend,
     execution_id: &ExecutionId,
     node_id: &str,
+    node_def: &NodeDef,
     tool_name: String,
 ) -> GuardOutcome {
     let gated = vec![tool_name];
@@ -322,10 +330,24 @@ async fn completion_covered(
         Some(_) => GuardOutcome::Held { gated },
         // A request recorded before the step was: only an exact digest match
         // proves it is this occurrence.
-        None => match derive_action_digest(backend, execution_id, node_id).await {
+        None => match match node_definition(node_def) {
+            Ok(definition) => {
+                derive_action_digest(backend, execution_id, node_id, &definition).await
+            }
+            Err(reason) => return GuardOutcome::Unavailable { reason },
+        } {
             Ok(current) if approval_covers(&status, &current) => GuardOutcome::Allow,
             Ok(_) => GuardOutcome::Held { gated },
             Err(e) => unavailable(e),
         },
     }
+}
+
+/// The [`definition_hash`] of `node_def` as registered. Serializing a
+/// `NodeDef` does not fail in practice; if it ever did, the decision fails
+/// closed rather than binding an approval to nothing.
+fn node_definition(node_def: &NodeDef) -> Result<String, String> {
+    serde_json::to_value(node_def)
+        .map(|v| definition_hash(&v))
+        .map_err(|e| format!("node definition unreadable; refusing to run unapproved: {e}"))
 }

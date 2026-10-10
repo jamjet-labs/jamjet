@@ -43,6 +43,9 @@ impl From<jamjet_state::backend::StateBackendError> for ApiError {
     fn from(e: jamjet_state::backend::StateBackendError) -> Self {
         match e {
             jamjet_state::backend::StateBackendError::NotFound(msg) => Self::NotFound(msg),
+            e @ jamjet_state::backend::StateBackendError::VersionConflict(_) => {
+                Self::Conflict(e.to_string())
+            }
             other => Self::Internal(other.to_string()),
         }
     }

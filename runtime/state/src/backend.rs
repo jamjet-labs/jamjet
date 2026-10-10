@@ -64,11 +64,31 @@ pub enum StateBackendError {
     #[error("database error: {0}")]
     Database(String),
 
+    /// A workflow version is already registered with a different definition.
+    /// Versions are immutable: an approval and the policy it was granted
+    /// under are bound to one definition, so a version cannot be redefined.
+    #[error("workflow version already registered with a different definition: {0}")]
+    VersionConflict(String),
+
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }
 
 pub type BackendResult<T> = Result<T, StateBackendError>;
+
+/// Whether two stored IRs are the same definition: equal canonical JSON, so
+/// key order and whitespace do not matter. Every backend's `store_workflow`
+/// uses this to tell an idempotent re-register from a redefinition.
+pub fn same_definition(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    crate::hashing::content_hash(a) == crate::hashing::content_hash(b)
+}
+
+/// The refusal for a redefinition of `workflow_id` v`version`.
+pub fn version_conflict(workflow_id: &str, version: &str) -> StateBackendError {
+    StateBackendError::VersionConflict(format!(
+        "{workflow_id} v{version}; register a new version instead"
+    ))
+}
 
 /// Trait abstracting the durable state storage backend.
 ///
@@ -79,6 +99,11 @@ pub trait StateBackend: Send + Sync {
     // ── Workflow definitions ─────────────────────────────────────────────
 
     /// Store a compiled workflow IR.
+    ///
+    /// A version is IMMUTABLE. Storing a version that already exists with the
+    /// same definition (see [`same_definition`]) is a no-op `Ok`; with a
+    /// different definition it is refused with
+    /// [`StateBackendError::VersionConflict`] and the stored IR is untouched.
     async fn store_workflow(&self, def: WorkflowDefinition) -> BackendResult<()>;
 
     /// Load a workflow definition by id and version.

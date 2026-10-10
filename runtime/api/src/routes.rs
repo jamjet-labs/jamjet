@@ -222,6 +222,27 @@ async fn create_workflow(
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let backend = state.backend_for(&tenant_id);
+
+    // A registered version is IMMUTABLE. Overwriting it let a developer drop
+    // the approval gate from a live workflow (the worker loads IR per item) or
+    // swap a node's body under an approval that still matched
+    // (approval-integrity review, C2). Re-registering the same definition is
+    // an idempotent 200, because deployments re-register on every boot; a
+    // different definition is a 409. The backend refuses the overwrite too, so
+    // a race between this read and the write cannot slip one through.
+    if let Some(existing) = backend.get_workflow(&workflow_id, &version).await? {
+        if !jamjet_state::backend::same_definition(&existing.ir, &body.ir) {
+            return Err(ApiError::Conflict(format!(
+                "workflow {workflow_id} v{version} is already registered with a different \
+                 definition; versions are immutable, register a new version"
+            )));
+        }
+        return Ok((
+            StatusCode::OK,
+            Json(json!({ "workflow_id": workflow_id, "version": version })),
+        ));
+    }
+
     let def = WorkflowDefinition {
         workflow_id: workflow_id.clone(),
         version: version.clone(),

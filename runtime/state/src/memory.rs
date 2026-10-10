@@ -120,9 +120,26 @@ impl StateBackend for InMemoryBackend {
     // ── Workflow definitions ─────────────────────────────────────────
 
     async fn store_workflow(&self, def: WorkflowDefinition) -> BackendResult<()> {
-        self.workflows
-            .insert((def.workflow_id.clone(), def.version.clone()), def);
-        Ok(())
+        use dashmap::mapref::entry::Entry;
+        match self
+            .workflows
+            .entry((def.workflow_id.clone(), def.version.clone()))
+        {
+            Entry::Occupied(existing) => {
+                if crate::backend::same_definition(&existing.get().ir, &def.ir) {
+                    Ok(())
+                } else {
+                    Err(crate::backend::version_conflict(
+                        &def.workflow_id,
+                        &def.version,
+                    ))
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(def);
+                Ok(())
+            }
+        }
     }
 
     async fn get_workflow(

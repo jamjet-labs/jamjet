@@ -494,9 +494,12 @@ impl StateBackend for TenantScopedSqliteBackend {
         let ir_json = serde_json::to_string(&def.ir)?;
         let created_at = def.created_at.to_rfc3339();
 
-        sqlx::query(
-            r#"INSERT OR REPLACE INTO workflow_definitions (workflow_id, version, ir_json, created_at, tenant_id)
-               VALUES (?, ?, ?, ?, ?)"#,
+        let inserted = sqlx::query(
+            // Never REPLACE: a version is immutable. A conflicting row is
+            // compared below instead of overwritten.
+            r#"INSERT INTO workflow_definitions (workflow_id, version, ir_json, created_at, tenant_id)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (tenant_id, workflow_id, version) DO NOTHING"#,
         )
         .bind(&def.workflow_id)
         .bind(&def.version)
@@ -506,8 +509,39 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
+        if inserted.rows_affected() == 1 {
+            return Ok(());
+        }
 
-        Ok(())
+        // The version exists. Same definition: an idempotent re-register.
+        // Anything else is a redefinition, refused.
+        let stored: Option<(String,)> = sqlx::query_as(
+            r#"SELECT ir_json FROM workflow_definitions
+               WHERE tenant_id = ? AND workflow_id = ? AND version = ?"#,
+        )
+        .bind(&self.tenant_id.0)
+        .bind(&def.workflow_id)
+        .bind(&def.version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        let Some((stored_json,)) = stored else {
+            // Lost to a concurrent delete between the two statements; there is
+            // no DELETE path today, so refuse rather than guess.
+            return Err(crate::backend::version_conflict(
+                &def.workflow_id,
+                &def.version,
+            ));
+        };
+        let stored_ir: serde_json::Value = serde_json::from_str(&stored_json)?;
+        if crate::backend::same_definition(&stored_ir, &def.ir) {
+            Ok(())
+        } else {
+            Err(crate::backend::version_conflict(
+                &def.workflow_id,
+                &def.version,
+            ))
+        }
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id, workflow_id = workflow_id))]

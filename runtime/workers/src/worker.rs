@@ -261,6 +261,7 @@ impl Worker {
                             item_id,
                             lease_fence,
                             &node_id,
+                            node_def,
                             kind,
                             &budget,
                         )
@@ -742,6 +743,7 @@ impl Worker {
         &self,
         execution_id: &ExecutionId,
         node_id: &str,
+        node_def: &NodeDef,
         item_id: WorkItemId,
         lease_fence: i64,
         tool_name: String,
@@ -752,6 +754,7 @@ impl Worker {
             self.backend.as_ref(),
             execution_id,
             node_id,
+            node_def,
             tool_name,
             approver,
             context,
@@ -941,12 +944,14 @@ impl Worker {
 
     // ── Autonomy check ────────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     async fn check_autonomy(
         &self,
         execution_id: &ExecutionId,
         item_id: WorkItemId,
         lease_fence: i64,
         node_id: &str,
+        node_def: &NodeDef,
         kind: &NodeKind,
         budget: &BudgetState,
     ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
@@ -996,6 +1001,7 @@ impl Worker {
                 self.hold_for_approval(
                     execution_id,
                     node_id,
+                    node_def,
                     item_id,
                     lease_fence,
                     tool_name,
@@ -4241,6 +4247,15 @@ mod tests {
         ir
     }
 
+    /// The definition hash the worker binds for `n1` in `gated_ir_json`.
+    fn n1_definition() -> String {
+        jamjet_state::approvals::definition_hash(&serde_json::to_value(gated_node_def()).unwrap())
+    }
+
+    fn gated_node_def() -> NodeDef {
+        serde_json::from_value(gated_ir_json()["nodes"]["n1"].clone()).unwrap()
+    }
+
     async fn gated_setup() -> (
         Arc<InMemoryBackend>,
         ExecutionId,
@@ -4439,9 +4454,14 @@ mod tests {
         // with an empty patch, so ONLY the step differs between the approved
         // occurrence and this one.
         let (backend, eid, worker, exec) = gated_setup().await;
-        let first = jamjet_state::approvals::derive_action_digest(backend.as_ref(), &eid, "n1")
-            .await
-            .unwrap();
+        let first = jamjet_state::approvals::derive_action_digest(
+            backend.as_ref(),
+            &eid,
+            "n1",
+            &n1_definition(),
+        )
+        .await
+        .unwrap();
         append(
             &backend,
             &eid,
@@ -4514,6 +4534,52 @@ mod tests {
         run_n1(&backend, &eid, &worker).await;
 
         assert_eq!(fired(&exec), 0);
+        assert_eq!(request_digests(&backend, &eid).await.len(), 2);
+    }
+
+    /// The approval was for the same run, occurrence, node id and state, but a
+    /// different node BODY (another tool under the same id, as a re-registered
+    /// IR would have had). It must not cover this node.
+    #[tokio::test]
+    async fn an_approval_for_a_different_node_definition_re_requests() {
+        let (backend, eid, worker, exec) = gated_setup().await;
+        run_n1(&backend, &eid, &worker).await;
+
+        let ctx = backend
+            .get_events(&eid)
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e.kind {
+                EventKind::ToolApprovalRequired { context, .. } => Some(context),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            ctx["action_definition"],
+            n1_definition(),
+            "the request names the body"
+        );
+
+        let mut other = serde_json::to_value(gated_node_def()).unwrap();
+        other["kind"]["tool_ref"] = serde_json::json!("payments.refund");
+        let other_digest = jamjet_state::approvals::derive_action_digest(
+            backend.as_ref(),
+            &eid,
+            "n1",
+            &jamjet_state::approvals::definition_hash(&other),
+        )
+        .await
+        .unwrap();
+        append(&backend, &eid, approval(Some(&other_digest))).await;
+
+        run_n1(&backend, &eid, &worker).await;
+
+        assert_eq!(
+            fired(&exec),
+            0,
+            "an approval of another body must not fire this one"
+        );
         assert_eq!(request_digests(&backend, &eid).await.len(), 2);
     }
 
