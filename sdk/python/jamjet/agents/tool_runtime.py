@@ -153,8 +153,9 @@ def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]
 
     if not name:
         raise ToolResolutionError("a tool call has no name")
-    ref = tools.get(name) if isinstance(tools, dict) else None
-    if ref is None:
+    has_entry = isinstance(tools, dict) and name in tools
+    ref = tools[name] if has_entry else None
+    if not has_entry:
         defn = get_tool(name)
         if defn is None:
             raise ToolResolutionError(f"tool {name!r} not found in the @tool registry")
@@ -163,6 +164,9 @@ def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]
     if not isinstance(ref, str) or ":" not in ref:
         raise ToolResolutionError(f"tools map entry for {name!r} is not a module:function reference")
     module_path, _, fn_path = ref.partition(":")
+    # Every part present: no relative or empty module, no empty segment.
+    if any(not part for part in module_path.split(".") + fn_path.split(".")):
+        raise ToolResolutionError(f"tools map entry for {name!r} is not a module:function reference: {ref!r}")
 
     # The common case, with no import: the tool registered under this name
     # is the one the entry names.
@@ -178,7 +182,7 @@ def _resolve_tool(name: str | None, tools: dict[str, str]) -> Callable[..., Any]
     snapshot = dict(_TOOL_REGISTRY)
     try:
         obj: Any = importlib.import_module(module_path)
-    except ImportError as exc:
+    except (ImportError, TypeError, ValueError) as exc:
         raise ToolResolutionError(f"tool {name!r}: tools map entry {ref!r} cannot be imported to verify it") from exc
     finally:
         for existing_name, existing in snapshot.items():

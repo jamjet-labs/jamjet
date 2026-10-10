@@ -327,3 +327,19 @@ async def test_a_look_alike_tool_marker_is_refused(bank, tmp_path):
     with pytest.raises(ToolResolutionError):
         await dispatch_tool_calls(_input("lookup", {"lookup": f"{bank}.fake:lure"}))
     assert _calls(bank) == []
+
+
+@pytest.mark.parametrize("entry", [".rel:x", ":x", "mod:", "a..b:x", "mod:a..b", "mod:.a", 7, None])
+async def test_every_malformed_entry_is_a_resolution_error(entry):
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input("lookup", {"lookup": entry}))
+
+
+async def test_a_null_entry_for_a_registered_tool_is_refused(bank):
+    """A present-but-null entry is malformed, as the engine treats it; it is not
+    read as "no entry" and resolved through the registry."""
+    __import__(f"{bank}.wires")
+    name = f"send_wire_{bank}"
+    with pytest.raises(ToolResolutionError):
+        await dispatch_tool_calls(_input(name, {name: None}))
+    assert _calls(bank) == []
