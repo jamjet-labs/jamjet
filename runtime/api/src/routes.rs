@@ -679,10 +679,10 @@ async fn approve_execution(
     // *after* the event is durably appended, never fails the request
     // (`enrich_and_append` warns-and-continues on a write error), and is off
     // the worker's fenced commit hot path — so it adds tamper-evident audit
-    // without touching the durability invariant. The per-tool-call / per-node
-    // worker events emitted through the fenced `commit_turn` path are not yet
-    // routed through the enricher (that needs the enricher threaded into the
-    // worker pool); tracked as F-t3-audit-emit.
+    // without touching the durability invariant. The request this decision
+    // answers was sealed when it was raised (`node_guard::record_request`).
+    // The per-node worker events emitted through the fenced `commit_turn` path
+    // are not yet routed through the enricher; tracked as F-t3-audit-emit.
     let ctx = jamjet_audit::RequestContext {
         actor_id,
         actor_type: jamjet_audit::ActorType::Human,
@@ -1373,7 +1373,7 @@ async fn claim_work_item(
     // can reach a worker down this route without passing through
     // `Worker::execute_item`. See `gate_claimed_item`.
     if matches!(
-        gate_claimed_item(backend.as_ref(), &wi).await,
+        gate_claimed_item(backend.as_ref(), &wi, state.enricher.as_ref()).await,
         ClaimGate::Withhold
     ) {
         return Ok(nothing_to_claim());
@@ -1464,7 +1464,11 @@ async fn compute_idempotency_key(
 /// That distinction is deliberately unobservable here — every refusal is the
 /// same `{"claimed": false}` — so acting on it would create exactly the signal
 /// the uniform response exists to deny the caller.
-async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkItem) -> ClaimGate {
+async fn gate_claimed_item(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+    sealer: &dyn jamjet_state::approvals::ApprovalSealer,
+) -> ClaimGate {
     // AUTHORITY. The coordinates that select the policy chain come from the
     // EXECUTION record, never from the payload.
     //
@@ -1651,6 +1655,9 @@ async fn gate_claimed_item(backend: &dyn jamjet_state::StateBackend, wi: &WorkIt
         workflow_policy.as_ref(),
         &node_def,
         &wi.payload,
+        // A request raised here is sealed into the audit chain, like one the
+        // in-process worker raises.
+        Some(sealer),
     )
     .await
     {
@@ -1783,6 +1790,8 @@ async fn completion_gate(
         workflow_policy.as_ref(),
         &node_def,
         &wi.payload,
+        // Complete mode never raises a request.
+        None,
     )
     .await
     {

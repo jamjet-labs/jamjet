@@ -19,6 +19,7 @@ use crate::dispatch_guard::{self, DispatchGuardOutcome};
 use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::workflow::{ApprovalDeadline, NodeDef, PolicySetIr};
 use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
+use jamjet_state::approvals::ApprovalSealer;
 use jamjet_state::approvals::{
     action_basis, answered_request, approval_covers, definition_hash, derive_action_digest,
     node_approval_status, stamp_deadline, NodeApprovalStatus, ACTION_BASIS_KEY,
@@ -83,6 +84,7 @@ pub async fn guard_item(
     workflow_policy: Option<&PolicySetIr>,
     node_def: &NodeDef,
     payload: &Value,
+    sealer: Option<&dyn ApprovalSealer>,
 ) -> GuardOutcome {
     let is_dispatch = dispatch_guard::is_agent_tool_dispatch(&node_def.kind);
     // The per-call guard for a dispatch node. `node_approved`: an approval of
@@ -101,6 +103,7 @@ pub async fn guard_item(
             node_def,
             &input,
             node_approved,
+            sealer,
         )
         .await
     };
@@ -205,6 +208,8 @@ pub async fn guard_item(
                         approver,
                         serde_json::json!({ "node_id": node_id }),
                         deadline,
+                        tenant_id,
+                        sealer,
                     )
                     .await
                 }
@@ -233,7 +238,8 @@ pub async fn guard_item(
 ///
 /// `deadline`: the request, if one is raised here, records when it expires
 /// and escalates (see `approvals::stamp_deadline`); `None` raises it with no
-/// deadline.
+/// deadline. A request raised here is sealed into the audit chain by
+/// `sealer`, for `tenant_id`.
 #[allow(clippy::too_many_arguments)]
 pub async fn require_approval(
     backend: &dyn StateBackend,
@@ -245,6 +251,8 @@ pub async fn require_approval(
     approver: String,
     context: Value,
     deadline: Option<ApprovalDeadline>,
+    tenant_id: &str,
+    sealer: Option<&dyn ApprovalSealer>,
 ) -> GuardOutcome {
     let gated = vec![tool_name.clone()];
     let events = match backend.get_events(execution_id).await {
@@ -331,33 +339,39 @@ pub async fn require_approval(
     // KNOWN LIMIT, unchanged: read-then-append with no compare-and-set, so two
     // concurrent claims for two items of one node can both append. Fail closed
     // either way: both return Held. See `dispatch_guard::guard_dispatch`.
-    let seq = match backend.latest_sequence(execution_id).await {
-        Ok(s) => s + 1,
-        Err(e) => {
-            return GuardOutcome::Unavailable {
-                reason: format!("approval required but could not be recorded: {e}"),
-            }
-        }
-    };
-    if let Err(e) = backend
-        .append_event(Event::new(
-            execution_id.clone(),
-            seq,
-            EventKind::ToolApprovalRequired {
-                node_id: node_id.to_string(),
-                tool_name,
-                approver,
-                context,
-            },
-        ))
-        .await
-    {
+    let request = Event::new(
+        execution_id.clone(),
+        0,
+        EventKind::ToolApprovalRequired {
+            node_id: node_id.to_string(),
+            tool_name,
+            approver,
+            context,
+        },
+    );
+    if let Err(reason) = record_request(backend, sealer, request, tenant_id).await {
         // An unrecorded request is an invisible hold: fail closed.
-        return GuardOutcome::Unavailable {
-            reason: format!("approval required but could not be recorded: {e}"),
-        };
+        return GuardOutcome::Unavailable { reason };
     }
     GuardOutcome::Held { gated }
+}
+
+/// Append an approval request and seal it into the audit chain: the one
+/// place a request is recorded, for both guards and both transports. The
+/// seal follows the durable append and cannot undo it; a failed append is
+/// `Err` and the caller fails closed.
+pub(crate) async fn record_request(
+    backend: &dyn StateBackend,
+    sealer: Option<&dyn ApprovalSealer>,
+    request: Event,
+    tenant_id: &str,
+) -> Result<(), String> {
+    let appended = backend
+        .append_event(request.clone())
+        .await
+        .map_err(|e| format!("approval required but could not be recorded: {e}"))?;
+    jamjet_state::approvals::seal_appended(sealer, request, appended, tenant_id).await;
+    Ok(())
 }
 
 /// The deadline a request raised under `sets` carries, or the refusal when

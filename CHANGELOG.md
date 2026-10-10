@@ -217,6 +217,15 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `timeouts.approval_timeout` field is removed and a non-null value is refused at
   registration, since nothing ever enforced it.
 
+- **Approval requests are sealed into the audit chain.** Only the decision was sealed;
+  the request a worker or the claim route raised was in the event log alone, so what
+  was asked could be rewritten unnoticed. Every `tool_approval_required`,
+  `approval_expired` and `approval_escalated` is now sealed into the signed,
+  hash-chained audit log with its action digest and deadline. Requests are recorded
+  through one helper shared by both guards and both transports; the in-process worker
+  pool and the scheduler take the server's `AuditEnricher` (`with_sealer`) through the
+  new `ApprovalSealer` trait.
+
 - **Clients can approve what they reviewed.** `jamjet approvals` prints each pending
   request's digest, what it covers and the exact approve command (`--show-basis` prints
   the bound payload). The command is printed alone on its line with every argument

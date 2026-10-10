@@ -132,7 +132,10 @@ Agents with `allowed_tools` constraints in their autonomy config cannot invoke t
 ## Audit Trail
 
 All of the following are permanently logged with identity, timestamp, and decision:
-- Human approval decisions
+- Human approval decisions, and the approval requests they answer (with the
+  action digest and deadline each request bound), their expiries and their
+  escalations. These are sealed into the signed, hash-chained audit log, so
+  editing what was asked breaks verification as editing the decision does.
 - Privileged tool invocations
 - Agent-to-agent delegations
 - Policy violations

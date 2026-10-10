@@ -43,6 +43,7 @@ pub struct WorkerPool {
     backend: Arc<dyn StateBackend>,
     groups: Vec<WorkerGroupConfig>,
     executors: Vec<(String, Arc<dyn NodeExecutor>)>,
+    sealer: Option<Arc<dyn jamjet_state::approvals::ApprovalSealer>>,
 }
 
 impl WorkerPool {
@@ -51,7 +52,14 @@ impl WorkerPool {
             backend,
             groups: Vec::new(),
             executors: Vec::new(),
+            sealer: None,
         }
+    }
+
+    /// Seal the approval requests every worker raises into the audit chain.
+    pub fn with_sealer(mut self, sealer: Arc<dyn jamjet_state::approvals::ApprovalSealer>) -> Self {
+        self.sealer = Some(sealer);
+        self
     }
 
     /// Add a worker group (workers with a specific queue affinity).
@@ -84,6 +92,9 @@ impl WorkerPool {
                 let backend = Arc::clone(&self.backend);
 
                 let mut worker = Worker::new(worker_id.clone(), backend, queue_types);
+                if let Some(sealer) = &self.sealer {
+                    worker = worker.with_sealer(Arc::clone(sealer));
+                }
                 for (kind, executor) in &executors {
                     worker = worker.register_executor(kind.clone(), Arc::clone(executor));
                 }

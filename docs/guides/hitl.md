@@ -279,6 +279,20 @@ Every human decision is recorded:
 - The `approved_digest` it authorised
 - Timestamp
 
+The request is recorded the same way. Every `tool_approval_required`, whichever
+component raised it (the HTTP claim route, the in-process worker, the agent
+tool dispatch guard), is sealed into the signed, hash-chained audit log next to
+the decision, with its context: the `action_digest`, what it covers and its
+deadline. So are `approval_expired` (actor `system:deadline`) and
+`approval_escalated`. Editing a sealed request, for example to point it at a
+different action, fails chain verification at that entry, exactly as editing a
+decision does.
+
+Sealing follows the durable write of the event and is best effort: a failed
+audit write is logged and does not undo the request. The scheduler does not
+know a run's tenant, so expiries and escalations are sealed under the
+`default` tenant.
+
 ```bash
 jamjet events exec_01abc --type approval_received
 ```

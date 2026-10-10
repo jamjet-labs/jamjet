@@ -50,6 +50,9 @@ pub struct Scheduler {
     /// replaying the whole log. The entry is dropped when the execution reaches
     /// a terminal state.
     progress: Mutex<HashMap<ExecutionId, ExecProgress>>,
+    /// Seals the expiries and escalations the deadline sweep records into the
+    /// audit chain.
+    sealer: Option<Arc<dyn jamjet_state::approvals::ApprovalSealer>>,
 }
 
 impl Scheduler {
@@ -59,7 +62,15 @@ impl Scheduler {
             config: SchedulerConfig::default(),
             ir_cache: Mutex::new(HashMap::new()),
             progress: Mutex::new(HashMap::new()),
+            sealer: None,
         }
+    }
+
+    /// Seal the expiries and escalations the deadline sweep records into the
+    /// signed audit chain (the server passes its `AuditEnricher`).
+    pub fn with_sealer(mut self, sealer: Arc<dyn jamjet_state::approvals::ApprovalSealer>) -> Self {
+        self.sealer = Some(sealer);
+        self
     }
 
     pub fn with_config(mut self, config: SchedulerConfig) -> Self {
@@ -172,9 +183,12 @@ impl Scheduler {
                     let condition = move |log: &[jamjet_state::Event]| {
                         still_pending(log, &node, request_sequence)
                     };
-                    if let ConditionalAppend::Appended(_) =
-                        self.backend.append_event_if(event, &condition).await?
+                    if let ConditionalAppend::Appended(seq) = self
+                        .backend
+                        .append_event_if(event.clone(), &condition)
+                        .await?
                     {
+                        self.seal(event, seq).await;
                         info!(execution_id = %execution_id, node_id = %node_id, %expires_at, "Approval request expired — rejected by system:deadline");
                         sweep.expired.push(node_id);
                     }
@@ -200,9 +214,12 @@ impl Scheduler {
                         still_pending(log, &node, request_sequence)
                             && not_escalated(log, &node, request_sequence)
                     };
-                    if let ConditionalAppend::Appended(_) =
-                        self.backend.append_event_if(event, &condition).await?
+                    if let ConditionalAppend::Appended(seq) = self
+                        .backend
+                        .append_event_if(event.clone(), &condition)
+                        .await?
                     {
+                        self.seal(event, seq).await;
                         info!(execution_id = %execution_id, node_id = %node_id, %escalate_at, "Approval request escalated");
                         sweep.escalated.push(node_id);
                     }
@@ -210,6 +227,20 @@ impl Scheduler {
             }
         }
         Ok(sweep)
+    }
+
+    /// Seal an expiry or escalation the sweep appended into the audit chain.
+    /// The scheduler runs on the unscoped backend and does not know a run's
+    /// tenant, so it seals under the default tenant (the same limit as every
+    /// other scheduler write).
+    async fn seal(&self, event: jamjet_state::Event, appended: jamjet_state::EventSequence) {
+        jamjet_state::approvals::seal_appended(
+            self.sealer.as_deref(),
+            event,
+            appended,
+            jamjet_state::DEFAULT_TENANT,
+        )
+        .await;
     }
 
     /// Reclaim expired work item leases and emit appropriate events.

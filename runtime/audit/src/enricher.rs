@@ -196,6 +196,17 @@ impl AuditEnricher {
     }
 }
 
+#[async_trait::async_trait]
+impl jamjet_state::approvals::ApprovalSealer for AuditEnricher {
+    /// Seal an engine-written approval record (request, expiry, escalation)
+    /// into the same chain as the decisions, as a system actor of the run's
+    /// tenant.
+    async fn seal_approval_record(&self, event: &Event, tenant_id: &str) {
+        let ctx = RequestContext::system_for_tenant("system", tenant_id);
+        self.enrich_and_append(event, Some(&ctx)).await;
+    }
+}
+
 /// Remove prompt data from the raw event JSON.
 fn strip_prompts(raw: &mut serde_json::Value) {
     if let Some(obj) = raw.as_object_mut() {
@@ -236,6 +247,8 @@ fn derive_actor_id(kind: &EventKind, default: &str) -> String {
             ..
         } => principal.clone(),
         EventKind::ApprovalReceived { user_id, .. } => user_id.clone(),
+        // An expiry is a rejection by its recorded principal, system:deadline.
+        EventKind::ApprovalExpired { principal, .. } => principal.clone(),
         EventKind::NodeStarted { worker_id, .. } => worker_id.clone(),
         _ => default.to_string(),
     }
@@ -250,6 +263,8 @@ fn derive_actor_type(kind: &EventKind, default: &ActorType) -> ActorType {
         | EventKind::NodeScheduled { .. } => ActorType::System,
         EventKind::PolicyViolation { .. }
         | EventKind::ToolApprovalRequired { .. }
+        | EventKind::ApprovalExpired { .. }
+        | EventKind::ApprovalEscalated { .. }
         | EventKind::AutonomyLimitReached { .. }
         | EventKind::CircuitBreakerTripped { .. }
         | EventKind::EscalationRequired { .. }

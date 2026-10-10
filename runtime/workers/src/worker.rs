@@ -36,6 +36,8 @@ pub struct Worker {
     queue_types: Vec<String>,
     poll_interval: Duration,
     executors: HashMap<String, Arc<dyn NodeExecutor>>,
+    /// Seals the approval requests this worker raises into the audit chain.
+    sealer: Option<Arc<dyn jamjet_state::approvals::ApprovalSealer>>,
 }
 
 /// Rebuild an [`ExecutionResult`] from a recorded `tool_effects` row.
@@ -85,7 +87,15 @@ impl Worker {
             queue_types,
             poll_interval: Duration::from_millis(500),
             executors: HashMap::new(),
+            sealer: None,
         }
+    }
+
+    /// Seal the approval requests this worker raises into the signed audit
+    /// chain (the server passes its `AuditEnricher`).
+    pub fn with_sealer(mut self, sealer: Arc<dyn jamjet_state::approvals::ApprovalSealer>) -> Self {
+        self.sealer = Some(sealer);
+        self
     }
 
     /// Attach an agent registry for autonomy enforcement.
@@ -121,8 +131,10 @@ impl Worker {
         }
     }
 
+    /// One iteration of [`run`](Self::run): claim one item and execute it.
+    /// `Ok(false)` when there was nothing to claim.
     #[instrument(skip(self), fields(worker_id = %self.worker_id))]
-    async fn poll_and_execute(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn poll_and_execute(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let queue_refs: Vec<&str> = self.queue_types.iter().map(|s| s.as_str()).collect();
         let item = self
             .backend
@@ -263,6 +275,7 @@ impl Worker {
                             lease_fence,
                             attempt,
                             &node_id,
+                            &tenant_id,
                             node_def,
                             &item.payload,
                             kind,
@@ -754,6 +767,7 @@ impl Worker {
         tool_name: String,
         approver: String,
         context: serde_json::Value,
+        tenant_id: &str,
     ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
         // An autonomy hold is not raised by a policy, so it has no deadline.
         let outcome = node_guard::require_approval(
@@ -766,6 +780,8 @@ impl Worker {
             approver,
             context,
             None,
+            tenant_id,
+            self.sealer.as_deref(),
         )
         .await;
         self.settle_outcome(
@@ -989,6 +1005,7 @@ impl Worker {
             ir.policy.as_ref(),
             node_def,
             payload,
+            self.sealer.as_deref(),
         )
         .await;
         self.settle_outcome(
@@ -1012,6 +1029,7 @@ impl Worker {
         lease_fence: i64,
         attempt: u32,
         node_id: &str,
+        tenant_id: &str,
         node_def: &NodeDef,
         payload: &serde_json::Value,
         kind: &NodeKind,
@@ -1071,6 +1089,7 @@ impl Worker {
                     tool_name,
                     "human".to_string(),
                     serde_json::json!({ "agent_ref": agent_ref }),
+                    tenant_id,
                 )
                 .await
             }

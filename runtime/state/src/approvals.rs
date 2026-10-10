@@ -434,6 +434,37 @@ pub fn pending_approvals(events: &[Event]) -> Vec<PendingApproval> {
     by_node.into_values().flatten().collect()
 }
 
+/// Seals an approval record (a request, an expiry, an escalation) that has
+/// been durably appended into the signed, hash-chained audit log, beside the
+/// decisions the approve routes seal. Implemented by `jamjet_audit`'s
+/// `AuditEnricher`; declared here so the worker and the scheduler, which
+/// append those records, need no dependency on the audit crate.
+///
+/// Sealing is after the durable append and best effort, like the decision
+/// path: a failed audit write is logged by the implementation and never
+/// undoes or blocks the record it describes.
+#[async_trait::async_trait]
+pub trait ApprovalSealer: Send + Sync {
+    /// Seal `event` (with its assigned sequence) for `tenant_id`.
+    async fn seal_approval_record(&self, event: &Event, tenant_id: &str);
+}
+
+/// Seal an approval record the engine has just appended: a request, an
+/// expiry or an escalation. Every place the engine appends one calls this,
+/// with the sequence the backend assigned, which the sealed entry carries.
+/// `None` seals nothing (a component built without an audit log).
+pub async fn seal_appended(
+    sealer: Option<&dyn ApprovalSealer>,
+    mut event: Event,
+    appended: EventSequence,
+    tenant_id: &str,
+) {
+    if let Some(sealer) = sealer {
+        event.sequence = appended;
+        sealer.seal_approval_record(&event, tenant_id).await;
+    }
+}
+
 /// Context key under which a request records when it expires: UTC, RFC 3339.
 pub const EXPIRES_AT_KEY: &str = "expires_at";
 

@@ -172,7 +172,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Spawn the scheduler as a background task — auto-chains nodes after completion.
-    let scheduler = jamjet_scheduler::Scheduler::new(state.backend.clone());
+    // The scheduler and the embedded workers seal the approval records they
+    // append (requests, expiries, escalations) into the same audit chain as
+    // the decisions the routes seal.
+    let scheduler =
+        jamjet_scheduler::Scheduler::new(state.backend.clone()).with_sealer(state.enricher.clone());
     tokio::spawn(async move { scheduler.run().await });
     info!("Scheduler started");
 
@@ -195,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("model seam coverage guard failed: {e}"))?,
         );
         let pool = jamjet_worker::default_pool(state.backend.clone())
+            .with_sealer(state.enricher.clone())
             .with_executor(
                 "model",
                 Arc::new(jamjet_worker::ModelNodeExecutor::new(

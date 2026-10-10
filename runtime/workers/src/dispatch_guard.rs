@@ -148,6 +148,9 @@ pub async fn guard_dispatch(
         node_def,
         payload_input,
         false,
+        // No audit log here: the transports go through `node_guard::guard_item`,
+        // which seals the requests it raises.
+        None,
     )
     .await
 }
@@ -169,6 +172,7 @@ pub(crate) async fn guard_dispatch_in(
     node_def: &NodeDef,
     payload_input: &Value,
     node_approved: bool,
+    sealer: Option<&dyn jamjet_state::approvals::ApprovalSealer>,
 ) -> DispatchGuardOutcome {
     let fire = mode == GuardMode::Fire;
     // Load tenant policy (sits between global and workflow in the chain).
@@ -502,31 +506,21 @@ pub(crate) async fn guard_dispatch_in(
                     };
                 }
             }
-            let seq = match backend.latest_sequence(execution_id).await {
-                Ok(s) => s + 1,
-                Err(e) => {
-                    return DispatchGuardOutcome::Unavailable {
-                        reason: format!("approval required but could not be recorded: {e}"),
-                    }
-                }
-            };
-            if let Err(e) = backend
-                .append_event(Event::new(
-                    execution_id.clone(),
-                    seq,
-                    EventKind::ToolApprovalRequired {
-                        node_id: node_id.to_string(),
-                        tool_name: gated.join(", "),
-                        approver,
-                        context,
-                    },
-                ))
-                .await
+            let request = Event::new(
+                execution_id.clone(),
+                0,
+                EventKind::ToolApprovalRequired {
+                    node_id: node_id.to_string(),
+                    tool_name: gated.join(", "),
+                    approver,
+                    context,
+                },
+            );
+            if let Err(reason) =
+                crate::node_guard::record_request(backend, sealer, request, tenant_id).await
             {
                 // Fail closed: an unrecorded request is an invisible hold.
-                return DispatchGuardOutcome::Unavailable {
-                    reason: format!("approval required but could not be recorded: {e}"),
-                };
+                return DispatchGuardOutcome::Unavailable { reason };
             }
             DispatchGuardOutcome::Held { gated }
         }
@@ -852,6 +846,7 @@ mod tests {
                 node_def,
                 input,
                 false,
+                None,
             )
             .await
         }
@@ -1333,6 +1328,59 @@ mod tests {
             "{}",
             requests[0].2
         );
+    }
+
+    /// Keeps what it is asked to seal.
+    #[derive(Default)]
+    struct CapturingSealer(std::sync::Mutex<Vec<(Event, String)>>);
+
+    #[async_trait::async_trait]
+    impl jamjet_state::approvals::ApprovalSealer for CapturingSealer {
+        async fn seal_approval_record(&self, event: &Event, tenant_id: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((event.clone(), tenant_id.to_string()));
+        }
+    }
+
+    /// A per-call dispatch request, raised through the shared guard, is
+    /// sealed with the sequence the log gave it.
+    #[tokio::test]
+    async fn a_dispatch_request_is_sealed_through_the_shared_guard() {
+        let f = Fixture::new();
+        let ir = ir(&[], &["send_wire"]);
+        let node_def = ir.node("n1").unwrap();
+        let sealer = CapturingSealer::default();
+        let outcome = crate::node_guard::guard_item(
+            f.backend.as_ref(),
+            GuardMode::Fire,
+            &f.execution_id,
+            "n1",
+            "acme",
+            ir.policy.as_ref(),
+            node_def,
+            &json!({ "input": input_for(&["send_wire"]) }),
+            Some(&sealer),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        let sealed = sealer.0.lock().unwrap().clone();
+        assert_eq!(sealed.len(), 1, "{sealed:?}");
+        let logged = f
+            .backend
+            .get_events(&f.execution_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. }))
+            .unwrap();
+        assert_eq!(sealed[0].0.id, logged.id);
+        assert_eq!(sealed[0].0.sequence, logged.sequence);
+        assert_eq!(sealed[0].1, "acme");
     }
 
     /// Re-entering an already-pending node must not stack up requests: an
