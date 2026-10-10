@@ -44,6 +44,38 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now asserts the *fix* — `h2 0.3.x` and `hyper 0.14` must stay out of the tree, so a
   future dependency bump cannot quietly bring the line back.
 
+### Fixed
+
+- **Runtime: an unmatched API request is a JSON 404, not the web UI.** The SPA
+  fallback answered every unmatched path, for every method, with `200 text/html`
+  (`index.html`). A client on a wrong path saw a success, failed to parse the body,
+  and the integrations above it logged a warning and carried on with no durability
+  and no audit. Any non-GET request, and any path under `/api/`, now gets
+  `404 {"error": "not found", "hint": "..."}`, with a hint naming the real routes.
+  A GET or HEAD page load still serves `index.html`, and no route was added.
+- **Web companion: fetch the runtime's real routes.** It requested `/api/executions`,
+  which the runtime has never served. It now uses the bare paths.
+- **Java SDK (`jamjet-sdk` 0.5.1): `JamjetClient` now drives the runtime.** Every call
+  went to `/api/v1/...`, which the runtime has never served, so only `health()`
+  worked. All calls now use the runtime's routes, and several request shapes were
+  wrong beyond the prefix:
+  - `createWorkflow` sends `{"ir": ...}` instead of the raw IR.
+  - `startExecution` posts `{workflow_id, workflow_version?, input}` to
+    `/executions`, not to `/workflows/{id}/execute`. A new overload takes the
+    workflow version.
+  - `sendExternalEvent` posts to `/executions/{id}/external-event`, not `/events`.
+  - `listWorkflows()` is deprecated and throws `UnsupportedOperationException`
+    without calling the runtime, which has no route for it.
+  - New `getApprovals(executionId)` reads `GET /executions/{id}/approvals`, and a new
+    `approve(executionId, decision, nodeId, actionDigest, comment)` overload sends the
+    reviewed action's digest.
+  - IDs are percent-encoded as path segments, and an HTML reply is reported as a
+    wrong base URL or path instead of a JSON parse failure.
+
+  `jamjet-cli` picks these up, so `jamjet run`, `jamjet executions` and
+  `jamjet agents` now work. A new CI job runs the client against a runtime built
+  from the same commit.
+
 ---
 
 ## 0.5.0 - 2026-08-22

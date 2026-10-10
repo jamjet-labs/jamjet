@@ -12,17 +12,19 @@ The JamJet Java SDK provides a type-safe, JDK 21+ native API for defining tools,
 <dependency>
     <groupId>dev.jamjet</groupId>
     <artifactId>jamjet-sdk</artifactId>
-    <version>0.1.0</version>
+    <version>0.5.1</version>
 </dependency>
 ```
 
 ### Gradle
 
 ```groovy
-implementation 'dev.jamjet:jamjet-sdk:0.1.0'
+implementation 'dev.jamjet:jamjet-sdk:0.5.1'
 ```
 
 **Requirements:** JDK 21+ (uses records, sealed interfaces, virtual threads).
+
+Use 0.5.1 or later with the runtime client. Earlier versions sent every runtime call to `/api/v1/...`, a prefix the runtime has never served.
 
 ---
 
@@ -30,6 +32,7 @@ implementation 'dev.jamjet:jamjet-sdk:0.1.0'
 
 ```java
 import dev.jamjet.workflow.Workflow;
+import dev.jamjet.workflow.Step;
 import dev.jamjet.agent.Agent;
 import dev.jamjet.tool.Tool;
 import dev.jamjet.tool.ToolCall;
@@ -67,10 +70,10 @@ record WebSearch(String query) implements ToolCall<String> {
 ### Registering tools
 
 ```java
-ToolRegistry.register(WebSearch.class);
+var registry = ToolRegistry.global().register(WebSearch.class);
 
-// Export as OpenAI function-calling format
-var functions = ToolRegistry.toOpenAiFunctions();
+// Export in OpenAI function-calling format
+var functions = registry.toOpenAiFormat();
 ```
 
 ---
@@ -100,12 +103,16 @@ var wf = Workflow.<ResearchState>builder("research")
 
 ### Conditional routing
 
+Configure a step with `Step.builder` to route on state. Conditions run in declaration order and the first match wins; `defaultNext` applies when none match.
+
 ```java
 var wf = Workflow.<ResearchState>builder("branching")
         .state(ResearchState.class)
-        .step("classify", s -> s, step -> step
-            .next(s -> s.result() != null, "summarize")
-            .next(s -> s.result() == null, "search"))
+        .step("classify", Step.builder("classify")
+                .handler((ResearchState s) -> s)
+                .when("summarize", (ResearchState s) -> s.result() != null)
+                .defaultNext("search")
+                .build())
         .step("search", s -> s)
         .step("summarize", s -> s)
         .build();
@@ -158,7 +165,7 @@ System.out.println(result.output());
 
 ```java
 var ir = agent.compile();
-// Submit to runtime via client
+// Register with the runtime (see "Runtime client" below)
 client.createWorkflow(ir.toMap());
 ```
 
@@ -166,24 +173,26 @@ client.createWorkflow(ir.toMap());
 
 ## Task interface (simplest API)
 
-For the simplest agent definition, use the `@Task` annotation on an interface:
+For the simplest agent definition, annotate an interface with `@Task`. The annotation goes on the interface and carries the agent's configuration (`model`, `tools`, `strategy`, `maxIterations`, `instructions`):
 
 ```java
 import dev.jamjet.agent.Task;
 import dev.jamjet.agent.JamjetAgent;
 
+@Task(instructions = "Research the given topic and return a summary", strategy = "react")
 interface Researcher {
-    @Task("Research the given topic and return a summary")
     String research(String topic);
 }
 
-// Execute via dynamic proxy
-var result = JamjetAgent.run(Researcher.class, "What is JamJet?");
+// Runs the agent and returns its text output
+String result = JamjetAgent.run(Researcher.class, "What is JamJet?");
 ```
 
 ---
 
 ## Runtime client
+
+`JamjetClient` calls the runtime's REST API at its bare routes (`/workflows`, `/executions`, `/agents`). Every method returns the runtime's JSON response as a `Map`. A non-2xx response throws `JamjetApiException` (or `JamjetAuthException` for 401/403) with the status code and body.
 
 ```java
 import dev.jamjet.JamjetClient;
@@ -191,22 +200,66 @@ import dev.jamjet.client.ClientConfig;
 
 var client = new JamjetClient(ClientConfig.builder()
         .baseUrl("http://localhost:7700")
-        .apiToken("your-token")
+        .apiToken("your-token")   // or set JAMJET_TOKEN; not needed in dev mode
         .build());
 
-// Submit workflow
-client.createWorkflow(ir.toMap());
+// Register a workflow definition: POST /workflows {"ir": ...}
+var ir = wf.compile();
+client.createWorkflow(ir.toMap());   // {"workflow_id": "research", "version": "0.1.0"}
 
-// Start execution
-var exec = client.startExecution("research", Map.of("question", "What is JamJet?"));
+// Start an execution: POST /executions
+var exec = client.startExecution(ir.id(), ir.version(), Map.of("question", "What is JamJet?"));
+var executionId = exec.get("execution_id").toString();
 
-// Check status
-var status = client.getExecution(exec.get("execution_id").toString());
+// Read its status and event log
+var status = client.getExecution(executionId).get("status");   // "running", "completed", ...
+var events = client.getEvents(executionId).get("events");
 
-// Human approval
-client.approve(executionId, Map.of("decision", "approved"));
+// List executions: {"executions": [...]}
+var recent = client.listExecutions("running", 20, 0);
 
-// List agents
+// Cancel
+client.cancelExecution(executionId);
+```
+
+The runtime has no route that lists workflow definitions, so `listWorkflows()` is deprecated and throws `UnsupportedOperationException` without calling the runtime.
+
+`startExecution(workflowId, input)` without a version runs version `1.0.0`. Pass the version you registered when it differs, as above.
+
+A compiled Java workflow registers and starts, but the runtime schedules each step as a work item for an external worker. Step lambdas only run in-process, through `wf.run(...)`.
+
+### Human approval
+
+An approval decides one exact action. Read the pending request first, show the reviewer what it covers, then send back its `node_id` and `context.action_digest` with the decision:
+
+```java
+// GET /executions/:id/approvals -> {"pending": [...], "decided": [...]}
+var approvals = client.getApprovals(executionId);
+
+@SuppressWarnings("unchecked")
+var pending = (List<Map<String, Object>>) approvals.get("pending");
+var request = pending.get(0);
+
+@SuppressWarnings("unchecked")
+var context = (Map<String, Object>) request.get("context");
+
+// ... the reviewer inspects `context` ...
+
+client.approve(executionId, "approved",
+        (String) request.get("node_id"),
+        (String) context.get("action_digest"),
+        "looks right");
+```
+
+Runtimes with approval integrity refuse an `approved` decision outside dev mode when the digest is missing (400) or no longer matches the pending action (409). Older runtimes ignore the field, so sending it is always safe. A rejection needs no digest.
+
+### External events and agents
+
+```java
+// Deliver an event to an execution waiting on a correlation key
+client.sendExternalEvent(executionId, "order-42", Map.of("status", "paid"));
+
+// Agents: {"agents": [...]}
 var agents = client.listAgents();
 ```
 
@@ -217,7 +270,7 @@ var agents = client.listAgents();
 The `IrValidator` mirrors the Rust runtime validator to catch errors before submission:
 
 ```java
-var ir = workflow.compile();
+var ir = wf.compile();
 var errors = IrValidator.validate(ir);
 
 if (!errors.isEmpty()) {
@@ -240,23 +293,27 @@ Checks performed:
 
 ## Eval harness
 
+Each line of the dataset is a JSON object. A row's `expected_contains` list is scored automatically:
+
+```json
+{"input": "What is JamJet?", "expected_contains": ["runtime"]}
+```
+
 ```java
 import dev.jamjet.eval.*;
 
-var dataset = EvalDataset.fromJsonl(Path.of("eval/cases.jsonl"));
+var dataset = EvalDataset.fromFile(Path.of("eval/cases.jsonl"));
 
-var runner = EvalRunner.builder()
-        .scorer(new Scorer.AssertionScorer("output", "expected"))
-        .scorer(new Scorer.LatencyScorer())
+var results = EvalRunner.builder()
+        .dataset(dataset)
+        .agent(agent)                       // or .runFn(input -> ...) for any code
+        .scorers(new Scorer.LatencyScorer(2_000_000, 10_000_000))   // target, max (µs)
         .parallelism(4)
-        .build();
+        .failBelow(0.8)                     // throws EvalFailureException below this mean
+        .build()
+        .run();
 
-var results = runner.run(dataset, row -> {
-    // Your agent/workflow execution
-    return agent.run(row.get("input").toString()).output();
-});
-
-results.forEach(r -> System.out.printf("%s: %.2f%n", r.id(), r.score()));
+results.forEach(r -> System.out.printf("%s: %.2f%n", r.input(), r.averageScore()));
 ```
 
 ---
@@ -269,7 +326,7 @@ The Java CLI (`jamjet-cli` module) provides command-line access:
 # Check runtime health
 jamjet health
 
-# Start a workflow execution
+# Start an execution of version 1.0.0 of a registered workflow
 jamjet run <workflow-id> [input.json]
 
 # Validate IR file (uses full IrValidator)
