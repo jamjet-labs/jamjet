@@ -228,7 +228,10 @@ pub async fn guard_item(
                 execution_id,
                 node_id,
                 agents_of_node,
-                step_tool_calls(node_def, payload),
+                match step_tool_calls(node_def, payload) {
+                    Ok(calls) => calls,
+                    Err(rule) => return GuardOutcome::Blocked { reason: rule },
+                },
             )
             .await
             {
@@ -517,9 +520,9 @@ async fn callee(
 /// The tool calls a node makes if it fires, for `max_tool_calls`: one for a
 /// node that uses a tool (or picks its target at run time), plus each call
 /// of an agent tool dispatch batch. The ADK dispatcher itself is not a tool
-/// use, only its calls are. An unreadable batch counts none here; the
-/// per-call guard refuses it before it can fire.
-fn step_tool_calls(node_def: &NodeDef, payload: &Value) -> u32 {
+/// use, only its calls are. An unreadable batch is an error (its audit rule),
+/// never zero calls: the limit must not depend on a later guard refusing it.
+fn step_tool_calls(node_def: &NodeDef, payload: &Value) -> Result<u32, String> {
     let is_dispatch = dispatch_guard::is_agent_tool_dispatch(&node_def.kind);
     let calls_only = match &node_def.kind {
         NodeKind::PythonFn {
@@ -535,13 +538,13 @@ fn step_tool_calls(node_def: &NodeDef, payload: &Value) -> u32 {
     let batch = if is_dispatch {
         jamjet_policy::dispatch::read_pending_tool_calls(&dispatch_guard::payload_input(payload))
             .map(|c| c.len())
-            .unwrap_or(0)
+            .map_err(dispatch_guard::unreadable_rule)?
     } else {
         0
     };
-    u32::try_from(batch)
+    Ok(u32::try_from(batch)
         .unwrap_or(u32::MAX)
-        .saturating_add(u32::from(own_call))
+        .saturating_add(u32::from(own_call)))
 }
 
 /// The agent card half of the decision. `Ok(None)`: every agent the node
@@ -1034,4 +1037,45 @@ pub(crate) fn basis_preview(payload: &Value, step: u64, node_def: &NodeDef) -> V
             "policy": node_def.policy,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn dispatch_node() -> NodeDef {
+        serde_json::from_value(json!({ "id": "n1", "kind": {
+            "type": "python_fn",
+            "module": "jamjet.agents.tool_runtime",
+            "function": "dispatch_tool_calls",
+            "output_schema": "",
+            "agent_tool_dispatch": true
+        }}))
+        .expect("dispatch node must deserialize")
+    }
+
+    #[test]
+    fn a_readable_batch_counts_each_call() {
+        let payload = json!({"input": {"tool_calls": [
+            {"id": "c1", "name": "lookup", "arguments": {}},
+            {"id": "c2", "name": "lookup", "arguments": {}}
+        ]}});
+        assert_eq!(step_tool_calls(&dispatch_node(), &payload), Ok(2));
+    }
+
+    #[test]
+    fn an_unreadable_batch_is_refused_not_counted_as_zero() {
+        for input in [
+            json!(null),
+            json!({"tool_calls": "send_wire"}),
+            json!({"tool_calls": [null]}),
+        ] {
+            let payload = json!({ "input": input });
+            assert!(
+                step_tool_calls(&dispatch_node(), &payload).is_err(),
+                "unreadable batch {payload} must not count as a number of calls"
+            );
+        }
+    }
 }
