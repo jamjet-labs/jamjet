@@ -181,7 +181,11 @@ def _int(entry: Mapping[str, Any], key: str) -> int:
     # Numbers arrive as _Number (their JSON text); an integer has digits only.
     if not isinstance(value, _Number) or not re.fullmatch(r"-?[0-9]+", value):
         raise ValueError(f"{key} is not a JSON integer")
-    return int(value)
+    number = int(value)
+    # Rust reads these as i64; a value outside it is not an entry Rust wrote.
+    if not -(2**63) <= number < 2**63:
+        raise ValueError(f"{key} is outside the i64 range")
+    return number
 
 
 def _text(entry: Mapping[str, Any], key: str, *, optional: bool = True) -> str:
@@ -287,6 +291,10 @@ def verify_entries(entries: Sequence[Mapping[str, Any]], public_key: bytes, *, l
         signature = entry.get("signature")
         if not signature:
             raise ChainError(index, "unsigned")
+        for key in ("entry_hash", "signature", "prev_hash"):
+            value = entry.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ChainError(index, "malformed", f"{key} is not a string")
         if linked and index > 0 and entry.get("prev_hash") != prev:
             raise ChainError(index, "broken_link")
         try:

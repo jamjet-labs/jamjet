@@ -19,6 +19,7 @@ pytest.importorskip("cryptography")
 
 from jamjet.runtime_audit import (  # noqa: E402
     ChainError,
+    _Number,
     chain_order,
     key_id,
     load_entries,
@@ -268,3 +269,25 @@ def test_signature_hex_must_be_canonical(mangle):
     with pytest.raises(ChainError) as e:
         verify_entries(bad, pk)
     assert e.value.reason == "bad_signature"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sequence", _Number("99999999999999999999")),
+        ("sequence", _Number("-9223372036854775809")),
+        ("prev_hash", ["not", "a", "string"]),
+        ("signature", {"not": "a string"}),
+        ("signature", 7),
+        ("entry_hash", ["not a string"]),
+    ],
+)
+def test_an_untyped_or_out_of_range_field_is_malformed_not_a_crash(field, value):
+    """The export is untrusted input: every bad entry is a ChainError, never a
+    raw exception a caller catching ChainError would not expect."""
+    entries, pk, _ = _vector()
+    bad = copy.deepcopy(entries)
+    bad[0][field] = value
+    with pytest.raises(ChainError) as e:
+        verify_entries(bad, pk)
+    assert e.value.reason == "malformed"
