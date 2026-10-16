@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 import typer
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from jamjet.cli.demo import demo_app
 from jamjet.client import JamjetClient
@@ -728,6 +729,80 @@ def _load_workflow_ir(path: str) -> dict[str, Any]:
     raise ValueError("Unsupported workflow file type. Use .yaml, .yml, or .py")
 
 
+_TIMELINE_EVENT_STYLES: dict[str, tuple[str, str, str]] = {
+    "node_completed": ("✓", "completed", "green"),
+    "node_failed": ("✗", "failed", "red"),
+    "node_cancelled": ("⊘", "cancelled", "yellow"),
+    "node_skipped": ("→", "skipped", "dim"),
+}
+_TIMELINE_BAR_WIDTH = 12
+
+
+def _timeline_duration(kind: Mapping[str, Any]) -> int | None:
+    """Return a recorded non-negative integer duration, if one is present."""
+    value = kind.get("duration_ms")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _print_execution_timeline(events: list[dict[str, Any]]) -> None:
+    """Render recorded terminal step events for a followed text-mode run."""
+    rows: list[tuple[str, str, str, str, int | None]] = []
+    for event in events:
+        kind = event.get("kind")
+        if not isinstance(kind, Mapping):
+            continue
+        event_type = kind.get("type")
+        if not isinstance(event_type, str):
+            continue
+        style_data = _TIMELINE_EVENT_STYLES.get(event_type)
+        if style_data is None:
+            continue
+        symbol, label, style = style_data
+        node_value = kind.get("node_id", "?")
+        node_id = node_value if isinstance(node_value, str) else str(node_value)
+        rows.append((symbol, label, style, node_id, _timeline_duration(kind)))
+
+    if not rows:
+        console.print("[yellow]Execution timeline unavailable: no terminal step events were recorded.[/yellow]")
+        return
+
+    known_durations = [duration for *_, duration in rows if duration is not None]
+    longest_duration = max(known_durations, default=0)
+    console.print("[bold]Execution timeline[/bold]")
+
+    for symbol, label, style, node_id, duration in rows:
+        line = Text("  ")
+        line.append(f"{symbol} {label}", style=style)
+        line.append("  ")
+        # Append node IDs as Text so recorded markup-like IDs stay literal.
+        line.append(node_id, style="bold")
+        line.append("  ")
+        if duration is None:
+            line.append("n/a", style="dim")
+            filled = 0
+        else:
+            line.append(f"{duration:,} ms")
+            filled = 0 if longest_duration == 0 else round(duration / longest_duration * _TIMELINE_BAR_WIDTH)
+            if duration > 0:
+                filled = max(1, filled)
+        line.append("  ")
+        line.append("█" * filled + "░" * (_TIMELINE_BAR_WIDTH - filled), style="cyan")
+        console.print(line)
+
+    if not known_durations:
+        console.print("  Recorded step time: unavailable (all step timings unknown)")
+    else:
+        recorded_total = sum(known_durations)
+        unknown_count = len(rows) - len(known_durations)
+        if unknown_count:
+            timing_word = "step timing" if unknown_count == 1 else "step timings"
+            console.print(f"  Recorded step time: {recorded_total:,} ms ({unknown_count} {timing_word} unknown)")
+        else:
+            console.print(f"  Recorded step time: {recorded_total:,} ms")
+
+
 @app.command()
 def run(
     workflow: str = typer.Argument(..., help="Workflow id or path to workflow.yaml"),
@@ -877,6 +952,25 @@ def run(
                 console.print("[yellow]Execution halted: strategy limit exceeded.[/yellow]")
             else:
                 console.print(f"[red]Execution ended:[/red] {final_status}")
+
+            try:
+                events_data = await c.get_events(exec_id)
+            except Exception:
+                console.print("[yellow]Execution timeline unavailable: could not fetch recorded step events.[/yellow]")
+            else:
+                if not isinstance(events_data, Mapping):
+                    console.print(
+                        "[yellow]Execution timeline unavailable: recorded step events had an invalid shape.[/yellow]"
+                    )
+                else:
+                    events = events_data.get("events")
+                    if not isinstance(events, list) or any(not isinstance(event, dict) for event in events):
+                        console.print(
+                            "[yellow]Execution timeline unavailable: recorded step events had an "
+                            "invalid shape.[/yellow]"
+                        )
+                    else:
+                        _print_execution_timeline(events)
 
     async def _stream_execution(c: JamjetClient, exec_id: str) -> None:
         """

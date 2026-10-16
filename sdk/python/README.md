@@ -144,6 +144,11 @@ jamjet validate workflow.yaml
 jamjet run workflow.yaml --input '{"question": "What is JamJet?"}'
 ```
 
+When `jamjet run` follows a text-mode execution, it also prints the recorded
+terminal step results with known durations, proportional bars, and a clearly
+labelled recorded step-time total. Missing step timings are shown as unknown;
+JSON output keeps its existing event payload unchanged.
+
 ### Connecting to an MCP Server
 
 ```yaml
