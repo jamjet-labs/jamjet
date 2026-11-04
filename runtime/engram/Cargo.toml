@@ -27,7 +27,10 @@ reqwest = { workspace = true }
 # `tokio::process` + async I/O are needed by CommandLlmClient.
 tokio = { version = "1", features = ["process", "io-util", "time", "macros"] }
 regex = "1"
-ort = { version = "2.0.0-rc.12", optional = true }
+# Exact pin: ort pre-releases break API between rcs (rc.15 changed
+# Session::builder to take an Environment), and with no committed
+# Cargo.lock a caret range picks up the newest rc on every CI run.
+ort = { version = "=2.0.0-rc.13", optional = true }
 
 [features]
 default = []
