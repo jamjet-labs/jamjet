@@ -47,7 +47,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres",
 # HTTP / gRPC
 axum = { version = "0.7", features = ["json", "macros"] }
 hyper = { version = "1", features = ["full"] }
-tower = "0.4"
+tower = "0.5"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 
 # HTTP client
@@ -62,7 +62,7 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.33"
 
 # Error handling
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 
 # Async traits
@@ -74,7 +74,7 @@ chrono = { version = "0.4", features = ["serde"] }
 ulid = "1"
 
 # Config
-config = "0.14"
+config = "0.15"
 dotenvy = "0.15"
 
 # Validation
