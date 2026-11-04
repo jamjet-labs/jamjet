@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 from pydantic import BaseModel
 
@@ -69,6 +69,32 @@ class Workflow:
         self._state_class = cls
         return cls
 
+    @overload
+    def step(
+        self,
+        func: F,
+        *,
+        name: str | None = None,
+        next: dict[str, Callable[..., bool]] | None = None,
+        human_approval: bool = False,
+        timeout: str | None = None,
+        retry_policy: str | None = None,
+        model: str | None = None,
+    ) -> F: ...
+
+    @overload
+    def step(
+        self,
+        func: None = None,
+        *,
+        name: str | None = None,
+        next: dict[str, Callable[..., bool]] | None = None,
+        human_approval: bool = False,
+        timeout: str | None = None,
+        retry_policy: str | None = None,
+        model: str | None = None,
+    ) -> Callable[[F], F]: ...
+
     def step(
         self,
         func: F | None = None,
@@ -79,7 +105,7 @@ class Workflow:
         timeout: str | None = None,
         retry_policy: str | None = None,
         model: str | None = None,
-    ) -> Any:
+    ) -> F | Callable[[F], F]:
         """
         Register a function as a workflow step (node).
 
