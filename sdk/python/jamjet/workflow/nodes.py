@@ -86,7 +86,20 @@ class EvalNode:
 
 @dataclass
 class CoordinatorNode:
-    """Dynamic agent routing with structured scoring + LLM tiebreaker."""
+    """Configure dynamic agent selection for a workflow graph.
+
+    Attributes:
+        task: Task description supplied to the routing strategy.
+        required_skills: Skills that candidate agents must provide.
+        output_key: Output key for the selected agent's URI. Defaults to "result".
+        preferred_skills: Skills a routing strategy may use as preferences.
+        trust_domain: Optional trust domain used to filter candidates.
+        budget: Optional budget configuration forwarded to the runtime.
+        tiebreaker: Optional model and threshold configuration for close scores.
+        strategy: Registered strategy name. Defaults to "default".
+        weights: Scoring dimension weights, or None for the strategy defaults.
+        input_mapping: Workflow input mapping forwarded to the runtime.
+    """
 
     task: str = ""
     required_skills: list[str] = field(default_factory=list)
@@ -100,6 +113,12 @@ class CoordinatorNode:
     input_mapping: dict | None = None
 
     def to_ir_kind(self) -> dict[str, Any]:
+        """Serialize the coordinator configuration as an IR node kind.
+
+        Returns:
+            A dictionary with empty mappings for unset weights and input mapping.
+            Trust domain, budget, and tiebreaker are included only when truthy.
+        """
         ir = {
             "type": "coordinator",
             "task": self.task,
@@ -121,7 +140,16 @@ class CoordinatorNode:
 
 @dataclass
 class AgentToolNode:
-    """Invoke a registered agent as a callable tool."""
+    """Configure an agent invocation for a workflow graph.
+
+    Attributes:
+        agent: Explicit agent URI, or "auto" for coordinator routing.
+        output_key: Output key for the agent's result. Defaults to "result".
+        mode: Invocation mode, such as "sync", "streaming", or "conversational".
+        input_mapping: Workflow input mapping forwarded to the runtime.
+        timeout_ms: Optional request timeout in milliseconds.
+        budget: Optional budget configuration forwarded to the runtime.
+    """
 
     agent: str = ""
     output_key: str = "result"
@@ -131,6 +159,13 @@ class AgentToolNode:
     budget: dict | None = None
 
     def to_ir_kind(self) -> dict[str, Any]:
+        """Serialize the agent invocation as an IR node kind.
+
+        Returns:
+            A dictionary encoding the target as automatic or explicit. Unset
+            input mapping becomes an empty dictionary; timeout and budget are
+            included only when truthy. The mode is forwarded without validation.
+        """
         agent_target: dict[str, Any] = {"auto": True} if self.agent == "auto" else {"explicit": self.agent}
         ir: dict[str, Any] = {
             "type": "agent_tool",

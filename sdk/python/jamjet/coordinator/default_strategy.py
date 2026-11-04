@@ -1,3 +1,5 @@
+"""Registry filtering and heuristic scoring with an optional LLM tiebreaker."""
+
 from __future__ import annotations
 
 import json
@@ -18,9 +20,15 @@ logger = logging.getLogger(__name__)
 
 
 class DefaultCoordinatorStrategy(CoordinatorStrategy):
-    """Built-in coordinator strategy: structured scoring with optional LLM tiebreaker."""
+    """Route using advertised agent metadata and optional model-based selection."""
 
     def __init__(self, registry: Any = None) -> None:
+        """Initialize the strategy with an optional agent registry.
+
+        Args:
+            registry: Object exposing an async list_agents() method that returns
+                agent mappings. Discovery returns no candidates when omitted.
+        """
         self._registry = registry
 
     async def discover(
@@ -31,6 +39,19 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
         trust_domain: str | None,
         context: dict[str, Any],
     ) -> tuple[list[AgentCandidate], list[dict[str, str]]]:
+        """Filter registry agents by required skills and trust domain.
+
+        Args:
+            task: Task description; unused by this implementation.
+            required_skills: Skills every returned agent must advertise.
+            preferred_skills: Optional skills; unused by this implementation.
+            trust_domain: Domain agents must match when this value is nonempty.
+            context: Additional inputs; unused by this implementation.
+
+        Returns:
+            Eligible candidates and excluded agents with URI and reason mappings.
+            Both lists are empty when no registry is configured.
+        """
         if self._registry is None:
             return [], []
 
@@ -80,6 +101,21 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
         weights: dict[str, float],
         context: dict[str, Any],
     ) -> tuple[list[ScoringResult], float]:
+        """Rank candidates using skill counts and advertised metadata.
+
+        Args:
+            task: Task description passed to the capability scoring hook. The
+                default hook does not inspect its text.
+            candidates: Agents to score.
+            weights: Dimension weights passed to DimensionScores.composite().
+                An empty mapping selects equal weights.
+            context: May contain preferred_reasoning_modes, a list of mode names
+                used to add a capability bonus for matching candidates.
+
+        Returns:
+            Rankings sorted by descending composite score and the difference
+            between the first two scores, or 1.0 with fewer than two candidates.
+        """
         results = []
         for c in candidates:
             reasoning_bonus = self._score_reasoning_modes(c, context)
@@ -111,6 +147,21 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
         tiebreaker_model: str,
         context: dict[str, Any],
     ) -> Decision:
+        """Select the top candidate, using a model when the top scores are close.
+
+        Args:
+            task: Task description supplied to the tiebreaker prompt.
+            top_candidates: Candidates in descending composite-score order.
+            threshold: Maximum difference between the top two scores that
+                enables a tiebreaker when a model is configured.
+            tiebreaker_model: Model identifier, or an empty string to disable it.
+            context: May contain agent_card_summaries, a mapping from agent URI
+                to a description included in the tiebreaker prompt.
+
+        Returns:
+            A decision with no selection for an empty list, the top-ranked agent
+            for structured selection, or the tiebreaker's result.
+        """
         if not top_candidates:
             return Decision(selected_uri=None, method="no_candidates", confidence=0.0)
 
@@ -137,7 +188,20 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
         context: dict[str, Any],
         max_candidates: int = 3,
     ) -> Decision:
-        """Call an LLM to break a tie between closely-scored candidates."""
+        """Ask a model to select among the leading candidates.
+
+        Args:
+            task: Task description included in the prompt.
+            candidates: Nonempty rankings in descending composite-score order.
+            model: Model identifier passed to call_llm().
+            context: Optional agent_card_summaries keyed by agent URI.
+            max_candidates: Maximum number of leading candidates shown.
+
+        Returns:
+            A model-backed decision with token counts. An invalid selected URI
+            falls back to the first candidate. A failed call or response parsing
+            returns a tiebreaker_failed decision selecting that same candidate.
+        """
         tied = candidates[:max_candidates]
 
         # Build prompt with Agent Card summaries
@@ -207,19 +271,23 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
             )
 
     def _score_capability(self, task: str, candidate: AgentCandidate) -> float:
+        """Return 0.3 without skills, otherwise skill count / 5 capped at 1.0."""
         if not candidate.skills:
             return 0.3
         return min(len(candidate.skills) / 5.0, 1.0)
 
     def _score_cost(self, candidate: AgentCandidate) -> float:
+        """Map low, medium, and high cost to scores; unknown cost scores 0.5."""
         mapping = {"low": 1.0, "medium": 0.7, "high": 0.4}
         return mapping.get(candidate.cost_class or "", 0.5)
 
     def _score_latency(self, candidate: AgentCandidate) -> float:
+        """Map low, medium, and high latency to scores; unknown latency scores 0.5."""
         mapping = {"low": 1.0, "medium": 0.7, "high": 0.4}
         return mapping.get(candidate.latency_class or "", 0.5)
 
     def _score_reasoning_modes(self, candidate: AgentCandidate, context: dict[str, Any]) -> float:
+        """Add up to 0.2 for overlap with context's preferred_reasoning_modes."""
         preferred = context.get("preferred_reasoning_modes", [])
         if not preferred or not candidate.reasoning_modes:
             return 0.0
