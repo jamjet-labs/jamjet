@@ -74,7 +74,7 @@ chrono = { version = "0.4", features = ["serde"] }
 ulid = "1"
 
 # Config
-config = "0.14"
+config = "0.15"
 dotenvy = "0.15"
 
 # Validation
