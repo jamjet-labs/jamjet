@@ -75,6 +75,21 @@ class TestDimensionScores:
         )
         assert result == 0.0
 
+    @pytest.mark.parametrize("weights", [{"cost_fit": 2.0}, {"unknown": 10.0}, {"cost_fit": 2.0, "unknown": 10.0}])
+    def test_composite_normalizes_only_known_dimensions(self, weights):
+        scores = DimensionScores(
+            capability_fit=1.0,
+            cost_fit=1.0,
+            latency_fit=1.0,
+            trust_compatibility=1.0,
+            historical_performance=1.0,
+        )
+        assert scores.composite(weights) == pytest.approx(1.0)
+
+    def test_composite_partial_weights_keep_default_multipliers(self):
+        scores = DimensionScores(capability_fit=1.0, cost_fit=0.0)
+        assert scores.composite({"cost_fit": 2.0}) == pytest.approx(2.5 / 6.0)
+
 
 class TestDefaultStrategy:
     @pytest.mark.asyncio

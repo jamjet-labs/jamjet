@@ -54,34 +54,26 @@ class DimensionScores:
         Args:
             weights: Weights keyed by dimension name. Missing dimensions use a
                 multiplier of 1.0. None or an empty mapping uses equal weights.
+                Unknown dimension names are ignored.
 
         Returns:
-            Weighted score sum divided by the sum of supplied weights, or 0.0
-            when that sum is zero.
+            Weighted score sum divided by the sum of effective dimension
+            weights, or 0.0 when that sum is zero.
         """
-        w = weights or {
-            "capability_fit": 1.0,
-            "cost_fit": 1.0,
-            "latency_fit": 1.0,
-            "trust_compatibility": 1.0,
-            "historical_performance": 1.0,
+        w = {
+            dim: (weights or {}).get(dim, 1.0)
+            for dim in (
+                "capability_fit",
+                "cost_fit",
+                "latency_fit",
+                "trust_compatibility",
+                "historical_performance",
+            )
         }
         total_weight = sum(w.values())
         if total_weight == 0:
             return 0.0
-        return (
-            sum(
-                getattr(self, dim) * w.get(dim, 1.0)
-                for dim in [
-                    "capability_fit",
-                    "cost_fit",
-                    "latency_fit",
-                    "trust_compatibility",
-                    "historical_performance",
-                ]
-            )
-            / total_weight
-        )
+        return sum(getattr(self, dim) * weight for dim, weight in w.items()) / total_weight
 
 
 @dataclass
