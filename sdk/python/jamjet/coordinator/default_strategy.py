@@ -89,6 +89,7 @@ class DefaultCoordinatorStrategy(CoordinatorStrategy):
                     latency_class=agent.get("latency_class"),
                     cost_class=agent.get("cost_class"),
                     trust_domain=agent.get("trust_domain"),
+                    reasoning_modes=agent.get("reasoning_modes", []),
                 )
             )
 

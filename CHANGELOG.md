@@ -415,6 +415,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Preserve registry agents' reasoning modes during coordinator discovery so
+  matching `preferred_reasoning_modes` contributes to capability scores.
+
 - **Runtime: an unmatched API request is a JSON 404, not the web UI.** The SPA
   fallback answered every unmatched path, for every method, with `200 text/html`
   (`index.html`). A client on a wrong path saw a success, failed to parse the body,
