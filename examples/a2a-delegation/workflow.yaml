@@ -1,18 +1,21 @@
 # examples/a2a-delegation/workflow.yaml
 #
-# A2A Delegation — delegate a sub-task to a remote A2A agent and incorporate
-# its result back into the parent workflow.
+# A2A Delegation: delegate a sub-task to a remote A2A agent and bring its
+# result back into the parent workflow.
 #
-# This example shows how a coordinator workflow can:
-#   1. Prepare a task specification
-#   2. Delegate to a specialist A2A agent (discovered at runtime)
-#   3. Stream progress from the remote agent
-#   4. Merge the remote result into local workflow state
+# The workflow:
+#   1. Prepares a task brief with a model
+#   2. Delegates the research to a specialist A2A agent
+#   3. Streams progress from the remote agent
+#   4. Formats the remote result into a report
 #
 # Prerequisites:
-#   export RESEARCH_AGENT_URL="https://research-agent.example.com"
-#     (or spin up the a2a-server example locally)
+#   A research agent that speaks A2A at the URL under a2a.remote_agents below
+#   (change it to yours, or run the a2a-server template locally).
 #   export ANTHROPIC_API_KEY="sk-ant-..."
+#
+# Check the definition (no runtime needed):
+#   jamjet validate workflow.yaml
 #
 # Run:
 #   jamjet dev
@@ -23,82 +26,59 @@
 workflow:
   id: a2a_delegation
   version: 0.1.0
-  description: "Coordinator delegates research to a specialist A2A agent, then formats the result"
-
-  start_node: prepare_brief
+  description: "A coordinator delegates research to a specialist A2A agent, then formats the result"
+  start: prepare_brief
 
   state_schema:
     type: object
     properties:
-      topic:          { type: string }
-      depth:          { type: string, enum: [brief, detailed], default: brief }
-      research_brief: { type: string }
-      research_result: { type: string }
-      final_report:   { type: string }
+      topic: { type: string }
+      depth: { type: string, enum: [brief, detailed], default: brief }
     required: [topic]
 
-  nodes:
-    # Step 1: Coordinator prepares a structured brief for the specialist.
-    - id: prepare_brief
-      kind: model
-      label: "Prepare research brief for specialist agent"
-      config:
-        model: claude-haiku-4-5-20251001
-        system: |
-          You produce structured research briefs. Given a topic and depth level,
-          produce a clear brief that a specialist research agent can act on.
-          Include: objectives, key questions to answer, desired output format.
-        prompt_template: |
-          Topic: {{ topic }}
-          Depth: {{ depth }}
-        output_to_state:
-          result: research_brief
-      edges:
-        - to: discover_agent
+a2a:
+  remote_agents:
+    research_agent:
+      url: "http://localhost:8080"
 
-    # Step 2: Discover the research agent via its Agent Card (A2A discovery).
-    - id: discover_agent
-      kind: agent_discovery
-      label: "Discover research agent capabilities"
-      config:
-        agent_url: "${RESEARCH_AGENT_URL}"
-        # Discovered capabilities are stored in state as 'discovered_agent'
-      edges:
-        - to: delegate_research
+nodes:
+  # Step 1: the coordinator prepares a structured brief for the specialist.
+  prepare_brief:
+    type: model
+    description: Prepare a research brief for the specialist agent
+    model: claude-haiku-4-5-20251001
+    system_prompt: |
+      You produce structured research briefs. Given a topic and depth level,
+      produce a clear brief that a specialist research agent can act on.
+      Include: objectives, key questions to answer, desired output format.
+    prompt: |
+      Topic: {{ state.topic }}
+      Depth: {{ state.depth }}
+    next: delegate_research
 
-    # Step 3: Delegate the research task to the A2A agent.
-    - id: delegate_research
-      kind: a2a_task
-      label: "Delegate research to specialist A2A agent"
-      config:
-        agent_url: "${RESEARCH_AGENT_URL}"
-        skill: conduct_research
-        input:
-          brief: "{{ research_brief }}"
-          depth: "{{ depth }}"
-        # JamJet polls task status and streams progress events automatically.
-        stream: true
-        timeout_seconds: 300
-        output_to_state:
-          result: research_result
-      edges:
-        - to: format_report
+  # Step 2: delegate the research task to the A2A agent and stream its progress.
+  delegate_research:
+    type: a2a_task
+    description: Delegate research to the specialist A2A agent
+    remote_agent: research_agent
+    skill: conduct_research
+    input:
+      topic: "{{ state.topic }}"
+      depth: "{{ state.depth }}"
+    stream: true
+    timeout: 300s
+    next: format_report
 
-    # Step 4: Coordinator formats the specialist's result into a final report.
-    - id: format_report
-      kind: model
-      label: "Format research result into final report"
-      config:
-        model: claude-sonnet-4-6
-        system: |
-          You are a technical writer. Format the raw research result into a
-          clean, well-structured report suitable for a business audience.
-          Include: executive summary, key findings, recommendations.
-        prompt_template: |
-          Topic: {{ topic }}
-          Raw research:
-          {{ research_result }}
-        output_to_state:
-          result: final_report
-      edges:
-        - to: end
+  # Step 3: the coordinator formats the specialist's result into a report.
+  format_report:
+    type: model
+    description: Format the research result into a final report
+    model: claude-sonnet-4-6
+    system_prompt: |
+      You are a technical writer. Format the raw research result into a
+      clean, well-structured report suitable for a business audience.
+      Include: executive summary, key findings, recommendations.
+    prompt: |
+      Topic: {{ state.topic }}
+      Format the research result into the final report.
+    next: end
