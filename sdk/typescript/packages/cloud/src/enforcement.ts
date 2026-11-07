@@ -43,24 +43,24 @@ function estimatePromptTokens(args0: unknown): number {
 }
 
 function getToolCalls(vendor: Vendor, response: unknown): Array<{ id?: string; name: string }> {
-  const res = response as Record<string, unknown>
+  const res = (response ?? {}) as Record<string, unknown>
   if (vendor === 'openai') {
+    // Every choice: with n > 1 a blocked call in any of them must be caught.
     const choices = Array.isArray(res['choices']) ? res['choices'] : []
-    const first = choices[0] as Record<string, unknown> | undefined
-    const message = (first?.['message'] ?? {}) as Record<string, unknown>
-    const tcs = Array.isArray(message['tool_calls']) ? message['tool_calls'] : []
-    return (tcs as Array<Record<string, unknown>>).map((tc) => {
-      const fn = (tc['function'] ?? {}) as Record<string, unknown>
-      const name = typeof fn['name'] === 'string' ? fn['name'] : ''
-      const entry: { id?: string; name: string } = { name }
-      if (typeof tc['id'] === 'string') entry.id = tc['id']
-      return entry
+    return (choices as Array<Record<string, unknown>>).flatMap((choice) => {
+      const message = (choice?.['message'] ?? {}) as Record<string, unknown>
+      const tcs = Array.isArray(message['tool_calls']) ? message['tool_calls'] : []
+      return (tcs as Array<Record<string, unknown>>).map((tc) => {
+        const entry: { id?: string; name: string } = { name: toolNameOf(tc) }
+        if (typeof tc['id'] === 'string') entry.id = tc['id']
+        return entry
+      })
     })
   }
-  // Anthropic
+  // Anthropic: client tool calls and server tool calls (e.g. web_search)
   const content = Array.isArray(res['content']) ? res['content'] : []
   return (content as Array<Record<string, unknown>>)
-    .filter((b) => b['type'] === 'tool_use')
+    .filter((b) => b['type'] === 'tool_use' || b['type'] === 'server_tool_use')
     .map((b) => {
       const name = typeof b['name'] === 'string' ? b['name'] : ''
       const entry: { id?: string; name: string } = { name }

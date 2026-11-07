@@ -105,6 +105,26 @@ describe('pre-call tool filtering', () => {
     expect(called).toBe(false)
   })
 
+  it('checks tool calls in every choice, not just the first', async () => {
+    const { client } = makeClient()
+    client._policy.add('block', 'wire_*')
+    await expect(
+      runEnforcedCall({
+        client,
+        vendor: 'openai',
+        original: async () => ({
+          model: 'gpt-4o',
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+          choices: [
+            { index: 0, message: { content: 'no tools here' } },
+            { index: 1, message: { tool_calls: [{ id: 'c2', type: 'function', function: { name: 'wire_money', arguments: '{}' } }] } },
+          ],
+        }),
+        args: [{ model: 'gpt-4o', messages: [], n: 2 }],
+      }),
+    ).rejects.toBeInstanceOf(JamjetPolicyBlocked)
+  })
+
   it('a refused response still counts against the budget', async () => {
     const { client } = makeClient({ maxCostUsd: 100 })
     client._policy.add('block', 'wire_*')
