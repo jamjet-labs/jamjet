@@ -135,7 +135,10 @@ import jamjet
 jamjet.cloud.configure(api_key="jj_...", project="my-agent")
 jamjet.cloud.policy("block", "*delete*")
 jamjet.cloud.policy("require_approval", "database.*")
-# Every OpenAI / Anthropic call in this process is now policy-gated.
+# Gated in this process: sync OpenAI chat.completions create/parse/stream and
+# Anthropic messages and beta.messages create/parse. OpenAI's Responses API and
+# Anthropic's messages.stream() are not enforced and refuse to run while a
+# block or approval rule is set. Async clients are not patched.
 ```
 
 → Runnable approval workflow in **[`examples/hitl-approval`](examples/hitl-approval)** · [Cloud Quickstart](https://docs.jamjet.dev/en/docs/cloud-quickstart)

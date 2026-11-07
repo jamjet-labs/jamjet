@@ -32,6 +32,7 @@ export {
   JamjetPolicyBlocked,
   JamjetApprovalRejected,
   JamjetApprovalTimeout,
+  JamjetUnenforceableCall,
 } from './errors.js'
 export type { WrapOptions } from './wrap.js'
 

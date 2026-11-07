@@ -51,17 +51,21 @@ function getToolCalls(vendor: Vendor, response: unknown): Array<{ id?: string; n
     return (choices as Array<Record<string, unknown>>).flatMap((choice) => {
       const message = (choice?.['message'] ?? {}) as Record<string, unknown>
       const tcs = Array.isArray(message['tool_calls']) ? message['tool_calls'] : []
-      return (tcs as Array<Record<string, unknown>>).map((tc) => {
+      const calls = (tcs as Array<Record<string, unknown>>).map((tc) => {
         const entry: { id?: string; name: string } = { name: toolNameOf(tc) }
         if (typeof tc['id'] === 'string') entry.id = tc['id']
         return entry
       })
+      // Legacy `functions` API: a single message.function_call.
+      const fc = message['function_call']
+      if (typeof fc === 'object' && fc !== null) calls.push({ name: toolNameOf(fc) })
+      return calls
     })
   }
   // Anthropic: client tool calls and server tool calls (e.g. web_search)
   const content = Array.isArray(res['content']) ? res['content'] : []
   return (content as Array<Record<string, unknown>>)
-    .filter((b) => b['type'] === 'tool_use' || b['type'] === 'server_tool_use')
+    .filter((b) => b['type'] === 'tool_use' || b['type'] === 'server_tool_use' || b['type'] === 'mcp_tool_use')
     .map((b) => {
       const name = typeof b['name'] === 'string' ? b['name'] : ''
       const entry: { id?: string; name: string } = { name }
@@ -97,6 +101,94 @@ function cacheReadSavingsUsd(model: string, cacheReadTokens: number): number {
   return (cacheReadTokens / 1_000_000) * per
 }
 
+/**
+ * Tools the vendor runs itself (Anthropic server tools such as web_search, and
+ * MCP toolsets) execute before the response comes back, so refusing their
+ * calls afterwards is too late: a rule that could match them strips them here.
+ */
+function isServerExecuted(tool: unknown): boolean {
+  if (typeof tool !== 'object' || tool === null) return false
+  const t = tool as Record<string, unknown>
+  const type = t['type']
+  if (typeof type !== 'string' || type === 'function' || type === 'custom') return false
+  return !('input_schema' in t)
+}
+
+function strippedBy(client: Client, tool: unknown): { name: string; kind: string; pattern: string | null } | null {
+  const t = tool as Record<string, unknown>
+  if (t?.['type'] === 'mcp_toolset') {
+    // Tool names inside an MCP server are unknown before the call; any
+    // restrictive rule could match one.
+    return client._policy.hasRestrictiveRules()
+      ? { name: `mcp_toolset:${String(t['mcp_server_name'] ?? '')}`, kind: 'block', pattern: '*' }
+      : null
+  }
+  const name = toolNameOf(tool)
+  const d = client._policy.evaluate(name)
+  if (d.blocked) return { name, kind: d.policyKind, pattern: d.pattern }
+  if (d.policyKind === 'require_approval' && isServerExecuted(tool)) {
+    return { name, kind: d.policyKind, pattern: d.pattern }
+  }
+  return null
+}
+
+/**
+ * Remove refused tools from `tools` and from the legacy OpenAI `functions`.
+ * Refuses a call whose tool_choice / function_call forces a refused tool, and
+ * drops the settings vendors reject once no tools are left. Returns arg0
+ * unchanged when nothing was removed.
+ */
+function filterRequestTools(
+  client: Client,
+  arg0: Record<string, unknown>,
+  decisions: Array<{ tool_name: string; policy_kind: string; pattern: string | null }>,
+): Record<string, unknown> {
+  let next = arg0
+  const lists: Array<{ key: 'tools' | 'functions'; choice: 'tool_choice' | 'function_call'; drop: string[] }> = [
+    { key: 'tools', choice: 'tool_choice', drop: ['tool_choice', 'parallel_tool_calls'] },
+    { key: 'functions', choice: 'function_call', drop: ['function_call'] },
+  ]
+  for (const { key, choice, drop } of lists) {
+    const list = arg0[key]
+    if (!Array.isArray(list) || list.length === 0) continue
+    const kept: unknown[] = []
+    const removed: string[] = []
+    for (const tool of list) {
+      const hit = strippedBy(client, tool)
+      if (hit === null) {
+        kept.push(tool)
+        continue
+      }
+      removed.push(hit.name)
+      decisions.push({ tool_name: hit.name, policy_kind: hit.kind, pattern: hit.pattern })
+    }
+    if (removed.length === 0) continue
+    // A forced choice of a removed tool cannot be honoured: refuse the call
+    // rather than let the vendor reject an unknown tool name.
+    const forced = toolNameOf(arg0[choice])
+    if (forced !== '' && removed.includes(forced)) {
+      const d = client._policy.evaluate(forced)
+      throw new JamjetPolicyBlocked(forced, d.pattern ?? '*')
+    }
+    next = next === arg0 ? { ...arg0 } : next
+    next[key] = kept
+    if (kept.length === 0) {
+      // Vendors reject an empty list, and the settings that only make sense with tools.
+      delete next[key]
+      for (const k of drop) delete next[k]
+    }
+  }
+  // Remote MCP servers run their tools on the vendor side under names unknown
+  // before the call; with any restrictive rule they are not offered.
+  const servers = arg0['mcp_servers']
+  if (Array.isArray(servers) && servers.length > 0 && client._policy.hasRestrictiveRules()) {
+    next = next === arg0 ? { ...arg0 } : next
+    delete next['mcp_servers']
+    decisions.push({ tool_name: 'mcp_servers', policy_kind: 'block', pattern: '*' })
+  }
+  return next
+}
+
 export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknown> {
   const { client, vendor, original, args, override, computePromptPrefixHash } = opts
   const arg0 = (args[0] ?? {}) as Record<string, unknown>
@@ -109,34 +201,10 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
   const agentRef = override?.agent ?? ctx?.agent
   const userCtx = override?.user ?? ctx?.user
 
-  // 1. Pre-call policy: filter tools. Names come from either vendor's tool
-  // shape (see toolNameOf), so Anthropic `{ name }` tools are covered too.
-  let mutatedArgs = args
+  // 1. Pre-call policy: strip refused tools from the request.
   const policyDecisions: Array<{ tool_name: string; policy_kind: string; pattern: string | null }> = []
-  if (Array.isArray(arg0['tools']) && arg0['tools'].length > 0) {
-    const { allowed, blocked } = client._policy.filterTools(arg0['tools'] as unknown[])
-    for (const t of blocked) {
-      const name = toolNameOf(t)
-      const d = client._policy.evaluate(name)
-      policyDecisions.push({ tool_name: name, policy_kind: d.policyKind, pattern: d.pattern })
-    }
-    if (blocked.length > 0) {
-      // A tool_choice that forces a stripped tool cannot be honoured: refuse
-      // the call rather than let the vendor reject an unknown tool name.
-      const forced = toolNameOf(arg0['tool_choice'])
-      if (forced !== '') {
-        const d = client._policy.evaluate(forced)
-        if (d.blocked) throw new JamjetPolicyBlocked(forced, d.pattern ?? '*')
-      }
-      const next: Record<string, unknown> = { ...arg0, tools: allowed }
-      if (allowed.length === 0) {
-        // Vendors reject an empty tools array, and a tool_choice with no tools.
-        delete next['tools']
-        delete next['tool_choice']
-      }
-      mutatedArgs = [next, ...args.slice(1)]
-    }
-  }
+  const filtered = filterRequestTools(client, arg0, policyDecisions)
+  let mutatedArgs = filtered === arg0 ? args : [filtered, ...args.slice(1)]
 
   // 2. Pre-call budget check
   const estTokens = estimatePromptTokens(arg0)

@@ -1,6 +1,7 @@
 import { getActive } from './client.js'
 import type { AgentRef, UserContext } from './context.js'
 import { runEnforcedCall } from './enforcement.js'
+import { refuseUnenforced, UNENFORCED_OPENAI_METHODS } from './unenforced.js'
 import { asVendorPromise } from './vendor-promise.js'
 
 const WRAPPED = Symbol.for('jamjet.wrapped')
@@ -20,6 +21,17 @@ export function wrap<T extends object>(client: T, opts?: WrapOptions): T {
   if (anyClient?.chat?.completions?.create) wrapMethod(anyClient.chat.completions, 'create', 'openai', opts)
   if (anyClient?.completions?.create) wrapMethod(anyClient.completions, 'create', 'openai', opts)
   if (anyClient?.messages?.create) wrapMethod(anyClient.messages, 'create', 'anthropic', opts)
+  if (anyClient?.beta?.messages?.create) wrapMethod(anyClient.beta.messages, 'create', 'anthropic', opts)
+  // OpenAI's Responses API is not enforced; refuse it while restrictive rules exist.
+  const responses = anyClient?.responses
+  if (responses && typeof responses.create === 'function' && !isWrapped(responses.create)) {
+    for (const key of UNENFORCED_OPENAI_METHODS) {
+      if (typeof responses[key] !== 'function') continue
+      const refusing = refuseUnenforced(`openai responses.${key}`, responses[key].bind(responses)) as WrappedFn<unknown>
+      ;(refusing as WrappedFn<unknown> & Record<symbol, unknown>)[WRAPPED] = true
+      responses[key] = refusing
+    }
+  }
   return client
 }
 

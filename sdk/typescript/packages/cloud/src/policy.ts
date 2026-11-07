@@ -75,6 +75,11 @@ export class PolicyEvaluator {
     return this.rules.length > 0
   }
 
+  /** True when a block or require_approval rule exists. */
+  hasRestrictiveRules(): boolean {
+    return this.rules.some((r) => r.action === 'block' || r.action === 'require_approval')
+  }
+
   filterTools<T>(tools: readonly T[]): { allowed: T[]; blocked: T[] } {
     const allowed: T[] = []
     const blocked: T[] = []

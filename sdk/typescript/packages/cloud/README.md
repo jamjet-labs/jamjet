@@ -110,10 +110,19 @@ Blocked tools are stripped before the model sees them (OpenAI `function` and
 blocked tool throws `JamjetPolicyBlocked`. Budget exhaustion throws
 `JamjetBudgetExceeded` before the next call goes out.
 
+Enforced entry points: OpenAI `chat.completions` (`create`, `parse`, `stream`,
+legacy `functions` included) and Anthropic `messages` and `beta.messages`
+(`create`, `parse`, `stream`). OpenAI's Responses API is not enforced: it
+throws `JamjetUnenforceableCall` while any block or require_approval rule is
+set. Server tools (such as web search) and MCP toolsets run on the vendor's
+side before a tool call could be refused, so a rule that could match them
+removes them from the request.
+
 Streaming calls get the same checks. Text streams through as it arrives; once
 any policy rule is set, chunks from the first tool call onward are held until
 the stream ends, checked, and only then handed to your code. Usage and cost are
-recorded when the stream finishes (or is abandoned) and count toward
+recorded when the stream finishes, fails, or is abandoned (an iterator dropped
+without being closed is recorded when it is garbage collected) and count toward
 `budget()`. When an OpenAI stream reports no usage, the cost is estimated and
 the span is marked `usage_estimated`.
 

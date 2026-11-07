@@ -86,6 +86,11 @@ class PolicyEvaluator:
         with self._lock:
             return bool(self._rules)
 
+    def has_restrictive_rules(self) -> bool:
+        """True when a block or require_approval rule exists."""
+        with self._lock:
+            return any(action in ("block", "require_approval") for action, _ in self._rules)
+
     def filter_tools(self, tools: list[Any]) -> tuple[list[Any], list[Any]]:
         """Split a tool list into (allowed, blocked).
 

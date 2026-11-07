@@ -5,7 +5,7 @@ from typing import Any
 
 from .budget import get_budget
 from .events import emit
-from .exceptions import JamJetPolicyBlocked
+from .exceptions import JamJetPolicyBlocked, JamJetUnenforceableCall
 from .middleware import Chain
 from .middleware.context import (
     anthropic_kwargs_from_call_context,
@@ -86,32 +86,76 @@ def _estimate_prompt_tokens(kwargs: dict[str, Any]) -> int:
         return 0
 
 
-def _filter_tools_pre_call(kwargs: dict[str, Any]) -> None:
-    """Strip blocked tools from the request, in either vendor's tool shape."""
-    tools = kwargs.get("tools")
-    if not tools:
-        return
-    # Materialise once: a generator would otherwise be spent by the check and
-    # reach the vendor empty.
-    tools = list(tools)
-    kwargs["tools"] = tools
+def _is_server_executed(tool: Any) -> bool:
+    """Tools the vendor runs itself (Anthropic server tools such as web_search)
+    execute before the response comes back, so refusing the call afterwards is
+    too late."""
+    kind = _field(tool, "type")
+    if not isinstance(kind, str) or kind in ("function", "custom"):
+        return False
+    return _field(tool, "input_schema") is None
+
+
+def _stripped_by(tool: Any) -> tuple[str, str, str | None] | None:
+    """(name, kind, pattern) when a rule removes ``tool`` from the request."""
     evaluator = get_evaluator()
-    allowed, blocked = evaluator.filter_tools(tools)
-    if not blocked:
-        return
-    # A tool_choice that forces a stripped tool cannot be honoured: refuse the
-    # call rather than let the vendor reject an unknown tool name.
-    forced = tool_name_of(kwargs.get("tool_choice"))
-    if forced:
-        decision = evaluator.evaluate(forced)
-        if decision.blocked:
+    if _field(tool, "type") == "mcp_toolset":
+        # Tool names inside an MCP server are unknown before the call; any
+        # restrictive rule could match one.
+        if evaluator.has_restrictive_rules():
+            return f"mcp_toolset:{_field(tool, 'mcp_server_name') or ''}", "block", "*"
+        return None
+    name = tool_name_of(tool)
+    decision = evaluator.evaluate(name)
+    if decision.blocked:
+        return name, decision.policy_kind, decision.pattern
+    if decision.policy_kind == "require_approval" and _is_server_executed(tool):
+        return name, decision.policy_kind, decision.pattern
+    return None
+
+
+def _filter_tools_pre_call(kwargs: dict[str, Any]) -> None:
+    """Strip refused tools from ``tools`` and the legacy OpenAI ``functions``.
+
+    Refuses a call whose ``tool_choice`` / ``function_call`` forces a removed
+    tool, and drops the settings vendors reject once no tools are left.
+    """
+    for key, choice, drop in (
+        ("tools", "tool_choice", ("tool_choice", "parallel_tool_calls")),
+        ("functions", "function_call", ("function_call",)),
+    ):
+        listed = kwargs.get(key)
+        if not listed:
+            continue
+        # Materialise once: a generator would otherwise be spent by the check
+        # and reach the vendor empty.
+        listed = list(listed)
+        kwargs[key] = listed
+        kept: list[Any] = []
+        removed: list[str] = []
+        for tool in listed:
+            hit = _stripped_by(tool)
+            if hit is None:
+                kept.append(tool)
+            else:
+                removed.append(hit[0])
+        if not removed:
+            continue
+        forced = tool_name_of(kwargs.get(choice))
+        if forced and forced in removed:
+            decision = get_evaluator().evaluate(forced)
             raise JamJetPolicyBlocked(forced, decision.pattern or "*")
-    if allowed:
-        kwargs["tools"] = allowed
-    else:
-        # Vendors reject an empty tools array, and a tool_choice with no tools.
-        kwargs.pop("tools", None)
-        kwargs.pop("tool_choice", None)
+        if kept:
+            kwargs[key] = kept
+        else:
+            # Vendors reject an empty list, and the settings that only make sense with tools.
+            kwargs.pop(key, None)
+            for k in drop:
+                kwargs.pop(k, None)
+    # Remote MCP servers run their tools on the vendor side under names unknown
+    # before the call; with any restrictive rule they are not offered.
+    if kwargs.get("mcp_servers") and get_evaluator().has_restrictive_rules():
+        kwargs.pop("mcp_servers", None)
 
 
 def _response_tool_calls(vendor: str, result: Any) -> list[tuple[str | None, str]]:
@@ -119,13 +163,18 @@ def _response_tool_calls(vendor: str, result: Any) -> list[tuple[str | None, str
     calls: list[tuple[str | None, str]] = []
     if vendor == "openai":
         for choice in _field(result, "choices") or []:
-            for tc in _field(_field(choice, "message"), "tool_calls") or []:
+            message = _field(choice, "message")
+            for tc in _field(message, "tool_calls") or []:
                 fn = _field(tc, "function") or _field(tc, "custom")
                 name = _field(fn, "name")
                 calls.append((_field(tc, "id"), name if isinstance(name, str) else ""))
+            # Legacy `functions` API: a single message.function_call.
+            legacy = _field(message, "function_call")
+            if legacy is not None:
+                calls.append((None, tool_name_of(legacy)))
         return calls
     for block in _field(result, "content") or []:
-        if _field(block, "type") in ("tool_use", "server_tool_use"):
+        if _field(block, "type") in ("tool_use", "server_tool_use", "mcp_tool_use"):
             name = _field(block, "name")
             calls.append((_field(block, "id"), name if isinstance(name, str) else ""))
     return calls
@@ -269,8 +318,16 @@ def _run_enforced(vendor: str, original: Any, self_inner: Any, args: Any, kwargs
     # Success path: a receipt iff middleware fired (e.g. PII redact).
     _emit_receipt_if_fired(call_ctx)
 
+    # `with_raw_response.create()` goes through this patch and gets the raw
+    # response back. Enforce on its parsed body (cached, so the caller's own
+    # .parse() returns the same, enforced object) and hand back the raw one.
+    raw = result if _is_raw_response(result) else None
+    if raw is not None:
+        result = raw.parse()
+
     if kwargs.get("stream") is True:
-        return _enforce_streamed(vendor, result, span, model, kwargs)
+        enforced = _enforce_streamed(vendor, result, span, model, kwargs)
+        return raw if raw is not None else enforced
 
     usage = getattr(result, "usage", None)
     if vendor == "openai":
@@ -286,7 +343,51 @@ def _run_enforced(vendor: str, original: Any, self_inner: Any, args: Any, kwargs
     _refuse_blocked(span, _response_tool_calls(vendor, result))
     span.finish(status="ok")
     emit(span.to_event_dict())
-    return result
+    return raw if raw is not None else result
+
+
+def _is_raw_response(result: Any) -> bool:
+    return hasattr(result, "http_response") and callable(getattr(result, "parse", None))
+
+
+def _refuse_unenforced(label: str, original: Any) -> Any:
+    """Wrap an SDK method this module does not enforce: it runs normally, unless
+    a block or require_approval rule is active, when it raises instead."""
+
+    def refusing(self_inner: Any, *args: Any, **kwargs: Any) -> Any:
+        if get_evaluator().has_restrictive_rules():
+            raise JamJetUnenforceableCall(label)
+        return original(self_inner, *args, **kwargs)
+
+    return refusing
+
+
+def _patch_methods(key: str, cls: Any, methods: dict[str, Any]) -> None:
+    """Replace ``cls.<name>`` with ``make(original)`` for each entry, remembering
+    the originals under ``key`` for unpatching."""
+    saved: list[tuple[Any, str, Any]] = []
+    for name, make in methods.items():
+        original = cls.__dict__.get(name)
+        if original is None:
+            continue
+        saved.append((cls, name, original))
+        setattr(cls, name, make(original))
+    _originals.setdefault(key, []).extend(saved)
+
+
+def _enforcing(vendor: str) -> Any:
+    def make(original: Any) -> Any:
+        def patched(self_inner: Any, *args: Any, **kwargs: Any) -> Any:
+            return _run_enforced(vendor, original, self_inner, args, kwargs)
+
+        return patched
+
+    return make
+
+
+def _unpatch(key: str) -> None:
+    for cls, name, original in _originals.pop(key, []):
+        setattr(cls, name, original)
 
 
 # ---------------------------------------------------------------------------
@@ -299,8 +400,11 @@ def patch_openai() -> None:
     captured: ``openai.chat.completions.create(...)`` and
     ``OpenAI().chat.completions.create(...)`` both flow through one wrapper.
 
-    We patch ``Completions.create`` at the *class* level, so every client
-    instance picks the patch up automatically. The async client is not patched.
+    Patched at the *class* level, so every client instance picks it up.
+    ``chat.completions.create`` and ``.parse`` are enforced; ``.stream()`` and
+    ``with_raw_response.create()`` go through ``create``. The Responses API is
+    not enforced and refuses to run while a block or require_approval rule is
+    active. The async client is not patched.
     """
     try:
         from openai.resources.chat.completions import Completions
@@ -310,22 +414,24 @@ def patch_openai() -> None:
     if "openai" in _originals:
         return  # already patched
 
-    original = Completions.create
-    _originals["openai"] = (Completions, original)
-
-    def patched_create(self_inner: Any, *args: Any, **kwargs: Any) -> Any:
-        return _run_enforced("openai", original, self_inner, args, kwargs)
-
-    Completions.create = patched_create  # type: ignore[assignment,method-assign]
+    _patch_methods("openai", Completions, {"create": _enforcing("openai"), "parse": _enforcing("openai")})
+    try:
+        from openai.resources.responses import Responses
+    except ImportError:
+        return
+    _patch_methods(
+        "openai",
+        Responses,
+        {
+            m: (lambda original, m=m: _refuse_unenforced(f"openai responses.{m}", original))
+            for m in ("create", "stream", "parse")
+        },
+    )
 
 
 def unpatch_openai() -> None:
-    """Restore the original Completions.create."""
-    entry = _originals.pop("openai", None)
-    if entry is None:
-        return
-    cls, original = entry
-    cls.create = original
+    """Restore the original openai methods."""
+    _unpatch("openai")
 
 
 # ---------------------------------------------------------------------------
@@ -333,47 +439,55 @@ def unpatch_openai() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _anthropic_messages_class() -> Any:
-    """The sync Messages resource class.
+def _anthropic_messages_classes() -> list[Any]:
+    """The sync Messages resource classes: ``messages`` and ``beta.messages``.
 
     ``anthropic.Anthropic.messages`` is a ``cached_property`` on the client
     class, so reading it on the class yields the descriptor, not the resource;
-    the class has to come from ``anthropic.resources``.
+    the classes have to come from ``anthropic.resources``.
     """
+    classes: list[Any] = []
     try:
         from anthropic.resources.messages import Messages
     except ImportError:
         try:
             from anthropic.resources import Messages  # type: ignore[no-redef,attr-defined,unused-ignore]
         except ImportError:
-            return None
-    return Messages
+            return classes
+    classes.append(Messages)
+    try:
+        from anthropic.resources.beta.messages import Messages as BetaMessages
+    except ImportError:
+        return classes
+    classes.append(BetaMessages)
+    return classes
 
 
 def patch_anthropic() -> None:
-    """Monkey-patch ``anthropic.Anthropic().messages.create`` (sync)."""
-    messages_cls = _anthropic_messages_class()
-    if messages_cls is None:
-        return
+    """Monkey-patch ``Anthropic().messages`` and ``Anthropic().beta.messages`` (sync).
 
+    ``create`` and ``parse`` are enforced, including ``with_raw_response``.
+    ``stream()`` posts directly instead of calling ``create``, so it is not
+    enforced and refuses to run while a block or require_approval rule is
+    active.
+    """
     if "anthropic" in _originals:
         return
-
-    original = messages_cls.create
-    _originals["anthropic"] = (messages_cls, original)
-
-    def patched_create(self_inner: Any, *args: Any, **kwargs: Any) -> Any:
-        return _run_enforced("anthropic", original, self_inner, args, kwargs)
-
-    messages_cls.create = patched_create
+    for cls in _anthropic_messages_classes():
+        _patch_methods(
+            "anthropic",
+            cls,
+            {
+                "create": _enforcing("anthropic"),
+                "parse": _enforcing("anthropic"),
+                "stream": lambda original: _refuse_unenforced("anthropic messages.stream", original),
+            },
+        )
 
 
 def unpatch_anthropic() -> None:
-    """Restore the original anthropic messages.create."""
-    if "anthropic" not in _originals:
-        return
-    messages_cls, original = _originals.pop("anthropic")
-    messages_cls.create = original
+    """Restore the original anthropic methods."""
+    _unpatch("anthropic")
 
 
 # ---------------------------------------------------------------------------

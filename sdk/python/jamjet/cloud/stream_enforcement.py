@@ -85,7 +85,12 @@ class StreamTally:
             content = _field(delta, "content")
             if isinstance(content, str):
                 self.output_chars += len(content)
-            for tc in _field(delta, "tool_calls") or []:
+            calls: list[Any] = list(_field(delta, "tool_calls") or [])
+            # Legacy `functions` API streams one delta.function_call per choice.
+            legacy = _field(delta, "function_call")
+            if legacy is not None:
+                calls.append({"index": "function_call", "function": legacy})
+            for tc in calls:
                 tool_chunk = True
                 entry = self._call(f"{_field(choice, 'index') or 0}:{_field(tc, 'index') or 0}")
                 call_id = _field(tc, "id")
@@ -125,7 +130,7 @@ class StreamTally:
             self.finished = True
         elif kind == "content_block_start":
             block = _field(event, "content_block")
-            if _field(block, "type") in ("tool_use", "server_tool_use"):
+            if _field(block, "type") in ("tool_use", "server_tool_use", "mcp_tool_use"):
                 entry = self._call(str(_field(event, "index") or 0))
                 name = _field(block, "name")
                 entry.name = name if isinstance(name, str) else ""

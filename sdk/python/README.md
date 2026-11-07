@@ -277,14 +277,19 @@ approval = jamjet.require_approval(action="charge_card", context={...})
 def lookup_customer(...): ...
 ```
 
-Policy and budget apply to the sync `OpenAI().chat.completions.create` and
-`Anthropic().messages.create` calls, OpenAI and Anthropic tool shapes alike.
+Policy and budget apply to the sync clients: OpenAI `chat.completions.create`,
+`.parse()`, `.stream()` and `with_raw_response`, and Anthropic `messages` and
+`beta.messages` `create` / `parse`, legacy OpenAI `functions` included.
 Blocked tools are stripped from the request, and a tool call the model returns
 for a blocked tool raises `JamJetPolicyBlocked`. With `stream=True`, text
 streams through as it arrives; once any policy rule is set, chunks from the
 first tool call onward are held until the stream ends and checked before your
-code sees them, and the streamed usage counts toward the budget. Async clients
-and Anthropic's `messages.stream()` helper are not patched.
+code sees them, and the streamed usage counts toward the budget. Server tools
+(such as web search) and MCP toolsets run on the vendor's side before a tool
+call could be refused, so a rule that could match them removes them from the
+request. OpenAI's Responses API and Anthropic's `messages.stream()` are not
+enforced: they raise `JamJetUnenforceableCall` while any block or
+require_approval rule is set. Async clients are not patched.
 
 Install with the LLM SDK you use:
 

@@ -1,8 +1,9 @@
 import { getActive } from '../client.js'
 import { runEnforcedCall } from '../enforcement.js'
+import { refuseUnenforced, UNENFORCED_OPENAI_METHODS } from '../unenforced.js'
 import { asVendorPromise } from '../vendor-promise.js'
 
-type OriginalRef = { proto: { create: (...args: any[]) => any }; original: (...args: any[]) => any }
+type OriginalRef = { proto: any; key: string; original: (...args: any[]) => any }
 let originals: OriginalRef[] = []
 
 const PATCH_MARK = Symbol.for('jamjet.openai.patched')
@@ -56,14 +57,26 @@ export function patchOpenAI(openaiModule: any): void {
       configurable: true,
       writable: true,
     })
-    originals.push({ proto, original })
+    originals.push({ proto, key: 'create', original })
+  }
+
+  // The Responses API is not enforced; refuse it while restrictive rules exist.
+  const responses = (openaiModule?.default ?? openaiModule?.OpenAI)?.Responses?.prototype
+  if (responses && !responses[PATCH_MARK]) {
+    for (const key of UNENFORCED_OPENAI_METHODS) {
+      const original = responses[key]
+      if (typeof original !== 'function') continue
+      responses[key] = refuseUnenforced(`openai responses.${key}`, original)
+      originals.push({ proto: responses, key, original })
+    }
+    Object.defineProperty(responses, PATCH_MARK, { value: true, enumerable: false, configurable: true, writable: true })
   }
 }
 
 export function unpatchOpenAI(): void {
-  for (const { proto, original } of originals) {
-    proto.create = original
-    delete (proto as any)[PATCH_MARK]
+  for (const { proto, key, original } of originals) {
+    proto[key] = original
+    delete proto[PATCH_MARK]
   }
   originals = []
 }

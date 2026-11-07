@@ -107,7 +107,11 @@ class Tally implements StreamTally {
       if (typeof choice?.['text'] === 'string') this.outputChars += choice['text'].length
       const delta = (choice?.['delta'] ?? {}) as Record<string, any>
       if (typeof delta['content'] === 'string') this.outputChars += delta['content'].length
-      const calls = Array.isArray(delta['tool_calls']) ? delta['tool_calls'] : []
+      const calls: Array<Record<string, any>> = Array.isArray(delta['tool_calls']) ? [...delta['tool_calls']] : []
+      // Legacy `functions` API streams one delta.function_call per choice.
+      if (typeof delta['function_call'] === 'object' && delta['function_call'] !== null) {
+        calls.push({ index: 'function_call', function: delta['function_call'] })
+      }
       for (const tc of calls) {
         toolChunk = true
         const entry = this.call(`${choice?.['index'] ?? 0}:${tc?.['index'] ?? 0}`)
@@ -151,7 +155,7 @@ class Tally implements StreamTally {
       }
       case 'content_block_start': {
         const block = (c['content_block'] ?? {}) as Record<string, any>
-        if (block['type'] === 'tool_use' || block['type'] === 'server_tool_use') {
+        if (block['type'] === 'tool_use' || block['type'] === 'server_tool_use' || block['type'] === 'mcp_tool_use') {
           const entry = this.call(String(c['index'] ?? 0))
           entry.name = typeof block['name'] === 'string' ? block['name'] : ''
           entry.joinedName = entry.name
@@ -184,19 +188,30 @@ class Tally implements StreamTally {
   }
 }
 
+// A caller that reads with next() and then drops the iterator never resumes
+// it, so neither its finally block nor onEnd would run and the stream's cost
+// would never reach the budget. When the dropped iterator is garbage
+// collected, this records it as incomplete and closes the upstream request.
+const abandoned =
+  typeof FinalizationRegistry === 'function'
+    ? new FinalizationRegistry<() => void>((finish) => finish())
+    : null
+
 function enforcedIterator(
   inner: AsyncIterator<unknown>,
   hooks: StreamEnforcementHooks,
 ): AsyncGenerator<unknown> {
   const tally = new Tally()
+  const token = {}
   let ended = false
   const end = (how: StreamEnd): void => {
     if (ended) return
     ended = true
+    abandoned?.unregister(token)
     hooks.onEnd(tally, how)
   }
 
-  return (async function* () {
+  const generator = (async function* () {
     const held: unknown[] = []
     let holding = false
     let upstreamDone = false
@@ -235,6 +250,17 @@ function enforcedIterator(
       end({ kind: 'incomplete' })
     }
   })()
+  // The callback must not reference `generator`, or it would never be collected.
+  abandoned?.register(
+    generator,
+    () => {
+      if (ended) return
+      Promise.resolve(inner.return?.()).catch(() => {})
+      end({ kind: 'incomplete' })
+    },
+    token,
+  )
+  return generator
 }
 
 /**
