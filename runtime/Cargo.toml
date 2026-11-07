@@ -58,7 +58,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = "0.32"
 opentelemetry-otlp = { version = "0.32", features = ["metrics", "grpc-tonic"] }
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.33"
 
 # Error handling
