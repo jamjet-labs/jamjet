@@ -166,12 +166,19 @@ def _failure_report(exc: BaseException) -> str:
     """The error text a worker sends with ``fail_work_item``.
 
     When the runtime refused the result, its error body can quote the output
-    back. Sending that to ``/fail`` would store server-echoed values in the
-    event log, so report only the status for an HTTP error.
+    back; sending that to ``/fail`` would store server-echoed values in the
+    event log, so only the status goes. Any other HTTP error came from the
+    handler's own call: report its status, host and path (not the query
+    string, which can carry tokens) without blaming the runtime.
     """
+    from jamjet.client import JamjetAPIError
+
     if isinstance(exc, httpx.HTTPStatusError):
         request = exc.request
-        return f"runtime refused the result: HTTP {exc.response.status_code} for {request.method} {request.url.path}"
+        status = exc.response.status_code
+        if isinstance(exc, JamjetAPIError):
+            return f"runtime refused the result: HTTP {status} for {request.method} {request.url.path}"
+        return f"HTTP {status} from {request.method} {request.url.scheme}://{request.url.host}{request.url.path}"
     return str(exc)
 
 
