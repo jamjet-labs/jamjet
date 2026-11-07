@@ -18,6 +18,7 @@ use std::collections::{HashSet, VecDeque};
 /// 10. All remote agents referenced by a2a_task nodes are configured
 /// 11. Every ADK tool-dispatch node carries its `agent_tool_dispatch` marker
 /// 12. Every node id is in the safe set (see [`validate_node_ids`])
+/// 13. Every model node's inline prompt is a template the runtime can render
 pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_metadata(ir)?;
     validate_no_duplicate_nodes(ir)?;
@@ -28,6 +29,7 @@ pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_refs(ir)?;
     validate_agent_tool_dispatch(ir)?;
     validate_condition_expressions(ir)?;
+    validate_prompt_templates(ir)?;
     validate_external_queues(ir)?;
     validate_node_ids(ir)?;
     validate_approval_deadlines(ir)?;
@@ -208,6 +210,31 @@ pub fn validate_condition_expressions(ir: &WorkflowIr) -> IrResult<()> {
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Every model node's inline prompt must be a template the runtime can
+/// render: text with `{{ state.<path> }}` substitutions and nothing else (see
+/// `jamjet_core::template`). A filter, statement or comment would fail every
+/// run that reaches the node, so it is refused here, once. A prompt FILE
+/// reference is not checked: the runtime cannot read it, and a node that
+/// reads the conversation in state still runs with one.
+pub fn validate_prompt_templates(ir: &WorkflowIr) -> IrResult<()> {
+    use jamjet_core::node::NodeKind;
+    use jamjet_core::template::{is_prompt_file_ref, validate_template};
+    let mut ids: Vec<&String> = ir.nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        if let NodeKind::Model { prompt_ref, .. } = &ir.nodes[id].kind {
+            if prompt_ref.trim().is_empty() || is_prompt_file_ref(prompt_ref) {
+                continue;
+            }
+            validate_template(prompt_ref).map_err(|reason| IrError::InvalidPromptTemplate {
+                node: id.clone(),
+                reason,
+            })?;
         }
     }
     Ok(())

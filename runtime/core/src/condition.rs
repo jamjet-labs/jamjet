@@ -192,7 +192,7 @@ fn eval_truthiness(expr: &str, state: &Value) -> bool {
 ///
 /// Returns `None` for any missing or non-traversable segment.
 /// Array indexing by zero-based numeric segment is supported: `"arr.0"` reads index 0.
-fn resolve_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
+pub(crate) fn resolve_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
     let mut current = root;
     for segment in dotted_path.split('.') {
         if segment.is_empty() {

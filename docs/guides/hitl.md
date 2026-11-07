@@ -131,7 +131,7 @@ payload carries.
 | `mcp_tool` | its `tool` | no state |
 | `a2a_task` | its `skill` | no state |
 | `agent` | its `agent_ref` | no state |
-| `model` | none: governed by `model_allowlist` only | the conversation (`messages`) and the resolved model settings |
+| `model` | none: governed by `model_allowlist` only | the prompt as rendered against the run's state, the conversation (`messages`) and the resolved model settings |
 | `condition` | none | the run's state, as `state` |
 | `agent_tool`, `agent_discovery`, `coordinator`, `eval`, `human_approval`, `wait`, `parallel`, `join`, `subgraph`, `memory_retrieval`, `policy`, `finalizer`, `limit_exceeded` | none | no state |
 

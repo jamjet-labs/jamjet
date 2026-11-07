@@ -27,6 +27,9 @@ pub enum IrError {
         reason: String,
     },
 
+    #[error("model node '{node}' prompt is not a template the runtime can render: {reason}")]
+    InvalidPromptTemplate { node: String, reason: String },
+
     #[error("external_fn node '{node}' queue `{queue}` is invalid: {reason}")]
     InvalidQueueName {
         node: String,
