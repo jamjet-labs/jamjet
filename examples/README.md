@@ -50,6 +50,12 @@ environment setup script and runs without a model API key.
   travels with the deploy. See `deploy-an-agent/README.md` and
   `docs/adk/consistency.md` for the engine's guarantees.
 
+## Coordinator routing
+
+- [`code-review-routing/`](./code-review-routing/) - A custom coordinator strategy
+  selects mock code reviewers using language expertise and diff size. Runs locally
+  without a model API key or runtime server.
+
 ## Java
 
 - `loan-underwriter-agent/` - A durable, auditable loan-underwriting agent on the JVM, built on Spring Boot, the JamJet Java runtime, and AgentBoundary action receipts. It survives a `kill -9` mid-run and resumes from disk checkpoints without repeating work, gates disbursement on a human officer approval, and produces a verifiable signed receipt bundle. Runs without a model API key. Requires JDK 21. See `loan-underwriter-agent/README.md` and `loan-underwriter-agent/scripts/demo.sh` for the crash demo.
