@@ -12,6 +12,59 @@ from typing import Any
 
 import httpx
 
+# How much of an error body goes into the exception message.
+_MAX_ERROR_DETAIL = 2000
+
+
+class JamjetAPIError(httpx.HTTPStatusError):
+    """A non-2xx answer from the runtime, with the server's reason attached.
+
+    A subclass of ``httpx.HTTPStatusError``, so existing ``except`` clauses and
+    ``.response.status_code`` checks keep working. ``detail`` holds the server's
+    message: the ``error`` field of its JSON body, or the body text.
+    """
+
+    def __init__(self, message: str, *, request: httpx.Request, response: httpx.Response, detail: str) -> None:
+        super().__init__(message, request=request, response=response)
+        self.detail = detail
+
+
+def _error_detail(response: httpx.Response) -> str:
+    """The server's reason for a failed request, or "" when the body is empty."""
+    try:
+        text = response.text.strip()
+    except Exception:  # an undecodable body is no reason to hide the status
+        return ""
+    if not text:
+        return ""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        for key in ("error", "detail", "message"):
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value.strip()
+                break
+    if len(text) > _MAX_ERROR_DETAIL:
+        text = text[:_MAX_ERROR_DETAIL] + "..."
+    return text
+
+
+def _raise_for_status(response: httpx.Response) -> None:
+    """``response.raise_for_status()``, but the raised error carries the
+    server's message instead of only the status line."""
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = _error_detail(response)
+        request = response.request
+        message = f"{response.status_code} {response.reason_phrase} for {request.method} {request.url}"
+        if detail:
+            message = f"{message}: {detail}"
+        raise JamjetAPIError(message, request=request, response=response, detail=detail) from exc
+
 
 @dataclass(frozen=True)
 class ArtifactRef:
@@ -60,14 +113,14 @@ class JamjetClient:
 
     async def health(self) -> dict[str, Any]:
         r = await self._client.get("/health")
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     # ── Workflows ─────────────────────────────────────────────────────────
 
     async def create_workflow(self, ir: dict[str, Any]) -> dict[str, Any]:
         r = await self._client.post("/workflows", json={"ir": ir})
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     # ── Cron schedules ────────────────────────────────────────────────────
@@ -92,12 +145,12 @@ class JamjetClient:
         if input is not None:
             body["input"] = input
         r = await self._client.post("/cron", json=body)
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def list_cron_jobs(self) -> dict[str, Any]:
         r = await self._client.get("/cron")
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     # ── Executions ────────────────────────────────────────────────────────
@@ -112,12 +165,12 @@ class JamjetClient:
         if workflow_version:
             body["workflow_version"] = workflow_version
         r = await self._client.post("/executions", json=body)
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def get_execution(self, execution_id: str) -> dict[str, Any]:
         r = await self._client.get(f"/executions/{execution_id}")
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def list_executions(
@@ -130,17 +183,17 @@ class JamjetClient:
         if status:
             params["status"] = status
         r = await self._client.get("/executions", params=params)
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def cancel_execution(self, execution_id: str) -> dict[str, Any]:
         r = await self._client.post(f"/executions/{execution_id}/cancel")
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def get_events(self, execution_id: str) -> dict[str, Any]:
         r = await self._client.get(f"/executions/{execution_id}/events")
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def approve(
@@ -177,7 +230,7 @@ class JamjetClient:
         if action_digest:
             body["action_digest"] = action_digest
         r = await self._client.post(f"/executions/{execution_id}/approve", json=body)
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def list_approvals(self, execution_id: str) -> dict[str, Any]:
@@ -187,7 +240,7 @@ class JamjetClient:
         ``GET /executions/{id}/approvals``.
         """
         r = await self._client.get(f"/executions/{execution_id}/approvals")
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def send_external_event(
@@ -200,7 +253,7 @@ class JamjetClient:
             f"/executions/{execution_id}/external-event",
             json={"correlation_key": correlation_key, "payload": payload},
         )
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     # ── Artifacts (content-addressed store) ───────────────────────────────
@@ -218,7 +271,7 @@ class JamjetClient:
         """
         headers = {"Content-Type": media_type} if media_type else None
         r = await self._client.post("/artifacts", content=data, headers=headers)
-        r.raise_for_status()
+        _raise_for_status(r)
         j = r.json()
         return ArtifactRef(
             hash=j["hash"],
@@ -233,44 +286,39 @@ class JamjetClient:
         exists for the caller's tenant.
         """
         r = await self._client.get(f"/artifacts/{hash}")
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.content
 
     # ── Agents ────────────────────────────────────────────────────────────
 
     async def register_agent(self, card: dict[str, Any]) -> dict[str, Any]:
         r = await self._client.post("/agents", json=card)
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def list_agents(self) -> dict[str, Any]:
         r = await self._client.get("/agents")
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def get_agent(self, agent_id: str) -> dict[str, Any]:
         r = await self._client.get(f"/agents/{agent_id}")
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def activate_agent(self, agent_id: str) -> dict[str, Any]:
         r = await self._client.post(f"/agents/{agent_id}/activate")
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def deactivate_agent(self, agent_id: str) -> dict[str, Any]:
         r = await self._client.post(f"/agents/{agent_id}/deactivate")
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def discover_agent(self, url: str) -> dict[str, Any]:
         r = await self._client.post("/agents/discover", json={"url": url})
-        r.raise_for_status()
-        return r.json()
-
-    async def get_agent_trace(self, agent_id: str, limit: int = 20) -> dict[str, Any]:
-        r = await self._client.get(f"/agents/{agent_id}/trace", params={"limit": limit})
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     # ── Work items (worker protocol) ────────────────────────────────────
@@ -292,7 +340,7 @@ class JamjetClient:
         if lease_secs is not None:
             body["lease_secs"] = int(lease_secs)
         r = await self._client.post("/work-items/claim", json=body)
-        r.raise_for_status()
+        _raise_for_status(r)
         data = r.json()
         if not data.get("claimed"):
             return None
@@ -361,7 +409,7 @@ class JamjetClient:
             f"/work-items/{item_id}/complete",
             json=body,
         )
-        r.raise_for_status()
+        _raise_for_status(r)
 
     async def fail_work_item(self, item_id: str, error: str, lease_fence: int = 0) -> None:
         """Report that this work item's node failed.
@@ -382,7 +430,7 @@ class JamjetClient:
             f"/work-items/{item_id}/fail",
             json=body,
         )
-        r.raise_for_status()
+        _raise_for_status(r)
 
     async def heartbeat_work_item(
         self,
@@ -402,7 +450,7 @@ class JamjetClient:
             f"/work-items/{item_id}/heartbeat",
             json={"worker_id": worker_id, "lease_fence": lease_fence},
         )
-        r.raise_for_status()
+        _raise_for_status(r)
         try:
             body = r.json()
         except ValueError:
@@ -413,12 +461,12 @@ class JamjetClient:
 
     async def post(self, path: str, **kwargs: Any) -> dict[str, Any]:
         r = await self._client.post(path, **kwargs)
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
         r = await self._client.get(path, **kwargs)
-        r.raise_for_status()
+        _raise_for_status(r)
         return r.json()
 
     async def __aenter__(self) -> JamjetClient:

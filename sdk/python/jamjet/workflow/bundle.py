@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from jamjet.workflow.types import DEFAULT_WORKFLOW_VERSION
+
 
 @dataclass
 class CronSpec:
@@ -184,7 +186,7 @@ def _compile_agent_unit(
             "labels": node_def.get("labels", {}),
         }
 
-    version = str(agent.get("version") or defaults.get("version") or "0.1.0")
+    version = str(agent.get("version") or defaults.get("version") or DEFAULT_WORKFLOW_VERSION)
     from jamjet.workflow.ir_compiler import agent_ref as _agent_ref
 
     acts_as = _agent_ref(agent.get("agent_ref"), location=f"agent '{unit_id}' agent_ref")
@@ -285,7 +287,7 @@ def compile_bundle(data: dict[str, Any]) -> CompiledBundle:
 
     # Workflow units (explicit graphs) reuse the graph compiler with catalog access.
     for uid, wf in workflows.items():
-        header = {"id": uid, "version": wf.get("version", defaults.get("version", "0.1.0"))}
+        header = {"id": uid, "version": wf.get("version", defaults.get("version", DEFAULT_WORKFLOW_VERSION))}
         for key in ("name", "description", "start", "state_schema", "labels", "agent_ref"):
             if key in wf:
                 header[key] = wf[key]

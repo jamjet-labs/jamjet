@@ -87,19 +87,28 @@ jobs:
       - run: uv run mypy jamjet/cloud
 
   python-test:
-    name: Python tests
+    name: Python tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor (requires-python) through the newest version we support.
+        python-version: ["3.11", "3.12", "3.13"]
     defaults:
       run:
         working-directory: sdk/python
+    env:
+      # Make uv build the venv on this leg's interpreter, not one it finds first.
+      UV_PYTHON: ${{ matrix.python-version }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - run: pip install uv
       - run: uv sync --all-extras
-      - run: uv run pytest --tb=short
+      - run: uv run python -c "import sys; print(sys.version)"
+      - run: uv run pytest --tb=short --durations=10
 
   # ── Java SDK ────────────────────────────────────────────────────────
   java-test:

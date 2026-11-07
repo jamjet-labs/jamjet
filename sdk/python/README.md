@@ -54,7 +54,7 @@ The rest of this README is the **Python authoring guide** — workflows, durabil
 
 ## Quick Start
 
-**Requirements:** Python 3.11+
+**Requirements:** Python 3.11+ (the `memory` extra, which adds Engram, needs 3.12+)
 
 ```bash
 # Install the CLI (runtime binary included)

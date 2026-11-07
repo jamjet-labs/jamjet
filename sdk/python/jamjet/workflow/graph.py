@@ -13,6 +13,7 @@ from jamjet.workflow.nodes import (
     ModelNode,
     ToolNode,
 )
+from jamjet.workflow.types import DEFAULT_WORKFLOW_VERSION
 
 AnyNode = ModelNode | ToolNode | ConditionNode | HumanApprovalNode | EvalNode | CoordinatorNode | AgentToolNode
 
@@ -31,7 +32,7 @@ class WorkflowGraph:
         ir = graph.compile()
     """
 
-    def __init__(self, workflow_id: str, version: str = "0.1.0") -> None:
+    def __init__(self, workflow_id: str, version: str = DEFAULT_WORKFLOW_VERSION) -> None:
         self.workflow_id = workflow_id
         self.version = version
         self._nodes: dict[str, AnyNode] = {}

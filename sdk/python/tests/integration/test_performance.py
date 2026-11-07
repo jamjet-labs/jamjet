@@ -15,6 +15,7 @@ Keep the budget generous. If a change makes this test fail, the change is very
 probably at fault.
 """
 
+import importlib.util
 import time
 
 import pytest
@@ -36,6 +37,9 @@ class _Bench:
 BUDGET_S = 12.0
 
 
+# memory=None selects the default MemoryConfig, which runs on jamjet-engram
+# (the `memory` extra, Python 3.12+).
+@pytest.mark.skipif(importlib.util.find_spec("engram") is None, reason="needs jamjet-engram (Python 3.12+)")
 @pytest.mark.asyncio
 async def test_100_sequential_runs_within_budget(tmp_path):
     """Crude end-to-end perf gate. Catches order-of-magnitude regressions."""

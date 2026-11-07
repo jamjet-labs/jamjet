@@ -153,6 +153,19 @@ def _client(runtime: str = LOCAL_RUNTIME_URL, token: str | None = None) -> Jamje
 # ── Protocol trace helpers ───────────────────────────────────────────────────
 
 
+def _event_kind(event: Mapping[str, Any]) -> dict[str, Any]:
+    """The event's ``kind`` payload. The runtime serializes each event as
+    ``{"sequence", "kind": {"type": ..., "node_id": ..., ...}, "created_at"}``,
+    so the type and the per-kind fields live under ``kind``. A flat event (the
+    fields at the top level) is read as its own payload."""
+    kind = event.get("kind")
+    return kind if isinstance(kind, dict) else dict(event)
+
+
+def _event_field(event: Mapping[str, Any], name: str) -> Any:
+    return _event_kind(event).get(name)
+
+
 def _filter_events(
     events: list[dict[str, Any]],
     *,
@@ -162,9 +175,9 @@ def _filter_events(
     """Filter events by protocol type and/or node ID."""
     result = events
     if protocol:
-        result = [e for e in result if e.get("protocol") == protocol]
+        result = [e for e in result if _event_field(e, "protocol") == protocol]
     if node:
-        result = [e for e in result if e.get("node_id") == node]
+        result = [e for e in result if _event_field(e, "node_id") == node]
     return result
 
 
@@ -172,10 +185,37 @@ def _build_protocol_tree(events: list[dict[str, Any]]) -> dict[str, list[dict[st
     """Group protocol events by node_id for tree display."""
     tree: dict[str, list[dict[str, Any]]] = {}
     for event in events:
-        node_id = event.get("node_id")
+        node_id = _event_field(event, "node_id")
         if node_id:
             tree.setdefault(node_id, []).append(event)
     return tree
+
+
+def _is_agent_tool_event(event: Mapping[str, Any]) -> bool:
+    """True for the runtime's ``agent_tool_*`` events (invoked, progress, turn, ...)."""
+    kind_type = _event_kind(event).get("type")
+    return isinstance(kind_type, str) and kind_type.startswith("agent_tool_")
+
+
+def _print_protocol_activity(events: list[dict[str, Any]]) -> None:
+    """One line per agent-as-tool node: protocol, event count, turns, latency."""
+    protocol_events = [e for e in events if _is_agent_tool_event(e)]
+    if not protocol_events:
+        return
+    console.print("\n[bold]Protocol Activity[/bold]")
+    for nid, node_events in _build_protocol_tree(protocol_events).items():
+        kinds = [_event_kind(e) for e in node_events]
+        invoked = next((k for k in kinds if k.get("type") == "agent_tool_invoked"), {})
+        completed = next((k for k in kinds if k.get("type") == "agent_tool_completed"), {})
+        proto = invoked.get("protocol", "unknown")
+        latency = completed.get("latency_ms", "?")
+        turns = sum(1 for k in kinds if k.get("type") == "agent_tool_turn")
+        # Node ids and protocol names come from the run: shown literally, never as markup.
+        console.print(
+            f"  {_safe(nid)} [{_safe(proto)}] — {len(node_events)} events, {turns} turns, {_safe(latency)}ms",
+            markup=False,
+            highlight=False,
+        )
 
 
 # ── init ─────────────────────────────────────────────────────────────────────
@@ -598,39 +638,17 @@ def validate(
     """Validate a workflow definition (YAML or Python)."""
     import os
 
-    from jamjet.workflow.ir_compiler import compile_yaml
-
     console.print(f"Validating: [bold]{path}[/bold]")
 
     if not os.path.isfile(path):
         console.print(f"[red]File not found:[/red] {path}")
         raise typer.Exit(1)
+    if not path.endswith((".yaml", ".yml", ".py")):
+        console.print("[red]Unsupported file type. Use .yaml, .yml, or .py[/red]")
+        raise typer.Exit(1)
 
     try:
-        if path.endswith(".yaml") or path.endswith(".yml"):
-            with open(path) as f:
-                source = f.read()
-            ir = compile_yaml(source)
-        elif path.endswith(".py"):
-            # Import the module and call compile() on the first Workflow object found.
-            import importlib.util
-
-            spec = importlib.util.spec_from_file_location("_wf_module", path)
-            mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-            spec.loader.exec_module(mod)  # type: ignore[union-attr]
-            from jamjet.workflow.workflow import Workflow
-
-            wf = next(
-                (v for v in vars(mod).values() if isinstance(v, Workflow)),
-                None,
-            )
-            if wf is None:
-                console.print("[red]No Workflow instance found in module.[/red]")
-                raise typer.Exit(1)
-            ir = wf.compile()
-        else:
-            console.print("[red]Unsupported file type. Use .yaml or .py[/red]")
-            raise typer.Exit(1)
+        ir = _load_workflow_ir(path)
 
         wf_id = ir.get("workflow_id")
         version = ir.get("version")
@@ -725,7 +743,9 @@ def _load_workflow_ir(path: str) -> dict[str, Any]:
         wf = next((v for v in vars(mod).values() if isinstance(v, Workflow)), None)
         if wf is None:
             raise ValueError("No Workflow instance found in module.")
-        return wf.compile()
+        # The runtime IR dict, not compile()'s WorkflowSpec: callers read it with
+        # .get() and POST it to /workflows.
+        return wf.to_ir()
     raise ValueError("Unsupported workflow file type. Use .yaml, .yml, or .py")
 
 
@@ -1144,17 +1164,7 @@ def inspect(
                 )
 
             # ── Protocol Activity section ─────────────────────────────────
-            protocol_events = [e for e in evts if e.get("kind", "").startswith("AgentTool")]
-            if protocol_events:
-                console.print("\n[bold]Protocol Activity[/bold]")
-                tree = _build_protocol_tree(protocol_events)
-                for nid, node_events in tree.items():
-                    invoked = next((e for e in node_events if e["kind"] == "AgentToolInvoked"), {})
-                    completed = next((e for e in node_events if e["kind"] == "AgentToolCompleted"), {})
-                    proto = invoked.get("protocol", "unknown")
-                    latency = completed.get("latency_ms", "?")
-                    turns = sum(1 for e in node_events if e["kind"] == "AgentToolTurn")
-                    console.print(f"  {nid} [{proto}] — {len(node_events)} events, {turns} turns, {latency}ms")
+            _print_protocol_activity(evts)
 
             # ── Strategy section ─────────────────────────────────────────
             _print_strategy_section(console, data, evts)
@@ -1440,44 +1450,6 @@ def agents_connect(
                 console.print(f"  Skills: {', '.join(s.get('id', '?') for s in skills)}")
 
     asyncio.run(_connect())
-
-
-@agents_app.command("trace")
-def agents_trace(
-    agent_id: str = typer.Argument(..., help="Agent ID to show communication trace for"),
-    limit: int = typer.Option(20, "--limit", "-n", help="Number of recent events to show"),
-    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
-) -> None:
-    """Show recent A2A communication events for an agent."""
-    from rich.table import Table
-
-    async def _trace() -> None:
-        async with _client(runtime) as c:
-            data = await c.get(f"/agents/{agent_id}/trace?limit={limit}")
-            events = data.get("events", [])
-
-        if not events:
-            console.print(f"[dim]No trace events found for agent {agent_id}[/dim]")
-            return
-
-        t = Table(title=f"Agent trace — {agent_id}", show_lines=False)
-        t.add_column("Time", style="dim", width=20)
-        t.add_column("Direction", width=10)
-        t.add_column("Type", style="cyan", width=18)
-        t.add_column("Details")
-
-        for evt in events:
-            direction = "[green]→ OUT[/green]" if evt.get("direction") == "outbound" else "[blue]← IN[/blue]"
-            t.add_row(
-                evt.get("timestamp", "")[:19],
-                direction,
-                evt.get("event_type", ""),
-                evt.get("summary", ""),
-            )
-
-        console.print(t)
-
-    asyncio.run(_trace())
 
 
 # ── mcp ───────────────────────────────────────────────────────────────────────
