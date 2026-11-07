@@ -600,10 +600,12 @@ def _compile_yaml_reporting(source: str) -> dict[str, Any]:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", WorkflowSchemaWarning)
         ir = compile_yaml(source)
+    # stderr, so `jamjet run --output json` keeps stdout to the JSON result.
+    err = Console(stderr=True)
     for w in caught:
         if issubclass(w.category, WorkflowSchemaWarning):
-            console.print("Warning:", style="yellow", end=" ")
-            console.print(str(w.message), markup=False, highlight=False)
+            err.print("Warning:", style="yellow", end=" ")
+            err.print(str(w.message), markup=False, highlight=False)
         else:
             warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
     return ir
