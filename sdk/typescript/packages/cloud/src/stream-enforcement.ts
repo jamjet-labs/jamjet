@@ -18,7 +18,10 @@ export type Vendor = 'openai' | 'anthropic'
 
 export interface StreamedToolCall {
   id?: string
+  /** The name as the openai SDK accumulates it: a non-empty fragment replaces. */
   name: string
+  /** Every name fragment joined, for a consumer that concatenates them. */
+  joinedName: string
   /** Raw argument text as streamed (OpenAI JSON string / Anthropic input_json deltas). */
   arguments: string
 }
@@ -31,6 +34,8 @@ export interface StreamTally {
   /** Characters of generated text and tool arguments; used when the stream reports no usage. */
   outputChars: number
   toolCalls: StreamedToolCall[]
+  /** The vendor's end-of-message signal arrived (finish_reason / message_stop). */
+  finished: boolean
 }
 
 export type StreamEnd =
@@ -40,8 +45,11 @@ export type StreamEnd =
 
 export interface StreamEnforcementHooks {
   vendor: Vendor
-  /** Hold tool-call chunks back until the calls are checked. Off when no policy rule exists. */
-  holdToolCalls: boolean
+  /**
+   * Hold tool-call chunks back until the calls are checked. Asked on every
+   * chunk, so a rule added while the stream is open still holds its calls.
+   */
+  holdToolCalls: () => boolean
   /** Throw to refuse the calls; the held chunks are then never released. */
   onToolCalls: (calls: StreamedToolCall[], tally: StreamTally) => void | Promise<void>
   /** Anthropic names a tool in full at content_block_start; throw here to stop early. */
@@ -61,12 +69,13 @@ class Tally implements StreamTally {
   cacheReadTokens = 0
   outputChars = 0
   toolCalls: StreamedToolCall[] = []
+  finished = false
   private byKey = new Map<string, StreamedToolCall>()
 
   private call(key: string): StreamedToolCall {
     let entry = this.byKey.get(key)
     if (!entry) {
-      entry = { name: '', arguments: '' }
+      entry = { name: '', joinedName: '', arguments: '' }
       this.byKey.set(key, entry)
       this.toolCalls.push(entry)
     }
@@ -93,6 +102,9 @@ class Tally implements StreamTally {
     let toolChunk = false
     const choices = Array.isArray(c['choices']) ? c['choices'] : []
     for (const choice of choices) {
+      if (choice?.['finish_reason'] != null) this.finished = true
+      // Legacy completions stream text on the choice itself.
+      if (typeof choice?.['text'] === 'string') this.outputChars += choice['text'].length
       const delta = (choice?.['delta'] ?? {}) as Record<string, any>
       if (typeof delta['content'] === 'string') this.outputChars += delta['content'].length
       const calls = Array.isArray(delta['tool_calls']) ? delta['tool_calls'] : []
@@ -103,7 +115,10 @@ class Tally implements StreamTally {
         const fn = (tc?.['function'] ?? tc?.['custom'] ?? {}) as Record<string, unknown>
         // Mirrors the openai SDK's own accumulator: a non-empty name replaces,
         // argument text appends.
-        if (typeof fn['name'] === 'string' && fn['name'] !== '') entry.name = fn['name']
+        if (typeof fn['name'] === 'string' && fn['name'] !== '') {
+          entry.name = fn['name']
+          entry.joinedName += fn['name']
+        }
         for (const key of ['arguments', 'input']) {
           const text = fn[key]
           if (typeof text === 'string') {
@@ -139,6 +154,7 @@ class Tally implements StreamTally {
         if (block['type'] === 'tool_use' || block['type'] === 'server_tool_use') {
           const entry = this.call(String(c['index'] ?? 0))
           entry.name = typeof block['name'] === 'string' ? block['name'] : ''
+          entry.joinedName = entry.name
           if (typeof block['id'] === 'string') entry.id = block['id']
           const started: { id?: string; name: string } = { name: entry.name }
           if (entry.id !== undefined) started.id = entry.id
@@ -159,6 +175,9 @@ class Tally implements StreamTally {
         }
         return { toolChunk: false }
       }
+      case 'message_stop':
+        this.finished = true
+        return { toolChunk: false }
       default:
         return { toolChunk: false }
     }
@@ -190,7 +209,7 @@ function enforcedIterator(
         }
         const { toolChunk, started } = tally.observe(hooks.vendor, step.value)
         if (started !== undefined) hooks.onToolCallStarted?.(started, tally)
-        if (hooks.holdToolCalls && toolChunk) holding = true
+        if (toolChunk && !holding && hooks.holdToolCalls()) holding = true
         if (holding) held.push(step.value)
         else yield step.value
       }
@@ -219,20 +238,26 @@ function enforcedIterator(
 }
 
 /**
- * Route every read of `stream` through the enforced iterator, in place, so the
- * object keeps its class, its `controller`, and helpers such as `tee()` and
- * `toReadableStream()`. Returns null when `stream` is not async-iterable.
+ * Route every read of `stream` through the enforced iterator. Returns what the
+ * caller should get back, or null when `stream` is not async-iterable.
+ *
+ * Stainless SDK streams (openai, @anthropic-ai/sdk) read through an own
+ * `iterator` property that `[Symbol.asyncIterator]`, `tee()` and
+ * `toReadableStream()` all call; it is replaced in place, so the object keeps
+ * its class and its `controller`. A result that is itself an iterator (has
+ * `next`) is replaced by the enforced iterator, so direct `next()` calls are
+ * checked too.
  */
-export function enforceStream<T>(stream: T, hooks: StreamEnforcementHooks): T | null {
+export function enforceStream(stream: unknown, hooks: StreamEnforcementHooks): unknown | null {
   if (typeof stream !== 'object' || stream === null) return null
   const s = stream as Record<string | symbol, any>
-  // Stainless SDK streams (openai, @anthropic-ai/sdk) read through an own
-  // `iterator` property; `[Symbol.asyncIterator]`, `tee()` and
-  // `toReadableStream()` all call it.
   if (typeof s['iterator'] === 'function') {
     const original = s['iterator'] as () => AsyncIterator<unknown>
     s['iterator'] = () => enforcedIterator(original.call(stream), hooks)
     return stream
+  }
+  if (typeof s['next'] === 'function') {
+    return enforcedIterator(stream as AsyncIterator<unknown>, hooks)
   }
   const iterate = s[Symbol.asyncIterator]
   if (typeof iterate !== 'function') return null

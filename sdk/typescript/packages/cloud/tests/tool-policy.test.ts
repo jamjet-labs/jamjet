@@ -207,7 +207,7 @@ describe('streaming: OpenAI chunks', () => {
       client,
       vendor: 'openai',
       original: streamOf([
-        { model: 'gpt-4o', choices: [{ index: 0, delta: { content: 'hi' } }] },
+        { model: 'gpt-4o', choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: 'stop' }] },
         { model: 'gpt-4o', choices: [], usage: { prompt_tokens: 1000, completion_tokens: 500 } },
       ]),
       args: [{ model: 'gpt-4o', stream: true, messages: [], stream_options: { include_usage: true } }],

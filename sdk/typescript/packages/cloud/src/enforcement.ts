@@ -7,7 +7,7 @@ import { estimateCost } from './cost.js'
 import { JamjetPolicyBlocked } from './errors.js'
 import { toolNameOf } from './policy.js'
 import { Span } from './span.js'
-import { enforceStream, type StreamTally, type Vendor } from './stream-enforcement.js'
+import { enforceStream, type StreamedToolCall, type StreamTally, type Vendor } from './stream-enforcement.js'
 
 export interface EnforcedCallOptions {
   client: Client
@@ -31,11 +31,12 @@ function newId(): string {
   return Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
 }
 
+/** ~4 characters per token over everything sent as input: messages, tool definitions, system, legacy prompt. */
 function estimatePromptTokens(args0: unknown): number {
   try {
     const a = args0 as Record<string, unknown>
-    const messages = Array.isArray(a['messages']) ? a['messages'] : []
-    const totalChars = JSON.stringify(messages).length
+    const input = [a['messages'], a['tools'], a['system'], a['prompt']].filter((v) => v !== undefined)
+    const totalChars = JSON.stringify(input).length
     return Math.ceil(totalChars / 4)
   } catch {
     return 0
@@ -216,25 +217,39 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
 
   if (isStreaming) {
     const streamState = (tally: StreamTally): CallState => ({ ...state, model: tally.model ?? model })
-    const refuseStreamed = (calls: ReadonlyArray<{ id?: string; name: string }>, tally: StreamTally): void => {
-      if (firstBlocked(client, calls) === null) return
+    const refuseStreamed = (calls: ReadonlyArray<StreamedToolCall>, tally: StreamTally): void => {
+      // Check the name the openai SDK keeps (last fragment) and the joined
+      // fragments, so a consumer that concatenates them cannot get a blocked name.
+      const names = calls.flatMap((c) => {
+        const base = c.id !== undefined ? { id: c.id } : {}
+        return c.joinedName !== '' && c.joinedName !== c.name
+          ? [{ ...base, name: c.name }, { ...base, name: c.joinedName }]
+          : [{ ...base, name: c.name }]
+      })
+      if (firstBlocked(client, names) === null) return
       recordUsage(streamState(tally), streamUsage(tally, estTokens, false), tally.cacheReadTokens, {
         usage_estimated: true,
         stream_incomplete: true,
       })
-      refuseBlocked(state, calls)
+      refuseBlocked(state, names)
     }
     const enforced = enforceStream(result, {
       vendor,
-      holdToolCalls: client._policy.hasRules(),
-      onToolCallStarted: (call, tally) => refuseStreamed([call], tally),
+      holdToolCalls: () => client._policy.hasRules(),
+      onToolCallStarted: (call, tally) => refuseStreamed([{ ...call, joinedName: call.name, arguments: '' }], tally),
       onToolCalls: (calls, tally) => refuseStreamed(calls, tally),
       onEnd: (tally, end) => {
         if (end.kind === 'error') {
-          if (!(end.error instanceof JamjetPolicyBlocked)) failSpan(state, end.error)
+          if (end.error instanceof JamjetPolicyBlocked) return // recorded where it was raised
+          // The tokens the stream produced before failing were still spent.
+          recordUsage(streamState(tally), streamUsage(tally, estTokens, false), tally.cacheReadTokens, {
+            usage_estimated: true,
+            stream_incomplete: true,
+          })
+          failSpan(state, end.error)
           return
         }
-        const complete = end.kind === 'complete'
+        const complete = end.kind === 'complete' && tally.finished
         const reported = tally.inputTokens !== undefined && tally.outputTokens !== undefined
         recordUsage(streamState(tally), streamUsage(tally, estTokens, complete), tally.cacheReadTokens, {
           ...(complete && reported ? {} : { usage_estimated: true }),

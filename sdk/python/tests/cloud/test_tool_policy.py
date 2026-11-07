@@ -12,13 +12,16 @@ import json
 from collections.abc import Callable, Iterator
 from typing import Any
 
-import anthropic  # imported before conftest can stub the module
 import httpx
-import openai
 import pytest
 
 from jamjet.cloud.exceptions import JamJetBudgetExceeded, JamJetPolicyBlocked
 from jamjet.cloud.policy import PolicyEvaluator
+
+# Both vendor SDKs are optional extras (`pip install jamjet[cloud-all]`); CI
+# installs them. Imported before conftest can stub the openai module.
+anthropic = pytest.importorskip("anthropic")
+openai = pytest.importorskip("openai")
 
 # `jamjet.cloud` defines functions named `budget` and `policy`, which shadow
 # the submodules on attribute access; fetch the modules themselves.
@@ -353,3 +356,71 @@ def test_anthropic_stream_records_cost_and_budget_applies(env: dict[str, Any]) -
         client.messages.create(
             model="claude-sonnet-4-6", max_tokens=64, stream=True, messages=[{"role": "user", "content": "x"}]
         )
+
+
+def test_tool_name_split_across_deltas_is_checked_joined(env: dict[str, Any]) -> None:
+    env["policy"].add("block", "wire_money")
+    base = {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o"}
+
+    def delta(d: dict[str, Any], finish: str | None = None) -> tuple[None, dict[str, Any]]:
+        return None, {**base, "choices": [{"index": 0, "delta": d, "finish_reason": finish}]}
+
+    body = _sse(
+        [
+            delta(
+                {
+                    "tool_calls": [
+                        {"index": 0, "id": "c1", "type": "function", "function": {"name": "wire_", "arguments": ""}}
+                    ]
+                }
+            ),
+            delta({"tool_calls": [{"index": 0, "function": {"name": "money", "arguments": "{}"}}]}),
+            delta({}, "tool_calls"),
+            (None, "[DONE]"),
+        ]
+    )
+    client = _openai(lambda _: body, [])
+    stream = client.chat.completions.create(model="gpt-4o", stream=True, messages=[{"role": "user", "content": "x"}])
+    with pytest.raises(JamJetPolicyBlocked):
+        list(stream)
+
+
+def test_stream_failure_still_records_usage(env: dict[str, Any]) -> None:
+    def broken(_self: Any, **_kwargs: Any) -> Iterator[dict[str, Any]]:
+        yield {
+            "type": "message_start",
+            "message": {"model": "claude-sonnet-4-6", "usage": {"input_tokens": 4000, "output_tokens": 1}},
+        }
+        raise ConnectionError("connection reset")
+
+    stream = patcher._run_enforced(
+        "anthropic", broken, None, (), {"model": "claude-sonnet-4-6", "stream": True, "messages": []}
+    )
+    with pytest.raises(ConnectionError):
+        list(stream)
+    assert budget_mod.get_budget().spent > 0
+    assert env["spans"][-1]["status"] == "error"
+    assert env["spans"][-1]["input_tokens"] == 4000
+
+
+def test_closing_a_stream_early_records_it(env: dict[str, Any]) -> None:
+    client = _anthropic(lambda _: _anthropic_stream("search"), [])
+    stream = client.messages.create(
+        model="claude-sonnet-4-6", max_tokens=64, stream=True, messages=[{"role": "user", "content": "x"}]
+    )
+    next(iter(stream))
+    stream.close()
+    assert env["spans"][-1]["payload"]["stream_incomplete"] is True
+    assert budget_mod.get_budget().spent > 0
+
+
+def test_tools_passed_as_a_generator_are_kept(env: dict[str, Any]) -> None:
+    env["policy"].add("block", "shell.*")
+    sent: list[dict[str, Any]] = []
+    client = _openai(lambda _: _openai_completion({"content": "ok"}), sent)
+    client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "x"}],
+        tools=(t for t in TOOLS_OPENAI),  # type: ignore[arg-type]
+    )
+    assert [t["function"]["name"] for t in sent[0]["tools"]] == ["search", "wire_money"]

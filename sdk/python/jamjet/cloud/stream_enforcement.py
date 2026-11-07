@@ -19,7 +19,7 @@ Mirrors ``sdk/typescript/packages/cloud/src/stream-enforcement.ts``.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,9 +30,12 @@ Vendor = str  # "openai" | "anthropic"
 
 @dataclass
 class StreamedToolCall:
+    # The name as the openai SDK accumulates it: a non-empty fragment replaces.
     name: str = ""
     id: str | None = None
     arguments: str = ""
+    # Every name fragment joined, for a consumer that concatenates them.
+    joined_name: str = ""
 
 
 @dataclass
@@ -45,6 +48,8 @@ class StreamTally:
     # reports no usage.
     output_chars: int = 0
     tool_calls: list[StreamedToolCall] = field(default_factory=list)
+    # The vendor's end-of-message signal arrived (finish_reason / message_stop).
+    finished: bool = False
     _by_key: dict[str, StreamedToolCall] = field(default_factory=dict, repr=False)
 
     def _call(self, key: str) -> StreamedToolCall:
@@ -71,6 +76,11 @@ class StreamTally:
             self.output_tokens = _int(_field(usage, "completion_tokens"), self.output_tokens)
         tool_chunk = False
         for choice in _field(chunk, "choices") or []:
+            if _field(choice, "finish_reason") is not None:
+                self.finished = True
+            text = _field(choice, "text")  # legacy completions
+            if isinstance(text, str):
+                self.output_chars += len(text)
             delta = _field(choice, "delta")
             content = _field(delta, "content")
             if isinstance(content, str):
@@ -87,6 +97,7 @@ class StreamTally:
                 name = _field(fn, "name")
                 if isinstance(name, str) and name:
                     entry.name = name
+                    entry.joined_name += name
                 for key in ("arguments", "input"):
                     text = _field(fn, key)
                     if isinstance(text, str):
@@ -110,12 +121,15 @@ class StreamTally:
             self.output_tokens = _int(_field(usage, "output_tokens"), self.output_tokens)
             self.input_tokens = _int(_field(usage, "input_tokens"), self.input_tokens)
             self.cache_read_tokens = _int(_field(usage, "cache_read_input_tokens"), self.cache_read_tokens) or 0
+        elif kind == "message_stop":
+            self.finished = True
         elif kind == "content_block_start":
             block = _field(event, "content_block")
             if _field(block, "type") in ("tool_use", "server_tool_use"):
                 entry = self._call(str(_field(event, "index") or 0))
                 name = _field(block, "name")
                 entry.name = name if isinstance(name, str) else ""
+                entry.joined_name = entry.name
                 block_id = _field(block, "id")
                 if isinstance(block_id, str):
                     entry.id = block_id
@@ -153,11 +167,11 @@ def enforced_iterator(
     inner: Iterator[Any],
     *,
     vendor: Vendor,
-    hold_tool_calls: bool,
+    hold_tool_calls: Callable[[], bool],
     on_tool_calls: OnToolCalls,
     on_tool_call_started: OnStarted,
     on_end: OnEnd,
-) -> Iterator[Any]:
+) -> Generator[Any, None, None]:
     tally = StreamTally()
     held: list[Any] = []
     holding = False
@@ -168,7 +182,8 @@ def enforced_iterator(
             tool_chunk, started = tally.observe(vendor, chunk)
             if started is not None:
                 on_tool_call_started(started, tally)
-            if hold_tool_calls and tool_chunk:
+            # Asked per chunk, so a rule added while the stream is open still holds.
+            if tool_chunk and not holding and hold_tool_calls():
                 holding = True
             if holding:
                 held.append(chunk)
@@ -203,7 +218,7 @@ def enforced_iterator(
 class _EnforcedStream:
     """Fallback wrapper for an iterable result that is not an SDK Stream."""
 
-    def __init__(self, wrapped: Any, iterator: Iterator[Any]) -> None:
+    def __init__(self, wrapped: Any, iterator: Generator[Any, None, None]) -> None:
         self._wrapped = wrapped
         self._iterator = iterator
 
@@ -216,10 +231,16 @@ class _EnforcedStream:
     def __enter__(self) -> _EnforcedStream:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def close(self) -> None:
+        close_iterator = getattr(self._iterator, "close", None)
+        if callable(close_iterator):
+            close_iterator()
         close = getattr(self._wrapped, "close", None)
         if callable(close):
             close()
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._wrapped, name)
@@ -230,12 +251,23 @@ def enforce_stream(result: Any, **hooks: Any) -> Any | None:
 
     SDK streams (``openai.Stream``, ``anthropic.Stream``) read through their
     ``_iterator`` attribute, so it is replaced in place and the object keeps
-    its class and its ``close()``/context-manager behaviour. Returns None when
-    ``result`` is not iterable.
+    its class and its context-manager behaviour. ``close()`` (also called on
+    context-manager exit) closes the enforced iterator first, so a stream the
+    caller abandons is still recorded. Returns None when ``result`` is not
+    iterable.
     """
     inner = getattr(result, "_iterator", None)
     if inner is not None and hasattr(inner, "__next__"):
-        result._iterator = enforced_iterator(inner, **hooks)
+        enforced = enforced_iterator(inner, **hooks)
+        result._iterator = enforced
+        original_close = getattr(result, "close", None)
+        if callable(original_close):
+
+            def close() -> None:
+                enforced.close()
+                original_close()
+
+            result.close = close
         return result
     try:
         iterator = iter(result)

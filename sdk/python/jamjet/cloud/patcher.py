@@ -77,10 +77,11 @@ def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
 
 
 def _estimate_prompt_tokens(kwargs: dict[str, Any]) -> int:
-    """~4 characters per token over the serialised messages (used when a
-    stream reports no usage)."""
+    """~4 characters per token over everything sent as input: messages, tool
+    definitions, system, legacy prompt (used when a stream reports no usage)."""
     try:
-        return -(-len(json.dumps(kwargs.get("messages") or [], default=str)) // 4)
+        sent = [kwargs[k] for k in ("messages", "tools", "system", "prompt") if kwargs.get(k) is not None]
+        return -(-len(json.dumps(sent, default=str)) // 4)
     except Exception:  # noqa: BLE001  an estimate must never break the call
         return 0
 
@@ -90,8 +91,12 @@ def _filter_tools_pre_call(kwargs: dict[str, Any]) -> None:
     tools = kwargs.get("tools")
     if not tools:
         return
+    # Materialise once: a generator would otherwise be spent by the check and
+    # reach the vendor empty.
+    tools = list(tools)
+    kwargs["tools"] = tools
     evaluator = get_evaluator()
-    allowed, blocked = evaluator.filter_tools(list(tools))
+    allowed, blocked = evaluator.filter_tools(tools)
     if not blocked:
         return
     # A tool_choice that forces a stripped tool cannot be honoured: refuse the
@@ -181,7 +186,10 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
         return input_tokens, output
 
     def refuse(calls: list[StreamedToolCall], tally: StreamTally) -> None:
+        # Check the name the openai SDK keeps (last fragment) and the joined
+        # fragments, so a consumer that concatenates them cannot get a blocked name.
         pairs = [(c.id, c.name) for c in calls]
+        pairs += [(c.id, c.joined_name) for c in calls if c.joined_name and c.joined_name != c.name]
         evaluator = get_evaluator()
         if not any(evaluator.evaluate(name).blocked for _, name in pairs):
             return
@@ -191,8 +199,18 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
 
     def on_end(tally: StreamTally, how: str, error: BaseException | None) -> None:
         if how == "error":
+            if isinstance(error, JamJetPolicyBlocked):
+                return  # recorded where it was raised
+            # The tokens the stream produced before failing were still spent.
+            input_tokens, output = usage_of(tally, complete=False)
+            _record_usage(
+                span, tally.model or model, input_tokens, output, usage_estimated=True, stream_incomplete=True
+            )
+            span.payload = {**span.payload, "error": str(error)}
+            span.finish(status="error")
+            emit(span.to_event_dict())
             return
-        complete = how == "complete"
+        complete = how == "complete" and tally.finished
         input_tokens, output = usage_of(tally, complete)
         reported = tally.input_tokens is not None and tally.output_tokens is not None
         extra: dict[str, Any] = {}
@@ -207,7 +225,7 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
     enforced = enforce_stream(
         result,
         vendor=vendor,
-        hold_tool_calls=get_evaluator().has_rules(),
+        hold_tool_calls=lambda: get_evaluator().has_rules(),
         on_tool_calls=refuse,
         on_tool_call_started=lambda call, tally: refuse([call], tally),
         on_end=on_end,
