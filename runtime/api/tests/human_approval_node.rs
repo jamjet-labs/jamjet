@@ -511,3 +511,263 @@ async fn an_unusable_timeout_or_fallback_is_refused_at_registration() {
         }
     }
 }
+
+/// A graph where the guarded step is also a join:
+///
+/// ```text
+/// review (human_approval, fallback: hold) ─┐
+///                                          ├─> publish ─┬─> deploy
+/// prep ────────────────────────────────────┴────────────┘
+/// publish ─> notify <─ hold
+/// ```
+///
+/// `prep` is a second root, so `publish` and `deploy` each have a live
+/// in-edge that does not pass through the approval.
+fn join_ir() -> Value {
+    let step = |id: &str| {
+        json!({
+            "id": id,
+            "kind": { "type": "python_fn", "module": "myapp.release", "function": id, "output_schema": "" },
+            "retry_policy": null, "node_timeout_secs": null, "description": null, "labels": {}
+        })
+    };
+    let edge = |from: &str, to: &str| json!({ "from": from, "to": to, "condition": null });
+    json!({
+        "workflow_id": "wf-release", "version": "0.1.0", "name": null, "description": null,
+        "state_schema": "", "start_node": "review",
+        "nodes": {
+            "review": {
+                "id": "review",
+                "kind": { "type": "human_approval", "description": "Ship?", "timeout_secs": 60, "fallback_node": "hold" },
+                "retry_policy": null, "node_timeout_secs": null, "description": null, "labels": {}
+            },
+            "prep": step("prep"),
+            "publish": step("publish"),
+            "deploy": step("deploy"),
+            "hold": step("hold"),
+            "notify": step("notify"),
+        },
+        "edges": [
+            edge("review", "publish"), edge("prep", "publish"),
+            edge("publish", "deploy"), edge("prep", "deploy"),
+            edge("publish", "notify"), edge("hold", "notify"),
+            edge("deploy", "end"), edge("notify", "end")
+        ],
+        "retry_policies": {}, "timeouts": {}, "models": {}, "tools": {},
+        "mcp_servers": {}, "remote_agents": {}, "labels": {}
+    })
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// Review finding (PR #169): after an expiry, a guarded step that is also a
+/// join ran on its other live in-edge, with no approval. The whole path the
+/// approval guarded is skipped; a node the fallback also leads to still runs.
+#[tokio::test]
+async fn an_expiry_never_runs_the_guarded_path_through_a_join() {
+    for env in envs().await {
+        let eid = start(&env, join_ir()).await;
+        settle(&env).await;
+        assert_eq!(
+            ran(&env),
+            vec!["prep".to_string()],
+            "{}: only prep before the decision",
+            env.name
+        );
+        let (ctx, _) = request(&events(&env, &eid).await);
+        let expires_at: DateTime<Utc> = ctx["expires_at"].as_str().unwrap().parse().unwrap();
+        env.scheduler
+            .sweep_approval_deadlines(&eid, expires_at)
+            .await
+            .unwrap();
+        settle(&env).await;
+
+        let evs = events(&env, &eid).await;
+        assert_eq!(
+            sorted(ran(&env)),
+            vec!["hold".to_string(), "notify".to_string(), "prep".to_string()],
+            "{}: {evs:#?}",
+            env.name
+        );
+        for guarded in ["publish", "deploy"] {
+            assert!(
+                evs.iter().any(|e| matches!(&e.kind,
+                    EventKind::NodeSkipped { node_id, .. } if node_id == guarded)),
+                "{}: {guarded} is skipped",
+                env.name
+            );
+        }
+        assert_eq!(finished(&evs), Some("completed"), "{}", env.name);
+    }
+}
+
+/// The same graph, approved: the guarded path runs and the fallback does not.
+#[tokio::test]
+async fn an_approval_runs_the_guarded_path_of_a_join() {
+    for env in envs().await {
+        let eid = start(&env, join_ir()).await;
+        settle(&env).await;
+        let (ctx, _) = request(&events(&env, &eid).await);
+        let digest = ctx["action_digest"].as_str().unwrap();
+        let (st, body) = call(
+            &env,
+            "POST",
+            &path(&eid, "/approve"),
+            &env.bob,
+            json!({ "decision": "approved", "node_id": "review", "action_digest": digest }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+        settle(&env).await;
+        let evs = events(&env, &eid).await;
+        assert_eq!(
+            sorted(ran(&env)),
+            vec![
+                "deploy".to_string(),
+                "notify".to_string(),
+                "prep".to_string(),
+                "publish".to_string()
+            ],
+            "{}: {evs:#?}",
+            env.name
+        );
+        assert_eq!(finished(&evs), Some("completed"), "{}", env.name);
+    }
+}
+
+/// Review finding (PR #169): a fallback upstream of the approval made the
+/// approval and the fallback wait on each other, and the run ended
+/// "completed" without anyone being asked. Registration refuses it.
+#[tokio::test]
+async fn a_fallback_upstream_of_the_approval_is_refused() {
+    for env in envs().await {
+        let mut ir = ir(Some(60), true, Value::Null);
+        // hold -> review, so review is reachable from its own fallback.
+        ir["start_node"] = json!("hold");
+        ir["edges"] = json!([
+            { "from": "hold", "to": "review", "condition": null },
+            { "from": "review", "to": "publish", "condition": null },
+            { "from": "publish", "to": "end", "condition": null }
+        ]);
+        let (st, body) = call(&env, "POST", "/workflows", &env.alice, json!({ "ir": ir })).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{}: {body}", env.name);
+        assert!(
+            body.to_string().contains("leads back"),
+            "{}: {body}",
+            env.name
+        );
+    }
+}
+
+/// A version stored before that check: the unusable fallback counts as none,
+/// so the run neither deadlocks nor reports success. It waits for a decision,
+/// and an expiry fails the node.
+#[tokio::test]
+async fn a_stored_upstream_fallback_is_ignored_and_an_expiry_fails() {
+    for env in envs().await {
+        let mut ir = ir(Some(60), true, Value::Null);
+        ir["start_node"] = json!("hold");
+        ir["edges"] = json!([
+            { "from": "hold", "to": "review", "condition": null },
+            { "from": "review", "to": "publish", "condition": null },
+            { "from": "publish", "to": "end", "condition": null }
+        ]);
+        support::store_ir(env.backend.as_ref(), &ir).await;
+        let (st, body) = call(
+            &env,
+            "POST",
+            "/executions",
+            &env.alice,
+            json!({ "workflow_id": "wf-release", "workflow_version": "0.1.0", "input": {} }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{}: {body}", env.name);
+        let id = body["execution_id"].as_str().unwrap();
+        let eid = ExecutionId(uuid::Uuid::parse_str(id.strip_prefix("exec_").unwrap()).unwrap());
+        settle(&env).await;
+        let evs = events(&env, &eid).await;
+        assert_eq!(
+            finished(&evs),
+            None,
+            "{}: must wait, not finish: {evs:#?}",
+            env.name
+        );
+        let (ctx, _) = request(&evs);
+        let expires_at: DateTime<Utc> = ctx["expires_at"].as_str().unwrap().parse().unwrap();
+        env.scheduler
+            .sweep_approval_deadlines(&eid, expires_at)
+            .await
+            .unwrap();
+        settle(&env).await;
+        let evs = events(&env, &eid).await;
+        assert_eq!(ran(&env), vec!["hold".to_string()], "{}", env.name);
+        assert_eq!(finished(&evs), Some("failed"), "{}: {evs:#?}", env.name);
+    }
+}
+
+/// Review finding (PR #169): the route of a `human_approval` node was read
+/// from a completion's output, which an external worker reporting the
+/// approved node writes. A forged `chosen_target` must not send the run to
+/// the fallback.
+#[tokio::test]
+async fn a_worker_reported_route_cannot_pick_the_fallback() {
+    for env in envs().await {
+        let (eid, ctx) = park(&env, ir(Some(60), true, Value::Null)).await;
+        let digest = ctx["action_digest"].as_str().unwrap();
+        let (st, body) = call(
+            &env,
+            "POST",
+            &path(&eid, "/approve"),
+            &env.bob,
+            json!({ "decision": "approved", "node_id": "review", "action_digest": digest }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+        env.scheduler.tick().await.unwrap();
+
+        // An external worker with its own token claims the re-dispatched
+        // item from `general` and reports a route of its choosing.
+        let (carol, _) = env
+            .backend
+            .create_token("carol", "developer")
+            .await
+            .unwrap();
+        let (st, claimed) = call(
+            &env,
+            "POST",
+            "/work-items/claim",
+            &carol,
+            json!({ "worker_id": "ext", "queue_types": ["general"] }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {claimed}", env.name);
+        assert_eq!(claimed["claimed"], true, "{}: {claimed}", env.name);
+        let item = claimed["work_item"]["id"].as_str().unwrap().to_string();
+        let (st, body) = call(
+            &env,
+            "POST",
+            &format!("/work-items/{item}/complete"),
+            &carol,
+            json!({
+                "output": { "chosen_target": "hold" },
+                "state_patch": {},
+                "lease_fence": claimed["work_item"]["lease_fence"],
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+        settle(&env).await;
+
+        let evs = events(&env, &eid).await;
+        assert_eq!(
+            ran(&env),
+            vec!["publish".to_string()],
+            "{}: {evs:#?}",
+            env.name
+        );
+        assert_eq!(finished(&evs), Some("completed"), "{}", env.name);
+    }
+}

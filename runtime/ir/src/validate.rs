@@ -245,18 +245,91 @@ pub fn validate_human_approvals(ir: &WorkflowIr) -> IrResult<()> {
                 )));
             }
         }
-        if let Some(fallback) = fallback_node {
-            if fallback == id {
-                return Err(invalid("fallback_node names the node itself".to_string()));
-            }
-            if !ir.nodes.contains_key(fallback) {
-                return Err(invalid(format!(
-                    "fallback_node '{fallback}' is not a node of this workflow"
-                )));
-            }
+        if fallback_node.is_some() {
+            human_approval_fallback(ir, id).map_err(invalid)?;
         }
     }
     Ok(())
+}
+
+/// The `fallback_node` of the `human_approval` node `node_id`, if it names one
+/// the engine can route to: `Ok(None)` when it names none (or `node_id` is not
+/// a `human_approval` node), `Err` with the reason when it names one that
+/// cannot work. Registration refuses the `Err` cases; the scheduler treats
+/// them as no fallback, so an expiry fails the node (a version stored before
+/// this check existed).
+///
+/// A fallback must be another node of the workflow, and the approval node
+/// must not be reachable from it. The scheduler gives the fallback an in-edge
+/// from the approval node, so a fallback upstream of it (the start node, or a
+/// "redo the draft" step) would wait on the approval while the approval waited
+/// on it, and the run would end without anyone being asked.
+pub fn human_approval_fallback<'a>(
+    ir: &'a WorkflowIr,
+    node_id: &str,
+) -> Result<Option<&'a str>, String> {
+    use jamjet_core::node::NodeKind;
+    let Some(NodeKind::HumanApproval {
+        fallback_node: Some(fallback),
+        ..
+    }) = ir.nodes.get(node_id).map(|n| &n.kind)
+    else {
+        return Ok(None);
+    };
+    if fallback == node_id {
+        return Err("fallback_node names the node itself".to_string());
+    }
+    if !ir.nodes.contains_key(fallback) {
+        return Err(format!(
+            "fallback_node '{fallback}' is not a node of this workflow"
+        ));
+    }
+    if reachable_from(ir, &[fallback.as_str()]).contains(node_id) {
+        return Err(format!(
+            "fallback_node '{fallback}' leads back to this node, so the run would wait on \
+             itself; a fallback must come after the approval, not before it"
+        ));
+    }
+    Ok(Some(fallback.as_str()))
+}
+
+/// Every node reachable from `starts` (included), following the IR's edges
+/// and each `human_approval` node's `fallback_node`, the in-edge the scheduler
+/// gives a fallback.
+pub fn reachable_from<'a>(ir: &'a WorkflowIr, starts: &[&str]) -> HashSet<&'a str> {
+    use jamjet_core::node::NodeKind;
+    let mut seen: HashSet<&'a str> = HashSet::new();
+    let mut queue: VecDeque<&'a str> = VecDeque::new();
+    for s in starts {
+        if let Some((id, _)) = ir.nodes.get_key_value(*s) {
+            if seen.insert(id.as_str()) {
+                queue.push_back(id.as_str());
+            }
+        }
+    }
+    while let Some(current) = queue.pop_front() {
+        let fallback = match ir.nodes.get(current).map(|n| &n.kind) {
+            Some(NodeKind::HumanApproval {
+                fallback_node: Some(f),
+                ..
+            }) => Some(f.as_str()),
+            _ => None,
+        };
+        for next in ir
+            .edges
+            .iter()
+            .filter(|e| e.from == current)
+            .map(|e| e.to.as_str())
+            .chain(fallback)
+        {
+            if let Some((id, _)) = ir.nodes.get_key_value(next) {
+                if seen.insert(id.as_str()) {
+                    queue.push_back(id.as_str());
+                }
+            }
+        }
+    }
+    seen
 }
 
 /// The longest queue name an `external_fn` node may use.

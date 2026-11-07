@@ -167,10 +167,12 @@ pub fn server_pool(
 
 /// Convenience: build a default pool with standard queue groups.
 ///
-/// - 2 general workers (`["general", "tool", "condition", "mcp_tool",
-///   "retrieval"]`). `retrieval` is claimed so that a `memory_retrieval` item
-///   (no executor; registration refuses the kind) fails instead of waiting
-///   forever on a queue nothing polls.
+/// - 2 general workers (`["general", "tool", "retrieval"]`). `retrieval` is
+///   claimed so that a `memory_retrieval` item (no executor; registration
+///   refuses the kind) fails instead of waiting forever on a queue nothing
+///   polls. They used to claim `condition` and `mcp_tool` too, queues no node
+///   kind is routed to, and so took the items of an `external_fn` node that
+///   named its queue `condition` or `mcp_tool` (registration allows both).
 /// - 2 model workers (`["model"]`)
 /// - 1 privileged worker (`["privileged"]`)
 /// - 0 python workers (`["python_tool"]`) — intent registration only. Durable
@@ -186,13 +188,7 @@ pub fn default_pool(backend: Arc<dyn StateBackend>) -> WorkerPool {
         .with_group(WorkerGroupConfig::new(
             "general-worker",
             2,
-            vec![
-                "general".into(),
-                "tool".into(),
-                "condition".into(),
-                "mcp_tool".into(),
-                "retrieval".into(),
-            ],
+            vec!["general".into(), "tool".into(), "retrieval".into()],
         ))
         .with_group(WorkerGroupConfig::new(
             "model-worker",
@@ -238,6 +234,26 @@ mod tests {
             .collect();
         expected.sort();
         assert_eq!(pool.executor_kinds(), expected);
+    }
+
+    /// The embedded workers claim only queues the engine routes its own
+    /// kinds to. Any other name is free for an `external_fn` node, whose
+    /// items an in-process worker would fail (it has no executor for them).
+    #[test]
+    fn the_embedded_pool_leaves_external_queue_names_alone() {
+        let backend: Arc<dyn StateBackend> = Arc::new(jamjet_state::InMemoryBackend::new());
+        let pool = default_pool(backend);
+        for group in pool.groups.iter().filter(|g| g.concurrency > 0) {
+            for q in &group.queue_types {
+                assert!(
+                    !matches!(
+                        jamjet_core::node::QueueType::from_name(q),
+                        jamjet_core::node::QueueType::Named(_)
+                    ),
+                    "the embedded pool claims `{q}`, a name an external_fn node may use"
+                );
+            }
+        }
     }
 
     /// Nothing executes `memory_retrieval`, and its items go to the

@@ -30,14 +30,21 @@ and the run waits there. Nothing after the node runs until someone decides.
   approval. The node has no "on rejected" route.
 - **Expired** (`timeout` passed with no decision): with a `fallback`, the node
   completes with `decision: "expired"` and the run continues at the fallback
-  node; the `next` path is skipped. Without one, the node fails like a
-  rejection by `system:deadline`, and so does the run.
+  node. Every step the approval guarded is skipped: everything reachable from
+  its `next` that the fallback does not also lead to, including a step that
+  another branch leads into as well. Without a fallback, the node fails like
+  a rejection by `system:deadline`, and so does the run.
 - The fallback node needs no edge into it. It runs only if the request
   expires; when the node is approved it is skipped.
 - `timeout` is a ceiling next to the policy chain's `approval_timeout_secs`
-  (see [Approval Deadlines](#approval-deadlines)): the shorter applies. It
-  must be between 1 second and a year, and `fallback` must name another node
-  of the workflow; registration refuses anything else.
+  (see [Approval Deadlines](#approval-deadlines)), and the shorter applies; a
+  tenant or policy deadline can expire the request too. `timeout` must be
+  between 1 second and a year. `fallback` must name another node of the
+  workflow that comes after the approval: one the approval node can be
+  reached from would wait on the approval while the approval waited on it.
+  Registration refuses anything else.
+- The route to the fallback comes from the engine's own record of the
+  expiry, never from a node result a worker reports.
 - The decision is made through the same route and rules as every approval:
   the approver is the API token, the token that started the run cannot
   approve it, and an approval must echo the request's `action_digest`.
