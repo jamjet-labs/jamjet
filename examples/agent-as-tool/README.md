@@ -25,10 +25,10 @@ python examples/agent-as-tool/main.py
 
 ## Support-message sentiment analysis (sync)
 
-[`sentiment_analysis.py`](sentiment_analysis.py) uses `agent_tool()` and
-`WorkflowGraph` to configure a customer-support sentiment classifier. Sync mode
-fits this task because each message needs one answer and does not need progress
-updates or a multi-turn conversation.
+[`sentiment_analysis.py`](sentiment_analysis.py) uses `WorkflowGraph` to
+configure a customer-support sentiment classifier. Sync mode fits this task
+because each message needs one answer and does not need progress updates or a
+multi-turn conversation.
 
 From the repository root, with the Python SDK installed:
 
@@ -41,8 +41,12 @@ it does not classify the message or require an API key. The graph contains one
 `classify_sentiment` node, with a five-second timeout and `sentiment` as its
 output key.
 
+The workflow demonstrates `input_mapping`, which shows how workflow state
+reaches the agent. The `{"message": "support_message"}` mapping tells the
+runtime to extract `support_message` from the workflow state and pass it as
+`message` to the agent invocation.
+
 To use the graph with a runtime, replace `https://sentiment.example.com` with
 your deployed HTTPS agent endpoint. That agent must implement `/tasks/send` and
-perform the classification; `agent_tool()` only stores its configuration. A
-positive/neutral/negative label is the suggested application contract, not a
-schema enforced by this example.
+perform the classification. A positive/neutral/negative label is the suggested
+application contract, not a schema enforced by this example.
