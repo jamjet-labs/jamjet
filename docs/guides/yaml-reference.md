@@ -274,13 +274,17 @@ prompt: |
   refused when it is registered (400, naming the node).
 - A string is inserted as is; any other value as compact JSON.
 - A path the run's state does not have fails the node, with the path in the
-  error. The model is not called with a prompt that has a gap in it.
-- A prompt file reference (`prompt: prompts/summarize.md`) is not read: the
-  file stays on the machine that compiled the workflow. Put the text inline.
-  A node with a file reference and no conversation (`messages`) in state fails
-  and says so.
+  error, and so does a prompt that renders empty. The model is not called
+  with a prompt that has a gap in it.
+- A prompt file reference (`prompt: prompts/summarize.md`: one line, ending
+  in `.md`, `.txt`, `.j2` or a similar extension, with no spaces unless it has
+  a `/`) is not read: the file stays on the machine that compiled the
+  workflow. Put the text inline. A node with a file reference and no
+  conversation (`messages`) in state fails and says so.
 - A node with a prompt sends only the prompt. The conversation in
-  `state.messages` is used by nodes with no prompt (the agent loop).
+  `state.messages` is sent by nodes with no prompt (the agent loop), and is
+  left out of a prompted node's work item, so an approval of the node binds
+  what the model receives.
 
 The runtime does not render `input:` mappings.
 

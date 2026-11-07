@@ -40,11 +40,16 @@ pub const PROMPT_FILE_EXTENSIONS: &[&str] = &[
 /// The SDK compilers write a file path when the author gave no inline prompt
 /// (`prompts/<node>.md`), and an author may write one under `prompt:`. The
 /// file stays on the machine that compiled the workflow, so the runtime
-/// cannot read it. A reference is a single token (no whitespace, no `{{`)
-/// ending in one of [`PROMPT_FILE_EXTENSIONS`].
+/// cannot read it. A reference is one line with no `{{`, ending in one of
+/// [`PROMPT_FILE_EXTENSIONS`], and either a single token or a path (it has a
+/// `/`, so `prompts/customer support.md` is a file while `Please summarize
+/// notes.md` is a prompt).
 pub fn is_prompt_file_ref(prompt_ref: &str) -> bool {
     let s = prompt_ref.trim();
-    if s.is_empty() || s.chars().any(char::is_whitespace) || s.contains("{{") {
+    if s.is_empty() || s.contains('\n') || s.contains("{{") {
+        return false;
+    }
+    if s.chars().any(char::is_whitespace) && !s.contains('/') {
         return false;
     }
     let lower = s.to_ascii_lowercase();
@@ -268,12 +273,15 @@ mod tests {
             "prompts/x.txt",
             "p.j2",
             "PROMPTS/A.MD",
+            "prompts/customer support.md",
         ] {
             assert!(is_prompt_file_ref(r), "{r}");
         }
         for r in [
             "",
             "Summarize this.md file for me",
+            "Please summarize notes.md",
+            "Read the notes.md\nthen answer prompts/x.md",
             "hello",
             "{{ state.file }}.md",
             ".md",

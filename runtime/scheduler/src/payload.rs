@@ -100,6 +100,9 @@ pub fn build_work_item_payload(
             if !tools.is_empty() {
                 obj.insert("tools".into(), Value::Array(tools.clone()));
             }
+            // A node with a prompt sends the prompt alone, so the payload,
+            // which is what an approval binds and a reviewer is shown, does
+            // not carry a conversation the model would not see.
             match model_prompt(prompt_ref, state) {
                 ModelPrompt::Text(text) => {
                     obj.insert("prompt".into(), Value::String(text));
@@ -107,10 +110,11 @@ pub fn build_work_item_payload(
                 ModelPrompt::Unavailable(reason) => {
                     obj.insert("prompt_error".into(), Value::String(reason));
                 }
-                ModelPrompt::None => {}
-            }
-            if let Some(messages) = state.get("messages") {
-                obj.insert("messages".into(), messages.clone());
+                ModelPrompt::None => {
+                    if let Some(messages) = state.get("messages") {
+                        obj.insert("messages".into(), messages.clone());
+                    }
+                }
             }
         }
         // The condition executor evaluates each branch against `state` and
@@ -166,6 +170,12 @@ fn model_prompt(prompt_ref: &str, state: &Map<String, Value>) -> ModelPrompt {
         ));
     }
     match jamjet_core::template::render_template(prompt_ref, state) {
+        // An empty prompt is not "no prompt": falling back to the
+        // conversation would send the model something the author did not ask.
+        Ok(text) if text.trim().is_empty() => ModelPrompt::Unavailable(
+            "prompt template: the prompt rendered empty (every value it reads is empty)"
+                .to_string(),
+        ),
         Ok(text) => ModelPrompt::Text(text),
         Err(reason) => ModelPrompt::Unavailable(format!("prompt template: {reason}")),
     }
@@ -248,7 +258,7 @@ mod tests {
     #[test]
     fn model_resolves_id_config_and_threads_messages() {
         let ir = ir_with(node(
-            json!({ "type": "model", "model_ref": "m", "prompt_ref": "p", "output_schema": "", "system_prompt": "be brief", "tools": [ { "name": "t" } ] }),
+            json!({ "type": "model", "model_ref": "m", "prompt_ref": "", "output_schema": "", "system_prompt": "be brief", "tools": [ { "name": "t" } ] }),
         ));
         let p = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
         assert_eq!(p["model"], "anthropic/claude-sonnet-4-6");
@@ -283,6 +293,32 @@ mod tests {
         );
         assert!(p.get("prompt_error").is_none());
         assert!(p.get("messages").is_none(), "no conversation in state");
+    }
+
+    /// A node with a prompt sends the prompt alone: the payload (what an
+    /// approval binds) carries no conversation the model would not see.
+    #[test]
+    fn a_prompted_model_does_not_carry_the_conversation() {
+        let ir = ir_with(model_node("Summarize: {{ state.key }}"));
+        let p = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
+        assert_eq!(p["prompt"], "Summarize: value");
+        assert!(p.get("messages").is_none(), "{p}");
+    }
+
+    /// A prompt that renders to nothing is an error, not "no prompt": the
+    /// conversation is not sent in its place.
+    #[test]
+    fn a_prompt_that_renders_empty_is_an_error() {
+        let ir = ir_with(model_node("{{ state.query }}"));
+        let mut s = state();
+        s.insert("query".into(), json!("  "));
+        let p = build_work_item_payload(&ir, "n", &ir.nodes["n"], &s, "wf", "0.1.0");
+        assert!(p.get("prompt").is_none());
+        assert!(p.get("messages").is_none());
+        assert!(p["prompt_error"]
+            .as_str()
+            .unwrap()
+            .contains("rendered empty"));
     }
 
     /// A prompt that cannot be rendered is carried as `prompt_error`, never
