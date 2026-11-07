@@ -85,7 +85,7 @@ def _compile_quietly(source: str) -> dict:
 
 def test_a_document_using_every_known_key_compiles_without_warnings() -> None:
     ir = _compile_quietly(VALID_GRAPH)
-    assert set(ir["nodes"]) == {"fetch", "route", "review", "answer"}
+    assert set(ir["nodes"]) == {"fetch", "route", "review", "answer", "answer__route"}
 
 
 @pytest.mark.parametrize(
@@ -145,12 +145,10 @@ def test_spellings_with_a_real_ir_target_are_mapped() -> None:
     nodes = ir["nodes"]
     assert nodes["a"]["description"] == "First"
     assert nodes["a"]["kind"]["system_prompt"] == "be brief"
-    assert ir["models"][nodes["a"]["kind"]["model_ref"]] == {
-        "provider": "",
-        "model": "m",
-        "temperature": 0.2,
-        "max_tokens": 300,
-    }
+    # model_ref stays the real model (model_allowlist and audit key on it); the
+    # settings sit on the models entry the runtime reads for it.
+    assert nodes["a"]["kind"]["model_ref"] == "m"
+    assert ir["models"]["m"] == {"provider": "", "model": "m", "temperature": 0.2, "max_tokens": 300}
     assert nodes["b"]["kind"] == {
         "type": "mcp_tool",
         "server": "github",
@@ -163,6 +161,48 @@ def test_spellings_with_a_real_ir_target_are_mapped() -> None:
     assert nodes["c"]["kind"]["timeout_secs"] == 30
     assert nodes["d"]["kind"]["description"] == "approve?"
     assert nodes["e"]["kind"]["branches"][0] == {"condition": "state.x == 1", "target": "a"}
+    # The runtime refuses a branch with no matching out-edge.
+    assert {"from": "e", "to": "a", "condition": None} in ir["edges"]
+    assert {"from": "e", "to": "end", "condition": None} in ir["edges"]
+
+
+def test_ir_shaped_branches_keep_their_targets() -> None:
+    source = (
+        HEADER + "nodes:\n  a:\n    type: condition\n    branches:\n"
+        "      - condition: state.x == 1\n        target: b\n      - condition: null\n        target: c\n"
+        "  b: {type: model, model: m}\n  c: {type: model, model: m}\n"
+    )
+    ir = _compile_quietly(source)
+    assert [b["target"] for b in ir["nodes"]["a"]["kind"]["branches"]] == ["b", "c"]
+    assert {e["to"] for e in ir["edges"] if e["from"] == "a"} == {"b", "c"}
+
+
+def test_sampling_settings_that_disagree_for_one_model_are_an_error() -> None:
+    source = (
+        HEADER + "nodes:\n  a: {type: model, model: m, temperature: 0.1, next: b}\n"
+        "  b: {type: model, model: m, temperature: 0.9}\n"
+    )
+    with pytest.raises(ValueError, match="different temperature/max_tokens"):
+        irc.compile_yaml(source)
+    shared = HEADER + "nodes:\n  a: {type: model, model: m, temperature: 0.1, next: b}\n  b: {type: model, model: m}\n"
+    with pytest.raises(ValueError, match="uses\\s+without them|without them"):
+        irc.compile_yaml(shared)
+
+
+@pytest.mark.parametrize("key", ["cost_budget_usd: 1", "token_budget: {total_tokens: 5}", "on_budget_exceeded: a"])
+def test_a_budget_on_a_node_is_an_error(key: str) -> None:
+    with pytest.raises(ValueError, match="no per-node budget"):
+        irc.compile_yaml(HEADER + f"nodes:\n  a:\n    type: model\n    model: m\n    {key}\n")
+
+
+def test_input_values_become_strings_and_nested_values_are_an_error() -> None:
+    node = "  a:\n    type: mcp_tool\n    server: s\n    tool: t\n    arguments: {count: 10, deep: true}\n"
+    source = HEADER + "nodes:\n" + node
+    ir = _compile_quietly(source)
+    assert ir["nodes"]["a"]["kind"]["input_mapping"] == {"count": "10", "deep": "true"}
+    nested = HEADER + "nodes:\n  a:\n    type: tool\n    tool_ref: t\n    input: {filter: {x: 1}}\n"
+    with pytest.raises(ValueError, match="node 'a': input 'filter' must be a string"):
+        irc.compile_yaml(nested)
 
 
 def test_an_alias_and_its_name_together_are_an_error() -> None:
@@ -203,7 +243,15 @@ def test_else_in_next_is_the_unconditional_edge() -> None:
     )
     source = HEADER + nodes
     ir = _compile_quietly(source)
-    assert {"from": "a", "to": "c", "condition": None} in ir["edges"]
+    # The runtime evaluates `when` only on condition nodes; given to another
+    # node it would run both targets, so the list becomes a routing node.
+    assert ir["nodes"]["a__route"]["kind"]["branches"] == [
+        {"condition": "state.x", "target": "b"},
+        {"condition": None, "target": "c"},
+    ]
+    a_edges = [e for e in ir["edges"] if e["from"] == "a"]
+    assert a_edges == [{"from": "a", "to": "a__route", "condition": None}]
+    assert {e["to"] for e in ir["edges"] if e["from"] == "a__route"} == {"b", "c"}
 
 
 def test_an_unknown_policy_key_is_an_error() -> None:
@@ -235,7 +283,7 @@ def test_budgets_and_data_policy_reach_the_ir_from_either_place(place: str) -> N
         source = "workflow:\n  id: w\n" + block + ONE_NODE
     else:
         source = "workflow:\n  id: w\n" + "".join(f"  {line}\n" for line in block.splitlines()) + ONE_NODE
-    ir = _compile_quietly(source)
+    ir, _ = _compile_warning_messages(source)
     assert ir["cost_budget_usd"] == 2.5
     assert ir["token_budget"] == {"total_tokens": 1000}
     assert ir["on_budget_exceeded"] == "over"
@@ -263,6 +311,16 @@ def test_malformed_governance_is_an_error(block: str, match: str) -> None:
         irc.compile_yaml("workflow:\n  id: w\n" + block + ONE_NODE)
 
 
+def test_unenforced_governance_compiles_with_a_warning() -> None:
+    source = "workflow:\n  id: w\n  cost_budget_usd: 1\n  on_budget_exceeded: over\n"
+    source += "  data_policy: {pii_fields: [ssn]}\n"
+    ir, messages = _compile_warning_messages(source + ONE_NODE)
+    assert ir["on_budget_exceeded"] == "over" and ir["data_policy"] == {"pii_fields": ["ssn"]}
+    assert any("on_budget_exceeded" in m and "does not read it" in m for m in messages), messages
+    assert any("data_policy" in m and "does not enforce it" in m for m in messages), messages
+    assert not any("enforces each" in m for m in messages)
+
+
 def test_an_on_budget_exceeded_action_that_is_not_a_node_warns_and_the_budget_stays() -> None:
     source = "workflow:\n  id: w\n  cost_budget_usd: 1\n  on_budget_exceeded: pause\n" + ONE_NODE
     ir, messages = _compile_warning_messages(source)
@@ -273,7 +331,9 @@ def test_an_on_budget_exceeded_action_that_is_not_a_node_warns_and_the_budget_st
 
 def test_node_data_policy_reaches_the_ir() -> None:
     source = HEADER + "nodes:\n  a:\n    type: model\n    model: m\n    data_policy: {pii_detectors: [email]}\n"
-    assert _compile_quietly(source)["nodes"]["a"]["data_policy"] == {"pii_detectors": ["email"]}
+    ir, messages = _compile_warning_messages(source)
+    assert ir["nodes"]["a"]["data_policy"] == {"pii_detectors": ["email"]}
+    assert any("does not enforce it" in m for m in messages)
 
 
 def test_agent_first_governance_reaches_the_ir() -> None:
@@ -405,6 +465,48 @@ def test_held_back_templates_are_refused_with_the_reason(tmp_path: Path, monkeyp
     listing = runner.invoke(app, ["init", "--list-templates"])
     assert "Not available in this release" in listing.output
     assert "research-agent" in listing.output
+
+
+def test_fleet_wide_governance_reaches_every_unit() -> None:
+    from jamjet.workflow.bundle import compile_bundle
+
+    fleet = (
+        "policy: {blocked_tools: [transfer_funds]}\n"
+        "defaults: {cost_budget_usd: 2}\n"
+        "workflows:\n  a:\n    nodes:\n      n: {type: model, model: m}\n"
+        "agents:\n  b:\n    strategy: react\n    goal: g\n    model: m\n"
+        "    limits: {max_iterations: 2, max_cost_usd: 0.1, timeout_seconds: 10}\n"
+    )
+    for ir in compile_bundle(yaml.safe_load(fleet)).workflows:
+        assert ir["policy"]["blocked_tools"] == ["transfer_funds"], ir["workflow_id"]
+        assert ir["cost_budget_usd"] == 2.0, ir["workflow_id"]
+
+
+@pytest.mark.parametrize(
+    ("fleet", "match"),
+    [
+        ("polcy: {blocked_tools: [x]}\nworkflows: {a: {nodes: {n: {type: model, model: m}}}}\n", "polcy"),
+        ("workflows: {a: {cost_budget: 3, nodes: {n: {type: model, model: m}}}}\n", "cost_budget"),
+        ("defaults: {polcy: {}}\nworkflows: {a: {nodes: {n: {type: model, model: m}}}}\n", "polcy"),
+        (
+            "policy: {blocked_tools: [x]}\n"
+            "workflows: {a: {policy: {blocked_tools: [y]}, nodes: {n: {type: model, model: m}}}}\n",
+            "set it in one place",
+        ),
+    ],
+)
+def test_fleet_typos_and_double_settings_are_errors(fleet: str, match: str) -> None:
+    from jamjet.workflow.bundle import compile_bundle
+
+    with pytest.raises(ValueError, match=match):
+        compile_bundle(yaml.safe_load(fleet))
+
+
+def test_an_unknown_template_name_is_printed_literally(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init", "x", "--template", "[bold]bad[/bold"])
+    assert result.exit_code == 1
+    assert "[bold]bad[/bold" in result.output
 
 
 # ── jamjet validate ──────────────────────────────────────────────────────────

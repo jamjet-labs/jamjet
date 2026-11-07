@@ -106,12 +106,17 @@ Every node may also carry `type`, `description`, `labels`, `policy`,
 route:
   type: condition
   conditions:
-    - if: "state.confidence >= 0.8"   # or `when:`
-      next: deliver                   # or `to:`
-    - if: "state.confidence < 0.8"
+    - if: "state.verdict == \"pass\""  # or `when:`; compare with == or != to a JSON literal
+      next: deliver                     # or `to:`
+    - if: "state.needs_review == true"
       next: escalate
   default: escalate
 ```
+
+A condition is a `state.<path>` reference, optionally compared with `==` or
+`!=` to a JSON literal; the runtime refuses anything else at registration. A
+conditional `next:` list on any other node type (`- when: ...`) compiles to a
+condition node of its own, `<node>__route`.
 
 ---
 

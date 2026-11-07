@@ -96,7 +96,7 @@ nodes:
   route:
     type: condition
     conditions:
-      - if: "state.priority == 'high'"
+      - if: 'state.priority == "high"'   # the value is a JSON literal
         next: human_review
     default: auto_respond
 

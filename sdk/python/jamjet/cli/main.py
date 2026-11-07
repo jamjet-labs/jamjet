@@ -250,6 +250,12 @@ def _print_protocol_activity(events: list[dict[str, Any]]) -> None:
 # ── init ─────────────────────────────────────────────────────────────────────
 
 
+def _escape_markup(text: str) -> str:
+    from rich.markup import escape
+
+    return escape(_safe(text))
+
+
 def _refuse_held_back_template(template: str) -> None:
     """Exit with the reason when a template is held back in this release."""
     from jamjet.templates import HELD_BACK_TEMPLATES
@@ -306,7 +312,7 @@ def init(
     _refuse_held_back_template(template)
     if template not in AVAILABLE_TEMPLATES:
         console.print(
-            f"[red]Error:[/red] unknown template '{template}'. "
+            f"[red]Error:[/red] unknown template '{_escape_markup(template)}'. "
             f"Run [bold]jamjet init --list-templates[/bold] to see options."
         )
         raise typer.Exit(1)
@@ -371,7 +377,7 @@ def create(
     _refuse_held_back_template(template)
     if template not in AVAILABLE_TEMPLATES:
         console.print(
-            f"[red]Error:[/red] unknown template '{template}'. "
+            f"[red]Error:[/red] unknown template '{_escape_markup(template)}'. "
             f"Run [bold]jamjet init --list-templates[/bold] to see options."
         )
         raise typer.Exit(1)

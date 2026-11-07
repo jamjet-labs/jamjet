@@ -46,7 +46,9 @@ class WorkflowSchemaWarning(UserWarning):
 # instead of dropped without a word. Keep these in step with
 # _compile_graph_yaml and _yaml_node_to_kind.
 #
-# Governance settings the runtime enforces. They may sit at the top level of
+# Governance settings. The runtime enforces policy, cost_budget_usd,
+# token_budget and continue_as_new; it reads neither data_policy nor
+# on_budget_exceeded yet, so those compile with a warning. They may sit at the top level of
 # the document or in the `workflow:` header, but not both.
 _GOVERNANCE_KEYS = ("policy", "cost_budget_usd", "token_budget", "on_budget_exceeded", "data_policy", "continue_as_new")
 _GRAPH_TOP_LEVEL_KEYS = frozenset(
@@ -172,6 +174,8 @@ def _normalize_node(node_id: str, raw: Any, extras: dict[str, dict[str, Any]]) -
         _rename(node_id, data, "message", "description")
     if node_type in ("tool", "mcp_tool"):
         _rename(node_id, data, "arguments", "input")
+    if "input" in data:
+        data["input"] = _input_mapping(node_id, data["input"])
     if node_type == "tool" and "server" in data:
         # An MCP call written as a tool node: the IR has a node kind for it.
         _warn(f"node '{node_id}': a tool node with server: is compiled as type: mcp_tool; write type: mcp_tool")
@@ -192,10 +196,19 @@ def _normalize_node(node_id: str, raw: Any, extras: dict[str, dict[str, Any]]) -
         branches = data.pop("branches")
         if not isinstance(branches, list):
             raise ValueError(f"node '{node_id}': branches must be a list")
+        aliases = {"condition": "if", "target": "next"}
         data["conditions"] = [
-            {("if" if k == "condition" else k): v for k, v in b.items()} if isinstance(b, dict) else b for b in branches
+            {aliases.get(k, k): v for k, v in b.items()} if isinstance(b, dict) else b for b in branches
         ]
 
+    for key in ("cost_budget_usd", "token_budget", "on_budget_exceeded"):
+        if key in data:
+            raise ValueError(
+                f"node '{node_id}': {key} cannot be set on a node; the runtime has no per-node budget. "
+                "Set it on the workflow (top level or the workflow: header)."
+            )
+    if "data_policy" in data:
+        _warn(f"node '{node_id}': data_policy is compiled into the IR, but the runtime does not enforce it yet")
     known = _NODE_COMMON_KEYS | _NODE_TYPE_KEYS[node_type]
     for key in sorted(str(k) for k in set(data) - known):
         hint = _IGNORED_NODE_KEY_HINTS.get(key)
@@ -213,6 +226,10 @@ def _normalize_node(node_id: str, raw: Any, extras: dict[str, dict[str, Any]]) -
         for i, cond in enumerate(conditions):
             if not isinstance(cond, dict):
                 raise ValueError(f"node '{node_id}': conditions[{i}] must be a mapping")
+            if "target" in cond:
+                if "next" in cond or "to" in cond:
+                    raise ValueError(f"node '{node_id}': conditions[{i}] sets target and next/to; keep one")
+                cond["next"] = cond.pop("target")
             _warn_unknown_keys(cond, _CONDITION_ENTRY_KEYS, location=f"node '{node_id}' conditions[{i}]")
 
     next_val = data.get("next")
@@ -234,14 +251,41 @@ def _normalize_node(node_id: str, raw: Any, extras: dict[str, dict[str, Any]]) -
         data["next"] = entries
 
     if node_type == "model" and ("temperature" in data or "max_tokens" in data):
-        # Sampling settings live on a model config in the IR, so this node gets
-        # its own entry, named after it.
+        # The runtime reads sampling settings from the models entry the node's
+        # model_ref names, so they go on the entry for this model, and
+        # model_ref (what model_allowlist checks and audit records) stays the
+        # real model.
         extras["models"][node_id] = {
             "model": data.get("model", "default_chat"),
             "temperature": data.pop("temperature", None),
             "max_tokens": data.pop("max_tokens", None),
         }
     return node_type, data
+
+
+def _input_mapping(node_id: str, raw: Any) -> dict[str, str]:
+    """A node's ``input`` as the runtime takes it: every value a string.
+
+    Numbers and booleans are written as their JSON text; a nested mapping or
+    list is an error, since the runtime would refuse it at registration with a
+    message that names neither the node nor the key.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"node '{node_id}': input must be a mapping of name to value, got {type(raw).__name__}")
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        if isinstance(value, str):
+            out[key] = value
+        elif isinstance(value, bool):
+            out[key] = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            out[key] = str(value)
+        else:
+            raise ValueError(
+                f"node '{node_id}': input '{key}' must be a string, number or boolean, "
+                f"got {type(value).__name__}; write it as a template string"
+            )
+    return out
 
 
 def _governance_value(sources: list[tuple[str, dict[str, Any]]], key: str) -> Any:
@@ -286,8 +330,11 @@ def _compile_data_policy(raw: Any, *, location: str) -> dict[str, Any] | None:
 def _apply_governance(ir: dict[str, Any], sources: list[tuple[str, dict[str, Any]]]) -> None:
     """Copy the governance settings found in ``sources`` into ``ir``.
 
-    The runtime enforces each of these, so none may be dropped: a setting given
-    in two places, or with a malformed value, is an error.
+    None may be dropped without a word: a setting given in two places, or with
+    a malformed value, is an error. The runtime enforces policy,
+    cost_budget_usd, token_budget and continue_as_new; data_policy and
+    on_budget_exceeded compile into the IR with a warning, because the runtime
+    does not read them yet.
     """
     ir["policy"] = _compile_policy(_governance_value(sources, "policy"), location="workflow-level policy")
     budget = _governance_value(sources, "cost_budget_usd")
@@ -304,16 +351,21 @@ def _apply_governance(ir: dict[str, Any], sources: list[tuple[str, dict[str, Any
             raise ValueError(f"on_budget_exceeded must name a node of this workflow, got {target!r}")
         if target in ir["nodes"]:
             ir["on_budget_exceeded"] = target
+            _warn(
+                "on_budget_exceeded is compiled into the IR, but the runtime does not read it yet: "
+                "a run that exceeds the budget fails"
+            )
         else:
             # Leaving it out is the stricter reading: the budget still holds, and
             # a run that exceeds it fails instead of going anywhere else.
             _warn(
                 f"on_budget_exceeded: {target!r} does not name a node of this workflow, so it is ignored "
-                "and a run that exceeds the budget fails. Name the node to route to instead."
+                "and a run that exceeds the budget fails"
             )
     data_policy = _compile_data_policy(_governance_value(sources, "data_policy"), location="workflow")
     if data_policy is not None:
         ir["data_policy"] = data_policy
+        _warn("data_policy is compiled into the IR, but the runtime does not enforce it yet")
     rollover = _governance_value(sources, "continue_as_new")
     if rollover is not None:
         if not isinstance(rollover, bool):
@@ -498,20 +550,68 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"workflow '{header.get('id', 'unknown')}' has no nodes to run")
 
     models = dict(data.get("models", {}) or {})
+    declared_models = set(models)
+    settings_by_model: dict[str, tuple[str, dict[str, Any]]] = {}
     for node_id, overrides in extras["models"].items():
-        base_name = overrides["model"]
-        base = dict(models.get(base_name) or {"provider": "", "model": base_name})
-        for key in ("temperature", "max_tokens"):
-            if overrides[key] is not None:
-                base[key] = overrides[key]
-        model_key = f"node:{node_id}"
-        models[model_key] = base
-        normalized[node_id][1]["model"] = model_key
+        name = overrides["model"]
+        wanted = {k: overrides[k] for k in ("temperature", "max_tokens") if overrides[k] is not None}
+        if name in settings_by_model and settings_by_model[name][1] != wanted:
+            raise ValueError(
+                f"nodes '{settings_by_model[name][0]}' and '{node_id}' set different temperature/max_tokens "
+                f"for model {name!r}; declare two entries under models: and name one in each node"
+            )
+        settings_by_model[name] = (node_id, wanted)
+    for name, (node_id, wanted) in settings_by_model.items():
+        others = [
+            nid
+            for nid, (t, d) in normalized.items()
+            if t == "model" and d.get("model", "default_chat") == name and nid not in extras["models"]
+        ]
+        if others:
+            raise ValueError(
+                f"node '{node_id}' sets temperature/max_tokens for model {name!r}, which node '{others[0]}' uses "
+                "without them; the runtime reads these per model, so declare an entry under models: instead"
+            )
+        entry = dict(models.get(name) or {"provider": "", "model": name})
+        for key, value in wanted.items():
+            if name in declared_models and key in entry and entry[key] != value:
+                raise ValueError(f"node '{node_id}' sets {key}={value!r}, but models.{name} has {entry[key]!r}")
+            entry[key] = value
+        models[name] = entry
     remote_agents = dict((data.get("a2a", {}) or {}).get("remote_agents", {}) or {})
     for name, cfg in extras["remote_agents"].items():
         if name in remote_agents:
             raise ValueError(f"node '{name}' sets agent_url, but a2a.remote_agents already has '{name}'")
         remote_agents[name] = cfg
+
+    # The runtime evaluates edge conditions only on condition nodes, so a
+    # conditional `next` list on another node gets a condition node of its own.
+    for node_id in list(normalized):
+        node_type, node_data = normalized[node_id]
+        next_val = node_data.get("next")
+        if node_type in ("condition", "branch") or not isinstance(next_val, list):
+            continue
+        if not any(isinstance(e, dict) and e.get("when") is not None for e in next_val):
+            continue
+        route_id = f"{node_id}__route"
+        if route_id in normalized:
+            raise ValueError(f"node '{node_id}': cannot add the routing node '{route_id}', the name is taken")
+        conditions: list[dict[str, Any]] = []
+        default = None
+        for i, entry in enumerate(next_val):
+            target = entry.get("to", "end") if isinstance(entry, dict) else entry
+            when = entry.get("when") if isinstance(entry, dict) else None
+            if when is None:
+                if default is not None:
+                    raise ValueError(f"node '{node_id}': next[{i}] is a second unconditional entry")
+                default = target
+            else:
+                conditions.append({"if": when, "next": target})
+        route: dict[str, Any] = {"type": "condition", "conditions": conditions}
+        if default is not None:
+            route["default"] = default
+        normalized[route_id] = ("condition", route)
+        node_data["next"] = route_id
 
     nodes: dict[str, Any] = {}
     edges: list[dict[str, Any]] = []
@@ -537,6 +637,17 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
             nodes[node_id]["agent_ref"] = node_agent
 
         next_val = node_data.get("next")
+        if node_type in ("condition", "branch"):
+            # The runtime routes a condition node along the out-edge matching
+            # the branch it picks, and refuses a branch with no such edge.
+            targets: list[str] = []
+            for branch in kind.get("branches", []):
+                if branch["target"] not in targets:
+                    targets.append(branch["target"])
+            for target in targets:
+                edges.append({"from": node_id, "to": target, "condition": None})
+            if next_val is None:
+                continue
         if isinstance(next_val, str):
             edges.append({"from": node_id, "to": _term(next_val, end_ids), "condition": None})
         elif isinstance(next_val, list):
