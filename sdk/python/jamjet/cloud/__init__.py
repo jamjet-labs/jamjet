@@ -80,8 +80,9 @@ def configure(
         approval_timeout_seconds: how long a tool call matched by a
             ``require_approval`` rule waits for a decision in JamJet Cloud
             before raising ``JamJetApprovalTimeout``. Sent to Cloud as the
-            approval's deadline; Cloud holds an approval for 1 minute to 24
-            hours and refuses decisions after it. Default 1 hour.
+            approval's deadline, clamped to 1 minute to 24 hours; Cloud
+            deployments since jamjet-cloud #87 refuse decisions after it.
+            Default 1 hour.
     """
     set_config(
         api_key=api_key,

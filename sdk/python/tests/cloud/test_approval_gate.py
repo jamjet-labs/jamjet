@@ -10,6 +10,7 @@ MockTransport.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 from collections.abc import Iterator
@@ -197,8 +198,9 @@ def test_approved_tool_call_is_returned(env: dict[str, Any]) -> None:
         "model": "gpt-4o",
         "rule": "payments.*",
         "tool_call_id": "call_9",
-        "arguments": '{"amount": 120}',
+        "arguments": {"amount": 120},
     }
+    assert context["arguments_sha256"] == hashlib.sha256(b'{"amount":120}').hexdigest()
     assert env["spans"][-1]["status"] == "ok"
     assert env["spans"][-1]["payload"]["approval_ids"] == ["apr_1"]
 
@@ -289,3 +291,164 @@ def test_streamed_tool_call_rejected_never_reaches_caller(env: dict[str, Any]) -
     assert budget_mod.get_budget().spent == pytest.approx(10 * 3e-6 + 20 * 15e-6)  # counted once
     assert len(env["spans"]) == 1
     assert env["spans"][-1]["status"] == "error"
+
+
+def test_context_masks_credentials_and_keeps_business_fields(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(redaction_mod._config, "enabled", True)
+    env["policy"].add("require_approval", "pay")
+    created: list[dict[str, Any]] = []
+    args = json.dumps(
+        {
+            "to": "DE89370400440532013000",
+            "payee": "ACME GmbH",
+            "amount": 5,
+            "auth": "Bearer sk-live-abcdef0123456789",
+            "note": "use token sk-live-abcdef0123456789",
+        }
+    )
+    with respx.mock(assert_all_called=False) as router:
+        _cloud(router, ["approved"], created)
+        _openai_with_tool_call("pay", args).chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "x"}]
+        )
+    ctx = created[0]["context"]["arguments"]
+    assert ctx["to"] == "****3000" and ctx["payee"] == "ACME GmbH" and ctx["amount"] == 5
+    assert ctx["auth"] == "[SECRET]"
+    assert "sk-live-abcdef0123456789" not in json.dumps(ctx)
+
+
+def test_context_masks_credentials_with_redaction_off(env: dict[str, Any]) -> None:
+    env["policy"].add("require_approval", "pay")
+    created: list[dict[str, Any]] = []
+    args = json.dumps(
+        {"password": "hunter2", "header": "Authorization: Bearer abc.def.ghi", "to": "DE89370400440532013000"}
+    )
+    with respx.mock(assert_all_called=False) as router:
+        _cloud(router, ["approved"], created)
+        _openai_with_tool_call("pay", args).chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "x"}]
+        )
+    ctx = created[0]["context"]["arguments"]
+    assert ctx["password"] == "[SECRET]" and ctx["to"] == "DE89370400440532013000"
+    assert "abc.def.ghi" not in json.dumps(ctx)
+
+
+def test_changed_arguments_after_approval_are_refused(env: dict[str, Any]) -> None:
+    env["policy"].add("require_approval", "pay")
+    response = {
+        "model": "gpt-4o",
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        "choices": [
+            {"message": {"tool_calls": [{"id": "c1", "function": {"name": "pay", "arguments": '{"amount": 5}'}}]}}
+        ],
+    }
+
+    def poll(request: httpx.Request) -> httpx.Response:
+        response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = '{"amount": 5000}'  # type: ignore[index]
+        return httpx.Response(200, json={"status": "approved"})
+
+    with respx.mock(assert_all_called=False) as router:
+        router.post(f"{API}/v1/approvals").mock(return_value=httpx.Response(200, json={"id": "apr_1"}))
+        router.get(url__regex=rf"{API}/v1/approvals/.+").mock(side_effect=poll)
+        with pytest.raises(JamJetApprovalRejected, match="changed after approval"):
+            patcher._run_enforced(
+                "openai", lambda _self, **_kw: response, None, (), {"model": "gpt-4o", "messages": []}
+            )
+
+
+def test_with_raw_response_opens_an_approval(env: dict[str, Any]) -> None:
+    env["policy"].add("require_approval", "payments.*")
+    created: list[dict[str, Any]] = []
+    with respx.mock(assert_all_called=False) as router:
+        _cloud(router, ["rejected"], created)
+        with pytest.raises(JamJetApprovalRejected):
+            _openai_with_tool_call("payments.refund").chat.completions.with_raw_response.create(
+                model="gpt-4o", messages=[{"role": "user", "content": "x"}]
+            )
+    assert created[0]["action"] == "payments.refund"
+
+
+def test_split_streamed_name_is_gated_joined(env: dict[str, Any]) -> None:
+    env["policy"].add("require_approval", "payments.*")
+    created: list[dict[str, Any]] = []
+    base = {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o"}
+    chunks = [
+        {
+            **base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "payments", "arguments": ""},
+                            }
+                        ],
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            **base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": [{"index": 0, "function": {"name": ".refund", "arguments": "{}"}}]},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+    client = openai.OpenAI(
+        api_key="x",
+        base_url="http://vendor.test/v1",
+        max_retries=0,
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+            )
+        ),
+    )
+    with respx.mock(assert_all_called=False) as router:
+        _cloud(router, ["rejected"], created)
+        with pytest.raises(JamJetApprovalRejected):
+            with client.chat.completions.stream(model="gpt-4o", messages=[{"role": "user", "content": "x"}]) as s:
+                s.get_final_completion()
+    assert created[0]["action"] == "payments.refund"
+
+
+def test_polling_rides_out_transient_failures() -> None:
+    replies = iter([httpx.Response(503), httpx.ConnectError("blip"), httpx.Response(200, json={"status": "approved"})])
+
+    def poll(request: httpx.Request) -> httpx.Response:
+        reply = next(replies)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    with respx.mock(assert_all_called=False) as router:
+        router.post(f"{API}/v1/approvals").mock(return_value=httpx.Response(200, json={"id": "apr_1"}))
+        router.get(url__regex=rf"{API}/v1/approvals/.+").mock(side_effect=poll)
+        assert request_approval("jj_test", API, "x", timeout_seconds=60, poll_interval=0.01) == "apr_1"
+
+
+def test_polling_fails_closed_with_the_real_reason() -> None:
+    with respx.mock(assert_all_called=False) as router:
+        router.post(f"{API}/v1/approvals").mock(return_value=httpx.Response(200, json={"id": "apr_1"}))
+        router.get(url__regex=rf"{API}/v1/approvals/.+").mock(side_effect=httpx.ConnectError("refused"))
+        with pytest.raises(JamJetApprovalTimeout) as info:
+            request_approval("jj_test", API, "x", timeout_seconds=60, poll_interval=0.01)
+    assert info.value.reason is not None and "refused" in info.value.reason
+    with respx.mock(assert_all_called=False) as router:
+        router.post(f"{API}/v1/approvals").mock(return_value=httpx.Response(503))
+        with pytest.raises(JamJetApprovalTimeout, match="HTTP 503"):
+            request_approval("jj_test", API, "x", timeout_seconds=60, poll_interval=0.01)

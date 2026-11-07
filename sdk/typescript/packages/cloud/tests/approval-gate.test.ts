@@ -4,6 +4,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { setupServer } from 'msw/node'
 import { http, HttpResponse } from 'msw'
+import { createHash } from 'node:crypto'
 import { Client, resetActive, setActive } from '../src/client.js'
 import { resolveConfig } from '../src/config.js'
 import { runEnforcedCall } from '../src/enforcement.js'
@@ -78,7 +79,9 @@ describe('require_approval on returned tool calls', () => {
       context: {
         tool: 'payments.refund',
         tool_call_id: 'call_9',
-        arguments: '{"amount":120,"to":"ACME"}',
+        arguments: { amount: 120, to: 'ACME' },
+        // sha256 of the canonical JSON {"amount":120,"to":"ACME"}
+        arguments_sha256: createHash('sha256').update('{"amount":120,"to":"ACME"}').digest('hex'),
         model: 'gpt-4o',
         vendor: 'openai',
         rule: 'payments.*',
@@ -155,7 +158,96 @@ describe('require_approval on returned tool calls', () => {
       original: openaiToolCall('email.send', '{"to":"jane.doe@example.com"}'),
       args: [{ model: 'gpt-4o', messages: [] }],
     })
-    expect(created[0]!.body['context']['arguments']).not.toContain('jane.doe@example.com')
+    expect(JSON.stringify(created[0]!.body['context']['arguments'])).not.toContain('jane.doe@example.com')
+  })
+})
+
+describe('approval context and binding', () => {
+  beforeEach(resetActive)
+  afterEach(resetActive)
+
+  it('masks credentials but keeps what the reviewer needs to judge', async () => {
+    const { client } = makeClient({ redaction: 'standard' })
+    policy('require_approval', 'pay')
+    const created: Created[] = []
+    approvals(() => ({ status: 'approved' }), created)
+    const args = JSON.stringify({ to: 'DE89370400440532013000', payee: 'ACME GmbH', amount: 5, auth: 'Bearer sk-live-abcdef0123456789', note: 'token sk-live-abcdef0123456789' })
+    await runEnforcedCall({ client, vendor: 'openai', original: openaiToolCall('pay', args), args: [{ model: 'gpt-4o', messages: [] }] })
+    const ctx = created[0]!.body['context']['arguments']
+    expect(ctx).toMatchObject({ to: '****3000', payee: 'ACME GmbH', amount: 5, auth: '[SECRET]' })
+    expect(JSON.stringify(ctx)).not.toContain('sk-live-abcdef0123456789')
+  })
+
+  it('masks credentials even with redaction off', async () => {
+    const { client } = makeClient({ redaction: 'off' })
+    policy('require_approval', 'pay')
+    const created: Created[] = []
+    approvals(() => ({ status: 'approved' }), created)
+    const args = JSON.stringify({ password: 'hunter2', header: 'Authorization: Bearer abc.def.ghi', to: 'DE89370400440532013000' })
+    await runEnforcedCall({ client, vendor: 'openai', original: openaiToolCall('pay', args), args: [{ model: 'gpt-4o', messages: [] }] })
+    const ctx = created[0]!.body['context']['arguments']
+    expect(ctx).toMatchObject({ password: '[SECRET]', to: 'DE89370400440532013000' })
+    expect(JSON.stringify(ctx)).not.toContain('abc.def.ghi')
+  })
+
+  it('refuses to release a call whose arguments changed while awaiting approval', async () => {
+    const { client } = makeClient()
+    policy('require_approval', 'pay')
+    const response = {
+      model: 'gpt-4o',
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+      choices: [{ index: 0, message: { tool_calls: [{ id: 'c1', type: 'function', function: { name: 'pay', arguments: '{"amount":5}' } }] } }],
+    }
+    server.use(
+      http.post(`${API}/v1/approvals`, () => HttpResponse.json({ id: 'apr_1' })),
+      http.get(`${API}/v1/approvals/:id`, () => {
+        response.choices[0]!.message.tool_calls[0]!.function.arguments = '{"amount":5000}'
+        return HttpResponse.json({ status: 'approved' })
+      }),
+    )
+    await expect(
+      runEnforcedCall({ client, vendor: 'openai', original: async () => response, args: [{ model: 'gpt-4o', messages: [] }] }),
+    ).rejects.toMatchObject({ name: 'JamjetApprovalRejected', reason: 'tool call arguments changed after approval' })
+  })
+
+  it("stops waiting when the caller's AbortSignal fires", async () => {
+    const { client } = makeClient()
+    policy('require_approval', 'pay')
+    approvals(() => ({ status: 'pending' }), [])
+    const ac = new AbortController()
+    const p = runEnforcedCall({
+      client,
+      vendor: 'openai',
+      original: openaiToolCall('pay'),
+      args: [{ model: 'gpt-4o', messages: [] }, { signal: ac.signal }],
+    })
+    p.catch(() => {})
+    setTimeout(() => ac.abort(), 30)
+    await expect(p).rejects.toMatchObject({ name: 'AbortError' })
+  })
+
+  it('gates a streamed tool name split across deltas by its joined name', async () => {
+    const { client } = makeClient()
+    policy('require_approval', 'payments.*')
+    const created: Created[] = []
+    approvals(() => ({ status: 'rejected' }), created)
+    const chunks = [
+      { model: 'gpt-4o', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'c1', type: 'function', function: { name: 'payments', arguments: '' } }] } }] },
+      { model: 'gpt-4o', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: '.refund', arguments: '{"amount":1}' } }] } }] },
+      { model: 'gpt-4o', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+    ]
+    const s = await runEnforcedCall({
+      client,
+      vendor: 'openai',
+      original: async () => ({ [Symbol.asyncIterator]: async function* () { for (const c of chunks) yield c } }),
+      args: [{ model: 'gpt-4o', messages: [], stream: true }],
+    })
+    await expect(
+      (async () => {
+        for await (const _ of s as AsyncIterable<unknown>) { /* read */ }
+      })(),
+    ).rejects.toBeInstanceOf(JamjetApprovalRejected)
+    expect(created[0]!.body['action']).toBe('payments.refund')
   })
 })
 

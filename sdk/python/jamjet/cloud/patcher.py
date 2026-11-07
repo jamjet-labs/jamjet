@@ -4,6 +4,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
+from .approval_context import arguments_digest, mask_for_approval, parsed_arguments
 from .approvals import request_approval
 from .budget import get_budget
 from .config import get_config
@@ -24,7 +25,6 @@ from .middleware.context import (
 from .middleware.receipts import build_llm_receipt, emit_receipt
 from .policy import _field, get_evaluator, tool_name_of
 from .redaction import _config as _redaction_config
-from .redaction import _redact_dict
 from .stream_enforcement import StreamedToolCall, StreamTally, enforce_stream
 from .trace import get_context
 
@@ -208,58 +208,76 @@ def _gate_approvals(
     model: str,
     calls: list[tuple[str | None, str, Any]],
     before_fail: Callable[[], None],
+    reread: Callable[[], list[tuple[str | None, str, Any]]],
 ) -> None:
     """Wait for a Cloud approval for each call matched by a require_approval rule.
 
-    Fails closed: a rejection, a timeout, or any failure to reach Cloud raises
-    (JamJetApprovalRejected / JamJetApprovalTimeout) after ``before_fail``
-    (records usage) runs and the span is emitted.
+    The approval context masks credentials (and PII when redaction is on) and
+    carries ``arguments_sha256``; after approval the call is re-read and must
+    still have the same digest. Fails closed: a rejection, a timeout, changed
+    arguments, or any failure to reach Cloud raises (JamJetApprovalRejected /
+    JamJetApprovalTimeout) after ``before_fail`` (records usage) runs and the
+    span is emitted.
     """
     evaluator = get_evaluator()
     cfg = get_config()
+    pii = bool(_redaction_config.get("enabled"))
     approved: list[str] = []
+
+    def fail(failure: JamJetApprovalRejected | JamJetApprovalTimeout, name: str) -> None:
+        before_fail()
+        outcome: dict[str, Any] = {"tool": name, "outcome": type(failure).__name__}
+        if failure.approval_id:
+            outcome["approval_id"] = failure.approval_id
+        span.payload = {**span.payload, "approval": outcome}
+        span.finish(status="error")
+        emit(span.to_event_dict())
+        raise failure
+
     for call_id, name, arguments in calls:
         decision = evaluator.evaluate(name)
         if decision.policy_kind != "require_approval":
             continue
-        context: dict[str, Any] = {"tool": name, "vendor": vendor, "model": model, "rule": decision.pattern}
+        digest = arguments_digest(arguments)
+        context: dict[str, Any] = {
+            "tool": name,
+            "vendor": vendor,
+            "model": model,
+            "rule": decision.pattern,
+            "arguments_sha256": digest,
+        }
         if call_id:
             context["tool_call_id"] = call_id
         if arguments is not None:
-            context["arguments"] = arguments
+            context["arguments"] = mask_for_approval(parsed_arguments(arguments), pii)
         if span.agent_name:
             context["agent"] = span.agent_name
-        if _redaction_config.get("enabled"):
-            context = _redact_dict(context)
         timeout = cfg.approval_timeout_seconds
-        failure: JamJetApprovalRejected | JamJetApprovalTimeout | None = None
         try:
             if not cfg.api_key:
                 raise RuntimeError("JamJet Cloud not configured; cannot request approval")
-            approved.append(
-                request_approval(
-                    api_key=cfg.api_key,
-                    api_url=cfg.api_url,
-                    action=name,
-                    context=context,
-                    timeout_seconds=timeout,
-                    poll_interval=cfg.approval_poll_interval,
-                )
+            approval_id = request_approval(
+                api_key=cfg.api_key,
+                api_url=cfg.api_url,
+                action=name,
+                context=context,
+                timeout_seconds=timeout,
+                poll_interval=cfg.approval_poll_interval,
             )
         except (JamJetApprovalRejected, JamJetApprovalTimeout) as exc:
-            failure = exc
+            fail(exc, name)
+            raise  # unreachable; fail() raises
         except Exception as exc:  # noqa: BLE001  any failure to reach Cloud fails closed
-            failure = JamJetApprovalTimeout("", timeout)
+            failure = JamJetApprovalTimeout("", timeout, reason=f"could not reach JamJet Cloud: {exc}")
             failure.__cause__ = exc
-        if failure is not None:
-            before_fail()
-            outcome: dict[str, Any] = {"tool": name, "outcome": type(failure).__name__}
-            if failure.approval_id:
-                outcome["approval_id"] = failure.approval_id
-            span.payload = {**span.payload, "approval": outcome}
-            span.finish(status="error")
-            emit(span.to_event_dict())
-            raise failure
+            fail(failure, name)
+            raise  # unreachable
+        # The approval covers these exact arguments: refuse to release the call
+        # if they changed while the reviewer was deciding.
+        now = [c for c in reread() if c[0] == call_id and c[1] == name]
+        if not now or arguments_digest(now[0][2]) != digest:
+            fail(JamJetApprovalRejected(approval_id, reason="tool call arguments changed after approval"), name)
+        approved.append(approval_id)
     if approved:
         span.payload = {**span.payload, "approval_ids": approved}
 
@@ -339,12 +357,23 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
             extra = {} if reported else {"usage_estimated": True}
             _record_usage(span, tally.model or model, input_tokens, output, **extra)
 
+        def gated(listed: list[StreamedToolCall]) -> list[tuple[str | None, str, Any]]:
+            # Gate the name as last sent and the fragments joined, like the block check.
+            out: list[tuple[str | None, str, Any]] = []
+            for c in listed:
+                arguments = _streamed_arguments(vendor, c.arguments)
+                out.append((c.id, c.name, arguments))
+                if c.joined_name and c.joined_name != c.name:
+                    out.append((c.id, c.joined_name, arguments))
+            return out
+
         _gate_approvals(
             span,
             vendor,
             tally.model or model,
-            [(c.id, c.name, _streamed_arguments(vendor, c.arguments)) for c in calls],
+            gated(calls),
             record_complete_usage,
+            lambda: gated(tally.tool_calls),
         )
 
     def on_end(tally: StreamTally, how: str, error: BaseException | None) -> None:
@@ -445,7 +474,7 @@ def _run_enforced(vendor: str, original: Any, self_inner: Any, args: Any, kwargs
     # Cloud decision and raise unless approved.
     calls = _response_tool_calls(vendor, result)
     _refuse_blocked(span, calls)
-    _gate_approvals(span, vendor, actual_model, calls, lambda: None)
+    _gate_approvals(span, vendor, actual_model, calls, lambda: None, lambda: _response_tool_calls(vendor, result))
     span.finish(status="ok")
     emit(span.to_event_dict())
     return raw if raw is not None else result

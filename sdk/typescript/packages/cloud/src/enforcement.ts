@@ -7,7 +7,7 @@ import { estimateCost } from './cost.js'
 import { DEFAULT_APPROVAL_TIMEOUT_MS, pollUntilResolved } from './approvals.js'
 import { JamjetApprovalRejected, JamjetApprovalTimeout, JamjetPolicyBlocked } from './errors.js'
 import { toolNameOf } from './policy.js'
-import { redactDict } from './redaction.js'
+import { argumentsDigest, maskForApproval, parsedArguments } from './approval-context.js'
 import { Span } from './span.js'
 import { enforceStream, type StreamedToolCall, type StreamTally, type Vendor } from './stream-enforcement.js'
 
@@ -330,9 +330,16 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
       onToolCallStarted: (call, tally) => refuseStreamed([{ ...call, joinedName: call.name, arguments: '' }], tally),
       onToolCalls: async (calls, tally) => {
         refuseStreamed(calls, tally)
+        // Gate the name as last sent and the fragments joined, like the block check.
+        const gated = (list: ReadonlyArray<StreamedToolCall>): ToolCall[] =>
+          list.flatMap((c) => {
+            const one: ToolCall = { name: c.name, arguments: streamedArguments(vendor, c.arguments) }
+            if (c.id !== undefined) one.id = c.id
+            return c.joinedName !== '' && c.joinedName !== c.name ? [one, { ...one, name: c.joinedName }] : [one]
+          })
         await gateApprovals(
           streamState(tally),
-          calls.map((c) => ({ ...c, arguments: streamedArguments(vendor, c.arguments) })),
+          gated(calls),
           () => {
             const reported = tally.inputTokens !== undefined && tally.outputTokens !== undefined
             recordUsage(
@@ -342,6 +349,8 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
               reported ? {} : { usage_estimated: true },
             )
           },
+          () => gated(tally.toolCalls),
+          requestSignal(args),
         )
       },
       onEnd: (tally, end) => {
@@ -386,7 +395,7 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
   // Cloud decision and throw unless approved.
   const calls = getToolCalls(vendor, result)
   refuseBlocked(state, calls)
-  await gateApprovals(state, calls, () => {})
+  await gateApprovals(state, calls, () => {}, () => getToolCalls(vendor, result), requestSignal(args))
 
   span.finish('ok')
   client.recordSpan(span.toEventDict())
@@ -430,48 +439,71 @@ function refuseBlocked(state: CallState, calls: ReadonlyArray<{ id?: string; nam
  * Fails closed: a rejection, a timeout, or any failure to reach Cloud throws,
  * after `beforeFail` (records usage) and the span are recorded.
  */
-async function gateApprovals(state: CallState, calls: ReadonlyArray<ToolCall>, beforeFail: () => void): Promise<void> {
+async function gateApprovals(
+  state: CallState,
+  calls: ReadonlyArray<ToolCall>,
+  beforeFail: () => void,
+  reread: () => ReadonlyArray<ToolCall>,
+  signal: AbortSignal | undefined,
+): Promise<void> {
   const { client, span } = state
   const approved: string[] = []
+  const pii = client.config.redaction.mode !== 'off'
+  const fail = (failure: Error, tool: string): never => {
+    recorded.add(failure)
+    beforeFail()
+    const id = (failure as { approvalId?: string }).approvalId
+    if (id) span.approvalId = id
+    span.payload = { ...span.payload, approval: { tool, outcome: failure.name } }
+    span.finish('error')
+    client.recordSpan(span.toEventDict())
+    throw failure
+  }
   for (const call of calls) {
     const decision = client._policy.evaluate(call.name)
     if (decision.policyKind !== 'require_approval') continue
+    const digest = await argumentsDigest(call.arguments)
     const context: Record<string, unknown> = {
       tool: call.name,
       vendor: state.vendor,
       model: state.model,
       rule: decision.pattern,
+      arguments_sha256: digest,
     }
     if (call.id !== undefined) context['tool_call_id'] = call.id
-    if (call.arguments !== undefined) context['arguments'] = call.arguments
+    if (call.arguments !== undefined) context['arguments'] = maskForApproval(parsedArguments(call.arguments), pii)
     if (span.agentName !== null) context['agent'] = span.agentName
     const timeoutMs = client.config.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS
+    let id: string
     try {
-      approved.push(
-        await pollUntilResolved({
-          apiKey: client.config.apiKey,
-          apiUrl: client.config.apiUrl,
-          action: call.name,
-          context:
-            client.config.redaction.mode === 'off' ? context : (redactDict(context) as Record<string, unknown>),
-          timeoutMs,
-          ...(client.config.approvalPollIntervalMs !== undefined
-            ? { pollIntervalMs: client.config.approvalPollIntervalMs }
-            : {}),
-        }),
-      )
+      id = await pollUntilResolved({
+        apiKey: client.config.apiKey,
+        apiUrl: client.config.apiUrl,
+        action: call.name,
+        context,
+        timeoutMs,
+        ...(client.config.approvalPollIntervalMs !== undefined
+          ? { pollIntervalMs: client.config.approvalPollIntervalMs }
+          : {}),
+        ...(signal !== undefined ? { signal } : {}),
+      })
     } catch (err) {
-      const failure =
+      if (signal?.aborted) fail(err instanceof Error ? err : new Error(String(err)), call.name)
+      fail(
         err instanceof JamjetApprovalRejected || err instanceof JamjetApprovalTimeout
           ? err
-          : new JamjetApprovalTimeout('', timeoutMs, { cause: err })
-      beforeFail()
-      if (failure.approvalId !== '') span.approvalId = failure.approvalId
-      span.payload = { ...span.payload, approval: { tool: call.name, outcome: failure.name } }
-      span.finish('error')
-      client.recordSpan(span.toEventDict())
-      throw failure
+          : new JamjetApprovalTimeout('', timeoutMs, { cause: err }),
+        call.name,
+      )
+      return
     }
+    // The approval covers these exact arguments: refuse to release the call
+    // if they changed while the reviewer was deciding.
+    const now = reread().find((c) => c.name === call.name && c.id === call.id)
+    if (now === undefined || (await argumentsDigest(now.arguments)) !== digest) {
+      fail(new JamjetApprovalRejected(id, 'tool call arguments changed after approval'), call.name)
+    }
+    approved.push(id)
   }
   if (approved.length > 0) {
     span.approvalId = approved[0]!
@@ -479,10 +511,21 @@ async function gateApprovals(state: CallState, calls: ReadonlyArray<ToolCall>, b
   }
 }
 
+/** The caller's AbortSignal, passed in the vendor's request options (second argument). */
+function requestSignal(args: unknown[]): AbortSignal | undefined {
+  const signal = (args[1] as { signal?: unknown } | undefined)?.signal
+  return typeof AbortSignal !== 'undefined' && signal instanceof AbortSignal ? signal : undefined
+}
+
 /** Errors whose span was recorded where they were raised. */
+const recorded = new WeakSet<object>()
+
 function alreadyRecorded(err: unknown): boolean {
   return (
-    err instanceof JamjetPolicyBlocked || err instanceof JamjetApprovalRejected || err instanceof JamjetApprovalTimeout
+    err instanceof JamjetPolicyBlocked ||
+    err instanceof JamjetApprovalRejected ||
+    err instanceof JamjetApprovalTimeout ||
+    (typeof err === 'object' && err !== null && recorded.has(err))
   )
 }
 
