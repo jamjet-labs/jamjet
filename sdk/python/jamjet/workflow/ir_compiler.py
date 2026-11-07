@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from jamjet.workflow.types import StepDef, WorkflowDef
+from jamjet.workflow.types import DEFAULT_WORKFLOW_VERSION, StepDef, WorkflowDef
 
 if TYPE_CHECKING:
     from jamjet.spec import WorkflowSpec
@@ -222,7 +222,7 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
 
     ir: dict[str, Any] = {
         "workflow_id": wf.get("id", "unknown"),
-        "version": wf.get("version", "0.1.0"),
+        "version": wf.get("version", DEFAULT_WORKFLOW_VERSION),
         "name": wf.get("name"),
         "description": wf.get("description"),
         "state_schema": _state_schema_str(wf.get("state_schema", "")),
@@ -293,7 +293,7 @@ def _compile_agent_yaml(data: dict[str, Any]) -> dict[str, Any]:
     tools = agent.get("tools", [])
     model = agent["model"]
     goal = agent["goal"]
-    version = agent.get("version", "0.1.0")
+    version = agent.get("version", DEFAULT_WORKFLOW_VERSION)
 
     # ── Compile strategy → IR sub-DAG ─────────────────────────────────────────
     compiled = compile_strategy(

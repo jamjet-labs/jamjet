@@ -6,6 +6,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+# The version a workflow gets when its author does not set one. It must match
+# the version the runtime assumes when a run names no version (`start_run` in
+# runtime/api/src/routes.rs), or a workflow registered with the default cannot
+# be started without spelling the version out.
+DEFAULT_WORKFLOW_VERSION = "1.0.0"
+
 
 @dataclass
 class StepDef:

@@ -5,6 +5,40 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+# The scoring dimensions of the runtime's `DimensionWeights`
+# (runtime/core/src/coordinator.rs). Its fields are required, so a coordinator
+# node must send all five or leave `weights` out; the runtime's default for an
+# absent block is 1.0 for every dimension.
+COORDINATOR_WEIGHT_DIMENSIONS = (
+    "capability_fit",
+    "cost_fit",
+    "latency_fit",
+    "trust_compatibility",
+    "historical_performance",
+)
+_DEFAULT_DIMENSION_WEIGHT = 1.0
+
+
+def _coordinator_weights(weights: dict[str, Any]) -> dict[str, float]:
+    """All five dimension weights, the missing ones at the runtime default 1.0.
+
+    Raises ``ValueError`` for an unknown dimension or a non-numeric weight: the
+    runtime would drop the first silently and reject the second at registration.
+    """
+    unknown = sorted(set(weights) - set(COORDINATOR_WEIGHT_DIMENSIONS))
+    if unknown:
+        raise ValueError(
+            f"Unknown coordinator weight(s): {', '.join(unknown)}. "
+            f"Known dimensions: {', '.join(COORDINATOR_WEIGHT_DIMENSIONS)}"
+        )
+    out: dict[str, float] = {}
+    for dim in COORDINATOR_WEIGHT_DIMENSIONS:
+        value = weights.get(dim, _DEFAULT_DIMENSION_WEIGHT)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Coordinator weight {dim!r} must be a number, got {value!r}")
+        out[dim] = float(value)
+    return out
+
 
 @dataclass
 class ModelNode:
@@ -116,19 +150,23 @@ class CoordinatorNode:
         """Serialize the coordinator configuration as an IR node kind.
 
         Returns:
-            A dictionary with empty mappings for unset weights and input mapping.
-            Trust domain, budget, and tiebreaker are included only when truthy.
+            A dictionary with an empty mapping for an unset input mapping.
+            ``weights`` is left out when unset (the runtime then weighs every
+            dimension 1.0); set weights are sent with all five dimensions, the
+            missing ones at 1.0. Trust domain, budget, and tiebreaker are
+            included only when truthy.
         """
-        ir = {
+        ir: dict[str, Any] = {
             "type": "coordinator",
             "task": self.task,
             "required_skills": self.required_skills,
             "preferred_skills": self.preferred_skills,
             "output_key": self.output_key,
             "strategy": self.strategy,
-            "weights": self.weights or {},
             "input_mapping": self.input_mapping or {},
         }
+        if self.weights:
+            ir["weights"] = _coordinator_weights(self.weights)
         if self.trust_domain:
             ir["trust_domain"] = self.trust_domain
         if self.budget:

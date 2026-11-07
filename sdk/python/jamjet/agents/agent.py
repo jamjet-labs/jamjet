@@ -164,7 +164,7 @@ class Agent:
             except ImportError as e:
                 raise ImportError(
                     "Agent(memory=True) requires the optional 'memory' extra "
-                    "(jamjet-engram). Install with: pip install 'jamjet[memory]'."
+                    "(jamjet-engram). Install with: pip install 'jamjet[memory]' (Python 3.12+)."
                 ) from e
             self._memory_enabled = True
         else:
@@ -389,7 +389,7 @@ class Agent:
             except ImportError as e:  # pragma: no cover - guarded at __init__
                 raise ImportError(
                     "Agent(memory=True) requires the optional 'memory' extra "
-                    "(jamjet-engram). Install with: pip install 'jamjet[memory]'."
+                    "(jamjet-engram). Install with: pip install 'jamjet[memory]' (Python 3.12+)."
                 ) from e
             from jamjet.memory.engram_bridge import AgentMemory  # noqa: PLC0415
             from jamjet.spec import MemoryConfig  # noqa: PLC0415
