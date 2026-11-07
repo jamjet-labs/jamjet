@@ -395,3 +395,25 @@ async def test_worker_does_not_send_server_echoed_values_to_fail() -> None:
     assert client.failures, "the worker should report the failure"
     assert "4111111111111111" not in client.failures[0]
     assert "HTTP 400" in client.failures[0]
+
+
+def test_a_handler_http_error_is_reported_with_its_own_host() -> None:
+    from jamjet.cli.main import _failure_report
+
+    request = httpx.Request("GET", "https://api.github.com/repos/acme/x?access_token=secret")
+    response = httpx.Response(404, request=request)
+    report = _failure_report(httpx.HTTPStatusError("404", request=request, response=response))
+    assert report == "HTTP 404 from GET https://api.github.com/repos/acme/x"
+    assert "runtime" not in report and "secret" not in report
+
+
+def test_a_runtime_refusal_is_reported_as_one() -> None:
+    from jamjet.cli.main import _failure_report
+    from jamjet.client import _raise_for_status
+
+    request = httpx.Request("POST", f"{BASE}/work-items/wi-1/complete")
+    response = httpx.Response(400, request=request, json={"error": "bad output 'secret'"})
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        _raise_for_status(response)
+    report = _failure_report(exc.value)
+    assert report == "runtime refused the result: HTTP 400 for POST /work-items/wi-1/complete"
