@@ -16,6 +16,12 @@ import java.util.Map;
  */
 public final class IrCompiler {
 
+    /**
+     * The version a workflow gets when none is set: what the runtime starts when a run names
+     * no version ({@code start_execution} defaults to {@code 1.0.0}).
+     */
+    public static final String DEFAULT_VERSION = "1.0.0";
+
     private IrCompiler() {}
 
     /**
@@ -133,7 +139,7 @@ public final class IrCompiler {
 
         return new WorkflowIr(
                 agent.name(),
-                "0.1.0",
+                DEFAULT_VERSION,
                 agent.name(),
                 agent.instructions().isBlank() ? agent.name() : agent.instructions(),
                 "",
