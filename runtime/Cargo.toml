@@ -87,7 +87,7 @@ pin-project = "1"
 
 # Crypto
 sha2 = "0.10"
-rand = "0.8"
+rand = "0.10"
 
 # Static file embedding
 rust-embed = { version = "8", features = ["compression"] }
