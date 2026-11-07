@@ -590,6 +590,42 @@ def dev(
 # ── validate ─────────────────────────────────────────────────────────────────
 
 
+def _compile_yaml_reporting(source: str) -> dict[str, Any]:
+    """``compile_yaml``, printing each schema warning (an unknown key outside a
+    node or policy) instead of leaving it to Python's warning output."""
+    import warnings
+
+    from jamjet.workflow.ir_compiler import WorkflowSchemaWarning, compile_yaml
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", WorkflowSchemaWarning)
+        ir = compile_yaml(source)
+    for w in caught:
+        if issubclass(w.category, WorkflowSchemaWarning):
+            console.print("Warning:", style="yellow", end=" ")
+            console.print(str(w.message), markup=False, highlight=False)
+        else:
+            warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
+    return ir
+
+
+def _validate_fleet(data: dict[str, Any]) -> None:
+    """Compile a fleet file (agents:/workflows: maps) and print each unit."""
+    from jamjet.workflow.bundle import compile_bundle
+
+    bundle = compile_bundle(data)
+    console.print(f"[green]Valid.[/green] fleet with {len(bundle.workflows)} unit(s)")
+    for ir in bundle.workflows:
+        console.print(
+            f"  {_safe(ir['workflow_id'])} v{_safe(ir['version'])}  "
+            f"Nodes: {len(ir.get('nodes', {}))}  Edges: {len(ir.get('edges', []))}",
+            markup=False,
+            highlight=False,
+        )
+    for job in bundle.cron_jobs:
+        console.print(f"  schedule {_safe(job.name)}: {_safe(job.cron_expression)}", markup=False, highlight=False)
+
+
 @app.command()
 def validate(
     path: str = typer.Argument(..., help="Path to workflow.yaml or .py"),
@@ -597,8 +633,6 @@ def validate(
 ) -> None:
     """Validate a workflow definition (YAML or Python)."""
     import os
-
-    from jamjet.workflow.ir_compiler import compile_yaml
 
     console.print(f"Validating: [bold]{path}[/bold]")
 
@@ -610,7 +644,13 @@ def validate(
         if path.endswith(".yaml") or path.endswith(".yml"):
             with open(path) as f:
                 source = f.read()
-            ir = compile_yaml(source)
+            from jamjet.workflow.bundle import is_bundle
+
+            data = yaml.safe_load(source)
+            if is_bundle(data):
+                _validate_fleet(data)
+                return
+            ir = _compile_yaml_reporting(source)
         elif path.endswith(".py"):
             # Import the module and call compile() on the first Workflow object found.
             import importlib.util
@@ -709,11 +749,9 @@ def deploy(
 
 def _load_workflow_ir(path: str) -> dict[str, Any]:
     """Compile a workflow file (.yaml/.yml/.py) to its IR dict."""
-    from jamjet.workflow.ir_compiler import compile_yaml
-
     if path.endswith((".yaml", ".yml")):
         with open(path) as fh:
-            return compile_yaml(fh.read())
+            return _compile_yaml_reporting(fh.read())
     if path.endswith(".py"):
         import importlib.util
 

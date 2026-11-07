@@ -16,10 +16,8 @@ Each agent uses a different JamJet reasoning strategy, showing how multiple stra
 ## Quick Start
 
 ```bash
-pip install jamjet
-export OPENAI_API_KEY=your-key          # or use Ollama:
-# export OPENAI_BASE_URL=http://localhost:11434/v1
-# export OPENAI_API_KEY=ollama
+pip install 'jamjet[model]'
+export ANTHROPIC_API_KEY=sk-ant-...     # the agents use claude-haiku-4-5
 python deliberation.py
 ```
 
@@ -28,4 +26,4 @@ python deliberation.py
 - Multi-agent workflows with typed shared state
 - Composing different reasoning strategies (react, critic, plan-and-execute)
 - Sequential agent collaboration with structured handoffs
-- Research-grade patterns running on a durable workflow engine
+- A research pattern written as a typed, step-by-step workflow

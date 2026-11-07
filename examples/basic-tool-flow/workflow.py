@@ -7,8 +7,12 @@ A simple JamJet workflow demonstrating:
 - Defining workflow state with @workflow.state
 - Defining steps with @workflow.step
 - Compiling to IR
+- Running it in-process
 
-To run:
+Run in-process (no runtime, no API key):
+    python workflow.py
+
+Run on the runtime:
     jamjet dev          # start local runtime
     jamjet run workflow.py --input '{"question": "What is JamJet?"}'
 """
@@ -71,7 +75,9 @@ async def summarize(state: State) -> State:
 
 
 if __name__ == "__main__":
-    import json
+    # The compiled definition. compile() returns a WorkflowSpec (Pydantic).
+    print(workflow.compile().model_dump_json(indent=2))
 
-    ir = workflow.compile()
-    print(json.dumps(ir, indent=2))
+    # Walk the steps in-process.
+    result = workflow.run_sync(State(question="What is JamJet?"))
+    print(f"final_answer: {result.state.final_answer}")
