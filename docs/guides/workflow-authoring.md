@@ -177,9 +177,9 @@ from jamjet import WorkflowGraph, ModelNode, ToolNode, ConditionNode, HumanAppro
 graph = WorkflowGraph("complex_pipeline")
 
 graph.add_node("fetch", ToolNode(tool_ref="get_ticket"))
-graph.add_node("classify", ModelNode(model="default_chat", prompt="prompts/classify.md"))
+graph.add_node("classify", ModelNode(model="default_chat", prompt="Classify this ticket: {{ state.ticket }}"))
 graph.add_node("review", HumanApprovalNode(timeout="48h"))
-graph.add_node("respond", ModelNode(model="default_chat", prompt="prompts/respond.md"))
+graph.add_node("respond", ModelNode(model="default_chat", prompt="Reply to this ticket: {{ state.ticket }}"))
 
 graph.add_edge("fetch", "classify")
 graph.add_edge("classify", "review", when="output.priority == 'high'")

@@ -28,6 +28,14 @@ impl NodeExecutor for ModelNodeExecutor {
     async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
 
+        // The scheduler could not produce the node's prompt (a template naming
+        // state the run does not have, or a prompt file it cannot read). Fail
+        // with that reason rather than call the model without the prompt.
+        // Not retryable: the item's payload, and so the reason, is fixed.
+        if let Some(reason) = item.payload.get("prompt_error").and_then(|v| v.as_str()) {
+            return Err(ExecutorError::Fatal(format!("ModelNodeExecutor: {reason}")));
+        }
+
         // Extract model config from the work item payload.
         // The payload is populated by the scheduler from the IR node definition.
         // Default to the fully-qualified provider-prefixed string so that:
@@ -59,8 +67,10 @@ impl NodeExecutor for ModelNodeExecutor {
             .and_then(|v| v.as_f64())
             .map(|f| f as f32);
 
-        // Build the messages from state and payload.
-        // The `prompt` field in payload may reference workflow state via template strings.
+        // Build the messages from the payload. `prompt` is the node's prompt,
+        // already rendered against the run's state by the scheduler; when the
+        // node has one it is the single user message. `messages` (the
+        // conversation in state) is used only when the node has no prompt.
         let prompt = item
             .payload
             .get("prompt")
@@ -473,6 +483,36 @@ mod tests {
         assert!(
             sp_tool_calls.is_empty(),
             "expected empty tool_calls in state_patch"
+        );
+    }
+
+    /// A payload whose prompt the scheduler could not produce fails the node
+    /// with the reason, and never reaches the model, even with a conversation
+    /// in the payload to fall back on.
+    #[tokio::test]
+    async fn a_prompt_error_fails_the_node_without_calling_the_model() {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let registry = Arc::new(
+            ModelRegistry::new()
+                .register(Arc::new(CapturingAdapter {
+                    captured: captured.clone(),
+                }))
+                .with_default("capturing"),
+        );
+        let executor = ModelNodeExecutor::new(registry);
+        let mut item = make_item();
+        item.payload = serde_json::json!({
+            "model": "fake-model",
+            "prompt_error": "prompt template: `{{ state.query }}`: the run's state has no `query`",
+            "messages": [ { "role": "user", "content": "hi" } ]
+        });
+        match executor.execute(&item).await {
+            Err(ExecutorError::Fatal(msg)) => assert!(msg.contains("no `query`"), "{msg}"),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "the model must not be called"
         );
     }
 
