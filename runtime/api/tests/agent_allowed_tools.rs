@@ -206,7 +206,7 @@ async fn run_in(
         assert!(st.is_success(), "start: {st} {body}");
         body["execution_id"].as_str().unwrap().to_string()
     } else {
-        support::register_and_start(&state, ir, input).await
+        support::store_and_start(&state, ir, input).await
     };
     let eid =
         ExecutionId(uuid::Uuid::parse_str(eid.strip_prefix("exec_").unwrap_or(&eid)).unwrap());
@@ -242,7 +242,11 @@ async fn fire(state: &AppState, tb: &support::TestBackend, transport: Transport)
             .register_executor("agent_tool", Arc::new(exec.clone()))
             .register_executor("coordinator", Arc::new(exec.clone()))
             .register_executor("agent", Arc::new(exec.clone()))
-            .register_executor("a2a_task", Arc::new(exec.clone()));
+            .register_executor("a2a_task", Arc::new(exec.clone()))
+            // A worker fails a node it has no executor for before the guard
+            // runs, so every kind these tests gate has one here.
+            .register_executor("finalizer", Arc::new(exec.clone()))
+            .register_executor("agent_discovery", Arc::new(exec.clone()));
             let _ = worker.poll_and_execute().await;
             exec.0.load(Ordering::SeqCst) > 0
         }
@@ -576,7 +580,7 @@ async fn an_unreadable_registry_holds_the_node() {
     for tb in support::backends().await {
         let mut state = support::make_state(tb.dyn_backend());
         state.agents = Arc::new(Broken);
-        let eid = support::register_and_start(
+        let eid = support::store_and_start(
             &state,
             ir("wf-broken", mcp_tool("search_web"), Some(AGENT), None, None),
             json!({}),
@@ -610,7 +614,7 @@ async fn a_worker_without_a_registry_refuses_an_attributed_node() {
         let state = state_for(&tb).await;
         let (st, _) = support::post(&state, "/agents", card(AGENT, &[])).await;
         assert!(st.is_success());
-        let eid = support::register_and_start(
+        let eid = support::store_and_start(
             &state,
             ir("wf-noreg", mcp_tool("search_web"), Some(AGENT), None, None),
             json!({}),
@@ -720,7 +724,7 @@ async fn a_result_for_an_unlisted_tool_is_not_recorded() {
         let state = state_for(&tb).await;
         let (st, _) = support::post(&state, "/agents", card(AGENT, &["search_*"])).await;
         assert!(st.is_success());
-        let eid = support::register_and_start(
+        let eid = support::store_and_start(
             &state,
             ir(
                 "wf-complete",
@@ -895,7 +899,7 @@ async fn a_result_for_an_unlisted_dispatch_call_is_not_recorded() {
         let state = state_for(&tb).await;
         let (st, _) = support::post(&state, "/agents", card(AGENT, &["search_web"])).await;
         assert!(st.is_success());
-        let eid = support::register_and_start(
+        let eid = support::store_and_start(
             &state,
             ir(
                 "wf-complete-dispatch",
@@ -1586,7 +1590,7 @@ async fn completing_an_unapproved_card_gated_node_is_refused() {
         )
         .await;
         assert!(st.is_success());
-        support::register_and_start(
+        support::store_and_start(
             &state,
             ir(
                 "wf-gate-complete",
@@ -1695,7 +1699,7 @@ async fn an_agent_node_with_an_unreadable_card_does_not_run() {
     for tb in support::backends().await {
         let mut state = support::make_state(tb.dyn_backend());
         state.agents = Arc::new(BrokenRegistry);
-        support::register_and_start(
+        support::store_and_start(
             &state,
             ir(
                 "wf-autonomy",

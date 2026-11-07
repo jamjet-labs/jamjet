@@ -9,6 +9,7 @@
 
 pub mod agent_limits;
 pub mod dispatch_guard;
+pub mod executable;
 pub mod executor;
 pub mod executors;
 pub mod heartbeat;
@@ -22,8 +23,8 @@ pub mod worker;
 pub use dispatch_guard::{guard_dispatch, DispatchGuardOutcome};
 pub use executor::{ExecutionResult, ExecutorError, NodeExecutor};
 pub use executors::{
-    A2aTaskExecutor, AgentDiscoveryExecutor, ConditionNodeExecutor, EvalExecutor, McpToolExecutor,
-    ModelNodeExecutor,
+    A2aTaskExecutor, AgentDiscoveryExecutor, ConditionNodeExecutor, EvalExecutor,
+    HumanApprovalExecutor, LimitExceededExecutor, McpToolExecutor, ModelNodeExecutor,
 };
-pub use pool::{default_pool, WorkerGroupConfig, WorkerPool};
+pub use pool::{default_pool, server_pool, WorkerGroupConfig, WorkerPool};
 pub use worker::Worker;

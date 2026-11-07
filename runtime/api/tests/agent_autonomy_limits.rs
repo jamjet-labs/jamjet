@@ -200,7 +200,7 @@ async fn start_on(
     let state = state_for(tb, backend.clone()).await;
     register(&state, cards).await;
     let wf = ir["workflow_id"].as_str().unwrap().to_string();
-    let eid = support::register_and_start(&state, ir.clone(), input.clone()).await;
+    let eid = support::store_and_start(&state, ir.clone(), input.clone()).await;
     let eid =
         ExecutionId(uuid::Uuid::parse_str(eid.strip_prefix("exec_").unwrap_or(&eid)).unwrap());
     Run {

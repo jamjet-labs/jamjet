@@ -441,13 +441,51 @@ impl Scheduler {
         // Fail nodes whose approval was rejected. Guarded by terminal_failed so
         // the emission fires exactly once: the next tick folds the NodeFailed,
         // which clears the `rejected` marker and inserts into terminal_failed.
+        //
+        // One exception: a `human_approval` node whose request EXPIRED and
+        // that names a `fallback_node` completes instead, routed to the
+        // fallback (see `edge_dead`). A human rejection still fails it.
         for (node_id, reason) in progress
             .rejected
             .iter()
-            .filter(|(n, _)| !progress.terminal_failed.contains(n.as_str()))
+            .filter(|(n, _)| {
+                !progress.terminal_failed.contains(n.as_str())
+                    && !progress.completed.contains(n.as_str())
+            })
             .map(|(n, r)| (n.clone(), r.clone()))
             .collect::<Vec<_>>()
         {
+            if progress.expired.contains(&node_id) {
+                if let Some(fallback) = ir.nodes.get(&node_id).and_then(|n| fallback_of(&n.kind)) {
+                    let seq = self.backend.latest_sequence(execution_id).await? + 1;
+                    self.backend
+                        .append_event(jamjet_state::Event::new(
+                            execution_id.clone(),
+                            seq,
+                            EventKind::NodeCompleted {
+                                node_id: node_id.clone(),
+                                output: serde_json::json!({
+                                    "decision": "expired",
+                                    "reason": reason,
+                                    "chosen_target": fallback,
+                                }),
+                                state_patch: serde_json::json!({}),
+                                duration_ms: 0,
+                                gen_ai_system: None,
+                                gen_ai_model: None,
+                                input_tokens: None,
+                                output_tokens: None,
+                                finish_reason: None,
+                                cost_usd: None,
+                                provenance: None,
+                                idempotency_key: None,
+                            },
+                        ))
+                        .await?;
+                    info!(execution_id = %execution_id, node_id = %node_id, %fallback, "Approval expired — routed to the fallback node");
+                    continue;
+                }
+            }
             let seq = self.backend.latest_sequence(execution_id).await? + 1;
             self.backend
                 .append_event(jamjet_state::Event::new(
@@ -491,10 +529,10 @@ impl Scheduler {
                 }
                 let mut has_in_edge = false;
                 let mut all_dead = true;
-                for e in ir.edges.iter().filter(|e| e.to == *node_id) {
+                for from in in_edge_sources(&ir, n) {
                     has_in_edge = true;
                     if !edge_dead(
-                        &e.from,
+                        from,
                         n,
                         &ir,
                         &progress.completed,
@@ -745,6 +783,10 @@ struct ExecProgress {
     unreadable: bool,
     /// A `RunStalled` is already in the log, so it is not recorded again.
     stall_recorded: bool,
+    /// Nodes in `rejected` because their request EXPIRED (not a human
+    /// rejection). A `human_approval` node among them with a `fallback_node`
+    /// completes routed to the fallback instead of failing.
+    expired: HashSet<NodeId>,
     /// Rejected approvals awaiting their `NodeFailed` emission, node -> reason.
     /// Cleared when the corresponding `NodeFailed{retryable: false}` folds in.
     /// Note: a rejected node stays in `scheduled` (consuming a concurrency slot)
@@ -783,6 +825,9 @@ impl ExecProgress {
                 self.scheduled.remove(node_id);
                 // Stale-hold cleanup: a completed node no longer awaits approval.
                 self.held.remove(node_id);
+                // An expired `human_approval` routed to its fallback completes.
+                self.rejected.remove(node_id);
+                self.expired.remove(node_id);
                 // FDL-3: record a Condition node's routing decision. The condition
                 // executor (FDL-2) records `chosen_target` on its `output`: a
                 // non-null string is the single live out-edge; a null/absent
@@ -833,6 +878,7 @@ impl ExecProgress {
                 self.scheduled.remove(node_id);
                 self.held.remove(node_id);
                 self.rejected.remove(node_id);
+                self.expired.remove(node_id);
             }
             EventKind::NodeFailed {
                 node_id,
@@ -842,6 +888,7 @@ impl ExecProgress {
                 self.terminal_failed.insert(node_id.clone());
                 self.scheduled.remove(node_id);
                 self.rejected.remove(node_id);
+                self.expired.remove(node_id);
                 self.held.remove(node_id);
             }
             EventKind::NodeFailed {
@@ -906,6 +953,7 @@ impl ExecProgress {
                             self.scheduled.remove(node_id);
                         }
                         jamjet_state::event::ApprovalDecision::Rejected => {
+                            self.expired.remove(node_id);
                             let mut reason = format!("approval rejected by {user_id}");
                             if let Some(c) = comment {
                                 reason.push_str(": ");
@@ -931,6 +979,7 @@ impl ExecProgress {
                 if self.held_request.get(node_id) == Some(request_sequence)
                     && self.held.remove(node_id)
                 {
+                    self.expired.insert(node_id.clone());
                     self.rejected.insert(
                         node_id.clone(),
                         format!(
@@ -983,6 +1032,13 @@ impl ExecProgress {
 ///   - an empty-`branches` Condition (a generic pass-through) — never routes,
 ///     so its out-edges are governed only by the skip rule (backward-compat);
 ///   - any non-Condition source that has not been skipped.
+///
+/// A `human_approval` node with a `fallback_node` routes too, once complete.
+/// Approved (no route recorded): its edges are live except the one to the
+/// fallback, which the IR need not draw (see [`in_edge_sources`]) and which
+/// is dead unless the IR draws it as an ordinary edge too. Expired (the
+/// scheduler recorded the fallback as `chosen_target`): only the edge to the
+/// fallback is live.
 fn edge_dead(
     src: &str,
     dst: &str,
@@ -1001,8 +1057,53 @@ fn edge_dead(
                 return routes.get(src).map(String::as_str) != Some(dst);
             }
         }
+        if let Some(fallback) = fallback_of(&node.kind) {
+            if completed.contains(src) {
+                return match routes.get(src) {
+                    Some(target) => target != dst,
+                    None => {
+                        dst == fallback && !ir.edges.iter().any(|e| e.from == src && e.to == dst)
+                    }
+                };
+            }
+        }
     }
     false
+}
+
+/// A `human_approval` node's `fallback_node`, if it names one.
+fn fallback_of(kind: &NodeKind) -> Option<&str> {
+    match kind {
+        NodeKind::HumanApproval {
+            fallback_node: Some(fallback),
+            ..
+        } => Some(fallback.as_str()),
+        _ => None,
+    }
+}
+
+/// The sources of `node_id`'s in-edges: the IR's edges into it, plus every
+/// `human_approval` node that names it as `fallback_node`. The compilers emit
+/// the fallback only on the approval node, not as an edge, and without this
+/// a fallback node had no in-edge, so it was a root and ran when the run
+/// started.
+fn in_edge_sources<'a>(ir: &'a WorkflowIr, node_id: &str) -> Vec<&'a str> {
+    let mut sources: Vec<&'a str> = ir
+        .edges
+        .iter()
+        .filter(|e| e.to == node_id)
+        .map(|e| e.from.as_str())
+        .collect();
+    let mut approvals: Vec<&'a str> = ir
+        .nodes
+        .iter()
+        .filter(|(_, n)| fallback_of(&n.kind) == Some(node_id))
+        .map(|(id, _)| id.as_str())
+        .filter(|id| !sources.contains(id))
+        .collect();
+    approvals.sort_unstable();
+    sources.extend(approvals);
+    sources
 }
 
 /// Check if a node is runnable. Route-aware AND-join over LIVE edges only.
@@ -1030,11 +1131,11 @@ fn is_runnable(
     let mut has_in_edge = false;
     let mut has_live_edge = false;
     let mut all_live_sources_done = true;
-    for e in ir.edges.iter().filter(|e| e.to == node_id) {
+    for from in in_edge_sources(ir, node_id) {
         has_in_edge = true;
-        if !edge_dead(&e.from, node_id, ir, completed, skipped, routes) {
+        if !edge_dead(from, node_id, ir, completed, skipped, routes) {
             has_live_edge = true;
-            if !completed.contains(&e.from) {
+            if !completed.contains(from) {
                 all_live_sources_done = false;
             }
         }

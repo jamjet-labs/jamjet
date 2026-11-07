@@ -68,19 +68,23 @@ nodes:
 
 ## Node types
 
-| Type | Description |
-|------|-------------|
-| `tool` | Call a Python function or HTTP endpoint |
-| `model` | LLM call with structured output |
-| `condition` | Branch based on state expression |
-| `human_approval` | Pause for human decision |
-| `wait` | Suspend until timer or external event |
-| `parallel` | Fan out to concurrent branches |
-| `join` | Wait for all parallel branches |
-| `mcp_tool` | Call a tool via MCP protocol |
-| `a2a_task` | Delegate to an external agent via A2A |
-| `agent` | Invoke a local JamJet agent |
-| `eval` | Evaluate node output with scorers *(Phase 3)* |
+| Type | Description | Who runs it |
+|------|-------------|-------------|
+| `model` | LLM call | the engine |
+| `condition` | Branch on a state expression | the engine |
+| `human_approval` | Wait for a human decision | the engine |
+| `eval` | Evaluate node output with scorers *(Phase 3)* | the engine |
+| `python_fn` | A Python `@tool` or `@workflow.step` function | an external `jamjet worker` |
+| `java_fn` | A Java `@Tool` method | an external Java tool worker |
+| `external_fn` | A handler on a queue the node names | an external worker on that queue |
+
+The engine has no executor for `tool`, `mcp_tool`, `a2a_task`, `agent`,
+`agent_tool`, `coordinator`, `wait`, `parallel`, `join`, `subgraph`,
+`memory_retrieval`, `policy` or `finalizer`. `POST /workflows` refuses a
+workflow with any of them (400, naming each node and its kind). Until 2026-11
+such a node was registered and then completed with an empty output without
+running. Fan-out and fan-in need no node: a node with several `next` targets
+runs them all, and a node with several incoming edges waits for all of them.
 
 ---
 
@@ -104,28 +108,29 @@ route:
 ```yaml
 review:
   type: human_approval
-  message: "Please review the generated report"
-  timeout: 48h                      # auto-reject after timeout
-  on_approved: deliver
-  on_rejected: revise
+  description: "Please review the generated report"
+  timeout: 48h                      # optional: the request expires after this
+  fallback: escalate                # optional: where the run goes on expiry
+  next: deliver                     # taken when approved
 ```
+
+Approved, the run continues along `next`. Rejected, the node and the run
+fail. Expired, the run goes to `fallback`, or fails if there is none. See
+[Human-in-the-Loop](hitl.md#approval-nodes).
 
 ---
 
 ## Wait / external event node
 
-```yaml
-await_payment:
-  type: wait
-  event: payment_confirmed          # event name sent via POST /executions/{id}/events
-  timeout: 24h
-  on_timeout: cancel_order
-  next: fulfill_order
-```
+Not supported: the engine has no executor for `wait`, and registration
+refuses it. To wait for a person, use a `human_approval` node.
 
 ---
 
 ## MCP tool node
+
+Registration refuses this kind: the engine has no executor for it. The shape
+below is what the compiler emits.
 
 ```yaml
 search_github:
@@ -141,6 +146,9 @@ search_github:
 ---
 
 ## A2A task node
+
+Registration refuses this kind: the engine has no executor for it. The shape
+below is what the compiler emits.
 
 ```yaml
 code_review:

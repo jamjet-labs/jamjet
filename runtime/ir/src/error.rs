@@ -27,6 +27,9 @@ pub enum IrError {
         reason: String,
     },
 
+    #[error("human_approval node '{node}' is invalid: {reason}")]
+    InvalidHumanApproval { node: String, reason: String },
+
     #[error("external_fn node '{node}' queue `{queue}` is invalid: {reason}")]
     InvalidQueueName {
         node: String,

@@ -18,6 +18,7 @@ use std::collections::{HashSet, VecDeque};
 /// 10. All remote agents referenced by a2a_task nodes are configured
 /// 11. Every ADK tool-dispatch node carries its `agent_tool_dispatch` marker
 /// 12. Every node id is in the safe set (see [`validate_node_ids`])
+/// 13. Every `human_approval` node's timeout and fallback can be honoured
 pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_metadata(ir)?;
     validate_no_duplicate_nodes(ir)?;
@@ -31,6 +32,7 @@ pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_external_queues(ir)?;
     validate_node_ids(ir)?;
     validate_approval_deadlines(ir)?;
+    validate_human_approvals(ir)?;
     Ok(())
 }
 
@@ -213,6 +215,50 @@ pub fn validate_condition_expressions(ir: &WorkflowIr) -> IrResult<()> {
     Ok(())
 }
 
+/// Every `human_approval` node can be honoured: its `timeout_secs` is a
+/// deadline the engine accepts (1 second to a year, like a policy's
+/// `approval_timeout_secs`), and its `fallback_node` names another node of
+/// the workflow. A fallback that does not exist would turn an expiry into a
+/// run that can never finish.
+pub fn validate_human_approvals(ir: &WorkflowIr) -> IrResult<()> {
+    use crate::workflow::MAX_APPROVAL_TIMEOUT_SECS;
+    use jamjet_core::node::NodeKind;
+    let mut ids: Vec<&String> = ir.nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        let NodeKind::HumanApproval {
+            timeout_secs,
+            fallback_node,
+            ..
+        } = &ir.nodes[id].kind
+        else {
+            continue;
+        };
+        let invalid = |reason: String| IrError::InvalidHumanApproval {
+            node: id.clone(),
+            reason,
+        };
+        if let Some(t) = timeout_secs {
+            if !(1..=MAX_APPROVAL_TIMEOUT_SECS).contains(t) {
+                return Err(invalid(format!(
+                    "timeout_secs must be between 1 and {MAX_APPROVAL_TIMEOUT_SECS}, got {t}"
+                )));
+            }
+        }
+        if let Some(fallback) = fallback_node {
+            if fallback == id {
+                return Err(invalid("fallback_node names the node itself".to_string()));
+            }
+            if !ir.nodes.contains_key(fallback) {
+                return Err(invalid(format!(
+                    "fallback_node '{fallback}' is not a node of this workflow"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The longest queue name an `external_fn` node may use.
 pub const MAX_QUEUE_NAME_LEN: usize = 64;
 
@@ -348,8 +394,19 @@ fn validate_reachability(ir: &WorkflowIr) -> IrResult<()> {
     visited.insert(&ir.start_node);
 
     while let Some(current) = queue.pop_front() {
-        for edge in ir.edges_from(current) {
-            let next = edge.to.as_str();
+        // A `human_approval` node's fallback is reached through it on expiry.
+        let fallback = ir.nodes.get(current).and_then(|n| match &n.kind {
+            jamjet_core::node::NodeKind::HumanApproval { fallback_node, .. } => {
+                fallback_node.as_deref()
+            }
+            _ => None,
+        });
+        for next in ir
+            .edges_from(current)
+            .into_iter()
+            .map(|edge| edge.to.as_str())
+            .chain(fallback)
+        {
             if next != "end" && !visited.contains(next) {
                 visited.insert(next);
                 queue.push_back(next);

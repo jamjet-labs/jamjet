@@ -88,29 +88,41 @@ impl WorkerPool {
         self
     }
 
+    /// The node kinds this pool has an executor for, sorted.
+    pub fn executor_kinds(&self) -> Vec<String> {
+        let mut kinds: Vec<String> = self.executors.iter().map(|(k, _)| k.clone()).collect();
+        kinds.sort();
+        kinds.dedup();
+        kinds
+    }
+
+    /// One worker with this pool's executors, sealer and agent registry,
+    /// claiming `queue_types`. [`spawn`](Self::spawn) builds every worker
+    /// with it; a test drives one directly.
+    pub fn build_worker(&self, worker_id: String, queue_types: Vec<String>) -> Worker {
+        let mut worker = Worker::new(worker_id, Arc::clone(&self.backend), queue_types);
+        if let Some(sealer) = &self.sealer {
+            worker = worker.with_sealer(Arc::clone(sealer));
+        }
+        if let Some(agents) = &self.agents {
+            worker = worker.with_agents(Arc::clone(agents));
+        }
+        for (kind, executor) in &self.executors {
+            worker = worker.register_executor(kind.clone(), Arc::clone(executor));
+        }
+        worker
+    }
+
     /// Spawn all worker tasks and return their join handles.
     ///
     /// Workers run indefinitely until their `JoinHandle` is aborted.
     pub fn spawn(self) -> Vec<JoinHandle<()>> {
-        let executors: Vec<(String, Arc<dyn NodeExecutor>)> = self.executors;
         let mut handles = Vec::new();
 
         for group in &self.groups {
             for i in 0..group.concurrency {
                 let worker_id = format!("{}-{}", group.id_prefix, i);
-                let queue_types = group.queue_types.clone();
-                let backend = Arc::clone(&self.backend);
-
-                let mut worker = Worker::new(worker_id.clone(), backend, queue_types);
-                if let Some(sealer) = &self.sealer {
-                    worker = worker.with_sealer(Arc::clone(sealer));
-                }
-                if let Some(agents) = &self.agents {
-                    worker = worker.with_agents(Arc::clone(agents));
-                }
-                for (kind, executor) in &executors {
-                    worker = worker.register_executor(kind.clone(), Arc::clone(executor));
-                }
+                let worker = self.build_worker(worker_id.clone(), group.queue_types.clone());
 
                 info!(
                     worker_id = %worker_id,
@@ -129,9 +141,36 @@ impl WorkerPool {
     }
 }
 
+/// The server's embedded pool: [`default_pool`]'s queue groups with an
+/// executor for every kind in [`crate::executable::IN_PROCESS_KINDS`], and no
+/// other. Registration (`POST /workflows`) refuses a workflow with a node of
+/// a kind outside that list and [`crate::executable::EXTERNAL_WORKER_KINDS`],
+/// so the two must agree; a test below holds them to each other.
+pub fn server_pool(
+    backend: Arc<dyn StateBackend>,
+    models: Arc<jamjet_models::ModelRegistry>,
+) -> WorkerPool {
+    use crate::executors::{
+        ConditionNodeExecutor, EvalExecutor, HumanApprovalExecutor, LimitExceededExecutor,
+        ModelNodeExecutor,
+    };
+    default_pool(Arc::clone(&backend))
+        .with_executor("model", Arc::new(ModelNodeExecutor::new(models.clone())))
+        .with_executor("eval", Arc::new(EvalExecutor::new(models)))
+        .with_executor("condition", Arc::new(ConditionNodeExecutor::new()))
+        .with_executor(
+            "human_approval",
+            Arc::new(HumanApprovalExecutor::new(backend)),
+        )
+        .with_executor("limit_exceeded", Arc::new(LimitExceededExecutor))
+}
+
 /// Convenience: build a default pool with standard queue groups.
 ///
-/// - 2 general workers (`["general", "tool", "condition", "mcp_tool"]`)
+/// - 2 general workers (`["general", "tool", "condition", "mcp_tool",
+///   "retrieval"]`). `retrieval` is claimed so that a `memory_retrieval` item
+///   (no executor; registration refuses the kind) fails instead of waiting
+///   forever on a queue nothing polls.
 /// - 2 model workers (`["model"]`)
 /// - 1 privileged worker (`["privileged"]`)
 /// - 0 python workers (`["python_tool"]`) — intent registration only. Durable
@@ -152,6 +191,7 @@ pub fn default_pool(backend: Arc<dyn StateBackend>) -> WorkerPool {
                 "tool".into(),
                 "condition".into(),
                 "mcp_tool".into(),
+                "retrieval".into(),
             ],
         ))
         .with_group(WorkerGroupConfig::new(
@@ -179,4 +219,37 @@ pub fn default_pool(backend: Arc<dyn StateBackend>) -> WorkerPool {
             0,
             vec!["java_tool".into()],
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Registration accepts a kind as in-process because this pool runs it.
+    /// If one list changes without the other, a workflow either registers
+    /// and fails every run, or is refused although it would run.
+    #[test]
+    fn the_server_pool_runs_exactly_the_in_process_kinds() {
+        let backend: Arc<dyn StateBackend> = Arc::new(jamjet_state::InMemoryBackend::new());
+        let pool = server_pool(backend, Arc::new(jamjet_models::ModelRegistry::new()));
+        let mut expected: Vec<String> = crate::executable::IN_PROCESS_KINDS
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(pool.executor_kinds(), expected);
+    }
+
+    /// Nothing executes `memory_retrieval`, and its items go to the
+    /// `retrieval` queue. The embedded pool claims that queue so such an item
+    /// fails (no executor) instead of waiting forever for a worker.
+    #[test]
+    fn the_embedded_pool_claims_the_retrieval_queue() {
+        let backend: Arc<dyn StateBackend> = Arc::new(jamjet_state::InMemoryBackend::new());
+        let pool = default_pool(backend);
+        assert!(pool
+            .groups
+            .iter()
+            .any(|g| g.concurrency > 0 && g.queue_types.iter().any(|q| q == "retrieval")));
+    }
 }

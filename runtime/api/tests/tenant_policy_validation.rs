@@ -160,15 +160,8 @@ async fn store_malformed_policy(env: &Env) {
 }
 
 async fn start(env: &Env) -> ExecutionId {
-    let (st, body) = call(
-        &env.app,
-        "POST",
-        "/workflows",
-        &env.alice,
-        json!({ "ir": tool_ir() }),
-    )
-    .await;
-    assert!(st.is_success(), "{st} {body}");
+    // Stored, not registered: `POST /workflows` refuses a `tool` node.
+    support::store_ir(env.backend.as_ref(), &tool_ir()).await;
     let (st, body) = call(
         &env.app,
         "POST",
@@ -225,7 +218,9 @@ async fn a_stored_malformed_policy_refuses_nodes_in_process() {
             .run()
             .await
     });
-    let workers = jamjet_worker::default_pool(base).spawn();
+    let workers = jamjet_worker::default_pool(base)
+        .with_executor("tool", Arc::new(support::NoopExecutor))
+        .spawn();
     let mut events = Vec::new();
     for _ in 0..500 {
         events = env.backend.get_events(&eid).await.unwrap();

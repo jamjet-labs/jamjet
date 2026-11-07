@@ -11,17 +11,41 @@ nodes:
   review_report:
     type: human_approval
     description: "Please review the generated report before publishing"
-    timeout: 72h          # optional: auto-route to fallback after timeout
-    fallback: auto_publish  # node to go to if timeout expires (optional)
+    timeout: 72h            # optional: the request expires after this
+    fallback: auto_publish  # optional: where the run goes if it expires
     next: publish
 ```
 
-When this node is reached:
-1. Workflow **pauses indefinitely** (or until timeout)
-2. The current workflow state is available via API for inspection
-3. A human approves or rejects the action via API or CLI
-4. The decision is **audit logged** with the human's identity and timestamp
-5. Workflow resumes
+When the run reaches this node, the engine records an approval request for
+it, the same request a policy's `require_approval_for` raises (see below),
+and the run waits there. Nothing after the node runs until someone decides.
+
+- The request is bound to this node and occurrence (its `action_digest`), its
+  context carries the node's `description`, and it is listed by
+  `GET /executions/:id/approvals` and `jamjet approvals`.
+- **Approved**: the node completes. Its output records the decision:
+  `decision`, `approved_by`, `principal`, `comment` and the sequences of the
+  request and the decision. The run continues along `next`.
+- **Rejected**: the node fails, and so does the run, as for any rejected
+  approval. The node has no "on rejected" route.
+- **Expired** (`timeout` passed with no decision): with a `fallback`, the node
+  completes with `decision: "expired"` and the run continues at the fallback
+  node; the `next` path is skipped. Without one, the node fails like a
+  rejection by `system:deadline`, and so does the run.
+- The fallback node needs no edge into it. It runs only if the request
+  expires; when the node is approved it is skipped.
+- `timeout` is a ceiling next to the policy chain's `approval_timeout_secs`
+  (see [Approval Deadlines](#approval-deadlines)): the shorter applies. It
+  must be between 1 second and a year, and `fallback` must name another node
+  of the workflow; registration refuses anything else.
+- The decision is made through the same route and rules as every approval:
+  the approver is the API token, the token that started the run cannot
+  approve it, and an approval must echo the request's `action_digest`.
+
+The engine runs `human_approval` nodes on its in-process workers (the server
+starts them with `jamjet dev`, or with `JAMJET_EMBED_WORKERS` set). Until
+2026-11 the node had no executor and a worker completed it without asking
+anyone; a release before that does not pause here.
 
 ---
 
@@ -192,6 +216,11 @@ What an approval proves, and what it does not:
 
 Limits worth knowing:
 
+- An approved `human_approval` node is dispatched again so it can complete,
+  on the `general` queue. An external worker that claims `general` over
+  `POST /work-items/claim` is handed it and reports its result, as for any
+  approved node (see "What an approval proves" above). Leave `general` to the
+  engine's workers.
 - An approval covers the action including its retries. A retry, or a lease that
   expires and is reclaimed, fires again under the same approval; the tool-effect
   idempotency key limits double effects, and firing is at-least-once in v1.
@@ -368,10 +397,14 @@ jamjet events exec_01abc --type approval_received
 human_review:
   type: human_approval
   timeout: 48h
-  fallback: auto_approve   # route here if timeout expires
+  fallback: escalate_to_lead   # route here if the request expires
 ```
 
-If no `fallback` is specified and the timeout expires, the workflow fails with a `timeout_exceeded` event.
+When the timeout passes undecided, the scheduler records `approval_expired`
+(by `system:deadline`). With a `fallback`, the node completes with
+`decision: "expired"` and the run goes to the fallback node. Without one, the
+node fails and the run fails. An expiry never approves anything, so do not
+point the fallback at the step the approval was guarding.
 
 ---
 
