@@ -48,38 +48,36 @@ class DimensionScores:
     trust_compatibility: float = 0.5
     historical_performance: float = 0.5
 
+    _DIMENSIONS = (
+        "capability_fit",
+        "cost_fit",
+        "latency_fit",
+        "trust_compatibility",
+        "historical_performance",
+    )
+
     def composite(self, weights: dict[str, float] | None = None) -> float:
         """Combine the dimension scores using the supplied weights.
 
         Args:
-            weights: Weights keyed by dimension name. Missing dimensions use a
-                multiplier of 1.0. None or an empty mapping uses equal weights.
+            weights: Weights keyed by dimension name. Missing dimensions
+                default to 1.0. Keys that are not valid dimension names are
+                ignored. None or an empty mapping uses equal weights.
 
         Returns:
-            Weighted score sum divided by the sum of supplied weights, or 0.0
+            Weighted score sum divided by the sum of effective weights, or 0.0
             when that sum is zero.
         """
-        w = weights or {
-            "capability_fit": 1.0,
-            "cost_fit": 1.0,
-            "latency_fit": 1.0,
-            "trust_compatibility": 1.0,
-            "historical_performance": 1.0,
-        }
-        total_weight = sum(w.values())
+        defaults = {dim: 1.0 for dim in self._DIMENSIONS}
+        if weights:
+            for dim in self._DIMENSIONS:
+                if dim in weights:
+                    defaults[dim] = weights[dim]
+        total_weight = sum(defaults.values())
         if total_weight == 0:
             return 0.0
         return (
-            sum(
-                getattr(self, dim) * w.get(dim, 1.0)
-                for dim in [
-                    "capability_fit",
-                    "cost_fit",
-                    "latency_fit",
-                    "trust_compatibility",
-                    "historical_performance",
-                ]
-            )
+            sum(getattr(self, dim) * defaults[dim] for dim in self._DIMENSIONS)
             / total_weight
         )
 
