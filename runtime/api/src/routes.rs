@@ -251,6 +251,21 @@ async fn create_workflow(
     // stored.
     jamjet_ir::validate_approval_deadlines(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    jamjet_ir::validate_human_approvals(&parsed)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // A node of a kind nothing in this runtime executes is refused. Until
+    // 2026-11 such a node was completed with an empty output by whichever
+    // worker claimed it, so the run reported success for work that never
+    // happened. Checked before the idempotent re-register below on purpose:
+    // a stored version with such a node cannot run either, and the author
+    // should hear that rather than get a 200.
+    let unexecutable = jamjet_worker::executable::unexecutable_nodes(&parsed);
+    if !unexecutable.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "invalid workflow IR: {}",
+            jamjet_worker::executable::refusal_message(&unexecutable)
+        )));
+    }
 
     let backend = state.backend_for(&tenant_id);
 

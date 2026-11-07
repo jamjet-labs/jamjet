@@ -10,3 +10,5 @@ pub use validate::{
     MAX_NODE_ID_LEN, MAX_QUEUE_NAME_LEN,
 };
 pub use workflow::{EdgeDef, NodeDef, WorkflowIr};
+
+pub use validate::{human_approval_fallback, reachable_from, validate_human_approvals};

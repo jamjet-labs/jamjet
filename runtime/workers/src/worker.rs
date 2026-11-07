@@ -226,6 +226,26 @@ impl Worker {
                 None => Err(ExecutorError::Fatal(format!(
                     "node {node_id} not found in IR"
                 ))),
+                // FAIL CLOSED on a kind this worker has no executor for. Until
+                // 2026-11 such a node completed with an empty output ("No
+                // executor; using stub"), so a `human_approval` node passed
+                // unapproved and a `tool` node reported success without running.
+                // Checked before the policy guard, so nothing that cannot run
+                // asks a human for approval first. Not retryable: another
+                // attempt on this worker finds the same registry.
+                Some(node_def) if !self.executors.contains_key(&node_kind_tag(&node_def.kind)) => {
+                    let kind_tag = node_kind_tag(&node_def.kind);
+                    node_span.record(gen_ai_attrs::JAMJET_NODE_KIND, kind_tag.as_str());
+                    warn!(
+                        execution_id = %execution_id,
+                        node_id = %node_id,
+                        kind = %kind_tag,
+                        "No executor for this node kind; failing the node"
+                    );
+                    Err(ExecutorError::Fatal(format!(
+                        "no executor for node kind {kind_tag}"
+                    )))
+                }
                 Some(node_def) => {
                     let kind = &node_def.kind;
                     let kind_tag = node_kind_tag(kind);
@@ -377,23 +397,10 @@ impl Worker {
                                         }
                                     }
                                     Some(executor) => executor.execute(&item).await,
-                                    None => {
-                                        info!(
-                                            node_id = %node_id,
-                                            kind = %kind_tag,
-                                            "No executor; using stub"
-                                        );
-                                        Ok(ExecutionResult {
-                                            output: serde_json::json!({}),
-                                            state_patch: serde_json::json!({}),
-                                            duration_ms: start.elapsed().as_millis() as u64,
-                                            gen_ai_system: None,
-                                            gen_ai_model: None,
-                                            input_tokens: None,
-                                            output_tokens: None,
-                                            finish_reason: None,
-                                        })
-                                    }
+                                    // Checked above; kept total, and closed.
+                                    None => Err(ExecutorError::Fatal(format!(
+                                        "no executor for node kind {kind_tag}"
+                                    ))),
                                 }
                             }
                         }
@@ -1343,8 +1350,9 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Minimal workflow IR with one tool node (no executor registered →
-    /// worker falls through to the stub path which succeeds instantly).
+    /// Minimal workflow IR with one tool node. A test that wants it to run
+    /// registers an executor for "tool" ([`NoopExecutor`]); with none the
+    /// worker fails the node.
     fn minimal_ir_json() -> serde_json::Value {
         serde_json::json!({
             "workflow_id": "test-wf",
@@ -1434,6 +1442,64 @@ mod tests {
         Worker::new("test-worker".into(), backend, vec!["default".into()])
     }
 
+    /// Completes any node with an empty output: what the worker used to do
+    /// for a node with no executor, now registered explicitly where a test
+    /// needs a node to run.
+    struct NoopExecutor;
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for NoopExecutor {
+        async fn execute(
+            &self,
+            _item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            Ok(ExecutionResult {
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({}),
+                duration_ms: 0,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+            })
+        }
+    }
+
+    /// A node of a kind this worker has no executor for fails, terminally,
+    /// and never completes. Until 2026-11 the worker completed it with an
+    /// empty output ("No executor; using stub"), so a `human_approval` node
+    /// passed unapproved and a `tool` node reported success without running.
+    #[tokio::test]
+    async fn a_node_with_no_executor_fails_and_never_completes() {
+        let (backend, eid) = setup_backend().await;
+        let worker = make_worker(Arc::clone(&backend));
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("item must be claimable");
+        worker.execute_item(item).await.unwrap();
+
+        let events = backend.get_events(&eid).await.unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::NodeCompleted { .. })),
+            "a node nothing ran must not complete: {events:#?}"
+        );
+        let failed: Vec<(&str, bool)> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::NodeFailed {
+                    error, retryable, ..
+                } => Some((error.as_str(), *retryable)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed, vec![("no executor for node kind tool", false)]);
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     /// Happy path: the worker routes completion through `commit_node_terminal`
@@ -1448,7 +1514,8 @@ mod tests {
     #[tokio::test]
     async fn happy_path_emits_exactly_one_node_completed() {
         let (backend, eid) = setup_backend().await;
-        let worker = make_worker(Arc::clone(&backend));
+        let worker =
+            make_worker(Arc::clone(&backend)).register_executor("tool", Arc::new(NoopExecutor));
 
         // Claim the item so we have a valid leased item to pass to execute_item.
         let item = backend
@@ -1531,7 +1598,8 @@ mod tests {
     #[tokio::test]
     async fn success_writes_snapshot_with_completed_node() {
         let (backend, eid) = setup_backend().await;
-        let worker = make_worker(Arc::clone(&backend));
+        let worker =
+            make_worker(Arc::clone(&backend)).register_executor("tool", Arc::new(NoopExecutor));
 
         let item = backend
             .claim_work_item("test-worker", &["default"])

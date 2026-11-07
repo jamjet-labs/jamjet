@@ -198,23 +198,11 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("model seam coverage guard failed: {e}"))?,
         );
-        let pool = jamjet_worker::default_pool(state.backend.clone())
+        // Exactly the kinds `POST /workflows` accepts as in-process
+        // (`jamjet_worker::executable::IN_PROCESS_KINDS`).
+        let pool = jamjet_worker::server_pool(state.backend.clone(), model_registry)
             .with_sealer(state.enricher.clone())
-            .with_agents(state.agents.clone())
-            .with_executor(
-                "model",
-                Arc::new(jamjet_worker::ModelNodeExecutor::new(
-                    model_registry.clone(),
-                )),
-            )
-            .with_executor(
-                "eval",
-                Arc::new(jamjet_worker::EvalExecutor::new(model_registry.clone())),
-            )
-            .with_executor(
-                "condition",
-                Arc::new(jamjet_worker::ConditionNodeExecutor::new()),
-            );
+            .with_agents(state.agents.clone());
         // Detaching the handles lets the workers run for the lifetime of the process
         // (same pattern as the scheduler above).
         let _worker_handles = pool.spawn();
