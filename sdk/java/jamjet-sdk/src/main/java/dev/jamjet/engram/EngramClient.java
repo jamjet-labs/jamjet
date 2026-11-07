@@ -51,7 +51,7 @@ public final class EngramClient implements AutoCloseable {
                 .build();
     }
 
-    /** Construct with default config (localhost:9090, reads ENGRAM_TOKEN from env). */
+    /** Construct with default config (localhost:9090, token from ENGRAM_AUTH_TOKEN). */
     public EngramClient() {
         this(EngramConfig.defaults());
     }
@@ -263,10 +263,25 @@ public final class EngramClient implements AutoCloseable {
                 throw new RuntimeException("Engram API error: HTTP " + resp.statusCode() + " for " + path + ": " + resp.body());
             }
             return mapper.readValue(resp.body(), type);
-        } catch (IOException | InterruptedException e) {
+        } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted during HTTP call for " + path, e);
+        } catch (IOException e) {
+            // Only a real interrupt is re-asserted. Setting the flag for a refused connection
+            // or a timeout made the caller's next blocking call fail.
+            if (isInterrupt(e)) {
+                Thread.currentThread().interrupt();
+            }
             throw new RuntimeException("HTTP error for " + path, e);
         }
+    }
+
+    /** An IOException that reports a thread interrupt (a socket timeout is not one). */
+    static boolean isInterrupt(IOException e) {
+        return e instanceof java.nio.channels.ClosedByInterruptException
+                || (e instanceof java.io.InterruptedIOException
+                    && !(e instanceof java.net.SocketTimeoutException)
+                    && !(e instanceof java.net.http.HttpTimeoutException));
     }
 
     private static String encode(String value) {
