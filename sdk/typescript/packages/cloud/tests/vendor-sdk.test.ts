@@ -63,7 +63,10 @@ function strictTool(name: string) {
 describe('patchers against the real vendor SDKs', () => {
   beforeEach(async () => {
     await resetActive()
-    setActive(new Client(resolveConfig({ apiKey: 'jj_t', project: 'p', maxCostUsd: 100 })))
+    // Spans stay in the process: no events go to a JamJet API.
+    const client = new Client(resolveConfig({ apiKey: 'jj_t', project: 'p', apiUrl: 'https://api.jamjet.test', maxCostUsd: 100 }))
+    client.recordSpan = () => {}
+    setActive(client)
     patchOpenAI(openaiModule)
     patchAnthropic(anthropicModule)
   })
