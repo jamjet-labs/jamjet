@@ -3,7 +3,7 @@ import type { Client } from './client.js'
 import type { AgentRef, UserContext } from './context.js'
 import { applyCacheInject } from './cache-inject.js'
 import { applyCompaction } from './compaction.js'
-import { estimateCost } from './cost.js'
+import { cacheReadSavingsUsd, estimateCost } from './cost.js'
 import { DEFAULT_APPROVAL_TIMEOUT_MS, pollUntilResolved } from './approvals.js'
 import { JamjetApprovalRejected, JamjetApprovalTimeout, JamjetPolicyBlocked } from './errors.js'
 import { toolNameOf } from './policy.js'
@@ -106,22 +106,14 @@ function extractUsage(vendor: Vendor, response: unknown): { input: number; outpu
   return { input: Number(usage['input_tokens']) || 0, output: Number(usage['output_tokens']) || 0 }
 }
 
+function extractCacheWrite(response: unknown): number {
+  const usage = ((response as Record<string, any>)?.usage ?? {}) as Record<string, unknown>
+  return Number(usage['cache_creation_input_tokens'] ?? 0) || 0
+}
+
 function extractCacheRead(_vendor: Vendor, response: unknown): number {
   const usage = ((response as Record<string, any>)?.usage ?? {}) as Record<string, unknown>
   return Number(usage['cache_read_input_tokens'] ?? 0) || 0
-}
-
-// Per-MTok savings = input price − cache_read price; mirrors pricing.rs v_2026_05_17.
-const CACHE_SAVING_PER_MTOK: Record<string, number> = {
-  'claude-opus-4-7': 15.0 - 1.5,
-  'claude-sonnet-4-6': 3.0 - 0.3,
-  'claude-haiku-4-5': 1.0 - 0.1,
-  'claude-haiku-4-5-20251001': 1.0 - 0.1,
-}
-
-function cacheReadSavingsUsd(model: string, cacheReadTokens: number): number {
-  const per = CACHE_SAVING_PER_MTOK[model] ?? 0
-  return (cacheReadTokens / 1_000_000) * per
 }
 
 /**
@@ -386,7 +378,7 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
   const res = result as Record<string, unknown>
   recordUsage(
     { ...state, model: typeof res['model'] === 'string' ? res['model'] : model },
-    extractUsage(vendor, result),
+    { ...extractUsage(vendor, result), cacheWrite: extractCacheWrite(result) },
     extractCacheRead(vendor, result),
   )
 
@@ -546,17 +538,17 @@ function streamUsage(
   tally: StreamTally,
   estimatedPromptTokens: number,
   complete: boolean,
-): { input: number; output: number } {
+): { input: number; output: number; cacheWrite: number } {
   const estimatedOutput = Math.ceil(tally.outputChars / 4)
   const output = complete
     ? (tally.outputTokens ?? estimatedOutput)
     : Math.max(tally.outputTokens ?? 0, estimatedOutput)
-  return { input: tally.inputTokens ?? estimatedPromptTokens, output }
+  return { input: tally.inputTokens ?? estimatedPromptTokens, output, cacheWrite: tally.cacheWriteTokens }
 }
 
 function recordUsage(
   state: CallState,
-  usage: { input: number; output: number },
+  usage: { input: number; output: number; cacheWrite?: number },
   cacheRead: number,
   extraPayload: Record<string, unknown> = {},
 ): void {
@@ -565,7 +557,7 @@ function recordUsage(
   span.name = `${vendor}.${model}`
   span.inputTokens = usage.input
   span.outputTokens = usage.output
-  span.costUsd = estimateCost(model, usage.input, usage.output)
+  span.costUsd = estimateCost(model, usage.input, usage.output, { read: cacheRead, write: usage.cacheWrite ?? 0 })
   state.client._budget.record(span.costUsd)
 
   if (state.cacheInjected) {

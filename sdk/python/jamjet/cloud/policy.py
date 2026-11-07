@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import fnmatch
+import re
 import threading
 from typing import Any
 
@@ -35,51 +35,52 @@ def tool_name_of(tool: Any) -> str:
     return name if isinstance(name, str) else ""
 
 
+def glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a tool-name glob, per sdk/conformance/README.md.
+
+    ``*`` is any run of characters (line breaks included), ``?`` is one code
+    point, everything else is literal, and matching is case-sensitive on every
+    platform. ``fnmatch`` is not used: it reads ``[a-z]`` as a character class
+    and folds case on Windows, which the TypeScript SDK does not.
+    """
+    parts = [".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in pattern]
+    return re.compile("".join(parts), re.DOTALL)
+
+
 class PolicyEvaluator:
     """Evaluate tool names against glob-based allow/block/require_approval rules."""
 
     def __init__(self) -> None:
-        self._rules: list[tuple[str, str]] = []  # (action, pattern)
+        self._rules: list[tuple[str, str, re.Pattern[str]]] = []  # (action, pattern, compiled)
         self._lock = threading.Lock()
 
     def add(self, action: str, pattern: str) -> None:
-        """Add a policy rule. action is 'block', 'allow', or 'require_approval'."""
+        """Add a policy rule. action is 'block', 'allow', 'require_approval' or 'audit'."""
+        compiled = glob_to_regex(pattern)
         with self._lock:
-            self._rules.append((action, pattern))
+            self._rules.append((action, pattern, compiled))
 
     def evaluate(self, tool_name: str) -> PolicyDecision:
         """Check a tool name against all rules. First matching rule wins.
 
-        Matches the conformance suite at jamjet-policy/conformance/policy-decisions.yaml
-        and the TS `@jamjet/cloud` evaluator: rules are evaluated top-to-bottom and
-        the first matching rule is returned. Later rules cannot override an earlier
-        match.
+        Matches the conformance suite (sdk/conformance/policy-decisions.yaml,
+        vendored from jamjet-policy) and the TS `@jamjet/cloud` evaluator: rules
+        are evaluated top-to-bottom and the first matching rule is returned.
+        Later rules cannot override an earlier match. The name is trimmed, as
+        Cloud trims the tool name it evaluates.
         """
+        tool_name = tool_name.strip()
         with self._lock:
             rules = list(self._rules)
-        matched_action: str | None = None
-        matched_pattern: str | None = None
-        for action, pattern in rules:
-            if fnmatch.fnmatch(tool_name, pattern):
-                matched_action = action
-                matched_pattern = pattern
-                break
-        if matched_action is None:
-            return PolicyDecision(blocked=False, policy_kind="allow", pattern=None, tool_name=tool_name)
-        if matched_action == "block":
-            return PolicyDecision(
-                blocked=True,
-                policy_kind="block",
-                pattern=matched_pattern,
-                tool_name=tool_name,
-            )
-        # require_approval or allow
-        return PolicyDecision(
-            blocked=False,
-            policy_kind=matched_action,
-            pattern=matched_pattern,
-            tool_name=tool_name,
-        )
+        for action, pattern, compiled in rules:
+            if compiled.fullmatch(tool_name):
+                return PolicyDecision(
+                    blocked=action == "block",
+                    policy_kind=action,
+                    pattern=pattern,
+                    tool_name=tool_name,
+                )
+        return PolicyDecision(blocked=False, policy_kind="allow", pattern=None, tool_name=tool_name)
 
     def has_rules(self) -> bool:
         """True once any rule has been added."""
@@ -89,7 +90,7 @@ class PolicyEvaluator:
     def has_restrictive_rules(self) -> bool:
         """True when a block or require_approval rule exists."""
         with self._lock:
-            return any(action in ("block", "require_approval") for action, _ in self._rules)
+            return any(action in ("block", "require_approval") for action, _, _ in self._rules)
 
     def filter_tools(self, tools: list[Any]) -> tuple[list[Any], list[Any]]:
         """Split a tool list into (allowed, blocked).

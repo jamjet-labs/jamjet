@@ -1,9 +1,12 @@
 import { describe, it, expect } from 'vitest'
 import { PolicyEvaluator } from '../src/policy.js'
-import { existsSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { parse } from 'yaml'
 
-const CONFORMANCE_PATH = '/Users/sunilp/Development/sunil-ws/jamjet-policy/conformance/policy-decisions.yaml'
+// Vendored copy of jamjet-policy's suite; see sdk/conformance/README.md.
+// Read unconditionally: a missing file fails the run instead of skipping it.
+const CONFORMANCE_PATH = fileURLToPath(new URL('../../../../conformance/policy-decisions.yaml', import.meta.url))
 
 type Case = {
   id: string
@@ -13,13 +16,12 @@ type Case = {
   requires_mcp_prefix_strip?: boolean
 }
 
-describe('PolicyEvaluator against jamjet-policy conformance suite', () => {
-  if (!existsSync(CONFORMANCE_PATH)) {
-    it.skip('conformance file not present locally — skipping', () => {})
-    return
-  }
+const suite = parse(readFileSync(CONFORMANCE_PATH, 'utf-8')) as { cases: Case[] }
 
-  const suite = parse(readFileSync(CONFORMANCE_PATH, 'utf-8')) as { cases: Case[] }
+describe('PolicyEvaluator against the jamjet-policy conformance suite', () => {
+  it('loads the vendored cases', () => {
+    expect(suite.cases.length).toBeGreaterThanOrEqual(30)
+  })
 
   for (const c of suite.cases) {
     if (c.requires_mcp_prefix_strip) continue

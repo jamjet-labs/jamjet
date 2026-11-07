@@ -1,0 +1,395 @@
+# Vendored from jamjet-labs/jamjet-policy, conformance/policy-decisions.yaml
+# (last changed in 9d56845; identical on main at 9e3b85b). Change it there
+# first, then copy it here. Both Cloud SDK test suites replay every case.
+#
+# Conformance suite. Every adapter MUST produce these decisions for these inputs.
+# Format: { policy: <policy yaml>, tool: <tool name>, expect: <decision> }
+# Decisions: ALLOWED | BLOCKED | WAITING_FOR_APPROVAL | AUDIT
+# (Approval timeouts and budget enforcement tested separately.)
+#
+# Semantics:
+#   - Rules are evaluated in order; FIRST match wins. Later rules cannot
+#     override an earlier match.
+#   - Glob: `*` matches zero or more arbitrary characters (including dots and
+#     other separators). `?` matches exactly one arbitrary character. All
+#     other characters are literal. Match is anchored to the full tool name.
+#   - Matching is case-sensitive.
+#   - When no rule matches (or the rules array is empty), the default decision
+#     is ALLOWED with rule: null and rule_kind: null.
+#   - Action -> decision mapping:
+#       allow            -> ALLOWED
+#       block            -> BLOCKED
+#       require_approval -> WAITING_FOR_APPROVAL
+#       audit            -> AUDIT
+#
+# Cases tagged `requires_mcp_prefix_strip: true` exercise adapter behavior
+# (stripping host-injected prefixes such as `mcp__<server>__` before matching),
+# not the raw evaluator. Adapter runners may opt in.
+
+version: 1
+cases:
+  - id: block-glob-delete
+    policy:
+      version: 1
+      rules:
+        - { match: "*delete*", action: block }
+    tool: database.delete_all_customers
+    expect:
+      decision: BLOCKED
+      rule: "*delete*"
+      rule_kind: block
+
+  - id: block-exact-shell-exec
+    policy:
+      version: 1
+      rules:
+        - { match: "shell.exec", action: block }
+    tool: shell.exec
+    expect:
+      decision: BLOCKED
+      rule: "shell.exec"
+      rule_kind: block
+
+  - id: allow-read
+    policy:
+      version: 1
+      rules:
+        - { match: "database.read_*", action: allow }
+    tool: database.read_orders
+    expect:
+      decision: ALLOWED
+      rule: "database.read_*"
+      rule_kind: allow
+
+  - id: require-approval-payments
+    policy:
+      version: 1
+      rules:
+        - { match: "payments.*", action: require_approval }
+    tool: payments.refund
+    expect:
+      decision: WAITING_FOR_APPROVAL
+      rule: "payments.*"
+      rule_kind: require_approval
+
+  - id: first-match-wins
+    policy:
+      version: 1
+      rules:
+        - { match: "*", action: allow }
+        - { match: "*delete*", action: block }
+    tool: database.delete_x
+    expect:
+      decision: ALLOWED
+      rule: "*"
+      rule_kind: allow
+
+  - id: no-match-default-allow
+    policy:
+      version: 1
+      rules:
+        - { match: "*delete*", action: block }
+    tool: database.read_orders
+    expect:
+      decision: ALLOWED
+      rule: null
+      rule_kind: null
+
+  - id: audit-action
+    policy:
+      version: 1
+      rules:
+        - { match: "slack.send_message", action: audit }
+    tool: slack.send_message
+    expect:
+      decision: AUDIT
+      rule: "slack.send_message"
+      rule_kind: audit
+
+  - id: question-mark-wildcard
+    policy:
+      version: 1
+      rules:
+        - { match: "db.delete_?", action: block }
+    tool: db.delete_x
+    expect:
+      decision: BLOCKED
+      rule: "db.delete_?"
+      rule_kind: block
+
+  - id: question-mark-no-match
+    policy:
+      version: 1
+      rules:
+        - { match: "db.delete_?", action: block }
+    tool: db.delete_users
+    expect:
+      decision: ALLOWED
+      rule: null
+      rule_kind: null
+
+  - id: empty-policy-default-allow
+    policy:
+      version: 1
+      rules: []
+    tool: any.tool
+    expect:
+      decision: ALLOWED
+      rule: null
+      rule_kind: null
+
+  # --- Glob mechanics: position of wildcard ---
+
+  - id: glob-at-start-matches
+    policy:
+      version: 1
+      rules:
+        - { match: "*delete", action: block }
+    tool: mass.delete
+    expect:
+      decision: BLOCKED
+      rule: "*delete"
+      rule_kind: block
+
+  - id: glob-at-start-no-match-suffix
+    policy:
+      version: 1
+      rules:
+        - { match: "*delete", action: block }
+    tool: delete_all
+    expect:
+      decision: ALLOWED
+      rule: null
+      rule_kind: null
+
+  - id: glob-at-end-matches-bare
+    policy:
+      version: 1
+      rules:
+        - { match: "database.*", action: block }
+    tool: database.read
+    expect:
+      decision: BLOCKED
+      rule: "database.*"
+      rule_kind: block
+
+  - id: glob-at-end-matches-compound
+    policy:
+      version: 1
+      rules:
+        - { match: "database.*", action: block }
+    tool: database.delete_x
+    expect:
+      decision: BLOCKED
+      rule: "database.*"
+      rule_kind: block
+
+  - id: glob-multiple-wildcards
+    policy:
+      version: 1
+      rules:
+        - { match: "*.delete_*", action: block }
+    tool: db.delete_users
+    expect:
+      decision: BLOCKED
+      rule: "*.delete_*"
+      rule_kind: block
+
+  - id: glob-just-star-matches-anything
+    policy:
+      version: 1
+      rules:
+        - { match: "*", action: audit }
+    tool: anything.goes.here
+    expect:
+      decision: AUDIT
+      rule: "*"
+      rule_kind: audit
+
+  - id: literal-only-exact-match
+    policy:
+      version: 1
+      rules:
+        - { match: "x", action: block }
+    tool: x
+    expect:
+      decision: BLOCKED
+      rule: "x"
+      rule_kind: block
+
+  - id: literal-only-no-partial-match
+    policy:
+      version: 1
+      rules:
+        - { match: "x", action: block }
+    tool: xy
+    expect:
+      decision: ALLOWED
+      rule: null
+      rule_kind: null
+
+  # --- Multi-rule ordering ---
+
+  - id: second-rule-matches
+    policy:
+      version: 1
+      rules:
+        - { match: "shell.*", action: block }
+        - { match: "database.read_*", action: allow }
+    tool: database.read_orders
+    expect:
+      decision: ALLOWED
+      rule: "database.read_*"
+      rule_kind: allow
+
+  - id: neither-rule-matches
+    policy:
+      version: 1
+      rules:
+        - { match: "shell.*", action: block }
+        - { match: "payments.*", action: require_approval }
+    tool: database.read_orders
+    expect:
+      decision: ALLOWED
+      rule: null
+      rule_kind: null
+
+  - id: audit-before-block-first-match-wins
+    policy:
+      version: 1
+      rules:
+        - { match: "slack.*", action: audit }
+        - { match: "slack.send_message", action: block }
+    tool: slack.send_message
+    expect:
+      decision: AUDIT
+      rule: "slack.*"
+      rule_kind: audit
+
+  - id: overlapping-approval-then-block
+    policy:
+      version: 1
+      rules:
+        - { match: "payments.*", action: require_approval }
+        - { match: "payments.refund", action: block }
+    tool: payments.refund
+    expect:
+      decision: WAITING_FOR_APPROVAL
+      rule: "payments.*"
+      rule_kind: require_approval
+
+  - id: specific-rule-before-catchall
+    policy:
+      version: 1
+      rules:
+        - { match: "payments.refund", action: block }
+        - { match: "payments.*", action: require_approval }
+    tool: payments.refund
+    expect:
+      decision: BLOCKED
+      rule: "payments.refund"
+      rule_kind: block
+
+  # --- Tool-name shape edge cases ---
+
+  - id: dotted-multi-segment-tool-name
+    policy:
+      version: 1
+      rules:
+        - { match: "service.*", action: allow }
+    tool: service.subservice.action
+    expect:
+      decision: ALLOWED
+      rule: "service.*"
+      rule_kind: allow
+
+  - id: tool-name-with-hyphens
+    policy:
+      version: 1
+      rules:
+        - { match: "tool-with-dashes", action: audit }
+    tool: tool-with-dashes
+    expect:
+      decision: AUDIT
+      rule: "tool-with-dashes"
+      rule_kind: audit
+
+  - id: tool-name-with-underscores
+    policy:
+      version: 1
+      rules:
+        - { match: "tool_with_underscores", action: block }
+    tool: tool_with_underscores
+    expect:
+      decision: BLOCKED
+      rule: "tool_with_underscores"
+      rule_kind: block
+
+  - id: case-sensitive-no-match
+    policy:
+      version: 1
+      rules:
+        - { match: "*delete*", action: block }
+    tool: Delete_all
+    expect:
+      decision: ALLOWED
+      rule: null
+      rule_kind: null
+
+  - id: case-sensitive-exact-mismatch
+    policy:
+      version: 1
+      rules:
+        - { match: "shell.exec", action: block }
+    tool: Shell.Exec
+    expect:
+      decision: ALLOWED
+      rule: null
+      rule_kind: null
+
+  - id: empty-tool-name-no-match
+    policy:
+      version: 1
+      rules:
+        - { match: "shell.exec", action: block }
+    tool: ""
+    expect:
+      decision: ALLOWED
+      rule: null
+      rule_kind: null
+
+  - id: empty-tool-name-matches-star
+    policy:
+      version: 1
+      rules:
+        - { match: "*", action: block }
+    tool: ""
+    expect:
+      decision: BLOCKED
+      rule: "*"
+      rule_kind: block
+
+  - id: very-long-tool-name-matches-star
+    policy:
+      version: 1
+      rules:
+        - { match: "*", action: audit }
+    tool: this.is.a.very.long.tool.name.with.many.segments.exceeding.fifty.characters.in.length
+    expect:
+      decision: AUDIT
+      rule: "*"
+      rule_kind: audit
+
+  # --- Adapter behavior: MCP prefix stripping (opt-in) ---
+
+  - id: mcp-prefix-strip-block
+    requires_mcp_prefix_strip: true
+    policy:
+      version: 1
+      rules:
+        - { match: "*delete*", action: block }
+    tool: mcp__postgres__database.delete_x
+    expect:
+      decision: BLOCKED
+      rule: "*delete*"
+      rule_kind: block

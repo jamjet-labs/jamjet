@@ -44,6 +44,7 @@ class StreamTally:
     input_tokens: int | None = None
     output_tokens: int | None = None
     cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
     # Characters of generated text and tool arguments; used when the stream
     # reports no usage.
     output_chars: int = 0
@@ -121,11 +122,13 @@ class StreamTally:
             self.input_tokens = _int(_field(usage, "input_tokens"), self.input_tokens)
             self.output_tokens = _int(_field(usage, "output_tokens"), self.output_tokens)
             self.cache_read_tokens = _int(_field(usage, "cache_read_input_tokens"), self.cache_read_tokens) or 0
+            self.cache_write_tokens = _int(_field(usage, "cache_creation_input_tokens"), self.cache_write_tokens) or 0
         elif kind == "message_delta":
             usage = _field(event, "usage")
             self.output_tokens = _int(_field(usage, "output_tokens"), self.output_tokens)
             self.input_tokens = _int(_field(usage, "input_tokens"), self.input_tokens)
             self.cache_read_tokens = _int(_field(usage, "cache_read_input_tokens"), self.cache_read_tokens) or 0
+            self.cache_write_tokens = _int(_field(usage, "cache_creation_input_tokens"), self.cache_write_tokens) or 0
         elif kind == "message_stop":
             self.finished = True
         elif kind == "content_block_start":
