@@ -162,6 +162,26 @@ class TestDefaultStrategy:
         assert filtered == []
 
     @pytest.mark.asyncio
+    async def test_discovered_reasoning_modes_boost_capability(self):
+        registry = AsyncMock()
+        registry.list_agents.return_value = [
+            {"uri": "agent-default", "skills": ["analysis"]},
+            {"uri": "agent-react", "skills": ["analysis"], "reasoning_modes": ["react"]},
+        ]
+        strategy = DefaultCoordinatorStrategy(registry=registry)
+        context = {"preferred_reasoning_modes": ["react"]}
+
+        candidates, filtered = await strategy.discover("task", ["analysis"], [], None, context)
+        rankings, _ = await strategy.score("task", candidates, {}, context)
+
+        assert filtered == []
+        assert candidates[0].reasoning_modes == []
+        assert candidates[1].reasoning_modes == ["react"]
+        assert rankings[0].agent_uri == "agent-react"
+        assert rankings[0].scores.capability_fit == pytest.approx(0.4)
+        assert rankings[1].scores.capability_fit == pytest.approx(0.2)
+
+    @pytest.mark.asyncio
     async def test_decide_skips_tiebreaker_when_spread_above_threshold(self, strategy):
         top = [
             ScoringResult(agent_uri="agent-a", scores=DimensionScores(), composite=0.9),
