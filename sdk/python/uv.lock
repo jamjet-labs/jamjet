@@ -2091,7 +2091,7 @@ requires-dist = [
     { name = "jamjet-engram", marker = "python_full_version >= '3.12' and extra == 'memory'", specifier = ">=0.1,<0.3" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4" },
     { name = "langchain", marker = "extra == 'langchain'", specifier = ">=0.3,<2.0" },
-    { name = "litellm", extras = ["mcp"], marker = "extra == 'model'", specifier = ">=1.50" },
+    { name = "litellm", marker = "extra == 'model'", specifier = ">=1.50,<1.106" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "openai", marker = "extra == 'cloud-all'", specifier = ">=2" },
     { name = "openai", marker = "extra == 'dev'", specifier = ">=1.0" },

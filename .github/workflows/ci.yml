@@ -110,6 +110,36 @@ jobs:
       - run: uv run python -c "import sys; print(sys.version)"
       - run: uv run pytest --tb=short --durations=10
 
+  # Install jamjet[model] the way a user does, with no lockfile, so CI tests the
+  # versions a fresh `pip install` really resolves. Then run the agent
+  # `jamjet create` scaffolds (against a stub Anthropic API) and the FastMCP
+  # example in the same environment.
+  python-first-run:
+    name: Python first run (no lockfile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install jamjet[model] and the MCP example's requirements
+        run: |
+          python -m venv /tmp/firstrun
+          /tmp/firstrun/bin/pip install --upgrade pip
+          /tmp/firstrun/bin/pip install "./sdk/python[model]" -r examples/05-mcp-tool-call/requirements.txt
+          /tmp/firstrun/bin/pip list | grep -iE "^(jamjet|litellm|mcp) "
+      - name: Run the scaffolded agent against a stub provider
+        run: |
+          python .github/scripts/stub_model_provider.py 8765 &
+          for i in $(seq 1 20); do curl -s -o /dev/null -X POST -d '{}' http://127.0.0.1:8765/v1/messages && break; sleep 0.5; done
+          cd /tmp && /tmp/firstrun/bin/jamjet create firstrun-agent
+          cd /tmp/firstrun-agent
+          ANTHROPIC_API_BASE=http://127.0.0.1:8765 ANTHROPIC_API_KEY=stub /tmp/firstrun/bin/python agent.py | tee out.txt
+          grep -q "42" out.txt
+      - name: Run examples/05-mcp-tool-call (FastMCP, mcp 1.x)
+        working-directory: examples/05-mcp-tool-call
+        run: /tmp/firstrun/bin/python main.py
+
   # ── Java SDK ────────────────────────────────────────────────────────
   java-test:
     name: Java SDK tests

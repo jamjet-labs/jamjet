@@ -247,13 +247,28 @@ def test_agents_trace_is_gone() -> None:
 # ── the default workflow version is the runtime's ────────────────────────────
 
 
+_VERSION_DEFAULT = re.compile(r'workflow_version\.unwrap_or_else\(\|\| "([^"]+)"\.into\(\)\)')
+
+
 def _runtime_default_version() -> str:
-    routes = REPO_ROOT / "runtime" / "api" / "src" / "routes.rs"
-    if not routes.is_file():
+    """The version the runtime assumes when a run or a cron job names none.
+
+    Both routes must agree, or a workflow registered with the SDK default can
+    be started but not scheduled (or the other way round).
+    """
+    sources = {
+        "start_run": REPO_ROOT / "runtime" / "api" / "src" / "routes.rs",
+        "create_cron": REPO_ROOT / "runtime" / "api" / "src" / "cron.rs",
+    }
+    if not all(path.is_file() for path in sources.values()):
         pytest.skip("runtime sources not in this checkout")
-    match = re.search(r'workflow_version\.unwrap_or_else\(\|\| "([^"]+)"\.into\(\)\)', routes.read_text())
-    assert match, "could not find the default version in start_run (runtime/api/src/routes.rs)"
-    return match.group(1)
+    found = {}
+    for route, path in sources.items():
+        match = _VERSION_DEFAULT.search(path.read_text())
+        assert match, f"could not find the default version in {route} ({path.relative_to(REPO_ROOT)})"
+        found[route] = match.group(1)
+    assert found["start_run"] == found["create_cron"], f"runtime defaults disagree: {found}"
+    return found["start_run"]
 
 
 def test_default_workflow_version_matches_the_runtime() -> None:
@@ -305,3 +320,78 @@ def test_coordinator_weight_dimensions_match_the_runtime() -> None:
     assert body, "DimensionWeights not found in runtime/core/src/coordinator.rs"
     fields = re.findall(r"pub (\w+): f64", body.group(1))
     assert tuple(fields) == COORDINATOR_WEIGHT_DIMENSIONS
+
+
+@respx.mock
+async def test_create_cron_job_names_the_default_version() -> None:
+    # An older runtime assumes 0.1.0 for POST /cron when the version is left out.
+    route = respx.post(f"{BASE}/cron").respond(201, json={"name": "nightly"})
+    async with JamjetClient(base_url=BASE) as c:
+        await c.create_cron_job(name="nightly", cron_expression="0 2 * * *", workflow_id="w")
+    body = json.loads(route.calls[0].request.content)
+    assert body["workflow_version"] == "1.0.0"
+
+
+# ── error text is capped, one line, and never read as markup ─────────────────
+
+
+@respx.mock
+async def test_client_error_detail_is_capped_and_escaped() -> None:
+    echoed = "bad value \x1b[31mred\x1b[0m\nnext line " + "x" * 2000
+    respx.post(f"{BASE}/workflows").respond(400, json={"error": echoed})
+    async with JamjetClient(base_url=BASE) as c:
+        with pytest.raises(httpx.HTTPStatusError) as exc:
+            await c.create_workflow({"workflow_id": "w"})
+    detail = getattr(exc.value, "detail", "")
+    assert "\x1b" not in str(exc.value)
+    assert "\\x1b[31m" in detail
+    assert "\n" not in str(exc.value)
+    assert len(detail) <= 503
+    assert detail.endswith("...")
+
+
+def test_cli_prints_error_text_literally(tmp_path: Path) -> None:
+    path = tmp_path / "flow.py"
+    path.write_text('raise ValueError("[bold red]not markup[/bold red] \\x1b[2J")\n')
+    result = runner.invoke(app, ["validate", str(path)])
+    assert result.exit_code == 1
+    assert "[bold red]not markup[/bold red]" in result.output
+    assert "\x1b[2J" not in result.output
+
+
+async def test_worker_does_not_send_server_echoed_values_to_fail() -> None:
+    from jamjet.cli.main import _worker_loop
+
+    request = httpx.Request("POST", f"{BASE}/work-items/wi-1/complete")
+    response = httpx.Response(400, request=request, json={"error": "invalid output: 'card=4111111111111111'"})
+
+    class Client:
+        def __init__(self) -> None:
+            self.failures: list[str] = []
+
+        async def claim_work_item(self, worker_id: str, queue_types: list[str], lease_secs: Any = None) -> dict:
+            return {
+                "id": "wi-1",
+                "execution_id": "exec_1",
+                "node_id": "n",
+                "queue_type": "python_tool",
+                "payload": {"module": "json", "function": "dumps", "input": {}},
+                "lease_fence": 1,
+            }
+
+        async def complete_work_item(self, *args: Any, **kwargs: Any) -> None:
+            from jamjet.client import _raise_for_status
+
+            _raise_for_status(response)
+
+        async def fail_work_item(self, item_id: str, error: str, lease_fence: int = 0) -> None:
+            self.failures.append(error)
+
+        async def heartbeat_work_item(self, *args: Any, **kwargs: Any) -> dict:
+            return {}
+
+    client = Client()
+    await _worker_loop(client, "w", ["python_tool"], once=True)
+    assert client.failures, "the worker should report the failure"
+    assert "4111111111111111" not in client.failures[0]
+    assert "HTTP 400" in client.failures[0]

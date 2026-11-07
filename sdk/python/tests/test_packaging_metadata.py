@@ -16,16 +16,23 @@ def _pyproject() -> dict:
     return tomllib.loads((SDK_ROOT / "pyproject.toml").read_text())
 
 
-def test_model_extra_brings_the_mcp_package_litellm_imports() -> None:
-    # litellm's completion path imports `mcp`, which litellm itself lists only
-    # under its `mcp`/`proxy` extras. Without it, the first agent built from
-    # `jamjet create` dies with ModuleNotFoundError: No module named 'mcp'.
-    model = _pyproject()["project"]["optional-dependencies"]["model"]
-    litellm = [r for r in model if re.match(r"litellm\b", r)]
+def test_model_extra_keeps_litellm_below_the_mcp2_import() -> None:
+    # litellm 1.106 imports mcp 2.x-only types whenever a completion passes
+    # tools, but lists mcp only under its own extras. An unbounded `litellm`
+    # gave the first agent from `jamjet create` ModuleNotFoundError: mcp, and
+    # `litellm[mcp]` would drag in mcp 2.x and break FastMCP (mcp 1.x) code.
+    from packaging.requirements import Requirement
+
+    model = [Requirement(r) for r in _pyproject()["project"]["optional-dependencies"]["model"]]
+    litellm = [r for r in model if r.name == "litellm"]
     assert litellm, f"the model extra has no litellm requirement: {model}"
-    mcp_via_litellm = any(re.match(r"litellm\[[^\]]*\bmcp\b[^\]]*\]", r) for r in litellm)
-    mcp_direct = any(re.match(r"mcp\b", r) for r in model)
-    assert mcp_via_litellm or mcp_direct, f"the model extra does not install mcp: {model}"
+    spec = litellm[0].specifier
+    assert "1.105.7" in spec, f"litellm 1.105.7 should be allowed: {spec}"
+    assert "1.106.0" not in spec, f"litellm 1.106+ imports mcp 2.x on the completion path: {spec}"
+    assert "mcp" not in litellm[0].extras, "litellm[mcp] pulls in mcp 2.x"
+    for r in model:
+        if r.name == "mcp":
+            assert "2.0.0" not in r.specifier, f"the model extra must not require mcp 2.x: {r}"
 
 
 def test_supported_python_floor_agrees_everywhere() -> None:

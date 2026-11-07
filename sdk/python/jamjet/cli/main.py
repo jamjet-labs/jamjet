@@ -38,6 +38,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import httpx
 import yaml
 
 if TYPE_CHECKING:
@@ -151,6 +152,27 @@ def _client(runtime: str = LOCAL_RUNTIME_URL, token: str | None = None) -> Jamje
 
 
 # ── Protocol trace helpers ───────────────────────────────────────────────────
+
+
+def _print_error(label: str, message: object) -> None:
+    """Print ``label`` in red, then ``message`` literally: escaped and never read
+    as Rich markup, since it can quote a file, a handler or the runtime."""
+    if label:
+        console.print(label, style="red", end=" ")
+    console.print(_safe(message), markup=False, highlight=False, soft_wrap=True)
+
+
+def _failure_report(exc: BaseException) -> str:
+    """The error text a worker sends with ``fail_work_item``.
+
+    When the runtime refused the result, its error body can quote the output
+    back. Sending that to ``/fail`` would store server-echoed values in the
+    event log, so report only the status for an HTTP error.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        request = exc.request
+        return f"runtime refused the result: HTTP {exc.response.status_code} for {request.method} {request.url.path}"
+    return str(exc)
 
 
 def _event_kind(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -552,7 +574,7 @@ def dev(
     try:
         binary = _find_server_binary()
     except FileNotFoundError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        _print_error("Error:", e)
         raise typer.Exit(1)
 
     enable_sidecar = not (engine_only or no_sidecar)
@@ -615,7 +637,7 @@ def dev(
     try:
         stack.run()
     except dev_stack.DevStackError as e:
-        console.print(f"[red]Dev stack failed to start:[/red] {e}")
+        _print_error("Dev stack failed to start:", e)
         raise typer.Exit(1)
     finally:
         if previous_sigterm is not None:
@@ -661,7 +683,7 @@ def validate(
             console.print_json(json.dumps(ir, indent=2))
 
     except Exception as e:
-        console.print(f"[red]Validation error:[/red] {e}")
+        _print_error("Validation error:", e)
         raise typer.Exit(1)
 
 
@@ -693,7 +715,7 @@ def deploy(
     try:
         target = resolve_runtime_target(runtime)
     except ValueError as e:
-        console.print(f"[red]{e}[/red]")
+        _print_error("", e)
         raise typer.Exit(1)
 
     data = yaml.safe_load(Path(file).read_text())
@@ -1406,7 +1428,7 @@ def agents_discover(
                 resp.raise_for_status()
                 card = resp.json()
         except Exception as exc:
-            console.print(f"[red]Failed to fetch Agent Card:[/red] {exc}")
+            _print_error("Failed to fetch Agent Card:", exc)
             raise typer.Exit(1) from exc
 
         t = Table(title=f"Agent Card — {url}", show_header=False, box=None)
@@ -1515,7 +1537,7 @@ def mcp_connect(
                         console.print(f"[red]HTTP {e.response.status_code}: {e.response.text}[/red]")
                         raise typer.Exit(1)
                     except httpx.RequestError as e:
-                        console.print(f"[red]Connection error: {e}[/red]")
+                        _print_error("Connection error:", e)
                         raise typer.Exit(1)
                     body = resp.json()
                     if "error" in body:
@@ -1580,7 +1602,7 @@ def a2a_discover(
                 console.print(f"[red]HTTP {e.response.status_code}: {e.response.text}[/red]")
                 raise typer.Exit(1)
             except httpx.RequestError as e:
-                console.print(f"[red]Connection error: {e}[/red]")
+                _print_error("Connection error:", e)
                 raise typer.Exit(1)
 
         card = resp.json()
@@ -1677,7 +1699,7 @@ def replay(
                 try:
                     overrides = json.loads(override_input)
                 except json.JSONDecodeError as e:
-                    console.print(f"[red]Invalid JSON in --override-input:[/red] {e}")
+                    _print_error("Invalid JSON in --override-input:", e)
                     raise typer.Exit(1)
                 replay_input.update(overrides)
 
@@ -1776,7 +1798,7 @@ def fork(
             try:
                 overrides = json.loads(override_input)
             except json.JSONDecodeError as e:
-                console.print(f"[red]Invalid JSON in --override-input:[/red] {e}")
+                _print_error("Invalid JSON in --override-input:", e)
                 raise typer.Exit(1)
             fork_input.update(overrides)
 
@@ -2051,13 +2073,13 @@ async def _worker_loop(
                     raise
                 console.print(f"[green]Completed[/green] id={item_id} node=[bold]{node_id}[/bold] {duration_ms}ms")
             except Exception as exc:
-                console.print(f"[red]Failed[/red] node={node_id}: {exc}")
+                _print_error("Failed", f"node={node_id}: {exc}")
                 try:
                     # Echo the fence here for the same reason completion does: it
                     # proves the lease is still ours. It also buys the retry and
                     # dead-letter semantics — without it the runtime settles the
                     # item, emits no NodeFailed, and the execution never finishes.
-                    await client.fail_work_item(item_id, str(exc), lease_fence=lease["fence"])
+                    await client.fail_work_item(item_id, _failure_report(exc), lease_fence=lease["fence"])
                 except Exception as fail_exc:
                     # 409: the lease was reclaimed while this node was failing, so
                     # a new claimant owns the item. Reporting our failure would
@@ -2126,7 +2148,7 @@ def worker(
             try:
                 _importlib.import_module(mod_name)
             except ImportError as exc:
-                console.print(f"[red]Error importing module:[/red] {mod_name}: {exc}")
+                _print_error("Error importing module:", f"{mod_name}: {exc}")
                 raise typer.Exit(1)
 
     console.print("[bold]JamJet Python Tool Worker[/bold]")
@@ -2202,7 +2224,7 @@ def eval_run(
     try:
         ds = EvalDataset.from_file(dataset)
     except (FileNotFoundError, ValueError) as e:
-        console.print(f"[red]Error loading dataset:[/red] {e}")
+        _print_error("Error loading dataset:", e)
         raise typer.Exit(1)
 
     console.print(f"Running eval: [bold]{len(ds)}[/bold] rows × [bold]{workflow}[/bold] with {len(scorers)} scorer(s)")
@@ -2280,7 +2302,7 @@ def eval_export(
         console.print(f"[red]Error:[/red] file not found: {results_json}")
         raise typer.Exit(1)
     except json.JSONDecodeError as e:
-        console.print(f"[red]Error:[/red] invalid JSON: {e}")
+        _print_error("Error:", f"invalid JSON: {e}")
         raise typer.Exit(1)
 
     if not isinstance(data, list):
@@ -2403,7 +2425,7 @@ def eval_compare(
         console.print(f"[red]Error:[/red] file not found: {results_json}")
         raise typer.Exit(1)
     except (json.JSONDecodeError, ValueError) as e:
-        console.print(f"[red]Error:[/red] {e}")
+        _print_error("Error:", e)
         raise typer.Exit(1)
 
     # Resolve condition dicts from the short names.
@@ -2429,7 +2451,7 @@ def eval_compare(
     try:
         result = grid_results.compare(cond_dict_a, cond_dict_b, test=test, alpha=alpha)
     except ValueError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        _print_error("Error:", e)
         raise typer.Exit(1)
 
     if fmt.lower() == "json":
@@ -2533,7 +2555,7 @@ def eval_trajectory_diff(
         console.print(f"[red]Error:[/red] file not found: {e.filename}")
         raise typer.Exit(1)
     except (json.JSONDecodeError, ValueError) as e:
-        console.print(f"[red]Error:[/red] {e}")
+        _print_error("Error:", e)
         raise typer.Exit(1)
 
     diff = diff_trajectories(before_traj, after_traj)

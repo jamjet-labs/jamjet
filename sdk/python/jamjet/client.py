@@ -12,8 +12,30 @@ from typing import Any
 
 import httpx
 
-# How much of an error body goes into the exception message.
-_MAX_ERROR_DETAIL = 2000
+# How much of an error body goes into the exception message. Runtime errors can
+# quote the request back (a value, a key), so keep only the start of it.
+_MAX_ERROR_DETAIL = 500
+_BIDI_CONTROLS = frozenset("\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+
+
+def _clean_detail(text: str) -> str:
+    """One line of plain text: control and bidi characters shown escaped,
+    whitespace collapsed, capped at ``_MAX_ERROR_DETAIL`` characters."""
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if ch in "\n\r\t":
+            out.append(" ")
+        elif code < 0x20 or 0x7F <= code <= 0x9F:
+            out.append(f"\\x{code:02x}")
+        elif ch in _BIDI_CONTROLS:
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(ch)
+    cleaned = " ".join("".join(out).split())
+    if len(cleaned) > _MAX_ERROR_DETAIL:
+        cleaned = cleaned[:_MAX_ERROR_DETAIL] + "..."
+    return cleaned
 
 
 class JamjetAPIError(httpx.HTTPStatusError):
@@ -21,7 +43,9 @@ class JamjetAPIError(httpx.HTTPStatusError):
 
     A subclass of ``httpx.HTTPStatusError``, so existing ``except`` clauses and
     ``.response.status_code`` checks keep working. ``detail`` holds the server's
-    message: the ``error`` field of its JSON body, or the body text.
+    message (the ``error`` field of its JSON body, or the body text) as one line
+    of at most 500 characters with control characters escaped. The raw body is
+    still on ``.response``.
     """
 
     def __init__(self, message: str, *, request: httpx.Request, response: httpx.Response, detail: str) -> None:
@@ -47,9 +71,7 @@ def _error_detail(response: httpx.Response) -> str:
             if isinstance(value, str) and value.strip():
                 text = value.strip()
                 break
-    if len(text) > _MAX_ERROR_DETAIL:
-        text = text[:_MAX_ERROR_DETAIL] + "..."
-    return text
+    return _clean_detail(text)
 
 
 def _raise_for_status(response: httpx.Response) -> None:
@@ -134,14 +156,17 @@ class JamjetClient:
         input: dict[str, Any] | None = None,
         enabled: bool = True,
     ) -> dict[str, Any]:
+        from jamjet.workflow.types import DEFAULT_WORKFLOW_VERSION
+
+        # Always name the version: a runtime from before 1.0.0 became the default
+        # assumes 0.1.0 for POST /cron and would not find a default-versioned workflow.
         body: dict[str, Any] = {
             "name": name,
             "cron_expression": cron_expression,
             "workflow_id": workflow_id,
             "enabled": enabled,
+            "workflow_version": workflow_version or DEFAULT_WORKFLOW_VERSION,
         }
-        if workflow_version:
-            body["workflow_version"] = workflow_version
         if input is not None:
             body["input"] = input
         r = await self._client.post("/cron", json=body)
