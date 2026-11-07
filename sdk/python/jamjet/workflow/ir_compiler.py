@@ -22,6 +22,7 @@ manual ``nodes:`` + ``edges:`` path::
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any
 
 import yaml
@@ -30,6 +31,110 @@ from jamjet.workflow.types import StepDef, WorkflowDef
 
 if TYPE_CHECKING:
     from jamjet.spec import WorkflowSpec
+
+
+class WorkflowSchemaWarning(UserWarning):
+    """A workflow document has a key the compiler does not read.
+
+    Raised as a warning for keys outside node and policy definitions (top-level
+    and ``workflow:`` header keys, ``agent:`` block keys). Inside a node or a
+    policy, an unknown key is an error instead: there it almost always means a
+    misspelled or unsupported setting that would silently do nothing.
+    """
+
+
+# The keys the graph compiler reads, so the ones it does not can be reported
+# instead of dropped. Keep these in step with _compile_graph_yaml and
+# _yaml_node_to_kind: a key read there but missing here is rejected.
+_GRAPH_TOP_LEVEL_KEYS = frozenset(
+    {"workflow", "nodes", "policy", "retry_policies", "timeouts", "models", "tools", "mcp", "a2a"}
+)
+_WORKFLOW_HEADER_KEYS = frozenset(
+    {"id", "version", "name", "description", "state_schema", "start", "labels", "agent_ref"}
+)
+# Every node may carry these, whatever its type.
+_NODE_COMMON_KEYS = frozenset(
+    {"type", "description", "labels", "policy", "retry_policy", "timeout", "acts_for", "next"}
+)
+# What each node type reads on top of the common keys.
+_NODE_TYPE_KEYS: dict[str, frozenset[str]] = {
+    "model": frozenset({"model", "prompt", "output_schema", "system_prompt"}),
+    "tool": frozenset({"tool_ref", "input", "output_schema"}),
+    "mcp_tool": frozenset({"server", "tool", "input", "output_schema"}),
+    "a2a_task": frozenset({"remote_agent", "skill", "input", "output_schema", "stream", "on_input_required"}),
+    "human_approval": frozenset({"fallback"}),
+    "agent": frozenset({"agent_ref", "input", "output_schema"}),
+    "condition": frozenset({"conditions", "default"}),
+    "branch": frozenset({"conditions", "default"}),
+    "eval": frozenset({"scorers", "on_fail", "max_retries", "input_expr"}),
+    "end": frozenset(),
+}
+_CONDITION_ENTRY_KEYS = frozenset({"if", "when", "next", "to"})
+_NEXT_ENTRY_KEYS = frozenset({"to", "when"})
+_AGENT_TOP_LEVEL_KEYS = frozenset({"agent"})
+_AGENT_KEYS = frozenset(
+    {
+        "id",
+        "name",
+        "version",
+        "strategy",
+        "strategy_config",
+        "goal",
+        "model",
+        "tools",
+        "limits",
+        "state_schema",
+        "agent_ref",
+    }
+)
+
+
+def _warn_unknown_keys(found: Any, known: frozenset[str], *, location: str) -> None:
+    unknown = sorted(str(k) for k in set(found) - known)
+    if unknown:
+        warnings.warn(
+            f"{location}: unknown key(s) {', '.join(unknown)} are ignored. Known keys: {', '.join(sorted(known))}",
+            WorkflowSchemaWarning,
+            stacklevel=3,
+        )
+
+
+def _check_node(node_id: str, node_data: Any) -> str:
+    """Raise ``ValueError`` for a node the compiler would misread; return its type."""
+    if not isinstance(node_data, dict):
+        raise ValueError(f"node '{node_id}' must be a mapping of settings, got {type(node_data).__name__}")
+    node_type = node_data.get("type", "tool")
+    if node_type not in _NODE_TYPE_KEYS:
+        raise ValueError(
+            f"node '{node_id}': unknown type {node_type!r}. Supported types: {', '.join(sorted(_NODE_TYPE_KEYS))}"
+        )
+    known = _NODE_COMMON_KEYS | _NODE_TYPE_KEYS[node_type]
+    unknown = sorted(str(k) for k in set(node_data) - known)
+    if unknown:
+        raise ValueError(
+            f"node '{node_id}' ({node_type}): unknown key(s) {', '.join(unknown)}. "
+            f"Allowed keys for {node_type}: {', '.join(sorted(known))}"
+        )
+    for i, cond in enumerate(node_data.get("conditions") or []):
+        if not isinstance(cond, dict):
+            raise ValueError(f"node '{node_id}': conditions[{i}] must be a mapping")
+        bad = sorted(str(k) for k in set(cond) - _CONDITION_ENTRY_KEYS)
+        if bad:
+            raise ValueError(
+                f"node '{node_id}': conditions[{i}] has unknown key(s) {', '.join(bad)}. "
+                f"Allowed: {', '.join(sorted(_CONDITION_ENTRY_KEYS))}"
+            )
+    next_val = node_data.get("next")
+    if isinstance(next_val, list):
+        for i, edge in enumerate(next_val):
+            if isinstance(edge, dict):
+                bad = sorted(str(k) for k in set(edge) - _NEXT_ENTRY_KEYS)
+                if bad:
+                    raise ValueError(
+                        f"node '{node_id}': next[{i}] has unknown key(s) {', '.join(bad)}. "
+                        f"Allowed: {', '.join(sorted(_NEXT_ENTRY_KEYS))}"
+                    )
+    return node_type
 
 
 def compile_to_ir(defn: WorkflowDef) -> dict[str, Any]:
@@ -143,10 +248,18 @@ def compile_yaml(yaml_content: str) -> dict[str, Any]:
             timeout_seconds: 120
     """
     data = yaml.safe_load(yaml_content)
+    if not isinstance(data, dict):
+        raise ValueError(f"a workflow document must be a mapping, got {type(data).__name__}")
 
     # ── Agent-first mode ──────────────────────────────────────────────────────
     if "agent" in data:
         return _compile_agent_yaml(data)
+
+    if "agents" in data or "workflows" in data:
+        raise ValueError(
+            "this is a fleet file (agents:/workflows: maps); compile it with "
+            "jamjet.workflow.bundle.compile_bundle, or use `jamjet validate`/`jamjet run`"
+        )
 
     # ── Graph/workflow mode ───────────────────────────────────────────────────
     return _compile_graph_yaml(data)
@@ -164,17 +277,36 @@ def agent_ref(value: Any, *, location: str) -> str | None:
 
 
 def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
-    """Compile a graph-mode document (``workflow:`` header + ``nodes:``) to IR."""
-    wf = data.get("workflow", {})
-    raw_nodes = data.get("nodes", {})
+    """Compile a graph-mode document (``workflow:`` header + ``nodes:``) to IR.
+
+    Raises ``ValueError`` for a document with no nodes, a malformed ``nodes:``
+    block, or a node with an unknown type or key. Unknown keys elsewhere are
+    reported as a ``WorkflowSchemaWarning``.
+    """
+    wf = data.get("workflow") or {}
+    if not isinstance(wf, dict):
+        raise ValueError(f"workflow: must be a mapping, got {type(wf).__name__}")
+    if "nodes" in wf:
+        raise ValueError(
+            "nodes: belongs at the top level of the document, not under workflow:. "
+            "Write `nodes:` as a mapping of node id to node definition."
+        )
+    _warn_unknown_keys(data, _GRAPH_TOP_LEVEL_KEYS, location="top level of the document")
+    _warn_unknown_keys(wf, _WORKFLOW_HEADER_KEYS, location="workflow header")
+    raw_nodes = data.get("nodes") or {}
+    if not isinstance(raw_nodes, dict):
+        raise ValueError(f"nodes: must be a mapping of node id to node definition, got {type(raw_nodes).__name__}")
 
     nodes: dict[str, Any] = {}
     edges: list[dict[str, Any]] = []
 
-    end_ids = frozenset(nid for nid, nd in raw_nodes.items() if isinstance(nd, dict) and nd.get("type") == "end")
+    node_types = {node_id: _check_node(node_id, node_data) for node_id, node_data in raw_nodes.items()}
+    end_ids = frozenset(nid for nid, node_type in node_types.items() if node_type == "end")
+    if len(end_ids) == len(node_types):
+        raise ValueError(f"workflow '{wf.get('id', 'unknown')}' has no nodes to run")
 
     for node_id, node_data in raw_nodes.items():
-        node_type = node_data.get("type", "tool")
+        node_type = node_types[node_id]
         if node_type == "end":
             continue
         kind = _yaml_node_to_kind(node_id, node_type, node_data, end_ids)
@@ -257,11 +389,20 @@ def _compile_agent_yaml(data: dict[str, Any]) -> dict[str, Any]:
     from jamjet.compiler.strategies import StrategyLimits, compile_strategy
 
     agent = data["agent"]
+    if not isinstance(agent, dict):
+        raise ValueError(f"agent: must be a mapping, got {type(agent).__name__}")
+    _warn_unknown_keys(data, _AGENT_TOP_LEVEL_KEYS, location="top level of the document")
+    _warn_unknown_keys(agent, _AGENT_KEYS, location="agent block")
 
     # ── Validate required fields ──────────────────────────────────────────────
     missing = [f for f in ("id", "strategy", "goal", "model") if not agent.get(f)]
     if missing:
         raise ValueError(f"agent-first workflow is missing required fields: {', '.join(missing)}")
+    tools_raw = agent.get("tools") or []
+    if not isinstance(tools_raw, list) or not all(isinstance(t, str) for t in tools_raw):
+        raise ValueError(
+            f"agent.tools must be a list of tool names (functions registered with @tool), got {tools_raw!r:.200}"
+        )
 
     limits_raw = agent.get("limits")
     if not limits_raw:

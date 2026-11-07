@@ -12,6 +12,11 @@
 #
 # Prerequisites:
 #   export ANTHROPIC_API_KEY="sk-ant-..."
+#   The tools listed below registered as @tool functions on a running
+#   `jamjet worker` (see examples/react-agent-durable for a worker setup).
+#
+# Check the definition (no runtime needed):
+#   jamjet validate agent.yaml
 #
 # Run:
 #   jamjet dev
@@ -24,14 +29,11 @@
 agent:
   id: plan_execute_writer
   version: 0.1.0
-  description: "Plan-and-execute writing agent — plan outline, execute each section, assemble"
+  name: "Plan-and-execute writing agent"
 
   strategy: plan-and-execute
   strategy_config:
-    # Number of parallel plan steps to generate and execute.
-    max_steps: 5
     # After each step, a verifier model checks quality before proceeding.
-    verifier: true
     verifier_model: claude-haiku-4-5-20251001
 
   model: claude-sonnet-4-6
@@ -44,23 +46,8 @@ agent:
     First, produce a numbered outline. Then write each section.
     Finally, assemble and polish the full piece.
 
-  tools:
-    - name: web_search
-      description: "Research background information"
-      input_schema:
-        type: object
-        properties:
-          query: { type: string }
-        required: [query]
-
-    - name: save_draft
-      description: "Save a draft section to the document"
-      input_schema:
-        type: object
-        properties:
-          section: { type: string, description: "Section heading" }
-          content: { type: string, description: "Section content in markdown" }
-        required: [section, content]
+  # The names of @tool functions; each carries its own description and schema.
+  tools: [web_search, save_draft]
 
   limits:
     max_iterations: 5

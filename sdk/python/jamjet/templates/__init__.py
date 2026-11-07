@@ -35,7 +35,6 @@ nodes:
       Answer this question clearly and concisely:
 
       {{{{ state.query }}}}
-    output_key: answer
     next: end
 
   end:
@@ -71,23 +70,19 @@ workflow:
 
 nodes:
   search:
-    type: tool
+    type: mcp_tool
     server: brave-search
     tool: web_search
-    arguments:
+    input:
       query: "{{{{ state.query }}}}"
-      count: 10
-    output_key: search_results
-    retry:
-      max_attempts: 3
-      backoff: exponential
-      delay_ms: 1000
+      count: "10"
+    retry_policy: io_default
     next: synthesize
 
   synthesize:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are a research assistant that synthesizes information from web search results
       into clear, structured reports. Always cite your sources.
     prompt: |
@@ -102,7 +97,6 @@ nodes:
       - Key findings
       - Different perspectives where applicable
       - Source citations
-    output_key: report
     next: end
 
   end:
@@ -151,20 +145,19 @@ workflow:
 
 nodes:
   fetch-pr:
-    type: tool
+    type: mcp_tool
     server: github
     tool: get_pull_request
-    arguments:
+    input:
       owner: "{{{{ state.repo.split('/')[0] }}}}"
       repo: "{{{{ state.repo.split('/')[1] }}}}"
       pull_number: "{{{{ state.pr_number }}}}"
-    output_key: pr_data
     next: review
 
   review:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are an expert code reviewer. Provide thorough, constructive feedback.
       Focus on: correctness, performance, security, readability, and test coverage.
     prompt: |
@@ -181,11 +174,7 @@ nodes:
       2. Issues found (critical → minor)
       3. Suggestions for improvement
       4. Overall verdict (approve / request changes / comment)
-    output_key: review
-    retry:
-      max_attempts: 2
-      backoff: constant
-      delay_ms: 2000
+    retry_policy: llm_default
     next: check-quality
 
   check-quality:
@@ -197,22 +186,22 @@ nodes:
         min_score: 4
         model: claude-haiku-4-5-20251001
       - type: assertion
-        check: "len(output['review']) >= 200"
+        checks:
+          - "len(output['review']) >= 200"
     on_fail: retry_with_feedback
     max_retries: 2
     next: post-comment
 
   post-comment:
-    type: tool
+    type: mcp_tool
     server: github
     tool: create_pull_request_review
-    arguments:
+    input:
       owner: "{{{{ state.repo.split('/')[0] }}}}"
       repo: "{{{{ state.repo.split('/')[1] }}}}"
       pull_number: "{{{{ state.pr_number }}}}"
       body: "{{{{ state.review }}}}"
       event: COMMENT
-    output_key: comment_url
     next: end
 
   end:
@@ -252,22 +241,18 @@ workflow:
 
 nodes:
   read-file:
-    type: tool
+    type: mcp_tool
     server: filesystem
     tool: read_file
-    arguments:
+    input:
       path: "{{{{ state.path }}}}"
-    output_key: file_content
-    retry:
-      max_attempts: 2
-      backoff: constant
-      delay_ms: 500
+    retry_policy: io_default
     next: answer
 
   answer:
     type: model
     model: claude-haiku-4-5-20251001
-    system: |
+    system_prompt: |
       You are a helpful assistant. Answer questions about files clearly and concisely.
     prompt: |
       File: {{{{ state.path }}}}
@@ -276,7 +261,6 @@ nodes:
       {{{{ state.file_content }}}}
 
       Question: {{{{ state.question }}}}
-    output_key: answer
     next: end
 
   end:
@@ -307,9 +291,10 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 # Usage:
 #   jamjet run workflow.yaml --input '{{"request": "Refund order #1234 for $99"}}'
 #
-# Resume after human review:
-#   jamjet resume <exec-id> --event reviewed --data '{{"approved": true}}'
-#   jamjet resume <exec-id> --event reviewed --data '{{"approved": false, "feedback": "Too large, check policy first"}}'
+# Decide on the paused review:
+#   jamjet approvals <exec-id>
+#   jamjet approve <exec-id> --decision approved
+#   jamjet approve <exec-id> --decision rejected --comment "Too large, check policy first"
 
 workflow:
   id: {name}
@@ -326,21 +311,20 @@ nodes:
   draft:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are a support agent. Draft a clear, professional response to customer requests.
       Be specific about what action will be taken.
     prompt: |
       Customer request: {{{{ state.request }}}}
 
       Draft a response that explains what action you will take and why.
-    output_key: draft_response
     next: await-review
 
   await-review:
-    type: wait
-    event: reviewed
-    timeout_hours: 8
-    on_timeout: auto-approve
+    type: human_approval
+    description: Review the drafted response before it is sent
+    timeout: 8h
+    fallback: auto-approve
     next: route
 
   route:
@@ -360,7 +344,6 @@ nodes:
 
       Request: {{{{ state.request }}}}
       Approved response: {{{{ state.draft_response }}}}
-    output_key: final_response
     next: end
 
   revise:
@@ -374,7 +357,6 @@ nodes:
       Feedback: {{{{ state.feedback }}}}
 
       Write a revised response addressing the feedback.
-    output_key: final_response
     next: end
 
   auto-approve:
@@ -385,7 +367,6 @@ nodes:
       Request: {{{{ state.request }}}}
       Draft: {{{{ state.draft_response }}}}
       Confirm the action taken.
-    output_key: final_response
     next: end
 
   end:
@@ -418,25 +399,24 @@ nodes:
   write:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are an expert writer. Produce clear, engaging, well-structured content.
       If you have received critique, incorporate it fully in this revision.
     prompt: |
       Topic: {{{{ state.topic }}}}
-      {%- if state.critique %}
+      {{%- if state.critique %}}
 
       Previous critique (score {{{{ state.score }}}}/5):
       {{{{ state.critique }}}}
 
       Revise your draft to address all points raised.
-      {%- endif %}
-    output_key: draft
+      {{%- endif %}}
     next: critique
 
   critique:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are a strict editor. Evaluate content quality honestly.
       Reply in this exact format:
       SCORE: <1-5>
@@ -446,13 +426,12 @@ nodes:
 
       Draft to review:
       {{{{ state.draft }}}}
-    output_key: critique
     next: route
 
   route:
     type: branch
     conditions:
-      - if: "int(state.critique.split('SCORE:')[1].split()[0]) >= 4"
+      - if: "state.score >= 4"
         next: accept
       - if: "state.attempts >= 3"
         next: accept
@@ -464,7 +443,6 @@ nodes:
     prompt: |
       Format this final approved draft cleanly:
       {{{{ state.draft }}}}
-    output_key: final
     next: end
 
   end:
@@ -489,7 +467,7 @@ nodes:
 #
 # From another JamJet agent:
 #   type: a2a_task
-#   agent_uri: "http://localhost:7700"
+#   remote_agent: "http://localhost:7700"
 #   skill: summarize
 
 workflow:
@@ -504,11 +482,10 @@ nodes:
   handle:
     type: model
     model: claude-haiku-4-5-20251001
-    system: |
+    system_prompt: |
       You are a helpful agent that processes delegated tasks.
       Complete the task clearly and concisely.
     prompt: "{{{{ state.message }}}}"
-    output_key: result
     next: end
 
   end:
@@ -562,22 +539,18 @@ workflow:
 
 nodes:
   retrieve:
-    type: tool
+    type: mcp_tool
     server: filesystem
     tool: read_file
-    arguments:
+    input:
       path: "{{{{ state.question | extract_path }}}}"
-    output_key: context
-    retry:
-      max_attempts: 2
-      backoff: constant
-      delay_ms: 500
+    retry_policy: io_default
     next: answer
 
   answer:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are a helpful assistant that answers questions using the provided context.
       Always ground your answer in the context. If the context does not contain
       enough information, say so clearly.
@@ -588,7 +561,6 @@ nodes:
       Question: {{{{ state.question }}}}
 
       Answer based only on the context above.
-    output_key: answer
     next: end
 
   end:
@@ -630,30 +602,25 @@ workflow:
 
 nodes:
   call-tool:
-    type: tool
+    type: mcp_tool
     server: brave-search
     tool: web_search
-    arguments:
+    input:
       query: "{{{{ state.query }}}}"
-      count: 5
-    output_key: tool_result
-    retry:
-      max_attempts: 3
-      backoff: exponential
-      delay_ms: 1000
+      count: "5"
+    retry_policy: io_default
     next: summarize
 
   summarize:
     type: model
     model: claude-haiku-4-5-20251001
-    system: You are a concise summarizer. Summarize search results in 3-5 sentences.
+    system_prompt: You are a concise summarizer. Summarize search results in 3-5 sentences.
     prompt: |
       Search results for "{{{{ state.query }}}}":
 
       {{{{ state.tool_result }}}}
 
       Write a clear summary.
-    output_key: summary
     next: end
 
   end:
@@ -734,13 +701,12 @@ workflow:
 
 nodes:
   calculate:
-    type: tool
+    type: mcp_tool
     server: {name}
     tool: add
-    arguments:
+    input:
       a: "{{{{ state.a }}}}"
       b: "{{{{ state.b }}}}"
-    output_key: result
     next: respond
 
   respond:
@@ -749,7 +715,6 @@ nodes:
     prompt: |
       {{{{ state.a }}}} + {{{{ state.b }}}} = {{{{ state.result }}}}
       Write one sentence confirming this calculation.
-    output_key: message
     next: end
 
   end:
@@ -789,24 +754,22 @@ workflow:
 nodes:
   delegate:
     type: a2a_task
-    agent_uri: "{{{{ state.agent_url }}}}"
+    remote_agent: "{{{{ state.agent_url }}}}"
     skill: default
     input:
       message: "{{{{ state.task }}}}"
-    output_key: agent_result
-    timeout_seconds: 120
+    timeout: 120s
     next: summarize
 
   summarize:
     type: model
     model: claude-haiku-4-5-20251001
-    system: You are a coordinator agent. Present the delegated result clearly.
+    system_prompt: You are a coordinator agent. Present the delegated result clearly.
     prompt: |
       Task delegated: {{{{ state.task }}}}
       Remote agent result: {{{{ state.agent_result }}}}
 
       Write a one-paragraph summary of what was accomplished.
-    output_key: final_summary
     next: end
 
   end:
@@ -1045,7 +1008,7 @@ nodes:
   research:
     type: model
     model: claude-haiku-4-5-20251001
-    system: |
+    system_prompt: |
       You are a research assistant. Search for relevant papers and information,
       then provide a detailed, well-cited summary.
     prompt: |
@@ -1057,7 +1020,6 @@ nodes:
       1. Key findings from recent literature
       2. Different perspectives or approaches
       3. Open questions and future directions
-    output_key: report
     next: evaluate
 
   evaluate:
@@ -1338,7 +1300,7 @@ Approvals surface in `/dashboard/approvals` for your team to review.
 #
 # Usage:
 #   jamjet run workflow.yaml --input '{{"task": "Deploy v2.0 to production"}}'
-#   jamjet resume <exec-id> --event human_approved --data '{{"approved": true}}'
+#   jamjet approve <exec-id> --decision approved
 
 workflow:
   id: {name}
@@ -1355,7 +1317,7 @@ nodes:
   propose:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are an operations agent. Propose a safe, detailed execution plan.
       Be specific about what actions will be taken and their risks.
     prompt: |
@@ -1368,14 +1330,13 @@ nodes:
       2. Estimated impact
       3. Rollback plan if something goes wrong
       4. Risk assessment (low / medium / high)
-    output_key: proposal
     next: await-approval
 
   await-approval:
-    type: wait
-    event: human_approved
-    timeout_hours: 24
-    on_timeout: escalate
+    type: human_approval
+    description: Approve the proposed execution plan
+    timeout: 24h
+    fallback: escalate
     next: check-approved
 
   check-approved:
@@ -1395,7 +1356,6 @@ nodes:
       Plan: {{{{ state.proposal }}}}
 
       Report what was done and confirm completion.
-    output_key: result
     next: end
 
   rejected:
@@ -1405,7 +1365,6 @@ nodes:
       The following plan was rejected: {{{{ state.proposal }}}}
       Reason: {{{{ state.rejection_reason }}}}
       Acknowledge the rejection and suggest alternatives.
-    output_key: result
     next: end
 
   escalate:
@@ -1415,7 +1374,6 @@ nodes:
       The approval for the following task timed out after 24 hours:
       {{{{ state.task }}}}
       Draft an escalation notice for the on-call team.
-    output_key: result
     next: end
 
   end:

@@ -56,11 +56,15 @@ nodes:
     type: model
     model: default_chat             # named model from models.yaml
     prompt: prompts/summarize.md    # prompt template file
-    input:
-      search_result: "{{ state.search_result }}"
+    system_prompt: You summarise search results in three sentences.
     output_schema: schemas.Summary
     next: end                       # built-in terminal node
 ```
+
+`jamjet validate` and the compiler reject a workflow with no nodes, a node
+whose `type` is not in the table below, and a node, condition or `next` entry
+with a key the compiler does not read, naming the key. An unknown key in the
+`workflow:` header or at the top level is reported as a warning.
 
 `agent_ref` (workflow) and `acts_for` (node) compile to the IR's `agent_ref`. The engine then holds the node to the named card's `allowed_tools`, `blocked_tools`, `require_approval_for` and `allowed_delegations` (see the [Agent Model Guide](agent-model-guide.md#enforcing-allowed_tools)), and refuses it if no agent is registered at that `uri`. A node uses `acts_for` because `agent_ref` on an `agent` node already names the agent it calls.
 
@@ -68,19 +72,20 @@ nodes:
 
 ## Node types
 
-| Type | Description |
-|------|-------------|
-| `tool` | Call a Python function or HTTP endpoint |
-| `model` | LLM call with structured output |
-| `condition` | Branch based on state expression |
-| `human_approval` | Pause for human decision |
-| `wait` | Suspend until timer or external event |
-| `parallel` | Fan out to concurrent branches |
-| `join` | Wait for all parallel branches |
-| `mcp_tool` | Call a tool via MCP protocol |
-| `a2a_task` | Delegate to an external agent via A2A |
-| `agent` | Invoke a local JamJet agent |
-| `eval` | Evaluate node output with scorers *(Phase 3)* |
+| Type | Description | Keys besides the common ones |
+|------|-------------|------------------------------|
+| `tool` | Call a registered tool | `tool_ref`, `input`, `output_schema` |
+| `model` | LLM call | `model`, `prompt`, `system_prompt`, `output_schema` |
+| `condition` (or `branch`) | Branch on a state expression | `conditions`, `default` |
+| `human_approval` | Pause for a human decision | `fallback` |
+| `mcp_tool` | Call a tool via MCP | `server`, `tool`, `input`, `output_schema` |
+| `a2a_task` | Delegate to an external agent via A2A | `remote_agent`, `skill`, `input`, `output_schema`, `stream`, `on_input_required` |
+| `agent` | Invoke a registered JamJet agent | `agent_ref`, `input`, `output_schema` |
+| `eval` | Evaluate node output with scorers | `scorers`, `on_fail`, `max_retries`, `input_expr` |
+| `end` | Terminal node | |
+
+Every node may also carry `type`, `description`, `labels`, `policy`,
+`retry_policy`, `timeout`, `acts_for` and `next`.
 
 ---
 
@@ -89,10 +94,10 @@ nodes:
 ```yaml
 route:
   type: condition
-  branches:
-    - condition: "state.confidence >= 0.8"
-      next: deliver
-    - condition: "state.confidence < 0.8"
+  conditions:
+    - if: "state.confidence >= 0.8"   # or `when:`
+      next: deliver                   # or `to:`
+    - if: "state.confidence < 0.8"
       next: escalate
   default: escalate
 ```
@@ -104,24 +109,14 @@ route:
 ```yaml
 review:
   type: human_approval
-  message: "Please review the generated report"
-  timeout: 48h                      # auto-reject after timeout
-  on_approved: deliver
-  on_rejected: revise
+  description: "Please review the generated report"
+  timeout: 48h
+  fallback: revise                  # where the run goes if nobody decides in time
+  next: deliver                     # where an approved run continues
 ```
 
----
-
-## Wait / external event node
-
-```yaml
-await_payment:
-  type: wait
-  event: payment_confirmed          # event name sent via POST /executions/{id}/events
-  timeout: 24h
-  on_timeout: cancel_order
-  next: fulfill_order
-```
+Decide with `jamjet approvals <exec-id>` and
+`jamjet approve <exec-id> --decision approved|rejected`.
 
 ---
 
@@ -130,7 +125,7 @@ await_payment:
 ```yaml
 search_github:
   type: mcp_tool
-  server: github                    # server name from agents.yaml mcp.servers
+  server: github                    # a server under mcp.servers in this file
   tool: search_code
   input:
     query: "{{ state.search_query }}"
@@ -145,7 +140,7 @@ search_github:
 ```yaml
 code_review:
   type: a2a_task
-  remote_agent: partner_reviewer    # agent name from agents.yaml a2a.remote_agents
+  remote_agent: partner_reviewer    # an agent under a2a.remote_agents in this file
   skill: security_review
   input:
     code: "{{ state.generated_code }}"

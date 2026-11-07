@@ -1,31 +1,24 @@
 # Claims Processing Agent
 
-An insurance claims processing pipeline using JamJet's native Python SDK. Four specialist agents — intake, assessor, fraud analyst, resolution writer — collaborate through a typed Pydantic workflow with durable execution, human-in-the-loop approval, and full audit trails.
+An insurance claims processing pipeline using JamJet's native Python SDK. Four specialist agents (intake, assessor, fraud analyst, resolution writer) collaborate through a typed Pydantic workflow with a human approval step for high-value claims.
 
 ## Use case
 
 A multi-step agent that processes insurance claims end-to-end:
 - Analyzes damage photos and claim descriptions
-- Looks up customer policy coverage in parallel
+- Looks up customer policy coverage
 - Estimates repair cost based on damage + policy terms
 - Runs fraud detection checks
 - Routes high-value claims (>$10K) to human adjusters for approval
 - Generates professional decision letters
 - Produces a complete audit trail for compliance
 
-## Why this example matters
-
-This is the kind of workflow where framework choice has real consequences:
-- **Crash at step 5?** JamJet resumes from the checkpoint. Other frameworks restart from scratch.
-- **$47K claim?** The `human_approval=True` step pauses for review — and survives restarts.
-- **Regulator audit?** `jamjet inspect` shows every decision, prompt, and tool call.
-
 ## Architecture
 
 ```
-intake → ┬─ analyze_photos ─┬→ assess_damage → check_fraud → approve → resolve
-         └─ lookup_policy  ─┘                                 ↓ (>$10K)
-                                                         human review
+intake → analyze_photos → lookup_policy → assess_damage → check_fraud → approve → resolve
+                                                                           ↓ (>$10K)
+                                                                      human review
 ```
 
 ## Agents
@@ -39,18 +32,17 @@ intake → ┬─ analyze_photos ─┬→ assess_damage → check_fraud → app
 
 ## Run
 
+The agents call Anthropic models, so set a key first:
+
 ```bash
-# Local (in-process, no runtime needed)
-python examples/claims-processing/main.py
-
-# On JamJet runtime (durable execution)
-jamjet dev
-python examples/claims-processing/main.py --runtime
-
-# Inspect and replay
-jamjet inspect <exec_id> --events
-jamjet replay <exec_id>
+pip install 'jamjet[model]'
+export ANTHROPIC_API_KEY=sk-ant-...
+python examples/claims-processing/main.py           # in-process, no runtime needed
+python examples/claims-processing/main.py CLM-5000  # another claim id
 ```
+
+For an agent that runs on the durable engine (event log, replay, crash
+recovery), see [`react-agent-durable`](../react-agent-durable).
 
 ## Key features demonstrated
 
@@ -58,13 +50,9 @@ jamjet replay <exec_id>
 |---------|---------------|
 | Native Python SDK | `Agent`, `Workflow`, `@workflow.step`, Pydantic state |
 | Agent strategies | react, plan-and-execute, critic — each suited to the task |
-| Typed state | `ClaimsState(BaseModel)` with compile-time validation |
-| Durable execution | Every step checkpointed — crash-safe |
-| Parallel branches | Photo analysis + policy lookup run concurrently |
-| Human-in-the-loop | `human_approval=True` for high-value claims |
+| Typed state | `ClaimsState(BaseModel)` validated at every step |
+| Human-in-the-loop | `human_approval=True` marks the approval step for high-value claims |
 | Tools | `@tool` decorated functions for photos, policy DB, fraud check |
-| Cost tracking | Per-step token and cost attribution |
-| Audit trail | Full execution trace for compliance |
 
 ## Comparing with Google ADK
 
