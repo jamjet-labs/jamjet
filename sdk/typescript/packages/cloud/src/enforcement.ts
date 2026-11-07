@@ -5,9 +5,9 @@ import { applyCacheInject } from './cache-inject.js'
 import { applyCompaction } from './compaction.js'
 import { estimateCost } from './cost.js'
 import { JamjetPolicyBlocked } from './errors.js'
+import { toolNameOf } from './policy.js'
 import { Span } from './span.js'
-
-type Vendor = 'openai' | 'anthropic'
+import { enforceStream, type StreamTally, type Vendor } from './stream-enforcement.js'
 
 export interface EnforcedCallOptions {
   client: Client
@@ -108,18 +108,32 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
   const agentRef = override?.agent ?? ctx?.agent
   const userCtx = override?.user ?? ctx?.user
 
-  // 1. Pre-call policy: filter tools
+  // 1. Pre-call policy: filter tools. Names come from either vendor's tool
+  // shape (see toolNameOf), so Anthropic `{ name }` tools are covered too.
   let mutatedArgs = args
   const policyDecisions: Array<{ tool_name: string; policy_kind: string; pattern: string | null }> = []
   if (Array.isArray(arg0['tools']) && arg0['tools'].length > 0) {
-    const { allowed, blocked } = client._policy.filterTools(arg0['tools'] as Array<{ function?: { name?: string } }>)
+    const { allowed, blocked } = client._policy.filterTools(arg0['tools'] as unknown[])
     for (const t of blocked) {
-      const name = t.function?.name ?? ''
+      const name = toolNameOf(t)
       const d = client._policy.evaluate(name)
       policyDecisions.push({ tool_name: name, policy_kind: d.policyKind, pattern: d.pattern })
     }
     if (blocked.length > 0) {
-      mutatedArgs = [{ ...arg0, tools: allowed }, ...args.slice(1)]
+      // A tool_choice that forces a stripped tool cannot be honoured: refuse
+      // the call rather than let the vendor reject an unknown tool name.
+      const forced = toolNameOf(arg0['tool_choice'])
+      if (forced !== '') {
+        const d = client._policy.evaluate(forced)
+        if (d.blocked) throw new JamjetPolicyBlocked(forced, d.pattern ?? '*')
+      }
+      const next: Record<string, unknown> = { ...arg0, tools: allowed }
+      if (allowed.length === 0) {
+        // Vendors reject an empty tools array, and a tool_choice with no tools.
+        delete next['tools']
+        delete next['tool_choice']
+      }
+      mutatedArgs = [next, ...args.slice(1)]
     }
   }
 
@@ -190,67 +204,159 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
     }
   }
 
+  const state: CallState = { client, span, vendor, model, cacheInjected, compactionSaved }
+
+  let result: unknown
   try {
-    const result = await original.apply(null, mutatedArgs)
+    result = await original.apply(null, mutatedArgs)
+  } catch (err) {
+    failSpan(state, err)
+    throw err
+  }
 
-    if (!isStreaming) {
-      // 4. Post-decision policy: re-check tool_calls returned by the model
-      // NOTE (Plan 2 limitation): require_approval matches do not gate the call
-      // here. Tools matched by require_approval rules pass through to the model
-      // and to user code unchanged. Pre-call approval gating is deferred to a
-      // future release; see docs/superpowers/specs/2026-05-08-ts-sdk-plan2.md §6.
-      const toolCalls = getToolCalls(vendor, result)
-      for (const tc of toolCalls) {
-        const d = client._policy.evaluate(tc.name)
-        if (d.blocked) {
-          const blockedEntry: { id?: string; name: string } = { name: tc.name }
-          if (tc.id !== undefined) blockedEntry.id = tc.id
-          span.policyBlockedToolCalls = [blockedEntry]
-          span.finish('error')
-          client.recordSpan(span.toEventDict())
-          throw new JamjetPolicyBlocked(tc.name, d.pattern ?? '*', { cause: tc })
-        }
-      }
-
-      // 5. Post-call cost record
-      const usage = extractUsage(vendor, result)
-      const res = result as Record<string, unknown>
-      const actualModel = typeof res['model'] === 'string' ? res['model'] : model
-      span.model = actualModel
-      span.name = `${vendor}.${actualModel}`
-      span.inputTokens = usage.input
-      span.outputTokens = usage.output
-      span.costUsd = estimateCost(actualModel, usage.input, usage.output)
-      client._budget.record(span.costUsd)
-
-      if (cacheInjected) {
-        const cacheRead = extractCacheRead(vendor, result)
-        const savedUsd = cacheReadSavingsUsd(actualModel, cacheRead)
-        span.payload = {
-          ...span.payload,
-          // Fractional cents intentional — Math.round would zero sub-cent per-call
-          // savings. Authoritative totals are recomputed server-side from
-          // cache_read_input_tokens; this is a secondary per-call annotation.
-          saved_cents: savedUsd * 100,
-          cache_injected: true,
-        }
-      }
-
-      if (compactionSaved > 0) {
-        span.payload = { ...span.payload, tokens_saved: compactionSaved, compacted: true }
-      }
+  if (isStreaming) {
+    const streamState = (tally: StreamTally): CallState => ({ ...state, model: tally.model ?? model })
+    const refuseStreamed = (calls: ReadonlyArray<{ id?: string; name: string }>, tally: StreamTally): void => {
+      if (firstBlocked(client, calls) === null) return
+      recordUsage(streamState(tally), streamUsage(tally, estTokens, false), tally.cacheReadTokens, {
+        usage_estimated: true,
+        stream_incomplete: true,
+      })
+      refuseBlocked(state, calls)
     }
-
+    const enforced = enforceStream(result, {
+      vendor,
+      holdToolCalls: client._policy.hasRules(),
+      onToolCallStarted: (call, tally) => refuseStreamed([call], tally),
+      onToolCalls: (calls, tally) => refuseStreamed(calls, tally),
+      onEnd: (tally, end) => {
+        if (end.kind === 'error') {
+          if (!(end.error instanceof JamjetPolicyBlocked)) failSpan(state, end.error)
+          return
+        }
+        const complete = end.kind === 'complete'
+        const reported = tally.inputTokens !== undefined && tally.outputTokens !== undefined
+        recordUsage(streamState(tally), streamUsage(tally, estTokens, complete), tally.cacheReadTokens, {
+          ...(complete && reported ? {} : { usage_estimated: true }),
+          ...(complete ? {} : { stream_incomplete: true }),
+        })
+        span.finish('ok')
+        client.recordSpan(span.toEventDict())
+      },
+    })
+    if (enforced !== null) return enforced
+    // Not iterable: nothing to observe. Record what we know and pass it on.
     span.finish('ok')
     client.recordSpan(span.toEventDict())
     return result
-  } catch (err) {
-    if (!(err instanceof JamjetPolicyBlocked)) {
-      span.finish('error')
-      const errMsg = err instanceof Error ? err.message : String(err)
-      span.payload = { error: errMsg }
-      client.recordSpan(span.toEventDict())
-    }
-    throw err
   }
+
+  // 4. Post-call cost record. Runs before the policy re-check so a refused
+  // response still counts against the budget: the tokens were spent.
+  const res = result as Record<string, unknown>
+  recordUsage(
+    { ...state, model: typeof res['model'] === 'string' ? res['model'] : model },
+    extractUsage(vendor, result),
+    extractCacheRead(vendor, result),
+  )
+
+  // 5. Post-decision policy: re-check tool calls returned by the model
+  // NOTE (Plan 2 limitation): require_approval matches do not gate the call
+  // here. Tools matched by require_approval rules pass through to the model
+  // and to user code unchanged. Pre-call approval gating is deferred to a
+  // future release; see docs/superpowers/specs/2026-05-08-ts-sdk-plan2.md §6.
+  refuseBlocked(state, getToolCalls(vendor, result))
+
+  span.finish('ok')
+  client.recordSpan(span.toEventDict())
+  return result
+}
+
+interface CallState {
+  client: Client
+  span: Span
+  vendor: Vendor
+  model: string
+  cacheInjected: boolean
+  compactionSaved: number
+}
+
+function firstBlocked(
+  client: Client,
+  calls: ReadonlyArray<{ id?: string; name: string }>,
+): { call: { id?: string; name: string }; pattern: string } | null {
+  for (const call of calls) {
+    const d = client._policy.evaluate(call.name)
+    if (d.blocked) return { call, pattern: d.pattern ?? '*' }
+  }
+  return null
+}
+
+/** Throws JamjetPolicyBlocked (and records the span) on the first blocked call. */
+function refuseBlocked(state: CallState, calls: ReadonlyArray<{ id?: string; name: string }>): void {
+  const hit = firstBlocked(state.client, calls)
+  if (hit === null) return
+  const blockedEntry: { id?: string; name: string } = { name: hit.call.name }
+  if (hit.call.id !== undefined) blockedEntry.id = hit.call.id
+  state.span.policyBlockedToolCalls = [blockedEntry]
+  state.span.finish('error')
+  state.client.recordSpan(state.span.toEventDict())
+  throw new JamjetPolicyBlocked(hit.call.name, hit.pattern, { cause: hit.call })
+}
+
+function failSpan(state: CallState, err: unknown): void {
+  if (err instanceof JamjetPolicyBlocked) return
+  state.span.finish('error')
+  const errMsg = err instanceof Error ? err.message : String(err)
+  state.span.payload = { ...state.span.payload, error: errMsg }
+  state.client.recordSpan(state.span.toEventDict())
+}
+
+/**
+ * Usage a stream reported, or an estimate (prompt estimate, ~4 characters per
+ * output token). A stream cut short has only a partial output count, so the
+ * larger of the reported count and the estimate is used.
+ */
+function streamUsage(
+  tally: StreamTally,
+  estimatedPromptTokens: number,
+  complete: boolean,
+): { input: number; output: number } {
+  const estimatedOutput = Math.ceil(tally.outputChars / 4)
+  const output = complete
+    ? (tally.outputTokens ?? estimatedOutput)
+    : Math.max(tally.outputTokens ?? 0, estimatedOutput)
+  return { input: tally.inputTokens ?? estimatedPromptTokens, output }
+}
+
+function recordUsage(
+  state: CallState,
+  usage: { input: number; output: number },
+  cacheRead: number,
+  extraPayload: Record<string, unknown> = {},
+): void {
+  const { span, vendor, model } = state
+  span.model = model
+  span.name = `${vendor}.${model}`
+  span.inputTokens = usage.input
+  span.outputTokens = usage.output
+  span.costUsd = estimateCost(model, usage.input, usage.output)
+  state.client._budget.record(span.costUsd)
+
+  if (state.cacheInjected) {
+    const savedUsd = cacheReadSavingsUsd(model, cacheRead)
+    span.payload = {
+      ...span.payload,
+      // Fractional cents intentional — Math.round would zero sub-cent per-call
+      // savings. Authoritative totals are recomputed server-side from
+      // cache_read_input_tokens; this is a secondary per-call annotation.
+      saved_cents: savedUsd * 100,
+      cache_injected: true,
+    }
+  }
+
+  if (state.compactionSaved > 0) {
+    span.payload = { ...span.payload, tokens_saved: state.compactionSaved, compacted: true }
+  }
+  if (Object.keys(extraPayload).length > 0) span.payload = { ...span.payload, ...extraPayload }
 }

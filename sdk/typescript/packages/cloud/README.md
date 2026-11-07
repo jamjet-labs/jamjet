@@ -105,8 +105,17 @@ budget(5.00) // hard cap in USD
 ```
 
 `policy()` and `budget()` apply to every wrapped LLM client in the process.
-Blocked tools are stripped before the model sees them; budget exhaustion throws
+Blocked tools are stripped before the model sees them (OpenAI `function` and
+`custom` tools, and Anthropic tools), and a tool call the model returns for a
+blocked tool throws `JamjetPolicyBlocked`. Budget exhaustion throws
 `JamjetBudgetExceeded` before the next call goes out.
+
+Streaming calls get the same checks. Text streams through as it arrives; once
+any policy rule is set, chunks from the first tool call onward are held until
+the stream ends, checked, and only then handed to your code. Usage and cost are
+recorded when the stream finishes (or is abandoned) and count toward
+`budget()`. When an OpenAI stream reports no usage, the cost is estimated and
+the span is marked `usage_estimated`.
 
 ## Standalone primitives (no Cloud account)
 

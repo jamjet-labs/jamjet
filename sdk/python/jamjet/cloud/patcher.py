@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .budget import get_budget
 from .events import emit
+from .exceptions import JamJetPolicyBlocked
 from .middleware import Chain
 from .middleware.context import (
     anthropic_kwargs_from_call_context,
@@ -12,7 +14,8 @@ from .middleware.context import (
     openai_kwargs_from_call_context,
 )
 from .middleware.receipts import build_llm_receipt, emit_receipt
-from .policy import get_evaluator
+from .policy import _field, get_evaluator, tool_name_of
+from .stream_enforcement import StreamedToolCall, StreamTally, enforce_stream
 from .trace import get_context
 
 # ---------------------------------------------------------------------------
@@ -69,6 +72,206 @@ def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Shared enforcement for one patched call
+# ---------------------------------------------------------------------------
+
+
+def _estimate_prompt_tokens(kwargs: dict[str, Any]) -> int:
+    """~4 characters per token over the serialised messages (used when a
+    stream reports no usage)."""
+    try:
+        return -(-len(json.dumps(kwargs.get("messages") or [], default=str)) // 4)
+    except Exception:  # noqa: BLE001  an estimate must never break the call
+        return 0
+
+
+def _filter_tools_pre_call(kwargs: dict[str, Any]) -> None:
+    """Strip blocked tools from the request, in either vendor's tool shape."""
+    tools = kwargs.get("tools")
+    if not tools:
+        return
+    evaluator = get_evaluator()
+    allowed, blocked = evaluator.filter_tools(list(tools))
+    if not blocked:
+        return
+    # A tool_choice that forces a stripped tool cannot be honoured: refuse the
+    # call rather than let the vendor reject an unknown tool name.
+    forced = tool_name_of(kwargs.get("tool_choice"))
+    if forced:
+        decision = evaluator.evaluate(forced)
+        if decision.blocked:
+            raise JamJetPolicyBlocked(forced, decision.pattern or "*")
+    if allowed:
+        kwargs["tools"] = allowed
+    else:
+        # Vendors reject an empty tools array, and a tool_choice with no tools.
+        kwargs.pop("tools", None)
+        kwargs.pop("tool_choice", None)
+
+
+def _response_tool_calls(vendor: str, result: Any) -> list[tuple[str | None, str]]:
+    """(id, name) of every tool call in a finished response."""
+    calls: list[tuple[str | None, str]] = []
+    if vendor == "openai":
+        for choice in _field(result, "choices") or []:
+            for tc in _field(_field(choice, "message"), "tool_calls") or []:
+                fn = _field(tc, "function") or _field(tc, "custom")
+                name = _field(fn, "name")
+                calls.append((_field(tc, "id"), name if isinstance(name, str) else ""))
+        return calls
+    for block in _field(result, "content") or []:
+        if _field(block, "type") in ("tool_use", "server_tool_use"):
+            name = _field(block, "name")
+            calls.append((_field(block, "id"), name if isinstance(name, str) else ""))
+    return calls
+
+
+def _refuse_blocked(span: Any, calls: list[tuple[str | None, str]]) -> None:
+    """Raise JamJetPolicyBlocked (and emit the span) on the first blocked call."""
+    evaluator = get_evaluator()
+    for call_id, name in calls:
+        decision = evaluator.evaluate(name)
+        if decision.blocked:
+            entry: dict[str, Any] = {"name": name}
+            if call_id is not None:
+                entry["id"] = call_id
+            span.payload = {**span.payload, "policy_blocked_tool_calls": [entry]}
+            span.finish(status="error")
+            emit(span.to_event_dict())
+            raise JamJetPolicyBlocked(name, decision.pattern or "*")
+
+
+def _record_usage(span: Any, model: str, input_tokens: int, output_tokens: int, **payload: Any) -> None:
+    cost = _estimate_cost(model, input_tokens, output_tokens)
+    span.model = model
+    span.input_tokens = input_tokens
+    span.output_tokens = output_tokens
+    span.cost_usd = cost
+    if payload:
+        span.payload = {**span.payload, **payload}
+    get_budget().record(cost)
+
+
+def _emit_receipt_if_fired(call_ctx: Any) -> None:
+    if not call_ctx.middleware_fired:
+        return
+    try:
+        receipt = build_llm_receipt(
+            call_ctx,
+            matched_rule={"match": call_ctx.middleware_fired[0]},
+            policy_version="1",
+        )
+        emit_receipt(receipt)
+    except Exception:  # noqa: BLE001  receipt emission must never break or mask the call
+        pass
+
+
+def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: dict[str, Any]) -> Any:
+    """Wrap a streaming result so its tool calls and usage are enforced."""
+    prompt_estimate = _estimate_prompt_tokens(kwargs)
+
+    def usage_of(tally: StreamTally, complete: bool) -> tuple[int, int]:
+        estimated_output = -(-tally.output_chars // 4)
+        if complete:
+            output = tally.output_tokens if tally.output_tokens is not None else estimated_output
+        else:
+            # A stream cut short has only a partial output count.
+            output = max(tally.output_tokens or 0, estimated_output)
+        input_tokens = tally.input_tokens if tally.input_tokens is not None else prompt_estimate
+        return input_tokens, output
+
+    def refuse(calls: list[StreamedToolCall], tally: StreamTally) -> None:
+        pairs = [(c.id, c.name) for c in calls]
+        evaluator = get_evaluator()
+        if not any(evaluator.evaluate(name).blocked for _, name in pairs):
+            return
+        input_tokens, output = usage_of(tally, complete=False)
+        _record_usage(span, tally.model or model, input_tokens, output, usage_estimated=True, stream_incomplete=True)
+        _refuse_blocked(span, pairs)
+
+    def on_end(tally: StreamTally, how: str, error: BaseException | None) -> None:
+        if how == "error":
+            return
+        complete = how == "complete"
+        input_tokens, output = usage_of(tally, complete)
+        reported = tally.input_tokens is not None and tally.output_tokens is not None
+        extra: dict[str, Any] = {}
+        if not (complete and reported):
+            extra["usage_estimated"] = True
+        if not complete:
+            extra["stream_incomplete"] = True
+        _record_usage(span, tally.model or model, input_tokens, output, **extra)
+        span.finish(status="ok")
+        emit(span.to_event_dict())
+
+    enforced = enforce_stream(
+        result,
+        vendor=vendor,
+        hold_tool_calls=get_evaluator().has_rules(),
+        on_tool_calls=refuse,
+        on_tool_call_started=lambda call, tally: refuse([call], tally),
+        on_end=on_end,
+    )
+    if enforced is not None:
+        return enforced
+    span.finish(status="ok")
+    emit(span.to_event_dict())
+    return result
+
+
+def _run_enforced(vendor: str, original: Any, self_inner: Any, args: Any, kwargs: dict[str, Any]) -> Any:
+    """One patched call: tool policy before and after, budget, span, middleware."""
+    budget = get_budget()
+    ctx = get_context()
+
+    _filter_tools_pre_call(kwargs)
+
+    model = kwargs.get("model", "gpt-4o" if vendor == "openai" else "claude-sonnet-4-6")
+    budget.check_or_raise(_estimate_cost(model, 500, 1000))
+
+    span = ctx.new_span(kind="llm_call", name=f"{vendor}.{model}")
+    # Phase 1 middleware: the chain wraps original(). When the chain is empty
+    # (default / flag-off / no middleware rules) the terminal lambda runs
+    # unchanged. When a middleware mutates ctx (e.g. PII redact), the rebuilt
+    # vendor kwargs flow into the real SDK call via the kwarg<->ctx round-trip.
+    if vendor == "openai":
+        call_ctx = call_context_from_openai_kwargs(kwargs)
+        to_kwargs = openai_kwargs_from_call_context
+    else:
+        call_ctx = call_context_from_anthropic_kwargs(kwargs)
+        to_kwargs = anthropic_kwargs_from_call_context
+    chain: Chain = _runtime_state().middleware_chain
+    try:
+        result = chain.run(call_ctx, terminal=lambda c: original(self_inner, *args, **to_kwargs(c)))
+    except BaseException:
+        # Middleware short-circuited via raise. Emit a deny-decision receipt
+        # iff middleware actually fired, then re-raise unchanged.
+        _emit_receipt_if_fired(call_ctx)
+        raise
+    # Success path: a receipt iff middleware fired (e.g. PII redact).
+    _emit_receipt_if_fired(call_ctx)
+
+    if kwargs.get("stream") is True:
+        return _enforce_streamed(vendor, result, span, model, kwargs)
+
+    usage = getattr(result, "usage", None)
+    if vendor == "openai":
+        input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        output_tokens = getattr(usage, "completion_tokens", 0) or 0
+    else:
+        input_tokens = getattr(usage, "input_tokens", 0) or 0
+        output_tokens = getattr(usage, "output_tokens", 0) or 0
+    actual_model = getattr(result, "model", model) or model
+    # Cost first: a refused response still counts against the budget, the
+    # tokens were spent.
+    _record_usage(span, actual_model, input_tokens, output_tokens)
+    _refuse_blocked(span, _response_tool_calls(vendor, result))
+    span.finish(status="ok")
+    emit(span.to_event_dict())
+    return result
+
+
+# ---------------------------------------------------------------------------
 # OpenAI patching
 # ---------------------------------------------------------------------------
 
@@ -78,8 +281,8 @@ def patch_openai() -> None:
     captured: ``openai.chat.completions.create(...)`` and
     ``OpenAI().chat.completions.create(...)`` both flow through one wrapper.
 
-    We patch the bound method on ``Completions`` (and ``AsyncCompletions``) at
-    the *class* level — every client instance picks the patch up automatically.
+    We patch ``Completions.create`` at the *class* level, so every client
+    instance picks the patch up automatically. The async client is not patched.
     """
     try:
         from openai.resources.chat.completions import Completions
@@ -93,83 +296,7 @@ def patch_openai() -> None:
     _originals["openai"] = (Completions, original)
 
     def patched_create(self_inner: Any, *args: Any, **kwargs: Any) -> Any:
-        budget = get_budget()
-        evaluator = get_evaluator()
-        ctx = get_context()
-
-        tools = kwargs.get("tools")
-        if tools:
-            allowed, blocked = evaluator.filter_tools(tools)
-            if not allowed and blocked:
-                kwargs.pop("tools", None)
-                kwargs.pop("tool_choice", None)
-            elif blocked:
-                kwargs["tools"] = allowed
-
-        model = kwargs.get("model", "gpt-4o")
-        budget.check_or_raise(_estimate_cost(model, 500, 1000))
-
-        span = ctx.new_span(kind="llm_call", name=f"openai.{model}")
-        # Phase 1 middleware: the chain wraps original(). When the chain is
-        # empty (default / flag-off / no middleware rules) the terminal lambda
-        # runs unchanged and behaviour is byte-identical to the pre-Phase-1
-        # path. When a middleware mutates ctx (e.g. PII redact), the rebuilt
-        # vendor kwargs flow into the real SDK call via the kwarg<->ctx
-        # round-trip.
-        call_ctx = call_context_from_openai_kwargs(kwargs)
-        chain: Chain = _runtime_state().middleware_chain
-        try:
-            result = chain.run(
-                call_ctx,
-                terminal=lambda c: original(self_inner, *args, **openai_kwargs_from_call_context(c)),
-            )
-        except BaseException:
-            # Middleware short-circuited via raise. Emit a deny-decision
-            # receipt iff middleware actually fired (we have telemetry to
-            # attribute), then re-raise — user code sees the original
-            # exception unchanged. Task 11 will tighten the catch to
-            # JamJetPolicyBlocked once PII middleware lands.
-            if call_ctx.middleware_fired:
-                try:
-                    receipt = build_llm_receipt(
-                        call_ctx,
-                        matched_rule={"match": call_ctx.middleware_fired[0]},
-                        policy_version="1",
-                    )
-                    emit_receipt(receipt)
-                except Exception:  # noqa: BLE001  receipt emission must never mask the user-facing error
-                    pass
-            raise
-
-        # Success path — emit a receipt iff middleware fired (e.g. PII
-        # redact). Happy passthrough leaves the existing span/event path
-        # unchanged and emits no receipt, preserving audit volume.
-        if call_ctx.middleware_fired:
-            try:
-                receipt = build_llm_receipt(
-                    call_ctx,
-                    matched_rule={"match": call_ctx.middleware_fired[0]},
-                    policy_version="1",
-                )
-                emit_receipt(receipt)
-            except Exception:  # noqa: BLE001  receipt emission must never break the LLM call
-                pass
-
-        usage = getattr(result, "usage", None)
-        input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-        output_tokens = getattr(usage, "completion_tokens", 0) or 0
-        actual_model = getattr(result, "model", model) or model
-        cost = _estimate_cost(actual_model, input_tokens, output_tokens)
-
-        span.model = actual_model
-        span.input_tokens = input_tokens
-        span.output_tokens = output_tokens
-        span.cost_usd = cost
-        span.finish(status="ok")
-
-        budget.record(cost)
-        emit(span.to_event_dict())
-        return result
+        return _run_enforced("openai", original, self_inner, args, kwargs)
 
     Completions.create = patched_create  # type: ignore[assignment,method-assign]
 
@@ -188,83 +315,39 @@ def unpatch_openai() -> None:
 # ---------------------------------------------------------------------------
 
 
-def patch_anthropic() -> None:
-    """Monkey-patch ``anthropic.Anthropic.messages.create`` (sync)."""
+def _anthropic_messages_class() -> Any:
+    """The sync Messages resource class.
+
+    ``anthropic.Anthropic.messages`` is a ``cached_property`` on the client
+    class, so reading it on the class yields the descriptor, not the resource;
+    the class has to come from ``anthropic.resources``.
+    """
     try:
-        import anthropic
+        from anthropic.resources.messages import Messages
     except ImportError:
+        try:
+            from anthropic.resources import Messages  # type: ignore[no-redef,attr-defined,unused-ignore]
+        except ImportError:
+            return None
+    return Messages
+
+
+def patch_anthropic() -> None:
+    """Monkey-patch ``anthropic.Anthropic().messages.create`` (sync)."""
+    messages_cls = _anthropic_messages_class()
+    if messages_cls is None:
         return
 
     if "anthropic" in _originals:
         return
 
-    # anthropic.Anthropic().messages is a Messages resource; we patch the class
-    # method. mypy can't see through the descriptor protocol used by the
-    # anthropic SDK to assign create at the class level, so silence the
-    # attr-defined errors here and at the assignment below.
-    messages_cls = anthropic.Anthropic.messages.__class__
-    original = messages_cls.create  # type: ignore[attr-defined,unused-ignore]
+    original = messages_cls.create
     _originals["anthropic"] = (messages_cls, original)
 
     def patched_create(self_inner: Any, *args: Any, **kwargs: Any) -> Any:
-        budget = get_budget()
-        ctx = get_context()
+        return _run_enforced("anthropic", original, self_inner, args, kwargs)
 
-        model = kwargs.get("model", "claude-sonnet-4-6")
-        budget.check_or_raise(_estimate_cost(model, 500, 1000))
-
-        span = ctx.new_span(kind="llm_call", name=f"anthropic.{model}")
-        # See _patched_create above for the Phase 1 middleware-chain rationale.
-        call_ctx = call_context_from_anthropic_kwargs(kwargs)
-        chain: Chain = _runtime_state().middleware_chain
-        try:
-            result = chain.run(
-                call_ctx,
-                terminal=lambda c: original(self_inner, *args, **anthropic_kwargs_from_call_context(c)),
-            )
-        except BaseException:
-            # Mirror the OpenAI block path — see the rationale comment above.
-            if call_ctx.middleware_fired:
-                try:
-                    receipt = build_llm_receipt(
-                        call_ctx,
-                        matched_rule={"match": call_ctx.middleware_fired[0]},
-                        policy_version="1",
-                    )
-                    emit_receipt(receipt)
-                except Exception:  # noqa: BLE001
-                    pass
-            raise
-
-        if call_ctx.middleware_fired:
-            try:
-                receipt = build_llm_receipt(
-                    call_ctx,
-                    matched_rule={"match": call_ctx.middleware_fired[0]},
-                    policy_version="1",
-                )
-                emit_receipt(receipt)
-            except Exception:  # noqa: BLE001
-                pass
-
-        # Anthropic response has .usage with input_tokens / output_tokens
-        usage = getattr(result, "usage", None)
-        input_tokens = getattr(usage, "input_tokens", 0) or 0
-        output_tokens = getattr(usage, "output_tokens", 0) or 0
-        actual_model = getattr(result, "model", model) or model
-        cost = _estimate_cost(actual_model, input_tokens, output_tokens)
-
-        span.model = actual_model
-        span.input_tokens = input_tokens
-        span.output_tokens = output_tokens
-        span.cost_usd = cost
-        span.finish(status="ok")
-
-        budget.record(cost)
-        emit(span.to_event_dict())
-        return result
-
-    messages_cls.create = patched_create  # type: ignore[attr-defined,unused-ignore]
+    messages_cls.create = patched_create
 
 
 def unpatch_anthropic() -> None:

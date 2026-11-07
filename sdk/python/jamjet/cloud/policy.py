@@ -7,6 +7,34 @@ from typing import Any
 from .models import PolicyDecision
 
 
+def _field(obj: Any, key: str) -> Any:
+    """Read ``key`` from a dict or an SDK object (pydantic model) alike."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def tool_name_of(tool: Any) -> str:
+    """Name of a tool definition, in any shape the patchers see.
+
+    Covers OpenAI function tools ``{"type": "function", "function": {"name"}}``,
+    OpenAI custom tools ``{"type": "custom", "custom": {"name"}}`` and Anthropic
+    tools ``{"name", "input_schema"}`` (client and server tools). Also reads a
+    forced ``tool_choice`` in either vendor's shape. Returns ``""`` when no
+    name is present.
+    """
+    for key in ("function", "custom"):
+        inner = _field(tool, key)
+        if inner is not None:
+            name = _field(inner, "name")
+            if isinstance(name, str):
+                return name
+    name = _field(tool, "name")
+    return name if isinstance(name, str) else ""
+
+
 class PolicyEvaluator:
     """Evaluate tool names against glob-based allow/block/require_approval rules."""
 
@@ -53,16 +81,20 @@ class PolicyEvaluator:
             tool_name=tool_name,
         )
 
-    def filter_tools(self, tools: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Split an OpenAI-format tool list into (allowed, blocked).
+    def has_rules(self) -> bool:
+        """True once any rule has been added."""
+        with self._lock:
+            return bool(self._rules)
 
-        Each tool dict is expected to have a ``function`` key with a ``name`` field.
+    def filter_tools(self, tools: list[Any]) -> tuple[list[Any], list[Any]]:
+        """Split a tool list into (allowed, blocked).
+
+        Accepts OpenAI and Anthropic tool shapes; see :func:`tool_name_of`.
         """
-        allowed: list[dict[str, Any]] = []
-        blocked: list[dict[str, Any]] = []
+        allowed: list[Any] = []
+        blocked: list[Any] = []
         for tool in tools:
-            name = tool.get("function", {}).get("name", "")
-            decision = self.evaluate(name)
+            decision = self.evaluate(tool_name_of(tool))
             if decision.blocked:
                 blocked.append(tool)
             else:

@@ -270,12 +270,21 @@ Open [app.jamjet.dev/dashboard/traces](https://app.jamjet.dev/dashboard/traces) 
 Optional governance primitives:
 
 ```python
-jamjet.policy("block", "payments.*")              # filter tools by name
+jamjet.policy("block", "payments.*")              # strip matching tools, refuse matching tool calls
 jamjet.budget(max_cost_usd=5.00)                   # cap spend; raises BudgetExceeded
 approval = jamjet.require_approval(action="charge_card", context={...})
 @jamjet.trace                                       # decorate any function
 def lookup_customer(...): ...
 ```
+
+Policy and budget apply to the sync `OpenAI().chat.completions.create` and
+`Anthropic().messages.create` calls, OpenAI and Anthropic tool shapes alike.
+Blocked tools are stripped from the request, and a tool call the model returns
+for a blocked tool raises `JamJetPolicyBlocked`. With `stream=True`, text
+streams through as it arrives; once any policy rule is set, chunks from the
+first tool call onward are held until the stream ends and checked before your
+code sees them, and the streamed usage counts toward the budget. Async clients
+and Anthropic's `messages.stream()` helper are not patched.
 
 Install with the LLM SDK you use:
 

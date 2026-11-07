@@ -1,6 +1,7 @@
 import { getActive } from './client.js'
 import type { AgentRef, UserContext } from './context.js'
 import { runEnforcedCall } from './enforcement.js'
+import { asVendorPromise } from './vendor-promise.js'
 
 const WRAPPED = Symbol.for('jamjet.wrapped')
 type WrappedFn<T> = T & { [WRAPPED]?: true }
@@ -31,20 +32,22 @@ function wrapMethod(
   const original = target[key]
   if (typeof original !== 'function' || isWrapped(original)) return
 
-  const wrapped: WrappedFn<typeof original> = async function (this: unknown, ...args: any[]) {
+  const wrapped: WrappedFn<typeof original> = function (this: unknown, ...args: any[]) {
     const client = getActive()
     if (!client) {
       // No client → behave as pass-through (Plan 1 contract)
       return original.call(this, ...args)
     }
-    return runEnforcedCall({
+    let raw: unknown
+    const enforced = runEnforcedCall({
       client,
       vendor,
       // Pre-bind `original` to `this` so runEnforcedCall can apply(null, ...) safely
-      original: (...a: any[]) => original.call(this, ...a),
+      original: (...a: any[]) => (raw = original.call(this, ...a)),
       args,
       ...(opts ? { override: opts } : {}),
     })
+    return asVendorPromise(enforced, () => raw)
   } as WrappedFn<typeof original>
 
   ;(wrapped as WrappedFn<typeof original>)[WRAPPED] = true
