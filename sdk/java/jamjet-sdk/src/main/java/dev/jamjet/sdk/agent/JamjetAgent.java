@@ -1,4 +1,4 @@
-package dev.jamjet.agent;
+package dev.jamjet.sdk.agent;
 
 import java.lang.reflect.Proxy;
 
@@ -14,7 +14,12 @@ import java.lang.reflect.Proxy;
  *
  * String result = JamjetAgent.run(ResearchTask.class, "Summarize JamJet");
  * }</pre>
+ *
+ * @deprecated runs the agent in-process through {@link Agent#run(String)}, with no policy,
+ *     approval, budget or audit. Use {@code dev.jamjet.agent.Agent} from
+ *     {@code dev.jamjet:jamjet-agent}.
  */
+@Deprecated(since = "0.6.0")
 public final class JamjetAgent {
 
     private JamjetAgent() {}

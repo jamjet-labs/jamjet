@@ -296,7 +296,7 @@ class IrValidatorTest {
 
     @Test
     void agentCompiledIrPassesValidation() {
-        var agent = dev.jamjet.agent.Agent.builder("validator-test")
+        var agent = dev.jamjet.sdk.agent.Agent.builder("validator-test")
                 .model("gpt-4o")
                 .strategy("react")
                 .maxIterations(3)
@@ -308,7 +308,7 @@ class IrValidatorTest {
 
     @Test
     void criticAgentIrPassesValidation() {
-        var agent = dev.jamjet.agent.Agent.builder("critic-test")
+        var agent = dev.jamjet.sdk.agent.Agent.builder("critic-test")
                 .model("gpt-4o")
                 .strategy("critic")
                 .maxIterations(5)
@@ -320,7 +320,7 @@ class IrValidatorTest {
 
     @Test
     void planAndExecuteIrPassesValidation() {
-        var agent = dev.jamjet.agent.Agent.builder("plan-test")
+        var agent = dev.jamjet.sdk.agent.Agent.builder("plan-test")
                 .model("gpt-4o")
                 .strategy("plan-and-execute")
                 .maxIterations(5)

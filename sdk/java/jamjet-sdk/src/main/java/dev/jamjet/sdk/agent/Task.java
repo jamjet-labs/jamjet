@@ -1,4 +1,4 @@
-package dev.jamjet.agent;
+package dev.jamjet.sdk.agent;
 
 import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;
@@ -24,9 +24,12 @@ import java.lang.annotation.Target;
  *
  * var result = JamjetAgent.run(ResearchTask.class, "What is JamJet?");
  * }</pre>
+ *
+ * @deprecated only used by {@link JamjetAgent}, which runs ungoverned.
  */
 @Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)
+@Deprecated(since = "0.6.0")
 public @interface Task {
 
     /** LLM model reference. */

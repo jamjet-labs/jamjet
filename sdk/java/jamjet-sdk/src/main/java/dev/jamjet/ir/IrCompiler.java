@@ -1,6 +1,6 @@
 package dev.jamjet.ir;
 
-import dev.jamjet.agent.Agent;
+import dev.jamjet.sdk.agent.Agent;
 import dev.jamjet.workflow.Workflow;
 
 import java.util.ArrayList;
