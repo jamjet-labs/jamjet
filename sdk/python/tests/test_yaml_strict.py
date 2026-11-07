@@ -11,6 +11,7 @@ import warnings
 from pathlib import Path
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from jamjet.cli.main import app
@@ -113,16 +114,60 @@ def test_a_node_list_is_rejected() -> None:
         irc.compile_yaml(HEADER + "nodes:\n  - id: a\n    type: model\n")
 
 
-def test_an_unknown_node_key_is_an_error() -> None:
+def _compile_warning_messages(source: str) -> tuple[dict, list[str]]:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ir = irc.compile_yaml(source)
+    return ir, [str(w.message) for w in caught if issubclass(w.category, irc.WorkflowSchemaWarning)]
+
+
+def test_an_unknown_node_key_is_dropped_with_a_warning_that_says_what_to_use() -> None:
     source = HEADER + "nodes:\n  a:\n    type: model\n    model: m\n    output_key: answer\n"
-    with pytest.raises(ValueError, match="node 'a' \\(model\\): unknown key\\(s\\) output_key"):
-        irc.compile_yaml(source)
+    ir, messages = _compile_warning_messages(source)
+    assert "output_key" not in ir["nodes"]["a"]["kind"]
+    assert any("'output_key' is ignored" in m and "state.last_model_output" in m for m in messages), messages
 
 
-def test_a_key_of_another_node_type_is_an_error() -> None:
-    # `server` belongs to mcp_tool; on a tool node it used to be dropped.
-    source = HEADER + "nodes:\n  a:\n    type: tool\n    server: github\n    tool: search\n"
-    with pytest.raises(ValueError, match="server, tool"):
+def test_spellings_with_a_real_ir_target_are_mapped() -> None:
+    source = (
+        HEADER + "nodes:\n"
+        "  a:\n    type: model\n    model: m\n    label: First\n    system: be brief\n"
+        "    temperature: 0.2\n    max_tokens: 300\n    next: b\n"
+        "  b:\n    type: tool\n    server: github\n    tool: search\n    arguments: {q: '{{ state.q }}'}\n"
+        "    next: c\n"
+        "  c:\n    type: a2a_task\n    agent_url: https://agent.example\n    skill: s\n    timeout_seconds: 30\n"
+        "    next: d\n"
+        "  d:\n    type: human_approval\n    message: approve?\n    next: e\n"
+        "  e:\n    type: condition\n    branches:\n      - condition: state.x == 1\n        next: a\n"
+        "    default: end\n"
+    )
+    ir, _ = _compile_warning_messages(source)
+    nodes = ir["nodes"]
+    assert nodes["a"]["description"] == "First"
+    assert nodes["a"]["kind"]["system_prompt"] == "be brief"
+    assert ir["models"][nodes["a"]["kind"]["model_ref"]] == {
+        "provider": "",
+        "model": "m",
+        "temperature": 0.2,
+        "max_tokens": 300,
+    }
+    assert nodes["b"]["kind"] == {
+        "type": "mcp_tool",
+        "server": "github",
+        "tool": "search",
+        "input_mapping": {"q": "{{ state.q }}"},
+        "output_schema": "",
+    }
+    assert nodes["c"]["kind"]["remote_agent"] == "c"
+    assert ir["remote_agents"]["c"] == {"url": "https://agent.example"}
+    assert nodes["c"]["kind"]["timeout_secs"] == 30
+    assert nodes["d"]["kind"]["description"] == "approve?"
+    assert nodes["e"]["kind"]["branches"][0] == {"condition": "state.x == 1", "target": "a"}
+
+
+def test_an_alias_and_its_name_together_are_an_error() -> None:
+    source = HEADER + "nodes:\n  a:\n    type: model\n    model: m\n    system: x\n    system_prompt: y\n"
+    with pytest.raises(ValueError, match="both system and system_prompt"):
         irc.compile_yaml(source)
 
 
@@ -131,22 +176,134 @@ def test_an_unknown_node_type_is_an_error() -> None:
         irc.compile_yaml(HEADER + "nodes:\n  a:\n    type: wait\n    next: end\n")
 
 
-def test_an_unknown_condition_key_is_an_error() -> None:
-    source = HEADER + "nodes:\n  a:\n    type: condition\n    conditions:\n      - condition: x\n        next: end\n"
-    with pytest.raises(ValueError, match=r"conditions\[0\] has unknown key\(s\) condition"):
+def test_limit_exceeded_is_a_node_type() -> None:
+    ir = _compile_quietly(
+        HEADER + "nodes:\n  a:\n    type: model\n    model: m\n    next: stop\n  stop:\n    type: limit_exceeded\n"
+    )
+    assert ir["nodes"]["stop"]["kind"] == {"type": "limit_exceeded"}
+
+
+def test_agent_ref_on_a_non_agent_node_points_at_acts_for() -> None:
+    source = HEADER + "nodes:\n  a:\n    type: model\n    model: m\n    agent_ref: jamjet://x\n"
+    with pytest.raises(ValueError, match="use acts_for"):
         irc.compile_yaml(source)
 
 
-def test_an_unknown_next_entry_key_is_an_error() -> None:
-    source = HEADER + "nodes:\n  a:\n    type: model\n    model: m\n    next:\n      - else: end\n"
-    with pytest.raises(ValueError, match=r"next\[0\] has unknown key\(s\) else"):
-        irc.compile_yaml(source)
+def test_an_unknown_condition_key_warns() -> None:
+    source = HEADER + "nodes:\n  a:\n    type: condition\n    conditions:\n      - unless: x\n        next: end\n"
+    _, messages = _compile_warning_messages(source)
+    assert any("conditions[0]" in m and "unless" in m for m in messages), messages
+
+
+def test_else_in_next_is_the_unconditional_edge() -> None:
+    nodes = (
+        "nodes:\n  a:\n    type: model\n    model: m\n    next:\n"
+        "      - when: state.x\n        to: b\n      - else: c\n"
+        "  b: {type: model, model: m}\n  c: {type: model, model: m}\n"
+    )
+    source = HEADER + nodes
+    ir = _compile_quietly(source)
+    assert {"from": "a", "to": "c", "condition": None} in ir["edges"]
 
 
 def test_an_unknown_policy_key_is_an_error() -> None:
     source = HEADER + "nodes:\n  a:\n    type: model\n    model: m\n    policy:\n      block_tools: [x]\n"
     with pytest.raises(ValueError, match="block_tools"):
         irc.compile_yaml(source)
+
+
+# ── governance is never dropped ──────────────────────────────────────────────
+
+ONE_NODE = "nodes:\n  a:\n    type: model\n    model: m\n  over:\n    type: model\n    model: m\n"
+
+
+def test_policy_under_the_workflow_header_reaches_the_ir() -> None:
+    ir = _compile_quietly("workflow:\n  id: w\n  policy: {blocked_tools: [transfer_funds]}\n" + ONE_NODE)
+    assert ir["policy"]["blocked_tools"] == ["transfer_funds"]
+
+
+@pytest.mark.parametrize("place", ["top", "header"])
+def test_budgets_and_data_policy_reach_the_ir_from_either_place(place: str) -> None:
+    block = (
+        "cost_budget_usd: 2.5\n"
+        "token_budget: {total_tokens: 1000}\n"
+        "on_budget_exceeded: over\n"
+        "data_policy: {pii_fields: [ssn], retention_days: 30}\n"
+        "continue_as_new: true\n"
+    )
+    if place == "top":
+        source = "workflow:\n  id: w\n" + block + ONE_NODE
+    else:
+        source = "workflow:\n  id: w\n" + "".join(f"  {line}\n" for line in block.splitlines()) + ONE_NODE
+    ir = _compile_quietly(source)
+    assert ir["cost_budget_usd"] == 2.5
+    assert ir["token_budget"] == {"total_tokens": 1000}
+    assert ir["on_budget_exceeded"] == "over"
+    assert ir["data_policy"] == {"pii_fields": ["ssn"], "retention_days": 30}
+    assert ir["continue_as_new"] is True
+
+
+def test_governance_set_in_two_places_is_an_error() -> None:
+    source = "workflow:\n  id: w\n  policy: {blocked_tools: [a]}\npolicy: {blocked_tools: [b]}\n" + ONE_NODE
+    with pytest.raises(ValueError, match="policy is set in the top level and the workflow: header"):
+        irc.compile_yaml(source)
+
+
+@pytest.mark.parametrize(
+    ("block", "match"),
+    [
+        ("cost_budget_usd: -1\n", "cost_budget_usd must be a positive number"),
+        ("token_budget: {tokens: 5}\n", "Unknown key\\(s\\) in token_budget"),
+        ("on_budget_exceeded: [over]\n", "on_budget_exceeded must name a node"),
+        ("data_policy: {pii: true}\n", "Unknown key\\(s\\) in data_policy"),
+    ],
+)
+def test_malformed_governance_is_an_error(block: str, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        irc.compile_yaml("workflow:\n  id: w\n" + block + ONE_NODE)
+
+
+def test_an_on_budget_exceeded_action_that_is_not_a_node_warns_and_the_budget_stays() -> None:
+    source = "workflow:\n  id: w\n  cost_budget_usd: 1\n  on_budget_exceeded: pause\n" + ONE_NODE
+    ir, messages = _compile_warning_messages(source)
+    assert ir["cost_budget_usd"] == 1.0
+    assert "on_budget_exceeded" not in ir
+    assert any("'pause' does not name a node" in m for m in messages), messages
+
+
+def test_node_data_policy_reaches_the_ir() -> None:
+    source = HEADER + "nodes:\n  a:\n    type: model\n    model: m\n    data_policy: {pii_detectors: [email]}\n"
+    assert _compile_quietly(source)["nodes"]["a"]["data_policy"] == {"pii_detectors": ["email"]}
+
+
+def test_agent_first_governance_reaches_the_ir() -> None:
+    ir = _compile_quietly(AGENT + "  policy: {blocked_tools: [rm]}\n  cost_budget_usd: 1.5\n")
+    assert ir["policy"]["blocked_tools"] == ["rm"]
+    assert ir["cost_budget_usd"] == 1.5
+
+
+def test_fleet_units_keep_their_governance() -> None:
+    from jamjet.workflow.bundle import compile_bundle
+
+    data = yaml.safe_load(
+        "workflows:\n"
+        "  pay:\n"
+        "    policy: {blocked_tools: [transfer_funds]}\n"
+        "    cost_budget_usd: 3\n"
+        "    nodes:\n"
+        "      a: {type: model, model: m}\n"
+        "agents:\n"
+        "  helper:\n"
+        "    strategy: react\n"
+        "    goal: g\n"
+        "    model: m\n"
+        "    limits: {max_iterations: 2, max_cost_usd: 0.1, timeout_seconds: 10}\n"
+        "    policy: {blocked_tools: [rm]}\n"
+    )
+    irs = {ir["workflow_id"]: ir for ir in compile_bundle(data).workflows}
+    assert irs["pay"]["policy"]["blocked_tools"] == ["transfer_funds"]
+    assert irs["pay"]["cost_budget_usd"] == 3.0
+    assert irs["helper"]["policy"]["blocked_tools"] == ["rm"]
 
 
 def test_unknown_top_level_and_header_keys_warn_but_compile() -> None:
@@ -188,6 +345,66 @@ def test_every_template_renders_and_compiles_cleanly(template: str) -> None:
         if name == "workflow.yaml":
             ir = _compile_quietly(content)
             assert ir["nodes"], f"{template}/{name} compiled to zero nodes"
+
+
+def state_reads_nothing_writes(source: str) -> list[str]:
+    """Template expressions in a graph workflow the engine could not fill.
+
+    The engine renders only `{{ state.<path> }}` (no filters, `{% %}` or
+    `{# #}`), and a model node writes only state.last_model_output, so a prompt
+    may read the declared inputs and that key, nothing else.
+    """
+    import re
+
+    doc = yaml.safe_load(source)
+    schema = (doc.get("workflow") or {}).get("state_schema") or {}
+    if isinstance(schema, dict) and isinstance(schema.get("properties"), dict):
+        schema = schema["properties"]
+    readable = set(schema) | {"last_model_output"}
+    problems = [f"block tag {m}" for m in re.findall(r"\{[%#].*?[%#]\}", source)]
+    for expr in re.findall(r"\{\{(.*?)\}\}", source):
+        expr = expr.strip()
+        match = re.fullmatch(r"state\.([A-Za-z_][\w]*)(?:\.[\w.]+)?", expr)
+        if not match:
+            problems.append(f"expression {{{{ {expr} }}}} is not a plain state.<path>")
+        elif match.group(1) not in readable:
+            problems.append(f"{{{{ {expr} }}}} reads a key nothing writes")
+    return problems
+
+
+@pytest.mark.parametrize("template", AVAILABLE_TEMPLATES)
+def test_template_prompts_read_only_what_the_engine_writes(template: str) -> None:
+    content = render_template(template, "demo").get("workflow.yaml")
+    if content is None:
+        pytest.skip("no workflow.yaml")
+    assert state_reads_nothing_writes(content) == []
+
+
+@pytest.mark.parametrize("template", AVAILABLE_TEMPLATES)
+def test_no_template_auto_approves_or_branches_on_rejection(template: str) -> None:
+    content = render_template(template, "demo").get("workflow.yaml") or ""
+    doc = yaml.safe_load(content) or {}
+    nodes = doc.get("nodes") or {}
+    for node_id, node in nodes.items():
+        if node.get("type") == "human_approval" and node.get("fallback"):
+            target = nodes.get(node["fallback"], {})
+            # Expiry must go to another person, never straight on as if approved.
+            assert target.get("type") == "human_approval", f"{template}: {node_id} falls back to {node['fallback']}"
+    assert "approved == false" not in content and "approved == true" not in content
+
+
+def test_held_back_templates_are_refused_with_the_reason(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from jamjet.templates import HELD_BACK_TEMPLATES
+
+    monkeypatch.chdir(tmp_path)
+    for template in sorted(HELD_BACK_TEMPLATES):
+        result = runner.invoke(app, ["init", f"p-{template}", "--template", template])
+        assert result.exit_code == 1, template
+        assert "not available in this release" in result.output
+        assert not (tmp_path / f"p-{template}").exists()
+    listing = runner.invoke(app, ["init", "--list-templates"])
+    assert "Not available in this release" in listing.output
+    assert "research-agent" in listing.output
 
 
 # ── jamjet validate ──────────────────────────────────────────────────────────

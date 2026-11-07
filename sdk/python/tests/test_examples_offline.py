@@ -71,10 +71,30 @@ ELSEWHERE = {
     "02-human-approval": "run against expected output in test_examples_run.py",
     "03-budget-cap": "run against expected output in test_examples_run.py",
     "04-mcp-tool-policy": "run against expected output in test_examples_run.py",
-    "loan-underwriter-agent": "Java (Maven), not part of the Python suite",
-    "support-agent-showcase": "Next.js app, not part of the Python suite",
     "trajectory-eval": "an evalset with no code; see test_trajectory_eval_fixture.py",
 }
+
+# What makes a directory a Python-suite example: Python code anywhere, or a
+# JamJet definition or dataset at its top. A directory with example files but
+# neither (a Java or TypeScript app, even one with an application.yml) belongs
+# to another suite.
+_PYTHON_SUITE_SUFFIXES = {".py"}
+_PYTHON_SUITE_TOP_LEVEL_SUFFIXES = {".yaml", ".yml", ".jsonl"}
+_EXAMPLE_FILE_SUFFIXES = {
+    ".py",
+    ".yaml",
+    ".yml",
+    ".jsonl",
+    ".java",
+    ".kt",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".json",
+    ".xml",
+    ".sh",
+}
+_SKIP_PARTS = {"node_modules", "__pycache__", "target", "build", "dist"}
 
 
 def _offline_env() -> dict[str, str]:
@@ -82,22 +102,49 @@ def _offline_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY") and k != "JAMJET_TOKEN"}
 
 
-def _example_dirs() -> set[str]:
-    return {p.name for p in EXAMPLES_DIR.iterdir() if p.is_dir() and not p.name.startswith((".", "_"))}
+def _example_files(directory: Path) -> list[Path]:
+    return [
+        p
+        for p in directory.rglob("*")
+        if p.is_file()
+        and p.suffix in _EXAMPLE_FILE_SUFFIXES
+        and not any(part in _SKIP_PARTS or part.startswith(".") for part in p.relative_to(directory).parts)
+    ]
+
+
+def _example_dirs() -> dict[str, list[Path]]:
+    """Example directories (not hidden, not caches) that hold example files."""
+    out = {}
+    for p in EXAMPLES_DIR.iterdir():
+        if p.is_dir() and not p.name.startswith((".", "_")):
+            files = _example_files(p)
+            if files:
+                out[p.name] = files
+    return out
+
+
+def _python_suite_examples() -> set[str]:
+    def is_python(name: str, files: list[Path]) -> bool:
+        top = EXAMPLES_DIR / name
+        return any(
+            f.suffix in _PYTHON_SUITE_SUFFIXES or (f.parent == top and f.suffix in _PYTHON_SUITE_TOP_LEVEL_SUFFIXES)
+            for f in files
+        )
+
+    return {name for name, files in _example_dirs().items() if is_python(name, files)}
 
 
 def test_every_example_is_accounted_for() -> None:
-    dirs = _example_dirs()
+    dirs = _python_suite_examples()
     covered = set(OFFLINE_RUN) | set(VALIDATE) | set(IMPORT_ONLY) | set(ELSEWHERE)
-    assert not dirs - covered, f"examples with no test: {sorted(dirs - covered)}"
+    assert not dirs - covered, f"Python examples with no test: {sorted(dirs - covered)}"
     assert not covered - dirs, f"tests for examples that do not exist: {sorted(covered - dirs)}"
 
 
 def test_readme_example_count_matches() -> None:
     readme = EXAMPLES_DIR.parent / "README.md"
     match = re.search(r"All (\d+) examples", readme.read_text())
-    if match is None:
-        pytest.skip("README no longer states an example count")
+    assert match, "README.md no longer says 'All N examples'; update this test with it"
     assert int(match.group(1)) == len(_example_dirs())
 
 
@@ -160,3 +207,14 @@ def test_model_example_imports_and_compiles(example: str) -> None:
         env=_offline_env(),
     )
     assert proc.returncode == 0, f"{example} exit={proc.returncode}\n{proc.stderr[-4000:]}"
+
+
+# Graph workflows (not strategy agents, whose prompts the strategy compiler writes).
+GRAPH_YAML = sorted(name for name, file in VALIDATE.items() if file == "workflow.yaml")
+
+
+@pytest.mark.parametrize("example", GRAPH_YAML)
+def test_graph_example_prompts_read_only_what_the_engine_writes(example: str) -> None:
+    from tests.test_yaml_strict import state_reads_nothing_writes
+
+    assert state_reads_nothing_writes((EXAMPLES_DIR / example / VALIDATE[example]).read_text()) == []

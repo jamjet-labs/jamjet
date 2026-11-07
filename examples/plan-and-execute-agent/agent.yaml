@@ -18,13 +18,11 @@
 # Check the definition (no runtime needed):
 #   jamjet validate agent.yaml
 #
-# Run:
-#   jamjet dev
-#   jamjet run agent.yaml \
-#     --input '{"task": "Write a blog post about the history of programming languages"}'
-#
-# Inspect the generated plan:
-#   jamjet inspect <exec_id>    # shows plan steps, cost per step, iteration count
+# Running it:
+#   In this release a model node writes its output only to
+#   state.last_model_output, while this strategy's later steps read their own
+#   per-step keys, so a run stops at the first step that reads one. Use this
+#   file with `jamjet validate`.
 
 agent:
   id: plan_execute_writer
@@ -41,7 +39,7 @@ agent:
   goal: |
     Complete the following writing task step by step:
 
-    {{ task }}
+    {{ state.task }}
 
     First, produce a numbered outline. Then write each section.
     Finally, assemble and polish the full piece.

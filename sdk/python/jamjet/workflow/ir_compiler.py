@@ -36,29 +36,44 @@ if TYPE_CHECKING:
 class WorkflowSchemaWarning(UserWarning):
     """A workflow document has a key the compiler does not read.
 
-    Raised as a warning for keys outside node and policy definitions (top-level
-    and ``workflow:`` header keys, ``agent:`` block keys). Inside a node or a
-    policy, an unknown key is an error instead: there it almost always means a
-    misspelled or unsupported setting that would silently do nothing.
+    The key is dropped from the compiled IR. Structural problems (no nodes,
+    ``nodes:`` nested under ``workflow:`` or written as a list, an unknown node
+    type) and malformed governance blocks are errors instead.
     """
 
 
 # The keys the graph compiler reads, so the ones it does not can be reported
-# instead of dropped. Keep these in step with _compile_graph_yaml and
-# _yaml_node_to_kind: a key read there but missing here is rejected.
+# instead of dropped without a word. Keep these in step with
+# _compile_graph_yaml and _yaml_node_to_kind.
+#
+# Governance settings the runtime enforces. They may sit at the top level of
+# the document or in the `workflow:` header, but not both.
+_GOVERNANCE_KEYS = ("policy", "cost_budget_usd", "token_budget", "on_budget_exceeded", "data_policy", "continue_as_new")
 _GRAPH_TOP_LEVEL_KEYS = frozenset(
-    {"workflow", "nodes", "policy", "retry_policies", "timeouts", "models", "tools", "mcp", "a2a"}
+    {
+        "workflow",
+        "nodes",
+        "retry_policies",
+        "timeouts",
+        "models",
+        "tools",
+        "mcp",
+        "a2a",
+        "id",
+        "version",
+        *_GOVERNANCE_KEYS,
+    }
 )
 _WORKFLOW_HEADER_KEYS = frozenset(
-    {"id", "version", "name", "description", "state_schema", "start", "labels", "agent_ref"}
+    {"id", "version", "name", "description", "state_schema", "start", "labels", "agent_ref", *_GOVERNANCE_KEYS}
 )
 # Every node may carry these, whatever its type.
 _NODE_COMMON_KEYS = frozenset(
-    {"type", "description", "labels", "policy", "retry_policy", "timeout", "acts_for", "next"}
+    {"type", "description", "labels", "policy", "data_policy", "retry_policy", "timeout", "acts_for", "next"}
 )
 # What each node type reads on top of the common keys.
 _NODE_TYPE_KEYS: dict[str, frozenset[str]] = {
-    "model": frozenset({"model", "prompt", "output_schema", "system_prompt"}),
+    "model": frozenset({"model", "prompt", "output_schema", "system_prompt", "temperature", "max_tokens"}),
     "tool": frozenset({"tool_ref", "input", "output_schema"}),
     "mcp_tool": frozenset({"server", "tool", "input", "output_schema"}),
     "a2a_task": frozenset({"remote_agent", "skill", "input", "output_schema", "stream", "on_input_required"}),
@@ -67,11 +82,12 @@ _NODE_TYPE_KEYS: dict[str, frozenset[str]] = {
     "condition": frozenset({"conditions", "default"}),
     "branch": frozenset({"conditions", "default"}),
     "eval": frozenset({"scorers", "on_fail", "max_retries", "input_expr"}),
+    "limit_exceeded": frozenset(),
     "end": frozenset(),
 }
 _CONDITION_ENTRY_KEYS = frozenset({"if", "when", "next", "to"})
 _NEXT_ENTRY_KEYS = frozenset({"to", "when"})
-_AGENT_TOP_LEVEL_KEYS = frozenset({"agent"})
+_AGENT_TOP_LEVEL_KEYS = frozenset({"agent", *_GOVERNANCE_KEYS})
 _AGENT_KEYS = frozenset(
     {
         "id",
@@ -85,56 +101,224 @@ _AGENT_KEYS = frozenset(
         "limits",
         "state_schema",
         "agent_ref",
+        *_GOVERNANCE_KEYS,
     }
 )
+
+# What to use instead of a node key the compiler does not read.
+_IGNORED_NODE_KEY_HINTS = {
+    "output_key": "a model node's output is written to state.last_model_output",
+    "retry": "name a policy with retry_policy: io_default, llm_default or no_retry",
+    "oauth_scopes": "OAuth scopes are not part of the workflow IR",
+    "prompt_template": "use prompt",
+    "kind": "use type",
+    "config": "put the settings on the node itself",
+}
+_TOKEN_BUDGET_KEYS = frozenset({"input_tokens", "output_tokens", "total_tokens"})
+_DATA_POLICY_KEYS = frozenset(
+    {"pii_fields", "pii_detectors", "redaction_mode", "retain_prompts", "retain_outputs", "retention_days"}
+)
+
+
+def _warn(message: str) -> None:
+    warnings.warn(message, WorkflowSchemaWarning, stacklevel=4)
 
 
 def _warn_unknown_keys(found: Any, known: frozenset[str], *, location: str) -> None:
     unknown = sorted(str(k) for k in set(found) - known)
     if unknown:
-        warnings.warn(
-            f"{location}: unknown key(s) {', '.join(unknown)} are ignored. Known keys: {', '.join(sorted(known))}",
-            WorkflowSchemaWarning,
-            stacklevel=3,
-        )
+        _warn(f"{location}: unknown key(s) {', '.join(unknown)} are ignored. Known keys: {', '.join(sorted(known))}")
 
 
-def _check_node(node_id: str, node_data: Any) -> str:
-    """Raise ``ValueError`` for a node the compiler would misread; return its type."""
-    if not isinstance(node_data, dict):
-        raise ValueError(f"node '{node_id}' must be a mapping of settings, got {type(node_data).__name__}")
-    node_type = node_data.get("type", "tool")
-    if node_type not in _NODE_TYPE_KEYS:
+def _rename(node_id: str, data: dict[str, Any], old: str, new: str) -> None:
+    """Read ``old`` as ``new``; both set is ambiguous and an error."""
+    if old not in data:
+        return
+    if new in data and data[new] != data[old]:
+        raise ValueError(f"node '{node_id}': both {old} and {new} are set; keep {new}")
+    data.setdefault(new, data[old])
+    del data[old]
+
+
+def _normalize_node(node_id: str, raw: Any, extras: dict[str, dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    """Check one node and map the spellings that have a real IR target.
+
+    Returns ``(type, node)``; ``node`` is a copy with aliases resolved and the
+    keys the compiler does not read removed (each reported with a warning).
+    ``extras`` collects the ``models`` and ``remote_agents`` entries a node's
+    settings need. Raises ``ValueError`` for a node that is not a mapping, an
+    unknown type, or `agent_ref` on a node that is not an `agent` node.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f"node '{node_id}' must be a mapping of settings, got {type(raw).__name__}")
+    data = dict(raw)
+    node_type = data.get("type", "tool")
+    if not isinstance(node_type, str) or node_type not in _NODE_TYPE_KEYS:
         raise ValueError(
             f"node '{node_id}': unknown type {node_type!r}. Supported types: {', '.join(sorted(_NODE_TYPE_KEYS))}"
         )
-    known = _NODE_COMMON_KEYS | _NODE_TYPE_KEYS[node_type]
-    unknown = sorted(str(k) for k in set(node_data) - known)
-    if unknown:
+    # `acts_for`, not `agent_ref`: on a node, `agent_ref` names the agent an
+    # `agent` node calls.
+    if node_type != "agent" and "agent_ref" in data:
         raise ValueError(
-            f"node '{node_id}' ({node_type}): unknown key(s) {', '.join(unknown)}. "
-            f"Allowed keys for {node_type}: {', '.join(sorted(known))}"
+            f"node '{node_id}': agent_ref names the agent an `agent` node calls; "
+            "to say which agent this node acts for, use acts_for"
         )
-    for i, cond in enumerate(node_data.get("conditions") or []):
-        if not isinstance(cond, dict):
-            raise ValueError(f"node '{node_id}': conditions[{i}] must be a mapping")
-        bad = sorted(str(k) for k in set(cond) - _CONDITION_ENTRY_KEYS)
-        if bad:
-            raise ValueError(
-                f"node '{node_id}': conditions[{i}] has unknown key(s) {', '.join(bad)}. "
-                f"Allowed: {', '.join(sorted(_CONDITION_ENTRY_KEYS))}"
-            )
-    next_val = node_data.get("next")
+
+    _rename(node_id, data, "label", "description")
+    if node_type == "model":
+        _rename(node_id, data, "system", "system_prompt")
+    if node_type == "human_approval":
+        _rename(node_id, data, "message", "description")
+    if node_type in ("tool", "mcp_tool"):
+        _rename(node_id, data, "arguments", "input")
+    if node_type == "tool" and "server" in data:
+        # An MCP call written as a tool node: the IR has a node kind for it.
+        _warn(f"node '{node_id}': a tool node with server: is compiled as type: mcp_tool; write type: mcp_tool")
+        node_type = "mcp_tool"
+        data["type"] = "mcp_tool"
+    if node_type == "a2a_task":
+        _rename(node_id, data, "timeout_seconds", "timeout")
+        for url_key in ("agent_url", "agent_uri"):
+            if url_key in data:
+                if "remote_agent" in data:
+                    raise ValueError(f"node '{node_id}': both {url_key} and remote_agent are set; keep one")
+                # A URL on the node becomes a remote agent of the same name.
+                extras["remote_agents"][node_id] = {"url": data.pop(url_key)}
+                data["remote_agent"] = node_id
+    if node_type in ("condition", "branch") and "branches" in data:
+        if "conditions" in data:
+            raise ValueError(f"node '{node_id}': both branches and conditions are set; keep conditions")
+        branches = data.pop("branches")
+        if not isinstance(branches, list):
+            raise ValueError(f"node '{node_id}': branches must be a list")
+        data["conditions"] = [
+            {("if" if k == "condition" else k): v for k, v in b.items()} if isinstance(b, dict) else b for b in branches
+        ]
+
+    known = _NODE_COMMON_KEYS | _NODE_TYPE_KEYS[node_type]
+    for key in sorted(str(k) for k in set(data) - known):
+        hint = _IGNORED_NODE_KEY_HINTS.get(key)
+        _warn(
+            f"node '{node_id}' ({node_type}): key '{key}' is ignored"
+            + (f"; {hint}" if hint else f". Keys {node_type} reads: {', '.join(sorted(known))}")
+            + ". It will be an error in a future release."
+        )
+        del data[key]
+
+    conditions = data.get("conditions")
+    if conditions is not None:
+        if not isinstance(conditions, list):
+            raise ValueError(f"node '{node_id}': conditions must be a list")
+        for i, cond in enumerate(conditions):
+            if not isinstance(cond, dict):
+                raise ValueError(f"node '{node_id}': conditions[{i}] must be a mapping")
+            _warn_unknown_keys(cond, _CONDITION_ENTRY_KEYS, location=f"node '{node_id}' conditions[{i}]")
+
+    next_val = data.get("next")
     if isinstance(next_val, list):
+        entries = []
         for i, edge in enumerate(next_val):
             if isinstance(edge, dict):
-                bad = sorted(str(k) for k in set(edge) - _NEXT_ENTRY_KEYS)
-                if bad:
-                    raise ValueError(
-                        f"node '{node_id}': next[{i}] has unknown key(s) {', '.join(bad)}. "
-                        f"Allowed: {', '.join(sorted(_NEXT_ENTRY_KEYS))}"
-                    )
-    return node_type
+                edge = dict(edge)
+                if "else" in edge:
+                    # `else: X` is the unconditional edge.
+                    if "to" in edge:
+                        raise ValueError(f"node '{node_id}': next[{i}] sets both else and to")
+                    edge["to"] = edge.pop("else")
+                for old, new in (("condition", "when"), ("if", "when"), ("next", "to")):
+                    if old in edge and new not in edge:
+                        edge[new] = edge.pop(old)
+                _warn_unknown_keys(edge, _NEXT_ENTRY_KEYS, location=f"node '{node_id}' next[{i}]")
+            entries.append(edge)
+        data["next"] = entries
+
+    if node_type == "model" and ("temperature" in data or "max_tokens" in data):
+        # Sampling settings live on a model config in the IR, so this node gets
+        # its own entry, named after it.
+        extras["models"][node_id] = {
+            "model": data.get("model", "default_chat"),
+            "temperature": data.pop("temperature", None),
+            "max_tokens": data.pop("max_tokens", None),
+        }
+    return node_type, data
+
+
+def _governance_value(sources: list[tuple[str, dict[str, Any]]], key: str) -> Any:
+    """``key`` from the one place it is set, or None. Set in two places is an error."""
+    found = [(where, block[key]) for where, block in sources if isinstance(block, dict) and key in block]
+    if len(found) > 1:
+        places = " and ".join(where for where, _ in found)
+        raise ValueError(f"{key} is set in {places}; set it in one place")
+    return found[0][1] if found else None
+
+
+def _compile_token_budget(raw: Any) -> dict[str, int]:
+    if not isinstance(raw, dict):
+        raise ValueError(f"token_budget must be a mapping of {', '.join(sorted(_TOKEN_BUDGET_KEYS))}")
+    unknown = sorted(set(raw) - _TOKEN_BUDGET_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown key(s) in token_budget: {', '.join(unknown)}. Allowed: {', '.join(sorted(_TOKEN_BUDGET_KEYS))}"
+        )
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"token_budget.{key} must be a positive whole number, got {value!r}")
+        out[key] = value
+    return out
+
+
+def _compile_data_policy(raw: Any, *, location: str) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"data_policy at {location} must be a mapping, got {type(raw).__name__}")
+    unknown = sorted(set(raw) - _DATA_POLICY_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown key(s) in data_policy at {location}: {', '.join(unknown)}. "
+            f"Allowed keys: {', '.join(sorted(_DATA_POLICY_KEYS))}"
+        )
+    return dict(raw)
+
+
+def _apply_governance(ir: dict[str, Any], sources: list[tuple[str, dict[str, Any]]]) -> None:
+    """Copy the governance settings found in ``sources`` into ``ir``.
+
+    The runtime enforces each of these, so none may be dropped: a setting given
+    in two places, or with a malformed value, is an error.
+    """
+    ir["policy"] = _compile_policy(_governance_value(sources, "policy"), location="workflow-level policy")
+    budget = _governance_value(sources, "cost_budget_usd")
+    if budget is not None:
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+            raise ValueError(f"cost_budget_usd must be a positive number, got {budget!r}")
+        ir["cost_budget_usd"] = float(budget)
+    tokens = _governance_value(sources, "token_budget")
+    if tokens is not None:
+        ir["token_budget"] = _compile_token_budget(tokens)
+    target = _governance_value(sources, "on_budget_exceeded")
+    if target is not None:
+        if not isinstance(target, str):
+            raise ValueError(f"on_budget_exceeded must name a node of this workflow, got {target!r}")
+        if target in ir["nodes"]:
+            ir["on_budget_exceeded"] = target
+        else:
+            # Leaving it out is the stricter reading: the budget still holds, and
+            # a run that exceeds it fails instead of going anywhere else.
+            _warn(
+                f"on_budget_exceeded: {target!r} does not name a node of this workflow, so it is ignored "
+                "and a run that exceeds the budget fails. Name the node to route to instead."
+            )
+    data_policy = _compile_data_policy(_governance_value(sources, "data_policy"), location="workflow")
+    if data_policy is not None:
+        ir["data_policy"] = data_policy
+    rollover = _governance_value(sources, "continue_as_new")
+    if rollover is not None:
+        if not isinstance(rollover, bool):
+            raise ValueError(f"continue_as_new must be true or false, got {rollover!r}")
+        ir["continue_as_new"] = rollover
 
 
 def compile_to_ir(defn: WorkflowDef) -> dict[str, Any]:
@@ -280,8 +464,10 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
     """Compile a graph-mode document (``workflow:`` header + ``nodes:``) to IR.
 
     Raises ``ValueError`` for a document with no nodes, a malformed ``nodes:``
-    block, or a node with an unknown type or key. Unknown keys elsewhere are
-    reported as a ``WorkflowSchemaWarning``.
+    block, a node of an unknown type, or a malformed or doubly-set governance
+    setting. Keys the compiler does not read are dropped with a
+    ``WorkflowSchemaWarning``; spellings with a real IR target (``system``,
+    ``temperature``, ``arguments``, ...) are mapped to it.
     """
     wf = data.get("workflow") or {}
     if not isinstance(wf, dict):
@@ -297,16 +483,39 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(raw_nodes, dict):
         raise ValueError(f"nodes: must be a mapping of node id to node definition, got {type(raw_nodes).__name__}")
 
+    # `id`/`version` at the top level stand for the header's.
+    header = dict(wf)
+    for key in ("id", "version"):
+        if key in data:
+            if key in header and header[key] != data[key]:
+                raise ValueError(f"{key} is set at the top level and under workflow: with different values")
+            header.setdefault(key, data[key])
+
+    extras: dict[str, dict[str, Any]] = {"models": {}, "remote_agents": {}}
+    normalized = {node_id: _normalize_node(node_id, node, extras) for node_id, node in raw_nodes.items()}
+    end_ids = frozenset(nid for nid, (node_type, _) in normalized.items() if node_type == "end")
+    if len(end_ids) == len(normalized):
+        raise ValueError(f"workflow '{header.get('id', 'unknown')}' has no nodes to run")
+
+    models = dict(data.get("models", {}) or {})
+    for node_id, overrides in extras["models"].items():
+        base_name = overrides["model"]
+        base = dict(models.get(base_name) or {"provider": "", "model": base_name})
+        for key in ("temperature", "max_tokens"):
+            if overrides[key] is not None:
+                base[key] = overrides[key]
+        model_key = f"node:{node_id}"
+        models[model_key] = base
+        normalized[node_id][1]["model"] = model_key
+    remote_agents = dict((data.get("a2a", {}) or {}).get("remote_agents", {}) or {})
+    for name, cfg in extras["remote_agents"].items():
+        if name in remote_agents:
+            raise ValueError(f"node '{name}' sets agent_url, but a2a.remote_agents already has '{name}'")
+        remote_agents[name] = cfg
+
     nodes: dict[str, Any] = {}
     edges: list[dict[str, Any]] = []
-
-    node_types = {node_id: _check_node(node_id, node_data) for node_id, node_data in raw_nodes.items()}
-    end_ids = frozenset(nid for nid, node_type in node_types.items() if node_type == "end")
-    if len(end_ids) == len(node_types):
-        raise ValueError(f"workflow '{wf.get('id', 'unknown')}' has no nodes to run")
-
-    for node_id, node_data in raw_nodes.items():
-        node_type = node_types[node_id]
+    for node_id, (node_type, node_data) in normalized.items():
         if node_type == "end":
             continue
         kind = _yaml_node_to_kind(node_id, node_type, node_data, end_ids)
@@ -320,13 +529,9 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
             "labels": node_data.get("labels", {}),
             "policy": node_policy,
         }
-        # `acts_for`, not `agent_ref`: on a node, `agent_ref` already names the
-        # agent an `agent` node calls.
-        if node_type != "agent" and "agent_ref" in node_data:
-            raise ValueError(
-                f"node '{node_id}': agent_ref names the agent an `agent` node calls; "
-                "to say which agent this node acts for, use acts_for"
-            )
+        node_data_policy = _compile_data_policy(node_data.get("data_policy"), location=f"node '{node_id}'")
+        if node_data_policy is not None:
+            nodes[node_id]["data_policy"] = node_data_policy
         node_agent = agent_ref(node_data.get("acts_for"), location=f"node '{node_id}' acts_for")
         if node_agent is not None:
             nodes[node_id]["agent_ref"] = node_agent
@@ -349,27 +554,26 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
         elif next_val == "end" or next_val is None:
             edges.append({"from": node_id, "to": "end", "condition": None})
 
-    workflow_policy = _compile_policy(data.get("policy"), location="workflow-level policy")
-    workflow_agent = agent_ref(wf.get("agent_ref"), location="workflow agent_ref")
+    workflow_agent = agent_ref(header.get("agent_ref"), location="workflow agent_ref")
 
     ir: dict[str, Any] = {
-        "workflow_id": wf.get("id", "unknown"),
-        "version": wf.get("version", DEFAULT_WORKFLOW_VERSION),
-        "name": wf.get("name"),
-        "description": wf.get("description"),
-        "state_schema": _state_schema_str(wf.get("state_schema", "")),
-        "start_node": wf.get("start", next(iter(nodes)) if nodes else ""),
+        "workflow_id": header.get("id", "unknown"),
+        "version": header.get("version", DEFAULT_WORKFLOW_VERSION),
+        "name": header.get("name"),
+        "description": header.get("description"),
+        "state_schema": _state_schema_str(header.get("state_schema", "")),
+        "start_node": header.get("start", next(iter(nodes)) if nodes else ""),
         "nodes": nodes,
         "edges": edges,
         "retry_policies": data.get("retry_policies", {}),
         "timeouts": data.get("timeouts", {}),
-        "models": data.get("models", {}),
+        "models": models,
         "tools": data.get("tools", {}),
-        "mcp_servers": data.get("mcp", {}).get("servers", {}),
-        "remote_agents": data.get("a2a", {}).get("remote_agents", {}),
-        "labels": wf.get("labels", {}),
-        "policy": workflow_policy,
+        "mcp_servers": (data.get("mcp", {}) or {}).get("servers", {}),
+        "remote_agents": remote_agents,
+        "labels": header.get("labels", {}),
     }
+    _apply_governance(ir, [("the top level", data), ("the workflow: header", wf)])
     if workflow_agent is not None:
         ir["agent_ref"] = workflow_agent
     return ir
@@ -488,6 +692,7 @@ def _compile_agent_yaml(data: dict[str, Any]) -> dict[str, Any]:
         },
         "strategy_metadata": strategy_meta,
     }
+    _apply_governance(out, [("the top level", data), ("the agent: block", agent)])
     acts_as = agent_ref(agent.get("agent_ref"), location=f"agent '{agent_id}' agent_ref")
     if acts_as is not None:
         out["agent_ref"] = acts_as

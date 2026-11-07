@@ -19,11 +19,11 @@
 # Check the definition (no runtime needed):
 #   jamjet validate agent.yaml
 #
-# Run:
-#   jamjet dev
-#   jamjet run agent.yaml \
-#     --input '{"goal": "Find the 3 most-starred Python ML repos on GitHub this week"}'
-#   jamjet run agent.yaml --stream   # live iteration output
+# Running it:
+#   In this release a model node writes its output only to
+#   state.last_model_output, while this strategy's later steps read their own
+#   per-step keys, so a run stops at the first step that reads one. Use this
+#   file with `jamjet validate`.
 
 agent:
   id: react_researcher
@@ -35,7 +35,7 @@ agent:
   model: claude-sonnet-4-6
 
   goal: |
-    {{ goal }}
+    {{ state.goal }}
 
     Use the available tools to gather information. Think step by step.
     When you have enough information to answer fully, call the `finish` tool.

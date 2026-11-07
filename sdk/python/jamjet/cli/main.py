@@ -243,6 +243,20 @@ def _print_protocol_activity(events: list[dict[str, Any]]) -> None:
 # ── init ─────────────────────────────────────────────────────────────────────
 
 
+def _refuse_held_back_template(template: str) -> None:
+    """Exit with the reason when a template is held back in this release."""
+    from jamjet.templates import HELD_BACK_TEMPLATES
+
+    reason = HELD_BACK_TEMPLATES.get(template)
+    if reason is not None:
+        console.print(
+            f"[red]Error:[/red] template '{template}' is not available in this release: {reason}. "
+            "A project from it could not run. "
+            "Run [bold]jamjet init --list-templates[/bold] to see the ones that can."
+        )
+        raise typer.Exit(1)
+
+
 @app.command()
 def init(
     project_name: str | None = typer.Argument(
@@ -266,19 +280,23 @@ def init(
 
     Pass a name to create a new directory, or omit to set up in the current directory.
 
-    Available templates: hello-agent (default), research-agent, code-reviewer, approval-workflow
+    Run `jamjet init --list-templates` to see the templates.
     """
     import os
 
-    from jamjet.templates import AVAILABLE_TEMPLATES, render_template
+    from jamjet.templates import AVAILABLE_TEMPLATES, HELD_BACK_TEMPLATES, render_template
 
     if list_templates:
         console.print("[bold]Available templates:[/bold]")
         for t in AVAILABLE_TEMPLATES:
             marker = "  [green]●[/green]" if t == "hello-agent" else "  [dim]●[/dim]"
             console.print(f"{marker} {t}")
+        console.print("[dim]Not available in this release:[/dim]")
+        for t, reason in sorted(HELD_BACK_TEMPLATES.items()):
+            console.print(f"  [dim]○ {t}: {reason}[/dim]")
         raise typer.Exit()
 
+    _refuse_held_back_template(template)
     if template not in AVAILABLE_TEMPLATES:
         console.print(
             f"[red]Error:[/red] unknown template '{template}'. "
@@ -343,6 +361,7 @@ def create(
 
     from jamjet.templates import AVAILABLE_TEMPLATES, render_template
 
+    _refuse_held_back_template(template)
     if template not in AVAILABLE_TEMPLATES:
         console.print(
             f"[red]Error:[/red] unknown template '{template}'. "

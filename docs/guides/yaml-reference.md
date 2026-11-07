@@ -61,10 +61,20 @@ nodes:
     next: end                       # built-in terminal node
 ```
 
-`jamjet validate` and the compiler reject a workflow with no nodes, a node
-whose `type` is not in the table below, and a node, condition or `next` entry
-with a key the compiler does not read, naming the key. An unknown key in the
-`workflow:` header or at the top level is reported as a warning.
+`jamjet validate` and the compiler reject a workflow with no nodes, `nodes:`
+nested under `workflow:` or written as a list, and a node whose `type` is not
+in the table below. A key the compiler does not read is dropped with a
+warning that names it and what to use instead; these warnings become errors in
+a later release. Some other spellings map to the same IR field and are
+accepted: `system` for `system_prompt`, `label` for `description`,
+`arguments` for `input`, `message` on `human_approval` for `description`, and
+`branches` (with `condition:` entries) for a condition node's `conditions`.
+`temperature` and `max_tokens` on a model node become that node's model
+settings.
+
+Governance settings (`policy`, `cost_budget_usd`, `token_budget`,
+`on_budget_exceeded`, `data_policy`, `continue_as_new`) may sit at the top
+level or in the `workflow:` header, but not both; a malformed one is an error.
 
 `agent_ref` (workflow) and `acts_for` (node) compile to the IR's `agent_ref`. The engine then holds the node to the named card's `allowed_tools`, `blocked_tools`, `require_approval_for` and `allowed_delegations` (see the [Agent Model Guide](agent-model-guide.md#enforcing-allowed_tools)), and refuses it if no agent is registered at that `uri`. A node uses `acts_for` because `agent_ref` on an `agent` node already names the agent it calls.
 
@@ -82,10 +92,11 @@ with a key the compiler does not read, naming the key. An unknown key in the
 | `a2a_task` | Delegate to an external agent via A2A | `remote_agent`, `skill`, `input`, `output_schema`, `stream`, `on_input_required` |
 | `agent` | Invoke a registered JamJet agent | `agent_ref`, `input`, `output_schema` |
 | `eval` | Evaluate node output with scorers | `scorers`, `on_fail`, `max_retries`, `input_expr` |
+| `limit_exceeded` | Terminal node for a run that hit a limit | |
 | `end` | Terminal node | |
 
 Every node may also carry `type`, `description`, `labels`, `policy`,
-`retry_policy`, `timeout`, `acts_for` and `next`.
+`data_policy`, `retry_policy`, `timeout`, `acts_for` and `next`.
 
 ---
 
@@ -111,11 +122,20 @@ review:
   type: human_approval
   description: "Please review the generated report"
   timeout: 48h
-  fallback: revise                  # where the run goes if nobody decides in time
+  fallback: second_review           # where the run goes if nobody decides in time
   next: deliver                     # where an approved run continues
+
+second_review:
+  type: human_approval
+  description: "Escalated: the first reviewer did not decide within 48 hours"
+  timeout: 48h
+  next: deliver
 ```
 
-Decide with `jamjet approvals <exec-id>` and
+Approving continues the run at `next`; rejecting fails it. When the deadline
+passes, the run goes to `fallback`, here a second approver. Do not point
+`fallback` at the step an approval would unlock: that approves the action by
+timeout. Decide with `jamjet approvals <exec-id>` and
 `jamjet approve <exec-id> --decision approved|rejected`.
 
 ---

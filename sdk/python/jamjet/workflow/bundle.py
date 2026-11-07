@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from jamjet.workflow.ir_compiler import _GOVERNANCE_KEYS, _apply_governance
 from jamjet.workflow.types import DEFAULT_WORKFLOW_VERSION
 
 
@@ -217,6 +218,7 @@ def _compile_agent_unit(
         },
         "strategy_metadata": compiled["strategy_metadata"],
     }
+    _apply_governance(ir, [(f"agent unit '{unit_id}'", agent)])
     if acts_as is not None:
         ir["agent_ref"] = acts_as
     return ir
@@ -292,6 +294,8 @@ def compile_bundle(data: dict[str, Any]) -> CompiledBundle:
             if key in wf:
                 header[key] = wf[key]
         doc = {
+            # Governance the runtime enforces travels with the unit, never dropped.
+            **{key: wf[key] for key in _GOVERNANCE_KEYS if key in wf},
             "workflow": header,
             "nodes": wf.get("nodes", {}),
             "retry_policies": wf.get("retry_policies", {}),

@@ -285,8 +285,12 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
     "hitl-approval": {
         "workflow.yaml": """\
 # {name}/workflow.yaml
-# Human-in-the-loop review workflow.
-# Agent drafts a response, waits for human review, then executes or revises.
+# Human-in-the-loop review: the agent drafts a reply, a person reviews it, and
+# only an approved reply is finalized.
+#
+# Approving continues the run; rejecting fails it. If the reviewer does not
+# decide within 8 hours, the review goes to a second reviewer; if that review
+# also expires, the run fails. Nothing is approved automatically.
 #
 # Usage:
 #   jamjet run workflow.yaml --input '{{"request": "Refund order #1234 for $99"}}'
@@ -301,10 +305,6 @@ workflow:
   version: 0.1.0
   state_schema:
     request: str
-    draft_response: str
-    approved: bool
-    feedback: str
-    final_response: str
   start: draft
 
 nodes:
@@ -318,55 +318,30 @@ nodes:
       Customer request: {{{{ state.request }}}}
 
       Draft a response that explains what action you will take and why.
-    next: await-review
+    next: review
 
-  await-review:
+  review:
     type: human_approval
     description: Review the drafted response before it is sent
     timeout: 8h
-    fallback: auto-approve
-    next: route
+    fallback: second-review
+    next: finalize
 
-  route:
-    type: branch
-    conditions:
-      - if: "state.approved == true"
-        next: execute
-      - if: "state.approved == false"
-        next: revise
-    default: execute
+  second-review:
+    type: human_approval
+    description: "Escalated: the first reviewer did not decide within 8 hours"
+    timeout: 8h
+    next: finalize
 
-  execute:
+  finalize:
     type: model
     model: claude-sonnet-4-6
     prompt: |
-      The following response was approved. Finalize and confirm action taken:
+      A reviewer approved this draft:
 
-      Request: {{{{ state.request }}}}
-      Approved response: {{{{ state.draft_response }}}}
-    next: end
+      {{{{ state.last_model_output }}}}
 
-  revise:
-    type: model
-    model: claude-sonnet-4-6
-    prompt: |
-      Your draft was not approved. Revise based on this feedback:
-
-      Original request: {{{{ state.request }}}}
-      Draft: {{{{ state.draft_response }}}}
-      Feedback: {{{{ state.feedback }}}}
-
-      Write a revised response addressing the feedback.
-    next: end
-
-  auto-approve:
-    type: model
-    model: claude-haiku-4-5-20251001
-    prompt: |
-      Review timed out after 8 hours. Auto-processing:
-      Request: {{{{ state.request }}}}
-      Draft: {{{{ state.draft_response }}}}
-      Confirm the action taken.
+      Write the final customer reply, keeping the action and the reasoning.
     next: end
 
   end:
@@ -377,8 +352,9 @@ nodes:
     "multi-agent-review": {
         "workflow.yaml": """\
 # {name}/workflow.yaml
-# Two-agent review loop: writer drafts, critic reviews, writer revises.
-# Repeats until the critic scores the output above the threshold.
+# Writer and critic: a model drafts, an LLM judge scores the draft, and a draft
+# below the bar goes back to the writer with the judge's feedback, up to two
+# more times. If it still falls short, the run fails.
 #
 # Usage:
 #   jamjet run workflow.yaml --input '{{"topic": "Write a product announcement for JamJet 1.0"}}'
@@ -388,11 +364,6 @@ workflow:
   version: 0.1.0
   state_schema:
     topic: str
-    draft: str
-    critique: str
-    score: int
-    attempts: int
-    final: str
   start: write
 
 nodes:
@@ -401,48 +372,22 @@ nodes:
     model: claude-sonnet-4-6
     system_prompt: |
       You are an expert writer. Produce clear, engaging, well-structured content.
-      If you have received critique, incorporate it fully in this revision.
+      If you have received critique, address every point in this revision.
     prompt: |
       Topic: {{{{ state.topic }}}}
-      {{%- if state.critique %}}
-
-      Previous critique (score {{{{ state.score }}}}/5):
-      {{{{ state.critique }}}}
-
-      Revise your draft to address all points raised.
-      {{%- endif %}}
     next: critique
 
   critique:
-    type: model
-    model: claude-sonnet-4-6
-    system_prompt: |
-      You are a strict editor. Evaluate content quality honestly.
-      Reply in this exact format:
-      SCORE: <1-5>
-      CRITIQUE: <one paragraph of specific, actionable feedback>
-    prompt: |
-      Topic: {{{{ state.topic }}}}
-
-      Draft to review:
-      {{{{ state.draft }}}}
-    next: route
-
-  route:
-    type: branch
-    conditions:
-      - if: "state.score >= 4"
-        next: accept
-      - if: "state.attempts >= 3"
-        next: accept
-    default: write
-
-  accept:
-    type: model
-    model: claude-haiku-4-5-20251001
-    prompt: |
-      Format this final approved draft cleanly:
-      {{{{ state.draft }}}}
+    type: eval
+    scorers:
+      - type: llm_judge
+        model: claude-sonnet-4-6
+        rubric: |
+          You are a strict editor. Is the draft accurate, specific, well structured
+          and right for the topic? Score 1-5.
+        min_score: 4
+    on_fail: retry_with_feedback
+    max_retries: 2
     next: end
 
   end:
@@ -1296,10 +1241,15 @@ Approvals surface in `/dashboard/approvals` for your team to review.
     "approval-workflow": {
         "workflow.yaml": """\
 # {name}/workflow.yaml
-# Human-in-the-loop approval gate — execution pauses until a human approves.
+# Human approval gate: execution pauses until a person approves the plan.
+#
+# Approving continues the run; rejecting fails it. If nobody decides within
+# 24 hours, the approval goes to a second approver; if that one also expires,
+# the run fails. Nothing is approved automatically.
 #
 # Usage:
 #   jamjet run workflow.yaml --input '{{"task": "Deploy v2.0 to production"}}'
+#   jamjet approvals <exec-id>
 #   jamjet approve <exec-id> --decision approved
 
 workflow:
@@ -1307,10 +1257,6 @@ workflow:
   version: 0.1.0
   state_schema:
     task: str
-    proposal: str
-    approved: bool
-    result: str
-    rejection_reason: str
   start: propose
 
 nodes:
@@ -1337,43 +1283,24 @@ nodes:
     description: Approve the proposed execution plan
     timeout: 24h
     fallback: escalate
-    next: check-approved
+    next: announce
 
-  check-approved:
-    type: branch
-    conditions:
-      - if: "state.approved == true"
-        next: execute
-    default: rejected
+  escalate:
+    type: human_approval
+    description: "Escalated: the first approver did not decide within 24 hours"
+    timeout: 24h
+    next: announce
 
-  execute:
+  announce:
     type: model
     model: claude-sonnet-4-6
     prompt: |
-      Execute this approved plan step by step:
+      This execution plan was approved:
 
-      Task: {{{{ state.task }}}}
-      Plan: {{{{ state.proposal }}}}
+      {{{{ state.last_model_output }}}}
 
-      Report what was done and confirm completion.
-    next: end
-
-  rejected:
-    type: model
-    model: claude-haiku-4-5-20251001
-    prompt: |
-      The following plan was rejected: {{{{ state.proposal }}}}
-      Reason: {{{{ state.rejection_reason }}}}
-      Acknowledge the rejection and suggest alternatives.
-    next: end
-
-  escalate:
-    type: model
-    model: claude-haiku-4-5-20251001
-    prompt: |
-      The approval for the following task timed out after 24 hours:
-      {{{{ state.task }}}}
-      Draft an escalation notice for the on-call team.
+      Write a short change announcement for the team: what will happen,
+      when, and how to roll it back.
     next: end
 
   end:
@@ -1480,7 +1407,21 @@ jamjet events  <execution-id>
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-AVAILABLE_TEMPLATES: list[str] = sorted(_TEMPLATES.keys())
+# Templates whose workflow needs a node kind the engine does not run, so a
+# project made from them could not run. `jamjet init` refuses them with this
+# reason; they come back when the engine runs those nodes.
+HELD_BACK_TEMPLATES: dict[str, str] = {
+    "a2a-delegator": "it delegates with an a2a_task node, which the engine does not run",
+    "a2a-server": "it relies on jamjet.toml to publish an Agent Card, and nothing reads jamjet.toml",
+    "code-reviewer": "it calls GitHub through mcp_tool nodes, which the engine does not run",
+    "mcp-tool-consumer": "it calls an MCP server through an mcp_tool node, which the engine does not run",
+    "mcp-tool-provider": "its workflow calls the server through an mcp_tool node, which the engine does not run",
+    "rag-assistant": "it retrieves files through an mcp_tool node, which the engine does not run",
+    "research-agent": "it searches through an mcp_tool node, which the engine does not run",
+    "single-agent-tool-flow": "it reads files through an mcp_tool node, which the engine does not run",
+}
+
+AVAILABLE_TEMPLATES: list[str] = sorted(name for name in _TEMPLATES if name not in HELD_BACK_TEMPLATES)
 
 
 def get_template(name: str) -> dict[str, str]:
@@ -1488,6 +1429,8 @@ def get_template(name: str) -> dict[str, str]:
 
     Raises KeyError if the template does not exist.
     """
+    if name in HELD_BACK_TEMPLATES:
+        raise KeyError(f"Template '{name}' is not available in this release: {HELD_BACK_TEMPLATES[name]}.")
     if name not in _TEMPLATES:
         raise KeyError(f"Unknown template '{name}'. Available: {', '.join(AVAILABLE_TEMPLATES)}")
     return _TEMPLATES[name]

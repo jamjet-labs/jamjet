@@ -1,9 +1,11 @@
 # examples/hitl-approval/workflow.yaml
 #
 # Human-in-the-loop approval: a model assesses the risk of a request, a human
-# approves or rejects it, and only an approved request is acted on.
+# approves or rejects it, and only an approved request goes on.
 #
-# Pattern: assess risk -> pause for human review -> act on the decision.
+# Approving continues the run; rejecting fails it. If nobody decides within 24
+# hours, the approval goes to a second approver; if that one also expires, the
+# run fails. Nothing is approved automatically.
 #
 # Prerequisites:
 #   export ANTHROPIC_API_KEY="sk-ant-..."
@@ -23,7 +25,7 @@
 workflow:
   id: hitl_approval
   version: 0.1.0
-  description: "A model assesses a request's risk; a human approves or rejects it before any action is taken"
+  description: "A model assesses a request's risk; a human approves or rejects it before anything else happens"
   start: assess_risk
 
   state_schema:
@@ -42,24 +44,34 @@ nodes:
       You are a risk assessment assistant. Given a business request, produce:
       1. A brief risk assessment (2-3 sentences).
       2. A risk level: low, medium, or high.
-
-      Respond in JSON: {"risk_assessment": "...", "risk_level": "low|medium|high"}
     prompt: "Request: {{ state.request }}"
     next: await_approval
 
-  # Step 2: pause until a human approves or rejects. A rejection stops the run
-  # here, so the action below only ever runs on an approved request.
+  # Step 2: pause until a human approves or rejects.
   await_approval:
     type: human_approval
     description: Review the request and its risk assessment, then approve or reject
     timeout: 24h
-    next: take_action
+    fallback: escalate
+    next: confirm
 
-  # Step 3: the approved request is executed by a registered tool.
-  take_action:
-    type: tool
-    description: Execute the approved request
-    tool_ref: execute_request
-    input:
-      request: "{{ state.request }}"
+  # Reached only if the first approver lets the deadline pass.
+  escalate:
+    type: human_approval
+    description: "Escalated: the first approver did not decide within 24 hours"
+    timeout: 24h
+    next: confirm
+
+  # Step 3: the approved request is written up for the requester.
+  confirm:
+    type: model
+    description: Confirm the approved request
+    model: claude-sonnet-4-6
+    prompt: |
+      This request was approved: {{ state.request }}
+
+      Risk assessment:
+      {{ state.last_model_output }}
+
+      Write a short confirmation for the requester.
     next: end

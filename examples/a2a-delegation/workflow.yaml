@@ -17,11 +17,10 @@
 # Check the definition (no runtime needed):
 #   jamjet validate workflow.yaml
 #
-# Run:
-#   jamjet dev
-#   jamjet run workflow.yaml \
-#     --input '{"topic": "Impact of LLMs on software engineering", "depth": "detailed"}'
-#   jamjet run workflow.yaml --stream   # progressive output
+# Running it:
+#   The engine in this release has no executor for a2a_task nodes and refuses
+#   to register a workflow that uses them, so `jamjet run` stops there. Use
+#   this file with `jamjet validate`.
 
 workflow:
   id: a2a_delegation
