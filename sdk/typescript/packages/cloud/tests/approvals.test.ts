@@ -109,3 +109,37 @@ describe('pollUntilResolved', () => {
     })
   })
 })
+
+describe('pollUntilResolved: server deadline', () => {
+  async function sentBody(timeoutMs: number): Promise<Record<string, unknown>> {
+    let body: Record<string, unknown> = {}
+    server.use(
+      http.post('https://api.jamjet.test/v1/approvals', async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({ id: 'apr_t' })
+      }),
+      http.get('https://api.jamjet.test/v1/approvals/apr_t', () => HttpResponse.json({ status: 'approved' })),
+    )
+    await pollUntilResolved({ ...opts, action: 'x', pollIntervalMs: 10, timeoutMs })
+    return body
+  }
+
+  it('sends the SDK timeout as timeout_ms so Cloud holds the request as long as the SDK waits', async () => {
+    expect((await sentBody(120_000))['timeout_ms']).toBe(120_000)
+  })
+
+  it('clamps timeout_ms to the range Cloud accepts (1 minute to 24 hours)', async () => {
+    expect((await sentBody(5_000))['timeout_ms']).toBe(60_000)
+    expect((await sentBody(3 * 86_400_000))['timeout_ms']).toBe(86_400_000)
+  })
+
+  it('treats any decided status other than approved as a rejection', async () => {
+    server.use(
+      http.post('https://api.jamjet.test/v1/approvals', () => HttpResponse.json({ id: 'apr_x' })),
+      http.get('https://api.jamjet.test/v1/approvals/apr_x', () => HttpResponse.json({ status: 'expired' })),
+    )
+    await expect(
+      pollUntilResolved({ ...opts, action: 'x', pollIntervalMs: 10, timeoutMs: 60_000 }),
+    ).rejects.toBeInstanceOf(JamjetApprovalRejected)
+  })
+})

@@ -1,5 +1,6 @@
 import { type Client, getActive } from './client.js'
 import type { AgentRef, ScopeFrame, UserContext } from './context.js'
+import type { JamjetApprovalRejected, JamjetApprovalTimeout } from './errors.js'
 import type { PolicyAction } from './policy.js'
 import { pollUntilResolved } from './approvals.js'
 import { recordOutcome as _recordOutcome } from './outcomes.js'
@@ -53,10 +54,14 @@ export async function withAgent<T>(
  *   tool-call chunks are held until the stream ends and checked first.
  * - `'allow'` — explicitly permits matching tools (useful to whitelist a subset
  *   when a broader `block` pattern is also registered).
- * - `'require_approval'` — **recognised by the evaluator but runtime
- *   enforcement is not yet implemented in 0.2.0.** Tools matched by a
- *   `require_approval` rule pass through to the model unchanged. Pre-call
- *   approval gating is deferred to a future release.
+ * - `'require_approval'` — matching tools stay available to the model. When
+ *   the model calls one, the SDK opens a Cloud approval (the tool name, call
+ *   id, arguments, model and rule go in its context) and waits for a decision
+ *   before returning the response. A rejection throws
+ *   {@link JamjetApprovalRejected}; no decision within `approvalTimeoutMs`
+ *   (init option, default 1 hour), or a Cloud that cannot be reached, throws
+ *   {@link JamjetApprovalTimeout}. On streaming calls the tool-call chunks are
+ *   held until the decision.
  */
 export function policy(action: PolicyAction, tools: string): void {
   activeOrThrow()._policy.add(action, tools)
@@ -127,21 +132,24 @@ export interface RequireApprovalOptions {
  * Request human approval for `action` and poll until a decision is returned.
  * Resolves with the approval ID string on approval; throws
  * `JamjetApprovalRejected` on rejection or `JamjetApprovalTimeout` if no
- * decision arrives within `opts.timeoutMs` (default: 30 000 ms). Pass
- * `opts.signal` to cancel the poll via an {@link AbortSignal}.
+ * decision arrives within `opts.timeoutMs` (default: the `approvalTimeoutMs`
+ * init option, else 1 hour; Cloud holds an approval for at most 24 hours).
+ * Pass `opts.signal` to cancel the poll via an {@link AbortSignal}.
  */
 export async function requireApproval(
   action: string,
   opts: RequireApprovalOptions = {},
 ): Promise<string> {
   const client = activeOrThrow()
+  const timeoutMs = opts.timeoutMs ?? client.config.approvalTimeoutMs
+  const pollIntervalMs = opts.pollIntervalMs ?? client.config.approvalPollIntervalMs
   return pollUntilResolved({
     apiKey: client.config.apiKey,
     apiUrl: client.config.apiUrl,
     action,
     ...(opts.context !== undefined ? { context: opts.context } : {}),
-    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
-    ...(opts.pollIntervalMs !== undefined ? { pollIntervalMs: opts.pollIntervalMs } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(pollIntervalMs !== undefined ? { pollIntervalMs } : {}),
     ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
   })
 }

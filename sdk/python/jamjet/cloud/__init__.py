@@ -53,6 +53,7 @@ def configure(
     redact_types: list[str] | None = None,
     policy_path: str | None = None,
     telemetry: bool = True,
+    approval_timeout_seconds: float = 3600.0,
 ) -> None:
     """Initialize the JamJet Cloud SDK.
 
@@ -76,6 +77,11 @@ def configure(
             pre-Phase-1 path.
         telemetry: set to ``False`` to suppress background policy-sync HTTP
             requests. Primarily useful in tests.
+        approval_timeout_seconds: how long a tool call matched by a
+            ``require_approval`` rule waits for a decision in JamJet Cloud
+            before raising ``JamJetApprovalTimeout``. Sent to Cloud as the
+            approval's deadline; Cloud holds an approval for 1 minute to 24
+            hours and refuses decisions after it. Default 1 hour.
     """
     set_config(
         api_key=api_key,
@@ -86,6 +92,7 @@ def configure(
         flush_size=flush_size,
         api_url=api_url,
         enabled=True,
+        approval_timeout_seconds=approval_timeout_seconds,
     )
     init_queue(flush_interval=flush_interval, flush_size=flush_size)
 
@@ -150,8 +157,16 @@ def _sync_policies(api_key: str | None, api_url: str, project: str) -> None:
 def policy(action: str, tools: str) -> None:
     """Add a local policy rule.
 
+    ``block`` strips matching tools from requests and raises
+    ``JamJetPolicyBlocked`` if the model calls one anyway. ``require_approval``
+    leaves the tool available; when the model calls it, the SDK opens an
+    approval in JamJet Cloud (tool, call id, arguments, model, rule) and waits
+    for the decision before returning the response. A rejection raises
+    ``JamJetApprovalRejected``; no decision within ``approval_timeout_seconds``,
+    or no way to reach Cloud, raises ``JamJetApprovalTimeout``.
+
     Args:
-        action: 'block', 'allow', or 'require_approval'.
+        action: 'block', 'allow', 'require_approval' or 'audit'.
         tools: Glob pattern for tool names (e.g. 'payments.*').
     """
     evaluator = get_evaluator()
@@ -166,11 +181,12 @@ def budget(max_cost_usd: float) -> None:
 def require_approval(
     action: str,
     context: dict[str, Any] | None = None,
-    timeout_seconds: float = 3600,
+    timeout_seconds: float | None = None,
 ) -> str:
     """Request human-in-the-loop approval. Blocks until approved, rejected, or timeout.
 
-    Returns the approval_id on success.
+    ``timeout_seconds`` defaults to the ``approval_timeout_seconds`` given to
+    :func:`configure` (1 hour unless set). Returns the approval_id on success.
     """
     cfg = get_config()
     if not cfg.api_key:
@@ -180,7 +196,8 @@ def require_approval(
         api_url=cfg.api_url,
         action=action,
         context=context,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=cfg.approval_timeout_seconds if timeout_seconds is None else timeout_seconds,
+        poll_interval=cfg.approval_poll_interval,
     )
 
 
