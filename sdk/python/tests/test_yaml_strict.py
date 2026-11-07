@@ -206,9 +206,44 @@ def test_validate_prints_schema_warnings_and_passes(tmp_path: Path) -> None:
     path.write_text("workflow:\n  id: w\n  start_node: a\nnodes:\n  a:\n    type: model\n    model: m\n")
     result = runner.invoke(app, ["validate", str(path)])
     assert result.exit_code == 0, result.output
-    assert "Warning:" in result.output
-    assert "start_node" in result.output
-    assert "Valid." in result.output
+    assert "Warning:" in result.stderr
+    assert "start_node" in result.stderr
+    assert "Valid." in result.stdout
+
+
+def test_run_json_output_stays_parseable_when_a_file_warns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    class FakeClient:
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def create_workflow(self, ir: dict) -> dict:
+            return {}
+
+        async def start_execution(self, **kwargs: object) -> dict:
+            return {"execution_id": "exec_1"}
+
+        async def get_execution(self, execution_id: str) -> dict:
+            return {"status": "completed"}
+
+        async def get_events(self, execution_id: str) -> dict:
+            return {"events": []}
+
+    async def no_sleep(delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("jamjet.cli.main._client", lambda runtime, token=None: FakeClient())
+    monkeypatch.setattr("jamjet.cli.main.asyncio.sleep", no_sleep)
+    path = tmp_path / "workflow.yaml"
+    path.write_text("workflow:\n  id: w\n  start_node: a\nnodes:\n  a:\n    type: model\n    model: m\n")
+    result = runner.invoke(app, ["run", str(path), "--output", "json", "--runtime", "http://fake:7700"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["execution_id"] == "exec_1"
+    assert "start_node" in result.stderr
 
 
 def test_validate_accepts_a_fleet_file(tmp_path: Path) -> None:
