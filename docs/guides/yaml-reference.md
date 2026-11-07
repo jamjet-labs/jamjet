@@ -272,7 +272,11 @@ prompt: |
   index a list. Filters (`| join(...)`), operators, calls, `{% ... %}` blocks
   and `{# ... #}` comments are not Jinja here. A workflow that uses them is
   refused when it is registered (400, naming the node).
-- A string is inserted as is; any other value as compact JSON.
+- To write `{{`, `{%` or `{#` as text (a JSON example, say), quote it,
+  `{{ '{{' }}`, or wrap the passage in `{% raw %}...{% endraw %}`, as in
+  Jinja2.
+- A string is inserted as is; any other value as compact JSON. A rendered
+  prompt over 256 KiB fails the node.
 - A path the run's state does not have fails the node, with the path in the
   error, and so does a prompt that renders empty. The model is not called
   with a prompt that has a gap in it.
