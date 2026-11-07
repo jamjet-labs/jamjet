@@ -181,6 +181,10 @@ class CoordinatorStrategy(ABC):
     ) -> Decision:
         """Select an agent from the ranked candidates.
 
+        The Rust runtime calls this stage only when the score spread is at or
+        below ``threshold``. When the spread is larger, it selects the top-ranked
+        candidate without calling this method.
+
         Args:
             task: Description of the task to route.
             top_candidates: Candidates in descending composite-score order.

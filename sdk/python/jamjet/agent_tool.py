@@ -11,7 +11,9 @@ class AgentToolDef:
     """Configuration for an agent-tool invocation, without executing the agent.
 
     Attributes:
-        agent_uri: Explicit agent URI, or ``"auto"`` for an automatic target.
+        agent_uri: Explicit agent URI, or ``"auto"`` for coordinator routing.
+            The graph compiler expands auto-routed agent-tool nodes into a
+            coordinator node followed by an agent-tool node.
         mode: Invocation mode: ``"sync"``, ``"streaming"``, or ``"conversational"``.
         description: Human-readable description included in the IR fragment.
         budget: Optional ``max_cost_usd`` and ``max_tokens`` limits, passed through
@@ -72,7 +74,9 @@ def agent_tool(
 
     Args:
         agent: Agent URI, such as ``"jamjet://org/classifier"``, or ``"auto"``
-            for an automatic target.
+            for coordinator routing. The graph compiler expands auto-routed
+            agent-tool nodes into a coordinator node followed by an agent-tool
+            node.
         description: Human-readable description of what this tool does.
         mode: Invocation mode: ``"sync"`` (default), ``"streaming"``, or
             ``"conversational"``.
