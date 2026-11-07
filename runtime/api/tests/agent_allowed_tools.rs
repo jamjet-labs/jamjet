@@ -293,6 +293,13 @@ fn assert_refused(o: &Outcome, needle: &str, ctx: &str) {
 }
 
 /// Every case on every backend and transport.
+/// Whether node `n1` of `ir` is dispatched to one of the engine's queues.
+fn on_engine_queue(ir: &Value) -> bool {
+    serde_json::from_value::<jamjet_core::NodeKind>(ir["nodes"]["n1"]["kind"].clone())
+        .map(|k| jamjet_worker::executable::ENGINE_QUEUES.contains(&k.queue_type().as_str()))
+        .unwrap_or(false)
+}
+
 async fn each(f: impl Fn(String) -> (Vec<Value>, Value, Value)) -> Vec<(String, Outcome)> {
     let mut out = Vec::new();
     // A fresh pair of backends per transport: the SQLite one holds the
@@ -301,6 +308,12 @@ async fn each(f: impl Fn(String) -> (Vec<Value>, Value, Value)) -> Vec<(String, 
         for tb in support::backends().await {
             let ctx = format!("{} over {:?}", tb.name(), t);
             let (cards, ir, input) = f(format!("wf-{}-{:?}", tb.name(), t).to_lowercase());
+            // The engine's queues (`general`, `model`) are not served to
+            // external workers, so a node dispatched to one is checked in
+            // process only.
+            if matches!(t, Transport::Claim) && on_engine_queue(&ir) {
+                continue;
+            }
             out.push((ctx, run(&tb, t, &cards, ir, input).await));
         }
     }

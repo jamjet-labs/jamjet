@@ -111,6 +111,16 @@ pub fn build_work_item_payload(
             );
             obj.insert("state".into(), Value::Object(state.clone()));
         }
+        // A `human_approval` node carries the run's state as `input`, so the
+        // approval request's action digest, and the payload a reviewer is
+        // shown, cover the data the run holds when the decision is asked for.
+        // If the state moves before the approved node is dispatched again
+        // (a parallel branch writes), the digest no longer matches and the
+        // guard asks again. Without it the request bound no data at all, and
+        // the guarded steps ran on whatever the state had become.
+        NodeKind::HumanApproval { .. } => {
+            obj.insert("input".into(), Value::Object(state.clone()));
+        }
         _ => {}
     }
 
@@ -234,5 +244,16 @@ mod tests {
         let ir = ir_with(node(json!({ "type": "condition", "branches": [] })));
         let p = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
         assert_eq!(p.as_object().unwrap().len(), 3);
+    }
+
+    /// The approval of a `human_approval` node binds the run's state: it is
+    /// the node's `input`, which the action digest covers.
+    #[test]
+    fn human_approval_carries_the_state_its_approval_binds() {
+        let ir = ir_with(node(
+            json!({ "type": "human_approval", "description": "Pay?", "timeout_secs": null, "fallback_node": null }),
+        ));
+        let p = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
+        assert_eq!(p["input"]["key"], "value");
     }
 }

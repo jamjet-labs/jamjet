@@ -28,6 +28,15 @@ pub const IN_PROCESS_KINDS: &[&str] = &[
 /// and any worker draining the queue an `external_fn` node names.
 pub const EXTERNAL_WORKER_KINDS: &[&str] = &["python_fn", "java_fn", "external_fn"];
 
+/// The queues the engine's own kinds are dispatched to (`NodeKind::queue_type`
+/// of every kind in [`IN_PROCESS_KINDS`]). `POST /work-items/claim` does not
+/// serve them: an external worker that took an item from one could report any
+/// result for a node the engine runs, such as an approved `human_approval`
+/// node with a state patch of its choosing, or a `condition` node with the
+/// route it wants. No external kind is dispatched to them (an `external_fn`
+/// queue cannot take a built-in name).
+pub const ENGINE_QUEUES: &[&str] = &["model", "general"];
+
 /// How this runtime executes a node kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Runner {
@@ -48,6 +57,11 @@ pub fn runner_for(kind: &str) -> Runner {
     } else {
         Runner::None
     }
+}
+
+/// How this runtime executes `kind`.
+pub fn runner_for_kind(kind: &jamjet_core::node::NodeKind) -> Runner {
+    runner_for(&node_kind_tag(kind))
 }
 
 /// The nodes of `ir` nothing in this runtime can execute, as `(node id,
@@ -81,6 +95,56 @@ pub fn refusal_message(unexecutable: &[(String, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every in-process kind is dispatched to an engine queue and no external
+    /// kind is, so withholding the engine queues from external claims
+    /// withholds exactly the engine's work.
+    #[test]
+    fn engine_queues_are_exactly_the_in_process_kinds_queues() {
+        use jamjet_core::node::NodeKind;
+        let kind = |tag: &str| -> NodeKind {
+            let v = match tag {
+                "model" => {
+                    serde_json::json!({ "type": "model", "model_ref": "m", "prompt_ref": "", "output_schema": "" })
+                }
+                "eval" => {
+                    serde_json::json!({ "type": "eval", "scorers": [], "on_fail": "halt", "input_expr": null })
+                }
+                "condition" => serde_json::json!({ "type": "condition", "branches": [] }),
+                "human_approval" => {
+                    serde_json::json!({ "type": "human_approval", "description": "", "timeout_secs": null, "fallback_node": null })
+                }
+                "limit_exceeded" => serde_json::json!({ "type": "limit_exceeded" }),
+                "python_fn" => {
+                    serde_json::json!({ "type": "python_fn", "module": "m", "function": "f", "output_schema": "" })
+                }
+                "java_fn" => {
+                    serde_json::json!({ "type": "java_fn", "class_name": "C", "method": "m", "output_schema": "" })
+                }
+                "external_fn" => {
+                    serde_json::json!({ "type": "external_fn", "queue": "q", "handler": "h", "output_schema": "" })
+                }
+                other => panic!("no sample for {other}"),
+            };
+            serde_json::from_value(v).unwrap()
+        };
+        for tag in IN_PROCESS_KINDS {
+            let q = kind(tag).queue_type();
+            assert!(
+                ENGINE_QUEUES.contains(&q.as_str()),
+                "{tag} goes to {}",
+                q.as_str()
+            );
+        }
+        for tag in EXTERNAL_WORKER_KINDS {
+            let q = kind(tag).queue_type();
+            assert!(
+                !ENGINE_QUEUES.contains(&q.as_str()),
+                "{tag} goes to {}",
+                q.as_str()
+            );
+        }
+    }
 
     #[test]
     fn every_kind_has_exactly_one_runner() {

@@ -63,15 +63,22 @@ impl NodeExecutor for HumanApprovalExecutor {
                 item.node_id
             )));
         };
-        let (principal, comment) = events
+        let (principal, comment, decided_at) = events
             .iter()
             .find_map(|e| match &e.kind {
                 EventKind::ApprovalReceived {
                     principal, comment, ..
-                } if e.sequence == sequence => Some((principal.clone(), comment.clone())),
+                } if e.sequence == sequence => Some((
+                    principal.clone(),
+                    comment.clone(),
+                    Some(
+                        e.created_at
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    ),
+                )),
                 _ => None,
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, None));
         // The approval must answer a request for THIS occurrence of the node
         // (the guard before this checked the same; this keeps the executor
         // closed on its own). A request records the node's completion count
@@ -105,16 +112,35 @@ impl NodeExecutor for HumanApprovalExecutor {
             )));
         }
         let request_sequence = Some(request.sequence);
+        // The decision also goes into the run's state under the node's id, so
+        // later steps and prompts can read it (`state.<node_id>.approver`).
+        // Namespaced by node id so two approvals in one workflow cannot
+        // overwrite each other's record. Only an approval reaches here; a
+        // rejection fails the node, so nothing downstream sees
+        // `approved: false` except a fallback after an expiry.
+        let mut state_patch = serde_json::Map::new();
+        state_patch.insert(
+            item.node_id.clone(),
+            json!({
+                "approved": true,
+                "decision": "approved",
+                "approver": user_id,
+                "principal": principal,
+                "comment": comment,
+                "decided_at": decided_at,
+            }),
+        );
         Ok(ExecutionResult {
             output: json!({
                 "decision": "approved",
                 "approved_by": user_id,
                 "principal": principal,
                 "comment": comment,
+                "decided_at": decided_at,
                 "request_sequence": request_sequence,
                 "decision_sequence": sequence,
             }),
-            state_patch: json!({}),
+            state_patch: serde_json::Value::Object(state_patch),
             duration_ms: start.elapsed().as_millis() as u64,
             gen_ai_system: None,
             gen_ai_model: None,
@@ -216,6 +242,27 @@ mod tests {
         assert_eq!(out["approved_by"], "bob");
         assert_eq!(out["principal"], "token:b");
         assert_eq!(out["comment"], "ok");
+    }
+
+    /// The decision is written into the run's state under the node's id.
+    #[tokio::test]
+    async fn an_approval_records_the_decision_in_state_under_the_node_id() {
+        let (backend, eid) = approved_log().await;
+        let exec = HumanApprovalExecutor::new(backend.clone());
+        let patch = exec.execute(&item(&eid)).await.unwrap().state_patch;
+        let rec = &patch["review"];
+        assert_eq!(rec["approved"], true);
+        assert_eq!(rec["approver"], "bob");
+        assert_eq!(rec["principal"], "token:b");
+        assert!(
+            rec["decided_at"].as_str().is_some_and(|s| s.ends_with('Z')),
+            "{rec}"
+        );
+        assert_eq!(
+            patch.as_object().unwrap().len(),
+            1,
+            "only the node's own key"
+        );
     }
 
     /// The approval on record answered a request for an earlier visit of the

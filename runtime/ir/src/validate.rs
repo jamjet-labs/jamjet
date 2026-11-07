@@ -96,6 +96,9 @@ pub fn validate_human_approvals(ir: &WorkflowIr) -> IrResult<()> {
     Ok(())
 }
 
+/// The `fallback_node` that ends the run on expiry instead of naming a node.
+pub const FALLBACK_END: &str = "end";
+
 /// The `fallback_node` of the `human_approval` node `node_id`, if it names one
 /// the engine can route to: `Ok(None)` when it names none (or `node_id` is not
 /// a `human_approval` node), `Err` with the reason when it names one that
@@ -107,7 +110,8 @@ pub fn validate_human_approvals(ir: &WorkflowIr) -> IrResult<()> {
 /// must not be reachable from it. The scheduler gives the fallback an in-edge
 /// from the approval node, so a fallback upstream of it (the start node, or a
 /// "redo the draft" step) would wait on the approval while the approval waited
-/// on it, and the run would end without anyone being asked.
+/// on it, and the run would end without anyone being asked. `end` (see
+/// [`FALLBACK_END`]) is accepted when no node has that id.
 pub fn human_approval_fallback<'a>(
     ir: &'a WorkflowIr,
     node_id: &str,
@@ -122,6 +126,12 @@ pub fn human_approval_fallback<'a>(
     };
     if fallback == node_id {
         return Err("fallback_node names the node itself".to_string());
+    }
+    // `fallback: end`, as edges spell the terminal: on expiry the run ends
+    // there, and the steps the approval guarded are skipped. Only when no
+    // node is actually called "end".
+    if fallback == FALLBACK_END && !ir.nodes.contains_key(fallback) {
+        return Ok(Some(FALLBACK_END));
     }
     if !ir.nodes.contains_key(fallback) {
         return Err(format!(

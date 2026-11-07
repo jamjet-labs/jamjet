@@ -81,9 +81,12 @@ nodes:
 The engine has no executor for `tool`, `mcp_tool`, `a2a_task`, `agent`,
 `agent_tool`, `coordinator`, `wait`, `parallel`, `join`, `subgraph`,
 `memory_retrieval`, `policy` or `finalizer`. `POST /workflows` refuses a
-workflow with any of them (400, naming each node and its kind). Until 2026-11
-such a node was registered and then completed with an empty output without
-running. Fan-out and fan-in need no node: a node with several `next` targets
+workflow with any of them (400, naming each node and its kind), including
+when it re-registers a version already stored. Until 2026-11 such a node was
+registered and then completed with an empty output without running. A
+version stored before then still starts (`POST /executions`, cron); when the
+run reaches such a node, the node fails with `no executor for node kind <kind>`
+and so does the run. Fan-out and fan-in need no node: a node with several `next` targets
 runs them all, and a node with several incoming edges waits for all of them.
 
 ---
@@ -110,12 +113,13 @@ review:
   type: human_approval
   description: "Please review the generated report"
   timeout: 48h                      # optional: the request expires after this
-  fallback: escalate                # optional: where the run goes on expiry
+  fallback: escalate                # optional: where the run goes on expiry (`end` to stop)
   next: deliver                     # taken when approved
 ```
 
-Approved, the run continues along `next`. Rejected, the node and the run
-fail. Expired, the run goes to `fallback`, or fails if there is none. See
+Approved, the run continues along `next`, and `state.review` holds the
+decision. Rejected, the node and the run fail. Expired, the run goes to
+`fallback` (or stops, for `end`), or fails if there is none. See
 [Human-in-the-Loop](hitl.md#approval-nodes).
 
 ---

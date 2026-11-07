@@ -392,6 +392,20 @@ async fn an_expired_request_routes_to_the_fallback_node() {
             .unwrap_or_else(|| panic!("{}: review completes on expiry: {evs:#?}", env.name));
         assert_eq!(output["decision"], "expired", "{}", env.name);
         assert_eq!(output["chosen_target"], "hold", "{}", env.name);
+        // The fallback can read why it runs: the decision is in the state.
+        let patch = evs
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::NodeCompleted {
+                    node_id,
+                    state_patch,
+                    ..
+                } if node_id == "review" => Some(state_patch.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(patch["review"]["approved"], false, "{}: {patch}", env.name);
+        assert_eq!(patch["review"]["decision"], "expired", "{}", env.name);
         assert_eq!(
             ran(&env),
             vec!["hold".to_string()],
@@ -709,11 +723,10 @@ async fn a_stored_upstream_fallback_is_ignored_and_an_expiry_fails() {
 }
 
 /// Review finding (PR #169): the route of a `human_approval` node was read
-/// from a completion's output, which an external worker reporting the
-/// approved node writes. A forged `chosen_target` must not send the run to
-/// the fallback.
+/// from a completion's output. A `chosen_target` in a reported result must
+/// not send the run to the fallback.
 #[tokio::test]
-async fn a_worker_reported_route_cannot_pick_the_fallback() {
+async fn a_route_in_a_completion_output_cannot_pick_the_fallback() {
     for env in envs().await {
         let (eid, ctx) = park(&env, ir(Some(60), true, Value::Null)).await;
         let digest = ctx["action_digest"].as_str().unwrap();
@@ -728,37 +741,42 @@ async fn a_worker_reported_route_cannot_pick_the_fallback() {
         assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
         env.scheduler.tick().await.unwrap();
 
-        // An external worker with its own token claims the re-dispatched
-        // item from `general` and reports a route of its choosing.
-        let (carol, _) = env
+        // A completion that names a route, written the way any reported
+        // result is (`commit_turn`). External workers can no longer claim or
+        // complete this item (see human_approval_binding.rs); this checks the
+        // scheduler does not route on the output even if one gets written.
+        let item = env
             .backend
-            .create_token("carol", "developer")
+            .claim_work_item("ext", &["general"])
+            .await
+            .unwrap()
+            .expect("the approved item is re-dispatched");
+        env.backend
+            .commit_turn(
+                item.id,
+                item.lease_fence,
+                Event::new(
+                    eid.clone(),
+                    0,
+                    EventKind::NodeCompleted {
+                        node_id: "review".into(),
+                        output: json!({ "chosen_target": "hold" }),
+                        state_patch: json!({}),
+                        duration_ms: 0,
+                        gen_ai_system: None,
+                        gen_ai_model: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        finish_reason: None,
+                        cost_usd: None,
+                        provenance: None,
+                        idempotency_key: None,
+                    },
+                ),
+                true,
+            )
             .await
             .unwrap();
-        let (st, claimed) = call(
-            &env,
-            "POST",
-            "/work-items/claim",
-            &carol,
-            json!({ "worker_id": "ext", "queue_types": ["general"] }),
-        )
-        .await;
-        assert_eq!(st, StatusCode::OK, "{}: {claimed}", env.name);
-        assert_eq!(claimed["claimed"], true, "{}: {claimed}", env.name);
-        let item = claimed["work_item"]["id"].as_str().unwrap().to_string();
-        let (st, body) = call(
-            &env,
-            "POST",
-            &format!("/work-items/{item}/complete"),
-            &carol,
-            json!({
-                "output": { "chosen_target": "hold" },
-                "state_patch": {},
-                "lease_fence": claimed["work_item"]["lease_fence"],
-            }),
-        )
-        .await;
-        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
         settle(&env).await;
 
         let evs = events(&env, &eid).await;
@@ -769,5 +787,50 @@ async fn a_worker_reported_route_cannot_pick_the_fallback() {
             env.name
         );
         assert_eq!(finished(&evs), Some("completed"), "{}", env.name);
+    }
+}
+
+/// `fallback: end` ends the run on expiry: the guarded steps are skipped and
+/// nothing runs in their place.
+#[tokio::test]
+async fn an_end_fallback_stops_the_run_on_expiry() {
+    for env in envs().await {
+        let mut ir = ir(Some(60), false, Value::Null);
+        ir["nodes"]["review"]["kind"]["fallback_node"] = json!("end");
+        let (eid, ctx) = park(&env, ir).await;
+        let expires_at: DateTime<Utc> = ctx["expires_at"].as_str().unwrap().parse().unwrap();
+        env.scheduler
+            .sweep_approval_deadlines(&eid, expires_at)
+            .await
+            .unwrap();
+        settle(&env).await;
+        let evs = events(&env, &eid).await;
+        assert!(ran(&env).is_empty(), "{}: {evs:#?}", env.name);
+        assert!(
+            evs.iter().any(|e| matches!(&e.kind,
+                EventKind::NodeSkipped { node_id, .. } if node_id == "publish")),
+            "{}: publish is skipped",
+            env.name
+        );
+        assert_eq!(finished(&evs), Some("completed"), "{}", env.name);
+    }
+}
+
+/// A version stored with a fallback registration now refuses still
+/// re-registers unchanged (deployments re-register on boot); the scheduler
+/// treats that fallback as none.
+#[tokio::test]
+async fn a_stored_version_with_an_upstream_fallback_still_re_registers() {
+    for env in envs().await {
+        let mut ir = ir(Some(60), true, Value::Null);
+        ir["start_node"] = json!("hold");
+        ir["edges"] = json!([
+            { "from": "hold", "to": "review", "condition": null },
+            { "from": "review", "to": "publish", "condition": null },
+            { "from": "publish", "to": "end", "condition": null }
+        ]);
+        support::store_ir(env.backend.as_ref(), &ir).await;
+        let (st, body) = call(&env, "POST", "/workflows", &env.alice, json!({ "ir": ir })).await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
     }
 }

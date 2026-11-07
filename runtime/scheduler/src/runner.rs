@@ -456,8 +456,20 @@ impl Scheduler {
             .map(|(n, r)| (n.clone(), r.clone()))
             .collect::<Vec<_>>()
         {
-            if progress.expired.contains(&node_id) {
+            if let Some(expires_at) = progress.expired.get(&node_id).copied() {
                 if let Some(fallback) = fallback_of(&ir, &node_id) {
+                    // The decision goes into state under the node's id, as an
+                    // approval's does, so the fallback can read why it runs.
+                    let mut state_patch = serde_json::Map::new();
+                    state_patch.insert(
+                        node_id.clone(),
+                        serde_json::json!({
+                            "approved": false,
+                            "decision": "expired",
+                            "decided_at": expires_at
+                                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        }),
+                    );
                     let seq = self.backend.latest_sequence(execution_id).await? + 1;
                     self.backend
                         .append_event(jamjet_state::Event::new(
@@ -470,7 +482,7 @@ impl Scheduler {
                                     "reason": reason,
                                     "chosen_target": fallback,
                                 }),
-                                state_patch: serde_json::json!({}),
+                                state_patch: serde_json::Value::Object(state_patch),
                                 duration_ms: 0,
                                 gen_ai_system: None,
                                 gen_ai_model: None,
@@ -810,7 +822,7 @@ struct ExecProgress {
     /// Nodes in `rejected` because their request EXPIRED (not a human
     /// rejection). A `human_approval` node among them with a usable
     /// `fallback_node` completes routed to the fallback instead of failing.
-    expired: HashSet<NodeId>,
+    expired: HashMap<NodeId, chrono::DateTime<chrono::Utc>>,
     /// `human_approval` nodes that completed while in `expired`: the
     /// scheduler's own expiry completion, routed to the fallback. Routing for
     /// these nodes is read from here and never from a completion's output,
@@ -856,7 +868,7 @@ impl ExecProgress {
                 self.held.remove(node_id);
                 // An expired `human_approval` routed to its fallback completes.
                 self.rejected.remove(node_id);
-                if self.expired.remove(node_id) {
+                if self.expired.remove(node_id).is_some() {
                     self.expired_fallbacks.insert(node_id.clone());
                 }
                 // FDL-3: record a Condition node's routing decision. The condition
@@ -1010,7 +1022,7 @@ impl ExecProgress {
                 if self.held_request.get(node_id) == Some(request_sequence)
                     && self.held.remove(node_id)
                 {
-                    self.expired.insert(node_id.clone());
+                    self.expired.insert(node_id.clone(), *expires_at);
                     self.rejected.insert(
                         node_id.clone(),
                         format!(

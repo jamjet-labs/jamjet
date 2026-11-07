@@ -183,6 +183,46 @@ impl Worker {
         );
         let _span_guard = node_span.enter();
 
+        // AUTHORITY. The workflow this item runs under, and so the policy and
+        // the node definition, come from its EXECUTION record, never from the
+        // payload, as on the claim route (`gate_claimed_item`). `POST
+        // /work-items` copies a caller's payload verbatim, so a payload naming
+        // another workflow, where the same node id is a `condition`, could
+        // otherwise run a `human_approval` node's item with no gate. A payload
+        // that disagrees with its execution is not the engine's: settle it
+        // before anything is recorded and leave the node alone.
+        let (workflow_id, workflow_version) = match self
+            .backend
+            .get_execution(&execution_id)
+            .await?
+        {
+            Some(exec) => (exec.workflow_id, exec.workflow_version),
+            None => {
+                warn!(execution_id = %execution_id, node_id = %node_id, "execution not found; settling the item");
+                self.backend
+                    .fail_work_item(item_id, "execution not found")
+                    .await?;
+                return Ok(());
+            }
+        };
+        let payload_disagrees = |key: &str, authoritative: &str| {
+            item.payload
+                .get(key)
+                .and_then(|v| v.as_str())
+                .is_some_and(|claimed| claimed != authoritative)
+        };
+        if payload_disagrees("workflow_id", &workflow_id)
+            || payload_disagrees("workflow_version", &workflow_version)
+        {
+            let reason = format!(
+                "work item payload coordinates disagree with execution {workflow_id} \
+                 v{workflow_version}"
+            );
+            warn!(execution_id = %execution_id, node_id = %node_id, %reason, "settling a work item that is not the engine's");
+            self.backend.fail_work_item(item_id, &reason).await?;
+            return Ok(());
+        }
+
         // Emit NodeStarted.
         let seq = self.backend.latest_sequence(&execution_id).await? + 1;
         self.backend
@@ -207,7 +247,6 @@ impl Worker {
         );
 
         // Load workflow IR.
-        let (workflow_id, workflow_version) = parse_payload(&item.payload);
         node_span.record(gen_ai_attrs::JAMJET_WORKFLOW_ID, workflow_id.as_str());
         node_span.record(
             gen_ai_attrs::JAMJET_WORKFLOW_VERSION,
@@ -1317,20 +1356,6 @@ impl Worker {
 
         Ok(())
     }
-}
-
-fn parse_payload(payload: &serde_json::Value) -> (String, String) {
-    let workflow_id = payload
-        .get("workflow_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let workflow_version = payload
-        .get("workflow_version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("1.0.0")
-        .to_string();
-    (workflow_id, workflow_version)
 }
 
 #[cfg(test)]
@@ -3633,7 +3658,9 @@ mod tests {
         backend
             .create_execution(WorkflowExecution {
                 execution_id: eid.clone(),
-                workflow_id: "wf".into(),
+                // The run of the workflow the item names: the worker reads the
+                // workflow from the execution, not the payload.
+                workflow_id: "adk-wf".into(),
                 workflow_version: "1.0.0".into(),
                 status: jamjet_core::workflow::WorkflowStatus::Running,
                 initial_input: serde_json::json!({}),
