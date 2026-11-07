@@ -5,6 +5,7 @@ import threading
 from typing import Any
 
 from .models import PolicyDecision
+from .remote_policy import RemotePolicies, rank
 
 
 def _field(obj: Any, key: str) -> Any:
@@ -47,12 +48,21 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
     return re.compile("".join(parts), re.DOTALL)
 
 
+def _current_agent_name() -> str:
+    from .agent import get_current_agent
+
+    current = get_current_agent()
+    return current.name if current is not None else "default"
+
+
 class PolicyEvaluator:
     """Evaluate tool names against glob-based allow/block/require_approval rules."""
 
     def __init__(self) -> None:
         self._rules: list[tuple[str, str, re.Pattern[str]]] = []  # (action, pattern, compiled)
         self._lock = threading.Lock()
+        # Cloud-managed rules, attached by configure(); see remote_policy.py.
+        self.remote: RemotePolicies | None = None
 
     def add(self, action: str, pattern: str) -> None:
         """Add a policy rule. action is 'block', 'allow', 'require_approval' or 'audit'."""
@@ -68,8 +78,20 @@ class PolicyEvaluator:
         are evaluated top-to-bottom and the first matching rule is returned.
         Later rules cannot override an earlier match. The name is trimmed, as
         Cloud trims the tool name it evaluates.
+
+        When Cloud-managed rules are attached (``configure(remote_policies=...)``),
+        the stricter of the local and the Cloud decision wins
+        (block > require_approval > audit > allow), so neither side can loosen
+        the other. On a tie the local decision is kept.
         """
         tool_name = tool_name.strip()
+        local = self._evaluate_local(tool_name)
+        remote = self.remote.decide(tool_name, _current_agent_name()) if self.remote is not None else None
+        if remote is not None and rank(remote.policy_kind) > rank(local.policy_kind):
+            return remote
+        return local
+
+    def _evaluate_local(self, tool_name: str) -> PolicyDecision:
         with self._lock:
             rules = list(self._rules)
         for action, pattern, compiled in rules:
@@ -83,14 +105,18 @@ class PolicyEvaluator:
         return PolicyDecision(blocked=False, policy_kind="allow", pattern=None, tool_name=tool_name)
 
     def has_rules(self) -> bool:
-        """True once any rule has been added."""
+        """True once any rule, local or Cloud-managed, can affect a decision."""
         with self._lock:
-            return bool(self._rules)
+            if self._rules:
+                return True
+        return self.remote is not None and self.remote.active()
 
     def has_restrictive_rules(self) -> bool:
         """True when a block or require_approval rule exists."""
         with self._lock:
-            return any(action in ("block", "require_approval") for action, _, _ in self._rules)
+            if any(action in ("block", "require_approval") for action, _, _ in self._rules):
+                return True
+        return self.remote is not None and self.remote.active()
 
     def filter_tools(self, tools: list[Any]) -> tuple[list[Any], list[Any]]:
         """Split a tool list into (allowed, blocked).
