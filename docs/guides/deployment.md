@@ -103,11 +103,14 @@ integration's recorded calls) claims that execution's work instead:
   run: policy refused it, the engine cannot evaluate it, or it failed for
   good), `approval_required` (it waits for an approval), `claimed_by_other`
   (another worker holds it), `not_found` (no live run with that id that you
-  may claim) or `not_ready` (not queued yet, or the engine could not decide
-  now; try again). `blocked` and `approval_required` come from the run's
-  log, so a retry, or another worker, gets the same answer. A run that has
-  ended answers `not_found` with its `status` (`"completed"`, `"failed"`,
-  `"cancelled"`, ...).
+  may claim), `refused` (the item was withheld as not the engine's: its
+  payload names another workflow than its run; the node is not failed) or
+  `not_ready` (not queued yet, or the engine could not decide now; try
+  again). `blocked`, `approval_required` and `refused` come from the run's
+  log, so a retry, or another worker, gets the same answer. Without
+  `node_id` they are about the nodes the run has open now, not a node it has
+  moved past. A run that has ended answers `not_found` with its `status`
+  (`"completed"`, `"failed"`, `"cancelled"`, ...).
 - `wait_ms` waits up to that many milliseconds, at most 10000, for a
   `not_ready` item to be queued, so a client can claim right after starting
   the run. A run that ends during the wait answers `not_found` then. One
@@ -120,12 +123,17 @@ integration's recorded calls) claims that execution's work instead:
   deciding answers `not_ready`. The decision runs to its end even when the
   client gives up on the request, so the retry after it gets the lease. A
   lease whose claim withheld the item for a reason to try again is decided
-  again as a new claim, with a new `lease_fence`. A lease that expires
-  before its decision finished costs no attempt: the node never ran.
+  again as a new claim, with a new `lease_fence`. A decision that outlives
+  the lease hands nothing out; one that hands the item out renews the lease
+  for its full length first. A lease that expires is charged an attempt
+  like any other, whatever its decision had reached, so an item whose
+  decision fails every time ends in the dead-letter queue.
 - A heartbeat that re-attaches a lease after an expiry keeps it handed out:
   the same worker claiming again gets it under the new `lease_fence`. A
-  heartbeat the store could not answer is a `503` with `Retry-After`, worth
-  retrying; a `409` means the lease is lost.
+  heartbeat the store could not answer before renewing is a `503` with
+  `Retry-After`, worth retrying; a `409` means the lease is lost. Once the
+  renewal is made the heartbeat answers with it, and `cancel_requested` is
+  `false` if the run could not be read; the next heartbeat asks again.
 
 Runtimes before this change ignore `execution_id` and `node_id` on a claim,
 and `claim` on a node, without refusing them: they hand out the oldest item
@@ -142,7 +150,8 @@ a counter, not a credential). `POST /work-items` marks the item from the
 node's kind, whatever the payload says. `claim` on any other kind is refused
 at registration. An item of such a node that lost its mark (enqueued straight
 into the store) is still not handed out oldest-first: it is put back, marked,
-for the claim that names its execution.
+for the claim that names its execution. One whose payload is not a JSON
+object cannot carry the mark, and its node is failed.
 
 This decides who runs the node and reports its result, not who can read the
 run: `GET /executions/:id` shows its state to any token of the tenant.

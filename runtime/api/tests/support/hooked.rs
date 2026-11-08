@@ -29,6 +29,10 @@ pub enum Write {
     Claimed(ExecutionId),
     /// A read of the leased items (after it returned).
     LeasedItems,
+    /// A lease renewed or re-attached (after it committed).
+    HeartbeatLease,
+    /// A read of an execution (after it returned).
+    GetExecution,
 }
 
 #[async_trait::async_trait]
@@ -40,7 +44,10 @@ pub struct HookedBackend {
     pub inner: Arc<dyn StateBackend>,
     pub hook: Arc<dyn AfterWrite>,
     /// While set, `get_work_item` fails as a store that is briefly away does.
-    pub fail_item_reads: std::sync::atomic::AtomicBool,
+    /// Shared, so a hook can set it.
+    pub fail_item_reads: Arc<std::sync::atomic::AtomicBool>,
+    /// While set, `get_workflow` panics: a gate that dies mid-decision.
+    pub panic_workflow_reads: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HookedBackend {
@@ -48,7 +55,8 @@ impl HookedBackend {
         Self {
             inner,
             hook,
-            fail_item_reads: std::sync::atomic::AtomicBool::new(false),
+            fail_item_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            panic_workflow_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -59,7 +67,9 @@ impl StateBackend for HookedBackend {
         &self,
         id: &ExecutionId,
     ) -> jamjet_state::backend::BackendResult<Option<WorkflowExecution>> {
-        self.inner.get_execution(id).await
+        let exec = self.inner.get_execution(id).await?;
+        self.hook.after(Write::GetExecution).await;
+        Ok(exec)
     }
 
     async fn get_events(
@@ -85,6 +95,12 @@ impl StateBackend for HookedBackend {
         workflow_id: &str,
         version: &str,
     ) -> jamjet_state::backend::BackendResult<Option<WorkflowDefinition>> {
+        if self
+            .panic_workflow_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("get_workflow: a poison pill");
+        }
         self.inner.get_workflow(workflow_id, version).await
     }
 
@@ -357,6 +373,18 @@ impl StateBackend for HookedBackend {
         Ok(leased)
     }
 
+    async fn release_lease(
+        &self,
+        item_id: uuid::Uuid,
+        lease_fence: i64,
+        from: jamjet_state::GateMark,
+        lease_secs: u64,
+    ) -> jamjet_state::backend::BackendResult<bool> {
+        self.inner
+            .release_lease(item_id, lease_fence, from, lease_secs)
+            .await
+    }
+
     async fn swap_gate(
         &self,
         item_id: uuid::Uuid,
@@ -401,9 +429,12 @@ impl StateBackend for HookedBackend {
         worker_id: &str,
         lease_fence: i64,
     ) -> jamjet_state::backend::BackendResult<jamjet_state::LeaseRenewal> {
-        self.inner
+        let renewal = self
+            .inner
             .heartbeat_lease(item_id, worker_id, lease_fence)
-            .await
+            .await?;
+        self.hook.after(Write::HeartbeatLease).await;
+        Ok(renewal)
     }
 
     async fn commit_turn_unless_terminal(

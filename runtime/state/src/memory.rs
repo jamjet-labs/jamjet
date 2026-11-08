@@ -110,6 +110,13 @@ impl InMemoryBackend {
             entry.lease_expires_at = Some(Utc::now() - chrono::Duration::hours(1));
         }
     }
+
+    /// Test helper: set a work item's lease expiry.
+    pub fn set_lease_expiry_for_test(&self, item_id: WorkItemId, at: chrono::DateTime<Utc>) {
+        if let Some(mut entry) = self.work_items.get_mut(&item_id) {
+            entry.lease_expires_at = Some(at);
+        }
+    }
 }
 
 impl InMemoryBackend {
@@ -660,6 +667,42 @@ impl StateBackend for InMemoryBackend {
         Ok(held)
     }
 
+    async fn release_lease(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: crate::backend::GateMark,
+        lease_secs: u64,
+    ) -> BackendResult<bool> {
+        use crate::backend::GateMark;
+        let now = Utc::now();
+        let Some(mut item) = self.work_items.get_mut(&item_id) else {
+            return Ok(false);
+        };
+        if item.worker_id.is_none()
+            || item.lease_fence != lease_fence
+            || !item.lease_expires_at.is_some_and(|t| t > now)
+        {
+            return Ok(false);
+        }
+        let mark = match self.released_fences.get(&item_id).map(|f| *f.value()) {
+            Some(f) if f == lease_fence => GateMark::Released,
+            Some(f) if f == -lease_fence => GateMark::Gating,
+            _ => GateMark::Undecided,
+        };
+        if mark != from {
+            return Ok(false);
+        }
+        item.lease_expires_at = Some(
+            now + chrono::Duration::seconds(
+                crate::backend::granted_lease_secs(Some(lease_secs)) as i64
+            ),
+        );
+        self.released_fences.insert(item_id, lease_fence);
+        drop(item);
+        Ok(true)
+    }
+
     async fn swap_gate(
         &self,
         item_id: WorkItemId,
@@ -733,27 +776,8 @@ impl StateBackend for InMemoryBackend {
                 .executions
                 .get(&item.execution_id)
                 .is_some_and(|e| e.value().status.is_terminal());
-            let gating = item.lease_fence != 0
-                && self
-                    .released_fences
-                    .get(&item.id)
-                    .is_some_and(|f| *f.value() == -item.lease_fence);
             if terminal {
                 withdrawn.push(item.id);
-            } else if gating {
-                // A claim gate that never finished: the node never ran.
-                // Back to pending, uncharged, nothing recorded.
-                let next = self
-                    .lease_epochs
-                    .get(&item.id)
-                    .map(|e| *e.value())
-                    .unwrap_or(0)
-                    + 1;
-                self.lease_epochs.insert(item.id, next);
-                self.released_fences.remove(&item.id);
-                item.worker_id = None;
-                item.lease_expires_at = None;
-                item.lease_fence = 0;
             } else if item.attempt + 1 < item.max_attempts {
                 expired.push(item.clone());
                 self.last_lease.insert(
@@ -1267,25 +1291,6 @@ impl StateBackend for InMemoryBackend {
             let item = entry.value_mut();
             if let Some(expires) = item.lease_expires_at {
                 if expires < now && item.worker_id.is_some() {
-                    let gating = item.lease_fence != 0
-                        && self
-                            .released_fences
-                            .get(&item.id)
-                            .is_some_and(|f| *f.value() == -item.lease_fence);
-                    if gating {
-                        let next = self
-                            .lease_epochs
-                            .get(&item.id)
-                            .map(|e| *e.value())
-                            .unwrap_or(0)
-                            + 1;
-                        self.lease_epochs.insert(item.id, next);
-                        self.released_fences.remove(&item.id);
-                        item.worker_id = None;
-                        item.lease_expires_at = None;
-                        item.lease_fence = 0;
-                        continue;
-                    }
                     item.attempt += 1;
                     if item.attempt < item.max_attempts {
                         self.last_lease.insert(

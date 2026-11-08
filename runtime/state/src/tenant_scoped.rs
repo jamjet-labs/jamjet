@@ -1264,6 +1264,24 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
     }
 
+    async fn release_lease(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: crate::backend::GateMark,
+        lease_secs: u64,
+    ) -> BackendResult<bool> {
+        crate::sqlite::release_lease_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            item_id,
+            lease_fence,
+            from,
+            lease_secs,
+        )
+        .await
+    }
+
     async fn swap_gate(
         &self,
         item_id: WorkItemId,
@@ -1821,11 +1839,6 @@ impl StateBackend for TenantScopedSqliteBackend {
             let item = row_to_work_item(row)?;
             let new_attempt = item.attempt + 1;
             let id_str = item.id.to_string();
-            // A gating lease never ran: requeued uncharged, not reported.
-            if crate::sqlite::is_gating(row, item.lease_fence) {
-                crate::sqlite::requeue_gating(&self.pool, &id_str, item.lease_fence).await?;
-                continue;
-            }
 
             if new_attempt >= item.max_attempts {
                 let dead_lettered_at = Utc::now().to_rfc3339();
@@ -1840,17 +1853,14 @@ impl StateBackend for TenantScopedSqliteBackend {
                 // another tenant's row. Settling before the insert is what keeps a
                 // lost race from leaving an orphan dead-letter row describing a
                 // node that actually succeeded.
-                let rows = sqlx::query(
-                    "UPDATE work_items SET status = 'dead_lettered', attempt = ?, lease_expires_at = NULL, worker_id = NULL \
-                     WHERE id = ? AND tenant_id = ? AND status = 'claimed'",
+                let rows = crate::sqlite::dead_letter_expired_in(
+                    &self.pool,
+                    Some(&self.tenant_id.0),
+                    &id_str,
+                    item.lease_fence,
+                    new_attempt,
                 )
-                .bind(new_attempt as i64)
-                .bind(&id_str)
-                .bind(&self.tenant_id.0)
-                .execute(&self.pool)
-                .await
-                .map_err(map_db_err)?
-                .rows_affected();
+                .await?;
                 if rows == 0 {
                     // Settled under us. Do NOT report it: the caller emits
                     // NodeFailed from this list, and a terminal event for a node
@@ -1890,20 +1900,15 @@ impl StateBackend for TenantScopedSqliteBackend {
                 // double-execution path. `lease_fence = 0` clears the stale
                 // token so the worker that just lost this item cannot park over
                 // the requeued attempt.
-                let rows = sqlx::query(
-                    "UPDATE work_items SET status = 'pending', attempt = ?, last_worker_id = worker_id, \
-                     last_lease_fence = lease_fence, worker_id = NULL, lease_expires_at = NULL, \
-                     retry_after = ?, lease_epoch = lease_epoch + 1, lease_fence = 0 \
-                     WHERE id = ? AND tenant_id = ? AND status = 'claimed'",
+                let rows = crate::sqlite::requeue_expired_in(
+                    &self.pool,
+                    Some(&self.tenant_id.0),
+                    &id_str,
+                    item.lease_fence,
+                    new_attempt,
+                    &retry_after,
                 )
-                .bind(new_attempt as i64)
-                .bind(&retry_after)
-                .bind(&id_str)
-                .bind(&self.tenant_id.0)
-                .execute(&self.pool)
-                .await
-                .map_err(map_db_err)?
-                .rows_affected();
+                .await?;
                 if rows == 0 {
                     continue;
                 }

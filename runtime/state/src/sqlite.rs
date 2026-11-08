@@ -1309,6 +1309,17 @@ impl StateBackend for SqliteBackend {
         crate::sqlite::park_for_execution_in(&self.pool, None, item_id, lease_fence).await
     }
 
+    async fn release_lease(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: crate::backend::GateMark,
+        lease_secs: u64,
+    ) -> BackendResult<bool> {
+        crate::sqlite::release_lease_in(&self.pool, None, item_id, lease_fence, from, lease_secs)
+            .await
+    }
+
     async fn mark_gate(
         &self,
         item_id: WorkItemId,
@@ -1852,11 +1863,6 @@ impl StateBackend for SqliteBackend {
             let item = row_to_work_item(row)?;
             let new_attempt = item.attempt + 1;
             let id_str = item.id.to_string();
-            // A gating lease never ran: requeued uncharged, not reported.
-            if is_gating(row, item.lease_fence) {
-                requeue_gating(&self.pool, &id_str, item.lease_fence).await?;
-                continue;
-            }
 
             if new_attempt >= item.max_attempts {
                 // Settle FIRST, guarded, then record. `AND status = 'claimed'`
@@ -1869,16 +1875,14 @@ impl StateBackend for SqliteBackend {
                 // settled. Doing the settle before the dead-letter insert is
                 // what keeps a lost race from leaving an orphan row describing
                 // a node that actually succeeded.
-                let rows = sqlx::query(
-                    "UPDATE work_items SET status = 'dead_lettered', attempt = ?, lease_expires_at = NULL, worker_id = NULL \
-                     WHERE id = ? AND status = 'claimed'",
+                let rows = dead_letter_expired_in(
+                    &self.pool,
+                    None,
+                    &id_str,
+                    item.lease_fence,
+                    new_attempt,
                 )
-                .bind(new_attempt as i64)
-                .bind(&id_str)
-                .execute(&self.pool)
-                .await
-                .map_err(map_db_err)?
-                .rows_affected();
+                .await?;
                 if rows == 0 {
                     // Settled under us. Do NOT report it: the caller emits
                     // NodeFailed from this list, and a terminal event for a node
@@ -1919,19 +1923,15 @@ impl StateBackend for SqliteBackend {
                 // for the sharper reason: requeueing a COMPLETED item is exactly
                 // the double-execution path — it goes straight back on the queue
                 // and runs its side effect again.
-                let rows = sqlx::query(
-                    "UPDATE work_items SET status = 'pending', attempt = ?, last_worker_id = worker_id, \
-                     last_lease_fence = lease_fence, worker_id = NULL, lease_expires_at = NULL, \
-                     retry_after = ?, lease_epoch = lease_epoch + 1, lease_fence = 0 \
-                     WHERE id = ? AND status = 'claimed'",
+                let rows = requeue_expired_in(
+                    &self.pool,
+                    None,
+                    &id_str,
+                    item.lease_fence,
+                    new_attempt,
+                    &retry_after,
                 )
-                .bind(new_attempt as i64)
-                .bind(&retry_after)
-                .bind(&id_str)
-                .execute(&self.pool)
-                .await
-                .map_err(map_db_err)?
-                .rows_affected();
+                .await?;
                 if rows == 0 {
                     continue;
                 }
@@ -2804,21 +2804,6 @@ pub(crate) async fn expire_stale_leases(
             .map_err(map_db_err)?;
             continue;
         }
-        // A lease still marked as gating: its claim gate never finished, so
-        // the node never ran. Back to pending, with no attempt charged and no
-        // failure recorded: three dropped requests used to dead-letter it.
-        if is_gating(row, item.lease_fence) {
-            sqlx::query(
-                "UPDATE work_items SET status = 'pending', worker_id = NULL, lease_expires_at = NULL, \
-                 lease_epoch = lease_epoch + 1, lease_fence = 0, released_fence = NULL \
-                 WHERE id = ? AND status = 'claimed'",
-            )
-            .bind(&id_str)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_db_err)?;
-            continue;
-        }
         if item.attempt + 1 >= item.max_attempts {
             // Spent: the sweep dead-letters it, with the NodeFailed it emits.
             continue;
@@ -2847,39 +2832,6 @@ pub(crate) async fn expire_stale_leases(
 
 /// The two events a lost lease leaves in the history: the failure of the
 /// attempt that held it, and the retry that the immediate re-queue is.
-/// Whether `row`'s lease is marked as gating (a claim gate started under it
-/// and never finished).
-pub(crate) fn is_gating(row: &sqlx::sqlite::SqliteRow, lease_fence: i64) -> bool {
-    lease_fence != 0
-        && row
-            .try_get::<Option<i64>, _>("released_fence")
-            .ok()
-            .flatten()
-            == Some(-lease_fence)
-}
-
-/// Return a gating lease to pending, uncharged: see [`expire_stale_leases`].
-/// Only while it is still that lease and still gating: read in a statement of
-/// its own, it may have been released (and handed out) since.
-pub(crate) async fn requeue_gating(
-    pool: &SqlitePool,
-    id: &str,
-    lease_fence: i64,
-) -> BackendResult<()> {
-    sqlx::query(
-        "UPDATE work_items SET status = 'pending', worker_id = NULL, lease_expires_at = NULL, \
-         lease_epoch = lease_epoch + 1, lease_fence = 0, released_fence = NULL \
-         WHERE id = ? AND status = 'claimed' AND lease_fence = ? AND released_fence = ?",
-    )
-    .bind(id)
-    .bind(lease_fence)
-    .bind(-lease_fence)
-    .execute(pool)
-    .await
-    .map_err(map_db_err)?;
-    Ok(())
-}
-
 pub(crate) fn lease_expiry_events(item: &WorkItem) -> [EventKind; 2] {
     [
         EventKind::NodeFailed {
@@ -3172,6 +3124,71 @@ pub(crate) async fn park_for_execution_in(
     Ok(rows > 0)
 }
 
+/// Settle an expired lease as dead-lettered, for `reclaim_expired_leases`.
+///
+/// Only while it is still THAT lease (`lease_fence`), still claimed: the
+/// sweep reads in a statement of its own, and between its read and this write
+/// a claim's own expiry pass may requeue the item and lease it again under a
+/// new fence. Guarded on status alone, this write took the new, live lease
+/// away from its worker. Returns the rows changed (0 or 1).
+pub(crate) async fn dead_letter_expired_in(
+    pool: &SqlitePool,
+    tenant: Option<&str>,
+    id: &str,
+    lease_fence: i64,
+    attempt: u32,
+) -> BackendResult<u64> {
+    let sql = format!(
+        "UPDATE work_items SET status = 'dead_lettered', attempt = ?, lease_expires_at = NULL, \
+         worker_id = NULL WHERE id = ? AND status = 'claimed' AND lease_fence = ?{}",
+        if tenant.is_some() {
+            " AND tenant_id = ?"
+        } else {
+            ""
+        }
+    );
+    let mut q = sqlx::query(&sql)
+        .bind(attempt as i64)
+        .bind(id)
+        .bind(lease_fence);
+    if let Some(t) = tenant {
+        q = q.bind(t);
+    }
+    Ok(q.execute(pool).await.map_err(map_db_err)?.rows_affected())
+}
+
+/// Requeue an expired lease for retry, for `reclaim_expired_leases`. Fenced as
+/// [`dead_letter_expired_in`], for the same reason.
+pub(crate) async fn requeue_expired_in(
+    pool: &SqlitePool,
+    tenant: Option<&str>,
+    id: &str,
+    lease_fence: i64,
+    attempt: u32,
+    retry_after: &str,
+) -> BackendResult<u64> {
+    let sql = format!(
+        "UPDATE work_items SET status = 'pending', attempt = ?, last_worker_id = worker_id, \
+         last_lease_fence = lease_fence, worker_id = NULL, lease_expires_at = NULL, \
+         retry_after = ?, lease_epoch = lease_epoch + 1, lease_fence = 0 \
+         WHERE id = ? AND status = 'claimed' AND lease_fence = ?{}",
+        if tenant.is_some() {
+            " AND tenant_id = ?"
+        } else {
+            ""
+        }
+    );
+    let mut q = sqlx::query(&sql)
+        .bind(attempt as i64)
+        .bind(retry_after)
+        .bind(id)
+        .bind(lease_fence);
+    if let Some(t) = tenant {
+        q = q.bind(t);
+    }
+    Ok(q.execute(pool).await.map_err(map_db_err)?.rows_affected())
+}
+
 /// [`StateBackend::swap_gate`] on the SQLite backends: one guarded UPDATE.
 pub(crate) async fn swap_gate_in(
     pool: &SqlitePool,
@@ -3180,6 +3197,46 @@ pub(crate) async fn swap_gate_in(
     lease_fence: i64,
     from: crate::backend::GateMark,
     to: crate::backend::GateMark,
+) -> BackendResult<bool> {
+    swap_gate_renewing(pool, tenant, item_id, lease_fence, from, to, None).await
+}
+
+/// [`StateBackend::release_lease`] on the SQLite backends: the swap to
+/// released, refused for an expired lease, and the lease renewed for
+/// `lease_secs` in the same UPDATE.
+pub(crate) async fn release_lease_in(
+    pool: &SqlitePool,
+    tenant: Option<&str>,
+    item_id: WorkItemId,
+    lease_fence: i64,
+    from: crate::backend::GateMark,
+    lease_secs: u64,
+) -> BackendResult<bool> {
+    let now = Utc::now();
+    let expires = now
+        + chrono::Duration::seconds(crate::backend::granted_lease_secs(Some(lease_secs)) as i64);
+    swap_gate_renewing(
+        pool,
+        tenant,
+        item_id,
+        lease_fence,
+        from,
+        crate::backend::GateMark::Released,
+        Some((now.to_rfc3339(), expires.to_rfc3339())),
+    )
+    .await
+}
+
+/// [`swap_gate_in`], and with `renew` (`now`, the new expiry) also only for a
+/// lease that has not expired, which it renews.
+async fn swap_gate_renewing(
+    pool: &SqlitePool,
+    tenant: Option<&str>,
+    item_id: WorkItemId,
+    lease_fence: i64,
+    from: crate::backend::GateMark,
+    to: crate::backend::GateMark,
+    renew: Option<(String, String)>,
 ) -> BackendResult<bool> {
     let value = |m: crate::backend::GateMark| match m {
         crate::backend::GateMark::Released => Some(lease_fence),
@@ -3195,22 +3252,36 @@ pub(crate) async fn swap_gate_in(
         _ => "released_fence = ?",
     };
     let sql = format!(
-        "UPDATE work_items SET released_fence = ? \
-         WHERE id = ? AND lease_fence = ? AND status = 'claimed' AND {from_clause}{}",
+        "UPDATE work_items SET released_fence = ?{} \
+         WHERE id = ? AND lease_fence = ? AND status = 'claimed' AND {from_clause}{}{}",
+        if renew.is_some() {
+            ", lease_expires_at = ?"
+        } else {
+            ""
+        },
+        if renew.is_some() {
+            " AND lease_expires_at > ?"
+        } else {
+            ""
+        },
         if tenant.is_some() {
             " AND tenant_id = ?"
         } else {
             ""
         }
     );
-    let mut q = sqlx::query(&sql)
-        .bind(value(to))
-        .bind(item_id.to_string())
-        .bind(lease_fence);
+    let mut q = sqlx::query(&sql).bind(value(to));
+    if let Some((_, expires)) = &renew {
+        q = q.bind(expires.clone());
+    }
+    q = q.bind(item_id.to_string()).bind(lease_fence);
     q = match from {
         crate::backend::GateMark::Undecided => q.bind(lease_fence).bind(lease_fence),
         other => q.bind(value(other)),
     };
+    if let Some((now, _)) = &renew {
+        q = q.bind(now.clone());
+    }
     if let Some(t) = tenant {
         q = q.bind(t);
     }
@@ -3294,6 +3365,67 @@ mod tests {
             parent_execution_id: None,
             segment_number: 0,
         }
+    }
+
+    /// The sweep's writes are fenced: between `reclaim_expired_leases`'s read
+    /// and its write, a claim's own expiry pass may requeue the item and lease
+    /// it again. Guarded on status alone, the sweep then took the new, live
+    /// lease from its worker (requeued it, or dead-lettered it).
+    #[tokio::test]
+    async fn the_sweep_does_not_take_a_lease_it_did_not_read() {
+        let db = open_test_db().await;
+        let exec = sample_execution();
+        let eid = exec.execution_id.clone();
+        db.create_execution(exec).await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        db.enqueue_work_item(WorkItem {
+            id,
+            execution_id: eid,
+            node_id: "n".into(),
+            queue_type: "q".into(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            tenant_id: "default".into(),
+            lease_fence: 0,
+        })
+        .await
+        .unwrap();
+        // The lease the sweep read, then lost to a claim's expiry pass.
+        let read = db.claim_work_item("w1", &["q"]).await.unwrap().unwrap();
+        db.force_lease_expired_for_test(id).await.unwrap();
+        let live = db.claim_work_item("w2", &["q"]).await.unwrap().unwrap();
+        assert_ne!(live.lease_fence, read.lease_fence);
+
+        let id_str = id.to_string();
+        let now = Utc::now().to_rfc3339();
+        for tenant in [None, Some("default")] {
+            assert_eq!(
+                requeue_expired_in(&db.pool, tenant, &id_str, read.lease_fence, 1, &now)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                dead_letter_expired_in(&db.pool, tenant, &id_str, read.lease_fence, 3)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+        let still = db.get_work_item(id).await.unwrap().unwrap();
+        assert_eq!(still.worker_id.as_deref(), Some("w2"));
+        assert_eq!(still.lease_fence, live.lease_fence);
+        // The lease it did read is still requeued.
+        assert_eq!(
+            requeue_expired_in(&db.pool, None, &id_str, live.lease_fence, 1, &now)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

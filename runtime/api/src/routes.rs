@@ -1486,6 +1486,9 @@ enum Refusal {
     ApprovalRequired,
     /// Nothing to hand out yet, or the engine could not decide now; try again.
     NotReady,
+    /// The item was withheld as not the engine's (its payload names another
+    /// workflow than its execution); the node itself is not failed.
+    Refused,
 }
 
 impl Refusal {
@@ -1494,6 +1497,7 @@ impl Refusal {
             Self::Blocked => "blocked",
             Self::ApprovalRequired => "approval_required",
             Self::NotReady => "not_ready",
+            Self::Refused => "refused",
         }
     }
 }
@@ -1617,13 +1621,26 @@ async fn claim_work_item(
         return Ok(nothing_to_claim());
     }
     // On record, so the same worker claiming this lease again by execution
-    // gets it back rather than a second decision. Best effort: without it
-    // that claim decides again, which is safe.
-    if let Err(e) = backend
-        .mark_gate(wi.id, wi.lease_fence, jamjet_state::GateMark::Released)
+    // gets it back rather than a second decision. A compare-and-swap from
+    // undecided, refused for an expired lease: a named retry from the same
+    // worker that landed during this gate has parked the lease and taken it
+    // again, and a blind mark used to hand the item out a second time here.
+    // A backend that cannot record the mark still hands out: a later claim
+    // by execution then decides again, which is safe.
+    match backend
+        .release_lease(
+            wi.id,
+            wi.lease_fence,
+            jamjet_state::GateMark::Undecided,
+            granted_lease_secs,
+        )
         .await
     {
-        warn!(work_item_id = %wi.id, error = %e, "claim: could not record the release");
+        Ok(true) => {}
+        Ok(false) => return Ok(nothing_to_claim()),
+        Err(e) => {
+            warn!(work_item_id = %wi.id, error = %e, "claim: could not record the release");
+        }
     }
 
     // The idempotency key for THIS node occurrence, computed here because claim
@@ -1691,15 +1708,29 @@ async fn may_act_for_execution(
     token: Option<&jamjet_state::ApiToken>,
     dev_mode: bool,
 ) -> Result<bool, ApiError> {
+    Ok(may_act_reading(backend, execution_id, token, dev_mode)
+        .await?
+        .0)
+}
+
+/// [`may_act_for_execution`], with the run's log when it read one, so a claim
+/// can answer from it without reading the log again.
+async fn may_act_reading(
+    backend: &dyn jamjet_state::StateBackend,
+    execution_id: &jamjet_core::workflow::ExecutionId,
+    token: Option<&jamjet_state::ApiToken>,
+    dev_mode: bool,
+) -> Result<(bool, Option<Vec<jamjet_state::Event>>), ApiError> {
     match (token, dev_mode) {
-        (None, true) => Ok(true),
+        (None, true) => Ok((true, None)),
         (None, false) => Err(ApiError::Unauthorized),
         (Some(t), _) => {
             let events = backend.get_events(execution_id).await?;
-            Ok(match jamjet_state::approvals::run_initiator(&events) {
+            let may = match jamjet_state::approvals::run_initiator(&events) {
                 Some(initiator) => initiator == crate::auth::principal_of(t),
                 None => crate::auth::Role::parse_role(&t.role) >= crate::auth::Role::Operator,
-            })
+            };
+            Ok((may, Some(events)))
         }
     }
 }
@@ -1798,7 +1829,9 @@ async fn claim_for_execution(
     let Some(execution_id) = filter.execution_id.clone() else {
         return Ok(claim_refused("not_found"));
     };
-    if !may_act_for_execution(backend.as_ref(), &execution_id, token, dev_mode).await? {
+    let (may, mut first_log) =
+        may_act_reading(backend.as_ref(), &execution_id, token, dev_mode).await?;
+    if !may {
         return Ok(claim_refused("not_found"));
     }
     if !run_is_live(backend.as_ref(), &execution_id).await? {
@@ -1847,7 +1880,11 @@ async fn claim_for_execution(
                 // so a retry used to see `not_ready` after a `blocked`.
                 if first_look || deadline <= tokio::time::Instant::now() {
                     first_look = false;
-                    let events = backend.get_events(&execution_id).await?;
+                    // The log the initiator check read, the first time.
+                    let events = match first_log.take() {
+                        Some(events) => events,
+                        None => backend.get_events(&execution_id).await?,
+                    };
                     if let Some(reason) =
                         reason_from_log(&events, filter.node_id.as_deref(), queue_refs)
                     {
@@ -1884,24 +1921,61 @@ async fn claim_for_execution(
             // client mid-gate used to leave the lease marked as gating until
             // it expired, and then charged it an attempt.
             jamjet_state::ExecutionClaim::AlreadyLeased(leased) => {
+                let item = leased.item.id;
                 let (st, be, worker, queues, flt) = owned(state, backend, body, queue_refs, filter);
-                return tokio::spawn(async move {
+                let gate = tokio::spawn(async move {
                     let q: Vec<&str> = queues.iter().map(String::as_str).collect();
                     rehand_lease(&st, be.as_ref(), leased, &worker, &q, &flt).await
-                })
-                .await
-                .map_err(|e| ApiError::Internal(format!("claim gate task failed: {e}")))?;
+                });
+                return match gate.await {
+                    Ok(answer) => answer,
+                    Err(e) => Err(gate_died(backend.as_ref(), item, &body.worker_id, e).await),
+                };
             }
             jamjet_state::ExecutionClaim::Claimed(wi) => {
+                let item = wi.id;
                 let (st, be, _, _, _) = owned(state, backend, body, queue_refs, filter);
-                return tokio::spawn(async move {
+                let gate = tokio::spawn(async move {
                     release_claimed(&st, be.as_ref(), wi, granted_lease_secs).await
-                })
-                .await
-                .map_err(|e| ApiError::Internal(format!("claim gate task failed: {e}")))?;
+                });
+                return match gate.await {
+                    Ok(answer) => answer,
+                    Err(e) => Err(gate_died(backend.as_ref(), item, &body.worker_id, e).await),
+                };
             }
         }
     }
+}
+
+/// A claim's gate task died (it panicked): its lease is left marked as
+/// gating, which no retry decides again. Move the mark to undecided, best
+/// effort, under whatever fence the item holds for this worker now (a re-hand
+/// may have taken a new lease before it died), so the lease expires like any
+/// other: charged, recorded, and dead-lettered once the attempts are spent. A
+/// gate that panics on every try used to loop at attempt 0 forever.
+async fn gate_died(
+    backend: &dyn jamjet_state::StateBackend,
+    item: Uuid,
+    worker_id: &str,
+    e: tokio::task::JoinError,
+) -> ApiError {
+    tracing::error!(work_item_id = %item, error = %e, "claim: the gate task died");
+    if let Ok(Some(wi)) = backend.get_work_item(item).await {
+        if wi.worker_id.as_deref() == Some(worker_id) {
+            if let Err(err) = backend
+                .swap_gate(
+                    item,
+                    wi.lease_fence,
+                    jamjet_state::GateMark::Gating,
+                    jamjet_state::GateMark::Undecided,
+                )
+                .await
+            {
+                warn!(work_item_id = %item, error = %err, "claim: could not clear a dead gate's mark");
+            }
+        }
+    }
+    ApiError::Internal(format!("claim gate task failed: {e}"))
 }
 
 /// Owned copies of what a claim's spawned gate needs.
@@ -1948,32 +2022,28 @@ async fn ended_run_answer(
 /// `approval_required` while a request for one of the nodes is pending,
 /// `blocked` when a node's latest outcome is a failure that is not retried (a
 /// policy block, a gate that cannot evaluate the node, or a worker's final
-/// failure: the node will not run), else `None`. The nodes looked at are
-/// `node_id`, or every node scheduled on one of `queues`.
+/// failure: the node will not run), `refused` when its latest item was
+/// withheld as not the engine's ([`EventKind::WorkItemRefused`]), else `None`.
+///
+/// The nodes looked at are `node_id`, or the nodes open on one of `queues`
+/// now ([`open_nodes`]): not every node the run ever scheduled, which made a
+/// node refused earlier, that the run had moved past, answer for the node
+/// it waits on now.
 ///
 /// A `PolicyViolation` alone says nothing final: the block's `NodeFailed` is
 /// written after it, and until that lands the item is still leased.
+///
+/// [`EventKind::WorkItemRefused`]: jamjet_state::EventKind::WorkItemRefused
 fn reason_from_log(
     events: &[jamjet_state::Event],
     node_id: Option<&str>,
     queues: &[&str],
 ) -> Option<&'static str> {
     use jamjet_state::EventKind;
-    let mut nodes: Vec<String> = match node_id {
+    let nodes: Vec<String> = match node_id {
         Some(n) => vec![n.to_string()],
-        None => events
-            .iter()
-            .filter_map(|e| match &e.kind {
-                EventKind::NodeScheduled {
-                    node_id,
-                    queue_type,
-                } if queues.contains(&queue_type.as_str()) => Some(node_id.clone()),
-                _ => None,
-            })
-            .collect(),
+        None => open_nodes(events, queues),
     };
-    nodes.sort();
-    nodes.dedup();
     let pending = nodes.iter().any(|n| {
         matches!(
             jamjet_state::approvals::node_approval_status(events, n),
@@ -1983,21 +2053,73 @@ fn reason_from_log(
     if pending {
         return Some("approval_required");
     }
-    let refused = nodes.iter().any(|n| {
-        events
-            .iter()
-            .rev()
-            .find_map(|e| match &e.kind {
-                EventKind::NodeScheduled { node_id, .. } if node_id == n => Some(false),
-                EventKind::NodeCompleted { node_id, .. } if node_id == n => Some(false),
-                EventKind::NodeFailed {
-                    node_id, retryable, ..
-                } if node_id == n => Some(!*retryable),
-                _ => None,
-            })
-            .unwrap_or(false)
-    });
-    refused.then_some("blocked")
+    let outcome = |n: &str| {
+        events.iter().rev().find_map(|e| match &e.kind {
+            EventKind::NodeScheduled { node_id, .. } | EventKind::NodeCompleted { node_id, .. }
+                if node_id == n =>
+            {
+                Some(None)
+            }
+            EventKind::NodeFailed {
+                node_id, retryable, ..
+            } if node_id == n => Some((!*retryable).then_some("blocked")),
+            EventKind::WorkItemRefused { node_id, .. } if node_id == n => Some(Some("refused")),
+            _ => None,
+        })
+    };
+    let outcomes: Vec<&'static str> = nodes.iter().filter_map(|n| outcome(n).flatten()).collect();
+    if outcomes.contains(&"blocked") {
+        Some("blocked")
+    } else if outcomes.contains(&"refused") {
+        Some("refused")
+    } else {
+        None
+    }
+}
+
+/// The nodes on one of `queues` that are open now: scheduled and not
+/// completed, and for one whose latest outcome is a refusal (a final
+/// failure, a refused item), only until another node is scheduled after it,
+/// which means the run moved past it.
+fn open_nodes(events: &[jamjet_state::Event], queues: &[&str]) -> Vec<String> {
+    use jamjet_state::EventKind;
+    let mut open = std::collections::BTreeSet::new();
+    let mut refused = std::collections::BTreeSet::new();
+    for e in events {
+        match &e.kind {
+            EventKind::NodeScheduled {
+                node_id,
+                queue_type,
+            } => {
+                for n in std::mem::take(&mut refused) {
+                    if &n != node_id {
+                        open.remove(&n);
+                    }
+                }
+                if queues.contains(&queue_type.as_str()) {
+                    open.insert(node_id.clone());
+                } else {
+                    open.remove(node_id);
+                }
+            }
+            EventKind::NodeCompleted { node_id, .. } => {
+                open.remove(node_id);
+                refused.remove(node_id);
+            }
+            EventKind::NodeFailed {
+                node_id,
+                retryable: false,
+                ..
+            }
+            | EventKind::WorkItemRefused { node_id, .. }
+                if open.contains(node_id) =>
+            {
+                refused.insert(node_id.clone());
+            }
+            _ => {}
+        }
+    }
+    open.into_iter().collect()
 }
 
 async fn run_is_live(
@@ -2090,8 +2212,11 @@ async fn release_claimed(
         ClaimGate::Release => {
             // On record before it is handed out: a lease handed out again is
             // re-checked as a completion only if this release is recorded.
+            // Refused for a lease that expired while the gate decided, and
+            // renewed in the same write: the worker gets the whole lease, not
+            // what the gate left of it.
             if !backend
-                .swap_gate(wi.id, wi.lease_fence, GateMark::Gating, GateMark::Released)
+                .release_lease(wi.id, wi.lease_fence, GateMark::Gating, lease_secs)
                 .await?
             {
                 return Ok(claim_refused("not_ready"));
@@ -2326,7 +2451,25 @@ async fn gate_claimed_item(
             %reason,
             "claim: withholding a work item that is not the engine's"
         );
-        return settle(backend.fail_work_item(wi.id, &reason).await, wi);
+        if let Err(e) = backend.fail_work_item(wi.id, &reason).await {
+            return settle(Err(e), wi);
+        }
+        // On record, so a retry is told the same (`refused`, read from the
+        // log), not `blocked` and then `not_ready`. Not `blocked`: no policy
+        // refused the node, and it is not failed.
+        let refused = jamjet_state::Event::new(
+            wi.execution_id.clone(),
+            0,
+            jamjet_state::EventKind::WorkItemRefused {
+                node_id: wi.node_id.clone(),
+                work_item_id: wi.id,
+                reason,
+            },
+        );
+        if let Err(e) = backend.append_event(refused).await {
+            warn!(work_item_id = %wi.id, error = %e, "claim: could not record a refused item");
+        }
+        return ClaimGate::Withhold(Refusal::Refused);
     }
 
     let ir_value = match backend.get_workflow(workflow_id, workflow_version).await {
@@ -2419,6 +2562,19 @@ async fn gate_claimed_item(
             node_id = %wi.node_id,
             "claim: an item claimable only by execution has no marker; not handed out"
         );
+        // A payload that is not an object cannot carry the marker: put back,
+        // it would head the queue for every poll. Not an item the engine
+        // builds, so it fails.
+        if !wi.payload.is_object() {
+            return fail_closed(
+                backend,
+                wi,
+                "an item of a node claimable only by its execution has a payload that is \
+                 not an object"
+                    .to_string(),
+            )
+            .await;
+        }
         if let Err(e) = backend
             .park_for_execution(wi.id, wi.lease_fence, wi.attempt)
             .await
@@ -2501,6 +2657,7 @@ async fn gate_claimed_item(
             registry: Some(agents),
         },
         Some(wi.id),
+        Some(wi.lease_fence),
     )
     .await
     {
@@ -2699,6 +2856,7 @@ async fn completion_gate(
             registry: Some(agents),
         },
         Some(wi.id),
+        Some(wi.lease_fence),
     )
     .await
     {
@@ -3610,13 +3768,25 @@ async fn heartbeat_work_item(
     // so it carries the cancel signal (spike finding G10, 2026-09-06). The
     // worker abandons the step; the claim route settles the item once its
     // lease lapses.
-    let cancel_requested = match backend.get_work_item(item_id).await.map_err(unreadable)? {
-        Some(wi) => backend
-            .get_execution(&wi.execution_id)
-            .await
-            .map_err(unreadable)?
-            .is_some_and(|exec| exec.status.is_terminal()),
-        None => false,
+    //
+    // The renewal has committed by now, maybe under a new fence. A read that
+    // fails here does not fail the request: the worker could not retry it,
+    // since its retry would carry the old fence and be refused, and a live
+    // lease would be dropped. Cancel is reported unknown as `false`; the next
+    // heartbeat asks again.
+    let cancel_requested = match backend.get_work_item(item_id).await {
+        Ok(Some(wi)) => match backend.get_execution(&wi.execution_id).await {
+            Ok(exec) => exec.is_some_and(|exec| exec.status.is_terminal()),
+            Err(e) => {
+                warn!(work_item_id = %id, error = %e, "heartbeat: cancel state unreadable after renewal");
+                false
+            }
+        },
+        Ok(None) => false,
+        Err(e) => {
+            warn!(work_item_id = %id, error = %e, "heartbeat: cancel state unreadable after renewal");
+            false
+        }
     };
     Ok(Json(json!({
         "renewed": true,

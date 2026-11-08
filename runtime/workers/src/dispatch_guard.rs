@@ -1396,6 +1396,7 @@ mod tests {
             Some(&sealer),
             Default::default(),
             None,
+            None,
         )
         .await;
         assert!(

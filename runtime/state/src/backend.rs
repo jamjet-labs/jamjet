@@ -509,6 +509,24 @@ pub trait StateBackend: Send + Sync {
         ))
     }
 
+    /// [`Self::swap_gate`] to [`GateMark::Released`], for a lease that has not
+    /// expired, renewing it for `lease_secs` in the same write. A gate that
+    /// outlived its lease used to hand out a lease the sweep was about to take
+    /// back, and the node then ran a second time. `Ok(false)` if the mark,
+    /// the fence or the expiry moved. The default refuses.
+    async fn release_lease(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: GateMark,
+        lease_secs: u64,
+    ) -> BackendResult<bool> {
+        let _ = (item_id, lease_fence, from, lease_secs);
+        Err(StateBackendError::Database(
+            "this backend cannot record the claim gate's release".into(),
+        ))
+    }
+
     /// Whether `filter` (which names an execution) matches an item that is
     /// pending and visible now, or claimed: a read-only probe a waiting claim
     /// polls instead of taking the write lock each time. The default says
