@@ -166,6 +166,36 @@ def test_spellings_with_a_real_ir_target_are_mapped() -> None:
     assert {"from": "e", "to": "end", "condition": None} in ir["edges"]
 
 
+def test_a_branch_target_is_not_a_root() -> None:
+    # The shape the approval templates used: review -> route (branch) -> pay.
+    # With no route -> pay edge the scheduler took pay for a root and ran it
+    # at the start, before anyone decided on review.
+    source = (
+        "workflow: {id: w, start: review}\nnodes:\n"
+        "  review: {type: human_approval, description: approve, next: route}\n"
+        "  route:\n    type: branch\n    conditions:\n      - if: state.go == true\n        next: pay\n"
+        "    default: end\n"
+        "  pay: {type: model, model: m}\n"
+    )
+    ir = _compile_quietly(source)
+    assert {"from": "route", "to": "pay", "condition": None} in ir["edges"]
+
+
+def test_a_node_nothing_leads_to_is_an_error() -> None:
+    source = HEADER + "nodes:\n  a: {type: model, model: m}\n  stray: {type: model, model: m}\n"
+    with pytest.raises(ValueError, match="'stray' have no incoming edge"):
+        irc.compile_yaml(source)
+
+
+def test_a_fallback_counts_as_an_incoming_edge() -> None:
+    source = (
+        "workflow: {id: w, start: a}\nnodes:\n"
+        "  a: {type: human_approval, description: approve, timeout: 1h, fallback: b, next: c}\n"
+        "  b: {type: human_approval, description: escalated}\n  c: {type: model, model: m}\n"
+    )
+    assert set(_compile_quietly(source)["nodes"]) == {"a", "b", "c"}
+
+
 def test_ir_shaped_branches_keep_their_targets() -> None:
     source = (
         HEADER + "nodes:\n  a:\n    type: condition\n    branches:\n"
@@ -262,7 +292,7 @@ def test_an_unknown_policy_key_is_an_error() -> None:
 
 # ── governance is never dropped ──────────────────────────────────────────────
 
-ONE_NODE = "nodes:\n  a:\n    type: model\n    model: m\n  over:\n    type: model\n    model: m\n"
+ONE_NODE = "nodes:\n  a:\n    type: model\n    model: m\n    next: over\n  over:\n    type: model\n    model: m\n"
 
 
 def test_policy_under_the_workflow_header_reaches_the_ir() -> None:

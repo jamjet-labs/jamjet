@@ -288,6 +288,26 @@ def _input_mapping(node_id: str, raw: Any) -> dict[str, str]:
     return out
 
 
+def _check_every_node_is_reachable(nodes: dict[str, Any], edges: list[dict[str, Any]], start: str) -> None:
+    """Raise ``ValueError`` for a node nothing leads to.
+
+    The scheduler treats a node with no incoming edge as a root and runs it
+    when the run starts, so a step meant to follow an approval would run before
+    anyone decides. Edges and a human_approval's fallback count as incoming.
+    """
+    incoming = {edge["to"] for edge in edges}
+    for node in nodes.values():
+        fallback = node["kind"].get("fallback_node") if node["kind"].get("type") == "human_approval" else None
+        if fallback:
+            incoming.add(fallback)
+    orphans = [node_id for node_id in nodes if node_id != start and node_id not in incoming]
+    if orphans:
+        raise ValueError(
+            f"node(s) {', '.join(repr(n) for n in orphans)} have no incoming edge, so the engine would run them "
+            "when the run starts. Point a next:, a condition branch or a fallback at each, or remove it."
+        )
+
+
 def _governance_value(sources: list[tuple[str, dict[str, Any]]], key: str) -> Any:
     """``key`` from the one place it is set, or None. Set in two places is an error."""
     found = [(where, block[key]) for where, block in sources if isinstance(block, dict) and key in block]
@@ -665,6 +685,8 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
         elif next_val == "end" or next_val is None:
             edges.append({"from": node_id, "to": "end", "condition": None})
 
+    start_node = header.get("start", next(iter(nodes)) if nodes else "")
+    _check_every_node_is_reachable(nodes, edges, start_node)
     workflow_agent = agent_ref(header.get("agent_ref"), location="workflow agent_ref")
 
     ir: dict[str, Any] = {
@@ -673,7 +695,7 @@ def _compile_graph_yaml(data: dict[str, Any]) -> dict[str, Any]:
         "name": header.get("name"),
         "description": header.get("description"),
         "state_schema": _state_schema_str(header.get("state_schema", "")),
-        "start_node": header.get("start", next(iter(nodes)) if nodes else ""),
+        "start_node": start_node,
         "nodes": nodes,
         "edges": edges,
         "retry_policies": data.get("retry_policies", {}),
