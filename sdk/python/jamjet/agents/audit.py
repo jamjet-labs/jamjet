@@ -108,13 +108,23 @@ class AuditSigner:
         return hmac.compare_digest(expected, signature_hex)
 
 
+def insecure_key_opt_in(value: str) -> bool:
+    """Whether a ``JAMJET_AUDIT_ALLOW_INSECURE_KEY`` value opts into the dev key.
+
+    ``1``, ``true``, ``yes`` or ``on``, ignoring case. Anything else is no.
+    Any non-empty value used to count, so ``=0`` signed with the public key.
+    Mirrors ``insecure_key_opt_in`` in ``runtime/audit/src/signer.rs``.
+    """
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def resolve_signer() -> AuditSigner:
     """Resolve the audit signer from the environment (honest, fail-closed)."""
     global _warned_unsigned, _warned_insecure
     key = os.environ.get(SIGNING_KEY_ENV)
     if key:
         return AuditSigner(key.encode("utf-8"))
-    if os.environ.get(ALLOW_INSECURE_KEY_ENV):
+    if insecure_key_opt_in(os.environ.get(ALLOW_INSECURE_KEY_ENV, "")):
         if not _warned_insecure:
             _warned_insecure = True
             warnings.warn(

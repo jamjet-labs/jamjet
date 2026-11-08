@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Ok(Command::TokenCreate(req)) => return jamjet_api::cli::run_token_create(&req).await,
+        Ok(Command::TokenRevoke(id)) => return jamjet_api::cli::run_token_revoke(&id).await,
         Err(e) => {
             eprintln!("jamjet-server: {e}\n\n{}", jamjet_api::cli::USAGE);
             std::process::exit(2);
@@ -60,13 +61,17 @@ async fn main() -> anyhow::Result<()> {
     // Dev mode turns authentication off: refuse it on anything but loopback
     // before opening any state.
     let bind_addr = format!("{}:{}", config.bind, config.port);
+    // In dev mode the server later binds exactly the addresses checked here,
+    // so a host name cannot resolve to loopback for the check and elsewhere
+    // for the bind.
+    let mut dev_addrs: Vec<std::net::SocketAddr> = Vec::new();
     let remote_dev_mode_allowed = if config.dev_mode {
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&bind_addr)
+        dev_addrs = tokio::net::lookup_host(&bind_addr)
             .await
             .map(|a| a.collect())
             .unwrap_or_default();
         let allow_remote = startup::env_flag(startup::DEV_MODE_ALLOW_REMOTE_ENV)?;
-        match startup::check_dev_mode_bind(true, &addrs, allow_remote) {
+        match startup::check_dev_mode_bind(true, &dev_addrs, allow_remote) {
             Ok(bind) => bind == DevBind::RemoteAllowed,
             Err(refusal) => anyhow::bail!(refusal),
         }
@@ -279,7 +284,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let router = build_router_with_opts(state, config.dev_mode);
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    // Dev mode on loopback answers only requests addressed to this machine
+    // (DNS rebinding; see `startup::require_loopback_host`).
+    let router = if config.dev_mode && !remote_dev_mode_allowed {
+        router.layer(axum::middleware::from_fn(startup::require_loopback_host))
+    } else {
+        router
+    };
+    let listener = if config.dev_mode {
+        tokio::net::TcpListener::bind(&dev_addrs[..]).await?
+    } else {
+        tokio::net::TcpListener::bind(&bind_addr).await?
+    };
 
     info!("JamJet runtime listening on {}", listener.local_addr()?);
 

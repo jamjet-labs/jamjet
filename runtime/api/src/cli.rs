@@ -1,5 +1,5 @@
 //! `jamjet-server`'s command line: no arguments serves; `token create` issues
-//! an API token.
+//! an API token and `token revoke` revokes one.
 //!
 //! Before this there was no way to issue a token: `create_token` had no
 //! caller outside tests, so a server with authentication on refused every
@@ -13,13 +13,16 @@ Usage:
   jamjet-server                      start the runtime (configured by environment variables)
   jamjet-server token create --role <role> [--tenant <id>] [--name <name>]
                                      issue an API token and print it once
+  jamjet-server token revoke <token id>
+                                     revoke a token (its id is printed when it is issued)
   jamjet-server help                 show this message
 
 Roles: operator, developer, reviewer, viewer.
 
-`token create` opens the same database the server uses: DATABASE_URL, or
-.jamjet/runtime.db in the working directory. Only the token's SHA-256 hash is
-stored; the token itself is printed once, on stdout.";
+The token commands open the database the server uses: DATABASE_URL, or
+.jamjet/runtime.db in the working directory. It must exist, so start the
+server against it once first. Only the token's SHA-256 hash is stored; the
+token itself is printed once, on stdout.";
 
 /// The roles a token may have, as `api_tokens.role` stores them.
 pub const ROLES: &[&str] = &["operator", "developer", "reviewer", "viewer"];
@@ -30,6 +33,7 @@ pub enum Command {
     Serve,
     Help,
     TokenCreate(TokenRequest),
+    TokenRevoke(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -50,8 +54,14 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
         Some("help" | "-h" | "--help") => Ok(Command::Help),
         Some("token") => match it.next() {
             Some("create") => parse_token_create(it.collect()),
+            Some("revoke") => match (it.next(), it.next()) {
+                (Some(id), None) if !id.trim().is_empty() && !id.starts_with('-') => {
+                    Ok(Command::TokenRevoke(id.to_string()))
+                }
+                _ => Err("`token revoke` takes one token id".into()),
+            },
             Some(other) => Err(format!("unknown token command {other:?}")),
-            None => Err("missing token command (did you mean `token create`?)".into()),
+            None => Err("missing token command (`token create` or `token revoke`)".into()),
         },
         Some(other) => Err(format!("unknown argument {other:?}")),
     }
@@ -101,9 +111,9 @@ pub async fn create_token(
     database_url: &str,
     req: &TokenRequest,
 ) -> anyhow::Result<(String, ApiToken)> {
-    let backend = SqliteBackend::open(database_url)
+    let backend = SqliteBackend::connect_existing(database_url)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to open the database: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(e))?;
     if req.tenant == DEFAULT_TENANT {
         return backend
             .create_token(&req.name, &req.role)
@@ -133,20 +143,29 @@ pub async fn create_token(
 /// everything else on stderr, so `TOKEN=$(jamjet-server token create ...)`
 /// captures only the token.
 pub async fn run_token_create(req: &TokenRequest) -> anyhow::Result<()> {
-    if std::env::var("STORAGE_BACKEND").as_deref() == Ok("memory") {
-        anyhow::bail!(
-            "STORAGE_BACKEND=memory keeps tokens inside the server process, so no \
-             other process can add one. Use SQLite (unset STORAGE_BACKEND) to use tokens."
-        );
-    }
-    let database_url = crate::startup::database_url(&ApiConfig::default());
+    let database_url = token_database()?;
     let (token, info) = create_token(&database_url, req).await?;
-    println!("{token}");
+    // The id first: if stdout is closed, the operator still learns which
+    // token to revoke.
     eprintln!(
-        "Created token {} (role {}, tenant {}, name {:?}). It is shown once; only its \
-         SHA-256 hash is stored.",
+        "Created token {} in {database_url} (role {}, tenant {}, name {:?}). It is \
+         shown once; only its SHA-256 hash is stored.",
         info.id, info.role, info.tenant_id, info.name
     );
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{token}")
+            .and_then(|_| out.flush())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "could not print the token ({e}); revoke {} with \
+                     `jamjet-server token revoke {}`",
+                    info.id,
+                    info.id
+                )
+            })?;
+    }
     if info.tenant_id != DEFAULT_TENANT {
         eprintln!(
             "warning: the runtime is single-tenant and refuses tokens of any tenant but \
@@ -154,6 +173,35 @@ pub async fn run_token_create(req: &TokenRequest) -> anyhow::Result<()> {
             crate::auth::TENANT_TOKENS_AS_DEFAULT_ENV
         );
     }
+    Ok(())
+}
+
+/// The database the token commands use: the server's, refused for the
+/// memory backend, whose tokens live inside the server process.
+fn token_database() -> anyhow::Result<String> {
+    if std::env::var("STORAGE_BACKEND").as_deref() == Ok("memory") {
+        anyhow::bail!(
+            "STORAGE_BACKEND=memory keeps tokens inside the server process, so no \
+             other process can add one. Use SQLite (unset STORAGE_BACKEND) to use tokens."
+        );
+    }
+    Ok(crate::startup::database_url(&ApiConfig::default()))
+}
+
+/// `jamjet-server token revoke <id>`.
+pub async fn run_token_revoke(id: &str) -> anyhow::Result<()> {
+    let database_url = token_database()?;
+    let backend = SqliteBackend::connect_existing(&database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    if !backend
+        .revoke_token(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to revoke the token: {e}"))?
+    {
+        anyhow::bail!("no active token {id:?} in {database_url}");
+    }
+    eprintln!("Revoked token {id}. It is refused from the next request on.");
     Ok(())
 }
 
@@ -207,6 +255,9 @@ mod tests {
             "serve",
             "token",
             "token make --role viewer",
+            "token revoke",
+            "token revoke a b",
+            "token revoke --role",
             "token create --role",
             "token create --role viewer --role operator",
             "token create --role viewer --scope x",

@@ -83,6 +83,17 @@ pub const ED25519_KEY_FILE_ENV: &str = "JAMJET_AUDIT_ED25519_KEY_FILE";
 /// The `spec` member of the statement an Ed25519 entry signature covers.
 pub const ED25519_SIG_SPEC: &str = "jamjet.audit.entry/v1";
 
+/// Whether `JAMJET_AUDIT_ALLOW_INSECURE_KEY`'s value opts into the built-in
+/// dev key: `1`, `true`, `yes` or `on`, ignoring case. Anything else is no.
+/// This read any non-empty value as yes, so `=0` or `=false` signed the log
+/// with a key everyone knows.
+pub fn insecure_key_opt_in(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// The prefix of a stored Ed25519 entry signature: `ed25519:<kid>:<hex>`.
 pub const ED25519_SIG_PREFIX: &str = "ed25519:";
 
@@ -310,12 +321,14 @@ impl AuditSigner {
     }
 
     /// The HMAC signer `from_env` builds in `hmac` mode.
+    ///
+    /// The insecure-key opt-in is read by [`insecure_key_opt_in`].
     fn hmac_from_env() -> Self {
         match std::env::var(SIGNING_KEY_ENV) {
             Ok(key) if !key.is_empty() => Self::new(key.into_bytes()),
             _ => {
                 let opted_in = std::env::var(ALLOW_INSECURE_KEY_ENV)
-                    .map(|v| !v.is_empty())
+                    .map(|v| insecure_key_opt_in(&v))
                     .unwrap_or(false);
                 if opted_in {
                     warn!(
@@ -590,5 +603,16 @@ mod tests {
         }
         assert!(signer.can_sign());
         assert!(signer.is_dev_key(), "explicit opt-in selects the dev key");
+    }
+
+    /// `0`, `false` and friends do not opt into the built-in dev key.
+    #[test]
+    fn only_a_yes_opts_into_the_insecure_key() {
+        for yes in ["1", "true", "TRUE", "yes", "on", " 1 "] {
+            assert!(insecure_key_opt_in(yes), "{yes:?}");
+        }
+        for no in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(!insecure_key_opt_in(no), "{no:?}");
+        }
     }
 }

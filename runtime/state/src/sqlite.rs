@@ -35,6 +35,54 @@ impl SqliteBackend {
         Ok(Self { pool })
     }
 
+    /// Open a database that already exists and has the runtime's schema,
+    /// without creating a file or running a migration. For tools that run
+    /// beside a server (`jamjet-server token ...`): creating an empty file
+    /// at a mistyped path would issue tokens no server reads, and migrating
+    /// under a running server (or an older one) would race it. An in-memory
+    /// or empty path is refused: what is written there is gone at exit.
+    pub async fn connect_existing(database_url: &str) -> Result<Self, String> {
+        let opts = SqliteConnectOptions::from_str(database_url)
+            .map_err(|e| format!("not a SQLite URL ({database_url}): {e}"))?
+            .create_if_missing(false)
+            .busy_timeout(std::time::Duration::from_secs(5));
+        let file = opts.get_filename().to_string_lossy().to_string();
+        if file.is_empty() || file == ":memory:" || database_url.contains("mode=memory") {
+            return Err(format!(
+                "{database_url} is an in-memory database; nothing written to it outlives this process"
+            ));
+        }
+        let pool = SqlitePool::connect_with(opts)
+            .await
+            .map_err(|e| format!("cannot open {file}: {e}"))?;
+        let has_schema =
+            sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_tokens'")
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| format!("cannot read {file}: {e}"))?
+                .is_some();
+        if !has_schema {
+            return Err(format!(
+                "{file} has no api_tokens table; start the server against it once so it \
+                 creates its schema"
+            ));
+        }
+        Ok(Self { pool })
+    }
+
+    /// Revoke the API token with this id. `Ok(false)` when there is no such
+    /// token, or it was already revoked.
+    pub async fn revoke_token(&self, id: &str) -> BackendResult<bool> {
+        let done =
+            sqlx::query("UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+                .bind(Utc::now().to_rfc3339())
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .map_err(map_db_err)?;
+        Ok(done.rows_affected() == 1)
+    }
+
     /// Run embedded migrations against the connected database.
     pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
         sqlx::migrate!("./migrations").run(&self.pool).await

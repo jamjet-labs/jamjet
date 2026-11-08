@@ -84,6 +84,62 @@ pub fn check_dev_mode_bind(
     ))
 }
 
+/// Whether an HTTP `Host` (or authority) names the local machine:
+/// `localhost` or a loopback address, with or without a port.
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        // `[::1]` or `[::1]:7700`
+        match rest.split_once(']') {
+            Some((inner, tail)) if tail.is_empty() || tail.starts_with(':') => inner,
+            _ => return false,
+        }
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name,
+            Some(_) => return false,
+            None => host,
+        }
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// In dev mode on loopback, answer only requests addressed to the local
+/// machine. Binding to 127.0.0.1 keeps other machines out, but not a web
+/// page: a page whose host name re-resolves to 127.0.0.1 (DNS rebinding) is
+/// then same-origin with the runtime, and dev mode has no token to stop its
+/// scripts registering workflows or approving runs. Such a request still
+/// carries the page's host name, so it is refused here.
+pub async fn require_loopback_host(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().authority().map(|a| a.to_string()));
+    if host.as_deref().is_some_and(is_loopback_host) {
+        return next.run(req).await;
+    }
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({
+            "error": format!(
+                "dev mode answers only requests addressed to localhost or a loopback \
+                 address; set {DEV_MODE_ALLOW_REMOTE_ENV}=1 to accept other host names"
+            )
+        })),
+    )
+        .into_response()
+}
+
 /// The SQLite database URL: `DATABASE_URL`, then the config, then
 /// `.jamjet/runtime.db` in the working directory (created if missing).
 pub fn database_url(config: &ApiConfig) -> String {
@@ -162,6 +218,58 @@ mod tests {
             check_dev_mode_bind(true, &[addr("0.0.0.0:7700")], true),
             Ok(DevBind::RemoteAllowed)
         );
+    }
+
+    #[test]
+    fn loopback_hosts_are_recognised() {
+        for h in [
+            "localhost",
+            "LOCALHOST:7700",
+            "127.0.0.1",
+            "127.0.0.1:7700",
+            "[::1]",
+            "[::1]:7700",
+        ] {
+            assert!(is_loopback_host(h), "{h}");
+        }
+        for h in [
+            "evil.example",
+            "evil.example:7700",
+            "localhost.evil.example",
+            "192.168.1.2:7700",
+            "0.0.0.0:7700",
+            "[::]:7700",
+            "127.0.0.1:x",
+            "[::1]x",
+            "",
+        ] {
+            assert!(!is_loopback_host(h), "{h}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_mode_refuses_a_request_for_another_host_name() {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(require_loopback_host));
+        let status = |host: &'static str| {
+            let app = app.clone();
+            async move {
+                let mut req = axum::http::Request::get("/health");
+                if !host.is_empty() {
+                    req = req.header("host", host);
+                }
+                app.oneshot(req.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(status("localhost:7700").await, 200);
+        assert_eq!(status("127.0.0.1:7700").await, 200);
+        assert_eq!(status("rebound.evil.example:7700").await, 403);
+        assert_eq!(status("").await, 403, "no host at all is refused");
     }
 
     #[test]

@@ -26,7 +26,24 @@ const WAIT: Duration = Duration::from_secs(30);
 fn temp_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("jjcli-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
+    // `dotenvy` walks up from the working directory to the first `.env`; an
+    // empty one here stops it reading a stray one in a parent.
+    std::fs::write(dir.join(".env"), "").unwrap();
     dir
+}
+
+/// A migrated database in `dir`, as a server that has started once leaves it.
+async fn server_database(dir: &std::path::Path) -> (String, Arc<SqliteBackend>) {
+    let url = format!("sqlite://{}", dir.join("runtime.db").display());
+    let backend = Arc::new(SqliteBackend::open(&url).await.unwrap());
+    (url, backend)
+}
+
+async fn token_rows(backend: &SqliteBackend) -> Vec<(String, Option<String>)> {
+    sqlx::query_as("SELECT id, revoked_at FROM api_tokens")
+        .fetch_all(&backend.pool())
+        .await
+        .unwrap()
 }
 
 /// The binary with only `PATH` and `HOME` inherited, run in `dir`.
@@ -95,7 +112,7 @@ fn state_on(backend: Arc<SqliteBackend>) -> AppState {
 #[tokio::test]
 async fn token_create_issues_a_token_the_server_accepts() {
     let dir = temp_dir();
-    let url = format!("sqlite://{}", dir.join("runtime.db").display());
+    let (url, backend) = server_database(&dir).await;
     let mut child = server(
         &dir,
         &["token", "create", "--role", "developer", "--name", "ci"],
@@ -117,7 +134,6 @@ async fn token_create_issues_a_token_the_server_accepts() {
     assert!(token.starts_with("jj_") && token.len() == 67, "{token:?}");
     assert!(stderr.contains("shown once"), "{stderr}");
 
-    let backend = Arc::new(SqliteBackend::open(&url).await.unwrap());
     let info = backend
         .validate_token(token)
         .await
@@ -165,7 +181,7 @@ async fn token_create_issues_a_token_the_server_accepts() {
 #[tokio::test]
 async fn token_create_refuses_an_unknown_tenant() {
     let dir = temp_dir();
-    let url = format!("sqlite://{}", dir.join("runtime.db").display());
+    let (url, backend) = server_database(&dir).await;
     let mut child = server(
         &dir,
         &["token", "create", "--role", "viewer", "--tenant", "acme"],
@@ -178,6 +194,117 @@ async fn token_create_refuses_an_unknown_tenant() {
     assert!(!status.success());
     assert!(stderr.contains("no tenant"), "{stderr}");
     assert!(read_all(child.stdout.take()).trim().is_empty());
+    assert!(token_rows(&backend).await.is_empty(), "nothing is written");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A token for a tenant that exists is stored in that tenant.
+#[tokio::test]
+async fn token_create_issues_a_token_for_an_existing_tenant() {
+    let dir = temp_dir();
+    let (url, backend) = server_database(&dir).await;
+    let now = chrono::Utc::now();
+    backend
+        .for_tenant(jamjet_state::TenantId::from("acme"))
+        .create_tenant(jamjet_state::Tenant {
+            id: "acme".into(),
+            name: "acme".into(),
+            status: jamjet_state::TenantStatus::Active,
+            policy: None,
+            limits: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    let mut child = server(
+        &dir,
+        &["token", "create", "--role", "viewer", "--tenant", "acme"],
+        &[("DATABASE_URL", &url)],
+    )
+    .spawn()
+    .unwrap();
+    let status = wait_exit(&mut child).expect("exits");
+    let stderr = read_all(child.stderr.take());
+    assert!(status.success(), "{stderr}");
+    assert!(
+        stderr.contains("single-tenant"),
+        "the tenant caveat is shown: {stderr}"
+    );
+    let token = read_all(child.stdout.take());
+    let info = backend
+        .validate_token(token.trim())
+        .await
+        .unwrap()
+        .expect("validates");
+    assert_eq!(info.tenant_id, "acme");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The token commands open the server's database; they do not create one.
+/// A mistyped path used to get a fresh database and a token no server reads.
+#[test]
+fn token_create_refuses_a_database_that_does_not_exist() {
+    let dir = temp_dir();
+    let missing = dir.join("nope").join("runtime.db");
+    let url = format!("sqlite://{}", missing.display());
+    let mut child = server(
+        &dir,
+        &["token", "create", "--role", "viewer"],
+        &[("DATABASE_URL", &url)],
+    )
+    .spawn()
+    .unwrap();
+    let status = wait_exit(&mut child).expect("exits");
+    assert!(!status.success());
+    assert!(read_all(child.stdout.take()).trim().is_empty());
+    assert!(!missing.exists(), "no database is created");
+    for url in ["sqlite::memory:", "sqlite://"] {
+        let mut child = server(
+            &dir,
+            &["token", "create", "--role", "viewer"],
+            &[("DATABASE_URL", url)],
+        )
+        .spawn()
+        .unwrap();
+        let status = wait_exit(&mut child).expect("exits");
+        assert!(!status.success(), "{url}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `token revoke <id>` revokes the token; it is refused from then on, and a
+/// second revoke reports that there is nothing to revoke.
+#[tokio::test]
+async fn token_revoke_revokes_the_token() {
+    let dir = temp_dir();
+    let (url, backend) = server_database(&dir).await;
+    let mut create = server(
+        &dir,
+        &["token", "create", "--role", "developer"],
+        &[("DATABASE_URL", &url)],
+    )
+    .spawn()
+    .unwrap();
+    assert!(wait_exit(&mut create).expect("exits").success());
+    let token = read_all(create.stdout.take()).trim().to_string();
+    let id = token_rows(&backend).await[0].0.clone();
+    assert!(backend.validate_token(&token).await.unwrap().is_some());
+
+    let mut revoke = server(&dir, &["token", "revoke", &id], &[("DATABASE_URL", &url)])
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut revoke).expect("exits");
+    assert!(status.success(), "{}", read_all(revoke.stderr.take()));
+    assert!(
+        backend.validate_token(&token).await.unwrap().is_none(),
+        "a revoked token is refused"
+    );
+
+    let mut again = server(&dir, &["token", "revoke", &id], &[("DATABASE_URL", &url)])
+        .spawn()
+        .unwrap();
+    assert!(!wait_exit(&mut again).expect("exits").success());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -222,6 +349,61 @@ fn dev_mode_on_a_remote_bind_refuses_to_start() {
     assert!(!status.success());
     assert!(stderr.contains("JAMJET_DEV_MODE_ALLOW_REMOTE"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dev mode on loopback answers only requests addressed to the local
+/// machine, so a page that rebinds its own host name to 127.0.0.1 cannot
+/// drive it.
+#[test]
+fn dev_mode_refuses_requests_for_another_host_name() {
+    let dir = temp_dir();
+    let mut child = server(
+        &dir,
+        &[],
+        &[
+            ("JAMJET_DEV_MODE", "1"),
+            ("STORAGE_BACKEND", "memory"),
+            ("JAMJET_BIND", "127.0.0.1"),
+            ("JAMJET_PORT", "0"),
+        ],
+    )
+    .spawn()
+    .unwrap();
+    let mut addr = None;
+    for line in BufReader::new(child.stdout.take().unwrap())
+        .lines()
+        .map_while(Result::ok)
+    {
+        if let Some(rest) = line.split("listening on ").nth(1) {
+            let a: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ':')
+                .collect();
+            addr = Some(a);
+            break;
+        }
+    }
+    let addr = addr.expect("the server reports where it listens");
+    let port = addr.rsplit(':').next().unwrap().to_string();
+    let status_line = |host: &str| -> String {
+        use std::io::Write;
+        let mut conn = std::net::TcpStream::connect(&addr).unwrap();
+        write!(
+            conn,
+            "GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        conn.read_to_string(&mut response).unwrap();
+        response.lines().next().unwrap_or("").to_string()
+    };
+    let rebound = status_line(&format!("rebound.evil.example:{port}"));
+    let local = status_line(&format!("localhost:{port}"));
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(rebound.contains("403"), "{rebound}");
+    assert!(local.contains("200"), "{local}");
 }
 
 /// An unknown argument is an error, not ignored: a mistyped command must not

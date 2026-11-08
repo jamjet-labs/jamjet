@@ -18,11 +18,12 @@ TOKEN=$(jamjet-server token create --role developer --name ci-deployer)
 `--role` is required and is one of the [RBAC](#rbac) roles. `--name` labels the
 token (default `<role>-cli`), and `--tenant` issues it for another tenant, which
 must exist (the runtime refuses such tokens unless
-`JAMJET_TENANT_TOKENS_AS_DEFAULT=1`; see below). The command opens the same
-database the server does, `DATABASE_URL` or `.jamjet/runtime.db` in the working
+`JAMJET_TENANT_TOKENS_AS_DEFAULT=1`; see below). The command opens the database
+the server uses, `DATABASE_URL` or `.jamjet/runtime.db` in the working
 directory, so run it with the server's environment and working directory. It
-can run while the server is up. The token is printed once, on stdout; only its
-hash is stored, and the token's id goes to stderr.
+does not create a database or change its schema: start the server against it
+once first. It can run while the server is up. The token is printed once, on
+stdout; only its hash is stored. Its id and the database go to stderr.
 
 In the Docker image the environment already points at the volume:
 
@@ -33,13 +34,15 @@ docker exec <container> jamjet-server token create --role operator
 A server with `STORAGE_BACKEND=memory` keeps tokens inside its own process, so
 the command refuses it and that server accepts no token.
 
-To expire a token set `expires_at` (RFC 3339), and to revoke it set
-`revoked_at`, on its row:
+To revoke a token, pass its id:
 
 ```bash
-sqlite3 /var/lib/jamjet/runtime.db \
-  "UPDATE api_tokens SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = '<token id>'"
+jamjet-server token revoke <token id>
 ```
+
+It is refused from the next request on. To make a token expire, set
+`expires_at` on its row in UTC, in the form `2026-12-31T23:59:59Z`: the check
+compares the text, so an offset such as `+05:30` is read wrong.
 
 Send the token as a Bearer header:
 
@@ -72,8 +75,11 @@ Roles are ordered: each role can do everything the roles below it can. Outside d
 mode every route below needs a Bearer token, and the role is enforced in code on the
 route, not by convention. Dev mode (`JAMJET_DEV_MODE=1`) has no tokens and enforces
 none of this, so the server refuses to start in dev mode unless it listens on loopback
-only. `JAMJET_DEV_MODE_ALLOW_REMOTE=1` overrides that, with a warning in the log:
-anyone who can reach the port then has every role.
+only, and then answers only requests addressed to `localhost` or a loopback address.
+The second check stops a web page that re-resolves its own host name to 127.0.0.1
+(DNS rebinding) from driving the runtime from your browser.
+`JAMJET_DEV_MODE_ALLOW_REMOTE=1` turns both off, with a warning in the log: anyone
+who can reach the port then has every role.
 
 | Route | Minimum role | Notes |
 |-------|--------------|-------|

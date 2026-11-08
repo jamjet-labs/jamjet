@@ -21,7 +21,7 @@ hooks:
 # ── Development ─────────────────────────────────────────────────────────
 # Start local runtime (SQLite mode, dev mode: no auth, loopback only)
 dev:
-    JAMJET_DEV_MODE=1 cargo run --bin jamjet-server
+    cd runtime && JAMJET_DEV_MODE=1 cargo run --bin jamjet-server
 
 # Build all Rust crates
 build:
