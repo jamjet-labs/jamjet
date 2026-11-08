@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+mod support;
+
 /// Serializes the tests in this binary. Each test spawns a scheduler (25ms
 /// ticks) plus a 5-worker pool, which is a lot of concurrent machinery per
 /// test; running three such stacks at once adds CPU/IO noise on top. The
@@ -183,7 +185,9 @@ async fn start() -> Harness {
     let scheduler = jamjet_scheduler::Scheduler::new(backend.clone())
         .with_poll_interval(Duration::from_millis(25));
     let sched_handle = tokio::spawn(async move { scheduler.run().await });
-    let worker_handles = jamjet_worker::default_pool(backend.clone()).spawn();
+    let worker_handles = jamjet_worker::default_pool(backend.clone())
+        .with_executor("tool", Arc::new(support::NoopExecutor))
+        .spawn();
 
     Harness {
         backend,

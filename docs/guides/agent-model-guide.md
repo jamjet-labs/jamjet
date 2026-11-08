@@ -116,6 +116,8 @@ jamjet agents inspect research-analyst --card
 
 ## Using Agents in Workflows
 
+Registration refuses this node kind (400): the engine has no executor for it, so it would never run. See [Node types](yaml-reference.md#node-types).
+
 ```yaml
 nodes:
   research:
@@ -127,7 +129,7 @@ nodes:
     next: review
 ```
 
-When an `agent` node runs, JamJet invokes the referenced agent with the given input and maps its output into the workflow state.
+The design is that an `agent` node invokes the referenced agent with the given input and maps its output into the workflow state; this runtime does not run it yet.
 
 ---
 

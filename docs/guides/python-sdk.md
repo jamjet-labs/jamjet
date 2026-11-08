@@ -111,21 +111,22 @@ workflow.edge("search", "escalate", condition=lambda s: s.result.confidence < 0.
 ## Human approval steps
 
 ```python
-@workflow.step(type="human_approval")
+@workflow.step(human_approval=True, timeout="48h")
 async def review(state: ResearchState) -> ResearchState:
-    # execution pauses here until a human approves/rejects via API or CLI
+    # compiled to a human_approval node: the runtime pauses the run here until
+    # someone approves or rejects it; it does not run this function
     ...
 ```
+
+See [Human-in-the-Loop](hitl.md#approval-nodes) for what approve, reject and
+expiry do.
 
 ---
 
 ## Waiting for external events
 
-```python
-@workflow.step(type="wait", event="payment_confirmed", timeout="24h")
-async def await_payment(state: OrderState) -> OrderState:
-    ...
-```
+Not supported by the runtime: it has no executor for `wait` nodes, and
+registration refuses them. To wait for a person, use a human approval step.
 
 ---
 

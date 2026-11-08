@@ -125,20 +125,18 @@ fn parse_eid(s: &str) -> ExecutionId {
     ExecutionId(uuid::Uuid::parse_str(hex).unwrap())
 }
 
-/// Alice registers the workflow and starts the run, so she is its initiator.
+/// Alice starts the run, so she is its initiator.
+///
+/// The gated node is a `tool` node, which `POST /workflows` now refuses
+/// (nothing in the runtime executes the kind), so the workflow is stored as a
+/// version registered before that check. Its item still reaches the in-process
+/// `tool` queue, which is what these tests attack over HTTP.
 async fn start(env: &Env, policy: Value) -> (String, ExecutionId) {
     start_with(env, policy, json!({ "amount": 10 })).await
 }
 
 async fn start_with(env: &Env, policy: Value, input: Value) -> (String, ExecutionId) {
-    let (st, body) = send(
-        &env.app,
-        "/workflows",
-        &env.alice,
-        json!({ "ir": gated_ir(policy) }),
-    )
-    .await;
-    assert!(st.is_success(), "register: {st} {body}");
+    support::store_ir(env.backend.as_ref(), &gated_ir(policy)).await;
     let (st, body) = send(
         &env.app,
         "/executions",
@@ -883,14 +881,8 @@ async fn dev_mode_still_accepts_an_unfenced_completion_of_an_approved_node() {
     let backend = Arc::new(InMemoryBackend::new());
     let state = support::make_state(backend.clone() as Arc<dyn StateBackend>);
     let app = build_router_with_opts(state, true);
-    let (st, body) = send(
-        &app,
-        "/workflows",
-        "",
-        json!({ "ir": gated_ir(approval_policy()) }),
-    )
-    .await;
-    assert!(st.is_success(), "{st} {body}");
+    // Stored, not registered: see `start_with`.
+    support::store_ir(backend.as_ref(), &gated_ir(approval_policy())).await;
     let (st, body) = send(
         &app,
         "/executions",

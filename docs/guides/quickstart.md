@@ -7,7 +7,8 @@ Get a JamJet workflow running locally in under 10 minutes.
 ## Prerequisites
 
 - Python 3.11+
-- An Anthropic API key (the starter workflow calls `claude-haiku-4-5`)
+- `ANTHROPIC_API_KEY` set in the shell that runs `jamjet dev` (the starter
+  workflow calls a Claude model)
 
 ---
 
@@ -31,12 +32,30 @@ jamjet init my-first-agent
 cd my-first-agent
 ```
 
-This uses the `hello-agent` template and creates:
+This creates the `hello-agent` starter:
 ```
 my-first-agent/
-  workflow.yaml         # one model node that answers state.query
-  evals/dataset.jsonl   # sample inputs for `jamjet eval run`
+  workflow.yaml         # one model node
+  evals/dataset.jsonl   # sample inputs for `jamjet eval`
 ```
+
+The workflow has one `model` node whose prompt reads the run's input:
+
+```yaml
+nodes:
+  think:
+    type: model
+    model: claude-haiku-4-5-20251001
+    prompt: |
+      Answer this question clearly and concisely:
+
+      {{ state.query }}
+    next: end
+```
+
+The runtime fills in `{{ state.query }}` from the run's state before it calls
+the model. A prompt can only substitute `{{ state.<path> }}`; see
+[Prompt templates](yaml-reference.md#prompt-templates).
 
 `jamjet init --list-templates` shows the other templates.
 
@@ -80,15 +99,13 @@ The template reads the question from `query`:
 jamjet run workflow.yaml --input '{"query": "What is the capital of France?"}'
 ```
 
-`jamjet run` registers the workflow, starts an execution, prints its status
-every second until it finishes, and ends with a per-step timeline:
+The CLI registers the workflow, starts a run and follows it until it ends.
+The model's reply is in the run's final state as `last_model_output`.
 
-```
-Registered my-first-agent v0.1.0
-Execution started: exec_...
-  Status: running
-  ...
-```
+The input must have every key the prompt reads. Run it with
+`{"question": ...}` instead and the `think` node fails with
+``the run's state has no `query` ``: the runtime does not send the model a
+prompt with a gap in it.
 
 ---
 
