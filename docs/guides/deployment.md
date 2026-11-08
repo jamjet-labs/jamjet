@@ -19,7 +19,9 @@ jamjet dev
 This starts the model sidecar, the engine and a Python tool worker. The engine
 runs in dev mode, on port 7700, with SQLite at `.jamjet/runtime.db` in the
 current directory. Dev mode turns off authentication and runs the in-process
-workers and the cron scheduler. Use it on your own machine only.
+workers and the cron scheduler. Use it on your own machine only: the server
+refuses to start in dev mode on any address but loopback unless
+`JAMJET_DEV_MODE_ALLOW_REMOTE=1` is set.
 
 ---
 
@@ -59,12 +61,13 @@ runtime/target/release/jamjet-server
 Outside dev mode:
 
 - Every route except `GET /health` and `GET /.well-known/did.json` needs a
-  Bearer token. [Security](security.md#api-tokens) shows how to create one.
-- Set `JAMJET_EMBED_WORKERS`. The in-process worker pool is the only thing
+  Bearer token. Issue one with `jamjet-server token create --role <role>`, run
+  with the same `DATABASE_URL`; see [Security](security.md#api-tokens).
+- Set `JAMJET_EMBED_WORKERS=1`. The in-process worker pool is the only thing
   that runs `model`, `condition`, `human_approval`, `eval` and
   `limit_exceeded` nodes; external workers cannot claim them. Without it a run
   stops at its first such node and stays `running`.
-- Set `JAMJET_EMBED_CRON` if you use cron schedules. There is no separate cron
+- Set `JAMJET_EMBED_CRON=1` if you use cron schedules. There is no separate cron
   process.
 - Approvals need the action digest the reviewer saw, and the person who
   started a run cannot approve it. See [Human-in-the-Loop](hitl.md).
@@ -99,20 +102,39 @@ a node that nothing leads to. See [Node types](yaml-reference.md#node-types).
 ## Docker
 
 The repo's `Dockerfile` builds the UI, the server and the Python SDK into one
-image. It sets `STORAGE_BACKEND=memory`, `JAMJET_BIND=0.0.0.0` and
-`JAMJET_PORT=8080`. In memory mode state is lost when the container stops,
-the audit log is not kept, and no token can be created, so outside dev mode
-every request is refused. Switch it to SQLite on a volume:
+image. By default it keeps state, the signed audit log and API tokens in SQLite
+at `/data/runtime.db` (a volume), turns authentication on, runs the in-process
+workers (`JAMJET_EMBED_WORKERS=1`), and listens on `0.0.0.0:8080`:
 
 ```bash
 docker build -t jamjet-runtime .
 
-docker run -p 7700:8080 -v jamjet-data:/data \
-  -e STORAGE_BACKEND=sqlite \
-  -e DATABASE_URL=sqlite:///data/runtime.db \
-  -e JAMJET_EMBED_WORKERS=1 \
+docker run -d --name jamjet -p 7700:8080 -v jamjet-data:/data jamjet-runtime
+
+# Issue a token; it is printed once.
+docker exec jamjet jamjet-server token create --role operator
+```
+
+Mount a volume on `/data`, or every container starts with an empty database
+and the tokens you issued are gone.
+
+For a throwaway demo with no state and no authentication, use memory mode and
+dev mode. Dev mode refuses to start on the container's `0.0.0.0` unless you opt
+in, so publish the port on loopback only:
+
+```bash
+docker run --rm -p 127.0.0.1:7700:8080 \
+  -e STORAGE_BACKEND=memory \
+  -e JAMJET_DEV_MODE=1 -e JAMJET_DEV_MODE_ALLOW_REMOTE=1 \
   jamjet-runtime
 ```
+
+In memory mode state is lost when the container stops, no audit log is kept,
+and no token can be issued.
+
+Images built before this change default to `STORAGE_BACKEND=memory`. With
+those, pass `-e STORAGE_BACKEND=sqlite -e DATABASE_URL=sqlite:///data/runtime.db`
+and a volume to get the setup above.
 
 Images on Docker Hub (`jamjetdev/jamjet`) are built from crate release tags.
 
@@ -126,11 +148,12 @@ These are the variables that change what the server does.
 |----------|--------------|---------|
 | `JAMJET_BIND` | Address to listen on | `127.0.0.1` |
 | `JAMJET_PORT` | Port to listen on | `7700` |
-| `JAMJET_DEV_MODE` | `1` or `true`: no authentication, in-process workers and cron | off |
-| `DATABASE_URL` | SQLite database, as `sqlite://<path>` | `sqlite://.jamjet/runtime.db` in the working directory |
+| `JAMJET_DEV_MODE` | `1` or `true`: no authentication, in-process workers and cron. Refused on a non-loopback bind | off |
+| `JAMJET_DEV_MODE_ALLOW_REMOTE` | `1`: let dev mode listen on a non-loopback address (logged as a warning) | off |
+| `DATABASE_URL` | SQLite database, as `sqlite://<path>` | `sqlite://.jamjet/runtime.db` in the working directory (`sqlite:///data/runtime.db` in the Docker image) |
 | `STORAGE_BACKEND` | `memory` keeps state in memory and keeps no audit log; any other value uses SQLite | SQLite |
-| `JAMJET_EMBED_WORKERS` | If set, to any value, runs the in-process worker pool outside dev mode | unset |
-| `JAMJET_EMBED_CRON` | If set, to any value, runs the cron scheduler outside dev mode (not with `STORAGE_BACKEND=memory`) | unset |
+| `JAMJET_EMBED_WORKERS` | `1`/`true`/`yes`/`on`: runs the in-process worker pool outside dev mode. `0`/`false`/`no`/`off` is off; any other value fails startup | off (`1` in the Docker image) |
+| `JAMJET_EMBED_CRON` | Same values: runs the cron scheduler outside dev mode (not with `STORAGE_BACKEND=memory`) | off |
 | `JAMJET_STORE_TERM` | Failover generation for the lease fence, a non-negative integer. An invalid value fails startup | unset |
 | `JAMJET_PUBLIC_URL` | Base URL used for the `did:web` id in `/.well-known/did.json` | `http://$JAMJET_BIND:$JAMJET_PORT` |
 | `JAMJET_MODEL_SEAM_URL` | Send every model call through the model sidecar at this URL. With the in-process workers on, startup fails if it does not answer `/health` | unset |

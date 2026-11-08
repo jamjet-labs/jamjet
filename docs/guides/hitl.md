@@ -85,7 +85,7 @@ an expiry means nobody approved, and that fallback would publish anyway.
   (see "Workers cannot skip the gate" below).
 
 The engine runs `human_approval` nodes on its in-process workers (the server
-starts them with `jamjet dev`, or with `JAMJET_EMBED_WORKERS` set). Until
+starts them with `jamjet dev`, or with `JAMJET_EMBED_WORKERS=1`). Until
 2026-11 the node had no executor and a worker completed it without asking
 anyone; a release before that does not pause here.
 

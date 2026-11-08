@@ -1,4 +1,6 @@
 use jamjet_agents::{InMemoryAgentRegistry, SqliteAgentRegistry};
+use jamjet_api::cli::Command;
+use jamjet_api::startup::{self, DevBind};
 use jamjet_api::{config::ApiConfig, routes::build_router_with_opts, state::AppState};
 use jamjet_audit::{AuditEnricher, NoopAuditBackend, SqliteAuditBackend};
 use jamjet_state::{InMemoryBackend, SqliteBackend};
@@ -39,7 +41,40 @@ async fn main() -> anyhow::Result<()> {
     // Load .env if present
     dotenvy::dotenv().ok();
 
+    // `token create` and `help` run and exit; no arguments serves.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match jamjet_api::cli::parse_args(&args) {
+        Ok(Command::Serve) => {}
+        Ok(Command::Help) => {
+            println!("{}", jamjet_api::cli::USAGE);
+            return Ok(());
+        }
+        Ok(Command::TokenCreate(req)) => return jamjet_api::cli::run_token_create(&req).await,
+        Err(e) => {
+            eprintln!("jamjet-server: {e}\n\n{}", jamjet_api::cli::USAGE);
+            std::process::exit(2);
+        }
+    }
+
     let config = ApiConfig::default();
+    // Dev mode turns authentication off: refuse it on anything but loopback
+    // before opening any state.
+    let bind_addr = format!("{}:{}", config.bind, config.port);
+    let remote_dev_mode_allowed = if config.dev_mode {
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&bind_addr)
+            .await
+            .map(|a| a.collect())
+            .unwrap_or_default();
+        let allow_remote = startup::env_flag(startup::DEV_MODE_ALLOW_REMOTE_ENV)?;
+        match startup::check_dev_mode_bind(true, &addrs, allow_remote) {
+            Ok(bind) => bind == DevBind::RemoteAllowed,
+            Err(refusal) => anyhow::bail!(refusal),
+        }
+    } else {
+        false
+    };
+    let embed_workers = startup::env_flag("JAMJET_EMBED_WORKERS")?;
+    let embed_cron = startup::env_flag("JAMJET_EMBED_CRON")?;
 
     // Telemetry — installs OTLP trace + metric pipelines when
     // OTEL_EXPORTER_OTLP_ENDPOINT is set, otherwise falls back to plain tracing.
@@ -47,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
     jamjet_telemetry::init(config.dev_mode, otel_endpoint.as_deref());
     // Fail here, saying what to install, rather than panic on first use:
     // building an HTTP client reads the system CA bundle, and the model
-    // adapters, the OAuth exchange and the MCP and A2A clients all build one.
+    // adapters and the MCP and A2A clients all build one.
     jamjet_models::http::client().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage_backend = std::env::var("STORAGE_BACKEND").unwrap_or_default();
     // Parse the failover generation up front so a misconfiguration fails startup
@@ -65,6 +100,14 @@ async fn main() -> anyhow::Result<()> {
         storage = %storage_label,
         "Starting JamJet runtime"
     );
+    if remote_dev_mode_allowed {
+        warn!(
+            bind = %bind_addr,
+            "DEV MODE IS REACHABLE FROM OTHER MACHINES: authentication is off and {}=1 is set. \
+             Anyone who can reach this address can register workflows, start runs and approve them.",
+            startup::DEV_MODE_ALLOW_REMOTE_ENV
+        );
+    }
 
     // Read once here, never per request from deep code.
     let approval_policy = jamjet_api::approvals::ApprovalPolicy::from_env();
@@ -101,17 +144,11 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         // Determine database URL: env > config > SQLite dev default
-        let database_url = std::env::var("DATABASE_URL")
-            .ok()
-            .or_else(|| config.database_url.clone())
-            .unwrap_or_else(|| {
-                // Local dev: store in .jamjet/ directory
-                let dir = std::path::PathBuf::from(".jamjet");
-                std::fs::create_dir_all(&dir).ok();
-                format!("sqlite://{}", dir.join("runtime.db").display())
-            });
+        let database_url = startup::database_url(&config);
 
-        info!(%database_url, "Connecting to state backend");
+        // The URL stays out of info logs.
+        info!("Connecting to state backend");
+        tracing::debug!(%database_url, "State backend URL");
 
         let backend = SqliteBackend::open(&database_url)
             .await
@@ -196,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
     // pool so submitted workflows actually execute. In production, run dedicated
     // worker processes against the same state backend instead. The base backend
     // claims across all tenants, so workers drain every execution's queue.
-    if config.dev_mode || std::env::var("JAMJET_EMBED_WORKERS").is_ok() {
+    if config.dev_mode || embed_workers {
         let model_registry = Arc::new(
             jamjet_models::registry::registry_from_env_checked()
                 .await
@@ -210,7 +247,14 @@ async fn main() -> anyhow::Result<()> {
         // Detaching the handles lets the workers run for the lifetime of the process
         // (same pattern as the scheduler above).
         let _worker_handles = pool.spawn();
-        info!("Embedded worker pool started (dev mode)");
+        info!(
+            started_by = if embed_workers {
+                "JAMJET_EMBED_WORKERS"
+            } else {
+                "dev mode"
+            },
+            "Embedded worker pool started"
+        );
     }
 
     // In dev mode (or when JAMJET_EMBED_CRON is set), run the cron scheduler in
@@ -219,20 +263,8 @@ async fn main() -> anyhow::Result<()> {
     // supported way to run cron, in production too: there is no separate cron
     // process, because one would need its own token and would become the
     // initiator of every run it starts.
-    if (config.dev_mode || std::env::var("JAMJET_EMBED_CRON").is_ok())
-        && storage_backend != "memory"
-    {
-        let database_url = std::env::var("DATABASE_URL")
-            .ok()
-            .or_else(|| config.database_url.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "sqlite://{}",
-                    std::path::PathBuf::from(".jamjet")
-                        .join("runtime.db")
-                        .display()
-                )
-            });
+    if (config.dev_mode || embed_cron) && storage_backend != "memory" {
+        let database_url = startup::database_url(&config);
         match jamjet_state::SqliteBackend::open(&database_url).await {
             Ok(b) => {
                 let launcher = std::sync::Arc::new(jamjet_api::cron::InProcessCronLauncher::new(
@@ -247,10 +279,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let router = build_router_with_opts(state, config.dev_mode);
-    let addr = format!("{}:{}", config.bind, config.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
-    info!("JamJet runtime listening on {addr}");
+    info!("JamJet runtime listening on {}", listener.local_addr()?);
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())

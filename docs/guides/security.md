@@ -8,35 +8,40 @@
 
 Outside dev mode every route except `GET /health` and `GET /.well-known/did.json`
 needs `Authorization: Bearer <token>`. The runtime checks the token against the
-`api_tokens` table in its SQLite database, by SHA-256 hash. There is no CLI
-command or API route that issues tokens, so you write the row yourself. Start
-the server once against the database file so the table exists, then:
+`api_tokens` table in its SQLite database, by SHA-256 hash. Issue one with the
+server binary:
 
 ```bash
-python3 - .jamjet/runtime.db ci-deployer developer <<'EOF'
-import datetime, hashlib, secrets, sqlite3, sys, uuid
-
-db, name, role = sys.argv[1:4]
-token = "jj_" + secrets.token_hex(32)
-con = sqlite3.connect(db)
-con.execute(
-    "INSERT INTO api_tokens (id, token_hash, name, role, created_at) VALUES (?, ?, ?, ?, ?)",
-    (str(uuid.uuid4()), hashlib.sha256(token.encode()).hexdigest(), name, role,
-     datetime.datetime.now(datetime.timezone.utc).isoformat()),
-)
-con.commit()
-print(token)
-EOF
+TOKEN=$(jamjet-server token create --role developer --name ci-deployer)
 ```
 
-The arguments are the database path, a name and a role (see [RBAC](#rbac)).
-The token is printed once; only its hash is stored. To expire a token set
-`expires_at` (RFC 3339), and to revoke it set `revoked_at`. In the Docker image
-the database is wherever `DATABASE_URL` points (see
-[Deployment](deployment.md#docker)), and the same script runs inside the
-container with `docker exec -i <container> python3 - /data/runtime.db ...`. A
-server with `STORAGE_BACKEND=memory` has no table to write to, so it accepts no
-token.
+`--role` is required and is one of the [RBAC](#rbac) roles. `--name` labels the
+token (default `<role>-cli`), and `--tenant` issues it for another tenant, which
+must exist (the runtime refuses such tokens unless
+`JAMJET_TENANT_TOKENS_AS_DEFAULT=1`; see below). The command opens the same
+database the server does, `DATABASE_URL` or `.jamjet/runtime.db` in the working
+directory, so run it with the server's environment and working directory. It
+can run while the server is up. The token is printed once, on stdout; only its
+hash is stored, and the token's id goes to stderr.
+
+In the Docker image the environment already points at the volume:
+
+```bash
+docker exec <container> jamjet-server token create --role operator
+```
+
+A server with `STORAGE_BACKEND=memory` keeps tokens inside its own process, so
+the command refuses it and that server accepts no token.
+
+To expire a token set `expires_at` (RFC 3339), and to revoke it set
+`revoked_at`, on its row:
+
+```bash
+sqlite3 /var/lib/jamjet/runtime.db \
+  "UPDATE api_tokens SET revoked_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = '<token id>'"
+```
+
+Send the token as a Bearer header:
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" http://localhost:7700/executions
@@ -66,7 +71,9 @@ client = JamjetClient(base_url="http://localhost:7700", api_token=os.environ["JA
 Roles are ordered: each role can do everything the roles below it can. Outside dev
 mode every route below needs a Bearer token, and the role is enforced in code on the
 route, not by convention. Dev mode (`JAMJET_DEV_MODE=1`) has no tokens and enforces
-none of this.
+none of this, so the server refuses to start in dev mode unless it listens on loopback
+only. `JAMJET_DEV_MODE_ALLOW_REMOTE=1` overrides that, with a warning in the log:
+anyone who can reach the port then has every role.
 
 | Route | Minimum role | Notes |
 |-------|--------------|-------|
