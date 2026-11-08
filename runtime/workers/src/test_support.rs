@@ -89,6 +89,11 @@ impl FailingGetEvents {
         }
     }
 
+    /// The backend behind the injected failures.
+    pub(crate) fn inner(&self) -> &InMemoryBackend {
+        &self.inner
+    }
+
     /// Read the log the guard could not, bypassing the injected failure.
     pub(crate) async fn recorded(&self, execution_id: &ExecutionId) -> Vec<Event> {
         self.inner.get_events(execution_id).await.unwrap()
