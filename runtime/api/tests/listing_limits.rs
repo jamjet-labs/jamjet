@@ -535,6 +535,78 @@ async fn a_page_reads_at_most_its_byte_budget() {
     );
 }
 
+/// Small events first and large ones after: the page still reads about its
+/// budget. Chunks were sized from the largest event seen so far, so after
+/// many small ones the next read took a thousand large ones.
+#[tokio::test]
+async fn small_events_then_large_ones_read_at_most_the_budget() {
+    use jamjet_api::routes::MAX_EVENTS_PAGE_BYTES;
+    let inner = Arc::new(InMemoryBackend::new());
+    let reads = Arc::new(Reads::default());
+    let e = execution(WorkflowStatus::Running);
+    let id = e.execution_id.clone();
+    inner.create_execution(e).await.unwrap();
+    let big = "z".repeat(64 * 1024);
+    let mut one = 0;
+    for seq in 1..=1100i64 {
+        let mut kind = completed(&format!("n{seq}"), json!({}));
+        if seq > 100 {
+            if let EventKind::NodeCompleted { state_patch, .. } = &mut kind {
+                *state_patch = json!({ "p": big });
+            }
+        }
+        let event = Event::new(id.clone(), seq, kind);
+        one = one.max(serde_json::to_vec(&event).unwrap().len());
+        inner.append_event(event).await.unwrap();
+    }
+    let state = make_state(hooked(&inner, &reads));
+    let (_, body) = get(&state, &format!("/executions/{id}/events")).await;
+    assert!(body["next_after"].is_number(), "{}", body["next_after"]);
+    let read = reads.page_bytes.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        read <= MAX_EVENTS_PAGE_BYTES + one,
+        "read {read} bytes for an {MAX_EVENTS_PAGE_BYTES}-byte page"
+    );
+}
+
+/// On SQLite the query ends the page at its budget, a little early (it
+/// estimates sizes high), and the page still says more follows.
+#[tokio::test]
+async fn a_page_the_store_ended_says_more_follows() {
+    use jamjet_api::routes::MAX_EVENTS_PAGE_BYTES;
+    let path = std::env::temp_dir().join(format!("jj-page-{}.db", uuid::Uuid::new_v4()));
+    let sqlite = Arc::new(
+        jamjet_state::SqliteBackend::open(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap(),
+    );
+    let e = execution(WorkflowStatus::Running);
+    let id = e.execution_id.clone();
+    sqlite.create_execution(e).await.unwrap();
+    let patch = "q".repeat(32 * 1024);
+    let n = (MAX_EVENTS_PAGE_BYTES / (32 * 1024)) as i64 + 20;
+    for seq in 1..=n {
+        let mut kind = completed(&format!("n{seq}"), json!({}));
+        if let EventKind::NodeCompleted { state_patch, .. } = &mut kind {
+            *state_patch = json!({ "p": patch });
+        }
+        sqlite
+            .append_event(Event::new(id.clone(), seq, kind))
+            .await
+            .unwrap();
+    }
+    let state = make_state(sqlite);
+    let (_, body) = get(&state, &format!("/executions/{id}/events")).await;
+    let shown = body["events"].as_array().unwrap().len() as i64;
+    assert!(shown < n, "{shown} of {n}");
+    assert!(
+        body["next_after"].is_number(),
+        "a page cut short by the store said nothing follows: {}",
+        body["next_after"]
+    );
+    let _ = std::fs::remove_file(path);
+}
+
 /// `inline_artifacts=none` inlines nothing, so it looks nothing up: one
 /// size query per reference was still made.
 #[tokio::test]

@@ -307,10 +307,11 @@ impl StateBackend for HookedBackend {
         execution_id: &ExecutionId,
         after: jamjet_state::EventSequence,
         limit: u32,
+        max_bytes: usize,
     ) -> jamjet_state::backend::BackendResult<Vec<Event>> {
         let events = self
             .inner
-            .get_events_page(execution_id, after, limit)
+            .get_events_page(execution_id, after, limit, max_bytes)
             .await?;
         let bytes = events
             .iter()

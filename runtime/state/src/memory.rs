@@ -98,6 +98,11 @@ impl InMemoryBackend {
         self.tool_effects.insert(key, value);
     }
 
+    /// Test helper: the ids of every work item held.
+    pub fn work_item_ids_for_test(&self) -> Vec<WorkItemId> {
+        self.work_items.iter().map(|e| *e.key()).collect()
+    }
+
     /// Test helper: backdate a work item's lease so the reclaim sweep
     /// (`reclaim_expired_leases`) treats it as expired. Mirrors
     /// `SqliteBackend::force_lease_expired_for_test`. Not part of the
@@ -413,6 +418,35 @@ impl StateBackend for InMemoryBackend {
             .unwrap_or_default())
     }
 
+    async fn get_events_page(
+        &self,
+        execution_id: &ExecutionId,
+        after: EventSequence,
+        limit: u32,
+        max_bytes: usize,
+    ) -> BackendResult<Vec<Event>> {
+        // Cloned one at a time, so no more of the log is copied than the
+        // page takes.
+        let mut total = 0usize;
+        Ok(self
+            .events
+            .get(execution_id)
+            .map(|r| {
+                r.value()
+                    .iter()
+                    .filter(|e| e.sequence > after)
+                    .take(limit as usize)
+                    .take_while(|e| {
+                        let fits = total < max_bytes;
+                        total += serde_json::to_vec(e).map(|b| b.len()).unwrap_or(0);
+                        fits
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn latest_sequence(&self, execution_id: &ExecutionId) -> BackendResult<EventSequence> {
         Ok(self
             .events
@@ -507,12 +541,13 @@ impl StateBackend for InMemoryBackend {
                 Ok(ReserveOutcome::Acquired)
             }
             Entry::Occupied(mut o) => {
-                let (holder, _, holder_expiry) = o.get().clone();
-                if holder == owner || holder_expiry <= now {
-                    // Reentrant for the holder, or lapsed and presumed dead.
-                    // Either way the reservation is REPLACED, so it now carries
-                    // the newer fence — which is what makes a late release from
-                    // the older attempt a no-op.
+                let (holder, holder_fence, holder_expiry) = o.get().clone();
+                if (holder == owner && holder_fence == lease_fence) || holder_expiry <= now {
+                    // Renewed by the attempt that holds it, or lapsed and
+                    // presumed dead. Another attempt of the same worker id (a
+                    // new fence) waits like any other: worker ids are fixed,
+                    // and a worker that panicked after its effect used to
+                    // take its own reservation back and fire again.
                     o.insert((owner.to_string(), lease_fence, expires_at));
                     return Ok(ReserveOutcome::Acquired);
                 }

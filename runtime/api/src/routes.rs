@@ -694,45 +694,40 @@ pub const MAX_EVENTS_PAGE_BYTES: usize = 8 * 1024 * 1024;
 /// events and about [`MAX_EVENTS_PAGE_BYTES`] of them as stored (always at
 /// least one). `true` if the byte budget ended it.
 ///
-/// Read in chunks sized from the events seen so far, so the budget bounds
-/// what is read, not only what is answered: a page of `limit` large events
-/// used to be read whole and then cut.
+/// One read, with the byte budget applied by the store
+/// ([`jamjet_state::StateBackend::get_events_page`]), so the budget bounds
+/// what is read, not only what is answered. Chunks sized from the largest
+/// event seen so far read far past it when small events came first and large
+/// ones after.
 pub async fn read_events_page(
     backend: &dyn jamjet_state::StateBackend,
     execution_id: &jamjet_core::workflow::ExecutionId,
     after: i64,
     limit: u32,
 ) -> jamjet_state::BackendResult<(Vec<jamjet_state::Event>, bool)> {
-    const FIRST_CHUNK: u32 = 16;
-    const MAX_CHUNK: u32 = 1000;
-    let mut events = Vec::new();
+    let read = backend
+        .get_events_page(execution_id, after, limit, MAX_EVENTS_PAGE_BYTES)
+        .await?;
+    let got = read.len();
+    let mut events = Vec::with_capacity(got);
     let mut total = 0usize;
-    let mut largest = 0usize;
-    let mut cursor = after;
-    let mut chunk = FIRST_CHUNK;
-    loop {
-        let want = chunk.min(limit.saturating_sub(events.len() as u32));
-        if want == 0 {
-            return Ok((events, false));
+    for e in read {
+        let size = serde_json::to_vec(&e).map(|b| b.len()).unwrap_or(0);
+        if total + size > MAX_EVENTS_PAGE_BYTES && !events.is_empty() {
+            return Ok((events, true));
         }
-        let read = backend.get_events_page(execution_id, cursor, want).await?;
-        let got = read.len() as u32;
-        for e in read {
-            let size = serde_json::to_vec(&e).map(|b| b.len()).unwrap_or(0);
-            if total + size > MAX_EVENTS_PAGE_BYTES && !events.is_empty() {
-                return Ok((events, true));
-            }
-            total += size;
-            largest = largest.max(size);
-            cursor = e.sequence;
-            events.push(e);
-        }
-        if got < want {
-            return Ok((events, false));
-        }
-        let left = MAX_EVENTS_PAGE_BYTES.saturating_sub(total);
-        chunk = ((left / largest.max(1)) as u32).clamp(1, MAX_CHUNK);
+        total += size;
+        events.push(e);
     }
+    // Fewer than asked for: the end of the log, or the store's budget ended
+    // the read. The log says which.
+    let cut = match events.last() {
+        Some(last) if (got as u32) < limit => {
+            backend.latest_sequence(execution_id).await? > last.sequence
+        }
+        _ => false,
+    };
+    Ok((events, cut))
 }
 
 /// Set while the server shuts down. [`refuse_claims_while_draining`] then

@@ -36,6 +36,10 @@ pub struct Worker {
     executors: HashMap<String, Arc<dyn NodeExecutor>>,
     /// Seals the approval requests this worker raises into the audit chain.
     sealer: Option<Arc<dyn jamjet_state::approvals::ApprovalSealer>>,
+    /// Items this worker took to the end without panicking, whatever their
+    /// outcome. The pool reads it to tell a panic that every item hits from
+    /// one bad item.
+    finished: std::sync::atomic::AtomicU64,
 }
 
 /// Rebuild an [`ExecutionResult`] from a recorded `tool_effects` row.
@@ -86,6 +90,7 @@ impl Worker {
             poll_interval: Duration::from_millis(500),
             executors: HashMap::new(),
             sealer: None,
+            finished: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -163,8 +168,16 @@ impl Worker {
             attempt = item.attempt,
             "Claimed work item"
         );
-        self.execute_item(item).await?;
+        let done = self.execute_item(item).await;
+        self.finished
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        done?;
         Ok(true)
+    }
+
+    /// Items this worker took to the end without panicking.
+    pub fn items_finished(&self) -> u64 {
+        self.finished.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn execute_item(
@@ -497,13 +510,14 @@ impl Worker {
                                     // No limit: renew the reservation while it
                                     // runs, as the heartbeat renews the lease.
                                     None => {
-                                        // Only while the lease is held: a dead
+                                        // Only while the lease is held. A dead
                                         // heartbeat means the item can be
-                                        // reclaimed, and renewing then kept the
-                                        // key from its next holder until a
-                                        // restart. A reservation another worker
-                                        // took over is lost: the effect is
-                                        // abandoned rather than fired twice.
+                                        // reclaimed: the effect is abandoned,
+                                        // since its reservation lapses and the
+                                        // next holder fires it. Waiting on it
+                                        // instead let both fire at once. A
+                                        // reservation another worker took over
+                                        // is lost the same way.
                                         let renew = async {
                                             loop {
                                                 tokio::time::sleep(ttl / 3).await;
@@ -511,9 +525,13 @@ impl Worker {
                                                     warn!(
                                                         execution_id = %execution_id,
                                                         node_id = %node_id,
-                                                        "lease lost: no longer renewing the effect reservation"
+                                                        "lease lost: the effect is abandoned"
                                                     );
-                                                    std::future::pending::<()>().await;
+                                                    return ExecutorError::Fatal(
+                                                        "the lease was lost while the node ran; \
+                                                         abandoned"
+                                                            .to_string(),
+                                                    );
                                                 }
                                                 match self
                                                     .backend
@@ -1539,7 +1557,19 @@ pub(crate) fn node_timeout(ir: &WorkflowIr, node_def: &NodeDef) -> Option<Durati
         .map(Duration::from_secs)
         .or(ir.timeouts.node_timeout)
         .filter(|d| !d.is_zero())
-        .map(|d| d.min(MAX_NODE_TIMEOUT))
+        .map(|d| {
+            // Registration refuses more; a workflow stored before it did is
+            // capped here, said so rather than silently.
+            if d > MAX_NODE_TIMEOUT {
+                warn!(
+                    workflow_id = %ir.workflow_id,
+                    node_id = %node_def.id,
+                    timeout_secs = d.as_secs(),
+                    "node timeout over 7 days; capped at 7 days"
+                );
+            }
+            d.min(MAX_NODE_TIMEOUT)
+        })
 }
 
 /// The longest node timeout a workflow may set: 7 days. `POST /workflows`
@@ -1983,6 +2013,119 @@ mod tests {
         assert!(done, "no item ran after the worker panicked");
     }
 
+    /// Panics on every item it runs.
+    struct AlwaysPanics;
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for AlwaysPanics {
+        async fn execute(
+            &self,
+            _item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            panic!("a bug every item hits");
+        }
+    }
+
+    /// The wait before a pool worker is started again doubles from a second
+    /// and stops at a minute. It was a second every time.
+    #[test]
+    fn the_restart_wait_backs_off_to_a_minute() {
+        use crate::pool::restart_wait;
+        let secs: Vec<u64> = (1..=9).map(|n| restart_wait(n).as_secs()).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
+    /// Aborting a pool worker's handle stops the worker. It ran in a task of
+    /// its own under the handle, which an abort detached, and it went on
+    /// claiming.
+    #[tokio::test(start_paused = true)]
+    async fn an_aborted_pool_worker_claims_nothing_more() {
+        let (backend, first) = backend_with_timeouts(None, None).await;
+        let pool = crate::pool::WorkerPool::new(Arc::clone(&backend) as Arc<dyn StateBackend>)
+            .with_group(crate::pool::WorkerGroupConfig::new(
+                "t",
+                1,
+                vec!["default".into()],
+            ))
+            .with_executor("tool", Arc::new(NoopExecutor));
+        let handles = pool.spawn();
+        // Running: it takes the first item.
+        for _ in 0..100 {
+            let events = backend.get_events(&first).await.unwrap();
+            if events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for h in handles {
+            h.abort();
+            let _ = h.await;
+        }
+        let second = ExecutionId::new();
+        backend
+            .create_execution(sample_execution(&second))
+            .await
+            .unwrap();
+        let item = sample_item(&second);
+        let id = item.id;
+        backend.enqueue_work_item(item).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let still = backend.get_work_item(id).await.unwrap().unwrap();
+        assert!(still.worker_id.is_none(), "claimed after the abort");
+    }
+
+    /// A worker that panics on every item stops being started again after a
+    /// few panics in a row, waiting longer each time, and does not run the
+    /// queue into the dead-letter queue. It was started again after a second,
+    /// forever, and took every item to its last attempt.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_panics_on_every_item_is_not_restarted_forever() {
+        let (backend, first) = backend_with_timeouts(None, None).await;
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let eid = ExecutionId::new();
+            backend
+                .create_execution(sample_execution(&eid))
+                .await
+                .unwrap();
+            let item = sample_item(&eid);
+            ids.push(item.id);
+            backend.enqueue_work_item(item).await.unwrap();
+        }
+        let _ = (first, ids);
+        let pool = crate::pool::WorkerPool::new(Arc::clone(&backend) as Arc<dyn StateBackend>)
+            .with_group(crate::pool::WorkerGroupConfig::new(
+                "t",
+                1,
+                vec!["default".into()],
+            ))
+            .with_executor("tool", Arc::new(AlwaysPanics));
+        let handles = pool.spawn();
+        let mut dead = 0;
+        for _ in 0..6 {
+            // Long enough for every restart wait, and for the leases.
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            for id in backend.work_item_ids_for_test() {
+                backend.force_lease_expired_for_test(id);
+            }
+            dead += backend
+                .reclaim_expired_leases()
+                .await
+                .unwrap()
+                .exhausted
+                .len();
+        }
+        let stopped = handles.iter().all(|h| h.is_finished());
+        for h in handles {
+            h.abort();
+        }
+        assert!(stopped, "the worker is still being started again");
+        assert!(dead < 5, "{dead} of 5 items dead-lettered");
+    }
+
     /// With no time limit, the reservation is renewed only while the lease
     /// is held. Once the heartbeat gives up, renewing kept the key from the
     /// item's next holder until a restart.
@@ -2025,6 +2168,74 @@ mod tests {
         let second = reservation_expiry_in(backend.as_ref(), &eid).await;
         assert_eq!(first, second, "renewed after the heartbeat died");
         run.abort();
+    }
+
+    /// Sleeps `0`, then counts one effect.
+    struct CountingSleep(Duration, Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for CountingSleep {
+        async fn execute(
+            &self,
+            item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            tokio::time::sleep(self.0).await;
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            NoopExecutor.execute(item).await
+        }
+    }
+
+    /// Once the lease is lost the effect is abandoned, not waited on: the
+    /// reservation lapses and the item's next holder fires it, so a fire that
+    /// ran on would make two. The renewal used to stop and wait while the
+    /// first fire carried on.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_lease_abandons_the_effect() {
+        let backend = Arc::new(crate::test_support::FailingGetEvents::failing_renew());
+        let eid = ExecutionId::new();
+        backend
+            .create_execution(sample_execution(&eid))
+            .await
+            .unwrap();
+        let mut ir = minimal_ir_json();
+        ir["nodes"]["n1"]["node_timeout_secs"] = serde_json::json!(0);
+        backend
+            .store_workflow(WorkflowDefinition {
+                workflow_id: "test-wf".into(),
+                version: "1.0.0".into(),
+                ir,
+                created_at: Utc::now(),
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ran_for = Worker::RESERVATION_TTL;
+        let worker = Worker::new(
+            "test-worker".into(),
+            Arc::clone(&backend) as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("tool", Arc::new(CountingSleep(ran_for, fired.clone())));
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let _ = worker.execute_item(item).await;
+        assert!(
+            started.elapsed() < ran_for,
+            "waited {:?} for a fire whose lease was lost",
+            started.elapsed()
+        );
+        tokio::time::sleep(ran_for * 2).await;
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the first fire ran on after its lease was lost"
+        );
     }
 
     /// A renewal that fails with anything but a lost fence is retried, three

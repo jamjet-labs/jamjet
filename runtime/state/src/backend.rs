@@ -268,17 +268,19 @@ pub trait StateBackend: Send + Sync {
     ) -> BackendResult<Vec<Event>>;
 
     /// At most `limit` events with a sequence above `after`, in ascending
-    /// order: one page of the run's log. The SQLite backends read only that
-    /// page; the default reads [`Self::get_events_since`] and cuts it.
+    /// order, and none after the one at which their serialized length reaches
+    /// `max_bytes` ([`within_budget`]): one page of the run's log. The
+    /// SQLite backends read only that page, the budget applied in the query;
+    /// the default reads [`Self::get_events_since`] and cuts it.
     async fn get_events_page(
         &self,
         execution_id: &ExecutionId,
         after: EventSequence,
         limit: u32,
+        max_bytes: usize,
     ) -> BackendResult<Vec<Event>> {
-        let mut events = self.get_events_since(execution_id, after).await?;
-        events.truncate(limit as usize);
-        Ok(events)
+        let events = self.get_events_since(execution_id, after).await?;
+        Ok(within_budget(events, limit, max_bytes))
     }
 
     /// Get the latest event sequence for an execution.
@@ -367,6 +369,13 @@ pub trait StateBackend: Send + Sync {
     /// Reservations are consulted ONLY when no committed effect exists, so a row
     /// left behind after a successful commit blocks nothing — the caller finds
     /// the recorded result first and replays it.
+    ///
+    /// The holder renews it under the same `lease_fence`. Another attempt of
+    /// the same `owner` (a new fence) waits for the TTL like any other worker:
+    /// worker ids are fixed (`general-worker-0`), and a worker that panicked
+    /// after its effect used to take its own reservation straight back and
+    /// fire again. A parked attempt (rate limited) releases it
+    /// ([`Self::release_tool_reservation`]), so its retry does not wait.
     async fn reserve_tool_effect(
         &self,
         key: &str,
@@ -379,20 +388,18 @@ pub trait StateBackend: Send + Sync {
 
     /// Give up a reservation this worker holds, without having recorded a result.
     ///
-    /// A reservation left standing is not a correctness problem — it is
-    /// reentrant for its holder, and it lapses on its TTL — but until then a
-    /// DIFFERENT worker that picks the node up must wait it out. Releasing on a
-    /// path that ends without committing (a park, a failure) turns that wait
-    /// from minutes into nothing.
+    /// A reservation left standing is not a correctness problem (it lapses on
+    /// its TTL), but until then any other attempt at the node, the same
+    /// worker's included, must wait it out. Releasing on a path that ends
+    /// without committing (a park, a failure) turns that wait from minutes
+    /// into nothing.
     ///
     /// Guarded by owner AND lease fence, because the owner alone is not enough.
-    /// Worker ids are configurable and reused, and `reserve_tool_effect` is
-    /// reentrant for the same owner — it REPLACES the reservation with the newer
-    /// lease. So an older attempt from the same worker id finishing late would
-    /// otherwise delete the NEWER attempt's reservation and let a third worker
-    /// acquire a key that is actively held. The fence is what distinguishes the
-    /// two attempts. A non-matching owner or fence is a silent no-op, like every
-    /// other fenced write here.
+    /// Worker ids are configurable and reused, so an older attempt from the
+    /// same worker id finishing late would otherwise delete a NEWER attempt's
+    /// reservation and let a third worker acquire a key that is actively held.
+    /// The fence is what distinguishes the two attempts. A non-matching owner
+    /// or fence is a silent no-op, like every other fenced write here.
     async fn release_tool_reservation(
         &self,
         key: &str,
@@ -856,6 +863,24 @@ pub const MIN_LEASE_SECS: u64 = 5;
 /// The longest lease a claim may ask for: short enough that a dead worker's
 /// item is not stranded for hours.
 pub const MAX_LEASE_SECS: u64 = 3600;
+
+/// The start of `events` a page takes: at most `limit` events, and none
+/// after the one at which their serialized length reaches `max_bytes` (so at
+/// least one, when there is one). The SQL backends do the same in the query,
+/// with an estimate no smaller than the serialized length, so a page of large
+/// events is never read past its budget.
+pub fn within_budget(events: Vec<Event>, limit: u32, max_bytes: usize) -> Vec<Event> {
+    let mut total = 0usize;
+    events
+        .into_iter()
+        .take(limit as usize)
+        .take_while(|e| {
+            let fits = total < max_bytes;
+            total += serde_json::to_vec(e).map(|b| b.len()).unwrap_or(0);
+            fits
+        })
+        .collect()
+}
 
 /// The lease a claim is granted for what it asked: the default when it asked
 /// for nothing, otherwise the request held to `[MIN_LEASE_SECS,

@@ -997,16 +997,17 @@ impl StateBackend for SqliteBackend {
         execution_id: &ExecutionId,
         after: EventSequence,
         limit: u32,
+        max_bytes: usize,
     ) -> BackendResult<Vec<Event>> {
-        let rows = sqlx::query(
-            "SELECT * FROM events WHERE execution_id = ? AND sequence > ? ORDER BY sequence ASC LIMIT ?",
-        )
-        .bind(execution_id_str(execution_id))
-        .bind(after)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_db_err)?;
+        let sql = events_page_sql(false);
+        let rows = sqlx::query(&sql)
+            .bind(execution_id_str(execution_id))
+            .bind(after)
+            .bind(limit as i64)
+            .bind(max_bytes.min(i64::MAX as usize) as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_db_err)?;
         rows.iter().map(row_to_event).collect()
     }
 
@@ -1208,7 +1209,8 @@ impl StateBackend for SqliteBackend {
                  lease_fence = excluded.lease_fence, \
                  expires_at = excluded.expires_at, \
                  reserved_at = excluded.reserved_at \
-             WHERE tool_reservations.expires_at <= ? OR tool_reservations.owner = ?",
+             WHERE tool_reservations.expires_at <= ? \
+                OR (tool_reservations.owner = ? AND tool_reservations.lease_fence = ?)",
         )
         .bind(key)
         .bind(execution_id_str(execution_id))
@@ -1219,6 +1221,7 @@ impl StateBackend for SqliteBackend {
         .bind(&now_s)
         .bind(&now_s)
         .bind(owner)
+        .bind(lease_fence)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?
@@ -2839,6 +2842,32 @@ pub(crate) async fn expire_stale_leases(
 }
 
 /// The two events a lost lease leaves in the history: the failure of the
+/// [`StateBackend::get_events_page`] on the SQLite backends: a running sum of
+/// each row's size as an event (its columns, and [`EVENT_JSON_OVERHEAD`] for
+/// the keys and the sequence) over at most `limit` rows, so every row once
+/// the sum before it reaches the budget stays out of the result, and a page
+/// of large events is never loaded past its budget. Binds: execution id, the
+/// tenant when `tenant`, `after`, `limit`, `max_bytes`.
+/// What an event's JSON adds to its stored columns: the keys, quotes and the
+/// sequence. More than it is, so the query's estimate is never short.
+const EVENT_JSON_OVERHEAD: usize = 96;
+
+pub(crate) fn events_page_sql(tenant: bool) -> String {
+    let size = format!(
+        "(length(kind_json) + length(id) + length(execution_id) + length(created_at) + {})",
+        EVENT_JSON_OVERHEAD
+    );
+    format!(
+        "SELECT id, execution_id, sequence, kind_json, created_at FROM ( \
+             SELECT *, SUM({size}) OVER (ORDER BY sequence) - {size} \
+                 AS before_bytes \
+             FROM (SELECT * FROM events WHERE execution_id = ?{} AND sequence > ? \
+                   ORDER BY sequence ASC LIMIT ?) \
+         ) WHERE before_bytes < ? ORDER BY sequence ASC",
+        if tenant { " AND tenant_id = ?" } else { "" }
+    )
+}
+
 /// attempt that held it, and the retry that the immediate re-queue is.
 pub(crate) fn lease_expiry_events(item: &WorkItem) -> [EventKind; 2] {
     [

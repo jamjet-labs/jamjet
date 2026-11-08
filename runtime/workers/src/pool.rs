@@ -148,22 +148,50 @@ impl WorkerPool {
                 };
                 // A worker that panics is started again. Nothing restarted it,
                 // so one bad item emptied the pool for the life of the process.
-                let worker = Arc::new(worker);
+                //
+                // In this task, not a task of its own: aborting this handle
+                // must stop the worker, and an inner task outlived the abort
+                // and went on claiming. The wait between restarts doubles up
+                // to a minute, and after RESTARTS_WITHOUT_PROGRESS panics in a
+                // row with no item finished between them the worker stays
+                // down: a panic every item hits would otherwise run the whole
+                // queue into the dead-letter queue, one charged attempt each.
                 let handle = tokio::spawn(async move {
+                    use futures::FutureExt;
                     let _running = running;
+                    let mut in_a_row = 0u32;
                     loop {
-                        let (w, s) = (Arc::clone(&worker), stop.clone());
-                        match tokio::spawn(async move { w.run_until(s).await }).await {
-                            Ok(()) => break,
-                            Err(e) if e.is_panic() && !*stop.borrow() => {
-                                tracing::error!(
-                                    worker_id = %worker_id,
-                                    "Worker panicked; starting it again"
-                                );
-                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            }
-                            Err(_) => break,
+                        let finished = worker.items_finished();
+                        let run = std::panic::AssertUnwindSafe(worker.run_until(stop.clone()))
+                            .catch_unwind()
+                            .await;
+                        if run.is_ok() || *stop.borrow() {
+                            break;
                         }
+                        in_a_row = if worker.items_finished() > finished {
+                            1
+                        } else {
+                            in_a_row + 1
+                        };
+                        if in_a_row >= RESTARTS_WITHOUT_PROGRESS {
+                            tracing::error!(
+                                worker_id = %worker_id,
+                                panics = in_a_row,
+                                "Worker panicked {in_a_row} times in a row without finishing an \
+                                 item; not starting it again. The items it took are retried \
+                                 when their leases expire. Restart the server once the cause is \
+                                 fixed."
+                            );
+                            break;
+                        }
+                        let wait = restart_wait(in_a_row);
+                        tracing::error!(
+                            worker_id = %worker_id,
+                            panics = in_a_row,
+                            wait_secs = wait.as_secs(),
+                            "Worker panicked; starting it again"
+                        );
+                        tokio::time::sleep(wait).await;
                     }
                 });
                 handles.push(handle);
@@ -172,6 +200,17 @@ impl WorkerPool {
 
         handles
     }
+}
+
+/// Panics in a row, with no item finished between them, after which a pool
+/// worker is not started again.
+pub const RESTARTS_WITHOUT_PROGRESS: u32 = 5;
+
+/// How long a pool worker waits before it is started again after its
+/// `in_a_row`-th panic in a row: 1 s, doubling, at most a minute.
+pub fn restart_wait(in_a_row: u32) -> std::time::Duration {
+    let secs = 1u64 << in_a_row.saturating_sub(1).min(6);
+    std::time::Duration::from_secs(secs.min(60))
 }
 
 /// The server's embedded pool: [`default_pool`]'s queue groups with an

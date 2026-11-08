@@ -931,18 +931,18 @@ impl StateBackend for TenantScopedSqliteBackend {
         execution_id: &ExecutionId,
         after: EventSequence,
         limit: u32,
+        max_bytes: usize,
     ) -> BackendResult<Vec<Event>> {
-        let rows = sqlx::query(
-            "SELECT * FROM events WHERE execution_id = ? AND tenant_id = ? AND sequence > ? \
-             ORDER BY sequence ASC LIMIT ?",
-        )
-        .bind(execution_id_str(execution_id))
-        .bind(&self.tenant_id.0)
-        .bind(after)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_db_err)?;
+        let sql = crate::sqlite::events_page_sql(true);
+        let rows = sqlx::query(&sql)
+            .bind(execution_id_str(execution_id))
+            .bind(&self.tenant_id.0)
+            .bind(after)
+            .bind(limit as i64)
+            .bind(max_bytes.min(i64::MAX as usize) as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_db_err)?;
         rows.iter().map(row_to_event).collect()
     }
 
@@ -1139,7 +1139,8 @@ impl StateBackend for TenantScopedSqliteBackend {
                  lease_fence = excluded.lease_fence, \
                  expires_at = excluded.expires_at, \
                  reserved_at = excluded.reserved_at \
-             WHERE tool_reservations.expires_at <= ? OR tool_reservations.owner = ?",
+             WHERE tool_reservations.expires_at <= ? \
+                OR (tool_reservations.owner = ? AND tool_reservations.lease_fence = ?)",
         )
         .bind(key)
         .bind(execution_id_str(execution_id))
@@ -1151,6 +1152,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .bind(&now_s)
         .bind(&now_s)
         .bind(owner)
+        .bind(lease_fence)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?
