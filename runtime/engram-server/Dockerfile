@@ -6,7 +6,7 @@ COPY runtime/ runtime/
 COPY rust-toolchain.toml .
 
 WORKDIR /build/runtime
-RUN cargo build --release --bin engram --package jamjet-engram-server
+RUN cargo build --release --locked --bin engram --package jamjet-engram-server
 
 # ── Stage 2: Minimal runtime image ─────────────────────────────────
 FROM debian:bookworm-slim

@@ -234,9 +234,23 @@ mod a2a_delegate {
     use crate::TaskRequest;
     use uuid::Uuid;
 
+    /// One client for every call: it holds the connection pool, and building one
+    /// reads the system trust store. Only a built client is kept, so a failure is
+    /// tried again on the next call.
+    fn http_client() -> Result<&'static reqwest::Client, String> {
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        if let Some(client) = CLIENT.get() {
+            return Ok(client);
+        }
+        let built = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("cannot build an HTTP client: {e}"))?;
+        Ok(CLIENT.get_or_init(|| built))
+    }
+
     pub async fn invoke_a2a(endpoint: &str, task: TaskRequest) -> Result<String, String> {
         let task_id = Uuid::new_v4().to_string();
-        let client = reqwest::Client::new();
+        let client = http_client()?;
         let url = format!("{}/", endpoint.trim_end_matches('/'));
         let body = serde_json::json!({
             "jsonrpc": "2.0",

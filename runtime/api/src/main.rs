@@ -45,6 +45,10 @@ async fn main() -> anyhow::Result<()> {
     // OTEL_EXPORTER_OTLP_ENDPOINT is set, otherwise falls back to plain tracing.
     let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
     jamjet_telemetry::init(config.dev_mode, otel_endpoint.as_deref());
+    // Fail here, saying what to install, rather than panic on first use:
+    // building an HTTP client reads the system CA bundle, and the model
+    // adapters, the OAuth exchange and the MCP and A2A clients all build one.
+    jamjet_models::http::client().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage_backend = std::env::var("STORAGE_BACKEND").unwrap_or_default();
     // Parse the failover generation up front so a misconfiguration fails startup
     // before we open any backend (rather than silently disabling failover-safety).

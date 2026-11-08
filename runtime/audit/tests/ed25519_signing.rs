@@ -170,7 +170,8 @@ fn hmac_and_ed25519_signatures_do_not_cross() {
     assert!(!ed.verify(hash.as_bytes(), bare));
 }
 
-/// HMAC mode is byte-for-byte what it was: a known-answer test.
+/// HMAC mode is byte-for-byte what it was: a known-answer test. The tags
+/// were computed with Python's `hmac` module, not with the crate under test.
 #[test]
 fn hmac_mode_is_unchanged() {
     let hmac = AuditSigner::new(b"jamjet-kat-key".to_vec());
@@ -179,6 +180,19 @@ fn hmac_mode_is_unchanged() {
         hmac.sign(b"0123456789abcdef").as_deref(),
         Some("3ea1433f028cd70bfa3e52f19aefc92211661429ea7efaca39b9d2481ac3a753")
     );
+    // A key longer than SHA-256's 64-byte block is hashed first (RFC 2104),
+    // a separate path through the HMAC code.
+    let long_key = "jamjet-kat-long-key-".repeat(5).into_bytes();
+    assert_eq!(long_key.len(), 100);
+    let long = AuditSigner::new(long_key);
+    assert_eq!(
+        long.sign(b"0123456789abcdef").as_deref(),
+        Some("f97c264829f7ff4e9c550fe2b11aefd8eebaa58251134730a77c8fc742698bdb")
+    );
+    assert!(long.verify(
+        b"0123456789abcdef",
+        "f97c264829f7ff4e9c550fe2b11aefd8eebaa58251134730a77c8fc742698bdb"
+    ));
     assert_eq!(verify_chain(&chain(&hmac), &hmac), Ok(()));
     assert_eq!(hmac.public_key(), None);
     assert_eq!(hmac.public_jwk(), None);

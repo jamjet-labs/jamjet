@@ -200,6 +200,8 @@ ENGRAM_LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=... engram serve
 ENGRAM_LLM_PROVIDER=command ENGRAM_LLM_COMMAND="python /path/to/wrapper.py" engram serve
 ```
 
+On Linux, the binary needs a system CA bundle (`ca-certificates` on Debian and Ubuntu) or `SSL_CERT_FILE` pointing at a PEM bundle, even for a local Ollama. Without one, `engram serve` exits at startup and says so. The Docker image already includes it.
+
 ### Option G — REST mode for testing
 
 ```bash

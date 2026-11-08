@@ -212,7 +212,7 @@ impl AgentRegistry for SqliteAgentRegistry {
     #[instrument(skip(self), fields(url = url))]
     async fn discover_remote(&self, url: &str) -> Result<Agent, String> {
         let agent_card_url = format!("{url}/.well-known/agent.json");
-        let card: AgentCard = reqwest::Client::new()
+        let card: AgentCard = http_client()?
             .get(&agent_card_url)
             .send()
             .await
@@ -226,6 +226,20 @@ impl AgentRegistry for SqliteAgentRegistry {
             .await?
             .ok_or_else(|| "agent not found after registration".into())
     }
+}
+
+/// One client for every call: it holds the connection pool, and building one
+/// reads the system trust store. Only a built client is kept, so a failure is
+/// tried again on the next call.
+fn http_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let built = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("cannot build an HTTP client: {e}"))?;
+    Ok(CLIENT.get_or_init(|| built))
 }
 
 #[cfg(test)]
