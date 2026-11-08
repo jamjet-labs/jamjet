@@ -3207,9 +3207,12 @@ mod tests {
                 execution_id: eid.clone(),
                 node_id: "n1".into(),
                 queue_type: "model".into(),
+                // What the scheduler writes for a model node: its resolved
+                // model, which the guard checks against the allowlists.
                 payload: serde_json::json!({
                     "workflow_id": "model-wf",
-                    "workflow_version": "1.0.0"
+                    "workflow_version": "1.0.0",
+                    "model": "anthropic/claude-sonnet-4-6"
                 }),
                 attempt: 0,
                 max_attempts: 3,
