@@ -199,9 +199,15 @@ class LocalCallerOnly:
       own name in ``Host``: refused unless it names this machine (403).
     * Any page can POST to 127.0.0.1. ``request.json()`` ignores the content
       type, so a ``text/plain`` form or ``fetch`` (which needs no preflight)
-      ran a completion on the developer's keys. Refused: ``Sec-Fetch-Site:
-      cross-site``, or an ``Origin`` that is not this machine (403), and a
-      ``POST`` that is not ``application/json`` (415).
+      ran a completion on the developer's keys. Refused: an ``Origin`` that is
+      not this machine, or with no ``Origin`` a ``Sec-Fetch-Site:
+      cross-site`` (403), and a ``POST`` that is not ``application/json``
+      (415). A loopback ``Origin`` is answered whatever ``Sec-Fetch-Site``
+      says: to the browser ``localhost:3000`` calling ``127.0.0.1`` is another
+      site.
+    * A tunnel that rewrites ``Host`` to ``localhost`` (ngrok, cloudflared)
+      passes the ``Host`` check. Its ``Forwarded`` or ``X-Forwarded-*`` header
+      gives it away (403), as in the runtime's dev mode.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -216,11 +222,15 @@ class LocalCallerOnly:
         refusal: tuple[int, str] | None = None
         origin = headers.get("origin")
         origin_host = origin.split("://", 1)[1] if origin and "://" in origin else (origin or "")
+        if origin is not None:
+            from_another_site = not _is_local_host(origin_host, allowed)
+        else:
+            from_another_site = headers.get("sec-fetch-site", "").lower() == "cross-site"
         if not _is_local_host(headers.get("host", ""), allowed):
             refusal = (403, "the model sidecar answers only requests addressed to this machine")
-        elif headers.get("sec-fetch-site", "").lower() == "cross-site" or (
-            origin is not None and not _is_local_host(origin_host, allowed)
-        ):
+        elif any(k == "forwarded" or k.startswith("x-forwarded-") for k in headers):
+            refusal = (403, "the model sidecar refuses requests relayed by a proxy or tunnel")
+        elif from_another_site:
             refusal = (403, "the model sidecar refuses requests from a page of another site")
         elif scope.get("method") == "POST":
             media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()

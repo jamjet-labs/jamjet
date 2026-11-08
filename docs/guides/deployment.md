@@ -25,7 +25,9 @@ refuses to start in dev mode on any address but loopback unless
 requests addressed to `localhost`, a loopback address or a name in
 `JAMJET_DEV_ALLOWED_HOSTS`, and refuses requests relayed by a proxy or tunnel
 and requests from a page of another site (see
-[RBAC](security.md#rbac)).
+[RBAC](security.md#rbac)). It trusts every page served from this machine, on
+any port, and a plain TCP tunnel to the port (`ssh -R`, `socat`) passes as
+local, so don't expose a dev-mode port that way.
 
 ---
 

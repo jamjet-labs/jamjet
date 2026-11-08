@@ -45,10 +45,16 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = jamjet_api::cli::parse_args(&args);
     // Before anything reads one: a switch set to something that is not a
-    // boolean stops the server (and the token commands, which seal into the
-    // audit log) instead of being read as off.
-    if !matches!(command, Ok(Command::Help) | Err(_)) {
-        startup::check_env_flags()?;
+    // boolean stops the server instead of being read as off.
+    match &command {
+        Ok(Command::Serve) => startup::check_env_flags()?,
+        // The token commands read one switch, the audit key opt-in: a server
+        // switch (dev mode, embedded workers) set to a typo must not stop
+        // an operator revoking a token.
+        Ok(Command::TokenCreate(_) | Command::TokenRevoke(_)) => {
+            startup::env_flag(jamjet_audit::signer::ALLOW_INSECURE_KEY_ENV)?;
+        }
+        Ok(Command::Help) | Err(_) => {}
     }
     match command {
         Ok(Command::Serve) => {}

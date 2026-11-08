@@ -495,6 +495,9 @@ async def test_a_text_plain_post_is_refused(monkeypatch: pytest.MonkeyPatch) -> 
         {"origin": "https://evil.example"},
         {"origin": "null"},
         {"origin": "http://localhost.evil.example"},
+        # As a browser sends them.
+        {"origin": "https://evil.example", "sec-fetch-site": "cross-site"},
+        {"origin": "null", "sec-fetch-site": "cross-site"},
     ],
 )
 async def test_a_cross_site_request_is_refused(monkeypatch: pytest.MonkeyPatch, headers: dict[str, str]) -> None:
@@ -509,6 +512,36 @@ async def test_another_host_name_is_refused(monkeypatch: pytest.MonkeyPatch, hos
     monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
     resp = await _post(host, {"content-type": "application/json"})
     assert resp.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        ("x-forwarded-host", "abc.ngrok.app"),
+        ("x-forwarded-for", "203.0.113.9"),
+        ("forwarded", "for=203.0.113.9;host=abc.ngrok.app"),
+        ("x-forwarded-proto", "https"),
+    ],
+)
+async def test_a_request_through_a_tunnel_is_refused(monkeypatch: pytest.MonkeyPatch, header: tuple[str, str]) -> None:
+    """ngrok ``--host-header=rewrite`` and cloudflared send ``Host:
+    localhost`` for a request from anywhere; their forwarding headers give
+    them away."""
+    monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
+    resp = await _post("http://localhost:4280", {"content-type": "application/json", header[0]: header[1]})
+    assert resp.status_code == 403
+
+
+async def test_a_local_page_on_another_port_is_answered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """To the browser, ``localhost:3000`` calling ``127.0.0.1`` is another
+    site, and it says so beside the Origin. The Origin decides."""
+    monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
+    for origin in ["http://localhost:3000", "http://127.0.0.1:5173", "http://[::1]:8080"]:
+        resp = await _post(
+            "http://127.0.0.1:4280",
+            {"content-type": "application/json", "origin": origin, "sec-fetch-site": "cross-site"},
+        )
+        assert resp.status_code == 200, origin
 
 
 async def test_local_callers_and_listed_hosts_are_answered(monkeypatch: pytest.MonkeyPatch) -> None:

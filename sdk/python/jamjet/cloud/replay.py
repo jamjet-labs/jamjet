@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from jamjet.flags import env_flag
+
 # ---------------------------------------------------------------------------
 # Bundle data model
 # ---------------------------------------------------------------------------
@@ -192,7 +194,9 @@ def _auto_activate() -> None:
         return
     try:
         bundle = load_bundle(bundle_path)
-        stub = os.environ.get("JAMJET_STUB_MODELS", "").lower() in ("1", "true", "yes")
+        # The one switch rule (`jamjet.flags`): `on` is on, and a value that
+        # is not a boolean is an error, not off.
+        stub = env_flag("JAMJET_STUB_MODELS")
         activate(bundle, stub_models=stub)
     except Exception as exc:  # noqa: BLE001
         import warnings

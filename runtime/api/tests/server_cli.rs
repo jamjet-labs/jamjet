@@ -625,6 +625,119 @@ async fn token_create_and_revoke_are_sealed_into_the_audit_log() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Run `jamjet-server` with `args` and `env` against `url`; its exit status
+/// and stderr.
+fn run_cli(dir: &PathBuf, url: &str, args: &[&str], env: &[(&str, &str)]) -> (bool, String) {
+    let mut all = vec![("DATABASE_URL", url)];
+    all.extend_from_slice(env);
+    let mut child = server(dir, args, &all).spawn().unwrap();
+    let ok = wait_exit(&mut child).expect("exits").success();
+    (ok, read_all(child.stderr.take()))
+}
+
+/// The token commands refuse to seal into a log whose newest entry is signed
+/// when they cannot sign the same way: with no key, another HMAC key, or an
+/// Ed25519 key. The entry used to go in unsigned or under the wrong key, and
+/// the log stopped verifying there. A revoke still revokes first.
+#[tokio::test]
+async fn token_commands_refuse_a_log_signed_with_another_key() {
+    let dir = temp_dir();
+    let (url, backend) = server_database(&dir).await;
+    let ours = ("JAMJET_AUDIT_SIGNING_KEY", "the-server-key-for-this-test");
+    let (ok, err) = run_cli(
+        &dir,
+        &url,
+        &["token", "create", "--role", "viewer"],
+        &[ours],
+    );
+    assert!(ok, "{err}");
+    let entries = audit_entries(&backend).await.len();
+
+    let seed = "07".repeat(32);
+    for (what, env) in [
+        (
+            "another HMAC key",
+            vec![("JAMJET_AUDIT_SIGNING_KEY", "some-other-key-entirely")],
+        ),
+        ("no signing key", vec![]),
+        (
+            "Ed25519 key",
+            vec![
+                ("JAMJET_AUDIT_SIGNING_MODE", "ed25519"),
+                ("JAMJET_AUDIT_ED25519_KEY", seed.as_str()),
+            ],
+        ),
+    ] {
+        let (ok, err) = run_cli(&dir, &url, &["token", "create", "--role", "operator"], &env);
+        assert!(!ok, "{what}: issued under another key");
+        assert!(err.contains("signed with an HMAC key"), "{what}: {err}");
+        assert!(err.contains(what), "{what}: {err}");
+        assert!(err.contains("JAMJET_AUDIT_SIGNING_KEY"), "{what}: {err}");
+    }
+    assert_eq!(token_rows(&backend).await.len(), 1, "a token was created");
+    assert_eq!(audit_entries(&backend).await.len(), entries);
+
+    // A revoke under another key revokes, and says the log has no record.
+    let id = token_rows(&backend).await[0].0.clone();
+    let (ok, err) = run_cli(
+        &dir,
+        &url,
+        &["token", "revoke", &id],
+        &[("JAMJET_AUDIT_SIGNING_KEY", "some-other-key-entirely")],
+    );
+    assert!(!ok, "{err}");
+    assert!(
+        err.contains("is revoked, but the audit log could not record it"),
+        "{err}"
+    );
+    assert!(
+        token_rows(&backend).await[0].1.is_some(),
+        "the token is still live"
+    );
+    assert_eq!(audit_entries(&backend).await.len(), entries);
+
+    // With the server's key: fine.
+    let (ok, err) = run_cli(
+        &dir,
+        &url,
+        &["token", "create", "--role", "viewer"],
+        &[ours],
+    );
+    assert!(ok, "{err}");
+    let signer = jamjet_audit::AuditSigner::new(ours.1.as_bytes().to_vec());
+    jamjet_audit::verify_chain(&audit_entries(&backend).await, &signer)
+        .expect("the chain verifies");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The token commands read one switch, the audit key opt-in. A server switch
+/// set to a typo used to stop them too, so a bad `JAMJET_DEV_MODE` kept an
+/// operator from revoking a token.
+#[tokio::test]
+async fn token_commands_read_only_the_audit_switch() {
+    let dir = temp_dir();
+    let (url, _backend) = server_database(&dir).await;
+    let (ok, err) = run_cli(
+        &dir,
+        &url,
+        &["token", "create", "--role", "viewer"],
+        &[
+            ("JAMJET_DEV_MODE", "enabled"),
+            ("JAMJET_EMBED_WORKERS", "maybe"),
+        ],
+    );
+    assert!(ok, "{err}");
+    let (ok, err) = run_cli(
+        &dir,
+        &url,
+        &["token", "create", "--role", "viewer"],
+        &[("JAMJET_AUDIT_ALLOW_INSECURE_KEY", "enabled")],
+    );
+    assert!(!ok);
+    assert!(err.contains("JAMJET_AUDIT_ALLOW_INSECURE_KEY"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A token the audit log cannot record is not issued.
 #[tokio::test]
 async fn a_token_the_audit_log_cannot_record_is_not_issued() {

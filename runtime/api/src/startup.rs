@@ -83,8 +83,20 @@ pub fn parse_allowed_hosts(raw: Option<&str>) -> Result<Vec<String>, String> {
         let plain = entry
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'));
-        let has_port = !entry.starts_with('[') && entry.matches(':').count() == 1;
-        if !plain || has_port || entry.contains("..") {
+        // `[` and `]` only around a whole IPv6 address: `[fd00::1]:7700` is an
+        // address and a port, and used to pass as one name.
+        let bracketed = entry.starts_with('[') || entry.ends_with(']');
+        let well_bracketed = entry.starts_with('[')
+            && entry.ends_with(']')
+            && entry.matches('[').count() == 1
+            && entry.matches(']').count() == 1;
+        let brackets_ok = if bracketed {
+            well_bracketed
+        } else {
+            !entry.contains(['[', ']'])
+        };
+        let has_port = !bracketed && entry.matches(':').count() == 1;
+        if !plain || !brackets_ok || has_port || entry.contains("..") {
             return Err(format!(
                 "{DEV_ALLOWED_HOSTS_ENV}: {entry:?} is not a host name; give names or \
                  addresses separated by commas, without a scheme, path or port"
@@ -186,9 +198,19 @@ pub fn is_allowed_host(host: &str, allowed: &[String]) -> bool {
 }
 
 /// Headers a proxy or tunnel adds. Dev mode refuses a request carrying any
-/// of them: ngrok (`--host-header=rewrite`) and cloudflared rewrite `Host`
-/// to `localhost`, so the Host check passes for a request from anywhere.
+/// of them, or any other `X-Forwarded-*`: ngrok (`--host-header=rewrite`)
+/// and cloudflared rewrite `Host` to `localhost`, so the Host check passes
+/// for a request from anywhere.
 pub const FORWARDING_HEADERS: &[&str] = &["forwarded", "x-forwarded-host", "x-forwarded-for"];
+
+/// Whether a request carries a header a proxy adds ([`FORWARDING_HEADERS`],
+/// or any `X-Forwarded-*`).
+pub fn is_forwarded(headers: &axum::http::HeaderMap) -> bool {
+    headers.keys().any(|k| {
+        let k = k.as_str();
+        FORWARDING_HEADERS.contains(&k) || k.starts_with("x-forwarded-")
+    })
+}
 
 /// Why dev mode refuses a request, or `None` to answer it.
 ///
@@ -199,11 +221,21 @@ pub const FORWARDING_HEADERS: &[&str] = &["forwarded", "x-forwarded-host", "x-fo
 /// * `Host` must be allowed. A page whose host name re-resolves to 127.0.0.1
 ///   (DNS rebinding) is same-origin with the runtime, but its requests carry
 ///   its own host name.
-/// * No [`FORWARDING_HEADERS`].
-/// * Not cross-site: `Sec-Fetch-Site: cross-site`, or an `Origin` that is not
-///   an allowed host (`null` included). A form or `fetch` from any page can
-///   POST to 127.0.0.1, and a POST with no body (cancel a run, deactivate an
-///   agent) needs nothing the browser would stop.
+/// * No [`FORWARDING_HEADERS`], nor any other `X-Forwarded-*`.
+/// * Not from a page of another site. With an `Origin`, the origin decides:
+///   it must be an allowed host (`null` is not). Without one,
+///   `Sec-Fetch-Site: cross-site` is refused. A form or `fetch` from any page
+///   can POST to 127.0.0.1, and a POST with no body (cancel a run,
+///   deactivate an agent) needs nothing the browser would stop. A browser
+///   sends `Sec-Fetch-Site: cross-site` beside a loopback `Origin` too
+///   (`localhost:3000` calling `127.0.0.1:7700` is another site), so the
+///   header alone used to refuse a local dev UI.
+///
+/// What this trusts: any page served from this machine, on any port, and
+/// any request that reaches the port without a proxy header. A plain TCP
+/// tunnel (`ssh -L`, `socat`) adds no header and keeps `Host` as the client
+/// sent it, so a request through one passes. Don't expose the port that
+/// way; use a token instead.
 pub fn dev_refusal(
     headers: &axum::http::HeaderMap,
     authority: Option<&str>,
@@ -214,16 +246,18 @@ pub fn dev_refusal(
     if !host.is_some_and(|h| is_allowed_host(h, allowed)) {
         return Some("dev mode answers only requests addressed to localhost, a loopback address or a name in JAMJET_DEV_ALLOWED_HOSTS");
     }
-    if FORWARDING_HEADERS.iter().any(|h| headers.contains_key(*h)) {
+    if is_forwarded(headers) {
         return Some("dev mode refuses requests relayed by a proxy or tunnel (Forwarded, X-Forwarded-Host, X-Forwarded-For)");
     }
-    let cross_site = header("sec-fetch-site").is_some_and(|v| v.eq_ignore_ascii_case("cross-site"));
-    let foreign_origin = headers.get("origin").is_some_and(|o| {
-        let origin = o.to_str().unwrap_or("");
-        let authority = origin.split_once("://").map(|(_, rest)| rest).unwrap_or("");
-        !is_allowed_host(authority, allowed)
-    });
-    if cross_site || foreign_origin {
+    let from_another_site = match headers.get("origin") {
+        Some(o) => {
+            let origin = o.to_str().unwrap_or("");
+            let authority = origin.split_once("://").map(|(_, rest)| rest).unwrap_or("");
+            !is_allowed_host(authority, allowed)
+        }
+        None => header("sec-fetch-site").is_some_and(|v| v.eq_ignore_ascii_case("cross-site")),
+    };
+    if from_another_site {
         return Some("dev mode refuses requests from a page of another site");
     }
     None
@@ -459,6 +493,8 @@ mod tests {
             ("x-forwarded-host", "abc.ngrok.app"),
             ("x-forwarded-for", "203.0.113.9"),
             ("forwarded", "for=203.0.113.9;host=abc.ngrok.app"),
+            ("x-forwarded-proto", "https"),
+            ("X-Forwarded-Port", "443"),
         ] {
             assert_eq!(
                 guarded(&[], "GET", &[("host", "localhost:7700"), (k, v)]).await,
@@ -485,6 +521,40 @@ mod tests {
                 "{extra:?}"
             );
         }
+        // As a browser sends them: the Origin and Sec-Fetch-Site together.
+        let cross = ("sec-fetch-site", "cross-site");
+        for origin in [
+            "https://evil.example",
+            "null",
+            "http://localhost.evil.example",
+        ] {
+            assert_eq!(
+                guarded(&[], "POST", &[local, ("origin", origin), cross]).await,
+                403,
+                "{origin}"
+            );
+        }
+        // A local dev UI on another port is another site to the browser.
+        for origin in [
+            "http://localhost:3000",
+            "http://127.0.0.1:5173",
+            "http://[::1]:8080",
+        ] {
+            assert_eq!(
+                guarded(&[], "POST", &[local, ("origin", origin), cross]).await,
+                200,
+                "{origin}"
+            );
+        }
+        assert_eq!(
+            guarded(
+                &["my-pc.local"],
+                "POST",
+                &[local, ("origin", "http://my-pc.local:3000"), cross]
+            )
+            .await,
+            200
+        );
         // A local page (a dev UI on another port) and a client that sends
         // neither header are answered.
         for extra in [
@@ -520,6 +590,11 @@ mod tests {
             "*.example",
             "a b",
             "a..b",
+            "[fd00::1]:7700",
+            "[fd00::1",
+            "fd00::1]",
+            "[[fd00::1]]",
+            "a[b]",
         ] {
             let err = parse_allowed_hosts(Some(bad)).unwrap_err();
             assert!(err.contains(DEV_ALLOWED_HOSTS_ENV), "{bad}: {err}");

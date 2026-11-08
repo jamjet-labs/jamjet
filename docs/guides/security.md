@@ -84,26 +84,41 @@ none of this, so dev mode has guards of its own:
   address or a name in `JAMJET_DEV_ALLOWED_HOSTS`. This stops a web page that
   re-resolves its own host name to 127.0.0.1 (DNS rebinding) from driving the
   runtime from your browser. `JAMJET_DEV_MODE_ALLOW_REMOTE` does not turn it off.
-- It refuses a request carrying `Forwarded`, `X-Forwarded-Host` or
-  `X-Forwarded-For`: a tunnel such as ngrok with `--host-header=rewrite`, or
-  cloudflared, rewrites `Host` to `localhost` for a request from anywhere.
-- It refuses a request from a page of another site (`Sec-Fetch-Site:
-  cross-site`, or an `Origin` that is not an allowed host). Any page can send a
-  POST with no body to 127.0.0.1, which is enough to cancel a run or deactivate
-  an agent.
+- It refuses a request carrying `Forwarded` or any `X-Forwarded-*` header: a
+  tunnel such as ngrok with `--host-header=rewrite`, or cloudflared, rewrites
+  `Host` to `localhost` for a request from anywhere.
+- It refuses a request from a page of another site. With an `Origin`, the
+  origin decides: it must be an allowed host (`null` is not). Without one,
+  `Sec-Fetch-Site: cross-site` is refused. Any page can send a POST with no
+  body to 127.0.0.1, which is enough to cancel a run or deactivate an agent.
+
+What these guards trust:
+
+- Any page served from this machine, on any port. A dev UI on
+  `localhost:3000` is answered, and so is anything else you run locally that
+  serves pages, including a dev server for a project you just cloned.
+- Any request that reaches the port without a proxy header. A plain TCP
+  tunnel (`ssh -R`, `socat`, a port forward) adds no header and keeps the
+  client's `Host`, so a request through one passes as local. Don't expose a
+  dev-mode port that way; turn dev mode off and use a token.
 
 The model sidecar (`jamjet.model.sidecar_server`) has no token either and
 spends the provider keys in its environment. It answers only requests
 addressed to this machine (or a name in `JAMJET_SIDECAR_ALLOWED_HOSTS`),
-refuses cross-site requests, and takes `POST /v1/complete` only as
-`application/json`.
+refuses requests through a proxy or from a page of another site by the same
+rules, and takes `POST /v1/complete` only as `application/json`. It trusts
+the same things.
 
 `jamjet-server token create` and `token revoke` seal `token_issued` and
 `token_revoked` into the audit log, with the token id, role, tenant and name.
 Separation of duties is keyed on the token id, so a reviewer token someone mints
 for themselves is on record. A token the log cannot record is revoked again and
-not printed. Run the commands with the audit signing key the server uses, or
-their entries are left unsigned.
+not printed. Run the commands with the audit signing settings the server uses.
+When the log's newest entry is signed and the command's environment has no key,
+another HMAC key or another Ed25519 key, `token create` refuses and creates
+nothing, and `token revoke` revokes the token and then reports that the log has
+no record of it. The token commands read one switch, `JAMJET_AUDIT_ALLOW_INSECURE_KEY`;
+the server's other switches don't stop them.
 
 | Route | Minimum role | Notes |
 |-------|--------------|-------|

@@ -6,7 +6,10 @@
 //! request until someone wrote a row into `api_tokens` by hand.
 
 use crate::config::ApiConfig;
-use jamjet_audit::{ActorType, AuditEnricher, AuditRecord, SqliteAuditBackend};
+use jamjet_audit::{
+    ActorType, AuditBackend, AuditEnricher, AuditQuery, AuditRecord, AuditSigner,
+    SqliteAuditBackend,
+};
 use jamjet_state::{ApiToken, SqliteBackend, StateBackend, TenantId, DEFAULT_TENANT};
 
 pub const USAGE: &str = "\
@@ -24,8 +27,9 @@ The token commands open the database the server uses: DATABASE_URL, or
 .jamjet/runtime.db in the working directory. It must exist, so start the
 server against it once first. Only the token's SHA-256 hash is stored; the
 token itself is printed once, on stdout. Each issue and revocation is sealed
-into the audit log (token_issued, token_revoked); run them with the audit
-signing key the server uses, or the entry is left unsigned.";
+into the audit log (token_issued, token_revoked), so run them with the audit
+signing settings the server uses: they refuse when the log's newest entry is
+signed and this environment cannot sign the same way.";
 
 /// The roles a token may have, as `api_tokens.role` stores them.
 pub const ROLES: &[&str] = &["operator", "developer", "reviewer", "viewer"];
@@ -152,12 +156,17 @@ pub async fn create_token(
 }
 
 /// The audit log of the database at `database_url`, signed as the server's
-/// environment says (`AuditSigner::from_env`).
+/// environment says (`AuditSigner::from_env`). Refused when the log's newest
+/// entry is signed and this environment cannot sign the same way
+/// ([`refuse_another_key`]).
 async fn audit_log(database_url: &str) -> anyhow::Result<AuditEnricher> {
-    let backend = SqliteAuditBackend::open(database_url)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot open the audit log in {database_url}: {e}"))?;
-    let audit = AuditEnricher::new(std::sync::Arc::new(backend));
+    let backend = std::sync::Arc::new(
+        SqliteAuditBackend::open(database_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot open the audit log in {database_url}: {e}"))?,
+    );
+    let audit = AuditEnricher::new(backend.clone());
+    refuse_another_key(backend.as_ref(), audit.signer()).await?;
     if !audit.signer().can_sign() {
         eprintln!(
             "warning: no audit signing key in this environment, so the audit entry is \
@@ -165,6 +174,56 @@ async fn audit_log(database_url: &str) -> anyhow::Result<AuditEnricher> {
         );
     }
     Ok(audit)
+}
+
+/// Refuse to append to a log whose newest entry is signed when `signer`
+/// cannot sign as it was signed: with no key, another HMAC key, or another
+/// Ed25519 key. The entry would sit in a signed chain unsigned, or signed
+/// with a key the server's verifier rejects, so the log would no longer
+/// verify from that entry on. A log whose newest entry is unsigned has no
+/// key to keep to.
+pub async fn refuse_another_key(
+    backend: &dyn AuditBackend,
+    signer: &AuditSigner,
+) -> anyhow::Result<()> {
+    let newest = backend
+        .query(&AuditQuery {
+            limit: 1,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot read the audit log's newest entry: {e}"))?;
+    let Some(head) = newest.into_iter().next() else {
+        return Ok(());
+    };
+    let (Some(hash), Some(signature)) = (head.entry_hash.as_deref(), head.signature.as_deref())
+    else {
+        return Ok(());
+    };
+    if signer.can_sign() && signer.verify(hash.as_bytes(), signature) {
+        return Ok(());
+    }
+    let signed_with = match signature
+        .strip_prefix(jamjet_audit::signer::ED25519_SIG_PREFIX)
+        .and_then(|rest| rest.split_once(':'))
+    {
+        Some((kid, _)) => format!("Ed25519 key {kid}"),
+        None => "an HMAC key".to_string(),
+    };
+    let here = match (signer.can_sign(), signer.kid()) {
+        (false, _) => "no signing key".to_string(),
+        (true, Some(kid)) => format!("Ed25519 key {kid}"),
+        (true, None) => "another HMAC key".to_string(),
+    };
+    anyhow::bail!(
+        "the audit log's newest entry is signed with {signed_with}, and this environment has \
+         {here}, so the entry for this command would break the log's signatures. Run it with \
+         the audit signing settings the server uses ({}, {} or {}/{}).",
+        jamjet_audit::signer::SIGNING_MODE_ENV,
+        jamjet_audit::signer::SIGNING_KEY_ENV,
+        jamjet_audit::signer::ED25519_KEY_ENV,
+        jamjet_audit::signer::ED25519_KEY_FILE_ENV,
+    )
 }
 
 /// The audit record of a token issued or revoked. Separation of duties is
@@ -292,7 +351,8 @@ pub async fn revoke_token(database_url: &str, id: &str) -> anyhow::Result<()> {
     let backend = SqliteBackend::connect_existing(database_url)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
-    let audit = audit_log(database_url).await?;
+    // Revoke first: a log that cannot be opened, or is signed with another
+    // key, must not keep a token alive.
     let Some(revoked) = backend
         .revoke_token(id)
         .await
@@ -300,6 +360,9 @@ pub async fn revoke_token(database_url: &str, id: &str) -> anyhow::Result<()> {
     else {
         anyhow::bail!("no active token {id:?} in {database_url}");
     };
+    let audit = audit_log(database_url).await.map_err(|e| {
+        anyhow::anyhow!("token {id} is revoked, but the audit log could not record it: {e}")
+    })?;
     let record = token_record(
         "token_revoked",
         id,
