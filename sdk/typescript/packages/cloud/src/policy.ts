@@ -7,8 +7,25 @@ export interface PolicyDecision {
   toolName: string
 }
 
-interface ToolLike {
-  function?: { name?: string }
+/**
+ * The name of a tool definition, in any shape the patchers see:
+ * OpenAI function tools `{ type: 'function', function: { name } }`,
+ * OpenAI custom tools `{ type: 'custom', custom: { name } }`, and
+ * Anthropic tools `{ name, input_schema }` (client and server tools).
+ * Also reads a forced `tool_choice` in either vendor's shape.
+ * Returns '' when no name is present.
+ */
+export function toolNameOf(tool: unknown): string {
+  if (typeof tool !== 'object' || tool === null) return ''
+  const t = tool as Record<string, unknown>
+  for (const key of ['function', 'custom']) {
+    const inner = t[key]
+    if (typeof inner === 'object' && inner !== null) {
+      const name = (inner as Record<string, unknown>)['name']
+      if (typeof name === 'string') return name
+    }
+  }
+  return typeof t['name'] === 'string' ? t['name'] : ''
 }
 
 function globToRegExp(pattern: string): RegExp {
@@ -53,12 +70,21 @@ export class PolicyEvaluator {
     }
   }
 
-  filterTools<T extends ToolLike>(tools: T[]): { allowed: T[]; blocked: T[] } {
+  /** True once any rule has been added. */
+  hasRules(): boolean {
+    return this.rules.length > 0
+  }
+
+  /** True when a block or require_approval rule exists. */
+  hasRestrictiveRules(): boolean {
+    return this.rules.some((r) => r.action === 'block' || r.action === 'require_approval')
+  }
+
+  filterTools<T>(tools: readonly T[]): { allowed: T[]; blocked: T[] } {
     const allowed: T[] = []
     const blocked: T[] = []
     for (const tool of tools) {
-      const name = tool.function?.name ?? ''
-      const decision = this.evaluate(name)
+      const decision = this.evaluate(toolNameOf(tool))
       if (decision.blocked) blocked.push(tool)
       else allowed.push(tool)
     }

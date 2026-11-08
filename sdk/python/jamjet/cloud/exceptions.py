@@ -24,6 +24,24 @@ class JamJetPolicyBlocked(Exception):
         super().__init__(f"Tool '{tool}' blocked by policy pattern '{pattern}'")
 
 
+class JamJetUnenforceableCall(JamJetPolicyBlocked):
+    """Raised for an SDK method this package does not enforce (for example the
+    OpenAI Responses API or Anthropic ``messages.stream()``) while a block or
+    require_approval rule is active. Subclasses JamJetPolicyBlocked so existing
+    handlers still catch it."""
+
+    def __init__(self, method: str) -> None:
+        super().__init__(tool=method, pattern="*")
+        self.method = method
+        self.args = (
+            f"{method} is not policy-enforced by jamjet.cloud, so it is refused while block or "
+            "require_approval rules are active. Use chat.completions.create or messages.create instead.",
+        )
+
+    def __str__(self) -> str:
+        return str(self.args[0])
+
+
 class JamJetPIIBlocked(JamJetPolicyBlocked):
     """Raised when a pre-LLM call is blocked because the request contained PII.
 

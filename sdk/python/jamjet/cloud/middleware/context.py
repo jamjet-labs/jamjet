@@ -37,17 +37,20 @@ def call_context_from_openai_kwargs(kwargs: dict[str, Any]) -> CallContext:
 
 
 def openai_kwargs_from_call_context(ctx: CallContext) -> dict[str, Any]:
-    """Reverse mapping. Re-inserts the system message at index 0 if present."""
+    """Reverse mapping. Re-inserts the system message at index 0 if present.
+
+    ``tools`` is left out when empty: a call made without tools (or whose
+    tools were all removed by policy) must not reach the vendor with an empty
+    tools array.
+    """
     messages: list[dict[str, Any]] = []
     if ctx.system is not None:
         messages.append({"role": "system", "content": ctx.system})
     messages.extend(ctx.messages)
-    return {
-        "model": ctx.model,
-        "messages": messages,
-        "tools": ctx.tools,
-        **ctx.extra_kwargs,
-    }
+    out: dict[str, Any] = {"model": ctx.model, "messages": messages, **ctx.extra_kwargs}
+    if ctx.tools:
+        out["tools"] = ctx.tools
+    return out
 
 
 def call_context_from_anthropic_kwargs(kwargs: dict[str, Any]) -> CallContext:
@@ -68,9 +71,10 @@ def anthropic_kwargs_from_call_context(ctx: CallContext) -> dict[str, Any]:
     out: dict[str, Any] = {
         "model": ctx.model,
         "messages": ctx.messages,
-        "tools": ctx.tools,
         **ctx.extra_kwargs,
     }
+    if ctx.tools:
+        out["tools"] = ctx.tools
     if ctx.system is not None:
         out["system"] = ctx.system
     return out

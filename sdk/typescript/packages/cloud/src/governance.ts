@@ -49,7 +49,8 @@ export async function withAgent<T>(
  *
  * - `'block'` — matching tools are stripped from the request before it reaches
  *   the model. If the model returns a tool-call for a blocked tool, a
- *   {@link JamjetPolicyBlocked} error is thrown.
+ *   {@link JamjetPolicyBlocked} error is thrown. On streaming calls the
+ *   tool-call chunks are held until the stream ends and checked first.
  * - `'allow'` — explicitly permits matching tools (useful to whitelist a subset
  *   when a broader `block` pattern is also registered).
  * - `'require_approval'` — **recognised by the evaluator but runtime

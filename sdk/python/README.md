@@ -273,12 +273,29 @@ Open [app.jamjet.dev/dashboard/traces](https://app.jamjet.dev/dashboard/traces) 
 Optional governance primitives:
 
 ```python
-jamjet.policy("block", "payments.*")              # filter tools by name
+jamjet.policy("block", "payments.*")              # strip matching tools, refuse matching tool calls
 jamjet.budget(max_cost_usd=5.00)                   # cap spend; raises BudgetExceeded
 approval = jamjet.require_approval(action="charge_card", context={...})
 @jamjet.trace                                       # decorate any function
 def lookup_customer(...): ...
 ```
+
+Policy and budget apply to the sync clients: OpenAI `chat.completions.create`,
+`.parse()`, `.stream()` and `with_raw_response`, and Anthropic `messages` and
+`beta.messages` `create` / `parse`, legacy OpenAI `functions` included.
+Blocked tools are stripped from the request, and a tool call the model returns
+for a blocked tool raises `JamJetPolicyBlocked`. With `stream=True`, text
+streams through as it arrives; once any policy rule is set, chunks from the
+first tool call onward are held until the stream ends and checked before your
+code sees them, and the streamed usage counts toward the budget. Server tools
+(such as web search) and MCP toolsets run on the vendor's side before a tool
+call could be refused, so a rule that could match them removes them from the
+request; Anthropic's own client tools (bash, text editor, computer, memory)
+are gated like any other tool. Not enforced, so they raise
+`JamJetUnenforceableCall` while any block or require_approval rule is set:
+OpenAI's Responses API, Anthropic's `messages.stream()`, the async clients
+(`AsyncOpenAI`, `AsyncAnthropic`), the batch APIs, and
+`with_raw_response` / `with_streaming_response` with `stream=True`.
 
 Install with the LLM SDK you use:
 

@@ -21,6 +21,23 @@ export class JamjetPolicyBlocked extends Error {
   }
 }
 
+/**
+ * Thrown for an SDK entry point this package does not enforce (for example
+ * OpenAI `responses.create`) while a block or require_approval rule is active.
+ * Extends {@link JamjetPolicyBlocked}, so existing handlers still catch it.
+ */
+export class JamjetUnenforceableCall extends JamjetPolicyBlocked {
+  readonly method: string
+  constructor(method: string) {
+    super(method, '*')
+    this.name = 'JamjetUnenforceableCall'
+    this.method = method
+    this.message =
+      `${method} is not policy-enforced by @jamjet/cloud, so it is refused while block or ` +
+      `require_approval rules are active. Use chat.completions.create or messages.create instead.`
+  }
+}
+
 export class JamjetApprovalRejected extends Error {
   readonly approvalId: string
   readonly reason?: string

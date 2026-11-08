@@ -105,8 +105,29 @@ budget(5.00) // hard cap in USD
 ```
 
 `policy()` and `budget()` apply to every wrapped LLM client in the process.
-Blocked tools are stripped before the model sees them; budget exhaustion throws
+Blocked tools are stripped before the model sees them (OpenAI `function` and
+`custom` tools, and Anthropic tools), and a tool call the model returns for a
+blocked tool throws `JamjetPolicyBlocked`. Budget exhaustion throws
 `JamjetBudgetExceeded` before the next call goes out.
+
+Enforced entry points: OpenAI `chat.completions` (`create`, `parse`, `stream`,
+legacy `functions` included) and Anthropic `messages` and `beta.messages`
+(`create`, `parse`, `stream`). `asResponse()` and `withResponse()` return a
+Response rebuilt from the enforced result (server-sent events for a stream).
+OpenAI's Responses API and the batch APIs are not enforced: they throw
+`JamjetUnenforceableCall` while any block or require_approval rule is set.
+Server tools (such as web search) and MCP toolsets run on the vendor's side
+before a tool call could be refused, so a rule that could match them removes
+them from the request; Anthropic's own client tools (bash, text editor,
+computer, memory) are gated like any other tool.
+
+Streaming calls get the same checks. Text streams through as it arrives; once
+any policy rule is set, chunks from the first tool call onward are held until
+the stream ends, checked, and only then handed to your code. Usage and cost are
+recorded when the stream finishes, fails, or is abandoned (an iterator dropped
+without being closed is recorded when it is garbage collected) and count toward
+`budget()`. When an OpenAI stream reports no usage, the cost is estimated and
+the span is marked `usage_estimated`.
 
 ## Standalone primitives (no Cloud account)
 
