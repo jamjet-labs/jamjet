@@ -573,17 +573,23 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// [`build_router`] behind [`crate::auth::require_bearer`] when `token` is
-/// set: what `engram serve --mode rest` runs.
-pub fn build_router_with_auth(state: AppState, token: Option<String>) -> Router {
+/// [`build_router`] behind what `auth` requires: a bearer token, or with
+/// none, [`crate::auth::require_local_caller`]. What `engram serve --mode
+/// rest` runs.
+pub fn build_router_with_auth(state: AppState, auth: &crate::auth::RestAuth) -> Router {
     let router = build_router(state);
-    match token {
-        Some(t) => {
-            let t = Arc::new(t);
+    match auth {
+        crate::auth::RestAuth::Token(t) => {
+            let t = Arc::new(t.clone());
             router.layer(axum::middleware::from_fn(move |req, next| {
                 crate::auth::require_bearer(t.clone(), req, next)
             }))
         }
-        None => router,
+        crate::auth::RestAuth::Open { loopback, .. } => {
+            let loopback = *loopback;
+            router.layer(axum::middleware::from_fn(move |req, next| {
+                crate::auth::require_local_caller(loopback, req, next)
+            }))
+        }
     }
 }

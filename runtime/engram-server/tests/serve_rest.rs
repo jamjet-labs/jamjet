@@ -8,7 +8,46 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_engram");
 
-fn engram(env: &[(&str, &str)]) -> Child {
+/// The child, killed when dropped, so a failed assertion does not leave a
+/// server running.
+struct Engram(Child);
+
+impl Drop for Engram {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl std::ops::Deref for Engram {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Engram {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+/// Read `child`'s stderr until a line contains `listening on`, then keep
+/// draining it on a thread so later writes do not hit a closed pipe.
+fn listening_addr(child: &mut Child) -> Option<String> {
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let mut addr = None;
+    for line in lines.by_ref().map_while(Result::ok) {
+        if let Some(rest) = line.split("listening on ").nth(1) {
+            addr = Some(rest.trim().to_string());
+            break;
+        }
+    }
+    std::thread::spawn(move || for _ in lines.map_while(Result::ok) {});
+    addr
+}
+
+fn engram(env: &[(&str, &str)]) -> Engram {
     let mut cmd = Command::new(BIN);
     cmd.args([
         "serve",
@@ -32,11 +71,13 @@ fn engram(env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
+    Engram(
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    )
 }
 
 #[test]
@@ -70,17 +111,7 @@ fn rest_off_loopback_without_a_token_refuses_to_start() {
 fn rest_with_a_token_refuses_requests_without_it() {
     let token = "3f9a1c0e7b2d4a6f8e1c3b5d7f9a2c4e";
     let mut child = engram(&[("ENGRAM_AUTH_TOKEN", token)]);
-    let mut addr = None;
-    for line in BufReader::new(child.stderr.take().unwrap())
-        .lines()
-        .map_while(Result::ok)
-    {
-        if let Some(rest) = line.split("listening on ").nth(1) {
-            addr = Some(rest.trim().to_string());
-            break;
-        }
-    }
-    let addr = addr.expect("the server reports where it listens");
+    let addr = listening_addr(&mut child).expect("the server reports where it listens");
     assert!(
         addr.starts_with("127.0.0.1:"),
         "loopback by default: {addr}"
@@ -101,8 +132,7 @@ fn rest_with_a_token_refuses_requests_without_it() {
     };
     let without = status_line(None);
     let with = status_line(Some(&format!("Bearer {token}")));
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     assert!(without.contains("401"), "{without}");
     assert!(with.contains("200"), "{with}");
 }
@@ -135,20 +165,8 @@ fn the_allow_unauthenticated_env_takes_yes_and_no() {
 
     // `=1` parses (on loopback, so nothing is exposed) and the server starts.
     let mut child = engram(&[("ENGRAM_ALLOW_UNAUTHENTICATED", "1")]);
-    let mut started = false;
-    let mut seen = String::new();
-    for line in BufReader::new(child.stderr.take().unwrap())
-        .lines()
-        .map_while(Result::ok)
-    {
-        seen.push_str(&line);
-        seen.push('\n');
-        if line.contains("listening on") {
-            started = true;
-            break;
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    assert!(started, "{seen}");
+    assert!(
+        listening_addr(&mut child).is_some(),
+        "`=1` must parse and start"
+    );
 }

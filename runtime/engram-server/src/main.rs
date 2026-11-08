@@ -539,26 +539,21 @@ async fn main() {
                             std::process::exit(2);
                         }
                     };
-                    let token = match auth {
-                        engram_server::auth::RestAuth::Token(t) => {
-                            if t.len() < 32 {
-                                eprintln!(
-                                    "engram: WARNING — ENGRAM_AUTH_TOKEN is under 32 characters"
-                                );
-                            }
-                            Some(t)
+                    match &auth {
+                        engram_server::auth::RestAuth::Token(t) if t.len() < 32 => {
+                            eprintln!("engram: WARNING — ENGRAM_AUTH_TOKEN is under 32 characters");
                         }
-                        engram_server::auth::RestAuth::Open { warning } => {
+                        engram_server::auth::RestAuth::Token(_) => {}
+                        engram_server::auth::RestAuth::Open { warning, .. } => {
                             eprintln!("engram: WARNING — {warning}");
-                            None
                         }
-                    };
+                    }
                     let state = AppState {
                         memory: memory.clone(),
                         llm_backend: config.llm.clone(),
                         extract_on_save,
                     };
-                    let app = rest::build_router_with_auth(state, token);
+                    let app = rest::build_router_with_auth(state, &auth);
                     let addr = if host.contains(':') && !host.starts_with('[') {
                         format!("[{host}]:{port}")
                     } else {

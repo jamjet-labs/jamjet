@@ -11,12 +11,17 @@
 //!   is pinned to the checked address with redirects off, so DNS cannot be
 //!   swapped between the check and the request and a 3xx cannot bounce it
 //!   inward;
-//! * the card is read with a size cap and a timeout;
-//! * the caller gets a generic error; the detail goes to the log.
+//! * the client ignores proxy environment variables, which would resolve
+//!   the host again past the check;
+//! * the lookup, the connection and the read share one 10 s budget, and the
+//!   card is capped at 256 KiB;
+//! * every fetch failure, a name that resolves inward included, gives the
+//!   caller the same message; the detail goes to the log.
 //!
 //! [`ALLOW_PRIVATE_ENV`] lifts the address and scheme rules for local
-//! development (an agent on `http://localhost`). Redirects stay off and the
-//! limits stay on. The address checks follow jamjet-cloud's outbound guard.
+//! development (an agent on `http://localhost`), except for link-local
+//! metadata addresses. Redirects stay off and the limits stay on. The
+//! address checks follow jamjet-cloud's outbound guard.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -114,6 +119,22 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     global_unicast && !special
 }
 
+/// Link-local addresses, where cloud metadata services answer
+/// (169.254.169.254, fd00:ec2::254 and the like). Refused even under
+/// [`ALLOW_PRIVATE_ENV`]: no local agent lives there, and the credentials
+/// such a service hands out are the usual SSRF prize.
+pub fn is_metadata_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            (s[0] & 0xffc0) == 0xfe80 // fe80::/10
+                || v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+        }
+    }
+}
+
 /// Host names that name the local machine or an internal zone, or have no
 /// dot (resolved by a search domain).
 fn is_public_name(host: &str) -> bool {
@@ -149,6 +170,15 @@ pub fn card_url(base: &str, allow_private: bool) -> Result<Url, DiscoveryError> 
     let host = url
         .host_str()
         .ok_or_else(|| refused("the URL has no host"))?;
+    let literal = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .ok();
+    if literal.is_some_and(is_metadata_ip) || host.eq_ignore_ascii_case("metadata.google.internal")
+    {
+        return Err(refused("the host is a metadata address"));
+    }
     if !allow_private {
         // IPv6 literals come back bracketed ("[::1]").
         let public = match host
@@ -180,10 +210,20 @@ pub async fn fetch_card(url: &Url, allow_private: bool) -> Result<Vec<u8>, Disco
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_string();
-    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((lookup_host.as_str(), port)).await {
-        Ok(a) => a.collect(),
-        Err(e) => {
+    // The lookup is inside the time budget too.
+    let lookup = tokio::time::timeout(
+        FETCH_TIMEOUT,
+        tokio::net::lookup_host((lookup_host.as_str(), port)),
+    )
+    .await;
+    let addrs: Vec<SocketAddr> = match lookup {
+        Ok(Ok(a)) => a.collect(),
+        Ok(Err(e)) => {
             tracing::warn!(%host, "agent discovery: cannot resolve: {e}");
+            return Err(DiscoveryError::FetchFailed);
+        }
+        Err(_) => {
+            tracing::warn!(%host, "agent discovery: resolving timed out");
             return Err(DiscoveryError::FetchFailed);
         }
     };
@@ -191,20 +231,26 @@ pub async fn fetch_card(url: &Url, allow_private: bool) -> Result<Vec<u8>, Disco
         tracing::warn!(%host, "agent discovery: the host resolved to nothing");
         return Err(DiscoveryError::FetchFailed);
     }
-    if !allow_private {
-        if let Some(bad) = addrs.iter().find(|a| !is_public_ip(a.ip())) {
-            tracing::warn!(%host, address = %bad.ip(), "agent discovery: refused a non-public address");
-            return Err(DiscoveryError::UrlRefused(
-                "the host resolves to a non-public address".into(),
-            ));
+    // A name that resolves inward fails like any other fetch: a distinct
+    // answer would tell the caller which internal names exist.
+    let refused = |a: &SocketAddr| {
+        if allow_private {
+            is_metadata_ip(a.ip())
+        } else {
+            !is_public_ip(a.ip())
         }
+    };
+    if let Some(bad) = addrs.iter().find(|a| refused(a)) {
+        tracing::warn!(%host, address = %bad.ip(), "agent discovery: refused a non-public address");
+        return Err(DiscoveryError::FetchFailed);
     }
     let client = reqwest::Client::builder()
         // A proxy from HTTP(S)_PROXY would resolve the host itself, past the
         // pin, and could reach what the check refused.
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .resolve(&host, addrs[0])
+        // Every address was checked, so any of them may be used.
+        .resolve_to_addrs(&host, &addrs)
         .connect_timeout(FETCH_TIMEOUT)
         .timeout(FETCH_TIMEOUT)
         .build()
@@ -326,6 +372,18 @@ mod tests {
                 .as_str(),
             "https://agents.example.com/.well-known/agent.json"
         );
+    }
+
+    #[test]
+    fn metadata_addresses_stay_refused_under_the_opt_in() {
+        for bad in [
+            "http://169.254.169.254/latest",
+            "http://[fe80::1]:8080",
+            "http://[fd00:ec2::254]",
+            "http://metadata.google.internal",
+        ] {
+            assert!(card_url(bad, true).is_err(), "{bad}");
+        }
     }
 
     #[test]

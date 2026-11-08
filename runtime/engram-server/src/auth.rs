@@ -7,7 +7,10 @@
 //! * with `ENGRAM_AUTH_TOKEN` set, every route but `/health` needs
 //!   `Authorization: Bearer <token>`;
 //! * without one, it starts only on a loopback address, or with an explicit
-//!   `--allow-unauthenticated` (`ENGRAM_ALLOW_UNAUTHENTICATED=1`);
+//!   `--allow-unauthenticated` (`ENGRAM_ALLOW_UNAUTHENTICATED=1`). Open on
+//!   loopback, it answers only requests addressed to `localhost` or a
+//!   loopback address, and refuses cross-site browser requests, so a web page
+//!   that rebinds its own name to 127.0.0.1 cannot read or delete memories;
 //! * off loopback, a token shorter than 16 characters, or one that looks
 //!   like a placeholder, is refused.
 //!
@@ -28,8 +31,9 @@ pub const MIN_REMOTE_TOKEN_LEN: usize = 16;
 pub enum RestAuth {
     /// Every route but `/health` needs this bearer token.
     Token(String),
-    /// No auth: loopback only, or explicitly allowed.
-    Open { warning: String },
+    /// No auth: on loopback (`loopback`: only requests addressed to the
+    /// local machine are answered), or explicitly allowed off it.
+    Open { warning: String, loopback: bool },
 }
 
 /// Decide [`RestAuth`] for a server on `host`, or refuse to start.
@@ -62,15 +66,17 @@ pub fn rest_auth(
         }
         _ if loopback => Ok(RestAuth::Open {
             warning: format!(
-                "no ENGRAM_AUTH_TOKEN: the REST API on {host} has no auth. Only \
-                 processes on this machine can reach it."
+                "no ENGRAM_AUTH_TOKEN: the REST API on {host} has no auth. It answers only \
+                 requests addressed to localhost, but any local process can use it."
             ),
+            loopback: true,
         }),
         _ if allow_unauthenticated => Ok(RestAuth::Open {
             warning: format!(
                 "no ENGRAM_AUTH_TOKEN and --allow-unauthenticated: the REST API on {host} \
                  has NO AUTH. Anyone who can reach it can read and delete every memory."
             ),
+            loopback: false,
         }),
         _ => Err(format!(
             "refusing to serve the REST API on {host} without auth. Set ENGRAM_AUTH_TOKEN, \
@@ -107,6 +113,68 @@ fn looks_like_placeholder(token: &str) -> bool {
     .iter()
     .any(|p| t.contains(p))
         || t.bytes().all(|b| b == first)
+        || {
+            let mut distinct: Vec<u8> = t.bytes().collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            distinct.len() < 5
+        }
+}
+
+/// Whether a `Host` (or `Origin` authority) names the local machine:
+/// `localhost` or a loopback address, with or without a port.
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inner, tail)) if tail.is_empty() || tail.starts_with(':') => inner,
+            _ => return false,
+        }
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name,
+            Some(_) => return false,
+            None => host,
+        }
+    };
+    name.eq_ignore_ascii_case("localhost") || is_loopback_literal(name)
+}
+
+/// The decision [`require_local_caller`] enforces.
+fn refuse_caller(loopback: bool, req: &Request<Body>) -> bool {
+    let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
+    let host = header("host")
+        .map(str::to_string)
+        .or_else(|| req.uri().authority().map(|a| a.to_string()));
+    let origin_host = header("origin").map(|o| {
+        o.split_once("://")
+            .map(|(_, rest)| rest.to_string())
+            .unwrap_or_else(|| o.to_string())
+    });
+    let cross_site = header("sec-fetch-site").is_some_and(|v| v.eq_ignore_ascii_case("cross-site"));
+    cross_site
+        || (loopback
+            && (!host.as_deref().is_some_and(is_loopback_host)
+                || origin_host.as_deref().is_some_and(|o| !is_loopback_host(o))))
+}
+
+/// For a server with no token: refuse cross-site browser requests and, on
+/// loopback, requests not addressed to the local machine. Binding 127.0.0.1
+/// keeps other machines out but not a web page whose name re-resolves to
+/// 127.0.0.1 (DNS rebinding): its requests carry its own host name, and a
+/// browser marks them with `Origin` and `Sec-Fetch-Site`.
+pub async fn require_local_caller(loopback: bool, req: Request<Body>, next: Next) -> Response {
+    let refused = refuse_caller(loopback, &req);
+    if !refused {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({
+            "error": "without ENGRAM_AUTH_TOKEN this server answers only local, same-site requests"
+        })),
+    )
+        .into_response()
 }
 
 /// Constant-time equality on the bytes, so the comparison does not leak how
@@ -153,7 +221,10 @@ mod tests {
         assert!(rest_auth("192.168.1.5", Some(""), false).is_err());
         assert!(matches!(
             rest_auth("0.0.0.0", None, true),
-            Ok(RestAuth::Open { .. })
+            Ok(RestAuth::Open {
+                loopback: false,
+                ..
+            })
         ));
         assert!(matches!(
             rest_auth("127.0.0.1", None, false),
@@ -170,6 +241,7 @@ mod tests {
     #[test]
     fn a_weak_token_is_refused_off_loopback() {
         for weak in [
+            "abababababababababab",
             "short",
             "changeme-changeme-changeme",
             "aaaaaaaaaaaaaaaaaaaa",

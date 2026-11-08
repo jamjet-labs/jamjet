@@ -146,12 +146,15 @@ has no OAuth or mTLS support.
 Agent Card at a URL the caller gives, so it is guarded: the URL must be
 `https` with no credentials in it, and the host must resolve only to public
 addresses (no loopback, private, link-local, CGNAT or metadata ranges). The
-request is pinned to the address that was checked, redirects are not
-followed, the card is capped at 256 KiB and 10 s, and any fetch failure
-returns the same message, so the route cannot be used to read internal
-services or map ports. For an agent on your own machine set
-`JAMJET_DISCOVERY_ALLOW_PRIVATE=1`, which also allows `http`; the other limits
-stay.
+request is pinned to the addresses that were checked, ignores proxy
+environment variables (a proxy would resolve the name again), and does not
+follow redirects. The lookup, the connection and the read share a 10 s budget,
+the card is capped at 256 KiB, and any fetch failure, including a name that
+resolves inward, returns the same message, so the route cannot be used to
+read internal services, map ports or list internal names. A URL refused for
+its scheme or host is a 400. For an agent on your own machine set
+`JAMJET_DISCOVERY_ALLOW_PRIVATE=1`, which also allows `http`; link-local
+metadata addresses stay refused, and the other limits stay.
 
 ---
 

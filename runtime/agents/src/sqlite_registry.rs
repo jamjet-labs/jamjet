@@ -264,6 +264,27 @@ mod tests {
         }
     }
 
+    /// Production uses this registry: its discovery goes through the egress
+    /// guard too, and a loopback URL is refused without a connection.
+    #[tokio::test]
+    async fn discovery_refuses_a_loopback_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let reg = open_test_registry().await;
+        // Bounded: a client that did connect would wait on this listener,
+        // which never answers.
+        let err =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reg.discover_remote(&url))
+                .await
+                .expect("refused at once, without waiting on the listener")
+                .unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+        // Nothing connected: the accept would complete at once if one had.
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept()).await;
+        assert!(accepted.is_err(), "a connection was made");
+    }
+
     #[tokio::test]
     async fn test_register_and_get() {
         let reg = open_test_registry().await;

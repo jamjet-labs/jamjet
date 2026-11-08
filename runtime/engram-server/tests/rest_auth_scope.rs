@@ -6,6 +6,7 @@ use axum::http::{Request, StatusCode};
 use engram::embedding::MockEmbeddingProvider;
 use engram::memory::Memory;
 use engram::scope::Scope;
+use engram_server::auth::RestAuth;
 use engram_server::config::LlmBackend;
 use engram_server::rest::{build_router, build_router_with_auth, AppState};
 use http_body_util::BodyExt;
@@ -56,7 +57,7 @@ async fn a_delete_without_the_token_is_refused() {
         .add_fact("keep me", Scope::user("default", "u1"))
         .await
         .unwrap();
-    let app = build_router_with_auth(state(&memory), Some(TOKEN.into()));
+    let app = build_router_with_auth(state(&memory), &RestAuth::Token(TOKEN.into()));
     let delete = |auth: Option<&str>| {
         let mut req = Request::delete(format!("/v1/memory/facts/{id}"));
         if let Some(a) = auth {
@@ -84,7 +85,7 @@ async fn a_delete_without_the_token_is_refused() {
 #[tokio::test]
 async fn health_needs_no_token() {
     let memory = memory().await;
-    let app = build_router_with_auth(state(&memory), Some(TOKEN.into()));
+    let app = build_router_with_auth(state(&memory), &RestAuth::Token(TOKEN.into()));
     let (status, body, _) = send(&app, Request::get("/health").body(Body::empty()).unwrap()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
@@ -235,4 +236,55 @@ async fn stats_count_only_the_callers_org() {
     )
     .await;
     assert_eq!(body["total_facts"], 1, "{body}");
+}
+
+/// With no token, on loopback, the server answers only requests addressed
+/// to the local machine and refuses cross-site browser requests. Binding
+/// 127.0.0.1 alone let a page that rebinds its own name to 127.0.0.1 read
+/// and delete every memory.
+#[tokio::test]
+async fn an_open_loopback_server_refuses_a_rebound_or_cross_site_request() {
+    let memory = memory().await;
+    let app = build_router_with_auth(
+        state(&memory),
+        &RestAuth::Open {
+            warning: String::new(),
+            loopback: true,
+        },
+    );
+    let stats = |headers: &[(&str, &str)]| {
+        let mut req = Request::get("/v1/memory/stats");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        req.body(Body::empty()).unwrap()
+    };
+    let ok = [("host", "127.0.0.1:9090")];
+    assert_eq!(send(&app, stats(&ok)).await.0, StatusCode::OK);
+    assert_eq!(
+        send(
+            &app,
+            stats(&[
+                ("host", "localhost:9090"),
+                ("origin", "http://localhost:3000")
+            ])
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for refused in [
+        vec![("host", "rebound.evil.example:9090")],
+        vec![
+            ("host", "127.0.0.1:9090"),
+            ("origin", "http://evil.example"),
+        ],
+        vec![("host", "127.0.0.1:9090"), ("sec-fetch-site", "cross-site")],
+    ] {
+        assert_eq!(
+            send(&app, stats(&refused)).await.0,
+            StatusCode::FORBIDDEN,
+            "{refused:?}"
+        );
+    }
 }

@@ -37,6 +37,16 @@ class ConsolidationResult:
     llm_calls_used: int = 0
 
 
+def _scope_params(org_id: str | None, user_id: str | None) -> dict[str, str]:
+    """The ``org_id`` / ``user_id`` query parameters the server scopes by."""
+    params: dict[str, str] = {}
+    if org_id:
+        params["org_id"] = org_id
+    if user_id:
+        params["user_id"] = user_id
+    return params
+
+
 class EngramClient:
     """
     Async HTTP client for the Engram memory REST API.
@@ -167,8 +177,19 @@ class EngramClient:
 
     # ── Forget ────────────────────────────────────────────────────────────
 
-    async def forget(self, fact_id: str, *, reason: str | None = None) -> dict[str, Any]:
-        """Soft-delete a fact by ID."""
+    async def forget(
+        self,
+        fact_id: str,
+        *,
+        reason: str | None = None,
+        org_id: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Soft-delete a fact by ID.
+
+        The server forgets the fact only if it is in ``org_id`` (default
+        ``default``) and, when given, belongs to ``user_id``; otherwise 404.
+        """
         # httpx doesn't support a body on .delete(); use .request() instead.
         body: dict[str, Any] = {}
         if reason:
@@ -176,6 +197,7 @@ class EngramClient:
         r = await self._client.request(
             "DELETE",
             f"/v1/memory/facts/{fact_id}",
+            params=_scope_params(org_id, user_id),
             json=body if body else None,
         )
         r.raise_for_status()
@@ -203,9 +225,9 @@ class EngramClient:
 
     # ── Stats ─────────────────────────────────────────────────────────────
 
-    async def stats(self) -> dict[str, Any]:
-        """Return aggregate memory statistics."""
-        r = await self._client.get("/v1/memory/stats")
+    async def stats(self, *, org_id: str | None = None, user_id: str | None = None) -> dict[str, Any]:
+        """Return fact counts for ``org_id`` (default ``default``), or one user in it."""
+        r = await self._client.get("/v1/memory/stats", params=_scope_params(org_id, user_id))
         r.raise_for_status()
         return r.json()
 
@@ -238,8 +260,8 @@ class EngramClient:
 
     # ── Delete user data ──────────────────────────────────────────────────
 
-    async def delete_user(self, user_id: str) -> dict[str, Any]:
-        """GDPR: delete all memory data for a user."""
-        r = await self._client.delete(f"/v1/memory/users/{user_id}")
+    async def delete_user(self, user_id: str, *, org_id: str | None = None) -> dict[str, Any]:
+        """GDPR: delete all memory data for a user in ``org_id`` (default ``default``)."""
+        r = await self._client.delete(f"/v1/memory/users/{user_id}", params=_scope_params(org_id, None))
         r.raise_for_status()
         return r.json()

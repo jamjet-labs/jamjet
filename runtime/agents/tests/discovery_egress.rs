@@ -9,6 +9,7 @@
 
 use jamjet_agents::outbound::{discover_card, DiscoveryError, FETCH_FAILED, MAX_CARD_BYTES};
 use jamjet_agents::{AgentRegistry, InMemoryAgentRegistry};
+use reqwest::Url;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -86,6 +87,26 @@ async fn discovery_refuses_a_loopback_url_without_connecting() {
     let err = registry.discover_remote(&https).await.unwrap_err();
     assert!(err.contains("refused"), "{err}");
     assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+/// A name (not an IP literal) that resolves to loopback is refused after the
+/// lookup, before any connection: the check that stops `*.nip.io`-style names
+/// and A records pointing inward. `fetch_card` skips the name heuristics, so
+/// only the resolved-address check stands between this and the listener.
+#[tokio::test]
+async fn a_name_that_resolves_inward_is_refused_without_connecting() {
+    let (url, hits) = serve(ok_json(&card_json())).await;
+    let port = url.rsplit(':').next().unwrap();
+    let named = Url::parse(&format!("https://localhost:{port}/.well-known/agent.json")).unwrap();
+    let err = jamjet_agents::outbound::fetch_card(&named, false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        DiscoveryError::FetchFailed,
+        "the same answer as any failure"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no connection is made");
 }
 
 /// With the local-development opt-in the same card is fetched and parsed:

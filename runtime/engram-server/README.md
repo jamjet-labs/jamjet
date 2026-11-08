@@ -227,12 +227,17 @@ curl -H "Authorization: Bearer $ENGRAM_AUTH_TOKEN" \
 REST mode listens on `127.0.0.1` unless `ENGRAM_HOST` says otherwise. With
 `ENGRAM_AUTH_TOKEN` set, every route but `/health` needs
 `Authorization: Bearer <token>`. Without a token it starts only on a loopback
-address; off loopback it refuses to start unless you pass
+address, where it answers only requests addressed to `localhost` or a loopback
+address and refuses cross-site browser requests (so a web page cannot reach it
+by rebinding its own name to 127.0.0.1); any local process can still use it.
+Off loopback it refuses to start without a token unless you pass
 `--allow-unauthenticated` (`ENGRAM_ALLOW_UNAUTHENTICATED=1`), and it refuses a
-token shorter than 16 characters or one that looks like a placeholder. The
-token is one shared secret, not bound to an org: whoever holds it can act in
-every org, so run one server per tenant to keep tenants apart. The Docker image
-sets `ENGRAM_HOST=0.0.0.0`, so REST mode there needs a token.
+token shorter than 16 characters, with fewer than 5 distinct characters, or
+that looks like a placeholder. Prefer the env var to `--auth-token`, which
+other users can see in the process list. The token is one shared secret, not
+bound to an org: whoever holds it can act in every org, so run one server per
+tenant to keep tenants apart. The Docker image sets `ENGRAM_HOST=0.0.0.0`, so
+REST mode there needs a token.
 
 No server. No config. No Python sidecar. One binary.
 
@@ -292,7 +297,7 @@ All scoped by `(org_id, user_id, session_id)` — org is the coarsest, session t
 
 ## REST API
 
-Thirteen endpoints, rooted at `/v1/memory`. Full OpenAPI-style surface:
+Twelve endpoints rooted at `/v1/memory`, plus `/health`. Full OpenAPI-style surface:
 
 | Method | Path | Handler |
 |--------|------|---------|
