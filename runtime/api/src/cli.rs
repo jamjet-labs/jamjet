@@ -160,6 +160,10 @@ pub async fn create_token(
 /// entry is signed and this environment cannot sign the same way
 /// ([`refuse_another_key`]).
 async fn audit_log(database_url: &str) -> anyhow::Result<AuditEnricher> {
+    // The one switch these commands read, read strictly: a typo is an error,
+    // not "off". Here, not before the command runs, so a revoke revokes
+    // first whatever the switch says.
+    crate::startup::env_flag(jamjet_audit::signer::ALLOW_INSECURE_KEY_ENV)?;
     let backend = std::sync::Arc::new(
         SqliteAuditBackend::open(database_url)
             .await
@@ -182,10 +186,37 @@ async fn audit_log(database_url: &str) -> anyhow::Result<AuditEnricher> {
 /// with a key the server's verifier rejects, so the log would no longer
 /// verify from that entry on. A log whose newest entry is unsigned has no
 /// key to keep to.
+///
+/// After a key rotation the server seals [`seal_key_change`] at its next
+/// start, so the newest entry is the new key's and these commands work again
+/// under it.
 pub async fn refuse_another_key(
     backend: &dyn AuditBackend,
     signer: &AuditSigner,
 ) -> anyhow::Result<()> {
+    let Some((signed_with, here)) = key_mismatch(backend, signer).await? else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "the audit log's newest entry is signed with {signed_with}, and this environment has \
+         {here}, so the entry for this command would break the log's signatures. Run it with \
+         the audit signing settings the server uses ({}, {} or {}/{}). After a key change, \
+         start the server once with the new key: it records the change, and the commands \
+         work under the new key from then on.",
+        jamjet_audit::signer::SIGNING_MODE_ENV,
+        jamjet_audit::signer::SIGNING_KEY_ENV,
+        jamjet_audit::signer::ED25519_KEY_ENV,
+        jamjet_audit::signer::ED25519_KEY_FILE_ENV,
+    )
+}
+
+/// When the log's newest entry is signed and `signer` cannot verify it: what
+/// it was signed with, and what `signer` has. `None` when they agree, the
+/// newest entry is unsigned, or the log is empty.
+async fn key_mismatch(
+    backend: &dyn AuditBackend,
+    signer: &AuditSigner,
+) -> anyhow::Result<Option<(String, String)>> {
     let newest = backend
         .query(&AuditQuery {
             limit: 1,
@@ -194,14 +225,14 @@ pub async fn refuse_another_key(
         .await
         .map_err(|e| anyhow::anyhow!("cannot read the audit log's newest entry: {e}"))?;
     let Some(head) = newest.into_iter().next() else {
-        return Ok(());
+        return Ok(None);
     };
     let (Some(hash), Some(signature)) = (head.entry_hash.as_deref(), head.signature.as_deref())
     else {
-        return Ok(());
+        return Ok(None);
     };
     if signer.can_sign() && signer.verify(hash.as_bytes(), signature) {
-        return Ok(());
+        return Ok(None);
     }
     let signed_with = match signature
         .strip_prefix(jamjet_audit::signer::ED25519_SIG_PREFIX)
@@ -215,15 +246,44 @@ pub async fn refuse_another_key(
         (true, Some(kid)) => format!("Ed25519 key {kid}"),
         (true, None) => "another HMAC key".to_string(),
     };
-    anyhow::bail!(
-        "the audit log's newest entry is signed with {signed_with}, and this environment has \
-         {here}, so the entry for this command would break the log's signatures. Run it with \
-         the audit signing settings the server uses ({}, {} or {}/{}).",
-        jamjet_audit::signer::SIGNING_MODE_ENV,
-        jamjet_audit::signer::SIGNING_KEY_ENV,
-        jamjet_audit::signer::ED25519_KEY_ENV,
-        jamjet_audit::signer::ED25519_KEY_FILE_ENV,
-    )
+    Ok(Some((signed_with, here)))
+}
+
+/// At server start: when the log's newest entry is signed and the server's
+/// key cannot verify it (the key was rotated, or the mode changed), seal an
+/// `audit_key_changed` record under the new key, naming both. Without it a
+/// rotation locked the token commands out for good: they refuse a log whose
+/// newest entry they cannot verify, the newest entry was the old key's, and
+/// with every token revoked nothing else made the server write a new one.
+///
+/// Returns whether a record was sealed. The record is on the chain like any
+/// entry, so a verifier sees where one key's entries end and the next's begin.
+pub async fn seal_key_change(
+    backend: &dyn AuditBackend,
+    audit: &AuditEnricher,
+) -> anyhow::Result<bool> {
+    let Some((previous, current)) = key_mismatch(backend, audit.signer()).await? else {
+        return Ok(false);
+    };
+    let current = match current.as_str() {
+        "another HMAC key" => "an HMAC key".to_string(),
+        other => other.to_string(),
+    };
+    audit
+        .seal_record(AuditRecord {
+            event_type: "audit_key_changed".to_string(),
+            actor_id: "system".to_string(),
+            actor_type: ActorType::System,
+            tenant_id: DEFAULT_TENANT.to_string(),
+            detail: serde_json::json!({
+                "type": "audit_key_changed",
+                "previous": previous,
+                "current": current,
+            }),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("the audit key change could not be recorded: {e}"))?;
+    Ok(true)
 }
 
 /// The audit record of a token issued or revoked. Separation of duties is

@@ -46,15 +46,12 @@ async fn main() -> anyhow::Result<()> {
     let command = jamjet_api::cli::parse_args(&args);
     // Before anything reads one: a switch set to something that is not a
     // boolean stops the server instead of being read as off.
-    match &command {
-        Ok(Command::Serve) => startup::check_env_flags()?,
-        // The token commands read one switch, the audit key opt-in: a server
-        // switch (dev mode, embedded workers) set to a typo must not stop
-        // an operator revoking a token.
-        Ok(Command::TokenCreate(_) | Command::TokenRevoke(_)) => {
-            startup::env_flag(jamjet_audit::signer::ALLOW_INSECURE_KEY_ENV)?;
-        }
-        Ok(Command::Help) | Err(_) => {}
+    // The token commands read one switch, the audit key opt-in, and check it
+    // when they open the audit log (after a revoke has revoked): a server
+    // switch (dev mode, embedded workers) set to a typo must not stop an
+    // operator revoking a token.
+    if matches!(&command, Ok(Command::Serve)) {
+        startup::check_env_flags()?;
     }
     match command {
         Ok(Command::Serve) => {}
@@ -214,6 +211,12 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to migrate audit log: {e}"))?;
         let audit: Arc<dyn jamjet_audit::AuditBackend> = Arc::new(audit_backend);
         let enricher = Arc::new(AuditEnricher::new(Arc::clone(&audit)));
+        // A rotated key: on record before anything else is sealed.
+        if jamjet_api::cli::seal_key_change(audit.as_ref(), &enricher).await? {
+            tracing::warn!(
+                "the audit signing key changed since the last entry; recorded as audit_key_changed"
+            );
+        }
 
         let sqlite = Arc::new(backend);
         let sqlite_clone = sqlite.clone();

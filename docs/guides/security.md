@@ -117,8 +117,21 @@ not printed. Run the commands with the audit signing settings the server uses.
 When the log's newest entry is signed and the command's environment has no key,
 another HMAC key or another Ed25519 key, `token create` refuses and creates
 nothing, and `token revoke` revokes the token and then reports that the log has
-no record of it. The token commands read one switch, `JAMJET_AUDIT_ALLOW_INSECURE_KEY`;
-the server's other switches don't stop them.
+no record of it. The token commands read one switch, `JAMJET_AUDIT_ALLOW_INSECURE_KEY`,
+after a revoke has revoked; the server's other switches don't stop them.
+
+After you rotate the audit key, start the server once with the new key before
+using the token commands with it. At start the server checks the log's newest
+entry, and when its key cannot verify it, it seals an `audit_key_changed`
+entry under the new key, naming the old and the new (`"previous": "Ed25519 key
+<kid>"`, `"current": ...`). That entry marks where one key's entries end on the
+chain.
+
+Each entry is dated after the one before it, so the log lists in chain order
+even when a writer's clock is behind. A newest entry dated in the future (a
+clock that ran ahead, then was corrected) holds every later entry's date just
+after it until real time catches up; the server logs a warning on each entry
+while the gap is over five minutes.
 
 | Route | Minimum role | Notes |
 |-------|--------------|-------|

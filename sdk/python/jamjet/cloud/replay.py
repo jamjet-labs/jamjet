@@ -192,11 +192,13 @@ def _auto_activate() -> None:
     bundle_path = os.environ.get("JAMJET_REPLAY_BUNDLE")
     if not bundle_path:
         return
+    # The one switch rule (`jamjet.flags`): `on` is on, and a value that is
+    # not a boolean raises. Read outside the `try` below: caught there, a typo
+    # only warned and left replay off, so the program ran real models and
+    # real tools while its user thought it was replaying.
+    stub = env_flag("JAMJET_STUB_MODELS")
     try:
         bundle = load_bundle(bundle_path)
-        # The one switch rule (`jamjet.flags`): `on` is on, and a value that
-        # is not a boolean is an error, not off.
-        stub = env_flag("JAMJET_STUB_MODELS")
         activate(bundle, stub_models=stub)
     except Exception as exc:  # noqa: BLE001
         import warnings

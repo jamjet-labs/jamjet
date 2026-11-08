@@ -261,10 +261,20 @@ impl AuditEnricher {
             }
             // Dated after the head even when this clock is behind it (it
             // stepped back, or another writer's runs ahead), so the listing
-            // order stays the chain's order.
+            // order stays the chain's order. A head far in the future pins
+            // every entry's date to it until this clock catches up: said
+            // loudly, since the dates then say nothing about when.
+            let clock = chrono::Utc::now();
+            if let Some(ahead) = chain.head_at.and_then(|at| head_far_ahead(at, clock)) {
+                warn!(
+                    ahead_secs = ahead.num_seconds(),
+                    "the audit log's newest entry is dated ahead of this clock; new entries \
+                     are dated just after it until the clock catches up"
+                );
+            }
             let now = match chain.head_at {
-                Some(at) => chrono::Utc::now().max(at + chrono::Duration::microseconds(1)),
-                None => chrono::Utc::now(),
+                Some(at) => clock.max(at + chrono::Duration::microseconds(1)),
+                None => clock,
             };
             entry.created_at = now;
             entry.expires_at = expires_at.map(|e| e + (now - built_at));
@@ -416,5 +426,38 @@ fn extract_policy_decision(kind: &EventKind) -> Option<String> {
 mod hex {
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
         bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+/// How far ahead of `now` the head is dated, when that is more than
+/// [`HEAD_SKEW_WARNING`]; `None` otherwise.
+fn head_far_ahead(
+    head_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::Duration> {
+    let ahead = head_at - now;
+    (ahead > HEAD_SKEW_WARNING).then_some(ahead)
+}
+
+/// A head dated further ahead than this is warned about at each seal.
+const HEAD_SKEW_WARNING: chrono::Duration = chrono::Duration::minutes(5);
+
+#[cfg(test)]
+mod skew_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_head_well_ahead_is_warned_about() {
+        let now = chrono::Utc::now();
+        assert_eq!(head_far_ahead(now, now), None);
+        assert_eq!(
+            head_far_ahead(now + chrono::Duration::minutes(4), now),
+            None
+        );
+        assert_eq!(head_far_ahead(now - chrono::Duration::hours(1), now), None);
+        assert_eq!(
+            head_far_ahead(now + chrono::Duration::hours(1), now),
+            Some(chrono::Duration::hours(1))
+        );
     }
 }

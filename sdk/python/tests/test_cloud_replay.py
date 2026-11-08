@@ -236,17 +236,16 @@ def test_stub_models_reads_the_switch_rule(
     _replay_mod.deactivate()
 
 
-def test_a_stub_models_value_that_is_not_a_boolean_does_not_replay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A typo is not read as off (real model calls); the replay is not
-    started, with a warning that names the value."""
+def test_a_stub_models_value_that_is_not_a_boolean_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A typo raises, naming the variable. A warning was not enough: replay
+    stayed off, and the program ran real models and real tools while its
+    user thought it was replaying."""
     import jamjet.cloud.replay as _replay_mod
 
     monkeypatch.setenv("JAMJET_REPLAY_BUNDLE", str(_bundle_dir(tmp_path)))
     monkeypatch.setenv("JAMJET_STUB_MODELS", "maybe")
     _replay_mod.deactivate()
-    with pytest.warns(UserWarning, match="JAMJET_STUB_MODELS"):
+    with pytest.raises(ValueError, match="JAMJET_STUB_MODELS"):
         _replay_mod._auto_activate()
     assert _replay_mod.get_active() is None
 

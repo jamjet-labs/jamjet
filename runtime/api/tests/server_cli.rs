@@ -735,6 +735,132 @@ async fn token_commands_read_only_the_audit_switch() {
     );
     assert!(!ok);
     assert!(err.contains("JAMJET_AUDIT_ALLOW_INSECURE_KEY"), "{err}");
+    // The switch is read after a revoke has revoked: a typo in it does not
+    // keep a token alive.
+    let id = token_rows(&_backend).await[0].0.clone();
+    let (ok, err) = run_cli(
+        &dir,
+        &url,
+        &["token", "revoke", &id],
+        &[("JAMJET_AUDIT_ALLOW_INSECURE_KEY", "enabled")],
+    );
+    assert!(!ok);
+    assert!(err.contains("is revoked"), "{err}");
+    assert!(err.contains("JAMJET_AUDIT_ALLOW_INSECURE_KEY"), "{err}");
+    assert!(
+        token_rows(&_backend).await[0].1.is_some(),
+        "the token is still live"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Start the server on the database in `dir` until it listens, then stop it.
+fn serve_once(dir: &PathBuf, url: &str, env: &[(&str, &str)]) -> String {
+    let mut all = vec![
+        ("DATABASE_URL", url),
+        ("JAMJET_BIND", "127.0.0.1"),
+        ("JAMJET_PORT", "0"),
+    ];
+    all.extend_from_slice(env);
+    let mut child = server(dir, &[], &all).spawn().unwrap();
+    let (tx, rx) = mpsc::channel::<String>();
+    for pipe in [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
+    let mut log = String::new();
+    let deadline = Instant::now() + WAIT;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                let done = line.contains("listening on");
+                log.push_str(&line);
+                log.push('\n');
+                if done {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        log.contains("listening on"),
+        "the server never came up: {log}"
+    );
+    log
+}
+
+/// After a key rotation the server records the change at its next start,
+/// under the new key, so the token commands work again with it. They used to
+/// refuse for good: the newest entry was the old key's, and with every token
+/// revoked nothing made the server write a new one.
+#[tokio::test]
+async fn a_rotated_key_is_recorded_at_start_and_the_token_commands_work_again() {
+    let dir = temp_dir();
+    let (url, backend) = server_database(&dir).await;
+    let old = ("JAMJET_AUDIT_SIGNING_KEY", "the-old-key-for-this-test");
+    let new = ("JAMJET_AUDIT_SIGNING_KEY", "the-new-key-for-this-test");
+    let (ok, err) = run_cli(
+        &dir,
+        &url,
+        &["token", "create", "--role", "operator"],
+        &[old],
+    );
+    assert!(ok, "{err}");
+    let id = token_rows(&backend).await[0].0.clone();
+    let (ok, err) = run_cli(&dir, &url, &["token", "revoke", &id], &[old]);
+    assert!(ok, "{err}");
+    // Rotated: refused until the server has run with the new key.
+    let (ok, _) = run_cli(
+        &dir,
+        &url,
+        &["token", "create", "--role", "operator"],
+        &[new],
+    );
+    assert!(!ok, "issued under a key the log does not end with");
+
+    serve_once(&dir, &url, &[new]);
+    let (ok, err) = run_cli(
+        &dir,
+        &url,
+        &["token", "create", "--role", "operator"],
+        &[new],
+    );
+    assert!(ok, "{err}");
+    // A second start under the same key records nothing more.
+    serve_once(&dir, &url, &[new]);
+
+    let entries = audit_entries(&backend).await;
+    let kinds: Vec<&str> = entries.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "token_issued",
+            "token_revoked",
+            "audit_key_changed",
+            "token_issued"
+        ]
+    );
+    let change = &entries[2];
+    assert_eq!(change.raw_event["previous"], "an HMAC key");
+    assert_eq!(change.raw_event["current"], "an HMAC key");
+    let signer = jamjet_audit::AuditSigner::new(new.1.as_bytes().to_vec());
+    for e in &entries[2..] {
+        jamjet_audit::verify_entry(e, &signer).expect("signed with the new key");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
