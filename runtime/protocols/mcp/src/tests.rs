@@ -24,27 +24,19 @@ use tokio::sync::Mutex;
 /// lets tests stage multiple sequential interactions with the client.
 struct MockTransport {
     responses: Mutex<std::collections::VecDeque<JsonRpcResponse>>,
-    /// Captures every request received (for assertion).
-    requests: Mutex<Vec<JsonRpcRequest>>,
 }
 
 impl MockTransport {
     fn new(responses: Vec<JsonRpcResponse>) -> Self {
         Self {
             responses: Mutex::new(responses.into()),
-            requests: Mutex::new(vec![]),
         }
-    }
-
-    async fn recorded_requests(&self) -> Vec<JsonRpcRequest> {
-        self.requests.lock().await.clone()
     }
 }
 
 #[async_trait]
 impl McpTransport for MockTransport {
-    async fn send(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse, String> {
-        self.requests.lock().await.push(request.clone());
+    async fn send(&self, _request: JsonRpcRequest) -> Result<JsonRpcResponse, String> {
         self.responses
             .lock()
             .await

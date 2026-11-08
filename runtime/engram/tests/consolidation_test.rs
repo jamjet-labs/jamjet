@@ -1,10 +1,9 @@
 use engram::consolidation::{ConsolidationConfig, ConsolidationEngine, ConsolidationOp};
 use engram::embedding::MockEmbeddingProvider;
-use engram::fact::{Fact, FactPatch, MemoryTier};
+use engram::fact::{FactPatch, MemoryTier};
 use engram::llm::MockLlmClient;
 use engram::memory::Memory;
 use engram::scope::Scope;
-use engram::store::FactStore;
 use serde_json::json;
 use std::sync::Arc;
 

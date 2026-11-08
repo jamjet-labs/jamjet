@@ -3,6 +3,7 @@ name = "jamjet-worker"
 description = "JamJet worker process — task execution, heartbeat, lease renewal"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

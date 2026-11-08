@@ -1,6 +1,8 @@
 import { getActive } from './client.js'
 import type { AgentRef, UserContext } from './context.js'
 import { runEnforcedCall } from './enforcement.js'
+import { refuseUnenforced, UNENFORCED_OPENAI_METHODS } from './unenforced.js'
+import { asVendorPromise } from './vendor-promise.js'
 
 const WRAPPED = Symbol.for('jamjet.wrapped')
 type WrappedFn<T> = T & { [WRAPPED]?: true }
@@ -19,6 +21,25 @@ export function wrap<T extends object>(client: T, opts?: WrapOptions): T {
   if (anyClient?.chat?.completions?.create) wrapMethod(anyClient.chat.completions, 'create', 'openai', opts)
   if (anyClient?.completions?.create) wrapMethod(anyClient.completions, 'create', 'openai', opts)
   if (anyClient?.messages?.create) wrapMethod(anyClient.messages, 'create', 'anthropic', opts)
+  if (anyClient?.beta?.messages?.create) wrapMethod(anyClient.beta.messages, 'create', 'anthropic', opts)
+  // OpenAI's Responses API is not enforced; refuse it while restrictive rules exist.
+  const responses = anyClient?.responses
+  if (responses && typeof responses.create === 'function' && !isWrapped(responses.create)) {
+    for (const key of UNENFORCED_OPENAI_METHODS) {
+      if (typeof responses[key] !== 'function') continue
+      const refusing = refuseUnenforced(`openai responses.${key}`, responses[key].bind(responses)) as WrappedFn<unknown>
+      ;(refusing as WrappedFn<unknown> & Record<symbol, unknown>)[WRAPPED] = true
+      responses[key] = refusing
+    }
+  }
+  // Batch APIs run their requests later, outside this process.
+  for (const batches of [anyClient?.batches, anyClient?.messages?.batches, anyClient?.beta?.messages?.batches]) {
+    if (batches && typeof batches.create === 'function' && !isWrapped(batches.create)) {
+      const refusing = refuseUnenforced('batches.create', batches.create.bind(batches)) as WrappedFn<unknown>
+      ;(refusing as WrappedFn<unknown> & Record<symbol, unknown>)[WRAPPED] = true
+      batches.create = refusing
+    }
+  }
   return client
 }
 
@@ -31,20 +52,22 @@ function wrapMethod(
   const original = target[key]
   if (typeof original !== 'function' || isWrapped(original)) return
 
-  const wrapped: WrappedFn<typeof original> = async function (this: unknown, ...args: any[]) {
+  const wrapped: WrappedFn<typeof original> = function (this: unknown, ...args: any[]) {
     const client = getActive()
     if (!client) {
       // No client → behave as pass-through (Plan 1 contract)
       return original.call(this, ...args)
     }
-    return runEnforcedCall({
+    let raw: unknown
+    const enforced = runEnforcedCall({
       client,
       vendor,
       // Pre-bind `original` to `this` so runEnforcedCall can apply(null, ...) safely
-      original: (...a: any[]) => original.call(this, ...a),
+      original: (...a: any[]) => (raw = original.call(this, ...a)),
       args,
       ...(opts ? { override: opts } : {}),
     })
+    return asVendorPromise(enforced, () => raw, vendor)
   } as WrappedFn<typeof original>
 
   ;(wrapped as WrappedFn<typeof original>)[WRAPPED] = true

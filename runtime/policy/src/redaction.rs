@@ -283,6 +283,16 @@ mod tests {
         assert_eq!(result1, result2);
         assert!(result1.starts_with("[HASH:"));
         assert_ne!(result1, "user@example.com");
+        // Stable across builds too: the first 8 bytes of SHA-256, computed
+        // outside Rust (`printf %s user@example.com | shasum -a 256`).
+        assert_eq!(result1, "[HASH:b4c9a289323b21a0]");
+        let field = PiiRedactor::from_policy(&DataPolicyIr {
+            pii_fields: vec!["$.email".to_string()],
+            redaction_mode: "hash".to_string(),
+            ..Default::default()
+        })
+        .redact_json(&serde_json::json!({ "email": "user@example.com" }));
+        assert_eq!(field["email"], "[HASH:b4c9a289323b21a0]");
     }
 
     #[test]

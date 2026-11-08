@@ -6,14 +6,14 @@
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::{
-    backend::{StateBackend, WorkflowDefinition},
+    backend::StateBackend,
     event::{Event, EventKind},
-    materializer::{apply_events, materialize},
+    materializer::materialize,
     snapshot::Snapshot,
     SqliteBackend,
 };
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -24,7 +24,7 @@ fn temp_db_path() -> PathBuf {
     path
 }
 
-async fn open_db(path: &PathBuf) -> SqliteBackend {
+async fn open_db(path: &Path) -> SqliteBackend {
     let url = format!("sqlite://{}", path.display());
     SqliteBackend::open(&url)
         .await

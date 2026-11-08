@@ -35,7 +35,7 @@ async def inject_runtime_attributes(
             from engram import Scope as EngramScope  # noqa: F811
         except ImportError as e:
             raise ImportError(
-                "Agent memory requires the 'memory' extra. Install with: pip install 'jamjet[memory]'"
+                "Agent memory requires the 'memory' extra. Install with: pip install 'jamjet[memory]' (Python 3.12+)"
             ) from e
         from jamjet.memory.engram_bridge import AgentMemory
 

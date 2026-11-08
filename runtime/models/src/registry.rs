@@ -215,12 +215,15 @@ pub(crate) fn apply_sidecar(_registry: ModelRegistry, url: String) -> ModelRegis
 /// Returns `Err` if `JAMJET_MODEL_SEAM_URL` is set but the sidecar is
 /// unreachable or responds non-2xx — so a misconfigured deployment fails loud
 /// at startup rather than silently falling through to the native adapters.
+/// Also returns `Err` if no HTTP client can be built (see [`crate::http`]).
 ///
 /// Call this at the `main()` call site instead of `registry_from_env()`.
 pub async fn registry_from_env_checked() -> Result<ModelRegistry, ModelError> {
+    // First: every adapter below builds a client with `Client::new()`, which
+    // panics where this returns an error (no CA bundle on Linux).
+    let client = crate::http::client()?;
     let registry = registry_from_env();
     if let Ok(url) = std::env::var("JAMJET_MODEL_SEAM_URL") {
-        let client = reqwest::Client::new();
         crate::sidecar::check_sidecar_health(&url, &client).await?;
     }
     Ok(registry)
@@ -286,6 +289,10 @@ mod tests {
         );
     }
 
+    // The variable must stay set across the await, so the guard is held
+    // through it. The other holders lock synchronously, and a tokio test
+    // runtime is single-threaded, so nothing waits on it here.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn registry_from_env_checked_errors_on_unreachable_sidecar() {
         let _guard = ENV_LOCK.lock().unwrap();

@@ -160,14 +160,7 @@ def test_build_chain_skips_unknown_action(monkeypatch):
 # Task 7: configure() builds the chain from a loaded policy.yaml
 # ---------------------------------------------------------------------------
 
-import pytest  # noqa: E402  (pre-existing pattern in this test file)
 
-
-@pytest.mark.xfail(
-    reason="PIIMiddleware (jamjet.cloud.middleware.pii) ships in Task 11; "
-    "until then build_chain raises ImportError for redact rules",
-    strict=False,
-)
 def test_configure_builds_chain_from_loaded_policy(monkeypatch, tmp_path):
     monkeypatch.setenv("JAMJET_MIDDLEWARE_ENABLED", "1")
     policy_yaml = tmp_path / "policy.yaml"

@@ -574,7 +574,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let next = cron_next("*/15 * * * *", from).unwrap();
-        assert!(next.minute() % 15 == 0);
+        assert!(next.minute().is_multiple_of(15));
     }
 
     #[test]

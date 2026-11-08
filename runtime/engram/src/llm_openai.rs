@@ -33,10 +33,7 @@ impl OpenAiLlmClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             model: model.into(),
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .expect("reqwest client build"),
+            client: crate::http::client_or_panic(Some(std::time::Duration::from_secs(300))),
         }
     }
 }

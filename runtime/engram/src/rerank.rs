@@ -55,7 +55,7 @@ impl CrossEncoderReranker {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "rerank")))]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -63,10 +63,7 @@ mod tests {
     #[test]
     fn load_fails_without_rerank_feature() {
         // Without the rerank feature, load should return an error
-        #[cfg(not(feature = "rerank"))]
-        {
-            let result = CrossEncoderReranker::load(&PathBuf::from("nonexistent.onnx"));
-            assert!(result.is_err());
-        }
+        let result = CrossEncoderReranker::load(&PathBuf::from("nonexistent.onnx"));
+        assert!(result.is_err());
     }
 }

@@ -103,7 +103,12 @@ async fn env(in_process_workers: bool) -> Env {
             .await
     })];
     if in_process_workers {
-        tasks.extend(jamjet_worker::default_pool(dyn_backend).spawn());
+        // A worker that could run the node, so what stops it is the block.
+        tasks.extend(
+            jamjet_worker::default_pool(dyn_backend)
+                .with_executor("tool", Arc::new(support::NoopExecutor))
+                .spawn(),
+        );
     }
     Env {
         backend,
@@ -114,14 +119,8 @@ async fn env(in_process_workers: bool) -> Env {
 }
 
 async fn start(env: &Env) -> ExecutionId {
-    let (st, body) = send(
-        &env.app,
-        "/workflows",
-        &env.alice,
-        json!({ "ir": blocked_ir() }),
-    )
-    .await;
-    assert!(st.is_success(), "{st} {body}");
+    // Stored, not registered: `POST /workflows` refuses a `tool` node.
+    support::store_ir(env.backend.as_ref(), &blocked_ir()).await;
     let (st, body) = send(
         &env.app,
         "/executions",

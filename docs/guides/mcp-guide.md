@@ -1,6 +1,6 @@
 # MCP Integration Guide
 
-Connect JamJet agents to external MCP servers, and expose your agent's tools as an MCP server.
+The runtime is an MCP server for its own operations. A workflow cannot call an MCP tool: registration refuses `mcp_tool` nodes. To put policy in front of an MCP client's tool calls, use the [`@jamjet/mcp-shim`](https://npmjs.com/package/@jamjet/mcp-shim) adapter, or call the MCP server from a Python step and check policy there, as [`examples/05-mcp-tool-call`](../../examples/05-mcp-tool-call) does.
 
 ---
 
@@ -30,6 +30,8 @@ agents:
 
 ### Using MCP tools in a workflow
 
+Registration refuses this node kind (400): the engine has no executor for it, so it would never run. See [Node types](yaml-reference.md#node-types).
+
 ```yaml
 nodes:
   search_code:
@@ -44,59 +46,40 @@ nodes:
     next: analyze_results
 ```
 
-### Discovering available tools
+### Listing a server's tools
 
 ```bash
-jamjet mcp connect http://localhost:8080/mcp
+jamjet mcp connect http://localhost:7700      # posts to <url>/mcp
 ```
 
-Output:
-```
-Connected to MCP server at http://localhost:8080/mcp
-Available tools:
-  - search_code       Search code in repositories
-  - read_file         Read a file from the repository
-  - list_issues       List open issues
-  ...
-```
+It runs `initialize` and `tools/list` and prints the server's name and tools.
+It also takes `stdio:<command>` to start a local server. It sends no token, so
+against a JamJet runtime it works in dev mode only.
 
 ---
 
-## Exposing Your Agent as an MCP Server
+## The runtime's MCP endpoint
 
-```yaml
-# agents.yaml
-agents:
-  analyst:
-    model: default_chat
-    mcp:
-      expose_as_server:
-        enabled: true
-        transport: http_sse
-        port: 9090
-        expose:
-          tools: [analyze_data, search_docs]
-          resources: [agent_memory]
-```
+`POST /mcp` (JSON-RPC) and `GET /mcp/sse` expose the runtime as eight tools:
 
-Start the agent:
+| Tool | What it does | Role outside dev mode |
+|------|--------------|-----------------------|
+| `jamjet_run_workflow` | Start an execution of a registered workflow | `developer` |
+| `jamjet_get_execution` | Read one execution | `viewer` |
+| `jamjet_list_executions` | List executions, with a status filter | `viewer` |
+| `jamjet_cancel_execution` | Cancel an execution | `developer` |
+| `jamjet_get_events` | Read an execution's event log | `viewer` |
+| `jamjet_approve` | Decide a pending approval | `reviewer` |
+| `jamjet_list_agents` | List registered agents | `viewer` |
+| `jamjet_discover_agent` | Fetch a remote Agent Card and register it | `developer` |
+
+Outside dev mode the endpoint needs the same Bearer token as the REST API, and
+each tool checks the caller's role as the matching REST route does. Approving
+over MCP follows the same rules as `POST /executions/:id/approve`, including
+separation of duties. See [Security](security.md#rbac).
+
 ```bash
-jamjet agents activate analyst
+curl -s -X POST http://localhost:7700/mcp \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
-
-Your agent is now an MCP server at `http://localhost:9090`. Any MCP client — VS Code, Cursor, another JamJet agent, any other framework — can discover and call `analyze_data` and `search_docs`.
-
----
-
-## Transports
-
-| Transport | Config | Use case |
-|-----------|--------|----------|
-| `stdio` | `command`, `args` | Local subprocess MCP servers |
-| `http_sse` | `url` | Remote HTTP MCP servers |
-
----
-
-## Durability
-
-MCP tool calls are fully durable. If the runtime crashes mid-call, the node is retried after the worker lease expires. Design your MCP tools to be idempotent where possible.

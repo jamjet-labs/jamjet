@@ -58,7 +58,7 @@
 //! signature unless a real key — or the explicit insecure opt-in — is present.
 
 use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use zeroize::Zeroize;

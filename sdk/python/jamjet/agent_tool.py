@@ -12,12 +12,8 @@ class AgentToolDef:
 
     Note:
         ``"auto"`` routing is not yet supported end to end by the bundled Rust
-        runtime. Generated graphs can fail registration on empty coordinator
-        weights. Even with valid weights, the embedded worker pool does not
-        register the routing executors and can complete nodes without invoking
-        an agent. Scheduler payloads also omit routing configuration, including
-        the agent URI, so a custom agent-tool executor can fail with a missing
-        URI error.
+        runtime. Workflow registration rejects the generated coordinator and
+        agent-tool nodes because the runtime has no runner for those kinds.
 
     Attributes:
         agent_uri: Explicit agent URI, or ``"auto"`` for coordinator routing.
@@ -83,11 +79,9 @@ def agent_tool(
 
     Note:
         ``"auto"`` is not yet supported end to end by the bundled Rust runtime.
-        Empty generated coordinator weights can prevent graph registration.
-        Correcting those weights alone is insufficient: the embedded worker
-        pool can complete nodes without invoking an agent, and scheduler
-        payloads omit the agent URI and other routing configuration needed by
-        custom executors.
+        The graph compiler expands the routing, but workflow registration
+        rejects coordinator and agent-tool nodes because the runtime has no
+        runner for those kinds.
 
     Args:
         agent: Agent URI, such as ``"jamjet://org/classifier"``, or ``"auto"``

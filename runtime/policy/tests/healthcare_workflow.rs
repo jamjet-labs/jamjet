@@ -20,6 +20,7 @@
 //! - Delete protected health information (PHI)
 //! - Submit unreviewed prescriptions
 //! - Route patient data through an unaudited model
+//!
 //! These are not theoretical — they are HIPAA violations carrying $50k+ fines.
 
 use jamjet_ir::workflow::PolicySetIr;

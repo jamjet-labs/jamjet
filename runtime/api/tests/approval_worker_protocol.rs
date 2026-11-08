@@ -125,20 +125,18 @@ fn parse_eid(s: &str) -> ExecutionId {
     ExecutionId(uuid::Uuid::parse_str(hex).unwrap())
 }
 
-/// Alice registers the workflow and starts the run, so she is its initiator.
+/// Alice starts the run, so she is its initiator.
+///
+/// The gated node is a `tool` node, which `POST /workflows` now refuses
+/// (nothing in the runtime executes the kind), so the workflow is stored as a
+/// version registered before that check. Its item still reaches the in-process
+/// `tool` queue, which is what these tests attack over HTTP.
 async fn start(env: &Env, policy: Value) -> (String, ExecutionId) {
     start_with(env, policy, json!({ "amount": 10 })).await
 }
 
 async fn start_with(env: &Env, policy: Value, input: Value) -> (String, ExecutionId) {
-    let (st, body) = send(
-        &env.app,
-        "/workflows",
-        &env.alice,
-        json!({ "ir": gated_ir(policy) }),
-    )
-    .await;
-    assert!(st.is_success(), "register: {st} {body}");
+    support::store_ir(env.backend.as_ref(), &gated_ir(policy)).await;
     let (st, body) = send(
         &env.app,
         "/executions",
@@ -285,10 +283,12 @@ async fn the_initiator_cannot_complete_a_gated_node_through_the_worker_protocol(
 async fn a_developer_cannot_enqueue_a_work_item() {
     let env = env().await;
     let (id, eid) = start(&env, approval_policy()).await;
+    // The gate's own queue: `POST /work-items` refuses a node on a queue its
+    // kind is not dispatched to, whoever asks.
     let body = json!({
         "execution_id": id,
         "node_id": "gate",
-        "queue_type": "attacker_q",
+        "queue_type": "tool",
         "payload": { "workflow_id": "wf-gate", "workflow_version": "0.1.0" },
     });
     let before = events(&env, &eid).await.len();
@@ -389,7 +389,7 @@ async fn an_external_claim_of_a_gated_node_is_held_until_approved() {
         json!({
             "execution_id": id,
             "node_id": "gate",
-            "queue_type": "attacker_q",
+            "queue_type": "tool",
             "payload": { "workflow_id": "wf-gate", "workflow_version": "0.1.0" },
         }),
     )
@@ -724,10 +724,13 @@ async fn a_large_bound_payload_is_truncated_in_the_listing_not_in_the_digest() {
     assert_eq!(st, StatusCode::OK, "{view}");
     let basis = &view["pending"][0]["context"]["action_basis"];
     assert_eq!(basis["payload_truncated"], true, "{basis}");
-    assert!(
-        basis["payload"].is_null(),
-        "the preview is dropped, not cut mid-value"
-    );
+    // Bounded, never dropped: every key is shown, and the large value is
+    // replaced by its size and its first characters, never cut mid-JSON.
+    let blob = &basis["payload"]["input"]["blob"];
+    assert_eq!(blob["preview_truncated"], true, "{basis}");
+    assert_eq!(blob["bytes"].as_u64().unwrap(), 64 * 1024 + 2);
+    assert!(blob["head"].as_str().unwrap().starts_with("xxx"));
+    assert_eq!(basis["payload"]["module"], "myapp.payments");
     assert!(basis["payload_bytes"].as_u64().unwrap() > 64 * 1024);
 }
 
@@ -883,14 +886,8 @@ async fn dev_mode_still_accepts_an_unfenced_completion_of_an_approved_node() {
     let backend = Arc::new(InMemoryBackend::new());
     let state = support::make_state(backend.clone() as Arc<dyn StateBackend>);
     let app = build_router_with_opts(state, true);
-    let (st, body) = send(
-        &app,
-        "/workflows",
-        "",
-        json!({ "ir": gated_ir(approval_policy()) }),
-    )
-    .await;
-    assert!(st.is_success(), "{st} {body}");
+    // Stored, not registered: see `start_with`.
+    support::store_ir(backend.as_ref(), &gated_ir(approval_policy())).await;
     let (st, body) = send(
         &app,
         "/executions",

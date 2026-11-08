@@ -124,7 +124,7 @@ public final class WorkflowGraph {
     public static final class Builder {
 
         private final String name;
-        private String version = "0.1.0";
+        private String version = dev.jamjet.ir.IrCompiler.DEFAULT_VERSION;
         private String startNode;
         private final LinkedHashMap<String, Map<String, Object>> nodes = new LinkedHashMap<>();
         private final List<Map<String, Object>> edges = new ArrayList<>();

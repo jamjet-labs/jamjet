@@ -130,15 +130,8 @@ async fn an_in_process_node_under_a_tenant_gate_is_held_on_sqlite() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    let (st, body) = call(
-        &app,
-        "POST",
-        "/workflows",
-        &alice,
-        json!({ "ir": tool_ir() }),
-    )
-    .await;
-    assert!(st.is_success(), "{st} {body}");
+    // Stored, not registered: `POST /workflows` refuses a `tool` node.
+    support::store_ir(sqlite.as_ref(), &tool_ir()).await;
     let (st, body) = call(
         &app,
         "POST",
@@ -160,7 +153,9 @@ async fn an_in_process_node_under_a_tenant_gate_is_held_on_sqlite() {
             .run()
             .await
     });
-    let workers = jamjet_worker::default_pool(base).spawn();
+    let workers = jamjet_worker::default_pool(base)
+        .with_executor("tool", Arc::new(support::NoopExecutor))
+        .spawn();
 
     let mut events = Vec::new();
     for _ in 0..500 {

@@ -28,7 +28,7 @@ JamJet sits underneath your agent (Claude Code, OpenAI Agents SDK, MCP clients, 
 - 🛡️ **Block unsafe tool calls** at runtime: database deletes, payments, file writes
 - ✋ **Pause for human approval** on risky actions, durably
 - 💸 **Cap cost** per agent, per run, per project
-- 📒 **Record an audit trail** that survives a regulator's review
+- 📒 **Record an audit trail** of every decision, with approvals signed and hash-chained
 - ⏪ **Replay or resume** crashed runs from the last checkpoint
 
 **Keep your agent framework. Add JamJet where tool calls need control.**
@@ -42,38 +42,23 @@ pip install jamjet
 jamjet demo unsafe-tool-call
 ```
 
-No API key. No Docker. No cloud account. The model is mocked; the enforcement path is real. Three more demos run the same way:
+No API key. No Docker. No cloud account. The model is mocked; the policy check is the SDK's own evaluator. The demos run in process and do not start the runtime. Three more demos run the same way:
 
 ```bash
 jamjet demo approval        # pause-for-approval flow
 jamjet demo budget-cap      # $0.05 cost cap
-jamjet demo mcp-tool-policy # MCP-shaped policy (preview of JamJet Gateway)
+jamjet demo mcp-tool-policy # policy on an MCP-shaped request (no MCP server involved)
 ```
 
 Works alongside **Claude Code · OpenAI Agents SDK · MCP clients · LangChain · CrewAI · ADK · Spring AI · LangChain4j**.
 
-## On the JVM: one dependency
+## On the JVM
 
-Spring AI and LangChain4j teams get the same layer without writing glue code. The Spring Boot starter auto-injects JamJet advisors into your `ChatClient`: every call becomes durable and audited, with no changes to your application code.
-
-```xml
-<dependency>
-    <groupId>dev.jamjet</groupId>
-    <artifactId>jamjet-spring-boot-starter</artifactId>
-    <version>0.1.0</version>
-</dependency>
-```
-
-```properties
-spring.jamjet.runtime-url=http://localhost:7700
-spring.jamjet.approval.enabled=true   # opt-in human-in-the-loop approval
-```
-
-Crash recovery, event sourcing, and a REST endpoint to approve or reject held actions. Falls back gracefully if the runtime is unreachable.
-
-Prefer no sidecar at all? **[JamJet Java Runtime](https://github.com/jamjet-labs/jamjet-runtime-java)** embeds durable execution directly in your JVM process: Java 21, no Docker, **8.9× faster** than calling out to a REST sidecar ([benchmark and launch post](https://jamjet.dev/blog/zero-sidecar-durable-agents-java/)). Works with Spring AI, LangChain4j, and Google ADK.
+**[JamJet Java Runtime](https://github.com/jamjet-labs/jamjet-runtime-java)** embeds durable execution directly in your JVM process: Java 21, no Docker, **8.9× faster** than calling out to a REST sidecar ([benchmark and launch post](https://jamjet.dev/blog/zero-sidecar-durable-agents-java/)). Works with Spring AI, LangChain4j, and Google ADK.
 
 → See a Spring Boot agent survive `kill -9` mid-run in **[`examples/loan-underwriter-agent`](examples/loan-underwriter-agent)**: resumes from disk checkpoints, gates disbursement on human approval, emits a signed receipt bundle.
+
+To record Spring AI calls on this runtime over HTTP instead, see [jamjet-spring](https://github.com/jamjet-labs/jamjet-spring). Its 0.1.0 release on Maven Central calls routes this runtime does not serve and records nothing.
 
 ## The same policy, everywhere
 
@@ -110,11 +95,10 @@ Drop this file in `~/.jamjet/`. Every adapter listed above uses it automatically
 > Prompts are not a security boundary. The runtime is.
 
 → Read **[When AI Deletes the Database](https://jamjet.dev/blog/when-ai-deletes-the-database/)** for why this is a runtime architecture problem, not a model problem.
-→ See the deeper **[durability demo at jamjet.dev/demo](https://jamjet.dev/demo)** for what happens when an agent crashes mid-tool-call.
 
 ## Policy in your own code
 
-Drop a policy beside your agent code. The runtime intercepts any matching tool call *before* it leaves the agent's process: `blocked_tools` are refused outright, `require_approval_for` pauses execution durably and waits for an out-of-band decision. Crashes don't lose the approval; execution resumes when it arrives.
+Drop a policy beside your agent code. The runtime checks every step against it before a worker runs the step: a `blocked_tools` match fails the step, and a `require_approval_for` match holds it until a reviewer decides. For a Python step the patterns match its handler (`module:function`, or the same path with dots) and its node id. The request and the decision are stored, so a restart loses neither. Outside dev mode the person who started a run cannot approve it.
 
 ```yaml
 # workflow.yaml
@@ -135,7 +119,12 @@ import jamjet
 jamjet.cloud.configure(api_key="jj_...", project="my-agent")
 jamjet.cloud.policy("block", "*delete*")
 jamjet.cloud.policy("require_approval", "database.*")
-# Every OpenAI / Anthropic call in this process is now policy-gated.
+# Gated in this process: sync OpenAI chat.completions create/parse/stream and
+# Anthropic messages and beta.messages create/parse: *delete* tools are
+# stripped, and a database.* tool call waits for approval. OpenAI's Responses
+# API, Anthropic's messages.stream(), async clients, batch APIs and raw
+# streamed responses are not enforced and refuse to run while a block or
+# approval rule is set.
 ```
 
 → Runnable approval workflow in **[`examples/hitl-approval`](examples/hitl-approval)** · [Cloud Quickstart](https://docs.jamjet.dev/en/docs/cloud-quickstart)
@@ -175,21 +164,21 @@ jamjet.cloud.policy("require_approval", "database.*")
 | Tool calls rely on scattered app logic | Runtime policy blocks unsafe actions |
 | Human approval is custom glue | Approval is a durable workflow step |
 | Costs are discovered after the bill | Budgets enforced per agent / per run |
-| Audit evidence is stitched from logs | Append-only event log, signed export |
+| Audit evidence is stitched from logs | Append-only event log per run; approvals sealed into a signed, hash-chained audit log |
 | Memory is framework-specific | Pair with [Engram](#engram) for portable memory (MCP · REST · Python · Java) |
-| Frameworks stay siloed | MCP + A2A connect tools and agents |
+| Frameworks stay siloed | One policy file across hooks, MCP clients and SDKs; the runtime is also an MCP server (`/mcp`) |
 
 ## A full runtime underneath
 
 The safety layer runs on a durable, event-sourced execution engine. When you want more than enforcement, it's already there:
 
-- **Durable execution.** Event log, snapshots, crash recovery, deterministic replay. `agent.run_durable(...)` in [`examples/react-agent-durable`](examples/react-agent-durable).
+- **Durable execution.** Event log, snapshots and crash recovery: after a restart a run picks up where it stopped, and steps that already completed do not run again. `agent.run_durable(...)` in [`examples/react-agent-durable`](examples/react-agent-durable).
 - **Sessions and memory.** Persistent `Session` threads across runs and restarts, with a governed Engram retrieve/record loop. [`examples/session-memory`](examples/session-memory).
 - **Multi-agent.** `Sequential`, `Parallel`, coordinator `Team`, and `Loop`; each sub-agent runs as its own governed durable execution. [`examples/team-multi-agent`](examples/team-multi-agent). Declare whole fleets in YAML with cron schedules: [`examples/fleet`](examples/fleet).
 - **Evaluation.** Batch eval with LLM-judge scoring ([`examples/eval-harness`](examples/eval-harness)) and trajectory regression diffs ([`examples/trajectory-eval`](examples/trajectory-eval)).
 - **Deploy.** `agent.deploy(runtime="local" | "self-host" | "cloud")` ships the same compiled IR to any runtime. [`examples/deploy-an-agent`](examples/deploy-an-agent).
 - **Dev loop.** `jamjet create` scaffolds a project; `jamjet dev` runs the whole local stack with one command.
-- **Web Companion.** A UI embedded in the runtime binary: graph view, timeline, state inspector, replay and fork controls.
+- **Web Companion.** A UI embedded in the runtime binary: graph view, timeline and state inspector.
 
 ## Works with your stack, not a replacement
 
@@ -220,7 +209,7 @@ Want to build the official integration for *your* framework? **[Claim a slot](ht
 
 ## Engram
 
-**[Engram](runtime/engram-server/README.md)** is the JamJet ecosystem's memory layer for agents. Where JamJet provides durable *execution* (process can crash and resume), Engram provides durable *memory* (facts persist across runs and version cleanly via `supersede()`). Temporal knowledge graph, hybrid retrieval, conflict detection. Ships as a [Rust crate](https://crates.io/crates/jamjet-engram) (also bundled into the Rust runtime above), an [MCP server](https://registry.modelcontextprotocol.io/servers/io.github.jamjet-labs/engram-server) (Docker · GHCR), a [standalone Python library](https://pypi.org/project/jamjet-engram) ([github.com/jamjet-labs/engram](https://github.com/jamjet-labs/engram), 71% on LongMemEval-S), a [Python client](https://pypi.org/project/jamjet) for the MCP server, and a [Spring AI `ChatMemoryRepository`](https://central.sonatype.com/artifact/dev.jamjet/engram-spring-boot-starter). Comparison with Mem0/Zep → [java-ai-memory.dev](https://java-ai-memory.dev).
+**[Engram](runtime/engram-server/README.md)** is the JamJet ecosystem's memory layer for agents. Where JamJet provides durable *execution* (process can crash and resume), Engram provides durable *memory* (facts persist across runs and version cleanly via `supersede()`). Temporal knowledge graph, hybrid retrieval, conflict detection. Ships as a [Rust crate](https://crates.io/crates/jamjet-engram), an [MCP server](https://registry.modelcontextprotocol.io/v0/servers?search=io.github.jamjet-labs/engram-server) (Docker · GHCR), a [standalone Python library](https://pypi.org/project/jamjet-engram) ([github.com/jamjet-labs/engram](https://github.com/jamjet-labs/engram), 71% on LongMemEval-S), a [Python client](https://pypi.org/project/jamjet) for the MCP server, and a [Spring AI `ChatMemoryRepository`](https://central.sonatype.com/artifact/dev.jamjet/engram-spring-boot-starter). Comparison with Mem0/Zep → [java-ai-memory.dev](https://java-ai-memory.dev).
 
 ## Architecture
 
@@ -229,37 +218,35 @@ Want to build the official integration for *your* framework? **[Claim a slot](ht
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                     Authoring Layer                       │
-│    Python SDK  |  Java SDK  |  TypeScript SDK  |  YAML     │
+│                     Authoring Layer                      │
+│    Python SDK  |  Java SDK  |  TypeScript SDK  |  YAML   │
 ├──────────────────────────────────────────────────────────┤
-│                 Compilation / Validation                   │
-│           Graph IR  |  Schema  |  Policy lint             │
+│                 Compilation / Validation                 │
+│           Graph IR  |  Schema  |  Policy lint            │
 ├────────────────────────────┬─────────────────────────────┤
-│      Rust Runtime Core     │      Protocol Layer          │
-│  Scheduler  |  State SM    │  MCP Client  |  MCP Server   │
-│  Event log  |  Snapshots   │  A2A Client  |  A2A Server   │
-│  Workers    |  Timers      │                              │
+│      Rust Runtime Core     │      Protocol Layer         │
+│  Scheduler  |  State SM    │  MCP server (/mcp)          │
+│  Event log  |  Snapshots   │  Agent discovery            │
+│  Workers    |  Timers      │                             │
 ├────────────────────────────┴─────────────────────────────┤
-│                    Enterprise Services                     │
-│  Policy  |  Audit  |  PII Redaction  |  OAuth  |  mTLS     │
+│                        Governance                        │
+│    Policy  |  Approvals  |  RBAC  |  Signed audit log    │
 ├──────────────────────────────────────────────────────────┤
-│                      Runtime Services                      │
-│  Model Adapters  |  Tool Execution  |  Engram Memory      │
+│                     Runtime Services                     │
+│    Model adapters  |  Model sidecar  |  External workers │
 ├──────────────────────────────────────────────────────────┤
-│                         Storage                           │
-│           Postgres (production)  |  SQLite (local)        │
+│                         Storage                          │
+│             SQLite  |  In-memory (ephemeral)             │
 └──────────────────────────────────────────────────────────┘
 ```
-
-*"Engram Memory" here is the in-process distribution bundled with the Rust runtime. Engram also ships standalone; see [Engram](#engram).*
 
 </details>
 
 ## Documentation
 
-Full docs at **[jamjet.dev](https://jamjet.dev/quickstart)**
+Full docs at **[docs.jamjet.dev](https://docs.jamjet.dev/en/docs/open-source/quickstart)**. The guides in [`docs/guides`](docs/guides) are versioned with the code:
 
-[Quickstart](https://jamjet.dev/quickstart) · [Concepts](https://jamjet.dev/concepts) · [Python SDK](https://jamjet.dev/python-sdk) · [Java SDK](https://jamjet.dev/java-sdk) · [YAML Workflows](https://jamjet.dev/yaml-workflows) · [REST API](https://jamjet.dev/api-reference) · [MCP](https://jamjet.dev/mcp) · [A2A](https://jamjet.dev/a2a) · [Eval](https://jamjet.dev/eval) · [Enterprise](https://jamjet.dev/enterprise) · [Observability](https://jamjet.dev/observability) · [CLI](https://jamjet.dev/cli) · [Deployment](https://jamjet.dev/deployment)
+[Quickstart](docs/guides/quickstart.md) · [Concepts](docs/guides/concepts.md) · [Python SDK](docs/guides/python-sdk.md) · [Java SDK](docs/guides/java-sdk.md) · [YAML Reference](docs/guides/yaml-reference.md) · [Human-in-the-Loop](docs/guides/hitl.md) · [Security](docs/guides/security.md) · [Deployment](docs/guides/deployment.md) · [Observability](docs/guides/observability.md) · [MCP](docs/guides/mcp-guide.md) · [A2A](docs/guides/a2a-guide.md) · [Eval](docs/guides/eval.md) · [REST API](https://docs.jamjet.dev/en/docs/reference/rest-api) · [CLI](https://docs.jamjet.dev/en/docs/open-source/cli)
 
 ## Contributing
 

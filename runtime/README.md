@@ -1,5 +1,12 @@
 # JamJet Runtime
 
+## System requirements
+
+On Linux, `jamjet-server` and `engram` check TLS certificates against the
+system CA bundle. Install it (`ca-certificates` on Debian and Ubuntu), or set
+`SSL_CERT_FILE` to a PEM bundle. Without one, both exit at startup and say so.
+The Docker images already include it.
+
 ## Observability
 
 The runtime emits OpenTelemetry GenAI spans and the standard

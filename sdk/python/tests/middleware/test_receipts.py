@@ -220,15 +220,19 @@ def test_emit_receipt_creates_directory(monkeypatch, tmp_path):
 # v0.2-alpha schema conformance
 # ---------------------------------------------------------------------------
 
-_SCHEMA_PATH = Path("/Users/sunilp/Development/sunil-ws/agentboundary/docs/schemas/action-receipt-v0.2-alpha.json")
+# A copy of docs/schemas/action-receipt-v0.2-alpha.json from jamjet-labs/agentboundary
+# (also served at https://agentboundary.jamjet.dev/schemas/action-receipt-v0.2-alpha.json).
+# Kept in-repo so this test runs everywhere instead of skipping off one machine.
+_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "fixtures" / "agentboundary" / "action-receipt-v0.2-alpha.json"
 
 
-@pytest.mark.skipif(not _SCHEMA_PATH.exists(), reason="agentboundary schema not present locally")
 def test_strict_view_validates_against_v02_alpha_schema():
     """The v0.2-alpha schema is ``additionalProperties: false``, so the
     ``middleware`` extension field is stripped via ``schema_strict_view``
     before validation. The JSONL audit stream keeps the full body."""
     import jsonschema
+
+    assert _SCHEMA_PATH.is_file(), f"schema fixture missing: {_SCHEMA_PATH}"
 
     schema = json.loads(_SCHEMA_PATH.read_text())
     for ctx_factory in (_block_ctx, _passthrough_redact_ctx):

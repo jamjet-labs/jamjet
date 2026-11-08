@@ -456,6 +456,13 @@ async fn main() {
                     std::process::exit(2);
                 }
             };
+            // The providers build their HTTP clients with no way to return an
+            // error; check here so a host with no CA bundle gets a message,
+            // not a panic.
+            if let Err(e) = engram::http::client(None) {
+                eprintln!("engram: {e}");
+                std::process::exit(2);
+            }
 
             eprintln!("engram: db = {db}");
             eprintln!("engram: llm = {}", config.llm.describe());

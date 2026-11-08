@@ -313,11 +313,27 @@ impl ActionBasis {
 /// re-request forever. These keys describe the engine's accounting, not the
 /// action, so they are left out.
 ///
+/// The `human_approval` decisions, under [`APPROVALS_STATE_KEY`]: written by
+/// the engine when an approval node completes (`state.__approvals.<node_id>`).
+/// Left out too, so one approval completing does not void another that is
+/// waiting beside it.
+///
+/// Engine-owned as well as unbound: nothing but the engine may write these
+/// keys. `POST /executions` drops them from a run's input,
+/// `POST /work-items/:id/complete` from a worker's reported `state_patch`, and
+/// the in-process worker from any executor's patch but the approval node's
+/// own, so no step can forge an approval record a later condition reads.
+///
 /// EXACTLY the engine's keys: not every `"__"`-prefixed key, because user state
 /// may use that prefix and a change to it must still void an approval. A new
 /// engine-written key goes here, and `engine_state_keys_cover_the_budget_writer`
 /// fails if the budget writer starts writing one that is not listed.
-pub const ENGINE_STATE_KEYS: &[&str] = &["__budget"];
+pub const ENGINE_STATE_KEYS: &[&str] = &["__budget", APPROVALS_STATE_KEY];
+
+/// The state key under which the engine records each `human_approval`
+/// node's decision, by node id: `state.__approvals.<node_id>`. Namespaced so
+/// a record never overwrites a user key named like the node.
+pub const APPROVALS_STATE_KEY: &str = "__approvals";
 
 /// `state` without the [`ENGINE_STATE_KEYS`]: what an approval binds.
 pub fn action_state(state: &serde_json::Value) -> serde_json::Value {

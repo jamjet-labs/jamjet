@@ -3,6 +3,7 @@ name = "jamjet-engram"
 description = "Engram — durable memory layer for AI agents. Temporal knowledge graph, semantic search, and MCP-native tools."
 version = "0.5.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -28,8 +29,9 @@ reqwest = { workspace = true }
 tokio = { version = "1", features = ["process", "io-util", "time", "macros"] }
 regex = "1"
 # Exact pin: ort pre-releases break API between rcs (rc.15 changed
-# Session::builder to take an Environment), and with no committed
-# Cargo.lock a caret range picks up the newest rc on every CI run.
+# Session::builder to take an Environment). The committed Cargo.lock does
+# not reach crates.io users of this crate, and a caret range would let
+# `cargo update` move to the newest rc.
 ort = { version = "=2.0.0-rc.13", optional = true }
 
 [features]

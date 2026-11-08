@@ -105,8 +105,49 @@ budget(5.00) // hard cap in USD
 ```
 
 `policy()` and `budget()` apply to every wrapped LLM client in the process.
-Blocked tools are stripped before the model sees them; budget exhaustion throws
+Blocked tools are stripped before the model sees them (OpenAI `function` and
+`custom` tools, and Anthropic tools), and a tool call the model returns for a
+blocked tool throws `JamjetPolicyBlocked`. Budget exhaustion throws
 `JamjetBudgetExceeded` before the next call goes out.
+
+Enforced entry points: OpenAI `chat.completions` (`create`, `parse`, `stream`,
+legacy `functions` included) and Anthropic `messages` and `beta.messages`
+(`create`, `parse`, `stream`). `asResponse()` and `withResponse()` return a
+Response rebuilt from the enforced result (server-sent events for a stream).
+OpenAI's Responses API and the batch APIs are not enforced: they throw
+`JamjetUnenforceableCall` while any block or require_approval rule is set.
+Server tools (such as web search) and MCP toolsets run on the vendor's side
+before a tool call could be refused, so a rule that could match them removes
+them from the request; Anthropic's own client tools (bash, text editor,
+computer, memory) are gated like any other tool.
+
+A `require_approval` rule keeps the tool available to the model. When the
+model calls it, the SDK opens an approval in JamJet Cloud with the tool name,
+call id, arguments, model and rule, and waits for a reviewer's decision before
+your code gets the response. Rejection throws `JamjetApprovalRejected`. No
+decision within `approvalTimeoutMs` (init option, default 1 hour), or no way to
+reach Cloud, throws `JamjetApprovalTimeout`. The timeout is sent to Cloud as
+the approval's deadline (clamped to 1 minute to 24 hours); JamJet Cloud
+deployments since jamjet-cloud #87 refuse decisions after it. The `signal` in
+the request options also cancels the wait.
+
+The approval shows the reviewer the call's arguments with credentials masked,
+always: by a short list of field names (`password`, `secret`, `api_key`,
+`authorization`, `access_token`, `refresh_token`, ...) and by shape (`Bearer`
+and `Basic` headers, JWTs, `sk-`/`AKIA`/`ghp_`-style keys, long high-entropy
+strings). With redaction on, emails, SSNs, phone
+numbers and IPs are masked too, and IBANs and card numbers keep their last 4.
+It also carries `arguments_sha256`, a SHA-256 of the canonical arguments; the
+SDK re-checks it before releasing the approved call and throws
+`JamjetApprovalRejected` if the arguments changed.
+
+Streaming calls get the same checks. Text streams through as it arrives; once
+any policy rule is set, chunks from the first tool call onward are held until
+the stream ends, checked, and only then handed to your code. Usage and cost are
+recorded when the stream finishes, fails, or is abandoned (an iterator dropped
+without being closed is recorded when it is garbage collected) and count toward
+`budget()`. When an OpenAI stream reports no usage, the cost is estimated and
+the span is marked `usage_estimated`.
 
 ## Standalone primitives (no Cloud account)
 
@@ -151,6 +192,7 @@ init({
   redaction: { mode: 'standard' }, // 'strict' | 'standard' | 'off'
   sampling: { rate: 1.0 },         // 0.0–1.0; errors and approvals always kept
   debug: false,                    // throws transport errors when true
+  approvalTimeoutMs: 3_600_000,    // how long a require_approval call waits (1 min to 24 h)
 })
 ```
 

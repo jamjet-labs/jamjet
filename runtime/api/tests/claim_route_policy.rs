@@ -142,9 +142,13 @@ fn dispatch_ir(marked: bool, blocked: &[&str], approval: &[&str]) -> Value {
 /// that has no `input` key, removing the gate makes the guard read the calls,
 /// get `NotAnObject`, and terminally fail the item — which is precisely the
 /// "breaks all durable tool execution" regression this fixture must catch.
-fn policed_condition_ir() -> Value {
-    ir_with_node(json!({ "id": "n1", "kind": { "type": "condition", "branches": [] } }))
-        .tap_policy(&["send_wire"], &[])
+/// An ordinary (not a dispatch) `python_fn` node under a workflow policy
+/// that blocks something else.
+fn policed_ordinary_ir() -> Value {
+    ir_with_node(json!({ "id": "n1", "kind": {
+        "type": "python_fn", "module": "app.steps", "function": "ordinary", "output_schema": ""
+    } }))
+    .tap_policy(&["send_wire"], &[])
 }
 
 fn ir_with_node(node: Value) -> Value {
@@ -1112,7 +1116,7 @@ async fn an_ordinary_item_on_another_queue_is_handed_out_untouched() {
     let backend = memory();
     let (execution_id, _) = seed(
         &backend,
-        policed_condition_ir(),
+        policed_ordinary_ir(),
         "tool",
         json!({ "workflow_id": WF, "workflow_version": VERSION, "node_id": "n1" }),
     )
@@ -1729,31 +1733,32 @@ async fn a_dispatch_node_is_gated_even_when_the_item_claims_another_queue() {
         dispatch_ir(true, &["send_wire"], &[]),
     )
     .await;
-    // Enqueued on the model queue, but the IR says this node is a dispatch.
-    let (_execution_id, id) = seed_item(
+    // Enqueued on the tool queue, but the IR says this node is a dispatch.
+    // (The model queue itself is no longer served to external workers.)
+    let (_execution_id, _id) = seed_item(
         &backend,
-        "model",
+        "tool",
         dispatch_payload(calls_input(&["send_wire"])),
     )
     .await;
 
     let state = make_state(backend.clone());
-    let resp = claim(&state, "model").await;
+    let resp = claim(&state, "tool").await;
 
     assert_withheld(&resp);
     // ...and it must not simply come back on the next poll.
-    assert_withheld(&claim(&state, "model").await);
+    assert_withheld(&claim(&state, "tool").await);
 }
 
 /// The unblocked case still comes back, so the gate is not simply refusing.
 #[tokio::test]
-async fn an_ordinary_model_item_is_still_handed_out() {
+async fn an_ordinary_item_is_still_handed_out() {
     let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
-    store(&backend, WF, VERSION, policed_condition_ir()).await;
-    let (_execution_id, _id) = seed_item(&backend, "model", json!({"node_id": "n1"})).await;
+    store(&backend, WF, VERSION, policed_ordinary_ir()).await;
+    let (_execution_id, _id) = seed_item(&backend, "tool", json!({"node_id": "n1"})).await;
 
     let state = make_state(backend.clone());
-    let resp = claim(&state, "model").await;
+    let resp = claim(&state, "tool").await;
     assert_eq!(
         resp["claimed"],
         json!(true),

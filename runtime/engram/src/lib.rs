@@ -14,6 +14,7 @@ pub mod fact;
 pub mod graph;
 pub mod graph_postgres;
 pub mod graph_sqlite;
+pub mod http;
 pub mod llm;
 pub mod llm_anthropic;
 pub mod llm_command;

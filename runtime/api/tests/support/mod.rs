@@ -115,6 +115,69 @@ pub async fn register_and_start(state: &AppState, ir: Value, input: Value) -> St
         .to_string()
 }
 
+/// Stands in for a real executor in tests of what happens BEFORE a node runs
+/// (the policy guard, approvals, blocks). Since 2026-11 a worker fails a node
+/// it has no executor for instead of completing it with an empty output, so
+/// such a test registers this for the kind it uses.
+pub struct NoopExecutor;
+
+#[async_trait::async_trait]
+impl jamjet_worker::NodeExecutor for NoopExecutor {
+    async fn execute(
+        &self,
+        _item: &jamjet_state::backend::WorkItem,
+    ) -> Result<jamjet_worker::ExecutionResult, jamjet_worker::ExecutorError> {
+        Ok(jamjet_worker::ExecutionResult {
+            output: json!({}),
+            state_patch: json!({}),
+            duration_ms: 0,
+            gen_ai_system: None,
+            gen_ai_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            finish_reason: None,
+        })
+    }
+}
+
+/// Store `ir` as a registered version WITHOUT the registration checks, the
+/// way a version registered before a check existed is stored.
+///
+/// `POST /workflows` refuses a node of a kind nothing in the runtime executes
+/// (`tool`, `mcp_tool`, `agent`, ...). The guard still runs for such a node
+/// when a stored version reaches it, whether a worker with its own executor
+/// runs it in process or an external worker claims its queue over HTTP, so
+/// the tests of that enforcement store their IR with this.
+pub async fn store_ir(backend: &dyn StateBackend, ir: &Value) {
+    backend
+        .store_workflow(jamjet_state::WorkflowDefinition {
+            workflow_id: ir["workflow_id"].as_str().unwrap().to_string(),
+            version: ir["version"].as_str().unwrap().to_string(),
+            ir: ir.clone(),
+            created_at: chrono::Utc::now(),
+            tenant_id: jamjet_state::DEFAULT_TENANT.to_string(),
+        })
+        .await
+        .expect("store workflow");
+}
+
+/// [`register_and_start`] for an IR registration would refuse: store it with
+/// [`store_ir`], then start one execution through `POST /executions`.
+pub async fn store_and_start(state: &AppState, ir: Value, input: Value) -> String {
+    store_ir(state.backend.as_ref(), &ir).await;
+    let (st, body) = post(
+        state,
+        "/executions",
+        json!({ "workflow_id": ir["workflow_id"], "workflow_version": ir["version"], "input": input }),
+    )
+    .await;
+    assert!(st.is_success(), "start failed: {st} {body}");
+    body["execution_id"]
+        .as_str()
+        .expect("execution_id in start response")
+        .to_string()
+}
+
 /// A backend a route test runs against, with a way to read a work item's
 /// settlement that does not depend on the backend's own read path.
 ///

@@ -186,3 +186,77 @@ async fn enricher_seals_and_chains_appended_entries() {
     assert_eq!(captured[1].prev_hash, captured[0].entry_hash);
     assert_eq!(captured[2].prev_hash, captured[1].entry_hash);
 }
+
+// ── U+001F in hashed fields (JVM review, 2026-11) ───────────────────────────
+
+/// The v1 entry hash joins fields with U+001F and no length prefix, so a
+/// field holding that byte can move a boundary. These two entries differ in
+/// actor_id, actor_type, tool_call_hash and ip_address, yet hash the same.
+/// The verifier refuses the separator inside any field, so neither verifies.
+#[test]
+fn a_field_holding_the_separator_is_refused_even_when_the_hash_matches() {
+    let signer = AuditSigner::new(b"test-key".to_vec());
+    let mut honest = make_entry(0, "mallory\u{1f}system");
+    honest.actor_type = ActorType::Human;
+    honest.seal(None, &signer);
+
+    let mut forged = honest.clone();
+    forged.actor_id = "mallory".to_string();
+    forged.actor_type = ActorType::System;
+    forged.tool_call_hash = Some("human".to_string());
+    forged.ip_address = Some("\u{1f}".to_string());
+    assert_eq!(
+        forged.content_hash(None),
+        honest.entry_hash.clone().unwrap(),
+        "the v1 hash cannot tell these apart"
+    );
+
+    assert_eq!(
+        verify_chain(std::slice::from_ref(&forged), &signer).unwrap_err(),
+        ChainError::SeparatorInField {
+            index: 0,
+            field: "ip_address"
+        }
+    );
+    assert_eq!(
+        verify_chain(std::slice::from_ref(&honest), &signer).unwrap_err(),
+        ChainError::SeparatorInField {
+            index: 0,
+            field: "actor_id"
+        }
+    );
+    assert_eq!(
+        jamjet_audit::verify_entry(&forged, &signer).unwrap_err(),
+        ChainError::SeparatorInField {
+            index: 0,
+            field: "ip_address"
+        }
+    );
+}
+
+/// A stored actor_type that is not one of the enum's values is refused on
+/// read, not read as `system`.
+#[tokio::test]
+async fn an_unknown_stored_actor_type_is_refused() {
+    let path = std::env::temp_dir().join(format!("jj-audit-{}.db", Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let backend = jamjet_audit::SqliteAuditBackend::open(&url).await.unwrap();
+    backend.migrate().await.unwrap();
+    let signer = AuditSigner::new(b"k".to_vec());
+    let mut entry = make_entry(0, "worker-1");
+    entry.seal(None, &signer);
+    backend.append(entry).await.unwrap();
+    let q = AuditQuery {
+        limit: 50,
+        ..Default::default()
+    };
+    assert_eq!(backend.query(&q).await.unwrap().len(), 1);
+
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query("UPDATE audit_log SET actor_type = 'mallory'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = backend.query(&q).await.unwrap_err();
+    assert!(err.to_string().contains("unknown actor_type"), "{err}");
+}

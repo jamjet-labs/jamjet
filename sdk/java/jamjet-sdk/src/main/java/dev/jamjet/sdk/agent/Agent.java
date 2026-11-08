@@ -1,4 +1,4 @@
-package dev.jamjet.agent;
+package dev.jamjet.sdk.agent;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -40,6 +40,14 @@ import java.util.concurrent.Executors;
  * var result = agent.run("What is JamJet?");
  * System.out.println(result.output());
  * }</pre>
+ *
+ * <p><strong>Not governed.</strong> {@link #run(String)} calls the model's
+ * {@code /chat/completions} endpoint directly, in this process: no policy, approval, budget
+ * or audit applies. For a governed, durable agent use {@code dev.jamjet.agent.Agent} from
+ * {@code dev.jamjet:jamjet-agent}. This class used to live in {@code dev.jamjet.agent} as
+ * well, so with both jars on the classpath the two {@code Agent} classes shared one name and
+ * whichever came first won; it moved to {@code dev.jamjet.sdk.agent} so that cannot happen.
+ * {@link #compile()} (IR for the runtime) is unaffected.
  */
 public final class Agent {
 
@@ -91,7 +99,12 @@ public final class Agent {
      *
      * <p>Reads {@code OPENAI_API_KEY} and {@code OPENAI_BASE_URL} from the environment.
      * Dispatches to the configured strategy executor.
+     *
+     * @deprecated runs ungoverned: no policy, approval, budget or audit. Submit
+     *     {@link #compile()} to the runtime, or use {@code dev.jamjet.agent.Agent} from
+     *     {@code dev.jamjet:jamjet-agent}.
      */
+    @Deprecated(since = "0.6.0")
     public AgentResult run(String prompt) {
         var apiKey = System.getenv().getOrDefault("OPENAI_API_KEY", "");
         var baseUrl = System.getenv().getOrDefault("OPENAI_BASE_URL", "https://api.openai.com/v1");
