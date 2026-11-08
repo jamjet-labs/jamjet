@@ -8,22 +8,14 @@ an insurance claim end-to-end: intake, assessment, fraud check, and resolution.
 Demonstrates:
   - Native Python SDK with Agent, Workflow, @workflow.step
   - Typed Pydantic state flowing through every step
-  - Parallel branches (photo analysis + policy lookup run concurrently)
-  - Human-in-the-loop approval gate for high-value claims
-  - Durable execution — crash at any step, resume from checkpoint
-  - Full audit trail with per-step cost/token attribution
+  - A human approval step marked on the workflow for high-value claims
+  - @tool functions the agents call for photos, policy and fraud checks
 
 Architecture:
-  intake → ┬─ analyze_photos ─┬→ assess_damage → check_fraud → approve → resolve
-           └─ lookup_policy  ─┘
+  intake → analyze_photos → lookup_policy → assess_damage → check_fraud → approve → resolve
 
-Run (local in-process):
+Run (in-process; the agents call Anthropic, so set ANTHROPIC_API_KEY):
     python examples/claims-processing/main.py
-
-Run (on JamJet runtime — durable):
-    jamjet dev
-    python examples/claims-processing/main.py --runtime
-    jamjet inspect <exec_id> --events
 """
 
 from __future__ import annotations
@@ -139,10 +131,11 @@ Explain your reasoning based on the risk score and any flags.""",
     max_iterations=2,
 )
 
-# Resolution writer — generates the decision letter
+# Resolution writer — generates the decision letter (no tools)
 resolution_writer = Agent(
     name="resolution_writer",
     model="claude-sonnet-4-6",
+    tools=[],
     instructions="""You are a senior claims adjuster writing the final decision letter.
 
 Based on the assessment, fraud check, and any human reviewer notes, write a
@@ -194,12 +187,6 @@ async def intake(state: ClaimsState) -> ClaimsState:
         f"Photos: {state.photo_urls}"
     )
     return state.model_copy(update={"claim_analysis": result.output})
-
-
-@workflow.step(parallel=["analyze_photos_step", "lookup_policy_step"])
-async def parallel_lookup(state: ClaimsState) -> ClaimsState:
-    """Step 2: Photo analysis and policy lookup run concurrently."""
-    return state
 
 
 @workflow.step
@@ -324,42 +311,13 @@ async def run_local(claim_id: str = "CLM-4821") -> None:
         print(f"{'═' * 60}")
         print(content or "(not available)")
 
-    print("\n  Inspect: jamjet inspect <exec_id> --events")
-    print("  Replay:  jamjet replay <exec_id>")
-
-
-async def run_on_runtime(claim_id: str = "CLM-4821") -> None:
-    """Submit to JamJet runtime for durable execution."""
-    from jamjet import JamjetClient
-
-    async with JamjetClient("http://localhost:7700") as client:
-        ir = workflow.compile()
-        await client.create_workflow(ir)
-
-        result = await client.start_execution(
-            workflow_id="claims_processor",
-            input={
-                "claim_id": claim_id,
-                "customer_id": "CUST-1092",
-                "submission": "Severe hail damage to roof...",
-                "photo_urls": ["s3://claims-bucket/CLM-4821/roof-overview.jpg"],
-            },
-        )
-        exec_id = result["execution_id"]
-        print(f"Execution started: {exec_id}")
-        print("The workflow will pause at the approval gate for claims >$10K.")
-        print(f"To approve: jamjet approve {exec_id} --decision approved")
 
 
 if __name__ == "__main__":
     claim_id = "CLM-4821"
-    runtime_mode = "--runtime" in sys.argv
 
     for arg in sys.argv[1:]:
         if arg.startswith("CLM-"):
             claim_id = arg
 
-    if runtime_mode:
-        asyncio.run(run_on_runtime(claim_id))
-    else:
-        asyncio.run(run_local(claim_id))
+    asyncio.run(run_local(claim_id))

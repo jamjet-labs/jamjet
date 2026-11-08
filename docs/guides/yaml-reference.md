@@ -59,15 +59,50 @@ nodes:
       Summarize this search result:
 
       {{ state.search_result }}
+    system_prompt: You summarise search results in three sentences.
     output_schema: schemas.Summary
     next: end                       # built-in terminal node
 ```
+
+`jamjet validate` and the compiler reject a workflow with no nodes, `nodes:`
+nested under `workflow:` or written as a list, a node whose `type` is not in
+the table below, and a node nothing leads to (no `next`, branch or `fallback`
+points at it), which the engine would otherwise run when the run starts. A key the compiler does not read is dropped with a
+warning that names it and what to use instead; these warnings become errors in
+a later release. Some other spellings map to the same IR field and are
+accepted: `system` for `system_prompt`, `label` for `description`,
+`arguments` for `input`, `message` on `human_approval` for `description`, and
+`branches` (with `condition:` entries) for a condition node's `conditions`.
+`temperature` and `max_tokens` on a model node become that node's model
+settings.
+
+Governance settings (`policy`, `cost_budget_usd`, `token_budget`,
+`on_budget_exceeded`, `data_policy`, `continue_as_new`) may sit at the top
+level or in the `workflow:` header, but not both; a malformed one is an error.
 
 `agent_ref` (workflow) and `acts_for` (node) compile to the IR's `agent_ref`. The engine then holds the node to the named card's `allowed_tools`, `blocked_tools`, `require_approval_for` and `allowed_delegations` (see the [Agent Model Guide](agent-model-guide.md#enforcing-allowed_tools)), and refuses it if no agent is registered at that `uri`. A node uses `acts_for` because `agent_ref` on an `agent` node already names the agent it calls.
 
 ---
 
 ## Node types
+
+| Type | Description | Who runs it | Keys besides the common ones |
+|------|-------------|-------------|------------------------------|
+| `model` | LLM call | the engine | `model`, `prompt`, `system_prompt`, `output_schema`, `temperature`, `max_tokens` |
+| `condition` (or `branch`) | Branch on a state expression | the engine | `conditions`, `default` |
+| `human_approval` | Wait for a human decision | the engine | `fallback` |
+| `eval` | Evaluate node output with scorers | the engine | `scorers`, `on_fail`, `max_retries`, `input_expr` |
+| `limit_exceeded` | Terminal node for a run that hit a limit | the engine | |
+| `end` | Terminal node | the engine | |
+| `tool` | Call a registered tool | refused at registration | `tool_ref`, `input`, `output_schema` |
+| `mcp_tool` | Call a tool via MCP | refused at registration | `server`, `tool`, `input`, `output_schema` |
+| `a2a_task` | Delegate to an external agent via A2A | refused at registration | `remote_agent`, `skill`, `input`, `output_schema`, `stream`, `on_input_required` |
+| `agent` | Invoke a registered JamJet agent | refused at registration | `agent_ref`, `input`, `output_schema` |
+
+Every node may also carry `type`, `description`, `labels`, `policy`,
+`data_policy`, `retry_policy`, `timeout`, `acts_for` and `next`. The
+`python_fn`, `java_fn` and `external_fn` kinds, which external workers run,
+come from the Python and Java SDKs rather than from YAML.
 
 | Type | Description | Who runs it |
 |------|-------------|-------------|
@@ -97,13 +132,18 @@ runs them all, and a node with several incoming edges waits for all of them.
 ```yaml
 route:
   type: condition
-  branches:
-    - condition: "state.confidence >= 0.8"
-      next: deliver
-    - condition: "state.confidence < 0.8"
+  conditions:
+    - if: "state.verdict == \"pass\""  # or `when:`; compare with == or != to a JSON literal
+      next: deliver                     # or `to:`
+    - if: "state.needs_review == true"
       next: escalate
   default: escalate
 ```
+
+A condition is a `state.<path>` reference, optionally compared with `==` or
+`!=` to a JSON literal; the runtime refuses anything else at registration. A
+conditional `next:` list on any other node type (`- when: ...`) compiles to a
+condition node of its own, `<node>__route`.
 
 ---
 
@@ -113,14 +153,25 @@ route:
 review:
   type: human_approval
   description: "Please review the generated report"
-  timeout: 48h                      # optional: the request expires after this
-  fallback: escalate                # optional: where the run goes on expiry (`end` to stop)
-  next: deliver                     # taken when approved
+  timeout: 48h
+  fallback: second_review           # where the run goes if nobody decides in time
+  next: deliver                     # where an approved run continues
+
+second_review:
+  type: human_approval
+  description: "Escalated: the first reviewer did not decide within 48 hours"
+  timeout: 48h
+  next: deliver
 ```
 
 Approved, the run continues along `next`, and `state.review` holds the
 decision. Rejected, the node and the run fail. Expired, the run goes to
-`fallback` (or stops, for `end`), or fails if there is none. See
+`fallback` (or stops, for `end`), or fails if there is none; here that is a
+second approver. Do not point `fallback` at the step an approval would
+unlock: that approves the action by timeout. Do not route on `state.review`
+either: a later node can still overwrite it. Decide with
+`jamjet approvals <exec-id>` and
+`jamjet approve <exec-id> --decision approved|rejected`. See
 [Human-in-the-Loop](hitl.md#approval-nodes).
 
 ---
@@ -140,7 +191,7 @@ below is what the compiler emits.
 ```yaml
 search_github:
   type: mcp_tool
-  server: github                    # server name from agents.yaml mcp.servers
+  server: github                    # a server under mcp.servers in this file
   tool: search_code
   input:
     query: "{{ state.search_query }}"
@@ -158,7 +209,7 @@ below is what the compiler emits.
 ```yaml
 code_review:
   type: a2a_task
-  remote_agent: partner_reviewer    # agent name from agents.yaml a2a.remote_agents
+  remote_agent: partner_reviewer    # an agent under a2a.remote_agents in this file
   skill: security_review
   input:
     code: "{{ state.generated_code }}"

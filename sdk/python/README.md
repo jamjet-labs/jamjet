@@ -68,15 +68,18 @@ cd my-agent-project
 cd my-existing-project
 jamjet init
 
-# Start local dev runtime (SQLite, embedded — no server setup needed)
+# Start local dev runtime (SQLite, embedded — no server setup needed).
+# The starter workflow calls claude-haiku-4-5, so export a key first.
+export ANTHROPIC_API_KEY=sk-ant-...
 jamjet dev
 ```
 
-In another terminal:
+In another terminal, from the project directory:
 
 ```bash
-# Run the example workflow
-jamjet run examples/basic_tool_flow
+# Check, then run, the workflow the template created (it reads `query`)
+jamjet validate workflow.yaml
+jamjet run workflow.yaml --input '{"query": "What is JamJet?"}'
 ```
 
 ### Hello World — Python
