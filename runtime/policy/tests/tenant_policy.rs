@@ -283,3 +283,65 @@ fn no_tenant_policy_leaves_the_ir_decision() {
         &[&workflow, &node]
     )));
 }
+
+/// `tool:*` is the tools-only catch-all: every tool, never a model node, in
+/// the tenant layer and in the IR. A tenant `*` covers model nodes too, so
+/// an operator who wants every tool call approved but not every model turn
+/// needs a way to say so.
+#[test]
+fn tool_star_covers_every_tool_and_no_model_node() {
+    for pattern in ["tool:*", "tool:**"] {
+        // Tenant gate and block.
+        let gate = set(&[], &[pattern], &[]);
+        assert!(
+            is_gate(&decide(&tool("send_wire"), &gate, &[])),
+            "{pattern}"
+        );
+        assert!(is_gate(&decide(&tool("db.drop"), &gate, &[])), "{pattern}");
+        assert!(
+            matches!(
+                decide(&model("anthropic/claude-sonnet-4-6"), &gate, &[]),
+                PolicyDecision::Allow
+            ),
+            "{pattern} must not hold a model node"
+        );
+        let block = set(&[pattern], &[], &[]);
+        assert!(
+            is_block(&decide(&tool("send_wire"), &block, &[])),
+            "{pattern}"
+        );
+        assert!(
+            matches!(
+                decide(&model("anthropic/claude-sonnet-4-6"), &block, &[]),
+                PolicyDecision::Allow
+            ),
+            "{pattern} must not block a model node"
+        );
+        // The same in an IR layer, where it matches what `*` matches.
+        let workflow = set(&[], &[pattern], &[]);
+        assert!(is_gate(&PolicyEvaluator.evaluate_chain(
+            &tool("x"),
+            None,
+            &[&workflow]
+        )));
+        assert!(matches!(
+            PolicyEvaluator.evaluate_chain(&model("anthropic/x"), None, &[&workflow]),
+            PolicyDecision::Allow
+        ));
+    }
+    // `*` still means every action at the tenant.
+    assert!(is_gate(&decide(
+        &model("anthropic/x"),
+        &set(&[], &["*"], &[]),
+        &[]
+    )));
+    // Only the catch-all is special: `tool:send` is the handler spelling it
+    // always was, not "the tool named send".
+    assert!(!is_gate(&decide(
+        &tool("send"),
+        &set(&[], &["tool:send"], &[]),
+        &[]
+    )));
+    assert!(!jamjet_policy::is_tools_catch_all("tool:send*"));
+    assert!(!jamjet_policy::is_tools_catch_all("tools:*"));
+}

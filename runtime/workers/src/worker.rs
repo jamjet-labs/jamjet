@@ -158,7 +158,6 @@ impl Worker {
         let execution_id = item.execution_id.clone();
         let node_id = item.node_id.clone();
         let tenant_id = item.tenant_id.clone();
-        let queue_type = item.queue_type.clone();
         let attempt = item.attempt;
         let max_attempts = item.max_attempts;
         let item_id = item.id;
@@ -510,7 +509,6 @@ impl Worker {
                                             &workflow_version,
                                             &tenant_id,
                                             item_id,
-                                            &queue_type,
                                             lease_fence,
                                         )
                                         .await;
@@ -1271,7 +1269,6 @@ impl Worker {
         workflow_version: &str,
         tenant_id: &str,
         item_id: WorkItemId,
-        queue_type: &str,
         lease_fence: i64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Double-roll guard: check SegmentBoundary event OR terminal status.
@@ -1338,6 +1335,23 @@ impl Worker {
         // Materialize carried state.
         let mat = materialize(self.backend.as_ref(), execution_id).await?;
 
+        // The start item as the scheduler dispatches any node: its own queue
+        // (not the queue of the item that hit the ceiling) and the payload
+        // `build_work_item_payload` builds over the carried state.
+        let start_node = ir
+            .node(start_node_id)
+            .ok_or_else(|| format!("start node {start_node_id} is not in the workflow"))?;
+        let carried = mat.current_state.as_object().cloned().unwrap_or_default();
+        let start_payload = jamjet_scheduler::payload::build_work_item_payload(
+            ir,
+            start_node_id,
+            start_node,
+            &carried,
+            workflow_id,
+            workflow_version,
+        );
+        let start_queue = start_node.kind.queue_type();
+
         // ORDER: new segment FIRST (crash-safe chain), THEN SegmentBoundary audit,
         // THEN terminal status on old execution.
         let next_id = start_next_segment(
@@ -1348,7 +1362,8 @@ impl Worker {
             workflow_version,
             next_seg,
             start_node_id,
-            queue_type,
+            start_queue.as_str(),
+            start_payload,
             tenant_id,
         )
         .await?;
@@ -2612,8 +2627,10 @@ mod tests {
             "new execution current_state must equal old execution's materialized current_state"
         );
 
+        // On the start node's own queue (a `tool` node's), not the queue of
+        // the item that hit the ceiling.
         let new_item = backend
-            .claim_work_item("test-worker-2", &["default"])
+            .claim_work_item("test-worker-2", &["tool"])
             .await
             .unwrap()
             .expect("new execution must have a claimable work item");
@@ -2624,6 +2641,127 @@ mod tests {
         assert_eq!(
             new_item.node_id, "n1",
             "new work item must target the start node"
+        );
+    }
+
+    /// A rollover's start item is built as the scheduler builds every item.
+    /// It used to carry two workflow fields only: a `model` start node had no
+    /// model, so the next segment's first turn was refused with a policy
+    /// violation that named no policy.
+    #[tokio::test]
+    async fn a_rollover_start_item_is_built_like_any_other() {
+        let mut ir_json = budget_ceiling_ir_json(true);
+        ir_json["nodes"]["n1"]["kind"] = serde_json::json!({
+            "type": "model",
+            "model_ref": "fast",
+            "prompt_ref": "",
+            "output_schema": "{}"
+        });
+        ir_json["models"] = serde_json::json!({
+            "fast": { "provider": "anthropic", "model": "claude-sonnet-4-6" }
+        });
+        let ir: WorkflowIr = serde_json::from_value(ir_json.clone()).unwrap();
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "seg-wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: serde_json::json!({ "counter": 5 }),
+                current_state: serde_json::json!({ "counter": 5 }),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        backend
+            .store_workflow(jamjet_state::backend::WorkflowDefinition {
+                workflow_id: "seg-wf".into(),
+                version: "1.0.0".into(),
+                ir: ir_json,
+                created_at: Utc::now(),
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        let state = serde_json::json!({ "counter": 5 });
+        backend
+            .enqueue_work_item(jamjet_state::backend::WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "model".into(),
+                payload: jamjet_scheduler::payload::build_work_item_payload(
+                    &ir,
+                    "n1",
+                    ir.node("n1").unwrap(),
+                    state.as_object().unwrap(),
+                    "seg-wf",
+                    "1.0.0",
+                ),
+                attempt: 0,
+                max_attempts: 3,
+                created_at: Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["model".into()],
+        )
+        .register_executor("model", Arc::new(BudgetTriggerExecutor));
+
+        let item = backend
+            .claim_work_item("test-worker", &["model"])
+            .await
+            .unwrap()
+            .unwrap();
+        worker.execute_item(item).await.unwrap();
+
+        let next = backend
+            .claim_work_item("test-worker", &["model"])
+            .await
+            .unwrap()
+            .expect("the next segment's start item is on the model queue");
+        assert_ne!(next.execution_id, eid);
+        let carried = jamjet_state::materialize(backend.as_ref(), &eid)
+            .await
+            .unwrap()
+            .current_state;
+        assert_eq!(
+            next.payload,
+            jamjet_scheduler::payload::build_work_item_payload(
+                &ir,
+                "n1",
+                ir.node("n1").unwrap(),
+                carried.as_object().unwrap(),
+                "seg-wf",
+                "1.0.0",
+            )
+        );
+        assert_eq!(next.payload["model"], "anthropic/claude-sonnet-4-6");
+
+        // Its first turn runs: no policy violation for a missing model.
+        let next_eid = next.execution_id.clone();
+        worker.execute_item(next).await.unwrap();
+        let events = backend.get_events(&next_eid).await.unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::PolicyViolation { .. })),
+            "{events:?}"
         );
     }
 
@@ -3225,6 +3363,139 @@ mod tests {
             .await
             .unwrap();
         (backend, eid)
+    }
+
+    /// Runs a model turn, counting the runs.
+    struct CountingModel {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for CountingModel {
+        async fn execute(
+            &self,
+            _item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ExecutionResult {
+                output: serde_json::json!({ "content": "ok" }),
+                state_patch: serde_json::json!({}),
+                duration_ms: 0,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+            })
+        }
+    }
+
+    /// A model node a tenant `require_approval_for: ["*"]` holds: it does not
+    /// run, and once the request is approved and the scheduler dispatches it
+    /// again, it runs, once.
+    #[tokio::test]
+    async fn a_held_model_node_runs_once_approved() {
+        let (backend, eid) = setup_model_backend().await;
+        let now = Utc::now();
+        backend
+            .create_tenant(jamjet_state::Tenant {
+                id: "default".into(),
+                name: "default".into(),
+                status: jamjet_state::TenantStatus::Active,
+                policy: Some(serde_json::json!({
+                    "blocked_tools": [],
+                    "require_approval_for": ["*"],
+                    "model_allowlist": []
+                })),
+                limits: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["model".into()],
+        )
+        .register_executor("model", Arc::new(CountingModel { runs: runs.clone() }));
+
+        let item = backend
+            .claim_work_item("test-worker", &["model"])
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = item.payload.clone();
+        worker.execute_item(item).await.unwrap();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0, "held");
+        let events = backend.get_events(&eid).await.unwrap();
+        let digest = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ToolApprovalRequired {
+                    node_id, context, ..
+                } if node_id == "n1" => context["action_digest"].as_str().map(String::from),
+                _ => None,
+            })
+            .expect("an approval request for the model turn");
+
+        // The approve route's record, bound to the request's digest.
+        let seq = backend.latest_sequence(&eid).await.unwrap() + 1;
+        backend
+            .append_event(jamjet_state::Event::new(
+                eid.clone(),
+                seq,
+                serde_json::from_value(serde_json::json!({
+                    "type": "approval_received",
+                    "node_id": "n1",
+                    "user_id": "approver",
+                    "decision": "approved",
+                    "comment": null,
+                    "state_patch": null,
+                    "approved_digest": digest,
+                }))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        // Dispatched again, as the scheduler does once the node is approved.
+        backend
+            .enqueue_work_item(WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "model".into(),
+                payload,
+                attempt: 0,
+                max_attempts: 3,
+                created_at: Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+        let item = backend
+            .claim_work_item("test-worker", &["model"])
+            .await
+            .unwrap()
+            .unwrap();
+        worker.execute_item(item).await.unwrap();
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "ran once approved"
+        );
+        let events = backend.get_events(&eid).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::NodeCompleted { node_id, .. } if node_id == "n1"
+            )),
+            "{events:?}"
+        );
     }
 
     /// A model-node output that exceeds the spill threshold (default 8 KiB, set

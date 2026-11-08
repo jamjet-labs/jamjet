@@ -91,6 +91,11 @@ pub fn segment_execution_id(parent_id: &ExecutionId, next_segment_number: u32) -
 /// function is now sound — the child row exists if and only if the whole
 /// segment committed.
 ///
+/// # The start item
+/// `queue_type` and `start_payload` are the start node's queue and the
+/// payload the scheduler builds for it (`build_work_item_payload` over the
+/// carried state), from the caller: this crate cannot build it.
+///
 /// # Returns
 /// The `ExecutionId` of the newly created (or pre-existing idempotent) segment.
 // Nine parameters are required by the plan interface; suppressing the lint rather
@@ -105,6 +110,7 @@ pub async fn start_next_segment(
     next_segment_number: u32,
     start_node_id: &str,
     queue_type: &str,
+    start_payload: serde_json::Value,
     tenant_id: &str,
 ) -> BackendResult<ExecutionId> {
     let new_id = segment_execution_id(parent_id, next_segment_number);
@@ -161,10 +167,12 @@ pub async fn start_next_segment(
         execution_id: new_id.clone(),
         node_id: start_node_id.to_string(),
         queue_type: queue_type.to_string(),
-        payload: serde_json::json!({
-            "workflow_id": workflow_id,
-            "workflow_version": workflow_version,
-        }),
+        // Built by the caller as the scheduler builds every item
+        // (`build_work_item_payload`), on the start node's own queue. Two
+        // workflow fields by hand left a model start node with no model (the
+        // claim gate refuses that, recording a policy violation) and a Python
+        // one with no function to call.
+        payload: start_payload,
         attempt: 0,
         max_attempts: 3,
         created_at: now,

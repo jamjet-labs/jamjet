@@ -127,7 +127,14 @@ replaces the workflow's, since one author owns both.
 A tenant catch-all (`["*"]`) applies to every Python, Java and external step,
 and to `model` nodes too: tenant `require_approval_for: ["*"]` holds every
 `model` node for approval (in an agent loop, every turn) and
-`blocked_tools: ["*"]` blocks it. A model call a Python or Java step makes
+`blocked_tools: ["*"]` blocks it. To cover every tool but not the model turns,
+write `["tool:*"]`: it matches what `*` matches inside the IR, every tool and
+no `model` node, in the tenant policy as in the IR.
+
+Upgrading: before the tenant policy was a ceiling, a tenant `*` matched tools
+only. A tenant policy that has `"*"` in `require_approval_for` now also holds
+each model turn, and one with `"*"` in `blocked_tools` blocks every model node.
+If you meant tools only, change it to `"tool:*"`. A model call a Python or Java step makes
 itself is not a `model` node and is not covered. Other patterns
 match tool names, which a model node does not have. In the IR, `["*"]` still
 means every tool and does not reach model nodes, so an agent compiled with

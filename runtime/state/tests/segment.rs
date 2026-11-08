@@ -313,7 +313,16 @@ async fn assert_start_next_segment(backend: &dyn StateBackend) {
     let carried = carried_materialized_state();
 
     let new_id = start_next_segment(
-        backend, &parent_id, &carried, "seg-wf", "1.0.0", 1, "start", "general", "default",
+        backend,
+        &parent_id,
+        &carried,
+        "seg-wf",
+        "1.0.0",
+        1,
+        "start",
+        "general",
+        serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        "default",
     )
     .await
     .expect("start_next_segment must succeed");
@@ -543,6 +552,7 @@ async fn assert_segment_chain_lineage(backend: &dyn StateBackend) {
         1,
         "start",
         "general",
+        serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
         "default",
     )
     .await
@@ -576,6 +586,7 @@ async fn assert_segment_chain_lineage(backend: &dyn StateBackend) {
         2,
         "start",
         "general",
+        serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
         "default",
     )
     .await
@@ -683,7 +694,16 @@ async fn sqlite_bounded_replay_independent_of_root_event_count() {
     let root_mat = materialize(&db, &root_id).await.expect("materialize root");
 
     let seg1_id = start_next_segment(
-        &db, &root_id, &root_mat, "seg-wf", "1.0.0", 1, "start", "general", "default",
+        &db,
+        &root_id,
+        &root_mat,
+        "seg-wf",
+        "1.0.0",
+        1,
+        "start",
+        "general",
+        serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        "default",
     )
     .await
     .expect("start_next_segment");
@@ -766,7 +786,16 @@ async fn sqlite_inert_old_segment_does_not_leak() {
     let root_mat = materialize(&db, &root_id).await.expect("materialize root");
 
     let seg1_id = start_next_segment(
-        &db, &root_id, &root_mat, "seg-wf", "1.0.0", 1, "start", "general", "default",
+        &db,
+        &root_id,
+        &root_mat,
+        "seg-wf",
+        "1.0.0",
+        1,
+        "start",
+        "general",
+        serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        "default",
     )
     .await
     .expect("start_next_segment");
@@ -866,7 +895,16 @@ async fn assert_two_rollover_byte_identity(backend: &dyn StateBackend) {
 
     // root -> seg1
     let seg1_id = start_next_segment(
-        backend, &root_id, &root_mat, "seg-wf", "1.0.0", 1, "start", "general", "default",
+        backend,
+        &root_id,
+        &root_mat,
+        "seg-wf",
+        "1.0.0",
+        1,
+        "start",
+        "general",
+        serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        "default",
     )
     .await
     .expect("start_next_segment seg1");
@@ -899,7 +937,16 @@ async fn assert_two_rollover_byte_identity(backend: &dyn StateBackend) {
         .expect("materialize seg1");
 
     let seg2_id = start_next_segment(
-        backend, &seg1_id, &seg1_mat, "seg-wf", "1.0.0", 2, "start", "general", "default",
+        backend,
+        &seg1_id,
+        &seg1_mat,
+        "seg-wf",
+        "1.0.0",
+        2,
+        "start",
+        "general",
+        serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        "default",
     )
     .await
     .expect("start_next_segment seg2");
@@ -1014,7 +1061,16 @@ async fn sqlite_child_forward_progress_after_rollover() {
     };
 
     let seg1_id = start_next_segment(
-        &db, &parent_id, &carried, "seg-wf", "1.0.0", 1, "start", "general", "default",
+        &db,
+        &parent_id,
+        &carried,
+        "seg-wf",
+        "1.0.0",
+        1,
+        "start",
+        "general",
+        serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        "default",
     )
     .await
     .expect("start_next_segment");
@@ -1097,7 +1153,16 @@ async fn sqlite_idempotent_start_next_segment_prevents_double_roll() {
 
     // First invocation: creates the child execution + seed + 2 events + work item.
     let id1 = start_next_segment(
-        &db, &parent_id, &carried, "seg-wf", "1.0.0", 1, "start", "general", "default",
+        &db,
+        &parent_id,
+        &carried,
+        "seg-wf",
+        "1.0.0",
+        1,
+        "start",
+        "general",
+        serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        "default",
     )
     .await
     .expect("first start_next_segment");
@@ -1105,7 +1170,16 @@ async fn sqlite_idempotent_start_next_segment_prevents_double_roll() {
     // Second invocation: simulates re-run after a crash before SegmentBoundary.
     // Must return the SAME id and must NOT enqueue a duplicate work item.
     let id2 = start_next_segment(
-        &db, &parent_id, &carried, "seg-wf", "1.0.0", 1, "start", "general", "default",
+        &db,
+        &parent_id,
+        &carried,
+        "seg-wf",
+        "1.0.0",
+        1,
+        "start",
+        "general",
+        serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        "default",
     )
     .await
     .expect("second start_next_segment (idempotent re-run)");
@@ -1149,7 +1223,16 @@ async fn assert_all_artifacts_present(backend: &dyn StateBackend) {
     let carried = carried_materialized_state();
 
     let new_id = start_next_segment(
-        backend, &parent_id, &carried, "seg-wf", "1.0.0", 1, "start", "general", "default",
+        backend,
+        &parent_id,
+        &carried,
+        "seg-wf",
+        "1.0.0",
+        1,
+        "start",
+        "general",
+        serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        "default",
     )
     .await
     .expect("start_next_segment");

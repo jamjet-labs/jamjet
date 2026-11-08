@@ -514,6 +514,19 @@ async fn guard_policy(
                             if let NodeKind::HumanApproval { description, .. } = &node_def.kind {
                                 c["description"] = Value::String(description.clone());
                             }
+                            // A dispatch node held by its own name: approving
+                            // it releases every call in its batch, so the
+                            // request names them, as a per-call gate's does.
+                            if is_dispatch {
+                                if let Ok(calls) = jamjet_policy::dispatch::read_pending_tool_calls(
+                                    &dispatch_guard::payload_input(payload),
+                                ) {
+                                    let names: Vec<&str> =
+                                        calls.iter().map(|c| c.name.as_str()).collect();
+                                    c["gated_tools"] = serde_json::json!(names);
+                                    c["calls"] = dispatch_guard::bound_calls(&calls);
+                                }
+                            }
                             c
                         },
                         deadline,

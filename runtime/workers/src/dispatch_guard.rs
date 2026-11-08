@@ -122,6 +122,20 @@ pub fn payload_input(payload: &Value) -> Value {
     payload.get("input").cloned().unwrap_or(Value::Null)
 }
 
+/// The calls of a dispatch batch as an approval binds them: `name` and
+/// `arguments` per call, in order, plus the `handler` a call resolves to
+/// through the run's `tools` map (the same name and arguments can run
+/// different code through the map). Nothing else.
+pub(crate) fn bound_calls(calls: &[jamjet_policy::dispatch::PendingToolCall]) -> Value {
+    serde_json::json!(calls
+        .iter()
+        .map(|c| match &c.handler {
+            Some(h) => serde_json::json!({"name": c.name, "arguments": c.arguments, "handler": h}),
+            None => serde_json::json!({"name": c.name, "arguments": c.arguments}),
+        })
+        .collect::<Vec<_>>())
+}
+
 /// Decide whether a marked agent dispatch node may run, and emit the audit
 /// trail. **The CALLER settles the work item.**
 ///
@@ -336,16 +350,7 @@ pub(crate) async fn guard_dispatch_in(
             // still matches the approval. Widening this to the raw call objects
             // would bind the approval to fields that carry no authority and
             // would make benign re-issues fail the check.
-            let calls_json = serde_json::json!(calls
-                .iter()
-                .map(|c| match &c.handler {
-                    // The resolved handler is bound too: the same name and
-                    // arguments can run different code through the map.
-                    Some(h) =>
-                        serde_json::json!({"name": c.name, "arguments": c.arguments, "handler": h}),
-                    None => serde_json::json!({"name": c.name, "arguments": c.arguments}),
-                })
-                .collect::<Vec<_>>());
+            let calls_json = bound_calls(&calls);
             let current_hash = content_hash(&calls_json);
 
             // ONE read of the event log, for the whole approval decision.
@@ -728,12 +733,18 @@ pub fn identify_policy_scope(
     }
     // Then most-specific first (same order as evaluator's reverse iteration).
     if let Some(p) = node_policy {
-        if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
+        if !matches!(
+            PolicyEvaluator.evaluate_ir(ctx, &[p]),
+            PolicyDecision::Allow
+        ) {
             return "node".to_string();
         }
     }
     if let Some(p) = workflow_policy {
-        if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
+        if !matches!(
+            PolicyEvaluator.evaluate_ir(ctx, &[p]),
+            PolicyDecision::Allow
+        ) {
             return "workflow".to_string();
         }
     }
@@ -1277,6 +1288,49 @@ mod tests {
             )
             .await
         }
+    }
+
+    /// A dispatch node held by its own name (here a tenant gate on `n1`):
+    /// approving it releases every call in its batch, so the request lists
+    /// them, as a per-call gate's request does. It used to name only the
+    /// dispatcher.
+    #[tokio::test]
+    async fn a_node_name_gate_on_a_dispatch_lists_its_calls() {
+        let f = Fixture::new();
+        f.with_tenant_policy(&[], &["n1"]).await;
+        let ir = unpoliced_ir();
+        let node_def = ir.node("n1").unwrap();
+        let payload = json!({
+            "workflow_id": ir.workflow_id,
+            "workflow_version": ir.version,
+            "node_id": "n1",
+            "input": input_for(&["send_wire", "lookup"]),
+        });
+        let outcome = crate::node_guard::guard_item(
+            f.backend.as_ref(),
+            GuardMode::Fire,
+            &f.execution_id,
+            "n1",
+            "default",
+            ir.policy.as_ref(),
+            node_def,
+            &payload,
+            None,
+            Default::default(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, crate::node_guard::GuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        let (_, _, ctx) = f.requests().await.pop().expect("a request");
+        assert_eq!(ctx["gated_tools"], json!(["send_wire", "lookup"]), "{ctx}");
+        assert_eq!(
+            ctx["calls"],
+            calls_json_for(&["send_wire", "lookup"]),
+            "{ctx}"
+        );
     }
 
     /// A workflow allowlist that lists the model used to allow it before the

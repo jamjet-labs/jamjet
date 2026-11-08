@@ -217,7 +217,8 @@ payload carries.
 
 Kinds with no name cannot be gated or blocked by a pattern, with one
 exception: a tenant catch-all (`require_approval_for: ["*"]` or
-`blocked_tools: ["*"]`) also applies to `model` nodes. `agent_tool` and
+`blocked_tools: ["*"]`) also applies to `model` nodes. `"tool:*"` is the
+catch-all for tools only, at the tenant as in the IR. `agent_tool` and
 `agent_discovery` make network calls in-process, so keep that in mind when
 relying on patterns alone.
 
