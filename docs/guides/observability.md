@@ -24,8 +24,8 @@ jamjet replay exec_01abc
 
 Every command takes `--runtime <url>` (default `http://localhost:7700`) and
 reads a token from `JAMJET_TOKEN` outside dev mode. `jamjet workers` calls
-`GET /workers`, which always returns an empty list: the runtime does not track
-workers.
+`GET /workers`, which lists each worker that holds a live lease with the items
+it holds. The runtime has no worker registry, so an idle worker is not listed.
 
 ---
 
@@ -54,7 +54,13 @@ workers.
 ```
 
 The table shows types only. The full events, with errors, policy decisions and
-approval details, come from `GET /executions/:id/events`.
+approval details, come from `GET /executions/:id/events`. It returns at most
+10000 events per call; when there are more, `next_after` in the response is the
+`after` to pass for the next page (`?after=<sequence>&limit=<n>`). A node output
+larger than 256 KiB stays a `{"$artifact": {"hash", "size", ...}}` reference,
+fetched with `GET /artifacts/:hash`; `?inline_artifacts=all` inlines every
+output and `none` inlines none. The CLI and the Python client follow the pages
+for you. `GET /executions` returns at most 200 runs per call (`limit`, `offset`).
 
 ---
 

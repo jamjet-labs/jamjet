@@ -112,21 +112,38 @@ impl Worker {
     }
 
     pub async fn run(&self) {
+        // A sender that is never used: the worker runs until aborted.
+        let (_never, stop) = tokio::sync::watch::channel(false);
+        self.run_until(stop).await
+    }
+
+    /// [`run`](Self::run) until `stop` turns true. The item in hand is
+    /// finished first: the check sits between items, so a shutdown never
+    /// abandons a node mid-execution, and no new item is claimed after it.
+    pub async fn run_until(&self, mut stop: tokio::sync::watch::Receiver<bool>) {
         info!(
             worker_id = %self.worker_id,
             queues = ?self.queue_types,
             "Worker started"
         );
-        loop {
-            match self.poll_and_execute().await {
-                Ok(true) => {}
-                Ok(false) => tokio::time::sleep(self.poll_interval).await,
+        while !*stop.borrow() {
+            let idle = match self.poll_and_execute().await {
+                Ok(true) => false,
+                Ok(false) => true,
                 Err(e) => {
                     warn!(worker_id = %self.worker_id, "Worker error: {e}");
-                    tokio::time::sleep(self.poll_interval).await;
+                    true
+                }
+            };
+            if idle {
+                tokio::select! {
+                    _ = tokio::time::sleep(self.poll_interval) => {}
+                    // A dropped sender (`run`, `spawn`) disables this arm.
+                    Ok(()) = stop.changed() => {}
                 }
             }
         }
+        info!(worker_id = %self.worker_id, "Worker stopped");
     }
 
     /// One iteration of [`run`](Self::run): claim one item and execute it.
@@ -424,16 +441,22 @@ impl Worker {
                                 );
                                 Ok(replayed_result(&outcome))
                             } else {
-                                // The key is ours — fire the executor.
-                                match self.executors.get(&kind_tag) {
-                                    Some(executor) if kind_tag == "agent_tool" => {
-                                        let (tx, mut rx) =
-                                            tokio::sync::mpsc::channel::<serde_json::Value>(64);
-                                        let backend = Arc::clone(&self.backend);
-                                        let eid = execution_id.clone();
-                                        let receiver_handle = tokio::spawn(async move {
-                                            while let Some(event) = rx.recv().await {
-                                                backend
+                                // The key is ours — fire the executor, under
+                                // the node's timeout. A timed-out node fails
+                                // terminally like any fatal error: its effect
+                                // may have happened, so it is not retried.
+                                let limit = node_timeout(&ir, node_def);
+                                let fire = async {
+                                    match self.executors.get(&kind_tag) {
+                                        Some(executor) if kind_tag == "agent_tool" => {
+                                            let (tx, mut rx) =
+                                                tokio::sync::mpsc::channel::<serde_json::Value>(64);
+                                            let backend = Arc::clone(&self.backend);
+                                            let eid = execution_id.clone();
+                                            let receiver_handle =
+                                                tokio::spawn(async move {
+                                                    while let Some(event) = rx.recv().await {
+                                                        backend
                                                     .patch_append_array(
                                                         &eid,
                                                         "agent_tool_events",
@@ -443,23 +466,43 @@ impl Worker {
                                                     .map_err(|e| {
                                                         format!("patch_append_array failed: {e}")
                                                     })?;
+                                                    }
+                                                    Ok::<(), String>(())
+                                                });
+                                            let result =
+                                                executor.execute_streaming(&item, tx).await;
+                                            match receiver_handle.await {
+                                                Ok(Err(e)) => Err(ExecutorError::Fatal(e)),
+                                                Err(e) => Err(ExecutorError::Fatal(format!(
+                                                    "Receiver task panicked: {e}"
+                                                ))),
+                                                Ok(Ok(())) => result,
                                             }
-                                            Ok::<(), String>(())
-                                        });
-                                        let result = executor.execute_streaming(&item, tx).await;
-                                        match receiver_handle.await {
-                                            Ok(Err(e)) => Err(ExecutorError::Fatal(e)),
-                                            Err(e) => Err(ExecutorError::Fatal(format!(
-                                                "Receiver task panicked: {e}"
-                                            ))),
-                                            Ok(Ok(())) => result,
                                         }
+                                        Some(executor) => executor.execute(&item).await,
+                                        // Checked above; kept total, and closed.
+                                        None => Err(ExecutorError::Fatal(format!(
+                                            "no executor for node kind {kind_tag}"
+                                        ))),
                                     }
-                                    Some(executor) => executor.execute(&item).await,
-                                    // Checked above; kept total, and closed.
-                                    None => Err(ExecutorError::Fatal(format!(
-                                        "no executor for node kind {kind_tag}"
-                                    ))),
+                                };
+                                match limit {
+                                    None => fire.await,
+                                    Some(limit) => match tokio::time::timeout(limit, fire).await {
+                                        Ok(result) => result,
+                                        Err(_) => {
+                                            warn!(
+                                                execution_id = %execution_id,
+                                                node_id = %node_id,
+                                                timeout_secs = limit.as_secs(),
+                                                "Node timed out"
+                                            );
+                                            Err(ExecutorError::Fatal(format!(
+                                                "node {node_id} timed out after {}s",
+                                                limit.as_secs()
+                                            )))
+                                        }
+                                    },
                                 }
                             }
                         }
@@ -1396,6 +1439,24 @@ impl Worker {
     }
 }
 
+/// How long a node's executor may run: the node's `node_timeout_secs`, else
+/// the workflow's `timeouts.node_timeout`. `None`, or zero, is no limit.
+///
+/// An IR with no `timeouts` key gets [`jamjet_core::timeout::TimeoutConfig`]'s
+/// default of 300 s; one with `timeouts: {}` (what the Python compiler emits)
+/// gets none. Until 2026-11 neither value was read.
+///
+/// This bounds the executor call on the engine's own workers. A human
+/// approval wait is not an executor call (the guard holds the node), so its
+/// deadline is the approval's own `timeout_secs`, not this.
+pub(crate) fn node_timeout(ir: &WorkflowIr, node_def: &NodeDef) -> Option<Duration> {
+    node_def
+        .node_timeout_secs
+        .map(Duration::from_secs)
+        .or(ir.timeouts.node_timeout)
+        .filter(|d| !d.is_zero())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1527,6 +1588,278 @@ mod tests {
                 finish_reason: None,
             })
         }
+    }
+
+    /// Sleeps far past any timeout a test sets, then completes.
+    struct SleepExecutor;
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for SleepExecutor {
+        async fn execute(
+            &self,
+            _item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            NoopExecutor.execute(_item).await
+        }
+    }
+
+    /// `minimal_ir_json` with `timeouts` and the node's `node_timeout_secs`
+    /// set as given (`None` leaves the key out).
+    async fn backend_with_timeouts(
+        timeouts: Option<serde_json::Value>,
+        node_timeout_secs: Option<u64>,
+    ) -> (Arc<InMemoryBackend>, ExecutionId) {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        backend
+            .create_execution(sample_execution(&eid))
+            .await
+            .unwrap();
+        let mut ir = minimal_ir_json();
+        if let Some(t) = timeouts {
+            ir["timeouts"] = t;
+        }
+        if let Some(secs) = node_timeout_secs {
+            ir["nodes"]["n1"]["node_timeout_secs"] = serde_json::json!(secs);
+        }
+        backend
+            .store_workflow(WorkflowDefinition {
+                workflow_id: "test-wf".into(),
+                version: "1.0.0".into(),
+                ir,
+                created_at: Utc::now(),
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
+        (backend, eid)
+    }
+
+    /// Run `n1` on a worker whose `tool` executor sleeps for an hour, and
+    /// return the node's terminal events as (completed, failed error, retryable).
+    async fn run_sleeping(backend: &Arc<InMemoryBackend>, eid: &ExecutionId) -> Vec<String> {
+        let worker =
+            make_worker(Arc::clone(backend)).register_executor("tool", Arc::new(SleepExecutor));
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("claimable");
+        worker.execute_item(item).await.unwrap();
+        backend
+            .get_events(eid)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::NodeCompleted { .. } => Some("completed".to_string()),
+                EventKind::NodeFailed {
+                    error, retryable, ..
+                } => Some(format!("failed retryable={retryable}: {error}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `node_timeout_secs` bounds the executor: the node fails, not
+    /// retryably, when it passes. Until 2026-11 nothing read it and the node
+    /// ran for the full hour.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_past_its_timeout_fails_terminally() {
+        let (backend, eid) = backend_with_timeouts(Some(serde_json::json!({})), Some(5)).await;
+        let started = tokio::time::Instant::now();
+        let outcome = run_sleeping(&backend, &eid).await;
+        assert_eq!(
+            outcome,
+            vec!["failed retryable=false: node n1 timed out after 5s".to_string()]
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The workflow's `timeouts.node_timeout` applies to a node with no
+    /// timeout of its own.
+    #[tokio::test(start_paused = true)]
+    async fn the_workflow_node_timeout_applies_when_the_node_sets_none() {
+        let (backend, eid) =
+            backend_with_timeouts(Some(serde_json::json!({ "node_timeout": 7 })), None).await;
+        let outcome = run_sleeping(&backend, &eid).await;
+        assert_eq!(
+            outcome,
+            vec!["failed retryable=false: node n1 timed out after 7s".to_string()]
+        );
+    }
+
+    /// An IR with no `timeouts` key gets the declared default of 300 s.
+    #[tokio::test(start_paused = true)]
+    async fn an_ir_without_timeouts_gets_the_default_node_timeout() {
+        let (backend, eid) = backend_with_timeouts(None, None).await;
+        let outcome = run_sleeping(&backend, &eid).await;
+        assert_eq!(
+            outcome,
+            vec!["failed retryable=false: node n1 timed out after 300s".to_string()]
+        );
+    }
+
+    /// `timeouts: {}` and no node timeout: no limit, so the node completes.
+    #[tokio::test(start_paused = true)]
+    async fn no_timeout_lets_the_node_complete() {
+        let (backend, eid) = backend_with_timeouts(Some(serde_json::json!({})), None).await;
+        assert_eq!(run_sleeping(&backend, &eid).await, vec!["completed"]);
+    }
+
+    /// A node timeout of 0 is no limit, even under a workflow node timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_node_timeout_is_no_limit() {
+        let (backend, eid) =
+            backend_with_timeouts(Some(serde_json::json!({ "node_timeout": 7 })), Some(0)).await;
+        assert_eq!(run_sleeping(&backend, &eid).await, vec!["completed"]);
+    }
+
+    /// Takes `0` to run each item.
+    struct SlowExecutor(Duration);
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for SlowExecutor {
+        async fn execute(
+            &self,
+            item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            tokio::time::sleep(self.0).await;
+            NoopExecutor.execute(item).await
+        }
+    }
+
+    /// Shutdown lets the item in hand finish and claims nothing more. The
+    /// workers were detached tasks and the server stopped only on Ctrl-C, so
+    /// SIGTERM killed whatever was running.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_finishes_the_item_in_hand_and_claims_no_more() {
+        let (backend, eid) = backend_with_timeouts(Some(serde_json::json!({})), None).await;
+        // A second item for the same run, waiting behind the first.
+        let mut second = sample_item(&eid);
+        second.node_id = "n1".into();
+        backend.enqueue_work_item(second).await.unwrap();
+
+        let (trigger, shutdown) = crate::shutdown::shutdown();
+        let handles = crate::pool::WorkerPool::new(backend.clone() as Arc<dyn StateBackend>)
+            .with_group(crate::pool::WorkerGroupConfig::new(
+                "w",
+                1,
+                vec!["default".into()],
+            ))
+            .with_executor("tool", Arc::new(SlowExecutor(Duration::from_secs(10))))
+            .with_shutdown(shutdown)
+            .spawn();
+
+        let started = |events: &[jamjet_state::Event]| {
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::NodeStarted { .. }))
+                .count()
+        };
+        while started(&backend.get_events(&eid).await.unwrap()) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let left = trigger.stop_and_drain(Duration::from_secs(60)).await;
+        assert_eq!(left, 0, "the worker drained within the grace period");
+        for h in handles {
+            h.await.unwrap();
+        }
+        let events = backend.get_events(&eid).await.unwrap();
+        assert_eq!(started(&events), 1, "nothing is claimed after shutdown");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+                .count(),
+            1,
+            "the item in hand completed"
+        );
+    }
+
+    /// The grace period bounds the wait: a worker still busy when it ends is
+    /// reported, not waited for.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_reports_a_worker_still_busy_after_the_grace_period() {
+        let (backend, eid) = backend_with_timeouts(Some(serde_json::json!({})), None).await;
+        let (trigger, shutdown) = crate::shutdown::shutdown();
+        let _handles = crate::pool::WorkerPool::new(backend.clone() as Arc<dyn StateBackend>)
+            .with_group(crate::pool::WorkerGroupConfig::new(
+                "w",
+                1,
+                vec!["default".into()],
+            ))
+            .with_executor("tool", Arc::new(SlowExecutor(Duration::from_secs(600))))
+            .with_shutdown(shutdown)
+            .spawn();
+        while !backend
+            .get_events(&eid)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::NodeStarted { .. }))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(trigger.stop_and_drain(Duration::from_secs(5)).await, 1);
+    }
+
+    /// An early `?` return after the heartbeat started must stop it. A bare
+    /// `JoinHandle` detached its task on drop, so the lease was renewed
+    /// forever and the item could never be reclaimed.
+    #[tokio::test(start_paused = true)]
+    async fn an_early_error_return_stops_the_heartbeat() {
+        use crate::test_support::FailingGetEvents;
+        use std::sync::atomic::Ordering;
+        // `count_node_completions` fails, so deriving the idempotency key
+        // returns early with `?`.
+        let backend = Arc::new(FailingGetEvents::failing_step_count());
+        let eid = ExecutionId::new();
+        backend
+            .create_execution(sample_execution(&eid))
+            .await
+            .unwrap();
+        backend
+            .store_workflow(WorkflowDefinition {
+                workflow_id: "test-wf".into(),
+                version: "1.0.0".into(),
+                ir: minimal_ir_json(),
+                created_at: Utc::now(),
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
+        let worker = Worker::new(
+            "test-worker".into(),
+            backend.clone() as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("tool", Arc::new(NoopExecutor));
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .expect("claimable");
+        assert!(
+            worker.execute_item(item).await.is_err(),
+            "the key cannot be derived"
+        );
+        // Let any heartbeat that is still alive tick a few times.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let at_return = backend.renewals.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(
+            backend.renewals.load(Ordering::SeqCst),
+            at_return,
+            "the heartbeat kept renewing after execute_item returned"
+        );
     }
 
     /// A node of a kind this worker has no executor for fails, terminally,

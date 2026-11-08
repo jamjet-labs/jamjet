@@ -3,6 +3,7 @@ use jamjet_api::{config::ApiConfig, routes::build_router_with_opts, state::AppSt
 use jamjet_audit::{AuditEnricher, NoopAuditBackend, SqliteAuditBackend};
 use jamjet_state::{InMemoryBackend, SqliteBackend};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Parse a `JAMJET_STORE_TERM` value: a non-negative integer (the promotion
@@ -179,15 +180,21 @@ async fn main() -> anyhow::Result<()> {
     // The scheduler and the embedded workers seal the approval records they
     // append (requests, expiries, escalations) into the same audit chain as
     // the decisions the routes seal.
+    //
+    // On SIGTERM or Ctrl-C the scheduler stops between ticks and the embedded
+    // workers finish the items they hold, for up to the grace period.
+    let shutdown_grace = shutdown_grace_from_env()?;
+    let (shutdown_trigger, shutdown) = jamjet_worker::shutdown();
     let scheduler =
         jamjet_scheduler::Scheduler::new(state.backend.clone()).with_sealer(state.enricher.clone());
-    tokio::spawn(async move { scheduler.run().await });
+    let scheduler_stop = shutdown.receiver();
+    let scheduler_handle = tokio::spawn(async move { scheduler.run_until(scheduler_stop).await });
     info!("Scheduler started");
 
     // Spawn the async projector alongside the scheduler.  Maintains the durable
     // proj_approvals read-model so the approvals endpoint serves from a projection
     // instead of replaying the event log on every request.
-    // No shutdown signal wired today — matches the scheduler; follow-up: F-2h-shutdown.
+    // It holds no work of its own, so it stops with the process.
     let projector = jamjet_scheduler::Projector::new(state.backend.clone());
     tokio::spawn(async move { projector.run().await });
     info!("Projector started");
@@ -206,7 +213,8 @@ async fn main() -> anyhow::Result<()> {
         // (`jamjet_worker::executable::IN_PROCESS_KINDS`).
         let pool = jamjet_worker::server_pool(state.backend.clone(), model_registry)
             .with_sealer(state.enricher.clone())
-            .with_agents(state.agents.clone());
+            .with_agents(state.agents.clone())
+            .with_shutdown(shutdown.clone());
         // Detaching the handles lets the workers run for the lifetime of the process
         // (same pattern as the scheduler above).
         let _worker_handles = pool.spawn();
@@ -256,14 +264,66 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    // The listener is closed and in-flight requests are answered. Now stop
+    // the scheduler and drain the embedded workers.
+    info!(
+        grace_secs = shutdown_grace.as_secs(),
+        "Shutting down: finishing in-flight work"
+    );
+    let still_running = shutdown_trigger.stop_and_drain(shutdown_grace).await;
+    if still_running > 0 {
+        warn!(
+            still_running,
+            "Grace period over with workers still running; their items are reclaimed when the lease expires"
+        );
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(5), scheduler_handle).await;
     info!("Shutting down");
     Ok(())
 }
 
+/// How long shutdown waits for in-flight work: `JAMJET_SHUTDOWN_GRACE_SECS`,
+/// default 30. An invalid value fails startup.
+fn shutdown_grace_from_env() -> anyhow::Result<Duration> {
+    match std::env::var("JAMJET_SHUTDOWN_GRACE_SECS") {
+        Err(std::env::VarError::NotPresent) => Ok(Duration::from_secs(30)),
+        Err(e) => anyhow::bail!("failed to read JAMJET_SHUTDOWN_GRACE_SECS: {e}"),
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|e| anyhow::anyhow!("invalid JAMJET_SHUTDOWN_GRACE_SECS `{raw}`: {e}")),
+    }
+}
+
+/// Resolves on Ctrl-C or SIGTERM. The server used to wait for Ctrl-C only, so
+/// SIGTERM, which container runtimes and service managers send, killed it
+/// with work in flight.
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install Ctrl-C handler");
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!("cannot listen for Ctrl-C: {e}");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(e) => {
+                warn!("cannot listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => info!("Ctrl-C received"),
+        _ = terminate => info!("SIGTERM received"),
+    }
 }
 
 #[cfg(test)]

@@ -194,7 +194,11 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 let caller = resolve_caller(&ctx, &args, dev_mode, Role::Viewer)?;
                 let tenant_id = caller.tenant.clone();
                 let status = args.get("status").and_then(|v| v.as_str()).and_then(parse_status);
-                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(50)
+                    .min(crate::routes::MAX_EXECUTIONS_PAGE as u64) as u32;
                 let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
                 let backend = s.backend_for(&tenant_id);
@@ -290,7 +294,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
         McpTool {
             name: "jamjet_get_events".into(),
             description: Some(concat!(
-                "Retrieve the full, ordered event log for a workflow execution. Read-only, no side effects. ",
+                "Retrieve the ordered event log for a workflow execution, up to 10000 events per call (follow next_after for more). Read-only, no side effects. ",
                 "Use this to debug execution behavior, understand which nodes ran and in what order, or inspect approval decisions. ",
                 "Returns a JSON object with an 'events' array. Each event has: execution_id, sequence (monotonic counter), ",
                 "timestamp, and kind (one of: WorkflowStarted, NodeScheduled, NodeStarted, NodeCompleted, NodeFailed, ",
@@ -304,6 +308,10 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     "execution_id": {
                         "type": "string",
                         "description": "Execution ID to retrieve events for. Accepts 'exec_<uuid>' or bare UUID format."
+                    },
+                    "after": {
+                        "type": "integer",
+                        "description": "Only events with a sequence above this. A response holds at most 10000 events; when there are more, its 'next_after' is the value to pass here for the next page."
                     },
                     "tenant_id": {
                         "type": "string",
@@ -324,8 +332,16 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 let tenant_id = caller.tenant.clone();
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
-                let events = backend.get_events(&eid).await.map_err(|e| format!("{e}"))?;
-                let text = serde_json::to_string(&json!({"events": events}))
+                let after = args.get("after").and_then(|v| v.as_i64()).unwrap_or(0);
+                let limit = crate::routes::MAX_EVENTS_PAGE;
+                let events = backend
+                    .get_events_page(&eid, after, limit)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                let next_after = (events.len() as u32 == limit)
+                    .then(|| events.last().map(|e| e.sequence))
+                    .flatten();
+                let text = serde_json::to_string(&json!({"events": events, "next_after": next_after}))
                     .map_err(|e| format!("{e}"))?;
                 Ok(vec![McpContent::Text { text }])
             }

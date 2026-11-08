@@ -360,6 +360,28 @@ impl StateBackend for InMemoryBackend {
             .collect())
     }
 
+    async fn list_running_executions_after(
+        &self,
+        after: Option<&ExecutionId>,
+        limit: u32,
+    ) -> BackendResult<Vec<WorkflowExecution>> {
+        let after = after.map(|a| a.0.to_string());
+        let mut results: Vec<WorkflowExecution> = self
+            .executions
+            .iter()
+            .filter(|r| r.value().status == WorkflowStatus::Running)
+            .filter(|r| {
+                after
+                    .as_ref()
+                    .is_none_or(|a| r.value().execution_id.0.to_string() > *a)
+            })
+            .map(|r| r.value().clone())
+            .collect();
+        results.sort_by_key(|r| r.execution_id.0.to_string());
+        results.truncate(limit as usize);
+        Ok(results)
+    }
+
     // ── Event log ────────────────────────────────────────────────────
 
     async fn append_event(&self, event: Event) -> BackendResult<EventSequence> {
@@ -548,6 +570,36 @@ impl StateBackend for InMemoryBackend {
         let id = item.id;
         self.work_items.insert(id, item);
         Ok(id)
+    }
+
+    async fn list_claimed_work_items(
+        &self,
+        limit: u32,
+    ) -> BackendResult<Vec<crate::backend::ClaimedWorkItem>> {
+        let now = Utc::now();
+        let mut out: Vec<crate::backend::ClaimedWorkItem> = self
+            .work_items
+            .iter()
+            .filter_map(|entry| {
+                let item = entry.value();
+                let worker_id = item.worker_id.clone()?;
+                item.lease_expires_at.filter(|t| *t > now)?;
+                Some(crate::backend::ClaimedWorkItem {
+                    worker_id,
+                    work_item_id: item.id,
+                    execution_id: item.execution_id.clone(),
+                    node_id: item.node_id.clone(),
+                    queue_type: item.queue_type.clone(),
+                    lease_expires_at: item.lease_expires_at,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            (a.worker_id.as_str(), a.lease_expires_at)
+                .cmp(&(b.worker_id.as_str(), b.lease_expires_at))
+        });
+        out.truncate(limit as usize);
+        Ok(out)
     }
 
     async fn claim_work_item(

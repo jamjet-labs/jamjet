@@ -201,6 +201,51 @@ pub trait StateBackend: Send + Sync {
         offset: u32,
     ) -> BackendResult<Vec<WorkflowExecution>>;
 
+    /// Running executions whose id sorts after `after` (all of them for
+    /// `None`), in id order, at most `limit`: a keyset page.
+    ///
+    /// The scheduler pages through this so it visits every running run each
+    /// tick. It used to read one `list_executions` page of 100, ordered by
+    /// `updated_at`, so past 100 running runs the rest never advanced; and
+    /// offset paging on `updated_at` skips rows as runs update and finish
+    /// under it. The id order does not move.
+    ///
+    /// The default reads every running execution through `list_executions`
+    /// and pages in memory; the SQLite and in-memory backends override it
+    /// with a direct query.
+    async fn list_running_executions_after(
+        &self,
+        after: Option<&ExecutionId>,
+        limit: u32,
+    ) -> BackendResult<Vec<WorkflowExecution>> {
+        const PAGE: u32 = 500;
+        let mut all = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = self
+                .list_executions(Some(WorkflowStatus::Running), PAGE, offset)
+                .await?;
+            let n = page.len() as u32;
+            all.extend(page);
+            if n < PAGE {
+                break;
+            }
+            offset += n;
+        }
+        all.sort_by_key(|e| e.execution_id.0.to_string());
+        all.dedup_by_key(|e| e.execution_id.0);
+        let after = after.map(|a| a.0.to_string());
+        Ok(all
+            .into_iter()
+            .filter(|e| {
+                after
+                    .as_ref()
+                    .is_none_or(|a| e.execution_id.0.to_string() > *a)
+            })
+            .take(limit as usize)
+            .collect())
+    }
+
     // ── Event log ────────────────────────────────────────────────────────
 
     /// Append an event to the event log.
@@ -218,8 +263,32 @@ pub trait StateBackend: Send + Sync {
         since_sequence: EventSequence,
     ) -> BackendResult<Vec<Event>>;
 
+    /// At most `limit` events with a sequence above `after`, in ascending
+    /// order: one page of the run's log. The SQLite backends read only that
+    /// page; the default reads [`Self::get_events_since`] and cuts it.
+    async fn get_events_page(
+        &self,
+        execution_id: &ExecutionId,
+        after: EventSequence,
+        limit: u32,
+    ) -> BackendResult<Vec<Event>> {
+        let mut events = self.get_events_since(execution_id, after).await?;
+        events.truncate(limit as usize);
+        Ok(events)
+    }
+
     /// Get the latest event sequence for an execution.
     async fn latest_sequence(&self, execution_id: &ExecutionId) -> BackendResult<EventSequence>;
+
+    /// Work items held under a lease that has not expired, ordered by
+    /// worker, at most `limit`. The default refuses: a backend that cannot
+    /// answer must not report "no workers".
+    async fn list_claimed_work_items(&self, limit: u32) -> BackendResult<Vec<ClaimedWorkItem>> {
+        let _ = limit;
+        Err(StateBackendError::Database(
+            "this backend does not list claimed work items".into(),
+        ))
+    }
 
     // ── Snapshots ────────────────────────────────────────────────────────
 
@@ -704,6 +773,18 @@ pub struct ApiToken {
 pub type WorkItemId = uuid::Uuid;
 
 /// A unit of work dispatched to a worker queue.
+/// A work item a worker holds a live lease on: what `GET /workers` reports.
+/// There is no worker registry, so a worker shows up only while it holds one.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClaimedWorkItem {
+    pub worker_id: String,
+    pub work_item_id: WorkItemId,
+    pub execution_id: ExecutionId,
+    pub node_id: String,
+    pub queue_type: String,
+    pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkItem {
     pub id: WorkItemId,

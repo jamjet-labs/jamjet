@@ -527,23 +527,34 @@ struct ListExecutionsQuery {
     offset: Option<u32>,
 }
 
+/// The most executions one `GET /executions` returns, whatever `limit` asks.
+pub const MAX_EXECUTIONS_PAGE: u32 = 200;
+
 async fn list_executions(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     Query(params): Query<ListExecutionsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
-    let status = params.status.as_deref().and_then(|s| match s {
-        "running" => Some(WorkflowStatus::Running),
-        "paused" => Some(WorkflowStatus::Paused),
-        "completed" => Some(WorkflowStatus::Completed),
-        "failed" => Some(WorkflowStatus::Failed),
-        _ => None,
-    });
+    // An unknown status is refused: it used to mean no filter, so
+    // `?status=cancelled` listed every run.
+    let status = match params.status.as_deref() {
+        None => None,
+        Some(s) => Some(
+            serde_json::from_value::<WorkflowStatus>(Value::String(s.to_string())).map_err(
+                |_| {
+                    ApiError::BadRequest(format!(
+                        "unknown status {s:?}; use pending, running, paused, completed, \
+                         failed, cancelled or limit_exceeded"
+                    ))
+                },
+            )?,
+        ),
+    };
     let executions = backend
         .list_executions(
             status,
-            params.limit.unwrap_or(50),
+            params.limit.unwrap_or(50).min(MAX_EXECUTIONS_PAGE),
             params.offset.unwrap_or(0),
         )
         .await?;
@@ -636,14 +647,54 @@ async fn cancel_execution(
     Ok(Json(json!({ "execution_id": id, "status": "cancelled" })))
 }
 
+/// The most events one `GET /executions/:id/events` returns, and the default.
+pub const MAX_EVENTS_PAGE: u32 = 10_000;
+
+/// The largest spilled output `GET /executions/:id/events` inlines by
+/// default. A larger one stays a `{"$artifact": {...}}` reference with its
+/// hash and size, for `GET /artifacts/:hash`.
+pub const MAX_INLINE_ARTIFACT_BYTES: u64 = 256 * 1024;
+
+#[derive(Deserialize)]
+struct ListEventsQuery {
+    /// Only events with a sequence above this one.
+    after: Option<i64>,
+    limit: Option<u32>,
+    /// `small` (default): inline spilled outputs up to
+    /// [`MAX_INLINE_ARTIFACT_BYTES`]; `all`; or `none`.
+    inline_artifacts: Option<String>,
+}
+
 async fn list_events(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
+    Query(params): Query<ListEventsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
     let execution_id = parse_execution_id(&id)?;
-    let mut events = backend.get_events(&execution_id).await?;
+    let max_inline = match params.inline_artifacts.as_deref() {
+        None | Some("small") => MAX_INLINE_ARTIFACT_BYTES,
+        Some("all") => u64::MAX,
+        Some("none") => 0,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!(
+                "inline_artifacts must be small, all or none, not {other:?}"
+            )))
+        }
+    };
+    // One page of the log, read as a page: this loaded the whole log and
+    // inlined every spilled output, however long the run.
+    let limit = params
+        .limit
+        .unwrap_or(MAX_EVENTS_PAGE)
+        .clamp(1, MAX_EVENTS_PAGE);
+    let mut events = backend
+        .get_events_page(&execution_id, params.after.unwrap_or(0), limit)
+        .await?;
+    let next_after = (events.len() as u32 == limit)
+        .then(|| events.last().map(|e| e.sequence))
+        .flatten();
 
     // Resolve ArtifactRef sentinels in NodeCompleted.output before returning to
     // the client.  The write path (2i-2) spills large outputs to the artifact
@@ -659,7 +710,7 @@ async fn list_events(
             output, node_id, ..
         } = &mut event.kind
         {
-            let resolved = jamjet_state::resolve_value(output, &*backend).await;
+            let resolved = jamjet_state::resolve_value_within(output, &*backend, max_inline).await;
             match resolved {
                 Ok(v) => *output = v,
                 Err(e) => {
@@ -681,7 +732,7 @@ async fn list_events(
         }
     }
 
-    Ok(Json(json!({ "events": events })))
+    Ok(Json(json!({ "events": events, "next_after": next_after })))
 }
 
 #[derive(Deserialize)]
@@ -1087,8 +1138,36 @@ async fn deactivate_agent(
 
 // ── Admin ────────────────────────────────────────────────────────────────────
 
-async fn list_workers(State(_state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!({ "workers": [] })))
+/// `GET /workers`: the workers holding a live lease, each with the items it
+/// holds. There is no worker registry, so an idle worker is not listed. This
+/// returned a hard-coded empty list.
+async fn list_workers(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+) -> Result<Json<Value>, ApiError> {
+    let claimed = state
+        .backend_for(&tenant_id)
+        .list_claimed_work_items(1000)
+        .await?;
+    let mut workers: Vec<Value> = Vec::new();
+    for item in claimed {
+        let entry = json!({
+            "work_item_id": item.work_item_id,
+            "execution_id": item.execution_id,
+            "node_id": item.node_id,
+            "queue_type": item.queue_type,
+            "lease_expires_at": item.lease_expires_at,
+        });
+        match workers.last_mut() {
+            Some(w) if w["worker_id"] == item.worker_id.as_str() => {
+                if let Some(items) = w["items"].as_array_mut() {
+                    items.push(entry);
+                }
+            }
+            _ => workers.push(json!({ "worker_id": item.worker_id, "items": [entry] })),
+        }
+    }
+    Ok(Json(json!({ "workers": workers })))
 }
 
 // ── Agent discovery ───────────────────────────────────────────────────────────

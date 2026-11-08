@@ -106,9 +106,12 @@ act on them.
 | `agent` | Invoke a registered JamJet agent | refused at registration | `agent_ref`, `input`, `output_schema` |
 
 Every node may also carry `type`, `description`, `labels`, `policy`,
-`data_policy`, `retry_policy`, `timeout`, `acts_for` and `next`. On any node
-but `human_approval`, `timeout` and `data_policy` are recorded in the IR and
-not enforced; a `human_approval` node's `timeout` is its deadline. The
+`data_policy`, `retry_policy`, `timeout`, `acts_for` and `next`. A
+`human_approval` node's `timeout` is its approval deadline. On a node the
+engine's own workers run (`model`, `condition`, `eval`, `limit_exceeded`),
+`timeout` bounds the run: past it the node fails and is not retried (`0` is
+no limit). A node an external worker runs is not timed out by the engine.
+`data_policy` is recorded in the IR and not enforced. The
 `python_fn`, `java_fn` and `external_fn` kinds, which external workers run,
 come from the Python and Java SDKs rather than from YAML.
 

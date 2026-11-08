@@ -217,9 +217,23 @@ class JamjetClient:
         return r.json()
 
     async def get_events(self, execution_id: str) -> dict[str, Any]:
-        r = await self._client.get(f"/executions/{execution_id}/events")
-        _raise_for_status(r)
-        return r.json()
+        """Return the run's whole event log as ``{"events": [...]}``.
+
+        The runtime returns the log in pages (10000 events at most, with a
+        ``next_after`` cursor when there are more); this follows the cursor
+        until the last page.
+        """
+        events: list[Any] = []
+        params: dict[str, Any] = {}
+        while True:
+            r = await self._client.get(f"/executions/{execution_id}/events", params=params)
+            _raise_for_status(r)
+            page = r.json()
+            events.extend(page.get("events", []))
+            next_after = page.get("next_after")
+            if next_after is None:
+                return {"events": events}
+            params = {"after": next_after}
 
     async def approve(
         self,

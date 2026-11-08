@@ -768,6 +768,24 @@ impl StateBackend for TenantScopedSqliteBackend {
         rows.iter().map(row_to_execution).collect()
     }
 
+    async fn list_running_executions_after(
+        &self,
+        after: Option<&ExecutionId>,
+        limit: u32,
+    ) -> BackendResult<Vec<WorkflowExecution>> {
+        let rows = sqlx::query(
+            "SELECT * FROM workflow_executions WHERE status = 'running' AND tenant_id = ? \
+             AND execution_id > ? ORDER BY execution_id LIMIT ?",
+        )
+        .bind(&self.tenant_id.0)
+        .bind(after.map(execution_id_str).unwrap_or_default())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        rows.iter().map(row_to_execution).collect()
+    }
+
     // ── Event log ─────────────────────────────────────────────────────────
 
     #[instrument(skip(self, event), fields(tenant = %self.tenant_id, execution_id = %event.execution_id))]
@@ -847,6 +865,63 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?;
 
+        rows.iter().map(row_to_event).collect()
+    }
+
+    async fn list_claimed_work_items(
+        &self,
+        limit: u32,
+    ) -> BackendResult<Vec<crate::backend::ClaimedWorkItem>> {
+        let rows = sqlx::query(
+            "SELECT id, execution_id, node_id, queue_type, worker_id, lease_expires_at FROM work_items \
+             WHERE status = 'claimed' AND worker_id IS NOT NULL AND lease_expires_at > ? AND tenant_id = ? ORDER BY worker_id, lease_expires_at LIMIT ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(&self.tenant_id.0)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        rows.iter()
+            .map(|row| {
+                Ok(crate::backend::ClaimedWorkItem {
+                    worker_id: row.try_get("worker_id").map_err(map_db_err)?,
+                    work_item_id: uuid::Uuid::parse_str(
+                        row.try_get::<&str, _>("id").map_err(map_db_err)?,
+                    )
+                    .map_err(|e| StateBackendError::Database(e.to_string()))?,
+                    execution_id: parse_execution_id(
+                        row.try_get::<&str, _>("execution_id").map_err(map_db_err)?,
+                    )?,
+                    node_id: row.try_get("node_id").map_err(map_db_err)?,
+                    queue_type: row.try_get("queue_type").map_err(map_db_err)?,
+                    lease_expires_at: row
+                        .try_get::<Option<&str>, _>("lease_expires_at")
+                        .map_err(map_db_err)?
+                        .map(parse_datetime)
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    async fn get_events_page(
+        &self,
+        execution_id: &ExecutionId,
+        after: EventSequence,
+        limit: u32,
+    ) -> BackendResult<Vec<Event>> {
+        let rows = sqlx::query(
+            "SELECT * FROM events WHERE execution_id = ? AND tenant_id = ? AND sequence > ? \
+             ORDER BY sequence ASC LIMIT ?",
+        )
+        .bind(execution_id_str(execution_id))
+        .bind(&self.tenant_id.0)
+        .bind(after)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_db_err)?;
         rows.iter().map(row_to_event).collect()
     }
 

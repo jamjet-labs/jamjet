@@ -30,6 +30,9 @@ pub(crate) struct FailingGetEvents {
     fail_events: bool,
     fail_tenant: bool,
     fail_count: bool,
+    /// How many times `renew_lease` was called: a heartbeat left running
+    /// keeps counting.
+    pub(crate) renewals: std::sync::atomic::AtomicUsize,
 }
 
 impl FailingGetEvents {
@@ -39,6 +42,7 @@ impl FailingGetEvents {
             fail_events: true,
             fail_tenant: false,
             fail_count: false,
+            renewals: Default::default(),
         }
     }
 
@@ -50,6 +54,7 @@ impl FailingGetEvents {
             fail_events: false,
             fail_tenant: true,
             fail_count: false,
+            renewals: Default::default(),
         }
     }
 
@@ -61,6 +66,7 @@ impl FailingGetEvents {
             fail_events: false,
             fail_tenant: false,
             fail_count: true,
+            renewals: Default::default(),
         }
     }
 
@@ -382,6 +388,8 @@ impl StateBackend for FailingGetEvents {
         worker_id: &str,
         lease_fence: i64,
     ) -> jamjet_state::backend::BackendResult<()> {
+        self.renewals
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner
             .renew_lease(item_id, worker_id, lease_fence)
             .await

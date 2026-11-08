@@ -107,6 +107,11 @@ impl McpTransport for StdioTransport {
 
 // ── HTTP+SSE transport ────────────────────────────────────────────────────────
 
+/// How long the HTTP transport waits to connect to an MCP server.
+pub const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long one MCP request may take, end to end.
+pub const MCP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// HTTP+SSE transport — connects to a remote MCP HTTP server.
 pub struct HttpSseTransport {
     url: String,
@@ -119,7 +124,14 @@ impl HttpSseTransport {
     pub fn new(url: String) -> Self {
         Self {
             url,
-            client: reqwest::Client::new(),
+            // Each call is one request and one JSON response, so a total
+            // timeout is safe. `Client::new()` had none: a server that
+            // accepted the connection and never answered hung the caller.
+            client: reqwest::Client::builder()
+                .connect_timeout(MCP_CONNECT_TIMEOUT)
+                .timeout(MCP_REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_else(|e| panic!("cannot build an HTTP client: {e}")),
             bearer_token: std::env::var("JAMJET_MCP_TOKEN").ok(),
         }
     }

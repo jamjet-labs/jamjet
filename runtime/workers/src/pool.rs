@@ -45,6 +45,7 @@ pub struct WorkerPool {
     executors: Vec<(String, Arc<dyn NodeExecutor>)>,
     sealer: Option<Arc<dyn jamjet_state::approvals::ApprovalSealer>>,
     agents: Option<Arc<dyn jamjet_agents::AgentRegistry>>,
+    shutdown: Option<crate::shutdown::Shutdown>,
 }
 
 impl WorkerPool {
@@ -55,7 +56,16 @@ impl WorkerPool {
             executors: Vec::new(),
             sealer: None,
             agents: None,
+            shutdown: None,
         }
+    }
+
+    /// Stop with `shutdown`: on its trigger each worker finishes the item it
+    /// holds, claims nothing more and exits, and the trigger waits for them.
+    /// Without one the workers run until their handles are aborted.
+    pub fn with_shutdown(mut self, shutdown: crate::shutdown::Shutdown) -> Self {
+        self.shutdown = Some(shutdown);
+        self
     }
 
     /// The agent registry every worker reads Agent Cards from: autonomy
@@ -115,8 +125,10 @@ impl WorkerPool {
 
     /// Spawn all worker tasks and return their join handles.
     ///
-    /// Workers run indefinitely until their `JoinHandle` is aborted.
+    /// Workers run until their `JoinHandle` is aborted, or, with
+    /// [`with_shutdown`](Self::with_shutdown), until it triggers.
     pub fn spawn(self) -> Vec<JoinHandle<()>> {
+        let (_never, idle) = tokio::sync::watch::channel(false);
         let mut handles = Vec::new();
 
         for group in &self.groups {
@@ -130,8 +142,13 @@ impl WorkerPool {
                     "Spawning worker"
                 );
 
+                let (stop, running) = match &self.shutdown {
+                    Some(s) => (s.receiver(), Some(s.enter())),
+                    None => (idle.clone(), None),
+                };
                 let handle = tokio::spawn(async move {
-                    worker.run().await;
+                    let _running = running;
+                    worker.run_until(stop).await;
                 });
                 handles.push(handle);
             }

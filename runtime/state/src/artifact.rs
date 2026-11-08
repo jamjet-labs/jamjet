@@ -156,20 +156,38 @@ pub fn spill_bytes(value: &Value, threshold: usize) -> Option<Vec<u8>> {
 /// A missing artifact (dangling ref) returns a `StateBackendError::NotFound`
 /// rather than panicking.
 pub async fn resolve_value(value: &Value, backend: &dyn StateBackend) -> BackendResult<Value> {
+    resolve_value_within(value, backend, u64::MAX).await
+}
+
+/// [`resolve_value`], except that a reference to an artifact larger than
+/// `max_size` bytes is left as its sentinel, which carries the hash and size
+/// a caller needs to fetch it on its own.
+pub async fn resolve_value_within(
+    value: &Value,
+    backend: &dyn StateBackend,
+    max_size: u64,
+) -> BackendResult<Value> {
+    let resolve = |v: &Value| {
+        let artifact_ref = ArtifactRef::from_sentinel(v).filter(|r| r.size <= max_size);
+        let v = v.clone();
+        async move {
+            match artifact_ref {
+                Some(r) => resolve_ref(&r, backend).await,
+                None => Ok(v),
+            }
+        }
+    };
+
     // Top-level sentinel?
-    if let Some(artifact_ref) = ArtifactRef::from_sentinel(value) {
-        return resolve_ref(&artifact_ref, backend).await;
+    if ArtifactRef::from_sentinel(value).is_some() {
+        return resolve(value).await;
     }
 
     // Walk one level into objects.
     if let Some(obj) = value.as_object() {
         let mut out = serde_json::Map::with_capacity(obj.len());
         for (k, v) in obj {
-            if let Some(artifact_ref) = ArtifactRef::from_sentinel(v) {
-                out.insert(k.clone(), resolve_ref(&artifact_ref, backend).await?);
-            } else {
-                out.insert(k.clone(), v.clone());
-            }
+            out.insert(k.clone(), resolve(v).await?);
         }
         return Ok(Value::Object(out));
     }
@@ -178,11 +196,7 @@ pub async fn resolve_value(value: &Value, backend: &dyn StateBackend) -> Backend
     if let Some(arr) = value.as_array() {
         let mut out = Vec::with_capacity(arr.len());
         for v in arr {
-            if let Some(artifact_ref) = ArtifactRef::from_sentinel(v) {
-                out.push(resolve_ref(&artifact_ref, backend).await?);
-            } else {
-                out.push(v.clone());
-            }
+            out.push(resolve(v).await?);
         }
         return Ok(Value::Array(out));
     }
