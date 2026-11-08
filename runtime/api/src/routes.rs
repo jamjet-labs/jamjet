@@ -2126,10 +2126,9 @@ fn settle(result: jamjet_state::backend::BackendResult<()>, wi: &WorkItem) -> Cl
 
 #[derive(Deserialize)]
 struct CompleteWorkItemRequest {
-    /// Execution ID for event emission (optional for backwards compat).
-    execution_id: Option<String>,
-    /// Node ID for event emission.
-    node_id: Option<String>,
+    // Workers may still send `execution_id` and `node_id`. They are ignored
+    // (serde drops unknown fields): the run and node are the ones the engine
+    // recorded for the item, never the caller's word.
     output: Value,
     state_patch: Value,
     #[serde(default)]

@@ -1199,7 +1199,7 @@ mod tests {
             },
         );
         // Simulate reversed delivery: Received (seq 2) arrives before Required (seq 1).
-        let mut events = vec![received_first, required_second];
+        let mut events = [received_first, required_second];
         events.sort_by_key(|e| e.sequence);
         // After sort: seq 1 (Required) must be first.
         assert_eq!(

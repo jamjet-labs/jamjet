@@ -8,7 +8,7 @@ use jamjet_state::{
     Event, EventKind, InMemoryBackend, SqliteBackend, TenantId,
 };
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 fn temp_db_path() -> PathBuf {
@@ -18,7 +18,7 @@ fn temp_db_path() -> PathBuf {
     path
 }
 
-async fn open_db(path: &PathBuf) -> SqliteBackend {
+async fn open_db(path: &Path) -> SqliteBackend {
     let url = format!("sqlite://{}", path.display());
     SqliteBackend::open(&url).await.expect("open test db")
 }

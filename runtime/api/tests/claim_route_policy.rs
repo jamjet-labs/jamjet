@@ -1735,7 +1735,7 @@ async fn a_dispatch_node_is_gated_even_when_the_item_claims_another_queue() {
     .await;
     // Enqueued on the tool queue, but the IR says this node is a dispatch.
     // (The model queue itself is no longer served to external workers.)
-    let (_execution_id, id) = seed_item(
+    let (_execution_id, _id) = seed_item(
         &backend,
         "tool",
         dispatch_payload(calls_input(&["send_wire"])),

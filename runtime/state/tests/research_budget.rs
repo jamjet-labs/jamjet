@@ -40,7 +40,7 @@ fn budget_accumulates_across_multiple_model_calls() {
 
     let mut budget = BudgetState::default();
 
-    let calls = vec![
+    let calls = [
         (2_000u64, 1_000u64, 0.003), // summarize
         (5_000, 3_000, 0.008),       // find precedents
         (8_000, 4_000, 0.012),       // analyze case 1

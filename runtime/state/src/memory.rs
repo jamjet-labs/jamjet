@@ -352,7 +352,7 @@ impl StateBackend for InMemoryBackend {
             })
             .map(|r| r.value().clone())
             .collect();
-        results.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        results.sort_by_key(|r| std::cmp::Reverse(r.started_at));
         Ok(results
             .into_iter()
             .skip(offset as usize)

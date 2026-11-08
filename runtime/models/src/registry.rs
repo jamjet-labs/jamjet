@@ -286,6 +286,10 @@ mod tests {
         );
     }
 
+    // The variable must stay set across the await, so the guard is held
+    // through it. The other holders lock synchronously, and a tokio test
+    // runtime is single-threaded, so nothing waits on it here.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn registry_from_env_checked_errors_on_unreachable_sidecar() {
         let _guard = ENV_LOCK.lock().unwrap();
