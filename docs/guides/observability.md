@@ -1,111 +1,106 @@
 # Observability & Debugging
 
-JamJet provides full execution traces, replay from any checkpoint, and structured event timelines.
+The runtime records every run as an ordered event log. The CLI reads it back,
+and the server can export traces and metrics over OpenTelemetry.
 
 ---
 
-## CLI Commands
+## CLI commands
 
 ```bash
-# Full execution state and current node
+# Run state, and a per-node token breakdown
 jamjet inspect exec_01abc
 
-# Event timeline (all events in order)
+# Event timeline, in order
 jamjet events exec_01abc
 
-# Filter by event type
-jamjet events exec_01abc --type node_completed
+# One node's events, or only MCP or A2A events
+jamjet events exec_01abc --node review
+jamjet events exec_01abc --protocol mcp
 
-# Replay from the beginning (uses recorded model/tool outputs)
+# Start a new run of the same workflow with the same input
 jamjet replay exec_01abc
-
-# Replay from a specific node
-jamjet replay exec_01abc --from-node summarize
-
-# Worker status
-jamjet workers list
 ```
+
+Every command takes `--runtime <url>` (default `http://localhost:7700`) and
+reads a token from `JAMJET_TOKEN` outside dev mode. `jamjet workers` calls
+`GET /workers`, which always returns an empty list: the runtime does not track
+workers.
 
 ---
 
-## Execution Timeline
+## Execution timeline
 
-`jamjet events exec_01abc` output:
+`jamjet events` prints one row per event. This run had a model step, a
+`human_approval` step and a second model step:
 
 ```
-exec_01abc  customer_support_triage
-──────────────────────────────────────────────────
-00:00.000   workflow_started
-00:00.012   node_scheduled      fetch_ticket
-00:00.015   node_started        fetch_ticket         worker=w1
-00:01.204   node_completed      fetch_ticket         1.2s
-00:01.205   node_scheduled      classify
-00:01.208   node_started        classify             worker=w1
-00:03.311   node_completed      classify             2.1s   priority=high
-00:03.312   node_scheduled      human_review
-00:03.315   interrupt_raised    human_review         waiting for approval
-...
-04:22.001   approval_received   human_review         user=alice  decision=approved
-04:22.003   node_completed      human_review
-04:22.004   node_scheduled      auto_respond
-...
+┃ Seq ┃ Type                   ┃ Node   ┃ Created at                  ┃
+│ 1   │ workflow_started       │ —      │ 2026-11-08T04:49:32.985567Z │
+│ 2   │ node_scheduled         │ draft  │ 2026-11-08T04:49:32.985640Z │
+│ 3   │ node_started           │ draft  │ 2026-11-08T04:49:58.680232Z │
+│ 4   │ node_completed         │ draft  │ 2026-11-08T04:49:58.690766Z │
+│ 5   │ node_scheduled         │ review │ 2026-11-08T04:49:59.181083Z │
+│ 6   │ node_started           │ review │ 2026-11-08T04:49:59.690663Z │
+│ 7   │ tool_approval_required │ review │ 2026-11-08T04:49:59.697179Z │
+│ 8   │ approval_received      │ review │ 2026-11-08T04:50:46.360187Z │
+│ 9   │ node_scheduled         │ review │ 2026-11-08T04:50:46.670902Z │
+│ 10  │ node_started           │ review │ 2026-11-08T04:50:46.675640Z │
+│ 11  │ node_completed         │ review │ 2026-11-08T04:50:46.679344Z │
+│ 12  │ node_scheduled         │ send   │ 2026-11-08T04:50:47.174579Z │
+│ 13  │ node_started           │ send   │ 2026-11-08T04:50:47.201141Z │
+│ 14  │ node_completed         │ send   │ 2026-11-08T04:50:47.206485Z │
+│ 15  │ workflow_completed     │ —      │ 2026-11-08T04:50:47.677390Z │
 ```
 
----
-
-## OpenTelemetry
-
-JamJet exports traces, metrics, and logs via OpenTelemetry.
-
-```yaml
-# jamjet.yaml
-observability:
-  otel:
-    enabled: true
-    endpoint: http://localhost:4318  # OTLP HTTP
-    service_name: jamjet-runtime
-```
-
-Spans emitted:
-- `jamjet.workflow` — full workflow trace
-- `jamjet.node` — per-node span with input/output metadata
-- `jamjet.model_call` — LLM call span (tokens, latency, model)
-- `jamjet.tool_call` — tool invocation span
-- `jamjet.mcp_call` — MCP tool round-trip
-- `jamjet.a2a_task` — A2A delegation span
+The table shows types only. The full events, with errors, policy decisions and
+approval details, come from `GET /executions/:id/events`.
 
 ---
 
 ## Replay
 
-Replay re-executes a workflow using **recorded outputs** for all model and tool calls. It is:
-- **Instant** — no real LLM or tool calls made
-- **Deterministic** — same outputs, same path through the graph
-- **Safe** — side-effect nodes are skipped by default in replay mode
+`jamjet replay <id>` starts a new execution of the same workflow version with
+the original input; `--override-input '<json>'` merges fields into it. The new
+run executes every step again, with real model and tool calls. It does not
+reuse the recorded outputs. `--from-node` prints a note and starts from the
+beginning. `jamjet fork <id> --override-input '<json>'` does the same with
+changed input.
 
-```bash
-jamjet replay exec_01abc --from-node classify
-```
-
-Useful for:
-- Debugging a failed execution by replaying just the failing section
-- Validating a bug fix without real model calls
-- Testing routing logic changes against historical data
+What the runtime does reuse is its own event log: after a crash or restart a
+run continues where it stopped, and steps that already completed do not run
+again.
 
 ---
 
-## Cost and Token Tracking
+## OpenTelemetry
 
-JamJet records token usage and cost (when available from the model provider) per execution:
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` on the server to export traces and metrics
+over OTLP/gRPC (for example `http://localhost:4317`).
 
-```bash
-jamjet inspect exec_01abc --costs
+- Spans: one `jamjet.node` span per step the server's in-process workers run
+  (`model`, `condition`, `human_approval`, `eval`, `limit_exceeded`), with
+  `jamjet.execution.id`, `jamjet.node.id`, `jamjet.node.kind`,
+  `jamjet.attempt`, `jamjet.worker.id`, `jamjet.workflow.id` and
+  `jamjet.workflow.version`. Model steps add the OpenTelemetry GenAI
+  attributes (`gen_ai.system`, `gen_ai.request.model`,
+  `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` and others).
+- Metrics: the `gen_ai.client.token.usage` histogram, per model call.
+
+Python and Java steps run in their own worker processes, and the server emits
+no spans for them. Prompts and completions are not attached to spans.
+
+---
+
+## Cost and token tracking
+
+`jamjet inspect` prints a per-node table of tokens, finish reason, cost and
+duration (hide it with `--no-tokens`). Cost shows when the model's reply
+carries one:
+
 ```
-
-```
-exec_01abc costs:
-  classify:   1,204 tokens  $0.002
-  summarize:  3,891 tokens  $0.006
-  ─────────────────────────────────
-  Total:      5,095 tokens  $0.008
+┃ Node  ┃ System    ┃ Model      ┃ Input Tokens ┃ Output Tokens ┃ Finish Reason ┃ Cost (USD) ┃ Duration (ms) ┃
+│ draft │ anthropic │ claude-ha… │           10 │             8 │ stop          │          — │            10 │
+│ send  │ anthropic │ claude-ha… │           10 │             8 │ stop          │          — │             5 │
+  Totals: input=20 tokens, output=16 tokens
 ```

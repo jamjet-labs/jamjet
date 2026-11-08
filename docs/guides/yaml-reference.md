@@ -79,6 +79,12 @@ settings.
 Governance settings (`policy`, `cost_budget_usd`, `token_budget`,
 `on_budget_exceeded`, `data_policy`, `continue_as_new`) may sit at the top
 level or in the `workflow:` header, but not both; a malformed one is an error.
+The runtime enforces `policy`, and the in-process worker enforces
+`token_budget` and `cost_budget_usd` for the nodes it runs; with
+`continue_as_new: true` a run that reaches its budget rolls over into a new
+segment. `on_budget_exceeded` and `data_policy` (PII
+redaction and retention) are compiled into the IR, and the runtime does not
+act on them.
 
 `agent_ref` (workflow) and `acts_for` (node) compile to the IR's `agent_ref`. The engine then holds the node to the named card's `allowed_tools`, `blocked_tools`, `require_approval_for` and `allowed_delegations` (see the [Agent Model Guide](agent-model-guide.md#enforcing-allowed_tools)), and refuses it if no agent is registered at that `uri`. A node uses `acts_for` because `agent_ref` on an `agent` node already names the agent it calls.
 
@@ -100,7 +106,9 @@ level or in the `workflow:` header, but not both; a malformed one is an error.
 | `agent` | Invoke a registered JamJet agent | refused at registration | `agent_ref`, `input`, `output_schema` |
 
 Every node may also carry `type`, `description`, `labels`, `policy`,
-`data_policy`, `retry_policy`, `timeout`, `acts_for` and `next`. The
+`data_policy`, `retry_policy`, `timeout`, `acts_for` and `next`. On any node
+but `human_approval`, `timeout` and `data_policy` are recorded in the IR and
+not enforced; a `human_approval` node's `timeout` is its deadline. The
 `python_fn`, `java_fn` and `external_fn` kinds, which external workers run,
 come from the Python and Java SDKs rather than from YAML.
 
@@ -309,26 +317,21 @@ tools:
 
 ## Retry policies
 
-Built-in named policies:
+A node's `retry_policy` is a name, and the runtime reads it for the number of
+attempts the node gets:
 
-| Name | Max attempts | Backoff |
-|------|-------------|---------|
-| `llm_default` | 3 | Exponential, jitter |
-| `io_default` | 5 | Exponential, jitter |
-| `fast` | 2 | Fixed 1s |
+| Name | Attempts |
+|------|----------|
+| `no_retry` | 1 |
+| `io_default` | 5 |
+| `llm_default` | 3 |
+| any other name, or none | 3 |
 
-Custom policy:
-
-```yaml
-retry_policies:
-  my_policy:
-    max_attempts: 4
-    backoff: exponential
-    base_delay: 2s
-    max_delay: 30s
-    jitter: true
-    retryable_errors: [timeout, rate_limit, 503]
-```
+A failed node is tried again until its attempts run out, waiting 2, 4, 8 and
+so on seconds between attempts (at most 64). Some failures end the node at
+once: a policy block, or a prompt that does not render. A `retry_policies:`
+block (custom `max_attempts`, `backoff`, `jitter`, `retryable_errors`) is
+compiled into the IR but the runtime does not read it.
 
 ---
 
