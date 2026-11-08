@@ -10,6 +10,15 @@ from typing import Any
 class AgentToolDef:
     """Configuration for an agent-tool invocation, without executing the agent.
 
+    Note:
+        ``"auto"`` routing is not yet supported end to end by the bundled Rust
+        runtime. Generated graphs can fail registration on empty coordinator
+        weights. Even with valid weights, the embedded worker pool does not
+        register the routing executors and can complete nodes without invoking
+        an agent. Scheduler payloads also omit routing configuration, including
+        the agent URI, so a custom agent-tool executor can fail with a missing
+        URI error.
+
     Attributes:
         agent_uri: Explicit agent URI, or ``"auto"`` for coordinator routing.
             The graph compiler expands auto-routed agent-tool nodes into a
@@ -71,6 +80,14 @@ def agent_tool(
 
     This stores configuration without calling an agent or validating the URI,
     invocation mode, or limits.
+
+    Note:
+        ``"auto"`` is not yet supported end to end by the bundled Rust runtime.
+        Empty generated coordinator weights can prevent graph registration.
+        Correcting those weights alone is insufficient: the embedded worker
+        pool can complete nodes without invoking an agent, and scheduler
+        payloads omit the agent URI and other routing configuration needed by
+        custom executors.
 
     Args:
         agent: Agent URI, such as ``"jamjet://org/classifier"``, or ``"auto"``
