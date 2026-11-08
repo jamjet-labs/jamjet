@@ -210,12 +210,14 @@ payload carries.
 | `mcp_tool` | its `tool` | no state |
 | `a2a_task` | its `skill` | no state |
 | `agent` | its `agent_ref` | no state |
-| `model` | none: governed by `model_allowlist` only | the prompt as rendered against the run's state (a node with no prompt: the conversation in `messages`) and the resolved model settings |
+| `model` | none, except a tenant catch-all (`["*"]`); also governed by `model_allowlist`, checked against the resolved `provider/model` | the prompt as rendered against the run's state (a node with no prompt: the conversation in `messages`) and the resolved model settings |
 | `condition` | none | the run's state, as `state` |
 | `human_approval` | none: gated always | the run's state, as `input` (the digest leaves out `__budget` and `__approvals`) |
 | `agent_tool`, `agent_discovery`, `coordinator`, `eval`, `wait`, `parallel`, `join`, `subgraph`, `memory_retrieval`, `policy`, `finalizer`, `limit_exceeded` | none | no state |
 
-Kinds with no name cannot be gated or blocked by a pattern. `agent_tool` and
+Kinds with no name cannot be gated or blocked by a pattern, with one
+exception: a tenant catch-all (`require_approval_for: ["*"]` or
+`blocked_tools: ["*"]`) also applies to `model` nodes. `agent_tool` and
 `agent_discovery` make network calls in-process, so keep that in mind when
 relying on patterns alone.
 
@@ -258,7 +260,9 @@ relying on patterns alone.
 - Workflow and node policies live in IR a developer registers, and a developer
   can register a new version without the gate. A gate that must bind the
   developers who start runs belongs in the tenant policy, which only an operator
-  can change (see the route table in the security guide).
+  can change (see the route table in the security guide). The tenant policy is
+  a ceiling: no workflow or node rule turns a tenant block into an approval or
+  widens the tenant's `model_allowlist`.
 
 What an approval proves, and what it does not:
 

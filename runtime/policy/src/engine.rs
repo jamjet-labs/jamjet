@@ -20,6 +20,24 @@ impl EvaluationContext {
             model_ref,
         }
     }
+
+    /// [`Self::from_node_kind`] for a work item about to run, with a model
+    /// node's model read from the item's `payload`.
+    ///
+    /// The node kind's `model_ref` can be an alias the IR's `models` map
+    /// resolves, and the scheduler writes the resolved `provider/model` to the
+    /// payload's `model`, which is what the executor calls. Checking the alias
+    /// let an author name an alias `anthropic` that calls `openai/gpt-4o` and
+    /// pass an "Anthropic only" allowlist, the tenant's included.
+    pub fn from_work_item(node_id: &str, kind: &NodeKind, payload: &serde_json::Value) -> Self {
+        let mut ctx = Self::from_node_kind(node_id, kind);
+        if ctx.node_kind_tag == "model" {
+            if let Some(model) = payload.get("model").and_then(|m| m.as_str()) {
+                ctx.model_ref = Some(model.to_string());
+            }
+        }
+        ctx
+    }
 }
 
 /// Map a `NodeKind` to its serde tag string.

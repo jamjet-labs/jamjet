@@ -384,24 +384,26 @@ async fn guard_policy(
         }
     };
 
-    // tenant -> workflow -> node; the evaluator iterates in reverse, so the
-    // most specific layer wins.
+    // The IR's layers, workflow then node: the most specific wins between
+    // them. The tenant layer is a ceiling over both (`evaluate_chain`).
+    let mut layers: Vec<&PolicySetIr> = Vec::new();
+    if let Some(p) = workflow_policy {
+        layers.push(p);
+    }
+    if let Some(p) = &node_def.policy {
+        layers.push(p);
+    }
+    // The whole chain, tenant first, for the approval deadline: every level
+    // is a ceiling there already.
     let mut sets: Vec<&PolicySetIr> = Vec::new();
     if let Some(ref tp) = tenant_policy_set {
         sets.push(tp);
     }
-    if let Some(p) = workflow_policy {
-        sets.push(p);
-    }
-    if let Some(p) = &node_def.policy {
-        sets.push(p);
-    }
-    let ctx = EvaluationContext::from_node_kind(node_id, &node_def.kind);
-    let decision = if sets.is_empty() {
-        PolicyDecision::Allow
-    } else {
-        PolicyEvaluator.evaluate(&ctx, &sets)
-    };
+    sets.extend(layers.iter().copied());
+    // A model node is checked against the model its payload calls, not the
+    // IR alias it names.
+    let ctx = EvaluationContext::from_work_item(node_id, &node_def.kind, payload);
+    let decision = PolicyEvaluator.evaluate_chain(&ctx, tenant_policy_set.as_ref(), &layers);
     // A `human_approval` node is gated by what it is: it exists to wait for a
     // person. Until 2026-11 it had no executor and the worker completed it
     // with an empty output, so the run went on with nobody asked.

@@ -221,9 +221,13 @@ pub enum DispatchDecision {
 /// Approval is per-batch rather than per-call because `hold_for_approval` keys
 /// approval state on `node_id` (`runtime/workers/src/worker.rs:667`). `gated`
 /// carries every call that asked for approval so the approver sees all of them.
+///
+/// Each call is evaluated with [`PolicyEvaluator::evaluate_chain`]: `tenant` is
+/// a ceiling the IR's `policy_sets` (workflow, then node) cannot lift.
 pub fn evaluate_dispatch(
     node_id: &str,
     calls: &[PendingToolCall],
+    tenant: Option<&PolicySetIr>,
     policy_sets: &[&PolicySetIr],
 ) -> DispatchDecision {
     let ev = PolicyEvaluator;
@@ -262,14 +266,16 @@ pub fn evaluate_dispatch(
                 model_ref: None,
             });
         }
-        let decisions = std::iter::once((call.name.clone(), ev.evaluate(&ctx, policy_sets))).chain(
-            handler_ctxs.iter().map(|h| {
-                (
-                    h.tool_name.clone().unwrap_or_default(),
-                    ev.evaluate(h, policy_sets),
-                )
-            }),
-        );
+        let decisions = std::iter::once((
+            call.name.clone(),
+            ev.evaluate_chain(&ctx, tenant, policy_sets),
+        ))
+        .chain(handler_ctxs.iter().map(|h| {
+            (
+                h.tool_name.clone().unwrap_or_default(),
+                ev.evaluate_chain(h, tenant, policy_sets),
+            )
+        }));
         let mut needs_approval = None;
         for (matched, decision) in decisions {
             match decision {
@@ -471,14 +477,19 @@ mod tests {
     #[test]
     fn ungated_batch_is_allowed() {
         let p = policy(&[], &[]);
-        let d = evaluate_dispatch("__tools_0__", &pending(&["read_file"]), &[&p]);
+        let d = evaluate_dispatch("__tools_0__", &pending(&["read_file"]), None, &[&p]);
         assert_eq!(d, DispatchDecision::Allow);
     }
 
     #[test]
     fn blocked_tool_blocks_the_batch() {
         let p = policy(&["send_wire"], &[]);
-        let d = evaluate_dispatch("__tools_0__", &pending(&["read_file", "send_wire"]), &[&p]);
+        let d = evaluate_dispatch(
+            "__tools_0__",
+            &pending(&["read_file", "send_wire"]),
+            None,
+            &[&p],
+        );
         match d {
             DispatchDecision::Block { tool_name, .. } => assert_eq!(tool_name, "send_wire"),
             other => panic!("expected Block, got {other:?}"),
@@ -488,7 +499,7 @@ mod tests {
     #[test]
     fn approval_tool_holds_the_batch() {
         let p = policy(&[], &["send_wire"]);
-        let d = evaluate_dispatch("__tools_0__", &pending(&["send_wire"]), &[&p]);
+        let d = evaluate_dispatch("__tools_0__", &pending(&["send_wire"]), None, &[&p]);
         match d {
             DispatchDecision::RequireApproval { gated, .. } => assert_eq!(gated, vec!["send_wire"]),
             other => panic!("expected RequireApproval, got {other:?}"),
@@ -503,6 +514,7 @@ mod tests {
         let d = evaluate_dispatch(
             "__tools_0__",
             &pending(&["read_file", "send_wire", "log"]),
+            None,
             &[&p],
         );
         match d {
@@ -521,6 +533,7 @@ mod tests {
         let d = evaluate_dispatch(
             "__tools_0__",
             &pending(&["send_wire", "read_file", "wire_batch"]),
+            None,
             &[&p],
         );
         match d {
@@ -535,14 +548,19 @@ mod tests {
     fn block_wins_over_approval() {
         // Fail closed: a batch containing both must never merely hold.
         let p = policy(&["drop_table"], &["send_wire"]);
-        let d = evaluate_dispatch("__tools_0__", &pending(&["send_wire", "drop_table"]), &[&p]);
+        let d = evaluate_dispatch(
+            "__tools_0__",
+            &pending(&["send_wire", "drop_table"]),
+            None,
+            &[&p],
+        );
         assert!(matches!(d, DispatchDecision::Block { .. }));
     }
 
     #[test]
     fn glob_patterns_match_per_call() {
         let p = policy(&["admin_*"], &[]);
-        let d = evaluate_dispatch("__tools_0__", &pending(&["admin_delete"]), &[&p]);
+        let d = evaluate_dispatch("__tools_0__", &pending(&["admin_delete"]), None, &[&p]);
         assert!(matches!(d, DispatchDecision::Block { .. }));
     }
 
@@ -550,18 +568,54 @@ mod tests {
     fn empty_batch_is_allowed() {
         let p = policy(&["send_wire"], &[]);
         assert_eq!(
-            evaluate_dispatch("__tools_0__", &[], &[&p]),
+            evaluate_dispatch("__tools_0__", &[], None, &[&p]),
             DispatchDecision::Allow
         );
     }
 
     #[test]
-    fn node_policy_overrides_tenant_policy() {
-        // Sets are ordered least-specific to most-specific; the evaluator
-        // iterates in reverse, so the node layer wins.
+    fn a_node_approval_rule_does_not_downgrade_a_tenant_block() {
+        // The tenant layer is a ceiling: a node `require_approval_for` used to
+        // turn the tenant's block into an approval request, so the IR author
+        // could get a tenant-blocked tool run by asking someone to approve it.
         let tenant = policy(&["send_wire"], &[]);
         let node = policy(&[], &["send_wire"]);
-        let d = evaluate_dispatch("__tools_0__", &pending(&["send_wire"]), &[&tenant, &node]);
+        let d = evaluate_dispatch(
+            "__tools_0__",
+            &pending(&["send_wire"]),
+            Some(&tenant),
+            &[&node],
+        );
+        assert!(matches!(d, DispatchDecision::Block { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn a_tenant_gate_holds_a_call_the_ir_allows() {
+        let tenant = policy(&[], &["send_wire"]);
+        let d = evaluate_dispatch(
+            "__tools_0__",
+            &pending(&["read_file", "send_wire"]),
+            Some(&tenant),
+            &[&policy(&[], &[])],
+        );
+        match d {
+            DispatchDecision::RequireApproval { gated, .. } => assert_eq!(gated, vec!["send_wire"]),
+            other => panic!("expected RequireApproval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_node_approval_rule_still_downgrades_a_workflow_block() {
+        // Inside the IR the most specific layer still wins: its author owns
+        // both layers.
+        let workflow = policy(&["send_wire"], &[]);
+        let node = policy(&[], &["send_wire"]);
+        let d = evaluate_dispatch(
+            "__tools_0__",
+            &pending(&["send_wire"]),
+            None,
+            &[&workflow, &node],
+        );
         assert!(matches!(d, DispatchDecision::RequireApproval { .. }));
     }
 
