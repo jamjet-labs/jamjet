@@ -148,13 +148,18 @@ Agent Card at a URL the caller gives, so it is guarded: the URL must be
 addresses (no loopback, private, link-local, CGNAT or metadata ranges). The
 request is pinned to the addresses that were checked, ignores proxy
 environment variables (a proxy would resolve the name again), and does not
-follow redirects. The lookup, the connection and the read share a 10 s budget,
+follow redirects. The lookup, the connection and the read share one 10 s budget,
+the card URL is the base's scheme, host and port with the path
+`/.well-known/agent.json` (any other path, query or fragment is dropped),
 the card is capped at 256 KiB, and any fetch failure, including a name that
 resolves inward, returns the same message, so the route cannot be used to
 read internal services, map ports or list internal names. A URL refused for
 its scheme or host is a 400. For an agent on your own machine set
-`JAMJET_DISCOVERY_ALLOW_PRIVATE=1`, which also allows `http`; link-local
-metadata addresses stay refused, and the other limits stay.
+`JAMJET_DISCOVERY_ALLOW_PRIVATE=1`, which also allows `http`. Cloud metadata
+addresses stay refused: link-local, 100.100.100.200, fd00:ec2::254,
+fd20:ce::254, fd00:c1::a9fe:a9fe, and any IPv6 address that carries one of
+the IPv4 ones (IPv4-mapped, IPv4-compatible, NAT64, 6to4). The other limits
+stay.
 
 ---
 

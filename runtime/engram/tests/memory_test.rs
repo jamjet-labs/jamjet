@@ -179,3 +179,39 @@ async fn stats_works() {
     assert_eq!(stats.total_facts, 2, "total_facts should be 2");
     assert_eq!(stats.valid_facts, 2, "valid_facts should be 2");
 }
+
+// ---------------------------------------------------------------------------
+// One user's erasure leaves every other org's recall alone
+// ---------------------------------------------------------------------------
+
+/// Deleting a user in org A leaves org B's vectors, so org B still recalls
+/// its facts. The vector store's scoped delete cleared every org's vectors.
+#[tokio::test]
+async fn deleting_a_user_keeps_other_orgs_vectors() {
+    let mem = Memory::in_memory(Box::new(MockEmbeddingProvider::new(64)))
+        .await
+        .expect("in_memory");
+    let a = user_scope("org-a", "user-1");
+    let b = user_scope("org-b", "user-2");
+    mem.add_fact("The sky is blue", a.clone()).await.expect("a");
+    mem.add_fact("The sea is blue", b.clone()).await.expect("b");
+
+    mem.delete_user_data(a.clone()).await.expect("delete a");
+
+    let recall = |scope: Scope| RecallQuery {
+        query: "blue".to_string(),
+        scope: Some(scope),
+        max_results: 5,
+        ..Default::default()
+    };
+    let b_results = mem.recall(&recall(b.clone())).await.expect("recall b");
+    assert!(
+        !b_results.is_empty(),
+        "org B's fact is no longer recalled after org A's erasure"
+    );
+    let a_results = mem.recall(&recall(a.clone())).await.expect("recall a");
+    assert!(
+        a_results.is_empty(),
+        "org A's erased fact is still recalled"
+    );
+}

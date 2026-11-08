@@ -50,7 +50,7 @@ Pick one with `ENGRAM_LLM_PROVIDER=…` — the same binary handles all of them.
 | Agents lose memory across processes | **Durable by default** — SQLite or Postgres, crash-safe, portable |
 | MCP support is an afterthought | **MCP-native** — 7 tools exposed by a single binary |
 | No time-travel over what the agent knew | **Temporal knowledge graph** — every fact is scoped and timestamped |
-| Can't isolate memory per user or tenant | **First-class scopes** — org / user / session built into every query |
+| Memory for many users gets mixed up | **First-class scopes** — org / user / session built into every query (a rail, not isolation: see the REST notes) |
 
 ---
 
@@ -234,10 +234,17 @@ Off loopback it refuses to start without a token unless you pass
 `--allow-unauthenticated` (`ENGRAM_ALLOW_UNAUTHENTICATED=1`), and it refuses a
 token shorter than 16 characters, with fewer than 5 distinct characters, or
 that looks like a placeholder. Prefer the env var to `--auth-token`, which
-other users can see in the process list. The token is one shared secret, not
-bound to an org: whoever holds it can act in every org, so run one server per
-tenant to keep tenants apart. The Docker image sets `ENGRAM_HOST=0.0.0.0`, so
-REST mode there needs a token.
+other users can see in the process list. The Docker image sets
+`ENGRAM_HOST=0.0.0.0`, so REST mode there needs a token.
+
+Scopes are a safety rail, not isolation. The caller names the `org_id` and
+`user_id` on each request (in the query string or the MCP arguments), and
+the server takes them as given, so a scope keeps an honest caller's data
+apart, and nothing stops a caller from naming another org. The token is one
+shared secret, not bound to an org: whoever holds it can act in every org.
+One token is not safe to share between tenants; run one server per tenant to
+keep them apart. On a shared host or a CI runner, where other users or jobs
+can reach loopback, set `ENGRAM_AUTH_TOKEN` even on `127.0.0.1`.
 
 No server. No config. No Python sidecar. One binary.
 
