@@ -40,8 +40,10 @@
 //! HMAC mode reads `JAMJET_AUDIT_SIGNING_KEY` (raw UTF-8 bytes are the key):
 //!
 //! * set (non-empty) -> sign with it (secure).
-//! * else `JAMJET_AUDIT_ALLOW_INSECURE_KEY` set -> sign with the **built-in,
-//!   publicly-known dev key**, logging loudly at `warn`.
+//! * else `JAMJET_AUDIT_ALLOW_INSECURE_KEY` on (`1`, `true`, `yes`, `on`) ->
+//!   sign with the **built-in, publicly-known dev key**, logging loudly at
+//!   `warn`. `jamjet-server` refuses to start on a value that is not a
+//!   boolean.
 //! * else -> the signer is **unsigned/refused**: it does NOT sign (entries are
 //!   left unsigned and [`crate::verify_chain`] reports them as `Unsigned`) and
 //!   [`AuditSigner::verify`] always returns `false`. It logs loudly at `warn`.
@@ -84,14 +86,12 @@ pub const ED25519_KEY_FILE_ENV: &str = "JAMJET_AUDIT_ED25519_KEY_FILE";
 pub const ED25519_SIG_SPEC: &str = "jamjet.audit.entry/v1";
 
 /// Whether `JAMJET_AUDIT_ALLOW_INSECURE_KEY`'s value opts into the built-in
-/// dev key: `1`, `true`, `yes` or `on`, ignoring case. Anything else is no.
-/// This read any non-empty value as yes, so `=0` or `=false` signed the log
-/// with a key everyone knows.
+/// dev key, read as every switch is ([`jamjet_core::flag::parse_flag`]).
+/// `jamjet-server` refuses a value that is not a boolean at startup; here it
+/// does not opt in. This read any non-empty value as yes, so `=0` or
+/// `=false` signed the log with a key everyone knows.
 pub fn insecure_key_opt_in(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    jamjet_core::flag::parse_flag(ALLOW_INSECURE_KEY_ENV, Some(value)).unwrap_or(false)
 }
 
 /// The prefix of a stored Ed25519 entry signature: `ed25519:<kid>:<hex>`.

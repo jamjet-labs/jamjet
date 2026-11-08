@@ -1,5 +1,5 @@
 //! Startup checks for `jamjet-server`: boolean environment flags, the dev-mode
-//! bind check, and where the database is.
+//! bind check, the dev-mode request guard, and where the database is.
 //!
 //! Kept out of `main.rs` so each decision is a plain function a test can call.
 
@@ -10,32 +10,94 @@ use std::net::SocketAddr;
 /// loopback. Read only when dev mode is on.
 pub const DEV_MODE_ALLOW_REMOTE_ENV: &str = "JAMJET_DEV_MODE_ALLOW_REMOTE";
 
-/// Parse a boolean environment value. `None` (unset) is `false`.
-///
-/// `1`, `true`, `yes`, `on` are true; `0`, `false`, `no`, `off` and the empty
-/// string are false, ignoring case and surrounding space. Anything else is an
-/// error naming the variable, so a typo fails startup instead of being read
-/// as one or the other. `JAMJET_EMBED_WORKERS` used to be checked for
-/// presence only, so `JAMJET_EMBED_WORKERS=0` turned the pool on.
+/// Host names dev mode answers besides `localhost` and loopback addresses,
+/// comma-separated: `host.docker.internal`, a WSL or LAN name. Read only when
+/// dev mode is on.
+pub const DEV_ALLOWED_HOSTS_ENV: &str = "JAMJET_DEV_ALLOWED_HOSTS";
+
+/// Starts the in-process worker pool outside dev mode.
+pub const EMBED_WORKERS_ENV: &str = "JAMJET_EMBED_WORKERS";
+
+/// Starts the in-process cron scheduler outside dev mode.
+pub const EMBED_CRON_ENV: &str = "JAMJET_EMBED_CRON";
+
+/// Every boolean switch `jamjet-server` reads. [`check_flags`] refuses to
+/// start on a value of any of them that is not a boolean.
+pub const BOOL_FLAGS: &[&str] = &[
+    crate::config::DEV_MODE_ENV,
+    DEV_MODE_ALLOW_REMOTE_ENV,
+    EMBED_WORKERS_ENV,
+    EMBED_CRON_ENV,
+    crate::approvals::ALLOW_SELF_APPROVAL_ENV,
+    crate::auth::TENANT_TOKENS_AS_DEFAULT_ENV,
+    jamjet_audit::signer::ALLOW_INSECURE_KEY_ENV,
+];
+
+/// Parse a boolean environment value ([`jamjet_core::flag::parse_flag`], the
+/// one rule every switch follows). `JAMJET_EMBED_WORKERS` used to be checked
+/// for presence only, so `JAMJET_EMBED_WORKERS=0` turned the pool on.
 pub fn parse_flag(name: &str, raw: Option<&str>) -> Result<bool, String> {
-    let Some(raw) = raw else { return Ok(false) };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" | "" => Ok(false),
-        other => Err(format!(
-            "{name}={other:?} is not a boolean; use 1/true/yes/on or 0/false/no/off"
-        )),
-    }
+    jamjet_core::flag::parse_flag(name, raw)
 }
 
 /// [`parse_flag`] on the process environment.
 pub fn env_flag(name: &str) -> anyhow::Result<bool> {
-    let raw = match std::env::var(name) {
-        Ok(v) => Some(v),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(e) => anyhow::bail!("failed to read {name}: {e}"),
+    jamjet_core::flag::env_flag(name).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Refuse to start if any of [`BOOL_FLAGS`] holds a value that is not a
+/// boolean, naming it. Code deep in the engine reads the switches again and
+/// takes an unreadable one as off; this makes sure it never sees one.
+/// `JAMJET_DEV_MODE`, `JAMJET_ALLOW_SELF_APPROVAL` and
+/// `JAMJET_TENANT_TOKENS_AS_DEFAULT` used to accept only `1` or `true` and
+/// read `yes` as off.
+pub fn check_flags(get: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    for name in BOOL_FLAGS {
+        parse_flag(name, get(name).as_deref())?;
+    }
+    Ok(())
+}
+
+/// [`check_flags`] on the process environment.
+pub fn check_env_flags() -> anyhow::Result<()> {
+    for name in BOOL_FLAGS {
+        env_flag(name)?;
+    }
+    Ok(())
+}
+
+/// Parse [`DEV_ALLOWED_HOSTS_ENV`]: comma-separated host names or addresses,
+/// without a scheme, path or port. Empty entries are skipped; anything that
+/// is not a plain name is an error, so a URL pasted in does not silently
+/// allow nothing.
+pub fn parse_allowed_hosts(raw: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
     };
-    parse_flag(name, raw.as_deref()).map_err(|e| anyhow::anyhow!(e))
+    let mut hosts = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim_matches(|c: char| c.is_ascii_whitespace());
+        if entry.is_empty() {
+            continue;
+        }
+        let plain = entry
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'));
+        let has_port = !entry.starts_with('[') && entry.matches(':').count() == 1;
+        if !plain || has_port || entry.contains("..") {
+            return Err(format!(
+                "{DEV_ALLOWED_HOSTS_ENV}: {entry:?} is not a host name; give names or \
+                 addresses separated by commas, without a scheme, path or port"
+            ));
+        }
+        hosts.push(
+            entry
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_ascii_lowercase(),
+        );
+    }
+    Ok(hosts)
 }
 
 /// What dev mode may do on the addresses the server is about to bind.
@@ -84,72 +146,140 @@ pub fn check_dev_mode_bind(
     ))
 }
 
+/// The name in an HTTP `Host` (or authority), without its port: `[::1]:7700`
+/// gives `::1`. `None` if it is malformed.
+fn host_name(host: &str) -> Option<&str> {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        // `[::1]` or `[::1]:7700`
+        return match rest.split_once(']') {
+            Some((inner, tail)) if tail.is_empty() || tail.starts_with(':') => Some(inner),
+            _ => None,
+        };
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => Some(name),
+        Some(_) => None,
+        None => Some(host),
+    }
+}
+
 /// Whether an HTTP `Host` (or authority) names the local machine:
 /// `localhost` or a loopback address, with or without a port.
 pub fn is_loopback_host(host: &str) -> bool {
-    let host = host.trim();
-    let name = if let Some(rest) = host.strip_prefix('[') {
-        // `[::1]` or `[::1]:7700`
-        match rest.split_once(']') {
-            Some((inner, tail)) if tail.is_empty() || tail.starts_with(':') => inner,
-            _ => return false,
-        }
-    } else {
-        match host.rsplit_once(':') {
-            Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name,
-            Some(_) => return false,
-            None => host,
-        }
-    };
-    name.eq_ignore_ascii_case("localhost")
-        || name
-            .parse::<std::net::IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false)
+    host_name(host).is_some_and(|name| {
+        name.eq_ignore_ascii_case("localhost")
+            || name
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false)
+    })
 }
 
-/// In dev mode on loopback, answer only requests addressed to the local
-/// machine. Binding to 127.0.0.1 keeps other machines out, but not a web
-/// page: a page whose host name re-resolves to 127.0.0.1 (DNS rebinding) is
-/// then same-origin with the runtime, and dev mode has no token to stop its
-/// scripts registering workflows or approving runs. Such a request still
-/// carries the page's host name, so it is refused here.
-pub async fn require_loopback_host(
+/// Whether dev mode answers a request for `host`: the local machine, or a
+/// name in `allowed` ([`DEV_ALLOWED_HOSTS_ENV`]).
+pub fn is_allowed_host(host: &str, allowed: &[String]) -> bool {
+    is_loopback_host(host)
+        || host_name(host).is_some_and(|name| {
+            !name.is_empty() && allowed.iter().any(|a| a.eq_ignore_ascii_case(name))
+        })
+}
+
+/// Headers a proxy or tunnel adds. Dev mode refuses a request carrying any
+/// of them: ngrok (`--host-header=rewrite`) and cloudflared rewrite `Host`
+/// to `localhost`, so the Host check passes for a request from anywhere.
+pub const FORWARDING_HEADERS: &[&str] = &["forwarded", "x-forwarded-host", "x-forwarded-for"];
+
+/// Why dev mode refuses a request, or `None` to answer it.
+///
+/// Dev mode has no token to stop a caller, so it answers only a request
+/// addressed to this machine (or a name in `allowed`), not relayed by a
+/// proxy or tunnel, and not sent by a page of another site:
+///
+/// * `Host` must be allowed. A page whose host name re-resolves to 127.0.0.1
+///   (DNS rebinding) is same-origin with the runtime, but its requests carry
+///   its own host name.
+/// * No [`FORWARDING_HEADERS`].
+/// * Not cross-site: `Sec-Fetch-Site: cross-site`, or an `Origin` that is not
+///   an allowed host (`null` included). A form or `fetch` from any page can
+///   POST to 127.0.0.1, and a POST with no body (cancel a run, deactivate an
+///   agent) needs nothing the browser would stop.
+pub fn dev_refusal(
+    headers: &axum::http::HeaderMap,
+    authority: Option<&str>,
+    allowed: &[String],
+) -> Option<&'static str> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let host = header("host").or(authority);
+    if !host.is_some_and(|h| is_allowed_host(h, allowed)) {
+        return Some("dev mode answers only requests addressed to localhost, a loopback address or a name in JAMJET_DEV_ALLOWED_HOSTS");
+    }
+    if FORWARDING_HEADERS.iter().any(|h| headers.contains_key(*h)) {
+        return Some("dev mode refuses requests relayed by a proxy or tunnel (Forwarded, X-Forwarded-Host, X-Forwarded-For)");
+    }
+    let cross_site = header("sec-fetch-site").is_some_and(|v| v.eq_ignore_ascii_case("cross-site"));
+    let foreign_origin = headers.get("origin").is_some_and(|o| {
+        let origin = o.to_str().unwrap_or("");
+        let authority = origin.split_once("://").map(|(_, rest)| rest).unwrap_or("");
+        !is_allowed_host(authority, allowed)
+    });
+    if cross_site || foreign_origin {
+        return Some("dev mode refuses requests from a page of another site");
+    }
+    None
+}
+
+/// The dev-mode request guard ([`dev_refusal`]), on every dev-mode router,
+/// whatever the bind. [`DEV_MODE_ALLOW_REMOTE_ENV`] allows a remote bind; it
+/// does not turn this off. Inside Docker the bind is `0.0.0.0` and dev mode
+/// has no token, so this is all that stops a rebound page.
+pub async fn require_local_request(
+    axum::extract::State(allowed): axum::extract::State<std::sync::Arc<Vec<String>>>,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let host = req
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_string)
-        .or_else(|| req.uri().authority().map(|a| a.to_string()));
-    if host.as_deref().is_some_and(is_loopback_host) {
-        return next.run(req).await;
+    let authority = req.uri().authority().map(|a| a.to_string());
+    match dev_refusal(req.headers(), authority.as_deref(), &allowed) {
+        None => next.run(req).await,
+        Some(reason) => (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response(),
     }
-    (
-        axum::http::StatusCode::FORBIDDEN,
-        axum::Json(serde_json::json!({
-            "error": format!(
-                "dev mode answers only requests addressed to localhost or a loopback \
-                 address; set {DEV_MODE_ALLOW_REMOTE_ENV}=1 to accept other host names"
-            )
-        })),
-    )
-        .into_response()
+}
+
+/// Put [`require_local_request`] on a dev-mode router.
+pub fn guard_dev_router(router: axum::Router, allowed: Vec<String>) -> axum::Router {
+    router.layer(axum::middleware::from_fn_with_state(
+        std::sync::Arc::new(allowed),
+        require_local_request,
+    ))
 }
 
 /// The SQLite database URL: `DATABASE_URL`, then the config, then
 /// `.jamjet/runtime.db` in the working directory (created if missing).
 pub fn database_url(config: &ApiConfig) -> String {
+    let url = existing_database_url(config);
+    if std::env::var("DATABASE_URL").is_err() && config.database_url.is_none() {
+        std::fs::create_dir_all(".jamjet").ok();
+    }
+    url
+}
+
+/// [`database_url`] without creating `.jamjet`: for the token commands,
+/// which open a database the server already made and must not leave a
+/// directory behind when there is none.
+pub fn existing_database_url(config: &ApiConfig) -> String {
     std::env::var("DATABASE_URL")
         .ok()
         .or_else(|| config.database_url.clone())
         .unwrap_or_else(|| {
-            let dir = std::path::PathBuf::from(".jamjet");
-            std::fs::create_dir_all(&dir).ok();
-            format!("sqlite://{}", dir.join("runtime.db").display())
+            format!(
+                "sqlite://{}",
+                std::path::Path::new(".jamjet").join("runtime.db").display()
+            )
         })
 }
 
@@ -247,29 +377,180 @@ mod tests {
         }
     }
 
+    /// A dev-mode router guarded with `allowed`, answering `method path`
+    /// with `headers`.
+    async fn guarded(
+        allowed: &[&str],
+        method: &str,
+        headers: &[(&str, &str)],
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let app = guard_dev_router(
+            axum::Router::new()
+                .route("/health", axum::routing::get(|| async { "ok" }))
+                .route(
+                    "/executions/x/cancel",
+                    axum::routing::post(|| async { "ok" }),
+                ),
+            allowed.iter().map(|h| h.to_string()).collect(),
+        );
+        let path = if method == "POST" {
+            "/executions/x/cancel"
+        } else {
+            "/health"
+        };
+        let mut req = axum::http::Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        app.oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
     #[tokio::test]
     async fn dev_mode_refuses_a_request_for_another_host_name() {
-        use tower::ServiceExt;
-        let app = axum::Router::new()
-            .route("/health", axum::routing::get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(require_loopback_host));
-        let status = |host: &'static str| {
-            let app = app.clone();
-            async move {
-                let mut req = axum::http::Request::get("/health");
-                if !host.is_empty() {
-                    req = req.header("host", host);
-                }
-                app.oneshot(req.body(axum::body::Body::empty()).unwrap())
-                    .await
-                    .unwrap()
-                    .status()
-            }
-        };
-        assert_eq!(status("localhost:7700").await, 200);
-        assert_eq!(status("127.0.0.1:7700").await, 200);
-        assert_eq!(status("rebound.evil.example:7700").await, 403);
-        assert_eq!(status("").await, 403, "no host at all is refused");
+        assert_eq!(
+            guarded(&[], "GET", &[("host", "localhost:7700")]).await,
+            200
+        );
+        assert_eq!(
+            guarded(&[], "GET", &[("host", "127.0.0.1:7700")]).await,
+            200
+        );
+        assert_eq!(guarded(&[], "GET", &[("host", "[::1]:7700")]).await, 200);
+        assert_eq!(
+            guarded(&[], "GET", &[("host", "rebound.evil.example:7700")]).await,
+            403
+        );
+        assert_eq!(guarded(&[], "GET", &[]).await, 403, "no host at all");
+    }
+
+    #[tokio::test]
+    async fn a_listed_host_is_answered_and_no_other() {
+        let allowed = ["host.docker.internal"];
+        assert_eq!(
+            guarded(&allowed, "GET", &[("host", "host.docker.internal:7700")]).await,
+            200
+        );
+        assert_eq!(
+            guarded(&allowed, "GET", &[("host", "HOST.DOCKER.INTERNAL")]).await,
+            200
+        );
+        for host in [
+            "rebound.evil.example",
+            "host.docker.internal.evil.example",
+            "evil-host.docker.internal",
+        ] {
+            assert_eq!(
+                guarded(&allowed, "GET", &[("host", host)]).await,
+                403,
+                "{host}"
+            );
+        }
+    }
+
+    /// ngrok `--host-header=rewrite` and cloudflared send `Host: localhost`
+    /// for a request from anywhere; the forwarding headers give them away.
+    #[tokio::test]
+    async fn a_request_through_a_tunnel_is_refused() {
+        for (k, v) in [
+            ("x-forwarded-host", "abc.ngrok.app"),
+            ("x-forwarded-for", "203.0.113.9"),
+            ("forwarded", "for=203.0.113.9;host=abc.ngrok.app"),
+        ] {
+            assert_eq!(
+                guarded(&[], "GET", &[("host", "localhost:7700"), (k, v)]).await,
+                403,
+                "{k}"
+            );
+        }
+    }
+
+    /// A page of any site can POST to 127.0.0.1, and a POST with no body
+    /// needs nothing the browser would stop.
+    #[tokio::test]
+    async fn a_cross_site_request_is_refused() {
+        let local = ("host", "127.0.0.1:7700");
+        for extra in [
+            ("sec-fetch-site", "cross-site"),
+            ("origin", "https://evil.example"),
+            ("origin", "null"),
+            ("origin", "http://localhost.evil.example"),
+        ] {
+            assert_eq!(
+                guarded(&[], "POST", &[local, extra]).await,
+                403,
+                "{extra:?}"
+            );
+        }
+        // A local page (a dev UI on another port) and a client that sends
+        // neither header are answered.
+        for extra in [
+            ("origin", "http://localhost:3000"),
+            ("sec-fetch-site", "same-site"),
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-site", "none"),
+        ] {
+            assert_eq!(
+                guarded(&[], "POST", &[local, extra]).await,
+                200,
+                "{extra:?}"
+            );
+        }
+        assert_eq!(guarded(&[], "POST", &[local]).await, 200);
+    }
+
+    #[test]
+    fn allowed_hosts_are_plain_names() {
+        assert_eq!(
+            parse_allowed_hosts(Some(" host.docker.internal, ,My-PC.local,[fd00::1]")),
+            Ok(vec![
+                "host.docker.internal".to_string(),
+                "my-pc.local".to_string(),
+                "fd00::1".to_string()
+            ])
+        );
+        assert_eq!(parse_allowed_hosts(None), Ok(vec![]));
+        for bad in [
+            "http://host.docker.internal",
+            "host.docker.internal:7700",
+            "host/path",
+            "*.example",
+            "a b",
+            "a..b",
+        ] {
+            let err = parse_allowed_hosts(Some(bad)).unwrap_err();
+            assert!(err.contains(DEV_ALLOWED_HOSTS_ENV), "{bad}: {err}");
+        }
+    }
+
+    /// Every switch: a value that is not a boolean stops startup, naming it.
+    /// `JAMJET_DEV_MODE`, `JAMJET_ALLOW_SELF_APPROVAL` and
+    /// `JAMJET_TENANT_TOKENS_AS_DEFAULT` read `yes` as off before.
+    #[test]
+    fn every_switch_refuses_a_value_that_is_not_a_boolean() {
+        assert!(check_flags(|_| None).is_ok());
+        assert!(check_flags(|_| Some("yes".into())).is_ok());
+        for name in BOOL_FLAGS {
+            let err = check_flags(|n| (n == *name).then(|| "enabled".to_string())).unwrap_err();
+            assert!(err.contains(name), "{name}: {err}");
+        }
+        for name in [
+            "JAMJET_DEV_MODE",
+            "JAMJET_DEV_MODE_ALLOW_REMOTE",
+            "JAMJET_EMBED_WORKERS",
+            "JAMJET_EMBED_CRON",
+            "JAMJET_ALLOW_SELF_APPROVAL",
+            "JAMJET_TENANT_TOKENS_AS_DEFAULT",
+            "JAMJET_AUDIT_ALLOW_INSECURE_KEY",
+        ] {
+            assert!(
+                BOOL_FLAGS.contains(&name),
+                "{name} is not checked at startup"
+            );
+        }
     }
 
     #[test]

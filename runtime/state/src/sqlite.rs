@@ -19,6 +19,14 @@ pub struct SqliteBackend {
     pool: SqlitePool,
 }
 
+/// A token [`SqliteBackend::revoke_token`] revoked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokedToken {
+    pub tenant_id: String,
+    pub role: String,
+    pub name: String,
+}
+
 impl SqliteBackend {
     /// Connect to the SQLite database at `database_url` and return a backend.
     /// `database_url` is a SQLx-compatible URL, e.g. `sqlite:///path/to/db.sqlite3`.
@@ -70,17 +78,24 @@ impl SqliteBackend {
         Ok(Self { pool })
     }
 
-    /// Revoke the API token with this id. `Ok(false)` when there is no such
-    /// token, or it was already revoked.
-    pub async fn revoke_token(&self, id: &str) -> BackendResult<bool> {
-        let done =
-            sqlx::query("UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
-                .bind(Utc::now().to_rfc3339())
-                .bind(id)
-                .execute(&self.pool)
-                .await
-                .map_err(map_db_err)?;
-        Ok(done.rows_affected() == 1)
+    /// Revoke the API token with this id, returning what was revoked (its
+    /// tenant, role and name, for the audit record). `Ok(None)` when there is
+    /// no such token, or it was already revoked.
+    pub async fn revoke_token(&self, id: &str) -> BackendResult<Option<RevokedToken>> {
+        let row = sqlx::query(
+            "UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL \
+             RETURNING tenant_id, role, name",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        Ok(row.map(|r| RevokedToken {
+            tenant_id: r.get("tenant_id"),
+            role: r.get("role"),
+            name: r.get("name"),
+        }))
     }
 
     /// Run embedded migrations against the connected database.

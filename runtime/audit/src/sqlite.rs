@@ -49,6 +49,51 @@ pub struct SqliteAuditBackend {
     pool: SqlitePool,
 }
 
+const INSERT_COLUMNS: &str = "(id, event_id, execution_id, sequence, event_type, \
+     actor_id, actor_type, tool_call_hash, policy_decision, \
+     http_request_id, http_method, http_path, ip_address, \
+     created_at, raw_event, tenant_id, expires_at, redacted, \
+     prev_hash, entry_hash, signature)";
+
+const INSERT_PLACEHOLDERS: &str = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
+
+const INSERT_VALUES: &str = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+/// The newest entry's hash: the order `GET /audit` lists entries in, with
+/// insertion order breaking a tie.
+const HEAD_SQL: &str =
+    "SELECT entry_hash FROM audit_log ORDER BY created_at DESC, rowid DESC LIMIT 1";
+
+/// Bind an entry's 21 columns, in [`INSERT_COLUMNS`] order.
+fn bind_entry<'q>(
+    q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    entry: &AuditLogEntry,
+) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>, AuditError> {
+    let raw = serde_json::to_string(&entry.raw_event)
+        .map_err(|e| AuditError::Serialization(e.to_string()))?;
+    Ok(q.bind(entry.id.to_string())
+        .bind(entry.event_id.to_string())
+        .bind(entry.execution_id.clone())
+        .bind(entry.sequence)
+        .bind(entry.event_type.clone())
+        .bind(entry.actor_id.clone())
+        .bind(actor_type_str(&entry.actor_type))
+        .bind(entry.tool_call_hash.clone())
+        .bind(entry.policy_decision.clone())
+        .bind(entry.http_request_id.clone())
+        .bind(entry.http_method.clone())
+        .bind(entry.http_path.clone())
+        .bind(entry.ip_address.clone())
+        .bind(entry.created_at.to_rfc3339())
+        .bind(raw)
+        .bind(entry.tenant_id.clone())
+        .bind(entry.expires_at.map(|dt| dt.to_rfc3339()))
+        .bind(entry.redacted as i32)
+        .bind(entry.prev_hash.clone())
+        .bind(entry.entry_hash.clone())
+        .bind(entry.signature.clone()))
+}
+
 impl SqliteAuditBackend {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -103,48 +148,39 @@ impl SqliteAuditBackend {
 #[async_trait]
 impl AuditBackend for SqliteAuditBackend {
     async fn append(&self, entry: AuditLogEntry) -> Result<(), AuditError> {
-        let raw = serde_json::to_string(&entry.raw_event)
-            .map_err(|e| AuditError::Serialization(e.to_string()))?;
-
-        let expires_at = entry.expires_at.map(|dt| dt.to_rfc3339());
-
-        sqlx::query(
-            r#"
-            INSERT OR IGNORE INTO audit_log
-                (id, event_id, execution_id, sequence, event_type,
-                 actor_id, actor_type, tool_call_hash, policy_decision,
-                 http_request_id, http_method, http_path, ip_address,
-                 created_at, raw_event, tenant_id, expires_at, redacted,
-                 prev_hash, entry_hash, signature)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(entry.id.to_string())
-        .bind(entry.event_id.to_string())
-        .bind(&entry.execution_id)
-        .bind(entry.sequence)
-        .bind(&entry.event_type)
-        .bind(&entry.actor_id)
-        .bind(actor_type_str(&entry.actor_type))
-        .bind(&entry.tool_call_hash)
-        .bind(&entry.policy_decision)
-        .bind(&entry.http_request_id)
-        .bind(&entry.http_method)
-        .bind(&entry.http_path)
-        .bind(&entry.ip_address)
-        .bind(entry.created_at.to_rfc3339())
-        .bind(raw)
-        .bind(&entry.tenant_id)
-        .bind(expires_at.as_deref())
-        .bind(entry.redacted as i32)
-        .bind(&entry.prev_hash)
-        .bind(&entry.entry_hash)
-        .bind(&entry.signature)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| AuditError::Database(e.to_string()))?;
+        let sql =
+            format!("INSERT OR IGNORE INTO audit_log {INSERT_COLUMNS} VALUES {INSERT_VALUES}");
+        bind_entry(sqlx::query(&sql), &entry)?
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AuditError::Database(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// One statement, so SQLite's write lock makes the check and the insert
+    /// atomic against every other writer of the file, in this process or
+    /// another.
+    async fn append_linked(&self, entry: AuditLogEntry) -> Result<bool, AuditError> {
+        let sql = format!(
+            "INSERT OR IGNORE INTO audit_log {INSERT_COLUMNS} SELECT {INSERT_PLACEHOLDERS} \
+             WHERE ({HEAD_SQL}) IS ?"
+        );
+        let prev = entry.prev_hash.clone();
+        let done = bind_entry(sqlx::query(&sql), &entry)?
+            .bind(prev)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AuditError::Database(e.to_string()))?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn head(&self) -> Result<Option<String>, AuditError> {
+        sqlx::query_scalar::<_, Option<String>>(HEAD_SQL)
+            .fetch_optional(&self.pool)
+            .await
+            .map(Option::flatten)
+            .map_err(|e| AuditError::Database(e.to_string()))
     }
 
     async fn query(&self, q: &AuditQuery) -> Result<Vec<AuditLogEntry>, AuditError> {

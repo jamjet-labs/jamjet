@@ -43,7 +43,14 @@ async fn main() -> anyhow::Result<()> {
 
     // `token create` and `help` run and exit; no arguments serves.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match jamjet_api::cli::parse_args(&args) {
+    let command = jamjet_api::cli::parse_args(&args);
+    // Before anything reads one: a switch set to something that is not a
+    // boolean stops the server (and the token commands, which seal into the
+    // audit log) instead of being read as off.
+    if !matches!(command, Ok(Command::Help) | Err(_)) {
+        startup::check_env_flags()?;
+    }
+    match command {
         Ok(Command::Serve) => {}
         Ok(Command::Help) => {
             println!("{}", jamjet_api::cli::USAGE);
@@ -65,6 +72,16 @@ async fn main() -> anyhow::Result<()> {
     // so a host name cannot resolve to loopback for the check and elsewhere
     // for the bind.
     let mut dev_addrs: Vec<std::net::SocketAddr> = Vec::new();
+    let dev_allowed_hosts = if config.dev_mode {
+        startup::parse_allowed_hosts(
+            std::env::var(startup::DEV_ALLOWED_HOSTS_ENV)
+                .ok()
+                .as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?
+    } else {
+        Vec::new()
+    };
     let remote_dev_mode_allowed = if config.dev_mode {
         dev_addrs = tokio::net::lookup_host(&bind_addr)
             .await
@@ -78,8 +95,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         false
     };
-    let embed_workers = startup::env_flag("JAMJET_EMBED_WORKERS")?;
-    let embed_cron = startup::env_flag("JAMJET_EMBED_CRON")?;
+    let embed_workers = startup::env_flag(startup::EMBED_WORKERS_ENV)?;
+    let embed_cron = startup::env_flag(startup::EMBED_CRON_ENV)?;
 
     // Telemetry — installs OTLP trace + metric pipelines when
     // OTEL_EXPORTER_OTLP_ENDPOINT is set, otherwise falls back to plain tracing.
@@ -109,8 +126,10 @@ async fn main() -> anyhow::Result<()> {
         warn!(
             bind = %bind_addr,
             "DEV MODE IS REACHABLE FROM OTHER MACHINES: authentication is off and {}=1 is set. \
-             Anyone who can reach this address can register workflows, start runs and approve them.",
-            startup::DEV_MODE_ALLOW_REMOTE_ENV
+             Anyone who can reach this address can register workflows, start runs and approve them. \
+             Requests must still name localhost, a loopback address or a host in {}.",
+            startup::DEV_MODE_ALLOW_REMOTE_ENV,
+            startup::DEV_ALLOWED_HOSTS_ENV
         );
     }
 
@@ -284,10 +303,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let router = build_router_with_opts(state, config.dev_mode);
-    // Dev mode on loopback answers only requests addressed to this machine
-    // (DNS rebinding; see `startup::require_loopback_host`).
-    let router = if config.dev_mode && !remote_dev_mode_allowed {
-        router.layer(axum::middleware::from_fn(startup::require_loopback_host))
+    // Dev mode answers only requests addressed to this machine (or a name in
+    // JAMJET_DEV_ALLOWED_HOSTS), not relayed and not cross-site, on any bind:
+    // see `startup::dev_refusal`.
+    let router = if config.dev_mode {
+        startup::guard_dev_router(router, dev_allowed_hosts)
     } else {
         router
     };

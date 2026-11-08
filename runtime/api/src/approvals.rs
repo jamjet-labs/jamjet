@@ -37,6 +37,9 @@ pub struct ApprovalSubmission {
     pub dev_mode: bool,
 }
 
+/// Lets the principal that started a run approve it.
+pub const ALLOW_SELF_APPROVAL_ENV: &str = "JAMJET_ALLOW_SELF_APPROVAL";
+
 /// Install-wide approval rules, read once at startup into `AppState`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApprovalPolicy {
@@ -47,12 +50,13 @@ pub struct ApprovalPolicy {
 }
 
 impl ApprovalPolicy {
-    /// Read `JAMJET_ALLOW_SELF_APPROVAL` (`1` or `true`). Anything else,
-    /// including unset or unparseable, enforces separation of duties.
+    /// Read [`ALLOW_SELF_APPROVAL_ENV`], a boolean switch
+    /// ([`jamjet_core::flag`]). `jamjet-server` refuses a value that is not a
+    /// boolean before it gets here; a library caller reads it as off, which
+    /// enforces separation of duties.
     pub fn from_env() -> Self {
         Self {
-            allow_self_approval: std::env::var("JAMJET_ALLOW_SELF_APPROVAL")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            allow_self_approval: jamjet_core::flag::env_flag(ALLOW_SELF_APPROVAL_ENV)
                 .unwrap_or(false),
         }
     }

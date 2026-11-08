@@ -19,9 +19,11 @@ Signing key (honest, fail-closed posture — mirrors the Rust signer, I4)
 The HMAC key is resolved at emission time:
 
 * ``JAMJET_AUDIT_SIGNING_KEY`` set (non-empty)  -> sign with it (secure).
-* else ``JAMJET_AUDIT_ALLOW_INSECURE_KEY`` set  -> sign with the *public*
+* else ``JAMJET_AUDIT_ALLOW_INSECURE_KEY`` on (``1``, ``true``, ``yes``,
+  ``on``)                                        -> sign with the *public*
   built-in dev key, with a loud warning. A deliberate, explicit opt-in to an
-  insecure key — never a silent default.
+  insecure key — never a silent default. A value that is not a boolean
+  raises :class:`ValueError`.
 * else (no key, no opt-in)                      -> entries are still chained
   (tamper-evident linkage) but left **UNSIGNED** (``signature is None``) with a
   one-time loud warning. :func:`verify_chain` reports such entries as
@@ -43,6 +45,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+
+from jamjet.flags import parse_flag
 
 # Field separator for canonical content hashing — a control byte that never
 # appears in our textual field values, so concatenation is unambiguous (matches
@@ -108,14 +112,15 @@ class AuditSigner:
         return hmac.compare_digest(expected, signature_hex)
 
 
-def insecure_key_opt_in(value: str) -> bool:
+def insecure_key_opt_in(value: str | None) -> bool:
     """Whether a ``JAMJET_AUDIT_ALLOW_INSECURE_KEY`` value opts into the dev key.
 
-    ``1``, ``true``, ``yes`` or ``on``, ignoring case. Anything else is no.
-    Any non-empty value used to count, so ``=0`` signed with the public key.
-    Mirrors ``insecure_key_opt_in`` in ``runtime/audit/src/signer.rs``.
+    Read by :func:`jamjet.flags.parse_flag`, as the runtime reads it: ``1``,
+    ``true``, ``yes`` or ``on`` opt in, ``0``, ``false``, ``no``, ``off`` or
+    unset do not, and anything else raises :class:`ValueError`. Any non-empty
+    value used to count, so ``=0`` signed with the public key.
     """
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    return parse_flag(ALLOW_INSECURE_KEY_ENV, value)
 
 
 def resolve_signer() -> AuditSigner:
@@ -124,7 +129,7 @@ def resolve_signer() -> AuditSigner:
     key = os.environ.get(SIGNING_KEY_ENV)
     if key:
         return AuditSigner(key.encode("utf-8"))
-    if insecure_key_opt_in(os.environ.get(ALLOW_INSECURE_KEY_ENV, "")):
+    if insecure_key_opt_in(os.environ.get(ALLOW_INSECURE_KEY_ENV)):
         if not _warned_insecure:
             _warned_insecure = True
             warnings.warn(

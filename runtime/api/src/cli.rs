@@ -6,6 +6,7 @@
 //! request until someone wrote a row into `api_tokens` by hand.
 
 use crate::config::ApiConfig;
+use jamjet_audit::{ActorType, AuditEnricher, AuditRecord, SqliteAuditBackend};
 use jamjet_state::{ApiToken, SqliteBackend, StateBackend, TenantId, DEFAULT_TENANT};
 
 pub const USAGE: &str = "\
@@ -22,7 +23,9 @@ Roles: operator, developer, reviewer, viewer.
 The token commands open the database the server uses: DATABASE_URL, or
 .jamjet/runtime.db in the working directory. It must exist, so start the
 server against it once first. Only the token's SHA-256 hash is stored; the
-token itself is printed once, on stdout.";
+token itself is printed once, on stdout. Each issue and revocation is sealed
+into the audit log (token_issued, token_revoked); run them with the audit
+signing key the server uses, or the entry is left unsigned.";
 
 /// The roles a token may have, as `api_tokens.role` stores them.
 pub const ROLES: &[&str] = &["operator", "developer", "reviewer", "viewer"];
@@ -102,6 +105,15 @@ fn parse_token_create(args: Vec<&str>) -> Result<Command, String> {
     if name.trim().is_empty() {
         return Err("--name must not be empty".into());
     }
+    // As for every identifier the engine records: the name and tenant reach
+    // the audit log, and an invisible character makes a name read as another.
+    for (flag, value) in [("--tenant", &tenant), ("--name", &name)] {
+        if value.chars().any(jamjet_ir::is_forbidden_identifier_char) {
+            return Err(format!(
+                "{flag} must not contain control characters or invisible format characters"
+            ));
+        }
+    }
     Ok(Command::TokenCreate(TokenRequest { role, tenant, name }))
 }
 
@@ -139,12 +151,91 @@ pub async fn create_token(
         .map_err(|e| anyhow::anyhow!("failed to create the token: {e}"))
 }
 
+/// The audit log of the database at `database_url`, signed as the server's
+/// environment says (`AuditSigner::from_env`).
+async fn audit_log(database_url: &str) -> anyhow::Result<AuditEnricher> {
+    let backend = SqliteAuditBackend::open(database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot open the audit log in {database_url}: {e}"))?;
+    let audit = AuditEnricher::new(std::sync::Arc::new(backend));
+    if !audit.signer().can_sign() {
+        eprintln!(
+            "warning: no audit signing key in this environment, so the audit entry is \
+             left unsigned; run with the key the server uses"
+        );
+    }
+    Ok(audit)
+}
+
+/// The audit record of a token issued or revoked. Separation of duties is
+/// keyed on the token id (`token:<id>`), so who holds which token must be on
+/// record, a reviewer token minted for oneself included. The command runs
+/// with database access, not a token, so the actor is `cli`.
+pub fn token_record(
+    event_type: &str,
+    id: &str,
+    tenant: &str,
+    role: &str,
+    name: &str,
+) -> AuditRecord {
+    AuditRecord {
+        event_type: event_type.to_string(),
+        actor_id: "cli".to_string(),
+        actor_type: ActorType::Human,
+        tenant_id: tenant.to_string(),
+        detail: serde_json::json!({
+            "type": event_type,
+            "token_id": id,
+            "principal": format!("token:{id}"),
+            "role": role,
+            "tenant_id": tenant,
+            "name": name,
+        }),
+    }
+}
+
+/// Issue a token and seal `token_issued` into the audit log. A token the log
+/// cannot record is revoked again and the command fails: no token is handed
+/// out off the record.
+pub async fn issue_token(
+    database_url: &str,
+    req: &TokenRequest,
+) -> anyhow::Result<(String, ApiToken)> {
+    let audit = audit_log(database_url).await?;
+    let (token, info) = create_token(database_url, req).await?;
+    let record = token_record(
+        "token_issued",
+        &info.id,
+        &info.tenant_id,
+        &info.role,
+        &info.name,
+    );
+    if let Err(e) = audit.seal_record(record).await {
+        let undone = SqliteBackend::connect_existing(database_url)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?
+            .revoke_token(&info.id)
+            .await;
+        anyhow::bail!(
+            "the audit log could not record the token, so it was not issued ({e}){}",
+            match undone {
+                Ok(Some(_)) => String::new(),
+                _ => format!(
+                    "; revoking it failed too, revoke {} with `jamjet-server token revoke {}`",
+                    info.id, info.id
+                ),
+            }
+        );
+    }
+    Ok((token, info))
+}
+
 /// `jamjet-server token create`: issue the token and print it on stdout, and
 /// everything else on stderr, so `TOKEN=$(jamjet-server token create ...)`
 /// captures only the token.
 pub async fn run_token_create(req: &TokenRequest) -> anyhow::Result<()> {
     let database_url = token_database()?;
-    let (token, info) = create_token(&database_url, req).await?;
+    let (token, info) = issue_token(&database_url, req).await?;
     // The id first: if stdout is closed, the operator still learns which
     // token to revoke.
     eprintln!(
@@ -185,22 +276,42 @@ fn token_database() -> anyhow::Result<String> {
              other process can add one. Use SQLite (unset STORAGE_BACKEND) to use tokens."
         );
     }
-    Ok(crate::startup::database_url(&ApiConfig::default()))
+    // Not `database_url`: that creates `.jamjet`, and a command run in the
+    // wrong directory must not leave one behind.
+    Ok(crate::startup::existing_database_url(&ApiConfig::default()))
+}
+
+/// Revoke a token and seal `token_revoked` into the audit log. The token is
+/// revoked whether or not the log records it (revoking is the safe side);
+/// a record that fails is reported as an error.
+pub async fn revoke_token(database_url: &str, id: &str) -> anyhow::Result<()> {
+    let audit = audit_log(database_url).await?;
+    let backend = SqliteBackend::connect_existing(database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let Some(revoked) = backend
+        .revoke_token(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to revoke the token: {e}"))?
+    else {
+        anyhow::bail!("no active token {id:?} in {database_url}");
+    };
+    let record = token_record(
+        "token_revoked",
+        id,
+        &revoked.tenant_id,
+        &revoked.role,
+        &revoked.name,
+    );
+    audit.seal_record(record).await.map_err(|e| {
+        anyhow::anyhow!("token {id} is revoked, but the audit log could not record it: {e}")
+    })
 }
 
 /// `jamjet-server token revoke <id>`.
 pub async fn run_token_revoke(id: &str) -> anyhow::Result<()> {
     let database_url = token_database()?;
-    let backend = SqliteBackend::connect_existing(&database_url)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-    if !backend
-        .revoke_token(id)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to revoke the token: {e}"))?
-    {
-        anyhow::bail!("no active token {id:?} in {database_url}");
-    }
+    revoke_token(&database_url, id).await?;
     eprintln!("Revoked token {id}. It is refused from the next request on.");
     Ok(())
 }

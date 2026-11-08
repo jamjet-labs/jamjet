@@ -1,6 +1,6 @@
 //! `AuditEnricher` — derives audit metadata from events and writes to the audit log.
 
-use crate::backend::{AuditBackend, AuditQuery};
+use crate::backend::AuditBackend;
 use crate::entry::{ActorType, AuditLogEntry};
 use crate::signer::AuditSigner;
 use chrono::Duration;
@@ -109,17 +109,6 @@ impl AuditEnricher {
         self.seal_failures.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// The `entry_hash` of the most recent entry already in the log, used to
-    /// resume the chain across process restarts. `None` for an empty log.
-    async fn latest_entry_hash(&self) -> Option<String> {
-        let q = AuditQuery {
-            limit: 1,
-            ..Default::default()
-        };
-        let latest = self.backend.query(&q).await.ok()?.into_iter().next()?;
-        latest.entry_hash
-    }
-
     /// Derive audit metadata from an event and append it to the audit log.
     ///
     /// Call this after every `StateBackend::append_event` call, passing
@@ -211,28 +200,90 @@ impl AuditEnricher {
             }
         }
 
-        // Seal the entry into the tamper-evident chain: link it to the
-        // previous entry's hash, then sign. Held under the chain lock for the
-        // whole read-head -> seal -> append -> advance-head sequence so that
-        // concurrent appends produce one linear chain.
-        let mut chain = self.chain.lock().await;
-        if !chain.seeded {
-            chain.head = self.latest_entry_hash().await;
-            chain.seeded = true;
-        }
-        entry.seal(chain.head.clone(), &self.signer);
-        let sealed_hash = entry.entry_hash.clone();
-
-        match self.backend.append(entry).await {
-            // Advance the head only after a durable append, so a failed write
-            // never leaves a gap that the next entry would link straight past.
-            Ok(()) => {
-                chain.head = sealed_hash;
-                Ok(())
-            }
-            Err(e) => Err(format!("audit log write failed: {e}")),
-        }
+        self.seal_and_append(entry).await
     }
+
+    /// Seal a record that is not an execution event (a token issued or
+    /// revoked) into the same chain, as [`try_enrich_and_append`] does an
+    /// event. It has no execution: `execution_id` is empty and `sequence` 0.
+    ///
+    /// [`try_enrich_and_append`]: Self::try_enrich_and_append
+    pub async fn seal_record(&self, record: AuditRecord) -> Result<(), String> {
+        let mut entry = AuditLogEntry::new(
+            uuid::Uuid::new_v4(),
+            String::new(),
+            0,
+            record.event_type,
+            record.actor_id,
+            record.actor_type,
+            record.detail,
+        );
+        entry.tenant_id = record.tenant_id;
+        let out = self.seal_and_append(entry).await;
+        if out.is_err() {
+            self.seal_failures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        out
+    }
+
+    /// Seal `entry` onto the chain and append it.
+    ///
+    /// Under the chain lock for the whole read-head -> seal -> append ->
+    /// advance-head sequence, so this process's appends form one line. Another
+    /// process may append to the same log (`jamjet-server token create`
+    /// beside the server): the append is linked
+    /// ([`AuditBackend::append_linked`]), and one that finds the head moved
+    /// re-reads it and seals again. `created_at` is set at each seal, so the
+    /// order entries are listed in (`created_at`) is the chain's order.
+    async fn seal_and_append(&self, mut entry: AuditLogEntry) -> Result<(), String> {
+        const ATTEMPTS: usize = 8;
+        let built_at = entry.created_at;
+        let expires_at = entry.expires_at;
+        let mut chain = self.chain.lock().await;
+        for attempt in 0..ATTEMPTS {
+            if !chain.seeded || attempt > 0 {
+                // An unreadable head is an error, not an empty log: linking
+                // the entry to nothing would break the chain here.
+                chain.head = self
+                    .backend
+                    .head()
+                    .await
+                    .map_err(|e| format!("audit log head unreadable: {e}"))?;
+                chain.seeded = true;
+            }
+            let now = chrono::Utc::now();
+            entry.created_at = now;
+            entry.expires_at = expires_at.map(|e| e + (now - built_at));
+            entry.seal(chain.head.clone(), &self.signer);
+            match self.backend.append_linked(entry.clone()).await {
+                // Advance the head only after a durable append, so a failed
+                // write never leaves a gap the next entry would link past.
+                Ok(true) => {
+                    chain.head = entry.entry_hash.clone();
+                    return Ok(());
+                }
+                Ok(false) => continue,
+                Err(e) => return Err(format!("audit log write failed: {e}")),
+            }
+        }
+        Err(format!(
+            "audit log write failed: another writer moved the head {ATTEMPTS} times"
+        ))
+    }
+}
+
+/// An audit record that is not an execution event, for
+/// [`AuditEnricher::seal_record`].
+#[derive(Debug, Clone)]
+pub struct AuditRecord {
+    /// e.g. `token_issued`.
+    pub event_type: String,
+    pub actor_id: String,
+    pub actor_type: ActorType,
+    pub tenant_id: String,
+    /// What happened, stored as the entry's `raw_event`.
+    pub detail: serde_json::Value,
 }
 
 #[async_trait::async_trait]
