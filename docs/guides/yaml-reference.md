@@ -90,6 +90,13 @@ run reaches such a node, the node fails with `no executor for node kind <kind>`
 and so does the run. Fan-out and fan-in need no node: a node with several `next` targets
 runs them all, and a node with several incoming edges waits for all of them.
 
+Every node but `start` must have an incoming edge (a `human_approval`
+fallback counts as one), and every node must be reachable from `start`.
+`POST /workflows` refuses a workflow that breaks either rule, naming the
+nodes: a node with no incoming edge would run when the run starts, before
+whatever it was meant to follow, and an unreachable one would never run. A
+condition's branch targets need edges from the condition too.
+
 ---
 
 ## Condition node
@@ -118,8 +125,8 @@ review:
   next: deliver                     # taken when approved
 ```
 
-Approved, the run continues along `next`, and `state.review` holds the
-decision. Rejected, the node and the run fail. Expired, the run goes to
+Approved, the run continues along `next`, and `state.__approvals.review`
+holds the decision. Rejected, the node and the run fail. Expired, the run goes to
 `fallback` (or stops, for `end`), or fails if there is none. See
 [Human-in-the-Loop](hitl.md#approval-nodes).
 

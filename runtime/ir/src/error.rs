@@ -69,6 +69,12 @@ pub enum IrError {
     #[error("node '{0}' is unreachable from the start node")]
     UnreachableNode(String),
 
+    #[error("{0}")]
+    UnreachableNodes(String),
+
+    #[error("{0} must not contain control characters")]
+    ControlCharacter(String),
+
     #[error("workflow has no start node defined")]
     NoStartNode,
 

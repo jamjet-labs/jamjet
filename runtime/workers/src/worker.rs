@@ -189,8 +189,8 @@ impl Worker {
         // /work-items` copies a caller's payload verbatim, so a payload naming
         // another workflow, where the same node id is a `condition`, could
         // otherwise run a `human_approval` node's item with no gate. A payload
-        // that disagrees with its execution is not the engine's: settle it
-        // before anything is recorded and leave the node alone.
+        // that disagrees with its execution is not the engine's: the node
+        // fails, before the item runs anything.
         let (workflow_id, workflow_version) = match self
             .backend
             .get_execution(&execution_id)
@@ -218,9 +218,29 @@ impl Worker {
                 "work item payload coordinates disagree with execution {workflow_id} \
                  v{workflow_version}"
             );
-            warn!(execution_id = %execution_id, node_id = %node_id, %reason, "settling a work item that is not the engine's");
-            self.backend.fail_work_item(item_id, &reason).await?;
-            return Ok(());
+            warn!(execution_id = %execution_id, node_id = %node_id, %reason, "failing a work item that is not the engine's");
+            // Fail the node visibly, in one fenced commit, rather than settle
+            // the item quietly: a hand-enqueued item came with its own
+            // `NodeScheduled`, and a quiet settle left the scheduler waiting on
+            // a node it believed dispatched, so the run hung.
+            let terminal = jamjet_state::Event::new(
+                execution_id.clone(),
+                0,
+                EventKind::NodeFailed {
+                    node_id: node_id.clone(),
+                    error: reason,
+                    attempt,
+                    retryable: false,
+                },
+            );
+            return match self
+                .backend
+                .commit_turn(item_id, lease_fence, terminal, false)
+                .await
+            {
+                Ok(_) | Err(StateBackendError::FenceLost(_)) => Ok(()),
+                Err(e) => Err(Box::new(e)),
+            };
         }
 
         // Emit NodeStarted.
@@ -448,6 +468,24 @@ impl Worker {
                     // Budget enforcement after execution.
                     match exec_result {
                         Ok(mut result) => {
+                            // Approval records are the engine's: only the
+                            // approval node itself writes one. Any other
+                            // executor's patch loses the key, so no step can
+                            // forge the record a later condition reads.
+                            if kind_tag != "human_approval" {
+                                if let Some(patch) = result.state_patch.as_object_mut() {
+                                    if patch
+                                        .remove(jamjet_state::approvals::APPROVALS_STATE_KEY)
+                                        .is_some()
+                                    {
+                                        warn!(
+                                            execution_id = %execution_id,
+                                            node_id = %node_id,
+                                            "dropped an approval record from a node's state_patch"
+                                        );
+                                    }
+                                }
+                            }
                             let mut budget = budget;
                             if let Some(r) = self
                                 .check_budget_after_execution(

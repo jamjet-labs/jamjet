@@ -722,10 +722,13 @@ async fn a_large_bound_payload_is_truncated_in_the_listing_not_in_the_digest() {
     assert_eq!(st, StatusCode::OK, "{view}");
     let basis = &view["pending"][0]["context"]["action_basis"];
     assert_eq!(basis["payload_truncated"], true, "{basis}");
-    assert!(
-        basis["payload"].is_null(),
-        "the preview is dropped, not cut mid-value"
-    );
+    // Bounded, never dropped: every key is shown, and the large value is
+    // replaced by its size and its first characters, never cut mid-JSON.
+    let blob = &basis["payload"]["input"]["blob"];
+    assert_eq!(blob["preview_truncated"], true, "{basis}");
+    assert_eq!(blob["bytes"].as_u64().unwrap(), 64 * 1024 + 2);
+    assert!(blob["head"].as_str().unwrap().starts_with("xxx"));
+    assert_eq!(basis["payload"]["module"], "myapp.payments");
     assert!(basis["payload_bytes"].as_u64().unwrap() > 64 * 1024);
 }
 

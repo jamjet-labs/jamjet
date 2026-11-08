@@ -192,6 +192,22 @@ async fn health() -> Json<Value> {
 
 // ── Workflow definitions ─────────────────────────────────────────────────────
 
+/// Refuse a control character in an identifier the engine records.
+///
+/// Worker ids, approver names, tenant ids and node ids reach the audit log's
+/// hashed fields (`actor_id`, `tenant_id`), and the v1 entry hash joins
+/// fields with U+001F and no length prefix: an `actor_id` holding that byte
+/// could move a field boundary and make one entry hash like another. Every
+/// control character is refused, not only U+001F; none belongs in an id.
+fn refuse_control_chars(what: &str, value: &str) -> Result<(), ApiError> {
+    if value.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(format!(
+            "{what} must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct CreateWorkflowRequest {
     ir: Value,
@@ -268,6 +284,16 @@ async fn create_workflow(
             jamjet_worker::executable::refusal_message(&unexecutable)
         )));
     }
+    // A node with no incoming edge runs when the run starts, whatever it was
+    // meant to follow, and an unreachable one never runs. Refused before the
+    // idempotent re-register too, for the same reason as above: a stored
+    // version with such a node runs that step out of order.
+    jamjet_ir::validate_entry_points(&parsed)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // Names the engine records (handlers, tools, agents, models) hold no
+    // control characters; see `refuse_control_chars`.
+    jamjet_ir::validate_identifier_chars(&parsed)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
 
     let backend = state.backend_for(&tenant_id);
 
@@ -659,6 +685,13 @@ async fn approve_execution(
         "rejected" => jamjet_state::event::ApprovalDecision::Rejected,
         other => return Err(ApiError::BadRequest(format!("unknown decision: {other}"))),
     };
+    // A dev-mode approver name becomes the audit entry's `actor_id`.
+    if let Some(u) = &body.user_id {
+        refuse_control_chars("user_id", u)?;
+    }
+    if let Some(n) = &body.node_id {
+        refuse_control_chars("node_id", n)?;
+    }
 
     let (user_id, principal) = match (&token, &dev_mode) {
         (Some(Extension(t)), _) => (t.name.clone(), Some(crate::auth::principal_of(t))),
@@ -1216,6 +1249,8 @@ async fn create_tenant(
     State(state): State<AppState>,
     Json(body): Json<CreateTenantRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    // A tenant id is a hashed field of every audit entry it owns.
+    refuse_control_chars("tenant id", &body.id)?;
     let now = Utc::now();
     let tenant = Tenant {
         id: TenantId::from(body.id.clone()),
@@ -1374,6 +1409,7 @@ async fn claim_work_item(
     Json(body): Json<ClaimWorkItemRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
+    refuse_control_chars("worker_id", &body.worker_id)?;
     // The engine's own queues are not served here. Its in-process workers run
     // every kind dispatched to them (`jamjet_worker::executable`), and a token
     // that took such an item could report any result for it: complete an
@@ -1584,7 +1620,7 @@ async fn gate_claimed_item(
     let workflow_version = execution.workflow_version.as_str();
 
     // Tripwire. `Worker::execute_item` applies the same rule (it reads the
-    // execution too, and settles a disagreeing item), so the two enforcement
+    // execution too, and fails a disagreeing item's node), so the two enforcement
     // seams cannot evaluate different policy for one item. There is no
     // legitimate producer of that shape — the scheduler
     // builds every payload from these very coordinates
@@ -1694,9 +1730,11 @@ async fn gate_claimed_item(
 
     // A kind the engine runs in process never reaches an external worker,
     // whatever queue the item sits on. The scheduler only dispatches those
-    // kinds to the engine queues, which the claim above leaves out, so this
-    // is an item someone enqueued by hand: settle and withhold it, but do NOT
-    // fail the node, which belongs to the engine's own item.
+    // kinds to the engine queues, which the claim above leaves out, and
+    // `POST /work-items` refuses them, so this is an item queued some other
+    // way (before that check existed). Withhold it and fail the node, so the
+    // run ends visibly instead of waiting on a node the scheduler believes
+    // is already dispatched.
     if jamjet_worker::executable::runner_for_kind(&kind)
         == jamjet_worker::executable::Runner::InProcess
     {
@@ -1704,8 +1742,7 @@ async fn gate_claimed_item(
             "node {} is a kind the engine runs itself; it is not handed to external workers",
             wi.node_id
         );
-        warn!(execution_id = %wi.execution_id, node_id = %wi.node_id, %reason, "claim: withholding");
-        return settle(backend.fail_work_item(wi.id, &reason).await, wi);
+        return fail_closed(backend, wi, reason).await;
     }
 
     // EVERY node kind is evaluated here, on every queue. This route used to
@@ -2424,6 +2461,19 @@ async fn enqueue_work_item(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let execution_id = parse_execution_id(&body.execution_id)?;
     let backend = state.backend_for(&tenant_id);
+    refuse_control_chars("node_id", &body.node_id)?;
+    refuse_control_chars("queue_type", &body.queue_type)?;
+
+    // A node the engine runs itself is never hand-enqueued: an item for one
+    // on another queue is withheld from external workers, and its
+    // `NodeScheduled` would leave the scheduler believing the node was
+    // dispatched, so the run would wait forever.
+    if engine_runs_node(backend.as_ref(), &execution_id, &body.node_id).await {
+        return Err(ApiError::BadRequest(format!(
+            "node {} is a kind the engine runs itself; it cannot be enqueued by hand",
+            body.node_id
+        )));
+    }
 
     // Emit NodeScheduled event.
     let seq = backend.latest_sequence(&execution_id).await? + 1;
@@ -2489,7 +2539,16 @@ struct FailWorkItemRequest {
 /// the execution's registered IR (never the item's payload). Unreadable reads
 /// as no: the routes that ask fall back to their existing checks.
 async fn engine_runs(backend: &dyn jamjet_state::StateBackend, wi: &WorkItem) -> bool {
-    let Ok(Some(exec)) = backend.get_execution(&wi.execution_id).await else {
+    engine_runs_node(backend, &wi.execution_id, &wi.node_id).await
+}
+
+/// [`engine_runs`] for a node of an execution.
+async fn engine_runs_node(
+    backend: &dyn jamjet_state::StateBackend,
+    execution_id: &ExecutionId,
+    node_id: &str,
+) -> bool {
+    let Ok(Some(exec)) = backend.get_execution(execution_id).await else {
         return false;
     };
     let Ok(Some(def)) = backend
@@ -2500,7 +2559,7 @@ async fn engine_runs(backend: &dyn jamjet_state::StateBackend, wi: &WorkItem) ->
     };
     def.ir
         .get("nodes")
-        .and_then(|n| n.get(&wi.node_id))
+        .and_then(|n| n.get(node_id))
         .and_then(|n| n.get("kind"))
         .and_then(|k| serde_json::from_value::<jamjet_core::NodeKind>(k.clone()).ok())
         .is_some_and(|k| {
@@ -2666,6 +2725,7 @@ async fn heartbeat_work_item(
     Path(id): Path<String>,
     Json(body): Json<HeartbeatRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    refuse_control_chars("worker_id", &body.worker_id)?;
     let item_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);

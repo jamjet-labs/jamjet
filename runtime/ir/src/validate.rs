@@ -34,6 +34,7 @@ pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_node_ids(ir)?;
     validate_approval_deadlines(ir)?;
     validate_human_approvals(ir)?;
+    validate_entry_points(ir)?;
     Ok(())
 }
 
@@ -59,6 +60,136 @@ pub fn validate_approval_deadlines(ir: &WorkflowIr) -> IrResult<()> {
         }
     }
     Ok(())
+}
+
+/// The identifier fields of a node kind: the names the engine records for
+/// a node (in approval requests, policy decisions and audit entries).
+const IDENTIFIER_FIELDS: &[&str] = &[
+    "tool_ref",
+    "module",
+    "function",
+    "class_name",
+    "method",
+    "handler",
+    "queue",
+    "server",
+    "tool",
+    "skill",
+    "remote_agent",
+    "agent_ref",
+    "model_ref",
+    "connector_ref",
+    "policy_ref",
+    "workflow_ref",
+];
+
+/// No identifier the engine records holds a control character: the workflow
+/// id and version, every node's and the workflow's `agent_ref`, and each
+/// node kind's handler, tool, agent and model names. They reach the audit
+/// log, whose v1 entry hash joins fields with U+001F and no length prefix,
+/// and the commands a reviewer pastes.
+pub fn validate_identifier_chars(ir: &WorkflowIr) -> IrResult<()> {
+    let bad = |v: &str| v.chars().any(char::is_control);
+    let refuse = |what: String| Err(IrError::ControlCharacter(what));
+    if bad(&ir.workflow_id) {
+        return refuse("workflow_id".into());
+    }
+    if bad(&ir.version) {
+        return refuse("version".into());
+    }
+    if ir.agent_ref.as_deref().is_some_and(bad) {
+        return refuse("agent_ref".into());
+    }
+    let mut ids: Vec<&String> = ir.nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        let node = &ir.nodes[id];
+        if node.agent_ref.as_deref().is_some_and(bad) {
+            return refuse(format!("node '{id}' agent_ref"));
+        }
+        let kind = serde_json::to_value(&node.kind).unwrap_or_default();
+        for field in IDENTIFIER_FIELDS {
+            if kind.get(*field).and_then(|v| v.as_str()).is_some_and(bad) {
+                return refuse(format!("node '{id}' {field}"));
+            }
+        }
+        if kind
+            .get("agent")
+            .and_then(|a| a.get("explicit"))
+            .and_then(|v| v.as_str())
+            .is_some_and(bad)
+        {
+            return refuse(format!("node '{id}' agent"));
+        }
+    }
+    Ok(())
+}
+
+/// Every node but the start node is entered through an edge, and every node
+/// is reachable from the start node (following edges and `human_approval`
+/// fallbacks).
+///
+/// The scheduler runs a node whose every live in-edge is done, so a node with
+/// NO in-edge is a root: it runs as soon as the run starts. A step the author
+/// meant to come after something (a condition's branch target the compiler
+/// drew no edge to, a step after an approval) would run first, with nothing
+/// checked. A node unreachable from the start never runs at all. Both are
+/// refused, naming every such node.
+pub fn validate_entry_points(ir: &WorkflowIr) -> IrResult<()> {
+    use jamjet_core::node::NodeKind;
+    let reachable = reachable_from(ir, &[ir.start_node.as_str()]);
+    let entered: HashSet<&str> = ir
+        .edges
+        .iter()
+        .map(|e| e.to.as_str())
+        .chain(ir.nodes.values().filter_map(|n| match &n.kind {
+            NodeKind::HumanApproval {
+                fallback_node: Some(f),
+                ..
+            } => Some(f.as_str()),
+            _ => None,
+        }))
+        .collect();
+    let mut ids: Vec<&String> = ir.nodes.keys().collect();
+    ids.sort();
+    let mut roots = Vec::new();
+    let mut unreachable = Vec::new();
+    for id in ids {
+        if *id == ir.start_node {
+            continue;
+        }
+        if !entered.contains(id.as_str()) {
+            roots.push(id.clone());
+        } else if !reachable.contains(id.as_str()) {
+            unreachable.push(id.clone());
+        }
+    }
+    if roots.is_empty() && unreachable.is_empty() {
+        return Ok(());
+    }
+    let list = |v: &[String]| {
+        v.iter()
+            .map(|n| format!("'{n}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut parts = Vec::new();
+    if !roots.is_empty() {
+        parts.push(format!(
+            "node(s) {} have no incoming edge, so they would run when the run starts; \
+             add an edge from the step each one follows (a condition's branch targets \
+             need edges from the condition too)",
+            list(&roots)
+        ));
+    }
+    if !unreachable.is_empty() {
+        parts.push(format!(
+            "node(s) {} cannot be reached from the start node '{}', so they would never run",
+            list(&unreachable),
+            ir.start_node
+        ));
+    }
+    Err(IrError::UnreachableNodes(parts.join("; ")))
 }
 
 /// Every `human_approval` node can be honoured: its `timeout_secs` is a

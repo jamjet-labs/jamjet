@@ -1059,14 +1059,20 @@ pub(crate) fn node_definition(node_def: &NodeDef) -> Result<String, String> {
 }
 
 /// The reviewer's view of what a request binds: the dispatched payload, its
-/// `input` included (dropped and flagged above [`ACTION_BASIS_STATE_CAP`]
-/// serialized bytes), the occurrence, and a summary of the node definition
+/// `input` included, the occurrence, and a summary of the node definition
 /// (id, kind with its module, function or tool, description and own policy).
+///
+/// A payload over [`ACTION_BASIS_STATE_CAP`] serialized bytes is shown
+/// bounded, never dropped: every key is kept, each top-level key of its
+/// `input` (or `state`) too, and a value too large to show is replaced by
+/// its size and the start of its text. Until 2026-11 an over-cap payload was
+/// shown as `null`, so a large state could hide the one key that mattered
+/// while the digest bound all of it.
 pub(crate) fn basis_preview(payload: &Value, step: u64, node_def: &NodeDef) -> Value {
     let payload_bytes = serde_json::to_string(payload).map(|s| s.len()).unwrap_or(0);
     let truncated = payload_bytes > ACTION_BASIS_STATE_CAP;
     serde_json::json!({
-        "payload": if truncated { Value::Null } else { payload.clone() },
+        "payload": if truncated { bounded_preview(payload) } else { payload.clone() },
         "payload_truncated": truncated,
         "payload_bytes": payload_bytes,
         "step": step,
@@ -1079,10 +1085,93 @@ pub(crate) fn basis_preview(payload: &Value, step: u64, node_def: &NodeDef) -> V
     })
 }
 
+/// The longest start of a value [`bounded_preview`] shows for one key.
+const PREVIEW_VALUE_MAX: usize = 1024;
+/// The shortest it shows, however many keys there are.
+const PREVIEW_VALUE_MIN: usize = 64;
+
+/// An over-cap payload, with every key and every top-level key of its state
+/// (`input` or `state`) kept, and each value shown whole or, if too large,
+/// as `{"preview_truncated": true, "bytes": <n>, "head": "<start>"}`.
+fn bounded_preview(payload: &Value) -> Value {
+    let Some(obj) = payload.as_object() else {
+        return fit(payload, ACTION_BASIS_STATE_CAP);
+    };
+    obj.iter()
+        .map(|(key, value)| {
+            let shown = match (key.as_str(), value) {
+                ("input" | "state", Value::Object(state)) => {
+                    let per_key = (ACTION_BASIS_STATE_CAP / state.len().max(1))
+                        .clamp(PREVIEW_VALUE_MIN, PREVIEW_VALUE_MAX);
+                    Value::Object(
+                        state
+                            .iter()
+                            .map(|(k, v)| (k.clone(), fit(v, per_key)))
+                            .collect(),
+                    )
+                }
+                _ => fit(value, PREVIEW_VALUE_MAX),
+            };
+            (key.clone(), shown)
+        })
+        .collect()
+}
+
+/// `value` itself when its JSON is at most `budget` bytes, otherwise its size
+/// and the start of its text (a string's own characters, any other value's
+/// JSON), cut on a character boundary.
+fn fit(value: &Value, budget: usize) -> Value {
+    let json = serde_json::to_string(value).unwrap_or_default();
+    if json.len() <= budget {
+        return value.clone();
+    }
+    let text = match value {
+        Value::String(s) => s.as_str(),
+        _ => json.as_str(),
+    };
+    let mut end = budget.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    serde_json::json!({
+        "preview_truncated": true,
+        "bytes": json.len(),
+        "head": &text[..end],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Above the cap every key is still shown, and a large value is cut,
+    /// never the key next to it (review of #169, probe H: a 20 KB `notes`
+    /// hid `zz_payee: "attacker"`).
+    #[test]
+    fn an_over_cap_payload_still_shows_every_state_key() {
+        let payload = json!({
+            "workflow_id": "wf", "node_id": "review",
+            "input": { "notes": "x".repeat(20_000), "zz_payee": "attacker", "amount": 5 }
+        });
+        let node: NodeDef = serde_json::from_value(json!({ "id": "review", "kind": {
+            "type": "human_approval", "description": "", "timeout_secs": null, "fallback_node": null
+        }}))
+        .unwrap();
+        let basis = basis_preview(&payload, 0, &node);
+        assert_eq!(basis["payload_truncated"], true);
+        let input = &basis["payload"]["input"];
+        assert_eq!(input["zz_payee"], "attacker", "{basis}");
+        assert_eq!(input["amount"], 5);
+        assert_eq!(input["notes"]["preview_truncated"], true);
+        assert_eq!(input["notes"]["bytes"], 20_002);
+        assert!(input["notes"]["head"].as_str().unwrap().starts_with("xxx"));
+        assert_eq!(basis["payload"]["node_id"], "review");
+        assert!(
+            serde_json::to_string(&basis).unwrap().len() < 4 * ACTION_BASIS_STATE_CAP,
+            "the preview stays bounded"
+        );
+    }
 
     fn dispatch_node() -> NodeDef {
         serde_json::from_value(json!({ "id": "n1", "kind": {

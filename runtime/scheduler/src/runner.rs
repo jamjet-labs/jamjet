@@ -458,10 +458,10 @@ impl Scheduler {
         {
             if let Some(expires_at) = progress.expired.get(&node_id).copied() {
                 if let Some(fallback) = fallback_of(&ir, &node_id) {
-                    // The decision goes into state under the node's id, as an
+                    // The decision goes into state under the engine's key, as an
                     // approval's does, so the fallback can read why it runs.
-                    let mut state_patch = serde_json::Map::new();
-                    state_patch.insert(
+                    let mut record = serde_json::Map::new();
+                    record.insert(
                         node_id.clone(),
                         serde_json::json!({
                             "approved": false,
@@ -482,7 +482,14 @@ impl Scheduler {
                                     "reason": reason,
                                     "chosen_target": fallback,
                                 }),
-                                state_patch: serde_json::Value::Object(state_patch),
+                                state_patch: serde_json::Value::Object(
+                                    [(
+                                        jamjet_state::approvals::APPROVALS_STATE_KEY.to_string(),
+                                        serde_json::Value::Object(record),
+                                    )]
+                                    .into_iter()
+                                    .collect(),
+                                ),
                                 duration_ms: 0,
                                 gen_ai_system: None,
                                 gen_ai_model: None,
@@ -885,6 +892,22 @@ impl ExecProgress {
                 }
                 if let serde_json::Value::Object(patch) = state_patch {
                     for (k, v) in patch {
+                        // Approval records are kept per node: a patch adds its
+                        // node's record to the map, never replaces the map,
+                        // so parallel approvals all stay readable (the
+                        // materializer deep-merges the same way).
+                        if k == jamjet_state::approvals::APPROVALS_STATE_KEY {
+                            if let (
+                                Some(serde_json::Value::Object(existing)),
+                                serde_json::Value::Object(added),
+                            ) = (self.final_state.get_mut(k), v)
+                            {
+                                for (node, record) in added {
+                                    existing.insert(node.clone(), record.clone());
+                                }
+                                continue;
+                            }
+                        }
                         self.final_state.insert(k.clone(), v.clone());
                     }
                 }
