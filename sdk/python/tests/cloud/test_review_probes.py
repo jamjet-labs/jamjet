@@ -144,12 +144,17 @@ def test_with_raw_response_stream_is_enforced(env: dict[str, Any]) -> None:
         {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
     ]
     body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+    sent: list[dict[str, Any]] = []
     client = _openai(
-        lambda: httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"}), []
+        lambda: httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"}), sent
     )
-    raw = client.chat.completions.with_raw_response.create(model="gpt-4o", messages=USER, stream=True)
-    with pytest.raises(JamJetPolicyBlocked):
-        list(raw.parse())
+    # The raw response's lines are the vendor's events; refused while rules exist.
+    with pytest.raises(JamJetUnenforceableCall):
+        client.chat.completions.with_raw_response.create(model="gpt-4o", messages=USER, stream=True)
+    with pytest.raises(JamJetUnenforceableCall):
+        with client.chat.completions.with_streaming_response.create(model="gpt-4o", messages=USER, stream=True) as r:
+            list(r.iter_lines())
+    assert sent == []
 
 
 def test_legacy_functions_are_stripped_and_refused(env: dict[str, Any]) -> None:
@@ -254,3 +259,43 @@ def test_parallel_tool_calls_dropped_with_the_last_tool(env: dict[str, Any]) -> 
     with pytest.raises(JamJetPolicyBlocked):
         client.chat.completions.create(model="gpt-4o", messages=USER, tools=[_strict("a")], parallel_tool_calls=False)
     assert "tools" not in sent[0] and "parallel_tool_calls" not in sent[0]
+
+
+async def test_async_clients_refuse_under_restrictive_rules(env: dict[str, Any]) -> None:
+    env["policy"].add("block", "delete_*")
+    # conftest swaps openai.AsyncOpenAI for a mock; use the real client class.
+    oai = importlib.import_module("openai._client").AsyncOpenAI(
+        api_key="x", base_url="http://vendor.test/v1", max_retries=0
+    )
+    ant = anthropic.AsyncAnthropic(api_key="x", base_url="http://vendor.test", max_retries=0)
+    with pytest.raises(JamJetUnenforceableCall):
+        await oai.chat.completions.create(model="gpt-4o", messages=USER)
+    with pytest.raises(JamJetUnenforceableCall):
+        await ant.messages.create(model="claude-sonnet-4-6", max_tokens=10, messages=USER)
+
+
+def test_batch_apis_refuse_under_restrictive_rules(env: dict[str, Any]) -> None:
+    env["policy"].add("block", "delete_*")
+    sent: list[dict[str, Any]] = []
+    oai = _openai(lambda: httpx.Response(500), sent)
+    ant = _anthropic(lambda: httpx.Response(500), sent)
+    with pytest.raises(JamJetUnenforceableCall):
+        oai.batches.create(input_file_id="f", endpoint="/v1/chat/completions", completion_window="24h")
+    with pytest.raises(JamJetUnenforceableCall):
+        ant.messages.batches.create(requests=[])
+    with pytest.raises(JamJetUnenforceableCall):
+        ant.beta.messages.batches.create(requests=[])
+    assert sent == []
+
+
+def test_anthropic_client_tools_are_gated_not_stripped(env: dict[str, Any]) -> None:
+    env["policy"].add("require_approval", "bash")
+    sent: list[dict[str, Any]] = []
+    client = _anthropic(lambda: _message("lookup"), sent)
+    client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=10,
+        messages=USER,
+        tools=[{"type": "bash_20250124", "name": "bash"}, {"type": "web_search_20250305", "name": "web_search"}],
+    )
+    assert [t["name"] for t in sent[0]["tools"]] == ["bash", "web_search"]

@@ -11,10 +11,12 @@ from typing import Any
 
 from .redaction import _redact_regex
 
-# Fields whose value is a credential, whatever it looks like.
+# Fields whose value is a credential, whatever it looks like. An explicit
+# list: a name pattern such as `*_token` would also hide business fields
+# (`payee_token`); credentials under other names are caught by shape below.
 _SECRET_KEY = re.compile(
-    r"^(pass(word|phrase)?|secret|client[_-]?secret|.*_secret|token|.*_token|api[_-]?key|.*_api[_-]?key"
-    r"|authorization|auth|credentials?|private[_-]?key|cookie|session[_-]?(id|token))$",
+    r"^(password|passwd|passphrase|secret|client_secret|api_key|apikey|x-api-key|authorization"
+    r"|access_token|refresh_token|id_token|private_key)$",
     re.IGNORECASE,
 )
 
@@ -28,7 +30,18 @@ _SECRET_VALUES = [
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
     re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),  # JWTs
 ]
+
+# Long high-entropy runs (32+ characters mixing upper case, lower case and
+# digits) are treated as keys too. Hex digests and plain numbers do not mix
+# cases, so they are kept.
+_HIGH_ENTROPY = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
+
+
+def _looks_random(run: str) -> bool:
+    return any(c.isupper() for c in run) and any(c.islower() for c in run) and any(c.isdigit() for c in run)
+
 
 # With redaction on: these are masked outright...
 _PII_MASKED = ["EMAIL_ADDRESS", "US_SSN", "PHONE_NUMBER", "IP_ADDRESS"]
@@ -41,6 +54,7 @@ SECRET = "[SECRET]"
 def _mask_string(text: str, pii: bool) -> str:
     for pattern in _SECRET_VALUES:
         text = pattern.sub(SECRET, text)
+    text = _HIGH_ENTROPY.sub(lambda m: SECRET if _looks_random(m.group(0)) else m.group(0), text)
     if not pii:
         return text
     text = _redact_regex(text, _PII_MASKED)

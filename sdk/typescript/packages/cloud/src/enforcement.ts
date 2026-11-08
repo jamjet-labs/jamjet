@@ -52,7 +52,7 @@ function getToolCalls(vendor: Vendor, response: unknown): ToolCall[] {
   if (vendor === 'openai') {
     // Every choice: with n > 1 a blocked call in any of them must be caught.
     const choices = Array.isArray(res['choices']) ? res['choices'] : []
-    return (choices as Array<Record<string, unknown>>).flatMap((choice) => {
+    return (choices as Array<Record<string, unknown>>).flatMap((choice, position) => {
       const message = (choice?.['message'] ?? {}) as Record<string, unknown>
       const tcs = Array.isArray(message['tool_calls']) ? message['tool_calls'] : []
       const calls = (tcs as Array<Record<string, unknown>>).map((tc) => {
@@ -66,7 +66,9 @@ function getToolCalls(vendor: Vendor, response: unknown): ToolCall[] {
       // Legacy `functions` API: a single message.function_call.
       const fc = message['function_call']
       if (typeof fc === 'object' && fc !== null) {
-        const entry: ToolCall = { name: toolNameOf(fc) }
+        // No id of its own: name it after the choice, so two choices calling
+        // the same function stay distinct.
+        const entry: ToolCall = { name: toolNameOf(fc), id: `function_call:${String(choice?.['index'] ?? position)}` }
         const args = (fc as Record<string, unknown>)['arguments']
         if (args !== undefined) entry.arguments = args
         calls.push(entry)
@@ -121,11 +123,18 @@ function extractCacheRead(_vendor: Vendor, response: unknown): number {
  * MCP toolsets) execute before the response comes back, so refusing their
  * calls afterwards is too late: a rule that could match them strips them here.
  */
+// Anthropic-defined tools your code executes (the model only asks): these are
+// gated like any other tool call.
+const CLIENT_TOOL_TYPES = /^(bash|text_editor|computer|memory)_/
+// Anything else with a vendor type and no input_schema runs on the vendor's
+// side (web_search, web_fetch, code_execution, tool_search_tool, advisor, ...).
+// Unknown types count as server-executed, so they fail closed.
 function isServerExecuted(tool: unknown): boolean {
   if (typeof tool !== 'object' || tool === null) return false
   const t = tool as Record<string, unknown>
   const type = t['type']
   if (typeof type !== 'string' || type === 'function' || type === 'custom') return false
+  if (CLIENT_TOOL_TYPES.test(type)) return false
   return !('input_schema' in t)
 }
 
@@ -322,12 +331,15 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
       onToolCallStarted: (call, tally) => refuseStreamed([{ ...call, joinedName: call.name, arguments: '' }], tally),
       onToolCalls: async (calls, tally) => {
         refuseStreamed(calls, tally)
-        // Gate the name as last sent and the fragments joined, like the block check.
+        // Gate the name as last sent or the fragments joined, like the block
+        // check: one approval per call, under the joined name when it is gated.
         const gated = (list: ReadonlyArray<StreamedToolCall>): ToolCall[] =>
-          list.flatMap((c) => {
-            const one: ToolCall = { name: c.name, arguments: streamedArguments(vendor, c.arguments) }
+          list.map((c) => {
+            const names = c.joinedName !== '' && c.joinedName !== c.name ? [c.joinedName, c.name] : [c.name]
+            const name = names.find((n) => client._policy.evaluate(n).policyKind === 'require_approval') ?? c.name
+            const one: ToolCall = { name, arguments: streamedArguments(vendor, c.arguments) }
             if (c.id !== undefined) one.id = c.id
-            return c.joinedName !== '' && c.joinedName !== c.name ? [one, { ...one, name: c.joinedName }] : [one]
+            return one
           })
         await gateApprovals(
           streamState(tally),

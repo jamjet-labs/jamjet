@@ -138,8 +138,9 @@ jamjet.cloud.policy("require_approval", "database.*")
 # Gated in this process: sync OpenAI chat.completions create/parse/stream and
 # Anthropic messages and beta.messages create/parse: *delete* tools are
 # stripped, and a database.* tool call waits for approval. OpenAI's Responses
-# API and Anthropic's messages.stream() are not enforced and refuse to run while
-# a block or approval rule is set. Async clients are not patched.
+# API, Anthropic's messages.stream(), async clients, batch APIs and raw
+# streamed responses are not enforced and refuse to run while a block or
+# approval rule is set.
 ```
 
 → Runnable approval workflow in **[`examples/hitl-approval`](examples/hitl-approval)** · [Cloud Quickstart](https://docs.jamjet.dev/en/docs/cloud-quickstart)

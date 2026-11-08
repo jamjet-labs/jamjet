@@ -90,7 +90,13 @@ class StreamTally:
             # Legacy `functions` API streams one delta.function_call per choice.
             legacy = _field(delta, "function_call")
             if legacy is not None:
-                calls.append({"index": "function_call", "function": legacy})
+                calls.append(
+                    {
+                        "index": "function_call",
+                        "id": f"function_call:{_field(choice, 'index') or 0}",
+                        "function": legacy,
+                    }
+                )
             for tc in calls:
                 tool_chunk = True
                 entry = self._call(f"{_field(choice, 'index') or 0}:{_field(tc, 'index') or 0}")

@@ -3,9 +3,10 @@ import { runEnforcedCall } from '../enforcement.js'
 // Node-only: pulls in `node:crypto` via prefix-hash.ts. Safe here because
 // this patcher is only loaded from `src/node.ts`, never the universal entry.
 import { computePrefixHash } from '../prefix-hash.js'
+import { refuseBatches, unmarkBatches } from '../unenforced.js'
 import { asVendorPromise } from '../vendor-promise.js'
 
-type OriginalRef = { proto: any; original: (...args: any[]) => any }
+type OriginalRef = { proto: any; key: string; original: (...args: any[]) => any }
 let originals: OriginalRef[] = []
 const PATCH_MARK = Symbol.for('jamjet.anthropic.patched')
 
@@ -44,7 +45,7 @@ export function patchAnthropic(anthropicModule: any): void {
         args,
         computePromptPrefixHash: computePrefixHash,
       })
-      return asVendorPromise(enforced, () => raw)
+      return asVendorPromise(enforced, () => raw, 'anthropic')
     }
 
     Object.defineProperty(proto, PATCH_MARK, {
@@ -53,14 +54,18 @@ export function patchAnthropic(anthropicModule: any): void {
       configurable: true,
       writable: true,
     })
-    originals.push({ proto, original })
+    originals.push({ proto, key: 'create', original })
   }
+  const root = anthropicModule?.default ?? anthropicModule?.Anthropic
+  refuseBatches(root?.Messages?.Batches?.prototype, 'anthropic messages.batches', originals)
+  refuseBatches(root?.Beta?.Messages?.Batches?.prototype, 'anthropic beta.messages.batches', originals)
 }
 
 export function unpatchAnthropic(): void {
-  for (const { proto, original } of originals) {
-    proto.create = original
+  for (const { proto, key, original } of originals) {
+    proto[key] = original
     delete proto[PATCH_MARK]
+    unmarkBatches(proto)
   }
   originals = []
 }

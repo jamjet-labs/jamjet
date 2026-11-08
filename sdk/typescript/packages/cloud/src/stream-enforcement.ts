@@ -112,7 +112,11 @@ class Tally implements StreamTally {
       const calls: Array<Record<string, any>> = Array.isArray(delta['tool_calls']) ? [...delta['tool_calls']] : []
       // Legacy `functions` API streams one delta.function_call per choice.
       if (typeof delta['function_call'] === 'object' && delta['function_call'] !== null) {
-        calls.push({ index: 'function_call', function: delta['function_call'] })
+        calls.push({
+          index: 'function_call',
+          id: `function_call:${String(choice?.['index'] ?? 0)}`,
+          function: delta['function_call'],
+        })
       }
       for (const tc of calls) {
         toolChunk = true
