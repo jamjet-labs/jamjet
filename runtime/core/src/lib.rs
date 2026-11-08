@@ -4,6 +4,7 @@ pub mod coordinator;
 pub mod error;
 pub mod node;
 pub mod retry;
+pub mod template;
 pub mod timeout;
 pub mod workflow;
 

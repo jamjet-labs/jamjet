@@ -239,6 +239,10 @@ async fn create_workflow(
     // then evaluate false forever, with only a WARN in the engine log to say so.
     jamjet_ir::validate_condition_expressions(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // Likewise a model prompt the runtime cannot render would fail every run
+    // that reaches the node.
+    jamjet_ir::validate_prompt_templates(&parsed)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
     // An `external_fn` queue named after a built-in queue (or empty, or with
     // characters a worker cannot send) would route its items to a worker that
     // cannot run them, or to none at all.

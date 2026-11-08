@@ -55,9 +55,10 @@ nodes:
   summarize:
     type: model
     model: default_chat             # named model from models.yaml
-    prompt: prompts/summarize.md    # prompt template file
-    input:
-      search_result: "{{ state.search_result }}"
+    prompt: |                       # rendered against the run's state
+      Summarize this search result:
+
+      {{ state.search_result }}
     output_schema: schemas.Summary
     next: end                       # built-in terminal node
 ```
@@ -256,16 +257,40 @@ retry_policies:
 
 ---
 
-## Template expressions
+## Prompt templates
 
-Node inputs support [Jinja2](https://jinja.palletsprojects.com/) expressions:
+A `model` node's `prompt` is rendered against the run's state when the node is
+dispatched, and the model receives the result as the user message:
 
 ```yaml
-input:
-  query: "{{ state.question }}"
-  context: "{{ state.search_result.answer | truncate(500) }}"
-  flag: "{{ state.retries > 2 }}"
+prompt: |
+  Title: {{ state.pr.title }}
+  First file: {{ state.pr.files.0 }}
 ```
+
+- The only expression is `{{ state.<path> }}`: dotted keys, and digits to
+  index a list. Filters (`| join(...)`), operators, calls, `{% ... %}` blocks
+  and `{# ... #}` comments are not Jinja here. A workflow that uses them is
+  refused when it is registered (400, naming the node).
+- To write `{{`, `{%` or `{#` as text (a JSON example, say), quote it,
+  `{{ '{{' }}`, or wrap the passage in `{% raw %}...{% endraw %}`, as in
+  Jinja2.
+- A string is inserted as is; any other value as compact JSON. A rendered
+  prompt over 256 KiB fails the node.
+- A path the run's state does not have fails the node, with the path in the
+  error, and so does a prompt that renders empty. The model is not called
+  with a prompt that has a gap in it.
+- A prompt file reference (`prompt: prompts/summarize.md`: one line, ending
+  in `.md`, `.txt`, `.j2` or a similar extension, with no spaces unless it has
+  a `/`) is not read: the file stays on the machine that compiled the
+  workflow. Put the text inline. A node with a file reference and no
+  conversation (`messages`) in state fails and says so.
+- A node with a prompt sends only the prompt. The conversation in
+  `state.messages` is sent by nodes with no prompt (the agent loop), and is
+  left out of a prompted node's work item, so an approval of the node binds
+  what the model receives.
+
+The runtime does not render `input:` mappings.
 
 ---
 

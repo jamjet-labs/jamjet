@@ -7,6 +7,8 @@ Get a JamJet workflow running locally in under 10 minutes.
 ## Prerequisites
 
 - Python 3.11+
+- `ANTHROPIC_API_KEY` set in the shell that runs `jamjet dev` (the starter
+  workflow calls a Claude model)
 
 ---
 
@@ -30,17 +32,30 @@ jamjet init my-first-agent
 cd my-first-agent
 ```
 
-This creates:
+This creates the `hello-agent` starter:
 ```
 my-first-agent/
-  workflow.yaml       # workflow definition
-  agents.yaml         # agent definitions
-  tools.yaml          # tool definitions
-  schemas.py          # Pydantic state schemas
-  prompts/
-    summarize.md      # prompt template
-  jamjet.yaml         # project config
+  workflow.yaml         # one model node
+  evals/dataset.jsonl   # sample inputs for `jamjet eval`
 ```
+
+The workflow has one `model` node whose prompt reads the run's input:
+
+```yaml
+nodes:
+  think:
+    type: model
+    model: claude-haiku-4-5-20251001
+    prompt: |
+      Answer this question clearly and concisely:
+
+      {{ state.query }}
+    next: end
+```
+
+The runtime fills in `{{ state.query }}` from the run's state before it calls
+the model. A prompt can only substitute `{{ state.<path> }}`; see
+[Prompt templates](yaml-reference.md#prompt-templates).
 
 ---
 
@@ -72,19 +87,16 @@ jamjet validate workflow.yaml
 ## 5. Run it
 
 ```bash
-jamjet run workflow.yaml --input '{"question": "What is the capital of France?"}'
+jamjet run workflow.yaml --input '{"query": "What is the capital of France?"}'
 ```
 
-Output:
-```
-Execution started: exec_01abc...
-  [fetch]     running...  done (1.2s)
-  [summarize] running...  done (2.1s)
-Completed in 3.4s
+The CLI registers the workflow, starts a run and follows it until it ends.
+The model's reply is in the run's final state as `last_model_output`.
 
-Result:
-  answer: "The capital of France is Paris."
-```
+The input must have every key the prompt reads. Run it with
+`{"question": ...}` instead and the `think` node fails with
+``the run's state has no `query` ``: the runtime does not send the model a
+prompt with a gap in it.
 
 ---
 
