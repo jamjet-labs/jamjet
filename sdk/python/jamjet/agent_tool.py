@@ -11,9 +11,9 @@ class AgentToolDef:
     """Configuration for an agent-tool invocation, without executing the agent.
 
     Note:
-        ``"auto"`` routing is not yet supported end to end by the bundled Rust
-        runtime. Workflow registration rejects the generated coordinator and
-        agent-tool nodes because the runtime has no runner for those kinds.
+        The bundled Rust runtime does not support agent-tool nodes with
+        explicit or ``"auto"`` targets. Workflow registration rejects
+        agent-tool and coordinator nodes because it has no runner for them.
 
     Attributes:
         agent_uri: Explicit agent URI, or ``"auto"`` for coordinator routing.
@@ -78,10 +78,9 @@ def agent_tool(
     invocation mode, or limits.
 
     Note:
-        ``"auto"`` is not yet supported end to end by the bundled Rust runtime.
-        The graph compiler expands the routing, but workflow registration
-        rejects coordinator and agent-tool nodes because the runtime has no
-        runner for those kinds.
+        The bundled Rust runtime does not support agent-tool nodes with
+        explicit or ``"auto"`` targets. Workflow registration rejects
+        agent-tool and coordinator nodes because it has no runner for them.
 
     Args:
         agent: Agent URI, such as ``"jamjet://org/classifier"``, or ``"auto"``
