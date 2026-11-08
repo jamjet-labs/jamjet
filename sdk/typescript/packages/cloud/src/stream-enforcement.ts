@@ -31,6 +31,8 @@ export interface StreamTally {
   inputTokens: number | undefined
   outputTokens: number | undefined
   cacheReadTokens: number
+  cacheWriteTokens: number
+  cacheWrite1hTokens: number
   /** Characters of generated text and tool arguments; used when the stream reports no usage. */
   outputChars: number
   toolCalls: StreamedToolCall[]
@@ -67,6 +69,8 @@ class Tally implements StreamTally {
   inputTokens: number | undefined = undefined
   outputTokens: number | undefined = undefined
   cacheReadTokens = 0
+  cacheWriteTokens = 0
+  cacheWrite1hTokens = 0
   outputChars = 0
   toolCalls: StreamedToolCall[] = []
   finished = false
@@ -148,6 +152,13 @@ class Tally implements StreamTally {
         this.inputTokens = num(usage['input_tokens']) ?? this.inputTokens
         this.outputTokens = num(usage['output_tokens']) ?? this.outputTokens
         this.cacheReadTokens = num(usage['cache_read_input_tokens']) ?? this.cacheReadTokens
+        if (usage['cache_creation_input_tokens'] !== undefined || usage['cache_creation'] !== undefined) {
+          const total = num(usage['cache_creation_input_tokens']) ?? 0
+          const split = usage['cache_creation'] as Record<string, unknown> | undefined
+          const oneHour = (split && num(split['ephemeral_1h_input_tokens'])) ?? 0
+          this.cacheWrite1hTokens = oneHour
+          this.cacheWriteTokens = (split && num(split['ephemeral_5m_input_tokens'])) ?? Math.max(0, total - oneHour)
+        }
         return { toolChunk: false }
       }
       case 'message_delta': {
@@ -155,6 +166,7 @@ class Tally implements StreamTally {
         this.outputTokens = num(usage['output_tokens']) ?? this.outputTokens
         this.inputTokens = num(usage['input_tokens']) ?? this.inputTokens
         this.cacheReadTokens = num(usage['cache_read_input_tokens']) ?? this.cacheReadTokens
+        this.cacheWriteTokens = num(usage['cache_creation_input_tokens']) ?? this.cacheWriteTokens
         return { toolChunk: false }
       }
       case 'content_block_start': {

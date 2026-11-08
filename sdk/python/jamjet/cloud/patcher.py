@@ -25,28 +25,10 @@ from .middleware.context import (
 )
 from .middleware.receipts import build_llm_receipt, emit_receipt
 from .policy import _field, get_evaluator, tool_name_of
+from .pricing import estimate_cost
 from .redaction import _config as _redaction_config
 from .stream_enforcement import StreamedToolCall, StreamTally, enforce_stream
 from .trace import get_context
-
-# ---------------------------------------------------------------------------
-# Cost estimation per-model (USD per token)
-# ---------------------------------------------------------------------------
-
-_COST_PER_TOKEN: dict[str, tuple[float, float]] = {
-    # (input_cost_per_token, output_cost_per_token)
-    "gpt-4o": (2.5e-6, 10e-6),
-    "gpt-4o-mini": (0.15e-6, 0.6e-6),
-    "gpt-4-turbo": (10e-6, 30e-6),
-    "gpt-4": (30e-6, 60e-6),
-    "gpt-3.5-turbo": (0.5e-6, 1.5e-6),
-    "claude-sonnet-4-6": (3e-6, 15e-6),
-    "claude-sonnet-4-20250514": (3e-6, 15e-6),
-    "claude-opus-4-6": (15e-6, 75e-6),
-    "claude-opus-4-20250514": (15e-6, 75e-6),
-    "claude-3-5-haiku-20241022": (0.8e-6, 4e-6),
-    "claude-3-haiku-20240307": (0.25e-6, 1.25e-6),
-}
 
 _originals: dict[str, Any] = {}
 
@@ -74,12 +56,8 @@ def _runtime_state() -> _RuntimeState:
 
 
 def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Estimate cost in USD for a given model and token counts."""
-    rates = _COST_PER_TOKEN.get(model)
-    if rates is None:
-        # Fallback: rough average
-        return (input_tokens * 3e-6) + (output_tokens * 15e-6)
-    return (input_tokens * rates[0]) + (output_tokens * rates[1])
+    """Estimate cost in USD for a given model and token counts (see pricing.py)."""
+    return estimate_cost(model, input_tokens, output_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +288,40 @@ def _refuse_blocked(span: Any, calls: list[tuple[str | None, str, Any]]) -> None
             raise JamJetPolicyBlocked(name, decision.pattern or "*")
 
 
-def _record_usage(span: Any, model: str, input_tokens: int, output_tokens: int, **payload: Any) -> None:
-    cost = _estimate_cost(model, input_tokens, output_tokens)
+def _cache_writes(usage: Any) -> dict[str, int]:
+    """Anthropic cache writes, split into 5-minute and 1-hour when the usage says so."""
+    total = _field(usage, "cache_creation_input_tokens") or 0
+    split = _field(usage, "cache_creation")
+    if split is not None:
+        one_hour = _field(split, "ephemeral_1h_input_tokens") or 0
+        five_min = _field(split, "ephemeral_5m_input_tokens")
+        return {
+            "cache_write": five_min if five_min is not None else max(0, total - one_hour),
+            "cache_write_1h": one_hour,
+        }
+    return {"cache_write": total, "cache_write_1h": 0}
+
+
+def _record_usage(
+    span: Any,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    cache_read: int = 0,
+    cache_write: int = 0,
+    cache_write_1h: int = 0,
+    **payload: Any,
+) -> None:
+    # Anthropic bills prompt-cache reads and writes on top of input_tokens.
+    cost = estimate_cost(
+        model,
+        input_tokens,
+        output_tokens,
+        cache_read=cache_read,
+        cache_write=cache_write,
+        cache_write_1h=cache_write_1h,
+    )
     span.model = model
     span.input_tokens = input_tokens
     span.output_tokens = output_tokens
@@ -358,7 +368,17 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
         if not any(evaluator.evaluate(name).blocked for _, name, _ in triples):
             return
         input_tokens, output = usage_of(tally, complete=False)
-        _record_usage(span, tally.model or model, input_tokens, output, usage_estimated=True, stream_incomplete=True)
+        _record_usage(
+            span,
+            tally.model or model,
+            input_tokens,
+            output,
+            cache_read=tally.cache_read_tokens,
+            cache_write=tally.cache_write_tokens,
+            cache_write_1h=tally.cache_write_1h_tokens,
+            usage_estimated=True,
+            stream_incomplete=True,
+        )
         _refuse_blocked(span, triples)
 
     def check_finished(calls: list[StreamedToolCall], tally: StreamTally) -> None:
@@ -368,7 +388,16 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
             input_tokens, output = usage_of(tally, complete=True)
             reported = tally.input_tokens is not None and tally.output_tokens is not None
             extra = {} if reported else {"usage_estimated": True}
-            _record_usage(span, tally.model or model, input_tokens, output, **extra)
+            _record_usage(
+                span,
+                tally.model or model,
+                input_tokens,
+                output,
+                cache_read=tally.cache_read_tokens,
+                cache_write=tally.cache_write_tokens,
+                cache_write_1h=tally.cache_write_1h_tokens,
+                **extra,
+            )
 
         def gated(listed: list[StreamedToolCall]) -> list[tuple[str | None, str, Any]]:
             # Gate the name as last sent or the fragments joined, like the block
@@ -397,7 +426,15 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
             # The tokens the stream produced before failing were still spent.
             input_tokens, output = usage_of(tally, complete=False)
             _record_usage(
-                span, tally.model or model, input_tokens, output, usage_estimated=True, stream_incomplete=True
+                span,
+                tally.model or model,
+                input_tokens,
+                output,
+                cache_read=tally.cache_read_tokens,
+                cache_write=tally.cache_write_tokens,
+                cache_write_1h=tally.cache_write_1h_tokens,
+                usage_estimated=True,
+                stream_incomplete=True,
             )
             span.payload = {**span.payload, "error": str(error)}
             span.finish(status="error")
@@ -411,7 +448,16 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
             extra["usage_estimated"] = True
         if not complete:
             extra["stream_incomplete"] = True
-        _record_usage(span, tally.model or model, input_tokens, output, **extra)
+        _record_usage(
+            span,
+            tally.model or model,
+            input_tokens,
+            output,
+            cache_read=tally.cache_read_tokens,
+            cache_write=tally.cache_write_tokens,
+            cache_write_1h=tally.cache_write_1h_tokens,
+            **extra,
+        )
         span.finish(status="ok")
         emit(span.to_event_dict())
 
@@ -489,7 +535,14 @@ def _run_enforced(vendor: str, original: Any, self_inner: Any, args: Any, kwargs
     actual_model = getattr(result, "model", model) or model
     # Cost first: a refused response still counts against the budget, the
     # tokens were spent.
-    _record_usage(span, actual_model, input_tokens, output_tokens)
+    _record_usage(
+        span,
+        actual_model,
+        input_tokens,
+        output_tokens,
+        cache_read=getattr(usage, "cache_read_input_tokens", 0) or 0,
+        **_cache_writes(usage),
+    )
     # Blocked calls raise; calls matched by a require_approval rule wait for a
     # Cloud decision and raise unless approved.
     calls = _response_tool_calls(vendor, result)
