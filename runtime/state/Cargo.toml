@@ -3,6 +3,7 @@ name = "jamjet-state"
 description = "JamJet durable state — event log, snapshots, SQLite and Postgres backends"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

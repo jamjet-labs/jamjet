@@ -3,6 +3,7 @@ name = "jamjet-timers"
 description = "JamJet durable timers — Postgres-backed timer store and cron scheduler"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

@@ -116,12 +116,12 @@ jobs:
 
       - name: Build binary (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }} -p jamjet-api
+        run: cargo build --release --locked --target ${{ matrix.target }} -p jamjet-api
         working-directory: runtime
 
       - name: Build binary (cross)
         if: ${{ matrix.cross }}
-        run: cross build --release --target ${{ matrix.target }} -p jamjet-api
+        run: cross build --release --locked --target ${{ matrix.target }} -p jamjet-api
         working-directory: runtime
 
       - name: Stage binary (Unix)

@@ -43,7 +43,7 @@ JamJet follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). B
 
 | Tool | Version | Install |
 |------|---------|---------|
-| Rust | stable | `rustup` |
+| Rust | stable (the minimum is `rust-version` in `runtime/Cargo.toml`) | `rustup` |
 | Python | 3.11+ | `pyenv` recommended |
 | PostgreSQL | 15+ | local or Docker |
 | `uv` | latest | `pip install uv` |
@@ -294,7 +294,7 @@ ADR format follows the [MADR](https://adr.github.io/madr/) template.
 ### Rust
 
 - `cargo fmt` — formatting (enforced in CI)
-- `cargo clippy -- -D warnings` — lints (enforced in CI)
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — lints (enforced in CI)
 - Prefer explicit error types over `Box<dyn Error>`
 - Use `tracing` for all log output, not `println!`
 - Every public API should have doc comments

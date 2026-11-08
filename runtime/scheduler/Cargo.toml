@@ -3,6 +3,7 @@ name = "jamjet-scheduler"
 description = "JamJet scheduler — runnable node detection, queue dispatch, lease management"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

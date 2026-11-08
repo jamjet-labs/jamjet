@@ -38,7 +38,7 @@ fi
 # ── 3. Rust clippy (staged Rust files only) ──────────────────────────────────
 if git diff --cached --name-only | grep -qE '\.rs$'; then
     info "Running cargo clippy..."
-    (cd runtime && cargo clippy --workspace --all-features -- -D warnings) \
+    (cd runtime && cargo clippy --workspace --all-targets --all-features -- -D warnings) \
         || fail "clippy found warnings — fix them before committing."
 fi
 
