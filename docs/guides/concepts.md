@@ -21,7 +21,7 @@ Agents are not just model+prompt wrappers. They are addressable, discoverable, a
 A **workflow** is a typed directed graph of nodes connected by edges. It:
 - Has a shared **typed state** object (Pydantic model)
 - Executes **durably** — survives crashes without losing completed steps
-- Can **branch** on conditions, **fan out** in parallel, **pause** for humans or timers
+- Can **branch** on conditions, **fan out** to several next nodes, and **pause** for a human decision
 - Compiles to a canonical **IR** (Intermediate Representation) before execution
 
 ---
@@ -66,9 +66,8 @@ class ResearchState(BaseModel):
 
 JamJet workflows are **durable by default**:
 - Every node completion is written to an append-only event log
-- If the runtime crashes, execution resumes from the last checkpoint
-- Human approval pauses survive restarts — they wait indefinitely
-- Timers survive restarts — they fire even after a long pause
+- If the runtime crashes, execution resumes from the last checkpoint, and completed nodes do not run again
+- A pending human approval survives restarts. It waits until someone decides or, if the node or policy sets a timeout, until its deadline passes; an expired approval never approves
 
 This is backed by an **event sourcing + snapshot** model. See [State & Durability](../architecture/state-and-durability.md).
 
@@ -76,21 +75,25 @@ This is backed by an **event sourcing + snapshot** model. See [State & Durabilit
 
 ## MCP (Model Context Protocol)
 
-MCP is the standard protocol for tool integration:
-- **As client** — connect to any MCP server and use its tools in your workflow
-- **As server** — expose your agent's tools to any MCP client (VS Code, Cursor, other agents)
+- **The runtime as an MCP server.** `/mcp` exposes the runtime itself as MCP
+  tools: start, inspect, list and cancel executions, read events, approve, and
+  list or discover agents. It takes the same tokens and roles as the REST API.
+- **Calling MCP tools.** A workflow cannot: registration refuses `mcp_tool`
+  nodes. To govern an MCP client's tool calls, use the
+  [`@jamjet/mcp-shim`](https://npmjs.com/package/@jamjet/mcp-shim) adapter, or
+  call the MCP server from a Python step and check policy there, as in
+  [`examples/05-mcp-tool-call`](../../examples/05-mcp-tool-call).
 
-MCP tool calls are fully durable — checkpointed like any other node.
+See the [MCP guide](mcp-guide.md).
 
 ---
 
 ## A2A (Agent-to-Agent)
 
-A2A is the standard protocol for inter-agent communication:
-- **As client** — discover external agents via their Agent Card and delegate tasks to them
-- **As server** — publish your agent at `/.well-known/agent.json` so any A2A client can find and invoke it
-
-A2A delegation is durable — JamJet tracks the remote task state and resumes correctly after a crash.
+The runtime can fetch a remote agent's Agent Card and register it
+(`POST /agents/discover`, or `jamjet agents discover <url> --register`; `jamjet a2a discover <url>` only prints the card). It does not delegate
+tasks over A2A (registration refuses `a2a_task` nodes) and does not serve an
+A2A endpoint. See the [A2A guide](a2a-guide.md).
 
 ---
 

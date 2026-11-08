@@ -1,52 +1,19 @@
-# WASI Tool Sandboxing Guide
+# Tool Sandboxing
 
-> **Status:** Planned — Phase 3 (v1), Phase 4 (production hardening). This guide will be written when WASI sandboxing is implemented.
+JamJet does not sandbox tools. There is no WASI or Wasm runtime in this repo
+and no `wasi_sandbox` tool type.
 
----
+A Python step (`python_fn`) runs inside the `jamjet worker` process that
+claimed it, with that process's filesystem, network access and environment.
+A Java step runs the same way in the Java worker. Contain workers the way you
+would contain any service that runs code you did not write:
 
-## Overview
-
-JamJet supports executing tools in **WASI/Wasm sandboxes** via Wasmtime — a Rust-native WebAssembly runtime. Sandboxed tools run in capability-constrained containers: they can only access filesystem paths, network hosts, and environment variables that are explicitly declared.
-
-This is particularly useful for:
-- Third-party or community-contributed tools you don't fully trust
-- Tools that should never access your host filesystem or network
-- Reproducible, deterministic tool execution
-
-## Why Wasmtime
-
-Wasmtime is Rust-native and integrates directly with Tokio's async runtime — making it a natural fit for JamJet's execution core with minimal overhead.
-
-## Planned YAML shape
-
-```yaml
-tools:
-  code_executor:
-    type: wasi_sandbox
-    module: tools/code_exec.wasm    # pre-compiled Wasm module
-    capabilities:
-      filesystem:
-        - path: /tmp/scratch
-          mode: read_write
-      network:
-        - host: api.github.com
-          port: 443
-      env:
-        - LANG
-        - TZ
-    limits:
-      memory_mb: 256
-      cpu_time_ms: 30000
-      fuel: 1000000                 # Wasmtime fuel for deterministic CPU limiting
-```
-
-## Planned guarantees
-
-- Sandbox enforces declared capabilities — no undeclared filesystem/network access
-- Tools respect memory and CPU limits
-- Performance overhead target: < 10% vs native tool execution for typical tools
-- Wasm modules are portable across platforms
-
-## Tracking
-
-Follow progress in `progress-tracker.md` under Phase 3, tasks 3.24–3.27.
+- Run each worker as its own unprivileged user, in a container or VM with only
+  the mounts and network routes its tools need.
+- Give a worker only the environment variables its tools need. A tool can read
+  everything in the worker's environment.
+- Gate the tools that change things with `blocked_tools`,
+  `require_approval_for` or an Agent Card's `allowed_tools`. The runtime
+  checks these when the step is about to be handed to a worker, so a blocked
+  step never reaches one and a gated step waits for a decision first. See
+  [Security](security.md) and [Human-in-the-Loop](hitl.md).

@@ -1,6 +1,6 @@
 # Workflow Authoring
 
-JamJet supports three authoring modes: YAML, Python decorators, and Python graph builder. All three compile to the same canonical IR.
+JamJet has two authoring modes: YAML and Python decorators. Both compile to the same canonical IR.
 
 The runtime executes `model`, `condition` and `human_approval` nodes itself, and Python, Java and `external_fn` steps on external workers.
 Registration refuses the other node kinds, including `tool` and `agent` used
@@ -11,6 +11,10 @@ in the YAML example below; see [Node types](yaml-reference.md#node-types).
 ## YAML Authoring
 
 ### Project structure
+
+`jamjet validate` and `jamjet run` read only the workflow file you pass them.
+The other files below show one way to lay out a project; nothing in the CLI or
+the runtime loads them.
 
 ```
 my-project/
@@ -128,7 +132,7 @@ nodes:
 ## Python Decorator API
 
 ```python
-from jamjet import Workflow, tool, agent
+from jamjet import Workflow, tool
 from pydantic import BaseModel
 
 class TriageState(BaseModel):
@@ -175,28 +179,6 @@ async def auto_respond(state: State) -> State:
 
 ---
 
-## Python Graph Builder API
-
-For complex orchestration where you want explicit control over the graph:
-
-```python
-from jamjet import WorkflowGraph, ModelNode, ToolNode, ConditionNode, HumanApprovalNode
-
-graph = WorkflowGraph("complex_pipeline")
-
-graph.add_node("fetch", ToolNode(tool_ref="get_ticket"))
-graph.add_node("classify", ModelNode(model="default_chat", prompt="Classify this ticket: {{ state.ticket }}"))
-graph.add_node("review", HumanApprovalNode(timeout="48h"))
-graph.add_node("respond", ModelNode(model="default_chat", prompt="Reply to this ticket: {{ state.ticket }}"))
-
-graph.add_edge("fetch", "classify")
-graph.add_edge("classify", "review", when="output.priority == 'high'")
-graph.add_edge("classify", "respond")  # default
-graph.add_edge("review", "respond")
-```
-
----
-
 ## Validation
 
 ```bash
@@ -206,6 +188,6 @@ jamjet validate workflow.yaml
 # Validate Python workflow
 jamjet validate my_workflow.py
 
-# Confirm both produce identical IR
-jamjet validate workflow.yaml --compare my_workflow.py
+# Print the compiled IR
+jamjet validate workflow.yaml --output
 ```

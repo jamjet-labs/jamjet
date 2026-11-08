@@ -132,13 +132,26 @@ registration refuses them. To wait for a person, use a human approval step.
 
 ## Retry policies
 
-```python
-from jamjet import RetryPolicy
+A step's `retry_policy` is a name. The runtime reads it for the number of
+attempts the step gets:
 
-@tool(retry_policy=RetryPolicy(max_attempts=3, backoff="exponential", jitter=True))
-async def call_external_api(...) -> ...:
+| Name | Attempts |
+|------|----------|
+| `no_retry` | 1 |
+| `io_default` | 5 |
+| `llm_default` | 3 |
+| any other name, or none | 3 |
+
+```python
+@workflow.step(retry_policy="io_default")
+async def call_external_api(state: State) -> State:
     ...
 ```
+
+A failed step is tried again until its attempts run out, waiting 2, 4, 8 and
+so on seconds between attempts (at most 64). Some failures end the step at
+once: a policy block, or a prompt that does not render. There is no
+`RetryPolicy` class, and the backoff is the same for every policy.
 
 ---
 

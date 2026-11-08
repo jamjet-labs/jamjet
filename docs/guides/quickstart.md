@@ -15,12 +15,30 @@ Get a JamJet workflow running locally in under 10 minutes.
 ## 1. Install the CLI
 
 ```bash
-pip install 'jamjet[model]'
+pip install 'jamjet[model,sidecar]'
 ```
+
+`model` adds the client the model sidecar calls providers with, and `sidecar`
+adds the server it runs on. `jamjet dev` stops with `the model sidecar needs
+uvicorn` if `sidecar` is missing.
 
 Verify:
 ```bash
 jamjet --version
+```
+
+`jamjet dev` uses the `jamjet-server` on your `PATH`, and downloads the binary
+published with the SDK's latest release when there is none. The binary
+published with `jamjet` 0.12.0 does not send a model node's prompt to the
+model, so the starter workflow below fails there with `no prompt or messages
+provided`. To follow this guide with the code on `main`, install from a clone
+and put the runtime you build on your `PATH`:
+
+```bash
+pip install './sdk/python[model,sidecar]'
+mkdir -p web/dist && touch web/dist/index.html   # the binary embeds the web UI from here
+(cd runtime && cargo build --bin jamjet-server)
+export PATH="$PWD/runtime/target/debug:$PATH"
 ```
 
 ---
@@ -104,8 +122,9 @@ The model's reply is in the run's final state as `last_model_output`.
 
 The input must have every key the prompt reads. Run it with
 `{"question": ...}` instead and the `think` node fails with
-``the run's state has no `query` ``: the runtime does not send the model a
-prompt with a gap in it.
+``the run's state has no `query` `` (in its `node_failed` event, from
+`curl localhost:7700/executions/<id>/events`): the runtime does not send the
+model a prompt with a gap in it.
 
 ---
 

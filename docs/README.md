@@ -19,8 +19,9 @@ Welcome to the JamJet documentation. Use the table below to find what you need.
 | [A2A Integration](guides/a2a-guide.md) | Delegating to and serving external A2A agents |
 | [Human-in-the-Loop](guides/hitl.md) | Approval nodes, state editing, audit logging |
 | [Observability](guides/observability.md) | Tracing, replay, debugging, OpenTelemetry |
-| [Deployment](guides/deployment.md) | Production deployment — Postgres, workers, scaling |
-| [Security](guides/security.md) | Auth, RBAC, secrets, sandboxing, audit |
+| [Deployment](guides/deployment.md) | Running the server: SQLite, tokens, workers, Docker, environment variables |
+| [Security](guides/security.md) | Tokens, RBAC, tenant policy, secrets, signed audit log |
+| [Tool Sandboxing](guides/wasi-sandboxing.md) | What runs where, and how to contain workers |
 
 ---
 
