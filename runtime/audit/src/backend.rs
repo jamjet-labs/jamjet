@@ -49,9 +49,17 @@ pub trait AuditBackend: Send + Sync {
     async fn append(&self, entry: AuditLogEntry) -> Result<(), AuditError>;
 
     /// Append `entry` only if the log's newest entry is still the one it was
-    /// sealed onto (`entry.prev_hash`; `None` for an empty log). `Ok(false)`:
-    /// another writer appended first, so the entry must be sealed onto the
-    /// new [`head`](Self::head) and tried again.
+    /// sealed onto (`entry.prev_hash`; `None` for an empty log) and `entry`
+    /// is dated after every entry already in the log. `Ok(false)`: another
+    /// writer appended first, so the entry must be sealed onto the new
+    /// [`head`](Self::head), dated after it, and tried again.
+    ///
+    /// The date check keeps the order entries are listed and found as the
+    /// head in (`created_at`) the chain's order. An entry linked onto the
+    /// head but dated before it (a clock that stepped back, another
+    /// machine's clock) listed before its predecessor and left the
+    /// predecessor reading as the head, so the next entry linked onto that
+    /// and forked the chain.
     ///
     /// Two processes append to one log (the server, and `jamjet-server token
     /// create` beside it), each holding the head in memory: a plain append
@@ -59,6 +67,22 @@ pub trait AuditBackend: Send + Sync {
     /// check, which is right only for a log one process writes.
     async fn append_linked(&self, entry: AuditLogEntry) -> Result<bool, AuditError> {
         self.append(entry).await.map(|()| true)
+    }
+
+    /// The newest entry's `entry_hash` and `created_at`, in the order
+    /// [`append_linked`](Self::append_linked) checks: `None` for an empty
+    /// log. A writer dates its next entry after this.
+    async fn head_at(&self) -> Result<Option<(Option<String>, DateTime<Utc>)>, AuditError> {
+        let q = AuditQuery {
+            limit: 1,
+            ..Default::default()
+        };
+        Ok(self
+            .query(&q)
+            .await?
+            .into_iter()
+            .next()
+            .map(|e| (e.entry_hash, e.created_at)))
     }
 
     /// The `entry_hash` of the newest entry, in the order

@@ -64,6 +64,10 @@ const INSERT_VALUES: &str = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 const HEAD_SQL: &str =
     "SELECT entry_hash FROM audit_log ORDER BY created_at DESC, rowid DESC LIMIT 1";
 
+/// [`HEAD_SQL`] with the head's `created_at`.
+const HEAD_AT_SQL: &str =
+    "SELECT entry_hash, created_at FROM audit_log ORDER BY created_at DESC, rowid DESC LIMIT 1";
+
 /// Bind an entry's 21 columns, in [`INSERT_COLUMNS`] order.
 fn bind_entry<'q>(
     q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
@@ -158,21 +162,40 @@ impl AuditBackend for SqliteAuditBackend {
         Ok(())
     }
 
-    /// One statement, so SQLite's write lock makes the check and the insert
+    /// One statement, so SQLite's write lock makes the checks and the insert
     /// atomic against every other writer of the file, in this process or
-    /// another.
+    /// another. `created_at` is compared as stored, an RFC 3339 string in
+    /// UTC, which sorts as the time does (the order [`HEAD_SQL`] reads).
     async fn append_linked(&self, entry: AuditLogEntry) -> Result<bool, AuditError> {
         let sql = format!(
             "INSERT OR IGNORE INTO audit_log {INSERT_COLUMNS} SELECT {INSERT_PLACEHOLDERS} \
-             WHERE ({HEAD_SQL}) IS ?"
+             WHERE ({HEAD_SQL}) IS ? \
+             AND NOT EXISTS (SELECT 1 FROM audit_log WHERE created_at >= ?)"
         );
         let prev = entry.prev_hash.clone();
+        let at = entry.created_at.to_rfc3339();
         let done = bind_entry(sqlx::query(&sql), &entry)?
             .bind(prev)
+            .bind(at)
             .execute(&self.pool)
             .await
             .map_err(|e| AuditError::Database(e.to_string()))?;
         Ok(done.rows_affected() == 1)
+    }
+
+    async fn head_at(
+        &self,
+    ) -> Result<Option<(Option<String>, chrono::DateTime<chrono::Utc>)>, AuditError> {
+        let row: Option<(Option<String>, String)> = sqlx::query_as(HEAD_AT_SQL)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AuditError::Database(e.to_string()))?;
+        row.map(|(hash, at)| {
+            chrono::DateTime::parse_from_rfc3339(&at)
+                .map(|t| (hash, t.with_timezone(&chrono::Utc)))
+                .map_err(|e| AuditError::Database(format!("head created_at {at:?}: {e}")))
+        })
+        .transpose()
     }
 
     async fn head(&self) -> Result<Option<String>, AuditError> {
@@ -211,7 +234,7 @@ impl AuditBackend for SqliteAuditBackend {
 
         let where_clause = wheres.join(" AND ");
         let sql = format!(
-            "SELECT * FROM audit_log WHERE {where_clause} ORDER BY created_at DESC LIMIT {} OFFSET {}",
+            "SELECT * FROM audit_log WHERE {where_clause} ORDER BY created_at DESC, rowid DESC LIMIT {} OFFSET {}",
             q.limit, q.offset
         );
 

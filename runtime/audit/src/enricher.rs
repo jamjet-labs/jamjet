@@ -57,6 +57,8 @@ struct ChainHead {
     seeded: bool,
     /// `entry_hash` of the most recently appended entry (`None` at genesis).
     head: Option<String>,
+    /// That entry's `created_at`: the next one is dated after it.
+    head_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Enriches events with audit metadata, seals them into the tamper-evident
@@ -234,8 +236,9 @@ impl AuditEnricher {
     /// process may append to the same log (`jamjet-server token create`
     /// beside the server): the append is linked
     /// ([`AuditBackend::append_linked`]), and one that finds the head moved
-    /// re-reads it and seals again. `created_at` is set at each seal, so the
-    /// order entries are listed in (`created_at`) is the chain's order.
+    /// re-reads it and seals again. `created_at` is set at each seal, after
+    /// the head's, so the order entries are listed in (`created_at`) is the
+    /// chain's order.
     async fn seal_and_append(&self, mut entry: AuditLogEntry) -> Result<(), String> {
         const ATTEMPTS: usize = 8;
         let built_at = entry.created_at;
@@ -245,14 +248,24 @@ impl AuditEnricher {
             if !chain.seeded || attempt > 0 {
                 // An unreadable head is an error, not an empty log: linking
                 // the entry to nothing would break the chain here.
-                chain.head = self
+                let head = self
                     .backend
-                    .head()
+                    .head_at()
                     .await
                     .map_err(|e| format!("audit log head unreadable: {e}"))?;
+                (chain.head, chain.head_at) = match head {
+                    Some((hash, at)) => (hash, Some(at)),
+                    None => (None, None),
+                };
                 chain.seeded = true;
             }
-            let now = chrono::Utc::now();
+            // Dated after the head even when this clock is behind it (it
+            // stepped back, or another writer's runs ahead), so the listing
+            // order stays the chain's order.
+            let now = match chain.head_at {
+                Some(at) => chrono::Utc::now().max(at + chrono::Duration::microseconds(1)),
+                None => chrono::Utc::now(),
+            };
             entry.created_at = now;
             entry.expires_at = expires_at.map(|e| e + (now - built_at));
             entry.seal(chain.head.clone(), &self.signer);
@@ -261,6 +274,7 @@ impl AuditEnricher {
                 // write never leaves a gap the next entry would link past.
                 Ok(true) => {
                     chain.head = entry.entry_hash.clone();
+                    chain.head_at = Some(entry.created_at);
                     return Ok(());
                 }
                 Ok(false) => continue,
