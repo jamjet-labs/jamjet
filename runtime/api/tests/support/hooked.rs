@@ -24,6 +24,11 @@ pub enum Write {
     /// A conditional append is about to run (reported BEFORE it): where a
     /// lock wait or a stall delays the append past the caller's own checks.
     BeforeAppendEventIf(ExecutionId),
+    /// A filtered claim leased an item (after it committed, before the caller
+    /// sees it): the gap between a claim and whatever its caller does next.
+    Claimed(ExecutionId),
+    /// A read of the leased items (after it returned).
+    LeasedItems,
 }
 
 #[async_trait::async_trait]
@@ -34,11 +39,17 @@ pub trait AfterWrite: Send + Sync {
 pub struct HookedBackend {
     pub inner: Arc<dyn StateBackend>,
     pub hook: Arc<dyn AfterWrite>,
+    /// While set, `get_work_item` fails as a store that is briefly away does.
+    pub fail_item_reads: std::sync::atomic::AtomicBool,
 }
 
 impl HookedBackend {
     pub fn new(inner: Arc<dyn StateBackend>, hook: Arc<dyn AfterWrite>) -> Self {
-        Self { inner, hook }
+        Self {
+            inner,
+            hook,
+            fail_item_reads: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 }
 
@@ -324,9 +335,16 @@ impl StateBackend for HookedBackend {
         lease_secs: Option<u64>,
         filter: &jamjet_state::ClaimFilter,
     ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::backend::WorkItem>> {
-        self.inner
+        let item = self
+            .inner
             .claim_work_item_filtered(worker_id, queue_types, lease_secs, filter)
-            .await
+            .await?;
+        if let Some(wi) = &item {
+            self.hook
+                .after(Write::Claimed(wi.execution_id.clone()))
+                .await;
+        }
+        Ok(item)
     }
 
     async fn leased_items(
@@ -334,7 +352,30 @@ impl StateBackend for HookedBackend {
         queue_types: &[&str],
         filter: &jamjet_state::ClaimFilter,
     ) -> jamjet_state::backend::BackendResult<Vec<jamjet_state::LeasedItem>> {
-        self.inner.leased_items(queue_types, filter).await
+        let leased = self.inner.leased_items(queue_types, filter).await?;
+        self.hook.after(Write::LeasedItems).await;
+        Ok(leased)
+    }
+
+    async fn swap_gate(
+        &self,
+        item_id: uuid::Uuid,
+        lease_fence: i64,
+        from: jamjet_state::GateMark,
+        to: jamjet_state::GateMark,
+    ) -> jamjet_state::backend::BackendResult<bool> {
+        self.inner.swap_gate(item_id, lease_fence, from, to).await
+    }
+
+    async fn park_for_execution(
+        &self,
+        item_id: uuid::Uuid,
+        lease_fence: i64,
+        attempt: u32,
+    ) -> jamjet_state::backend::BackendResult<bool> {
+        self.inner
+            .park_for_execution(item_id, lease_fence, attempt)
+            .await
     }
 
     async fn mark_gate(
@@ -402,6 +443,14 @@ impl StateBackend for HookedBackend {
         &self,
         item_id: jamjet_state::backend::WorkItemId,
     ) -> jamjet_state::backend::BackendResult<Option<WorkItem>> {
+        if self
+            .fail_item_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(jamjet_state::StateBackendError::Database(
+                "the store is briefly away".into(),
+            ));
+        }
         self.inner.get_work_item(item_id).await
     }
 

@@ -23,6 +23,14 @@ pub enum ApiError {
 
     #[error("forbidden: {0}")]
     Forbidden(String),
+
+    /// 429, with `Retry-After`: the caller should try again shortly.
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
+
+    /// 503, with `Retry-After`: a transient failure, worth a retry.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
 }
 
 impl IntoResponse for ApiError {
@@ -34,8 +42,18 @@ impl IntoResponse for ApiError {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".into()),
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
+            Self::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
+            Self::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
         };
-        (status, Json(json!({ "error": message }))).into_response()
+        let retry = matches!(self, Self::TooManyRequests(_) | Self::Unavailable(_));
+        let mut resp = (status, Json(json!({ "error": message }))).into_response();
+        if retry {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        resp
     }
 }
 

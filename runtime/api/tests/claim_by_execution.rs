@@ -86,6 +86,38 @@ async fn send(
     )
 }
 
+/// [`send`], with the status and the `Retry-After` header.
+async fn send_with_headers(
+    state: &AppState,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Value,
+) -> (u16, Option<String>, Value) {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(t) = token {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let resp = build_router_with_opts(state.clone(), token.is_none())
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .map(|v| v.to_str().unwrap().to_string());
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        retry_after,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 async fn register(state: &AppState, token: Option<&str>, ir: Value) {
     let (st, body) = send(state, "POST", "/workflows", token, json!({ "ir": ir })).await;
     assert!((200..300).contains(&st), "{st} {body}");
@@ -668,10 +700,30 @@ async fn a_lease_handed_out_again_is_checked_again() {
     }
 }
 
-/// Lease `node` of `e` to `worker` with no gate run, as an interrupted claim
-/// (a dropped connection, a lookup error) leaves it.
+/// Lease `node` of `e` to `worker` with its gate undecided, as a gate that
+/// could not decide (a lookup error) leaves it.
 async fn lease_undecided(backend: &Arc<dyn StateBackend>, e: &str, node: &str, worker: &str) {
-    let leased = backend
+    let leased = lease_gating(backend, e, node, worker).await;
+    assert!(backend
+        .swap_gate(
+            leased.id,
+            leased.lease_fence,
+            jamjet_state::GateMark::Gating,
+            jamjet_state::GateMark::Undecided
+        )
+        .await
+        .unwrap());
+}
+
+/// Lease `node` of `e` to `worker` as a claim by execution does: marked as
+/// gating in the same statement, before any gate runs.
+async fn lease_gating(
+    backend: &Arc<dyn StateBackend>,
+    e: &str,
+    node: &str,
+    worker: &str,
+) -> WorkItem {
+    backend
         .claim_work_item_filtered(
             worker,
             &[QUEUE],
@@ -682,8 +734,8 @@ async fn lease_undecided(backend: &Arc<dyn StateBackend>, e: &str, node: &str, w
             },
         )
         .await
-        .unwrap();
-    assert!(leased.is_some(), "nothing to lease for {node}");
+        .unwrap()
+        .unwrap_or_else(|| panic!("nothing to lease for {node}"))
 }
 
 /// A lease no gate decided is decided when the same worker claims again:
@@ -942,7 +994,7 @@ async fn a_wait_ends_when_the_run_does() {
         .await;
         assert_eq!(
             body,
-            json!({ "claimed": false, "reason": "not_found" }),
+            json!({ "claimed": false, "reason": "not_found", "status": "cancelled" }),
             "{name}"
         );
         assert!(
@@ -982,7 +1034,7 @@ async fn an_ended_runs_items_are_settled() {
         let (_, body) = claim(&state, None, "w", json!({ "execution_id": e })).await;
         assert_eq!(
             body,
-            json!({ "claimed": false, "reason": "not_found" }),
+            json!({ "claimed": false, "reason": "not_found", "status": "cancelled" }),
             "{name}"
         );
         assert!(
@@ -1018,8 +1070,9 @@ async fn a_long_wait_is_cut_to_the_cap() {
 }
 
 /// One principal holds at most a few waiting claims; the next one answers at
-/// once. With its own token: the count is per process, and the other tests
-/// wait as `dev`.
+/// once, with a 429 and `Retry-After`, not a `not_ready` that reads like a
+/// wait that ran out. With its own token: the count is per process, and the
+/// other tests wait as `dev`.
 #[tokio::test]
 async fn waiting_claims_are_capped_per_principal() {
     let (url, path) = sqlite_url();
@@ -1045,8 +1098,13 @@ async fn waiting_claims_are_capped_per_principal() {
     // Let them all start waiting.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let started = std::time::Instant::now();
-    let (_, body) = claim(&state, Some(&token), "one-more", req.clone()).await;
-    assert_eq!(body, json!({ "claimed": false, "reason": "not_ready" }));
+    let mut over = req.clone();
+    over["worker_id"] = json!("one-more");
+    over["queue_types"] = json!([QUEUE]);
+    let (st, retry_after, body) =
+        send_with_headers(&state, "POST", "/work-items/claim", Some(&token), over).await;
+    assert_eq!(st, 429, "{body}");
+    assert_eq!(retry_after.as_deref(), Some("1"), "{body}");
     assert!(
         started.elapsed() < std::time::Duration::from_millis(1000),
         "the claim past the cap waited {:?}",
@@ -1378,4 +1436,576 @@ async fn claim_on_another_kind_is_refused_at_registration() {
     .await;
     assert_eq!(st, 400, "{body}");
     assert!(body.to_string().contains("external_fn"), "{body}");
+}
+
+// ── Second review: the gap after a claim, stable reasons, and the gate ───────
+
+type Action = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+type Trigger = fn(&support::hooked::Write) -> bool;
+
+/// Runs one action, once, on the first write that matches its trigger after
+/// it is armed.
+#[derive(Default)]
+struct Once {
+    armed: std::sync::Mutex<Option<(Trigger, Action)>>,
+}
+
+impl Once {
+    fn arm(
+        &self,
+        trigger: Trigger,
+        action: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        *self.armed.lock().unwrap() = Some((trigger, Box::pin(action)));
+    }
+}
+
+#[async_trait::async_trait]
+impl support::hooked::AfterWrite for Once {
+    async fn after(&self, write: support::hooked::Write) {
+        let action = {
+            let mut armed = self.armed.lock().unwrap();
+            match armed.as_ref() {
+                Some((trigger, _)) if trigger(&write) => armed.take().map(|(_, a)| a),
+                _ => None,
+            }
+        };
+        if let Some(action) = action {
+            action.await;
+        }
+    }
+}
+
+/// Each backend behind a [`Once`] hook, with the inner backend and a way to
+/// backdate a lease on it.
+#[allow(clippy::type_complexity)]
+async fn hooked_backends() -> Vec<(
+    &'static str,
+    Arc<dyn StateBackend>,
+    Arc<dyn StateBackend>,
+    Arc<Once>,
+    Expire,
+    Option<std::path::PathBuf>,
+)> {
+    let mut out = Vec::new();
+    let memory = Arc::new(InMemoryBackend::new());
+    let (url, path) = sqlite_url();
+    let sqlite: Arc<dyn StateBackend> = Arc::new(SqliteBackend::open(&url).await.unwrap());
+    let (url2, path2) = sqlite_url();
+    let scoped: Arc<dyn StateBackend> = Arc::new(
+        SqliteBackend::open(&url2)
+            .await
+            .unwrap()
+            .for_tenant(jamjet_state::TenantId::from("default")),
+    );
+    for (name, inner, expire, path) in [
+        (
+            "memory",
+            memory.clone() as Arc<dyn StateBackend>,
+            Expire::Memory(memory),
+            None,
+        ),
+        ("sqlite", sqlite, Expire::Sql(url), Some(path)),
+        ("tenant_scoped", scoped, Expire::Sql(url2), Some(path2)),
+    ] {
+        let hook = Arc::new(Once::default());
+        let hooked: Arc<dyn StateBackend> = Arc::new(support::hooked::HookedBackend::new(
+            inner.clone(),
+            hook.clone(),
+        ));
+        out.push((name, hooked, inner, hook, expire, path));
+    }
+    out
+}
+
+/// Backdates a lease so the next sweep finds it expired.
+#[derive(Clone)]
+enum Expire {
+    Memory(Arc<InMemoryBackend>),
+    Sql(String),
+}
+
+impl Expire {
+    async fn lease(&self, id: uuid::Uuid) {
+        match self {
+            Expire::Memory(b) => b.force_lease_expired_for_test(id),
+            Expire::Sql(url) => {
+                let pool = sqlx::SqlitePool::connect(url).await.unwrap();
+                sqlx::query(
+                    "UPDATE work_items SET lease_expires_at = '2020-01-01T00:00:00+00:00' WHERE id = ?",
+                )
+                .bind(id.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+                pool.close().await;
+            }
+        }
+    }
+}
+
+async fn register_agent(state: &AppState) -> &'static str {
+    let agent = "jamjet://acme/caller";
+    let (st, body) = post(
+        state,
+        "/agents",
+        json!({
+            "id": agent, "uri": agent, "name": "caller", "description": "",
+            "version": "1.0.0",
+            "capabilities": { "skills": [], "protocols": [], "tools_provided": [], "tools_consumed": [] },
+            "autonomy": "fully_autonomous",
+            "constraints": { "max_iterations": 5 },
+            "auth": { "type": "none" }
+        }),
+    )
+    .await;
+    assert!(st.is_success(), "{st} {body}");
+    agent
+}
+
+fn by_this(e: &str) -> ClaimFilter {
+    ClaimFilter {
+        execution_id: Some(execution_id(e)),
+        node_id: None,
+    }
+}
+
+/// A retry from the same worker that lands right after the first claim's
+/// lease, before anything else of that claim ran, waits for it. The lease
+/// used to be marked as gating in a write of its own after the claim, and a
+/// retry in between decided the item beside the first claim and handed it
+/// out a second time.
+#[tokio::test]
+async fn a_retry_right_after_the_lease_is_not_handed_the_item_too() {
+    for (name, backend, inner, hook, _, path) in hooked_backends().await {
+        let state = make_state(backend.clone());
+        let agent = register_agent(&state).await;
+        let mut workflow = ir("wf-gap", Some("by_execution"), None);
+        workflow["agent_ref"] = json!(agent);
+        register(&state, None, workflow).await;
+        let e = start(&state, None, "wf-gap").await;
+
+        let answer = Arc::new(std::sync::Mutex::new(None));
+        let (st2, e2, a2) = (state.clone(), e.clone(), answer.clone());
+        hook.arm(
+            |w| matches!(w, support::hooked::Write::Claimed(_)),
+            async move {
+                let (_, body) = claim(&st2, None, "w1", json!({ "execution_id": e2 })).await;
+                *a2.lock().unwrap() = Some(body);
+            },
+        );
+        let (_, first) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        let retry = answer.lock().unwrap().clone().expect("the retry ran");
+        assert_eq!(
+            retry,
+            json!({ "claimed": false, "reason": "not_ready" }),
+            "{name}: {first}"
+        );
+        assert_eq!(first["claimed"], true, "{name}: {first}");
+        let kinds = event_kinds(&inner, &e).await;
+        assert_eq!(
+            count(&kinds, |k| matches!(k, EventKind::AgentStepAdmitted { .. })),
+            1,
+            "{name}: {kinds:?}"
+        );
+        cleanup(path);
+    }
+}
+
+/// A refusal is the same however often it is asked, and whoever asks: the
+/// gate settles the item it refuses, and a retry used to find nothing and
+/// say `not_ready` after a `blocked`. A run that ended says so, with its
+/// status.
+#[tokio::test]
+async fn a_refusal_is_the_same_on_every_retry() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        for (wf, p, reason) in [
+            ("wf-stable-block", policy(&["first"], &[]), "blocked"),
+            (
+                "wf-stable-gate",
+                policy(&[], &["first"]),
+                "approval_required",
+            ),
+        ] {
+            register(&state, None, ir(wf, Some("by_execution"), Some(p))).await;
+            let e = start(&state, None, wf).await;
+            for worker in ["w1", "w1", "w2"] {
+                let (_, body) = claim(&state, None, worker, json!({ "execution_id": e })).await;
+                assert_eq!(
+                    body,
+                    json!({ "claimed": false, "reason": reason }),
+                    "{name}: {wf} as {worker}"
+                );
+            }
+            let (_, body) = claim(
+                &state,
+                None,
+                "w2",
+                json!({ "execution_id": e, "node_id": "first" }),
+            )
+            .await;
+            assert_eq!(
+                body,
+                json!({ "claimed": false, "reason": reason }),
+                "{name}: {wf} by node"
+            );
+            if reason == "approval_required" {
+                let (st, body) = send(
+                    &state,
+                    "POST",
+                    &format!("/executions/{e}/cancel"),
+                    None,
+                    json!({}),
+                )
+                .await;
+                assert!((200..300).contains(&st), "{name}: {st} {body}");
+                let (_, body) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+                assert_eq!(
+                    body,
+                    json!({ "claimed": false, "reason": "not_found", "status": "cancelled" }),
+                    "{name}"
+                );
+            }
+        }
+        cleanup(path);
+    }
+}
+
+/// A client that gives up while the gate decides does not leave the lease
+/// half decided: the gate runs to its end in a task of its own, and the same
+/// worker claiming again gets the released lease. It used to stay marked as
+/// gating, answering `not_ready` until the lease expired.
+#[tokio::test]
+async fn a_gate_finishes_when_its_client_gives_up() {
+    for (name, backend, inner, hook, _, path) in hooked_backends().await {
+        let state = make_state(backend.clone());
+        let agent = register_agent(&state).await;
+        let mut workflow = ir("wf-drop", Some("by_execution"), None);
+        workflow["agent_ref"] = json!(agent);
+        register(&state, None, workflow).await;
+        let e = start(&state, None, "wf-drop").await;
+        hook.arm(
+            |w| matches!(w, support::hooked::Write::GetEvents(_)),
+            tokio::time::sleep(std::time::Duration::from_millis(400)),
+        );
+        let gave_up = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            claim(&state, None, "w1", json!({ "execution_id": e })),
+        )
+        .await;
+        assert!(gave_up.is_err(), "{name}: the gate did not stall");
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let leased = inner.leased_items(&[QUEUE], &by_this(&e)).await.unwrap();
+        assert_eq!(leased.len(), 1, "{name}");
+        assert_eq!(
+            leased[0].gate,
+            jamjet_state::GateMark::Released,
+            "{name}: the gate stopped with its request"
+        );
+        let (_, again) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(again["claimed"], true, "{name}: {again}");
+        assert_eq!(
+            again["work_item"]["lease_fence"],
+            json!(leased[0].item.lease_fence),
+            "{name}"
+        );
+        let kinds = event_kinds(&inner, &e).await;
+        assert_eq!(
+            count(&kinds, |k| matches!(k, EventKind::AgentStepAdmitted { .. })),
+            1,
+            "{name}: {kinds:?}"
+        );
+        cleanup(path);
+    }
+}
+
+/// A lease that expires while still marked as gating never ran: it goes back
+/// to pending with no attempt charged and nothing to report. Three dropped
+/// requests used to dead-letter a node that never ran.
+#[tokio::test]
+async fn a_gating_lease_that_expires_costs_no_attempt() {
+    for (name, backend, _inner, _hook, expire, path) in hooked_backends().await {
+        let state = make_state(backend.clone());
+        register(&state, None, ir("wf-expire", Some("by_execution"), None)).await;
+        let e = start(&state, None, "wf-expire").await;
+
+        // The sweep.
+        let leased = lease_gating(&backend, &e, "first", "w1").await;
+        expire.lease(leased.id).await;
+        let swept = backend.reclaim_expired_leases().await.unwrap();
+        assert!(
+            swept.retryable.is_empty() && swept.exhausted.is_empty(),
+            "{name}: reported {swept:?}"
+        );
+        let item = backend.get_work_item(leased.id).await.unwrap().unwrap();
+        assert_eq!(item.attempt, 0, "{name}: an attempt was charged");
+        assert!(item.worker_id.is_none(), "{name}: still leased");
+
+        // A claim's own expiry pass.
+        let leased = lease_gating(&backend, &e, "first", "w1").await;
+        expire.lease(leased.id).await;
+        let (_, body) = claim(&state, None, "w2", json!({ "execution_id": e })).await;
+        assert_eq!(body["claimed"], true, "{name}: {body}");
+        let item = backend.get_work_item(leased.id).await.unwrap().unwrap();
+        assert_eq!(item.attempt, 0, "{name}: an attempt was charged");
+        cleanup(path);
+    }
+}
+
+/// A worker's own lease, taken by a request of its own while this one looked,
+/// is its lease: handed back, not `claimed_by_other`, even when another
+/// worker's lease on the same run was seen first.
+#[tokio::test]
+async fn ones_own_lease_is_not_claimed_by_other() {
+    for (name, backend, inner, hook, _, path) in hooked_backends().await {
+        let state = make_state(backend.clone());
+        let workflow = ir("wf-own", Some("by_execution"), None);
+        register(&state, None, workflow.clone()).await;
+        let e = start(&state, None, "wf-own").await;
+        lease_gating(&inner, &e, "first", "w2").await;
+        enqueue_second(&inner, workflow, &e).await;
+
+        let fence = Arc::new(std::sync::Mutex::new(None));
+        let (i2, e2, f2) = (inner.clone(), e.clone(), fence.clone());
+        hook.arm(
+            |w| matches!(w, support::hooked::Write::LeasedItems),
+            async move {
+                // The worker's other request: it leased `second` and its gate
+                // released it.
+                let mine = lease_gating(&i2, &e2, "second", "w1").await;
+                assert!(i2
+                    .swap_gate(
+                        mine.id,
+                        mine.lease_fence,
+                        jamjet_state::GateMark::Gating,
+                        jamjet_state::GateMark::Released
+                    )
+                    .await
+                    .unwrap());
+                *f2.lock().unwrap() = Some(mine.lease_fence);
+            },
+        );
+        let (_, body) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(body["claimed"], true, "{name}: {body}");
+        assert_eq!(body["work_item"]["node_id"], "second", "{name}");
+        assert_eq!(
+            body["work_item"]["lease_fence"],
+            json!(fence.lock().unwrap().expect("the other request ran")),
+            "{name}"
+        );
+        cleanup(path);
+    }
+}
+
+/// A retry that saw the lease undecided does not go on once another has
+/// taken it to gating: the move to gating is a compare-and-swap on the mark
+/// the retry saw. Without it both decided the same item.
+#[tokio::test]
+async fn a_retry_with_a_stale_view_of_the_mark_stops() {
+    for (name, backend, inner, hook, _, path) in hooked_backends().await {
+        let state = make_state(backend.clone());
+        register(&state, None, ir("wf-stale", Some("by_execution"), None)).await;
+        let e = start(&state, None, "wf-stale").await;
+        lease_undecided(&inner, &e, "first", "w1").await;
+        let (i2, e2) = (inner.clone(), e.clone());
+        hook.arm(
+            |w| matches!(w, support::hooked::Write::LeasedItems),
+            async move {
+                // Another retry took it to gating, and is about to decide.
+                let l = i2.leased_items(&[QUEUE], &by_this(&e2)).await.unwrap();
+                assert!(i2
+                    .swap_gate(
+                        l[0].item.id,
+                        l[0].item.lease_fence,
+                        jamjet_state::GateMark::Undecided,
+                        jamjet_state::GateMark::Gating
+                    )
+                    .await
+                    .unwrap());
+            },
+        );
+        let (_, body) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(
+            body,
+            json!({ "claimed": false, "reason": "not_ready" }),
+            "{name}"
+        );
+        cleanup(path);
+    }
+}
+
+/// A gate whose lease was swept as gating while it decided (it ran past the
+/// lease) does not hand the item out: the move to released is a
+/// compare-and-swap, and the lease is gone.
+#[tokio::test]
+async fn a_gate_whose_lease_was_swept_hands_nothing_out() {
+    for (name, backend, inner, hook, expire, path) in hooked_backends().await {
+        let state = make_state(backend.clone());
+        let agent = register_agent(&state).await;
+        let mut workflow = ir("wf-swept", Some("by_execution"), None);
+        workflow["agent_ref"] = json!(agent);
+        register(&state, None, workflow).await;
+        let e = start(&state, None, "wf-swept").await;
+        let (i2, e2, x2) = (inner.clone(), e.clone(), expire.clone());
+        hook.arm(
+            |w| matches!(w, support::hooked::Write::GetEvents(_)),
+            async move {
+                let l = i2.leased_items(&[QUEUE], &by_this(&e2)).await.unwrap();
+                x2.lease(l[0].item.id).await;
+                i2.reclaim_expired_leases().await.unwrap();
+            },
+        );
+        let (_, body) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(
+            body,
+            json!({ "claimed": false, "reason": "not_ready" }),
+            "{name}"
+        );
+        cleanup(path);
+    }
+}
+
+/// A released lease re-attached by a heartbeat after an expiry stays
+/// released under its new fence: the same worker claiming again gets that
+/// lease back. It used to read as undecided and be decided again under a
+/// third fence, while the worker was already running it.
+#[tokio::test]
+async fn a_reattached_lease_stays_released() {
+    for (name, backend, inner, _hook, expire, path) in hooked_backends().await {
+        let state = make_state(backend.clone());
+        register(&state, None, ir("wf-reattach", Some("by_execution"), None)).await;
+        let e = start(&state, None, "wf-reattach").await;
+        let (_, first) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(first["claimed"], true, "{name}: {first}");
+        let id = first["work_item"]["id"].as_str().unwrap().to_string();
+        expire.lease(uuid::Uuid::parse_str(&id).unwrap()).await;
+        inner.reclaim_expired_leases().await.unwrap();
+        let (st, beat) = send(
+            &state,
+            "POST",
+            &format!("/work-items/{id}/heartbeat"),
+            None,
+            json!({ "worker_id": "w1", "lease_fence": first["work_item"]["lease_fence"] }),
+        )
+        .await;
+        assert_eq!(st, 200, "{name}: {beat}");
+        assert_eq!(beat["reattached"], true, "{name}: {beat}");
+        let (_, again) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(again["claimed"], true, "{name}: {again}");
+        assert_eq!(
+            again["work_item"]["lease_fence"], beat["lease_fence"],
+            "{name}"
+        );
+        cleanup(path);
+    }
+}
+
+/// An item of a node claimable only by its execution that lost its marker is
+/// not handed out oldest-first. It is put back marked, so it does not sit at
+/// the head of the queue for every poll, and the claim by execution gets it.
+#[tokio::test]
+async fn an_unmarked_item_of_a_by_execution_node_is_refused_oldest_first() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        let workflow = ir("wf-unmarked", Some("by_execution"), None);
+        register(&state, None, workflow.clone()).await;
+        let e = start(&state, None, "wf-unmarked").await;
+        // Take the start item out of the way.
+        let (_, body) = claim(&state, None, "w", json!({ "execution_id": e })).await;
+        assert_eq!(body["claimed"], true, "{name}: {body}");
+        // `second`, enqueued without the marker, then a plain run's item.
+        let wf: WorkflowIr = serde_json::from_value(workflow).unwrap();
+        let mut payload = jamjet_scheduler::payload::build_work_item_payload(
+            &wf,
+            "second",
+            wf.node("second").unwrap(),
+            &serde_json::Map::new(),
+            &wf.workflow_id,
+            "0.1.0",
+        );
+        payload.as_object_mut().unwrap().remove("claim");
+        let unmarked = uuid::Uuid::new_v4();
+        backend
+            .enqueue_work_item(WorkItem {
+                id: unmarked,
+                execution_id: execution_id(&e),
+                node_id: "second".into(),
+                queue_type: QUEUE.into(),
+                payload,
+                attempt: 0,
+                max_attempts: 3,
+                created_at: chrono::Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        register(&state, None, ir("wf-behind", None, None)).await;
+        let behind = start(&state, None, "wf-behind").await;
+
+        // Three polls: whatever order a backend hands items out in, each of
+        // the two pending items is looked at.
+        let mut handed = Vec::new();
+        for _ in 0..3 {
+            let (_, body) = claim(&state, None, "oldest-first", json!({})).await;
+            if body["claimed"] == true {
+                handed.push(body["work_item"]["execution_id"].clone());
+            }
+        }
+        assert_eq!(handed, vec![json!(behind)], "{name}");
+        let item = backend.get_work_item(unmarked).await.unwrap().unwrap();
+        assert_eq!(
+            item.payload["claim"], "by_execution",
+            "{name}: put back unmarked, it heads the queue for every poll"
+        );
+        assert!(item.worker_id.is_none(), "{name}");
+        let (_, body) = claim(
+            &state,
+            None,
+            "w",
+            json!({ "execution_id": e, "node_id": "second" }),
+        )
+        .await;
+        assert_eq!(body["claimed"], true, "{name}: {body}");
+        assert_eq!(body["work_item"]["attempt"], json!(0), "{name}: {body}");
+        cleanup(path);
+    }
+}
+
+/// A heartbeat whose read of the item fails is a 503 the worker retries,
+/// with `Retry-After`, not a 500 it takes for a lost lease.
+#[tokio::test]
+async fn a_heartbeat_that_cannot_read_the_item_is_unavailable() {
+    for (name, _, inner, _, _, path) in hooked_backends().await {
+        let hooked = Arc::new(support::hooked::HookedBackend::new(
+            inner.clone(),
+            Arc::new(Once::default()),
+        ));
+        let backend: Arc<dyn StateBackend> = hooked.clone();
+        let state = make_state(backend);
+        register(&state, None, ir("wf-beat", Some("by_execution"), None)).await;
+        let e = start(&state, None, "wf-beat").await;
+        let (_, first) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(first["claimed"], true, "{name}: {first}");
+        let id = first["work_item"]["id"].as_str().unwrap().to_string();
+        hooked
+            .fail_item_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (st, retry_after, body) = send_with_headers(
+            &state,
+            "POST",
+            &format!("/work-items/{id}/heartbeat"),
+            None,
+            json!({ "worker_id": "w1", "lease_fence": first["work_item"]["lease_fence"] }),
+        )
+        .await;
+        assert_eq!(st, 503, "{name}: {body}");
+        assert_eq!(retry_after.as_deref(), Some("1"), "{name}");
+        cleanup(path);
+    }
 }

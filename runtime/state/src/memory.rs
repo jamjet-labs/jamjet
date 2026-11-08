@@ -613,6 +613,27 @@ impl StateBackend for InMemoryBackend {
             .collect())
     }
 
+    async fn park_for_execution(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        attempt: u32,
+    ) -> BackendResult<bool> {
+        let now = Utc::now().to_rfc3339();
+        if !self
+            .park_work_item(item_id, lease_fence, &now, attempt)
+            .await?
+        {
+            return Ok(false);
+        }
+        if let Some(mut entry) = self.work_items.get_mut(&item_id) {
+            if let Some(obj) = entry.payload.as_object_mut() {
+                obj.insert("claim".into(), serde_json::json!("by_execution"));
+            }
+        }
+        Ok(true)
+    }
+
     async fn mark_gate(
         &self,
         item_id: WorkItemId,
@@ -637,6 +658,39 @@ impl StateBackend for InMemoryBackend {
             }
         }
         Ok(held)
+    }
+
+    async fn swap_gate(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: crate::backend::GateMark,
+        to: crate::backend::GateMark,
+    ) -> BackendResult<bool> {
+        use crate::backend::GateMark;
+        // The item's shard lock, taken for writing, is held across the test
+        // and the set, so two swaps of one item run one after the other.
+        let Some(item) = self.work_items.get_mut(&item_id) else {
+            return Ok(false);
+        };
+        if item.worker_id.is_none() || item.lease_fence != lease_fence {
+            return Ok(false);
+        }
+        let now = match self.released_fences.get(&item_id).map(|f| *f.value()) {
+            Some(f) if f == lease_fence => GateMark::Released,
+            Some(f) if f == -lease_fence => GateMark::Gating,
+            _ => GateMark::Undecided,
+        };
+        if now != from {
+            return Ok(false);
+        }
+        match to {
+            GateMark::Released => self.released_fences.insert(item_id, lease_fence),
+            GateMark::Gating => self.released_fences.insert(item_id, -lease_fence),
+            GateMark::Undecided => self.released_fences.remove(&item_id).map(|(_, v)| v),
+        };
+        drop(item);
+        Ok(true)
     }
 
     async fn has_claimable(
@@ -679,8 +733,27 @@ impl StateBackend for InMemoryBackend {
                 .executions
                 .get(&item.execution_id)
                 .is_some_and(|e| e.value().status.is_terminal());
+            let gating = item.lease_fence != 0
+                && self
+                    .released_fences
+                    .get(&item.id)
+                    .is_some_and(|f| *f.value() == -item.lease_fence);
             if terminal {
                 withdrawn.push(item.id);
+            } else if gating {
+                // A claim gate that never finished: the node never ran.
+                // Back to pending, uncharged, nothing recorded.
+                let next = self
+                    .lease_epochs
+                    .get(&item.id)
+                    .map(|e| *e.value())
+                    .unwrap_or(0)
+                    + 1;
+                self.lease_epochs.insert(item.id, next);
+                self.released_fences.remove(&item.id);
+                item.worker_id = None;
+                item.lease_expires_at = None;
+                item.lease_fence = 0;
             } else if item.attempt + 1 < item.max_attempts {
                 expired.push(item.clone());
                 self.last_lease.insert(
@@ -744,6 +817,10 @@ impl StateBackend for InMemoryBackend {
                 item.lease_fence = fence;
                 self.lease_secs.insert(item.id, lease_len);
                 self.last_lease.remove(&item.id);
+                // Leased already marked as gating, as in SQLite.
+                if filter.execution_id.is_some() {
+                    self.released_fences.insert(item.id, -fence);
+                }
                 return Ok(Some(item.clone()));
             }
         }
@@ -834,6 +911,14 @@ impl StateBackend for InMemoryBackend {
         entry.attempt = entry.attempt.saturating_sub(1);
         drop(entry);
         self.last_lease.remove(&item_id);
+        // Released under the lost fence: still released under the new one.
+        if self
+            .released_fences
+            .get(&item_id)
+            .is_some_and(|f| *f.value() == lease_fence)
+        {
+            self.released_fences.insert(item_id, fence);
+        }
         Ok(crate::backend::LeaseRenewal {
             lease_fence: fence,
             reattached: true,
@@ -1182,6 +1267,25 @@ impl StateBackend for InMemoryBackend {
             let item = entry.value_mut();
             if let Some(expires) = item.lease_expires_at {
                 if expires < now && item.worker_id.is_some() {
+                    let gating = item.lease_fence != 0
+                        && self
+                            .released_fences
+                            .get(&item.id)
+                            .is_some_and(|f| *f.value() == -item.lease_fence);
+                    if gating {
+                        let next = self
+                            .lease_epochs
+                            .get(&item.id)
+                            .map(|e| *e.value())
+                            .unwrap_or(0)
+                            + 1;
+                        self.lease_epochs.insert(item.id, next);
+                        self.released_fences.remove(&item.id);
+                        item.worker_id = None;
+                        item.lease_expires_at = None;
+                        item.lease_fence = 0;
+                        continue;
+                    }
                     item.attempt += 1;
                     if item.attempt < item.max_attempts {
                         self.last_lease.insert(

@@ -1233,6 +1233,21 @@ impl StateBackend for TenantScopedSqliteBackend {
             .await
     }
 
+    async fn park_for_execution(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        _attempt: u32,
+    ) -> BackendResult<bool> {
+        crate::sqlite::park_for_execution_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            item_id,
+            lease_fence,
+        )
+        .await
+    }
+
     async fn mark_gate(
         &self,
         item_id: WorkItemId,
@@ -1245,6 +1260,24 @@ impl StateBackend for TenantScopedSqliteBackend {
             item_id,
             lease_fence,
             mark,
+        )
+        .await
+    }
+
+    async fn swap_gate(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: crate::backend::GateMark,
+        to: crate::backend::GateMark,
+    ) -> BackendResult<bool> {
+        crate::sqlite::swap_gate_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            item_id,
+            lease_fence,
+            from,
+            to,
         )
         .await
     }
@@ -1329,8 +1362,14 @@ impl StateBackend for TenantScopedSqliteBackend {
         let new_epoch = current_epoch + 1;
         let new_fence = term * 4_294_967_296_i64 + new_epoch;
 
+        // A claim naming an execution leases the item already marked as
+        // gating (`released_fence = -fence`), in this same statement: a retry
+        // that looked between the claim and a separate mark took the lease for
+        // undecided and decided it a second time.
+        let mark = filter.execution_id.as_ref().map(|_| -new_fence);
         sqlx::query(
-            "UPDATE work_items SET status = 'claimed', worker_id = ?, lease_expires_at = ?, claimed_at = ?, lease_epoch = ?, lease_fence = ?, lease_secs = ? WHERE id = ?",
+            "UPDATE work_items SET status = 'claimed', worker_id = ?, lease_expires_at = ?, claimed_at = ?, lease_epoch = ?, lease_fence = ?, lease_secs = ?, \
+             released_fence = CASE WHEN ? IS NULL THEN released_fence ELSE ? END WHERE id = ?",
         )
         .bind(worker_id)
         .bind(&lease_expires_at)
@@ -1338,6 +1377,8 @@ impl StateBackend for TenantScopedSqliteBackend {
         .bind(new_epoch)
         .bind(new_fence)
         .bind(lease_len)
+        .bind(mark)
+        .bind(mark)
         .bind(&item_id)
         .execute(&mut *tx)
         .await
@@ -1780,6 +1821,11 @@ impl StateBackend for TenantScopedSqliteBackend {
             let item = row_to_work_item(row)?;
             let new_attempt = item.attempt + 1;
             let id_str = item.id.to_string();
+            // A gating lease never ran: requeued uncharged, not reported.
+            if crate::sqlite::is_gating(row, item.lease_fence) {
+                crate::sqlite::requeue_gating(&self.pool, &id_str, item.lease_fence).await?;
+                continue;
+            }
 
             if new_attempt >= item.max_attempts {
                 let dead_lettered_at = Utc::now().to_rfc3339();

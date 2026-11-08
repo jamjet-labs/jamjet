@@ -492,6 +492,23 @@ pub trait StateBackend: Send + Sync {
         ))
     }
 
+    /// Move `item_id`'s gate mark under `lease_fence` from `from` to `to`,
+    /// only if it is still `from`: a compare-and-swap, so of two claims that
+    /// saw the same mark only one goes on. `Ok(false)` if the mark or the
+    /// lease moved. The default refuses.
+    async fn swap_gate(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: GateMark,
+        to: GateMark,
+    ) -> BackendResult<bool> {
+        let _ = (item_id, lease_fence, from, to);
+        Err(StateBackendError::Database(
+            "this backend cannot record the claim gate's mark".into(),
+        ))
+    }
+
     /// Whether `filter` (which names an execution) matches an item that is
     /// pending and visible now, or claimed: a read-only probe a waiting claim
     /// polls instead of taking the write lock each time. The default says
@@ -541,7 +558,18 @@ pub trait StateBackend: Send + Sync {
         {
             return Ok(ExecutionClaim::Claimed(item));
         }
-        if !leased.is_empty() || !self.leased_items(queue_types, filter).await?.is_empty() {
+        // Read again before answering: the matching item may have been
+        // claimed since by this same worker (a concurrent request of its
+        // own), even when another lease was seen first. That is its lease,
+        // and it gets it back, not `claimed_by_other`.
+        let again = self.leased_items(queue_types, filter).await?;
+        if let Some(mine) = again
+            .iter()
+            .find(|l| l.item.worker_id.as_deref() == Some(worker_id))
+        {
+            return Ok(ExecutionClaim::AlreadyLeased(mine.clone()));
+        }
+        if !again.is_empty() {
             return Ok(ExecutionClaim::LeasedToOther);
         }
         Ok(ExecutionClaim::Nothing)
@@ -718,6 +746,26 @@ pub trait StateBackend: Send + Sync {
         retry_after: &str,
         next_attempt: u32,
     ) -> BackendResult<bool>;
+
+    /// Return a leased item to `pending` now, same attempt, fence-guarded as
+    /// [`Self::park_work_item`], and mark its payload `claim: by_execution`.
+    ///
+    /// For an item the oldest-first claim leased although its node is
+    /// claimable only by its execution: the item lost the marker, and putting
+    /// it back plain would hand it to the same claim on its next poll, ahead of
+    /// everything queued behind it. Marked, that claim skips it.
+    ///
+    /// The default parks it without the mark: refused still, but not repaired.
+    async fn park_for_execution(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        attempt: u32,
+    ) -> BackendResult<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.park_work_item(item_id, lease_fence, &now, attempt)
+            .await
+    }
 
     /// Fence-guarded finalization of a continue-as-new rollover on the OLD execution.
     ///
