@@ -452,3 +452,79 @@ def test_polling_fails_closed_with_the_real_reason() -> None:
         router.post(f"{API}/v1/approvals").mock(return_value=httpx.Response(503))
         with pytest.raises(JamJetApprovalTimeout, match="HTTP 503"):
             request_approval("jj_test", API, "x", timeout_seconds=60, poll_interval=0.01)
+
+
+def test_masking_by_shape_and_explicit_fields(env: dict[str, Any]) -> None:
+    env["policy"].add("require_approval", "pay")
+    created: list[dict[str, Any]] = []
+    args = json.dumps(
+        {
+            "payee_token": "ACME-PAYEE-001",
+            "access_token": "short",
+            "note": "key Zx8Qm2Lp9Rt4Vb7Nc1Kd6Hs3Jf5Gw0Ye",
+            "digest": "a3f5c9e1b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2",
+            "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+        }
+    )
+    with respx.mock(assert_all_called=False) as router:
+        _cloud(router, ["approved"], created)
+        _openai_with_tool_call("pay", args).chat.completions.create(
+            model="gpt-4o", messages=[{"role": "user", "content": "x"}]
+        )
+    assert created[0]["context"]["arguments"] == {
+        "payee_token": "ACME-PAYEE-001",
+        "access_token": "[SECRET]",
+        "note": "key [SECRET]",
+        "digest": "a3f5c9e1b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2",
+        "jwt": "[SECRET]",
+    }
+
+
+def test_two_choices_with_the_same_legacy_function_are_each_approved(env: dict[str, Any]) -> None:
+    env["policy"].add("require_approval", "pay")
+    created: list[dict[str, Any]] = []
+    response = {
+        "model": "gpt-4o",
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        "choices": [
+            {"index": 0, "message": {"function_call": {"name": "pay", "arguments": '{"amount": 1}'}}},
+            {"index": 1, "message": {"function_call": {"name": "pay", "arguments": '{"amount": 2}'}}},
+        ],
+    }
+    with respx.mock(assert_all_called=False) as router:
+        _cloud(router, ["approved"], created)
+        patcher._run_enforced("openai", lambda _s, **_k: response, None, (), {"model": "gpt-4o", "messages": []})
+    assert [c["context"]["tool_call_id"] for c in created] == ["function_call:0", "function_call:1"]
+
+
+def test_one_approval_when_fragment_and_joined_name_both_match(env: dict[str, Any]) -> None:
+    env["policy"].add("require_approval", "*refund")
+    created: list[dict[str, Any]] = []
+    chunks = [
+        {
+            "model": "gpt-4o",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "pay", "arguments": ""}}]},
+                }
+            ],
+        },
+        {
+            "model": "gpt-4o",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": [{"index": 0, "function": {"name": "ments.refund", "arguments": "{}"}}]},
+                }
+            ],
+        },
+        {"model": "gpt-4o", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    with respx.mock(assert_all_called=False) as router:
+        _cloud(router, ["approved"], created)
+        stream = patcher._run_enforced(
+            "openai", lambda _s, **_k: iter(chunks), None, (), {"model": "gpt-4o", "messages": [], "stream": True}
+        )
+        list(stream)
+    assert [c["action"] for c in created] == ["payments.refund"]

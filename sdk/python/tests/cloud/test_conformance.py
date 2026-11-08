@@ -67,6 +67,7 @@ def test_cost_vector(vector: dict[str, Any]) -> None:
         vector["output_tokens"],
         cache_read=vector.get("cache_read_tokens", 0),
         cache_write=vector.get("cache_write_tokens", 0),
+        cache_write_1h=vector.get("cache_write_1h_tokens", 0),
     )
     assert cost == pytest.approx(vector["usd"], abs=1e-12)
 
@@ -119,3 +120,14 @@ def test_patcher_charges_anthropic_cache_tokens(monkeypatch: pytest.MonkeyPatch)
         assert budget.get_budget().spent == pytest.approx(0.021)
     finally:
         budget.set_budget(None)
+
+
+def test_one_hour_cache_writes_are_split_out() -> None:
+    split = patcher._cache_writes(
+        {
+            "cache_creation_input_tokens": 3000,
+            "cache_creation": {"ephemeral_5m_input_tokens": 1000, "ephemeral_1h_input_tokens": 2000},
+        }
+    )
+    assert split == {"cache_write": 1000, "cache_write_1h": 2000}
+    assert patcher._cache_writes({"cache_creation_input_tokens": 3000}) == {"cache_write": 3000, "cache_write_1h": 0}

@@ -112,11 +112,14 @@ blocked tool throws `JamjetPolicyBlocked`. Budget exhaustion throws
 
 Enforced entry points: OpenAI `chat.completions` (`create`, `parse`, `stream`,
 legacy `functions` included) and Anthropic `messages` and `beta.messages`
-(`create`, `parse`, `stream`). OpenAI's Responses API is not enforced: it
-throws `JamjetUnenforceableCall` while any block or require_approval rule is
-set. Server tools (such as web search) and MCP toolsets run on the vendor's
-side before a tool call could be refused, so a rule that could match them
-removes them from the request.
+(`create`, `parse`, `stream`). `asResponse()` and `withResponse()` return a
+Response rebuilt from the enforced result (server-sent events for a stream).
+OpenAI's Responses API and the batch APIs are not enforced: they throw
+`JamjetUnenforceableCall` while any block or require_approval rule is set.
+Server tools (such as web search) and MCP toolsets run on the vendor's side
+before a tool call could be refused, so a rule that could match them removes
+them from the request; Anthropic's own client tools (bash, text editor,
+computer, memory) are gated like any other tool.
 
 A `require_approval` rule keeps the tool available to the model. When the
 model calls it, the SDK opens an approval in JamJet Cloud with the tool name,
@@ -128,9 +131,11 @@ the approval's deadline (clamped to 1 minute to 24 hours); JamJet Cloud
 deployments since jamjet-cloud #87 refuse decisions after it. The `signal` in
 the request options also cancels the wait.
 
-The approval shows the reviewer the call's arguments with credentials masked
-(by field name, such as `password` or `api_key`, and by shape, such as
-`Bearer ...` or `sk-...`), always. With redaction on, emails, SSNs, phone
+The approval shows the reviewer the call's arguments with credentials masked,
+always: by a short list of field names (`password`, `secret`, `api_key`,
+`authorization`, `access_token`, `refresh_token`, ...) and by shape (`Bearer`
+and `Basic` headers, JWTs, `sk-`/`AKIA`/`ghp_`-style keys, long high-entropy
+strings). With redaction on, emails, SSNs, phone
 numbers and IPs are masked too, and IBANs and card numbers keep their last 4.
 It also carries `arguments_sha256`, a SHA-256 of the canonical arguments; the
 SDK re-checks it before releasing the approved call and throws

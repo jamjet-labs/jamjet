@@ -12,7 +12,10 @@ files are the contract both of them test against, so the two cannot drift.
 ## Tool-name globs
 
 A rule's pattern is matched against the whole tool name, after trimming
-leading and trailing whitespace from the name (as Cloud does):
+leading and trailing ASCII whitespace from the name: space, `\t`, `\n`, `\r`,
+`\f` and `\v`, nothing else. JavaScript's `trim()`, Python's `str.strip()` and
+Rust's `str::trim()` each strip a different, wider set (U+FEFF, U+00A0, U+0085,
+`\x1c`-`\x1f`), so implementations trim explicitly; Cloud's evaluate should too.
 
 - `*` matches any run of characters, including none, `.` and line breaks.
 - `?` matches exactly one Unicode code point.
@@ -30,12 +33,16 @@ Rules are evaluated in order and the first match wins. No match means allow.
 ## Prices
 
 `prices.models` lists USD per million tokens. A model ID not in the table is
-normalised first (`prices.normalize`; vectors in `normalize`): provider prefix,
-Bedrock version, Vertex `@date`, Anthropic `-YYYYMMDD` and OpenAI
-`-YYYY-MM-DD` / `-MMDD` dates are removed. A model still unknown is priced at
+normalised first (`prices.normalize`; vectors in `normalize`): a Bedrock
+cross-region prefix (`us.`, `eu.`, ...), a provider prefix, a Bedrock version,
+a Vertex `@date`, an Anthropic `-YYYYMMDD` and an OpenAI `-YYYY-MM-DD` /
+`-MMDD` date are removed one at a time, checking the table after each, so a
+dated snapshot with its own price (`gpt-4o-2024-05-13`) keeps it. A model still unknown is priced at
 `prices.fallback`. Cost is `input_tokens * input + output_tokens * output`,
 plus, for Anthropic, prompt-cache reads at `cache_read` (0.1x input when none is
-listed) and cache writes at 1.25x input, all divided by one million. OpenAI's
+listed), 5-minute cache writes at 1.25x input and 1-hour cache writes at 2x
+input, all divided by one million. `prices.source` says where each price
+comes from. OpenAI's
 `prompt_tokens` already include cached tokens, so nothing is added for it. The cache-read saving for a model is
 `(input - cache_read)` per million cache-read tokens. It is zero when no
 `cache_read` price is listed. Both SDK tables must equal `prices.models`

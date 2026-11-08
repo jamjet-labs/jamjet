@@ -52,7 +52,7 @@ function getToolCalls(vendor: Vendor, response: unknown): ToolCall[] {
   if (vendor === 'openai') {
     // Every choice: with n > 1 a blocked call in any of them must be caught.
     const choices = Array.isArray(res['choices']) ? res['choices'] : []
-    return (choices as Array<Record<string, unknown>>).flatMap((choice) => {
+    return (choices as Array<Record<string, unknown>>).flatMap((choice, position) => {
       const message = (choice?.['message'] ?? {}) as Record<string, unknown>
       const tcs = Array.isArray(message['tool_calls']) ? message['tool_calls'] : []
       const calls = (tcs as Array<Record<string, unknown>>).map((tc) => {
@@ -66,7 +66,9 @@ function getToolCalls(vendor: Vendor, response: unknown): ToolCall[] {
       // Legacy `functions` API: a single message.function_call.
       const fc = message['function_call']
       if (typeof fc === 'object' && fc !== null) {
-        const entry: ToolCall = { name: toolNameOf(fc) }
+        // No id of its own: name it after the choice, so two choices calling
+        // the same function stay distinct.
+        const entry: ToolCall = { name: toolNameOf(fc), id: `function_call:${String(choice?.['index'] ?? position)}` }
         const args = (fc as Record<string, unknown>)['arguments']
         if (args !== undefined) entry.arguments = args
         calls.push(entry)
@@ -106,9 +108,17 @@ function extractUsage(vendor: Vendor, response: unknown): { input: number; outpu
   return { input: Number(usage['input_tokens']) || 0, output: Number(usage['output_tokens']) || 0 }
 }
 
-function extractCacheWrite(response: unknown): number {
-  const usage = ((response as Record<string, any>)?.usage ?? {}) as Record<string, unknown>
-  return Number(usage['cache_creation_input_tokens'] ?? 0) || 0
+/** Anthropic cache writes, split into 5-minute and 1-hour when the usage says so. */
+export function cacheWrites(usage: unknown): { cacheWrite: number; cacheWrite1h: number } {
+  const u = (usage ?? {}) as Record<string, any>
+  const total = Number(u['cache_creation_input_tokens'] ?? 0) || 0
+  const split = u['cache_creation']
+  if (split && typeof split === 'object') {
+    const oneHour = Number(split['ephemeral_1h_input_tokens'] ?? 0) || 0
+    const fiveMin = Number(split['ephemeral_5m_input_tokens'] ?? Math.max(0, total - oneHour)) || 0
+    return { cacheWrite: fiveMin, cacheWrite1h: oneHour }
+  }
+  return { cacheWrite: total, cacheWrite1h: 0 }
 }
 
 function extractCacheRead(_vendor: Vendor, response: unknown): number {
@@ -121,11 +131,18 @@ function extractCacheRead(_vendor: Vendor, response: unknown): number {
  * MCP toolsets) execute before the response comes back, so refusing their
  * calls afterwards is too late: a rule that could match them strips them here.
  */
+// Anthropic-defined tools your code executes (the model only asks): these are
+// gated like any other tool call.
+const CLIENT_TOOL_TYPES = /^(bash|text_editor|computer|memory)_/
+// Anything else with a vendor type and no input_schema runs on the vendor's
+// side (web_search, web_fetch, code_execution, tool_search_tool, advisor, ...).
+// Unknown types count as server-executed, so they fail closed.
 function isServerExecuted(tool: unknown): boolean {
   if (typeof tool !== 'object' || tool === null) return false
   const t = tool as Record<string, unknown>
   const type = t['type']
   if (typeof type !== 'string' || type === 'function' || type === 'custom') return false
+  if (CLIENT_TOOL_TYPES.test(type)) return false
   return !('input_schema' in t)
 }
 
@@ -322,12 +339,15 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
       onToolCallStarted: (call, tally) => refuseStreamed([{ ...call, joinedName: call.name, arguments: '' }], tally),
       onToolCalls: async (calls, tally) => {
         refuseStreamed(calls, tally)
-        // Gate the name as last sent and the fragments joined, like the block check.
+        // Gate the name as last sent or the fragments joined, like the block
+        // check: one approval per call, under the joined name when it is gated.
         const gated = (list: ReadonlyArray<StreamedToolCall>): ToolCall[] =>
-          list.flatMap((c) => {
-            const one: ToolCall = { name: c.name, arguments: streamedArguments(vendor, c.arguments) }
+          list.map((c) => {
+            const names = c.joinedName !== '' && c.joinedName !== c.name ? [c.joinedName, c.name] : [c.name]
+            const name = names.find((n) => client._policy.evaluate(n).policyKind === 'require_approval') ?? c.name
+            const one: ToolCall = { name, arguments: streamedArguments(vendor, c.arguments) }
             if (c.id !== undefined) one.id = c.id
-            return c.joinedName !== '' && c.joinedName !== c.name ? [one, { ...one, name: c.joinedName }] : [one]
+            return one
           })
         await gateApprovals(
           streamState(tally),
@@ -378,7 +398,7 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
   const res = result as Record<string, unknown>
   recordUsage(
     { ...state, model: typeof res['model'] === 'string' ? res['model'] : model },
-    { ...extractUsage(vendor, result), cacheWrite: extractCacheWrite(result) },
+    { ...extractUsage(vendor, result), ...cacheWrites((result as Record<string, unknown> | null)?.['usage']) },
     extractCacheRead(vendor, result),
   )
 
@@ -538,17 +558,22 @@ function streamUsage(
   tally: StreamTally,
   estimatedPromptTokens: number,
   complete: boolean,
-): { input: number; output: number; cacheWrite: number } {
+): { input: number; output: number; cacheWrite: number; cacheWrite1h: number } {
   const estimatedOutput = Math.ceil(tally.outputChars / 4)
   const output = complete
     ? (tally.outputTokens ?? estimatedOutput)
     : Math.max(tally.outputTokens ?? 0, estimatedOutput)
-  return { input: tally.inputTokens ?? estimatedPromptTokens, output, cacheWrite: tally.cacheWriteTokens }
+  return {
+    input: tally.inputTokens ?? estimatedPromptTokens,
+    output,
+    cacheWrite: tally.cacheWriteTokens,
+    cacheWrite1h: tally.cacheWrite1hTokens,
+  }
 }
 
 function recordUsage(
   state: CallState,
-  usage: { input: number; output: number; cacheWrite?: number },
+  usage: { input: number; output: number; cacheWrite?: number; cacheWrite1h?: number },
   cacheRead: number,
   extraPayload: Record<string, unknown> = {},
 ): void {
@@ -557,7 +582,11 @@ function recordUsage(
   span.name = `${vendor}.${model}`
   span.inputTokens = usage.input
   span.outputTokens = usage.output
-  span.costUsd = estimateCost(model, usage.input, usage.output, { read: cacheRead, write: usage.cacheWrite ?? 0 })
+  span.costUsd = estimateCost(model, usage.input, usage.output, {
+    read: cacheRead,
+    write: usage.cacheWrite ?? 0,
+    write1h: usage.cacheWrite1h ?? 0,
+  })
   state.client._budget.record(span.costUsd)
 
   if (state.cacheInjected) {

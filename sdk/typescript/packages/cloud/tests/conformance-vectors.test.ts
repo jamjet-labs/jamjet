@@ -10,7 +10,7 @@ const vectors = JSON.parse(
 ) as {
   glob: Array<{ pattern: string; name: string; match: boolean }>
   prices: { fallback: { input: number; output: number }; models: Record<string, { input: number; output: number; cache_read?: number }> }
-  cost: Array<{ model: string; input_tokens: number; output_tokens: number; cache_read_tokens?: number; cache_write_tokens?: number; usd: number }>
+  cost: Array<{ model: string; input_tokens: number; output_tokens: number; cache_read_tokens?: number; cache_write_tokens?: number; cache_write_1h_tokens?: number; usd: number }>
   normalize: Array<{ model: string; as: string }>
   cache_read_savings: Array<{ model: string; cache_read_tokens: number; usd: number }>
 }
@@ -38,7 +38,7 @@ describe('price table', () => {
 
   for (const v of vectors.cost) {
     it(`cost of ${v.model} ${v.input_tokens}/${v.output_tokens}`, () => {
-      const cache = { read: v.cache_read_tokens ?? 0, write: v.cache_write_tokens ?? 0 }
+      const cache = { read: v.cache_read_tokens ?? 0, write: v.cache_write_tokens ?? 0, write1h: v.cache_write_1h_tokens ?? 0 }
       expect(estimateCost(v.model, v.input_tokens, v.output_tokens, cache)).toBeCloseTo(v.usd, 12)
     })
   }
@@ -81,5 +81,15 @@ describe('Anthropic prompt-cache tokens count toward the budget', () => {
       expect(client._budget.spent).toBeCloseTo(0.021, 12)
     }
     await resetActive()
+  })
+})
+
+describe('Anthropic 1-hour cache writes', () => {
+  it('are charged at 2x input when the usage splits them out', async () => {
+    const { cacheWrites } = await import('../src/enforcement.js')
+    const split = cacheWrites({ cache_creation_input_tokens: 3000, cache_creation: { ephemeral_5m_input_tokens: 1000, ephemeral_1h_input_tokens: 2000 } })
+    expect(split).toEqual({ cacheWrite: 1000, cacheWrite1h: 2000 })
+    expect(cacheWrites({ cache_creation_input_tokens: 3000 })).toEqual({ cacheWrite: 3000, cacheWrite1h: 0 })
+    expect(estimateCost('claude-sonnet-4-6', 0, 0, { write: 1000, write1h: 2000 })).toBeCloseTo((1000 * 3.75 + 2000 * 6) / 1e6, 12)
   })
 })

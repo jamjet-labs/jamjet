@@ -76,15 +76,17 @@ class PolicyEvaluator:
         Matches the conformance suite (sdk/conformance/policy-decisions.yaml,
         vendored from jamjet-policy) and the TS `@jamjet/cloud` evaluator: rules
         are evaluated top-to-bottom and the first matching rule is returned.
-        Later rules cannot override an earlier match. The name is trimmed, as
-        Cloud trims the tool name it evaluates.
+        Later rules cannot override an earlier match. The name is trimmed of
+        ASCII whitespace only (space, \\t, \\n, \\r, \\f, \\v), per
+        sdk/conformance/README.md; ``str.strip()`` would also strip U+0085 and
+        \\x1c-\\x1f.
 
         When Cloud-managed rules are attached (``configure(remote_policies=...)``),
         the stricter of the local and the Cloud decision wins
         (block > require_approval > audit > allow), so neither side can loosen
         the other. On a tie the local decision is kept.
         """
-        tool_name = tool_name.strip()
+        tool_name = tool_name.strip(" \t\n\r\f\v")
         local = self._evaluate_local(tool_name)
         remote = self.remote.decide(tool_name, _current_agent_name()) if self.remote is not None else None
         if remote is not None and rank(remote.policy_kind) > rank(local.policy_kind):

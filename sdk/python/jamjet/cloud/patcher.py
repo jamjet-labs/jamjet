@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -74,12 +75,20 @@ def _estimate_prompt_tokens(kwargs: dict[str, Any]) -> int:
         return 0
 
 
+# Anthropic-defined tools your code executes (the model only asks): these are
+# gated like any other tool call.
+_CLIENT_TOOL_TYPES = re.compile(r"^(bash|text_editor|computer|memory)_")
+
+
 def _is_server_executed(tool: Any) -> bool:
-    """Tools the vendor runs itself (Anthropic server tools such as web_search)
-    execute before the response comes back, so refusing the call afterwards is
-    too late."""
+    """Tools the vendor runs itself (web_search, web_fetch, code_execution,
+    tool_search_tool, advisor, ...) execute before the response comes back, so
+    refusing the call afterwards is too late. Unknown vendor types count as
+    server-executed, so they fail closed."""
     kind = _field(tool, "type")
     if not isinstance(kind, str) or kind in ("function", "custom"):
+        return False
+    if _CLIENT_TOOL_TYPES.match(kind):
         return False
     return _field(tool, "input_schema") is None
 
@@ -150,7 +159,7 @@ def _response_tool_calls(vendor: str, result: Any) -> list[tuple[str | None, str
     """(id, name, arguments) of every tool call in a finished response."""
     calls: list[tuple[str | None, str, Any]] = []
     if vendor == "openai":
-        for choice in _field(result, "choices") or []:
+        for position, choice in enumerate(_field(result, "choices") or []):
             message = _field(choice, "message")
             for tc in _field(message, "tool_calls") or []:
                 fn = _field(tc, "function") or _field(tc, "custom")
@@ -160,7 +169,11 @@ def _response_tool_calls(vendor: str, result: Any) -> list[tuple[str | None, str
             # Legacy `functions` API: a single message.function_call.
             legacy = _field(message, "function_call")
             if legacy is not None:
-                calls.append((None, tool_name_of(legacy), _field(legacy, "arguments")))
+                # No id of its own: name it after the choice, so two choices
+                # calling the same function stay distinct.
+                index = _field(choice, "index")
+                call_id = f"function_call:{position if index is None else index}"
+                calls.append((call_id, tool_name_of(legacy), _field(legacy, "arguments")))
         return calls
     for block in _field(result, "content") or []:
         if _field(block, "type") in ("tool_use", "server_tool_use", "mcp_tool_use"):
@@ -275,6 +288,20 @@ def _refuse_blocked(span: Any, calls: list[tuple[str | None, str, Any]]) -> None
             raise JamJetPolicyBlocked(name, decision.pattern or "*")
 
 
+def _cache_writes(usage: Any) -> dict[str, int]:
+    """Anthropic cache writes, split into 5-minute and 1-hour when the usage says so."""
+    total = _field(usage, "cache_creation_input_tokens") or 0
+    split = _field(usage, "cache_creation")
+    if split is not None:
+        one_hour = _field(split, "ephemeral_1h_input_tokens") or 0
+        five_min = _field(split, "ephemeral_5m_input_tokens")
+        return {
+            "cache_write": five_min if five_min is not None else max(0, total - one_hour),
+            "cache_write_1h": one_hour,
+        }
+    return {"cache_write": total, "cache_write_1h": 0}
+
+
 def _record_usage(
     span: Any,
     model: str,
@@ -283,10 +310,18 @@ def _record_usage(
     *,
     cache_read: int = 0,
     cache_write: int = 0,
+    cache_write_1h: int = 0,
     **payload: Any,
 ) -> None:
     # Anthropic bills prompt-cache reads and writes on top of input_tokens.
-    cost = estimate_cost(model, input_tokens, output_tokens, cache_read=cache_read, cache_write=cache_write)
+    cost = estimate_cost(
+        model,
+        input_tokens,
+        output_tokens,
+        cache_read=cache_read,
+        cache_write=cache_write,
+        cache_write_1h=cache_write_1h,
+    )
     span.model = model
     span.input_tokens = input_tokens
     span.output_tokens = output_tokens
@@ -340,6 +375,7 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
             output,
             cache_read=tally.cache_read_tokens,
             cache_write=tally.cache_write_tokens,
+            cache_write_1h=tally.cache_write_1h_tokens,
             usage_estimated=True,
             stream_incomplete=True,
         )
@@ -359,17 +395,19 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
                 output,
                 cache_read=tally.cache_read_tokens,
                 cache_write=tally.cache_write_tokens,
+                cache_write_1h=tally.cache_write_1h_tokens,
                 **extra,
             )
 
         def gated(listed: list[StreamedToolCall]) -> list[tuple[str | None, str, Any]]:
-            # Gate the name as last sent and the fragments joined, like the block check.
+            # Gate the name as last sent or the fragments joined, like the block
+            # check: one approval per call, under the joined name when it is gated.
+            evaluator = get_evaluator()
             out: list[tuple[str | None, str, Any]] = []
             for c in listed:
-                arguments = _streamed_arguments(vendor, c.arguments)
-                out.append((c.id, c.name, arguments))
-                if c.joined_name and c.joined_name != c.name:
-                    out.append((c.id, c.joined_name, arguments))
+                names = [c.joined_name, c.name] if c.joined_name and c.joined_name != c.name else [c.name]
+                name = next((n for n in names if evaluator.evaluate(n).policy_kind == "require_approval"), c.name)
+                out.append((c.id, name, _streamed_arguments(vendor, c.arguments)))
             return out
 
         _gate_approvals(
@@ -394,6 +432,7 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
                 output,
                 cache_read=tally.cache_read_tokens,
                 cache_write=tally.cache_write_tokens,
+                cache_write_1h=tally.cache_write_1h_tokens,
                 usage_estimated=True,
                 stream_incomplete=True,
             )
@@ -416,6 +455,7 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
             output,
             cache_read=tally.cache_read_tokens,
             cache_write=tally.cache_write_tokens,
+            cache_write_1h=tally.cache_write_1h_tokens,
             **extra,
         )
         span.finish(status="ok")
@@ -440,6 +480,12 @@ def _run_enforced(vendor: str, original: Any, self_inner: Any, args: Any, kwargs
     """One patched call: tool policy before and after, budget, span, middleware."""
     budget = get_budget()
     ctx = get_context()
+
+    # with_raw_response / with_streaming_response hand back the raw HTTP
+    # response; for a stream its lines are the vendor's events, which would
+    # skip enforcement. Refuse that while restrictive rules exist.
+    if kwargs.get("stream") is True and _raw_response_requested(kwargs) and get_evaluator().has_restrictive_rules():
+        raise JamJetUnenforceableCall(f"{vendor} with_raw_response / with_streaming_response with stream=True")
 
     _filter_tools_pre_call(kwargs)
 
@@ -495,7 +541,7 @@ def _run_enforced(vendor: str, original: Any, self_inner: Any, args: Any, kwargs
         input_tokens,
         output_tokens,
         cache_read=getattr(usage, "cache_read_input_tokens", 0) or 0,
-        cache_write=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        **_cache_writes(usage),
     )
     # Blocked calls raise; calls matched by a require_approval rule wait for a
     # Cloud decision and raise unless approved.
@@ -505,6 +551,14 @@ def _run_enforced(vendor: str, original: Any, self_inner: Any, args: Any, kwargs
     span.finish(status="ok")
     emit(span.to_event_dict())
     return raw if raw is not None else result
+
+
+def _raw_response_requested(kwargs: dict[str, Any]) -> bool:
+    headers = kwargs.get("extra_headers") or {}
+    try:
+        return any(str(k).lower() == "x-stainless-raw-response" for k in headers)
+    except TypeError:
+        return False
 
 
 def _is_raw_response(result: Any) -> bool:
@@ -534,6 +588,24 @@ def _patch_methods(key: str, cls: Any, methods: dict[str, Any]) -> None:
         saved.append((cls, name, original))
         setattr(cls, name, make(original))
     _originals.setdefault(key, []).extend(saved)
+
+
+def _refuse_classes(key: str, targets: list[tuple[str, str, tuple[str, ...], str]]) -> None:
+    """Async clients and batch APIs are not enforced (batches run later, outside
+    this process): their methods raise JamJetUnenforceableCall while a block or
+    require_approval rule is set, and run normally otherwise."""
+    import importlib
+
+    for module_name, class_name, methods, label in targets:
+        try:
+            cls = getattr(importlib.import_module(module_name), class_name)
+        except (ImportError, AttributeError):
+            continue
+        _patch_methods(
+            key,
+            cls,
+            {m: (lambda original, m=m, label=label: _refuse_unenforced(f"{label}.{m}", original)) for m in methods},
+        )
 
 
 def _enforcing(vendor: str) -> Any:
@@ -587,6 +659,20 @@ def patch_openai() -> None:
             m: (lambda original, m=m: _refuse_unenforced(f"openai responses.{m}", original))
             for m in ("create", "stream", "parse")
         },
+    )
+    _refuse_classes(
+        "openai",
+        [
+            (
+                "openai.resources.chat.completions",
+                "AsyncCompletions",
+                ("create", "parse", "stream"),
+                "openai async chat.completions",
+            ),
+            ("openai.resources.responses", "AsyncResponses", ("create", "parse", "stream"), "openai async responses"),
+            ("openai.resources.batches", "Batches", ("create",), "openai batches"),
+            ("openai.resources.batches", "AsyncBatches", ("create",), "openai async batches"),
+        ],
     )
 
 
@@ -644,6 +730,32 @@ def patch_anthropic() -> None:
                 "stream": lambda original: _refuse_unenforced("anthropic messages.stream", original),
             },
         )
+    _refuse_classes(
+        "anthropic",
+        [
+            (
+                "anthropic.resources.messages",
+                "AsyncMessages",
+                ("create", "parse", "stream"),
+                "anthropic async messages",
+            ),
+            (
+                "anthropic.resources.beta.messages",
+                "AsyncMessages",
+                ("create", "parse", "stream"),
+                "anthropic async beta.messages",
+            ),
+            ("anthropic.resources.messages.batches", "Batches", ("create",), "anthropic messages.batches"),
+            ("anthropic.resources.messages.batches", "AsyncBatches", ("create",), "anthropic async messages.batches"),
+            ("anthropic.resources.beta.messages.batches", "Batches", ("create",), "anthropic beta.messages.batches"),
+            (
+                "anthropic.resources.beta.messages.batches",
+                "AsyncBatches",
+                ("create",),
+                "anthropic async beta.messages.batches",
+            ),
+        ],
+    )
 
 
 def unpatch_anthropic() -> None:

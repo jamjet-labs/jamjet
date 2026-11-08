@@ -2,9 +2,11 @@
 // to the call it approves. Mirrors sdk/python/jamjet/cloud/approval_context.py.
 import { redact } from './redaction.js'
 
-// Fields whose value is a credential, whatever it looks like.
+// Fields whose value is a credential, whatever it looks like. An explicit
+// list: a name pattern such as `*_token` would also hide business fields
+// (`payee_token`); credentials under other names are caught by shape below.
 const SECRET_KEY =
-  /^(pass(word|phrase)?|secret|client[_-]?secret|.*_secret|token|.*_token|api[_-]?key|.*_api[_-]?key|authorization|auth|credentials?|private[_-]?key|cookie|session[_-]?(id|token))$/i
+  /^(password|passwd|passphrase|secret|client_secret|api_key|apikey|x-api-key|authorization|access_token|refresh_token|id_token|private_key)$/i
 
 // Credentials recognisable by shape inside any string.
 const SECRET_VALUES: RegExp[] = [
@@ -16,7 +18,17 @@ const SECRET_VALUES: RegExp[] = [
   /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
   /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+  // JWTs
+  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
 ]
+
+// Long high-entropy runs (32+ characters mixing upper case, lower case and
+// digits) are treated as keys too. Hex digests and plain numbers do not mix
+// cases, so they are kept.
+const HIGH_ENTROPY = /[A-Za-z0-9+/_=-]{32,}/g
+function looksRandom(run: string): boolean {
+  return /[A-Z]/.test(run) && /[a-z]/.test(run) && /\d/.test(run)
+}
 
 // With redaction on: these are masked outright...
 const PII_MASKED = ['EMAIL_ADDRESS', 'US_SSN', 'PHONE_NUMBER', 'IP_ADDRESS'] as const
@@ -28,6 +40,7 @@ const SECRET = '[SECRET]'
 function maskString(text: string, pii: boolean): string {
   let out = text
   for (const re of SECRET_VALUES) out = out.replace(re, SECRET)
+  out = out.replace(HIGH_ENTROPY, (run) => (looksRandom(run) ? SECRET : run))
   if (!pii) return out
   out = redact(out, { piiTypes: PII_MASKED })
   for (const re of ACCOUNT_NUMBERS) {
@@ -40,8 +53,9 @@ function maskString(text: string, pii: boolean): string {
 }
 
 /**
- * The approval context as sent to Cloud. Credentials are always masked (by
- * field name and by shape). With `pii` on (redaction not `off`), emails,
+ * The approval context as sent to Cloud. Credentials are always masked: by
+ * an explicit list of field names, and by shape (bearer and basic headers,
+ * JWTs, known key prefixes, long high-entropy strings). With `pii` on (redaction not `off`), emails,
  * SSNs, phone numbers and IPs are masked too, and IBANs and card numbers keep
  * their last 4. Amounts, payees and other business fields are kept.
  */

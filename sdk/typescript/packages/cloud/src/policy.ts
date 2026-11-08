@@ -54,8 +54,10 @@ export class PolicyEvaluator {
   }
 
   evaluate(rawName: string): PolicyDecision {
-    // Trimmed, as Cloud trims the tool name it evaluates.
-    const toolName = rawName.trim()
+    // Trimmed of ASCII whitespace only (space, \t, \n, \r, \f, \v), per
+    // sdk/conformance/README.md. String.prototype.trim would also strip
+    // U+FEFF, U+00A0 and other Unicode spaces.
+    const toolName = rawName.replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, '')
     // First-match-wins per policy spec §5 (rules evaluated top-to-bottom,
     // first matching rule is returned; later rules cannot override).
     let matchedAction: PolicyAction | null = null
