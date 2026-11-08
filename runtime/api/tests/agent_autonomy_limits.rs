@@ -894,6 +894,7 @@ async fn a_new_segment_keeps_the_counters() {
             "n1",
             "tool",
             json!({ "workflow_id": wf.clone(), "workflow_version": "0.1.0", "node_id": "n1" }),
+            3,
             "default",
         )
         .await
