@@ -256,7 +256,9 @@ relying on patterns alone.
   `payments.*` stops honest mistakes, not an author who writes their own IR.
   Only a catch-all binds that author. Where it matters, set the tenant policy
   to `require_approval_for: ["*"]` and keep precision elsewhere (in which tools
-  your workers expose), rather than relying on a narrow pattern.
+  your workers expose), rather than relying on a narrow pattern. A tenant
+  catch-all also holds every `model` node, so in an agent loop each model turn
+  waits for its own approval, under the tenant's approval deadline.
 - Workflow and node policies live in IR a developer registers, and a developer
   can register a new version without the gate. A gate that must bind the
   developers who start runs belongs in the tenant policy, which only an operator

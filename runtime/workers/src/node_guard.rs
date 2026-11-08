@@ -89,6 +89,10 @@ pub const ALLOWED_TOOLS_RULE: &str = "agent allowed_tools";
 /// with this.
 pub const BLOCKED_TOOLS_RULE: &str = "agent blocked_tools";
 
+/// The rule recorded when a `model` work item's payload names no model, so
+/// the model allowlists cannot be checked against what would run.
+pub const MODEL_UNNAMED_RULE: &str = "model work item names no model";
+
 /// Every rule recorded for a refusal by a card's `allowed_delegations` starts
 /// with this.
 pub const ALLOWED_DELEGATIONS_RULE: &str = "agent allowed_delegations";
@@ -155,8 +159,9 @@ struct CardGate {
 }
 
 /// Decide whether `node_def` may fire (or, in `Complete` mode, whether its
-/// result may be recorded), evaluating the tenant -> workflow -> node policy
-/// chain and, for an approval-gated node, the approval bound to the action.
+/// result may be recorded), evaluating the workflow and node policies under
+/// the tenant policy as a ceiling (`PolicyEvaluator::evaluate_chain`) and,
+/// for an approval-gated node, the approval bound to the action.
 ///
 /// `workflow_policy` is the IR's workflow-level policy and `payload` the work
 /// item's payload as the engine recorded it.
@@ -401,7 +406,26 @@ async fn guard_policy(
     }
     sets.extend(layers.iter().copied());
     // A model node is checked against the model its payload calls, not the
-    // IR alias it names.
+    // IR alias it names. A payload with no model would leave the guard
+    // checking the alias while the executor called its built-in default, so
+    // it is refused. The scheduler always writes one.
+    if matches!(node_def.kind, NodeKind::Model { .. })
+        && payload.get("model").and_then(Value::as_str).is_none()
+    {
+        let reason = MODEL_UNNAMED_RULE.to_string();
+        if mode == GuardMode::Fire {
+            warn!(execution_id = %execution_id, node_id, "Model work item names no model; refusing");
+            dispatch_guard::record_policy_violation(
+                backend,
+                execution_id,
+                node_id,
+                reason.clone(),
+                "unknown".to_string(),
+            )
+            .await;
+        }
+        return GuardOutcome::Blocked { reason };
+    }
     let ctx = EvaluationContext::from_work_item(node_id, &node_def.kind, payload);
     let decision = PolicyEvaluator.evaluate_chain(&ctx, tenant_policy_set.as_ref(), &layers);
     // A `human_approval` node is gated by what it is: it exists to wait for a

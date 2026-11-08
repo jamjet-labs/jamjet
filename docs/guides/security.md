@@ -101,8 +101,8 @@ have to carry the tenant first, and none does yet:
 - the agent registry (global today).
 
 Tenant policy (`PUT /tenants/:id`, operator only) is a ceiling over the
-policies in a workflow's IR. Nothing a developer writes in the IR can lift a
-tenant rule; it can only add to it:
+policies in a workflow's IR. No workflow or node rule can lift a tenant rule;
+it can only add to it:
 
 - a tenant `blocked_tools` match blocks the node, whatever the workflow or node
   policy says (an IR `require_approval_for` on the same name no longer turns it
@@ -110,9 +110,15 @@ tenant rule; it can only add to it:
 - a tenant `require_approval_for` match holds a node the IR allows;
 - on a `model` node the model must be on the tenant's `model_allowlist` and on
   the most specific IR allowlist that has one, so the IR can narrow the
-  tenant's list but not widen it. The model checked is the one the node calls:
-  the IR's `models` entry the node names, resolved to `provider/model`, not the
-  alias.
+  tenant's list but not widen it. The model checked is the string the node
+  sends to the model registry: the IR's `models` entry the node names,
+  resolved to `provider/model`, not the alias. So an allowlist of bare names
+  (`claude-*`) does not match a resolved `anthropic/claude-...`; list the
+  provider (`anthropic`) or the full ref. The registry routes `anthropic/`,
+  `openai/` and `google/` refs and a few bare-name prefixes (`claude-`, `gpt-`,
+  `llama`, ...) to their adapters, and sends any other string to its default
+  adapter. An allowlist entry for a provider it has no route for, such as
+  `ollama/...`, therefore does not keep the call on that provider.
 
 Inside the IR the most specific layer still wins: a node `require_approval_for`
 turns a workflow block into an approval request, and a node `model_allowlist`
@@ -120,7 +126,9 @@ replaces the workflow's, since one author owns both.
 
 A tenant catch-all (`["*"]`) applies to every Python, Java and external step,
 and to `model` nodes too: tenant `require_approval_for: ["*"]` holds every
-model call for approval and `blocked_tools: ["*"]` blocks it. Other patterns
+`model` node for approval (in an agent loop, every turn) and
+`blocked_tools: ["*"]` blocks it. A model call a Python or Java step makes
+itself is not a `model` node and is not covered. Other patterns
 match tool names, which a model node does not have. In the IR, `["*"]` still
 means every tool and does not reach model nodes, so an agent compiled with
 `approval_required=True` is not asked to approve its own model calls. Neither

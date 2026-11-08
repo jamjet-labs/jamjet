@@ -177,7 +177,7 @@ pub(crate) async fn guard_dispatch_in(
     card_gated: &[String],
 ) -> DispatchGuardOutcome {
     let fire = mode == GuardMode::Fire;
-    // Load tenant policy (sits between global and workflow in the chain).
+    // Load the tenant policy: a ceiling over the workflow and node layers.
     //
     // `Ok(None)` — this tenant has no policy — and `Err` — we could not find out
     // — must NOT collapse together. Swallowing the error makes an unreadable
@@ -1321,6 +1321,59 @@ mod tests {
             matches!(outcome, DispatchGuardOutcome::Blocked { ref reason } if reason.contains("openai/gpt-4o")),
             "{outcome:?}"
         );
+    }
+
+    /// A model work item whose payload names no model is refused: the guard
+    /// would check the alias while the executor called its default model.
+    #[tokio::test]
+    async fn a_model_item_that_names_no_model_is_refused() {
+        let f = Fixture::new();
+        let ir = model_ir("anthropic", "claude-opus-4-8", json!({}));
+        let node_def = ir.node("n1").unwrap();
+        let outcome = crate::node_guard::guard_item(
+            f.backend.as_ref(),
+            GuardMode::Fire,
+            &f.execution_id,
+            "n1",
+            "default",
+            ir.policy.as_ref(),
+            node_def,
+            &json!({ "workflow_id": "model-wf", "node_id": "n1", "prompt": "hi" }),
+            None,
+            Default::default(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, DispatchGuardOutcome::Blocked { reason }
+                if reason == crate::node_guard::MODEL_UNNAMED_RULE),
+            "{outcome:?}"
+        );
+        assert_eq!(f.violations().await.len(), 1);
+    }
+
+    /// A per-call dispatch request raised under a tenant gate carries the
+    /// tenant's deadline: the chain the deadline is read from still holds the
+    /// tenant layer after the evaluation stopped taking it as one more layer.
+    #[tokio::test]
+    async fn a_dispatch_request_carries_the_tenant_deadline() {
+        let f = Fixture::new();
+        let mut tenant = policy_json(&[], &["send_wire"]);
+        tenant["approval_timeout_secs"] = json!(900);
+        f.with_tenant(tenant).await;
+        let before = chrono::Utc::now();
+        let outcome = f.guard(&unpoliced_ir(), &input_for(&["send_wire"])).await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        let requests = f.requests().await;
+        let deadline = jamjet_state::approvals::RequestDeadline::of(&requests[0].2);
+        let jamjet_state::approvals::DeadlineTime::At(expires_at) = deadline.expires_at else {
+            panic!("no expires_at: {}", requests[0].2);
+        };
+        let off = (expires_at - (before + chrono::Duration::seconds(900))).num_seconds();
+        assert!((0..=5).contains(&off), "expires_at {expires_at}");
     }
 
     /// A model on both allowlists runs.
