@@ -35,7 +35,6 @@ nodes:
       Answer this question clearly and concisely:
 
       {{{{ state.query }}}}
-    output_key: answer
     next: end
 
   end:
@@ -71,23 +70,19 @@ workflow:
 
 nodes:
   search:
-    type: tool
+    type: mcp_tool
     server: brave-search
     tool: web_search
-    arguments:
+    input:
       query: "{{{{ state.query }}}}"
-      count: 10
-    output_key: search_results
-    retry:
-      max_attempts: 3
-      backoff: exponential
-      delay_ms: 1000
+      count: "10"
+    retry_policy: io_default
     next: synthesize
 
   synthesize:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are a research assistant that synthesizes information from web search results
       into clear, structured reports. Always cite your sources.
     prompt: |
@@ -102,7 +97,6 @@ nodes:
       - Key findings
       - Different perspectives where applicable
       - Source citations
-    output_key: report
     next: end
 
   end:
@@ -151,20 +145,19 @@ workflow:
 
 nodes:
   fetch-pr:
-    type: tool
+    type: mcp_tool
     server: github
     tool: get_pull_request
-    arguments:
+    input:
       owner: "{{{{ state.repo.split('/')[0] }}}}"
       repo: "{{{{ state.repo.split('/')[1] }}}}"
       pull_number: "{{{{ state.pr_number }}}}"
-    output_key: pr_data
     next: review
 
   review:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are an expert code reviewer. Provide thorough, constructive feedback.
       Focus on: correctness, performance, security, readability, and test coverage.
     prompt: |
@@ -181,11 +174,7 @@ nodes:
       2. Issues found (critical → minor)
       3. Suggestions for improvement
       4. Overall verdict (approve / request changes / comment)
-    output_key: review
-    retry:
-      max_attempts: 2
-      backoff: constant
-      delay_ms: 2000
+    retry_policy: llm_default
     next: check-quality
 
   check-quality:
@@ -197,22 +186,22 @@ nodes:
         min_score: 4
         model: claude-haiku-4-5-20251001
       - type: assertion
-        check: "len(output['review']) >= 200"
+        checks:
+          - "len(output['review']) >= 200"
     on_fail: retry_with_feedback
     max_retries: 2
     next: post-comment
 
   post-comment:
-    type: tool
+    type: mcp_tool
     server: github
     tool: create_pull_request_review
-    arguments:
+    input:
       owner: "{{{{ state.repo.split('/')[0] }}}}"
       repo: "{{{{ state.repo.split('/')[1] }}}}"
       pull_number: "{{{{ state.pr_number }}}}"
       body: "{{{{ state.review }}}}"
       event: COMMENT
-    output_key: comment_url
     next: end
 
   end:
@@ -252,22 +241,18 @@ workflow:
 
 nodes:
   read-file:
-    type: tool
+    type: mcp_tool
     server: filesystem
     tool: read_file
-    arguments:
+    input:
       path: "{{{{ state.path }}}}"
-    output_key: file_content
-    retry:
-      max_attempts: 2
-      backoff: constant
-      delay_ms: 500
+    retry_policy: io_default
     next: answer
 
   answer:
     type: model
     model: claude-haiku-4-5-20251001
-    system: |
+    system_prompt: |
       You are a helpful assistant. Answer questions about files clearly and concisely.
     prompt: |
       File: {{{{ state.path }}}}
@@ -276,7 +261,6 @@ nodes:
       {{{{ state.file_content }}}}
 
       Question: {{{{ state.question }}}}
-    output_key: answer
     next: end
 
   end:
@@ -301,91 +285,63 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
     "hitl-approval": {
         "workflow.yaml": """\
 # {name}/workflow.yaml
-# Human-in-the-loop review workflow.
-# Agent drafts a response, waits for human review, then executes or revises.
+# Human-in-the-loop review: the agent drafts a reply, a person reviews it, and
+# only an approved reply is finalized.
+#
+# Approving continues the run; rejecting fails it. If the reviewer does not
+# decide within 8 hours, the review goes to a second reviewer; if that review
+# also expires, the run fails. Nothing is approved automatically.
 #
 # Usage:
 #   jamjet run workflow.yaml --input '{{"request": "Refund order #1234 for $99"}}'
 #
-# Resume after human review:
-#   jamjet resume <exec-id> --event reviewed --data '{{"approved": true}}'
-#   jamjet resume <exec-id> --event reviewed --data '{{"approved": false, "feedback": "Too large, check policy first"}}'
+# Decide on the paused review:
+#   jamjet approvals <exec-id>
+#   jamjet approve <exec-id> --decision approved
+#   jamjet approve <exec-id> --decision rejected --comment "Too large, check policy first"
 
 workflow:
   id: {name}
   version: 0.1.0
   state_schema:
     request: str
-    draft_response: str
-    approved: bool
-    feedback: str
-    final_response: str
   start: draft
 
 nodes:
   draft:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are a support agent. Draft a clear, professional response to customer requests.
       Be specific about what action will be taken.
     prompt: |
       Customer request: {{{{ state.request }}}}
 
       Draft a response that explains what action you will take and why.
-    output_key: draft_response
-    next: await-review
+    next: review
 
-  await-review:
-    type: wait
-    event: reviewed
-    timeout_hours: 8
-    on_timeout: auto-approve
-    next: route
+  review:
+    type: human_approval
+    description: Review the drafted response before it is sent
+    timeout: 8h
+    fallback: second-review
+    next: finalize
 
-  route:
-    type: branch
-    conditions:
-      - if: "state.approved == true"
-        next: execute
-      - if: "state.approved == false"
-        next: revise
-    default: execute
+  second-review:
+    type: human_approval
+    description: "Escalated: the first reviewer did not decide within 8 hours"
+    timeout: 8h
+    next: finalize
 
-  execute:
+  finalize:
     type: model
     model: claude-sonnet-4-6
     prompt: |
-      The following response was approved. Finalize and confirm action taken:
+      A reviewer approved this draft:
 
-      Request: {{{{ state.request }}}}
-      Approved response: {{{{ state.draft_response }}}}
-    output_key: final_response
-    next: end
+      {{{{ state.last_model_output }}}}
 
-  revise:
-    type: model
-    model: claude-sonnet-4-6
-    prompt: |
-      Your draft was not approved. Revise based on this feedback:
-
-      Original request: {{{{ state.request }}}}
-      Draft: {{{{ state.draft_response }}}}
-      Feedback: {{{{ state.feedback }}}}
-
-      Write a revised response addressing the feedback.
-    output_key: final_response
-    next: end
-
-  auto-approve:
-    type: model
-    model: claude-haiku-4-5-20251001
-    prompt: |
-      Review timed out after 8 hours. Auto-processing:
-      Request: {{{{ state.request }}}}
-      Draft: {{{{ state.draft_response }}}}
-      Confirm the action taken.
-    output_key: final_response
+      Write the final customer reply, keeping the action and the reasoning.
     next: end
 
   end:
@@ -396,8 +352,9 @@ nodes:
     "multi-agent-review": {
         "workflow.yaml": """\
 # {name}/workflow.yaml
-# Two-agent review loop: writer drafts, critic reviews, writer revises.
-# Repeats until the critic scores the output above the threshold.
+# Writer and critic: a model drafts, an LLM judge scores the draft, and a draft
+# below the bar goes back to the writer with the judge's feedback, up to two
+# more times. If it still falls short, the run fails.
 #
 # Usage:
 #   jamjet run workflow.yaml --input '{{"topic": "Write a product announcement for JamJet 1.0"}}'
@@ -407,64 +364,30 @@ workflow:
   version: 0.1.0
   state_schema:
     topic: str
-    draft: str
-    critique: str
-    score: int
-    attempts: int
-    final: str
   start: write
 
 nodes:
   write:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are an expert writer. Produce clear, engaging, well-structured content.
-      If you have received critique, incorporate it fully in this revision.
+      If you have received critique, address every point in this revision.
     prompt: |
       Topic: {{{{ state.topic }}}}
-      {%- if state.critique %}
-
-      Previous critique (score {{{{ state.score }}}}/5):
-      {{{{ state.critique }}}}
-
-      Revise your draft to address all points raised.
-      {%- endif %}
-    output_key: draft
     next: critique
 
   critique:
-    type: model
-    model: claude-sonnet-4-6
-    system: |
-      You are a strict editor. Evaluate content quality honestly.
-      Reply in this exact format:
-      SCORE: <1-5>
-      CRITIQUE: <one paragraph of specific, actionable feedback>
-    prompt: |
-      Topic: {{{{ state.topic }}}}
-
-      Draft to review:
-      {{{{ state.draft }}}}
-    output_key: critique
-    next: route
-
-  route:
-    type: branch
-    conditions:
-      - if: "int(state.critique.split('SCORE:')[1].split()[0]) >= 4"
-        next: accept
-      - if: "state.attempts >= 3"
-        next: accept
-    default: write
-
-  accept:
-    type: model
-    model: claude-haiku-4-5-20251001
-    prompt: |
-      Format this final approved draft cleanly:
-      {{{{ state.draft }}}}
-    output_key: final
+    type: eval
+    scorers:
+      - type: llm_judge
+        model: claude-sonnet-4-6
+        rubric: |
+          You are a strict editor. Is the draft accurate, specific, well structured
+          and right for the topic? Score 1-5.
+        min_score: 4
+    on_fail: retry_with_feedback
+    max_retries: 2
     next: end
 
   end:
@@ -489,7 +412,7 @@ nodes:
 #
 # From another JamJet agent:
 #   type: a2a_task
-#   agent_uri: "http://localhost:7700"
+#   remote_agent: "http://localhost:7700"
 #   skill: summarize
 
 workflow:
@@ -504,11 +427,10 @@ nodes:
   handle:
     type: model
     model: claude-haiku-4-5-20251001
-    system: |
+    system_prompt: |
       You are a helpful agent that processes delegated tasks.
       Complete the task clearly and concisely.
     prompt: "{{{{ state.message }}}}"
-    output_key: result
     next: end
 
   end:
@@ -562,22 +484,18 @@ workflow:
 
 nodes:
   retrieve:
-    type: tool
+    type: mcp_tool
     server: filesystem
     tool: read_file
-    arguments:
+    input:
       path: "{{{{ state.question | extract_path }}}}"
-    output_key: context
-    retry:
-      max_attempts: 2
-      backoff: constant
-      delay_ms: 500
+    retry_policy: io_default
     next: answer
 
   answer:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are a helpful assistant that answers questions using the provided context.
       Always ground your answer in the context. If the context does not contain
       enough information, say so clearly.
@@ -588,7 +506,6 @@ nodes:
       Question: {{{{ state.question }}}}
 
       Answer based only on the context above.
-    output_key: answer
     next: end
 
   end:
@@ -630,30 +547,25 @@ workflow:
 
 nodes:
   call-tool:
-    type: tool
+    type: mcp_tool
     server: brave-search
     tool: web_search
-    arguments:
+    input:
       query: "{{{{ state.query }}}}"
-      count: 5
-    output_key: tool_result
-    retry:
-      max_attempts: 3
-      backoff: exponential
-      delay_ms: 1000
+      count: "5"
+    retry_policy: io_default
     next: summarize
 
   summarize:
     type: model
     model: claude-haiku-4-5-20251001
-    system: You are a concise summarizer. Summarize search results in 3-5 sentences.
+    system_prompt: You are a concise summarizer. Summarize search results in 3-5 sentences.
     prompt: |
       Search results for "{{{{ state.query }}}}":
 
       {{{{ state.tool_result }}}}
 
       Write a clear summary.
-    output_key: summary
     next: end
 
   end:
@@ -734,13 +646,12 @@ workflow:
 
 nodes:
   calculate:
-    type: tool
+    type: mcp_tool
     server: {name}
     tool: add
-    arguments:
+    input:
       a: "{{{{ state.a }}}}"
       b: "{{{{ state.b }}}}"
-    output_key: result
     next: respond
 
   respond:
@@ -749,7 +660,6 @@ nodes:
     prompt: |
       {{{{ state.a }}}} + {{{{ state.b }}}} = {{{{ state.result }}}}
       Write one sentence confirming this calculation.
-    output_key: message
     next: end
 
   end:
@@ -789,24 +699,22 @@ workflow:
 nodes:
   delegate:
     type: a2a_task
-    agent_uri: "{{{{ state.agent_url }}}}"
+    remote_agent: "{{{{ state.agent_url }}}}"
     skill: default
     input:
       message: "{{{{ state.task }}}}"
-    output_key: agent_result
-    timeout_seconds: 120
+    timeout: 120s
     next: summarize
 
   summarize:
     type: model
     model: claude-haiku-4-5-20251001
-    system: You are a coordinator agent. Present the delegated result clearly.
+    system_prompt: You are a coordinator agent. Present the delegated result clearly.
     prompt: |
       Task delegated: {{{{ state.task }}}}
       Remote agent result: {{{{ state.agent_result }}}}
 
       Write a one-paragraph summary of what was accomplished.
-    output_key: final_summary
     next: end
 
   end:
@@ -1045,7 +953,7 @@ nodes:
   research:
     type: model
     model: claude-haiku-4-5-20251001
-    system: |
+    system_prompt: |
       You are a research assistant. Search for relevant papers and information,
       then provide a detailed, well-cited summary.
     prompt: |
@@ -1057,7 +965,6 @@ nodes:
       1. Key findings from recent literature
       2. Different perspectives or approaches
       3. Open questions and future directions
-    output_key: report
     next: evaluate
 
   evaluate:
@@ -1334,28 +1241,29 @@ Approvals surface in `/dashboard/approvals` for your team to review.
     "approval-workflow": {
         "workflow.yaml": """\
 # {name}/workflow.yaml
-# Human-in-the-loop approval gate — execution pauses until a human approves.
+# Human approval gate: execution pauses until a person approves the plan.
+#
+# Approving continues the run; rejecting fails it. If nobody decides within
+# 24 hours, the approval goes to a second approver; if that one also expires,
+# the run fails. Nothing is approved automatically.
 #
 # Usage:
 #   jamjet run workflow.yaml --input '{{"task": "Deploy v2.0 to production"}}'
-#   jamjet resume <exec-id> --event human_approved --data '{{"approved": true}}'
+#   jamjet approvals <exec-id>
+#   jamjet approve <exec-id> --decision approved
 
 workflow:
   id: {name}
   version: 0.1.0
   state_schema:
     task: str
-    proposal: str
-    approved: bool
-    result: str
-    rejection_reason: str
   start: propose
 
 nodes:
   propose:
     type: model
     model: claude-sonnet-4-6
-    system: |
+    system_prompt: |
       You are an operations agent. Propose a safe, detailed execution plan.
       Be specific about what actions will be taken and their risks.
     prompt: |
@@ -1368,54 +1276,31 @@ nodes:
       2. Estimated impact
       3. Rollback plan if something goes wrong
       4. Risk assessment (low / medium / high)
-    output_key: proposal
     next: await-approval
 
   await-approval:
-    type: wait
-    event: human_approved
-    timeout_hours: 24
-    on_timeout: escalate
-    next: check-approved
+    type: human_approval
+    description: Approve the proposed execution plan
+    timeout: 24h
+    fallback: escalate
+    next: announce
 
-  check-approved:
-    type: branch
-    conditions:
-      - if: "state.approved == true"
-        next: execute
-    default: rejected
+  escalate:
+    type: human_approval
+    description: "Escalated: the first approver did not decide within 24 hours"
+    timeout: 24h
+    next: announce
 
-  execute:
+  announce:
     type: model
     model: claude-sonnet-4-6
     prompt: |
-      Execute this approved plan step by step:
+      This execution plan was approved:
 
-      Task: {{{{ state.task }}}}
-      Plan: {{{{ state.proposal }}}}
+      {{{{ state.last_model_output }}}}
 
-      Report what was done and confirm completion.
-    output_key: result
-    next: end
-
-  rejected:
-    type: model
-    model: claude-haiku-4-5-20251001
-    prompt: |
-      The following plan was rejected: {{{{ state.proposal }}}}
-      Reason: {{{{ state.rejection_reason }}}}
-      Acknowledge the rejection and suggest alternatives.
-    output_key: result
-    next: end
-
-  escalate:
-    type: model
-    model: claude-haiku-4-5-20251001
-    prompt: |
-      The approval for the following task timed out after 24 hours:
-      {{{{ state.task }}}}
-      Draft an escalation notice for the on-call team.
-    output_key: result
+      Write a short change announcement for the team: what will happen,
+      when, and how to roll it back.
     next: end
 
   end:
@@ -1522,7 +1407,21 @@ jamjet events  <execution-id>
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-AVAILABLE_TEMPLATES: list[str] = sorted(_TEMPLATES.keys())
+# Templates whose workflow needs a node kind the engine does not run, so a
+# project made from them could not run. `jamjet init` refuses them with this
+# reason; they come back when the engine runs those nodes.
+HELD_BACK_TEMPLATES: dict[str, str] = {
+    "a2a-delegator": "it delegates with an a2a_task node, which the engine does not run",
+    "a2a-server": "it relies on jamjet.toml to publish an Agent Card, and nothing reads jamjet.toml",
+    "code-reviewer": "it calls GitHub through mcp_tool nodes, which the engine does not run",
+    "mcp-tool-consumer": "it calls an MCP server through an mcp_tool node, which the engine does not run",
+    "mcp-tool-provider": "its workflow calls the server through an mcp_tool node, which the engine does not run",
+    "rag-assistant": "it retrieves files through an mcp_tool node, which the engine does not run",
+    "research-agent": "it searches through an mcp_tool node, which the engine does not run",
+    "single-agent-tool-flow": "it reads files through an mcp_tool node, which the engine does not run",
+}
+
+AVAILABLE_TEMPLATES: list[str] = sorted(name for name in _TEMPLATES if name not in HELD_BACK_TEMPLATES)
 
 
 def get_template(name: str) -> dict[str, str]:
@@ -1530,6 +1429,8 @@ def get_template(name: str) -> dict[str, str]:
 
     Raises KeyError if the template does not exist.
     """
+    if name in HELD_BACK_TEMPLATES:
+        raise KeyError(f"Template '{name}' is not available in this release: {HELD_BACK_TEMPLATES[name]}.")
     if name not in _TEMPLATES:
         raise KeyError(f"Unknown template '{name}'. Available: {', '.join(AVAILABLE_TEMPLATES)}")
     return _TEMPLATES[name]

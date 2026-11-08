@@ -17,7 +17,7 @@ version = "0.12.0"
 description = "JamJet — open-source safety layer for AI agents. Block unsafe tool calls, require approval, enforce budgets, audit, replay."
 readme = "README.md"
 license = { text = "Apache-2.0" }
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 keywords = ["ai", "agents", "workflow", "mcp", "a2a", "llm", "rust", "durable", "orchestration"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -62,6 +62,7 @@ dev = [
     "scipy>=1.11",
     "hypothesis>=6.0",
     "respx>=0.21",
+    "jsonschema>=4",
 ]
 # Optional extras for the `jamjet.cloud` governance submodule (introduced in 0.6.0).
 # `pip install jamjet[openai]` enables auto-instrumentation of OpenAI calls;
@@ -69,7 +70,12 @@ dev = [
 openai = ["openai>=2"]
 anthropic = ["anthropic>=0.40"]
 cloud-all = ["openai>=2", "anthropic>=0.40"]
-model = ["litellm>=1.50"]
+# From litellm 1.106 on, a completion that passes tools imports mcp 2.x-only
+# types (mcp.types.CacheableResult), and litellm lists mcp only under its own
+# extras: a fresh install's first agent then dies on the import, and pulling in
+# mcp 2.x would break FastMCP (mcp 1.x) code. Below 1.106 that path imports no
+# mcp at all. Raise this bound together with a move to mcp 2.x.
+model = ["litellm>=1.50,<1.106"]
 sidecar = ["starlette>=0.40", "uvicorn>=0.30"]
 # Optional extras for the `jamjet.durable` framework shims (introduced in 0.7.0).
 # Each enables a thin durable_run() context manager that bridges the framework's
@@ -80,7 +86,9 @@ adk = ["google-adk>=0.1"]
 anthropic-agent = ["anthropic>=0.40"]
 openai-agents = ["openai-agents>=0.1"]
 pii = ["presidio-analyzer>=2.2,<3.0"]
-memory = ["jamjet-engram>=0.1,<0.3"]
+# jamjet-engram needs Python 3.12+. On 3.11 the extra installs nothing and
+# memory features raise an ImportError that says so.
+memory = ["jamjet-engram>=0.1,<0.3; python_version >= '3.12'"]
 
 [project.scripts]
 jamjet = "jamjet.cli.main:app"
@@ -113,3 +121,8 @@ disallow_any_generics = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# A stale xfail (the bug got fixed) fails the run instead of passing quietly.
+xfail_strict = true
+markers = [
+    "slow: slow tests; the full run includes them, skip with `pytest -m \"not slow\"`",
+]

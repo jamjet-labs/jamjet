@@ -1,0 +1,60 @@
+# examples/mcp-tool-consumer/workflow.yaml
+#
+# MCP Tool Consumer: call a tool on an external MCP server from a workflow,
+# then summarise the result with a model.
+#
+# MCP servers are declared under mcp.servers (stdio or HTTP+SSE) and a node of
+# type mcp_tool names the server and the tool to call.
+#
+# Prerequisites:
+#   uv, for the reference MCP fetch server used below (it runs over stdio):
+#     uvx mcp-server-fetch
+#   export ANTHROPIC_API_KEY="sk-ant-..."
+#
+# Check MCP connectivity first:
+#   jamjet mcp connect "stdio:uvx mcp-server-fetch"
+#
+# Check the definition (no runtime needed):
+#   jamjet validate workflow.yaml
+#
+# Running it:
+#   The engine in this release has no executor for mcp_tool nodes and refuses
+#   to register a workflow that uses them, so `jamjet run` stops there. Use
+#   this file with `jamjet validate`.
+
+workflow:
+  id: mcp_tool_consumer
+  version: 0.1.0
+  description: "Call a tool on an MCP server, then summarise the result"
+  start: fetch_page
+  state_schema:
+    type: object
+    properties:
+      topic: { type: string }
+    required: [topic]
+
+mcp:
+  servers:
+    fetch:
+      transport: stdio
+      command: uvx
+      args: ["mcp-server-fetch"]
+
+nodes:
+  fetch_page:
+    type: mcp_tool
+    description: Fetch a Wikipedia page through the MCP fetch tool
+    server: fetch
+    tool: fetch
+    input:
+      url: "https://en.wikipedia.org/wiki/{{ state.topic }}"
+    retry_policy: io_default
+    next: summarise
+
+  summarise:
+    type: model
+    description: Summarise the fetched content
+    model: claude-haiku-4-5-20251001
+    system_prompt: You are a concise summarizer. Summarize the content in 3-5 sentences.
+    prompt: "Summarise what the fetched page says about {{ state.topic }}."
+    next: end

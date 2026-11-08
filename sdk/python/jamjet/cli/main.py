@@ -38,6 +38,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import httpx
 import yaml
 
 if TYPE_CHECKING:
@@ -153,6 +154,47 @@ def _client(runtime: str = LOCAL_RUNTIME_URL, token: str | None = None) -> Jamje
 # ── Protocol trace helpers ───────────────────────────────────────────────────
 
 
+def _print_error(label: str, message: object) -> None:
+    """Print ``label`` in red, then ``message`` literally: escaped and never read
+    as Rich markup, since it can quote a file, a handler or the runtime."""
+    if label:
+        console.print(label, style="red", end=" ")
+    console.print(_safe(message), markup=False, highlight=False, soft_wrap=True)
+
+
+def _failure_report(exc: BaseException) -> str:
+    """The error text a worker sends with ``fail_work_item``.
+
+    When the runtime refused the result, its error body can quote the output
+    back; sending that to ``/fail`` would store server-echoed values in the
+    event log, so only the status goes. Any other HTTP error came from the
+    handler's own call: report its status, host and path (not the query
+    string, which can carry tokens) without blaming the runtime.
+    """
+    from jamjet.client import JamjetAPIError
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        request = exc.request
+        status = exc.response.status_code
+        if isinstance(exc, JamjetAPIError):
+            return f"runtime refused the result: HTTP {status} for {request.method} {request.url.path}"
+        return f"HTTP {status} from {request.method} {request.url.scheme}://{request.url.host}{request.url.path}"
+    return str(exc)
+
+
+def _event_kind(event: Mapping[str, Any]) -> dict[str, Any]:
+    """The event's ``kind`` payload. The runtime serializes each event as
+    ``{"sequence", "kind": {"type": ..., "node_id": ..., ...}, "created_at"}``,
+    so the type and the per-kind fields live under ``kind``. A flat event (the
+    fields at the top level) is read as its own payload."""
+    kind = event.get("kind")
+    return kind if isinstance(kind, dict) else dict(event)
+
+
+def _event_field(event: Mapping[str, Any], name: str) -> Any:
+    return _event_kind(event).get(name)
+
+
 def _filter_events(
     events: list[dict[str, Any]],
     *,
@@ -162,9 +204,9 @@ def _filter_events(
     """Filter events by protocol type and/or node ID."""
     result = events
     if protocol:
-        result = [e for e in result if e.get("protocol") == protocol]
+        result = [e for e in result if _event_field(e, "protocol") == protocol]
     if node:
-        result = [e for e in result if e.get("node_id") == node]
+        result = [e for e in result if _event_field(e, "node_id") == node]
     return result
 
 
@@ -172,13 +214,60 @@ def _build_protocol_tree(events: list[dict[str, Any]]) -> dict[str, list[dict[st
     """Group protocol events by node_id for tree display."""
     tree: dict[str, list[dict[str, Any]]] = {}
     for event in events:
-        node_id = event.get("node_id")
+        node_id = _event_field(event, "node_id")
         if node_id:
             tree.setdefault(node_id, []).append(event)
     return tree
 
 
+def _is_agent_tool_event(event: Mapping[str, Any]) -> bool:
+    """True for the runtime's ``agent_tool_*`` events (invoked, progress, turn, ...)."""
+    kind_type = _event_kind(event).get("type")
+    return isinstance(kind_type, str) and kind_type.startswith("agent_tool_")
+
+
+def _print_protocol_activity(events: list[dict[str, Any]]) -> None:
+    """One line per agent-as-tool node: protocol, event count, turns, latency."""
+    protocol_events = [e for e in events if _is_agent_tool_event(e)]
+    if not protocol_events:
+        return
+    console.print("\n[bold]Protocol Activity[/bold]")
+    for nid, node_events in _build_protocol_tree(protocol_events).items():
+        kinds = [_event_kind(e) for e in node_events]
+        invoked = next((k for k in kinds if k.get("type") == "agent_tool_invoked"), {})
+        completed = next((k for k in kinds if k.get("type") == "agent_tool_completed"), {})
+        proto = invoked.get("protocol", "unknown")
+        latency = completed.get("latency_ms", "?")
+        turns = sum(1 for k in kinds if k.get("type") == "agent_tool_turn")
+        # Node ids and protocol names come from the run: shown literally, never as markup.
+        console.print(
+            f"  {_safe(nid)} [{_safe(proto)}] — {len(node_events)} events, {turns} turns, {_safe(latency)}ms",
+            markup=False,
+            highlight=False,
+        )
+
+
 # ── init ─────────────────────────────────────────────────────────────────────
+
+
+def _escape_markup(text: str) -> str:
+    from rich.markup import escape
+
+    return escape(_safe(text))
+
+
+def _refuse_held_back_template(template: str) -> None:
+    """Exit with the reason when a template is held back in this release."""
+    from jamjet.templates import HELD_BACK_TEMPLATES
+
+    reason = HELD_BACK_TEMPLATES.get(template)
+    if reason is not None:
+        console.print(
+            f"[red]Error:[/red] template '{template}' is not available in this release: {reason}. "
+            "A project from it could not run. "
+            "Run [bold]jamjet init --list-templates[/bold] to see the ones that can."
+        )
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -204,22 +293,26 @@ def init(
 
     Pass a name to create a new directory, or omit to set up in the current directory.
 
-    Available templates: hello-agent (default), research-agent, code-reviewer, approval-workflow
+    Run `jamjet init --list-templates` to see the templates.
     """
     import os
 
-    from jamjet.templates import AVAILABLE_TEMPLATES, render_template
+    from jamjet.templates import AVAILABLE_TEMPLATES, HELD_BACK_TEMPLATES, render_template
 
     if list_templates:
         console.print("[bold]Available templates:[/bold]")
         for t in AVAILABLE_TEMPLATES:
             marker = "  [green]●[/green]" if t == "hello-agent" else "  [dim]●[/dim]"
             console.print(f"{marker} {t}")
+        console.print("[dim]Not available in this release:[/dim]")
+        for t, reason in sorted(HELD_BACK_TEMPLATES.items()):
+            console.print(f"  [dim]○ {t}: {reason}[/dim]")
         raise typer.Exit()
 
+    _refuse_held_back_template(template)
     if template not in AVAILABLE_TEMPLATES:
         console.print(
-            f"[red]Error:[/red] unknown template '{template}'. "
+            f"[red]Error:[/red] unknown template '{_escape_markup(template)}'. "
             f"Run [bold]jamjet init --list-templates[/bold] to see options."
         )
         raise typer.Exit(1)
@@ -281,9 +374,10 @@ def create(
 
     from jamjet.templates import AVAILABLE_TEMPLATES, render_template
 
+    _refuse_held_back_template(template)
     if template not in AVAILABLE_TEMPLATES:
         console.print(
-            f"[red]Error:[/red] unknown template '{template}'. "
+            f"[red]Error:[/red] unknown template '{_escape_markup(template)}'. "
             f"Run [bold]jamjet init --list-templates[/bold] to see options."
         )
         raise typer.Exit(1)
@@ -512,7 +606,7 @@ def dev(
     try:
         binary = _find_server_binary()
     except FileNotFoundError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        _print_error("Error:", e)
         raise typer.Exit(1)
 
     enable_sidecar = not (engine_only or no_sidecar)
@@ -575,7 +669,7 @@ def dev(
     try:
         stack.run()
     except dev_stack.DevStackError as e:
-        console.print(f"[red]Dev stack failed to start:[/red] {e}")
+        _print_error("Dev stack failed to start:", e)
         raise typer.Exit(1)
     finally:
         if previous_sigterm is not None:
@@ -590,6 +684,44 @@ def dev(
 # ── validate ─────────────────────────────────────────────────────────────────
 
 
+def _compile_yaml_reporting(source: str) -> dict[str, Any]:
+    """``compile_yaml``, printing each schema warning (an unknown key outside a
+    node or policy) instead of leaving it to Python's warning output."""
+    import warnings
+
+    from jamjet.workflow.ir_compiler import WorkflowSchemaWarning, compile_yaml
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", WorkflowSchemaWarning)
+        ir = compile_yaml(source)
+    # stderr, so `jamjet run --output json` keeps stdout to the JSON result.
+    err = Console(stderr=True)
+    for w in caught:
+        if issubclass(w.category, WorkflowSchemaWarning):
+            err.print("Warning:", style="yellow", end=" ")
+            err.print(str(w.message), markup=False, highlight=False)
+        else:
+            warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
+    return ir
+
+
+def _validate_fleet(data: dict[str, Any]) -> None:
+    """Compile a fleet file (agents:/workflows: maps) and print each unit."""
+    from jamjet.workflow.bundle import compile_bundle
+
+    bundle = compile_bundle(data)
+    console.print(f"[green]Valid.[/green] fleet with {len(bundle.workflows)} unit(s)")
+    for ir in bundle.workflows:
+        console.print(
+            f"  {_safe(ir['workflow_id'])} v{_safe(ir['version'])}  "
+            f"Nodes: {len(ir.get('nodes', {}))}  Edges: {len(ir.get('edges', []))}",
+            markup=False,
+            highlight=False,
+        )
+    for job in bundle.cron_jobs:
+        console.print(f"  schedule {_safe(job.name)}: {_safe(job.cron_expression)}", markup=False, highlight=False)
+
+
 @app.command()
 def validate(
     path: str = typer.Argument(..., help="Path to workflow.yaml or .py"),
@@ -598,39 +730,25 @@ def validate(
     """Validate a workflow definition (YAML or Python)."""
     import os
 
-    from jamjet.workflow.ir_compiler import compile_yaml
-
     console.print(f"Validating: [bold]{path}[/bold]")
 
     if not os.path.isfile(path):
         console.print(f"[red]File not found:[/red] {path}")
         raise typer.Exit(1)
+    if not path.endswith((".yaml", ".yml", ".py")):
+        console.print("[red]Unsupported file type. Use .yaml, .yml, or .py[/red]")
+        raise typer.Exit(1)
 
     try:
-        if path.endswith(".yaml") or path.endswith(".yml"):
+        if path.endswith((".yaml", ".yml")):
+            from jamjet.workflow.bundle import is_bundle
+
             with open(path) as f:
-                source = f.read()
-            ir = compile_yaml(source)
-        elif path.endswith(".py"):
-            # Import the module and call compile() on the first Workflow object found.
-            import importlib.util
-
-            spec = importlib.util.spec_from_file_location("_wf_module", path)
-            mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-            spec.loader.exec_module(mod)  # type: ignore[union-attr]
-            from jamjet.workflow.workflow import Workflow
-
-            wf = next(
-                (v for v in vars(mod).values() if isinstance(v, Workflow)),
-                None,
-            )
-            if wf is None:
-                console.print("[red]No Workflow instance found in module.[/red]")
-                raise typer.Exit(1)
-            ir = wf.compile()
-        else:
-            console.print("[red]Unsupported file type. Use .yaml or .py[/red]")
-            raise typer.Exit(1)
+                data = yaml.safe_load(f.read())
+            if is_bundle(data):
+                _validate_fleet(data)
+                return
+        ir = _load_workflow_ir(path)
 
         wf_id = ir.get("workflow_id")
         version = ir.get("version")
@@ -643,7 +761,7 @@ def validate(
             console.print_json(json.dumps(ir, indent=2))
 
     except Exception as e:
-        console.print(f"[red]Validation error:[/red] {e}")
+        _print_error("Validation error:", e)
         raise typer.Exit(1)
 
 
@@ -675,7 +793,7 @@ def deploy(
     try:
         target = resolve_runtime_target(runtime)
     except ValueError as e:
-        console.print(f"[red]{e}[/red]")
+        _print_error("", e)
         raise typer.Exit(1)
 
     data = yaml.safe_load(Path(file).read_text())
@@ -709,11 +827,9 @@ def deploy(
 
 def _load_workflow_ir(path: str) -> dict[str, Any]:
     """Compile a workflow file (.yaml/.yml/.py) to its IR dict."""
-    from jamjet.workflow.ir_compiler import compile_yaml
-
     if path.endswith((".yaml", ".yml")):
         with open(path) as fh:
-            return compile_yaml(fh.read())
+            return _compile_yaml_reporting(fh.read())
     if path.endswith(".py"):
         import importlib.util
 
@@ -725,7 +841,9 @@ def _load_workflow_ir(path: str) -> dict[str, Any]:
         wf = next((v for v in vars(mod).values() if isinstance(v, Workflow)), None)
         if wf is None:
             raise ValueError("No Workflow instance found in module.")
-        return wf.compile()
+        # The runtime IR dict, not compile()'s WorkflowSpec: callers read it with
+        # .get() and POST it to /workflows.
+        return wf.to_ir()
     raise ValueError("Unsupported workflow file type. Use .yaml, .yml, or .py")
 
 
@@ -1144,17 +1262,7 @@ def inspect(
                 )
 
             # ── Protocol Activity section ─────────────────────────────────
-            protocol_events = [e for e in evts if e.get("kind", "").startswith("AgentTool")]
-            if protocol_events:
-                console.print("\n[bold]Protocol Activity[/bold]")
-                tree = _build_protocol_tree(protocol_events)
-                for nid, node_events in tree.items():
-                    invoked = next((e for e in node_events if e["kind"] == "AgentToolInvoked"), {})
-                    completed = next((e for e in node_events if e["kind"] == "AgentToolCompleted"), {})
-                    proto = invoked.get("protocol", "unknown")
-                    latency = completed.get("latency_ms", "?")
-                    turns = sum(1 for e in node_events if e["kind"] == "AgentToolTurn")
-                    console.print(f"  {nid} [{proto}] — {len(node_events)} events, {turns} turns, {latency}ms")
+            _print_protocol_activity(evts)
 
             # ── Strategy section ─────────────────────────────────────────
             _print_strategy_section(console, data, evts)
@@ -1396,7 +1504,7 @@ def agents_discover(
                 resp.raise_for_status()
                 card = resp.json()
         except Exception as exc:
-            console.print(f"[red]Failed to fetch Agent Card:[/red] {exc}")
+            _print_error("Failed to fetch Agent Card:", exc)
             raise typer.Exit(1) from exc
 
         t = Table(title=f"Agent Card — {url}", show_header=False, box=None)
@@ -1440,44 +1548,6 @@ def agents_connect(
                 console.print(f"  Skills: {', '.join(s.get('id', '?') for s in skills)}")
 
     asyncio.run(_connect())
-
-
-@agents_app.command("trace")
-def agents_trace(
-    agent_id: str = typer.Argument(..., help="Agent ID to show communication trace for"),
-    limit: int = typer.Option(20, "--limit", "-n", help="Number of recent events to show"),
-    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
-) -> None:
-    """Show recent A2A communication events for an agent."""
-    from rich.table import Table
-
-    async def _trace() -> None:
-        async with _client(runtime) as c:
-            data = await c.get(f"/agents/{agent_id}/trace?limit={limit}")
-            events = data.get("events", [])
-
-        if not events:
-            console.print(f"[dim]No trace events found for agent {agent_id}[/dim]")
-            return
-
-        t = Table(title=f"Agent trace — {agent_id}", show_lines=False)
-        t.add_column("Time", style="dim", width=20)
-        t.add_column("Direction", width=10)
-        t.add_column("Type", style="cyan", width=18)
-        t.add_column("Details")
-
-        for evt in events:
-            direction = "[green]→ OUT[/green]" if evt.get("direction") == "outbound" else "[blue]← IN[/blue]"
-            t.add_row(
-                evt.get("timestamp", "")[:19],
-                direction,
-                evt.get("event_type", ""),
-                evt.get("summary", ""),
-            )
-
-        console.print(t)
-
-    asyncio.run(_trace())
 
 
 # ── mcp ───────────────────────────────────────────────────────────────────────
@@ -1543,7 +1613,7 @@ def mcp_connect(
                         console.print(f"[red]HTTP {e.response.status_code}: {e.response.text}[/red]")
                         raise typer.Exit(1)
                     except httpx.RequestError as e:
-                        console.print(f"[red]Connection error: {e}[/red]")
+                        _print_error("Connection error:", e)
                         raise typer.Exit(1)
                     body = resp.json()
                     if "error" in body:
@@ -1608,7 +1678,7 @@ def a2a_discover(
                 console.print(f"[red]HTTP {e.response.status_code}: {e.response.text}[/red]")
                 raise typer.Exit(1)
             except httpx.RequestError as e:
-                console.print(f"[red]Connection error: {e}[/red]")
+                _print_error("Connection error:", e)
                 raise typer.Exit(1)
 
         card = resp.json()
@@ -1705,7 +1775,7 @@ def replay(
                 try:
                     overrides = json.loads(override_input)
                 except json.JSONDecodeError as e:
-                    console.print(f"[red]Invalid JSON in --override-input:[/red] {e}")
+                    _print_error("Invalid JSON in --override-input:", e)
                     raise typer.Exit(1)
                 replay_input.update(overrides)
 
@@ -1804,7 +1874,7 @@ def fork(
             try:
                 overrides = json.loads(override_input)
             except json.JSONDecodeError as e:
-                console.print(f"[red]Invalid JSON in --override-input:[/red] {e}")
+                _print_error("Invalid JSON in --override-input:", e)
                 raise typer.Exit(1)
             fork_input.update(overrides)
 
@@ -2079,13 +2149,13 @@ async def _worker_loop(
                     raise
                 console.print(f"[green]Completed[/green] id={item_id} node=[bold]{node_id}[/bold] {duration_ms}ms")
             except Exception as exc:
-                console.print(f"[red]Failed[/red] node={node_id}: {exc}")
+                _print_error("Failed", f"node={node_id}: {exc}")
                 try:
                     # Echo the fence here for the same reason completion does: it
                     # proves the lease is still ours. It also buys the retry and
                     # dead-letter semantics — without it the runtime settles the
                     # item, emits no NodeFailed, and the execution never finishes.
-                    await client.fail_work_item(item_id, str(exc), lease_fence=lease["fence"])
+                    await client.fail_work_item(item_id, _failure_report(exc), lease_fence=lease["fence"])
                 except Exception as fail_exc:
                     # 409: the lease was reclaimed while this node was failing, so
                     # a new claimant owns the item. Reporting our failure would
@@ -2154,7 +2224,7 @@ def worker(
             try:
                 _importlib.import_module(mod_name)
             except ImportError as exc:
-                console.print(f"[red]Error importing module:[/red] {mod_name}: {exc}")
+                _print_error("Error importing module:", f"{mod_name}: {exc}")
                 raise typer.Exit(1)
 
     console.print("[bold]JamJet Python Tool Worker[/bold]")
@@ -2230,7 +2300,7 @@ def eval_run(
     try:
         ds = EvalDataset.from_file(dataset)
     except (FileNotFoundError, ValueError) as e:
-        console.print(f"[red]Error loading dataset:[/red] {e}")
+        _print_error("Error loading dataset:", e)
         raise typer.Exit(1)
 
     console.print(f"Running eval: [bold]{len(ds)}[/bold] rows × [bold]{workflow}[/bold] with {len(scorers)} scorer(s)")
@@ -2308,7 +2378,7 @@ def eval_export(
         console.print(f"[red]Error:[/red] file not found: {results_json}")
         raise typer.Exit(1)
     except json.JSONDecodeError as e:
-        console.print(f"[red]Error:[/red] invalid JSON: {e}")
+        _print_error("Error:", f"invalid JSON: {e}")
         raise typer.Exit(1)
 
     if not isinstance(data, list):
@@ -2431,7 +2501,7 @@ def eval_compare(
         console.print(f"[red]Error:[/red] file not found: {results_json}")
         raise typer.Exit(1)
     except (json.JSONDecodeError, ValueError) as e:
-        console.print(f"[red]Error:[/red] {e}")
+        _print_error("Error:", e)
         raise typer.Exit(1)
 
     # Resolve condition dicts from the short names.
@@ -2457,7 +2527,7 @@ def eval_compare(
     try:
         result = grid_results.compare(cond_dict_a, cond_dict_b, test=test, alpha=alpha)
     except ValueError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        _print_error("Error:", e)
         raise typer.Exit(1)
 
     if fmt.lower() == "json":
@@ -2561,7 +2631,7 @@ def eval_trajectory_diff(
         console.print(f"[red]Error:[/red] file not found: {e.filename}")
         raise typer.Exit(1)
     except (json.JSONDecodeError, ValueError) as e:
-        console.print(f"[red]Error:[/red] {e}")
+        _print_error("Error:", e)
         raise typer.Exit(1)
 
     diff = diff_trajectories(before_traj, after_traj)

@@ -74,6 +74,12 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
                     <useModulePath>false</useModulePath>
+                    <!-- EngramConfigEnvTest reads these: the Engram server's variable must
+                         win over the old ENGRAM_TOKEN. No other test reads them. -->
+                    <environmentVariables>
+                        <ENGRAM_AUTH_TOKEN>auth-token-from-env</ENGRAM_AUTH_TOKEN>
+                        <ENGRAM_TOKEN>legacy-token-from-env</ENGRAM_TOKEN>
+                    </environmentVariables>
                 </configuration>
             </plugin>
             <plugin>

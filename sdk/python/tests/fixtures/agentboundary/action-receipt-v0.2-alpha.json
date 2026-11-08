@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentboundary.jamjet.dev/schemas/action-receipt-v0.2-alpha.json",
+  "title": "AgentBoundary Action Receipt v0.2-alpha",
+  "description": "v0.2-alpha extends v0.1 with optional fields: provenance and completeness_score (an emitter self-reports which receipt fields it observed directly vs inferred vs synthesized; a verifier MUST recompute the score), prior_receipt (chain link), and refusal (what was NOT allowed). It also requires approval only when a require-approval action proceeded. See docs/spec/v0.2-alpha.md for normative semantics.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "receipt_id",
+    "issued_at",
+    "actor",
+    "agent",
+    "tool",
+    "target",
+    "arguments_hash",
+    "policy",
+    "execution",
+    "receipt_hash"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "agentboundary/v0.2-alpha",
+      "description": "Schema version literal."
+    },
+    "receipt_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Globally unique receipt identifier (UUID v4 or v7 recommended)."
+    },
+    "issued_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp when the receipt was emitted."
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["human", "system", "agent"]
+        },
+        "id": { "type": "string", "minLength": 1 },
+        "display_name": { "type": "string" }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["framework", "framework_version", "model"],
+      "properties": {
+        "framework": { "type": "string", "minLength": 1 },
+        "framework_version": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "model_version": { "type": "string" }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "capability"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string" },
+        "capability": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Dotted-namespace capability identifier, e.g. 'github.merge', 'stripe.refund', 'spring.service.mutation'."
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system", "environment"],
+      "properties": {
+        "system": { "type": "string", "minLength": 1 },
+        "environment": {
+          "type": "string",
+          "enum": ["prod", "staging", "dev"]
+        },
+        "resource_id": { "type": "string" }
+      }
+    },
+    "arguments_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "Lowercase hex SHA-256 of canonicalized arguments. Proves the executed arguments match what was approved."
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "decision"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "decision": {
+          "type": "string",
+          "enum": ["allow", "deny", "escalate", "require-approval"]
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approver", "approved_at"],
+      "properties": {
+        "approver": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id"],
+          "properties": {
+            "id": { "type": "string", "minLength": 1 },
+            "display_name": { "type": "string" },
+            "role": { "type": "string" }
+          }
+        },
+        "approved_at": { "type": "string", "format": "date-time" },
+        "context": { "type": "string" }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "completed_at"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["success", "failure", "blocked"]
+        },
+        "completed_at": { "type": "string", "format": "date-time" },
+        "error_code": { "type": "string" },
+        "result_ref": { "type": "string" }
+      }
+    },
+    "refusal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict"],
+      "description": "Present when the action was refused at the action boundary and did not run. Records what was NOT allowed: 'deny' (policy or approver refused), 'require-approval' (approval was required and not given), 'expired' (an approval or escalation window lapsed). A receipt carrying refusal MUST have execution.status=blocked (conformance check LEVEL_2_REFUSAL_EXECUTED). See docs/spec/v0.2-alpha.md section 2.3.",
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": ["deny", "require-approval", "expired"]
+        },
+        "reason_code": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Implementation-defined machine-readable reason, e.g. policy-deny, approval-missing, approver-not-authorized, approval-window-elapsed."
+        }
+      }
+    },
+    "prior_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt_id", "receipt_hash"],
+      "description": "Singly-linked back-reference to the previous receipt in this emitter's stream. A verifier walking the chain detects deletion (broken link), reordering (hash mismatch), and insertion (forged hash). The first receipt in a stream omits this field.",
+      "properties": {
+        "receipt_id": { "type": "string", "format": "uuid" },
+        "receipt_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-field self-report: which receipt fields the emitter observed directly, inferred from observed data, or synthesized at translation time. Entries omitted for a present field default to 'synthesized' in the score formula. Entries present for an absent field are silently ignored.",
+      "properties": {
+        "receipt_id": { "$ref": "#/$defs/provenanceValue" },
+        "issued_at": { "$ref": "#/$defs/provenanceValue" },
+        "actor.type": { "$ref": "#/$defs/provenanceValue" },
+        "actor.id": { "$ref": "#/$defs/provenanceValue" },
+        "actor.display_name": { "$ref": "#/$defs/provenanceValue" },
+        "agent.framework": { "$ref": "#/$defs/provenanceValue" },
+        "agent.framework_version": { "$ref": "#/$defs/provenanceValue" },
+        "agent.model": { "$ref": "#/$defs/provenanceValue" },
+        "agent.model_version": { "$ref": "#/$defs/provenanceValue" },
+        "tool.name": { "$ref": "#/$defs/provenanceValue" },
+        "tool.version": { "$ref": "#/$defs/provenanceValue" },
+        "tool.capability": { "$ref": "#/$defs/provenanceValue" },
+        "target.system": { "$ref": "#/$defs/provenanceValue" },
+        "target.environment": { "$ref": "#/$defs/provenanceValue" },
+        "target.resource_id": { "$ref": "#/$defs/provenanceValue" },
+        "arguments_hash": { "$ref": "#/$defs/provenanceValue" },
+        "policy.name": { "$ref": "#/$defs/provenanceValue" },
+        "policy.version": { "$ref": "#/$defs/provenanceValue" },
+        "policy.decision": { "$ref": "#/$defs/provenanceValue" },
+        "approval.approver.id": { "$ref": "#/$defs/provenanceValue" },
+        "approval.approver.display_name": { "$ref": "#/$defs/provenanceValue" },
+        "approval.approver.role": { "$ref": "#/$defs/provenanceValue" },
+        "approval.approved_at": { "$ref": "#/$defs/provenanceValue" },
+        "approval.context": { "$ref": "#/$defs/provenanceValue" },
+        "execution.status": { "$ref": "#/$defs/provenanceValue" },
+        "execution.completed_at": { "$ref": "#/$defs/provenanceValue" },
+        "execution.error_code": { "$ref": "#/$defs/provenanceValue" },
+        "execution.result_ref": { "$ref": "#/$defs/provenanceValue" },
+        "prior_receipt.receipt_id": { "$ref": "#/$defs/provenanceValue" },
+        "prior_receipt.receipt_hash": { "$ref": "#/$defs/provenanceValue" },
+        "refusal.verdict": { "$ref": "#/$defs/provenanceValue" },
+        "refusal.reason_code": { "$ref": "#/$defs/provenanceValue" }
+      }
+    },
+    "completeness_score": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Self-reported emission completeness, derived deterministically from provenance (see spec v0.2-alpha). MUST equal the recomputed value or Level 4 conformance fails. Three-decimal precision is enforced by the L4 check, not by the schema (multipleOf with 0.001 is unreliable under common JSON parsers due to float rounding)."
+    },
+    "receipt_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "Lowercase hex SHA-256 of all preceding fields canonicalized. Tamper-evidence anchor; covers provenance and completeness_score."
+    }
+  },
+  "$defs": {
+    "provenanceValue": {
+      "type": "string",
+      "enum": ["observed", "inferred", "synthesized"]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["policy", "execution"],
+        "properties": {
+          "policy": {
+            "required": ["decision"],
+            "properties": {
+              "decision": { "const": "require-approval" }
+            }
+          },
+          "execution": {
+            "required": ["status"],
+            "properties": {
+              "status": { "enum": ["success", "failure"] }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": ["approval"]
+      }
+    },
+    {
+      "if": { "required": ["completeness_score"] },
+      "then": { "required": ["provenance"] }
+    }
+  ]
+}

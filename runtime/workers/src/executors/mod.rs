@@ -4,6 +4,7 @@ pub mod agent_tool;
 pub mod condition_node;
 pub mod coordinator;
 pub mod eval;
+pub mod human_approval;
 pub mod mcp_tool;
 pub mod model_node;
 
@@ -13,5 +14,6 @@ pub use agent_tool::AgentToolExecutor;
 pub use condition_node::ConditionNodeExecutor;
 pub use coordinator::CoordinatorExecutor;
 pub use eval::EvalExecutor;
+pub use human_approval::{HumanApprovalExecutor, LimitExceededExecutor};
 pub use mcp_tool::McpToolExecutor;
 pub use model_node::ModelNodeExecutor;

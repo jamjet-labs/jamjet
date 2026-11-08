@@ -43,6 +43,8 @@ agents:
 
 ### Workflow node
 
+Registration refuses this node kind (400): the engine has no executor for it, so it would never run. See [Node types](yaml-reference.md#node-types).
+
 ```yaml
 nodes:
   review:

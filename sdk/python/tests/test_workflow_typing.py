@@ -2,6 +2,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import assert_type
 
+import pytest
 from mypy import api
 from pydantic import BaseModel
 
@@ -59,6 +60,8 @@ async def check_invalid_async_calls() -> None:
     await configured_async("wrong")  # type: ignore[arg-type]
 
 
+# Runs mypy over this file: the slowest test in the suite.
+@pytest.mark.slow
 def test_workflow_step_typing(tmp_path: Path) -> None:
     stdout, stderr, status = api.run(["--follow-imports=silent", "--cache-dir", str(tmp_path / "mypy"), __file__])
     assert status == 0, stdout + stderr

@@ -30,6 +30,8 @@ agents:
 
 ### Using MCP tools in a workflow
 
+Registration refuses this node kind (400): the engine has no executor for it, so it would never run. See [Node types](yaml-reference.md#node-types).
+
 ```yaml
 nodes:
   search_code:
