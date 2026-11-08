@@ -201,6 +201,10 @@ pub async fn issue_token(
     database_url: &str,
     req: &TokenRequest,
 ) -> anyhow::Result<(String, ApiToken)> {
+    // The database first: its refusal says how to make one.
+    SqliteBackend::connect_existing(database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     let audit = audit_log(database_url).await?;
     let (token, info) = create_token(database_url, req).await?;
     let record = token_record(
@@ -285,10 +289,10 @@ fn token_database() -> anyhow::Result<String> {
 /// revoked whether or not the log records it (revoking is the safe side);
 /// a record that fails is reported as an error.
 pub async fn revoke_token(database_url: &str, id: &str) -> anyhow::Result<()> {
-    let audit = audit_log(database_url).await?;
     let backend = SqliteBackend::connect_existing(database_url)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
+    let audit = audit_log(database_url).await?;
     let Some(revoked) = backend
         .revoke_token(id)
         .await
@@ -357,6 +361,29 @@ mod tests {
     fn an_unknown_role_is_refused() {
         assert!(parse_args(&args("token create --role admin")).is_err());
         assert!(parse_args(&args("token create")).is_err());
+    }
+
+    /// As for every identifier the engine records: the name reaches the
+    /// audit log, and an invisible character makes one name read as another.
+    #[test]
+    fn a_name_or_tenant_with_a_control_or_format_character_is_refused() {
+        for bad in ["ci\u{1f}x", "ci\u{202e}gnp", "ci\u{200b}", "a\nb"] {
+            let name = vec![
+                "token".to_string(),
+                "create".into(),
+                "--role".into(),
+                "viewer".into(),
+                "--name".into(),
+                bad.to_string(),
+            ];
+            let err = parse_args(&name).unwrap_err();
+            assert!(err.contains("--name"), "{bad:?}: {err}");
+            let mut tenant = name.clone();
+            tenant[4] = "--tenant".into();
+            let err = parse_args(&tenant).unwrap_err();
+            assert!(err.contains("--tenant"), "{bad:?}: {err}");
+        }
+        assert!(parse_args(&args("token create --role viewer --name café-ci")).is_ok());
     }
 
     #[test]

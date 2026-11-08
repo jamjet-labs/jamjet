@@ -32,11 +32,32 @@ fn temp_dir() -> PathBuf {
     dir
 }
 
-/// A migrated database in `dir`, as a server that has started once leaves it.
+/// A migrated database in `dir`, as a server that has started once leaves it:
+/// the state schema and the audit log.
 async fn server_database(dir: &std::path::Path) -> (String, Arc<SqliteBackend>) {
     let url = format!("sqlite://{}", dir.join("runtime.db").display());
     let backend = Arc::new(SqliteBackend::open(&url).await.unwrap());
+    jamjet_audit::SqliteAuditBackend::new(backend.pool())
+        .migrate()
+        .await
+        .unwrap();
     (url, backend)
+}
+
+/// The audit log's entries, oldest first (the order `GET /audit` lists them
+/// in, reversed).
+async fn audit_entries(backend: &SqliteBackend) -> Vec<jamjet_audit::AuditLogEntry> {
+    use jamjet_audit::AuditBackend;
+    let q = jamjet_audit::AuditQuery {
+        limit: 1000,
+        ..Default::default()
+    };
+    let mut entries = jamjet_audit::SqliteAuditBackend::new(backend.pool())
+        .query(&q)
+        .await
+        .unwrap();
+    entries.reverse();
+    entries
 }
 
 async fn token_rows(backend: &SqliteBackend) -> Vec<(String, Option<String>)> {
@@ -547,4 +568,305 @@ fn the_database_url_is_not_logged_at_info() {
     assert!(log.contains("Connecting to state backend"), "{log}");
     assert!(!log.contains("secret-name"), "{log}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issuing and revoking a token is on the audit record: separation of duties
+/// is keyed on the token id, so a reviewer token minted for oneself must show.
+/// Both entries are sealed into the chain the server writes, and with the
+/// server's key they verify.
+#[tokio::test]
+async fn token_create_and_revoke_are_sealed_into_the_audit_log() {
+    let dir = temp_dir();
+    let (url, backend) = server_database(&dir).await;
+    let key = (
+        "JAMJET_AUDIT_SIGNING_KEY",
+        "a-real-secret-for-this-test-only",
+    );
+    let mut create = server(
+        &dir,
+        &[
+            "token", "create", "--role", "reviewer", "--name", "me-again",
+        ],
+        &[("DATABASE_URL", &url), key],
+    )
+    .spawn()
+    .unwrap();
+    assert!(
+        wait_exit(&mut create).expect("exits").success(),
+        "{}",
+        read_all(create.stderr.take())
+    );
+    let id = token_rows(&backend).await[0].0.clone();
+    let mut revoke = server(
+        &dir,
+        &["token", "revoke", &id],
+        &[("DATABASE_URL", &url), key],
+    )
+    .spawn()
+    .unwrap();
+    assert!(
+        wait_exit(&mut revoke).expect("exits").success(),
+        "{}",
+        read_all(revoke.stderr.take())
+    );
+
+    let entries = audit_entries(&backend).await;
+    let kinds: Vec<&str> = entries.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(kinds, ["token_issued", "token_revoked"]);
+    for e in &entries {
+        assert_eq!(e.raw_event["token_id"], id.as_str());
+        assert_eq!(e.raw_event["principal"], format!("token:{id}"));
+        assert_eq!(e.raw_event["role"], "reviewer");
+        assert_eq!(e.raw_event["name"], "me-again");
+        assert_eq!(e.tenant_id, "default");
+    }
+    let signer = jamjet_audit::AuditSigner::new(key.1.as_bytes().to_vec());
+    jamjet_audit::verify_chain(&entries, &signer).expect("the chain verifies");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A token the audit log cannot record is not issued.
+#[tokio::test]
+async fn a_token_the_audit_log_cannot_record_is_not_issued() {
+    let dir = temp_dir();
+    let (url, backend) = server_database(&dir).await;
+    sqlx::query("DROP TABLE audit_log")
+        .execute(&backend.pool())
+        .await
+        .unwrap();
+    let mut create = server(
+        &dir,
+        &["token", "create", "--role", "operator"],
+        &[("DATABASE_URL", &url)],
+    )
+    .spawn()
+    .unwrap();
+    let status = wait_exit(&mut create).expect("exits");
+    let stderr = read_all(create.stderr.take());
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        read_all(create.stdout.take()).trim().is_empty(),
+        "no token printed"
+    );
+    let rows = token_rows(&backend).await;
+    assert!(
+        rows.iter().all(|(_, revoked)| revoked.is_some()),
+        "an unrecorded token is revoked: {rows:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Run in a directory with no database, the token commands fail and leave
+/// no `.jamjet` behind.
+#[test]
+fn token_commands_do_not_create_a_jamjet_directory() {
+    let dir = temp_dir();
+    for args in [
+        &["token", "create", "--role", "viewer"][..],
+        &["token", "revoke", "some-id"][..],
+    ] {
+        let mut child = server(&dir, args, &[]).spawn().unwrap();
+        let status = wait_exit(&mut child).expect("exits");
+        assert!(!status.success(), "{args:?}");
+        assert!(!dir.join(".jamjet").exists(), "{args:?} created .jamjet");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A switch set to something that is not a boolean stops the server, naming
+/// it. `JAMJET_ALLOW_SELF_APPROVAL=enabled` used to read as off and serve.
+#[test]
+fn a_switch_that_is_not_a_boolean_stops_startup() {
+    for name in [
+        "JAMJET_ALLOW_SELF_APPROVAL",
+        "JAMJET_TENANT_TOKENS_AS_DEFAULT",
+        "JAMJET_AUDIT_ALLOW_INSECURE_KEY",
+        "JAMJET_DEV_MODE",
+    ] {
+        let dir = temp_dir();
+        let mut child = server(
+            &dir,
+            &[],
+            &[
+                (name, "enabled"),
+                ("STORAGE_BACKEND", "memory"),
+                ("JAMJET_BIND", "127.0.0.1"),
+                ("JAMJET_PORT", "0"),
+            ],
+        )
+        .spawn()
+        .unwrap();
+        let status = wait_exit(&mut child).expect("must not serve");
+        let stderr = read_all(child.stderr.take());
+        assert!(!status.success(), "{name}");
+        assert!(stderr.contains(name), "{name}: {stderr}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `JAMJET_DEV_MODE=yes` turns dev mode on, as `1` and `true` do. It used to
+/// read as off.
+#[test]
+fn dev_mode_yes_is_dev_mode() {
+    let log = startup_log(&[("JAMJET_DEV_MODE", "yes")]);
+    // Dev mode logs in colour; drop the escape sequences.
+    let mut plain = String::new();
+    let mut chars = log.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    assert!(
+        plain.contains("dev_mode: true") || plain.contains("dev_mode=true"),
+        "{plain}"
+    );
+}
+
+/// A dev-mode server's address and a raw `GET /health` (or body-less `POST`)
+/// to it with these headers, returning the status line.
+fn dev_status(addr: &str, method: &str, headers: &[(&str, &str)]) -> String {
+    use std::io::Write;
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    let path = if method == "POST" {
+        "/executions/exec_00000000000000000000000000000000/cancel"
+    } else {
+        "/health"
+    };
+    let mut req = format!("{method} {path} HTTP/1.1\r\nConnection: close\r\nContent-Length: 0\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    conn.write_all(req.as_bytes()).unwrap();
+    let mut response = String::new();
+    conn.read_to_string(&mut response).unwrap();
+    response.lines().next().unwrap_or("").to_string()
+}
+
+/// Start a dev-mode server with `env`; return it and a loopback address to
+/// reach it on.
+fn dev_server(dir: &PathBuf, env: &[(&str, &str)]) -> (Child, String) {
+    let mut base = vec![
+        ("JAMJET_DEV_MODE", "1"),
+        ("STORAGE_BACKEND", "memory"),
+        ("JAMJET_PORT", "0"),
+    ];
+    base.extend_from_slice(env);
+    let mut child = server(dir, &[], &base).spawn().unwrap();
+    let mut port = None;
+    for line in BufReader::new(child.stdout.take().unwrap())
+        .lines()
+        .map_while(Result::ok)
+    {
+        if let Some(rest) = line.split("listening on ").nth(1) {
+            let a: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ':')
+                .collect();
+            port = a.rsplit(':').next().map(str::to_string);
+            break;
+        }
+    }
+    let port = port.expect("the server reports where it listens");
+    (child, format!("127.0.0.1:{port}"))
+}
+
+/// `JAMJET_DEV_MODE_ALLOW_REMOTE` allows a remote bind; it does not turn the
+/// Host check off. In Docker the bind is 0.0.0.0, and without the check a
+/// rebound page drove a dev-mode runtime with no token. Before this the
+/// rebound host below got 200.
+#[test]
+fn a_remote_dev_bind_still_checks_the_host() {
+    let dir = temp_dir();
+    let (mut child, addr) = dev_server(
+        &dir,
+        &[
+            ("JAMJET_BIND", "0.0.0.0"),
+            ("JAMJET_DEV_MODE_ALLOW_REMOTE", "1"),
+        ],
+    );
+    let port = addr.rsplit(':').next().unwrap().to_string();
+    let rebound = dev_status(
+        &addr,
+        "GET",
+        &[("Host", &format!("rebound.evil.example:{port}"))],
+    );
+    let docker = dev_status(
+        &addr,
+        "GET",
+        &[("Host", &format!("host.docker.internal:{port}"))],
+    );
+    let local = dev_status(&addr, "GET", &[("Host", &format!("localhost:{port}"))]);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(rebound.contains("403"), "{rebound}");
+    assert!(docker.contains("403"), "{docker}");
+    assert!(local.contains("200"), "{local}");
+
+    // A name listed in JAMJET_DEV_ALLOWED_HOSTS is answered.
+    let (mut child, addr) = dev_server(
+        &dir,
+        &[
+            ("JAMJET_BIND", "0.0.0.0"),
+            ("JAMJET_DEV_MODE_ALLOW_REMOTE", "1"),
+            ("JAMJET_DEV_ALLOWED_HOSTS", "host.docker.internal"),
+        ],
+    );
+    let port = addr.rsplit(':').next().unwrap().to_string();
+    let docker = dev_status(
+        &addr,
+        "GET",
+        &[("Host", &format!("host.docker.internal:{port}"))],
+    );
+    let rebound = dev_status(
+        &addr,
+        "GET",
+        &[("Host", &format!("rebound.evil.example:{port}"))],
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(docker.contains("200"), "{docker}");
+    assert!(rebound.contains("403"), "{rebound}");
+}
+
+/// A tunnel that rewrites `Host` to localhost (ngrok `--host-header=rewrite`,
+/// cloudflared) still sends forwarding headers; a page of another site sends
+/// its `Origin`. Dev mode refuses both.
+#[test]
+fn dev_mode_refuses_tunnels_and_cross_site_requests() {
+    let dir = temp_dir();
+    let (mut child, addr) = dev_server(&dir, &[("JAMJET_BIND", "127.0.0.1")]);
+    let port = addr.rsplit(':').next().unwrap().to_string();
+    let host = format!("localhost:{port}");
+    let tunnel = dev_status(
+        &addr,
+        "GET",
+        &[("Host", &host), ("X-Forwarded-Host", "abc.ngrok.app")],
+    );
+    let cross = dev_status(
+        &addr,
+        "POST",
+        &[("Host", &host), ("Origin", "https://evil.example")],
+    );
+    let fetch = dev_status(
+        &addr,
+        "POST",
+        &[("Host", &host), ("Sec-Fetch-Site", "cross-site")],
+    );
+    let local = dev_status(&addr, "GET", &[("Host", &host)]);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(tunnel.contains("403"), "{tunnel}");
+    assert!(cross.contains("403"), "{cross}");
+    assert!(fetch.contains("403"), "{fetch}");
+    assert!(local.contains("200"), "{local}");
 }

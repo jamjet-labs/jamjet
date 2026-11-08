@@ -6,17 +6,27 @@ Exposes two routes consumed by the durable Rust engine:
 
 Run with:
   uvicorn jamjet.model.sidecar_server:app --host 127.0.0.1 --port 4280
+
+The sidecar has no token, and it spends the provider keys in its environment,
+so it answers only a caller on this machine (see :class:`LocalCallerOnly`):
+a request addressed to ``localhost`` or a loopback address (or a name in
+``JAMJET_SIDECAR_ALLOWED_HOSTS``), not sent by a page of another site, and
+``POST /v1/complete`` only with ``Content-Type: application/json``.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json as _json
+import os
 from typing import Any
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from jamjet.model.defaults import default_model_middleware
 from jamjet.model.seam import Model
@@ -147,9 +157,86 @@ async def _handle_health(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+ALLOWED_HOSTS_ENV = "JAMJET_SIDECAR_ALLOWED_HOSTS"
+
+
+def _host_name(host: str) -> str | None:
+    """The name in a ``Host`` value without its port (``[::1]:4280`` -> ``::1``)."""
+    host = host.strip()
+    if host.startswith("["):
+        inner, sep, tail = host[1:].partition("]")
+        return inner if sep and (not tail or tail.startswith(":")) else None
+    name, sep, port = host.rpartition(":")
+    if not sep:
+        return host
+    return name if port.isdigit() else None
+
+
+def _is_local_host(host: str, allowed: frozenset[str]) -> bool:
+    name = _host_name(host)
+    if not name:
+        return False
+    if name.lower() == "localhost" or name.lower() in allowed:
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def _allowed_hosts() -> frozenset[str]:
+    raw = os.environ.get(ALLOWED_HOSTS_ENV, "")
+    return frozenset(h.strip().strip("[]").lower() for h in raw.split(",") if h.strip())
+
+
+class LocalCallerOnly:
+    """Refuse a request that is not from a local, same-site caller.
+
+    The sidecar has no authentication and binds 127.0.0.1, which keeps other
+    machines out but not a web page in the developer's browser:
+
+    * A page whose host name re-resolves to 127.0.0.1 (DNS rebinding) sends its
+      own name in ``Host``: refused unless it names this machine (403).
+    * Any page can POST to 127.0.0.1. ``request.json()`` ignores the content
+      type, so a ``text/plain`` form or ``fetch`` (which needs no preflight)
+      ran a completion on the developer's keys. Refused: ``Sec-Fetch-Site:
+      cross-site``, or an ``Origin`` that is not this machine (403), and a
+      ``POST`` that is not ``application/json`` (415).
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        allowed = _allowed_hosts()
+        refusal: tuple[int, str] | None = None
+        origin = headers.get("origin")
+        origin_host = origin.split("://", 1)[1] if origin and "://" in origin else (origin or "")
+        if not _is_local_host(headers.get("host", ""), allowed):
+            refusal = (403, "the model sidecar answers only requests addressed to this machine")
+        elif headers.get("sec-fetch-site", "").lower() == "cross-site" or (
+            origin is not None and not _is_local_host(origin_host, allowed)
+        ):
+            refusal = (403, "the model sidecar refuses requests from a page of another site")
+        elif scope.get("method") == "POST":
+            media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if media_type != "application/json":
+                refusal = (415, "POST /v1/complete takes Content-Type: application/json")
+        if refusal is None:
+            await self.app(scope, receive, send)
+            return
+        status, error = refusal
+        await JSONResponse({"error": error}, status_code=status)(scope, receive, send)
+
+
 app = Starlette(
     routes=[
         Route("/v1/complete", _handle_complete, methods=["POST"]),
         Route("/health", _handle_health, methods=["GET"]),
-    ]
+    ],
+    middleware=[Middleware(LocalCallerOnly)],
 )
