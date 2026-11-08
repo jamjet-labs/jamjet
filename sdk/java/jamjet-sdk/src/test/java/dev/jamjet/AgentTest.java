@@ -1,7 +1,7 @@
 package dev.jamjet;
 
-import dev.jamjet.agent.Agent;
-import dev.jamjet.agent.AgentResult;
+import dev.jamjet.sdk.agent.Agent;
+import dev.jamjet.sdk.agent.AgentResult;
 import dev.jamjet.tool.Tool;
 import dev.jamjet.tool.ToolCall;
 import org.junit.jupiter.api.Test;

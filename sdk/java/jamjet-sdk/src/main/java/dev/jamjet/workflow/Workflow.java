@@ -146,7 +146,7 @@ public final class Workflow {
     public static final class Builder<S> {
 
         private final String name;
-        private String version = "0.1.0";
+        private String version = dev.jamjet.ir.IrCompiler.DEFAULT_VERSION;
         private Class<?> stateClass;
         private final List<Step> steps = new ArrayList<>();
 

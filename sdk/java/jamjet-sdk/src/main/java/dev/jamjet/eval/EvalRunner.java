@@ -1,6 +1,6 @@
 package dev.jamjet.eval;
 
-import dev.jamjet.agent.Agent;
+import dev.jamjet.sdk.agent.Agent;
 import dev.jamjet.workflow.Workflow;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -161,7 +161,8 @@ public final class EvalRunner {
             return this;
         }
 
-        /** Run eval rows against an {@link Agent}. */
+        /** Run eval rows against an {@link Agent}, in-process (ungoverned, see {@link Agent#run(String)}). */
+        @SuppressWarnings("deprecation")
         public Builder agent(Agent agent) {
             this.runFn = prompt -> agent.run(prompt).output();
             return this;
