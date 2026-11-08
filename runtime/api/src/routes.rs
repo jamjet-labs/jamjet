@@ -1423,6 +1423,14 @@ struct ClaimWorkItemRequest {
     /// steps asks for what it can heartbeat comfortably.
     #[serde(default)]
     lease_secs: Option<u64>,
+    /// Claim only this execution's item on `queue_types`, for a worker that
+    /// drives one execution at a time on its own queue. Without it the
+    /// oldest claimable item on the queues is handed out, as before.
+    #[serde(default)]
+    execution_id: Option<String>,
+    /// With `execution_id`, claim only this node's item.
+    #[serde(default)]
+    node_id: Option<String>,
 }
 
 /// The claim response for "you get nothing".
@@ -1472,6 +1480,21 @@ async fn claim_work_item(
     // actually holds, not the one it asked for.
     let granted_lease_secs = jamjet_state::granted_lease_secs(body.lease_secs);
     let lease_secs = Some(granted_lease_secs);
+    // Narrow the claim to one execution (and node). The tenant scope of the
+    // backend still applies: an execution of another tenant matches nothing.
+    if body.node_id.is_some() && body.execution_id.is_none() {
+        return Err(ApiError::BadRequest(
+            "node_id narrows a claim by execution_id; give both".into(),
+        ));
+    }
+    let filter = jamjet_state::ClaimFilter {
+        execution_id: body
+            .execution_id
+            .as_deref()
+            .map(parse_execution_id)
+            .transpose()?,
+        node_id: body.node_id.clone(),
+    };
     // A cancelled, completed or failed execution can still own pending items:
     // one re-queued by an expired lease, or the start node of a run cancelled
     // before any worker polled. Handing those out burns worker time on a run
@@ -1481,7 +1504,7 @@ async fn claim_work_item(
     let mut claimed = None;
     for _ in 0..16 {
         let Some(candidate) = backend
-            .claim_work_item_with_lease(&body.worker_id, &queue_refs, lease_secs)
+            .claim_work_item_filtered(&body.worker_id, &queue_refs, lease_secs, &filter)
             .await?
         else {
             break;

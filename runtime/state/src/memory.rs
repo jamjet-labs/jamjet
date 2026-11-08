@@ -565,6 +565,22 @@ impl StateBackend for InMemoryBackend {
         queue_types: &[&str],
         lease_secs: Option<u64>,
     ) -> BackendResult<Option<WorkItem>> {
+        self.claim_work_item_filtered(
+            worker_id,
+            queue_types,
+            lease_secs,
+            &crate::backend::ClaimFilter::default(),
+        )
+        .await
+    }
+
+    async fn claim_work_item_filtered(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+        filter: &crate::backend::ClaimFilter,
+    ) -> BackendResult<Option<WorkItem>> {
         // The fast reclaim of expired leases, mirroring the SQLite claim path:
         // re-queue, remember the holder, charge the attempt, record the retry.
         // An item of a terminal execution is settled instead, with nothing
@@ -618,7 +634,13 @@ impl StateBackend for InMemoryBackend {
         let lease_len = crate::backend::granted_lease_secs(lease_secs);
         for mut entry in self.work_items.iter_mut() {
             let item = entry.value_mut();
-            if item.worker_id.is_none() && queue_types.contains(&item.queue_type.as_str()) {
+            let wanted = filter
+                .execution_id
+                .as_ref()
+                .is_none_or(|e| *e == item.execution_id)
+                && filter.node_id.as_ref().is_none_or(|n| *n == item.node_id);
+            if item.worker_id.is_none() && queue_types.contains(&item.queue_type.as_str()) && wanted
+            {
                 let new_epoch = self
                     .lease_epochs
                     .get(&item.id)

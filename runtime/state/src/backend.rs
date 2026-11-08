@@ -384,6 +384,35 @@ pub trait StateBackend: Send + Sync {
         lease_secs: Option<u64>,
     ) -> BackendResult<Option<WorkItem>>;
 
+    /// [`Self::claim_work_item_with_lease`], limited by `filter`: with an
+    /// `execution_id`, only that execution's items on `queue_types` can be
+    /// claimed (and with a `node_id` too, only that node's). An empty filter
+    /// claims exactly as `claim_work_item_with_lease` does.
+    ///
+    /// A worker that owns an app-specific queue and drives one execution at a
+    /// time (the Spring integration's recorded calls) needs its own item, not
+    /// the oldest one on the queue: concurrent callers otherwise claim each
+    /// other's nodes.
+    ///
+    /// The default refuses a non-empty filter: a backend that cannot honour
+    /// it must not hand out some other execution's item instead.
+    async fn claim_work_item_filtered(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+        filter: &ClaimFilter,
+    ) -> BackendResult<Option<WorkItem>> {
+        if filter.is_empty() {
+            return self
+                .claim_work_item_with_lease(worker_id, queue_types, lease_secs)
+                .await;
+        }
+        Err(StateBackendError::Database(
+            "this backend cannot claim by execution".into(),
+        ))
+    }
+
     /// Renew the lease, or re-attach it when the presented fence was lost only
     /// to expiry and nobody has claimed the item since, as after an engine
     /// restart longer than the lease (PAS spike finding G8). The fence in the
@@ -704,6 +733,21 @@ pub struct ApiToken {
 pub type WorkItemId = uuid::Uuid;
 
 /// A unit of work dispatched to a worker queue.
+/// Which items a claim may take; see
+/// [`StateBackend::claim_work_item_filtered`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaimFilter {
+    pub execution_id: Option<ExecutionId>,
+    pub node_id: Option<String>,
+}
+
+impl ClaimFilter {
+    /// No restriction: the oldest claimable item on the queues.
+    pub fn is_empty(&self) -> bool {
+        self.execution_id.is_none() && self.node_id.is_none()
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkItem {
     pub id: WorkItemId,

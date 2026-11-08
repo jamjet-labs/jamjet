@@ -1215,6 +1215,22 @@ impl StateBackend for TenantScopedSqliteBackend {
         queue_types: &[&str],
         lease_secs: Option<u64>,
     ) -> BackendResult<Option<WorkItem>> {
+        self.claim_work_item_filtered(
+            worker_id,
+            queue_types,
+            lease_secs,
+            &crate::backend::ClaimFilter::default(),
+        )
+        .await
+    }
+
+    async fn claim_work_item_filtered(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+        filter: &crate::backend::ClaimFilter,
+    ) -> BackendResult<Option<WorkItem>> {
         if queue_types.is_empty() {
             return Ok(None);
         }
@@ -1237,8 +1253,10 @@ impl StateBackend for TenantScopedSqliteBackend {
             .join(",");
         let query_str = format!(
             "SELECT * FROM work_items WHERE status = 'pending' AND queue_type IN ({}) \
-             AND tenant_id = ? AND (retry_after IS NULL OR retry_after <= ?) ORDER BY created_at ASC LIMIT 1",
-            placeholders
+             AND tenant_id = ? AND (retry_after IS NULL OR retry_after <= ?){}{} ORDER BY created_at ASC LIMIT 1",
+            placeholders,
+            if filter.execution_id.is_some() { " AND execution_id = ?" } else { "" },
+            if filter.node_id.is_some() { " AND node_id = ?" } else { "" },
         );
         let mut q = sqlx::query(&query_str);
         for qt in queue_types {
@@ -1246,6 +1264,12 @@ impl StateBackend for TenantScopedSqliteBackend {
         }
         q = q.bind(&self.tenant_id.0);
         q = q.bind(&now);
+        if let Some(e) = &filter.execution_id {
+            q = q.bind(execution_id_str(e));
+        }
+        if let Some(n) = &filter.node_id {
+            q = q.bind(n.as_str());
+        }
         let row = q.fetch_optional(&mut *tx).await.map_err(map_db_err)?;
 
         let Some(row) = row else {

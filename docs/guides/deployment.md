@@ -81,6 +81,14 @@ JAMJET_TOKEN=jj_... jamjet worker --runtime http://your-runtime:7700 --modules m
 Java tool methods (`java_fn`) run on the Java SDK's worker, and `external_fn`
 handlers on any worker that drains the queue the node names.
 
+A worker claims with `POST /work-items/claim` and
+`{"worker_id": "...", "queue_types": ["..."]}`, which hands out the oldest
+claimable item on those queues. A worker that drives one execution at a time
+on its own queue can add `"execution_id": "exec_..."` to claim only that
+execution's item, and `"node_id"` with it to claim only that node's. A claim
+that matches nothing answers `{"claimed": false}`, as an empty queue does. The
+token's tenant applies as usual: another tenant's execution matches nothing.
+
 ### 4. Register workflows
 
 ```bash
