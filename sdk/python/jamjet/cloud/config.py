@@ -16,6 +16,10 @@ class CloudConfig:
     flush_interval: float = 5.0
     flush_size: int = 50
     enabled: bool = True
+    # How long a require_approval tool call waits for a Cloud decision before
+    # failing closed. Sent to Cloud as the approval's deadline.
+    approval_timeout_seconds: float = 3600.0
+    approval_poll_interval: float = 5.0
 
 
 _lock = threading.Lock()

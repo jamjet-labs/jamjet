@@ -15,7 +15,7 @@ Get a JamJet workflow running locally in under 10 minutes.
 ## 1. Install the CLI
 
 ```bash
-pip install jamjet
+pip install 'jamjet[model]'
 ```
 
 Verify:
@@ -57,34 +57,43 @@ The runtime fills in `{{ state.query }}` from the run's state before it calls
 the model. A prompt can only substitute `{{ state.<path> }}`; see
 [Prompt templates](yaml-reference.md#prompt-templates).
 
+`jamjet init --list-templates` shows the other templates.
+
 ---
 
 ## 3. Start local dev mode
 
+In the first terminal:
+
 ```bash
+export ANTHROPIC_API_KEY=sk-ant-...
 jamjet dev
 ```
 
-This starts the local runtime (SQLite-backed) in the background. You'll see:
-
-```
-JamJet runtime started
-  Mode: local (SQLite)
-  API: http://localhost:7700
-  Ready.
-```
+This starts the local stack: a model sidecar, the engine (SQLite-backed, on
+port 7700) and a Python tool worker. It prints the binary, the engine and
+sidecar URLs and `Mode: local (SQLite)`, and runs until you press Ctrl+C.
 
 ---
 
 ## 4. Validate your workflow
 
+In a second terminal:
+
 ```bash
 jamjet validate workflow.yaml
+```
+
+```
+Valid. workflow_id=my-first-agent version=0.1.0
+  Nodes: 1  Edges: 1
 ```
 
 ---
 
 ## 5. Run it
+
+The template reads the question from `query`:
 
 ```bash
 jamjet run workflow.yaml --input '{"query": "What is the capital of France?"}'
@@ -103,12 +112,12 @@ prompt with a gap in it.
 ## 6. Inspect the execution
 
 ```bash
-jamjet inspect exec_01abc
+jamjet inspect exec_...
 ```
 
 ```bash
 # See the full event timeline
-jamjet events exec_01abc
+jamjet events exec_...
 ```
 
 ---

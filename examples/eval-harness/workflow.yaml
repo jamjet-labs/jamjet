@@ -1,0 +1,27 @@
+# examples/eval-harness/workflow.yaml
+#
+# The workflow the eval harness scores: one model node that answers the
+# `query` field of each row in qa_pairs.jsonl.
+#
+# Check the definition (no runtime needed):
+#   jamjet validate workflow.yaml
+
+workflow:
+  id: eval_qa
+  version: 0.1.0
+  description: "Answer a short factual question"
+  start: answer
+  state_schema:
+    type: object
+    properties:
+      query: { type: string }
+    required: [query]
+
+nodes:
+  answer:
+    type: model
+    description: Answer the question
+    model: claude-haiku-4-5-20251001
+    system_prompt: Answer factual questions with the shortest correct answer.
+    prompt: "{{ state.query }}"
+    next: end

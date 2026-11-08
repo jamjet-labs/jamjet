@@ -68,15 +68,18 @@ cd my-agent-project
 cd my-existing-project
 jamjet init
 
-# Start local dev runtime (SQLite, embedded — no server setup needed)
+# Start local dev runtime (SQLite, embedded — no server setup needed).
+# The starter workflow calls claude-haiku-4-5, so export a key first.
+export ANTHROPIC_API_KEY=sk-ant-...
 jamjet dev
 ```
 
-In another terminal:
+In another terminal, from the project directory:
 
 ```bash
-# Run the example workflow
-jamjet run examples/basic_tool_flow
+# Check, then run, the workflow the template created (it reads `query`)
+jamjet validate workflow.yaml
+jamjet run workflow.yaml --input '{"query": "What is JamJet?"}'
 ```
 
 ### Hello World — Python
@@ -270,12 +273,42 @@ Open [app.jamjet.dev/dashboard/traces](https://app.jamjet.dev/dashboard/traces) 
 Optional governance primitives:
 
 ```python
-jamjet.policy("block", "payments.*")              # filter tools by name
+jamjet.policy("block", "payments.*")              # strip matching tools, refuse matching tool calls
 jamjet.budget(max_cost_usd=5.00)                   # cap spend; raises BudgetExceeded
 approval = jamjet.require_approval(action="charge_card", context={...})
 @jamjet.trace                                       # decorate any function
 def lookup_customer(...): ...
 ```
+
+Policy and budget apply to the sync clients: OpenAI `chat.completions.create`,
+`.parse()`, `.stream()` and `with_raw_response`, and Anthropic `messages` and
+`beta.messages` `create` / `parse`, legacy OpenAI `functions` included.
+Blocked tools are stripped from the request, and a tool call the model returns
+for a blocked tool raises `JamJetPolicyBlocked`. With `stream=True`, text
+streams through as it arrives; once any policy rule is set, chunks from the
+first tool call onward are held until the stream ends and checked before your
+code sees them, and the streamed usage counts toward the budget. Server tools
+(such as web search) and MCP toolsets run on the vendor's side before a tool
+call could be refused, so a rule that could match them removes them from the
+request; Anthropic's own client tools (bash, text editor, computer, memory)
+are gated like any other tool. Not enforced, so they raise
+`JamJetUnenforceableCall` while any block or require_approval rule is set:
+OpenAI's Responses API, Anthropic's `messages.stream()`, the async clients
+(`AsyncOpenAI`, `AsyncAnthropic`), the batch APIs, and
+`with_raw_response` / `with_streaming_response` with `stream=True`.
+
+`jamjet.policy("require_approval", "payments.*")` keeps the tool available.
+When the model calls it, the SDK opens an approval in JamJet Cloud with the
+tool name, call id, arguments, model and rule, and waits for a reviewer's
+decision before returning the response. A rejection raises
+`JamJetApprovalRejected`. No decision within `approval_timeout_seconds`
+(a `configure()` argument, default 1 hour), or no way to reach Cloud, raises
+`JamJetApprovalTimeout`. The timeout is sent to Cloud as the approval's
+deadline (clamped to 1 minute to 24 hours); JamJet Cloud deployments since
+jamjet-cloud #87 refuse decisions after it. The approval shows the call's
+arguments with credentials always masked, PII masked when redaction is on
+(IBANs and card numbers keep their last 4), and an `arguments_sha256` that the
+SDK re-checks before releasing the approved call.
 
 Install with the LLM SDK you use:
 

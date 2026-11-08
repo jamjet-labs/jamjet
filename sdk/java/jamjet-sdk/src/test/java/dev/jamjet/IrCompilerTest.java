@@ -1,7 +1,7 @@
 package dev.jamjet;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import dev.jamjet.agent.Agent;
+import dev.jamjet.sdk.agent.Agent;
 import dev.jamjet.ir.WorkflowIr;
 import dev.jamjet.workflow.Workflow;
 import org.junit.jupiter.api.Test;

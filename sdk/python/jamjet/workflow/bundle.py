@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from jamjet.workflow.ir_compiler import _GOVERNANCE_KEYS, _apply_governance, _governance_value
 from jamjet.workflow.types import DEFAULT_WORKFLOW_VERSION
 
 
@@ -217,6 +218,7 @@ def _compile_agent_unit(
         },
         "strategy_metadata": compiled["strategy_metadata"],
     }
+    _apply_governance(ir, [(f"agent unit '{unit_id}'", agent)])
     if acts_as is not None:
         ir["agent_ref"] = acts_as
     return ir
@@ -251,9 +253,78 @@ def _detect_cycle(graph: dict[str, list[str]]) -> list[str] | None:
     return None
 
 
+# The keys a fleet file may use. A key outside these would be dropped, and a
+# dropped governance key (a misspelled `polcy:`) is a control nobody enforces,
+# so unknown keys are errors here.
+_FLEET_KEYS = frozenset({"version", "defaults", "tools", "mcp", "agents", "workflows", *_GOVERNANCE_KEYS})
+_DEFAULTS_KEYS = frozenset({"model", "limits", "version", *_GOVERNANCE_KEYS})
+_AGENT_UNIT_KEYS = frozenset(
+    {
+        "agent_ref",
+        "description",
+        "goal",
+        "limits",
+        "model",
+        "name",
+        "schedule",
+        "state_schema",
+        "strategy",
+        "strategy_config",
+        "tools",
+        "uses",
+        "version",
+        *_GOVERNANCE_KEYS,
+    }
+)
+_WORKFLOW_UNIT_KEYS = frozenset(
+    {
+        "agent_ref",
+        "description",
+        "labels",
+        "models",
+        "name",
+        "nodes",
+        "remote_agents",
+        "retry_policies",
+        "schedule",
+        "start",
+        "state_schema",
+        "timeouts",
+        "version",
+        *_GOVERNANCE_KEYS,
+    }
+)
+
+
+def _reject_unknown(found: Any, known: frozenset[str], *, location: str) -> None:
+    if not isinstance(found, dict):
+        raise ValueError(f"{location} must be a mapping, got {type(found).__name__}")
+    unknown = sorted(str(k) for k in set(found) - known)
+    if unknown:
+        raise ValueError(f"{location}: unknown key(s) {', '.join(unknown)}. Allowed: {', '.join(sorted(known))}")
+
+
+def _fleet_governance(data: dict[str, Any], defaults: dict[str, Any], uid: str, unit: dict[str, Any]) -> dict[str, Any]:
+    """The governance settings a unit runs under: its own, or the fleet's.
+
+    A setting may come from the fleet's top level, `defaults:` or the unit,
+    but from one place only: a unit quietly replacing a fleet-wide policy
+    would weaken it, so two places is an error.
+    """
+    sources = [("the fleet's top level", data), ("defaults:", defaults), (f"unit '{uid}'", unit)]
+    merged: dict[str, Any] = {}
+    for key in _GOVERNANCE_KEYS:
+        value = _governance_value(sources, key)
+        if value is not None:
+            merged[key] = value
+    return merged
+
+
 def compile_bundle(data: dict[str, Any]) -> CompiledBundle:
     """Compile a fleet document into a CompiledBundle."""
-    defaults = data.get("defaults", {})
+    _reject_unknown(data, _FLEET_KEYS, location="fleet file")
+    defaults = data.get("defaults", {}) or {}
+    _reject_unknown(defaults, _DEFAULTS_KEYS, location="defaults:")
     tool_catalog = data.get("tools", {})
     mcp_catalog = data.get("mcp", {}).get("servers", {})
     agents = data.get("agents", {}) or {}
@@ -271,6 +342,11 @@ def compile_bundle(data: dict[str, Any]) -> CompiledBundle:
 
     # Agent units.
     for uid, agent in agents.items():
+        _reject_unknown(agent, _AGENT_UNIT_KEYS, location=f"agent unit '{uid}'")
+        agent = {
+            **{k: v for k, v in agent.items() if k not in _GOVERNANCE_KEYS},
+            **_fleet_governance(data, defaults, uid, agent),
+        }
         resolved = _resolve_uses(
             uid,
             agent.get("uses", []),
@@ -287,17 +363,23 @@ def compile_bundle(data: dict[str, Any]) -> CompiledBundle:
 
     # Workflow units (explicit graphs) reuse the graph compiler with catalog access.
     for uid, wf in workflows.items():
+        _reject_unknown(wf, _WORKFLOW_UNIT_KEYS, location=f"workflow unit '{uid}'")
         header = {"id": uid, "version": wf.get("version", defaults.get("version", DEFAULT_WORKFLOW_VERSION))}
         for key in ("name", "description", "start", "state_schema", "labels", "agent_ref"):
             if key in wf:
                 header[key] = wf[key]
         doc = {
+            # Governance travels with the unit, never dropped.
+            **_fleet_governance(data, defaults, uid, wf),
             "workflow": header,
             "nodes": wf.get("nodes", {}),
             "retry_policies": wf.get("retry_policies", {}),
             "timeouts": wf.get("timeouts", {}),
             "models": wf.get("models", {}),
-            "tools": tool_catalog,
+            # Only catalog entries already in the runtime's ToolConfig shape: the
+            # human-authored ones (description, input_schema) are refused at
+            # registration, as agent units already account for.
+            "tools": {k: v for k, v in tool_catalog.items() if isinstance(v, dict) and {"kind", "reference"} <= set(v)},
             "mcp": {"servers": mcp_catalog},
             "a2a": {"remote_agents": wf.get("remote_agents", {})},
         }

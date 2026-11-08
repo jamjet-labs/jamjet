@@ -4,10 +4,12 @@ import type { AgentRef, UserContext } from './context.js'
 import { applyCacheInject } from './cache-inject.js'
 import { applyCompaction } from './compaction.js'
 import { estimateCost } from './cost.js'
-import { JamjetPolicyBlocked } from './errors.js'
+import { DEFAULT_APPROVAL_TIMEOUT_MS, pollUntilResolved } from './approvals.js'
+import { JamjetApprovalRejected, JamjetApprovalTimeout, JamjetPolicyBlocked } from './errors.js'
+import { toolNameOf } from './policy.js'
+import { argumentsDigest, maskForApproval, parsedArguments } from './approval-context.js'
 import { Span } from './span.js'
-
-type Vendor = 'openai' | 'anthropic'
+import { enforceStream, type StreamedToolCall, type StreamTally, type Vendor } from './stream-enforcement.js'
 
 export interface EnforcedCallOptions {
   client: Client
@@ -31,42 +33,70 @@ function newId(): string {
   return Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
 }
 
+/** ~4 characters per token over everything sent as input: messages, tool definitions, system, legacy prompt. */
 function estimatePromptTokens(args0: unknown): number {
   try {
     const a = args0 as Record<string, unknown>
-    const messages = Array.isArray(a['messages']) ? a['messages'] : []
-    const totalChars = JSON.stringify(messages).length
+    const input = [a['messages'], a['tools'], a['system'], a['prompt']].filter((v) => v !== undefined)
+    const totalChars = JSON.stringify(input).length
     return Math.ceil(totalChars / 4)
   } catch {
     return 0
   }
 }
 
-function getToolCalls(vendor: Vendor, response: unknown): Array<{ id?: string; name: string }> {
-  const res = response as Record<string, unknown>
+type ToolCall = { id?: string; name: string; arguments?: unknown }
+
+function getToolCalls(vendor: Vendor, response: unknown): ToolCall[] {
+  const res = (response ?? {}) as Record<string, unknown>
   if (vendor === 'openai') {
+    // Every choice: with n > 1 a blocked call in any of them must be caught.
     const choices = Array.isArray(res['choices']) ? res['choices'] : []
-    const first = choices[0] as Record<string, unknown> | undefined
-    const message = (first?.['message'] ?? {}) as Record<string, unknown>
-    const tcs = Array.isArray(message['tool_calls']) ? message['tool_calls'] : []
-    return (tcs as Array<Record<string, unknown>>).map((tc) => {
-      const fn = (tc['function'] ?? {}) as Record<string, unknown>
-      const name = typeof fn['name'] === 'string' ? fn['name'] : ''
-      const entry: { id?: string; name: string } = { name }
-      if (typeof tc['id'] === 'string') entry.id = tc['id']
-      return entry
+    return (choices as Array<Record<string, unknown>>).flatMap((choice, position) => {
+      const message = (choice?.['message'] ?? {}) as Record<string, unknown>
+      const tcs = Array.isArray(message['tool_calls']) ? message['tool_calls'] : []
+      const calls = (tcs as Array<Record<string, unknown>>).map((tc) => {
+        const entry: ToolCall = { name: toolNameOf(tc) }
+        if (typeof tc['id'] === 'string') entry.id = tc['id']
+        const fn = (tc['function'] ?? tc['custom'] ?? {}) as Record<string, unknown>
+        const args = fn['arguments'] ?? fn['input']
+        if (args !== undefined) entry.arguments = args
+        return entry
+      })
+      // Legacy `functions` API: a single message.function_call.
+      const fc = message['function_call']
+      if (typeof fc === 'object' && fc !== null) {
+        // No id of its own: name it after the choice, so two choices calling
+        // the same function stay distinct.
+        const entry: ToolCall = { name: toolNameOf(fc), id: `function_call:${String(choice?.['index'] ?? position)}` }
+        const args = (fc as Record<string, unknown>)['arguments']
+        if (args !== undefined) entry.arguments = args
+        calls.push(entry)
+      }
+      return calls
     })
   }
-  // Anthropic
+  // Anthropic: client tool calls and server tool calls (e.g. web_search)
   const content = Array.isArray(res['content']) ? res['content'] : []
   return (content as Array<Record<string, unknown>>)
-    .filter((b) => b['type'] === 'tool_use')
+    .filter((b) => b['type'] === 'tool_use' || b['type'] === 'server_tool_use' || b['type'] === 'mcp_tool_use')
     .map((b) => {
       const name = typeof b['name'] === 'string' ? b['name'] : ''
-      const entry: { id?: string; name: string } = { name }
+      const entry: ToolCall = { name }
       if (typeof b['id'] === 'string') entry.id = b['id']
+      if (b['input'] !== undefined) entry.arguments = b['input']
       return entry
     })
+}
+
+/** Streamed arguments arrive as text; Anthropic's are JSON, so parse them to match the non-streamed shape. */
+function streamedArguments(vendor: Vendor, text: string): unknown {
+  if (vendor !== 'anthropic' || text === '') return text
+  try {
+    return JSON.parse(text)
+  } catch {
+    return text
+  }
 }
 
 function extractUsage(vendor: Vendor, response: unknown): { input: number; output: number } {
@@ -96,6 +126,101 @@ function cacheReadSavingsUsd(model: string, cacheReadTokens: number): number {
   return (cacheReadTokens / 1_000_000) * per
 }
 
+/**
+ * Tools the vendor runs itself (Anthropic server tools such as web_search, and
+ * MCP toolsets) execute before the response comes back, so refusing their
+ * calls afterwards is too late: a rule that could match them strips them here.
+ */
+// Anthropic-defined tools your code executes (the model only asks): these are
+// gated like any other tool call.
+const CLIENT_TOOL_TYPES = /^(bash|text_editor|computer|memory)_/
+// Anything else with a vendor type and no input_schema runs on the vendor's
+// side (web_search, web_fetch, code_execution, tool_search_tool, advisor, ...).
+// Unknown types count as server-executed, so they fail closed.
+function isServerExecuted(tool: unknown): boolean {
+  if (typeof tool !== 'object' || tool === null) return false
+  const t = tool as Record<string, unknown>
+  const type = t['type']
+  if (typeof type !== 'string' || type === 'function' || type === 'custom') return false
+  if (CLIENT_TOOL_TYPES.test(type)) return false
+  return !('input_schema' in t)
+}
+
+function strippedBy(client: Client, tool: unknown): { name: string; kind: string; pattern: string | null } | null {
+  const t = tool as Record<string, unknown>
+  if (t?.['type'] === 'mcp_toolset') {
+    // Tool names inside an MCP server are unknown before the call; any
+    // restrictive rule could match one.
+    return client._policy.hasRestrictiveRules()
+      ? { name: `mcp_toolset:${String(t['mcp_server_name'] ?? '')}`, kind: 'block', pattern: '*' }
+      : null
+  }
+  const name = toolNameOf(tool)
+  const d = client._policy.evaluate(name)
+  if (d.blocked) return { name, kind: d.policyKind, pattern: d.pattern }
+  if (d.policyKind === 'require_approval' && isServerExecuted(tool)) {
+    return { name, kind: d.policyKind, pattern: d.pattern }
+  }
+  return null
+}
+
+/**
+ * Remove refused tools from `tools` and from the legacy OpenAI `functions`.
+ * Refuses a call whose tool_choice / function_call forces a refused tool, and
+ * drops the settings vendors reject once no tools are left. Returns arg0
+ * unchanged when nothing was removed.
+ */
+function filterRequestTools(
+  client: Client,
+  arg0: Record<string, unknown>,
+  decisions: Array<{ tool_name: string; policy_kind: string; pattern: string | null }>,
+): Record<string, unknown> {
+  let next = arg0
+  const lists: Array<{ key: 'tools' | 'functions'; choice: 'tool_choice' | 'function_call'; drop: string[] }> = [
+    { key: 'tools', choice: 'tool_choice', drop: ['tool_choice', 'parallel_tool_calls'] },
+    { key: 'functions', choice: 'function_call', drop: ['function_call'] },
+  ]
+  for (const { key, choice, drop } of lists) {
+    const list = arg0[key]
+    if (!Array.isArray(list) || list.length === 0) continue
+    const kept: unknown[] = []
+    const removed: string[] = []
+    for (const tool of list) {
+      const hit = strippedBy(client, tool)
+      if (hit === null) {
+        kept.push(tool)
+        continue
+      }
+      removed.push(hit.name)
+      decisions.push({ tool_name: hit.name, policy_kind: hit.kind, pattern: hit.pattern })
+    }
+    if (removed.length === 0) continue
+    // A forced choice of a removed tool cannot be honoured: refuse the call
+    // rather than let the vendor reject an unknown tool name.
+    const forced = toolNameOf(arg0[choice])
+    if (forced !== '' && removed.includes(forced)) {
+      const d = client._policy.evaluate(forced)
+      throw new JamjetPolicyBlocked(forced, d.pattern ?? '*')
+    }
+    next = next === arg0 ? { ...arg0 } : next
+    next[key] = kept
+    if (kept.length === 0) {
+      // Vendors reject an empty list, and the settings that only make sense with tools.
+      delete next[key]
+      for (const k of drop) delete next[k]
+    }
+  }
+  // Remote MCP servers run their tools on the vendor side under names unknown
+  // before the call; with any restrictive rule they are not offered.
+  const servers = arg0['mcp_servers']
+  if (Array.isArray(servers) && servers.length > 0 && client._policy.hasRestrictiveRules()) {
+    next = next === arg0 ? { ...arg0 } : next
+    delete next['mcp_servers']
+    decisions.push({ tool_name: 'mcp_servers', policy_kind: 'block', pattern: '*' })
+  }
+  return next
+}
+
 export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknown> {
   const { client, vendor, original, args, override, computePromptPrefixHash } = opts
   const arg0 = (args[0] ?? {}) as Record<string, unknown>
@@ -108,20 +233,10 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
   const agentRef = override?.agent ?? ctx?.agent
   const userCtx = override?.user ?? ctx?.user
 
-  // 1. Pre-call policy: filter tools
-  let mutatedArgs = args
+  // 1. Pre-call policy: strip refused tools from the request.
   const policyDecisions: Array<{ tool_name: string; policy_kind: string; pattern: string | null }> = []
-  if (Array.isArray(arg0['tools']) && arg0['tools'].length > 0) {
-    const { allowed, blocked } = client._policy.filterTools(arg0['tools'] as Array<{ function?: { name?: string } }>)
-    for (const t of blocked) {
-      const name = t.function?.name ?? ''
-      const d = client._policy.evaluate(name)
-      policyDecisions.push({ tool_name: name, policy_kind: d.policyKind, pattern: d.pattern })
-    }
-    if (blocked.length > 0) {
-      mutatedArgs = [{ ...arg0, tools: allowed }, ...args.slice(1)]
-    }
-  }
+  const filtered = filterRequestTools(client, arg0, policyDecisions)
+  let mutatedArgs = filtered === arg0 ? args : [filtered, ...args.slice(1)]
 
   // 2. Pre-call budget check
   const estTokens = estimatePromptTokens(arg0)
@@ -190,67 +305,295 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
     }
   }
 
+  const state: CallState = { client, span, vendor, model, cacheInjected, compactionSaved }
+
+  let result: unknown
   try {
-    const result = await original.apply(null, mutatedArgs)
+    result = await original.apply(null, mutatedArgs)
+  } catch (err) {
+    failSpan(state, err)
+    throw err
+  }
 
-    if (!isStreaming) {
-      // 4. Post-decision policy: re-check tool_calls returned by the model
-      // NOTE (Plan 2 limitation): require_approval matches do not gate the call
-      // here. Tools matched by require_approval rules pass through to the model
-      // and to user code unchanged. Pre-call approval gating is deferred to a
-      // future release; see docs/superpowers/specs/2026-05-08-ts-sdk-plan2.md §6.
-      const toolCalls = getToolCalls(vendor, result)
-      for (const tc of toolCalls) {
-        const d = client._policy.evaluate(tc.name)
-        if (d.blocked) {
-          const blockedEntry: { id?: string; name: string } = { name: tc.name }
-          if (tc.id !== undefined) blockedEntry.id = tc.id
-          span.policyBlockedToolCalls = [blockedEntry]
-          span.finish('error')
-          client.recordSpan(span.toEventDict())
-          throw new JamjetPolicyBlocked(tc.name, d.pattern ?? '*', { cause: tc })
-        }
-      }
-
-      // 5. Post-call cost record
-      const usage = extractUsage(vendor, result)
-      const res = result as Record<string, unknown>
-      const actualModel = typeof res['model'] === 'string' ? res['model'] : model
-      span.model = actualModel
-      span.name = `${vendor}.${actualModel}`
-      span.inputTokens = usage.input
-      span.outputTokens = usage.output
-      span.costUsd = estimateCost(actualModel, usage.input, usage.output)
-      client._budget.record(span.costUsd)
-
-      if (cacheInjected) {
-        const cacheRead = extractCacheRead(vendor, result)
-        const savedUsd = cacheReadSavingsUsd(actualModel, cacheRead)
-        span.payload = {
-          ...span.payload,
-          // Fractional cents intentional — Math.round would zero sub-cent per-call
-          // savings. Authoritative totals are recomputed server-side from
-          // cache_read_input_tokens; this is a secondary per-call annotation.
-          saved_cents: savedUsd * 100,
-          cache_injected: true,
-        }
-      }
-
-      if (compactionSaved > 0) {
-        span.payload = { ...span.payload, tokens_saved: compactionSaved, compacted: true }
-      }
+  if (isStreaming) {
+    const streamState = (tally: StreamTally): CallState => ({ ...state, model: tally.model ?? model })
+    const refuseStreamed = (calls: ReadonlyArray<StreamedToolCall>, tally: StreamTally): void => {
+      // Check the name the openai SDK keeps (last fragment) and the joined
+      // fragments, so a consumer that concatenates them cannot get a blocked name.
+      const names = calls.flatMap((c) => {
+        const base = c.id !== undefined ? { id: c.id } : {}
+        return c.joinedName !== '' && c.joinedName !== c.name
+          ? [{ ...base, name: c.name }, { ...base, name: c.joinedName }]
+          : [{ ...base, name: c.name }]
+      })
+      if (firstBlocked(client, names) === null) return
+      recordUsage(streamState(tally), streamUsage(tally, estTokens, false), tally.cacheReadTokens, {
+        usage_estimated: true,
+        stream_incomplete: true,
+      })
+      refuseBlocked(state, names)
     }
-
+    const enforced = enforceStream(result, {
+      vendor,
+      holdToolCalls: () => client._policy.hasRules(),
+      onToolCallStarted: (call, tally) => refuseStreamed([{ ...call, joinedName: call.name, arguments: '' }], tally),
+      onToolCalls: async (calls, tally) => {
+        refuseStreamed(calls, tally)
+        // Gate the name as last sent or the fragments joined, like the block
+        // check: one approval per call, under the joined name when it is gated.
+        const gated = (list: ReadonlyArray<StreamedToolCall>): ToolCall[] =>
+          list.map((c) => {
+            const names = c.joinedName !== '' && c.joinedName !== c.name ? [c.joinedName, c.name] : [c.name]
+            const name = names.find((n) => client._policy.evaluate(n).policyKind === 'require_approval') ?? c.name
+            const one: ToolCall = { name, arguments: streamedArguments(vendor, c.arguments) }
+            if (c.id !== undefined) one.id = c.id
+            return one
+          })
+        await gateApprovals(
+          streamState(tally),
+          gated(calls),
+          () => {
+            const reported = tally.inputTokens !== undefined && tally.outputTokens !== undefined
+            recordUsage(
+              streamState(tally),
+              streamUsage(tally, estTokens, true),
+              tally.cacheReadTokens,
+              reported ? {} : { usage_estimated: true },
+            )
+          },
+          () => gated(tally.toolCalls),
+          requestSignal(args),
+        )
+      },
+      onEnd: (tally, end) => {
+        if (end.kind === 'error') {
+          if (alreadyRecorded(end.error)) return // recorded where it was raised
+          // The tokens the stream produced before failing were still spent.
+          recordUsage(streamState(tally), streamUsage(tally, estTokens, false), tally.cacheReadTokens, {
+            usage_estimated: true,
+            stream_incomplete: true,
+          })
+          failSpan(state, end.error)
+          return
+        }
+        const complete = end.kind === 'complete' && tally.finished
+        const reported = tally.inputTokens !== undefined && tally.outputTokens !== undefined
+        recordUsage(streamState(tally), streamUsage(tally, estTokens, complete), tally.cacheReadTokens, {
+          ...(complete && reported ? {} : { usage_estimated: true }),
+          ...(complete ? {} : { stream_incomplete: true }),
+        })
+        span.finish('ok')
+        client.recordSpan(span.toEventDict())
+      },
+    })
+    if (enforced !== null) return enforced
+    // Not iterable: nothing to observe. Record what we know and pass it on.
     span.finish('ok')
     client.recordSpan(span.toEventDict())
     return result
-  } catch (err) {
-    if (!(err instanceof JamjetPolicyBlocked)) {
-      span.finish('error')
-      const errMsg = err instanceof Error ? err.message : String(err)
-      span.payload = { error: errMsg }
-      client.recordSpan(span.toEventDict())
-    }
-    throw err
   }
+
+  // 4. Post-call cost record. Runs before the policy re-check so a refused
+  // response still counts against the budget: the tokens were spent.
+  const res = result as Record<string, unknown>
+  recordUsage(
+    { ...state, model: typeof res['model'] === 'string' ? res['model'] : model },
+    extractUsage(vendor, result),
+    extractCacheRead(vendor, result),
+  )
+
+  // 5. Post-decision policy: re-check tool calls returned by the model.
+  // Blocked calls throw; calls matched by a require_approval rule wait for a
+  // Cloud decision and throw unless approved.
+  const calls = getToolCalls(vendor, result)
+  refuseBlocked(state, calls)
+  await gateApprovals(state, calls, () => {}, () => getToolCalls(vendor, result), requestSignal(args))
+
+  span.finish('ok')
+  client.recordSpan(span.toEventDict())
+  return result
+}
+
+interface CallState {
+  client: Client
+  span: Span
+  vendor: Vendor
+  model: string
+  cacheInjected: boolean
+  compactionSaved: number
+}
+
+function firstBlocked(
+  client: Client,
+  calls: ReadonlyArray<{ id?: string; name: string }>,
+): { call: { id?: string; name: string }; pattern: string } | null {
+  for (const call of calls) {
+    const d = client._policy.evaluate(call.name)
+    if (d.blocked) return { call, pattern: d.pattern ?? '*' }
+  }
+  return null
+}
+
+/** Throws JamjetPolicyBlocked (and records the span) on the first blocked call. */
+function refuseBlocked(state: CallState, calls: ReadonlyArray<{ id?: string; name: string }>): void {
+  const hit = firstBlocked(state.client, calls)
+  if (hit === null) return
+  const blockedEntry: { id?: string; name: string } = { name: hit.call.name }
+  if (hit.call.id !== undefined) blockedEntry.id = hit.call.id
+  state.span.policyBlockedToolCalls = [blockedEntry]
+  state.span.finish('error')
+  state.client.recordSpan(state.span.toEventDict())
+  throw new JamjetPolicyBlocked(hit.call.name, hit.pattern, { cause: hit.call })
+}
+
+/**
+ * Wait for a Cloud approval for each call matched by a require_approval rule.
+ * Fails closed: a rejection, a timeout, or any failure to reach Cloud throws,
+ * after `beforeFail` (records usage) and the span are recorded.
+ */
+async function gateApprovals(
+  state: CallState,
+  calls: ReadonlyArray<ToolCall>,
+  beforeFail: () => void,
+  reread: () => ReadonlyArray<ToolCall>,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const { client, span } = state
+  const approved: string[] = []
+  const pii = client.config.redaction.mode !== 'off'
+  const fail = (failure: Error, tool: string): never => {
+    recorded.add(failure)
+    beforeFail()
+    const id = (failure as { approvalId?: string }).approvalId
+    if (id) span.approvalId = id
+    span.payload = { ...span.payload, approval: { tool, outcome: failure.name } }
+    span.finish('error')
+    client.recordSpan(span.toEventDict())
+    throw failure
+  }
+  for (const call of calls) {
+    const decision = client._policy.evaluate(call.name)
+    if (decision.policyKind !== 'require_approval') continue
+    const digest = await argumentsDigest(call.arguments)
+    const context: Record<string, unknown> = {
+      tool: call.name,
+      vendor: state.vendor,
+      model: state.model,
+      rule: decision.pattern,
+      arguments_sha256: digest,
+    }
+    if (call.id !== undefined) context['tool_call_id'] = call.id
+    if (call.arguments !== undefined) context['arguments'] = maskForApproval(parsedArguments(call.arguments), pii)
+    if (span.agentName !== null) context['agent'] = span.agentName
+    const timeoutMs = client.config.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS
+    let id: string
+    try {
+      id = await pollUntilResolved({
+        apiKey: client.config.apiKey,
+        apiUrl: client.config.apiUrl,
+        action: call.name,
+        context,
+        timeoutMs,
+        ...(client.config.approvalPollIntervalMs !== undefined
+          ? { pollIntervalMs: client.config.approvalPollIntervalMs }
+          : {}),
+        ...(signal !== undefined ? { signal } : {}),
+      })
+    } catch (err) {
+      if (signal?.aborted) fail(err instanceof Error ? err : new Error(String(err)), call.name)
+      fail(
+        err instanceof JamjetApprovalRejected || err instanceof JamjetApprovalTimeout
+          ? err
+          : new JamjetApprovalTimeout('', timeoutMs, { cause: err }),
+        call.name,
+      )
+      return
+    }
+    // The approval covers these exact arguments: refuse to release the call
+    // if they changed while the reviewer was deciding.
+    const now = reread().find((c) => c.name === call.name && c.id === call.id)
+    if (now === undefined || (await argumentsDigest(now.arguments)) !== digest) {
+      fail(new JamjetApprovalRejected(id, 'tool call arguments changed after approval'), call.name)
+    }
+    approved.push(id)
+  }
+  if (approved.length > 0) {
+    span.approvalId = approved[0]!
+    if (approved.length > 1) span.payload = { ...span.payload, approval_ids: approved }
+  }
+}
+
+/** The caller's AbortSignal, passed in the vendor's request options (second argument). */
+function requestSignal(args: unknown[]): AbortSignal | undefined {
+  const signal = (args[1] as { signal?: unknown } | undefined)?.signal
+  return typeof AbortSignal !== 'undefined' && signal instanceof AbortSignal ? signal : undefined
+}
+
+/** Errors whose span was recorded where they were raised. */
+const recorded = new WeakSet<object>()
+
+function alreadyRecorded(err: unknown): boolean {
+  return (
+    err instanceof JamjetPolicyBlocked ||
+    err instanceof JamjetApprovalRejected ||
+    err instanceof JamjetApprovalTimeout ||
+    (typeof err === 'object' && err !== null && recorded.has(err))
+  )
+}
+
+function failSpan(state: CallState, err: unknown): void {
+  if (alreadyRecorded(err)) return
+  state.span.finish('error')
+  const errMsg = err instanceof Error ? err.message : String(err)
+  state.span.payload = { ...state.span.payload, error: errMsg }
+  state.client.recordSpan(state.span.toEventDict())
+}
+
+/**
+ * Usage a stream reported, or an estimate (prompt estimate, ~4 characters per
+ * output token). A stream cut short has only a partial output count, so the
+ * larger of the reported count and the estimate is used.
+ */
+function streamUsage(
+  tally: StreamTally,
+  estimatedPromptTokens: number,
+  complete: boolean,
+): { input: number; output: number } {
+  const estimatedOutput = Math.ceil(tally.outputChars / 4)
+  const output = complete
+    ? (tally.outputTokens ?? estimatedOutput)
+    : Math.max(tally.outputTokens ?? 0, estimatedOutput)
+  return { input: tally.inputTokens ?? estimatedPromptTokens, output }
+}
+
+function recordUsage(
+  state: CallState,
+  usage: { input: number; output: number },
+  cacheRead: number,
+  extraPayload: Record<string, unknown> = {},
+): void {
+  const { span, vendor, model } = state
+  span.model = model
+  span.name = `${vendor}.${model}`
+  span.inputTokens = usage.input
+  span.outputTokens = usage.output
+  span.costUsd = estimateCost(model, usage.input, usage.output)
+  state.client._budget.record(span.costUsd)
+
+  if (state.cacheInjected) {
+    const savedUsd = cacheReadSavingsUsd(model, cacheRead)
+    span.payload = {
+      ...span.payload,
+      // Fractional cents intentional — Math.round would zero sub-cent per-call
+      // savings. Authoritative totals are recomputed server-side from
+      // cache_read_input_tokens; this is a secondary per-call annotation.
+      saved_cents: savedUsd * 100,
+      cache_injected: true,
+    }
+  }
+
+  if (state.compactionSaved > 0) {
+    span.payload = { ...span.payload, tokens_saved: state.compactionSaved, compacted: true }
+  }
+  if (Object.keys(extraPayload).length > 0) span.payload = { ...span.payload, ...extraPayload }
 }

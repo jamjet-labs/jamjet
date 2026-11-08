@@ -95,10 +95,14 @@ nodes:
   classify:
     type: agent
     agent_ref: classifier
-    next:
-      - when: "output.priority == 'high'"
-        to: human_review
-      - else: auto_respond
+    next: route
+
+  route:
+    type: condition
+    conditions:
+      - if: 'state.priority == "high"'   # the value is a JSON literal
+        next: human_review
+    default: auto_respond
 
   human_review:
     type: human_approval

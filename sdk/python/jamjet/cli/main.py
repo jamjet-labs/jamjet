@@ -250,6 +250,26 @@ def _print_protocol_activity(events: list[dict[str, Any]]) -> None:
 # ── init ─────────────────────────────────────────────────────────────────────
 
 
+def _escape_markup(text: str) -> str:
+    from rich.markup import escape
+
+    return escape(_safe(text))
+
+
+def _refuse_held_back_template(template: str) -> None:
+    """Exit with the reason when a template is held back in this release."""
+    from jamjet.templates import HELD_BACK_TEMPLATES
+
+    reason = HELD_BACK_TEMPLATES.get(template)
+    if reason is not None:
+        console.print(
+            f"[red]Error:[/red] template '{template}' is not available in this release: {reason}. "
+            "A project from it could not run. "
+            "Run [bold]jamjet init --list-templates[/bold] to see the ones that can."
+        )
+        raise typer.Exit(1)
+
+
 @app.command()
 def init(
     project_name: str | None = typer.Argument(
@@ -273,22 +293,26 @@ def init(
 
     Pass a name to create a new directory, or omit to set up in the current directory.
 
-    Available templates: hello-agent (default), research-agent, code-reviewer, approval-workflow
+    Run `jamjet init --list-templates` to see the templates.
     """
     import os
 
-    from jamjet.templates import AVAILABLE_TEMPLATES, render_template
+    from jamjet.templates import AVAILABLE_TEMPLATES, HELD_BACK_TEMPLATES, render_template
 
     if list_templates:
         console.print("[bold]Available templates:[/bold]")
         for t in AVAILABLE_TEMPLATES:
             marker = "  [green]●[/green]" if t == "hello-agent" else "  [dim]●[/dim]"
             console.print(f"{marker} {t}")
+        console.print("[dim]Not available in this release:[/dim]")
+        for t, reason in sorted(HELD_BACK_TEMPLATES.items()):
+            console.print(f"  [dim]○ {t}: {reason}[/dim]")
         raise typer.Exit()
 
+    _refuse_held_back_template(template)
     if template not in AVAILABLE_TEMPLATES:
         console.print(
-            f"[red]Error:[/red] unknown template '{template}'. "
+            f"[red]Error:[/red] unknown template '{_escape_markup(template)}'. "
             f"Run [bold]jamjet init --list-templates[/bold] to see options."
         )
         raise typer.Exit(1)
@@ -350,9 +374,10 @@ def create(
 
     from jamjet.templates import AVAILABLE_TEMPLATES, render_template
 
+    _refuse_held_back_template(template)
     if template not in AVAILABLE_TEMPLATES:
         console.print(
-            f"[red]Error:[/red] unknown template '{template}'. "
+            f"[red]Error:[/red] unknown template '{_escape_markup(template)}'. "
             f"Run [bold]jamjet init --list-templates[/bold] to see options."
         )
         raise typer.Exit(1)
@@ -659,6 +684,44 @@ def dev(
 # ── validate ─────────────────────────────────────────────────────────────────
 
 
+def _compile_yaml_reporting(source: str) -> dict[str, Any]:
+    """``compile_yaml``, printing each schema warning (an unknown key outside a
+    node or policy) instead of leaving it to Python's warning output."""
+    import warnings
+
+    from jamjet.workflow.ir_compiler import WorkflowSchemaWarning, compile_yaml
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", WorkflowSchemaWarning)
+        ir = compile_yaml(source)
+    # stderr, so `jamjet run --output json` keeps stdout to the JSON result.
+    err = Console(stderr=True)
+    for w in caught:
+        if issubclass(w.category, WorkflowSchemaWarning):
+            err.print("Warning:", style="yellow", end=" ")
+            err.print(str(w.message), markup=False, highlight=False)
+        else:
+            warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
+    return ir
+
+
+def _validate_fleet(data: dict[str, Any]) -> None:
+    """Compile a fleet file (agents:/workflows: maps) and print each unit."""
+    from jamjet.workflow.bundle import compile_bundle
+
+    bundle = compile_bundle(data)
+    console.print(f"[green]Valid.[/green] fleet with {len(bundle.workflows)} unit(s)")
+    for ir in bundle.workflows:
+        console.print(
+            f"  {_safe(ir['workflow_id'])} v{_safe(ir['version'])}  "
+            f"Nodes: {len(ir.get('nodes', {}))}  Edges: {len(ir.get('edges', []))}",
+            markup=False,
+            highlight=False,
+        )
+    for job in bundle.cron_jobs:
+        console.print(f"  schedule {_safe(job.name)}: {_safe(job.cron_expression)}", markup=False, highlight=False)
+
+
 @app.command()
 def validate(
     path: str = typer.Argument(..., help="Path to workflow.yaml or .py"),
@@ -677,6 +740,14 @@ def validate(
         raise typer.Exit(1)
 
     try:
+        if path.endswith((".yaml", ".yml")):
+            from jamjet.workflow.bundle import is_bundle
+
+            with open(path) as f:
+                data = yaml.safe_load(f.read())
+            if is_bundle(data):
+                _validate_fleet(data)
+                return
         ir = _load_workflow_ir(path)
 
         wf_id = ir.get("workflow_id")
@@ -756,11 +827,9 @@ def deploy(
 
 def _load_workflow_ir(path: str) -> dict[str, Any]:
     """Compile a workflow file (.yaml/.yml/.py) to its IR dict."""
-    from jamjet.workflow.ir_compiler import compile_yaml
-
     if path.endswith((".yaml", ".yml")):
         with open(path) as fh:
-            return compile_yaml(fh.read())
+            return _compile_yaml_reporting(fh.read())
     if path.endswith(".py"):
         import importlib.util
 

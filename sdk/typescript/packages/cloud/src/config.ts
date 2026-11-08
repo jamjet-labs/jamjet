@@ -23,6 +23,14 @@ export const InitOptionsSchema = z.object({
   debug: z.boolean().default(false),
   ctx: z.unknown().optional(),
   maxCostUsd: z.number().positive().optional(),
+  /**
+   * How long a `require_approval` tool call waits for a decision before it
+   * fails closed. Sent to Cloud as the approval's deadline, which Cloud
+   * holds between 1 minute and 24 hours. Default 1 hour.
+   */
+  approvalTimeoutMs: z.number().int().positive().optional(),
+  /** How often to poll Cloud for an approval decision. Default 5 seconds. */
+  approvalPollIntervalMs: z.number().int().positive().optional(),
 })
 
 export type InitOptions = z.input<typeof InitOptionsSchema>
