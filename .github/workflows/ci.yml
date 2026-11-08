@@ -310,6 +310,26 @@ jobs:
           done
           echo "clean: no h2 0.3.x, no hyper 0.14"
 
+      # sqlx and reqwest both use rustls with aws-lc-rs. If ring is enabled
+      # too, rustls has no single default provider and any
+      # `ClientConfig::builder()` call panics. Checked positively: the step
+      # fails if it cannot read the aws-lc-rs feature at all.
+      - name: Assert rustls is built with one crypto provider
+        working-directory: runtime
+        run: |
+          features=$(cargo tree --workspace --target all -e features -i rustls --locked)
+          if ! echo "$features" | grep -q 'rustls feature "aws-lc-rs"'; then
+            echo "::error::could not find rustls's aws-lc-rs feature"
+            echo "$features"
+            exit 1
+          fi
+          if echo "$features" | grep -q 'rustls feature "ring"'; then
+            echo "::error::rustls is built with ring as well as aws-lc-rs"
+            echo "$features"
+            exit 1
+          fi
+          echo "clean: rustls uses aws-lc-rs only"
+
   python-audit:
     name: Python dependency audit
     runs-on: ubuntu-latest
