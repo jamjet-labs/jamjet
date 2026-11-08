@@ -302,7 +302,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
         McpTool {
             name: "jamjet_get_events".into(),
             description: Some(concat!(
-                "Retrieve the ordered event log for a workflow execution, up to 10000 events per call (follow next_after for more). Read-only, no side effects. ",
+                "Retrieve the ordered event log for a workflow execution, up to 10000 events or 8 MiB per call (follow next_after for more). Read-only, no side effects. ",
                 "Use this to debug execution behavior, understand which nodes ran and in what order, or inspect approval decisions. ",
                 "Returns a JSON object with an 'events' array. Each event has: execution_id, sequence (monotonic counter), ",
                 "timestamp, and kind (one of: WorkflowStarted, NodeScheduled, NodeStarted, NodeCompleted, NodeFailed, ",
@@ -349,13 +349,12 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         .ok_or_else(|| format!("after must be an integer sequence, not {v}"))?,
                 };
                 let limit = crate::routes::MAX_EVENTS_PAGE;
-                let events = backend
+                let mut events = backend
                     .get_events_page(&eid, after, limit)
                     .await
                     .map_err(|e| format!("{e}"))?;
-                let next_after = (events.len() as u32 == limit)
-                    .then(|| events.last().map(|e| e.sequence))
-                    .flatten();
+                let cut = crate::routes::cap_events_page(&mut events);
+                let next_after = crate::routes::events_next_after(&events, limit, cut);
                 let text = serde_json::to_string(&json!({"events": events, "next_after": next_after}))
                     .map_err(|e| format!("{e}"))?;
                 Ok(vec![McpContent::Text { text }])

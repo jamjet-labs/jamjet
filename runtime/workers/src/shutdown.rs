@@ -13,6 +13,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
 
+/// How long shutdown waits for the in-process workers by default
+/// (`JAMJET_SHUTDOWN_GRACE_SECS`).
+pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
+
+/// How long shutdown then waits for the scheduler to stop between ticks.
+pub const SCHEDULER_STOP: Duration = Duration::from_secs(2);
+
+/// How long shutdown then waits for open HTTP connections.
+pub const HTTP_DRAIN: Duration = Duration::from_secs(3);
+
+/// The longest a default shutdown takes, which must fit Kubernetes' default
+/// 30 s between SIGTERM and SIGKILL with room to spare.
+pub const MAX_DEFAULT_SHUTDOWN: Duration = Duration::from_secs(25);
+
 #[derive(Default)]
 struct Running {
     count: AtomicUsize,
@@ -91,5 +105,17 @@ impl ShutdownTrigger {
         };
         let _ = tokio::time::timeout(grace, drained).await;
         self.running.count.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod default_timings {
+    use super::*;
+
+    /// Grace, scheduler and HTTP drain together, with the defaults: within
+    /// 25 s. The grace alone used to be 30 s, past Kubernetes' default.
+    #[test]
+    fn a_default_shutdown_fits_a_thirty_second_kill() {
+        assert!(DEFAULT_SHUTDOWN_GRACE + SCHEDULER_STOP + HTTP_DRAIN <= MAX_DEFAULT_SHUTDOWN);
     }
 }

@@ -1264,6 +1264,16 @@ impl StateBackend for TenantScopedSqliteBackend {
         Ok(row.map(|r| r.get::<Vec<u8>, _>("bytes")))
     }
 
+    async fn artifact_size(&self, hash: &str) -> BackendResult<Option<u64>> {
+        let row = sqlx::query("SELECT size FROM artifacts WHERE tenant_id = ? AND hash = ?")
+            .bind(&self.tenant_id.0)
+            .bind(hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+        Ok(row.map(|r| r.get::<i64, _>("size").max(0) as u64))
+    }
+
     // ── Work item queue ───────────────────────────────────────────────────
 
     #[instrument(skip(self, item), fields(tenant = %self.tenant_id, execution_id = %item.execution_id))]

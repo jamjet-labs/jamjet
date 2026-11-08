@@ -324,3 +324,151 @@ async fn an_events_limit_above_the_cap_returns_the_cap() {
     );
     assert_eq!(body["next_after"], MAX_EVENTS_PAGE as i64);
 }
+
+/// A sentinel claiming `size: 0` for a large stored artifact: the page is
+/// charged the stored bytes, per reference. Charged by the claim, once per
+/// event, one event holding 100 such references inlined all of them.
+#[tokio::test]
+async fn a_page_charges_stored_bytes_not_the_claimed_size() {
+    use jamjet_api::routes::INLINE_PAGE_BUDGET;
+    let backend = Arc::new(InMemoryBackend::new());
+    let e = execution(WorkflowStatus::Running);
+    let id = e.execution_id.clone();
+    backend.create_execution(e).await.unwrap();
+    // About 250 KiB, under the per-output cap.
+    let each = (MAX_INLINE_ARTIFACT_BYTES - 6 * 1024) as usize;
+    let output = json!({ "content": "x".repeat(each - 32) });
+    let stored = serde_json::to_vec(&output).unwrap();
+    let r = backend
+        .put_artifact(&stored, Some("application/json"))
+        .await
+        .unwrap();
+    let mut sentinel = r.to_sentinel();
+    sentinel[jamjet_state::ARTIFACT_SENTINEL_KEY]["size"] = json!(0);
+    backend
+        .append_event(Event::new(
+            id.clone(),
+            1,
+            completed("n", json!(vec![sentinel.clone(); 100])),
+        ))
+        .await
+        .unwrap();
+    // And across events, each claiming 0.
+    for i in 0..80 {
+        backend
+            .append_event(Event::new(
+                id.clone(),
+                i + 2,
+                completed("m", sentinel.clone()),
+            ))
+            .await
+            .unwrap();
+    }
+    let state = make_state(backend);
+    let (_, body) = get(&state, &format!("/executions/{id}/events")).await;
+    let events = body["events"].as_array().unwrap();
+    let is_ref = |v: &Value| v.get(jamjet_state::ARTIFACT_SENTINEL_KEY).is_some();
+    let in_array = events[0]["kind"]["output"].as_array().unwrap();
+    let inlined_in_array = in_array.iter().filter(|v| !is_ref(v)).count();
+    let inlined_after = events[1..]
+        .iter()
+        .filter(|e| !is_ref(&e["kind"]["output"]))
+        .count();
+    let inlined = (inlined_in_array + inlined_after) as u64;
+    assert!(
+        inlined * stored.len() as u64 <= INLINE_PAGE_BUDGET,
+        "{inlined_in_array} in the array and {inlined_after} after inlined"
+    );
+    assert!(
+        inlined_in_array > 0,
+        "references within the budget are inlined"
+    );
+    assert!(inlined_in_array < 100, "the array inlined every reference");
+}
+
+/// Events under the spill threshold are never spilled, so a page of them
+/// had no byte bound. It ends at [`MAX_EVENTS_PAGE_BYTES`] with a cursor, and
+/// the next page carries on.
+#[tokio::test]
+async fn a_page_ends_at_its_byte_budget() {
+    use jamjet_api::routes::MAX_EVENTS_PAGE_BYTES;
+    let backend = Arc::new(InMemoryBackend::new());
+    let e = execution(WorkflowStatus::Running);
+    let id = e.execution_id.clone();
+    backend.create_execution(e).await.unwrap();
+    let patch = "y".repeat(7 * 1024);
+    let n = (MAX_EVENTS_PAGE_BYTES / (7 * 1024)) as i64 + 50;
+    for seq in 1..=n {
+        let mut kind = completed(&format!("n{seq}"), json!({}));
+        if let EventKind::NodeCompleted { state_patch, .. } = &mut kind {
+            *state_patch = json!({ "p": patch });
+        }
+        backend
+            .append_event(Event::new(id.clone(), seq, kind))
+            .await
+            .unwrap();
+    }
+    let state = make_state(backend);
+    let (_, first) = get(&state, &format!("/executions/{id}/events")).await;
+    let got = first["events"].as_array().unwrap().len() as i64;
+    assert!(got < n, "one page held all {n}");
+    assert!(
+        serde_json::to_vec(&first["events"]).unwrap().len() <= MAX_EVENTS_PAGE_BYTES + 16 * 1024,
+        "the page is past its byte budget"
+    );
+    assert_eq!(first["next_after"], json!(got), "{}", first["next_after"]);
+    let (_, second) = get(&state, &format!("/executions/{id}/events?after={got}")).await;
+    assert_eq!(
+        got + second["events"].as_array().unwrap().len() as i64,
+        n,
+        "the rest is on the next page"
+    );
+    assert!(second["next_after"].is_null());
+}
+
+/// Counts artifact reads.
+struct CountReads(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl support::hooked::AfterWrite for CountReads {
+    async fn after(&self, write: support::hooked::Write) {
+        if let support::hooked::Write::GetArtifact(_) = write {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// A reference past the per-output cap is not read: its stored size, looked
+/// up first, decides. A sentinel claiming `size: 0` used to get its whole blob
+/// read before the length was checked.
+#[tokio::test]
+async fn a_reference_past_the_cap_is_not_read() {
+    let inner = Arc::new(InMemoryBackend::new());
+    let reads = Arc::new(CountReads(std::sync::atomic::AtomicUsize::new(0)));
+    let backend: Arc<dyn StateBackend> = Arc::new(support::hooked::HookedBackend::new(
+        inner.clone(),
+        reads.clone(),
+    ));
+    let e = execution(WorkflowStatus::Running);
+    let id = e.execution_id.clone();
+    inner.create_execution(e).await.unwrap();
+    let big = json!({ "content": "z".repeat(MAX_INLINE_ARTIFACT_BYTES as usize + 1024) });
+    let r = inner
+        .put_artifact(&serde_json::to_vec(&big).unwrap(), Some("application/json"))
+        .await
+        .unwrap();
+    let mut sentinel = r.to_sentinel();
+    sentinel[jamjet_state::ARTIFACT_SENTINEL_KEY]["size"] = json!(0);
+    inner
+        .append_event(Event::new(id.clone(), 1, completed("n", sentinel)))
+        .await
+        .unwrap();
+    let state = make_state(backend);
+    let (_, body) = get(&state, &format!("/executions/{id}/events")).await;
+    let output = &body["events"][0]["kind"]["output"];
+    assert!(
+        output.get(jamjet_state::ARTIFACT_SENTINEL_KEY).is_some(),
+        "{output}"
+    );
+    assert_eq!(reads.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}

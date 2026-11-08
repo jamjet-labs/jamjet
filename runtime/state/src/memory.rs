@@ -563,6 +563,13 @@ impl StateBackend for InMemoryBackend {
             .map(|r| r.value().0.clone()))
     }
 
+    async fn artifact_size(&self, hash: &str) -> BackendResult<Option<u64>> {
+        Ok(self
+            .artifacts
+            .get(&("default".to_string(), hash.to_string()))
+            .map(|r| r.value().0.len() as u64))
+    }
+
     // ── Work queue ───────────────────────────────────────────────────
 
     async fn enqueue_work_item(&self, item: WorkItem) -> BackendResult<WorkItemId> {

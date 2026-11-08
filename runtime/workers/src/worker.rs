@@ -421,8 +421,16 @@ impl Worker {
                             // turning a contended key into a permanent wedge,
                             // which is strictly worse than the double-fire the
                             // reservation prevents.
+                            let limit = node_timeout(&ir, node_def);
+                            let ttl = Self::reservation_ttl(limit);
                             let claimed = match self
-                                .await_or_claim_effect(&key, &execution_id, &node_id, lease_fence)
+                                .await_or_claim_effect(
+                                    &key,
+                                    &execution_id,
+                                    &node_id,
+                                    lease_fence,
+                                    ttl,
+                                )
                                 .await
                             {
                                 Ok(c) => c,
@@ -445,7 +453,6 @@ impl Worker {
                                 // the node's timeout. A timed-out node fails
                                 // terminally like any fatal error: its effect
                                 // may have happened, so it is not retried.
-                                let limit = node_timeout(&ir, node_def);
                                 let fire = async {
                                     match self.executors.get(&kind_tag) {
                                         Some(executor) if kind_tag == "agent_tool" => {
@@ -487,7 +494,38 @@ impl Worker {
                                     }
                                 };
                                 match limit {
-                                    None => fire.await,
+                                    // No limit: renew the reservation while it
+                                    // runs, as the heartbeat renews the lease.
+                                    None => {
+                                        let renew = async {
+                                            loop {
+                                                tokio::time::sleep(ttl / 3).await;
+                                                if let Err(e) = self
+                                                    .backend
+                                                    .reserve_tool_effect(
+                                                        &key,
+                                                        &execution_id,
+                                                        &node_id,
+                                                        &self.worker_id,
+                                                        lease_fence,
+                                                        ttl,
+                                                    )
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        execution_id = %execution_id,
+                                                        node_id = %node_id,
+                                                        error = %e,
+                                                        "could not renew the effect reservation"
+                                                    );
+                                                }
+                                            }
+                                        };
+                                        tokio::select! {
+                                            result = fire => result,
+                                            never = renew => never,
+                                        }
+                                    }
                                     Some(limit) => match tokio::time::timeout(limit, fire).await {
                                         Ok(result) => result,
                                         Err(_) => {
@@ -936,6 +974,22 @@ impl Worker {
     /// double-fire the reservation exists to prevent.
     const RESERVATION_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+    /// How far past the node's timeout a reservation reaches.
+    const RESERVATION_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// How long a reservation for a node under `limit` lasts: past the
+    /// node's own timeout, with a margin, and never less than
+    /// [`Self::RESERVATION_TTL`]. A fixed 300 s let a node allowed 600 s
+    /// outlive its reservation, so a duplicate item could take the key and
+    /// fire the effect again. A node with no limit gets the floor and renews
+    /// it while it runs.
+    fn reservation_ttl(limit: Option<std::time::Duration>) -> std::time::Duration {
+        match limit {
+            Some(t) => (t + Self::RESERVATION_MARGIN).max(Self::RESERVATION_TTL),
+            None => Self::RESERVATION_TTL,
+        }
+    }
+
     /// How long to wait for the winner's result before giving the item back.
     const RESULT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
     const RESULT_POLL_ATTEMPTS: u32 = 40; // 10s
@@ -961,6 +1015,7 @@ impl Worker {
         execution_id: &ExecutionId,
         node_id: &str,
         lease_fence: i64,
+        ttl: std::time::Duration,
     ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
         for attempt in 0..2 {
             match self
@@ -971,7 +1026,7 @@ impl Worker {
                     node_id,
                     &self.worker_id,
                     lease_fence,
-                    Self::RESERVATION_TTL,
+                    ttl,
                 )
                 .await?
             {
@@ -1719,6 +1774,71 @@ mod tests {
         let (backend, eid) =
             backend_with_timeouts(Some(serde_json::json!({ "node_timeout": 7 })), Some(0)).await;
         assert_eq!(run_sleeping(&backend, &eid).await, vec!["completed"]);
+    }
+
+    /// The effect reservation's expiry as another worker would find it, while
+    /// `n1` runs (`None`: not reserved).
+    async fn reservation_expiry(backend: &Arc<InMemoryBackend>, eid: &ExecutionId) -> String {
+        let key = jamjet_state::derive_idempotency_key(backend.as_ref(), eid, "n1")
+            .await
+            .unwrap();
+        match backend
+            .reserve_tool_effect(&key, eid, "n1", "another-worker", 0, Duration::from_secs(1))
+            .await
+            .unwrap()
+        {
+            jamjet_state::ReserveOutcome::Held { expires_at, .. } => expires_at,
+            other => panic!("the key is not reserved: {other:?}"),
+        }
+    }
+
+    /// A node allowed 600 s holds its effect reservation past 600 s. The
+    /// reservation was a fixed 300 s, so a duplicate item that came after
+    /// that could take the key and fire the effect a second time. (The expiry
+    /// is wall-clock, which paused time does not move, so the recorded expiry
+    /// is what is checked.)
+    #[tokio::test(start_paused = true)]
+    async fn an_effect_reservation_outlasts_the_node_timeout() {
+        let (backend, eid) = backend_with_timeouts(None, Some(600)).await;
+        let worker =
+            make_worker(Arc::clone(&backend)).register_executor("tool", Arc::new(SleepExecutor));
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .unwrap();
+        let run = tokio::spawn(async move { worker.execute_item(item).await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let expires =
+            chrono::DateTime::parse_from_rfc3339(&reservation_expiry(&backend, &eid).await)
+                .unwrap()
+                .with_timezone(&Utc);
+        let left = expires - Utc::now();
+        assert!(left >= chrono::Duration::seconds(600), "{left:?}");
+        run.abort();
+    }
+
+    /// A node with no time limit renews its reservation while it runs, as
+    /// the heartbeat renews its lease.
+    #[tokio::test(start_paused = true)]
+    async fn an_unlimited_node_renews_its_reservation() {
+        let (backend, eid) =
+            backend_with_timeouts(Some(serde_json::json!({ "node_timeout": 7 })), Some(0)).await;
+        let worker =
+            make_worker(Arc::clone(&backend)).register_executor("tool", Arc::new(SleepExecutor));
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .unwrap();
+        let run = tokio::spawn(async move { worker.execute_item(item).await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let first = reservation_expiry(&backend, &eid).await;
+        // Past a third of the 300 s reservation: one renewal.
+        tokio::time::sleep(Duration::from_secs(110)).await;
+        let second = reservation_expiry(&backend, &eid).await;
+        assert!(second > first, "not renewed: {first} then {second}");
+        run.abort();
     }
 
     /// Takes `0` to run each item.

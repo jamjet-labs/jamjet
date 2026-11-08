@@ -661,23 +661,36 @@ pub const MAX_INLINE_ARTIFACT_BYTES: u64 = 256 * 1024;
 pub const INLINE_PAGE_BUDGET: u64 = 16 * 1024 * 1024;
 pub const INLINE_PAGE_BUDGET_ALL: u64 = 64 * 1024 * 1024;
 
-/// The bytes `value`'s artifact references (at the top or one level down)
-/// of at most `cap` bytes would inline.
-fn inlinable_bytes(value: &Value, cap: u64) -> u64 {
-    let size = |v: &Value| {
-        jamjet_state::ArtifactRef::from_sentinel(v)
-            .map(|r| r.size)
-            .filter(|s| *s <= cap)
-            .unwrap_or(0)
-    };
-    if jamjet_state::ArtifactRef::from_sentinel(value).is_some() {
-        return size(value);
+/// The most bytes of events one page holds, as stored (before spilled
+/// outputs are inlined, which [`INLINE_PAGE_BUDGET`] bounds on its own).
+/// Outputs and state patches under the spill threshold are never spilled, so
+/// a page of [`MAX_EVENTS_PAGE`] such events had no bound. A page ends early,
+/// with `next_after`, once it is past this; it always holds one event.
+pub const MAX_EVENTS_PAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Cut `events` to the longest prefix of at most [`MAX_EVENTS_PAGE_BYTES`]
+/// (and at least one event). `true` if it cut any.
+pub fn cap_events_page(events: &mut Vec<jamjet_state::Event>) -> bool {
+    let mut total = 0usize;
+    let mut keep = events.len();
+    for (i, e) in events.iter().enumerate() {
+        total += serde_json::to_vec(e).map(|b| b.len()).unwrap_or(0);
+        if total > MAX_EVENTS_PAGE_BYTES && i > 0 {
+            keep = i;
+            break;
+        }
     }
-    match value {
-        Value::Object(o) => o.values().map(size).sum(),
-        Value::Array(a) => a.iter().map(size).sum(),
-        _ => 0,
-    }
+    let cut = keep < events.len();
+    events.truncate(keep);
+    cut
+}
+
+/// The cursor for a page: the last event's sequence when the page was cut
+/// short or filled `limit`, else `None` (the end of the log).
+pub fn events_next_after(events: &[jamjet_state::Event], limit: u32, cut: bool) -> Option<i64> {
+    (cut || events.len() as u32 == limit)
+        .then(|| events.last().map(|e| e.sequence))
+        .flatten()
 }
 
 #[derive(Deserialize)]
@@ -717,9 +730,8 @@ async fn list_events(
     let mut events = backend
         .get_events_page(&execution_id, params.after.unwrap_or(0), limit)
         .await?;
-    let next_after = (events.len() as u32 == limit)
-        .then(|| events.last().map(|e| e.sequence))
-        .flatten();
+    let cut = cap_events_page(&mut events);
+    let next_after = events_next_after(&events, limit, cut);
 
     // Resolve ArtifactRef sentinels in NodeCompleted.output before returning to
     // the client.  The write path (2i-2) spills large outputs to the artifact
@@ -735,12 +747,12 @@ async fn list_events(
             output, node_id, ..
         } = &mut event.kind
         {
-            let cap = max_inline.min(budget);
-            let inlined = inlinable_bytes(output, cap);
-            let resolved = jamjet_state::resolve_value_within(output, &*backend, cap).await;
-            if resolved.is_ok() {
-                budget = budget.saturating_sub(inlined);
-            }
+            // Charged per reference, by the bytes it inlined: a sentinel's
+            // own `size` is the writer's claim, and an external worker writes
+            // the output.
+            let resolved =
+                jamjet_state::resolve_value_budgeted(output, &*backend, max_inline, &mut budget)
+                    .await;
             match resolved {
                 Ok(v) => *output = v,
                 Err(e) => {

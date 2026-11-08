@@ -215,6 +215,75 @@ pub async fn resolve_value_within(
     Ok(value.clone())
 }
 
+/// Resolve the artifact references in `value` (at the top or one level
+/// down) whose stored size is at most `max_each` and fits what is left of
+/// `budget`, charging `budget` the bytes each one inlined. Any other
+/// reference stays its sentinel.
+///
+/// The size a sentinel claims is never used: an external worker writes the
+/// output, so it can claim `0` for a large artifact. The stored size decides,
+/// and it is read before the bytes are, so a reference past the budget costs
+/// one size lookup and no blob read. Each child is charged on its own, so an
+/// array of references cannot inline them all under one check.
+pub async fn resolve_value_budgeted(
+    value: &Value,
+    backend: &dyn StateBackend,
+    max_each: u64,
+    budget: &mut u64,
+) -> BackendResult<Value> {
+    async fn one(
+        v: &Value,
+        backend: &dyn StateBackend,
+        max_each: u64,
+        budget: &mut u64,
+    ) -> BackendResult<Value> {
+        let Some(r) = ArtifactRef::from_sentinel(v) else {
+            return Ok(v.clone());
+        };
+        let cap = max_each.min(*budget);
+        match backend.artifact_size(&r.hash).await? {
+            None => Err(StateBackendError::NotFound(format!(
+                "artifact {} not found (dangling ref)",
+                r.hash
+            ))),
+            Some(size) if size > cap => Ok(v.clone()),
+            Some(_) => match backend.get_artifact(&r.hash).await? {
+                // Checked again: what was read decides.
+                Some(bytes) if bytes.len() as u64 <= cap => {
+                    let resolved =
+                        serde_json::from_slice(&bytes).map_err(StateBackendError::Serialization)?;
+                    *budget = budget.saturating_sub(bytes.len() as u64);
+                    Ok(resolved)
+                }
+                Some(_) => Ok(v.clone()),
+                None => Err(StateBackendError::NotFound(format!(
+                    "artifact {} not found (dangling ref)",
+                    r.hash
+                ))),
+            },
+        }
+    }
+
+    if ArtifactRef::from_sentinel(value).is_some() {
+        return one(value, backend, max_each, budget).await;
+    }
+    if let Some(obj) = value.as_object() {
+        let mut out = serde_json::Map::with_capacity(obj.len());
+        for (k, v) in obj {
+            out.insert(k.clone(), one(v, backend, max_each, budget).await?);
+        }
+        return Ok(Value::Object(out));
+    }
+    if let Some(arr) = value.as_array() {
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            out.push(one(v, backend, max_each, budget).await?);
+        }
+        return Ok(Value::Array(out));
+    }
+    Ok(value.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

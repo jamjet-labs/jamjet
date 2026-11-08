@@ -271,7 +271,11 @@ async fn main() -> anyhow::Result<()> {
         warn!("Second shutdown signal: exiting now");
         std::process::exit(1);
     });
-    let mut http_stop = signalled.clone();
+    // The HTTP server stops on its own signal, sent after the workers have
+    // drained: external workers heartbeat and complete their items through
+    // it, and with the listener closed at the first signal their leases
+    // lapsed during the drain and the work ran again.
+    let (http_stop_tx, mut http_stop) = tokio::sync::watch::channel(false);
     let mut server = tokio::spawn(async move {
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
@@ -280,15 +284,16 @@ async fn main() -> anyhow::Result<()> {
             .await
     });
     let mut signal = signalled.clone();
-    tokio::select! {
-        // The server ended on its own: nothing to drain for.
-        res = &mut server => return Ok(res??),
-        _ = signal.wait_for(|s| *s) => {}
-    }
+    // `biased`: the signal is polled first, and either way the drain below
+    // runs. A server that ended on its own still leaves workers to drain.
+    let ended = tokio::select! {
+        biased;
+        _ = signal.wait_for(|s| *s) => None,
+        res = &mut server => Some(res),
+    };
 
-    // Stop the scheduler and the workers first, alongside the HTTP drain:
-    // the workers must stop claiming at once, and an open connection (an
-    // MCP SSE stream never ends) must not hold the drain back.
+    // Stop the scheduler and the workers. An open connection (an MCP SSE
+    // stream never ends) must not hold the drain back.
     info!(
         grace_secs = shutdown_grace.as_secs(),
         "Shutting down: finishing in-flight work"
@@ -300,27 +305,31 @@ async fn main() -> anyhow::Result<()> {
             "Grace period over with workers still running; their items are reclaimed when the lease expires"
         );
     }
-    let _ = tokio::time::timeout(Duration::from_secs(5), scheduler_handle).await;
-    match tokio::time::timeout(HTTP_DRAIN, &mut server).await {
-        Ok(res) => res??,
-        Err(_) => {
-            warn!("HTTP connections still open after the drain; closing them");
-            server.abort();
+    let _ = tokio::time::timeout(jamjet_worker::shutdown::SCHEDULER_STOP, scheduler_handle).await;
+    match ended {
+        Some(res) => res??,
+        None => {
+            let _ = http_stop_tx.send(true);
+            match tokio::time::timeout(jamjet_worker::shutdown::HTTP_DRAIN, &mut server).await {
+                Ok(res) => res??,
+                Err(_) => {
+                    warn!("HTTP connections still open after the drain; closing them");
+                    server.abort();
+                }
+            }
         }
     }
     info!("Shutting down");
     Ok(())
 }
 
-/// How long shutdown waits for open HTTP connections once the workers are
-/// drained.
-const HTTP_DRAIN: Duration = Duration::from_secs(5);
-
 /// How long shutdown waits for in-flight work: `JAMJET_SHUTDOWN_GRACE_SECS`,
-/// default 30. An invalid value fails startup.
+/// default [`jamjet_worker::shutdown::DEFAULT_SHUTDOWN_GRACE`] (20 s; with
+/// the scheduler and HTTP drains a shutdown takes at most 25 s). An invalid
+/// value fails startup.
 fn shutdown_grace_from_env() -> anyhow::Result<Duration> {
     match std::env::var("JAMJET_SHUTDOWN_GRACE_SECS") {
-        Err(std::env::VarError::NotPresent) => Ok(Duration::from_secs(30)),
+        Err(std::env::VarError::NotPresent) => Ok(jamjet_worker::shutdown::DEFAULT_SHUTDOWN_GRACE),
         Err(e) => anyhow::bail!("failed to read JAMJET_SHUTDOWN_GRACE_SECS: {e}"),
         Ok(raw) => raw
             .trim()

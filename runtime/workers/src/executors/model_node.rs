@@ -128,7 +128,27 @@ impl NodeExecutor for ModelNodeExecutor {
             .with_tools(tools);
         // Intercept RateLimited before erasing the type. ONLY RateLimited becomes
         // ExecutorError::RateLimited; every other ModelError variant becomes Fatal.
-        let response = match self.registry.chat(request).await {
+        // `models.<name>.timeout_secs` from the IR, which the scheduler
+        // writes into the payload. It used to be read nowhere.
+        let request_timeout = item
+            .payload
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .filter(|t| *t > 0)
+            .map(std::time::Duration::from_secs);
+        let called = match request_timeout {
+            None => self.registry.chat(request).await,
+            Some(limit) => match tokio::time::timeout(limit, self.registry.chat(request)).await {
+                Ok(r) => r,
+                Err(_) => {
+                    return Err(ExecutorError::Fatal(format!(
+                        "Model call failed: no answer within the model's timeout_secs ({}s)",
+                        limit.as_secs()
+                    )))
+                }
+            },
+        };
+        let response = match called {
             Ok(r) => r,
             Err(ModelError::RateLimited { retry_after_secs }) => {
                 return Err(ExecutorError::RateLimited { retry_after_secs });
@@ -373,6 +393,58 @@ mod tests {
                 .with_default("fake"),
         );
         ModelNodeExecutor::new(registry)
+    }
+
+    /// Never answers.
+    struct HangingAdapter;
+
+    #[async_trait::async_trait]
+    impl ModelAdapter for HangingAdapter {
+        fn system_name(&self) -> &'static str {
+            "hanging"
+        }
+        fn default_model(&self) -> &str {
+            "fake-model"
+        }
+        async fn chat(&self, _req: ModelRequest) -> Result<ModelResponse, ModelError> {
+            std::future::pending().await
+        }
+        async fn structured_output(
+            &self,
+            _req: StructuredRequest,
+        ) -> Result<ModelResponse, ModelError> {
+            std::future::pending().await
+        }
+    }
+
+    /// `models.<name>.timeout_secs` bounds the model request. It was read
+    /// nowhere, so a model that never answered held the node for its whole
+    /// node timeout (or forever, with none).
+    #[tokio::test(start_paused = true)]
+    async fn the_model_timeout_bounds_the_request() {
+        let registry = Arc::new(
+            ModelRegistry::new()
+                .register(Arc::new(HangingAdapter))
+                .with_default("hanging"),
+        );
+        let executor = ModelNodeExecutor::new(registry);
+        let mut item = make_item();
+        item.payload["timeout_secs"] = serde_json::json!(5);
+        let started = tokio::time::Instant::now();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(60), executor.execute(&item))
+                .await
+                .expect("the request was not bounded by timeout_secs");
+        assert!(
+            matches!(&result, Err(ExecutorError::Fatal(m)) if m.contains("timeout_secs")),
+            "{result:?}"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_secs(5)
+                && waited < std::time::Duration::from_secs(6),
+            "{waited:?}"
+        );
     }
 
     /// ONLY ModelError::RateLimited maps to ExecutorError::RateLimited, with the

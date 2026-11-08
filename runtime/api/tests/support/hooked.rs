@@ -24,6 +24,8 @@ pub enum Write {
     /// A conditional append is about to run (reported BEFORE it): where a
     /// lock wait or a stall delays the append past the caller's own checks.
     BeforeAppendEventIf(ExecutionId),
+    /// An artifact's bytes were read (after the read).
+    GetArtifact(String),
 }
 
 #[async_trait::async_trait]
@@ -285,7 +287,13 @@ impl StateBackend for HookedBackend {
         &self,
         hash: &str,
     ) -> jamjet_state::backend::BackendResult<Option<Vec<u8>>> {
-        self.inner.get_artifact(hash).await
+        let bytes = self.inner.get_artifact(hash).await?;
+        self.hook.after(Write::GetArtifact(hash.to_string())).await;
+        Ok(bytes)
+    }
+
+    async fn artifact_size(&self, hash: &str) -> jamjet_state::backend::BackendResult<Option<u64>> {
+        self.inner.artifact_size(hash).await
     }
 
     async fn enqueue_work_item(

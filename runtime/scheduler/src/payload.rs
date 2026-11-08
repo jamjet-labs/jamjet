@@ -93,6 +93,11 @@ pub fn build_work_item_payload(
                 if let Some(mt) = cfg.max_tokens {
                     obj.insert("max_tokens".into(), json!(mt));
                 }
+                // The model's own request timeout; the node's timeout still
+                // bounds the whole step. Zero means none, as for nodes.
+                if let Some(t) = cfg.timeout_secs.filter(|t| *t > 0) {
+                    obj.insert("timeout_secs".into(), json!(t));
+                }
             }
             if let Some(sp) = system_prompt {
                 obj.insert("system_prompt".into(), Value::String(sp.clone()));
@@ -277,6 +282,18 @@ mod tests {
         assert_eq!(p["system_prompt"], "be brief");
         assert_eq!(p["tools"][0]["name"], "t");
         assert_eq!(p["messages"][0]["content"], "hi");
+    }
+
+    /// The model's `timeout_secs` reaches the executor; zero is no timeout.
+    #[test]
+    fn model_carries_its_timeout() {
+        let mut ir = ir_with(model_node(""));
+        ir.models.get_mut("m").unwrap().timeout_secs = Some(45);
+        let p = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
+        assert_eq!(p["timeout_secs"], 45);
+        ir.models.get_mut("m").unwrap().timeout_secs = Some(0);
+        let p = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
+        assert!(p.get("timeout_secs").is_none(), "{p}");
     }
 
     fn model_node(prompt_ref: &str) -> Value {

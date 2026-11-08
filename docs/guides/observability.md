@@ -55,12 +55,14 @@ it holds. The runtime has no worker registry, so an idle worker is not listed.
 
 The table shows types only. The full events, with errors, policy decisions and
 approval details, come from `GET /executions/:id/events`. It returns at most
-10000 events per call; when a page is full, `next_after` in the response is the
-`after` to pass for the next page (`?after=<sequence>&limit=<n>`), and `null`
-otherwise. A node output larger than 256 KiB stays a
+10000 events, or 8 MiB of events as stored, per call; when a page is full or
+cut short, `next_after` in the response is the `after` to pass for the next
+page (`?after=<sequence>&limit=<n>`), and `null` otherwise. The MCP tool
+`jamjet_get_events` pages the same way. A node output larger than 256 KiB stays a
 `{"$artifact": {"hash", "size", ...}}` reference, fetched with
 `GET /artifacts/:hash`, and so do the rest of a page's outputs once it has
-inlined 16 MiB. `?inline_artifacts=all` lifts the 256 KiB limit (the page limit
+inlined 16 MiB. The limits count the stored bytes, not the size a reference
+claims. `?inline_artifacts=all` lifts the 256 KiB limit (the page limit
 is then 64 MiB) and `none` inlines nothing. The CLI and the Python client follow
 the pages for you. `GET /executions` returns at most 200 runs per call
 (`limit`, `offset`). `GET /workers` lists at most 1000 held items.

@@ -420,6 +420,14 @@ pub trait StateBackend: Send + Sync {
     /// artifact does not exist for this tenant.
     async fn get_artifact(&self, hash: &str) -> BackendResult<Option<Vec<u8>>>;
 
+    /// The stored size of an artifact, in bytes, without reading it: what a
+    /// caller with a byte budget checks before fetching. `None` if it does not
+    /// exist. The default reads the bytes; the SQL backends read the size the
+    /// engine recorded when it stored them.
+    async fn artifact_size(&self, hash: &str) -> BackendResult<Option<u64>> {
+        Ok(self.get_artifact(hash).await?.map(|b| b.len() as u64))
+    }
+
     // ── Queue (simple Postgres/SQLite backed queue in v1) ────────────────
 
     /// Enqueue a work item for execution.

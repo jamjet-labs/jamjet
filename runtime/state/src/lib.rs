@@ -21,8 +21,8 @@ pub mod tenant;
 pub mod tenant_scoped;
 
 pub use artifact::{
-    artifact_threshold, resolve_value, resolve_value_within, spill_bytes, ArtifactRef,
-    ARTIFACT_SENTINEL_KEY, DEFAULT_SPILL_THRESHOLD,
+    artifact_threshold, resolve_value, resolve_value_budgeted, resolve_value_within, spill_bytes,
+    ArtifactRef, ARTIFACT_SENTINEL_KEY, DEFAULT_SPILL_THRESHOLD,
 };
 pub use backend::{
     granted_lease_secs, ApiToken, ApprovalProjectionRow, BackendResult, ClaimedWorkItem,

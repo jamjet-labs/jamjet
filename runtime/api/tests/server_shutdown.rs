@@ -150,3 +150,116 @@ fn an_open_sse_stream_does_not_hold_shutdown() {
     assert!(status.success(), "{status:?}\n{}", server.log);
     assert!(server.log.contains("Shutting down"), "{}", server.log);
 }
+
+/// A model sidecar that answers `/health` and takes `/v1/complete` without
+/// ever answering, so a model turn stays in flight. Says on `called` when the
+/// first completion arrives.
+fn hanging_sidecar() -> (String, mpsc::Receiver<()>) {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (tx, called) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        for conn in listener.incoming().map_while(Result::ok) {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut conn = conn;
+                let mut buf = [0u8; 4096];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                if head.starts_with("GET /health") {
+                    let body = r#"{"ok":true}"#;
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                } else {
+                    let _ = tx.send(());
+                    std::thread::sleep(Duration::from_secs(120));
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), called)
+}
+
+fn http(addr: &str, request: &str) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut conn = std::net::TcpStream::connect(addr)?;
+    conn.set_read_timeout(Some(Duration::from_secs(5)))?;
+    conn.write_all(request.as_bytes())?;
+    let mut out = String::new();
+    conn.read_to_string(&mut out)?;
+    Ok(out)
+}
+
+fn post_json(addr: &str, path: &str, body: &str) -> String {
+    http(
+        addr,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .unwrap()
+}
+
+/// While the in-process workers drain, the server still answers: external
+/// workers heartbeat and complete through it. The listener used to close at
+/// the signal, so their leases lapsed during the drain and the work ran
+/// again.
+#[test]
+fn the_server_answers_while_the_workers_drain() {
+    let (seam, called) = hanging_sidecar();
+    let mut server = Server::start(&[
+        ("JAMJET_DEV_MODE", "1"),
+        ("JAMJET_MODEL_SEAM_URL", &seam),
+        ("JAMJET_SHUTDOWN_GRACE_SECS", "3"),
+    ]);
+    let addr = server.addr();
+    let ir = serde_json::json!({
+        "workflow_id": "drain-wf", "version": "0.1.0", "name": null, "description": null,
+        "state_schema": "", "start_node": "talk",
+        "nodes": { "talk": { "id": "talk", "kind": {
+            "type": "model", "model_ref": "anthropic/claude-sonnet-4-6",
+            "prompt_ref": "hello", "output_schema": ""
+        }, "retry_policy": null, "node_timeout_secs": null, "description": null, "labels": {} } },
+        "edges": [ { "from": "talk", "to": "end", "condition": null } ],
+        "retry_policies": {}, "timeouts": {}, "models": {}, "tools": {},
+        "mcp_servers": {}, "remote_agents": {}, "labels": {}
+    });
+    let reg = post_json(
+        &addr,
+        "/workflows",
+        &serde_json::json!({ "ir": ir }).to_string(),
+    );
+    assert!(reg.starts_with("HTTP/1.1 2"), "{reg}");
+    let run = post_json(
+        &addr,
+        "/executions",
+        r#"{"workflow_id":"drain-wf","workflow_version":"0.1.0","input":{}}"#,
+    );
+    assert!(run.starts_with("HTTP/1.1 2"), "{run}");
+    called
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| panic!("the model turn never started: {}", server.log));
+
+    // One second after the SIGTERM `terminate` sends: inside the 3 s grace,
+    // with the model turn still in flight.
+    let probe_addr = addr.clone();
+    let probe = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1000));
+        http(
+            &probe_addr,
+            "GET /health HTTP/1.1\r\nHost: localhost\r\nconnection: close\r\n\r\n",
+        )
+    });
+    let status = server
+        .terminate(Duration::from_secs(30))
+        .unwrap_or_else(|| panic!("still running: {}", server.log));
+    let during = probe.join().unwrap();
+    let during = during.unwrap_or_else(|e| panic!("refused during the drain: {e}\n{}", server.log));
+    assert!(during.starts_with("HTTP/1.1 200"), "{during}");
+    assert!(status.success(), "{status:?}\n{}", server.log);
+}
