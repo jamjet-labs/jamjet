@@ -701,29 +701,48 @@ async fn a_negative_cost_is_refused() {
 
 // ── time_budget_secs ────────────────────────────────────────────────────────
 
+/// The guard reads the wall clock (`Utc::now()` against the first step's
+/// `created_at`), so this test sleeps for real. The sleeps are chosen so the
+/// outcome does not depend on how fast the machine is:
+///
+/// - The third step is refused however slow the machine is: it is checked
+///   at least `INSIDE + PAST` = `BUDGET` after the first step was recorded,
+///   and a sleep never returns early.
+/// - The second step is admitted unless the steps around the first sleep
+///   take longer than `BUDGET - INSIDE` (2 s) between them. With a 1 s budget
+///   and 600 ms sleeps that slack was 400 ms, which a loaded CI runner used
+///   up.
+/// - The third step is only `PAST` after the second, less than the budget,
+///   so a guard timing from the latest step would let it run. If a slow
+///   machine stretched that gap past the budget, the test still passes; it
+///   just stops telling the two apart for that run.
 #[tokio::test]
 async fn the_time_budget_runs_from_the_first_step() {
+    const BUDGET: u64 = 3;
+    const INSIDE: std::time::Duration = std::time::Duration::from_secs(1);
+    const PAST: std::time::Duration = std::time::Duration::from_secs(2);
+    assert_eq!((INSIDE + PAST).as_secs(), BUDGET);
     for (ctx, tb, t, wf) in each().await {
         let mut run = start(
             &tb,
-            &[card(json!({ "time_budget_secs": 1 }))],
+            &[card(json!({ "time_budget_secs": BUDGET }))],
             ir(&wf, mcp_tool(), Some(AGENT), None, None),
             json!({}),
         )
         .await;
         assert!(run.step(t, DONE).await, "{ctx}");
-        // The clock runs from the FIRST step, not the latest: 600 ms after
-        // the first step is inside the budget, 600 ms after that is not,
-        // though it is only 600 ms after the step before it.
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        // The clock runs from the FIRST step, not the latest: 1 s after the
+        // first step is inside the budget, 2 s after that is not, though it
+        // is only 2 s after the step before it.
+        tokio::time::sleep(INSIDE).await;
         assert!(run.step(t, DONE).await, "{ctx}: inside the budget");
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        tokio::time::sleep(PAST).await;
         let ran = run.step(t, DONE).await;
         assert!(!ran, "{ctx}: ran past the time budget");
         let limits = run.limits().await;
         assert_eq!(limits.len(), 1, "{ctx}: {limits:?}");
         assert_eq!(limits[0].0, "time_budget", "{ctx}");
-        assert_eq!(limits[0].1, json!(1), "{ctx}");
+        assert_eq!(limits[0].1, json!(BUDGET), "{ctx}");
         assert!(run.failed_for_good().await.is_some(), "{ctx}");
     }
 }

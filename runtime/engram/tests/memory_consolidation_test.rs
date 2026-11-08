@@ -2,7 +2,6 @@ use engram::consolidation::{ConsolidationConfig, ConsolidationOp};
 use engram::embedding::MockEmbeddingProvider;
 use engram::memory::Memory;
 use engram::scope::Scope;
-use engram::store::FactStore;
 
 fn user_scope() -> Scope {
     Scope::user("default", "u1")

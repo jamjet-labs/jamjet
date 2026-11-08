@@ -76,7 +76,7 @@ impl ProtocolRegistry {
             .iter()
             .filter(|(prefix, _)| url.starts_with(prefix.as_str()))
             .collect();
-        candidates.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        candidates.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
         if let Some((prefix, proto)) = candidates.first() {
             debug!(url = %url, prefix = %prefix, protocol = %proto, "URL matched protocol adapter");

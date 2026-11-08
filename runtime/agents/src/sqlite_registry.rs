@@ -234,16 +234,9 @@ mod tests {
     use crate::card::{AgentCapabilities, AuthSpec, AutonomyLevel};
 
     async fn open_test_registry() -> SqliteAgentRegistry {
-        // Use the state migration to create the agents table.
-        let backend = jamjet_state::SqliteBackend::open("sqlite::memory:")
-            .await
-            .expect("failed to open in-memory db");
-        // Re-use the pool from SqliteBackend by connecting to the same in-memory URL.
-        // In-memory SQLite is connection-scoped, so we need a fresh connection here
-        // that shares the schema from migrations.
-        // For tests, connect to a named in-memory DB.
+        // The state migrations create the agents table; run them on this
+        // pool's own in-memory database.
         let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
-        // Run migrations manually.
         sqlx::migrate!("../state/migrations")
             .run(&pool)
             .await
