@@ -31,10 +31,12 @@ an expiry means nobody approved, and that fallback would publish anyway.
   (`__budget`, `__approvals`). The pending listing shows that state, and the
   request's context carries the node's `description`. It is listed by
   `GET /executions/:id/approvals` and `jamjet approvals`. A state over 16 KiB
-  is shown bounded: every key is listed, and a value too large to show is
-  replaced by its size and its first characters
-  (`{"preview_truncated": true, "bytes": ..., "head": ...}`). The digest
-  still covers all of it.
+  is shown bounded: its key structure is kept, nested objects included, and
+  only a value too large to show is replaced by its size and its first
+  characters (`{"preview_truncated": true, "bytes": ..., "head": ...}`). In a
+  state with so many keys that not all fit, an object whose keys were cut
+  says how many (`{"preview_truncated": true, "keys": ..., "keys_omitted":
+  ..., "shown": {...}}`). The digest still covers all of it.
 - The check runs when the approved node is dispatched again, not when it
   completes. If the run's state changed in between (a parallel branch
   wrote), the approval no longer covers it: the node asks again, showing

@@ -539,7 +539,8 @@ impl Scheduler {
             // Collect the nodes that become skippable in this pass against the
             // current progress, then emit + fold them. A node is skippable iff
             // it is not already resolved, has >= 1 in-edge, and ALL its in-edges
-            // are dead. (Roots — no in-edges — are never skipped here.)
+            // are dead, or it has no in-edge and is not the start node. (The
+            // start node, the one root, is never skipped here.)
             let mut newly_skippable: Vec<(NodeId, &str)> = Vec::new();
             for node_id in ir.nodes.keys() {
                 let n = node_id.as_str();
@@ -576,6 +577,15 @@ impl Scheduler {
                 }
                 if has_in_edge && all_dead {
                     newly_skippable.push((node_id.clone(), "branch not taken"));
+                } else if !has_in_edge && n != ir.start_node {
+                    // Only the start node is a root (see `is_runnable`). A node
+                    // nothing leads into, in a version stored before
+                    // registration refused one, never runs: it is skipped, so
+                    // the run shows it and its exclusive tail is skipped too.
+                    newly_skippable.push((
+                        node_id.clone(),
+                        "no incoming edge; only the start node runs without one",
+                    ));
                 }
             }
             if newly_skippable.is_empty() {
@@ -1212,8 +1222,16 @@ fn in_edge_sources<'a>(ir: &'a WorkflowIr, node_id: &str) -> Vec<&'a str> {
 ///
 /// A node runs iff it is not already completed/scheduled/skipped, it has at
 /// least one LIVE in-edge (an in-edge `src -> node` that is not [`edge_dead`]),
-/// and EVERY live in-edge's source has COMPLETED. A node with NO in-edges is a
-/// root — runnable until it has run (matches the original topology behaviour).
+/// and EVERY live in-edge's source has COMPLETED. The workflow's start node,
+/// when nothing leads into it, is the one root: runnable until it has run.
+///
+/// Any OTHER node with no in-edge is never runnable. Until 2026-11 every such
+/// node was a root and ran when the run started, whatever it was meant to
+/// follow: a condition's branch target the compiler drew no edge to ran
+/// before the approval upstream of the condition was decided. Registration
+/// refuses that shape now (`jamjet_ir::validate_entry_points`) and so does
+/// `start_run`; this covers a run of a stored version already in flight. The
+/// skip cascade records such a node as skipped.
 ///
 /// A node whose every in-edge is dead is NOT runnable here (it is a skip
 /// candidate the cascade marks `NodeSkipped`); a node reachable via any live
@@ -1251,11 +1269,11 @@ fn is_runnable(
             }
         }
     }
-    // A node with no in-edges is a root — runnable (subject to the already-run
-    // guards above). A node with in-edges runs iff it has a live in-edge AND
-    // every live in-edge's source has completed.
+    // Only the start node is a root: runnable (subject to the already-run
+    // guards above) with no in-edge. A node with in-edges runs iff it has a
+    // live in-edge AND every live in-edge's source has completed.
     if !has_in_edge {
-        return true;
+        return node_id == ir.start_node;
     }
     has_live_edge && all_live_sources_done
 }
@@ -3108,6 +3126,62 @@ mod tests {
             WorkflowStatus::Completed,
             "the run must still terminate when no branch matched (no hang)"
         );
+    }
+
+    /// Only the start node runs without an in-edge (review of #178, probe Y2).
+    /// In a version stored before registration refused the shape, `route`'s
+    /// branch target `pay` had no edge from `route`, so it was a root and ran
+    /// when the run started, before the step upstream of `route` finished. It
+    /// is skipped now, with its exclusive tail, and the run completes.
+    #[tokio::test]
+    async fn only_the_start_node_runs_without_an_in_edge() {
+        let ir = build_ir(
+            "review",
+            serde_json::json!({
+                "review": cond_node("review", serde_json::json!([])),
+                "route": cond_node("route", serde_json::json!([
+                    {"condition": "state.ok == true", "target": "pay"},
+                    {"condition": null, "target": "end"}
+                ])),
+                "pay": cond_node("pay", serde_json::json!([])),
+                "after_pay": cond_node("after_pay", serde_json::json!([]))
+            }),
+            serde_json::json!([
+                {"from": "review", "to": "route", "condition": null},
+                {"from": "route", "to": "end", "condition": null},
+                {"from": "pay", "to": "after_pay", "condition": null},
+                {"from": "after_pay", "to": "end", "condition": null}
+            ]),
+        );
+        let (s, b, e) = setup(ir).await;
+
+        tick(&s, &e).await;
+        let evs = b.get_events(&e).await.unwrap();
+        assert_eq!(
+            scheduled_nodes(&evs),
+            vec!["review".to_string()],
+            "only the start node runs when the run starts"
+        );
+        let mut skipped = skipped_nodes(&evs);
+        skipped.sort();
+        assert_eq!(skipped, vec!["after_pay".to_string(), "pay".to_string()]);
+
+        append(&b, &e, node_completed("review", serde_json::json!({}))).await;
+        tick(&s, &e).await;
+        append(
+            &b,
+            &e,
+            condition_completed("route", Some("pay"), &["pay", "end"]),
+        )
+        .await;
+        tick(&s, &e).await;
+        let evs = b.get_events(&e).await.unwrap();
+        assert_eq!(
+            scheduled_nodes(&evs),
+            vec!["review".to_string(), "route".to_string()],
+            "a node nothing leads into never runs, even when a branch names it"
+        );
+        assert_eq!(status(&b, &e).await, WorkflowStatus::Completed);
     }
 
     // ── FDL-4: determinism / replay of the route + skip set ─────────────────────

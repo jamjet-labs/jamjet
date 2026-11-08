@@ -130,7 +130,11 @@ fallback counts as one), and every node must be reachable from `start`.
 `POST /workflows` refuses a workflow that breaks either rule, naming the
 nodes: a node with no incoming edge would run when the run starts, before
 whatever it was meant to follow, and an unreachable one would never run. A
-condition's branch targets need edges from the condition too.
+condition's branch targets need edges from the condition too. It also
+refuses an edge to a node that does not exist. A version stored before
+these checks is not started (`POST /executions` answers 409, naming the
+nodes), and in a run of one already under way a node with no incoming edge
+other than `start` is skipped, never run.
 
 ---
 

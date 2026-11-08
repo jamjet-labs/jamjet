@@ -72,11 +72,14 @@ pub enum IrError {
     #[error("{0}")]
     UnreachableNodes(String),
 
-    #[error("{0} must not contain control characters")]
+    #[error("{0} must not contain control characters or invisible format characters")]
     ControlCharacter(String),
 
     #[error("workflow has no start node defined")]
     NoStartNode,
+
+    #[error("start node '{0}' does not exist")]
+    MissingStartNode(String),
 
     #[error("workflow has no terminal (end) path from node '{0}'")]
     NoTerminalPath(String),

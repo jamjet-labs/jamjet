@@ -283,10 +283,12 @@ async fn the_initiator_cannot_complete_a_gated_node_through_the_worker_protocol(
 async fn a_developer_cannot_enqueue_a_work_item() {
     let env = env().await;
     let (id, eid) = start(&env, approval_policy()).await;
+    // The gate's own queue: `POST /work-items` refuses a node on a queue its
+    // kind is not dispatched to, whoever asks.
     let body = json!({
         "execution_id": id,
         "node_id": "gate",
-        "queue_type": "attacker_q",
+        "queue_type": "tool",
         "payload": { "workflow_id": "wf-gate", "workflow_version": "0.1.0" },
     });
     let before = events(&env, &eid).await.len();
@@ -387,7 +389,7 @@ async fn an_external_claim_of_a_gated_node_is_held_until_approved() {
         json!({
             "execution_id": id,
             "node_id": "gate",
-            "queue_type": "attacker_q",
+            "queue_type": "tool",
             "payload": { "workflow_id": "wf-gate", "workflow_version": "0.1.0" },
         }),
     )

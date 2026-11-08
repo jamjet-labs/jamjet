@@ -1063,11 +1063,13 @@ pub(crate) fn node_definition(node_def: &NodeDef) -> Result<String, String> {
 /// (id, kind with its module, function or tool, description and own policy).
 ///
 /// A payload over [`ACTION_BASIS_STATE_CAP`] serialized bytes is shown
-/// bounded, never dropped: every key is kept, each top-level key of its
-/// `input` (or `state`) too, and a value too large to show is replaced by
-/// its size and the start of its text. Until 2026-11 an over-cap payload was
-/// shown as `null`, so a large state could hide the one key that mattered
-/// while the digest bound all of it.
+/// bounded, never dropped: its key structure is kept, nested objects
+/// included ([`bounded_preview`]), and only leaf values too large to show are
+/// replaced by their size and the start of their text. Until 2026-11 an
+/// over-cap payload was shown as `null`, so a large state could hide the one
+/// key that mattered while the digest bound all of it; then for a while only
+/// the top-level keys of its state were kept, so a key nested next to a large
+/// value (`order.payee` beside `order.memo`) was still hidden.
 pub(crate) fn basis_preview(payload: &Value, step: u64, node_def: &NodeDef) -> Value {
     let payload_bytes = serde_json::to_string(payload).map(|s| s.len()).unwrap_or(0);
     let truncated = payload_bytes > ACTION_BASIS_STATE_CAP;
@@ -1089,32 +1091,136 @@ pub(crate) fn basis_preview(payload: &Value, step: u64, node_def: &NodeDef) -> V
 const PREVIEW_VALUE_MAX: usize = 1024;
 /// The shortest it shows, however many keys there are.
 const PREVIEW_VALUE_MIN: usize = 64;
+/// How deep [`bounded_preview`] follows nested containers. One deeper is
+/// shown like a leaf: whole if it fits, else its size and the start of its
+/// JSON.
+const PREVIEW_MAX_DEPTH: usize = 8;
+/// What [`bounded_preview`] spends on key paths: each shown key costs its
+/// name plus [`PREVIEW_KEY_RESERVE`]. Shallow keys are spent first.
+const PREVIEW_KEY_BUDGET: usize = 4 * ACTION_BASIS_STATE_CAP;
+/// What one shown key reserves besides its name: the shortest value shown
+/// and the JSON around it.
+const PREVIEW_KEY_RESERVE: usize = PREVIEW_VALUE_MIN + 64;
 
-/// An over-cap payload, with every key and every top-level key of its state
-/// (`input` or `state`) kept, and each value shown whole or, if too large,
+/// A value [`bounded_preview`] walks into: an object, or an array holding an
+/// object or an array. An array of plain values is a leaf.
+fn is_container(value: &Value) -> bool {
+    match value {
+        Value::Object(_) => true,
+        Value::Array(items) => items.iter().any(|i| i.is_object() || i.is_array()),
+        _ => false,
+    }
+}
+
+/// A container's entries as (cost of the key's name, value).
+fn entries(value: &Value) -> Vec<(usize, &Value)> {
+    match value {
+        Value::Object(map) => map.iter().map(|(k, v)| (k.len(), v)).collect(),
+        Value::Array(items) => items.iter().map(|v| (0, v)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// An over-cap payload with its key structure kept: every key path is shown,
+/// nested objects (and arrays holding objects) to [`PREVIEW_MAX_DEPTH`]
+/// levels, and only leaf values are cut, each shown whole or, if too large,
 /// as `{"preview_truncated": true, "bytes": <n>, "head": "<start>"}`.
+///
+/// Bounded: key paths are taken breadth first, shallow before deep, until
+/// [`PREVIEW_KEY_BUDGET`] is spent, and the leaves share
+/// [`ACTION_BASIS_STATE_CAP`] (each between [`PREVIEW_VALUE_MIN`] and
+/// [`PREVIEW_VALUE_MAX`] bytes). Should the budget run out, a container whose
+/// keys were not all shown says so, never silently: it is shown as
+/// `{"preview_truncated": true, "keys": <n>, "keys_omitted": <m>, "shown":
+/// {...}}` (`items` and `items_omitted` for an array).
 fn bounded_preview(payload: &Value) -> Value {
-    let Some(obj) = payload.as_object() else {
-        return fit(payload, ACTION_BASIS_STATE_CAP);
+    // Pass 1, breadth first: how many entries of each container are shown.
+    // Containers are identified by address; they all live in `payload`.
+    let mut shown: std::collections::HashMap<*const Value, usize> =
+        std::collections::HashMap::new();
+    let mut budget = PREVIEW_KEY_BUDGET;
+    let mut spent = false;
+    let mut leaves = 0usize;
+    let mut level: Vec<&Value> = if is_container(payload) {
+        vec![payload]
+    } else {
+        Vec::new()
     };
-    obj.iter()
-        .map(|(key, value)| {
-            let shown = match (key.as_str(), value) {
-                ("input" | "state", Value::Object(state)) => {
-                    let per_key = (ACTION_BASIS_STATE_CAP / state.len().max(1))
-                        .clamp(PREVIEW_VALUE_MIN, PREVIEW_VALUE_MAX);
-                    Value::Object(
-                        state
-                            .iter()
-                            .map(|(k, v)| (k.clone(), fit(v, per_key)))
-                            .collect(),
-                    )
+    let mut depth = 0;
+    while !level.is_empty() {
+        let mut next = Vec::new();
+        for container in level {
+            let mut n = 0;
+            for (name, child) in entries(container) {
+                let cost = name + PREVIEW_KEY_RESERVE;
+                if spent || cost > budget {
+                    spent = true;
+                    break;
                 }
-                _ => fit(value, PREVIEW_VALUE_MAX),
-            };
-            (key.clone(), shown)
-        })
-        .collect()
+                budget -= cost;
+                n += 1;
+                if depth + 1 < PREVIEW_MAX_DEPTH && is_container(child) {
+                    next.push(child);
+                } else {
+                    leaves += 1;
+                }
+            }
+            shown.insert(container as *const Value, n);
+        }
+        level = next;
+        depth += 1;
+    }
+    // Pass 2: build it, the leaves sharing the cap.
+    let per_leaf =
+        (ACTION_BASIS_STATE_CAP / leaves.max(1)).clamp(PREVIEW_VALUE_MIN, PREVIEW_VALUE_MAX);
+    build_preview(payload, &shown, per_leaf)
+}
+
+fn build_preview(
+    value: &Value,
+    shown: &std::collections::HashMap<*const Value, usize>,
+    per_leaf: usize,
+) -> Value {
+    let Some(&n) = shown.get(&(value as *const Value)) else {
+        return fit(value, per_leaf);
+    };
+    match value {
+        Value::Object(map) => {
+            let out: serde_json::Map<String, Value> = map
+                .iter()
+                .take(n)
+                .map(|(k, v)| (k.clone(), build_preview(v, shown, per_leaf)))
+                .collect();
+            if n == map.len() {
+                Value::Object(out)
+            } else {
+                serde_json::json!({
+                    "preview_truncated": true,
+                    "keys": map.len(),
+                    "keys_omitted": map.len() - n,
+                    "shown": out,
+                })
+            }
+        }
+        Value::Array(items) => {
+            let out: Vec<Value> = items
+                .iter()
+                .take(n)
+                .map(|v| build_preview(v, shown, per_leaf))
+                .collect();
+            if n == items.len() {
+                Value::Array(out)
+            } else {
+                serde_json::json!({
+                    "preview_truncated": true,
+                    "items": items.len(),
+                    "items_omitted": items.len() - n,
+                    "shown": out,
+                })
+            }
+        }
+        _ => fit(value, per_leaf),
+    }
 }
 
 /// `value` itself when its JSON is at most `budget` bytes, otherwise its size
@@ -1170,6 +1276,93 @@ mod tests {
         assert!(
             serde_json::to_string(&basis).unwrap().len() < 4 * ACTION_BASIS_STATE_CAP,
             "the preview stays bounded"
+        );
+    }
+
+    fn review_node() -> NodeDef {
+        serde_json::from_value(json!({ "id": "review", "kind": {
+            "type": "human_approval", "description": "", "timeout_secs": null, "fallback_node": null
+        }}))
+        .unwrap()
+    }
+
+    /// Above the cap a key nested beside a large value is still shown (review
+    /// of #178, probe H: `order.memo` of 5 KB hid `order.payee`), in an object
+    /// and in an array of objects; only the large leaves are cut.
+    #[test]
+    fn an_over_cap_payload_keeps_nested_key_paths() {
+        let payload = json!({
+            "workflow_id": "wf", "node_id": "review",
+            "input": {
+                "notes": "x".repeat(20_000),
+                "zz_payee": "attacker",
+                "order": { "memo": "y".repeat(5000), "payee": "attacker2", "lines": [1, 2, 3] },
+                "items": [ { "memo": "z".repeat(5000), "payee": "attacker3" } ],
+                "deep": { "a": { "b": { "c": { "d": { "e": { "f": { "g": { "h": { "i": "end" } } } } } } } } }
+            }
+        });
+        let basis = basis_preview(&payload, 0, &review_node());
+        assert_eq!(basis["payload_truncated"], true);
+        let input = &basis["payload"]["input"];
+        assert_eq!(input["zz_payee"], "attacker", "{basis}");
+        assert_eq!(input["order"]["payee"], "attacker2", "{basis}");
+        assert_eq!(input["order"]["lines"], json!([1, 2, 3]));
+        assert_eq!(input["order"]["memo"]["preview_truncated"], true);
+        assert_eq!(input["order"]["memo"]["bytes"], 5002);
+        assert_eq!(input["items"][0]["payee"], "attacker3", "{basis}");
+        assert_eq!(input["items"][0]["memo"]["preview_truncated"], true);
+        assert_eq!(input["notes"]["preview_truncated"], true);
+        // Past the depth limit the rest is shown like a leaf: whole, as it fits.
+        assert!(
+            input["deep"].to_string().contains("end"),
+            "{}",
+            input["deep"]
+        );
+        assert!(serde_json::to_string(&basis).unwrap().len() < 4 * ACTION_BASIS_STATE_CAP);
+    }
+
+    /// However many keys, however long or deep, the preview stays bounded,
+    /// and keys it cannot show are counted, never dropped silently.
+    #[test]
+    fn an_over_cap_preview_stays_bounded_and_counts_what_it_omits() {
+        let bound = 6 * ACTION_BASIS_STATE_CAP;
+        let many: serde_json::Map<String, Value> = (0..50_000)
+            .map(|i| (format!("k{i:05}"), json!(i)))
+            .collect();
+        let long: serde_json::Map<String, Value> = (0..100)
+            .map(|i| (format!("{i:03}{}", "k".repeat(4000)), json!("v")))
+            .collect();
+        let mut deep = json!("leaf");
+        for _ in 0..500 {
+            deep = json!({ "n": deep, "pad": "p".repeat(100) });
+        }
+        let wide_deep: serde_json::Map<String, Value> = (0..2000)
+            .map(|i| (format!("o{i}"), json!({ "a": { "b": { "c": i } } })))
+            .collect();
+        for input in [
+            Value::Object(many),
+            Value::Object(long),
+            deep,
+            Value::Object(wide_deep),
+        ] {
+            let payload = json!({ "workflow_id": "wf", "node_id": "review", "input": input });
+            let basis = basis_preview(&payload, 0, &review_node());
+            let len = serde_json::to_string(&basis).unwrap().len();
+            assert!(len < bound, "preview of {len} bytes");
+            assert_eq!(basis["payload"]["workflow_id"], "wf");
+        }
+        let many: serde_json::Map<String, Value> = (0..50_000)
+            .map(|i| (format!("k{i:05}"), json!(i)))
+            .collect();
+        let basis = basis_preview(&json!({ "input": many }), 0, &review_node());
+        let input = &basis["payload"]["input"];
+        assert_eq!(input["preview_truncated"], true, "{input}");
+        assert_eq!(input["keys"], 50_000);
+        let omitted = input["keys_omitted"].as_u64().unwrap();
+        let shown = input["shown"].as_object().unwrap().len() as u64;
+        assert!(
+            omitted > 0 && shown + omitted == 50_000,
+            "{shown} + {omitted}"
         );
     }
 
