@@ -32,7 +32,7 @@ regex = "1"
 # Session::builder to take an Environment). The committed Cargo.lock does
 # not reach crates.io users of this crate, and a caret range would let
 # `cargo update` move to the newest rc.
-ort = { version = "=2.0.0-rc.13", optional = true }
+ort = { version = "=2.0.0-rc.15", optional = true }
 
 [features]
 default = []
