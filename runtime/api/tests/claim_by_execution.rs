@@ -1018,33 +1018,210 @@ async fn a_long_wait_is_cut_to_the_cap() {
 }
 
 /// One principal holds at most a few waiting claims; the next one answers at
-/// once.
-#[tokio::test(start_paused = true)]
+/// once. With its own token: the count is per process, and the other tests
+/// wait as `dev`.
+#[tokio::test]
 async fn waiting_claims_are_capped_per_principal() {
-    let state = make_state(Arc::new(InMemoryBackend::new()));
-    register(&state, None, ir("wf-many", Some("by_execution"), None)).await;
-    let e = start(&state, None, "wf-many").await;
-    let req = json!({ "execution_id": e, "node_id": "second", "wait_ms": 5000 });
+    let (url, path) = sqlite_url();
+    let sqlite = Arc::new(SqliteBackend::open(&url).await.unwrap());
+    let (token, _) = sqlite.create_token("waiter", "developer").await.unwrap();
+    let backend: Arc<dyn StateBackend> = sqlite;
+    let state = make_state(backend);
+    register(
+        &state,
+        Some(&token),
+        ir("wf-many", Some("by_execution"), None),
+    )
+    .await;
+    let e = start(&state, Some(&token), "wf-many").await;
+    let req = json!({ "execution_id": e, "node_id": "second", "wait_ms": 2000 });
     let mut waiters = Vec::new();
     for i in 0..jamjet_api::routes::MAX_WAITING_CLAIMS_PER_PRINCIPAL {
-        let (state, req) = (state.clone(), req.clone());
+        let (state, req, token) = (state.clone(), req.clone(), token.clone());
         waiters.push(tokio::spawn(async move {
-            claim(&state, None, &format!("w{i}"), req).await
+            claim(&state, Some(&token), &format!("w{i}"), req).await
         }));
     }
     // Let them all start waiting.
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    let started = tokio::time::Instant::now();
-    let (_, body) = claim(&state, None, "one-more", req.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    let (_, body) = claim(&state, Some(&token), "one-more", req.clone()).await;
     assert_eq!(body, json!({ "claimed": false, "reason": "not_ready" }));
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(1),
+        started.elapsed() < std::time::Duration::from_millis(1000),
         "the claim past the cap waited {:?}",
         started.elapsed()
     );
     for w in waiters {
         let (_, body) = w.await.unwrap();
         assert_eq!(body, json!({ "claimed": false, "reason": "not_ready" }));
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// A retry that arrives while the first claim's gate is still deciding (its
+/// client gave up early) waits for it: deciding the same item beside a
+/// running gate wrote the gate's events twice.
+#[tokio::test]
+async fn a_lease_whose_gate_is_running_is_not_decided_twice() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        register(
+            &state,
+            None,
+            ir(
+                "wf-gating",
+                Some("by_execution"),
+                Some(policy(&[], &["first"])),
+            ),
+        )
+        .await;
+        let e = start(&state, None, "wf-gating").await;
+        let leased = backend
+            .claim_work_item_filtered(
+                "w1",
+                &[QUEUE],
+                Some(60),
+                &ClaimFilter {
+                    execution_id: Some(execution_id(&e)),
+                    node_id: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(backend
+            .mark_gate(
+                leased.id,
+                leased.lease_fence,
+                jamjet_state::GateMark::Gating
+            )
+            .await
+            .unwrap());
+
+        let (_, body) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(
+            body,
+            json!({ "claimed": false, "reason": "not_ready" }),
+            "{name}"
+        );
+        let kinds = event_kinds(&backend, &e).await;
+        assert_eq!(
+            count(&kinds, |k| matches!(
+                k,
+                EventKind::ToolApprovalRequired { .. }
+            )),
+            0,
+            "{name}: decided beside the running gate: {kinds:?}"
+        );
+        let still = backend.get_work_item(leased.id).await.unwrap().unwrap();
+        assert_eq!(
+            still.lease_fence, leased.lease_fence,
+            "{name}: the lease was taken"
+        );
+        cleanup(path);
+    }
+}
+
+/// Makes one claim as `w1` from inside the first full read of the run's log
+/// after it is armed: a retry landing while the first claim's gate decides.
+struct RetryDuringGate {
+    state: std::sync::OnceLock<AppState>,
+    execution: std::sync::OnceLock<String>,
+    fired: std::sync::atomic::AtomicBool,
+    answer: std::sync::Mutex<Option<Value>>,
+}
+
+#[async_trait::async_trait]
+impl support::hooked::AfterWrite for RetryDuringGate {
+    async fn after(&self, write: support::hooked::Write) {
+        let support::hooked::Write::GetEvents(_) = write else {
+            return;
+        };
+        let (Some(state), Some(e)) = (self.state.get(), self.execution.get()) else {
+            return;
+        };
+        if self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let (_, body) = claim(state, None, "w1", json!({ "execution_id": e })).await;
+        *self.answer.lock().unwrap() = Some(body);
+    }
+}
+
+/// A retry from the same worker while the first claim's gate is deciding
+/// (a client that gave up early) waits for that gate. Deciding the item
+/// beside it admitted the agent's step twice for one item.
+#[tokio::test]
+async fn a_retry_during_the_gate_waits_for_it() {
+    let hook = Arc::new(RetryDuringGate {
+        state: std::sync::OnceLock::new(),
+        execution: std::sync::OnceLock::new(),
+        fired: std::sync::atomic::AtomicBool::new(false),
+        answer: std::sync::Mutex::new(None),
+    });
+    let inner: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let backend: Arc<dyn StateBackend> = Arc::new(support::hooked::HookedBackend::new(
+        inner.clone(),
+        hook.clone(),
+    ));
+    let state = make_state(backend.clone());
+    let agent = "jamjet://acme/caller";
+    let (st, body) = post(
+        &state,
+        "/agents",
+        json!({
+            "id": agent, "uri": agent, "name": "caller", "description": "",
+            "version": "1.0.0",
+            "capabilities": { "skills": [], "protocols": [], "tools_provided": [], "tools_consumed": [] },
+            "autonomy": "fully_autonomous",
+            "constraints": { "max_iterations": 5 },
+            "auth": { "type": "none" }
+        }),
+    )
+    .await;
+    assert!(st.is_success(), "{st} {body}");
+    let mut workflow = ir("wf-race", Some("by_execution"), None);
+    workflow["agent_ref"] = json!(agent);
+    register(&state, None, workflow).await;
+    let e = start(&state, None, "wf-race").await;
+    hook.state.set(state.clone()).ok().unwrap();
+    hook.execution.set(e.clone()).unwrap();
+
+    let (_, first) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+    let retry = hook.answer.lock().unwrap().clone().expect("the retry ran");
+    assert_eq!(
+        retry,
+        json!({ "claimed": false, "reason": "not_ready" }),
+        "{first}"
+    );
+    assert_eq!(first["claimed"], true, "{first}");
+    let kinds = event_kinds(&inner, &e).await;
+    assert_eq!(
+        count(&kinds, |k| matches!(k, EventKind::AgentStepAdmitted { .. })),
+        1,
+        "{kinds:?}"
+    );
+}
+
+/// A lease the oldest-first claim handed out is on record as released, so
+/// the same worker claiming it again by execution gets it back, not a second
+/// decision that moves its fence.
+#[tokio::test]
+async fn an_oldest_first_lease_is_handed_out_again_as_released() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        register(&state, None, ir("wf-mixed", None, None)).await;
+        let e = start(&state, None, "wf-mixed").await;
+        let (_, first) = claim(&state, None, "w1", json!({})).await;
+        assert_eq!(first["claimed"], true, "{name}: {first}");
+        let (_, again) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(again["claimed"], true, "{name}: {again}");
+        assert_eq!(
+            again["work_item"]["lease_fence"], first["work_item"]["lease_fence"],
+            "{name}"
+        );
+        cleanup(path);
     }
 }
 

@@ -1300,8 +1300,13 @@ impl StateBackend for SqliteBackend {
         crate::sqlite::leased_items_in(&self.pool, None, queue_types, filter).await
     }
 
-    async fn mark_released(&self, item_id: WorkItemId, lease_fence: i64) -> BackendResult<bool> {
-        crate::sqlite::mark_released_in(&self.pool, None, item_id, lease_fence).await
+    async fn mark_gate(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        mark: crate::backend::GateMark,
+    ) -> BackendResult<bool> {
+        crate::sqlite::mark_gate_in(&self.pool, None, item_id, lease_fence, mark).await
     }
 
     async fn has_claimable(
@@ -2965,7 +2970,8 @@ pub(crate) async fn leased_items_in(
     }
     let placeholders = vec!["?"; queue_types.len()].join(",");
     let query_str = format!(
-        "SELECT *, (released_fence IS lease_fence) AS released_now FROM work_items \
+        "SELECT *, CASE WHEN released_fence IS lease_fence THEN 2 \
+         WHEN released_fence IS -lease_fence THEN 1 ELSE 0 END AS gate_mark FROM work_items \
          WHERE status = 'claimed' AND queue_type IN ({placeholders}) \
          AND execution_id = ? AND lease_expires_at > ?{}{}",
         if tenant.is_some() {
@@ -3002,19 +3008,31 @@ pub(crate) async fn leased_items_in(
                     .flatten()
                     .map(|s| s.max(0) as u64)
                     .unwrap_or_else(|| crate::backend::granted_lease_secs(None)),
-                released: row.try_get::<bool, _>("released_now").unwrap_or(false),
+                gate: match row.try_get::<i64, _>("gate_mark").unwrap_or(0) {
+                    2 => crate::backend::GateMark::Released,
+                    1 => crate::backend::GateMark::Gating,
+                    _ => crate::backend::GateMark::Undecided,
+                },
             })
         })
         .collect()
 }
 
-/// [`StateBackend::mark_released`] on the SQLite backends.
-pub(crate) async fn mark_released_in(
+/// [`StateBackend::mark_gate`] on the SQLite backends. `released_fence`
+/// holds the fence for a release, its negation while a gate runs (fences are
+/// positive), and NULL otherwise.
+pub(crate) async fn mark_gate_in(
     pool: &SqlitePool,
     tenant: Option<&str>,
     item_id: WorkItemId,
     lease_fence: i64,
+    mark: crate::backend::GateMark,
 ) -> BackendResult<bool> {
+    let value = match mark {
+        crate::backend::GateMark::Released => Some(lease_fence),
+        crate::backend::GateMark::Gating => Some(-lease_fence),
+        crate::backend::GateMark::Undecided => None,
+    };
     let sql = format!(
         "UPDATE work_items SET released_fence = ? \
          WHERE id = ? AND lease_fence = ? AND status = 'claimed'{}",
@@ -3025,7 +3043,7 @@ pub(crate) async fn mark_released_in(
         }
     );
     let mut q = sqlx::query(&sql)
-        .bind(lease_fence)
+        .bind(value)
         .bind(item_id.to_string())
         .bind(lease_fence);
     if let Some(t) = tenant {

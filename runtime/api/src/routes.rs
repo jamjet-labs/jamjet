@@ -1615,6 +1615,15 @@ async fn claim_work_item(
     ) {
         return Ok(nothing_to_claim());
     }
+    // On record, so the same worker claiming this lease again by execution
+    // gets it back rather than a second decision. Best effort: without it
+    // that claim decides again, which is safe.
+    if let Err(e) = backend
+        .mark_gate(wi.id, wi.lease_fence, jamjet_state::GateMark::Released)
+        .await
+    {
+        warn!(work_item_id = %wi.id, error = %e, "claim: could not record the release");
+    }
 
     // The idempotency key for THIS node occurrence, computed here because claim
     // time is fire time for the external tier — the moment the payload leaves
@@ -1906,6 +1915,12 @@ async fn settle_items_of_ended_run(
 
 /// Gate an item this claim just leased (`GuardMode::Fire`, as any claim) and,
 /// if it may run, record the release under its fence and hand it out.
+///
+/// The gate's mark goes on the lease first ([`jamjet_state::GateMark::Gating`]),
+/// so a retry that arrives while this gate runs waits for it (`not_ready`)
+/// instead of deciding the same item beside it. A gate that withholds and
+/// leaves the lease clears the mark; one cut short (its request dropped)
+/// leaves it until the lease expires, and the next claim decides.
 async fn release_claimed(
     state: &AppState,
     backend: &dyn jamjet_state::StateBackend,
@@ -1919,6 +1934,12 @@ async fn release_claimed(
             .await?;
         return Ok(claim_refused("not_found"));
     }
+    if !backend
+        .mark_gate(wi.id, wi.lease_fence, jamjet_state::GateMark::Gating)
+        .await?
+    {
+        return Ok(claim_refused("not_ready"));
+    }
     match gate_claimed_item(
         backend,
         &wi,
@@ -1928,11 +1949,23 @@ async fn release_claimed(
     )
     .await
     {
-        ClaimGate::Withhold(reason) => Ok(claim_refused(reason.as_str())),
+        ClaimGate::Withhold(reason) => {
+            // Mostly settled already, and then this matches nothing.
+            if let Err(e) = backend
+                .mark_gate(wi.id, wi.lease_fence, jamjet_state::GateMark::Undecided)
+                .await
+            {
+                warn!(work_item_id = %wi.id, error = %e, "claim: could not clear the gate's mark");
+            }
+            Ok(claim_refused(reason.as_str()))
+        }
         ClaimGate::Release => {
             // On record before it is handed out: a lease handed out again is
             // re-checked as a completion only if this release is recorded.
-            if !backend.mark_released(wi.id, wi.lease_fence).await? {
+            if !backend
+                .mark_gate(wi.id, wi.lease_fence, jamjet_state::GateMark::Released)
+                .await?
+            {
                 return Ok(claim_refused("not_ready"));
             }
             claimed_response(backend, &wi, lease_secs).await
@@ -1943,7 +1976,9 @@ async fn release_claimed(
 /// The same worker claims an item it already leases: its claim response was
 /// lost, or an earlier claim's gate never finished.
 ///
-/// * Released under this lease ([`jamjet_state::LeasedItem::released`]): it
+/// * A gate deciding it now (or cut short): `not_ready`, until it finishes or
+///   the lease expires.
+/// * Released under this lease ([`jamjet_state::GateMark::Released`]): it
 ///   is checked again in `GuardMode::Complete`, which writes nothing and
 ///   admits what was released (the approval and the agent step it ran
 ///   under). If that still holds, the lease is renewed and handed out with
@@ -1969,7 +2004,12 @@ async fn rehand_lease(
             .await?;
         return Ok(claim_refused("not_found"));
     }
-    if leased.released {
+    if leased.gate == jamjet_state::GateMark::Gating {
+        // A gate is deciding this lease now, or was cut short: not decided a
+        // second time beside it.
+        return Ok(claim_refused("not_ready"));
+    }
+    if leased.gate == jamjet_state::GateMark::Released {
         match gate_claimed_item(
             backend,
             &wi,
@@ -2674,13 +2714,15 @@ async fn complete_work_item(
     // exactness, which is already v1's documented posture (`F-2c-3` in
     // `runtime/workers/src/worker.rs`), and is why a mismatch is not an error.
     //
-    // Best effort: if the item cannot be read, no effect is recorded. A missing
-    // replay entry costs a re-fire; a wrong one costs the wrong answer.
+    // An item that cannot be read refuses the completion (below), so no
+    // effect is recorded under a key it could not derive.
+    // An unreadable item is an error: it could be one only its execution's
+    // initiator may complete, and nothing would show that.
     let recorded = match backend.get_work_item(item_id).await {
         Ok(item) => item,
         Err(e) => {
             warn!(work_item_id = %id, error = %e, "complete: could not read the work item");
-            None
+            return Err(e.into());
         }
     };
     if let Some(wi) = recorded.as_ref() {
@@ -3194,7 +3236,8 @@ async fn fail_work_item(
     let item_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::BadRequest(format!("invalid work item id: {id}")))?;
     let backend = state.backend_for(&tenant_id);
-    if let Ok(Some(wi)) = backend.get_work_item(item_id).await {
+    // Read strictly: an unreadable item must not skip the check.
+    if let Some(wi) = backend.get_work_item(item_id).await? {
         if foreign_by_execution_item(
             backend.as_ref(),
             &wi,

@@ -1233,9 +1233,20 @@ impl StateBackend for TenantScopedSqliteBackend {
             .await
     }
 
-    async fn mark_released(&self, item_id: WorkItemId, lease_fence: i64) -> BackendResult<bool> {
-        crate::sqlite::mark_released_in(&self.pool, Some(&self.tenant_id.0), item_id, lease_fence)
-            .await
+    async fn mark_gate(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        mark: crate::backend::GateMark,
+    ) -> BackendResult<bool> {
+        crate::sqlite::mark_gate_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            item_id,
+            lease_fence,
+            mark,
+        )
+        .await
     }
 
     async fn has_claimable(

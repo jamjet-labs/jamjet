@@ -107,13 +107,16 @@ integration's recorded calls) claims that execution's work instead:
 - `wait_ms` waits up to that many milliseconds, at most 10000, for a
   `not_ready` item to be queued, so a client can claim right after starting
   the run. A run that ends during the wait answers `not_found` then. One
-  principal holds at most 4 waiting claims; a claim past that answers at once.
+  principal holds at most 4 waiting claims on one server process; a claim
+  past that answers at once.
 - The same `worker_id` claiming again gets the item it already holds, with
   the same `lease_fence`, after the policy is checked again; a lost claim
   response does not lose the item. The lease is renewed, and `lease_secs`
-  gives the length it was granted. A lease whose claim never handed the item
-  out (the request was cut short) is decided again as a new claim, with a new
-  `lease_fence`.
+  gives the length it was granted. A retry while the first claim is still
+  deciding answers `not_ready`. A lease whose claim never handed the item out
+  (it was refused for a reason to try again) is decided again as a new claim,
+  with a new `lease_fence`; one whose request was cut short waits until its
+  lease expires.
 
 An `external_fn` node can require this: with `"claim": "by_execution"` in its
 kind, its items are handed out only to a claim that names the execution, never

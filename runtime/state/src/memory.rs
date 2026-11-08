@@ -603,22 +603,38 @@ impl StateBackend for InMemoryBackend {
                     .get(&item.id)
                     .map(|s| *s.value())
                     .unwrap_or_else(|| crate::backend::granted_lease_secs(None)),
-                released: self
-                    .released_fences
-                    .get(&item.id)
-                    .is_some_and(|f| *f.value() == item.lease_fence),
+                gate: match self.released_fences.get(&item.id).map(|f| *f.value()) {
+                    Some(f) if f == item.lease_fence => crate::backend::GateMark::Released,
+                    Some(f) if f == -item.lease_fence => crate::backend::GateMark::Gating,
+                    _ => crate::backend::GateMark::Undecided,
+                },
                 item,
             })
             .collect())
     }
 
-    async fn mark_released(&self, item_id: WorkItemId, lease_fence: i64) -> BackendResult<bool> {
+    async fn mark_gate(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        mark: crate::backend::GateMark,
+    ) -> BackendResult<bool> {
         let held = self
             .work_items
             .get(&item_id)
             .is_some_and(|i| i.worker_id.is_some() && i.lease_fence == lease_fence);
         if held {
-            self.released_fences.insert(item_id, lease_fence);
+            match mark {
+                crate::backend::GateMark::Released => {
+                    self.released_fences.insert(item_id, lease_fence);
+                }
+                crate::backend::GateMark::Gating => {
+                    self.released_fences.insert(item_id, -lease_fence);
+                }
+                crate::backend::GateMark::Undecided => {
+                    self.released_fences.remove(&item_id);
+                }
+            }
         }
         Ok(held)
     }

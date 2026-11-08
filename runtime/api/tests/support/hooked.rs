@@ -317,6 +317,43 @@ impl StateBackend for HookedBackend {
             .await
     }
 
+    async fn claim_work_item_filtered(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+        filter: &jamjet_state::ClaimFilter,
+    ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::backend::WorkItem>> {
+        self.inner
+            .claim_work_item_filtered(worker_id, queue_types, lease_secs, filter)
+            .await
+    }
+
+    async fn leased_items(
+        &self,
+        queue_types: &[&str],
+        filter: &jamjet_state::ClaimFilter,
+    ) -> jamjet_state::backend::BackendResult<Vec<jamjet_state::LeasedItem>> {
+        self.inner.leased_items(queue_types, filter).await
+    }
+
+    async fn mark_gate(
+        &self,
+        item_id: uuid::Uuid,
+        lease_fence: i64,
+        mark: jamjet_state::GateMark,
+    ) -> jamjet_state::backend::BackendResult<bool> {
+        self.inner.mark_gate(item_id, lease_fence, mark).await
+    }
+
+    async fn has_claimable(
+        &self,
+        queue_types: &[&str],
+        filter: &jamjet_state::ClaimFilter,
+    ) -> jamjet_state::backend::BackendResult<bool> {
+        self.inner.has_claimable(queue_types, filter).await
+    }
+
     async fn heartbeat_lease(
         &self,
         item_id: jamjet_state::backend::WorkItemId,

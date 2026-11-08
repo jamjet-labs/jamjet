@@ -91,16 +91,29 @@ impl ClaimFilter {
     }
 }
 
+/// Where the claim gate stands on an item under its current lease
+/// ([`StateBackend::mark_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateMark {
+    /// No gate decided under this lease: one withheld it and left the lease,
+    /// or none ran. A claim may decide it again.
+    Undecided,
+    /// A gate is deciding under this lease, or was cut short (its request
+    /// dropped). Not to be decided a second time beside it; the lease
+    /// expires and the next claim decides.
+    Gating,
+    /// The gate released the payload under this lease.
+    Released,
+}
+
 /// An item leased now, as [`StateBackend::leased_items`] lists it.
 #[derive(Debug, Clone)]
 pub struct LeasedItem {
     pub item: WorkItem,
     /// The lease length the claim was granted, which every renewal honours.
     pub lease_secs: u64,
-    /// Whether the claim gate released the payload under THIS lease
-    /// ([`StateBackend::mark_released`]). A lease no gate released (one left
-    /// behind by an interrupted or undecided gate) must be decided again.
-    pub released: bool,
+    /// The claim gate's mark under THIS lease.
+    pub gate: GateMark,
 }
 
 /// What [`StateBackend::claim_for_execution`] found.
@@ -464,14 +477,18 @@ pub trait StateBackend: Send + Sync {
         ))
     }
 
-    /// Record that the claim gate released `item_id`'s payload under
-    /// `lease_fence`. `Ok(false)` if the item is not claimed under that fence
-    /// any more. The default refuses, so a backend without it cannot hand a
-    /// lease out again as released.
-    async fn mark_released(&self, item_id: WorkItemId, lease_fence: i64) -> BackendResult<bool> {
-        let _ = (item_id, lease_fence);
+    /// Record the claim gate's mark for `item_id` under `lease_fence`.
+    /// `Ok(false)` if the item is not claimed under that fence any more. The
+    /// default refuses, so a backend without it cannot hand a lease out again.
+    async fn mark_gate(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        mark: GateMark,
+    ) -> BackendResult<bool> {
+        let _ = (item_id, lease_fence, mark);
         Err(StateBackendError::Database(
-            "this backend cannot record a release".into(),
+            "this backend cannot record the claim gate's mark".into(),
         ))
     }
 
