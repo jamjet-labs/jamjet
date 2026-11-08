@@ -71,9 +71,14 @@ class JamJetApprovalRejected(Exception):
 
 
 class JamJetApprovalTimeout(Exception):
-    """Raised when a human-in-the-loop approval times out."""
+    """Raised when a human-in-the-loop approval times out, or when Cloud could
+    not be reached to create or poll it (``reason`` says which)."""
 
-    def __init__(self, approval_id: str, timeout_seconds: float) -> None:
+    def __init__(self, approval_id: str, timeout_seconds: float, reason: str | None = None) -> None:
         self.approval_id = approval_id
         self.timeout_seconds = timeout_seconds
-        super().__init__(f"Approval {approval_id} timed out after {timeout_seconds}s")
+        self.reason = reason
+        msg = f"Approval {approval_id} timed out after {timeout_seconds}s"
+        if reason:
+            msg = f"Approval {approval_id or '(not created)'} failed: {reason}"
+        super().__init__(msg)

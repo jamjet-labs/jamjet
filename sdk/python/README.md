@@ -297,6 +297,19 @@ OpenAI's Responses API, Anthropic's `messages.stream()`, the async clients
 (`AsyncOpenAI`, `AsyncAnthropic`), the batch APIs, and
 `with_raw_response` / `with_streaming_response` with `stream=True`.
 
+`jamjet.policy("require_approval", "payments.*")` keeps the tool available.
+When the model calls it, the SDK opens an approval in JamJet Cloud with the
+tool name, call id, arguments, model and rule, and waits for a reviewer's
+decision before returning the response. A rejection raises
+`JamJetApprovalRejected`. No decision within `approval_timeout_seconds`
+(a `configure()` argument, default 1 hour), or no way to reach Cloud, raises
+`JamJetApprovalTimeout`. The timeout is sent to Cloud as the approval's
+deadline (clamped to 1 minute to 24 hours); JamJet Cloud deployments since
+jamjet-cloud #87 refuse decisions after it. The approval shows the call's
+arguments with credentials always masked, PII masked when redaction is on
+(IBANs and card numbers keep their last 4), and an `arguments_sha256` that the
+SDK re-checks before releasing the approved call.
+
 Install with the LLM SDK you use:
 
 ```bash

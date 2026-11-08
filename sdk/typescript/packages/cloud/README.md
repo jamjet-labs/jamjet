@@ -121,6 +121,26 @@ before a tool call could be refused, so a rule that could match them removes
 them from the request; Anthropic's own client tools (bash, text editor,
 computer, memory) are gated like any other tool.
 
+A `require_approval` rule keeps the tool available to the model. When the
+model calls it, the SDK opens an approval in JamJet Cloud with the tool name,
+call id, arguments, model and rule, and waits for a reviewer's decision before
+your code gets the response. Rejection throws `JamjetApprovalRejected`. No
+decision within `approvalTimeoutMs` (init option, default 1 hour), or no way to
+reach Cloud, throws `JamjetApprovalTimeout`. The timeout is sent to Cloud as
+the approval's deadline (clamped to 1 minute to 24 hours); JamJet Cloud
+deployments since jamjet-cloud #87 refuse decisions after it. The `signal` in
+the request options also cancels the wait.
+
+The approval shows the reviewer the call's arguments with credentials masked,
+always: by a short list of field names (`password`, `secret`, `api_key`,
+`authorization`, `access_token`, `refresh_token`, ...) and by shape (`Bearer`
+and `Basic` headers, JWTs, `sk-`/`AKIA`/`ghp_`-style keys, long high-entropy
+strings). With redaction on, emails, SSNs, phone
+numbers and IPs are masked too, and IBANs and card numbers keep their last 4.
+It also carries `arguments_sha256`, a SHA-256 of the canonical arguments; the
+SDK re-checks it before releasing the approved call and throws
+`JamjetApprovalRejected` if the arguments changed.
+
 Streaming calls get the same checks. Text streams through as it arrives; once
 any policy rule is set, chunks from the first tool call onward are held until
 the stream ends, checked, and only then handed to your code. Usage and cost are
@@ -172,6 +192,7 @@ init({
   redaction: { mode: 'standard' }, // 'strict' | 'standard' | 'off'
   sampling: { rate: 1.0 },         // 0.0–1.0; errors and approvals always kept
   debug: false,                    // throws transport errors when true
+  approvalTimeoutMs: 3_600_000,    // how long a require_approval call waits (1 min to 24 h)
 })
 ```
 

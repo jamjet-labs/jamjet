@@ -4,8 +4,10 @@ import type { AgentRef, UserContext } from './context.js'
 import { applyCacheInject } from './cache-inject.js'
 import { applyCompaction } from './compaction.js'
 import { estimateCost } from './cost.js'
-import { JamjetPolicyBlocked } from './errors.js'
+import { DEFAULT_APPROVAL_TIMEOUT_MS, pollUntilResolved } from './approvals.js'
+import { JamjetApprovalRejected, JamjetApprovalTimeout, JamjetPolicyBlocked } from './errors.js'
 import { toolNameOf } from './policy.js'
+import { argumentsDigest, maskForApproval, parsedArguments } from './approval-context.js'
 import { Span } from './span.js'
 import { enforceStream, type StreamedToolCall, type StreamTally, type Vendor } from './stream-enforcement.js'
 
@@ -43,22 +45,34 @@ function estimatePromptTokens(args0: unknown): number {
   }
 }
 
-function getToolCalls(vendor: Vendor, response: unknown): Array<{ id?: string; name: string }> {
+type ToolCall = { id?: string; name: string; arguments?: unknown }
+
+function getToolCalls(vendor: Vendor, response: unknown): ToolCall[] {
   const res = (response ?? {}) as Record<string, unknown>
   if (vendor === 'openai') {
     // Every choice: with n > 1 a blocked call in any of them must be caught.
     const choices = Array.isArray(res['choices']) ? res['choices'] : []
-    return (choices as Array<Record<string, unknown>>).flatMap((choice) => {
+    return (choices as Array<Record<string, unknown>>).flatMap((choice, position) => {
       const message = (choice?.['message'] ?? {}) as Record<string, unknown>
       const tcs = Array.isArray(message['tool_calls']) ? message['tool_calls'] : []
       const calls = (tcs as Array<Record<string, unknown>>).map((tc) => {
-        const entry: { id?: string; name: string } = { name: toolNameOf(tc) }
+        const entry: ToolCall = { name: toolNameOf(tc) }
         if (typeof tc['id'] === 'string') entry.id = tc['id']
+        const fn = (tc['function'] ?? tc['custom'] ?? {}) as Record<string, unknown>
+        const args = fn['arguments'] ?? fn['input']
+        if (args !== undefined) entry.arguments = args
         return entry
       })
       // Legacy `functions` API: a single message.function_call.
       const fc = message['function_call']
-      if (typeof fc === 'object' && fc !== null) calls.push({ name: toolNameOf(fc) })
+      if (typeof fc === 'object' && fc !== null) {
+        // No id of its own: name it after the choice, so two choices calling
+        // the same function stay distinct.
+        const entry: ToolCall = { name: toolNameOf(fc), id: `function_call:${String(choice?.['index'] ?? position)}` }
+        const args = (fc as Record<string, unknown>)['arguments']
+        if (args !== undefined) entry.arguments = args
+        calls.push(entry)
+      }
       return calls
     })
   }
@@ -68,10 +82,21 @@ function getToolCalls(vendor: Vendor, response: unknown): Array<{ id?: string; n
     .filter((b) => b['type'] === 'tool_use' || b['type'] === 'server_tool_use' || b['type'] === 'mcp_tool_use')
     .map((b) => {
       const name = typeof b['name'] === 'string' ? b['name'] : ''
-      const entry: { id?: string; name: string } = { name }
+      const entry: ToolCall = { name }
       if (typeof b['id'] === 'string') entry.id = b['id']
+      if (b['input'] !== undefined) entry.arguments = b['input']
       return entry
     })
+}
+
+/** Streamed arguments arrive as text; Anthropic's are JSON, so parse them to match the non-streamed shape. */
+function streamedArguments(vendor: Vendor, text: string): unknown {
+  if (vendor !== 'anthropic' || text === '') return text
+  try {
+    return JSON.parse(text)
+  } catch {
+    return text
+  }
 }
 
 function extractUsage(vendor: Vendor, response: unknown): { input: number; output: number } {
@@ -312,10 +337,37 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
       vendor,
       holdToolCalls: () => client._policy.hasRules(),
       onToolCallStarted: (call, tally) => refuseStreamed([{ ...call, joinedName: call.name, arguments: '' }], tally),
-      onToolCalls: (calls, tally) => refuseStreamed(calls, tally),
+      onToolCalls: async (calls, tally) => {
+        refuseStreamed(calls, tally)
+        // Gate the name as last sent or the fragments joined, like the block
+        // check: one approval per call, under the joined name when it is gated.
+        const gated = (list: ReadonlyArray<StreamedToolCall>): ToolCall[] =>
+          list.map((c) => {
+            const names = c.joinedName !== '' && c.joinedName !== c.name ? [c.joinedName, c.name] : [c.name]
+            const name = names.find((n) => client._policy.evaluate(n).policyKind === 'require_approval') ?? c.name
+            const one: ToolCall = { name, arguments: streamedArguments(vendor, c.arguments) }
+            if (c.id !== undefined) one.id = c.id
+            return one
+          })
+        await gateApprovals(
+          streamState(tally),
+          gated(calls),
+          () => {
+            const reported = tally.inputTokens !== undefined && tally.outputTokens !== undefined
+            recordUsage(
+              streamState(tally),
+              streamUsage(tally, estTokens, true),
+              tally.cacheReadTokens,
+              reported ? {} : { usage_estimated: true },
+            )
+          },
+          () => gated(tally.toolCalls),
+          requestSignal(args),
+        )
+      },
       onEnd: (tally, end) => {
         if (end.kind === 'error') {
-          if (end.error instanceof JamjetPolicyBlocked) return // recorded where it was raised
+          if (alreadyRecorded(end.error)) return // recorded where it was raised
           // The tokens the stream produced before failing were still spent.
           recordUsage(streamState(tally), streamUsage(tally, estTokens, false), tally.cacheReadTokens, {
             usage_estimated: true,
@@ -350,12 +402,12 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
     extractCacheRead(vendor, result),
   )
 
-  // 5. Post-decision policy: re-check tool calls returned by the model
-  // NOTE (Plan 2 limitation): require_approval matches do not gate the call
-  // here. Tools matched by require_approval rules pass through to the model
-  // and to user code unchanged. Pre-call approval gating is deferred to a
-  // future release; see docs/superpowers/specs/2026-05-08-ts-sdk-plan2.md §6.
-  refuseBlocked(state, getToolCalls(vendor, result))
+  // 5. Post-decision policy: re-check tool calls returned by the model.
+  // Blocked calls throw; calls matched by a require_approval rule wait for a
+  // Cloud decision and throw unless approved.
+  const calls = getToolCalls(vendor, result)
+  refuseBlocked(state, calls)
+  await gateApprovals(state, calls, () => {}, () => getToolCalls(vendor, result), requestSignal(args))
 
   span.finish('ok')
   client.recordSpan(span.toEventDict())
@@ -394,8 +446,103 @@ function refuseBlocked(state: CallState, calls: ReadonlyArray<{ id?: string; nam
   throw new JamjetPolicyBlocked(hit.call.name, hit.pattern, { cause: hit.call })
 }
 
+/**
+ * Wait for a Cloud approval for each call matched by a require_approval rule.
+ * Fails closed: a rejection, a timeout, or any failure to reach Cloud throws,
+ * after `beforeFail` (records usage) and the span are recorded.
+ */
+async function gateApprovals(
+  state: CallState,
+  calls: ReadonlyArray<ToolCall>,
+  beforeFail: () => void,
+  reread: () => ReadonlyArray<ToolCall>,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const { client, span } = state
+  const approved: string[] = []
+  const pii = client.config.redaction.mode !== 'off'
+  const fail = (failure: Error, tool: string): never => {
+    recorded.add(failure)
+    beforeFail()
+    const id = (failure as { approvalId?: string }).approvalId
+    if (id) span.approvalId = id
+    span.payload = { ...span.payload, approval: { tool, outcome: failure.name } }
+    span.finish('error')
+    client.recordSpan(span.toEventDict())
+    throw failure
+  }
+  for (const call of calls) {
+    const decision = client._policy.evaluate(call.name)
+    if (decision.policyKind !== 'require_approval') continue
+    const digest = await argumentsDigest(call.arguments)
+    const context: Record<string, unknown> = {
+      tool: call.name,
+      vendor: state.vendor,
+      model: state.model,
+      rule: decision.pattern,
+      arguments_sha256: digest,
+    }
+    if (call.id !== undefined) context['tool_call_id'] = call.id
+    if (call.arguments !== undefined) context['arguments'] = maskForApproval(parsedArguments(call.arguments), pii)
+    if (span.agentName !== null) context['agent'] = span.agentName
+    const timeoutMs = client.config.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS
+    let id: string
+    try {
+      id = await pollUntilResolved({
+        apiKey: client.config.apiKey,
+        apiUrl: client.config.apiUrl,
+        action: call.name,
+        context,
+        timeoutMs,
+        ...(client.config.approvalPollIntervalMs !== undefined
+          ? { pollIntervalMs: client.config.approvalPollIntervalMs }
+          : {}),
+        ...(signal !== undefined ? { signal } : {}),
+      })
+    } catch (err) {
+      if (signal?.aborted) fail(err instanceof Error ? err : new Error(String(err)), call.name)
+      fail(
+        err instanceof JamjetApprovalRejected || err instanceof JamjetApprovalTimeout
+          ? err
+          : new JamjetApprovalTimeout('', timeoutMs, { cause: err }),
+        call.name,
+      )
+      return
+    }
+    // The approval covers these exact arguments: refuse to release the call
+    // if they changed while the reviewer was deciding.
+    const now = reread().find((c) => c.name === call.name && c.id === call.id)
+    if (now === undefined || (await argumentsDigest(now.arguments)) !== digest) {
+      fail(new JamjetApprovalRejected(id, 'tool call arguments changed after approval'), call.name)
+    }
+    approved.push(id)
+  }
+  if (approved.length > 0) {
+    span.approvalId = approved[0]!
+    if (approved.length > 1) span.payload = { ...span.payload, approval_ids: approved }
+  }
+}
+
+/** The caller's AbortSignal, passed in the vendor's request options (second argument). */
+function requestSignal(args: unknown[]): AbortSignal | undefined {
+  const signal = (args[1] as { signal?: unknown } | undefined)?.signal
+  return typeof AbortSignal !== 'undefined' && signal instanceof AbortSignal ? signal : undefined
+}
+
+/** Errors whose span was recorded where they were raised. */
+const recorded = new WeakSet<object>()
+
+function alreadyRecorded(err: unknown): boolean {
+  return (
+    err instanceof JamjetPolicyBlocked ||
+    err instanceof JamjetApprovalRejected ||
+    err instanceof JamjetApprovalTimeout ||
+    (typeof err === 'object' && err !== null && recorded.has(err))
+  )
+}
+
 function failSpan(state: CallState, err: unknown): void {
-  if (err instanceof JamjetPolicyBlocked) return
+  if (alreadyRecorded(err)) return
   state.span.finish('error')
   const errMsg = err instanceof Error ? err.message : String(err)
   state.span.payload = { ...state.span.payload, error: errMsg }
