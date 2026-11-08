@@ -75,7 +75,7 @@ cloud-all = ["openai>=2", "anthropic>=0.40"]
 # extras: a fresh install's first agent then dies on the import, and pulling in
 # mcp 2.x would break FastMCP (mcp 1.x) code. Below 1.106 that path imports no
 # mcp at all. Raise this bound together with a move to mcp 2.x.
-model = ["litellm>=1.50,<1.106"]
+model = ["litellm>=1.50,<1.109"]
 sidecar = ["starlette>=0.40", "uvicorn>=0.30"]
 # Optional extras for the `jamjet.durable` framework shims (introduced in 0.7.0).
 # Each enables a thin durable_run() context manager that bridges the framework's
