@@ -293,6 +293,30 @@ async def test_tool_decorator_falls_through_when_no_recording() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_bad_stub_models_value_stops_a_tool_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With a replay bundle set and a typo in JAMJET_STUB_MODELS, a @tool call
+    raises. The decorator swallowed every exception from importing the replay
+    module, so the real tool ran with no warning at all."""
+    import sys
+
+    called = False
+
+    @tool
+    async def charge(amount: int) -> int:
+        nonlocal called
+        called = True
+        return amount
+
+    monkeypatch.setenv("JAMJET_REPLAY_BUNDLE", str(_bundle_dir(tmp_path)))
+    monkeypatch.setenv("JAMJET_STUB_MODELS", "maybe")
+    # Imported fresh, as in a process that set the variables at start.
+    monkeypatch.delitem(sys.modules, "jamjet.cloud.replay", raising=False)
+    with pytest.raises(ValueError, match="JAMJET_STUB_MODELS"):
+        await charge(amount=5)
+    assert not called
+
+
+@pytest.mark.asyncio
 async def test_tool_decorator_calls_real_fn_when_no_bundle() -> None:
     deactivate()
 
