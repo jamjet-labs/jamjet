@@ -288,6 +288,20 @@ def _refuse_blocked(span: Any, calls: list[tuple[str | None, str, Any]]) -> None
             raise JamJetPolicyBlocked(name, decision.pattern or "*")
 
 
+def _cache_writes(usage: Any) -> dict[str, int]:
+    """Anthropic cache writes, split into 5-minute and 1-hour when the usage says so."""
+    total = _field(usage, "cache_creation_input_tokens") or 0
+    split = _field(usage, "cache_creation")
+    if split is not None:
+        one_hour = _field(split, "ephemeral_1h_input_tokens") or 0
+        five_min = _field(split, "ephemeral_5m_input_tokens")
+        return {
+            "cache_write": five_min if five_min is not None else max(0, total - one_hour),
+            "cache_write_1h": one_hour,
+        }
+    return {"cache_write": total, "cache_write_1h": 0}
+
+
 def _record_usage(
     span: Any,
     model: str,
@@ -296,10 +310,18 @@ def _record_usage(
     *,
     cache_read: int = 0,
     cache_write: int = 0,
+    cache_write_1h: int = 0,
     **payload: Any,
 ) -> None:
     # Anthropic bills prompt-cache reads and writes on top of input_tokens.
-    cost = estimate_cost(model, input_tokens, output_tokens, cache_read=cache_read, cache_write=cache_write)
+    cost = estimate_cost(
+        model,
+        input_tokens,
+        output_tokens,
+        cache_read=cache_read,
+        cache_write=cache_write,
+        cache_write_1h=cache_write_1h,
+    )
     span.model = model
     span.input_tokens = input_tokens
     span.output_tokens = output_tokens
@@ -353,6 +375,7 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
             output,
             cache_read=tally.cache_read_tokens,
             cache_write=tally.cache_write_tokens,
+            cache_write_1h=tally.cache_write_1h_tokens,
             usage_estimated=True,
             stream_incomplete=True,
         )
@@ -372,6 +395,7 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
                 output,
                 cache_read=tally.cache_read_tokens,
                 cache_write=tally.cache_write_tokens,
+                cache_write_1h=tally.cache_write_1h_tokens,
                 **extra,
             )
 
@@ -408,6 +432,7 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
                 output,
                 cache_read=tally.cache_read_tokens,
                 cache_write=tally.cache_write_tokens,
+                cache_write_1h=tally.cache_write_1h_tokens,
                 usage_estimated=True,
                 stream_incomplete=True,
             )
@@ -430,6 +455,7 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
             output,
             cache_read=tally.cache_read_tokens,
             cache_write=tally.cache_write_tokens,
+            cache_write_1h=tally.cache_write_1h_tokens,
             **extra,
         )
         span.finish(status="ok")
@@ -515,7 +541,7 @@ def _run_enforced(vendor: str, original: Any, self_inner: Any, args: Any, kwargs
         input_tokens,
         output_tokens,
         cache_read=getattr(usage, "cache_read_input_tokens", 0) or 0,
-        cache_write=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        **_cache_writes(usage),
     )
     # Blocked calls raise; calls matched by a require_approval rule wait for a
     # Cloud decision and raise unless approved.

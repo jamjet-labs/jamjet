@@ -45,6 +45,7 @@ class StreamTally:
     output_tokens: int | None = None
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    cache_write_1h_tokens: int = 0
     # Characters of generated text and tool arguments; used when the stream
     # reports no usage.
     output_chars: int = 0
@@ -128,7 +129,18 @@ class StreamTally:
             self.input_tokens = _int(_field(usage, "input_tokens"), self.input_tokens)
             self.output_tokens = _int(_field(usage, "output_tokens"), self.output_tokens)
             self.cache_read_tokens = _int(_field(usage, "cache_read_input_tokens"), self.cache_read_tokens) or 0
-            self.cache_write_tokens = _int(_field(usage, "cache_creation_input_tokens"), self.cache_write_tokens) or 0
+            split = _field(usage, "cache_creation")
+            if split is not None:
+                self.cache_write_1h_tokens = _int(_field(split, "ephemeral_1h_input_tokens"), 0) or 0
+                five_min = _int(_field(split, "ephemeral_5m_input_tokens"), None)
+                total = _int(_field(usage, "cache_creation_input_tokens"), 0) or 0
+                self.cache_write_tokens = (
+                    five_min if five_min is not None else max(0, total - self.cache_write_1h_tokens)
+                )
+            else:
+                self.cache_write_tokens = (
+                    _int(_field(usage, "cache_creation_input_tokens"), self.cache_write_tokens) or 0
+                )
         elif kind == "message_delta":
             usage = _field(event, "usage")
             self.output_tokens = _int(_field(usage, "output_tokens"), self.output_tokens)

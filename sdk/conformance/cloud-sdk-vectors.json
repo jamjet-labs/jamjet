@@ -176,11 +176,53 @@
       "pattern": "x",
       "name": " x ",
       "match": true
+    },
+    {
+      "pattern": "wire_*",
+      "name": "\t\u000b\fwire_money\r\n",
+      "match": true,
+      "why": "ASCII whitespace (space, \\t, \\n, \\r, \\f, \\v) is trimmed"
+    },
+    {
+      "pattern": "wire_*",
+      "name": "\u001cwire_money",
+      "match": false,
+      "why": "only ASCII whitespace is trimmed"
+    },
+    {
+      "pattern": "wire_*",
+      "name": "\u001dwire_money",
+      "match": false
+    },
+    {
+      "pattern": "wire_*",
+      "name": "\u001ewire_money",
+      "match": false
+    },
+    {
+      "pattern": "wire_*",
+      "name": "\u001fwire_money",
+      "match": false
+    },
+    {
+      "pattern": "wire_*",
+      "name": "wire_money",
+      "match": false
+    },
+    {
+      "pattern": "wire_*",
+      "name": "﻿wire_money",
+      "match": false
+    },
+    {
+      "pattern": "wire_*",
+      "name": " wire_money",
+      "match": false
     }
   ],
   "prices": {
     "unit": "USD per million tokens",
-    "source": "Claude models: Anthropic list prices (anthropic.com/pricing) as of 2026-09-25. OpenAI models: carried over unchanged from the earlier SDK tables. cache_read is listed only where the price is published; it feeds the cache-hit savings estimate.",
+    "source": "Claude models: Anthropic list prices (anthropic.com/pricing), as of 2026-09-25. gpt-5, gpt-5-mini, gpt-5-nano, gpt-4.1, gpt-4.1-mini, o3, o3-pro: OpenAI standard prices from developers.openai.com/api/docs/pricing, read 2026-11-08. gpt-4o-2024-05-13: OpenAI's price for that snapshot ($5/$15), which differs from the gpt-4o alias. Other OpenAI models: carried over from the earlier SDK tables. cache_read is listed only where the price is published.",
     "fallback": {
       "input": 3.0,
       "output": 15.0
@@ -189,6 +231,10 @@
       "gpt-4o": {
         "input": 2.5,
         "output": 10.0
+      },
+      "gpt-4o-2024-05-13": {
+        "input": 5.0,
+        "output": 15.0
       },
       "gpt-4o-mini": {
         "input": 0.15,
@@ -205,6 +251,34 @@
       "gpt-3.5-turbo": {
         "input": 0.5,
         "output": 1.5
+      },
+      "gpt-5": {
+        "input": 1.25,
+        "output": 10.0
+      },
+      "gpt-5-mini": {
+        "input": 0.25,
+        "output": 2.0
+      },
+      "gpt-5-nano": {
+        "input": 0.05,
+        "output": 0.4
+      },
+      "gpt-4.1": {
+        "input": 2.0,
+        "output": 8.0
+      },
+      "gpt-4.1-mini": {
+        "input": 0.4,
+        "output": 1.6
+      },
+      "o3": {
+        "input": 2.0,
+        "output": 8.0
+      },
+      "o3-pro": {
+        "input": 20.0,
+        "output": 80.0
       },
       "claude-fable-5-1": {
         "input": 10.0,
@@ -284,8 +358,8 @@
         "output": 1.25
       }
     },
-    "cache": "Anthropic only (OpenAI's prompt_tokens already include cached tokens): cache reads are charged at cache_read, or 0.1x input when none is listed; cache writes at 1.25x input (5-minute cache).",
-    "normalize": "Exact model ID first. Otherwise strip a provider prefix (openai/, openai., anthropic/, anthropic.), then a Bedrock version (-v1:0), a Vertex @YYYYMMDD, an Anthropic -YYYYMMDD, an OpenAI -YYYY-MM-DD or -MMDD date, and look up again."
+    "cache": "Anthropic only (OpenAI's prompt_tokens already include cached tokens): cache reads at cache_read, or 0.1x input when none is listed; cache writes at 1.25x input for the 5-minute cache and 2x input for the 1-hour cache (usage.cache_creation.ephemeral_1h_input_tokens). Without that breakdown all of cache_creation_input_tokens is charged at 1.25x.",
+    "normalize": "Exact model ID first. Otherwise strip a Bedrock cross-region prefix (us., eu., apac., global., jp., au., ca.), a provider prefix (openai/, openai., anthropic/, anthropic.), then a Bedrock version (-v1:0), a Vertex @YYYYMMDD, an Anthropic -YYYYMMDD and an OpenAI -YYYY-MM-DD or -MMDD date, and look up again."
   },
   "cost": [
     {
@@ -351,6 +425,27 @@
       "cache_read_tokens": 10000,
       "cache_write_tokens": 1000,
       "usd": 0.00675
+    },
+    {
+      "model": "gpt-4o-2024-05-13",
+      "input_tokens": 1000,
+      "output_tokens": 500,
+      "usd": 0.0125
+    },
+    {
+      "model": "gpt-5",
+      "input_tokens": 1000,
+      "output_tokens": 500,
+      "usd": 0.00625
+    },
+    {
+      "model": "claude-sonnet-4-6",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_write_tokens": 1000,
+      "cache_write_1h_tokens": 1000,
+      "usd": 0.00975,
+      "why": "1000 5-minute writes at 1.25x ($3.75) + 1000 1-hour writes at 2x ($6.00), per million"
     }
   ],
   "cache_read_savings": [
@@ -415,6 +510,34 @@
     {
       "model": "mystery-model-2024-01-01",
       "as": "mystery-model"
+    },
+    {
+      "model": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+      "as": "claude-sonnet-4-20250514"
+    },
+    {
+      "model": "eu.anthropic.claude-opus-4-5-20251101-v1:0",
+      "as": "claude-opus-4-5"
+    },
+    {
+      "model": "global.anthropic.claude-sonnet-4-6",
+      "as": "claude-sonnet-4-6"
+    },
+    {
+      "model": "gpt-4o-2024-05-13",
+      "as": "gpt-4o-2024-05-13"
+    },
+    {
+      "model": "gpt-4o-2024-08-06",
+      "as": "gpt-4o"
+    },
+    {
+      "model": "gpt-5-2025-08-07",
+      "as": "gpt-5"
+    },
+    {
+      "model": "o3-2025-04-16",
+      "as": "o3"
     }
   ]
 }

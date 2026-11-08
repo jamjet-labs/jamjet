@@ -108,9 +108,17 @@ function extractUsage(vendor: Vendor, response: unknown): { input: number; outpu
   return { input: Number(usage['input_tokens']) || 0, output: Number(usage['output_tokens']) || 0 }
 }
 
-function extractCacheWrite(response: unknown): number {
-  const usage = ((response as Record<string, any>)?.usage ?? {}) as Record<string, unknown>
-  return Number(usage['cache_creation_input_tokens'] ?? 0) || 0
+/** Anthropic cache writes, split into 5-minute and 1-hour when the usage says so. */
+export function cacheWrites(usage: unknown): { cacheWrite: number; cacheWrite1h: number } {
+  const u = (usage ?? {}) as Record<string, any>
+  const total = Number(u['cache_creation_input_tokens'] ?? 0) || 0
+  const split = u['cache_creation']
+  if (split && typeof split === 'object') {
+    const oneHour = Number(split['ephemeral_1h_input_tokens'] ?? 0) || 0
+    const fiveMin = Number(split['ephemeral_5m_input_tokens'] ?? Math.max(0, total - oneHour)) || 0
+    return { cacheWrite: fiveMin, cacheWrite1h: oneHour }
+  }
+  return { cacheWrite: total, cacheWrite1h: 0 }
 }
 
 function extractCacheRead(_vendor: Vendor, response: unknown): number {
@@ -390,7 +398,7 @@ export async function runEnforcedCall(opts: EnforcedCallOptions): Promise<unknow
   const res = result as Record<string, unknown>
   recordUsage(
     { ...state, model: typeof res['model'] === 'string' ? res['model'] : model },
-    { ...extractUsage(vendor, result), cacheWrite: extractCacheWrite(result) },
+    { ...extractUsage(vendor, result), ...cacheWrites((result as Record<string, unknown> | null)?.['usage']) },
     extractCacheRead(vendor, result),
   )
 
@@ -550,17 +558,22 @@ function streamUsage(
   tally: StreamTally,
   estimatedPromptTokens: number,
   complete: boolean,
-): { input: number; output: number; cacheWrite: number } {
+): { input: number; output: number; cacheWrite: number; cacheWrite1h: number } {
   const estimatedOutput = Math.ceil(tally.outputChars / 4)
   const output = complete
     ? (tally.outputTokens ?? estimatedOutput)
     : Math.max(tally.outputTokens ?? 0, estimatedOutput)
-  return { input: tally.inputTokens ?? estimatedPromptTokens, output, cacheWrite: tally.cacheWriteTokens }
+  return {
+    input: tally.inputTokens ?? estimatedPromptTokens,
+    output,
+    cacheWrite: tally.cacheWriteTokens,
+    cacheWrite1h: tally.cacheWrite1hTokens,
+  }
 }
 
 function recordUsage(
   state: CallState,
-  usage: { input: number; output: number; cacheWrite?: number },
+  usage: { input: number; output: number; cacheWrite?: number; cacheWrite1h?: number },
   cacheRead: number,
   extraPayload: Record<string, unknown> = {},
 ): void {
@@ -569,7 +582,11 @@ function recordUsage(
   span.name = `${vendor}.${model}`
   span.inputTokens = usage.input
   span.outputTokens = usage.output
-  span.costUsd = estimateCost(model, usage.input, usage.output, { read: cacheRead, write: usage.cacheWrite ?? 0 })
+  span.costUsd = estimateCost(model, usage.input, usage.output, {
+    read: cacheRead,
+    write: usage.cacheWrite ?? 0,
+    write1h: usage.cacheWrite1h ?? 0,
+  })
   state.client._budget.record(span.costUsd)
 
   if (state.cacheInjected) {

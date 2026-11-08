@@ -66,10 +66,12 @@ class PolicyEvaluator:
         Matches the conformance suite (sdk/conformance/policy-decisions.yaml,
         vendored from jamjet-policy) and the TS `@jamjet/cloud` evaluator: rules
         are evaluated top-to-bottom and the first matching rule is returned.
-        Later rules cannot override an earlier match. The name is trimmed, as
-        Cloud trims the tool name it evaluates.
+        Later rules cannot override an earlier match. The name is trimmed of
+        ASCII whitespace only (space, \\t, \\n, \\r, \\f, \\v), per
+        sdk/conformance/README.md; ``str.strip()`` would also strip U+0085 and
+        \\x1c-\\x1f.
         """
-        tool_name = tool_name.strip()
+        tool_name = tool_name.strip(" \t\n\r\f\v")
         with self._lock:
             rules = list(self._rules)
         for action, pattern, compiled in rules:
