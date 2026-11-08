@@ -26,7 +26,7 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 dashmap = "6"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 [dev-dependencies]
 tokio = { workspace = true }
