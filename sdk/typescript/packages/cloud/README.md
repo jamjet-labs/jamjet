@@ -131,9 +131,11 @@ the approval's deadline (clamped to 1 minute to 24 hours); JamJet Cloud
 deployments since jamjet-cloud #87 refuse decisions after it. The `signal` in
 the request options also cancels the wait.
 
-The approval shows the reviewer the call's arguments with credentials masked
-(by field name, such as `password` or `api_key`, and by shape, such as
-`Bearer ...` or `sk-...`), always. With redaction on, emails, SSNs, phone
+The approval shows the reviewer the call's arguments with credentials masked,
+always: by a short list of field names (`password`, `secret`, `api_key`,
+`authorization`, `access_token`, `refresh_token`, ...) and by shape (`Bearer`
+and `Basic` headers, JWTs, `sk-`/`AKIA`/`ghp_`-style keys, long high-entropy
+strings). With redaction on, emails, SSNs, phone
 numbers and IPs are masked too, and IBANs and card numbers keep their last 4.
 It also carries `arguments_sha256`, a SHA-256 of the canonical arguments; the
 SDK re-checks it before releasing the approved call and throws

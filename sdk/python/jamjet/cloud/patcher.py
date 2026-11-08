@@ -181,7 +181,7 @@ def _response_tool_calls(vendor: str, result: Any) -> list[tuple[str | None, str
     """(id, name, arguments) of every tool call in a finished response."""
     calls: list[tuple[str | None, str, Any]] = []
     if vendor == "openai":
-        for choice in _field(result, "choices") or []:
+        for position, choice in enumerate(_field(result, "choices") or []):
             message = _field(choice, "message")
             for tc in _field(message, "tool_calls") or []:
                 fn = _field(tc, "function") or _field(tc, "custom")
@@ -191,7 +191,11 @@ def _response_tool_calls(vendor: str, result: Any) -> list[tuple[str | None, str
             # Legacy `functions` API: a single message.function_call.
             legacy = _field(message, "function_call")
             if legacy is not None:
-                calls.append((None, tool_name_of(legacy), _field(legacy, "arguments")))
+                # No id of its own: name it after the choice, so two choices
+                # calling the same function stay distinct.
+                index = _field(choice, "index")
+                call_id = f"function_call:{position if index is None else index}"
+                calls.append((call_id, tool_name_of(legacy), _field(legacy, "arguments")))
         return calls
     for block in _field(result, "content") or []:
         if _field(block, "type") in ("tool_use", "server_tool_use", "mcp_tool_use"):
@@ -367,13 +371,14 @@ def _enforce_streamed(vendor: str, result: Any, span: Any, model: str, kwargs: d
             _record_usage(span, tally.model or model, input_tokens, output, **extra)
 
         def gated(listed: list[StreamedToolCall]) -> list[tuple[str | None, str, Any]]:
-            # Gate the name as last sent and the fragments joined, like the block check.
+            # Gate the name as last sent or the fragments joined, like the block
+            # check: one approval per call, under the joined name when it is gated.
+            evaluator = get_evaluator()
             out: list[tuple[str | None, str, Any]] = []
             for c in listed:
-                arguments = _streamed_arguments(vendor, c.arguments)
-                out.append((c.id, c.name, arguments))
-                if c.joined_name and c.joined_name != c.name:
-                    out.append((c.id, c.joined_name, arguments))
+                names = [c.joined_name, c.name] if c.joined_name and c.joined_name != c.name else [c.name]
+                name = next((n for n in names if evaluator.evaluate(n).policy_kind == "require_approval"), c.name)
+                out.append((c.id, name, _streamed_arguments(vendor, c.arguments)))
             return out
 
         _gate_approvals(

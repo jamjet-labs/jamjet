@@ -251,6 +251,74 @@ describe('approval context and binding', () => {
   })
 })
 
+describe('approval re-review fixes', () => {
+  beforeEach(resetActive)
+  afterEach(resetActive)
+
+  it('masks credentials by shape and an explicit field list, not every *_token field', async () => {
+    const { client } = makeClient()
+    policy('require_approval', 'pay')
+    const created: Created[] = []
+    approvals(() => ({ status: 'approved' }), created)
+    const args = JSON.stringify({
+      payee_token: 'ACME-PAYEE-001',
+      access_token: 'short',
+      note: 'key Zx8Qm2Lp9Rt4Vb7Nc1Kd6Hs3Jf5Gw0Ye',
+      digest: 'a3f5c9e1b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2',
+      jwt: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl',
+    })
+    await runEnforcedCall({ client, vendor: 'openai', original: openaiToolCall('pay', args), args: [{ model: 'gpt-4o', messages: [] }] })
+    expect(created[0]!.body['context']['arguments']).toEqual({
+      payee_token: 'ACME-PAYEE-001',
+      access_token: '[SECRET]',
+      note: 'key [SECRET]',
+      digest: 'a3f5c9e1b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2',
+      jwt: '[SECRET]',
+    })
+  })
+
+  it('two choices calling the same legacy function with different arguments are each approved', async () => {
+    const { client } = makeClient()
+    policy('require_approval', 'pay')
+    const created: Created[] = []
+    approvals(() => ({ status: 'approved' }), created)
+    await runEnforcedCall({
+      client,
+      vendor: 'openai',
+      original: async () => ({
+        model: 'gpt-4o',
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+        choices: [
+          { index: 0, message: { function_call: { name: 'pay', arguments: '{"amount":1}' } } },
+          { index: 1, message: { function_call: { name: 'pay', arguments: '{"amount":2}' } } },
+        ],
+      }),
+      args: [{ model: 'gpt-4o', messages: [], n: 2 }],
+    })
+    expect(created.map((c) => c.body['context']['tool_call_id'])).toEqual(['function_call:0', 'function_call:1'])
+  })
+
+  it('opens one approval when both the last fragment and the joined name are gated', async () => {
+    const { client } = makeClient()
+    policy('require_approval', '*refund')
+    const created: Created[] = []
+    approvals(() => ({ status: 'approved' }), created)
+    const chunks = [
+      { model: 'gpt-4o', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'c1', type: 'function', function: { name: 'pay', arguments: '' } }] } }] },
+      { model: 'gpt-4o', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'ments.refund', arguments: '{}' } }] } }] },
+      { model: 'gpt-4o', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+    ]
+    const s = await runEnforcedCall({
+      client,
+      vendor: 'openai',
+      original: async () => ({ [Symbol.asyncIterator]: async function* () { for (const c of chunks) yield c } }),
+      args: [{ model: 'gpt-4o', messages: [], stream: true }],
+    })
+    for await (const _ of s as AsyncIterable<unknown>) { /* read */ }
+    expect(created.map((c) => c.body['action'])).toEqual(['payments.refund'])
+  })
+})
+
 describe('require_approval on streamed tool calls', () => {
   beforeEach(resetActive)
   afterEach(resetActive)
