@@ -200,6 +200,9 @@ pub async fn fetch_card(url: &Url, allow_private: bool) -> Result<Vec<u8>, Disco
         }
     }
     let client = reqwest::Client::builder()
+        // A proxy from HTTP(S)_PROXY would resolve the host itself, past the
+        // pin, and could reach what the check refused.
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .resolve(&host, addrs[0])
         .connect_timeout(FETCH_TIMEOUT)

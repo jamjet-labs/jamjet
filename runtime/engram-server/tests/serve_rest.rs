@@ -106,3 +106,49 @@ fn rest_with_a_token_refuses_requests_without_it() {
     assert!(without.contains("401"), "{without}");
     assert!(with.contains("200"), "{with}");
 }
+
+/// `ENGRAM_ALLOW_UNAUTHENTICATED` takes yes/no values. clap's plain bool
+/// parser refused `1` (the form the README gives) as an invalid value, and
+/// `0` must mean no.
+#[test]
+fn the_allow_unauthenticated_env_takes_yes_and_no() {
+    // `=0` off loopback: refused for want of auth, not as a parse error.
+    let mut child = engram(&[
+        ("ENGRAM_HOST", "0.0.0.0"),
+        ("ENGRAM_ALLOW_UNAUTHENTICATED", "0"),
+    ]);
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() && start.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!status.success());
+    assert!(stderr.contains("refusing to serve"), "{stderr}");
+
+    // `=1` parses (on loopback, so nothing is exposed) and the server starts.
+    let mut child = engram(&[("ENGRAM_ALLOW_UNAUTHENTICATED", "1")]);
+    let mut started = false;
+    let mut seen = String::new();
+    for line in BufReader::new(child.stderr.take().unwrap())
+        .lines()
+        .map_while(Result::ok)
+    {
+        seen.push_str(&line);
+        seen.push('\n');
+        if line.contains("listening on") {
+            started = true;
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(started, "{seen}");
+}

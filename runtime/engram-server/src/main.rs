@@ -64,8 +64,14 @@ enum Cli {
         auth_token: Option<String>,
 
         /// Serve the REST API off loopback with no token. Anyone who can reach
-        /// the port can then read and delete every memory.
-        #[arg(long, env = "ENGRAM_ALLOW_UNAUTHENTICATED")]
+        /// the port can then read and delete every memory. The env var takes
+        /// 1/true/yes/on or 0/false/no/off.
+        #[arg(
+            long,
+            env = "ENGRAM_ALLOW_UNAUTHENTICATED",
+            action = clap::ArgAction::SetTrue,
+            value_parser = clap::builder::BoolishValueParser::new()
+        )]
         allow_unauthenticated: bool,
 
         // ── LLM provider ──────────────────────────────────────────────
