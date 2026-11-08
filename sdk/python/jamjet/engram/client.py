@@ -60,7 +60,9 @@ class EngramClient:
         timeout: float = 30.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        self._token = api_token or os.environ.get("ENGRAM_TOKEN")
+        # ENGRAM_AUTH_TOKEN is what both Engram servers and the Java SDK read;
+        # ENGRAM_TOKEN is kept for existing setups.
+        self._token = api_token or os.environ.get("ENGRAM_AUTH_TOKEN") or os.environ.get("ENGRAM_TOKEN")
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,

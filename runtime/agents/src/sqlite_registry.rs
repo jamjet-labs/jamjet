@@ -211,35 +211,18 @@ impl AgentRegistry for SqliteAgentRegistry {
 
     #[instrument(skip(self), fields(url = url))]
     async fn discover_remote(&self, url: &str) -> Result<Agent, String> {
-        let agent_card_url = format!("{url}/.well-known/agent.json");
-        let card: AgentCard = http_client()?
-            .get(&agent_card_url)
-            .send()
+        // Through the egress guard: public https only, pinned, no redirects,
+        // bounded, and a generic error. The default client followed
+        // redirects, reached any address and echoed the failure.
+        let card = crate::outbound::discover_card(url, crate::outbound::private_allowed())
             .await
-            .map_err(|e| format!("fetch Agent Card: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("parse Agent Card: {e}"))?;
+            .map_err(|e| e.to_string())?;
 
         let id = self.register(card).await?;
         self.get(id)
             .await?
             .ok_or_else(|| "agent not found after registration".into())
     }
-}
-
-/// One client for every call: it holds the connection pool, and building one
-/// reads the system trust store. Only a built client is kept, so a failure is
-/// tried again on the next call.
-fn http_client() -> Result<&'static reqwest::Client, String> {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    if let Some(client) = CLIENT.get() {
-        return Ok(client);
-    }
-    let built = reqwest::Client::builder()
-        .build()
-        .map_err(|e| format!("cannot build an HTTP client: {e}"))?;
-    Ok(CLIENT.get_or_init(|| built))
 }
 
 #[cfg(test)]

@@ -142,6 +142,17 @@ credentials in an `mcp:` or `a2a:` block are not used. Its own MCP endpoint,
 `/mcp`, takes the same Bearer tokens and roles as the REST routes. The server
 has no OAuth or mTLS support.
 
+`POST /agents/discover` (and the MCP tool `jamjet_discover_agent`) fetches the
+Agent Card at a URL the caller gives, so it is guarded: the URL must be
+`https` with no credentials in it, and the host must resolve only to public
+addresses (no loopback, private, link-local, CGNAT or metadata ranges). The
+request is pinned to the address that was checked, redirects are not
+followed, the card is capped at 256 KiB and 10 s, and any fetch failure
+returns the same message, so the route cannot be used to read internal
+services or map ports. For an agent on your own machine set
+`JAMJET_DISCOVERY_ALLOW_PRIVATE=1`, which also allows `http`; the other limits
+stay.
+
 ---
 
 ## Tool permissions

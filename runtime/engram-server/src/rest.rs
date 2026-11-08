@@ -75,6 +75,14 @@ pub struct ForgetRequest {
     pub reason: Option<String>,
 }
 
+/// The scope a forget, stats or delete call acts in: `org_id` (default
+/// `default`) and, optionally, `user_id`.
+#[derive(Deserialize, Default)]
+pub struct ScopeParams {
+    pub org_id: Option<String>,
+    pub user_id: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub struct ConsolidateRequest {
     pub user_id: Option<String>,
@@ -272,6 +280,7 @@ async fn context_handler(
 async fn forget_handler(
     State(state): State<AppState>,
     Path(fact_id): Path<String>,
+    Query(scope): Query<ScopeParams>,
     body: Option<Json<ForgetRequest>>,
 ) -> impl IntoResponse {
     let id = match uuid::Uuid::parse_str(&fact_id) {
@@ -282,14 +291,15 @@ async fn forget_handler(
     };
 
     let reason = body.and_then(|b| b.reason.clone());
+    let scope = parse_scope(scope.org_id.as_deref(), scope.user_id.as_deref(), None);
 
-    match state.memory.forget(id, reason.as_deref()).await {
+    match crate::handlers::forget_in_scope(&state.memory, id, &scope, reason.as_deref()).await {
         Ok(()) => Json(serde_json::json!({
             "success": true,
             "deleted_fact_id": fact_id,
         }))
         .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => err(StatusCode::NOT_FOUND, e).into_response(),
     }
 }
 
@@ -325,18 +335,15 @@ async fn search_handler(
     }
 }
 
-/// GET /v1/memory/stats
-async fn stats_handler(State(state): State<AppState>) -> impl IntoResponse {
-    match state.memory.stats(None).await {
-        Ok(stats) => Json(serde_json::json!({
-            "total_facts": stats.total_facts,
-            "valid_facts": stats.valid_facts,
-            "invalidated_facts": stats.invalidated_facts,
-            "total_entities": stats.total_entities,
-            "total_relationships": stats.total_relationships,
-        }))
-        .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+/// GET /v1/memory/stats?org_id=&user_id=
+async fn stats_handler(
+    State(state): State<AppState>,
+    Query(scope): Query<ScopeParams>,
+) -> impl IntoResponse {
+    let scope = parse_scope(scope.org_id.as_deref(), scope.user_id.as_deref(), None);
+    match crate::handlers::stats_in_scope(&state.memory, &scope).await {
+        Ok(stats) => Json(stats).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
@@ -363,8 +370,9 @@ async fn consolidate_handler(
 async fn delete_user_handler(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
+    Query(scope): Query<ScopeParams>,
 ) -> impl IntoResponse {
-    let scope = Scope::user("default", &user_id);
+    let scope = Scope::user(scope.org_id.as_deref().unwrap_or("default"), &user_id);
 
     match state.memory.delete_user_data(scope).await {
         Ok(count) => Json(serde_json::json!({
@@ -556,9 +564,26 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/memory/messages",
             post(save_messages_handler).get(list_conversations_handler),
         )
+        // axum 0.7 path syntax. `{conversation_id}` (0.8 syntax) was a
+        // literal path here, so GET and DELETE always answered 404.
         .route(
-            "/v1/memory/messages/{conversation_id}",
+            "/v1/memory/messages/:conversation_id",
             get(get_messages_handler).delete(delete_messages_handler),
         )
         .with_state(state)
+}
+
+/// [`build_router`] behind [`crate::auth::require_bearer`] when `token` is
+/// set: what `engram serve --mode rest` runs.
+pub fn build_router_with_auth(state: AppState, token: Option<String>) -> Router {
+    let router = build_router(state);
+    match token {
+        Some(t) => {
+            let t = Arc::new(t);
+            router.layer(axum::middleware::from_fn(move |req, next| {
+                crate::auth::require_bearer(t.clone(), req, next)
+            }))
+        }
+        None => router,
+    }
 }
