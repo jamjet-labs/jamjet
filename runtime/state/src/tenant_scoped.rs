@@ -1859,18 +1859,8 @@ impl StateBackend for TenantScopedSqliteBackend {
     // ── API tokens ────────────────────────────────────────────────────────
 
     async fn create_token(&self, name: &str, role: &str) -> BackendResult<(String, ApiToken)> {
-        use rand::Rng;
-        use sha2::{Digest, Sha256};
-
-        let random_bytes: [u8; 32] = rand::thread_rng().gen();
-        let token = format!(
-            "jj_{}",
-            random_bytes
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        );
-        let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let token = crate::api_token::generate();
+        let token_hash = crate::api_token::hash(&token);
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
@@ -1900,9 +1890,7 @@ impl StateBackend for TenantScopedSqliteBackend {
     }
 
     async fn validate_token(&self, token: &str) -> BackendResult<Option<ApiToken>> {
-        use sha2::{Digest, Sha256};
-
-        let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let token_hash = crate::api_token::hash(token);
         let now = Utc::now().to_rfc3339();
 
         let row = sqlx::query(
