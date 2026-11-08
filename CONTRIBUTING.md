@@ -174,8 +174,8 @@ cargo test --package jamjet-scheduler -- --test-threads 1
 jamjet dev
 
 # In another terminal
-jamjet run examples/basic-tool-flow
-jamjet run examples/rag-assistant
+jamjet run examples/basic-tool-flow/workflow.py --input '{"question": "What is JamJet?"}'
+jamjet validate examples/rag-assistant/workflow.yaml
 ```
 
 ---

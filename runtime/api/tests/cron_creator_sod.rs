@@ -135,15 +135,8 @@ async fn fire_due_jobs(env: &Env) {
 /// Alice registers the gated workflow and schedules it. Returns the cron run,
 /// held at the gate, and the digest of its pending request.
 async fn held_cron_run(env: &Env) -> (ExecutionId, String) {
-    let (st, body) = send(
-        &env.app,
-        "POST",
-        "/workflows",
-        &env.alice,
-        Some(json!({ "ir": gated_ir() })),
-    )
-    .await;
-    assert!(st.is_success(), "{st} {body}");
+    // Stored, not registered: `POST /workflows` refuses a `tool` node.
+    support::store_ir(env.state.backend.as_ref(), &gated_ir()).await;
     let (st, body) = send(
         &env.app,
         "POST",

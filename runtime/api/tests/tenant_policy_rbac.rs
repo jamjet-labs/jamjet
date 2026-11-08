@@ -189,15 +189,8 @@ async fn a_developer_cannot_drop_the_tenant_gate() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "operator sets the gate: {body}");
-    let (st, body) = call(
-        &env.app,
-        Method::POST,
-        "/workflows",
-        &env.alice,
-        Some(json!({ "ir": ungated_ir("0.1.0") })),
-    )
-    .await;
-    assert!(st.is_success(), "{st} {body}");
+    // Stored, not registered: `POST /workflows` refuses a `tool` node.
+    support::store_ir(env.backend.as_ref(), &ungated_ir("0.1.0")).await;
 
     // Control: the tenant gate holds the first run.
     let first = start(&env).await;

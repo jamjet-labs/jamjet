@@ -200,7 +200,7 @@ async fn start_on(
     let state = state_for(tb, backend.clone()).await;
     register(&state, cards).await;
     let wf = ir["workflow_id"].as_str().unwrap().to_string();
-    let eid = support::register_and_start(&state, ir.clone(), input.clone()).await;
+    let eid = support::store_and_start(&state, ir.clone(), input.clone()).await;
     let eid =
         ExecutionId(uuid::Uuid::parse_str(eid.strip_prefix("exec_").unwrap_or(&eid)).unwrap());
     Run {
@@ -406,6 +406,17 @@ async fn each() -> Vec<(String, support::TestBackend, Transport, String)> {
     out
 }
 
+/// `each` without the claim transport, for a node dispatched to one of the
+/// engine's queues (`general`, `model`), which external workers are not
+/// served.
+fn in_process_only(
+    all: Vec<(String, support::TestBackend, Transport, String)>,
+) -> Vec<(String, support::TestBackend, Transport, String)> {
+    all.into_iter()
+        .filter(|(_, _, t, _)| !matches!(t, Transport::Claim))
+        .collect()
+}
+
 /// The node was refused by `limit`, recorded, and failed for good.
 async fn assert_limit(run: &Run, ran: bool, limit: &str, value: Value, actual: Value, ctx: &str) {
     assert!(!ran, "{ctx}: the step past the limit ran");
@@ -467,7 +478,8 @@ fn agent_node(target: &str) -> Value {
 /// An `agent` node is a step of the agent it calls, attributed or not.
 #[tokio::test]
 async fn an_agent_node_charges_the_agent_it_calls() {
-    for (ctx, tb, t, wf) in each().await {
+    // The engine's queues are not served to external workers: in process only.
+    for (ctx, tb, t, wf) in in_process_only(each().await) {
         let mut run = start(
             &tb,
             &[card(json!({ "max_iterations": 1 }))],
@@ -484,7 +496,8 @@ async fn an_agent_node_charges_the_agent_it_calls() {
 /// A callee with no registered card has no limits to apply.
 #[tokio::test]
 async fn an_agent_node_calling_an_unregistered_agent_runs() {
-    for (ctx, tb, t, wf) in each().await {
+    // The engine's queues are not served to external workers: in process only.
+    for (ctx, tb, t, wf) in in_process_only(each().await) {
         let mut run = start(
             &tb,
             &[],
@@ -538,7 +551,8 @@ async fn a_dispatch_batch_counts_each_call() {
 /// A model step calls no tool, so a spent tool call budget does not stop it.
 #[tokio::test]
 async fn a_model_step_is_not_a_tool_call() {
-    for (ctx, tb, t, wf) in each().await {
+    // The engine's queues are not served to external workers: in process only.
+    for (ctx, tb, t, wf) in in_process_only(each().await) {
         let mut run = start(
             &tb,
             &[card(json!({ "max_tool_calls": 0 }))],

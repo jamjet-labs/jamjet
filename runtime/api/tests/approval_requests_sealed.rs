@@ -29,6 +29,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+mod support;
+
 /// Keeps every appended entry in chain order.
 #[derive(Default)]
 struct CapturingAuditBackend {
@@ -261,6 +263,7 @@ async fn a_request_raised_by_the_in_process_worker_is_sealed() {
         env.backend.clone() as Arc<dyn StateBackend>,
         vec!["python_tool".into()],
     )
+    .register_executor("python_fn", Arc::new(support::NoopExecutor))
     .with_sealer(env.enricher.clone());
     assert!(
         worker.poll_and_execute().await.unwrap(),

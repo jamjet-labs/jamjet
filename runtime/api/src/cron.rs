@@ -51,12 +51,11 @@ pub async fn create_cron(
         (None, Some(_)) => None,
         (None, None) => return Err(ApiError::Unauthorized),
     };
-    // Defaults to the SDK compiler's default workflow version ("0.1.0"), which is
-    // what `jamjet deploy` registers. This intentionally differs from
-    // start_execution's "1.0.0" fallback; reconciling one canonical default across
-    // the API is tracked as separate runtime work. The deploy flow always sends the
-    // version explicitly, so this default only applies to raw POST /cron callers.
-    let version = body.workflow_version.unwrap_or_else(|| "0.1.0".into());
+    // The same default as `start_run` in routes.rs and the Python SDK's
+    // DEFAULT_WORKFLOW_VERSION, so a workflow registered without a version can be
+    // both started and scheduled without naming one. The SDK and `jamjet deploy`
+    // send the version explicitly; this default only applies to callers that omit it.
+    let version = body.workflow_version.unwrap_or_else(|| "1.0.0".into());
 
     // The target workflow must be registered (deploy registers first).
     let backend = state.backend_for(&tenant_id);

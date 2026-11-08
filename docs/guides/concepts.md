@@ -28,20 +28,18 @@ A **workflow** is a typed directed graph of nodes connected by edges. It:
 
 ## Node
 
-A **node** is a discrete unit of work in a workflow graph. JamJet supports:
+A **node** is a discrete unit of work in a workflow graph. The runtime runs:
 
 | Node type | What it does |
 |-----------|-------------|
 | `model` | LLM call with a prompt and structured output |
-| `tool` | Python function, HTTP endpoint, or MCP tool |
 | `condition` | Routes to different next nodes based on expressions |
 | `human_approval` | Pauses for a human decision |
-| `wait` | Suspends until a timer fires or external event arrives |
-| `parallel` | Fans out to multiple branches concurrently |
-| `join` | Waits for all parallel branches to complete |
-| `mcp_tool` | Calls a tool via MCP protocol |
-| `a2a_task` | Delegates to an external agent via A2A |
-| `agent` | Invokes a local JamJet agent |
+| `python_fn`, `java_fn`, `external_fn` | A function run by an external worker (`@tool`, `@workflow.step`, a Java `@Tool`, or any worker on a named queue) |
+
+The IR also has `tool`, `wait`, `parallel`, `join`, `mcp_tool`, `a2a_task`,
+`agent` and other kinds the engine has no executor for. Registration refuses a
+workflow that uses them. See [Node types](yaml-reference.md#node-types).
 
 ---
 

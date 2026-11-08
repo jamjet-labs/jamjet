@@ -19,6 +19,13 @@ from jamjet.eval.grid import (
 from jamjet.eval.runner import EvalResult
 from jamjet.eval.scorers import ScorerResult
 
+# Tests that run a scipy-backed comparison. Whichever runs first pays for the
+# first `scipy.stats` import in the process: about a second on a warm venv, but
+# tens of seconds on a fresh one while its native libraries load for the first
+# time. They are marked together so `pytest -m "not slow"` skips the import
+# entirely; marking one test would only move the cost to the next.
+needs_scipy = pytest.mark.slow
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -111,6 +118,7 @@ def test_comparison_result_defaults():
 # ── compare() with scipy ─────────────────────────────────────────────────────
 
 
+@needs_scipy
 def test_compare_welch():
     gr = _make_grid_results(
         [4.0, 4.5, 3.8, 4.2, 4.1],
@@ -128,6 +136,7 @@ def test_compare_welch():
     assert result.mean_diff > 0
 
 
+@needs_scipy
 def test_compare_wilcoxon():
     gr = _make_grid_results(
         [4.0, 4.5, 3.8, 4.2, 4.1],
@@ -139,6 +148,7 @@ def test_compare_wilcoxon():
     assert result.p_value is not None
 
 
+@needs_scipy
 def test_compare_mann_whitney():
     gr = _make_grid_results(
         [4.0, 4.5, 3.8, 4.2, 4.1],
@@ -150,6 +160,7 @@ def test_compare_mann_whitney():
     assert result.p_value is not None
 
 
+@needs_scipy
 def test_compare_auto_picks_wilcoxon_for_small_paired():
     gr = _make_grid_results(
         [4.0, 4.5, 3.8, 4.2, 4.1],
@@ -160,6 +171,7 @@ def test_compare_auto_picks_wilcoxon_for_small_paired():
     assert result.test_name == "wilcoxon_signed_rank"
 
 
+@needs_scipy
 def test_compare_auto_picks_mann_whitney_for_unequal():
     gr = _make_grid_results(
         [4.0, 4.5, 3.8, 4.2],
@@ -204,6 +216,7 @@ def test_compare_insufficient_data():
         gr.compare({"strategy": "react"}, {"strategy": "debate"})
 
 
+@needs_scipy
 def test_compare_not_significant():
     # Scores that are very close should not be significant.
     gr = _make_grid_results(
@@ -214,6 +227,7 @@ def test_compare_not_significant():
     assert result.significant is False
 
 
+@needs_scipy
 def test_compare_custom_alpha():
     gr = _make_grid_results(
         [4.0, 4.5, 3.8, 4.2, 4.1],
@@ -289,6 +303,7 @@ def test_auto_passthrough_non_auto():
 # ── Welch's t-test ───────────────────────────────────────────────────────────
 
 
+@needs_scipy
 def test_welch_t_test_returns_correct_type():
     result = _run_comparison(
         [4.0, 4.5, 3.8, 4.2, 4.1],
@@ -300,6 +315,7 @@ def test_welch_t_test_returns_correct_type():
     assert isinstance(result.p_value, float)
 
 
+@needs_scipy
 def test_welch_identical_samples():
     vals = [3.0, 3.0, 3.0, 3.0, 3.0]
     result = _run_comparison(vals, vals, test="welch")
@@ -310,6 +326,7 @@ def test_welch_identical_samples():
 # ── Confidence interval computation ─────────────────────────────────────────
 
 
+@needs_scipy
 def test_confidence_interval_contains_mean_diff():
     a = [4.0, 4.5, 3.8, 4.2, 4.1]
     b = [3.0, 3.2, 2.8, 3.1, 3.0]
@@ -318,6 +335,7 @@ def test_confidence_interval_contains_mean_diff():
     assert ci_lo <= mean_diff <= ci_hi
 
 
+@needs_scipy
 def test_confidence_interval_narrower_at_lower_confidence():
     a = [4.0, 4.5, 3.8, 4.2, 4.1, 4.3, 3.9, 4.0]
     b = [3.0, 3.2, 2.8, 3.1, 3.0, 3.3, 2.9, 3.1]
@@ -328,6 +346,7 @@ def test_confidence_interval_narrower_at_lower_confidence():
     assert width_99 > width_95
 
 
+@needs_scipy
 def test_confidence_interval_zero_variance():
     a = [3.0, 3.0, 3.0]
     b = [3.0, 3.0, 3.0]
@@ -395,6 +414,7 @@ def test_grid_results_from_json_invalid_format(tmp_path):
 # ── CLI command ──────────────────────────────────────────────────────────────
 
 
+@needs_scipy
 def test_cli_compare_table_output(tmp_path):
     from typer.testing import CliRunner
 
@@ -413,6 +433,7 @@ def test_cli_compare_table_output(tmp_path):
     assert "Statistical Comparison" in result.output or "Comparison" in result.output
 
 
+@needs_scipy
 def test_cli_compare_json_output(tmp_path):
     from typer.testing import CliRunner
 
@@ -472,6 +493,7 @@ def test_cli_compare_condition_not_found(tmp_path):
     assert "not found" in result.output
 
 
+@needs_scipy
 def test_cli_compare_welch_test_flag(tmp_path):
     from typer.testing import CliRunner
 

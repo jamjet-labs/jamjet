@@ -192,13 +192,17 @@ async fn java_tool_claim_complete_round_trip_advances_durably() {
         .await
         .expect("enqueue_work_item");
 
-    // Spawn the scheduler + the default worker pool. The pool registers
+    // Spawn the scheduler + the server worker pool. The pool registers
     // `java_tool` with ZERO internal workers, so the JavaFn node's work item is
     // claimable only by an external worker — which this test plays the part of.
     let scheduler = jamjet_scheduler::Scheduler::new(backend.clone())
         .with_poll_interval(Duration::from_millis(25));
     let sched_handle = tokio::spawn(async move { scheduler.run().await });
-    let worker_handles = jamjet_worker::default_pool(backend.clone()).spawn();
+    let worker_handles = jamjet_worker::server_pool(
+        backend.clone(),
+        Arc::new(jamjet_models::ModelRegistry::new()),
+    )
+    .spawn();
 
     let state = make_state(backend.clone());
 

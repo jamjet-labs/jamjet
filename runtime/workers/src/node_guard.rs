@@ -402,11 +402,16 @@ async fn guard_policy(
     } else {
         PolicyEvaluator.evaluate(&ctx, &sets)
     };
-    // A card gate or an autonomy escalation turns an allow into an approval;
-    // a block stays a block, and a chain gate is already one (whose approval
-    // also covers the escalation: both approve this one action).
+    // A `human_approval` node is gated by what it is: it exists to wait for a
+    // person. Until 2026-11 it had no executor and the worker completed it
+    // with an empty output, so the run went on with nobody asked.
+    let human_gate = human_approval_node(&node_def.kind);
+    // A card gate, an autonomy escalation or a `human_approval` node turns an
+    // allow into an approval; a block stays a block, and a chain gate is
+    // already one (whose approval also covers the escalation: both approve
+    // this one action).
     let decision = match decision {
-        PolicyDecision::Allow if card_gate.is_some() || escalation.is_some() => {
+        PolicyDecision::Allow if card_gate.is_some() || escalation.is_some() || human_gate => {
             PolicyDecision::RequireApproval {
                 approver: "human".to_string(),
             }
@@ -452,8 +457,17 @@ async fn guard_policy(
                     // the node: raising the request with no deadline would
                     // leave it open forever under a policy that says it
                     // expires.
+                    // A `human_approval` node's `timeout_secs` is one more
+                    // ceiling next to the chain's: the shortest applies.
+                    let node_timeout = human_approval_timeout(&node_def.kind);
+                    let mut deadline_sets = sets.clone();
+                    if let Some(t) = &node_timeout {
+                        deadline_sets.push(t);
+                    }
                     let deadline =
-                        match deadline_or_block(backend, execution_id, node_id, &sets).await {
+                        match deadline_or_block(backend, execution_id, node_id, &deadline_sets)
+                            .await
+                        {
                             Ok(d) => d,
                             Err(blocked) => return blocked,
                         };
@@ -469,6 +483,10 @@ async fn guard_policy(
                             let mut c = serde_json::json!({ "node_id": node_id });
                             if let Some(e) = escalation {
                                 c[crate::agent_limits::ESCALATION_KEY] = e.context();
+                            }
+                            // What the reviewer is asked, as the author wrote it.
+                            if let NodeKind::HumanApproval { description, .. } = &node_def.kind {
+                                c["description"] = Value::String(description.clone());
                             }
                             c
                         },
@@ -489,6 +507,28 @@ async fn guard_policy(
                 other => other,
             }
         }
+    }
+}
+
+/// Whether `kind` is a `human_approval` node, which always needs an approval.
+fn human_approval_node(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::HumanApproval { .. })
+}
+
+/// A `human_approval` node's `timeout_secs`, as a policy level for
+/// [`ApprovalDeadline::resolve`]: so it is checked like any other level (1
+/// second to a year) and is a ceiling next to the tenant, workflow and node
+/// policies, never a way to lengthen theirs.
+fn human_approval_timeout(kind: &NodeKind) -> Option<PolicySetIr> {
+    match kind {
+        NodeKind::HumanApproval {
+            timeout_secs: Some(t),
+            ..
+        } => Some(PolicySetIr {
+            approval_timeout_secs: Some(*t),
+            ..PolicySetIr::default()
+        }),
+        _ => None,
     }
 }
 

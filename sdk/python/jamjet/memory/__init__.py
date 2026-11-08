@@ -11,7 +11,8 @@ def __getattr__(name: str):  # noqa: ANN001, ANN202
             from engram import Scope
         except ImportError as e:
             raise ImportError(
-                "jamjet.memory.Scope requires the 'memory' extra. Install with: pip install 'jamjet[memory]'"
+                "jamjet.memory.Scope requires the 'memory' extra. "
+                "Install with: pip install 'jamjet[memory]' (Python 3.12+)"
             ) from e
         return Scope
     if name == "AgentMemory":
@@ -19,7 +20,8 @@ def __getattr__(name: str):  # noqa: ANN001, ANN202
             from jamjet.memory.engram_bridge import AgentMemory
         except ImportError as e:
             raise ImportError(
-                "jamjet.memory.AgentMemory requires the 'memory' extra. Install with: pip install 'jamjet[memory]'"
+                "jamjet.memory.AgentMemory requires the 'memory' extra. "
+                "Install with: pip install 'jamjet[memory]' (Python 3.12+)"
             ) from e
         return AgentMemory
     raise AttributeError(f"module 'jamjet.memory' has no attribute {name!r}")

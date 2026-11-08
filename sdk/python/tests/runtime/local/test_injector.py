@@ -1,3 +1,5 @@
+import importlib.util
+
 import pytest
 
 from jamjet.decorators import DurableAgent
@@ -5,6 +7,7 @@ from jamjet.runtime.local.injector import inject_runtime_attributes
 from jamjet.spec import MemoryConfig
 
 
+@pytest.mark.skipif(importlib.util.find_spec("engram") is None, reason="needs jamjet-engram (Python 3.12+)")
 @pytest.mark.asyncio
 async def test_injector_wires_memory(tmp_path):
     @DurableAgent(memory=MemoryConfig(db_path=str(tmp_path / "engram.db")))
