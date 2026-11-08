@@ -33,6 +33,7 @@ pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_external_queues(ir)?;
     validate_node_ids(ir)?;
     validate_approval_deadlines(ir)?;
+    validate_human_approvals(ir)?;
     Ok(())
 }
 
@@ -58,6 +59,133 @@ pub fn validate_approval_deadlines(ir: &WorkflowIr) -> IrResult<()> {
         }
     }
     Ok(())
+}
+
+/// Every `human_approval` node can be honoured: its `timeout_secs` is a
+/// deadline the engine accepts (1 second to a year, like a policy's
+/// `approval_timeout_secs`), and its `fallback_node` names another node of
+/// the workflow. A fallback that does not exist would turn an expiry into a
+/// run that can never finish.
+pub fn validate_human_approvals(ir: &WorkflowIr) -> IrResult<()> {
+    use crate::workflow::MAX_APPROVAL_TIMEOUT_SECS;
+    use jamjet_core::node::NodeKind;
+    let mut ids: Vec<&String> = ir.nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        let NodeKind::HumanApproval {
+            timeout_secs,
+            fallback_node,
+            ..
+        } = &ir.nodes[id].kind
+        else {
+            continue;
+        };
+        let invalid = |reason: String| IrError::InvalidHumanApproval {
+            node: id.clone(),
+            reason,
+        };
+        if let Some(t) = timeout_secs {
+            if !(1..=MAX_APPROVAL_TIMEOUT_SECS).contains(t) {
+                return Err(invalid(format!(
+                    "timeout_secs must be between 1 and {MAX_APPROVAL_TIMEOUT_SECS}, got {t}"
+                )));
+            }
+        }
+        if fallback_node.is_some() {
+            human_approval_fallback(ir, id).map_err(invalid)?;
+        }
+    }
+    Ok(())
+}
+
+/// The `fallback_node` that ends the run on expiry instead of naming a node.
+pub const FALLBACK_END: &str = "end";
+
+/// The `fallback_node` of the `human_approval` node `node_id`, if it names one
+/// the engine can route to: `Ok(None)` when it names none (or `node_id` is not
+/// a `human_approval` node), `Err` with the reason when it names one that
+/// cannot work. Registration refuses the `Err` cases; the scheduler treats
+/// them as no fallback, so an expiry fails the node (a version stored before
+/// this check existed).
+///
+/// A fallback must be another node of the workflow, and the approval node
+/// must not be reachable from it. The scheduler gives the fallback an in-edge
+/// from the approval node, so a fallback upstream of it (the start node, or a
+/// "redo the draft" step) would wait on the approval while the approval waited
+/// on it, and the run would end without anyone being asked. `end` (see
+/// [`FALLBACK_END`]) is accepted when no node has that id.
+pub fn human_approval_fallback<'a>(
+    ir: &'a WorkflowIr,
+    node_id: &str,
+) -> Result<Option<&'a str>, String> {
+    use jamjet_core::node::NodeKind;
+    let Some(NodeKind::HumanApproval {
+        fallback_node: Some(fallback),
+        ..
+    }) = ir.nodes.get(node_id).map(|n| &n.kind)
+    else {
+        return Ok(None);
+    };
+    if fallback == node_id {
+        return Err("fallback_node names the node itself".to_string());
+    }
+    // `fallback: end`, as edges spell the terminal: on expiry the run ends
+    // there, and the steps the approval guarded are skipped. Only when no
+    // node is actually called "end".
+    if fallback == FALLBACK_END && !ir.nodes.contains_key(fallback) {
+        return Ok(Some(FALLBACK_END));
+    }
+    if !ir.nodes.contains_key(fallback) {
+        return Err(format!(
+            "fallback_node '{fallback}' is not a node of this workflow"
+        ));
+    }
+    if reachable_from(ir, &[fallback.as_str()]).contains(node_id) {
+        return Err(format!(
+            "fallback_node '{fallback}' leads back to this node, so the run would wait on \
+             itself; a fallback must come after the approval, not before it"
+        ));
+    }
+    Ok(Some(fallback.as_str()))
+}
+
+/// Every node reachable from `starts` (included), following the IR's edges
+/// and each `human_approval` node's `fallback_node`, the in-edge the scheduler
+/// gives a fallback.
+pub fn reachable_from<'a>(ir: &'a WorkflowIr, starts: &[&str]) -> HashSet<&'a str> {
+    use jamjet_core::node::NodeKind;
+    let mut seen: HashSet<&'a str> = HashSet::new();
+    let mut queue: VecDeque<&'a str> = VecDeque::new();
+    for s in starts {
+        if let Some((id, _)) = ir.nodes.get_key_value(*s) {
+            if seen.insert(id.as_str()) {
+                queue.push_back(id.as_str());
+            }
+        }
+    }
+    while let Some(current) = queue.pop_front() {
+        let fallback = match ir.nodes.get(current).map(|n| &n.kind) {
+            Some(NodeKind::HumanApproval {
+                fallback_node: Some(f),
+                ..
+            }) => Some(f.as_str()),
+            _ => None,
+        };
+        for next in ir
+            .edges
+            .iter()
+            .filter(|e| e.from == current)
+            .map(|e| e.to.as_str())
+            .chain(fallback)
+        {
+            if let Some((id, _)) = ir.nodes.get_key_value(next) {
+                if seen.insert(id.as_str()) {
+                    queue.push_back(id.as_str());
+                }
+            }
+        }
+    }
+    seen
 }
 
 /// Refuse a non-null `timeouts.approval_timeout` in a raw IR document.
@@ -375,8 +503,19 @@ fn validate_reachability(ir: &WorkflowIr) -> IrResult<()> {
     visited.insert(&ir.start_node);
 
     while let Some(current) = queue.pop_front() {
-        for edge in ir.edges_from(current) {
-            let next = edge.to.as_str();
+        // A `human_approval` node's fallback is reached through it on expiry.
+        let fallback = ir.nodes.get(current).and_then(|n| match &n.kind {
+            jamjet_core::node::NodeKind::HumanApproval { fallback_node, .. } => {
+                fallback_node.as_deref()
+            }
+            _ => None,
+        });
+        for next in ir
+            .edges_from(current)
+            .into_iter()
+            .map(|edge| edge.to.as_str())
+            .chain(fallback)
+        {
             if next != "end" && !visited.contains(next) {
                 visited.insert(next);
                 queue.push_back(next);

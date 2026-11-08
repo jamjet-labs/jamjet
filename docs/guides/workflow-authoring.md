@@ -2,6 +2,10 @@
 
 JamJet supports three authoring modes: YAML, Python decorators, and Python graph builder. All three compile to the same canonical IR.
 
+The runtime executes `model`, `condition` and `human_approval` nodes itself, and Python, Java and `external_fn` steps on external workers.
+Registration refuses the other node kinds, including `tool` and `agent` used
+in the YAML example below; see [Node types](yaml-reference.md#node-types).
+
 ---
 
 ## YAML Authoring

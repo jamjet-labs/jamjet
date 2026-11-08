@@ -22,7 +22,7 @@ fn ir(policy: Value) -> Value {
         "nodes": {
             "gate": {
                 "id": "gate",
-                "kind": { "type": "tool", "tool_ref": "payments.transfer", "input_mapping": {}, "output_schema": "" },
+                "kind": { "type": "python_fn", "module": "payments", "function": "transfer", "output_schema": "" },
                 "retry_policy": null,
                 "node_timeout_secs": null,
                 "description": null,
@@ -94,7 +94,7 @@ async fn re_registering_without_the_policy_is_refused_and_the_gate_still_holds()
         let (st, claimed) = support::post(
             &state,
             "/work-items/claim",
-            json!({ "worker_id": "w", "queue_types": ["tool"] }),
+            json!({ "worker_id": "w", "queue_types": ["python_tool"] }),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
