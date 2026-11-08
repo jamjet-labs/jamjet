@@ -273,12 +273,53 @@ Open [app.jamjet.dev/dashboard/traces](https://app.jamjet.dev/dashboard/traces) 
 Optional governance primitives:
 
 ```python
-jamjet.policy("block", "payments.*")              # filter tools by name
+jamjet.policy("block", "payments.*")              # strip matching tools, refuse matching tool calls
 jamjet.budget(max_cost_usd=5.00)                   # cap spend; raises BudgetExceeded
 approval = jamjet.require_approval(action="charge_card", context={...})
 @jamjet.trace                                       # decorate any function
 def lookup_customer(...): ...
 ```
+
+Policy and budget apply to the sync clients: OpenAI `chat.completions.create`,
+`.parse()`, `.stream()` and `with_raw_response`, and Anthropic `messages` and
+`beta.messages` `create` / `parse`, legacy OpenAI `functions` included.
+Blocked tools are stripped from the request, and a tool call the model returns
+for a blocked tool raises `JamJetPolicyBlocked`. With `stream=True`, text
+streams through as it arrives; once any policy rule is set, chunks from the
+first tool call onward are held until the stream ends and checked before your
+code sees them, and the streamed usage counts toward the budget. Server tools
+(such as web search) and MCP toolsets run on the vendor's side before a tool
+call could be refused, so a rule that could match them removes them from the
+request; Anthropic's own client tools (bash, text editor, computer, memory)
+are gated like any other tool. Not enforced, so they raise
+`JamJetUnenforceableCall` while any block or require_approval rule is set:
+OpenAI's Responses API, Anthropic's `messages.stream()`, the async clients
+(`AsyncOpenAI`, `AsyncAnthropic`), the batch APIs, and
+`with_raw_response` / `with_streaming_response` with `stream=True`.
+
+`jamjet.policy("require_approval", "payments.*")` keeps the tool available.
+When the model calls it, the SDK opens an approval in JamJet Cloud with the
+tool name, call id, arguments, model and rule, and waits for a reviewer's
+decision before returning the response. A rejection raises
+`JamJetApprovalRejected`. No decision within `approval_timeout_seconds`
+(a `configure()` argument, default 1 hour), or no way to reach Cloud, raises
+`JamJetApprovalTimeout`. The timeout is sent to Cloud as the approval's
+deadline (clamped to 1 minute to 24 hours); JamJet Cloud deployments since
+jamjet-cloud #87 refuse decisions after it. The approval shows the call's
+arguments with credentials always masked, PII masked when redaction is on
+(IBANs and card numbers keep their last 4), and an `arguments_sha256` that the
+SDK re-checks before releasing the approved call.
+
+Block and approval rules managed in the JamJet Cloud dashboard apply too. By
+default they load in the background and a failure is logged as a warning.
+`configure(..., remote_policies=True)` loads them before `configure()` returns
+and fails closed: if Cloud cannot be read, every tool call is blocked until
+`jamjet.refresh_policies()` succeeds. The stricter of a local and a Cloud
+decision wins. Cloud decides its own rules (dry-run, agent scope,
+environment), so a tool name that a Cloud rule could match is checked against
+Cloud once per tool, agent and environment. Cloud rules reload every 60
+seconds (`remote_policy_refresh_seconds`, with jitter); a failed reload keeps
+the last rules that loaded.
 
 Install with the LLM SDK you use:
 

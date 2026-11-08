@@ -50,6 +50,30 @@ describe('PolicyEvaluator', () => {
     expect(blocked[0]!.function.name).toBe('wire_money')
   })
 
+  it('filterTools strips Anthropic-format tools by their top-level name', () => {
+    const e = new PolicyEvaluator()
+    e.add('block', 'wire_*')
+    const tools = [
+      { name: 'search', input_schema: { type: 'object' } },
+      { name: 'wire_money', input_schema: { type: 'object' } },
+    ]
+    const { allowed, blocked } = e.filterTools(tools)
+    expect(allowed.map((t) => t.name)).toEqual(['search'])
+    expect(blocked.map((t) => t.name)).toEqual(['wire_money'])
+  })
+
+  it('filterTools strips OpenAI custom tools by custom.name', () => {
+    const e = new PolicyEvaluator()
+    e.add('block', 'shell.*')
+    const tools = [
+      { type: 'custom', custom: { name: 'shell.exec' } },
+      { type: 'custom', custom: { name: 'notes.read' } },
+    ]
+    const { allowed, blocked } = e.filterTools(tools)
+    expect(allowed.map((t) => t.custom.name)).toEqual(['notes.read'])
+    expect(blocked.map((t) => t.custom.name)).toEqual(['shell.exec'])
+  })
+
   it('filterTools handles tools without function.name gracefully', () => {
     const e = new PolicyEvaluator()
     e.add('block', '*')
