@@ -55,6 +55,27 @@ from typing import Any
 SIG_SPEC = "jamjet.audit.entry/v1"
 SIG_PREFIX = "ed25519:"
 _FIELD_SEP = b"\x1f"
+# The text fields the v1 content hash joins with ``_FIELD_SEP``. The format has
+# no length prefixes, so one of these holding U+001F could move a field
+# boundary: an ``actor_id`` of "mallory\x1fsystem" with ``actor_type`` "human"
+# can hash like ``actor_id`` "mallory" with "system". The runtime refuses
+# control characters where these values enter and its verifier refuses the
+# separator inside them; so does this one, and so does the Java verifier.
+_HASHED_TEXT_FIELDS = (
+    "execution_id",
+    "event_type",
+    "actor_id",
+    "actor_type",
+    "tool_call_hash",
+    "policy_decision",
+    "http_request_id",
+    "http_method",
+    "http_path",
+    "ip_address",
+    "tenant_id",
+    "prev_hash",
+)
+_ACTOR_TYPES = frozenset({"human", "agent", "system"})
 _P = 2**255 - 19
 # Encodings of the points of order dividing 8, sign bit cleared (libsodium's
 # blocklist). A key or an R among them proves nothing; the runtime refuses
@@ -78,8 +99,10 @@ class ChainError(Exception):
 
     ``index`` is the entry's position in the list passed in; ``reason`` is one of
     ``"unsealed"``, ``"unsigned"``, ``"broken_link"``, ``"hash_mismatch"``,
-    ``"bad_signature"``, ``"wrong_key"`` and ``"malformed"`` (a field Rust would
-    not read: wrong JSON type, or a UUID not in lowercase hyphenated form).
+    ``"bad_signature"``, ``"wrong_key"``, ``"separator_in_field"`` (a hashed text
+    field holds U+001F, the v1 hash's field separator) and ``"malformed"`` (a
+    field Rust would not read: wrong JSON type, a UUID not in lowercase
+    hyphenated form, or an ``actor_type`` other than human, agent or system).
     """
 
     def __init__(self, index: int, reason: str, detail: str = "") -> None:
@@ -297,6 +320,13 @@ def verify_entries(entries: Sequence[Mapping[str, Any]], public_key: bytes, *, l
                 raise ChainError(index, "malformed", f"{key} is not a string")
         if linked and index > 0 and entry.get("prev_hash") != prev:
             raise ChainError(index, "broken_link")
+        for key in _HASHED_TEXT_FIELDS:
+            value = entry.get(key)
+            if isinstance(value, str) and "\x1f" in value:
+                raise ChainError(index, "separator_in_field", f"{key} contains U+001F")
+        actor_type = entry.get("actor_type")
+        if isinstance(actor_type, str) and actor_type not in _ACTOR_TYPES:
+            raise ChainError(index, "malformed", f"actor_type {actor_type!r} is not human, agent or system")
         try:
             recomputed = entry_content_hash(entry, entry.get("prev_hash"))
         except (KeyError, ValueError, TypeError) as e:

@@ -125,6 +125,17 @@ run reaches such a node, the node fails with `no executor for node kind <kind>`
 and so does the run. Fan-out and fan-in need no node: a node with several `next` targets
 runs them all, and a node with several incoming edges waits for all of them.
 
+Every node but `start` must have an incoming edge (a `human_approval`
+fallback counts as one), and every node must be reachable from `start`.
+`POST /workflows` refuses a workflow that breaks either rule, naming the
+nodes: a node with no incoming edge would run when the run starts, before
+whatever it was meant to follow, and an unreachable one would never run. A
+condition's branch targets need edges from the condition too. It also
+refuses an edge to a node that does not exist. A version stored before
+these checks is not started (`POST /executions` answers 409, naming the
+nodes), and in a run of one already under way a node with no incoming edge
+other than `start` is skipped, never run.
+
 ---
 
 ## Condition node
@@ -164,12 +175,13 @@ second_review:
   next: deliver
 ```
 
-Approved, the run continues along `next`, and `state.review` holds the
-decision. Rejected, the node and the run fail. Expired, the run goes to
+Approved, the run continues along `next`, and `state.__approvals.review`
+holds the decision. Rejected, the node and the run fail. Expired, the run goes to
 `fallback` (or stops, for `end`), or fails if there is none; here that is a
 second approver. Do not point `fallback` at the step an approval would
-unlock: that approves the action by timeout. Do not route on `state.review`
-either: a later node can still overwrite it. Decide with
+unlock: that approves the action by timeout. Only the engine writes
+`state.__approvals`, so a condition can route on it; a plain `state.review`
+key is ordinary state that any later node can overwrite. Decide with
 `jamjet approvals <exec-id>` and
 `jamjet approve <exec-id> --decision approved|rejected`. See
 [Human-in-the-Loop](hitl.md#approval-nodes).

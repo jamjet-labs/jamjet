@@ -309,8 +309,8 @@ async fn an_approval_does_not_cover_state_that_moved_after_the_request() {
     let input = ran_input(&env, "publish").expect("publish runs once approved");
     assert_eq!(input["amount"], 1000000);
     // The decision is in the state the next step reads, under the node id.
-    assert_eq!(input["review"]["approved"], true, "{input}");
-    assert_eq!(input["review"]["approver"], "bob", "{input}");
+    assert_eq!(input["__approvals"]["review"]["approved"], true, "{input}");
+    assert_eq!(input["__approvals"]["review"]["approver"], "bob", "{input}");
 }
 
 /// PROBE B. The approved node is not handed to an external worker, and a
@@ -460,10 +460,10 @@ async fn an_external_token_cannot_claim_or_report_a_condition_node() {
 }
 
 /// An item for an engine-run node is withheld from external workers on any
-/// queue, not only the engine's: `POST /work-items` can put one on a queue an
-/// external worker polls. (A `condition` node: unlike `human_approval`, the
-/// policy guard alone would let it through.) It is settled without failing
-/// the node, whose real item belongs to the engine.
+/// queue, not only the engine's. (A `condition` node: unlike
+/// `human_approval`, the policy guard alone would let it through.) Since
+/// `POST /work-items` refuses engine kinds, such an item was queued some
+/// other way; its node fails visibly.
 #[tokio::test]
 async fn an_engine_node_on_an_external_queue_is_withheld() {
     let env = env().await;
@@ -513,18 +513,21 @@ async fn an_engine_node_on_an_external_queue_is_withheld() {
     .await;
     assert_eq!(st, StatusCode::OK, "{claimed}");
     assert_eq!(claimed, json!({ "claimed": false }), "{claimed}");
-    // The engine still routes the run itself.
+    // The node fails visibly (a stray item's `NodeScheduled` would otherwise
+    // leave the run waiting), and so does the run.
+    let evs = env.backend.get_events(&eid).await.unwrap();
+    assert!(
+        evs.iter().any(|e| matches!(&e.kind,
+            EventKind::NodeFailed { node_id, retryable: false, error, .. }
+                if node_id == "route" && error.contains("engine runs itself"))),
+        "{evs:#?}"
+    );
     settle(&env).await;
     let evs = env.backend.get_events(&eid).await.unwrap();
     assert!(
-        evs.iter().any(
-            |e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == "route")
-        ),
+        evs.iter()
+            .any(|e| matches!(e.kind, EventKind::WorkflowFailed { .. })),
         "{evs:#?}"
-    );
-    assert!(
-        ran_input(&env, "mutate").is_some(),
-        "the default branch ran"
     );
 }
 
@@ -581,17 +584,21 @@ async fn the_engine_does_not_run_an_item_under_the_workflow_its_payload_names() 
                 if node_id == "review")),
         "the stray item must not run: {evs:#?}"
     );
+    // The node fails visibly, so the run ends rather than hanging; nothing
+    // after it runs and no approval was asked for the stray.
+    assert!(
+        evs.iter().any(|e| matches!(&e.kind,
+            EventKind::NodeFailed { node_id, retryable: false, error, .. }
+                if node_id == "review" && error.contains("disagree"))),
+        "the stray item's node fails visibly: {evs:#?}"
+    );
     settle(&env).await;
-    assert_eq!(
-        ran_input(&env, "publish"),
-        None,
-        "publish waits for the approval"
-    );
-    assert_eq!(
-        requests(&env.backend.get_events(&eid).await.unwrap()).len(),
-        1,
-        "the real item asks for approval"
-    );
+    assert_eq!(ran_input(&env, "publish"), None, "publish never runs");
+    let evs = env.backend.get_events(&eid).await.unwrap();
+    assert!(requests(&evs).is_empty(), "{evs:#?}");
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e.kind, EventKind::WorkflowFailed { .. })));
 }
 
 /// PROBE C. The initiator cannot approve their own run.

@@ -404,8 +404,16 @@ async fn an_expired_request_routes_to_the_fallback_node() {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(patch["review"]["approved"], false, "{}: {patch}", env.name);
-        assert_eq!(patch["review"]["decision"], "expired", "{}", env.name);
+        assert_eq!(
+            patch["__approvals"]["review"]["approved"], false,
+            "{}: {patch}",
+            env.name
+        );
+        assert_eq!(
+            patch["__approvals"]["review"]["decision"], "expired",
+            "{}",
+            env.name
+        );
         assert_eq!(
             ran(&env),
             vec!["hold".to_string()],
@@ -513,9 +521,9 @@ async fn the_shorter_of_the_node_timeout_and_the_policy_deadline_applies() {
 #[tokio::test]
 async fn an_unusable_timeout_or_fallback_is_refused_at_registration() {
     for env in envs().await {
-        let mut bad_fallback = ir(Some(60), true, Value::Null);
+        let mut bad_fallback = ir(Some(60), false, Value::Null);
         bad_fallback["nodes"]["review"]["kind"]["fallback_node"] = json!("nowhere");
-        let mut self_fallback = ir(Some(60), true, Value::Null);
+        let mut self_fallback = ir(Some(60), false, Value::Null);
         self_fallback["nodes"]["review"]["kind"]["fallback_node"] = json!("review");
         for bad in [ir(Some(0), false, Value::Null), bad_fallback, self_fallback] {
             let (st, body) =
@@ -529,14 +537,14 @@ async fn an_unusable_timeout_or_fallback_is_refused_at_registration() {
 /// A graph where the guarded step is also a join:
 ///
 /// ```text
-/// review (human_approval, fallback: hold) ─┐
-///                                          ├─> publish ─┬─> deploy
-/// prep ────────────────────────────────────┴────────────┘
+/// s ─> review (human_approval, fallback: hold) ─┐
+///                                               ├─> publish ─┬─> deploy
+/// s ─> prep ────────────────────────────────────┴────────────┘
 /// publish ─> notify <─ hold
 /// ```
 ///
-/// `prep` is a second root, so `publish` and `deploy` each have a live
-/// in-edge that does not pass through the approval.
+/// `prep` is a parallel branch from the start, so `publish` and `deploy`
+/// each have a live in-edge that does not pass through the approval.
 fn join_ir() -> Value {
     let step = |id: &str| {
         json!({
@@ -548,8 +556,9 @@ fn join_ir() -> Value {
     let edge = |from: &str, to: &str| json!({ "from": from, "to": to, "condition": null });
     json!({
         "workflow_id": "wf-release", "version": "0.1.0", "name": null, "description": null,
-        "state_schema": "", "start_node": "review",
+        "state_schema": "", "start_node": "s",
         "nodes": {
+            "s": step("s"),
             "review": {
                 "id": "review",
                 "kind": { "type": "human_approval", "description": "Ship?", "timeout_secs": 60, "fallback_node": "hold" },
@@ -562,6 +571,7 @@ fn join_ir() -> Value {
             "notify": step("notify"),
         },
         "edges": [
+            edge("s", "review"), edge("s", "prep"),
             edge("review", "publish"), edge("prep", "publish"),
             edge("publish", "deploy"), edge("prep", "deploy"),
             edge("publish", "notify"), edge("hold", "notify"),
@@ -587,7 +597,7 @@ async fn an_expiry_never_runs_the_guarded_path_through_a_join() {
         settle(&env).await;
         assert_eq!(
             ran(&env),
-            vec!["prep".to_string()],
+            vec!["s".to_string(), "prep".to_string()],
             "{}: only prep before the decision",
             env.name
         );
@@ -602,7 +612,12 @@ async fn an_expiry_never_runs_the_guarded_path_through_a_join() {
         let evs = events(&env, &eid).await;
         assert_eq!(
             sorted(ran(&env)),
-            vec!["hold".to_string(), "notify".to_string(), "prep".to_string()],
+            vec![
+                "hold".to_string(),
+                "notify".to_string(),
+                "prep".to_string(),
+                "s".to_string()
+            ],
             "{}: {evs:#?}",
             env.name
         );
@@ -643,7 +658,8 @@ async fn an_approval_runs_the_guarded_path_of_a_join() {
                 "deploy".to_string(),
                 "notify".to_string(),
                 "prep".to_string(),
-                "publish".to_string()
+                "publish".to_string(),
+                "s".to_string()
             ],
             "{}: {evs:#?}",
             env.name

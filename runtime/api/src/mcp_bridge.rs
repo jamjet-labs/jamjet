@@ -144,6 +144,8 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 let backend = s.backend_for(&tenant_id);
                 let exec = backend.get_execution(&eid).await.map_err(|e| format!("{e}"))?
                     .ok_or_else(|| format!("execution {id_str} not found"))?;
+                // The same view as `GET /executions/:id`: state from the log.
+                let exec = crate::routes::with_derived_state(backend.as_ref(), exec).await;
                 let text = serde_json::to_string(&exec).map_err(|e| format!("{e}"))?;
                 Ok(vec![McpContent::Text { text }])
             }

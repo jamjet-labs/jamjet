@@ -27,23 +27,39 @@ point it at a step that does what the approval guards (an `auto_publish`):
 an expiry means nobody approved, and that fallback would publish anyway.
 
 - The request is bound to this node and occurrence and to the run's state
-  when it was asked (its `action_digest`). The pending listing shows that
-  state, and the request's context carries the node's `description`. It is
-  listed by `GET /executions/:id/approvals` and `jamjet approvals`.
-- If the run's state changes before the approved node completes (a parallel
-  branch writes), the approval no longer covers it: the node asks again,
-  showing the new state.
+  when it was asked (its `action_digest`), apart from the engine's own keys
+  (`__budget`, `__approvals`). The pending listing shows that state, and the
+  request's context carries the node's `description`. It is listed by
+  `GET /executions/:id/approvals` and `jamjet approvals`. A state over 16 KiB
+  is shown bounded: its key structure is kept, nested objects included, and
+  only a value too large to show is replaced by its size and its first
+  characters (`{"preview_truncated": true, "bytes": ..., "head": ...}`). In a
+  state with so many keys that not all fit, an object whose keys were cut
+  says how many (`{"preview_truncated": true, "keys": ..., "keys_omitted":
+  ..., "shown": {...}}`). The digest still covers all of it.
+- The check runs when the approved node is dispatched again, not when it
+  completes. If the run's state changed in between (a parallel branch
+  wrote), the approval no longer covers it: the node asks again, showing
+  the new state. Another approval completing does not count as a change,
+  so two approvals waiting side by side are each asked once.
 - **Approved**: the node completes. Its output records the decision:
   `decision`, `approved_by`, `principal`, `comment`, `decided_at` and the
   sequences of the request and the decision. The decision is also written to
-  the run's state under the node's id, so later steps and prompts can read
-  it: `state.review_report.approved` (`true`), `.approver`, `.principal`,
-  `.comment`, `.decided_at`. The run continues along `next`.
+  the run's state, under the engine's key `__approvals` and the node's id,
+  so later steps and prompts can read it:
+  `state.__approvals.review_report.approved` (`true`), `.approver`,
+  `.principal`, `.comment`, `.decided_at`. The run continues along `next`.
+- Only the engine writes `state.__approvals`. It is dropped from a run's
+  input (`POST /executions`), from the `state_patch` an external worker
+  reports (`POST /work-items/:id/complete`), and from the patch of any
+  in-process step but the approval node itself, so no step can forge the
+  record a later condition reads. It never overwrites a user key named like
+  the node.
 - **Rejected**: the node fails, and so does the run, as for any rejected
   approval. The node has no "on rejected" route.
 - **Expired** (`timeout` passed with no decision): with a `fallback`, the node
   completes with `decision: "expired"`, writes `approved: false` and
-  `decision: "expired"` under its id in the state, and the run continues at
+  `decision: "expired"` to `state.__approvals.<node_id>`, and the run continues at
   the fallback node (or ends, for `end`). Every step the approval guarded is
   skipped: everything reachable from
   its `next` that the fallback does not also lead to, including a step that
@@ -170,8 +186,11 @@ Rules the runtime enforces:
   `POST /work-items/:id/complete` and `/fail` refuse a result for one (403).
   Before this, any developer token could take an approved `human_approval`
   node from `general` and complete it with a state patch of its own, or
-  choose a `condition` node's route. The in-process worker also reads an
-  item's workflow from its execution, not its payload.
+  choose a `condition` node's route. `POST /work-items` refuses to enqueue
+  one of these nodes (400). The in-process worker reads an item's workflow
+  from its execution, not its payload, and fails the node of an item whose
+  payload names another workflow, so a stray item ends the run visibly
+  instead of leaving it waiting.
 - **A workflow version is immutable.** Re-registering the same IR is a no-op;
   a different IR under the same version is a 409. Register a new version.
 
@@ -193,7 +212,7 @@ payload carries.
 | `agent` | its `agent_ref` | no state |
 | `model` | none: governed by `model_allowlist` only | the prompt as rendered against the run's state (a node with no prompt: the conversation in `messages`) and the resolved model settings |
 | `condition` | none | the run's state, as `state` |
-| `human_approval` | none: gated always | the run's state, as `input` |
+| `human_approval` | none: gated always | the run's state, as `input` (the digest leaves out `__budget` and `__approvals`) |
 | `agent_tool`, `agent_discovery`, `coordinator`, `eval`, `wait`, `parallel`, `join`, `subgraph`, `memory_retrieval`, `policy`, `finalizer`, `limit_exceeded` | none | no state |
 
 Kinds with no name cannot be gated or blocked by a pattern. `agent_tool` and
@@ -389,6 +408,17 @@ once. Upgrade the engine to continue the run.
 ---
 
 ## Audit Log
+
+Identifiers that reach the audit log's hashed fields refuse control
+characters where they enter: worker ids (`POST /work-items/claim`, heartbeat),
+a dev-mode approver name, tenant ids, hand-enqueued node ids and queue names,
+and the workflow id, version and handler, tool, agent and model names at
+registration. The v1 entry hash joins its fields with U+001F and no length
+prefix, so a field holding that byte could move a field boundary. The
+verifier also refuses an entry whose text fields hold U+001F, and reading a
+stored entry whose `actor_type` is not `human`, `agent` or `system` fails
+instead of reading it as `system`. A length-prefixed v2 hash format is the
+real fix; the format is not changed here.
 
 Every human decision is recorded:
 - Who made it (the API token's name and `token:<id>`)

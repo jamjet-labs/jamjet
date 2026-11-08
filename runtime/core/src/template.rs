@@ -84,17 +84,17 @@ pub fn validate_template(template: &str) -> Result<(), String> {
 
 /// Render `template` against the run's `state`.
 pub fn render_template(template: &str, state: &Map<String, Value>) -> Result<String, String> {
+    let over = || format!("the rendered prompt is over the {MAX_RENDERED_PROMPT_BYTES}-byte limit");
     let mut out = String::with_capacity(template.len().min(MAX_RENDERED_PROMPT_BYTES));
-    let mut push = |text: &str| {
-        if out.len() + text.len() > MAX_RENDERED_PROMPT_BYTES {
-            return Err(format!(
-                "the rendered prompt is over the {MAX_RENDERED_PROMPT_BYTES}-byte limit"
-            ));
-        }
-        out.push_str(text);
-        Ok(())
-    };
     for piece in parse(template)? {
+        let room = MAX_RENDERED_PROMPT_BYTES - out.len();
+        let mut push = |text: &str| {
+            if text.len() > room {
+                return Err(over());
+            }
+            out.push_str(text);
+            Ok(())
+        };
         match piece {
             Piece::Text(t) => push(t)?,
             Piece::State(path) => {
@@ -103,12 +103,41 @@ pub fn render_template(template: &str, state: &Map<String, Value>) -> Result<Str
                 })?;
                 match value {
                     Value::String(s) => push(s)?,
-                    other => push(&other.to_string())?,
+                    // Serialized into a writer that stops at the room left,
+                    // so a huge object is never built in full only to be
+                    // refused.
+                    other => {
+                        let mut w = Bounded {
+                            buf: Vec::new(),
+                            room,
+                        };
+                        serde_json::to_writer(&mut w, other).map_err(|_| over())?;
+                        push(std::str::from_utf8(&w.buf).map_err(|e| e.to_string())?)?;
+                    }
                 }
             }
         }
     }
     Ok(out)
+}
+
+/// A writer that refuses to grow past `room` bytes.
+struct Bounded {
+    buf: Vec<u8>,
+    room: usize,
+}
+
+impl std::io::Write for Bounded {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() + data.len() > self.room {
+            return Err(std::io::Error::other("over the prompt limit"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn parse(template: &str) -> Result<Vec<Piece<'_>>, String> {
@@ -341,6 +370,44 @@ mod tests {
         ] {
             assert!(validate_template(bad).is_err(), "accepted: {bad}");
         }
+    }
+
+    /// An `{% endraw %}` with no `{% raw %}` before it is a statement like
+    /// any other: refused, never read as the end of a raw block.
+    #[test]
+    fn an_endraw_without_a_raw_is_refused() {
+        for t in ["{% if %}x{% endraw %}", "x{% endraw %}"] {
+            assert!(validate_template(t).is_err(), "accepted: {t}");
+        }
+    }
+
+    /// The writer a non-string value is serialized into stops at the room
+    /// left, so a huge value is never built in full.
+    #[test]
+    fn the_bounded_writer_stops_at_its_room() {
+        use std::io::Write;
+        let mut w = Bounded {
+            buf: Vec::new(),
+            room: 4,
+        };
+        assert!(w.write_all(b"abcd").is_ok());
+        assert!(w.write_all(b"e").is_err());
+        assert_eq!(w.buf, b"abcd");
+    }
+
+    /// A non-string value over the room left is refused without being
+    /// serialized in full.
+    #[test]
+    fn a_large_object_value_is_refused_at_the_limit() {
+        let big: Vec<u32> = (0..200_000).collect();
+        let s = state(json!({ "big": big }));
+        let err = render_template("{{ state.big }}", &s).unwrap_err();
+        assert!(err.contains("limit"), "{err}");
+        let small = state(json!({ "o": { "a": [1, 2] } }));
+        assert_eq!(
+            render_template("{{ state.o }}", &small).unwrap(),
+            r#"{"a":[1,2]}"#
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use async_trait::async_trait;
 use jamjet_state::approvals::{
     answered_request, node_approval_status, NodeApprovalStatus, ACTION_STEP_KEY,
+    APPROVALS_STATE_KEY,
 };
 use jamjet_state::backend::{StateBackend, WorkItem};
 use jamjet_state::event::EventKind;
@@ -112,14 +113,16 @@ impl NodeExecutor for HumanApprovalExecutor {
             )));
         }
         let request_sequence = Some(request.sequence);
-        // The decision also goes into the run's state under the node's id, so
-        // later steps and prompts can read it (`state.<node_id>.approver`).
-        // Namespaced by node id so two approvals in one workflow cannot
-        // overwrite each other's record. Only an approval reaches here; a
-        // rejection fails the node, so nothing downstream sees
-        // `approved: false` except a fallback after an expiry.
-        let mut state_patch = serde_json::Map::new();
-        state_patch.insert(
+        // The decision also goes into the run's state, under the engine's own
+        // key (`state.__approvals.<node_id>.approver`), so later steps and
+        // prompts can read it. Engine-owned: no worker or run input can write
+        // that key (`approvals::ENGINE_STATE_KEYS`), so the record cannot be
+        // forged, and it never overwrites a user key named like the node.
+        // Only an approval reaches here; a rejection fails the node, so
+        // nothing downstream sees `approved: false` except a fallback after
+        // an expiry.
+        let mut record = serde_json::Map::new();
+        record.insert(
             item.node_id.clone(),
             json!({
                 "approved": true,
@@ -140,7 +143,14 @@ impl NodeExecutor for HumanApprovalExecutor {
                 "request_sequence": request_sequence,
                 "decision_sequence": sequence,
             }),
-            state_patch: serde_json::Value::Object(state_patch),
+            state_patch: serde_json::Value::Object(
+                [(
+                    APPROVALS_STATE_KEY.to_string(),
+                    serde_json::Value::Object(record),
+                )]
+                .into_iter()
+                .collect(),
+            ),
             duration_ms: start.elapsed().as_millis() as u64,
             gen_ai_system: None,
             gen_ai_model: None,
@@ -250,7 +260,7 @@ mod tests {
         let (backend, eid) = approved_log().await;
         let exec = HumanApprovalExecutor::new(backend.clone());
         let patch = exec.execute(&item(&eid)).await.unwrap().state_patch;
-        let rec = &patch["review"];
+        let rec = &patch["__approvals"]["review"];
         assert_eq!(rec["approved"], true);
         assert_eq!(rec["approver"], "bob");
         assert_eq!(rec["principal"], "token:b");
@@ -258,10 +268,11 @@ mod tests {
             rec["decided_at"].as_str().is_some_and(|s| s.ends_with('Z')),
             "{rec}"
         );
+        assert_eq!(patch.as_object().unwrap().len(), 1, "only the engine's key");
         assert_eq!(
-            patch.as_object().unwrap().len(),
+            patch["__approvals"].as_object().unwrap().len(),
             1,
-            "only the node's own key"
+            "only this node's record"
         );
     }
 

@@ -34,6 +34,7 @@ pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_node_ids(ir)?;
     validate_approval_deadlines(ir)?;
     validate_human_approvals(ir)?;
+    validate_entry_points(ir)?;
     Ok(())
 }
 
@@ -59,6 +60,181 @@ pub fn validate_approval_deadlines(ir: &WorkflowIr) -> IrResult<()> {
         }
     }
     Ok(())
+}
+
+/// The identifier fields of a node kind: the names the engine records for
+/// a node (in approval requests, policy decisions and audit entries).
+const IDENTIFIER_FIELDS: &[&str] = &[
+    "tool_ref",
+    "module",
+    "function",
+    "class_name",
+    "method",
+    "handler",
+    "queue",
+    "server",
+    "tool",
+    "skill",
+    "remote_agent",
+    "agent_ref",
+    "model_ref",
+    "connector_ref",
+    "policy_ref",
+    "workflow_ref",
+];
+
+/// Whether an identifier may not hold `c`: a control character (Unicode
+/// `Cc`), an invisible format character (the `Cf` code points of Unicode
+/// 15.1: soft hyphen, zero-width space, joiners and marks, bidirectional
+/// embeddings, overrides and isolates, word joiner and invisible operators,
+/// byte-order mark, tag characters and the rest), or a line or paragraph
+/// separator (U+2028, U+2029).
+///
+/// A format character is invisible where a reviewer reads the name: `pay`
+/// followed by U+202E shows its tail reversed, and a zero-width space makes
+/// two names that look the same differ. Letters of any script, accents,
+/// emoji and U+00A0 (a visible space) are not refused. One consequence: an
+/// emoji ZWJ sequence or a tag-sequence flag holds a `Cf` character and is
+/// refused.
+pub fn is_forbidden_identifier_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08E2}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0001}'
+                | '\u{E0020}'..='\u{E007F}'
+        )
+}
+
+/// No identifier the engine records holds a control or invisible format
+/// character ([`is_forbidden_identifier_char`]): the workflow id and
+/// version, every node's and the workflow's `agent_ref`, and each node kind's
+/// handler, tool, agent and model names. They reach the audit log, whose v1
+/// entry hash joins fields with U+001F and no length prefix, the approval
+/// requests a reviewer reads, and the commands a reviewer pastes.
+pub fn validate_identifier_chars(ir: &WorkflowIr) -> IrResult<()> {
+    let bad = |v: &str| v.chars().any(is_forbidden_identifier_char);
+    let refuse = |what: String| Err(IrError::ControlCharacter(what));
+    if bad(&ir.workflow_id) {
+        return refuse("workflow_id".into());
+    }
+    if bad(&ir.version) {
+        return refuse("version".into());
+    }
+    if ir.agent_ref.as_deref().is_some_and(bad) {
+        return refuse("agent_ref".into());
+    }
+    let mut ids: Vec<&String> = ir.nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        let node = &ir.nodes[id];
+        if node.agent_ref.as_deref().is_some_and(bad) {
+            return refuse(format!("node '{id}' agent_ref"));
+        }
+        let kind = serde_json::to_value(&node.kind).unwrap_or_default();
+        for field in IDENTIFIER_FIELDS {
+            if kind.get(*field).and_then(|v| v.as_str()).is_some_and(bad) {
+                return refuse(format!("node '{id}' {field}"));
+            }
+        }
+        if kind
+            .get("agent")
+            .and_then(|a| a.get("explicit"))
+            .and_then(|v| v.as_str())
+            .is_some_and(bad)
+        {
+            return refuse(format!("node '{id}' agent"));
+        }
+    }
+    Ok(())
+}
+
+/// Every node but the start node is entered through an edge, and every node
+/// is reachable from the start node (following edges and `human_approval`
+/// fallbacks).
+///
+/// The scheduler runs a node whose every live in-edge is done, so a node with
+/// NO in-edge is a root: it runs as soon as the run starts. A step the author
+/// meant to come after something (a condition's branch target the compiler
+/// drew no edge to, a step after an approval) would run first, with nothing
+/// checked. A node unreachable from the start never runs at all. Both are
+/// refused, naming every such node.
+pub fn validate_entry_points(ir: &WorkflowIr) -> IrResult<()> {
+    use jamjet_core::node::NodeKind;
+    // A missing start node would make every node look unreachable; say what
+    // is actually wrong.
+    validate_start_node(ir)?;
+    let reachable = reachable_from(ir, &[ir.start_node.as_str()]);
+    let entered: HashSet<&str> = ir
+        .edges
+        .iter()
+        .map(|e| e.to.as_str())
+        .chain(ir.nodes.values().filter_map(|n| match &n.kind {
+            NodeKind::HumanApproval {
+                fallback_node: Some(f),
+                ..
+            } => Some(f.as_str()),
+            _ => None,
+        }))
+        .collect();
+    let mut ids: Vec<&String> = ir.nodes.keys().collect();
+    ids.sort();
+    let mut roots = Vec::new();
+    let mut unreachable = Vec::new();
+    for id in ids {
+        if *id == ir.start_node {
+            continue;
+        }
+        if !entered.contains(id.as_str()) {
+            roots.push(id.clone());
+        } else if !reachable.contains(id.as_str()) {
+            unreachable.push(id.clone());
+        }
+    }
+    if roots.is_empty() && unreachable.is_empty() {
+        return Ok(());
+    }
+    let list = |v: &[String]| {
+        v.iter()
+            .map(|n| format!("'{n}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut parts = Vec::new();
+    if !roots.is_empty() {
+        parts.push(format!(
+            "node(s) {} have no incoming edge, so they would run when the run starts; \
+             add an edge from the step each one follows (a condition's branch targets \
+             need edges from the condition too)",
+            list(&roots)
+        ));
+    }
+    if !unreachable.is_empty() {
+        parts.push(format!(
+            "node(s) {} cannot be reached from the start node '{}', so they would never run",
+            list(&unreachable),
+            ir.start_node
+        ));
+    }
+    Err(IrError::UnreachableNodes(parts.join("; ")))
 }
 
 /// Every `human_approval` node can be honoured: its `timeout_secs` is a
@@ -437,12 +613,14 @@ fn validate_start_node(ir: &WorkflowIr) -> IrResult<()> {
         return Err(IrError::NoStartNode);
     }
     if !ir.nodes.contains_key(&ir.start_node) {
-        return Err(IrError::UnreachableNode(ir.start_node.clone()));
+        return Err(IrError::MissingStartNode(ir.start_node.clone()));
     }
     Ok(())
 }
 
-fn validate_edges(ir: &WorkflowIr) -> IrResult<()> {
+/// Every edge leads to a node of the workflow, or to `end`. An edge to a node
+/// that does not exist would route the run to nothing.
+pub fn validate_edges(ir: &WorkflowIr) -> IrResult<()> {
     for edge in &ir.edges {
         if !ir.nodes.contains_key(&edge.to) && edge.to != "end" {
             return Err(IrError::UnknownEdgeTarget {
@@ -872,5 +1050,89 @@ mod tests {
         ir.version = "not-semver".into();
         let err = validate_workflow(&ir);
         assert!(matches!(err, Err(IrError::InvalidVersion(_))));
+    }
+
+    /// Format characters are refused in identifiers along with control
+    /// characters (review of #178, probe C: `pay\u{202e}lmth` and
+    /// `zero\u{200b}width` registered). Letters of any script, accents,
+    /// emoji and NBSP are not.
+    #[test]
+    fn identifiers_refuse_format_characters_and_keep_unicode_names() {
+        let refused = [
+            '\u{1f}',
+            '\t',
+            '\u{7f}',
+            '\u{85}',
+            '\u{ad}',
+            '\u{61c}',
+            '\u{180e}',
+            '\u{200b}',
+            '\u{200c}',
+            '\u{200d}',
+            '\u{200e}',
+            '\u{200f}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{202a}',
+            '\u{202b}',
+            '\u{202c}',
+            '\u{202d}',
+            '\u{202e}',
+            '\u{2060}',
+            '\u{2061}',
+            '\u{2064}',
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}',
+            '\u{feff}',
+            '\u{fff9}',
+            '\u{e0001}',
+            '\u{e0041}',
+            '\u{e007f}',
+        ];
+        for c in refused {
+            assert!(
+                is_forbidden_identifier_char(c),
+                "accepted U+{:04X}",
+                c as u32
+            );
+        }
+        for name in [
+            "数据_é_🙂",
+            "nbsp\u{a0}x",
+            "wf é",
+            "Ωmega",
+            "café",
+            "❤\u{fe0f}",
+            "a-b.c_d",
+        ] {
+            assert!(
+                !name.chars().any(is_forbidden_identifier_char),
+                "refused {name:?}"
+            );
+        }
+
+        let cond = NodeKind::Condition { branches: vec![] };
+        for bad in [
+            "pay\u{202e}lmth",
+            "zero\u{200b}width",
+            "\u{feff}wf",
+            "wf\u{2066}x",
+        ] {
+            let mut ir = make_ir("a", vec![("a", cond.clone())], vec![("a", "end")]);
+            ir.workflow_id = bad.into();
+            assert!(
+                matches!(
+                    validate_identifier_chars(&ir),
+                    Err(IrError::ControlCharacter(_))
+                ),
+                "accepted workflow_id {bad:?}"
+            );
+        }
+        let mut ir = make_ir("a", vec![("a", cond.clone())], vec![("a", "end")]);
+        ir.workflow_id = "数据_é_🙂".into();
+        ir.version = "0.1.0".into();
+        assert!(validate_identifier_chars(&ir).is_ok());
     }
 }

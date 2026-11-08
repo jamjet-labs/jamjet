@@ -25,6 +25,14 @@ pub enum ChainError {
     HashMismatch { index: usize },
     #[error("entry {index} signature is invalid for its entry_hash (forged or wrong key)")]
     BadSignature { index: usize },
+    /// A hashed text field holds the field separator (U+001F). The v1 hash
+    /// joins fields with that byte and no length prefix, so such a value can
+    /// move a field boundary (`actor_id` "mallory\u{1f}system" with
+    /// `actor_type` "human" hashes like `actor_id` "mallory" with "system").
+    /// The engine refuses control characters where these values enter, so
+    /// one here was not written by it: refused, never verified.
+    #[error("entry {index} field {field} contains the field separator U+001F")]
+    SeparatorInField { index: usize, field: &'static str },
 }
 
 impl ChainError {
@@ -35,7 +43,8 @@ impl ChainError {
             | ChainError::Unsigned { index }
             | ChainError::BrokenLink { index }
             | ChainError::HashMismatch { index }
-            | ChainError::BadSignature { index } => *index,
+            | ChainError::BadSignature { index }
+            | ChainError::SeparatorInField { index, .. } => *index,
         }
     }
 }
@@ -45,6 +54,7 @@ impl ChainError {
 /// such as one tenant's entries of a chain shared by several.
 pub fn verify_entry(entry: &AuditLogEntry, signer: &AuditSigner) -> Result<(), ChainError> {
     let index = 0;
+    refuse_separator(entry, index)?;
     let entry_hash = entry
         .entry_hash
         .as_deref()
@@ -60,6 +70,31 @@ pub fn verify_entry(entry: &AuditLogEntry, signer: &AuditSigner) -> Result<(), C
         return Err(ChainError::BadSignature { index });
     }
     Ok(())
+}
+
+/// [`ChainError::SeparatorInField`] if any text field the content hash joins
+/// holds U+001F.
+fn refuse_separator(entry: &AuditLogEntry, index: usize) -> Result<(), ChainError> {
+    let fields: [(&'static str, Option<&str>); 11] = [
+        ("execution_id", Some(&entry.execution_id)),
+        ("event_type", Some(&entry.event_type)),
+        ("actor_id", Some(&entry.actor_id)),
+        ("tool_call_hash", entry.tool_call_hash.as_deref()),
+        ("policy_decision", entry.policy_decision.as_deref()),
+        ("http_request_id", entry.http_request_id.as_deref()),
+        ("http_method", entry.http_method.as_deref()),
+        ("http_path", entry.http_path.as_deref()),
+        ("ip_address", entry.ip_address.as_deref()),
+        ("tenant_id", Some(&entry.tenant_id)),
+        ("prev_hash", entry.prev_hash.as_deref()),
+    ];
+    match fields
+        .iter()
+        .find(|(_, v)| v.is_some_and(|v| v.contains('\u{1f}')))
+    {
+        Some((field, _)) => Err(ChainError::SeparatorInField { index, field }),
+        None => Ok(()),
+    }
 }
 
 /// Verify a contiguous, ordered slice of sealed audit entries.
@@ -78,6 +113,10 @@ pub fn verify_chain(entries: &[AuditLogEntry], signer: &AuditSigner) -> Result<(
             .signature
             .as_deref()
             .ok_or(ChainError::Unsigned { index })?;
+
+        // 0. No hashed text field may hold the field separator: the v1 hash
+        //    has no length prefixes, so it would make the boundaries ambiguous.
+        refuse_separator(entry, index)?;
 
         // 1. Linkage: this entry's prev_hash must equal the previous entry's
         //    entry_hash (and None at the genesis).

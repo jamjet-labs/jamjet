@@ -241,6 +241,40 @@ impl Run {
             .queue_type()
             .as_str()
             .to_string();
+        // `POST /work-items` refuses a node the engine runs itself, so an
+        // engine node's item is queued the way the scheduler queues it.
+        if jamjet_worker::executable::ENGINE_QUEUES.contains(&queue.as_str()) {
+            let seq = self.backend.latest_sequence(&self.eid).await.unwrap() + 1;
+            self.backend
+                .append_event(jamjet_state::Event::new(
+                    self.eid.clone(),
+                    seq,
+                    EventKind::NodeScheduled {
+                        node_id: "n1".into(),
+                        queue_type: queue.clone(),
+                    },
+                ))
+                .await
+                .unwrap();
+            self.backend
+                .enqueue_work_item(jamjet_state::backend::WorkItem {
+                    id: uuid::Uuid::new_v4(),
+                    execution_id: self.eid.clone(),
+                    node_id: "n1".into(),
+                    queue_type: queue,
+                    payload,
+                    attempt: 0,
+                    max_attempts: 3,
+                    created_at: chrono::Utc::now(),
+                    lease_expires_at: None,
+                    worker_id: None,
+                    lease_fence: 0,
+                    tenant_id: jamjet_state::DEFAULT_TENANT.into(),
+                })
+                .await
+                .unwrap();
+            return;
+        }
         let (st, body) = support::post(
             &self.state,
             "/work-items",

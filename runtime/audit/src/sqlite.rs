@@ -263,7 +263,15 @@ fn row_to_entry(row: AuditRow) -> Result<AuditLogEntry, AuditError> {
         sequence: row.sequence,
         event_type: row.event_type,
         actor_id: row.actor_id,
-        actor_type: parse_actor_type(&row.actor_type),
+        // Strict: a stored actor_type that is not one of the enum's values
+        // was not written by the engine. Reading it as `System` (as before)
+        // let a row whose actor_type text had been altered verify as system.
+        actor_type: parse_actor_type(&row.actor_type).ok_or_else(|| {
+            AuditError::Serialization(format!(
+                "audit entry {} has an unknown actor_type {:?}",
+                row.id, row.actor_type
+            ))
+        })?,
         tool_call_hash: row.tool_call_hash,
         policy_decision: row.policy_decision,
         http_request_id: row.http_request_id,
@@ -292,10 +300,11 @@ fn actor_type_str(a: &ActorType) -> &'static str {
     }
 }
 
-fn parse_actor_type(s: &str) -> ActorType {
+fn parse_actor_type(s: &str) -> Option<ActorType> {
     match s {
-        "human" => ActorType::Human,
-        "agent" => ActorType::Agent,
-        _ => ActorType::System,
+        "human" => Some(ActorType::Human),
+        "agent" => Some(ActorType::Agent),
+        "system" => Some(ActorType::System),
+        _ => None,
     }
 }

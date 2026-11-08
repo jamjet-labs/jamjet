@@ -291,3 +291,76 @@ def test_an_untyped_or_out_of_range_field_is_malformed_not_a_crash(field, value)
     with pytest.raises(ChainError) as e:
         verify_entries(bad, pk)
     assert e.value.reason == "malformed"
+
+
+# ── U+001F field boundaries (the vector Rust and Java test too) ─────────────
+
+
+def _sealed(entry: dict, sk) -> dict:
+    """``entry`` sealed as the runtime seals it: content hash, then an Ed25519
+    signature over the JCS statement."""
+    from jamjet.runtime_audit import entry_content_hash, signing_statement
+
+    pk = sk.public_key().public_bytes_raw()
+    kid = key_id(pk)
+    # Read the way the verifier reads a GET /audit response (numbers kept as
+    # their JSON text).
+    entry = load_entries(json.dumps([entry]))[0]
+    entry_hash = entry_content_hash(entry, None)
+    entry["entry_hash"] = entry_hash
+    entry["signature"] = f"ed25519:{kid}:{sk.sign(signing_statement(entry_hash, kid)).hex()}"
+    return entry
+
+
+def _base_entry() -> dict:
+    return {
+        "id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+        "event_id": "01010101-0101-0101-0101-010101010101",
+        "execution_id": "exec-1",
+        "sequence": 0,
+        "event_type": "node_completed",
+        "actor_id": "mallory\x1fsystem",
+        "actor_type": "human",
+        "created_at": "2026-11-08T00:00:00Z",
+        "raw_event": {"type": "node_completed"},
+        "tenant_id": "default",
+        "redacted": False,
+    }
+
+
+def test_a_field_holding_the_separator_is_refused_even_when_the_hash_matches():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from jamjet.runtime_audit import entry_content_hash
+
+    sk = Ed25519PrivateKey.generate()
+    pk = sk.public_key().public_bytes_raw()
+    honest = _sealed(_base_entry(), sk)
+    # The same bytes under the v1 hash, read with different field boundaries.
+    forged = dict(honest)
+    forged.update(actor_id="mallory", actor_type="system", tool_call_hash="human", ip_address="\x1f")
+    assert entry_content_hash(forged, None) == honest["entry_hash"]
+
+    for entry, field in ((honest, "actor_id"), (forged, "ip_address")):
+        with pytest.raises(ChainError) as err:
+            verify_entries([entry], pk)
+        assert err.value.reason == "separator_in_field"
+        assert field in str(err.value)
+
+
+def test_an_actor_type_outside_the_enum_is_malformed():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    sk = Ed25519PrivateKey.generate()
+    pk = sk.public_key().public_bytes_raw()
+    entry = _base_entry()
+    entry["actor_id"] = "mallory"
+    entry["actor_type"] = "root"
+    sealed = _sealed(entry, sk)
+    with pytest.raises(ChainError) as err:
+        verify_entries([sealed], pk)
+    assert err.value.reason == "malformed"
+    assert "actor_type" in str(err.value)
+    # The same entry with a real actor type verifies: only the type is refused.
+    entry["actor_type"] = "agent"
+    verify_entries([_sealed(entry, sk)], pk)

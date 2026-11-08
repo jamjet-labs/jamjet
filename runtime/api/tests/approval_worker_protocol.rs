@@ -283,10 +283,12 @@ async fn the_initiator_cannot_complete_a_gated_node_through_the_worker_protocol(
 async fn a_developer_cannot_enqueue_a_work_item() {
     let env = env().await;
     let (id, eid) = start(&env, approval_policy()).await;
+    // The gate's own queue: `POST /work-items` refuses a node on a queue its
+    // kind is not dispatched to, whoever asks.
     let body = json!({
         "execution_id": id,
         "node_id": "gate",
-        "queue_type": "attacker_q",
+        "queue_type": "tool",
         "payload": { "workflow_id": "wf-gate", "workflow_version": "0.1.0" },
     });
     let before = events(&env, &eid).await.len();
@@ -387,7 +389,7 @@ async fn an_external_claim_of_a_gated_node_is_held_until_approved() {
         json!({
             "execution_id": id,
             "node_id": "gate",
-            "queue_type": "attacker_q",
+            "queue_type": "tool",
             "payload": { "workflow_id": "wf-gate", "workflow_version": "0.1.0" },
         }),
     )
@@ -722,10 +724,13 @@ async fn a_large_bound_payload_is_truncated_in_the_listing_not_in_the_digest() {
     assert_eq!(st, StatusCode::OK, "{view}");
     let basis = &view["pending"][0]["context"]["action_basis"];
     assert_eq!(basis["payload_truncated"], true, "{basis}");
-    assert!(
-        basis["payload"].is_null(),
-        "the preview is dropped, not cut mid-value"
-    );
+    // Bounded, never dropped: every key is shown, and the large value is
+    // replaced by its size and its first characters, never cut mid-JSON.
+    let blob = &basis["payload"]["input"]["blob"];
+    assert_eq!(blob["preview_truncated"], true, "{basis}");
+    assert_eq!(blob["bytes"].as_u64().unwrap(), 64 * 1024 + 2);
+    assert!(blob["head"].as_str().unwrap().starts_with("xxx"));
+    assert_eq!(basis["payload"]["module"], "myapp.payments");
     assert!(basis["payload_bytes"].as_u64().unwrap() > 64 * 1024);
 }
 
