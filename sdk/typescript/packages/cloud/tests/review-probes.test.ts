@@ -118,6 +118,13 @@ describe('tools the vendor runs itself', () => {
     expect(sent.tools.map((t: any) => t.name)).toEqual(['web_lookup'])
   })
 
+  it('keeps Anthropic client tools (bash, text editor, computer, memory) to gate their calls', async () => {
+    const sent = await sentWith([['require_approval', 'bash']], {
+      tools: [{ type: 'bash_20250124', name: 'bash' }, { type: 'text_editor_20250728', name: 'str_replace_based_edit_tool' }],
+    })
+    expect(sent.tools.map((t: any) => t.name)).toEqual(['bash', 'str_replace_based_edit_tool'])
+  })
+
   it('strips MCP toolsets and servers while any restrictive rule exists', async () => {
     const sent = await sentWith([['block', 'delete_*']], {
       tools: [{ type: 'mcp_toolset', mcp_server_name: 'db' }, { name: 'search', input_schema: { type: 'object' } }],
@@ -223,5 +230,41 @@ describe('other SDK entry points', () => {
     const blocked = { ...comp, choices: [{ index: 0, message: { role: 'assistant', content: null, refusal: null, tool_calls: [{ id: 't', type: 'function', function: { name: 'delete_all', arguments: '{}' } }] }, finish_reason: 'tool_calls', logprobs: null }] }
     const client2 = new OpenAI({ apiKey: 'x', fetch: stub(blocked, []) as any })
     await expect((client2.chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: 'x' }] }) as any).asResponse()).rejects.toBeInstanceOf(JamjetPolicyBlocked)
+  })
+
+  it('batch APIs are refused while a restrictive rule is active', async () => {
+    const cap: any[] = []
+    const oai = new OpenAI({ apiKey: 'x', fetch: stub({}, cap) as any })
+    const ant = new Anthropic({ apiKey: 'x', fetch: stub({}, cap) as any })
+    expect(() => oai.batches.create({ input_file_id: 'f', endpoint: '/v1/chat/completions', completion_window: '24h' })).toThrow(JamjetUnenforceableCall)
+    expect(() => ant.messages.batches.create({ requests: [] })).toThrow(JamjetUnenforceableCall)
+    expect(() => ant.beta.messages.batches.create({ requests: [] })).toThrow(JamjetUnenforceableCall)
+    expect(cap).toHaveLength(0)
+  })
+
+  it('a streaming asResponse()/withResponse() body is the enforced stream as SSE', async () => {
+    const base = { id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'gpt-4o' }
+    const sseBody = (name: string) =>
+      [
+        { ...base, choices: [{ index: 0, delta: { role: 'assistant', content: 'hi' }, finish_reason: null }] },
+        { ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'c', type: 'function', function: { name, arguments: '{}' } }] }, finish_reason: null }] },
+        { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+      ]
+        .map((c) => `data: ${JSON.stringify(c)}\n\n`)
+        .join('') + 'data: [DONE]\n\n'
+    const sseFetch = (name: string) => async () => new Response(sseBody(name), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    const ok = new OpenAI({ apiKey: 'x', fetch: sseFetch('search') as any })
+    const res = await (ok.chat.completions.create({ model: 'gpt-4o', stream: true, messages: [{ role: 'user', content: 'x' }] }) as any).asResponse()
+    expect(res.headers.get('content-type')).toBe('text/event-stream')
+    const text = await res.text()
+    expect(text.startsWith('data: {')).toBe(true)
+    expect(text.trim().endsWith('data: [DONE]')).toBe(true)
+    const bad = new OpenAI({ apiKey: 'x', fetch: sseFetch('delete_all') as any })
+    const { response } = await (bad.chat.completions.create({ model: 'gpt-4o', stream: true, messages: [{ role: 'user', content: 'x' }] }) as any).withResponse()
+    const read = await response.text().then(
+      (t: string) => t,
+      (e: unknown) => e,
+    )
+    expect(read).toBeInstanceOf(JamjetPolicyBlocked)
   })
 })

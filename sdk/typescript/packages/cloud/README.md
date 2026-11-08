@@ -112,11 +112,14 @@ blocked tool throws `JamjetPolicyBlocked`. Budget exhaustion throws
 
 Enforced entry points: OpenAI `chat.completions` (`create`, `parse`, `stream`,
 legacy `functions` included) and Anthropic `messages` and `beta.messages`
-(`create`, `parse`, `stream`). OpenAI's Responses API is not enforced: it
-throws `JamjetUnenforceableCall` while any block or require_approval rule is
-set. Server tools (such as web search) and MCP toolsets run on the vendor's
-side before a tool call could be refused, so a rule that could match them
-removes them from the request.
+(`create`, `parse`, `stream`). `asResponse()` and `withResponse()` return a
+Response rebuilt from the enforced result (server-sent events for a stream).
+OpenAI's Responses API and the batch APIs are not enforced: they throw
+`JamjetUnenforceableCall` while any block or require_approval rule is set.
+Server tools (such as web search) and MCP toolsets run on the vendor's side
+before a tool call could be refused, so a rule that could match them removes
+them from the request; Anthropic's own client tools (bash, text editor,
+computer, memory) are gated like any other tool.
 
 Streaming calls get the same checks. Text streams through as it arrives; once
 any policy rule is set, chunks from the first tool call onward are held until
