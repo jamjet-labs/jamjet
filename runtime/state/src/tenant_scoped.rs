@@ -1124,9 +1124,7 @@ impl StateBackend for TenantScopedSqliteBackend {
     ) -> BackendResult<ReserveOutcome> {
         let now = Utc::now();
         let now_s = now.to_rfc3339();
-        let expires_at = (now
-            + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::minutes(5)))
-        .to_rfc3339();
+        let expires_at = crate::backend::reservation_expiry(now, ttl).to_rfc3339();
 
         // See the untenanted backend for why this is one statement. `tenant_id`
         // is written on the row, but the KEY is the conflict target: an

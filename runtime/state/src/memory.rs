@@ -495,8 +495,7 @@ impl StateBackend for InMemoryBackend {
         ttl: std::time::Duration,
     ) -> BackendResult<ReserveOutcome> {
         let now = Utc::now();
-        let expires_at =
-            now + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::minutes(5));
+        let expires_at = crate::backend::reservation_expiry(now, ttl);
 
         // `entry` holds the shard lock across the whole test-and-set, which is
         // what makes this atomic in the same way the SQL upsert is. A get-then-

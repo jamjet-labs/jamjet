@@ -275,3 +275,34 @@ async fn a_node_id_must_be_safe_and_match_its_key() {
         assert!(body.to_string().contains(needle), "{key}/{id}: {body}");
     }
 }
+
+/// A node timeout past 7 days is refused at registration. Near `u64::MAX`
+/// it overflowed the reservation math and panicked the worker that ran it.
+#[tokio::test]
+async fn a_node_timeout_past_the_limit_is_refused() {
+    let max = jamjet_worker::worker::MAX_NODE_TIMEOUT.as_secs();
+    let state = make_state(Arc::new(jamjet_state::InMemoryBackend::new()));
+    for (huge, at_workflow) in [
+        (u64::MAX, false),
+        (10_000_000_000_000, false),
+        (max + 1, false),
+        (max + 1, true),
+    ] {
+        let mut ir = dispatch_ir(Some(true));
+        if at_workflow {
+            ir["timeouts"] = serde_json::json!({ "node_timeout": huge });
+        } else {
+            let id = ir["start_node"].as_str().unwrap().to_string();
+            ir["nodes"][&id]["node_timeout_secs"] = serde_json::json!(huge);
+        }
+        assert_eq!(
+            post_workflow(&state, ir).await,
+            StatusCode::BAD_REQUEST,
+            "{huge}"
+        );
+    }
+    let mut ir = dispatch_ir(Some(true));
+    let id = ir["start_node"].as_str().unwrap().to_string();
+    ir["nodes"][&id]["node_timeout_secs"] = serde_json::json!(max);
+    assert!(post_workflow(&state, ir).await.is_success());
+}

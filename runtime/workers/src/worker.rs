@@ -497,10 +497,25 @@ impl Worker {
                                     // No limit: renew the reservation while it
                                     // runs, as the heartbeat renews the lease.
                                     None => {
+                                        // Only while the lease is held: a dead
+                                        // heartbeat means the item can be
+                                        // reclaimed, and renewing then kept the
+                                        // key from its next holder until a
+                                        // restart. A reservation another worker
+                                        // took over is lost: the effect is
+                                        // abandoned rather than fired twice.
                                         let renew = async {
                                             loop {
                                                 tokio::time::sleep(ttl / 3).await;
-                                                if let Err(e) = self
+                                                if heartbeat.is_finished() {
+                                                    warn!(
+                                                        execution_id = %execution_id,
+                                                        node_id = %node_id,
+                                                        "lease lost: no longer renewing the effect reservation"
+                                                    );
+                                                    std::future::pending::<()>().await;
+                                                }
+                                                match self
                                                     .backend
                                                     .reserve_tool_effect(
                                                         &key,
@@ -512,18 +527,27 @@ impl Worker {
                                                     )
                                                     .await
                                                 {
-                                                    warn!(
+                                                    Ok(jamjet_state::ReserveOutcome::Acquired) => {}
+                                                    Ok(jamjet_state::ReserveOutcome::Held {
+                                                        owner,
+                                                        ..
+                                                    }) => {
+                                                        return ExecutorError::Fatal(format!(
+                                                            "the effect reservation was taken over by {owner}; abandoned"
+                                                        ));
+                                                    }
+                                                    Err(e) => warn!(
                                                         execution_id = %execution_id,
                                                         node_id = %node_id,
                                                         error = %e,
                                                         "could not renew the effect reservation"
-                                                    );
+                                                    ),
                                                 }
                                             }
                                         };
                                         tokio::select! {
                                             result = fire => result,
-                                            never = renew => never,
+                                            lost = renew => Err(lost),
                                         }
                                     }
                                     Some(limit) => match tokio::time::timeout(limit, fire).await {
@@ -985,7 +1009,9 @@ impl Worker {
     /// it while it runs.
     fn reservation_ttl(limit: Option<std::time::Duration>) -> std::time::Duration {
         match limit {
-            Some(t) => (t + Self::RESERVATION_MARGIN).max(Self::RESERVATION_TTL),
+            Some(t) => t
+                .saturating_add(Self::RESERVATION_MARGIN)
+                .max(Self::RESERVATION_TTL),
             None => Self::RESERVATION_TTL,
         }
     }
@@ -1504,13 +1530,22 @@ impl Worker {
 /// This bounds the executor call on the engine's own workers. A human
 /// approval wait is not an executor call (the guard holds the node), so its
 /// deadline is the approval's own `timeout_secs`, not this.
+///
+/// Held to [`MAX_NODE_TIMEOUT`]: registration refuses more, and a workflow
+/// stored before it did must not overflow the reservation math.
 pub(crate) fn node_timeout(ir: &WorkflowIr, node_def: &NodeDef) -> Option<Duration> {
     node_def
         .node_timeout_secs
         .map(Duration::from_secs)
         .or(ir.timeouts.node_timeout)
         .filter(|d| !d.is_zero())
+        .map(|d| d.min(MAX_NODE_TIMEOUT))
 }
+
+/// The longest node timeout a workflow may set: 7 days. `POST /workflows`
+/// refuses more. A run that needs longer waits on a timer or an approval, not
+/// in one executor call.
+pub const MAX_NODE_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[cfg(test)]
 mod tests {
@@ -1779,7 +1814,11 @@ mod tests {
     /// The effect reservation's expiry as another worker would find it, while
     /// `n1` runs (`None`: not reserved).
     async fn reservation_expiry(backend: &Arc<InMemoryBackend>, eid: &ExecutionId) -> String {
-        let key = jamjet_state::derive_idempotency_key(backend.as_ref(), eid, "n1")
+        reservation_expiry_in(backend.as_ref(), eid).await
+    }
+
+    async fn reservation_expiry_in(backend: &dyn StateBackend, eid: &ExecutionId) -> String {
+        let key = jamjet_state::derive_idempotency_key(backend, eid, "n1")
             .await
             .unwrap();
         match backend
@@ -1839,6 +1878,175 @@ mod tests {
         let second = reservation_expiry(&backend, &eid).await;
         assert!(second > first, "not renewed: {first} then {second}");
         run.abort();
+    }
+
+    /// Each layer of the overflow fix on its own: the TTL saturates, and a
+    /// stored timeout is held to the cap.
+    #[test]
+    fn a_reservation_ttl_saturates_and_a_timeout_is_capped() {
+        assert_eq!(Worker::reservation_ttl(Some(Duration::MAX)), Duration::MAX);
+        let mut ir_json = minimal_ir_json();
+        ir_json["nodes"]["n1"]["node_timeout_secs"] = serde_json::json!(u64::MAX);
+        let ir: WorkflowIr = serde_json::from_value(ir_json).unwrap();
+        assert_eq!(
+            node_timeout(&ir, ir.node("n1").unwrap()),
+            Some(MAX_NODE_TIMEOUT)
+        );
+    }
+
+    /// A node timeout near `u64::MAX` used to overflow the reservation math
+    /// and panic the worker task, which nothing started again.
+    #[tokio::test]
+    async fn a_huge_node_timeout_does_not_kill_the_worker() {
+        for secs in [u64::MAX, 10_000_000_000_000] {
+            let (backend, eid) = backend_with_timeouts(None, Some(secs)).await;
+            let worker =
+                make_worker(Arc::clone(&backend)).register_executor("tool", Arc::new(NoopExecutor));
+            let item = backend
+                .claim_work_item("test-worker", &["default"])
+                .await
+                .unwrap()
+                .unwrap();
+            let joined = tokio::spawn(async move { worker.execute_item(item).await }).await;
+            assert!(
+                !joined.as_ref().is_err_and(|e| e.is_panic()),
+                "{secs}: the worker task panicked"
+            );
+            assert!(joined.unwrap().is_ok(), "{secs}");
+            let events = backend.get_events(&eid).await.unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e.kind, EventKind::NodeCompleted { .. })),
+                "{secs}: {events:?}"
+            );
+        }
+    }
+
+    /// Panics on the first item it runs.
+    struct PanicOnce(std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl NodeExecutor for PanicOnce {
+        async fn execute(
+            &self,
+            item: &jamjet_state::backend::WorkItem,
+        ) -> Result<ExecutionResult, ExecutorError> {
+            if !self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                panic!("an executor bug");
+            }
+            NoopExecutor.execute(item).await
+        }
+    }
+
+    /// A pool worker whose task panics is started again and takes the next
+    /// item. The task used to end for good, so one bad item emptied the pool.
+    #[tokio::test]
+    async fn a_worker_that_panics_is_started_again() {
+        let (backend, first) = backend_with_timeouts(None, None).await;
+        let second = ExecutionId::new();
+        backend
+            .create_execution(sample_execution(&second))
+            .await
+            .unwrap();
+        backend
+            .enqueue_work_item(sample_item(&second))
+            .await
+            .unwrap();
+        let pool = crate::pool::WorkerPool::new(Arc::clone(&backend) as Arc<dyn StateBackend>)
+            .with_group(crate::pool::WorkerGroupConfig::new(
+                "t",
+                1,
+                vec!["default".into()],
+            ))
+            .with_executor("tool", Arc::new(PanicOnce(Default::default())));
+        let handles = pool.spawn();
+        let completed = |events: &[jamjet_state::Event]| {
+            events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::NodeCompleted { .. }))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut done = false;
+        while std::time::Instant::now() < deadline {
+            let a = backend.get_events(&first).await.unwrap();
+            let b = backend.get_events(&second).await.unwrap();
+            if completed(&a) || completed(&b) {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for h in handles {
+            h.abort();
+        }
+        assert!(done, "no item ran after the worker panicked");
+    }
+
+    /// With no time limit, the reservation is renewed only while the lease
+    /// is held. Once the heartbeat gives up, renewing kept the key from the
+    /// item's next holder until a restart.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_heartbeat_stops_the_reservation_renewal() {
+        let backend = Arc::new(crate::test_support::FailingGetEvents::failing_renew());
+        let eid = ExecutionId::new();
+        backend
+            .create_execution(sample_execution(&eid))
+            .await
+            .unwrap();
+        let mut ir = minimal_ir_json();
+        ir["nodes"]["n1"]["node_timeout_secs"] = serde_json::json!(0);
+        backend
+            .store_workflow(WorkflowDefinition {
+                workflow_id: "test-wf".into(),
+                version: "1.0.0".into(),
+                ir,
+                created_at: Utc::now(),
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
+        let worker = Worker::new(
+            "test-worker".into(),
+            Arc::clone(&backend) as Arc<dyn StateBackend>,
+            vec!["default".into()],
+        )
+        .register_executor("tool", Arc::new(SleepExecutor));
+        let item = backend
+            .claim_work_item("test-worker", &["default"])
+            .await
+            .unwrap()
+            .unwrap();
+        let run = tokio::spawn(async move { worker.execute_item(item).await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let first = reservation_expiry_in(backend.as_ref(), &eid).await;
+        tokio::time::sleep(Duration::from_secs(110)).await;
+        let second = reservation_expiry_in(backend.as_ref(), &eid).await;
+        assert_eq!(first, second, "renewed after the heartbeat died");
+        run.abort();
+    }
+
+    /// A renewal that fails with anything but a lost fence is retried, three
+    /// times with backoff, before the heartbeat gives up. One busy database
+    /// used to end it.
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_retries_a_transient_error_before_giving_up() {
+        let backend = Arc::new(crate::test_support::FailingGetEvents::failing_renew());
+        let heartbeat = crate::heartbeat::spawn_heartbeat(
+            Arc::clone(&backend) as Arc<dyn StateBackend>,
+            Uuid::new_v4(),
+            "w".into(),
+            1,
+            Duration::from_secs(10),
+        );
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(heartbeat.is_finished());
+        assert_eq!(
+            backend.renewals.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "one renewal and three retries"
+        );
     }
 
     /// Takes `0` to run each item.

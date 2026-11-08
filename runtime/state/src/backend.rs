@@ -833,6 +833,24 @@ pub struct WorkItem {
 
 /// The lease a claim gets when the worker does not say how long it needs.
 pub const DEFAULT_LEASE_SECS: u64 = 30;
+
+/// The longest an effect reservation is held, whatever is asked: far past
+/// any node timeout registration allows, and far inside what a timestamp can
+/// hold. A huge TTL used to overflow the expiry and panic the worker.
+pub const MAX_RESERVATION_TTL: std::time::Duration =
+    std::time::Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+/// When a reservation of `ttl` taken at `now` expires: `ttl` held to
+/// [`MAX_RESERVATION_TTL`], added without overflowing.
+pub fn reservation_expiry(
+    now: chrono::DateTime<chrono::Utc>,
+    ttl: std::time::Duration,
+) -> chrono::DateTime<chrono::Utc> {
+    let held = chrono::Duration::from_std(ttl.min(MAX_RESERVATION_TTL))
+        .unwrap_or_else(|_| chrono::Duration::days(36_500));
+    now.checked_add_signed(held)
+        .unwrap_or_else(|| now + chrono::Duration::days(36_500))
+}
 /// The shortest lease a claim may ask for: long enough to be renewable.
 pub const MIN_LEASE_SECS: u64 = 5;
 /// The longest lease a claim may ask for: short enough that a dead worker's
@@ -951,4 +969,27 @@ pub enum FailOutcome {
         /// The item with its FINAL attempt number.
         item: Box<WorkItem>,
     },
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    /// A huge TTL neither panics nor leaves the four-digit years the
+    /// reservation table compares as text.
+    #[test]
+    fn a_huge_reservation_ttl_has_a_comparable_expiry() {
+        let now = chrono::Utc::now();
+        // Far, not the 5-minute fallback that reopened the double-fire
+        // window, and never a panic (10^13 s converts but overflows the add).
+        for ttl in [
+            std::time::Duration::MAX,
+            std::time::Duration::from_secs(10_000_000_000_000),
+        ] {
+            let at = super::reservation_expiry(now, ttl);
+            assert!(
+                at >= now + chrono::Duration::days(365 * 50),
+                "{ttl:?}: {at}"
+            );
+            assert_eq!(at.format("%Y").to_string().len(), 4, "{ttl:?}: {at}");
+        }
+    }
 }

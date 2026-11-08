@@ -472,3 +472,217 @@ async fn a_reference_past_the_cap_is_not_read() {
     );
     assert_eq!(reads.0.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
+
+/// Sums the bytes of every events page read, and counts size lookups.
+#[derive(Default)]
+struct Reads {
+    page_bytes: std::sync::atomic::AtomicUsize,
+    size_lookups: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl support::hooked::AfterWrite for Reads {
+    async fn after(&self, write: support::hooked::Write) {
+        use std::sync::atomic::Ordering::SeqCst;
+        match write {
+            support::hooked::Write::EventsPage(n) => {
+                self.page_bytes.fetch_add(n, SeqCst);
+            }
+            support::hooked::Write::ArtifactSize(_) => {
+                self.size_lookups.fetch_add(1, SeqCst);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn hooked(inner: &Arc<InMemoryBackend>, reads: &Arc<Reads>) -> Arc<dyn StateBackend> {
+    Arc::new(support::hooked::HookedBackend::new(
+        inner.clone(),
+        reads.clone(),
+    ))
+}
+
+/// The byte budget bounds what is read, not only what is answered: a page
+/// of 10000 events was read whole and then cut to 8 MiB.
+#[tokio::test]
+async fn a_page_reads_at_most_its_byte_budget() {
+    use jamjet_api::routes::MAX_EVENTS_PAGE_BYTES;
+    let inner = Arc::new(InMemoryBackend::new());
+    let reads = Arc::new(Reads::default());
+    let e = execution(WorkflowStatus::Running);
+    let id = e.execution_id.clone();
+    inner.create_execution(e).await.unwrap();
+    let patch = "y".repeat(7 * 1024);
+    let n = (MAX_EVENTS_PAGE_BYTES / (7 * 1024)) as i64 * 2;
+    let mut one = 0;
+    for seq in 1..=n {
+        let mut kind = completed(&format!("n{seq}"), json!({}));
+        if let EventKind::NodeCompleted { state_patch, .. } = &mut kind {
+            *state_patch = json!({ "p": patch });
+        }
+        let event = Event::new(id.clone(), seq, kind);
+        one = serde_json::to_vec(&event).unwrap().len();
+        inner.append_event(event).await.unwrap();
+    }
+    let state = make_state(hooked(&inner, &reads));
+    let (_, body) = get(&state, &format!("/executions/{id}/events")).await;
+    assert!(body["next_after"].is_number(), "{}", body["next_after"]);
+    let read = reads.page_bytes.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        read <= MAX_EVENTS_PAGE_BYTES + one,
+        "read {read} bytes for an {MAX_EVENTS_PAGE_BYTES}-byte page"
+    );
+}
+
+/// `inline_artifacts=none` inlines nothing, so it looks nothing up: one
+/// size query per reference was still made.
+#[tokio::test]
+async fn inlining_nothing_looks_nothing_up() {
+    let inner = Arc::new(InMemoryBackend::new());
+    let reads = Arc::new(Reads::default());
+    let e = execution(WorkflowStatus::Running);
+    let id = e.execution_id.clone();
+    inner.create_execution(e).await.unwrap();
+    for i in 0..5 {
+        let r = inner
+            .put_artifact(
+                &serde_json::to_vec(&json!({ "i": i })).unwrap(),
+                Some("application/json"),
+            )
+            .await
+            .unwrap();
+        inner
+            .append_event(Event::new(
+                id.clone(),
+                i + 1,
+                completed("n", r.to_sentinel()),
+            ))
+            .await
+            .unwrap();
+    }
+    let state = make_state(hooked(&inner, &reads));
+    let (_, body) = get(
+        &state,
+        &format!("/executions/{id}/events?inline_artifacts=none"),
+    )
+    .await;
+    assert_eq!(body["events"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        reads.size_lookups.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+/// Inlined outputs are charged as they are written back, not as stored:
+/// `1e15` is 4 bytes stored and 18 written (`1000000000000000.0`), so a page
+/// charged by stored size answered far past its budget.
+#[tokio::test]
+async fn a_page_charges_what_it_writes() {
+    use jamjet_api::routes::INLINE_PAGE_BUDGET;
+    let inner = Arc::new(InMemoryBackend::new());
+    let e = execution(WorkflowStatus::Running);
+    let id = e.execution_id.clone();
+    inner.create_execution(e).await.unwrap();
+    let raw = format!("[{}]", vec!["1e15"; 10_000].join(","));
+    let written = serde_json::to_vec(&serde_json::from_str::<Value>(&raw).unwrap())
+        .unwrap()
+        .len();
+    assert!(written > raw.len() * 3);
+    let r = inner
+        .put_artifact(raw.as_bytes(), Some("application/json"))
+        .await
+        .unwrap();
+    // Stored, they fit the budget; written, they do not.
+    let n = INLINE_PAGE_BUDGET as usize / raw.len() - 1;
+    for i in 0..n {
+        inner
+            .append_event(Event::new(
+                id.clone(),
+                i as i64 + 1,
+                completed("n", r.to_sentinel()),
+            ))
+            .await
+            .unwrap();
+    }
+    let state = make_state(inner);
+    let (_, body) = get(&state, &format!("/executions/{id}/events")).await;
+    let inlined = body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e["kind"]["output"]
+                .get(jamjet_state::ARTIFACT_SENTINEL_KEY)
+                .is_none()
+        })
+        .count();
+    assert!(
+        (inlined * written) as u64 <= INLINE_PAGE_BUDGET,
+        "{inlined} outputs of {written} bytes inlined"
+    );
+}
+
+/// While the server drains, the claim route hands out nothing: an item
+/// claimed then would lose its lease when the server stops.
+#[tokio::test]
+async fn a_draining_server_hands_out_no_work() {
+    use tower::ServiceExt;
+    let backend = Arc::new(InMemoryBackend::new());
+    let e = execution(WorkflowStatus::Running);
+    let id = e.execution_id.clone();
+    backend.create_execution(e).await.unwrap();
+    let item_id = uuid::Uuid::new_v4();
+    backend
+        .enqueue_work_item(jamjet_state::backend::WorkItem {
+            id: item_id,
+            execution_id: id,
+            node_id: "n".into(),
+            queue_type: "app".into(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: chrono::Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            tenant_id: "default".into(),
+            lease_fence: 0,
+        })
+        .await
+        .unwrap();
+    let state = make_state(backend.clone());
+    let draining = jamjet_api::routes::Draining::default();
+    let app = jamjet_api::routes::build_router_with_opts(state, true).layer(
+        axum::middleware::from_fn_with_state(
+            draining.clone(),
+            jamjet_api::routes::refuse_claims_while_draining,
+        ),
+    );
+    let claim = || {
+        axum::http::Request::post("/work-items/claim")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({ "worker_id": "w", "queue_types": ["app"] }).to_string(),
+            ))
+            .unwrap()
+    };
+    draining.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    let resp = app.clone().oneshot(claim()).await.unwrap();
+    let bytes = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body, json!({ "claimed": false }));
+    let untouched = backend.get_work_item(item_id).await.unwrap().unwrap();
+    assert!(untouched.worker_id.is_none(), "claimed while draining");
+    // Not draining: the claim takes it (the gate then settles this
+    // workflow-less item, so it leaves the queue either way).
+    draining.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    app.oneshot(claim()).await.unwrap();
+    let after = backend.get_work_item(item_id).await.unwrap();
+    assert!(
+        after.is_none_or(|i| i.worker_id.is_some()),
+        "not claimed once the drain was off"
+    );
+}

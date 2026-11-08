@@ -26,6 +26,10 @@ pub enum Write {
     BeforeAppendEventIf(ExecutionId),
     /// An artifact's bytes were read (after the read).
     GetArtifact(String),
+    /// An artifact's size was looked up.
+    ArtifactSize(String),
+    /// A page of events was read: how many bytes they serialize to.
+    EventsPage(usize),
 }
 
 #[async_trait::async_trait]
@@ -293,7 +297,27 @@ impl StateBackend for HookedBackend {
     }
 
     async fn artifact_size(&self, hash: &str) -> jamjet_state::backend::BackendResult<Option<u64>> {
-        self.inner.artifact_size(hash).await
+        let size = self.inner.artifact_size(hash).await?;
+        self.hook.after(Write::ArtifactSize(hash.to_string())).await;
+        Ok(size)
+    }
+
+    async fn get_events_page(
+        &self,
+        execution_id: &ExecutionId,
+        after: jamjet_state::EventSequence,
+        limit: u32,
+    ) -> jamjet_state::backend::BackendResult<Vec<Event>> {
+        let events = self
+            .inner
+            .get_events_page(execution_id, after, limit)
+            .await?;
+        let bytes = events
+            .iter()
+            .map(|e| serde_json::to_vec(e).map(|b| b.len()).unwrap_or(0))
+            .sum();
+        self.hook.after(Write::EventsPage(bytes)).await;
+        Ok(events)
     }
 
     async fn enqueue_work_item(

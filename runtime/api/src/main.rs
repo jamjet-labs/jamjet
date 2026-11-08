@@ -276,6 +276,11 @@ async fn main() -> anyhow::Result<()> {
     // it, and with the listener closed at the first signal their leases
     // lapsed during the drain and the work ran again.
     let (http_stop_tx, mut http_stop) = tokio::sync::watch::channel(false);
+    let draining = jamjet_api::routes::Draining::default();
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        draining.clone(),
+        jamjet_api::routes::refuse_claims_while_draining,
+    ));
     let mut server = tokio::spawn(async move {
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
@@ -292,6 +297,8 @@ async fn main() -> anyhow::Result<()> {
         res = &mut server => Some(res),
     };
 
+    // No new claims from here on; heartbeats and completions still work.
+    draining.0.store(true, std::sync::atomic::Ordering::SeqCst);
     // Stop the scheduler and the workers. An open connection (an MCP SSE
     // stream never ends) must not hold the drain back.
     info!(

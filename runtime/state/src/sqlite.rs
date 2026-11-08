@@ -1189,9 +1189,7 @@ impl StateBackend for SqliteBackend {
     ) -> BackendResult<ReserveOutcome> {
         let now = Utc::now();
         let now_s = now.to_rfc3339();
-        let expires_at = (now
-            + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::minutes(5)))
-        .to_rfc3339();
+        let expires_at = crate::backend::reservation_expiry(now, ttl).to_rfc3339();
 
         // ONE statement, so there is no gap between "is anyone holding this" and
         // "I am holding this" — the gap is the entire bug this prevents.

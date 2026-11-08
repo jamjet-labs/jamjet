@@ -349,11 +349,9 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         .ok_or_else(|| format!("after must be an integer sequence, not {v}"))?,
                 };
                 let limit = crate::routes::MAX_EVENTS_PAGE;
-                let mut events = backend
-                    .get_events_page(&eid, after, limit)
+                let (events, cut) = crate::routes::read_events_page(&*backend, &eid, after, limit)
                     .await
                     .map_err(|e| format!("{e}"))?;
-                let cut = crate::routes::cap_events_page(&mut events);
                 let next_after = crate::routes::events_next_after(&events, limit, cut);
                 let text = serde_json::to_string(&json!({"events": events, "next_after": next_after}))
                     .map_err(|e| format!("{e}"))?;

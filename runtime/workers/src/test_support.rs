@@ -30,6 +30,9 @@ pub(crate) struct FailingGetEvents {
     fail_events: bool,
     fail_tenant: bool,
     fail_count: bool,
+    /// Fail `renew_lease` with an error other than a lost fence (a busy
+    /// database), every time.
+    fail_renew: bool,
     /// How many times `renew_lease` was called: a heartbeat left running
     /// keeps counting.
     pub(crate) renewals: std::sync::atomic::AtomicUsize,
@@ -42,6 +45,7 @@ impl FailingGetEvents {
             fail_events: true,
             fail_tenant: false,
             fail_count: false,
+            fail_renew: false,
             renewals: Default::default(),
         }
     }
@@ -54,6 +58,7 @@ impl FailingGetEvents {
             fail_events: false,
             fail_tenant: true,
             fail_count: false,
+            fail_renew: false,
             renewals: Default::default(),
         }
     }
@@ -66,6 +71,20 @@ impl FailingGetEvents {
             fail_events: false,
             fail_tenant: false,
             fail_count: true,
+            fail_renew: false,
+            renewals: Default::default(),
+        }
+    }
+
+    /// Fail `renew_lease` instead, every time, with a busy-database error:
+    /// the heartbeat's lease cannot be renewed.
+    pub(crate) fn failing_renew() -> Self {
+        Self {
+            inner: InMemoryBackend::new(),
+            fail_events: false,
+            fail_tenant: false,
+            fail_count: false,
+            fail_renew: true,
             renewals: Default::default(),
         }
     }
@@ -390,6 +409,11 @@ impl StateBackend for FailingGetEvents {
     ) -> jamjet_state::backend::BackendResult<()> {
         self.renewals
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_renew {
+            return Err(jamjet_state::StateBackendError::Database(
+                "database is locked".into(),
+            ));
+        }
         self.inner
             .renew_lease(item_id, worker_id, lease_fence)
             .await

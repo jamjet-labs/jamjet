@@ -110,7 +110,12 @@ Every node may also carry `type`, `description`, `labels`, `policy`,
 `human_approval` node's `timeout` is its approval deadline. On a node the
 engine's own workers run (`model`, `condition`, `eval`, `limit_exceeded`),
 `timeout` bounds the run: past it the node fails and is not retried (`0` is
-no limit). A node an external worker runs is not timed out by the engine.
+no limit). A timeout over 7 days is refused at registration. A node an
+external worker runs is not timed out by the engine. On the engine's
+workers a node's effect reservation lasts its timeout plus 60 s (at least 5
+minutes), so after a worker crashes mid-node another attempt can take the
+node over only once that has passed; a node with no limit renews its
+reservation while its lease is held.
 `data_policy` is recorded in the IR and not enforced. The
 `python_fn`, `java_fn` and `external_fn` kinds, which external workers run,
 come from the Python and Java SDKs rather than from YAML.

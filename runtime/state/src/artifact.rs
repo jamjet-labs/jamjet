@@ -241,6 +241,10 @@ pub async fn resolve_value_budgeted(
             return Ok(v.clone());
         };
         let cap = max_each.min(*budget);
+        // Nothing can be inlined (`none`, or the budget spent): no lookup.
+        if cap == 0 {
+            return Ok(v.clone());
+        }
         match backend.artifact_size(&r.hash).await? {
             None => Err(StateBackendError::NotFound(format!(
                 "artifact {} not found (dangling ref)",
@@ -250,9 +254,17 @@ pub async fn resolve_value_budgeted(
             Some(_) => match backend.get_artifact(&r.hash).await? {
                 // Checked again: what was read decides.
                 Some(bytes) if bytes.len() as u64 <= cap => {
-                    let resolved =
+                    let resolved: Value =
                         serde_json::from_slice(&bytes).map_err(StateBackendError::Serialization)?;
-                    *budget = budget.saturating_sub(bytes.len() as u64);
+                    // Charged as it will be written back: `1e15` is stored in
+                    // 4 bytes and serialized in 18.
+                    let written = serde_json::to_vec(&resolved)
+                        .map(|b| b.len() as u64)
+                        .unwrap_or(u64::MAX);
+                    if written > cap {
+                        return Ok(v.clone());
+                    }
+                    *budget = budget.saturating_sub(written);
                     Ok(resolved)
                 }
                 Some(_) => Ok(v.clone()),

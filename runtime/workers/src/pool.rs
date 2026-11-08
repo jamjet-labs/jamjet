@@ -146,9 +146,25 @@ impl WorkerPool {
                     Some(s) => (s.receiver(), Some(s.enter())),
                     None => (idle.clone(), None),
                 };
+                // A worker that panics is started again. Nothing restarted it,
+                // so one bad item emptied the pool for the life of the process.
+                let worker = Arc::new(worker);
                 let handle = tokio::spawn(async move {
                     let _running = running;
-                    worker.run_until(stop).await;
+                    loop {
+                        let (w, s) = (Arc::clone(&worker), stop.clone());
+                        match tokio::spawn(async move { w.run_until(s).await }).await {
+                            Ok(()) => break,
+                            Err(e) if e.is_panic() && !*stop.borrow() => {
+                                tracing::error!(
+                                    worker_id = %worker_id,
+                                    "Worker panicked; starting it again"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            }
+                            Err(_) => break,
+                        }
+                    }
                 });
                 handles.push(handle);
             }

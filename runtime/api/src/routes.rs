@@ -242,6 +242,28 @@ async fn create_workflow(
     // shape here, not `validate_workflow`'s ref rules.)
     let parsed = serde_json::from_value::<jamjet_ir::WorkflowIr>(body.ir.clone())
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // A node timeout bounds an executor call; past the cap it is a mistake,
+    // and near u64::MAX it overflowed the reservation math and panicked the
+    // worker that ran the node.
+    let max = jamjet_worker::worker::MAX_NODE_TIMEOUT;
+    let too_long = |d: std::time::Duration| d > max;
+    if parsed.timeouts.node_timeout.is_some_and(too_long) {
+        return Err(ApiError::BadRequest(format!(
+            "invalid workflow IR: timeouts.node_timeout is over the {} s limit",
+            max.as_secs()
+        )));
+    }
+    for (id, node) in &parsed.nodes {
+        if node
+            .node_timeout_secs
+            .is_some_and(|s| too_long(std::time::Duration::from_secs(s)))
+        {
+            return Err(ApiError::BadRequest(format!(
+                "invalid workflow IR: node {id}: node_timeout_secs is over the {} s limit",
+                max.as_secs()
+            )));
+        }
+    }
 
     // ONE rule from `validate_workflow` runs here, deliberately, while the ref
     // rules above do not. An unmarked ADK tool-dispatch node is not a reference
@@ -668,21 +690,73 @@ pub const INLINE_PAGE_BUDGET_ALL: u64 = 64 * 1024 * 1024;
 /// with `next_after`, once it is past this; it always holds one event.
 pub const MAX_EVENTS_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Cut `events` to the longest prefix of at most [`MAX_EVENTS_PAGE_BYTES`]
-/// (and at least one event). `true` if it cut any.
-pub fn cap_events_page(events: &mut Vec<jamjet_state::Event>) -> bool {
+/// Read one page of `execution_id`'s events after `after`: at most `limit`
+/// events and about [`MAX_EVENTS_PAGE_BYTES`] of them as stored (always at
+/// least one). `true` if the byte budget ended it.
+///
+/// Read in chunks sized from the events seen so far, so the budget bounds
+/// what is read, not only what is answered: a page of `limit` large events
+/// used to be read whole and then cut.
+pub async fn read_events_page(
+    backend: &dyn jamjet_state::StateBackend,
+    execution_id: &jamjet_core::workflow::ExecutionId,
+    after: i64,
+    limit: u32,
+) -> jamjet_state::BackendResult<(Vec<jamjet_state::Event>, bool)> {
+    const FIRST_CHUNK: u32 = 16;
+    const MAX_CHUNK: u32 = 1000;
+    let mut events = Vec::new();
     let mut total = 0usize;
-    let mut keep = events.len();
-    for (i, e) in events.iter().enumerate() {
-        total += serde_json::to_vec(e).map(|b| b.len()).unwrap_or(0);
-        if total > MAX_EVENTS_PAGE_BYTES && i > 0 {
-            keep = i;
-            break;
+    let mut largest = 0usize;
+    let mut cursor = after;
+    let mut chunk = FIRST_CHUNK;
+    loop {
+        let want = chunk.min(limit.saturating_sub(events.len() as u32));
+        if want == 0 {
+            return Ok((events, false));
         }
+        let read = backend.get_events_page(execution_id, cursor, want).await?;
+        let got = read.len() as u32;
+        for e in read {
+            let size = serde_json::to_vec(&e).map(|b| b.len()).unwrap_or(0);
+            if total + size > MAX_EVENTS_PAGE_BYTES && !events.is_empty() {
+                return Ok((events, true));
+            }
+            total += size;
+            largest = largest.max(size);
+            cursor = e.sequence;
+            events.push(e);
+        }
+        if got < want {
+            return Ok((events, false));
+        }
+        let left = MAX_EVENTS_PAGE_BYTES.saturating_sub(total);
+        chunk = ((left / largest.max(1)) as u32).clamp(1, MAX_CHUNK);
     }
-    let cut = keep < events.len();
-    events.truncate(keep);
-    cut
+}
+
+/// Set while the server shuts down. [`refuse_claims_while_draining`] then
+/// hands out no new work: the workers drain, and an item claimed now would
+/// lose its lease when the server stops and run again after the restart.
+#[derive(Clone, Default)]
+pub struct Draining(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+/// Middleware: while [`Draining`] is set, `POST /work-items/claim` answers
+/// `{"claimed": false}`, as an empty queue does. Heartbeats and completions
+/// are still served.
+pub async fn refuse_claims_while_draining(
+    State(draining): State<Draining>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if draining.0.load(std::sync::atomic::Ordering::SeqCst)
+        && req.method() == axum::http::Method::POST
+        && req.uri().path() == "/work-items/claim"
+    {
+        return nothing_to_claim().into_response();
+    }
+    next.run(req).await
 }
 
 /// The cursor for a page: the last event's sequence when the page was cut
@@ -727,10 +801,8 @@ async fn list_events(
         .limit
         .unwrap_or(MAX_EVENTS_PAGE)
         .clamp(1, MAX_EVENTS_PAGE);
-    let mut events = backend
-        .get_events_page(&execution_id, params.after.unwrap_or(0), limit)
-        .await?;
-    let cut = cap_events_page(&mut events);
+    let (mut events, cut) =
+        read_events_page(&*backend, &execution_id, params.after.unwrap_or(0), limit).await?;
     let next_after = events_next_after(&events, limit, cut);
 
     // Resolve ArtifactRef sentinels in NodeCompleted.output before returning to

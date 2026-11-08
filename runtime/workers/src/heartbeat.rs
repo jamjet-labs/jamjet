@@ -1,9 +1,13 @@
 //! Worker heartbeat — periodically renews the lease on a claimed work item.
 
-use jamjet_state::backend::{StateBackend, WorkItemId};
+use jamjet_state::backend::{StateBackend, StateBackendError, WorkItemId};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
+
+/// How many times one renewal is retried on an error other than a lost
+/// fence, with backoff (1 s, 2 s, 4 s), before the heartbeat gives up.
+const TRANSIENT_RETRIES: u32 = 3;
 
 /// The heartbeat task of one claimed item. Dropping it stops the task.
 ///
@@ -45,15 +49,41 @@ pub fn spawn_heartbeat(
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if let Err(e) = backend.renew_lease(item_id, &worker_id, lease_fence).await {
-                // The lease is gone (stolen, failed over, or item already settled).
-                // Stop renewing; the fenced commit path fails closed on its own.
-                info!(
-                    worker_id = %worker_id,
-                    item_id = %item_id,
-                    "Heartbeat stopping: lease no longer held ({e})"
-                );
-                break;
+            // A lost fence ends the heartbeat at once. Any other error (a
+            // busy database) is retried with backoff first: one used to end
+            // it, and a no-limit node then lost its lease and its reservation
+            // over a transient error.
+            let mut failures = 0u32;
+            loop {
+                match backend.renew_lease(item_id, &worker_id, lease_fence).await {
+                    Ok(()) => break,
+                    Err(StateBackendError::FenceLost(_)) => {
+                        info!(
+                            worker_id = %worker_id,
+                            item_id = %item_id,
+                            "Heartbeat stopping: lease no longer held"
+                        );
+                        return;
+                    }
+                    Err(e) if failures < TRANSIENT_RETRIES => {
+                        failures += 1;
+                        warn!(
+                            worker_id = %worker_id,
+                            item_id = %item_id,
+                            attempt = failures,
+                            "Heartbeat: renewing the lease failed ({e}); retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(500) * 2u32.pow(failures)).await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            worker_id = %worker_id,
+                            item_id = %item_id,
+                            "Heartbeat stopping: renewing the lease kept failing ({e})"
+                        );
+                        return;
+                    }
+                }
             }
         }
     }))
