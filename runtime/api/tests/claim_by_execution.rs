@@ -2519,3 +2519,37 @@ async fn an_unmarkable_item_is_failed_not_put_back() {
         cleanup(path);
     }
 }
+
+/// An oldest-first release that errs hands nothing out. It is the only check
+/// that the lease did not expire while the gate decided, and a busy database
+/// there used to hand out a dead lease, so the node ran twice.
+#[tokio::test]
+async fn an_oldest_first_release_that_errs_hands_nothing_out() {
+    let inner = Arc::new(InMemoryBackend::new());
+    let hook = Arc::new(Once::default());
+    let hooked = Arc::new(support::hooked::HookedBackend::new(
+        inner.clone() as Arc<dyn StateBackend>,
+        hook.clone(),
+    ));
+    let state = make_state(hooked.clone());
+    register(&state, None, ir("wf-busy", None, None)).await;
+    let e = start(&state, None, "wf-busy").await;
+    // The lease runs out while the gate decides (its check that the run is
+    // live), and the release then fails.
+    let (i2, e2) = (inner.clone(), e.clone());
+    hook.arm(
+        |w| matches!(w, support::hooked::Write::GetExecution),
+        async move {
+            let l = i2.leased_items(&[QUEUE], &by_this(&e2)).await.unwrap();
+            i2.set_lease_expiry_for_test(
+                l[0].item.id,
+                chrono::Utc::now() - chrono::Duration::seconds(5),
+            );
+        },
+    );
+    hooked
+        .fail_release
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (_, body) = claim(&state, None, "w1", json!({})).await;
+    assert_eq!(body, json!({ "claimed": false }));
+}

@@ -1625,8 +1625,9 @@ async fn claim_work_item(
     // undecided, refused for an expired lease: a named retry from the same
     // worker that landed during this gate has parked the lease and taken it
     // again, and a blind mark used to hand the item out a second time here.
-    // A backend that cannot record the mark still hands out: a later claim
-    // by execution then decides again, which is safe.
+    // A release that errs hands nothing out either: it is the only check
+    // that the lease has not expired while the gate decided, and a dead
+    // lease handed out runs the node twice.
     match backend
         .release_lease(
             wi.id,
@@ -1640,6 +1641,7 @@ async fn claim_work_item(
         Ok(false) => return Ok(nothing_to_claim()),
         Err(e) => {
             warn!(work_item_id = %wi.id, error = %e, "claim: could not record the release");
+            return Ok(nothing_to_claim());
         }
     }
 

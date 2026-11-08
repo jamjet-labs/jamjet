@@ -48,6 +48,8 @@ pub struct HookedBackend {
     pub fail_item_reads: Arc<std::sync::atomic::AtomicBool>,
     /// While set, `get_workflow` panics: a gate that dies mid-decision.
     pub panic_workflow_reads: Arc<std::sync::atomic::AtomicBool>,
+    /// While set, `release_lease` fails as a busy database does.
+    pub fail_release: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HookedBackend {
@@ -57,6 +59,7 @@ impl HookedBackend {
             hook,
             fail_item_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             panic_workflow_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_release: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -380,6 +383,11 @@ impl StateBackend for HookedBackend {
         from: jamjet_state::GateMark,
         lease_secs: u64,
     ) -> jamjet_state::backend::BackendResult<bool> {
+        if self.fail_release.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(jamjet_state::StateBackendError::Database(
+                "database is locked".into(),
+            ));
+        }
         self.inner
             .release_lease(item_id, lease_fence, from, lease_secs)
             .await
