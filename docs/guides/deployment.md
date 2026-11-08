@@ -21,7 +21,11 @@ runs in dev mode, on port 7700, with SQLite at `.jamjet/runtime.db` in the
 current directory. Dev mode turns off authentication and runs the in-process
 workers and the cron scheduler. Use it on your own machine only: the server
 refuses to start in dev mode on any address but loopback unless
-`JAMJET_DEV_MODE_ALLOW_REMOTE=1` is set.
+`JAMJET_DEV_MODE_ALLOW_REMOTE=1` is set. On any bind, dev mode answers only
+requests addressed to `localhost`, a loopback address or a name in
+`JAMJET_DEV_ALLOWED_HOSTS`, and refuses requests relayed by a proxy or tunnel
+and requests from a page of another site (see
+[RBAC](security.md#rbac)).
 
 ---
 
@@ -141,7 +145,9 @@ docker run --rm -p 127.0.0.1:7700:8080 \
 
 Publishing on `127.0.0.1` keeps other machines from the published port, but
 the server still has no authentication: any container on the same Docker
-network can reach it directly. Use this on your own machine only. In memory
+network can reach it directly. Requests must name `localhost` or a loopback
+address; to call it as `host.docker.internal` (or by a WSL or LAN name), add
+`-e JAMJET_DEV_ALLOWED_HOSTS=host.docker.internal`. Use this on your own machine only. In memory
 mode state is lost when the container stops, no audit log is kept, and no
 token can be issued.
 
@@ -157,16 +163,26 @@ Images on Docker Hub (`jamjetdev/jamjet`) are built from crate release tags.
 
 These are the variables that change what the server does.
 
+The on/off switches (`JAMJET_DEV_MODE`, `JAMJET_DEV_MODE_ALLOW_REMOTE`,
+`JAMJET_EMBED_WORKERS`, `JAMJET_EMBED_CRON`, `JAMJET_ALLOW_SELF_APPROVAL`,
+`JAMJET_TENANT_TOKENS_AS_DEFAULT`, `JAMJET_AUDIT_ALLOW_INSECURE_KEY`) all read
+the same way: `1`, `true`, `yes` or `on` is on; `0`, `false`, `no`, `off`, empty
+or unset is off, in any case. Any other value stops the server at startup with
+the variable's name, instead of being read as one or the other. The Python SDK
+reads `JAMJET_AUDIT_ALLOW_INSECURE_KEY` the same way and raises `ValueError` on
+any other value.
+
 | Variable | What it does | Default |
 |----------|--------------|---------|
 | `JAMJET_BIND` | Address to listen on | `127.0.0.1` |
 | `JAMJET_PORT` | Port to listen on | `7700` |
-| `JAMJET_DEV_MODE` | `1` or `true`: no authentication, in-process workers and cron. Refused on a non-loopback bind | off |
-| `JAMJET_DEV_MODE_ALLOW_REMOTE` | `1`: let dev mode listen on a non-loopback address and answer any host name (logged as a warning) | off |
+| `JAMJET_DEV_MODE` | No authentication, in-process workers and cron. Refused on a non-loopback bind | off |
+| `JAMJET_DEV_MODE_ALLOW_REMOTE` | Let dev mode listen on a non-loopback address (logged as a warning). Requests must still name an allowed host | off |
+| `JAMJET_DEV_ALLOWED_HOSTS` | Host names dev mode answers besides `localhost` and loopback addresses, comma-separated, without scheme or port (`host.docker.internal`) | none |
 | `DATABASE_URL` | SQLite database, as `sqlite://<path>` | `sqlite://.jamjet/runtime.db` in the working directory (`sqlite:///data/runtime.db` in the Docker image) |
 | `STORAGE_BACKEND` | `memory` keeps state in memory and keeps no audit log; any other value uses SQLite | SQLite |
-| `JAMJET_EMBED_WORKERS` | `1`/`true`/`yes`/`on`: runs the in-process worker pool outside dev mode. `0`/`false`/`no`/`off` or empty is off; any other value fails startup | off (`1` in the Docker image) |
-| `JAMJET_EMBED_CRON` | Same values: runs the cron scheduler outside dev mode (not with `STORAGE_BACKEND=memory`) | off (`1` in the Docker image) |
+| `JAMJET_EMBED_WORKERS` | Runs the in-process worker pool outside dev mode | off (`1` in the Docker image) |
+| `JAMJET_EMBED_CRON` | Runs the cron scheduler outside dev mode (not with `STORAGE_BACKEND=memory`) | off (`1` in the Docker image) |
 | `JAMJET_STORE_TERM` | Failover generation for the lease fence, a non-negative integer. An invalid value fails startup | unset |
 | `JAMJET_PUBLIC_URL` | Base URL used for the `did:web` id in `/.well-known/did.json` | `http://$JAMJET_BIND:$JAMJET_PORT` |
 | `JAMJET_MODEL_SEAM_URL` | Send every model call through the model sidecar at this URL. With the in-process workers on, startup fails if it does not answer `/health` | unset |
@@ -175,11 +191,11 @@ These are the variables that change what the server does.
 | `JAMJET_ARTIFACT_THRESHOLD_BYTES` | Node outputs larger than this are stored as artifacts | `8192` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Export traces and metrics over OTLP | unset |
 | `RUST_LOG` | Log filter. Logs are JSON outside dev mode | `info` |
-| `JAMJET_ALLOW_SELF_APPROVAL` | `1` or `true`: the principal that started a run may approve it | off |
-| `JAMJET_TENANT_TOKENS_AS_DEFAULT` | `1` or `true`: tokens of other tenants act in `default` (no isolation) | off |
+| `JAMJET_ALLOW_SELF_APPROVAL` | The principal that started a run may approve it | off |
+| `JAMJET_TENANT_TOKENS_AS_DEFAULT` | Tokens of other tenants act in `default` (no isolation) | off |
 | `JAMJET_AUDIT_SIGNING_MODE` | `hmac` or `ed25519` | `hmac` |
 | `JAMJET_AUDIT_SIGNING_KEY` | HMAC key for the audit log | unset (entries left unsigned) |
-| `JAMJET_AUDIT_ALLOW_INSECURE_KEY` | `1`/`true`/`yes`/`on`: sign with the built-in public dev key when no HMAC key is set. Any other value is off | off |
+| `JAMJET_AUDIT_ALLOW_INSECURE_KEY` | Sign with the built-in public dev key when no HMAC key is set | off |
 | `JAMJET_AUDIT_ED25519_KEY_FILE` or `JAMJET_AUDIT_ED25519_KEY` | Ed25519 seed, 64 hex digits | unset |
 
 ---

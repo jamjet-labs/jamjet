@@ -74,12 +74,36 @@ client = JamjetClient(base_url="http://localhost:7700", api_token=os.environ["JA
 Roles are ordered: each role can do everything the roles below it can. Outside dev
 mode every route below needs a Bearer token, and the role is enforced in code on the
 route, not by convention. Dev mode (`JAMJET_DEV_MODE=1`) has no tokens and enforces
-none of this, so the server refuses to start in dev mode unless it listens on loopback
-only, and then answers only requests addressed to `localhost` or a loopback address.
-The second check stops a web page that re-resolves its own host name to 127.0.0.1
-(DNS rebinding) from driving the runtime from your browser.
-`JAMJET_DEV_MODE_ALLOW_REMOTE=1` turns both off, with a warning in the log: anyone
-who can reach the port then has every role.
+none of this, so dev mode has guards of its own:
+
+- It refuses to start unless it listens on loopback only.
+  `JAMJET_DEV_MODE_ALLOW_REMOTE=1` lets it listen elsewhere (Docker's
+  `0.0.0.0`), with a warning in the log: anyone who can reach the port then has
+  every role.
+- On any bind, it answers only requests addressed to `localhost`, a loopback
+  address or a name in `JAMJET_DEV_ALLOWED_HOSTS`. This stops a web page that
+  re-resolves its own host name to 127.0.0.1 (DNS rebinding) from driving the
+  runtime from your browser. `JAMJET_DEV_MODE_ALLOW_REMOTE` does not turn it off.
+- It refuses a request carrying `Forwarded`, `X-Forwarded-Host` or
+  `X-Forwarded-For`: a tunnel such as ngrok with `--host-header=rewrite`, or
+  cloudflared, rewrites `Host` to `localhost` for a request from anywhere.
+- It refuses a request from a page of another site (`Sec-Fetch-Site:
+  cross-site`, or an `Origin` that is not an allowed host). Any page can send a
+  POST with no body to 127.0.0.1, which is enough to cancel a run or deactivate
+  an agent.
+
+The model sidecar (`jamjet.model.sidecar_server`) has no token either and
+spends the provider keys in its environment. It answers only requests
+addressed to this machine (or a name in `JAMJET_SIDECAR_ALLOWED_HOSTS`),
+refuses cross-site requests, and takes `POST /v1/complete` only as
+`application/json`.
+
+`jamjet-server token create` and `token revoke` seal `token_issued` and
+`token_revoked` into the audit log, with the token id, role, tenant and name.
+Separation of duties is keyed on the token id, so a reviewer token someone mints
+for themselves is on record. A token the log cannot record is revoked again and
+not printed. Run the commands with the audit signing key the server uses, or
+their entries are left unsigned.
 
 | Route | Minimum role | Notes |
 |-------|--------------|-------|
