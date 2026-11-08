@@ -204,6 +204,8 @@ async fn main() -> anyhow::Result<()> {
     // worker processes against the same state backend instead. The base backend
     // claims across all tenants, so workers drain every execution's queue.
     if config.dev_mode || std::env::var("JAMJET_EMBED_WORKERS").is_ok() {
+        // Checked on its own so a bad value is reported as what it is.
+        jamjet_models::http::model_timeout().map_err(|e| anyhow::anyhow!("{e}"))?;
         let model_registry = Arc::new(
             jamjet_models::registry::registry_from_env_checked()
                 .await
@@ -215,8 +217,7 @@ async fn main() -> anyhow::Result<()> {
             .with_sealer(state.enricher.clone())
             .with_agents(state.agents.clone())
             .with_shutdown(shutdown.clone());
-        // Detaching the handles lets the workers run for the lifetime of the process
-        // (same pattern as the scheduler above).
+        // The workers stop through `shutdown`; their handles are not needed.
         let _worker_handles = pool.spawn();
         info!("Embedded worker pool started (dev mode)");
     }
@@ -258,14 +259,36 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    info!("JamJet runtime listening on {addr}");
+    info!("JamJet runtime listening on {}", listener.local_addr()?);
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // The first SIGTERM or Ctrl-C starts a graceful shutdown; a second one
+    // exits at once.
+    let (signalled_tx, signalled) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = signalled_tx.send(true);
+        shutdown_signal().await;
+        warn!("Second shutdown signal: exiting now");
+        std::process::exit(1);
+    });
+    let mut http_stop = signalled.clone();
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = http_stop.wait_for(|s| *s).await;
+            })
+            .await
+    });
+    let mut signal = signalled.clone();
+    tokio::select! {
+        // The server ended on its own: nothing to drain for.
+        res = &mut server => return Ok(res??),
+        _ = signal.wait_for(|s| *s) => {}
+    }
 
-    // The listener is closed and in-flight requests are answered. Now stop
-    // the scheduler and drain the embedded workers.
+    // Stop the scheduler and the workers first, alongside the HTTP drain:
+    // the workers must stop claiming at once, and an open connection (an
+    // MCP SSE stream never ends) must not hold the drain back.
     info!(
         grace_secs = shutdown_grace.as_secs(),
         "Shutting down: finishing in-flight work"
@@ -278,9 +301,20 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let _ = tokio::time::timeout(Duration::from_secs(5), scheduler_handle).await;
+    match tokio::time::timeout(HTTP_DRAIN, &mut server).await {
+        Ok(res) => res??,
+        Err(_) => {
+            warn!("HTTP connections still open after the drain; closing them");
+            server.abort();
+        }
+    }
     info!("Shutting down");
     Ok(())
 }
+
+/// How long shutdown waits for open HTTP connections once the workers are
+/// drained.
+const HTTP_DRAIN: Duration = Duration::from_secs(5);
 
 /// How long shutdown waits for in-flight work: `JAMJET_SHUTDOWN_GRACE_SECS`,
 /// default 30. An invalid value fails startup.

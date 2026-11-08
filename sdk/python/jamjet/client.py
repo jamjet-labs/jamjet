@@ -216,15 +216,19 @@ class JamjetClient:
         _raise_for_status(r)
         return r.json()
 
-    async def get_events(self, execution_id: str) -> dict[str, Any]:
+    async def get_events(self, execution_id: str, *, inline_artifacts: str | None = None) -> dict[str, Any]:
         """Return the run's whole event log as ``{"events": [...]}``.
 
         The runtime returns the log in pages (10000 events at most, with a
-        ``next_after`` cursor when there are more); this follows the cursor
-        until the last page.
+        ``next_after`` cursor when a page is full); this follows the cursor
+        until the last page. Spilled node outputs over 256 KiB come back as
+        ``$artifact`` references unless ``inline_artifacts="all"``.
         """
         events: list[Any] = []
-        params: dict[str, Any] = {}
+        base: dict[str, Any] = {}
+        if inline_artifacts is not None:
+            base["inline_artifacts"] = inline_artifacts
+        params: dict[str, Any] = dict(base)
         while True:
             r = await self._client.get(f"/executions/{execution_id}/events", params=params)
             _raise_for_status(r)
@@ -233,7 +237,7 @@ class JamjetClient:
             next_after = page.get("next_after")
             if next_after is None:
                 return {"events": events}
-            params = {"after": next_after}
+            params = {**base, "after": next_after}
 
     async def approve(
         self,

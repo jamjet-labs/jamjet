@@ -655,6 +655,31 @@ pub const MAX_EVENTS_PAGE: u32 = 10_000;
 /// hash and size, for `GET /artifacts/:hash`.
 pub const MAX_INLINE_ARTIFACT_BYTES: u64 = 256 * 1024;
 
+/// The most spilled output one events page inlines in total: 16 MiB by
+/// default, 64 MiB with `inline_artifacts=all`. Past it the rest of the
+/// page's spilled outputs stay references.
+pub const INLINE_PAGE_BUDGET: u64 = 16 * 1024 * 1024;
+pub const INLINE_PAGE_BUDGET_ALL: u64 = 64 * 1024 * 1024;
+
+/// The bytes `value`'s artifact references (at the top or one level down)
+/// of at most `cap` bytes would inline.
+fn inlinable_bytes(value: &Value, cap: u64) -> u64 {
+    let size = |v: &Value| {
+        jamjet_state::ArtifactRef::from_sentinel(v)
+            .map(|r| r.size)
+            .filter(|s| *s <= cap)
+            .unwrap_or(0)
+    };
+    if jamjet_state::ArtifactRef::from_sentinel(value).is_some() {
+        return size(value);
+    }
+    match value {
+        Value::Object(o) => o.values().map(size).sum(),
+        Value::Array(a) => a.iter().map(size).sum(),
+        _ => 0,
+    }
+}
+
 #[derive(Deserialize)]
 struct ListEventsQuery {
     /// Only events with a sequence above this one.
@@ -673,10 +698,10 @@ async fn list_events(
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
     let execution_id = parse_execution_id(&id)?;
-    let max_inline = match params.inline_artifacts.as_deref() {
-        None | Some("small") => MAX_INLINE_ARTIFACT_BYTES,
-        Some("all") => u64::MAX,
-        Some("none") => 0,
+    let (max_inline, mut budget) = match params.inline_artifacts.as_deref() {
+        None | Some("small") => (MAX_INLINE_ARTIFACT_BYTES, INLINE_PAGE_BUDGET),
+        Some("all") => (u64::MAX, INLINE_PAGE_BUDGET_ALL),
+        Some("none") => (0, 0),
         Some(other) => {
             return Err(ApiError::BadRequest(format!(
                 "inline_artifacts must be small, all or none, not {other:?}"
@@ -710,7 +735,12 @@ async fn list_events(
             output, node_id, ..
         } = &mut event.kind
         {
-            let resolved = jamjet_state::resolve_value_within(output, &*backend, max_inline).await;
+            let cap = max_inline.min(budget);
+            let inlined = inlinable_bytes(output, cap);
+            let resolved = jamjet_state::resolve_value_within(output, &*backend, cap).await;
+            if resolved.is_ok() {
+                budget = budget.saturating_sub(inlined);
+            }
             match resolved {
                 Ok(v) => *output = v,
                 Err(e) => {

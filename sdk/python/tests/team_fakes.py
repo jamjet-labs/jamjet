@@ -127,5 +127,5 @@ class MultiAgentFakeClient:
     async def get_execution(self, execution_id: str) -> dict[str, Any]:
         return self._by_exec[execution_id]
 
-    async def get_events(self, execution_id: str) -> dict[str, Any]:
+    async def get_events(self, execution_id: str, **_kwargs: Any) -> dict[str, Any]:
         return {"events": []}

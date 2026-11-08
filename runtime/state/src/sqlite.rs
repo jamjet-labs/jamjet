@@ -839,19 +839,40 @@ impl StateBackend for SqliteBackend {
 
     async fn list_running_executions_after(
         &self,
-        after: Option<&ExecutionId>,
+        after: Option<&str>,
         limit: u32,
-    ) -> BackendResult<Vec<WorkflowExecution>> {
+    ) -> BackendResult<crate::backend::RunningPage> {
         let rows = sqlx::query(
             "SELECT * FROM workflow_executions WHERE status = 'running' AND execution_id > ? \
              ORDER BY execution_id LIMIT ?",
         )
-        .bind(after.map(execution_id_str).unwrap_or_default())
+        .bind(after.unwrap_or_default())
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(map_db_err)?;
-        rows.iter().map(row_to_execution).collect()
+        // A row that does not parse is left out, but its id still moves the
+        // cursor: the scheduler walks these pages, and one bad row must not
+        // stop it.
+        let next_after = rows
+            .last()
+            .map(|row| row.try_get::<String, _>("execution_id"))
+            .transpose()
+            .map_err(map_db_err)?;
+        let executions = rows
+            .iter()
+            .filter_map(|row| match row_to_execution(row) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!("skipping an unreadable running execution: {e}");
+                    None
+                }
+            })
+            .collect();
+        Ok(crate::backend::RunningPage {
+            executions,
+            next_after,
+        })
     }
 
     // ── Event log ─────────────────────────────────────────────────────────

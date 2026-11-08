@@ -362,24 +362,23 @@ impl StateBackend for InMemoryBackend {
 
     async fn list_running_executions_after(
         &self,
-        after: Option<&ExecutionId>,
+        after: Option<&str>,
         limit: u32,
-    ) -> BackendResult<Vec<WorkflowExecution>> {
-        let after = after.map(|a| a.0.to_string());
+    ) -> BackendResult<crate::backend::RunningPage> {
         let mut results: Vec<WorkflowExecution> = self
             .executions
             .iter()
             .filter(|r| r.value().status == WorkflowStatus::Running)
-            .filter(|r| {
-                after
-                    .as_ref()
-                    .is_none_or(|a| r.value().execution_id.0.to_string() > *a)
-            })
+            .filter(|r| after.is_none_or(|a| r.value().execution_id.0.to_string().as_str() > a))
             .map(|r| r.value().clone())
             .collect();
         results.sort_by_key(|r| r.execution_id.0.to_string());
         results.truncate(limit as usize);
-        Ok(results)
+        let next_after = results.last().map(|e| e.execution_id.0.to_string());
+        Ok(crate::backend::RunningPage {
+            executions: results,
+            next_after,
+        })
     }
 
     // ── Event log ────────────────────────────────────────────────────

@@ -171,9 +171,20 @@ pub async fn resolve_value_within(
         let artifact_ref = ArtifactRef::from_sentinel(v).filter(|r| r.size <= max_size);
         let v = v.clone();
         async move {
-            match artifact_ref {
-                Some(r) => resolve_ref(&r, backend).await,
-                None => Ok(v),
+            let Some(r) = artifact_ref else {
+                return Ok(v);
+            };
+            match backend.get_artifact(&r.hash).await? {
+                // The sentinel's size is what its writer claimed: an external
+                // worker can return one. The stored bytes decide.
+                Some(bytes) if bytes.len() as u64 > max_size => Ok(v),
+                Some(bytes) => {
+                    serde_json::from_slice(&bytes).map_err(StateBackendError::Serialization)
+                }
+                None => Err(StateBackendError::NotFound(format!(
+                    "artifact {} not found (dangling ref)",
+                    r.hash
+                ))),
             }
         }
     };
@@ -202,19 +213,6 @@ pub async fn resolve_value_within(
     }
 
     Ok(value.clone())
-}
-
-async fn resolve_ref(
-    artifact_ref: &ArtifactRef,
-    backend: &dyn StateBackend,
-) -> BackendResult<Value> {
-    match backend.get_artifact(&artifact_ref.hash).await? {
-        Some(bytes) => serde_json::from_slice(&bytes).map_err(StateBackendError::Serialization),
-        None => Err(StateBackendError::NotFound(format!(
-            "artifact {} not found (dangling ref)",
-            artifact_ref.hash
-        ))),
-    }
 }
 
 #[cfg(test)]

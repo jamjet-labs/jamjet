@@ -146,7 +146,7 @@ These are the variables that change what the server does.
 | `JAMJET_AUDIT_ALLOW_INSECURE_KEY` | Sign with the built-in public dev key when no HMAC key is set | unset |
 | `JAMJET_AUDIT_ED25519_KEY_FILE` or `JAMJET_AUDIT_ED25519_KEY` | Ed25519 seed, 64 hex digits | unset |
 | `JAMJET_MODEL_TIMEOUT_SECS` | Longest one model provider call may take, in seconds. Connecting is limited to 10 s. An invalid value fails startup | `300` |
-| `JAMJET_SHUTDOWN_GRACE_SECS` | On SIGTERM or Ctrl-C, how long to wait for the in-process workers to finish the items they hold | `30` |
+| `JAMJET_SHUTDOWN_GRACE_SECS` | On SIGTERM or Ctrl-C, how long to wait for the in-process workers to finish the items they hold. Open HTTP connections get 5 s more, and a second signal exits at once. Give the orchestrator longer than the sum: Kubernetes' `terminationGracePeriodSeconds` defaults to 30 and `docker stop` to 10 | `30` |
 
 ---
 

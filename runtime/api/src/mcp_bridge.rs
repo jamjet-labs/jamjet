@@ -193,7 +193,15 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
             async move {
                 let caller = resolve_caller(&ctx, &args, dev_mode, Role::Viewer)?;
                 let tenant_id = caller.tenant.clone();
-                let status = args.get("status").and_then(|v| v.as_str()).and_then(parse_status);
+                let status = match args.get("status").and_then(|v| v.as_str()) {
+                    None => None,
+                    Some(s) => Some(parse_status(s).ok_or_else(|| {
+                        format!(
+                            "unknown status {s:?}; use pending, running, paused, completed, \
+                             failed, cancelled or limit_exceeded"
+                        )
+                    })?),
+                };
                 let limit = args
                     .get("limit")
                     .and_then(|v| v.as_u64())
@@ -332,7 +340,14 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 let tenant_id = caller.tenant.clone();
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
-                let after = args.get("after").and_then(|v| v.as_i64()).unwrap_or(0);
+                // A cursor that is not an integer is refused: read as 0, a
+                // caller passing "10000" would get page one forever.
+                let after = match args.get("after") {
+                    None | Some(Value::Null) => 0,
+                    Some(v) => v
+                        .as_i64()
+                        .ok_or_else(|| format!("after must be an integer sequence, not {v}"))?,
+                };
                 let limit = crate::routes::MAX_EVENTS_PAGE;
                 let events = backend
                     .get_events_page(&eid, after, limit)
@@ -648,12 +663,8 @@ fn parse_execution_id(s: &str) -> Result<ExecutionId, String> {
     Ok(ExecutionId(uuid))
 }
 
+/// Any workflow status by its name. An unknown one used to mean no filter,
+/// so `"cancelled"` listed every run.
 fn parse_status(s: &str) -> Option<WorkflowStatus> {
-    match s {
-        "running" => Some(WorkflowStatus::Running),
-        "paused" => Some(WorkflowStatus::Paused),
-        "completed" => Some(WorkflowStatus::Completed),
-        "failed" => Some(WorkflowStatus::Failed),
-        _ => None,
-    }
+    serde_json::from_value(Value::String(s.to_string())).ok()
 }

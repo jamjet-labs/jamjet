@@ -1,6 +1,6 @@
 //! `list_running_executions_after`: the keyset page the scheduler walks to
-//! reach every running run. Checked on each backend that implements it, and
-//! on the trait default.
+//! reach every running run. Checked on each backend that implements it (the
+//! trait default, which the test doubles use, is not covered here).
 
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
@@ -43,24 +43,28 @@ async fn walk(backend: &dyn StateBackend) {
     running.sort();
 
     let mut seen: Vec<String> = Vec::new();
-    let mut after: Option<ExecutionId> = None;
+    let mut after: Option<String> = None;
     let mut pages = 0;
     loop {
         let page = backend
-            .list_running_executions_after(after.as_ref(), 3)
+            .list_running_executions_after(after.as_deref(), 3)
             .await
             .unwrap();
         pages += 1;
-        assert!(page.len() <= 3);
-        assert!(page.iter().all(|e| e.status == WorkflowStatus::Running));
-        seen.extend(page.iter().map(|e| e.execution_id.0.to_string()));
-        if page.len() < 3 {
-            break;
+        assert!(page.executions.len() <= 3);
+        assert!(page
+            .executions
+            .iter()
+            .all(|e| e.status == WorkflowStatus::Running));
+        seen.extend(page.executions.iter().map(|e| e.execution_id.0.to_string()));
+        match page.next_after {
+            Some(next) => after = Some(next),
+            None => break,
         }
-        after = page.last().map(|e| e.execution_id.clone());
     }
     assert_eq!(seen, running, "every running run once, in id order");
-    assert_eq!(pages, 3);
+    // 3 + 3 + 1, then one page that scans nothing.
+    assert_eq!(pages, 4);
 }
 
 #[tokio::test]
@@ -78,4 +82,40 @@ async fn tenant_scoped_sqlite_pages_every_running_run() {
 #[tokio::test]
 async fn memory_pages_every_running_run() {
     walk(&InMemoryBackend::new()).await;
+}
+
+/// A running row that does not parse is skipped, and the rows after it are
+/// still reached. The page used to fail as a whole, so one bad row stopped
+/// the scheduler's walk at it on every tick.
+#[tokio::test]
+async fn an_unreadable_row_does_not_hide_the_rows_after_it() {
+    let b = SqliteBackend::open("sqlite::memory:").await.unwrap();
+    let mut ids: Vec<String> = Vec::new();
+    for _ in 0..3 {
+        let e = execution(WorkflowStatus::Running);
+        ids.push(e.execution_id.0.to_string());
+        b.create_execution(e).await.unwrap();
+    }
+    ids.sort();
+    sqlx::query("UPDATE workflow_executions SET started_at = 'not a time' WHERE execution_id = ?")
+        .bind(&ids[1])
+        .execute(&b.pool())
+        .await
+        .unwrap();
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..10 {
+        let page = b
+            .list_running_executions_after(after.as_deref(), 1)
+            .await
+            .expect("an unreadable row is skipped, not an error");
+        seen.extend(page.executions.iter().map(|e| e.execution_id.0.to_string()));
+        // Walk the way the scheduler does: follow the cursor.
+        match page.next_after {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, vec![ids[0].clone(), ids[2].clone()]);
 }

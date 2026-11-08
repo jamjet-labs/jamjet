@@ -201,8 +201,8 @@ pub trait StateBackend: Send + Sync {
         offset: u32,
     ) -> BackendResult<Vec<WorkflowExecution>>;
 
-    /// Running executions whose id sorts after `after` (all of them for
-    /// `None`), in id order, at most `limit`: a keyset page.
+    /// Up to `limit` running executions whose id sorts after `after` (all
+    /// of them for `None`), in id order: a keyset page.
     ///
     /// The scheduler pages through this so it visits every running run each
     /// tick. It used to read one `list_executions` page of 100, ordered by
@@ -210,14 +210,18 @@ pub trait StateBackend: Send + Sync {
     /// offset paging on `updated_at` skips rows as runs update and finish
     /// under it. The id order does not move.
     ///
+    /// A row that cannot be read is left out of `executions` but still moves
+    /// the cursor, so it cannot stop the walk. `next_after` is the id of the
+    /// last row scanned, `None` once a page scans nothing.
+    ///
     /// The default reads every running execution through `list_executions`
     /// and pages in memory; the SQLite and in-memory backends override it
     /// with a direct query.
     async fn list_running_executions_after(
         &self,
-        after: Option<&ExecutionId>,
+        after: Option<&str>,
         limit: u32,
-    ) -> BackendResult<Vec<WorkflowExecution>> {
+    ) -> BackendResult<RunningPage> {
         const PAGE: u32 = 500;
         let mut all = Vec::new();
         let mut offset = 0;
@@ -234,16 +238,16 @@ pub trait StateBackend: Send + Sync {
         }
         all.sort_by_key(|e| e.execution_id.0.to_string());
         all.dedup_by_key(|e| e.execution_id.0);
-        let after = after.map(|a| a.0.to_string());
-        Ok(all
+        let executions: Vec<WorkflowExecution> = all
             .into_iter()
-            .filter(|e| {
-                after
-                    .as_ref()
-                    .is_none_or(|a| e.execution_id.0.to_string() > *a)
-            })
+            .filter(|e| after.is_none_or(|a| e.execution_id.0.to_string().as_str() > a))
             .take(limit as usize)
-            .collect())
+            .collect();
+        let next_after = executions.last().map(|e| e.execution_id.0.to_string());
+        Ok(RunningPage {
+            executions,
+            next_after,
+        })
     }
 
     // ── Event log ────────────────────────────────────────────────────────
@@ -773,6 +777,17 @@ pub struct ApiToken {
 pub type WorkItemId = uuid::Uuid;
 
 /// A unit of work dispatched to a worker queue.
+/// One keyset page of running executions; see
+/// [`StateBackend::list_running_executions_after`].
+#[derive(Debug, Clone, Default)]
+pub struct RunningPage {
+    /// The rows of the page that could be read.
+    pub executions: Vec<WorkflowExecution>,
+    /// The id of the last row scanned, readable or not: the `after` of the
+    /// next page. `None` once a page scans nothing.
+    pub next_after: Option<String>,
+}
+
 /// A work item a worker holds a live lease on: what `GET /workers` reports.
 /// There is no worker registry, so a worker shows up only while it holds one.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

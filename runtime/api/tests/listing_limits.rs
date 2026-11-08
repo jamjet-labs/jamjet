@@ -221,3 +221,106 @@ async fn a_large_spilled_output_stays_a_reference_by_default() {
     .await;
     assert_eq!(status, 400);
 }
+
+/// A sentinel whose `size` understates the stored bytes stays a reference:
+/// an external worker writes the sentinel, so its size is a claim.
+#[tokio::test]
+async fn a_sentinel_that_understates_its_size_stays_a_reference() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let e = execution(WorkflowStatus::Running);
+    let id = e.execution_id.clone();
+    backend.create_execution(e).await.unwrap();
+    let large = json!({ "content": "l".repeat(MAX_INLINE_ARTIFACT_BYTES as usize + 1) });
+    let mut r = backend
+        .put_artifact(
+            &serde_json::to_vec(&large).unwrap(),
+            Some("application/json"),
+        )
+        .await
+        .unwrap();
+    r.size = 10;
+    backend
+        .append_event(Event::new(
+            id.clone(),
+            1,
+            completed("liar", r.to_sentinel()),
+        ))
+        .await
+        .unwrap();
+    let state = make_state(backend);
+    let (_, body) = get(&state, &format!("/executions/{id}/events")).await;
+    let out = &body["events"][0]["kind"]["output"];
+    assert!(
+        out.get(jamjet_state::ARTIFACT_SENTINEL_KEY).is_some(),
+        "the stored bytes decide, not the claim"
+    );
+}
+
+/// A page inlines at most `INLINE_PAGE_BUDGET` of spilled output in all;
+/// the per-output cap alone let a page of small spills grow without bound.
+#[tokio::test]
+async fn a_page_inlines_at_most_its_budget() {
+    use jamjet_api::routes::INLINE_PAGE_BUDGET;
+    let backend = Arc::new(InMemoryBackend::new());
+    let e = execution(WorkflowStatus::Running);
+    let id = e.execution_id.clone();
+    backend.create_execution(e).await.unwrap();
+    // Each just under the per-output cap; together past the page budget.
+    let each = (MAX_INLINE_ARTIFACT_BYTES - 1024) as usize;
+    let n = (INLINE_PAGE_BUDGET as usize / each) + 3;
+    for i in 0..n {
+        let output = json!({ "i": i, "content": "x".repeat(each - 32) });
+        let r = backend
+            .put_artifact(
+                &serde_json::to_vec(&output).unwrap(),
+                Some("application/json"),
+            )
+            .await
+            .unwrap();
+        backend
+            .append_event(Event::new(
+                id.clone(),
+                i as i64 + 1,
+                completed("n", r.to_sentinel()),
+            ))
+            .await
+            .unwrap();
+    }
+    let state = make_state(backend);
+    let (_, body) = get(&state, &format!("/executions/{id}/events")).await;
+    let outputs: Vec<&Value> = body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| &e["kind"]["output"])
+        .collect();
+    let refs = outputs
+        .iter()
+        .filter(|o| o.get(jamjet_state::ARTIFACT_SENTINEL_KEY).is_some())
+        .count();
+    let inlined = outputs.len() - refs;
+    assert!(refs >= 1, "past the budget, outputs stay references");
+    assert!(
+        (inlined as u64) * (each as u64) <= INLINE_PAGE_BUDGET,
+        "{inlined} inlined"
+    );
+    assert!(inlined > 0, "outputs within the budget are inlined");
+}
+
+/// `?limit=` above the cap returns the cap and a cursor.
+#[tokio::test]
+async fn an_events_limit_above_the_cap_returns_the_cap() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let id = run_with_events(&backend, MAX_EVENTS_PAGE as i64 + 1).await;
+    let state = make_state(backend);
+    let (_, body) = get(
+        &state,
+        &format!("/executions/{id}/events?limit={}", MAX_EVENTS_PAGE * 2),
+    )
+    .await;
+    assert_eq!(
+        body["events"].as_array().unwrap().len(),
+        MAX_EVENTS_PAGE as usize
+    );
+    assert_eq!(body["next_after"], MAX_EVENTS_PAGE as i64);
+}

@@ -128,16 +128,16 @@ impl Scheduler {
         // 2. Schedule runnable nodes for every running execution, a keyset
         // page at a time. This read one page of the 100 most recently
         // updated runs, so any run past the 100th never advanced.
-        let mut after: Option<ExecutionId> = None;
+        // The walk follows the backend's cursor until a page scans nothing:
+        // a row a backend cannot read is left out of a page but still moves
+        // the cursor, so one unreadable run cannot stop every run after it.
+        let mut after: Option<String> = None;
         loop {
             let page = self
                 .backend
-                .list_running_executions_after(after.as_ref(), RUNNING_PAGE)
+                .list_running_executions_after(after.as_deref(), RUNNING_PAGE)
                 .await?;
-            for execution in &page {
-                if self.enforce_workflow_timeout(execution).await {
-                    continue;
-                }
+            for execution in &page.executions {
                 self.schedule_runnable_nodes(
                     &execution.execution_id,
                     &execution.workflow_id,
@@ -151,10 +151,10 @@ impl Scheduler {
                     );
                 });
             }
-            if page.len() < RUNNING_PAGE as usize {
-                break;
+            match page.next_after {
+                Some(next) => after = Some(next),
+                None => break,
             }
-            after = page.last().map(|e| e.execution_id.clone());
         }
         Ok(())
     }
@@ -379,72 +379,6 @@ impl Scheduler {
             .unwrap()
             .insert(cache_key, Arc::clone(&ir));
         Ok(Some(ir))
-    }
-
-    /// Fail a run that has been running longer than its workflow's
-    /// `timeouts.workflow_timeout`. Returns `true` when the run is now
-    /// terminal (this tick finished it, or something else had), so the
-    /// caller does not schedule it.
-    ///
-    /// The run fails through `finish_execution`, the same single write a
-    /// cancel uses, so an in-flight node's fenced completion finds the run
-    /// terminal and is refused. Measured from this execution's own
-    /// `started_at`: a continue-as-new segment starts its own clock. Until
-    /// 2026-11 the field was never read, though `limits.timeout_seconds`
-    /// compiles to it.
-    async fn enforce_workflow_timeout(
-        &self,
-        execution: &jamjet_core::workflow::WorkflowExecution,
-    ) -> bool {
-        let ir = match self
-            .load_ir(&execution.workflow_id, &execution.workflow_version)
-            .await
-        {
-            Ok(Some(ir)) => ir,
-            // Scheduling reports a missing or unreadable definition.
-            _ => return false,
-        };
-        let Some(limit) = ir.timeouts.workflow_timeout.filter(|d| !d.is_zero()) else {
-            return false;
-        };
-        let elapsed = chrono::Utc::now() - execution.started_at;
-        let Ok(elapsed) = elapsed.to_std() else {
-            // started_at in the future: clock skew, not a timeout.
-            return false;
-        };
-        if elapsed < limit {
-            return false;
-        }
-        let event = jamjet_state::Event::new(
-            execution.execution_id.clone(),
-            0,
-            EventKind::WorkflowFailed {
-                error: format!("workflow timed out after {}s", limit.as_secs()),
-            },
-        );
-        match self
-            .backend
-            .finish_execution(event, jamjet_core::workflow::WorkflowStatus::Failed)
-            .await
-        {
-            Ok(jamjet_state::ExecutionFinish::Finished(_)) => {
-                warn!(
-                    execution_id = %execution.execution_id,
-                    timeout_secs = limit.as_secs(),
-                    "Workflow timed out"
-                );
-                self.progress
-                    .lock()
-                    .unwrap()
-                    .remove(&execution.execution_id);
-                true
-            }
-            Ok(jamjet_state::ExecutionFinish::AlreadyTerminal(_)) => true,
-            Err(e) => {
-                warn!(execution_id = %execution.execution_id, "Failed to time out workflow: {e}");
-                false
-            }
-        }
     }
 
     /// For a given execution, find all nodes that can now run and enqueue them.
@@ -1535,51 +1469,6 @@ mod tests {
             }
         }
         assert_eq!(stuck, 0, "{stuck} of {} runs were not scheduled", ids.len());
-    }
-
-    fn ir_with_workflow_timeout(secs: u64) -> serde_json::Value {
-        let mut ir = linear_ir();
-        ir["timeouts"] = serde_json::json!({ "workflow_timeout": secs });
-        ir
-    }
-
-    /// A run older than its `timeouts.workflow_timeout` fails. Nothing read
-    /// the field before, though `limits.timeout_seconds` compiles to it.
-    #[tokio::test]
-    async fn a_run_past_its_workflow_timeout_fails() {
-        let (s, backend, fresh) = setup(ir_with_workflow_timeout(5)).await;
-        let old = running_execution(chrono::Utc::now() - chrono::Duration::seconds(60));
-        let old_id = old.execution_id.clone();
-        backend.create_execution(old).await.unwrap();
-
-        s.tick().await.unwrap();
-
-        assert_eq!(status(&backend, &old_id).await, WorkflowStatus::Failed);
-        let events = backend.get_events(&old_id).await.unwrap();
-        assert!(
-            events.iter().any(|e| matches!(&e.kind,
-                EventKind::WorkflowFailed { error } if error == "workflow timed out after 5s")),
-            "{events:#?}"
-        );
-        assert!(
-            scheduled_nodes(&events).is_empty(),
-            "a timed-out run dispatches nothing"
-        );
-        // The run inside its timeout is scheduled as usual.
-        assert_eq!(status(&backend, &fresh).await, WorkflowStatus::Running);
-        let fresh_events = backend.get_events(&fresh).await.unwrap();
-        assert_eq!(scheduled_nodes(&fresh_events), vec!["a"]);
-    }
-
-    /// No `workflow_timeout`: an old run keeps running.
-    #[tokio::test]
-    async fn without_a_workflow_timeout_an_old_run_keeps_running() {
-        let (s, backend, _) = setup(linear_ir()).await;
-        let old = running_execution(chrono::Utc::now() - chrono::Duration::days(30));
-        let old_id = old.execution_id.clone();
-        backend.create_execution(old).await.unwrap();
-        s.tick().await.unwrap();
-        assert_eq!(status(&backend, &old_id).await, WorkflowStatus::Running);
     }
 
     #[tokio::test]
