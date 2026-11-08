@@ -201,6 +201,20 @@ pub fn resolve_node_scopes(
 
 // ── Token exchange (HTTP) ───────────────────────────────────────────────────
 
+/// One client for every call: it holds the connection pool, and building one
+/// reads the system trust store. Only a built client is kept, so a failure is
+/// tried again on the next call.
+fn http_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let built = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("cannot build an HTTP client: {e}"))?;
+    Ok(CLIENT.get_or_init(|| built))
+}
+
 /// Perform an RFC 8693 token exchange with the authorization server.
 ///
 /// This is a blocking HTTP call — designed to be called from async context.
@@ -228,7 +242,7 @@ pub async fn exchange_token(
         ("client_secret", &config.client_secret),
     ];
 
-    let client = reqwest::Client::new();
+    let client = http_client().map_err(OAuthError::NetworkError)?;
     let mut request = client.post(&config.token_endpoint).form(&params);
 
     if let Some(audience) = &config.audience {
