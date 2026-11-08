@@ -574,6 +574,29 @@ impl StateBackend for InMemoryBackend {
         .await
     }
 
+    async fn leased_items(
+        &self,
+        queue_types: &[&str],
+        filter: &crate::backend::ClaimFilter,
+    ) -> BackendResult<Vec<WorkItem>> {
+        let Some(execution_id) = &filter.execution_id else {
+            return Ok(Vec::new());
+        };
+        let now = Utc::now();
+        Ok(self
+            .work_items
+            .iter()
+            .map(|e| e.value().clone())
+            .filter(|i| {
+                i.worker_id.is_some()
+                    && i.lease_expires_at.is_some_and(|t| t > now)
+                    && i.execution_id == *execution_id
+                    && queue_types.contains(&i.queue_type.as_str())
+                    && filter.node_id.as_ref().is_none_or(|n| *n == i.node_id)
+            })
+            .collect())
+    }
+
     async fn claim_work_item_filtered(
         &self,
         worker_id: &str,
@@ -634,11 +657,22 @@ impl StateBackend for InMemoryBackend {
         let lease_len = crate::backend::granted_lease_secs(lease_secs);
         for mut entry in self.work_items.iter_mut() {
             let item = entry.value_mut();
-            let wanted = filter
-                .execution_id
-                .as_ref()
-                .is_none_or(|e| *e == item.execution_id)
-                && filter.node_id.as_ref().is_none_or(|n| *n == item.node_id);
+            // The oldest-first claim never takes an item marked claimable
+            // only by execution; a filtered one may.
+            let by_execution_only = item
+                .payload
+                .get(jamjet_core::node::CLAIM_PAYLOAD_KEY)
+                .and_then(|v| v.as_str())
+                == Some(jamjet_core::node::CLAIM_BY_EXECUTION);
+            let wanted = if filter.is_empty() {
+                !by_execution_only
+            } else {
+                filter
+                    .execution_id
+                    .as_ref()
+                    .is_none_or(|e| *e == item.execution_id)
+                    && filter.node_id.as_ref().is_none_or(|n| *n == item.node_id)
+            };
             if item.worker_id.is_none() && queue_types.contains(&item.queue_type.as_str()) && wanted
             {
                 let new_epoch = self

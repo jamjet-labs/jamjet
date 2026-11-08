@@ -83,11 +83,37 @@ handlers on any worker that drains the queue the node names.
 
 A worker claims with `POST /work-items/claim` and
 `{"worker_id": "...", "queue_types": ["..."]}`, which hands out the oldest
-claimable item on those queues. A worker that drives one execution at a time
-on its own queue can add `"execution_id": "exec_..."` to claim only that
-execution's item, and `"node_id"` with it to claim only that node's. A claim
-that matches nothing answers `{"claimed": false}`, as an empty queue does. The
-token's tenant applies as usual: another tenant's execution matches nothing.
+claimable item on those queues, or `{"claimed": false}`.
+
+A worker that drives one execution at a time on its own queue (the Spring
+integration's recorded calls) claims that execution's work instead:
+
+```json
+{ "worker_id": "...", "queue_types": ["app-calls"],
+  "execution_id": "exec_...", "node_id": "call-3", "wait_ms": 5000 }
+```
+
+- `node_id` (optional) narrows the claim to one node of the execution.
+- Only the run's initiator may claim by `execution_id` (anyone in dev mode).
+  A run that recorded no initiator (started in dev mode, or before initiators
+  were recorded) can be claimed by an `operator`. The token's tenant applies.
+- The policy gate is the same as for any claim.
+- When nothing comes back the answer says why:
+  `{"claimed": false, "reason": "..."}` with `blocked` (policy refused the
+  node), `approval_required` (it waits for an approval), `claimed_by_other`
+  (another worker holds it), `not_found` (no live run with that id that you
+  may claim) or `not_ready` (not queued yet, or the engine could not decide
+  now; try again).
+- `wait_ms` waits up to that many milliseconds, at most 10000, for a
+  `not_ready` item to be queued, so a client can claim right after starting
+  the run.
+- The same `worker_id` claiming again gets the item it already holds, with
+  the same `lease_fence`, after the policy is checked again; a lost claim
+  response does not lose the item.
+
+An `external_fn` node can require this: with `"claim": "by_execution"` in its
+kind, its items are handed out only to a claim that names the execution, never
+to the oldest-first claim, whoever polls the queue.
 
 ### 4. Register workflows
 

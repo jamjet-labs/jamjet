@@ -1292,6 +1292,41 @@ impl StateBackend for SqliteBackend {
         .await
     }
 
+    async fn leased_items(
+        &self,
+        queue_types: &[&str],
+        filter: &crate::backend::ClaimFilter,
+    ) -> BackendResult<Vec<WorkItem>> {
+        let Some(execution_id) = &filter.execution_id else {
+            return Ok(Vec::new());
+        };
+        if queue_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = queue_types
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let query_str =
+            format!(
+            "SELECT * FROM work_items WHERE status = 'claimed' AND queue_type IN ({placeholders}) \
+             AND execution_id = ? AND lease_expires_at > ?{}",
+            if filter.node_id.is_some() { " AND node_id = ?" } else { "" }
+        );
+        let mut q = sqlx::query(&query_str);
+        for qt in queue_types {
+            q = q.bind(*qt);
+        }
+        q = q.bind(execution_id_str(execution_id));
+        q = q.bind(Utc::now().to_rfc3339());
+        if let Some(n) = &filter.node_id {
+            q = q.bind(n.as_str());
+        }
+        let rows = q.fetch_all(&self.pool).await.map_err(map_db_err)?;
+        rows.iter().map(row_to_work_item).collect()
+    }
+
     async fn claim_work_item_filtered(
         &self,
         worker_id: &str,
@@ -1330,7 +1365,10 @@ impl StateBackend for SqliteBackend {
             if filter.execution_id.is_some() {
                 " AND execution_id = ?"
             } else {
-                ""
+                // The oldest-first claim never takes an item marked
+                // claimable only by execution.
+                " AND (json_extract(payload_json, '$.claim') IS NULL \
+                 OR json_extract(payload_json, '$.claim') != 'by_execution')"
             },
             if filter.node_id.is_some() {
                 " AND node_id = ?"

@@ -91,6 +91,19 @@ impl ClaimFilter {
     }
 }
 
+/// What [`StateBackend::claim_for_execution`] found.
+#[derive(Debug, Clone)]
+pub enum ExecutionClaim {
+    /// A pending item, now leased to the caller.
+    Claimed(WorkItem),
+    /// An item already leased to this worker, returned with its lease.
+    AlreadyLeased(WorkItem),
+    /// Another worker holds the matching item.
+    LeasedToOther,
+    /// No matching item is pending or leased.
+    Nothing,
+}
+
 /// Whether two stored IRs are the same definition: equal canonical JSON, so
 /// key order and whitespace do not matter. Every backend's `store_workflow`
 /// uses this to tell an idempotent re-register from a redefinition.
@@ -401,13 +414,11 @@ pub trait StateBackend: Send + Sync {
 
     /// [`Self::claim_work_item_with_lease`], limited by `filter`: with an
     /// `execution_id`, only that execution's items on `queue_types` can be
-    /// claimed (and with a `node_id` too, only that node's). An empty filter
-    /// claims exactly as `claim_work_item_with_lease` does.
-    ///
-    /// A worker that owns an app-specific queue and drives one execution at a
-    /// time (the Spring integration's recorded calls) needs its own item, not
-    /// the oldest one on the queue: concurrent callers otherwise claim each
-    /// other's nodes.
+    /// claimed (and with a `node_id` too, only that node's). A filtered claim
+    /// may take an item marked claimable only by execution
+    /// (`jamjet_core::node::ClaimMode::ByExecution`); the unfiltered claim
+    /// never does. An empty filter claims exactly as
+    /// `claim_work_item_with_lease` does.
     ///
     /// The default refuses a non-empty filter: a backend that cannot honour
     /// it must not hand out some other execution's item instead.
@@ -426,6 +437,60 @@ pub trait StateBackend: Send + Sync {
         Err(StateBackendError::Database(
             "this backend cannot claim by execution".into(),
         ))
+    }
+
+    /// The items matching `filter` on `queue_types` that are leased now (a
+    /// lease that has not expired), whoever holds them. The default refuses.
+    async fn leased_items(
+        &self,
+        queue_types: &[&str],
+        filter: &ClaimFilter,
+    ) -> BackendResult<Vec<WorkItem>> {
+        let _ = (queue_types, filter);
+        Err(StateBackendError::Database(
+            "this backend cannot list leased items".into(),
+        ))
+    }
+
+    /// A claim naming an execution: [`Self::claim_work_item_filtered`] plus
+    /// what a caller needs to know when it gets nothing, and idempotence for
+    /// one worker.
+    ///
+    /// 1. An item matching `filter` already leased to `worker_id` comes back
+    ///    as it is, same lease fence ([`ExecutionClaim::AlreadyLeased`]): a
+    ///    worker whose claim response was lost gets its lease, not a refusal.
+    /// 2. Otherwise a pending item is claimed ([`ExecutionClaim::Claimed`]).
+    /// 3. Otherwise, if another worker holds one, [`ExecutionClaim::LeasedToOther`];
+    ///    else [`ExecutionClaim::Nothing`].
+    async fn claim_for_execution(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+        filter: &ClaimFilter,
+    ) -> BackendResult<ExecutionClaim> {
+        if filter.execution_id.is_none() {
+            return Err(StateBackendError::Database(
+                "a claim for an execution needs its execution_id".into(),
+            ));
+        }
+        let leased = self.leased_items(queue_types, filter).await?;
+        if let Some(mine) = leased
+            .iter()
+            .find(|i| i.worker_id.as_deref() == Some(worker_id))
+        {
+            return Ok(ExecutionClaim::AlreadyLeased(mine.clone()));
+        }
+        if let Some(item) = self
+            .claim_work_item_filtered(worker_id, queue_types, lease_secs, filter)
+            .await?
+        {
+            return Ok(ExecutionClaim::Claimed(item));
+        }
+        if !leased.is_empty() || !self.leased_items(queue_types, filter).await?.is_empty() {
+            return Ok(ExecutionClaim::LeasedToOther);
+        }
+        Ok(ExecutionClaim::Nothing)
     }
 
     /// Renew the lease, or re-attach it when the presented fence was lost only
