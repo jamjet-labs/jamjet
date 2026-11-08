@@ -322,6 +322,7 @@ async fn assert_start_next_segment(backend: &dyn StateBackend) {
         "start",
         "general",
         serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        3,
         "default",
     )
     .await
@@ -553,6 +554,7 @@ async fn assert_segment_chain_lineage(backend: &dyn StateBackend) {
         "start",
         "general",
         serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        3,
         "default",
     )
     .await
@@ -587,6 +589,7 @@ async fn assert_segment_chain_lineage(backend: &dyn StateBackend) {
         "start",
         "general",
         serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        3,
         "default",
     )
     .await
@@ -703,6 +706,7 @@ async fn sqlite_bounded_replay_independent_of_root_event_count() {
         "start",
         "general",
         serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        3,
         "default",
     )
     .await
@@ -795,6 +799,7 @@ async fn sqlite_inert_old_segment_does_not_leak() {
         "start",
         "general",
         serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        3,
         "default",
     )
     .await
@@ -904,6 +909,7 @@ async fn assert_two_rollover_byte_identity(backend: &dyn StateBackend) {
         "start",
         "general",
         serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        3,
         "default",
     )
     .await
@@ -946,6 +952,7 @@ async fn assert_two_rollover_byte_identity(backend: &dyn StateBackend) {
         "start",
         "general",
         serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        3,
         "default",
     )
     .await
@@ -1070,6 +1077,7 @@ async fn sqlite_child_forward_progress_after_rollover() {
         "start",
         "general",
         serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        3,
         "default",
     )
     .await
@@ -1162,6 +1170,7 @@ async fn sqlite_idempotent_start_next_segment_prevents_double_roll() {
         "start",
         "general",
         serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        3,
         "default",
     )
     .await
@@ -1179,6 +1188,7 @@ async fn sqlite_idempotent_start_next_segment_prevents_double_roll() {
         "start",
         "general",
         serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        3,
         "default",
     )
     .await
@@ -1232,6 +1242,7 @@ async fn assert_all_artifacts_present(backend: &dyn StateBackend) {
         "start",
         "general",
         serde_json::json!({ "workflow_id": "x", "workflow_version": "x" }),
+        3,
         "default",
     )
     .await

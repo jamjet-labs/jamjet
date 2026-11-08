@@ -75,6 +75,7 @@ async fn child_initiator(
         "start",
         "general",
         serde_json::json!({ "workflow_id": "seg-wf", "workflow_version": "1.0.0" }),
+        3,
         "default",
     )
     .await

@@ -92,9 +92,10 @@ pub fn segment_execution_id(parent_id: &ExecutionId, next_segment_number: u32) -
 /// segment committed.
 ///
 /// # The start item
-/// `queue_type` and `start_payload` are the start node's queue and the
-/// payload the scheduler builds for it (`build_work_item_payload` over the
-/// carried state), from the caller: this crate cannot build it.
+/// `queue_type`, `start_payload` and `max_attempts` are the start node's
+/// queue, the payload the scheduler builds for it (`build_work_item_payload`
+/// over the carried state) and the attempt budget of its retry policy
+/// (`max_attempts_for`), from the caller: this crate cannot build them.
 ///
 /// # Returns
 /// The `ExecutionId` of the newly created (or pre-existing idempotent) segment.
@@ -111,6 +112,7 @@ pub async fn start_next_segment(
     start_node_id: &str,
     queue_type: &str,
     start_payload: serde_json::Value,
+    max_attempts: u32,
     tenant_id: &str,
 ) -> BackendResult<ExecutionId> {
     let new_id = segment_execution_id(parent_id, next_segment_number);
@@ -174,7 +176,9 @@ pub async fn start_next_segment(
         // one with no function to call.
         payload: start_payload,
         attempt: 0,
-        max_attempts: 3,
+        // The node's own budget, as the scheduler gives every item: a fixed 3
+        // retried a `no_retry` start node and cut an `io_default` one short.
+        max_attempts,
         created_at: now,
         lease_expires_at: None,
         worker_id: None,

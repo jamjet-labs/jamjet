@@ -345,3 +345,24 @@ fn tool_star_covers_every_tool_and_no_model_node() {
     assert!(!jamjet_policy::is_tools_catch_all("tool:send*"));
     assert!(!jamjet_policy::is_tools_catch_all("tools:*"));
 }
+
+/// The cases in `sdk/python/tests/fixtures/blocked_tool_patterns.json`, which
+/// the in-process Python runtime is tested on too: a `blocked_tools` pattern
+/// blocks the same tools in both. `tool:*` blocked nothing in-process.
+#[test]
+fn blocked_tool_patterns_match_the_in_process_runtime() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../sdk/python/tests/fixtures/blocked_tool_patterns.json");
+    let all: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let cases = all["cases"].as_array().unwrap();
+    assert!(cases.len() > 10, "{} cases", cases.len());
+    for case in cases {
+        let pattern = case["pattern"].as_str().unwrap();
+        let name = case["tool"].as_str().unwrap();
+        let blocks = case["blocks"].as_bool().unwrap();
+        let layer = set(&[pattern], &[], &[]);
+        let d = PolicyEvaluator.evaluate_chain(&tool(name), None, &[&layer]);
+        assert_eq!(is_block(&d), blocks, "{pattern:?} on {name:?}: {d:?}");
+    }
+}

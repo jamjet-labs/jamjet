@@ -1331,6 +1331,59 @@ mod tests {
             calls_json_for(&["send_wire", "lookup"]),
             "{ctx}"
         );
+        assert_eq!(ctx["calls_truncated"], false, "{ctx}");
+    }
+
+    /// The calls a node-name request lists are bounded as its payload is: a
+    /// batch with a 64 KiB argument is shown by its keys and sizes, not
+    /// stored whole in the request.
+    #[tokio::test]
+    async fn a_node_name_gate_bounds_the_calls_it_lists() {
+        let f = Fixture::new();
+        f.with_tenant_policy(&[], &["n1"]).await;
+        let ir = unpoliced_ir();
+        let node_def = ir.node("n1").unwrap();
+        let big = "x".repeat(64 * 1024);
+        let payload = json!({
+            "workflow_id": ir.workflow_id,
+            "workflow_version": ir.version,
+            "node_id": "n1",
+            "input": { "tool_calls": [
+                { "id": "c1", "name": "send_wire", "arguments": { "memo": big, "payee": "acme" } }
+            ] },
+        });
+        let outcome = crate::node_guard::guard_item(
+            f.backend.as_ref(),
+            GuardMode::Fire,
+            &f.execution_id,
+            "n1",
+            "default",
+            ir.policy.as_ref(),
+            node_def,
+            &payload,
+            None,
+            Default::default(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, crate::node_guard::GuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        let (_, _, ctx) = f.requests().await.pop().expect("a request");
+        assert_eq!(ctx["gated_tools"], json!(["send_wire"]));
+        assert_eq!(ctx["calls_truncated"], true);
+        assert!(ctx["calls_bytes"].as_u64().unwrap() > 64 * 1024);
+        let shown = serde_json::to_string(&ctx["calls"]).unwrap().len();
+        assert!(
+            shown < jamjet_state::approvals::ACTION_BASIS_STATE_CAP * 2,
+            "{shown} bytes"
+        );
+        assert!(
+            ctx["calls"].to_string().contains("payee"),
+            "the small key next to the large one is hidden: {}",
+            ctx["calls"]
+        );
     }
 
     /// A workflow allowlist that lists the model used to allow it before the

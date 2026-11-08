@@ -1364,6 +1364,7 @@ impl Worker {
             start_node_id,
             start_queue.as_str(),
             start_payload,
+            jamjet_scheduler::payload::max_attempts_for(start_node.retry_policy.as_deref()),
             tenant_id,
         )
         .await?;
@@ -2657,6 +2658,7 @@ mod tests {
             "prompt_ref": "",
             "output_schema": "{}"
         });
+        ir_json["nodes"]["n1"]["retry_policy"] = serde_json::json!("io_default");
         ir_json["models"] = serde_json::json!({
             "fast": { "provider": "anthropic", "model": "claude-sonnet-4-6" }
         });
@@ -2752,6 +2754,12 @@ mod tests {
             )
         );
         assert_eq!(next.payload["model"], "anthropic/claude-sonnet-4-6");
+        // The start node's own attempt budget, not a fixed 3.
+        assert_eq!(
+            next.max_attempts,
+            jamjet_scheduler::payload::max_attempts_for(Some("io_default"))
+        );
+        assert_ne!(next.max_attempts, 3);
 
         // Its first turn runs: no policy violation for a missing model.
         let next_eid = next.execution_id.clone();

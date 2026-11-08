@@ -524,7 +524,16 @@ async fn guard_policy(
                                     let names: Vec<&str> =
                                         calls.iter().map(|c| c.name.as_str()).collect();
                                     c["gated_tools"] = serde_json::json!(names);
-                                    c["calls"] = dispatch_guard::bound_calls(&calls);
+                                    // Bounded as the payload is: a batch with
+                                    // a large argument is shown by its keys
+                                    // and sizes, not stored whole in the log.
+                                    let all = dispatch_guard::bound_calls(&calls);
+                                    let bytes =
+                                        serde_json::to_string(&all).map(|s| s.len()).unwrap_or(0);
+                                    let cut = bytes > ACTION_BASIS_STATE_CAP;
+                                    c["calls"] = if cut { bounded_preview(&all) } else { all };
+                                    c["calls_truncated"] = Value::Bool(cut);
+                                    c["calls_bytes"] = serde_json::json!(bytes);
                                 }
                             }
                             c

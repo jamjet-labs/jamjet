@@ -1,0 +1,25 @@
+{
+  "comment": "blocked_tools patterns against a tool name, and whether they block it. Shared by runtime/policy/tests/tenant_policy.rs (the engine) and sdk/python/tests/test_governance_parity.py (the in-process runtime), so a pattern cannot mean one thing in each.",
+  "cases": [
+    { "pattern": "tool:*", "tool": "send_wire", "blocks": true },
+    { "pattern": "tool:**", "tool": "send_wire", "blocks": true },
+    { "pattern": "tool:***", "tool": "db.drop", "blocks": true },
+    { "pattern": "tool:*", "tool": "tool:x", "blocks": true },
+    { "pattern": "tool:", "tool": "send_wire", "blocks": false },
+    { "pattern": "tool:", "tool": "tool:", "blocks": true },
+    { "pattern": "tool:?", "tool": "x", "blocks": false },
+    { "pattern": "tool:*x", "tool": "send_wire", "blocks": false },
+    { "pattern": "tool:send_*", "tool": "send_wire", "blocks": false },
+    { "pattern": "tool:send_*", "tool": "tool:send_wire", "blocks": true },
+    { "pattern": "TOOL:*", "tool": "send_wire", "blocks": false },
+    { "pattern": " tool:*", "tool": "send_wire", "blocks": false },
+    { "pattern": "*", "tool": "send_wire", "blocks": true },
+    { "pattern": "**", "tool": "send_wire", "blocks": true },
+    { "pattern": "send_*", "tool": "send_wire", "blocks": true },
+    { "pattern": "send_?ire", "tool": "send_wire", "blocks": true },
+    { "pattern": "send", "tool": "send_wire", "blocks": false },
+    { "pattern": "Send_wire", "tool": "send_wire", "blocks": false },
+    { "pattern": "[s]end_wire", "tool": "send_wire", "blocks": false },
+    { "pattern": "[s]end_wire", "tool": "[s]end_wire", "blocks": true }
+  ]
+}

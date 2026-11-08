@@ -30,9 +30,24 @@
 //!   resolves to `bank.wires:send_wire`.
 //! - A node with no tool name (a model, a condition) is not a tool use, and the
 //!   list does not apply to it.
+//! - `tool:*` is every tool here too, as in a policy's `blocked_tools`
+//!   ([`crate::is_tools_catch_all`]): read as written it named nothing, so it
+//!   allowed no tool in `allowed_tools` and blocked none in a card's
+//!   `blocked_tools`.
 
 use crate::dispatch::PendingToolCall;
-use crate::{glob_match, EvaluationContext, FUNCTION_KIND_TAGS, PYTHON_REF_TAG};
+use crate::{
+    glob_match, is_tools_catch_all, EvaluationContext, FUNCTION_KIND_TAGS, PYTHON_REF_TAG,
+};
+
+/// `pattern`, with the tools-only catch-all read as `*`.
+fn resolved(pattern: &str) -> &str {
+    if is_tools_catch_all(pattern) {
+        "*"
+    } else {
+        pattern
+    }
+}
 
 /// Kinds that run something they choose at run time (a coordinator, agent
 /// discovery, an `auto` agent tool). There is no name to check, so a
@@ -41,7 +56,7 @@ pub const RUN_TIME_TARGET_TAGS: &[&str] = &["coordinator", "agent_discovery", "a
 
 /// Whether `name` is matched by one of `patterns`, as written.
 fn listed(patterns: &[String], name: &str) -> bool {
-    patterns.iter().any(|p| glob_match(p, name))
+    patterns.iter().any(|p| glob_match(resolved(p), name))
 }
 
 /// A pattern that names a path (`app.tools:*`, `bank.wires.send_wire`,
@@ -62,7 +77,7 @@ fn function_name(handler: &str) -> &str {
 /// `read_utils:delete_everything`.
 fn handler_listed(ctx: &EvaluationContext, handler: &str, allowed: &[String]) -> bool {
     let canonical = ctx.canonical_handler();
-    allowed.iter().any(|p| {
+    allowed.iter().map(|p| resolved(p)).any(|p| {
         if is_path_pattern(p) {
             glob_match(p, handler)
                 || canonical
@@ -206,6 +221,32 @@ mod tests {
             arguments: json!({}),
             handler: handler.map(str::to_string),
         }
+    }
+
+    /// `tool:*` means every tool on a card as in a policy. Read as written
+    /// it named nothing: `allowed_tools: ["tool:*"]` refused every tool, and
+    /// a card's `blocked_tools: ["tool:*"]` blocked none.
+    #[test]
+    fn tool_star_is_every_tool_on_a_card_too() {
+        for pattern in ["tool:*", "tool:**"] {
+            let p = list(&[pattern]);
+            for c in [
+                ctx("tool", "n", Some("send_wire")),
+                ctx("mcp_tool", "n", Some("db.drop")),
+                ctx("python_fn", "n", Some("bank.wires:send_wire")),
+            ] {
+                assert!(node_allowed(&c, &p).is_ok(), "{pattern} {c:?}");
+                assert!(node_named_by(&c, &p).is_some(), "{pattern} {c:?}");
+            }
+            let wire = call("send_wire", Some("bank.wires:send_wire"));
+            assert!(call_allowed(&wire, &p).is_ok(), "{pattern}");
+            assert!(call_named_by(&wire, &p).is_some(), "{pattern}");
+            // Still not a model call: the list does not apply to one.
+            assert!(node_named_by(&ctx("model", "n", None), &p).is_none());
+        }
+        // Only the catch-all: `tool:send_*` is a literal pattern as before.
+        let p = list(&["tool:send_*"]);
+        assert!(node_allowed(&ctx("tool", "n", Some("send_wire")), &p).is_err());
     }
 
     #[test]
