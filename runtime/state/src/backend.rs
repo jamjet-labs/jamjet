@@ -76,6 +76,21 @@ pub enum StateBackendError {
 
 pub type BackendResult<T> = Result<T, StateBackendError>;
 
+/// Which items a claim may take; see
+/// [`StateBackend::claim_work_item_filtered`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaimFilter {
+    pub execution_id: Option<ExecutionId>,
+    pub node_id: Option<String>,
+}
+
+impl ClaimFilter {
+    /// No restriction: the oldest claimable item on the queues.
+    pub fn is_empty(&self) -> bool {
+        self.execution_id.is_none() && self.node_id.is_none()
+    }
+}
+
 /// Whether two stored IRs are the same definition: equal canonical JSON, so
 /// key order and whitespace do not matter. Every backend's `store_workflow`
 /// uses this to tell an idempotent re-register from a redefinition.
@@ -733,21 +748,6 @@ pub struct ApiToken {
 pub type WorkItemId = uuid::Uuid;
 
 /// A unit of work dispatched to a worker queue.
-/// Which items a claim may take; see
-/// [`StateBackend::claim_work_item_filtered`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ClaimFilter {
-    pub execution_id: Option<ExecutionId>,
-    pub node_id: Option<String>,
-}
-
-impl ClaimFilter {
-    /// No restriction: the oldest claimable item on the queues.
-    pub fn is_empty(&self) -> bool {
-        self.execution_id.is_none() && self.node_id.is_none()
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkItem {
     pub id: WorkItemId,
