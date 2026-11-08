@@ -355,28 +355,11 @@ impl Memory {
     /// store keeps no scope, and its scoped delete cleared every org's
     /// vectors, so one user's erasure emptied recall for everyone.
     pub async fn delete_user_data(&self, scope: Scope) -> Result<u64, MemoryError> {
-        // Every fact in the scope, superseded ones too: those are deleted
-        // below as well, and so must their vectors be.
-        const PAGE: u32 = 1000;
-        let mut ids = Vec::new();
-        let mut offset = 0;
-        loop {
-            let filter = FactFilter {
-                scope: Some(scope.clone()),
-                valid_only: false,
-                limit: PAGE,
-                offset,
-                ..FactFilter::new()
-            };
-            let page = self.fact_store.list_facts(&filter).await?;
-            let n = page.len() as u32;
-            ids.extend(page.into_iter().map(|f| f.id));
-            if n < PAGE {
-                break;
-            }
-            offset += PAGE;
-        }
-        let fact_count = self.fact_store.delete_scope_data(&scope).await?;
+        // The ids of exactly the facts deleted, from the same statement:
+        // listing first and deleting after could miss a fact added in
+        // between, and paging by `created_at` is not stable over ties.
+        let ids = self.fact_store.delete_scope_returning(&scope).await?;
+        let fact_count = ids.len() as u64;
         for id in ids {
             self.vector_store.delete(id).await?;
         }

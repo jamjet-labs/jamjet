@@ -154,6 +154,26 @@ def _client(runtime: str = LOCAL_RUNTIME_URL, token: str | None = None) -> Jamje
 # ── Protocol trace helpers ───────────────────────────────────────────────────
 
 
+def _agent_card_url(url: str) -> str:
+    """The Agent Card URL for a base URL, as the runtime builds it.
+
+    The base's scheme, host and port with the path ``/.well-known/agent.json``;
+    any path, query or fragment is dropped. ``POST /agents/discover`` does the
+    same, so what ``discover`` shows is the card ``--register`` registers.
+    Appending the path to the text, as these commands did, fetched
+    ``<base>/<path>/.well-known/agent.json`` while the runtime fetched the
+    origin's card.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(url.strip())
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise typer.BadParameter(f"not an http(s) URL with a host: {url!r}")
+    if parts.username is not None or parts.password is not None:
+        raise typer.BadParameter("the URL must not contain credentials")
+    return urlunsplit((parts.scheme, parts.netloc, "/.well-known/agent.json", "", ""))
+
+
 def _print_error(label: str, message: object) -> None:
     """Print ``label`` in red, then ``message`` literally: escaped and never read
     as Rich markup, since it can quote a file, a handler or the runtime."""
@@ -1495,7 +1515,7 @@ def agents_discover(
     import httpx
     from rich.table import Table
 
-    well_known = url.rstrip("/") + "/.well-known/agent.json"
+    well_known = _agent_card_url(url)
 
     async def _discover() -> None:
         try:
@@ -1667,7 +1687,7 @@ def a2a_discover(
     async def _discover() -> None:
         import httpx
 
-        card_url = url.rstrip("/") + "/.well-known/agent.json"
+        card_url = _agent_card_url(url)
         console.print(f"Fetching Agent Card from: [cyan]{card_url}[/cyan]\n")
 
         async with httpx.AsyncClient(timeout=10.0) as client:

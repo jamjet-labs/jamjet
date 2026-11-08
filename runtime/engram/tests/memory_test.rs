@@ -215,3 +215,49 @@ async fn deleting_a_user_keeps_other_orgs_vectors() {
         "org A's erased fact is still recalled"
     );
 }
+
+/// Erasing a scope deletes the vectors of exactly the facts it deleted, and
+/// all of them: 2500 facts that share one `created_at`, more than one page
+/// of the listing that used to collect their ids before a separate delete.
+#[tokio::test]
+async fn erasure_deletes_every_vector_of_the_scope() {
+    use engram::embedding::EmbeddingProvider;
+    use engram::fact::Fact;
+    use std::sync::Arc;
+    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbeddingProvider::new(16));
+    let facts = engram::store_sqlite::SqliteFactStore::open("sqlite::memory:")
+        .await
+        .unwrap();
+    facts.migrate().await.unwrap();
+    let graph = engram::graph_sqlite::SqliteGraphStore::open("sqlite::memory:")
+        .await
+        .unwrap();
+    graph.migrate().await.unwrap();
+    let vectors = Arc::new(engram::vector_embedded::EmbeddedVectorStore::new(16));
+    let mem = Memory::new(Arc::new(facts), vectors.clone(), Arc::new(graph), embedder);
+
+    let a = user_scope("org-a", "user-1");
+    let b = user_scope("org-b", "user-2");
+    let at = chrono::Utc::now();
+    let mut batch: Vec<Fact> = (0..2500)
+        .map(|i| {
+            let mut f = Fact::new(format!("fact {i}"), a.clone());
+            f.created_at = at;
+            f.valid_from = at;
+            f
+        })
+        .collect();
+    let mut kept = Fact::new("org b's fact", b.clone());
+    kept.created_at = at;
+    batch.push(kept);
+    assert_eq!(mem.import(batch).await.unwrap(), 2501);
+    assert_eq!(vectors.len(), 2501);
+
+    let deleted = mem.delete_user_data(a).await.unwrap();
+    assert_eq!(deleted, 2500);
+    assert_eq!(
+        vectors.len(),
+        1,
+        "org A's vectors left behind, or org B's lost"
+    );
+}

@@ -138,6 +138,9 @@ pub fn is_metadata_ip(ip: IpAddr) -> bool {
                 || v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
                 || v6 == Ipv6Addr::new(0xfd20, 0xce, 0, 0, 0, 0, 0, 0x254)
                 || v6 == Ipv6Addr::new(0xfd00, 0xc1, 0, 0, 0, 0, 0xa9fe, 0xa9fe)
+                // Local-use NAT64: the IPv4 address sits where the network
+                // operator chose, so no fixed layout finds it. All refused.
+                || s[..3] == [0x64, 0xff9b, 1]
                 || embedded_v4(v6).is_some_and(is_metadata_v4)
         }
     }
@@ -148,8 +151,9 @@ fn is_metadata_v4(v4: Ipv4Addr) -> bool {
 }
 
 /// The IPv4 address an IPv6 one carries: IPv4-mapped (`::ffff:a.b.c.d`),
-/// IPv4-compatible (`::a.b.c.d`), NAT64 (`64:ff9b::/96`, and the local-use
-/// `64:ff9b:1::/48` with the RFC 6052 layout) and 6to4 (`2002:aabb:ccdd::`).
+/// IPv4-translated (SIIT, `::ffff:0:a.b.c.d`), IPv4-compatible
+/// (`::a.b.c.d`), NAT64 (`64:ff9b::/96`), 6to4 (`2002:aabb:ccdd::`) and the
+/// Teredo client (`2001:0::/32`, the last 32 bits inverted).
 fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     let s = v6.segments();
     let o = v6.octets();
@@ -163,11 +167,14 @@ fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
         return Some(last);
     }
-    if s[..3] == [0x64, 0xff9b, 1] {
-        return Some(Ipv4Addr::new(o[6], o[7], o[9], o[10]));
+    if s[..6] == [0, 0, 0, 0, 0xffff, 0] {
+        return Some(last); // IPv4-translated (SIIT)
     }
     if s[0] == 0x2002 {
         return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    if s[0] == 0x2001 && s[1] == 0 {
+        return Some(Ipv4Addr::new(!o[12], !o[13], !o[14], !o[15])); // Teredo client
     }
     None
 }
@@ -463,6 +470,11 @@ mod tests {
             "::ffff:169.254.169.254",
             "64:ff9b::a9fe:a9fe",
             "64:ff9b:1:a9fe:a9:fe00::",
+            "64:ff9b:1::1",
+            "64:ff9b:1:ffff::a9fe:a9fe",
+            "::ffff:0:a9fe:a9fe",
+            "::ffff:0:6464:64c8",
+            "2001:0:4136:e378:8000:63bf:5601:5601",
             "2002:a9fe:a9fe::",
             "2002:a9fe:a9fe:1::1",
             "::a9fe:a9fe",
@@ -477,6 +489,8 @@ mod tests {
             "::",
             "64:ff9b::a01:203",
             "2002:a00:1::",
+            "::ffff:0:a00:1",
+            "2001:0:4136:e378:8000:63bf:f5ff:fffe",
         ] {
             assert!(!is_metadata_ip(ip.parse().unwrap()), "{ip}");
         }

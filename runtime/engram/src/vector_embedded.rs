@@ -53,6 +53,16 @@ impl EmbeddedVectorStore {
         }
     }
 
+    /// How many vectors the store holds.
+    pub fn len(&self) -> usize {
+        self.entries.read().map(|e| e.len()).unwrap_or(0)
+    }
+
+    /// Whether the store holds no vectors.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------

@@ -157,8 +157,11 @@ read internal services, map ports or list internal names. A URL refused for
 its scheme or host is a 400. For an agent on your own machine set
 `JAMJET_DISCOVERY_ALLOW_PRIVATE=1`, which also allows `http`. Cloud metadata
 addresses stay refused: link-local, 100.100.100.200, fd00:ec2::254,
-fd20:ce::254, fd00:c1::a9fe:a9fe, and any IPv6 address that carries one of
-the IPv4 ones (IPv4-mapped, IPv4-compatible, NAT64, 6to4). The other limits
+fd20:ce::254, fd00:c1::a9fe:a9fe, all of the local-use NAT64 prefix
+64:ff9b:1::/48, and an IPv6 address that carries one of those IPv4 addresses
+in one of these forms: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-translated
+(`::ffff:0:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), NAT64 (`64:ff9b::/96`),
+6to4 (`2002::/16`) or a Teredo client (`2001:0::/32`). The other limits
 stay.
 
 ---
