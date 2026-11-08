@@ -287,9 +287,12 @@ first tool call onward are held until the stream ends and checked before your
 code sees them, and the streamed usage counts toward the budget. Server tools
 (such as web search) and MCP toolsets run on the vendor's side before a tool
 call could be refused, so a rule that could match them removes them from the
-request. OpenAI's Responses API and Anthropic's `messages.stream()` are not
-enforced: they raise `JamJetUnenforceableCall` while any block or
-require_approval rule is set. Async clients are not patched.
+request; Anthropic's own client tools (bash, text editor, computer, memory)
+are gated like any other tool. Not enforced, so they raise
+`JamJetUnenforceableCall` while any block or require_approval rule is set:
+OpenAI's Responses API, Anthropic's `messages.stream()`, the async clients
+(`AsyncOpenAI`, `AsyncAnthropic`), the batch APIs, and
+`with_raw_response` / `with_streaming_response` with `stream=True`.
 
 `jamjet.policy("require_approval", "payments.*")` keeps the tool available.
 When the model calls it, the SDK opens an approval in JamJet Cloud with the

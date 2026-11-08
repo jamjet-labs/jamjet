@@ -32,6 +32,14 @@ export function wrap<T extends object>(client: T, opts?: WrapOptions): T {
       responses[key] = refusing
     }
   }
+  // Batch APIs run their requests later, outside this process.
+  for (const batches of [anyClient?.batches, anyClient?.messages?.batches, anyClient?.beta?.messages?.batches]) {
+    if (batches && typeof batches.create === 'function' && !isWrapped(batches.create)) {
+      const refusing = refuseUnenforced('batches.create', batches.create.bind(batches)) as WrappedFn<unknown>
+      ;(refusing as WrappedFn<unknown> & Record<symbol, unknown>)[WRAPPED] = true
+      batches.create = refusing
+    }
+  }
   return client
 }
 
@@ -59,7 +67,7 @@ function wrapMethod(
       args,
       ...(opts ? { override: opts } : {}),
     })
-    return asVendorPromise(enforced, () => raw)
+    return asVendorPromise(enforced, () => raw, vendor)
   } as WrappedFn<typeof original>
 
   ;(wrapped as WrappedFn<typeof original>)[WRAPPED] = true

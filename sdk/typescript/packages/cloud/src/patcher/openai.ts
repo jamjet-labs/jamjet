@@ -1,6 +1,6 @@
 import { getActive } from '../client.js'
 import { runEnforcedCall } from '../enforcement.js'
-import { refuseUnenforced, UNENFORCED_OPENAI_METHODS } from '../unenforced.js'
+import { refuseBatches, refuseUnenforced, UNENFORCED_OPENAI_METHODS, unmarkBatches } from '../unenforced.js'
 import { asVendorPromise } from '../vendor-promise.js'
 
 type OriginalRef = { proto: any; key: string; original: (...args: any[]) => any }
@@ -48,7 +48,7 @@ export function patchOpenAI(openaiModule: any): void {
         original: (...a: any[]) => (raw = original.call(this, ...a)),
         args,
       })
-      return asVendorPromise(enforced, () => raw)
+      return asVendorPromise(enforced, () => raw, 'openai')
     }
 
     Object.defineProperty(proto, PATCH_MARK, {
@@ -71,12 +71,14 @@ export function patchOpenAI(openaiModule: any): void {
     }
     Object.defineProperty(responses, PATCH_MARK, { value: true, enumerable: false, configurable: true, writable: true })
   }
+  refuseBatches((openaiModule?.default ?? openaiModule?.OpenAI)?.Batches?.prototype, 'openai batches', originals)
 }
 
 export function unpatchOpenAI(): void {
   for (const { proto, key, original } of originals) {
     proto[key] = original
     delete proto[PATCH_MARK]
+    unmarkBatches(proto)
   }
   originals = []
 }

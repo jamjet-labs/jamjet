@@ -129,11 +129,18 @@ function cacheReadSavingsUsd(model: string, cacheReadTokens: number): number {
  * MCP toolsets) execute before the response comes back, so refusing their
  * calls afterwards is too late: a rule that could match them strips them here.
  */
+// Anthropic-defined tools your code executes (the model only asks): these are
+// gated like any other tool call.
+const CLIENT_TOOL_TYPES = /^(bash|text_editor|computer|memory)_/
+// Anything else with a vendor type and no input_schema runs on the vendor's
+// side (web_search, web_fetch, code_execution, tool_search_tool, advisor, ...).
+// Unknown types count as server-executed, so they fail closed.
 function isServerExecuted(tool: unknown): boolean {
   if (typeof tool !== 'object' || tool === null) return false
   const t = tool as Record<string, unknown>
   const type = t['type']
   if (typeof type !== 'string' || type === 'function' || type === 'custom') return false
+  if (CLIENT_TOOL_TYPES.test(type)) return false
   return !('input_schema' in t)
 }
 
