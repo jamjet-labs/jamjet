@@ -22,7 +22,7 @@ impl OllamaLlmClient {
         Self {
             base_url: "http://localhost:11434".to_string(),
             model: "llama3.2".to_string(),
-            client: reqwest::Client::new(),
+            client: crate::http::client_or_panic(None),
         }
     }
 
@@ -30,7 +30,7 @@ impl OllamaLlmClient {
         Self {
             base_url: base_url.into(),
             model: model.into(),
-            client: reqwest::Client::new(),
+            client: crate::http::client_or_panic(None),
         }
     }
 }
