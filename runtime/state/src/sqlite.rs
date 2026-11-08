@@ -1296,35 +1296,20 @@ impl StateBackend for SqliteBackend {
         &self,
         queue_types: &[&str],
         filter: &crate::backend::ClaimFilter,
-    ) -> BackendResult<Vec<WorkItem>> {
-        let Some(execution_id) = &filter.execution_id else {
-            return Ok(Vec::new());
-        };
-        if queue_types.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = queue_types
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-        let query_str =
-            format!(
-            "SELECT * FROM work_items WHERE status = 'claimed' AND queue_type IN ({placeholders}) \
-             AND execution_id = ? AND lease_expires_at > ?{}",
-            if filter.node_id.is_some() { " AND node_id = ?" } else { "" }
-        );
-        let mut q = sqlx::query(&query_str);
-        for qt in queue_types {
-            q = q.bind(*qt);
-        }
-        q = q.bind(execution_id_str(execution_id));
-        q = q.bind(Utc::now().to_rfc3339());
-        if let Some(n) = &filter.node_id {
-            q = q.bind(n.as_str());
-        }
-        let rows = q.fetch_all(&self.pool).await.map_err(map_db_err)?;
-        rows.iter().map(row_to_work_item).collect()
+    ) -> BackendResult<Vec<crate::backend::LeasedItem>> {
+        crate::sqlite::leased_items_in(&self.pool, None, queue_types, filter).await
+    }
+
+    async fn mark_released(&self, item_id: WorkItemId, lease_fence: i64) -> BackendResult<bool> {
+        crate::sqlite::mark_released_in(&self.pool, None, item_id, lease_fence).await
+    }
+
+    async fn has_claimable(
+        &self,
+        queue_types: &[&str],
+        filter: &crate::backend::ClaimFilter,
+    ) -> BackendResult<bool> {
+        crate::sqlite::has_claimable_in(&self.pool, None, queue_types, filter).await
     }
 
     async fn claim_work_item_filtered(
@@ -2961,6 +2946,139 @@ pub(crate) async fn reattach_lease(
         lease_fence: new_fence,
         reattached: true,
     })
+}
+
+/// The items matching `filter` that are leased now, for
+/// [`StateBackend::leased_items`] on the SQLite backends; `tenant` scopes the
+/// tenant-scoped one.
+pub(crate) async fn leased_items_in(
+    pool: &SqlitePool,
+    tenant: Option<&str>,
+    queue_types: &[&str],
+    filter: &crate::backend::ClaimFilter,
+) -> BackendResult<Vec<crate::backend::LeasedItem>> {
+    let Some(execution_id) = &filter.execution_id else {
+        return Ok(Vec::new());
+    };
+    if queue_types.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; queue_types.len()].join(",");
+    let query_str = format!(
+        "SELECT *, (released_fence IS lease_fence) AS released_now FROM work_items \
+         WHERE status = 'claimed' AND queue_type IN ({placeholders}) \
+         AND execution_id = ? AND lease_expires_at > ?{}{}",
+        if tenant.is_some() {
+            " AND tenant_id = ?"
+        } else {
+            ""
+        },
+        if filter.node_id.is_some() {
+            " AND node_id = ?"
+        } else {
+            ""
+        }
+    );
+    let mut q = sqlx::query(&query_str);
+    for qt in queue_types {
+        q = q.bind(*qt);
+    }
+    q = q.bind(execution_id_str(execution_id));
+    q = q.bind(Utc::now().to_rfc3339());
+    if let Some(t) = tenant {
+        q = q.bind(t);
+    }
+    if let Some(n) = &filter.node_id {
+        q = q.bind(n.as_str());
+    }
+    let rows = q.fetch_all(pool).await.map_err(map_db_err)?;
+    rows.iter()
+        .map(|row| {
+            Ok(crate::backend::LeasedItem {
+                item: row_to_work_item(row)?,
+                lease_secs: row
+                    .try_get::<Option<i64>, _>("lease_secs")
+                    .ok()
+                    .flatten()
+                    .map(|s| s.max(0) as u64)
+                    .unwrap_or_else(|| crate::backend::granted_lease_secs(None)),
+                released: row.try_get::<bool, _>("released_now").unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// [`StateBackend::mark_released`] on the SQLite backends.
+pub(crate) async fn mark_released_in(
+    pool: &SqlitePool,
+    tenant: Option<&str>,
+    item_id: WorkItemId,
+    lease_fence: i64,
+) -> BackendResult<bool> {
+    let sql = format!(
+        "UPDATE work_items SET released_fence = ? \
+         WHERE id = ? AND lease_fence = ? AND status = 'claimed'{}",
+        if tenant.is_some() {
+            " AND tenant_id = ?"
+        } else {
+            ""
+        }
+    );
+    let mut q = sqlx::query(&sql)
+        .bind(lease_fence)
+        .bind(item_id.to_string())
+        .bind(lease_fence);
+    if let Some(t) = tenant {
+        q = q.bind(t);
+    }
+    let done = q.execute(pool).await.map_err(map_db_err)?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// [`StateBackend::has_claimable`] on the SQLite backends: a read, no lock.
+pub(crate) async fn has_claimable_in(
+    pool: &SqlitePool,
+    tenant: Option<&str>,
+    queue_types: &[&str],
+    filter: &crate::backend::ClaimFilter,
+) -> BackendResult<bool> {
+    let Some(execution_id) = &filter.execution_id else {
+        return Ok(true);
+    };
+    if queue_types.is_empty() {
+        return Ok(false);
+    }
+    let placeholders = vec!["?"; queue_types.len()].join(",");
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM work_items WHERE queue_type IN ({placeholders}) \
+         AND execution_id = ?{}{} AND (status = 'claimed' OR (status = 'pending' \
+         AND (retry_after IS NULL OR retry_after <= ?))))",
+        if tenant.is_some() {
+            " AND tenant_id = ?"
+        } else {
+            ""
+        },
+        if filter.node_id.is_some() {
+            " AND node_id = ?"
+        } else {
+            ""
+        }
+    );
+    let mut q = sqlx::query_scalar::<_, bool>(&sql);
+    for qt in queue_types {
+        q = q.bind(*qt);
+    }
+    q = q.bind(execution_id_str(execution_id));
+    if let Some(t) = tenant {
+        q = q.bind(t);
+    }
+    if let Some(n) = &filter.node_id {
+        q = q.bind(n.as_str());
+    }
+    q.bind(Utc::now().to_rfc3339())
+        .fetch_one(pool)
+        .await
+        .map_err(map_db_err)
 }
 
 #[cfg(test)]

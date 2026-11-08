@@ -106,14 +106,26 @@ integration's recorded calls) claims that execution's work instead:
   now; try again).
 - `wait_ms` waits up to that many milliseconds, at most 10000, for a
   `not_ready` item to be queued, so a client can claim right after starting
-  the run.
+  the run. A run that ends during the wait answers `not_found` then. One
+  principal holds at most 4 waiting claims; a claim past that answers at once.
 - The same `worker_id` claiming again gets the item it already holds, with
   the same `lease_fence`, after the policy is checked again; a lost claim
-  response does not lose the item.
+  response does not lose the item. The lease is renewed, and `lease_secs`
+  gives the length it was granted. A lease whose claim never handed the item
+  out (the request was cut short) is decided again as a new claim, with a new
+  `lease_fence`.
 
 An `external_fn` node can require this: with `"claim": "by_execution"` in its
 kind, its items are handed out only to a claim that names the execution, never
-to the oldest-first claim, whoever polls the queue.
+to the oldest-first claim, whoever polls the queue. Such an item is also
+completed, failed and heartbeated only by a caller who may claim it; anyone
+else is answered `404`, as for an item that does not exist (a `lease_fence` is
+a counter, not a credential). `POST /work-items` marks the item from the
+node's kind, whatever the payload says. `claim` on any other kind is refused
+at registration.
+
+This decides who runs the node and reports its result, not who can read the
+run: `GET /executions/:id` shows its state to any token of the tenant.
 
 ### 4. Register workflows
 

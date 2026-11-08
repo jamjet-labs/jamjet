@@ -91,13 +91,25 @@ impl ClaimFilter {
     }
 }
 
+/// An item leased now, as [`StateBackend::leased_items`] lists it.
+#[derive(Debug, Clone)]
+pub struct LeasedItem {
+    pub item: WorkItem,
+    /// The lease length the claim was granted, which every renewal honours.
+    pub lease_secs: u64,
+    /// Whether the claim gate released the payload under THIS lease
+    /// ([`StateBackend::mark_released`]). A lease no gate released (one left
+    /// behind by an interrupted or undecided gate) must be decided again.
+    pub released: bool,
+}
+
 /// What [`StateBackend::claim_for_execution`] found.
 #[derive(Debug, Clone)]
 pub enum ExecutionClaim {
     /// A pending item, now leased to the caller.
     Claimed(WorkItem),
     /// An item already leased to this worker, returned with its lease.
-    AlreadyLeased(WorkItem),
+    AlreadyLeased(LeasedItem),
     /// Another worker holds the matching item.
     LeasedToOther,
     /// No matching item is pending or leased.
@@ -445,11 +457,35 @@ pub trait StateBackend: Send + Sync {
         &self,
         queue_types: &[&str],
         filter: &ClaimFilter,
-    ) -> BackendResult<Vec<WorkItem>> {
+    ) -> BackendResult<Vec<LeasedItem>> {
         let _ = (queue_types, filter);
         Err(StateBackendError::Database(
             "this backend cannot list leased items".into(),
         ))
+    }
+
+    /// Record that the claim gate released `item_id`'s payload under
+    /// `lease_fence`. `Ok(false)` if the item is not claimed under that fence
+    /// any more. The default refuses, so a backend without it cannot hand a
+    /// lease out again as released.
+    async fn mark_released(&self, item_id: WorkItemId, lease_fence: i64) -> BackendResult<bool> {
+        let _ = (item_id, lease_fence);
+        Err(StateBackendError::Database(
+            "this backend cannot record a release".into(),
+        ))
+    }
+
+    /// Whether `filter` (which names an execution) matches an item that is
+    /// pending and visible now, or claimed: a read-only probe a waiting claim
+    /// polls instead of taking the write lock each time. The default says
+    /// yes, which only costs a claim attempt.
+    async fn has_claimable(
+        &self,
+        queue_types: &[&str],
+        filter: &ClaimFilter,
+    ) -> BackendResult<bool> {
+        let _ = (queue_types, filter);
+        Ok(true)
     }
 
     /// A claim naming an execution: [`Self::claim_work_item_filtered`] plus
@@ -459,6 +495,7 @@ pub trait StateBackend: Send + Sync {
     /// 1. An item matching `filter` already leased to `worker_id` comes back
     ///    as it is, same lease fence ([`ExecutionClaim::AlreadyLeased`]): a
     ///    worker whose claim response was lost gets its lease, not a refusal.
+    ///    Whether it may be handed out again is the caller's to decide.
     /// 2. Otherwise a pending item is claimed ([`ExecutionClaim::Claimed`]).
     /// 3. Otherwise, if another worker holds one, [`ExecutionClaim::LeasedToOther`];
     ///    else [`ExecutionClaim::Nothing`].
@@ -477,7 +514,7 @@ pub trait StateBackend: Send + Sync {
         let leased = self.leased_items(queue_types, filter).await?;
         if let Some(mine) = leased
             .iter()
-            .find(|i| i.worker_id.as_deref() == Some(worker_id))
+            .find(|l| l.item.worker_id.as_deref() == Some(worker_id))
         {
             return Ok(ExecutionClaim::AlreadyLeased(mine.clone()));
         }

@@ -1228,36 +1228,23 @@ impl StateBackend for TenantScopedSqliteBackend {
         &self,
         queue_types: &[&str],
         filter: &crate::backend::ClaimFilter,
-    ) -> BackendResult<Vec<WorkItem>> {
-        let Some(execution_id) = &filter.execution_id else {
-            return Ok(Vec::new());
-        };
-        if queue_types.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = queue_types
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-        let query_str =
-            format!(
-            "SELECT * FROM work_items WHERE status = 'claimed' AND queue_type IN ({placeholders}) \
-             AND execution_id = ? AND tenant_id = ? AND lease_expires_at > ?{}",
-            if filter.node_id.is_some() { " AND node_id = ?" } else { "" }
-        );
-        let mut q = sqlx::query(&query_str);
-        for qt in queue_types {
-            q = q.bind(*qt);
-        }
-        q = q.bind(execution_id_str(execution_id));
-        q = q.bind(&self.tenant_id.0);
-        q = q.bind(Utc::now().to_rfc3339());
-        if let Some(n) = &filter.node_id {
-            q = q.bind(n.as_str());
-        }
-        let rows = q.fetch_all(&self.pool).await.map_err(map_db_err)?;
-        rows.iter().map(row_to_work_item).collect()
+    ) -> BackendResult<Vec<crate::backend::LeasedItem>> {
+        crate::sqlite::leased_items_in(&self.pool, Some(&self.tenant_id.0), queue_types, filter)
+            .await
+    }
+
+    async fn mark_released(&self, item_id: WorkItemId, lease_fence: i64) -> BackendResult<bool> {
+        crate::sqlite::mark_released_in(&self.pool, Some(&self.tenant_id.0), item_id, lease_fence)
+            .await
+    }
+
+    async fn has_claimable(
+        &self,
+        queue_types: &[&str],
+        filter: &crate::backend::ClaimFilter,
+    ) -> BackendResult<bool> {
+        crate::sqlite::has_claimable_in(&self.pool, Some(&self.tenant_id.0), queue_types, filter)
+            .await
     }
 
     async fn claim_work_item_filtered(

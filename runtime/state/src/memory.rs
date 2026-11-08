@@ -51,6 +51,8 @@ pub struct InMemoryBackend {
     artifacts: DashMap<(String, String), (Vec<u8>, Option<String>)>,
     /// Lease length a worker asked for at claim time, in seconds.
     lease_secs: DashMap<WorkItemId, u64>,
+    /// The fence under which the claim gate last released each item.
+    released_fences: DashMap<WorkItemId, i64>,
     /// Who held an expired lease and with which fence, so a late heartbeat
     /// from that worker can re-attach instead of losing the work.
     last_lease: DashMap<WorkItemId, (String, i64)>,
@@ -76,6 +78,7 @@ impl InMemoryBackend {
             projector_checkpoints: DashMap::new(),
             artifacts: DashMap::new(),
             lease_secs: DashMap::new(),
+            released_fences: DashMap::new(),
             last_lease: DashMap::new(),
         }
     }
@@ -578,7 +581,7 @@ impl StateBackend for InMemoryBackend {
         &self,
         queue_types: &[&str],
         filter: &crate::backend::ClaimFilter,
-    ) -> BackendResult<Vec<WorkItem>> {
+    ) -> BackendResult<Vec<crate::backend::LeasedItem>> {
         let Some(execution_id) = &filter.execution_id else {
             return Ok(Vec::new());
         };
@@ -594,7 +597,46 @@ impl StateBackend for InMemoryBackend {
                     && queue_types.contains(&i.queue_type.as_str())
                     && filter.node_id.as_ref().is_none_or(|n| *n == i.node_id)
             })
+            .map(|item| crate::backend::LeasedItem {
+                lease_secs: self
+                    .lease_secs
+                    .get(&item.id)
+                    .map(|s| *s.value())
+                    .unwrap_or_else(|| crate::backend::granted_lease_secs(None)),
+                released: self
+                    .released_fences
+                    .get(&item.id)
+                    .is_some_and(|f| *f.value() == item.lease_fence),
+                item,
+            })
             .collect())
+    }
+
+    async fn mark_released(&self, item_id: WorkItemId, lease_fence: i64) -> BackendResult<bool> {
+        let held = self
+            .work_items
+            .get(&item_id)
+            .is_some_and(|i| i.worker_id.is_some() && i.lease_fence == lease_fence);
+        if held {
+            self.released_fences.insert(item_id, lease_fence);
+        }
+        Ok(held)
+    }
+
+    async fn has_claimable(
+        &self,
+        queue_types: &[&str],
+        filter: &crate::backend::ClaimFilter,
+    ) -> BackendResult<bool> {
+        let Some(execution_id) = &filter.execution_id else {
+            return Ok(true);
+        };
+        Ok(self.work_items.iter().any(|e| {
+            let i = e.value();
+            i.execution_id == *execution_id
+                && queue_types.contains(&i.queue_type.as_str())
+                && filter.node_id.as_ref().is_none_or(|n| *n == i.node_id)
+        }))
     }
 
     async fn claim_work_item_filtered(
@@ -664,15 +706,12 @@ impl StateBackend for InMemoryBackend {
                 .get(jamjet_core::node::CLAIM_PAYLOAD_KEY)
                 .and_then(|v| v.as_str())
                 == Some(jamjet_core::node::CLAIM_BY_EXECUTION);
-            let wanted = if filter.is_empty() {
-                !by_execution_only
-            } else {
-                filter
-                    .execution_id
-                    .as_ref()
-                    .is_none_or(|e| *e == item.execution_id)
-                    && filter.node_id.as_ref().is_none_or(|n| *n == item.node_id)
-            };
+            // Only a claim naming the execution may take such an item, as
+            // in SQLite: a `node_id`-only filter does not.
+            let wanted = match &filter.execution_id {
+                None => !by_execution_only,
+                Some(e) => *e == item.execution_id,
+            } && filter.node_id.as_ref().is_none_or(|n| *n == item.node_id);
             if item.worker_id.is_none() && queue_types.contains(&item.queue_type.as_str()) && wanted
             {
                 let new_epoch = self

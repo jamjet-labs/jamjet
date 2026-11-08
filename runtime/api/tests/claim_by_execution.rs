@@ -115,16 +115,28 @@ async fn claim(state: &AppState, token: Option<&str>, worker: &str, extra: Value
 /// Enqueue `second` for `execution_id`, as the scheduler would once `first`
 /// completed, so one execution holds two items on the queue.
 async fn enqueue_second(backend: &Arc<dyn StateBackend>, workflow_ir: Value, execution_id: &str) {
+    enqueue(backend, workflow_ir, execution_id, "second", json!({})).await;
+}
+
+/// Enqueue `node` for `execution_id` as the scheduler would, its payload
+/// built from the run state `state`.
+async fn enqueue(
+    backend: &Arc<dyn StateBackend>,
+    workflow_ir: Value,
+    execution_id: &str,
+    node_id: &str,
+    state: Value,
+) {
     let ir: WorkflowIr = serde_json::from_value(workflow_ir).unwrap();
     let eid = jamjet_core::workflow::ExecutionId(
         uuid::Uuid::parse_str(execution_id.trim_start_matches("exec_")).unwrap(),
     );
-    let node = ir.node("second").unwrap();
+    let node = ir.node(node_id).unwrap();
     let payload = jamjet_scheduler::payload::build_work_item_payload(
         &ir,
-        "second",
+        node_id,
         node,
-        &serde_json::Map::new(),
+        state.as_object().unwrap(),
         &ir.workflow_id,
         "0.1.0",
     );
@@ -132,7 +144,7 @@ async fn enqueue_second(backend: &Arc<dyn StateBackend>, workflow_ir: Value, exe
         .enqueue_work_item(WorkItem {
             id: uuid::Uuid::new_v4(),
             execution_id: eid,
-            node_id: "second".into(),
+            node_id: node_id.into(),
             queue_type: QUEUE.into(),
             payload,
             attempt: 0,
@@ -213,6 +225,24 @@ async fn filter_basics(backend: Arc<dyn StateBackend>) {
     // A node filter needs an execution, and an execution id must parse.
     let (st, _) = claim(&state, None, "w", json!({ "node_id": "first" })).await;
     assert_eq!(st, 400);
+    // Checked whatever the queues: naming only an engine queue used to
+    // answer `{"claimed": false}` before the check ran.
+    let (st, _) = claim(
+        &state,
+        None,
+        "w",
+        json!({ "node_id": "first", "queue_types": ["general"] }),
+    )
+    .await;
+    assert_eq!(st, 400);
+    let (_, body) = claim(
+        &state,
+        None,
+        "w",
+        json!({ "execution_id": foreign, "queue_types": ["general"] }),
+    )
+    .await;
+    assert_eq!(body, json!({ "claimed": false, "reason": "not_found" }));
     let (st, _) = claim(&state, None, "w", json!({ "execution_id": "not-an-id" })).await;
     assert_eq!(st, 400);
 }
@@ -251,6 +281,22 @@ async fn opted_in_items_stay_with_their_execution(backend: Arc<dyn StateBackend>
         body,
         json!({ "claimed": false }),
         "the oldest-first claim must not take an opted-in item"
+    );
+    // Nor a claim that names the node but not the execution.
+    let by_node = backend
+        .claim_work_item_filtered(
+            "other-worker",
+            &[QUEUE],
+            None,
+            &ClaimFilter {
+                execution_id: None,
+                node_id: Some("first".into()),
+            },
+        )
+        .await;
+    assert!(
+        !matches!(by_node, Ok(Some(_))),
+        "a node-only filter took an opted-in item"
     );
     let (_, body) = claim(&state, None, "owner", json!({ "execution_id": e })).await;
     assert_eq!(body["claimed"], true, "{body}");
@@ -369,249 +415,582 @@ async fn only_the_initiator_claims_by_execution() {
     let _ = std::fs::remove_file(path);
 }
 
-// ── Reasons, waiting, and the same lease ─────────────────────────────────────
+// ── Reasons, waiting, and the same lease, on every backend ───────────────────
 
-/// A blocked node is refused with `blocked`, through the same policy gate as
-/// the oldest-first claim, and its payload is not handed out.
-#[tokio::test]
-async fn a_blocked_node_is_refused_with_its_reason() {
-    let state = make_state(Arc::new(InMemoryBackend::new()));
-    let policy =
-        json!({ "blocked_tools": ["first"], "require_approval_for": [], "model_allowlist": [] });
-    register(
-        &state,
-        None,
-        ir("wf-block", Some("by_execution"), Some(policy)),
-    )
-    .await;
-    let e = start(&state, None, "wf-block").await;
-    let (_, body) = claim(&state, None, "w", json!({ "execution_id": e })).await;
-    assert_eq!(body, json!({ "claimed": false, "reason": "blocked" }));
+/// One backend of each kind, with the file to remove after.
+async fn backends() -> Vec<(
+    &'static str,
+    Arc<dyn StateBackend>,
+    Option<std::path::PathBuf>,
+)> {
+    backends_with_pools()
+        .await
+        .into_iter()
+        .map(|(n, b, p, _)| (n, b, p))
+        .collect()
 }
 
-#[tokio::test]
-async fn a_gated_node_is_refused_with_approval_required() {
-    let state = make_state(Arc::new(InMemoryBackend::new()));
-    let policy =
-        json!({ "blocked_tools": [], "require_approval_for": ["first"], "model_allowlist": [] });
-    register(
-        &state,
-        None,
-        ir("wf-gate", Some("by_execution"), Some(policy)),
-    )
-    .await;
-    let e = start(&state, None, "wf-gate").await;
-    let (_, body) = claim(&state, None, "w", json!({ "execution_id": e })).await;
-    assert_eq!(
-        body,
-        json!({ "claimed": false, "reason": "approval_required" })
+/// [`backends`], with the plain SQLite backend's pool: that backend manages
+/// no tenants through the API.
+#[allow(clippy::type_complexity)]
+async fn backends_with_pools() -> Vec<(
+    &'static str,
+    Arc<dyn StateBackend>,
+    Option<std::path::PathBuf>,
+    Option<sqlx::SqlitePool>,
+)> {
+    let (url, path) = sqlite_url();
+    let plain = SqliteBackend::open(&url).await.unwrap();
+    let pool = plain.pool();
+    let sqlite: Arc<dyn StateBackend> = Arc::new(plain);
+    let (url2, path2) = sqlite_url();
+    let scoped: Arc<dyn StateBackend> = Arc::new(
+        SqliteBackend::open(&url2)
+            .await
+            .unwrap()
+            .for_tenant(jamjet_state::TenantId::from("default")),
     );
+    vec![
+        ("memory", Arc::new(InMemoryBackend::new()), None, None),
+        ("sqlite", sqlite, Some(path), Some(pool)),
+        ("tenant_scoped", scoped, Some(path2), None),
+    ]
+}
+
+fn cleanup(path: Option<std::path::PathBuf>) {
+    if let Some(p) = path {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+fn policy(blocked: &[&str], gated: &[&str]) -> Value {
+    json!({ "blocked_tools": blocked, "require_approval_for": gated, "model_allowlist": [] })
+}
+
+fn count(kinds: &[EventKind], pred: impl Fn(&EventKind) -> bool) -> usize {
+    kinds.iter().filter(|k| pred(k)).count()
+}
+
+/// A blocked node is refused with `blocked`, through the same policy gate as
+/// the oldest-first claim, and its payload is not handed out. A gated one
+/// with `approval_required`.
+#[tokio::test]
+async fn blocked_and_gated_nodes_are_refused_with_their_reason() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        register(
+            &state,
+            None,
+            ir(
+                "wf-block",
+                Some("by_execution"),
+                Some(policy(&["first"], &[])),
+            ),
+        )
+        .await;
+        let e = start(&state, None, "wf-block").await;
+        let (_, body) = claim(&state, None, "w", json!({ "execution_id": e })).await;
+        assert_eq!(
+            body,
+            json!({ "claimed": false, "reason": "blocked" }),
+            "{name}"
+        );
+
+        register(
+            &state,
+            None,
+            ir(
+                "wf-gate",
+                Some("by_execution"),
+                Some(policy(&[], &["first"])),
+            ),
+        )
+        .await;
+        let e = start(&state, None, "wf-gate").await;
+        let (_, body) = claim(&state, None, "w", json!({ "execution_id": e })).await;
+        assert_eq!(
+            body,
+            json!({ "claimed": false, "reason": "approval_required" }),
+            "{name}"
+        );
+        cleanup(path);
+    }
 }
 
 /// Another worker's lease: `claimed_by_other`. The same worker again: the
 /// same item and the same lease fence, so a lost claim response does not
-/// lose the item.
+/// lose the item. The lease is renewed, and the answer gives the length it
+/// holds, not the one the retry asked for.
 #[tokio::test]
 async fn the_same_worker_gets_its_lease_again_and_another_is_told_why() {
-    let state = make_state(Arc::new(InMemoryBackend::new()));
-    register(&state, None, ir("wf-lease", Some("by_execution"), None)).await;
-    let e = start(&state, None, "wf-lease").await;
-    let (_, first) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
-    assert_eq!(first["claimed"], true, "{first}");
-    let (_, again) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
-    assert_eq!(again["claimed"], true, "{again}");
-    assert_eq!(again["work_item"]["id"], first["work_item"]["id"]);
-    assert_eq!(
-        again["work_item"]["lease_fence"],
-        first["work_item"]["lease_fence"]
-    );
-    let (_, other) = claim(&state, None, "w2", json!({ "execution_id": e })).await;
-    assert_eq!(
-        other,
-        json!({ "claimed": false, "reason": "claimed_by_other" })
-    );
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        register(&state, None, ir("wf-lease", Some("by_execution"), None)).await;
+        let e = start(&state, None, "wf-lease").await;
+        let (_, first) = claim(
+            &state,
+            None,
+            "w1",
+            json!({ "execution_id": e, "lease_secs": 60 }),
+        )
+        .await;
+        assert_eq!(first["claimed"], true, "{name}: {first}");
+        let id = uuid::Uuid::parse_str(first["work_item"]["id"].as_str().unwrap()).unwrap();
+        let before = backend
+            .get_work_item(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lease_expires_at;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let (_, again) = claim(
+            &state,
+            None,
+            "w1",
+            json!({ "execution_id": e, "lease_secs": 300 }),
+        )
+        .await;
+        assert_eq!(again["claimed"], true, "{name}: {again}");
+        assert_eq!(again["work_item"]["id"], first["work_item"]["id"], "{name}");
+        assert_eq!(
+            again["work_item"]["lease_fence"], first["work_item"]["lease_fence"],
+            "{name}"
+        );
+        assert_eq!(first["work_item"]["lease_secs"], 60, "{name}: {first}");
+        assert_eq!(again["work_item"]["lease_secs"], 60, "{name}: {again}");
+        let after = backend
+            .get_work_item(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lease_expires_at;
+        assert!(
+            after > before,
+            "{name}: the lease was not renewed: {before:?} {after:?}"
+        );
+
+        let (_, other) = claim(&state, None, "w2", json!({ "execution_id": e })).await;
+        assert_eq!(
+            other,
+            json!({ "claimed": false, "reason": "claimed_by_other" }),
+            "{name}"
+        );
+        cleanup(path);
+    }
 }
 
-/// A lease handed out again is checked against the policy again: a node
-/// blocked since the first claim is not handed out a second time.
-#[tokio::test]
-async fn a_lease_handed_out_again_is_checked_again() {
-    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
-    let state = make_state(backend.clone());
-    register(&state, None, ir("wf-recheck", Some("by_execution"), None)).await;
-    let e = start(&state, None, "wf-recheck").await;
-    let (_, first) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
-    assert_eq!(first["claimed"], true, "{first}");
-    // The memory backend starts with no tenant record: create it, then set
-    // its policy.
-    let (st, body) = post(
-        &state,
-        "/tenants",
-        json!({ "id": "default", "name": "default" }),
-    )
-    .await;
-    assert!(st.is_success() || st.as_u16() == 409, "{st} {body}");
+/// Set the default tenant's policy: through `PUT /tenants` where the
+/// backend manages tenants, else in its table (the plain SQLite backend does
+/// not; its `default` tenant row comes from the migrations).
+async fn set_tenant_policy(
+    state: &AppState,
+    backend: &Arc<dyn StateBackend>,
+    pool: Option<&sqlx::SqlitePool>,
+    name: &str,
+    p: Value,
+) {
+    let default = jamjet_state::TenantId::from("default");
+    if backend.get_tenant(&default).await.unwrap().is_none() {
+        let (st, body) = post(
+            state,
+            "/tenants",
+            json!({ "id": "default", "name": "default" }),
+        )
+        .await;
+        assert!(st.is_success(), "{name}: {st} {body}");
+    }
     let (st, body) = send(
-        &state,
+        state,
         "PUT",
         "/tenants/default",
         None,
-        json!({ "policy": { "blocked_tools": ["first"], "require_approval_for": [], "model_allowlist": [] } }),
+        json!({ "policy": p.clone() }),
     )
     .await;
-    assert!((200..300).contains(&st), "{st} {body}");
-    let (_, again) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
-    assert_eq!(again, json!({ "claimed": false, "reason": "blocked" }));
-    // Recorded as any block is, and the node failed for good.
-    let kinds = event_kinds(&backend, &e).await;
+    if (200..300).contains(&st) {
+        return;
+    }
     assert!(
-        kinds
-            .iter()
-            .any(|k| matches!(k, EventKind::PolicyViolation { node_id, .. } if node_id == "first")),
-        "no PolicyViolation: {kinds:?}"
+        body.to_string().contains("not supported"),
+        "{name}: {st} {body}"
     );
-    assert!(
-        kinds.iter().any(|k| matches!(k, EventKind::NodeFailed { node_id, retryable: false, .. } if node_id == "first")),
-        "node not failed: {kinds:?}"
-    );
+    sqlx::query("UPDATE tenants SET policy_json = ? WHERE id = 'default'")
+        .bind(p.to_string())
+        .execute(pool.expect("the plain SQLite backend's pool"))
+        .await
+        .unwrap();
 }
 
-/// A lease that no gate decided (an infra error left it behind) is decided
-/// when the same worker claims again: the approval request is raised, and
-/// the node is not failed.
+/// A lease handed out again is checked against the policy again: a node
+/// blocked since the first claim is not handed out a second time, the block
+/// is recorded once, and the node failed.
 #[tokio::test]
-async fn a_lease_left_undecided_is_decided_on_the_next_claim() {
-    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
-    let state = make_state(backend.clone());
-    let policy =
-        json!({ "blocked_tools": [], "require_approval_for": ["first"], "model_allowlist": [] });
-    register(
-        &state,
-        None,
-        ir("wf-undecided", Some("by_execution"), Some(policy)),
-    )
-    .await;
-    let e = start(&state, None, "wf-undecided").await;
-    // Leased to w1 with no gate run, as a lookup error leaves it.
+async fn a_lease_handed_out_again_is_checked_again() {
+    for (name, backend, path, pool) in backends_with_pools().await {
+        let state = make_state(backend.clone());
+        register(&state, None, ir("wf-recheck", Some("by_execution"), None)).await;
+        let e = start(&state, None, "wf-recheck").await;
+        let (_, first) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(first["claimed"], true, "{name}: {first}");
+        set_tenant_policy(
+            &state,
+            &backend,
+            pool.as_ref(),
+            name,
+            policy(&["first"], &[]),
+        )
+        .await;
+        let (_, again) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(
+            again,
+            json!({ "claimed": false, "reason": "blocked" }),
+            "{name}"
+        );
+        let kinds = event_kinds(&backend, &e).await;
+        assert_eq!(
+            count(
+                &kinds,
+                |k| matches!(k, EventKind::PolicyViolation { node_id, .. } if node_id == "first")
+            ),
+            1,
+            "{name}: {kinds:?}"
+        );
+        assert_eq!(
+            count(
+                &kinds,
+                |k| matches!(k, EventKind::NodeFailed { node_id, retryable: false, .. } if node_id == "first")
+            ),
+            1,
+            "{name}: {kinds:?}"
+        );
+        cleanup(path);
+    }
+}
+
+/// Lease `node` of `e` to `worker` with no gate run, as an interrupted claim
+/// (a dropped connection, a lookup error) leaves it.
+async fn lease_undecided(backend: &Arc<dyn StateBackend>, e: &str, node: &str, worker: &str) {
     let leased = backend
         .claim_work_item_filtered(
-            "w1",
+            worker,
             &[QUEUE],
             Some(60),
             &ClaimFilter {
-                execution_id: Some(execution_id(&e)),
-                node_id: None,
+                execution_id: Some(execution_id(e)),
+                node_id: Some(node.into()),
             },
         )
         .await
         .unwrap();
-    assert!(leased.is_some());
-
-    let (_, body) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
-    assert_eq!(
-        body,
-        json!({ "claimed": false, "reason": "approval_required" })
-    );
-    let kinds = event_kinds(&backend, &e).await;
-    assert!(
-        kinds.iter().any(
-            |k| matches!(k, EventKind::ToolApprovalRequired { node_id, .. } if node_id == "first")
-        ),
-        "no approval request raised: {kinds:?}"
-    );
-    assert!(
-        !kinds
-            .iter()
-            .any(|k| matches!(k, EventKind::NodeFailed { .. })),
-        "node failed: {kinds:?}"
-    );
+    assert!(leased.is_some(), "nothing to lease for {node}");
 }
 
-/// The same for a node acting for an agent: a re-check admits only a step
-/// an earlier claim admitted, so a lease no gate decided is refused there.
-/// It must be decided again (the step admitted, the item handed out), not
+/// A lease no gate decided is decided when the same worker claims again:
+/// the approval request is raised, and the node is not failed.
+#[tokio::test]
+async fn a_lease_left_undecided_is_decided_on_the_next_claim() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        register(
+            &state,
+            None,
+            ir(
+                "wf-undecided",
+                Some("by_execution"),
+                Some(policy(&[], &["first"])),
+            ),
+        )
+        .await;
+        let e = start(&state, None, "wf-undecided").await;
+        lease_undecided(&backend, &e, "first", "w1").await;
+
+        let (_, body) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(
+            body,
+            json!({ "claimed": false, "reason": "approval_required" }),
+            "{name}"
+        );
+        let kinds = event_kinds(&backend, &e).await;
+        assert_eq!(
+            count(
+                &kinds,
+                |k| matches!(k, EventKind::ToolApprovalRequired { node_id, .. } if node_id == "first")
+            ),
+            1,
+            "{name}: {kinds:?}"
+        );
+        assert_eq!(
+            count(&kinds, |k| matches!(k, EventKind::NodeFailed { .. })),
+            0,
+            "{name}"
+        );
+        cleanup(path);
+    }
+}
+
+/// The same for a node acting for an agent: a completion-style re-check
+/// admits only a step an earlier claim admitted, so a lease no gate decided
+/// must be decided again (the step admitted once, the item handed out), not
 /// failed.
 #[tokio::test]
 async fn an_undecided_agent_step_is_admitted_not_failed() {
-    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
-    let state = make_state(backend.clone());
-    let agent = "jamjet://acme/caller";
-    let (st, body) = post(
-        &state,
-        "/agents",
-        json!({
-            "id": agent, "uri": agent, "name": "caller", "description": "",
-            "version": "1.0.0",
-            "capabilities": { "skills": [], "protocols": [], "tools_provided": [], "tools_consumed": [] },
-            "autonomy": "fully_autonomous",
-            "constraints": { "max_iterations": 5 },
-            "auth": { "type": "none" }
-        }),
-    )
-    .await;
-    assert!(st.is_success(), "{st} {body}");
-    let mut workflow = ir("wf-agent", Some("by_execution"), None);
-    workflow["agent_ref"] = json!(agent);
-    register(&state, None, workflow).await;
-    let e = start(&state, None, "wf-agent").await;
-    let leased = backend
-        .claim_work_item_filtered(
-            "w1",
-            &[QUEUE],
-            Some(60),
-            &ClaimFilter {
-                execution_id: Some(execution_id(&e)),
-                node_id: None,
-            },
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        let agent = "jamjet://acme/caller";
+        let (st, body) = post(
+            &state,
+            "/agents",
+            json!({
+                "id": agent, "uri": agent, "name": "caller", "description": "",
+                "version": "1.0.0",
+                "capabilities": { "skills": [], "protocols": [], "tools_provided": [], "tools_consumed": [] },
+                "autonomy": "fully_autonomous",
+                "constraints": { "max_iterations": 5 },
+                "auth": { "type": "none" }
+            }),
         )
-        .await
-        .unwrap();
-    assert!(leased.is_some());
+        .await;
+        assert!(st.is_success(), "{name}: {st} {body}");
+        let mut workflow = ir("wf-agent", Some("by_execution"), None);
+        workflow["agent_ref"] = json!(agent);
+        register(&state, None, workflow).await;
+        let e = start(&state, None, "wf-agent").await;
+        lease_undecided(&backend, &e, "first", "w1").await;
 
-    let (_, body) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
-    assert_eq!(body["claimed"], true, "{body}");
-    let kinds = event_kinds(&backend, &e).await;
-    assert!(
-        kinds
-            .iter()
-            .any(|k| matches!(k, EventKind::AgentStepAdmitted { .. })),
-        "step not admitted: {kinds:?}"
-    );
-    assert!(
-        !kinds
-            .iter()
-            .any(|k| matches!(k, EventKind::NodeFailed { .. })),
-        "node failed: {kinds:?}"
-    );
+        let (_, body) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(body["claimed"], true, "{name}: {body}");
+        let kinds = event_kinds(&backend, &e).await;
+        assert_eq!(
+            count(&kinds, |k| matches!(k, EventKind::AgentStepAdmitted { .. })),
+            1,
+            "{name}: {kinds:?}"
+        );
+        assert_eq!(
+            count(&kinds, |k| matches!(k, EventKind::NodeFailed { .. })),
+            0,
+            "{name}"
+        );
+        cleanup(path);
+    }
+}
+
+/// A gated node approved and dispatched again: the claim releases it under
+/// the approval, and the same worker claiming again gets the same lease.
+#[tokio::test]
+async fn an_approved_node_is_released_and_handed_out_again() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        let workflow = ir(
+            "wf-approved",
+            Some("by_execution"),
+            Some(policy(&[], &["first"])),
+        );
+        register(&state, None, workflow.clone()).await;
+        let e = start(&state, None, "wf-approved").await;
+        let (_, body) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(body["reason"], "approval_required", "{name}: {body}");
+        let (st, body) = send(
+            &state,
+            "POST",
+            &format!("/executions/{e}/approve"),
+            None,
+            json!({ "decision": "approved", "node_id": "first" }),
+        )
+        .await;
+        assert_eq!(st, 200, "{name}: {body}");
+        // The scheduler dispatches the approved node again, same input.
+        enqueue(&backend, workflow.clone(), &e, "first", json!({})).await;
+
+        let (_, first) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(first["claimed"], true, "{name}: {first}");
+        let (_, again) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(again["claimed"], true, "{name}: {again}");
+        assert_eq!(
+            again["work_item"]["lease_fence"], first["work_item"]["lease_fence"],
+            "{name}"
+        );
+        cleanup(path);
+    }
+}
+
+/// A lease no gate released is not re-checked as a completion. Completion
+/// checking accepts an approval for the node's current occurrence whatever
+/// payload it was asked for, so an approval of one payload would release
+/// another one: here the run state moved between the request and the
+/// dispatch after the approval, and the interrupted claim's lease must raise
+/// a new request.
+#[tokio::test]
+async fn an_approval_of_another_payload_does_not_release_an_undecided_lease() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        let workflow = ir(
+            "wf-moved",
+            Some("by_execution"),
+            Some(policy(&[], &["first"])),
+        );
+        register(&state, None, workflow.clone()).await;
+        let e = start(&state, None, "wf-moved").await;
+        let (_, body) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(body["reason"], "approval_required", "{name}: {body}");
+        let (st, body) = send(
+            &state,
+            "POST",
+            &format!("/executions/{e}/approve"),
+            None,
+            json!({ "decision": "approved", "node_id": "first" }),
+        )
+        .await;
+        assert_eq!(st, 200, "{name}: {body}");
+        // Dispatched again with another input, and the claim of it cut short.
+        enqueue(
+            &backend,
+            workflow.clone(),
+            &e,
+            "first",
+            json!({ "amount": 9_000_000 }),
+        )
+        .await;
+        lease_undecided(&backend, &e, "first", "w1").await;
+
+        let (_, body) = claim(&state, None, "w1", json!({ "execution_id": e })).await;
+        assert_eq!(
+            body,
+            json!({ "claimed": false, "reason": "approval_required" }),
+            "{name}: released under an approval of another payload"
+        );
+        let kinds = event_kinds(&backend, &e).await;
+        assert_eq!(
+            count(
+                &kinds,
+                |k| matches!(k, EventKind::ToolApprovalRequired { node_id, .. } if node_id == "first")
+            ),
+            2,
+            "{name}: {kinds:?}"
+        );
+        cleanup(path);
+    }
 }
 
 /// `not_ready` when the item is not queued yet, and `wait_ms` waits for it.
 #[tokio::test]
 async fn not_ready_and_a_bounded_wait() {
-    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
-    let state = make_state(backend.clone());
-    let workflow = ir("wf-wait", Some("by_execution"), None);
-    register(&state, None, workflow.clone()).await;
-    let e = start(&state, None, "wf-wait").await;
-    let second = json!({ "execution_id": e, "node_id": "second" });
-    let (_, body) = claim(&state, None, "w", second.clone()).await;
-    assert_eq!(body, json!({ "claimed": false, "reason": "not_ready" }));
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        let workflow = ir("wf-wait", Some("by_execution"), None);
+        register(&state, None, workflow.clone()).await;
+        let e = start(&state, None, "wf-wait").await;
+        let second = json!({ "execution_id": e, "node_id": "second" });
+        let (_, body) = claim(&state, None, "w", second.clone()).await;
+        assert_eq!(
+            body,
+            json!({ "claimed": false, "reason": "not_ready" }),
+            "{name}"
+        );
 
-    // The item appears while the claim waits.
-    let b2 = backend.clone();
-    let e2 = e.clone();
-    let wf2 = workflow.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        enqueue_second(&b2, wf2, &e2).await;
-    });
-    let mut waiting = second.clone();
-    waiting["wait_ms"] = json!(3000);
-    let started = std::time::Instant::now();
-    let (_, body) = claim(&state, None, "w", waiting).await;
-    assert_eq!(body["claimed"], true, "{body}");
-    assert_eq!(body["work_item"]["node_id"], "second");
-    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        // The item appears while the claim waits.
+        let b2 = backend.clone();
+        let e2 = e.clone();
+        let wf2 = workflow.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            enqueue_second(&b2, wf2, &e2).await;
+        });
+        let mut waiting = second.clone();
+        waiting["wait_ms"] = json!(3000);
+        let started = std::time::Instant::now();
+        let (_, body) = claim(&state, None, "w", waiting).await;
+        assert_eq!(body["claimed"], true, "{name}: {body}");
+        assert_eq!(body["work_item"]["node_id"], "second", "{name}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{name}"
+        );
+        cleanup(path);
+    }
+}
+
+/// A run that ends while a claim waits for it answers `not_found` then, not
+/// `not_ready` at the end of the wait.
+#[tokio::test]
+async fn a_wait_ends_when_the_run_does() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        register(&state, None, ir("wf-ends", Some("by_execution"), None)).await;
+        let e = start(&state, None, "wf-ends").await;
+        let state2 = state.clone();
+        let e2 = e.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let (st, body) = send(
+                &state2,
+                "POST",
+                &format!("/executions/{e2}/cancel"),
+                None,
+                json!({}),
+            )
+            .await;
+            assert!((200..300).contains(&st), "{st} {body}");
+        });
+        let started = std::time::Instant::now();
+        let (_, body) = claim(
+            &state,
+            None,
+            "w",
+            json!({ "execution_id": e, "node_id": "second", "wait_ms": 5000 }),
+        )
+        .await;
+        assert_eq!(
+            body,
+            json!({ "claimed": false, "reason": "not_found" }),
+            "{name}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{name}"
+        );
+        cleanup(path);
+    }
+}
+
+/// The items of a run that ended are settled by a claim for it: the
+/// oldest-first claim, which settles other ended runs' items, never takes
+/// these.
+#[tokio::test]
+async fn an_ended_runs_items_are_settled() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        register(&state, None, ir("wf-ended", Some("by_execution"), None)).await;
+        let e = start(&state, None, "wf-ended").await;
+        let (st, body) = send(
+            &state,
+            "POST",
+            &format!("/executions/{e}/cancel"),
+            None,
+            json!({}),
+        )
+        .await;
+        assert!((200..300).contains(&st), "{name}: {st} {body}");
+        let filter = ClaimFilter {
+            execution_id: Some(execution_id(&e)),
+            node_id: None,
+        };
+        assert!(
+            backend.has_claimable(&[QUEUE], &filter).await.unwrap(),
+            "{name}"
+        );
+        let (_, body) = claim(&state, None, "w", json!({ "execution_id": e })).await;
+        assert_eq!(
+            body,
+            json!({ "claimed": false, "reason": "not_found" }),
+            "{name}"
+        );
+        assert!(
+            !backend.has_claimable(&[QUEUE], &filter).await.unwrap(),
+            "{name}: the ended run's item is still pending"
+        );
+        cleanup(path);
+    }
 }
 
 /// A wait longer than the cap is cut to the cap (10 s), so a claim cannot
@@ -636,4 +1015,190 @@ async fn a_long_wait_is_cut_to_the_cap() {
         waited >= cap && waited < cap + std::time::Duration::from_secs(1),
         "{waited:?}"
     );
+}
+
+/// One principal holds at most a few waiting claims; the next one answers at
+/// once.
+#[tokio::test(start_paused = true)]
+async fn waiting_claims_are_capped_per_principal() {
+    let state = make_state(Arc::new(InMemoryBackend::new()));
+    register(&state, None, ir("wf-many", Some("by_execution"), None)).await;
+    let e = start(&state, None, "wf-many").await;
+    let req = json!({ "execution_id": e, "node_id": "second", "wait_ms": 5000 });
+    let mut waiters = Vec::new();
+    for i in 0..jamjet_api::routes::MAX_WAITING_CLAIMS_PER_PRINCIPAL {
+        let (state, req) = (state.clone(), req.clone());
+        waiters.push(tokio::spawn(async move {
+            claim(&state, None, &format!("w{i}"), req).await
+        }));
+    }
+    // Let them all start waiting.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let started = tokio::time::Instant::now();
+    let (_, body) = claim(&state, None, "one-more", req.clone()).await;
+    assert_eq!(body, json!({ "claimed": false, "reason": "not_ready" }));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the claim past the cap waited {:?}",
+        started.elapsed()
+    );
+    for w in waiters {
+        let (_, body) = w.await.unwrap();
+        assert_eq!(body, json!({ "claimed": false, "reason": "not_ready" }));
+    }
+}
+
+// ── Enqueue by hand, and acting on an item ───────────────────────────────────
+
+/// `POST /work-items` takes the marker from the IR, not the caller: sent
+/// without it, an opted-in node's item is still never handed out
+/// oldest-first, and a caller cannot mark another node's item.
+#[tokio::test]
+async fn a_hand_enqueued_item_is_marked_from_the_ir() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let state = make_state(backend.clone());
+    register(&state, None, ir("wf-hand", Some("by_execution"), None)).await;
+    let e = start(&state, None, "wf-hand").await;
+    // Take the start item out of the way.
+    let (_, body) = claim(&state, None, "w", json!({ "execution_id": e })).await;
+    assert_eq!(body["claimed"], true, "{body}");
+    let (st, body) = send(
+        &state,
+        "POST",
+        "/work-items",
+        None,
+        json!({ "execution_id": e, "node_id": "second", "queue_type": QUEUE, "payload": { "handler": "second" } }),
+    )
+    .await;
+    assert!((200..300).contains(&st), "{st} {body}");
+    let (_, body) = claim(&state, None, "oldest-first", json!({})).await;
+    assert_eq!(body, json!({ "claimed": false }));
+    let (_, body) = claim(
+        &state,
+        None,
+        "w",
+        json!({ "execution_id": e, "node_id": "second" }),
+    )
+    .await;
+    assert_eq!(
+        body["work_item"]["payload"]["claim"], "by_execution",
+        "{body}"
+    );
+
+    register(&state, None, ir("wf-plain", None, None)).await;
+    let p = start(&state, None, "wf-plain").await;
+    let (_, body) = claim(&state, None, "w", json!({ "execution_id": p })).await;
+    assert_eq!(body["claimed"], true, "{body}");
+    let (st, body) = send(
+        &state,
+        "POST",
+        "/work-items",
+        None,
+        json!({ "execution_id": p, "node_id": "second", "queue_type": QUEUE, "payload": { "claim": "by_execution" } }),
+    )
+    .await;
+    assert!((200..300).contains(&st), "{st} {body}");
+    let (_, body) = claim(&state, None, "oldest-first", json!({})).await;
+    assert_eq!(body["claimed"], true, "{body}");
+    assert!(
+        body["work_item"]["payload"].get("claim").is_none(),
+        "{body}"
+    );
+}
+
+/// Completing, failing or heartbeating an opted-in item takes the same right
+/// as claiming it: another principal is answered as for an item that does not
+/// exist, though it knows the id and the fence (a fence is a counter, often
+/// 1, not a credential).
+#[tokio::test]
+async fn only_the_initiator_completes_fails_or_heartbeats() {
+    let (url, path) = sqlite_url();
+    let sqlite = Arc::new(SqliteBackend::open(&url).await.unwrap());
+    let (alice, _) = sqlite.create_token("alice", "developer").await.unwrap();
+    let (bob, _) = sqlite.create_token("bob", "developer").await.unwrap();
+    let backend: Arc<dyn StateBackend> = sqlite;
+    let state = make_state(backend);
+    register(
+        &state,
+        Some(&alice),
+        ir("wf-act", Some("by_execution"), None),
+    )
+    .await;
+    let e = start(&state, Some(&alice), "wf-act").await;
+    let (_, body) = claim(
+        &state,
+        Some(&alice),
+        "alice-worker",
+        json!({ "execution_id": e }),
+    )
+    .await;
+    assert_eq!(body["claimed"], true, "{body}");
+    let id = body["work_item"]["id"].as_str().unwrap().to_string();
+    let fence = body["work_item"]["lease_fence"].clone();
+
+    let (st, body) = send(
+        &state,
+        "POST",
+        &format!("/work-items/{id}/heartbeat"),
+        Some(&bob),
+        json!({ "worker_id": "alice-worker", "lease_fence": fence }),
+    )
+    .await;
+    assert_eq!(st, 404, "{body}");
+    let (st, body) = send(
+        &state,
+        "POST",
+        &format!("/work-items/{id}/fail"),
+        Some(&bob),
+        json!({ "error": "no", "lease_fence": fence }),
+    )
+    .await;
+    assert_eq!(st, 404, "{body}");
+    for with_fence in [true, false] {
+        let mut req = json!({ "output": { "forged": true }, "state_patch": {} });
+        if with_fence {
+            req["lease_fence"] = fence.clone();
+        }
+        let (st, body) = send(
+            &state,
+            "POST",
+            &format!("/work-items/{id}/complete"),
+            Some(&bob),
+            req,
+        )
+        .await;
+        assert_eq!(st, 404, "fence {with_fence}: {body}");
+    }
+    let (st, body) = send(
+        &state,
+        "POST",
+        &format!("/work-items/{id}/complete"),
+        Some(&alice),
+        json!({ "output": {}, "state_patch": {}, "lease_fence": fence }),
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    let _ = std::fs::remove_file(path);
+}
+
+/// `claim` means something on `external_fn` only; anywhere else it is
+/// refused at registration rather than silently ignored.
+#[tokio::test]
+async fn claim_on_another_kind_is_refused_at_registration() {
+    let state = make_state(Arc::new(InMemoryBackend::new()));
+    let mut workflow = ir("wf-wrong", None, None);
+    workflow["nodes"]["second"]["kind"] = json!({
+        "type": "python_fn", "module": "m", "function": "f", "output_schema": "",
+        "claim": "by_execution"
+    });
+    let (st, body) = send(
+        &state,
+        "POST",
+        "/workflows",
+        None,
+        json!({ "ir": workflow }),
+    )
+    .await;
+    assert_eq!(st, 400, "{body}");
+    assert!(body.to_string().contains("external_fn"), "{body}");
 }
