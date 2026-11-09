@@ -91,21 +91,26 @@ class TestDimensionScores:
         """Missing dimensions default to weight 1.0 in both sums."""
         scores = DimensionScores(
             capability_fit=1.0,
-            cost_fit=1.0,
+            cost_fit=0.0,
             latency_fit=1.0,
             trust_compatibility=1.0,
             historical_performance=1.0,
         )
         # 4 dims at weight 1.0, cost_fit at 2.0 → total weight = 6
-        # numerator = (1*1 + 1*2 + 1*1 + 1*1 + 1*1) = 6 → 6/6 = 1.0
+        # numerator = (1*1 + 0*2 + 1*1 + 1*1 + 1*1) = 4 → 4/6
         result = scores.composite({"cost_fit": 2.0})
-        assert result == pytest.approx(1.0)
+        assert result == pytest.approx(4.0 / 6.0)
 
     def test_composite_ignores_unknown_keys(self):
         scores = DimensionScores()
         result_with_junk = scores.composite({"not_a_dimension": 999.0})
         result_default = scores.composite()
         assert result_with_junk == pytest.approx(result_default)
+
+    def test_composite_rejects_negative_weight(self):
+        scores = DimensionScores()
+        with pytest.raises(ValueError, match="Negative weight"):
+            scores.composite({"cost_fit": -1.0})
 
 
 class TestDefaultStrategy:
