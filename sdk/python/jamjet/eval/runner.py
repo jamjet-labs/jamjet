@@ -231,8 +231,9 @@ class EvalRunner:
                                 cost = kind.get("cost_usd")
                                 if cost is not None:
                                     cost_usd = (cost_usd or 0.0) + cost
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        if row.expected_trajectory is not None and error is None:
+                            error = f"could not fetch trajectory events: {exc}"
 
         except Exception as e:
             error = str(e)

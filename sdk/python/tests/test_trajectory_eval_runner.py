@@ -18,7 +18,9 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+import respx
 
 from jamjet.eval.dataset import EvalDataset, EvalRow
 from jamjet.eval.runner import AgentEvalRunner, EvalRunner
@@ -193,6 +195,35 @@ async def test_runner_no_expected_trajectory_is_output_only(monkeypatch):
     assert names == {"assertion"}  # NO trajectory scorer appended
     # trajectory tool_sequence still captured for inspection / regression diffing
     assert result.trajectory == ["search"]
+
+
+@pytest.mark.parametrize("expected_trajectory", [{"used_tool": "search"}, {"did_not_use": "delete"}, None])
+@respx.mock
+async def test_runner_event_fetch_failure_cannot_pass_trajectory_checks(expected_trajectory):
+    """Missing event evidence must not silently turn a trajectory eval into output-only."""
+    runtime = "http://runtime.test"
+    respx.post(f"{runtime}/executions").mock(return_value=httpx.Response(200, json={"execution_id": "exec-1"}))
+    respx.get(f"{runtime}/executions/exec-1").mock(
+        return_value=httpx.Response(200, json={"status": "completed", "state": {"answer": "42"}})
+    )
+    respx.get(f"{runtime}/executions/exec-1/events").mock(
+        return_value=httpx.Response(503, json={"error": "event log unavailable"})
+    )
+    row = EvalRow(id="r1", input={"q": "hi"}, expected_trajectory=expected_trajectory)
+    runner = EvalRunner("wf", [AssertionScorer(checks=["'answer' in output"])], runtime=runtime, poll_interval_s=0.0)
+
+    [result] = await runner.run(EvalDataset([row]))
+
+    assert result.output == {"answer": "42"}
+    assert result.scorers[0].passed is True
+    assert result.trajectory is None
+    if expected_trajectory is None:
+        assert result.passed is True
+        assert result.error is None
+    else:
+        assert result.passed is False
+        assert "trajectory" in result.error
+        assert "event log unavailable" in result.error
 
 
 # ── AgentEvalRunner: trajectory from in-process tool_calls ─────────────────────
