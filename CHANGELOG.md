@@ -415,6 +415,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Fail trajectory evaluations when their event log cannot be fetched, instead of
+  silently passing them based on output scorers alone. Output-only evaluations
+  retain best-effort event collection.
+
 - Preserve registry agents' reasoning modes during coordinator discovery so
   matching `preferred_reasoning_modes` contributes to capability scores.
 
