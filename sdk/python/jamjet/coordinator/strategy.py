@@ -74,17 +74,12 @@ class DimensionScores:
                 if dim in weights:
                     w = weights[dim]
                     if w < 0:
-                        raise ValueError(
-                            f"Negative weight for dimension '{dim}': {w}"
-                        )
+                        raise ValueError(f"Negative weight for dimension '{dim}': {w}")
                     defaults[dim] = w
         total_weight = sum(defaults.values())
         if total_weight == 0:
             return 0.0
-        return (
-            sum(getattr(self, dim) * defaults[dim] for dim in self._DIMENSIONS)
-            / total_weight
-        )
+        return sum(getattr(self, dim) * defaults[dim] for dim in self._DIMENSIONS) / total_weight
 
 
 @dataclass
