@@ -224,7 +224,7 @@ class EvalRunner:
                     # and trajectory reconstruction (the trajectory-eval hook).
                     try:
                         events_data = await client.get_events(exec_id)
-                        events_list = events_data.get("events", [])
+                        events_list = events_data["events"]
                         for evt in events_list:
                             kind = evt.get("kind", {})
                             if kind.get("type") == "node_completed":

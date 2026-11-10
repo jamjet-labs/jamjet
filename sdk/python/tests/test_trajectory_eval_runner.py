@@ -198,17 +198,21 @@ async def test_runner_no_expected_trajectory_is_output_only(monkeypatch):
 
 
 @pytest.mark.parametrize("expected_trajectory", [{"used_tool": "search"}, {"did_not_use": "delete"}, None])
+@pytest.mark.parametrize(
+    ("event_status", "event_body", "error_text"),
+    [(503, {"error": "event log unavailable"}, "event log unavailable"), (200, {}, "events")],
+)
 @respx.mock
-async def test_runner_event_fetch_failure_cannot_pass_trajectory_checks(expected_trajectory):
+async def test_runner_event_fetch_failure_cannot_pass_trajectory_checks(
+    expected_trajectory, event_status, event_body, error_text
+):
     """Missing event evidence must not silently turn a trajectory eval into output-only."""
     runtime = "http://runtime.test"
     respx.post(f"{runtime}/executions").mock(return_value=httpx.Response(200, json={"execution_id": "exec-1"}))
     respx.get(f"{runtime}/executions/exec-1").mock(
         return_value=httpx.Response(200, json={"status": "completed", "state": {"answer": "42"}})
     )
-    respx.get(f"{runtime}/executions/exec-1/events").mock(
-        return_value=httpx.Response(503, json={"error": "event log unavailable"})
-    )
+    respx.get(f"{runtime}/executions/exec-1/events").mock(return_value=httpx.Response(event_status, json=event_body))
     row = EvalRow(id="r1", input={"q": "hi"}, expected_trajectory=expected_trajectory)
     runner = EvalRunner("wf", [AssertionScorer(checks=["'answer' in output"])], runtime=runtime, poll_interval_s=0.0)
 
@@ -223,7 +227,48 @@ async def test_runner_event_fetch_failure_cannot_pass_trajectory_checks(expected
     else:
         assert result.passed is False
         assert "trajectory" in result.error
-        assert "event log unavailable" in result.error
+        assert error_text in result.error
+
+
+@pytest.mark.parametrize("event_status", [200, 503])
+@respx.mock
+async def test_runner_event_failure_preserves_execution_error(event_status):
+    """An unavailable event log must not replace an earlier execution failure."""
+    runtime = "http://runtime.test"
+    respx.post(f"{runtime}/executions").mock(return_value=httpx.Response(200, json={"execution_id": "exec-1"}))
+    respx.get(f"{runtime}/executions/exec-1").mock(
+        return_value=httpx.Response(200, json={"status": "failed", "error": "model timeout"})
+    )
+    respx.get(f"{runtime}/executions/exec-1/events").mock(return_value=httpx.Response(event_status, json={}))
+    row = EvalRow(id="r1", input={"q": "hi"}, expected_trajectory={"did_not_use": "delete"})
+    runner = EvalRunner("wf", [], runtime=runtime, poll_interval_s=0.0)
+
+    [result] = await runner.run(EvalDataset([row]))
+
+    assert result.passed is False
+    assert result.error == "execution failed: model timeout"
+    assert result.trajectory is None
+    assert result.scorers == []
+
+
+@respx.mock
+async def test_runner_empty_event_log_is_valid_for_negative_trajectory_assertion():
+    """An explicit empty event log is evidence that no forbidden tool was called."""
+    runtime = "http://runtime.test"
+    respx.post(f"{runtime}/executions").mock(return_value=httpx.Response(200, json={"execution_id": "exec-1"}))
+    respx.get(f"{runtime}/executions/exec-1").mock(
+        return_value=httpx.Response(200, json={"status": "completed", "state": {"answer": "42"}})
+    )
+    respx.get(f"{runtime}/executions/exec-1/events").mock(return_value=httpx.Response(200, json={"events": []}))
+    row = EvalRow(id="r1", input={"q": "hi"}, expected_trajectory={"did_not_use": "delete"})
+    runner = EvalRunner("wf", [], runtime=runtime, poll_interval_s=0.0)
+
+    [result] = await runner.run(EvalDataset([row]))
+
+    assert result.passed is True
+    assert result.error is None
+    assert result.trajectory == []
+    assert [scorer.scorer for scorer in result.scorers] == ["trajectory"]
 
 
 # ── AgentEvalRunner: trajectory from in-process tool_calls ─────────────────────
