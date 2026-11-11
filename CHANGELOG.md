@@ -415,6 +415,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Reject malformed LLM judge ratings instead of coercing them or accepting scores
+  outside the documented 1–5 scale.
+
 - Fail trajectory evaluations when their event log cannot be fetched, instead of
   silently passing them based on output scorers alone. Output-only evaluations
   retain best-effort event collection.
