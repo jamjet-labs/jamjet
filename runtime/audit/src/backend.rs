@@ -49,6 +49,9 @@ pub trait AuditBackend: Send + Sync {
     async fn append(&self, entry: AuditLogEntry) -> Result<(), AuditError>;
 
     /// Query audit log entries with optional filters.
+    ///
+    /// The filter values come from callers (`GET /audit` query parameters).
+    /// Bind them as values; never format them into SQL.
     async fn query(&self, q: &AuditQuery) -> Result<Vec<AuditLogEntry>, AuditError>;
 
     /// Count audit log entries matching the query (for pagination).
