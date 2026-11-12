@@ -5,18 +5,25 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from jamjet.agent_tool import agent_tool
 from jamjet.workflow.graph import WorkflowGraph
 
 
 def build_workflow() -> dict[str, Any]:
     """Use one request/response to classify a customer-support message."""
     # Each message is independent: no progress stream or conversation is needed.
+    classifier = agent_tool(
+        agent="https://sentiment.example.com",
+        description="Classify the sentiment of one customer-support message.",
+        mode="sync",
+        timeout_ms=5000,
+    )
     graph = WorkflowGraph("support-sentiment")
     graph.add_agent_tool(
         "classify_sentiment",
-        agent="https://sentiment.example.com",
-        mode="sync",
-        timeout_ms=5000,
+        agent=classifier.agent_uri,
+        mode=classifier.mode,
+        timeout_ms=classifier.timeout_ms,
         output_key="sentiment",
         input_mapping={"message": "support_message"},
     )
@@ -24,20 +31,10 @@ def build_workflow() -> dict[str, Any]:
 
 
 def main() -> None:
-    sample_message = "My replacement arrived quickly. Thank you!"
-    print(f"Sample input: {sample_message}")
+    initial_state = {"support_message": "My replacement arrived quickly. Thank you!"}
+    print(f"Sample workflow state: {json.dumps(initial_state)}")
     print("\nCompiled workflow (no agent is invoked):")
-    workflow = build_workflow()
-    print(json.dumps(workflow, indent=2))
-
-    # Verify input_mapping is present
-    classify_node = workflow["nodes"]["classify_sentiment"]
-    print(
-        f"\nInput mapping for classify_sentiment node: {classify_node['kind']['input_mapping']}"
-    )
-    print(
-        "The 'support_message' from workflow state will be mapped to 'message' for the agent."
-    )
+    print(json.dumps(build_workflow(), indent=2))
 
 
 if __name__ == "__main__":
