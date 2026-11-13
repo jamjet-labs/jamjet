@@ -156,20 +156,49 @@ pub fn spill_bytes(value: &Value, threshold: usize) -> Option<Vec<u8>> {
 /// A missing artifact (dangling ref) returns a `StateBackendError::NotFound`
 /// rather than panicking.
 pub async fn resolve_value(value: &Value, backend: &dyn StateBackend) -> BackendResult<Value> {
+    resolve_value_within(value, backend, u64::MAX).await
+}
+
+/// [`resolve_value`], except that a reference to an artifact larger than
+/// `max_size` bytes is left as its sentinel, which carries the hash and size
+/// a caller needs to fetch it on its own.
+pub async fn resolve_value_within(
+    value: &Value,
+    backend: &dyn StateBackend,
+    max_size: u64,
+) -> BackendResult<Value> {
+    let resolve = |v: &Value| {
+        let artifact_ref = ArtifactRef::from_sentinel(v).filter(|r| r.size <= max_size);
+        let v = v.clone();
+        async move {
+            let Some(r) = artifact_ref else {
+                return Ok(v);
+            };
+            match backend.get_artifact(&r.hash).await? {
+                // The sentinel's size is what its writer claimed: an external
+                // worker can return one. The stored bytes decide.
+                Some(bytes) if bytes.len() as u64 > max_size => Ok(v),
+                Some(bytes) => {
+                    serde_json::from_slice(&bytes).map_err(StateBackendError::Serialization)
+                }
+                None => Err(StateBackendError::NotFound(format!(
+                    "artifact {} not found (dangling ref)",
+                    r.hash
+                ))),
+            }
+        }
+    };
+
     // Top-level sentinel?
-    if let Some(artifact_ref) = ArtifactRef::from_sentinel(value) {
-        return resolve_ref(&artifact_ref, backend).await;
+    if ArtifactRef::from_sentinel(value).is_some() {
+        return resolve(value).await;
     }
 
     // Walk one level into objects.
     if let Some(obj) = value.as_object() {
         let mut out = serde_json::Map::with_capacity(obj.len());
         for (k, v) in obj {
-            if let Some(artifact_ref) = ArtifactRef::from_sentinel(v) {
-                out.insert(k.clone(), resolve_ref(&artifact_ref, backend).await?);
-            } else {
-                out.insert(k.clone(), v.clone());
-            }
+            out.insert(k.clone(), resolve(v).await?);
         }
         return Ok(Value::Object(out));
     }
@@ -178,11 +207,7 @@ pub async fn resolve_value(value: &Value, backend: &dyn StateBackend) -> Backend
     if let Some(arr) = value.as_array() {
         let mut out = Vec::with_capacity(arr.len());
         for v in arr {
-            if let Some(artifact_ref) = ArtifactRef::from_sentinel(v) {
-                out.push(resolve_ref(&artifact_ref, backend).await?);
-            } else {
-                out.push(v.clone());
-            }
+            out.push(resolve(v).await?);
         }
         return Ok(Value::Array(out));
     }
@@ -190,17 +215,85 @@ pub async fn resolve_value(value: &Value, backend: &dyn StateBackend) -> Backend
     Ok(value.clone())
 }
 
-async fn resolve_ref(
-    artifact_ref: &ArtifactRef,
+/// Resolve the artifact references in `value` (at the top or one level
+/// down) whose stored size is at most `max_each` and fits what is left of
+/// `budget`, charging `budget` the bytes each one inlined. Any other
+/// reference stays its sentinel.
+///
+/// The size a sentinel claims is never used: an external worker writes the
+/// output, so it can claim `0` for a large artifact. The stored size decides,
+/// and it is read before the bytes are, so a reference past the budget costs
+/// one size lookup and no blob read. Each child is charged on its own, so an
+/// array of references cannot inline them all under one check.
+pub async fn resolve_value_budgeted(
+    value: &Value,
     backend: &dyn StateBackend,
+    max_each: u64,
+    budget: &mut u64,
 ) -> BackendResult<Value> {
-    match backend.get_artifact(&artifact_ref.hash).await? {
-        Some(bytes) => serde_json::from_slice(&bytes).map_err(StateBackendError::Serialization),
-        None => Err(StateBackendError::NotFound(format!(
-            "artifact {} not found (dangling ref)",
-            artifact_ref.hash
-        ))),
+    async fn one(
+        v: &Value,
+        backend: &dyn StateBackend,
+        max_each: u64,
+        budget: &mut u64,
+    ) -> BackendResult<Value> {
+        let Some(r) = ArtifactRef::from_sentinel(v) else {
+            return Ok(v.clone());
+        };
+        let cap = max_each.min(*budget);
+        // Nothing can be inlined (`none`, or the budget spent): no lookup.
+        if cap == 0 {
+            return Ok(v.clone());
+        }
+        match backend.artifact_size(&r.hash).await? {
+            None => Err(StateBackendError::NotFound(format!(
+                "artifact {} not found (dangling ref)",
+                r.hash
+            ))),
+            Some(size) if size > cap => Ok(v.clone()),
+            Some(_) => match backend.get_artifact(&r.hash).await? {
+                // Checked again: what was read decides.
+                Some(bytes) if bytes.len() as u64 <= cap => {
+                    let resolved: Value =
+                        serde_json::from_slice(&bytes).map_err(StateBackendError::Serialization)?;
+                    // Charged as it will be written back: `1e15` is stored in
+                    // 4 bytes and serialized in 18.
+                    let written = serde_json::to_vec(&resolved)
+                        .map(|b| b.len() as u64)
+                        .unwrap_or(u64::MAX);
+                    if written > cap {
+                        return Ok(v.clone());
+                    }
+                    *budget = budget.saturating_sub(written);
+                    Ok(resolved)
+                }
+                Some(_) => Ok(v.clone()),
+                None => Err(StateBackendError::NotFound(format!(
+                    "artifact {} not found (dangling ref)",
+                    r.hash
+                ))),
+            },
+        }
     }
+
+    if ArtifactRef::from_sentinel(value).is_some() {
+        return one(value, backend, max_each, budget).await;
+    }
+    if let Some(obj) = value.as_object() {
+        let mut out = serde_json::Map::with_capacity(obj.len());
+        for (k, v) in obj {
+            out.insert(k.clone(), one(v, backend, max_each, budget).await?);
+        }
+        return Ok(Value::Object(out));
+    }
+    if let Some(arr) = value.as_array() {
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            out.push(one(v, backend, max_each, budget).await?);
+        }
+        return Ok(Value::Array(out));
+    }
+    Ok(value.clone())
 }
 
 #[cfg(test)]

@@ -145,6 +145,8 @@ These are the variables that change what the server does.
 | `JAMJET_AUDIT_SIGNING_KEY` | HMAC key for the audit log | unset (entries left unsigned) |
 | `JAMJET_AUDIT_ALLOW_INSECURE_KEY` | Sign with the built-in public dev key when no HMAC key is set | unset |
 | `JAMJET_AUDIT_ED25519_KEY_FILE` or `JAMJET_AUDIT_ED25519_KEY` | Ed25519 seed, 64 hex digits | unset |
+| `JAMJET_MODEL_TIMEOUT_SECS` | Longest one model provider call may take, in seconds. Connecting is limited to 10 s. An invalid value fails startup. A model's own `timeout_secs` in the IR (`models.<name>.timeout_secs`) limits its calls further | `300` |
+| `JAMJET_SHUTDOWN_GRACE_SECS` | On SIGTERM or Ctrl-C, how long to wait for the in-process workers to finish the items they hold. The server keeps answering HTTP meanwhile, so external workers can heartbeat and complete. Then the scheduler gets 2 s and open HTTP connections 3 s more, and a second signal exits at once. With the default a shutdown takes at most 25 s, inside Kubernetes' default `terminationGracePeriodSeconds` of 30. `docker stop` sends SIGKILL after 10 s: run it as `docker stop -t 30`, or set this to 5 | `20` |
 
 ---
 

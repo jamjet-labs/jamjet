@@ -201,6 +201,55 @@ pub trait StateBackend: Send + Sync {
         offset: u32,
     ) -> BackendResult<Vec<WorkflowExecution>>;
 
+    /// Up to `limit` running executions whose id sorts after `after` (all
+    /// of them for `None`), in id order: a keyset page.
+    ///
+    /// The scheduler pages through this so it visits every running run each
+    /// tick. It used to read one `list_executions` page of 100, ordered by
+    /// `updated_at`, so past 100 running runs the rest never advanced; and
+    /// offset paging on `updated_at` skips rows as runs update and finish
+    /// under it. The id order does not move.
+    ///
+    /// A row that cannot be read is left out of `executions` but still moves
+    /// the cursor, so it cannot stop the walk. `next_after` is the id of the
+    /// last row scanned, `None` once a page scans nothing.
+    ///
+    /// The default reads every running execution through `list_executions`
+    /// and pages in memory; the SQLite and in-memory backends override it
+    /// with a direct query.
+    async fn list_running_executions_after(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> BackendResult<RunningPage> {
+        const PAGE: u32 = 500;
+        let mut all = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = self
+                .list_executions(Some(WorkflowStatus::Running), PAGE, offset)
+                .await?;
+            let n = page.len() as u32;
+            all.extend(page);
+            if n < PAGE {
+                break;
+            }
+            offset += n;
+        }
+        all.sort_by_key(|e| e.execution_id.0.to_string());
+        all.dedup_by_key(|e| e.execution_id.0);
+        let executions: Vec<WorkflowExecution> = all
+            .into_iter()
+            .filter(|e| after.is_none_or(|a| e.execution_id.0.to_string().as_str() > a))
+            .take(limit as usize)
+            .collect();
+        let next_after = executions.last().map(|e| e.execution_id.0.to_string());
+        Ok(RunningPage {
+            executions,
+            next_after,
+        })
+    }
+
     // ── Event log ────────────────────────────────────────────────────────
 
     /// Append an event to the event log.
@@ -218,8 +267,34 @@ pub trait StateBackend: Send + Sync {
         since_sequence: EventSequence,
     ) -> BackendResult<Vec<Event>>;
 
+    /// At most `limit` events with a sequence above `after`, in ascending
+    /// order, and none after the one at which their serialized length reaches
+    /// `max_bytes` ([`within_budget`]): one page of the run's log. The
+    /// SQLite backends read only that page, the budget applied in the query;
+    /// the default reads [`Self::get_events_since`] and cuts it.
+    async fn get_events_page(
+        &self,
+        execution_id: &ExecutionId,
+        after: EventSequence,
+        limit: u32,
+        max_bytes: usize,
+    ) -> BackendResult<Vec<Event>> {
+        let events = self.get_events_since(execution_id, after).await?;
+        Ok(within_budget(events, limit, max_bytes))
+    }
+
     /// Get the latest event sequence for an execution.
     async fn latest_sequence(&self, execution_id: &ExecutionId) -> BackendResult<EventSequence>;
+
+    /// Work items held under a lease that has not expired, ordered by
+    /// worker, at most `limit`. The default refuses: a backend that cannot
+    /// answer must not report "no workers".
+    async fn list_claimed_work_items(&self, limit: u32) -> BackendResult<Vec<ClaimedWorkItem>> {
+        let _ = limit;
+        Err(StateBackendError::Database(
+            "this backend does not list claimed work items".into(),
+        ))
+    }
 
     // ── Snapshots ────────────────────────────────────────────────────────
 
@@ -294,6 +369,13 @@ pub trait StateBackend: Send + Sync {
     /// Reservations are consulted ONLY when no committed effect exists, so a row
     /// left behind after a successful commit blocks nothing — the caller finds
     /// the recorded result first and replays it.
+    ///
+    /// The holder renews it under the same `lease_fence`. Another attempt of
+    /// the same `owner` (a new fence) waits for the TTL like any other worker:
+    /// worker ids are fixed (`general-worker-0`), and a worker that panicked
+    /// after its effect used to take its own reservation straight back and
+    /// fire again. A parked attempt (rate limited) releases it
+    /// ([`Self::release_tool_reservation`]), so its retry does not wait.
     async fn reserve_tool_effect(
         &self,
         key: &str,
@@ -306,20 +388,18 @@ pub trait StateBackend: Send + Sync {
 
     /// Give up a reservation this worker holds, without having recorded a result.
     ///
-    /// A reservation left standing is not a correctness problem — it is
-    /// reentrant for its holder, and it lapses on its TTL — but until then a
-    /// DIFFERENT worker that picks the node up must wait it out. Releasing on a
-    /// path that ends without committing (a park, a failure) turns that wait
-    /// from minutes into nothing.
+    /// A reservation left standing is not a correctness problem (it lapses on
+    /// its TTL), but until then any other attempt at the node, the same
+    /// worker's included, must wait it out. Releasing on a path that ends
+    /// without committing (a park, a failure) turns that wait from minutes
+    /// into nothing.
     ///
     /// Guarded by owner AND lease fence, because the owner alone is not enough.
-    /// Worker ids are configurable and reused, and `reserve_tool_effect` is
-    /// reentrant for the same owner — it REPLACES the reservation with the newer
-    /// lease. So an older attempt from the same worker id finishing late would
-    /// otherwise delete the NEWER attempt's reservation and let a third worker
-    /// acquire a key that is actively held. The fence is what distinguishes the
-    /// two attempts. A non-matching owner or fence is a silent no-op, like every
-    /// other fenced write here.
+    /// Worker ids are configurable and reused, so an older attempt from the
+    /// same worker id finishing late would otherwise delete a NEWER attempt's
+    /// reservation and let a third worker acquire a key that is actively held.
+    /// The fence is what distinguishes the two attempts. A non-matching owner
+    /// or fence is a silent no-op, like every other fenced write here.
     async fn release_tool_reservation(
         &self,
         key: &str,
@@ -346,6 +426,14 @@ pub trait StateBackend: Send + Sync {
     /// Retrieve artifact bytes by hash (tenant-scoped). Returns `None` if the
     /// artifact does not exist for this tenant.
     async fn get_artifact(&self, hash: &str) -> BackendResult<Option<Vec<u8>>>;
+
+    /// The stored size of an artifact, in bytes, without reading it: what a
+    /// caller with a byte budget checks before fetching. `None` if it does not
+    /// exist. The default reads the bytes; the SQL backends read the size the
+    /// engine recorded when it stored them.
+    async fn artifact_size(&self, hash: &str) -> BackendResult<Option<u64>> {
+        Ok(self.get_artifact(hash).await?.map(|b| b.len() as u64))
+    }
 
     // ── Queue (simple Postgres/SQLite backed queue in v1) ────────────────
 
@@ -704,6 +792,29 @@ pub struct ApiToken {
 pub type WorkItemId = uuid::Uuid;
 
 /// A unit of work dispatched to a worker queue.
+/// One keyset page of running executions; see
+/// [`StateBackend::list_running_executions_after`].
+#[derive(Debug, Clone, Default)]
+pub struct RunningPage {
+    /// The rows of the page that could be read.
+    pub executions: Vec<WorkflowExecution>,
+    /// The id of the last row scanned, readable or not: the `after` of the
+    /// next page. `None` once a page scans nothing.
+    pub next_after: Option<String>,
+}
+
+/// A work item a worker holds a live lease on: what `GET /workers` reports.
+/// There is no worker registry, so a worker shows up only while it holds one.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClaimedWorkItem {
+    pub worker_id: String,
+    pub work_item_id: WorkItemId,
+    pub execution_id: ExecutionId,
+    pub node_id: String,
+    pub queue_type: String,
+    pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkItem {
     pub id: WorkItemId,
@@ -729,11 +840,47 @@ pub struct WorkItem {
 
 /// The lease a claim gets when the worker does not say how long it needs.
 pub const DEFAULT_LEASE_SECS: u64 = 30;
+
+/// The longest an effect reservation is held, whatever is asked: far past
+/// any node timeout registration allows, and far inside what a timestamp can
+/// hold. A huge TTL used to overflow the expiry and panic the worker.
+pub const MAX_RESERVATION_TTL: std::time::Duration =
+    std::time::Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+/// When a reservation of `ttl` taken at `now` expires: `ttl` held to
+/// [`MAX_RESERVATION_TTL`], added without overflowing.
+pub fn reservation_expiry(
+    now: chrono::DateTime<chrono::Utc>,
+    ttl: std::time::Duration,
+) -> chrono::DateTime<chrono::Utc> {
+    let held = chrono::Duration::from_std(ttl.min(MAX_RESERVATION_TTL))
+        .unwrap_or_else(|_| chrono::Duration::days(36_500));
+    now.checked_add_signed(held)
+        .unwrap_or_else(|| now + chrono::Duration::days(36_500))
+}
 /// The shortest lease a claim may ask for: long enough to be renewable.
 pub const MIN_LEASE_SECS: u64 = 5;
 /// The longest lease a claim may ask for: short enough that a dead worker's
 /// item is not stranded for hours.
 pub const MAX_LEASE_SECS: u64 = 3600;
+
+/// The start of `events` a page takes: at most `limit` events, and none
+/// after the one at which their serialized length reaches `max_bytes` (so at
+/// least one, when there is one). The SQL backends do the same in the query,
+/// with an estimate no smaller than the serialized length, so a page of large
+/// events is never read past its budget.
+pub fn within_budget(events: Vec<Event>, limit: u32, max_bytes: usize) -> Vec<Event> {
+    let mut total = 0usize;
+    events
+        .into_iter()
+        .take(limit as usize)
+        .take_while(|e| {
+            let fits = total < max_bytes;
+            total += serde_json::to_vec(e).map(|b| b.len()).unwrap_or(0);
+            fits
+        })
+        .collect()
+}
 
 /// The lease a claim is granted for what it asked: the default when it asked
 /// for nothing, otherwise the request held to `[MIN_LEASE_SECS,
@@ -847,4 +994,27 @@ pub enum FailOutcome {
         /// The item with its FINAL attempt number.
         item: Box<WorkItem>,
     },
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    /// A huge TTL neither panics nor leaves the four-digit years the
+    /// reservation table compares as text.
+    #[test]
+    fn a_huge_reservation_ttl_has_a_comparable_expiry() {
+        let now = chrono::Utc::now();
+        // Far, not the 5-minute fallback that reopened the double-fire
+        // window, and never a panic (10^13 s converts but overflows the add).
+        for ttl in [
+            std::time::Duration::MAX,
+            std::time::Duration::from_secs(10_000_000_000_000),
+        ] {
+            let at = super::reservation_expiry(now, ttl);
+            assert!(
+                at >= now + chrono::Duration::days(365 * 50),
+                "{ttl:?}: {at}"
+            );
+            assert_eq!(at.format("%Y").to_string().len(), 4, "{ttl:?}: {at}");
+        }
+    }
 }

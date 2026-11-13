@@ -730,7 +730,10 @@ class Agent:
             # Events carry artifact-resolved NodeCompleted outputs (server-side),
             # used only as a fallback if a spilled answer sentinel slips through.
             try:
-                events = (await client.get_events(exec_id)).get("events", [])
+                # Every output inlined: the fallback reads the final answer
+                # from them, and the runtime leaves large ones as references
+                # by default.
+                events = (await client.get_events(exec_id, inline_artifacts="all")).get("events", [])
             except Exception:  # noqa: BLE001 - events are a best-effort fallback
                 events = []
 

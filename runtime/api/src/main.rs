@@ -3,6 +3,7 @@ use jamjet_api::{config::ApiConfig, routes::build_router_with_opts, state::AppSt
 use jamjet_audit::{AuditEnricher, NoopAuditBackend, SqliteAuditBackend};
 use jamjet_state::{InMemoryBackend, SqliteBackend};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Parse a `JAMJET_STORE_TERM` value: a non-negative integer (the promotion
@@ -179,15 +180,21 @@ async fn main() -> anyhow::Result<()> {
     // The scheduler and the embedded workers seal the approval records they
     // append (requests, expiries, escalations) into the same audit chain as
     // the decisions the routes seal.
+    //
+    // On SIGTERM or Ctrl-C the scheduler stops between ticks and the embedded
+    // workers finish the items they hold, for up to the grace period.
+    let shutdown_grace = shutdown_grace_from_env()?;
+    let (shutdown_trigger, shutdown) = jamjet_worker::shutdown();
     let scheduler =
         jamjet_scheduler::Scheduler::new(state.backend.clone()).with_sealer(state.enricher.clone());
-    tokio::spawn(async move { scheduler.run().await });
+    let scheduler_stop = shutdown.receiver();
+    let scheduler_handle = tokio::spawn(async move { scheduler.run_until(scheduler_stop).await });
     info!("Scheduler started");
 
     // Spawn the async projector alongside the scheduler.  Maintains the durable
     // proj_approvals read-model so the approvals endpoint serves from a projection
     // instead of replaying the event log on every request.
-    // No shutdown signal wired today — matches the scheduler; follow-up: F-2h-shutdown.
+    // It holds no work of its own, so it stops with the process.
     let projector = jamjet_scheduler::Projector::new(state.backend.clone());
     tokio::spawn(async move { projector.run().await });
     info!("Projector started");
@@ -197,6 +204,8 @@ async fn main() -> anyhow::Result<()> {
     // worker processes against the same state backend instead. The base backend
     // claims across all tenants, so workers drain every execution's queue.
     if config.dev_mode || std::env::var("JAMJET_EMBED_WORKERS").is_ok() {
+        // Checked on its own so a bad value is reported as what it is.
+        jamjet_models::http::model_timeout().map_err(|e| anyhow::anyhow!("{e}"))?;
         let model_registry = Arc::new(
             jamjet_models::registry::registry_from_env_checked()
                 .await
@@ -206,9 +215,9 @@ async fn main() -> anyhow::Result<()> {
         // (`jamjet_worker::executable::IN_PROCESS_KINDS`).
         let pool = jamjet_worker::server_pool(state.backend.clone(), model_registry)
             .with_sealer(state.enricher.clone())
-            .with_agents(state.agents.clone());
-        // Detaching the handles lets the workers run for the lifetime of the process
-        // (same pattern as the scheduler above).
+            .with_agents(state.agents.clone())
+            .with_shutdown(shutdown.clone());
+        // The workers stop through `shutdown`; their handles are not needed.
         let _worker_handles = pool.spawn();
         info!("Embedded worker pool started (dev mode)");
     }
@@ -250,20 +259,121 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    info!("JamJet runtime listening on {addr}");
+    info!("JamJet runtime listening on {}", listener.local_addr()?);
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // The first SIGTERM or Ctrl-C starts a graceful shutdown; a second one
+    // exits at once.
+    let (signalled_tx, signalled) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = signalled_tx.send(true);
+        shutdown_signal().await;
+        warn!("Second shutdown signal: exiting now");
+        std::process::exit(1);
+    });
+    // The HTTP server stops on its own signal, sent after the workers have
+    // drained: external workers heartbeat and complete their items through
+    // it, and with the listener closed at the first signal their leases
+    // lapsed during the drain and the work ran again.
+    let (http_stop_tx, mut http_stop) = tokio::sync::watch::channel(false);
+    let draining = jamjet_api::routes::Draining::default();
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        draining.clone(),
+        jamjet_api::routes::refuse_claims_while_draining,
+    ));
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = http_stop.wait_for(|s| *s).await;
+            })
+            .await
+    });
+    let mut signal = signalled.clone();
+    // `biased`: the signal is polled first, and either way the drain below
+    // runs. A server that ended on its own still leaves workers to drain.
+    let ended = tokio::select! {
+        biased;
+        _ = signal.wait_for(|s| *s) => None,
+        res = &mut server => Some(res),
+    };
 
+    // No new claims from here on; heartbeats and completions still work.
+    draining.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Stop the scheduler and the workers. An open connection (an MCP SSE
+    // stream never ends) must not hold the drain back.
+    info!(
+        grace_secs = shutdown_grace.as_secs(),
+        "Shutting down: finishing in-flight work"
+    );
+    let still_running = shutdown_trigger.stop_and_drain(shutdown_grace).await;
+    if still_running > 0 {
+        warn!(
+            still_running,
+            "Grace period over with workers still running; their items are reclaimed when the lease expires"
+        );
+    }
+    let _ = tokio::time::timeout(jamjet_worker::shutdown::SCHEDULER_STOP, scheduler_handle).await;
+    match ended {
+        Some(res) => res??,
+        None => {
+            let _ = http_stop_tx.send(true);
+            match tokio::time::timeout(jamjet_worker::shutdown::HTTP_DRAIN, &mut server).await {
+                Ok(res) => res??,
+                Err(_) => {
+                    warn!("HTTP connections still open after the drain; closing them");
+                    server.abort();
+                }
+            }
+        }
+    }
     info!("Shutting down");
     Ok(())
 }
 
+/// How long shutdown waits for in-flight work: `JAMJET_SHUTDOWN_GRACE_SECS`,
+/// default [`jamjet_worker::shutdown::DEFAULT_SHUTDOWN_GRACE`] (20 s; with
+/// the scheduler and HTTP drains a shutdown takes at most 25 s). An invalid
+/// value fails startup.
+fn shutdown_grace_from_env() -> anyhow::Result<Duration> {
+    match std::env::var("JAMJET_SHUTDOWN_GRACE_SECS") {
+        Err(std::env::VarError::NotPresent) => Ok(jamjet_worker::shutdown::DEFAULT_SHUTDOWN_GRACE),
+        Err(e) => anyhow::bail!("failed to read JAMJET_SHUTDOWN_GRACE_SECS: {e}"),
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|e| anyhow::anyhow!("invalid JAMJET_SHUTDOWN_GRACE_SECS `{raw}`: {e}")),
+    }
+}
+
+/// Resolves on Ctrl-C or SIGTERM. The server used to wait for Ctrl-C only, so
+/// SIGTERM, which container runtimes and service managers send, killed it
+/// with work in flight.
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install Ctrl-C handler");
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!("cannot listen for Ctrl-C: {e}");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(e) => {
+                warn!("cannot listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => info!("Ctrl-C received"),
+        _ = terminate => info!("SIGTERM received"),
+    }
 }
 
 #[cfg(test)]

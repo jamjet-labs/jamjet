@@ -222,6 +222,9 @@ pub async fn registry_from_env_checked() -> Result<ModelRegistry, ModelError> {
     // First: every adapter below builds a client with `Client::new()`, which
     // panics where this returns an error (no CA bundle on Linux).
     let client = crate::http::client()?;
+    // An unreadable model timeout fails startup; the adapters would fall back
+    // to the default silently.
+    crate::http::model_timeout()?;
     let registry = registry_from_env();
     if let Ok(url) = std::env::var("JAMJET_MODEL_SEAM_URL") {
         crate::sidecar::check_sidecar_health(&url, &client).await?;
@@ -400,5 +403,41 @@ mod tests {
         // Unrecognised string falls to the default.
         let d = registry.resolve("unknown-model");
         assert_eq!(d.unwrap().system_name(), "anthropic");
+    }
+
+    /// A provider that accepts the connection and never answers. The
+    /// adapters built their clients with `reqwest::Client::new()`, which has
+    /// no timeout, so this call never returned.
+    #[tokio::test]
+    async fn a_provider_that_never_answers_times_out() {
+        use crate::adapter::{ChatMessage, ModelAdapter, ModelRequest};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // Accept and hold every connection, writing nothing.
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let adapter = {
+            let _guard = ENV_LOCK.lock().unwrap();
+            unsafe {
+                std::env::set_var(crate::http::MODEL_TIMEOUT_ENV, "1");
+            }
+            let adapter = crate::sidecar::SidecarModelAdapter::new(url);
+            unsafe {
+                std::env::remove_var(crate::http::MODEL_TIMEOUT_ENV);
+            }
+            adapter
+        };
+        let call = adapter.chat(ModelRequest::new(vec![ChatMessage::user("hi")]));
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), call).await;
+        silent.abort();
+        match outcome {
+            Ok(Err(_)) => {}
+            Ok(Ok(r)) => panic!("a silent provider cannot answer: {r:?}"),
+            Err(_) => panic!("the call did not time out on its own"),
+        }
     }
 }

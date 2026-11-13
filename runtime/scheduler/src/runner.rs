@@ -9,6 +9,9 @@ use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
+/// How many running executions the scheduler reads per page.
+const RUNNING_PAGE: u32 = 100;
+
 /// Configuration for the scheduler.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
@@ -85,18 +88,30 @@ impl Scheduler {
 
     /// Run the scheduler loop. This runs indefinitely until the future is cancelled.
     pub async fn run(&self) {
+        let (_never, stop) = tokio::sync::watch::channel(false);
+        self.run_until(stop).await
+    }
+
+    /// [`run`](Self::run) until `stop` turns true, checked between ticks so
+    /// a tick in progress completes.
+    pub async fn run_until(&self, mut stop: tokio::sync::watch::Receiver<bool>) {
         info!(
             "Scheduler started (poll_interval={:?}, max_concurrent={}, max_dispatch_per_tick={})",
             self.config.poll_interval,
             self.config.max_concurrent_nodes_per_execution,
             self.config.max_dispatch_per_tick,
         );
-        loop {
+        while !*stop.borrow() {
             if let Err(e) = self.tick().await {
                 warn!("Scheduler tick error: {e}");
             }
-            tokio::time::sleep(self.config.poll_interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(self.config.poll_interval) => {}
+                // A dropped sender (`run`) disables this arm.
+                Ok(()) = stop.changed() => {}
+            }
         }
+        info!("Scheduler stopped");
     }
 
     /// A single scheduler tick: reclaim expired leases, then find all running
@@ -110,25 +125,36 @@ impl Scheduler {
             warn!("Failed to reclaim expired leases: {e}");
         });
 
-        // 2. Schedule runnable nodes for each running execution.
-        let running = self
-            .backend
-            .list_executions(Some(jamjet_core::workflow::WorkflowStatus::Running), 100, 0)
-            .await?;
-
-        for execution in running {
-            self.schedule_runnable_nodes(
-                &execution.execution_id,
-                &execution.workflow_id,
-                &execution.workflow_version,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                warn!(
-                    execution_id = %execution.execution_id,
-                    "Failed to schedule runnable nodes: {e}"
-                );
-            });
+        // 2. Schedule runnable nodes for every running execution, a keyset
+        // page at a time. This read one page of the 100 most recently
+        // updated runs, so any run past the 100th never advanced.
+        // The walk follows the backend's cursor until a page scans nothing:
+        // a row a backend cannot read is left out of a page but still moves
+        // the cursor, so one unreadable run cannot stop every run after it.
+        let mut after: Option<String> = None;
+        loop {
+            let page = self
+                .backend
+                .list_running_executions_after(after.as_deref(), RUNNING_PAGE)
+                .await?;
+            for execution in &page.executions {
+                self.schedule_runnable_nodes(
+                    &execution.execution_id,
+                    &execution.workflow_id,
+                    &execution.workflow_version,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        execution_id = %execution.execution_id,
+                        "Failed to schedule runnable nodes: {e}"
+                    );
+                });
+            }
+            match page.next_after {
+                Some(next) => after = Some(next),
+                None => break,
+            }
         }
         Ok(())
     }
@@ -327,6 +353,34 @@ impl Scheduler {
         Ok(())
     }
 
+    /// The workflow IR, from a cache keyed by (workflow_id, version).
+    /// Registered IR is immutable per version, so it is deserialized once
+    /// rather than on every tick for every running execution. `None` when no
+    /// such version is registered.
+    async fn load_ir(
+        &self,
+        workflow_id: &str,
+        workflow_version: &str,
+    ) -> Result<Option<Arc<WorkflowIr>>, Box<dyn std::error::Error + Send + Sync>> {
+        let cache_key = (workflow_id.to_string(), workflow_version.to_string());
+        if let Some(ir) = self.ir_cache.lock().unwrap().get(&cache_key).cloned() {
+            return Ok(Some(ir));
+        }
+        let Some(def) = self
+            .backend
+            .get_workflow(workflow_id, workflow_version)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let ir = Arc::new(serde_json::from_value::<WorkflowIr>(def.ir)?);
+        self.ir_cache
+            .lock()
+            .unwrap()
+            .insert(cache_key, Arc::clone(&ir));
+        Ok(Some(ir))
+    }
+
     /// For a given execution, find all nodes that can now run and enqueue them.
     #[instrument(skip(self), fields(execution_id = %execution_id))]
     async fn schedule_runnable_nodes(
@@ -335,29 +389,9 @@ impl Scheduler {
         workflow_id: &str,
         workflow_version: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Load the workflow IR, using a cache keyed by (workflow_id, version).
-        // Registered IR is immutable per version, so we deserialize it once
-        // rather than on every tick for every running execution.
-        let cache_key = (workflow_id.to_string(), workflow_version.to_string());
-        let cached = self.ir_cache.lock().unwrap().get(&cache_key).cloned();
-        let ir: Arc<WorkflowIr> = match cached {
-            Some(ir) => ir,
-            None => {
-                let def = self
-                    .backend
-                    .get_workflow(workflow_id, workflow_version)
-                    .await?;
-                let Some(def) = def else {
-                    warn!(%workflow_id, %workflow_version, "Workflow definition not found; cannot schedule");
-                    return Ok(());
-                };
-                let ir = Arc::new(serde_json::from_value::<WorkflowIr>(def.ir)?);
-                self.ir_cache
-                    .lock()
-                    .unwrap()
-                    .insert(cache_key, Arc::clone(&ir));
-                ir
-            }
+        let Some(ir) = self.load_ir(workflow_id, workflow_version).await? else {
+            warn!(%workflow_id, %workflow_version, "Workflow definition not found; cannot schedule");
+            return Ok(());
         };
 
         // Fold only the events appended since the last tick into the cached
@@ -1396,6 +1430,45 @@ mod tests {
             provenance: None,
             idempotency_key: None,
         }
+    }
+
+    fn running_execution(started_at: chrono::DateTime<chrono::Utc>) -> WorkflowExecution {
+        WorkflowExecution {
+            execution_id: ExecutionId::new(),
+            workflow_id: "wf".into(),
+            workflow_version: "0.1.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: serde_json::json!({}),
+            current_state: serde_json::json!({}),
+            started_at,
+            updated_at: started_at,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        }
+    }
+
+    /// One tick advances every running run. It read one page of the 100 most
+    /// recently updated, so with 150 running the other 50 never moved.
+    #[tokio::test]
+    async fn a_tick_advances_every_running_run_past_the_first_page() {
+        let (s, backend, first) = setup(linear_ir()).await;
+        let mut ids = vec![first];
+        for _ in 0..(2 * RUNNING_PAGE as usize + 49) {
+            let e = running_execution(chrono::Utc::now());
+            ids.push(e.execution_id.clone());
+            backend.create_execution(e).await.unwrap();
+        }
+        s.tick().await.unwrap();
+        let mut stuck = 0;
+        for id in &ids {
+            let events = backend.get_events(id).await.unwrap();
+            if !scheduled_nodes(&events).contains(&"a".to_string()) {
+                stuck += 1;
+            }
+        }
+        assert_eq!(stuck, 0, "{stuck} of {} runs were not scheduled", ids.len());
     }
 
     #[tokio::test]

@@ -248,8 +248,8 @@ When `max_attempts` is exhausted, the node moves to `failed` and the item is sen
 
 | Timeout type | Scope | Behavior on expiry |
 |-------------|-------|--------------------|
-| `node_timeout` | Single node execution | Node fails (triggers retry policy) |
-| `workflow_timeout` | Entire workflow | Workflow cancelled |
+| `node_timeout` | Single node execution on the engine's own workers (a node's `node_timeout_secs` overrides it; `0` is no limit) | Node fails, not retried, whatever `retryable_on` says |
+| `workflow_timeout` | Entire workflow | Recorded in the IR, not enforced |
 | `heartbeat_timeout` | Worker heartbeat interval | Lease reclaimed, work re-queued |
 | `approval_timeout` | Human approval node | Node fails or routes to fallback |
 | `schedule_timeout` | Timer/scheduled resume | Timer fires escalation event |

@@ -30,7 +30,7 @@ pub struct OllamaAdapter {
 impl OllamaAdapter {
     pub fn new(host: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::model_client(),
             host: host.into(),
             default_model: DEFAULT_MODEL.into(),
         }

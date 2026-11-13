@@ -98,6 +98,11 @@ impl InMemoryBackend {
         self.tool_effects.insert(key, value);
     }
 
+    /// Test helper: the ids of every work item held.
+    pub fn work_item_ids_for_test(&self) -> Vec<WorkItemId> {
+        self.work_items.iter().map(|e| *e.key()).collect()
+    }
+
     /// Test helper: backdate a work item's lease so the reclaim sweep
     /// (`reclaim_expired_leases`) treats it as expired. Mirrors
     /// `SqliteBackend::force_lease_expired_for_test`. Not part of the
@@ -360,6 +365,27 @@ impl StateBackend for InMemoryBackend {
             .collect())
     }
 
+    async fn list_running_executions_after(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> BackendResult<crate::backend::RunningPage> {
+        let mut results: Vec<WorkflowExecution> = self
+            .executions
+            .iter()
+            .filter(|r| r.value().status == WorkflowStatus::Running)
+            .filter(|r| after.is_none_or(|a| r.value().execution_id.0.to_string().as_str() > a))
+            .map(|r| r.value().clone())
+            .collect();
+        results.sort_by_key(|r| r.execution_id.0.to_string());
+        results.truncate(limit as usize);
+        let next_after = results.last().map(|e| e.execution_id.0.to_string());
+        Ok(crate::backend::RunningPage {
+            executions: results,
+            next_after,
+        })
+    }
+
     // ── Event log ────────────────────────────────────────────────────
 
     async fn append_event(&self, event: Event) -> BackendResult<EventSequence> {
@@ -386,6 +412,35 @@ impl StateBackend for InMemoryBackend {
                 r.value()
                     .iter()
                     .filter(|e| e.sequence > since_sequence)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn get_events_page(
+        &self,
+        execution_id: &ExecutionId,
+        after: EventSequence,
+        limit: u32,
+        max_bytes: usize,
+    ) -> BackendResult<Vec<Event>> {
+        // Cloned one at a time, so no more of the log is copied than the
+        // page takes.
+        let mut total = 0usize;
+        Ok(self
+            .events
+            .get(execution_id)
+            .map(|r| {
+                r.value()
+                    .iter()
+                    .filter(|e| e.sequence > after)
+                    .take(limit as usize)
+                    .take_while(|e| {
+                        let fits = total < max_bytes;
+                        total += serde_json::to_vec(e).map(|b| b.len()).unwrap_or(0);
+                        fits
+                    })
                     .cloned()
                     .collect()
             })
@@ -474,8 +529,7 @@ impl StateBackend for InMemoryBackend {
         ttl: std::time::Duration,
     ) -> BackendResult<ReserveOutcome> {
         let now = Utc::now();
-        let expires_at =
-            now + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::minutes(5));
+        let expires_at = crate::backend::reservation_expiry(now, ttl);
 
         // `entry` holds the shard lock across the whole test-and-set, which is
         // what makes this atomic in the same way the SQL upsert is. A get-then-
@@ -487,12 +541,13 @@ impl StateBackend for InMemoryBackend {
                 Ok(ReserveOutcome::Acquired)
             }
             Entry::Occupied(mut o) => {
-                let (holder, _, holder_expiry) = o.get().clone();
-                if holder == owner || holder_expiry <= now {
-                    // Reentrant for the holder, or lapsed and presumed dead.
-                    // Either way the reservation is REPLACED, so it now carries
-                    // the newer fence — which is what makes a late release from
-                    // the older attempt a no-op.
+                let (holder, holder_fence, holder_expiry) = o.get().clone();
+                if (holder == owner && holder_fence == lease_fence) || holder_expiry <= now {
+                    // Renewed by the attempt that holds it, or lapsed and
+                    // presumed dead. Another attempt of the same worker id (a
+                    // new fence) waits like any other: worker ids are fixed,
+                    // and a worker that panicked after its effect used to
+                    // take its own reservation back and fire again.
                     o.insert((owner.to_string(), lease_fence, expires_at));
                     return Ok(ReserveOutcome::Acquired);
                 }
@@ -542,12 +597,49 @@ impl StateBackend for InMemoryBackend {
             .map(|r| r.value().0.clone()))
     }
 
+    async fn artifact_size(&self, hash: &str) -> BackendResult<Option<u64>> {
+        Ok(self
+            .artifacts
+            .get(&("default".to_string(), hash.to_string()))
+            .map(|r| r.value().0.len() as u64))
+    }
+
     // ── Work queue ───────────────────────────────────────────────────
 
     async fn enqueue_work_item(&self, item: WorkItem) -> BackendResult<WorkItemId> {
         let id = item.id;
         self.work_items.insert(id, item);
         Ok(id)
+    }
+
+    async fn list_claimed_work_items(
+        &self,
+        limit: u32,
+    ) -> BackendResult<Vec<crate::backend::ClaimedWorkItem>> {
+        let now = Utc::now();
+        let mut out: Vec<crate::backend::ClaimedWorkItem> = self
+            .work_items
+            .iter()
+            .filter_map(|entry| {
+                let item = entry.value();
+                let worker_id = item.worker_id.clone()?;
+                item.lease_expires_at.filter(|t| *t > now)?;
+                Some(crate::backend::ClaimedWorkItem {
+                    worker_id,
+                    work_item_id: item.id,
+                    execution_id: item.execution_id.clone(),
+                    node_id: item.node_id.clone(),
+                    queue_type: item.queue_type.clone(),
+                    lease_expires_at: item.lease_expires_at,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            (a.worker_id.as_str(), a.lease_expires_at)
+                .cmp(&(b.worker_id.as_str(), b.lease_expires_at))
+        });
+        out.truncate(limit as usize);
+        Ok(out)
     }
 
     async fn claim_work_item(

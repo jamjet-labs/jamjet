@@ -768,6 +768,45 @@ impl StateBackend for TenantScopedSqliteBackend {
         rows.iter().map(row_to_execution).collect()
     }
 
+    async fn list_running_executions_after(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> BackendResult<crate::backend::RunningPage> {
+        let rows = sqlx::query(
+            "SELECT * FROM workflow_executions WHERE status = 'running' AND tenant_id = ? \
+             AND execution_id > ? ORDER BY execution_id LIMIT ?",
+        )
+        .bind(&self.tenant_id.0)
+        .bind(after.unwrap_or_default())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        // A row that does not parse is left out, but its id still moves the
+        // cursor: the scheduler walks these pages, and one bad row must not
+        // stop it.
+        let next_after = rows
+            .last()
+            .map(|row| row.try_get::<String, _>("execution_id"))
+            .transpose()
+            .map_err(map_db_err)?;
+        let executions = rows
+            .iter()
+            .filter_map(|row| match row_to_execution(row) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!("skipping an unreadable running execution: {e}");
+                    None
+                }
+            })
+            .collect();
+        Ok(crate::backend::RunningPage {
+            executions,
+            next_after,
+        })
+    }
+
     // ── Event log ─────────────────────────────────────────────────────────
 
     #[instrument(skip(self, event), fields(tenant = %self.tenant_id, execution_id = %event.execution_id))]
@@ -847,6 +886,63 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?;
 
+        rows.iter().map(row_to_event).collect()
+    }
+
+    async fn list_claimed_work_items(
+        &self,
+        limit: u32,
+    ) -> BackendResult<Vec<crate::backend::ClaimedWorkItem>> {
+        let rows = sqlx::query(
+            "SELECT id, execution_id, node_id, queue_type, worker_id, lease_expires_at FROM work_items \
+             WHERE status = 'claimed' AND worker_id IS NOT NULL AND lease_expires_at > ? AND tenant_id = ? ORDER BY worker_id, lease_expires_at LIMIT ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(&self.tenant_id.0)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        rows.iter()
+            .map(|row| {
+                Ok(crate::backend::ClaimedWorkItem {
+                    worker_id: row.try_get("worker_id").map_err(map_db_err)?,
+                    work_item_id: uuid::Uuid::parse_str(
+                        row.try_get::<&str, _>("id").map_err(map_db_err)?,
+                    )
+                    .map_err(|e| StateBackendError::Database(e.to_string()))?,
+                    execution_id: parse_execution_id(
+                        row.try_get::<&str, _>("execution_id").map_err(map_db_err)?,
+                    )?,
+                    node_id: row.try_get("node_id").map_err(map_db_err)?,
+                    queue_type: row.try_get("queue_type").map_err(map_db_err)?,
+                    lease_expires_at: row
+                        .try_get::<Option<&str>, _>("lease_expires_at")
+                        .map_err(map_db_err)?
+                        .map(parse_datetime)
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    async fn get_events_page(
+        &self,
+        execution_id: &ExecutionId,
+        after: EventSequence,
+        limit: u32,
+        max_bytes: usize,
+    ) -> BackendResult<Vec<Event>> {
+        let sql = crate::sqlite::events_page_sql(true);
+        let rows = sqlx::query(&sql)
+            .bind(execution_id_str(execution_id))
+            .bind(&self.tenant_id.0)
+            .bind(after)
+            .bind(limit as i64)
+            .bind(max_bytes.min(i64::MAX as usize) as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_db_err)?;
         rows.iter().map(row_to_event).collect()
     }
 
@@ -1028,9 +1124,7 @@ impl StateBackend for TenantScopedSqliteBackend {
     ) -> BackendResult<ReserveOutcome> {
         let now = Utc::now();
         let now_s = now.to_rfc3339();
-        let expires_at = (now
-            + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::minutes(5)))
-        .to_rfc3339();
+        let expires_at = crate::backend::reservation_expiry(now, ttl).to_rfc3339();
 
         // See the untenanted backend for why this is one statement. `tenant_id`
         // is written on the row, but the KEY is the conflict target: an
@@ -1045,7 +1139,8 @@ impl StateBackend for TenantScopedSqliteBackend {
                  lease_fence = excluded.lease_fence, \
                  expires_at = excluded.expires_at, \
                  reserved_at = excluded.reserved_at \
-             WHERE tool_reservations.expires_at <= ? OR tool_reservations.owner = ?",
+             WHERE tool_reservations.expires_at <= ? \
+                OR (tool_reservations.owner = ? AND tool_reservations.lease_fence = ?)",
         )
         .bind(key)
         .bind(execution_id_str(execution_id))
@@ -1057,6 +1152,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .bind(&now_s)
         .bind(&now_s)
         .bind(owner)
+        .bind(lease_fence)
         .execute(&self.pool)
         .await
         .map_err(map_db_err)?
@@ -1166,6 +1262,16 @@ impl StateBackend for TenantScopedSqliteBackend {
             .map_err(map_db_err)?;
 
         Ok(row.map(|r| r.get::<Vec<u8>, _>("bytes")))
+    }
+
+    async fn artifact_size(&self, hash: &str) -> BackendResult<Option<u64>> {
+        let row = sqlx::query("SELECT size FROM artifacts WHERE tenant_id = ? AND hash = ?")
+            .bind(&self.tenant_id.0)
+            .bind(hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_db_err)?;
+        Ok(row.map(|r| r.get::<i64, _>("size").max(0) as u64))
     }
 
     // ── Work item queue ───────────────────────────────────────────────────
