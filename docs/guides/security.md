@@ -8,35 +8,43 @@
 
 Outside dev mode every route except `GET /health` and `GET /.well-known/did.json`
 needs `Authorization: Bearer <token>`. The runtime checks the token against the
-`api_tokens` table in its SQLite database, by SHA-256 hash. There is no CLI
-command or API route that issues tokens, so you write the row yourself. Start
-the server once against the database file so the table exists, then:
+`api_tokens` table in its SQLite database, by SHA-256 hash. Issue one with the
+server binary:
 
 ```bash
-python3 - .jamjet/runtime.db ci-deployer developer <<'EOF'
-import datetime, hashlib, secrets, sqlite3, sys, uuid
-
-db, name, role = sys.argv[1:4]
-token = "jj_" + secrets.token_hex(32)
-con = sqlite3.connect(db)
-con.execute(
-    "INSERT INTO api_tokens (id, token_hash, name, role, created_at) VALUES (?, ?, ?, ?, ?)",
-    (str(uuid.uuid4()), hashlib.sha256(token.encode()).hexdigest(), name, role,
-     datetime.datetime.now(datetime.timezone.utc).isoformat()),
-)
-con.commit()
-print(token)
-EOF
+TOKEN=$(jamjet-server token create --role developer --name ci-deployer)
 ```
 
-The arguments are the database path, a name and a role (see [RBAC](#rbac)).
-The token is printed once; only its hash is stored. To expire a token set
-`expires_at` (RFC 3339), and to revoke it set `revoked_at`. In the Docker image
-the database is wherever `DATABASE_URL` points (see
-[Deployment](deployment.md#docker)), and the same script runs inside the
-container with `docker exec -i <container> python3 - /data/runtime.db ...`. A
-server with `STORAGE_BACKEND=memory` has no table to write to, so it accepts no
-token.
+`--role` is required and is one of the [RBAC](#rbac) roles. `--name` labels the
+token (default `<role>-cli`), and `--tenant` issues it for another tenant, which
+must exist (the runtime refuses such tokens unless
+`JAMJET_TENANT_TOKENS_AS_DEFAULT=1`; see below). The command opens the database
+the server uses, `DATABASE_URL` or `.jamjet/runtime.db` in the working
+directory, so run it with the server's environment and working directory. It
+does not create a database or change its schema: start the server against it
+once first. It can run while the server is up. The token is printed once, on
+stdout; only its hash is stored. Its id and the database go to stderr.
+
+In the Docker image the environment already points at the volume:
+
+```bash
+docker exec <container> jamjet-server token create --role operator
+```
+
+A server with `STORAGE_BACKEND=memory` keeps tokens inside its own process, so
+the command refuses it and that server accepts no token.
+
+To revoke a token, pass its id:
+
+```bash
+jamjet-server token revoke <token id>
+```
+
+It is refused from the next request on. To make a token expire, set
+`expires_at` on its row in UTC, in the form `2026-12-31T23:59:59Z`: the check
+compares the text, so an offset such as `+05:30` is read wrong.
+
+Send the token as a Bearer header:
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" http://localhost:7700/executions
@@ -66,7 +74,64 @@ client = JamjetClient(base_url="http://localhost:7700", api_token=os.environ["JA
 Roles are ordered: each role can do everything the roles below it can. Outside dev
 mode every route below needs a Bearer token, and the role is enforced in code on the
 route, not by convention. Dev mode (`JAMJET_DEV_MODE=1`) has no tokens and enforces
-none of this.
+none of this, so dev mode has guards of its own:
+
+- It refuses to start unless it listens on loopback only.
+  `JAMJET_DEV_MODE_ALLOW_REMOTE=1` lets it listen elsewhere (Docker's
+  `0.0.0.0`), with a warning in the log: anyone who can reach the port then has
+  every role.
+- On any bind, it answers only requests addressed to `localhost`, a loopback
+  address or a name in `JAMJET_DEV_ALLOWED_HOSTS`. This stops a web page that
+  re-resolves its own host name to 127.0.0.1 (DNS rebinding) from driving the
+  runtime from your browser. `JAMJET_DEV_MODE_ALLOW_REMOTE` does not turn it off.
+- It refuses a request carrying `Forwarded` or any `X-Forwarded-*` header: a
+  tunnel such as ngrok with `--host-header=rewrite`, or cloudflared, rewrites
+  `Host` to `localhost` for a request from anywhere.
+- It refuses a request from a page of another site. With an `Origin`, the
+  origin decides: it must be an allowed host (`null` is not). Without one,
+  `Sec-Fetch-Site: cross-site` is refused. Any page can send a POST with no
+  body to 127.0.0.1, which is enough to cancel a run or deactivate an agent.
+
+What these guards trust:
+
+- Any page served from this machine, on any port. A dev UI on
+  `localhost:3000` is answered, and so is anything else you run locally that
+  serves pages, including a dev server for a project you just cloned.
+- Any request that reaches the port without a proxy header. A plain TCP
+  tunnel (`ssh -R`, `socat`, a port forward) adds no header and keeps the
+  client's `Host`, so a request through one passes as local. Don't expose a
+  dev-mode port that way; turn dev mode off and use a token.
+
+The model sidecar (`jamjet.model.sidecar_server`) has no token either and
+spends the provider keys in its environment. It answers only requests
+addressed to this machine (or a name in `JAMJET_SIDECAR_ALLOWED_HOSTS`),
+refuses requests through a proxy or from a page of another site by the same
+rules, and takes `POST /v1/complete` only as `application/json`. It trusts
+the same things.
+
+`jamjet-server token create` and `token revoke` seal `token_issued` and
+`token_revoked` into the audit log, with the token id, role, tenant and name.
+Separation of duties is keyed on the token id, so a reviewer token someone mints
+for themselves is on record. A token the log cannot record is revoked again and
+not printed. Run the commands with the audit signing settings the server uses.
+When the log's newest entry is signed and the command's environment has no key,
+another HMAC key or another Ed25519 key, `token create` refuses and creates
+nothing, and `token revoke` revokes the token and then reports that the log has
+no record of it. The token commands read one switch, `JAMJET_AUDIT_ALLOW_INSECURE_KEY`,
+after a revoke has revoked; the server's other switches don't stop them.
+
+After you rotate the audit key, start the server once with the new key before
+using the token commands with it. At start the server checks the log's newest
+entry, and when its key cannot verify it, it seals an `audit_key_changed`
+entry under the new key, naming the old and the new (`"previous": "Ed25519 key
+<kid>"`, `"current": ...`). That entry marks where one key's entries end on the
+chain.
+
+Each entry is dated after the one before it, so the log lists in chain order
+even when a writer's clock is behind. A newest entry dated in the future (a
+clock that ran ahead, then was corrected) holds every later entry's date just
+after it until real time catches up; the server logs a warning on each entry
+while the gap is over five minutes.
 
 | Route | Minimum role | Notes |
 |-------|--------------|-------|

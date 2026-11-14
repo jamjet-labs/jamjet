@@ -217,7 +217,7 @@ async def test_complete_core_tool_calls_infer_finish_reason() -> None:
 async def test_health_route() -> None:
     """GET /health returns {"ok": true}."""
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:4280") as client:
         resp = await client.get("/health")
 
     assert resp.status_code == 200
@@ -229,7 +229,7 @@ async def test_complete_route(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:4280") as client:
         resp = await client.post(
             "/v1/complete",
             json={
@@ -257,7 +257,7 @@ async def test_complete_route_malformed_json(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:4280") as client:
         resp = await client.post(
             "/v1/complete",
             content=b"not json at all",
@@ -273,7 +273,7 @@ async def test_complete_route_missing_model_key(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:4280") as client:
         resp = await client.post(
             "/v1/complete",
             json={"messages": [{"role": "user", "content": "hi"}]},
@@ -330,7 +330,7 @@ async def test_complete_route_rate_limited_returns_429(monkeypatch: pytest.Monke
     monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeRateLimitModel())
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:4280") as client:
         resp = await client.post(
             "/v1/complete",
             json={
@@ -353,7 +353,7 @@ async def test_complete_route_rate_limited_propagates_retry_after(
     monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeRateLimitModelWithRetryAfter())
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:4280") as client:
         resp = await client.post(
             "/v1/complete",
             json={
@@ -413,7 +413,7 @@ async def test_complete_route_model_denied_is_non_200(monkeypatch: pytest.Monkey
 
     # raise_app_exceptions=False mirrors uvicorn: unhandled exceptions become 500.
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:4280") as client:
         resp = await client.post(
             "/v1/complete",
             json={
@@ -460,3 +460,95 @@ def test_get_model_has_governed_middleware() -> None:
 
     # Restore singleton state so subsequent tests get a fresh instance.
     sidecar_module._model = None
+
+
+# ---------------------------------------------------------------------------
+# Only a local, same-site caller (LocalCallerOnly)
+# ---------------------------------------------------------------------------
+
+_BODY = '{"model": "anthropic/claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]}'
+
+
+async def _post(base_url: str, headers: dict[str, str]) -> httpx.Response:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url=base_url) as client:
+        return await client.post("/v1/complete", content=_BODY.encode(), headers=headers)
+
+
+async def test_a_text_plain_post_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Any page can POST text/plain to 127.0.0.1 without a preflight, and
+    ``request.json()`` ignored the type, so it ran a completion on the
+    developer's keys."""
+    monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
+    resp = await _post("http://127.0.0.1:4280", {"content-type": "text/plain"})
+    assert resp.status_code == 415
+    resp = await _post("http://127.0.0.1:4280", {})
+    assert resp.status_code == 415
+    resp = await _post("http://127.0.0.1:4280", {"content-type": "application/json; charset=utf-8"})
+    assert resp.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"sec-fetch-site": "cross-site"},
+        {"origin": "https://evil.example"},
+        {"origin": "null"},
+        {"origin": "http://localhost.evil.example"},
+        # As a browser sends them.
+        {"origin": "https://evil.example", "sec-fetch-site": "cross-site"},
+        {"origin": "null", "sec-fetch-site": "cross-site"},
+    ],
+)
+async def test_a_cross_site_request_is_refused(monkeypatch: pytest.MonkeyPatch, headers: dict[str, str]) -> None:
+    monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
+    resp = await _post("http://127.0.0.1:4280", {"content-type": "application/json", **headers})
+    assert resp.status_code == 403
+
+
+@pytest.mark.parametrize("host", ["http://rebound.evil.example:4280", "http://sidecar:4280"])
+async def test_another_host_name_is_refused(monkeypatch: pytest.MonkeyPatch, host: str) -> None:
+    """A page that rebinds its own name to 127.0.0.1 sends that name."""
+    monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
+    resp = await _post(host, {"content-type": "application/json"})
+    assert resp.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        ("x-forwarded-host", "abc.ngrok.app"),
+        ("x-forwarded-for", "203.0.113.9"),
+        ("forwarded", "for=203.0.113.9;host=abc.ngrok.app"),
+        ("x-forwarded-proto", "https"),
+    ],
+)
+async def test_a_request_through_a_tunnel_is_refused(monkeypatch: pytest.MonkeyPatch, header: tuple[str, str]) -> None:
+    """ngrok ``--host-header=rewrite`` and cloudflared send ``Host:
+    localhost`` for a request from anywhere; their forwarding headers give
+    them away."""
+    monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
+    resp = await _post("http://localhost:4280", {"content-type": "application/json", header[0]: header[1]})
+    assert resp.status_code == 403
+
+
+async def test_a_local_page_on_another_port_is_answered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """To the browser, ``localhost:3000`` calling ``127.0.0.1`` is another
+    site, and it says so beside the Origin. The Origin decides."""
+    monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
+    for origin in ["http://localhost:3000", "http://127.0.0.1:5173", "http://[::1]:8080"]:
+        resp = await _post(
+            "http://127.0.0.1:4280",
+            {"content-type": "application/json", "origin": origin, "sec-fetch-site": "cross-site"},
+        )
+        assert resp.status_code == 200, origin
+
+
+async def test_local_callers_and_listed_hosts_are_answered(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sidecar_module, "_get_model", lambda: FakeModel())
+    for base in ["http://127.0.0.1:4280", "http://localhost:4280", "http://[::1]:4280"]:
+        resp = await _post(base, {"content-type": "application/json", "origin": "http://localhost:3000"})
+        assert resp.status_code == 200, base
+    monkeypatch.setenv("JAMJET_SIDECAR_ALLOWED_HOSTS", "sidecar, other")
+    resp = await _post("http://sidecar:4280", {"content-type": "application/json"})
+    assert resp.status_code == 200

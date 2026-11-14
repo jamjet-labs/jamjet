@@ -27,12 +27,11 @@ We will coordinate disclosure with you and give credit to reporters (unless you 
 
 JamJet's security model is documented in [docs/guides/security.md](docs/guides/security.md). Key areas:
 
-- **Authentication:** API tokens (v1); OAuth/OIDC (v2)
+- **Authentication:** API tokens, issued with `jamjet-server token create`. There is no OAuth, OIDC or mTLS support.
 - **Authorization:** RBAC with operator, developer, reviewer, viewer roles
-- **Inter-agent auth:** Bearer tokens, OAuth2 client credentials, mTLS (cross-org)
-- **Secrets:** Environment variables (local); pluggable secrets backend (production)
-- **Tool sandboxing:** Permission classes and allowlists (v1); isolated sandbox workers (v2)
-- **Audit trail:** All human actions, privileged tool use, and inter-agent delegations are logged
+- **Secrets:** read from the server's environment (and a key file for the Ed25519 audit key). There is no secrets backend.
+- **Tool limits:** `blocked_tools`, `require_approval_for` and an agent's `allowed_tools`. There is no sandbox.
+- **Audit trail:** approval requests and decisions go to a hash-chained, optionally signed log. Policy blocks, delegations, logins and token issuance are not written to it.
 
 ## Scope
 

@@ -2,6 +2,7 @@ pub mod agent_tool;
 pub mod condition;
 pub mod coordinator;
 pub mod error;
+pub mod flag;
 pub mod node;
 pub mod retry;
 pub mod template;

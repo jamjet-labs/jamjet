@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+/// Turns authentication off for local development. A boolean switch
+/// ([`jamjet_core::flag`]).
+pub const DEV_MODE_ENV: &str = "JAMJET_DEV_MODE";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     /// Host address the API server binds to.
@@ -25,9 +29,10 @@ impl Default for ApiConfig {
                 .unwrap_or(7700),
             database_url: None,
             log_level: "info".into(),
-            dev_mode: std::env::var("JAMJET_DEV_MODE")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+            // `jamjet-server` refuses a value that is not a boolean before it
+            // gets here (`startup::check_flags`); a library caller reads it as
+            // off, which keeps authentication on.
+            dev_mode: jamjet_core::flag::env_flag(DEV_MODE_ENV).unwrap_or(false),
         }
     }
 }

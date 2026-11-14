@@ -208,6 +208,48 @@ def test_auto_activate_from_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     _replay_mod.deactivate()
 
 
+def _bundle_dir(tmp_path: Path) -> Path:
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"trace_id": "tr_env", "schema_version": "replay-1.0", "event_count": 0})
+    )
+    (tmp_path / "events.jsonl").write_text("")
+    (tmp_path / "audit.jsonl").write_text("")
+    (tmp_path / "agents.json").write_text("[]")
+    return tmp_path
+
+
+@pytest.mark.parametrize(("value", "stub"), [("on", True), ("ON", True), ("0", False), ("off", False)])
+def test_stub_models_reads_the_switch_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, stub: bool
+) -> None:
+    """``JAMJET_STUB_MODELS`` follows ``jamjet.flags``. It took only
+    ``1``/``true``/``yes``, so ``on`` read as off and the replay called real
+    models."""
+    import jamjet.cloud.replay as _replay_mod
+
+    monkeypatch.setenv("JAMJET_REPLAY_BUNDLE", str(_bundle_dir(tmp_path)))
+    monkeypatch.setenv("JAMJET_STUB_MODELS", value)
+    _replay_mod.deactivate()
+    _replay_mod._auto_activate()
+    assert _replay_mod.get_active() is not None
+    assert _replay_mod.is_stub_models() is stub
+    _replay_mod.deactivate()
+
+
+def test_a_stub_models_value_that_is_not_a_boolean_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A typo raises, naming the variable. A warning was not enough: replay
+    stayed off, and the program ran real models and real tools while its
+    user thought it was replaying."""
+    import jamjet.cloud.replay as _replay_mod
+
+    monkeypatch.setenv("JAMJET_REPLAY_BUNDLE", str(_bundle_dir(tmp_path)))
+    monkeypatch.setenv("JAMJET_STUB_MODELS", "maybe")
+    _replay_mod.deactivate()
+    with pytest.raises(ValueError, match="JAMJET_STUB_MODELS"):
+        _replay_mod._auto_activate()
+    assert _replay_mod.get_active() is None
+
+
 # ---------------------------------------------------------------------------
 # @tool replay intercept integration
 # ---------------------------------------------------------------------------
@@ -248,6 +290,30 @@ async def test_tool_decorator_falls_through_when_no_recording() -> None:
         assert result == 12  # real fn called
     finally:
         deactivate()
+
+
+@pytest.mark.asyncio
+async def test_a_bad_stub_models_value_stops_a_tool_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With a replay bundle set and a typo in JAMJET_STUB_MODELS, a @tool call
+    raises. The decorator swallowed every exception from importing the replay
+    module, so the real tool ran with no warning at all."""
+    import sys
+
+    called = False
+
+    @tool
+    async def charge(amount: int) -> int:
+        nonlocal called
+        called = True
+        return amount
+
+    monkeypatch.setenv("JAMJET_REPLAY_BUNDLE", str(_bundle_dir(tmp_path)))
+    monkeypatch.setenv("JAMJET_STUB_MODELS", "maybe")
+    # Imported fresh, as in a process that set the variables at start.
+    monkeypatch.delitem(sys.modules, "jamjet.cloud.replay", raising=False)
+    with pytest.raises(ValueError, match="JAMJET_STUB_MODELS"):
+        await charge(amount=5)
+    assert not called
 
 
 @pytest.mark.asyncio

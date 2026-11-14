@@ -136,9 +136,8 @@ static TENANT_TOKENS_AS_DEFAULT: std::sync::OnceLock<bool> = std::sync::OnceLock
 /// call; `main` makes that call at startup and logs a warning when it is on.
 pub fn tenant_tokens_as_default() -> bool {
     *TENANT_TOKENS_AS_DEFAULT.get_or_init(|| {
-        std::env::var(TENANT_TOKENS_AS_DEFAULT_ENV)
-            .map(|v| matches!(v.as_str(), "1" | "true"))
-            .unwrap_or(false)
+        // `jamjet-server` refuses a value that is not a boolean at startup.
+        jamjet_core::flag::env_flag(TENANT_TOKENS_AS_DEFAULT_ENV).unwrap_or(false)
     })
 }
 
