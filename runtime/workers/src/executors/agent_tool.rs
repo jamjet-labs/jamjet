@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument, warn, Span};
 
 pub struct AgentToolExecutor;
 
@@ -398,7 +398,13 @@ impl AgentToolExecutor {
 
 #[async_trait]
 impl NodeExecutor for AgentToolExecutor {
-    #[instrument(skip(self, item), fields(node_id = %item.node_id))]
+    #[instrument(skip(self, item), fields(
+        node_id = %item.node_id,
+        jamjet.agent_tool.mode = tracing::field::Empty,
+        jamjet.agent_tool.protocol = tracing::field::Empty,
+        jamjet.agent_tool.agent_uri = tracing::field::Empty,
+        jamjet.agent_tool.latency_ms = tracing::field::Empty,
+    ))]
     async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
         let p = &item.payload;
@@ -469,7 +475,7 @@ impl NodeExecutor for AgentToolExecutor {
 
         debug!(agent_uri = %agent_uri, mode = %mode, protocol = %protocol, "AgentTool: invoking");
 
-        match mode.as_str() {
+        let result = match mode.as_str() {
             "sync" => self
                 .execute_sync(
                     item,
@@ -513,12 +519,29 @@ impl NodeExecutor for AgentToolExecutor {
             other => Err(ExecutorError::Fatal(format!(
                 "Unknown agent_tool mode: '{other}'"
             ))),
-        }
+        };
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+        jamjet_telemetry::record_agent_tool_attrs(
+            &Span::current(),
+            &mode,
+            protocol,
+            agent_uri,
+            latency_ms,
+        );
+
+        result
     }
 
     /// Incremental NDJSON streaming with per-chunk idle timeout, budget guard,
     /// and A2A cancel on early termination. Events are sent via `tx` in real time.
-    #[instrument(skip(self, item, tx), fields(node_id = %item.node_id))]
+    #[instrument(skip(self, item, tx), fields(
+        node_id = %item.node_id,
+        jamjet.agent_tool.mode = tracing::field::Empty,
+        jamjet.agent_tool.protocol = tracing::field::Empty,
+        jamjet.agent_tool.agent_uri = tracing::field::Empty,
+        jamjet.agent_tool.latency_ms = tracing::field::Empty,
+    ))]
     async fn execute_streaming(
         &self,
         item: &WorkItem,
@@ -812,6 +835,16 @@ impl NodeExecutor for AgentToolExecutor {
                 }
             }
         }
+
+        // ── Record OTel span attributes ────────────────────────────────
+        let final_latency_ms = start.elapsed().as_millis() as u64;
+        jamjet_telemetry::record_agent_tool_attrs(
+            &Span::current(),
+            &mode,
+            protocol,
+            agent_uri,
+            final_latency_ms,
+        );
 
         // ── Return error for hard failures ───────────────────────────────
         if let Some(error) = terminal_error {

@@ -306,6 +306,20 @@ pub mod gen_ai_attrs {
     pub const JAMJET_ATTEMPT: &str = "jamjet.attempt";
     /// Estimated USD cost of this operation (if available).
     pub const JAMJET_COST_USD: &str = "jamjet.cost.usd";
+
+    // ── Coordinator span attributes ──────────────────────────────────────────
+
+    pub const COORDINATOR_CANDIDATES_COUNT: &str = "jamjet.coordinator.candidates_count";
+    pub const COORDINATOR_SPREAD: &str = "jamjet.coordinator.spread";
+    pub const COORDINATOR_METHOD: &str = "jamjet.coordinator.method";
+    pub const COORDINATOR_SELECTED_AGENT: &str = "jamjet.coordinator.selected_agent";
+
+    // ── Agent-tool span attributes ───────────────────────────────────────────
+
+    pub const AGENT_TOOL_MODE: &str = "jamjet.agent_tool.mode";
+    pub const AGENT_TOOL_PROTOCOL: &str = "jamjet.agent_tool.protocol";
+    pub const AGENT_TOOL_AGENT_URI: &str = "jamjet.agent_tool.agent_uri";
+    pub const AGENT_TOOL_LATENCY_MS: &str = "jamjet.agent_tool.latency_ms";
 }
 
 /// Helper to record GenAI attributes on the current span.
@@ -419,6 +433,36 @@ pub fn record_execution_context(
     span.record(gen_ai_attrs::JAMJET_WORKFLOW_ID, workflow_id);
     span.record(gen_ai_attrs::JAMJET_NODE_ID, node_id);
     span.record(gen_ai_attrs::JAMJET_NODE_KIND, node_kind);
+}
+
+/// Record coordinator-specific span attributes.
+pub fn record_coordinator_attrs(
+    span: &tracing::Span,
+    candidates_count: u64,
+    spread: f64,
+    method: &str,
+    selected_agent: Option<&str>,
+) {
+    span.record(gen_ai_attrs::COORDINATOR_CANDIDATES_COUNT, candidates_count);
+    span.record(gen_ai_attrs::COORDINATOR_SPREAD, spread);
+    span.record(gen_ai_attrs::COORDINATOR_METHOD, method);
+    if let Some(uri) = selected_agent {
+        span.record(gen_ai_attrs::COORDINATOR_SELECTED_AGENT, uri);
+    }
+}
+
+/// Record agent-tool-specific span attributes.
+pub fn record_agent_tool_attrs(
+    span: &tracing::Span,
+    mode: &str,
+    protocol: &str,
+    agent_uri: &str,
+    latency_ms: u64,
+) {
+    span.record(gen_ai_attrs::AGENT_TOOL_MODE, mode);
+    span.record(gen_ai_attrs::AGENT_TOOL_PROTOCOL, protocol);
+    span.record(gen_ai_attrs::AGENT_TOOL_AGENT_URI, agent_uri);
+    span.record(gen_ai_attrs::AGENT_TOOL_LATENCY_MS, latency_ms);
 }
 
 #[cfg(test)]
