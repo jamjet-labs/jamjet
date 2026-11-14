@@ -54,7 +54,7 @@ fn external_fn() -> NodeKind {
 
 fn decide(node_id: &str, kind: &NodeKind, policy: &PolicySetIr) -> PolicyDecision {
     let ctx = EvaluationContext::from_node_kind(node_id, kind);
-    PolicyEvaluator.evaluate(&ctx, &[policy])
+    PolicyEvaluator.evaluate_ir(&ctx, &[policy])
 }
 
 fn gated(d: &PolicyDecision) -> bool {

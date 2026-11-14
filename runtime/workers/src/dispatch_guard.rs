@@ -122,6 +122,20 @@ pub fn payload_input(payload: &Value) -> Value {
     payload.get("input").cloned().unwrap_or(Value::Null)
 }
 
+/// The calls of a dispatch batch as an approval binds them: `name` and
+/// `arguments` per call, in order, plus the `handler` a call resolves to
+/// through the run's `tools` map (the same name and arguments can run
+/// different code through the map). Nothing else.
+pub(crate) fn bound_calls(calls: &[jamjet_policy::dispatch::PendingToolCall]) -> Value {
+    serde_json::json!(calls
+        .iter()
+        .map(|c| match &c.handler {
+            Some(h) => serde_json::json!({"name": c.name, "arguments": c.arguments, "handler": h}),
+            None => serde_json::json!({"name": c.name, "arguments": c.arguments}),
+        })
+        .collect::<Vec<_>>())
+}
+
 /// Decide whether a marked agent dispatch node may run, and emit the audit
 /// trail. **The CALLER settles the work item.**
 ///
@@ -177,7 +191,7 @@ pub(crate) async fn guard_dispatch_in(
     card_gated: &[String],
 ) -> DispatchGuardOutcome {
     let fire = mode == GuardMode::Fire;
-    // Load tenant policy (sits between global and workflow in the chain).
+    // Load the tenant policy: a ceiling over the workflow and node layers.
     //
     // `Ok(None)` — this tenant has no policy — and `Err` — we could not find out
     // — must NOT collapse together. Swallowing the error makes an unreadable
@@ -216,23 +230,24 @@ pub(crate) async fn guard_dispatch_in(
         }
     };
 
-    // Build policy chain: tenant -> workflow -> node (least-specific to
-    // most-specific). The evaluator iterates in reverse, so node rules win.
-    let mut sets: Vec<&PolicySetIr> = Vec::new();
-    if let Some(ref tp) = tenant_policy_set {
-        sets.push(tp);
-    }
+    // The IR's layers, workflow then node (least to most specific): node
+    // rules win between them. The tenant layer is a ceiling over both.
+    let mut layers: Vec<&PolicySetIr> = Vec::new();
     if let Some(p) = workflow_policy {
-        sets.push(p);
+        layers.push(p);
     }
     if let Some(p) = &node_def.policy {
-        sets.push(p);
+        layers.push(p);
     }
+    let tenant = tenant_policy_set.as_ref();
+    // The whole chain, tenant first, for the approval deadline: every level
+    // is a ceiling there already.
+    let sets: Vec<&PolicySetIr> = tenant.into_iter().chain(layers.iter().copied()).collect();
     // `card_gated`: calls an agent card's `require_approval_for` names. They
     // are gated here, through the same per-call request as a chain gate, so
     // the approver sees every call and its arguments, and a chain block on
     // any call in the batch is refused before anyone is asked to approve.
-    if sets.is_empty() && card_gated.is_empty() {
+    if tenant.is_none() && layers.is_empty() && card_gated.is_empty() {
         return DispatchGuardOutcome::Allow;
     }
 
@@ -266,24 +281,27 @@ pub(crate) async fn guard_dispatch_in(
         }
     };
 
-    let decision = match jamjet_policy::dispatch::evaluate_dispatch(node_id, &calls, &sets) {
-        DispatchDecision::Allow if !card_gated.is_empty() => DispatchDecision::RequireApproval {
-            approver: "human".to_string(),
-            gated: card_gated.to_vec(),
-        },
-        DispatchDecision::RequireApproval {
-            approver,
-            mut gated,
-        } => {
-            for name in card_gated {
-                if !gated.contains(name) {
-                    gated.push(name.clone());
+    let decision =
+        match jamjet_policy::dispatch::evaluate_dispatch(node_id, &calls, tenant, &layers) {
+            DispatchDecision::Allow if !card_gated.is_empty() => {
+                DispatchDecision::RequireApproval {
+                    approver: "human".to_string(),
+                    gated: card_gated.to_vec(),
                 }
             }
-            DispatchDecision::RequireApproval { approver, gated }
-        }
-        other => other,
-    };
+            DispatchDecision::RequireApproval {
+                approver,
+                mut gated,
+            } => {
+                for name in card_gated {
+                    if !gated.contains(name) {
+                        gated.push(name.clone());
+                    }
+                }
+                DispatchDecision::RequireApproval { approver, gated }
+            }
+            other => other,
+        };
     match decision {
         DispatchDecision::Allow => DispatchGuardOutcome::Allow,
 
@@ -332,16 +350,7 @@ pub(crate) async fn guard_dispatch_in(
             // still matches the approval. Widening this to the raw call objects
             // would bind the approval to fields that carry no authority and
             // would make benign re-issues fail the check.
-            let calls_json = serde_json::json!(calls
-                .iter()
-                .map(|c| match &c.handler {
-                    // The resolved handler is bound too: the same name and
-                    // arguments can run different code through the map.
-                    Some(h) =>
-                        serde_json::json!({"name": c.name, "arguments": c.arguments, "handler": h}),
-                    None => serde_json::json!({"name": c.name, "arguments": c.arguments}),
-                })
-                .collect::<Vec<_>>());
+            let calls_json = bound_calls(&calls);
             let current_hash = content_hash(&calls_json);
 
             // ONE read of the event log, for the whole approval decision.
@@ -704,28 +713,46 @@ pub(crate) async fn record_policy_violation(
 
 /// Determine which policy scope triggered a non-Allow decision.
 ///
-/// Checks each scope individually from most-specific (node) to least-specific
-/// (tenant), returning the name of the first scope that produces a non-Allow
-/// decision.
+/// A tenant block is named first: the tenant layer is a ceiling, so when it
+/// blocks it decided, whatever the IR's layers say. Otherwise each scope is
+/// checked on its own from most-specific (node) to least-specific (tenant),
+/// returning the name of the first scope that produces a non-Allow decision.
 pub fn identify_policy_scope(
     ctx: &EvaluationContext,
     tenant_policy: Option<&PolicySetIr>,
     workflow_policy: Option<&PolicySetIr>,
     node_policy: Option<&PolicySetIr>,
 ) -> String {
-    // Check most-specific first (same order as evaluator's reverse iteration).
+    if let Some(p) = tenant_policy {
+        if matches!(
+            PolicyEvaluator.evaluate_tenant(ctx, p),
+            PolicyDecision::Block { .. }
+        ) {
+            return "tenant".to_string();
+        }
+    }
+    // Then most-specific first (same order as evaluator's reverse iteration).
     if let Some(p) = node_policy {
-        if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
+        if !matches!(
+            PolicyEvaluator.evaluate_ir(ctx, &[p]),
+            PolicyDecision::Allow
+        ) {
             return "node".to_string();
         }
     }
     if let Some(p) = workflow_policy {
-        if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
+        if !matches!(
+            PolicyEvaluator.evaluate_ir(ctx, &[p]),
+            PolicyDecision::Allow
+        ) {
             return "workflow".to_string();
         }
     }
     if let Some(p) = tenant_policy {
-        if !matches!(PolicyEvaluator.evaluate(ctx, &[p]), PolicyDecision::Allow) {
+        if !matches!(
+            PolicyEvaluator.evaluate_tenant(ctx, p),
+            PolicyDecision::Allow
+        ) {
             return "tenant".to_string();
         }
     }
@@ -1169,6 +1196,325 @@ mod tests {
         let outcome = f.guard(&unpoliced_ir(), &input_for(&["send_wire"])).await;
         assert!(matches!(outcome, DispatchGuardOutcome::Blocked { .. }));
         assert_eq!(f.violations().await[0].1, "tenant");
+    }
+
+    /// The tenant layer is a ceiling: a workflow `require_approval_for` on
+    /// the same tool used to turn the tenant's block into an approval
+    /// request, so the run held for a person instead of refusing.
+    #[tokio::test]
+    async fn a_workflow_gate_does_not_downgrade_a_tenant_block() {
+        let f = Fixture::new();
+        f.with_tenant_policy(&["send_wire"], &[]).await;
+        let outcome = f
+            .guard(&ir(&[], &["send_wire"]), &input_for(&["send_wire"]))
+            .await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Blocked { .. }),
+            "{outcome:?}"
+        );
+        assert!(f.requests().await.is_empty(), "nobody is asked to approve");
+        assert_eq!(f.violations().await[0].1, "tenant");
+    }
+
+    // ── Tenant ceiling on a model node ───────────────────────────────────────
+
+    /// A model node `n1` naming the IR alias `fast`, which the `models` map
+    /// resolves to `provider/model`, under a workflow policy.
+    fn model_ir(provider: &str, model: &str, policy: serde_json::Value) -> WorkflowIr {
+        serde_json::from_value(json!({
+            "workflow_id": "model-wf",
+            "version": "1.0.0",
+            "state_schema": "{}",
+            "start_node": "n1",
+            "nodes": { "n1": { "id": "n1", "kind": {
+                "type": "model",
+                "model_ref": "fast",
+                "prompt_ref": "hello",
+                "output_schema": "",
+                "system_prompt": null
+            }}},
+            "edges": [],
+            "retry_policies": {},
+            "models": { "fast": { "provider": provider, "model": model } },
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {},
+            "policy": policy
+        }))
+        .expect("model IR must deserialize")
+    }
+
+    impl Fixture {
+        async fn with_tenant(&self, policy: serde_json::Value) {
+            let now = chrono::Utc::now();
+            self.backend
+                .create_tenant(Tenant {
+                    id: "default".into(),
+                    name: "default".into(),
+                    status: TenantStatus::Active,
+                    policy: Some(policy),
+                    limits: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .unwrap();
+        }
+
+        /// The model node of `ir` through the shared guard, with the payload
+        /// the scheduler builds for it.
+        async fn guard_model(&self, ir: &WorkflowIr) -> DispatchGuardOutcome {
+            let node_def = ir.node("n1").unwrap();
+            let payload = jamjet_scheduler::payload::build_work_item_payload(
+                ir,
+                "n1",
+                node_def,
+                &serde_json::Map::new(),
+                &ir.workflow_id,
+                &ir.version,
+            );
+            crate::node_guard::guard_item(
+                self.backend.as_ref(),
+                GuardMode::Fire,
+                &self.execution_id,
+                "n1",
+                "default",
+                ir.policy.as_ref(),
+                node_def,
+                &payload,
+                None,
+                Default::default(),
+                None,
+            )
+            .await
+        }
+    }
+
+    /// A dispatch node held by its own name (here a tenant gate on `n1`):
+    /// approving it releases every call in its batch, so the request lists
+    /// them, as a per-call gate's request does. It used to name only the
+    /// dispatcher.
+    #[tokio::test]
+    async fn a_node_name_gate_on_a_dispatch_lists_its_calls() {
+        let f = Fixture::new();
+        f.with_tenant_policy(&[], &["n1"]).await;
+        let ir = unpoliced_ir();
+        let node_def = ir.node("n1").unwrap();
+        let payload = json!({
+            "workflow_id": ir.workflow_id,
+            "workflow_version": ir.version,
+            "node_id": "n1",
+            "input": input_for(&["send_wire", "lookup"]),
+        });
+        let outcome = crate::node_guard::guard_item(
+            f.backend.as_ref(),
+            GuardMode::Fire,
+            &f.execution_id,
+            "n1",
+            "default",
+            ir.policy.as_ref(),
+            node_def,
+            &payload,
+            None,
+            Default::default(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, crate::node_guard::GuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        let (_, _, ctx) = f.requests().await.pop().expect("a request");
+        assert_eq!(ctx["gated_tools"], json!(["send_wire", "lookup"]), "{ctx}");
+        assert_eq!(
+            ctx["calls"],
+            calls_json_for(&["send_wire", "lookup"]),
+            "{ctx}"
+        );
+        assert_eq!(ctx["calls_truncated"], false, "{ctx}");
+    }
+
+    /// The calls a node-name request lists are bounded as its payload is: a
+    /// batch with a 64 KiB argument is shown by its keys and sizes, not
+    /// stored whole in the request.
+    #[tokio::test]
+    async fn a_node_name_gate_bounds_the_calls_it_lists() {
+        let f = Fixture::new();
+        f.with_tenant_policy(&[], &["n1"]).await;
+        let ir = unpoliced_ir();
+        let node_def = ir.node("n1").unwrap();
+        let big = "x".repeat(64 * 1024);
+        let payload = json!({
+            "workflow_id": ir.workflow_id,
+            "workflow_version": ir.version,
+            "node_id": "n1",
+            "input": { "tool_calls": [
+                { "id": "c1", "name": "send_wire", "arguments": { "memo": big, "payee": "acme" } }
+            ] },
+        });
+        let outcome = crate::node_guard::guard_item(
+            f.backend.as_ref(),
+            GuardMode::Fire,
+            &f.execution_id,
+            "n1",
+            "default",
+            ir.policy.as_ref(),
+            node_def,
+            &payload,
+            None,
+            Default::default(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, crate::node_guard::GuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        let (_, _, ctx) = f.requests().await.pop().expect("a request");
+        assert_eq!(ctx["gated_tools"], json!(["send_wire"]));
+        assert_eq!(ctx["calls_truncated"], true);
+        assert!(ctx["calls_bytes"].as_u64().unwrap() > 64 * 1024);
+        let shown = serde_json::to_string(&ctx["calls"]).unwrap().len();
+        assert!(
+            shown < jamjet_state::approvals::ACTION_BASIS_STATE_CAP * 2,
+            "{shown} bytes"
+        );
+        assert!(
+            ctx["calls"].to_string().contains("payee"),
+            "the small key next to the large one is hidden: {}",
+            ctx["calls"]
+        );
+    }
+
+    /// A workflow allowlist that lists the model used to allow it before the
+    /// tenant's allowlist was read.
+    #[tokio::test]
+    async fn a_workflow_allowlist_does_not_widen_the_tenant_allowlist() {
+        let f = Fixture::new();
+        f.with_tenant(json!({ "model_allowlist": ["anthropic"] }))
+            .await;
+        let ir = model_ir(
+            "openai",
+            "gpt-4o",
+            json!({ "model_allowlist": ["openai/*"] }),
+        );
+        let outcome = f.guard_model(&ir).await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Blocked { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(f.violations().await[0].1, "tenant");
+    }
+
+    /// The allowlist is checked against the model the executor calls, not the
+    /// alias: an alias spelled like an allowed provider used to pass.
+    #[tokio::test]
+    async fn an_allowlist_is_checked_against_the_resolved_model_not_the_alias() {
+        let f = Fixture::new();
+        f.with_tenant(json!({ "model_allowlist": ["anthropic"] }))
+            .await;
+        let mut ir = model_ir("openai", "gpt-4o", json!({}));
+        let fast = ir.models.remove("fast").unwrap();
+        ir.models.insert("anthropic".into(), fast);
+        if let Some(n) = ir.nodes.get_mut("n1") {
+            n.kind = serde_json::from_value(json!({
+                "type": "model", "model_ref": "anthropic", "prompt_ref": "hello",
+                "output_schema": "", "system_prompt": null
+            }))
+            .unwrap();
+        }
+        let outcome = f.guard_model(&ir).await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Blocked { ref reason } if reason.contains("openai/gpt-4o")),
+            "{outcome:?}"
+        );
+    }
+
+    /// A model work item whose payload names no model is refused: the guard
+    /// would check the alias while the executor called its default model.
+    #[tokio::test]
+    async fn a_model_item_that_names_no_model_is_refused() {
+        let f = Fixture::new();
+        let ir = model_ir("anthropic", "claude-opus-4-8", json!({}));
+        let node_def = ir.node("n1").unwrap();
+        let outcome = crate::node_guard::guard_item(
+            f.backend.as_ref(),
+            GuardMode::Fire,
+            &f.execution_id,
+            "n1",
+            "default",
+            ir.policy.as_ref(),
+            node_def,
+            &json!({ "workflow_id": "model-wf", "node_id": "n1", "prompt": "hi" }),
+            None,
+            Default::default(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, DispatchGuardOutcome::Blocked { reason }
+                if reason == crate::node_guard::MODEL_UNNAMED_RULE),
+            "{outcome:?}"
+        );
+        assert_eq!(f.violations().await.len(), 1);
+    }
+
+    /// A per-call dispatch request raised under a tenant gate carries the
+    /// tenant's deadline: the chain the deadline is read from still holds the
+    /// tenant layer after the evaluation stopped taking it as one more layer.
+    #[tokio::test]
+    async fn a_dispatch_request_carries_the_tenant_deadline() {
+        let f = Fixture::new();
+        let mut tenant = policy_json(&[], &["send_wire"]);
+        tenant["approval_timeout_secs"] = json!(900);
+        f.with_tenant(tenant).await;
+        let before = chrono::Utc::now();
+        let outcome = f.guard(&unpoliced_ir(), &input_for(&["send_wire"])).await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        let requests = f.requests().await;
+        let deadline = jamjet_state::approvals::RequestDeadline::of(&requests[0].2);
+        let jamjet_state::approvals::DeadlineTime::At(expires_at) = deadline.expires_at else {
+            panic!("no expires_at: {}", requests[0].2);
+        };
+        let off = (expires_at - (before + chrono::Duration::seconds(900))).num_seconds();
+        assert!((0..=5).contains(&off), "expires_at {expires_at}");
+    }
+
+    /// A model on both allowlists runs.
+    #[tokio::test]
+    async fn a_model_on_both_allowlists_runs() {
+        let f = Fixture::new();
+        f.with_tenant(json!({ "model_allowlist": ["anthropic"] }))
+            .await;
+        let ir = model_ir(
+            "anthropic",
+            "claude-opus-4-8",
+            json!({ "model_allowlist": ["anthropic/claude-opus-*"] }),
+        );
+        let outcome = f.guard_model(&ir).await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Allow),
+            "{outcome:?}"
+        );
+    }
+
+    /// A tenant `require_approval_for: ["*"]` holds a model node. A model node
+    /// has no tool name, so this used to match nothing and the call ran.
+    #[tokio::test]
+    async fn a_tenant_catch_all_gate_holds_a_model_node() {
+        let f = Fixture::new();
+        f.with_tenant(json!({ "require_approval_for": ["*"] }))
+            .await;
+        let ir = model_ir("anthropic", "claude-opus-4-8", json!({}));
+        let outcome = f.guard_model(&ir).await;
+        assert!(
+            matches!(outcome, DispatchGuardOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(f.requests().await.len(), 1);
     }
 
     // ── Unreadable ────────────────────────────────────────────────────────────

@@ -119,7 +119,8 @@ pub struct NodeDef {
     /// Extra observability labels for this node's spans.
     #[serde(default)]
     pub labels: HashMap<String, String>,
-    /// Node-level policy override (most specific — overrides workflow + global).
+    /// Node-level policy (most specific IR layer: overrides the workflow's,
+    /// never the tenant's, which is a ceiling over both).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicySetIr>,
     /// Node-level data policy override.

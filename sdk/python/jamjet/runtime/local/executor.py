@@ -29,6 +29,18 @@ if TYPE_CHECKING:
     from jamjet.agents.governance import GovernanceConfig
 
 
+TOOLS_ONLY_PREFIX = "tool:"
+
+
+def _is_tools_catch_all(pattern: str) -> bool:
+    """``tool:`` and one or more ``*``: every tool, never a model call.
+
+    The engine's ``is_tools_catch_all`` (``runtime/policy/src/lib.rs``).
+    """
+    rest = pattern[len(TOOLS_ONLY_PREFIX) :] if pattern.startswith(TOOLS_ONLY_PREFIX) else ""
+    return bool(rest) and set(rest) == {"*"}
+
+
 class LocalRuntime:
     name = "local"
     supported_ir_versions: tuple[str, ...] = ("1.0",)
@@ -251,6 +263,10 @@ class LocalRuntime:
         (`glob_match` in `runtime/policy/src/lib.rs`), and the policy is resolved
         with the same function the durable path compiles into the IR, so a given
         `Agent(...)` cannot mean one thing in-process and another durable.
+        ``tool:*`` is every tool, as in the engine (`is_tools_catch_all`):
+        matched as written it named no tool, so it blocked nothing here.
+        `tests/fixtures/blocked_tool_patterns.json` holds the cases both sides
+        are tested on.
         """
         if governance is None:
             return spec
@@ -262,6 +278,7 @@ class LocalRuntime:
         if not patterns:
             return spec
 
+        patterns = ["*" if _is_tools_catch_all(p) else p for p in patterns]
         kept = [t for t in spec.tools if not any(_glob_match(pat, t.name) for pat in patterns)]
         if len(kept) == len(spec.tools):
             return spec
