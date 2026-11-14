@@ -415,6 +415,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Allow scoped local `DurableAgent` runs without the optional Engram package
+  when memory is absent, disabled, or configured with the `none` backend.
+
 - Fail trajectory evaluations when their event log cannot be fetched, instead of
   silently passing them based on output scorers alone. Output-only evaluations
   retain best-effort event collection.

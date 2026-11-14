@@ -176,7 +176,7 @@ class LocalRuntime:
         instance = cls()
 
         engram_scope = None
-        if scope is not None:
+        if scope is not None and spec.memory is not None and spec.memory.enabled and spec.memory.backend != "none":
             try:
                 from engram import Scope as EngramScope
             except ImportError as e:
