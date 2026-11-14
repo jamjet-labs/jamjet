@@ -49,6 +49,10 @@ ENV ENGRAM_LLM_MODEL=llama3.2
 ENV ENGRAM_EMBEDDING_MODEL=nomic-embed-text
 ENV ENGRAM_EMBEDDING_DIMS=768
 
+# REST mode (ENGRAM_MODE=rest) listens on every interface in a container, so
+# it needs ENGRAM_AUTH_TOKEN; MCP stdio mode has no listener.
+ENV ENGRAM_HOST=0.0.0.0
+
 # Default to MCP stdio mode (most common use case for AI agents)
 ENTRYPOINT ["engram"]
 CMD ["serve"]

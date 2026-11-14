@@ -14,7 +14,8 @@ Cards.
 jamjet a2a discover https://agents.partner.com
 ```
 
-The CLI fetches `<url>/.well-known/agent.json` and prints it:
+The CLI fetches `/.well-known/agent.json` at the URL's origin (its scheme,
+host and port; any path, query or fragment is dropped) and prints it:
 
 ```
 Fetching Agent Card from: https://agents.partner.com/.well-known/agent.json
@@ -44,8 +45,10 @@ It only reads the card. Nothing is registered.
 ## Registering a remote agent
 
 `POST /agents/discover` with `{"url": "<base url>"}` (or
-`jamjet agents discover <url> --register`) fetches the same
-`/.well-known/agent.json` and registers it in the runtime's agent registry.
+`jamjet agents discover <url> --register`) fetches the same card, at the
+origin's `/.well-known/agent.json`, and registers it in the runtime's agent
+registry. An agent served under a path (`https://host/team/x`) is read and
+registered from `https://host/.well-known/agent.json`.
 The document must be a JamJet Agent Card (`id`, `uri`, `name`, `capabilities`,
 `autonomy`, `auth` and the other fields in the
 [Agent Model Guide](agent-model-guide.md)). A standard A2A card does not parse,

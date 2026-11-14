@@ -142,6 +142,28 @@ credentials in an `mcp:` or `a2a:` block are not used. Its own MCP endpoint,
 `/mcp`, takes the same Bearer tokens and roles as the REST routes. The server
 has no OAuth or mTLS support.
 
+`POST /agents/discover` (and the MCP tool `jamjet_discover_agent`) fetches the
+Agent Card at a URL the caller gives, so it is guarded: the URL must be
+`https` with no credentials in it, and the host must resolve only to public
+addresses (no loopback, private, link-local, CGNAT or metadata ranges). The
+request is pinned to the addresses that were checked, ignores proxy
+environment variables (a proxy would resolve the name again), and does not
+follow redirects. The lookup, the connection and the read share one 10 s budget,
+the card URL is the base's scheme, host and port with the path
+`/.well-known/agent.json` (any other path, query or fragment is dropped),
+the card is capped at 256 KiB, and any fetch failure, including a name that
+resolves inward, returns the same message, so the route cannot be used to
+read internal services, map ports or list internal names. A URL refused for
+its scheme or host is a 400. For an agent on your own machine set
+`JAMJET_DISCOVERY_ALLOW_PRIVATE=1`, which also allows `http`. Cloud metadata
+addresses stay refused: link-local, 100.100.100.200, fd00:ec2::254,
+fd20:ce::254, fd00:c1::a9fe:a9fe, all of the local-use NAT64 prefix
+64:ff9b:1::/48, and an IPv6 address that carries one of those IPv4 addresses
+in one of these forms: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-translated
+(`::ffff:0:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), NAT64 (`64:ff9b::/96`),
+6to4 (`2002::/16`) or a Teredo client (`2001:0::/32`). The other limits
+stay.
+
 ---
 
 ## Tool permissions

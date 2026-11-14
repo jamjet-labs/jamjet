@@ -136,6 +136,7 @@ These are the variables that change what the server does.
 | `JAMJET_MODEL_SEAM_URL` | Send every model call through the model sidecar at this URL. With the in-process workers on, startup fails if it does not answer `/health` | unset |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Provider keys for direct model calls | unset |
 | `OLLAMA_HOST` | Ollama server | `http://localhost:11434` |
+| `JAMJET_DISCOVERY_ALLOW_PRIVATE` | `1`/`true`/`yes`/`on`: let `POST /agents/discover` reach private and loopback addresses and plain `http`. For local development | off |
 | `JAMJET_ARTIFACT_THRESHOLD_BYTES` | Node outputs larger than this are stored as artifacts | `8192` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Export traces and metrics over OTLP | unset |
 | `RUST_LOG` | Log filter. Logs are JSON outside dev mode | `info` |

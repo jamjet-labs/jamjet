@@ -1103,11 +1103,14 @@ async fn discover_agent(
     State(state): State<AppState>,
     Json(body): Json<DiscoverAgentRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let agent = state
-        .agents
-        .discover_remote(&body.url)
-        .await
-        .map_err(ApiError::Internal)?;
+    // A URL discovery refuses is the caller's input: 400, not 500.
+    let agent = state.agents.discover_remote(&body.url).await.map_err(|e| {
+        if e.starts_with("agent discovery refused") {
+            ApiError::BadRequest(e)
+        } else {
+            ApiError::Internal(e)
+        }
+    })?;
     Ok((
         StatusCode::CREATED,
         Json(

@@ -350,9 +350,19 @@ impl Memory {
     ///
     /// Returns the number of facts deleted. Intended for GDPR / right-to-erasure
     /// requests.
+    ///
+    /// The vectors deleted are those of exactly the facts deleted. The vector
+    /// store keeps no scope, and its scoped delete cleared every org's
+    /// vectors, so one user's erasure emptied recall for everyone.
     pub async fn delete_user_data(&self, scope: Scope) -> Result<u64, MemoryError> {
-        let fact_count = self.fact_store.delete_scope_data(&scope).await?;
-        self.vector_store.delete_by_scope(&scope).await?;
+        // The ids of exactly the facts deleted, from the same statement:
+        // listing first and deleting after could miss a fact added in
+        // between, and paging by `created_at` is not stable over ties.
+        let ids = self.fact_store.delete_scope_returning(&scope).await?;
+        let fact_count = ids.len() as u64;
+        for id in ids {
+            self.vector_store.delete(id).await?;
+        }
         self.graph_store.delete_by_scope(&scope).await?;
         Ok(fact_count)
     }

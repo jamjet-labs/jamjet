@@ -81,6 +81,36 @@ pub trait FactStore: Send + Sync {
     /// requests. Returns the number of facts deleted.
     async fn delete_scope_data(&self, scope: &Scope) -> Result<u64, MemoryError>;
 
+    /// [`Self::delete_scope_data`], returning the ids of the facts deleted,
+    /// in the same statement: what `Memory::delete_user_data` needs to delete
+    /// their vectors. The default lists the scope (superseded facts too) and
+    /// then deletes it, which a fact added in between, or paging over ties,
+    /// can make disagree; the SQL stores override it with
+    /// `DELETE ... RETURNING id`.
+    async fn delete_scope_returning(&self, scope: &Scope) -> Result<Vec<FactId>, MemoryError> {
+        const PAGE: u32 = 1000;
+        let mut ids = Vec::new();
+        let mut offset = 0;
+        loop {
+            let filter = FactFilter {
+                scope: Some(scope.clone()),
+                valid_only: false,
+                limit: PAGE,
+                offset,
+                ..FactFilter::new()
+            };
+            let page = self.list_facts(&filter).await?;
+            let n = page.len() as u32;
+            ids.extend(page.into_iter().map(|f| f.id));
+            if n < PAGE {
+                break;
+            }
+            offset += PAGE;
+        }
+        self.delete_scope_data(scope).await?;
+        Ok(ids)
+    }
+
     /// Export all facts matching `filter` as a JSON-serialisable vector.
     /// Implementations SHOULD stream or batch internally to avoid loading
     /// unbounded data into memory when the result set is large.
