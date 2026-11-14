@@ -44,15 +44,10 @@ it does not classify the message or require an API key. The graph contains one
 output key.
 
 The workflow demonstrates `input_mapping`, which shows how workflow state
-reaches the agent. The `{"message": "support_message"}` mapping tells the
-runtime to extract `support_message` from the workflow state and pass it as
-`message` to the agent invocation.
+would reach the agent. The `{"message": "support_message"}` mapping is recorded
+in the compiled workflow node; nothing in the bundled runtime applies that
+mapping today.
 
-To use the graph with a runtime, replace `https://sentiment.example.com` with
-your deployed HTTPS agent endpoint. That agent must implement `/tasks/send` and
-perform the classification. A positive/neutral/negative label is the suggested
-application contract, not a schema enforced by this example.
-
-Use a worker configured with an agent-tool executor for a live run. The API
-server's embedded development worker can complete this node with an empty
-result without calling the classifier.
+This example stops at the compiled workflow. The bundled JamJet runtime has no
+executor for `agent_tool` nodes and refuses to register a workflow that contains
+one, so there is no live run to try yet. The endpoint URL is a placeholder.
