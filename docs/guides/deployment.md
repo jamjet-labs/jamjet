@@ -81,6 +81,81 @@ JAMJET_TOKEN=jj_... jamjet worker --runtime http://your-runtime:7700 --modules m
 Java tool methods (`java_fn`) run on the Java SDK's worker, and `external_fn`
 handlers on any worker that drains the queue the node names.
 
+A worker claims with `POST /work-items/claim` and
+`{"worker_id": "...", "queue_types": ["..."]}`, which hands out the oldest
+claimable item on those queues, or `{"claimed": false}`.
+
+A worker that drives one execution at a time on its own queue (the Spring
+integration's recorded calls) claims that execution's work instead:
+
+```json
+{ "worker_id": "...", "queue_types": ["app-calls"],
+  "execution_id": "exec_...", "node_id": "call-3", "wait_ms": 5000 }
+```
+
+- `node_id` (optional) narrows the claim to one node of the execution.
+- Only the run's initiator may claim by `execution_id` (anyone in dev mode).
+  A run that recorded no initiator (started in dev mode, or before initiators
+  were recorded) can be claimed by an `operator`. The token's tenant applies.
+- The policy gate is the same as for any claim.
+- When nothing comes back the answer says why:
+  `{"claimed": false, "reason": "..."}` with `blocked` (the node will not
+  run: policy refused it, the engine cannot evaluate it, or it failed for
+  good), `approval_required` (it waits for an approval), `claimed_by_other`
+  (another worker holds it), `not_found` (no live run with that id that you
+  may claim), `refused` (the item was withheld as not the engine's: its
+  payload names another workflow than its run; the node is not failed) or
+  `not_ready` (not queued yet, or the engine could not decide now; try
+  again). `blocked`, `approval_required` and `refused` come from the run's
+  log, so a retry, or another worker, gets the same answer. Without
+  `node_id` they are about the nodes the run has open now, not a node it has
+  moved past. A run that has ended answers `not_found` with its `status`
+  (`"completed"`, `"failed"`, `"cancelled"`, ...).
+- `wait_ms` waits up to that many milliseconds, at most 10000, for a
+  `not_ready` item to be queued, so a client can claim right after starting
+  the run. A run that ends during the wait answers `not_found` then. One
+  principal holds at most 16 waiting claims on one server process; a claim
+  past that, with nothing to hand out, answers `429` with `Retry-After`.
+- The same `worker_id` claiming again gets the item it already holds, with
+  the same `lease_fence`, after the policy is checked again; a lost claim
+  response does not lose the item. The lease is renewed, and `lease_secs`
+  gives the length it was granted. A retry while the first claim is still
+  deciding answers `not_ready`. The decision runs to its end even when the
+  client gives up on the request, so the retry after it gets the lease. A
+  lease whose claim withheld the item for a reason to try again is decided
+  again as a new claim, with a new `lease_fence`. A decision that outlives
+  the lease hands nothing out; one that hands the item out renews the lease
+  for its full length first. A lease that expires is charged an attempt
+  like any other, whatever its decision had reached, so an item whose
+  decision fails every time ends in the dead-letter queue.
+- A heartbeat that re-attaches a lease after an expiry keeps it handed out:
+  the same worker claiming again gets it under the new `lease_fence`. A
+  heartbeat the store could not answer before renewing is a `503` with
+  `Retry-After`, worth retrying; a `409` means the lease is lost. Once the
+  renewal is made the heartbeat answers with it, and `cancel_requested` is
+  `false` if the run could not be read; the next heartbeat asks again.
+
+Runtimes before this change ignore `execution_id` and `node_id` on a claim,
+and `claim` on a node, without refusing them: they hand out the oldest item
+on the queues, to any worker that polls. A client that may meet one should
+check that the item it got is the one it asked for (its `execution_id` and
+`node_id`), or check the runtime version first.
+
+An `external_fn` node can require this: with `"claim": "by_execution"` in its
+kind, its items are handed out only to a claim that names the execution, never
+to the oldest-first claim, whoever polls the queue. Such an item is also
+completed, failed and heartbeated only by a caller who may claim it; anyone
+else is answered `404`, as for an item that does not exist (a `lease_fence` is
+a counter, not a credential). `POST /work-items` marks the item from the
+node's kind, whatever the payload says. `claim` on any other kind is refused
+at registration. An item of such a node that lost its mark (enqueued straight
+into the store) is still not handed out oldest-first: it is put back, marked,
+for the claim that names its execution. One whose payload is not a JSON
+object cannot carry the mark, and its node is failed.
+
+This decides who runs the node and reports its result, not who can read the
+run: `GET /executions/:id` shows its state to any token of the tenant.
+
 ### 4. Register workflows
 
 ```bash

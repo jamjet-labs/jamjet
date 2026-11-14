@@ -24,6 +24,15 @@ pub enum Write {
     /// A conditional append is about to run (reported BEFORE it): where a
     /// lock wait or a stall delays the append past the caller's own checks.
     BeforeAppendEventIf(ExecutionId),
+    /// A filtered claim leased an item (after it committed, before the caller
+    /// sees it): the gap between a claim and whatever its caller does next.
+    Claimed(ExecutionId),
+    /// A read of the leased items (after it returned).
+    LeasedItems,
+    /// A lease renewed or re-attached (after it committed).
+    HeartbeatLease,
+    /// A read of an execution (after it returned).
+    GetExecution,
 }
 
 #[async_trait::async_trait]
@@ -34,11 +43,24 @@ pub trait AfterWrite: Send + Sync {
 pub struct HookedBackend {
     pub inner: Arc<dyn StateBackend>,
     pub hook: Arc<dyn AfterWrite>,
+    /// While set, `get_work_item` fails as a store that is briefly away does.
+    /// Shared, so a hook can set it.
+    pub fail_item_reads: Arc<std::sync::atomic::AtomicBool>,
+    /// While set, `get_workflow` panics: a gate that dies mid-decision.
+    pub panic_workflow_reads: Arc<std::sync::atomic::AtomicBool>,
+    /// While set, `release_lease` fails as a busy database does.
+    pub fail_release: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HookedBackend {
     pub fn new(inner: Arc<dyn StateBackend>, hook: Arc<dyn AfterWrite>) -> Self {
-        Self { inner, hook }
+        Self {
+            inner,
+            hook,
+            fail_item_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            panic_workflow_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_release: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 }
 
@@ -48,7 +70,9 @@ impl StateBackend for HookedBackend {
         &self,
         id: &ExecutionId,
     ) -> jamjet_state::backend::BackendResult<Option<WorkflowExecution>> {
-        self.inner.get_execution(id).await
+        let exec = self.inner.get_execution(id).await?;
+        self.hook.after(Write::GetExecution).await;
+        Ok(exec)
     }
 
     async fn get_events(
@@ -74,6 +98,12 @@ impl StateBackend for HookedBackend {
         workflow_id: &str,
         version: &str,
     ) -> jamjet_state::backend::BackendResult<Option<WorkflowDefinition>> {
+        if self
+            .panic_workflow_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("get_workflow: a poison pill");
+        }
         self.inner.get_workflow(workflow_id, version).await
     }
 
@@ -317,15 +347,102 @@ impl StateBackend for HookedBackend {
             .await
     }
 
+    async fn claim_work_item_filtered(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+        filter: &jamjet_state::ClaimFilter,
+    ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::backend::WorkItem>> {
+        let item = self
+            .inner
+            .claim_work_item_filtered(worker_id, queue_types, lease_secs, filter)
+            .await?;
+        if let Some(wi) = &item {
+            self.hook
+                .after(Write::Claimed(wi.execution_id.clone()))
+                .await;
+        }
+        Ok(item)
+    }
+
+    async fn leased_items(
+        &self,
+        queue_types: &[&str],
+        filter: &jamjet_state::ClaimFilter,
+    ) -> jamjet_state::backend::BackendResult<Vec<jamjet_state::LeasedItem>> {
+        let leased = self.inner.leased_items(queue_types, filter).await?;
+        self.hook.after(Write::LeasedItems).await;
+        Ok(leased)
+    }
+
+    async fn release_lease(
+        &self,
+        item_id: uuid::Uuid,
+        lease_fence: i64,
+        from: jamjet_state::GateMark,
+        lease_secs: u64,
+    ) -> jamjet_state::backend::BackendResult<bool> {
+        if self.fail_release.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(jamjet_state::StateBackendError::Database(
+                "database is locked".into(),
+            ));
+        }
+        self.inner
+            .release_lease(item_id, lease_fence, from, lease_secs)
+            .await
+    }
+
+    async fn swap_gate(
+        &self,
+        item_id: uuid::Uuid,
+        lease_fence: i64,
+        from: jamjet_state::GateMark,
+        to: jamjet_state::GateMark,
+    ) -> jamjet_state::backend::BackendResult<bool> {
+        self.inner.swap_gate(item_id, lease_fence, from, to).await
+    }
+
+    async fn park_for_execution(
+        &self,
+        item_id: uuid::Uuid,
+        lease_fence: i64,
+        attempt: u32,
+    ) -> jamjet_state::backend::BackendResult<bool> {
+        self.inner
+            .park_for_execution(item_id, lease_fence, attempt)
+            .await
+    }
+
+    async fn mark_gate(
+        &self,
+        item_id: uuid::Uuid,
+        lease_fence: i64,
+        mark: jamjet_state::GateMark,
+    ) -> jamjet_state::backend::BackendResult<bool> {
+        self.inner.mark_gate(item_id, lease_fence, mark).await
+    }
+
+    async fn has_claimable(
+        &self,
+        queue_types: &[&str],
+        filter: &jamjet_state::ClaimFilter,
+    ) -> jamjet_state::backend::BackendResult<bool> {
+        self.inner.has_claimable(queue_types, filter).await
+    }
+
     async fn heartbeat_lease(
         &self,
         item_id: jamjet_state::backend::WorkItemId,
         worker_id: &str,
         lease_fence: i64,
     ) -> jamjet_state::backend::BackendResult<jamjet_state::LeaseRenewal> {
-        self.inner
+        let renewal = self
+            .inner
             .heartbeat_lease(item_id, worker_id, lease_fence)
-            .await
+            .await?;
+        self.hook.after(Write::HeartbeatLease).await;
+        Ok(renewal)
     }
 
     async fn commit_turn_unless_terminal(
@@ -365,6 +482,14 @@ impl StateBackend for HookedBackend {
         &self,
         item_id: jamjet_state::backend::WorkItemId,
     ) -> jamjet_state::backend::BackendResult<Option<WorkItem>> {
+        if self
+            .fail_item_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(jamjet_state::StateBackendError::Database(
+                "the store is briefly away".into(),
+            ));
+        }
         self.inner.get_work_item(item_id).await
     }
 

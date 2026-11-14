@@ -49,6 +49,7 @@ fn external_fn() -> NodeKind {
         queue: "pas-control".into(),
         handler: "transfer".into(),
         output_schema: String::new(),
+        claim: Default::default(),
     }
 }
 

@@ -76,6 +76,59 @@ pub enum StateBackendError {
 
 pub type BackendResult<T> = Result<T, StateBackendError>;
 
+/// Which items a claim may take; see
+/// [`StateBackend::claim_work_item_filtered`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaimFilter {
+    pub execution_id: Option<ExecutionId>,
+    pub node_id: Option<String>,
+}
+
+impl ClaimFilter {
+    /// No restriction: the oldest claimable item on the queues.
+    pub fn is_empty(&self) -> bool {
+        self.execution_id.is_none() && self.node_id.is_none()
+    }
+}
+
+/// Where the claim gate stands on an item under its current lease
+/// ([`StateBackend::mark_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateMark {
+    /// No gate decided under this lease: one withheld it and left the lease,
+    /// or none ran. A claim may decide it again.
+    Undecided,
+    /// A gate is deciding under this lease, or was cut short (its request
+    /// dropped). Not to be decided a second time beside it; the lease
+    /// expires and the next claim decides.
+    Gating,
+    /// The gate released the payload under this lease.
+    Released,
+}
+
+/// An item leased now, as [`StateBackend::leased_items`] lists it.
+#[derive(Debug, Clone)]
+pub struct LeasedItem {
+    pub item: WorkItem,
+    /// The lease length the claim was granted, which every renewal honours.
+    pub lease_secs: u64,
+    /// The claim gate's mark under THIS lease.
+    pub gate: GateMark,
+}
+
+/// What [`StateBackend::claim_for_execution`] found.
+#[derive(Debug, Clone)]
+pub enum ExecutionClaim {
+    /// A pending item, now leased to the caller.
+    Claimed(WorkItem),
+    /// An item already leased to this worker, returned with its lease.
+    AlreadyLeased(LeasedItem),
+    /// Another worker holds the matching item.
+    LeasedToOther,
+    /// No matching item is pending or leased.
+    Nothing,
+}
+
 /// Whether two stored IRs are the same definition: equal canonical JSON, so
 /// key order and whitespace do not matter. Every backend's `store_workflow`
 /// uses this to tell an idempotent re-register from a redefinition.
@@ -384,6 +437,162 @@ pub trait StateBackend: Send + Sync {
         lease_secs: Option<u64>,
     ) -> BackendResult<Option<WorkItem>>;
 
+    /// [`Self::claim_work_item_with_lease`], limited by `filter`: with an
+    /// `execution_id`, only that execution's items on `queue_types` can be
+    /// claimed (and with a `node_id` too, only that node's). A filtered claim
+    /// may take an item marked claimable only by execution
+    /// (`jamjet_core::node::ClaimMode::ByExecution`); the unfiltered claim
+    /// never does. An empty filter claims exactly as
+    /// `claim_work_item_with_lease` does.
+    ///
+    /// The default refuses a non-empty filter: a backend that cannot honour
+    /// it must not hand out some other execution's item instead.
+    async fn claim_work_item_filtered(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+        filter: &ClaimFilter,
+    ) -> BackendResult<Option<WorkItem>> {
+        if filter.is_empty() {
+            return self
+                .claim_work_item_with_lease(worker_id, queue_types, lease_secs)
+                .await;
+        }
+        Err(StateBackendError::Database(
+            "this backend cannot claim by execution".into(),
+        ))
+    }
+
+    /// The items matching `filter` on `queue_types` that are leased now (a
+    /// lease that has not expired), whoever holds them. The default refuses.
+    async fn leased_items(
+        &self,
+        queue_types: &[&str],
+        filter: &ClaimFilter,
+    ) -> BackendResult<Vec<LeasedItem>> {
+        let _ = (queue_types, filter);
+        Err(StateBackendError::Database(
+            "this backend cannot list leased items".into(),
+        ))
+    }
+
+    /// Record the claim gate's mark for `item_id` under `lease_fence`.
+    /// `Ok(false)` if the item is not claimed under that fence any more. The
+    /// default refuses, so a backend without it cannot hand a lease out again.
+    async fn mark_gate(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        mark: GateMark,
+    ) -> BackendResult<bool> {
+        let _ = (item_id, lease_fence, mark);
+        Err(StateBackendError::Database(
+            "this backend cannot record the claim gate's mark".into(),
+        ))
+    }
+
+    /// Move `item_id`'s gate mark under `lease_fence` from `from` to `to`,
+    /// only if it is still `from`: a compare-and-swap, so of two claims that
+    /// saw the same mark only one goes on. `Ok(false)` if the mark or the
+    /// lease moved. The default refuses.
+    async fn swap_gate(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: GateMark,
+        to: GateMark,
+    ) -> BackendResult<bool> {
+        let _ = (item_id, lease_fence, from, to);
+        Err(StateBackendError::Database(
+            "this backend cannot record the claim gate's mark".into(),
+        ))
+    }
+
+    /// [`Self::swap_gate`] to [`GateMark::Released`], for a lease that has not
+    /// expired, renewing it for `lease_secs` in the same write. A gate that
+    /// outlived its lease used to hand out a lease the sweep was about to take
+    /// back, and the node then ran a second time. `Ok(false)` if the mark,
+    /// the fence or the expiry moved. The default refuses.
+    async fn release_lease(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: GateMark,
+        lease_secs: u64,
+    ) -> BackendResult<bool> {
+        let _ = (item_id, lease_fence, from, lease_secs);
+        Err(StateBackendError::Database(
+            "this backend cannot record the claim gate's release".into(),
+        ))
+    }
+
+    /// Whether `filter` (which names an execution) matches an item that is
+    /// pending and visible now, or claimed: a read-only probe a waiting claim
+    /// polls instead of taking the write lock each time. The default says
+    /// yes, which only costs a claim attempt.
+    async fn has_claimable(
+        &self,
+        queue_types: &[&str],
+        filter: &ClaimFilter,
+    ) -> BackendResult<bool> {
+        let _ = (queue_types, filter);
+        Ok(true)
+    }
+
+    /// A claim naming an execution: [`Self::claim_work_item_filtered`] plus
+    /// what a caller needs to know when it gets nothing, and idempotence for
+    /// one worker.
+    ///
+    /// 1. An item matching `filter` already leased to `worker_id` comes back
+    ///    as it is, same lease fence ([`ExecutionClaim::AlreadyLeased`]): a
+    ///    worker whose claim response was lost gets its lease, not a refusal.
+    ///    Whether it may be handed out again is the caller's to decide.
+    /// 2. Otherwise a pending item is claimed ([`ExecutionClaim::Claimed`]).
+    /// 3. Otherwise, if another worker holds one, [`ExecutionClaim::LeasedToOther`];
+    ///    else [`ExecutionClaim::Nothing`].
+    async fn claim_for_execution(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+        filter: &ClaimFilter,
+    ) -> BackendResult<ExecutionClaim> {
+        if filter.execution_id.is_none() {
+            return Err(StateBackendError::Database(
+                "a claim for an execution needs its execution_id".into(),
+            ));
+        }
+        let leased = self.leased_items(queue_types, filter).await?;
+        if let Some(mine) = leased
+            .iter()
+            .find(|l| l.item.worker_id.as_deref() == Some(worker_id))
+        {
+            return Ok(ExecutionClaim::AlreadyLeased(mine.clone()));
+        }
+        if let Some(item) = self
+            .claim_work_item_filtered(worker_id, queue_types, lease_secs, filter)
+            .await?
+        {
+            return Ok(ExecutionClaim::Claimed(item));
+        }
+        // Read again before answering: the matching item may have been
+        // claimed since by this same worker (a concurrent request of its
+        // own), even when another lease was seen first. That is its lease,
+        // and it gets it back, not `claimed_by_other`.
+        let again = self.leased_items(queue_types, filter).await?;
+        if let Some(mine) = again
+            .iter()
+            .find(|l| l.item.worker_id.as_deref() == Some(worker_id))
+        {
+            return Ok(ExecutionClaim::AlreadyLeased(mine.clone()));
+        }
+        if !again.is_empty() {
+            return Ok(ExecutionClaim::LeasedToOther);
+        }
+        Ok(ExecutionClaim::Nothing)
+    }
+
     /// Renew the lease, or re-attach it when the presented fence was lost only
     /// to expiry and nobody has claimed the item since, as after an engine
     /// restart longer than the lease (PAS spike finding G8). The fence in the
@@ -555,6 +764,26 @@ pub trait StateBackend: Send + Sync {
         retry_after: &str,
         next_attempt: u32,
     ) -> BackendResult<bool>;
+
+    /// Return a leased item to `pending` now, same attempt, fence-guarded as
+    /// [`Self::park_work_item`], and mark its payload `claim: by_execution`.
+    ///
+    /// For an item the oldest-first claim leased although its node is
+    /// claimable only by its execution: the item lost the marker, and putting
+    /// it back plain would hand it to the same claim on its next poll, ahead of
+    /// everything queued behind it. Marked, that claim skips it.
+    ///
+    /// The default parks it without the mark: refused still, but not repaired.
+    async fn park_for_execution(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        attempt: u32,
+    ) -> BackendResult<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.park_work_item(item_id, lease_fence, &now, attempt)
+            .await
+    }
 
     /// Fence-guarded finalization of a continue-as-new rollover on the OLD execution.
     ///

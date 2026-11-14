@@ -51,6 +51,8 @@ pub struct InMemoryBackend {
     artifacts: DashMap<(String, String), (Vec<u8>, Option<String>)>,
     /// Lease length a worker asked for at claim time, in seconds.
     lease_secs: DashMap<WorkItemId, u64>,
+    /// The fence under which the claim gate last released each item.
+    released_fences: DashMap<WorkItemId, i64>,
     /// Who held an expired lease and with which fence, so a late heartbeat
     /// from that worker can re-attach instead of losing the work.
     last_lease: DashMap<WorkItemId, (String, i64)>,
@@ -76,6 +78,7 @@ impl InMemoryBackend {
             projector_checkpoints: DashMap::new(),
             artifacts: DashMap::new(),
             lease_secs: DashMap::new(),
+            released_fences: DashMap::new(),
             last_lease: DashMap::new(),
         }
     }
@@ -105,6 +108,13 @@ impl InMemoryBackend {
     pub fn force_lease_expired_for_test(&self, item_id: WorkItemId) {
         if let Some(mut entry) = self.work_items.get_mut(&item_id) {
             entry.lease_expires_at = Some(Utc::now() - chrono::Duration::hours(1));
+        }
+    }
+
+    /// Test helper: set a work item's lease expiry.
+    pub fn set_lease_expiry_for_test(&self, item_id: WorkItemId, at: chrono::DateTime<Utc>) {
+        if let Some(mut entry) = self.work_items.get_mut(&item_id) {
+            entry.lease_expires_at = Some(at);
         }
     }
 }
@@ -565,6 +575,190 @@ impl StateBackend for InMemoryBackend {
         queue_types: &[&str],
         lease_secs: Option<u64>,
     ) -> BackendResult<Option<WorkItem>> {
+        self.claim_work_item_filtered(
+            worker_id,
+            queue_types,
+            lease_secs,
+            &crate::backend::ClaimFilter::default(),
+        )
+        .await
+    }
+
+    async fn leased_items(
+        &self,
+        queue_types: &[&str],
+        filter: &crate::backend::ClaimFilter,
+    ) -> BackendResult<Vec<crate::backend::LeasedItem>> {
+        let Some(execution_id) = &filter.execution_id else {
+            return Ok(Vec::new());
+        };
+        let now = Utc::now();
+        Ok(self
+            .work_items
+            .iter()
+            .map(|e| e.value().clone())
+            .filter(|i| {
+                i.worker_id.is_some()
+                    && i.lease_expires_at.is_some_and(|t| t > now)
+                    && i.execution_id == *execution_id
+                    && queue_types.contains(&i.queue_type.as_str())
+                    && filter.node_id.as_ref().is_none_or(|n| *n == i.node_id)
+            })
+            .map(|item| crate::backend::LeasedItem {
+                lease_secs: self
+                    .lease_secs
+                    .get(&item.id)
+                    .map(|s| *s.value())
+                    .unwrap_or_else(|| crate::backend::granted_lease_secs(None)),
+                gate: match self.released_fences.get(&item.id).map(|f| *f.value()) {
+                    Some(f) if f == item.lease_fence => crate::backend::GateMark::Released,
+                    Some(f) if f == -item.lease_fence => crate::backend::GateMark::Gating,
+                    _ => crate::backend::GateMark::Undecided,
+                },
+                item,
+            })
+            .collect())
+    }
+
+    async fn park_for_execution(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        attempt: u32,
+    ) -> BackendResult<bool> {
+        let now = Utc::now().to_rfc3339();
+        if !self
+            .park_work_item(item_id, lease_fence, &now, attempt)
+            .await?
+        {
+            return Ok(false);
+        }
+        if let Some(mut entry) = self.work_items.get_mut(&item_id) {
+            if let Some(obj) = entry.payload.as_object_mut() {
+                obj.insert("claim".into(), serde_json::json!("by_execution"));
+            }
+        }
+        Ok(true)
+    }
+
+    async fn mark_gate(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        mark: crate::backend::GateMark,
+    ) -> BackendResult<bool> {
+        let held = self
+            .work_items
+            .get(&item_id)
+            .is_some_and(|i| i.worker_id.is_some() && i.lease_fence == lease_fence);
+        if held {
+            match mark {
+                crate::backend::GateMark::Released => {
+                    self.released_fences.insert(item_id, lease_fence);
+                }
+                crate::backend::GateMark::Gating => {
+                    self.released_fences.insert(item_id, -lease_fence);
+                }
+                crate::backend::GateMark::Undecided => {
+                    self.released_fences.remove(&item_id);
+                }
+            }
+        }
+        Ok(held)
+    }
+
+    async fn release_lease(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: crate::backend::GateMark,
+        lease_secs: u64,
+    ) -> BackendResult<bool> {
+        use crate::backend::GateMark;
+        let now = Utc::now();
+        let Some(mut item) = self.work_items.get_mut(&item_id) else {
+            return Ok(false);
+        };
+        if item.worker_id.is_none()
+            || item.lease_fence != lease_fence
+            || !item.lease_expires_at.is_some_and(|t| t > now)
+        {
+            return Ok(false);
+        }
+        let mark = match self.released_fences.get(&item_id).map(|f| *f.value()) {
+            Some(f) if f == lease_fence => GateMark::Released,
+            Some(f) if f == -lease_fence => GateMark::Gating,
+            _ => GateMark::Undecided,
+        };
+        if mark != from {
+            return Ok(false);
+        }
+        item.lease_expires_at = Some(
+            now + chrono::Duration::seconds(
+                crate::backend::granted_lease_secs(Some(lease_secs)) as i64
+            ),
+        );
+        self.released_fences.insert(item_id, lease_fence);
+        drop(item);
+        Ok(true)
+    }
+
+    async fn swap_gate(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: crate::backend::GateMark,
+        to: crate::backend::GateMark,
+    ) -> BackendResult<bool> {
+        use crate::backend::GateMark;
+        // The item's shard lock, taken for writing, is held across the test
+        // and the set, so two swaps of one item run one after the other.
+        let Some(item) = self.work_items.get_mut(&item_id) else {
+            return Ok(false);
+        };
+        if item.worker_id.is_none() || item.lease_fence != lease_fence {
+            return Ok(false);
+        }
+        let now = match self.released_fences.get(&item_id).map(|f| *f.value()) {
+            Some(f) if f == lease_fence => GateMark::Released,
+            Some(f) if f == -lease_fence => GateMark::Gating,
+            _ => GateMark::Undecided,
+        };
+        if now != from {
+            return Ok(false);
+        }
+        match to {
+            GateMark::Released => self.released_fences.insert(item_id, lease_fence),
+            GateMark::Gating => self.released_fences.insert(item_id, -lease_fence),
+            GateMark::Undecided => self.released_fences.remove(&item_id).map(|(_, v)| v),
+        };
+        drop(item);
+        Ok(true)
+    }
+
+    async fn has_claimable(
+        &self,
+        queue_types: &[&str],
+        filter: &crate::backend::ClaimFilter,
+    ) -> BackendResult<bool> {
+        let Some(execution_id) = &filter.execution_id else {
+            return Ok(true);
+        };
+        Ok(self.work_items.iter().any(|e| {
+            let i = e.value();
+            i.execution_id == *execution_id
+                && queue_types.contains(&i.queue_type.as_str())
+                && filter.node_id.as_ref().is_none_or(|n| *n == i.node_id)
+        }))
+    }
+
+    async fn claim_work_item_filtered(
+        &self,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+        filter: &crate::backend::ClaimFilter,
+    ) -> BackendResult<Option<WorkItem>> {
         // The fast reclaim of expired leases, mirroring the SQLite claim path:
         // re-queue, remember the holder, charge the attempt, record the retry.
         // An item of a terminal execution is settled instead, with nothing
@@ -618,7 +812,21 @@ impl StateBackend for InMemoryBackend {
         let lease_len = crate::backend::granted_lease_secs(lease_secs);
         for mut entry in self.work_items.iter_mut() {
             let item = entry.value_mut();
-            if item.worker_id.is_none() && queue_types.contains(&item.queue_type.as_str()) {
+            // The oldest-first claim never takes an item marked claimable
+            // only by execution; a filtered one may.
+            let by_execution_only = item
+                .payload
+                .get(jamjet_core::node::CLAIM_PAYLOAD_KEY)
+                .and_then(|v| v.as_str())
+                == Some(jamjet_core::node::CLAIM_BY_EXECUTION);
+            // Only a claim naming the execution may take such an item, as
+            // in SQLite: a `node_id`-only filter does not.
+            let wanted = match &filter.execution_id {
+                None => !by_execution_only,
+                Some(e) => *e == item.execution_id,
+            } && filter.node_id.as_ref().is_none_or(|n| *n == item.node_id);
+            if item.worker_id.is_none() && queue_types.contains(&item.queue_type.as_str()) && wanted
+            {
                 let new_epoch = self
                     .lease_epochs
                     .get(&item.id)
@@ -633,6 +841,10 @@ impl StateBackend for InMemoryBackend {
                 item.lease_fence = fence;
                 self.lease_secs.insert(item.id, lease_len);
                 self.last_lease.remove(&item.id);
+                // Leased already marked as gating, as in SQLite.
+                if filter.execution_id.is_some() {
+                    self.released_fences.insert(item.id, -fence);
+                }
                 return Ok(Some(item.clone()));
             }
         }
@@ -723,6 +935,14 @@ impl StateBackend for InMemoryBackend {
         entry.attempt = entry.attempt.saturating_sub(1);
         drop(entry);
         self.last_lease.remove(&item_id);
+        // Released under the lost fence: still released under the new one.
+        if self
+            .released_fences
+            .get(&item_id)
+            .is_some_and(|f| *f.value() == lease_fence)
+        {
+            self.released_fences.insert(item_id, fence);
+        }
         Ok(crate::backend::LeaseRenewal {
             lease_fence: fence,
             reattached: true,

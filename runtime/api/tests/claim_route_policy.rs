@@ -1419,6 +1419,18 @@ impl StateBackend for FailFirstGetEvents {
         self.inner.claim_work_item(worker_id, queue_types).await
     }
 
+    async fn release_lease(
+        &self,
+        item_id: uuid::Uuid,
+        lease_fence: i64,
+        from: jamjet_state::GateMark,
+        lease_secs: u64,
+    ) -> jamjet_state::backend::BackendResult<bool> {
+        self.inner
+            .release_lease(item_id, lease_fence, from, lease_secs)
+            .await
+    }
+
     async fn claim_work_item_with_lease(
         &self,
         worker_id: &str,

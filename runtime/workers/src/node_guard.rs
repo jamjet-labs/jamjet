@@ -190,6 +190,7 @@ pub async fn guard_item(
     sealer: Option<&dyn ApprovalSealer>,
     agents: AgentScope<'_>,
     work_item_id: Option<uuid::Uuid>,
+    lease_fence: Option<i64>,
 ) -> GuardOutcome {
     use crate::agent_limits;
 
@@ -304,9 +305,43 @@ pub async fn guard_item(
     }
     match (outcome, plan) {
         (GuardOutcome::Allow, Some(plan)) => {
+            // The admission spends a step, and an escalation's single-use
+            // approval: only for a lease still held. A gate whose lease was
+            // swept while it decided used to admit a step for an item it
+            // never handed out.
+            if let (Some(item), Some(fence)) = (work_item_id, lease_fence) {
+                if let Err(moved) = lease_still_held(backend, item, fence).await {
+                    return moved;
+                }
+            }
             agent_limits::admit(backend, execution_id, node_id, work_item_id, plan).await
         }
         (outcome, _) => outcome,
+    }
+}
+
+/// `Ok` while `item` is still leased under `fence` and the lease has not
+/// expired; else the `Unavailable` to decide again on the next attempt.
+async fn lease_still_held(
+    backend: &dyn StateBackend,
+    item: uuid::Uuid,
+    fence: i64,
+) -> Result<(), GuardOutcome> {
+    let now = chrono::Utc::now();
+    match backend.get_work_item(item).await {
+        Ok(Some(wi))
+            if wi.lease_fence == fence
+                && wi.worker_id.is_some()
+                && wi.lease_expires_at.is_some_and(|t| t > now) =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(GuardOutcome::Unavailable {
+            reason: "the lease moved while the step was decided; not admitted".to_string(),
+        }),
+        Err(e) => Err(GuardOutcome::Unavailable {
+            reason: format!("the lease could not be read; not admitted: {e}"),
+        }),
     }
 }
 
