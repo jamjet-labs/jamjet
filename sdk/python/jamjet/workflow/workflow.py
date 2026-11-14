@@ -28,8 +28,8 @@ from typing import TYPE_CHECKING, Any, TypeVar, overload
 from pydantic import BaseModel
 
 from jamjet.workflow.executor import ExecutionResult, execute_workflow
-from jamjet.workflow.ir_compiler import compile_to_workflow_spec
-from jamjet.workflow.types import StepDef, WorkflowDef
+from jamjet.workflow.ir_compiler import compile_to_ir, compile_to_workflow_spec
+from jamjet.workflow.types import DEFAULT_WORKFLOW_VERSION, StepDef, WorkflowDef
 
 if TYPE_CHECKING:
     from jamjet.spec import WorkflowSpec
@@ -46,7 +46,7 @@ class Workflow:
     Compiles to the canonical IR for submission to the runtime.
     """
 
-    def __init__(self, workflow_id: str, version: str = "0.1.0") -> None:
+    def __init__(self, workflow_id: str, version: str = DEFAULT_WORKFLOW_VERSION) -> None:
         self.workflow_id = workflow_id
         self.version = version
         self._state_class: type[BaseModel] | None = None
@@ -147,20 +147,29 @@ class Workflow:
 
         Raises ValueError if the workflow is not valid.
         """
+        return compile_to_workflow_spec(self._definition())
 
+    def to_ir(self) -> dict[str, Any]:
+        """
+        Compile this workflow to the runtime IR dict, the body ``POST /workflows``
+        takes. ``jamjet validate`` and ``jamjet run`` use this for ``.py`` files.
+
+        Raises ValueError if the workflow is not valid.
+        """
+        return compile_to_ir(self._definition())
+
+    def _definition(self) -> WorkflowDef:
         if self._state_class is None:
             raise ValueError(f"Workflow '{self.workflow_id}' has no @workflow.state defined")
         if not self._steps:
             raise ValueError(f"Workflow '{self.workflow_id}' has no @workflow.step definitions")
-
-        defn = WorkflowDef(
+        return WorkflowDef(
             workflow_id=self.workflow_id,
             version=self.version,
             state_schema=f"{self._state_class.__module__}.{self._state_class.__name__}",
             start_node=self._start or self._steps[0].name,
             steps=self._steps,
         )
-        return compile_to_workflow_spec(defn)
 
     async def run(self, initial_state: BaseModel, *, max_steps: int = 100) -> ExecutionResult:
         """

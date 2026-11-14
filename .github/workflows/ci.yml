@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly, so main is checked against a new stable toolchain, new advisories
+  # and fresh Python resolves even in a week with no pushes.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 # Least privilege for the whole workflow. Every job here reads the repo, builds,
 # and reports — none of them writes to it, so none needs the default write-capable
@@ -41,11 +46,10 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
-        # Note: NOT `-D warnings`. New clippy versions regularly introduce lints
-        # that flag existing code (e.g. 1.95 added stricter collapsible_match);
-        # treating those as errors makes every clippy bump a tax. We keep clippy
-        # as informational and rely on review + targeted #[allow] for real issues.
-        run: cargo clippy --workspace --all-features
+        # Any warning fails the job, tests and the optional features included.
+        # A new stable clippy can add lints that flag existing code; the weekly
+        # scheduled run shows that on main instead of on an unrelated PR.
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   rust-test:
     name: Rust tests
@@ -62,7 +66,70 @@ jobs:
       - name: Create web/dist placeholder for rust-embed
         run: mkdir -p ../web/dist && echo '<!DOCTYPE html><html><body></body></html>' > ../web/dist/index.html
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  # The jobs above build with default features, so engram's `rerank` (ONNX
+  # Runtime through `ort`) is otherwise compiled only by clippy and never run.
+  rust-test-all-features:
+    name: Rust tests (all features)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runtime
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime -> target
+          key: all-features
+      - name: Create web/dist placeholder for rust-embed
+        run: mkdir -p ../web/dist && echo '<!DOCTYPE html><html><body></body></html>' > ../web/dist/index.html
+      - name: Test
+        run: cargo test --workspace --all-features --locked
+
+  # `rust-version` in runtime/Cargo.toml is what crates.io users are told they
+  # need. Build on exactly that toolchain, read from the manifest so the two
+  # cannot drift apart.
+  rust-msrv:
+    name: Rust MSRV
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runtime
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read rust-version
+        id: msrv
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ -z "$msrv" ]; then
+            echo "::error::no rust-version in runtime/Cargo.toml"
+            exit 1
+          fi
+          echo "rust-version=$msrv"
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime -> target
+          key: msrv
+      - name: Create web/dist placeholder for rust-embed
+        run: mkdir -p ../web/dist && echo '<!DOCTYPE html><html><body></body></html>' > ../web/dist/index.html
+      - name: Check on the declared rust-version
+        env:
+          # Overrides rust-toolchain.toml, which asks for stable.
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          rustc --version
+          case "$(rustc --version)" in
+            "rustc $MSRV."* | "rustc $MSRV "*) ;;
+            *) echo "::error::expected rustc $MSRV, got $(rustc --version)"; exit 1 ;;
+          esac
+          cargo check --workspace --all-targets --all-features --locked
 
   # ── Python SDK ──────────────────────────────────────────────────────
   python-lint:
@@ -87,19 +154,58 @@ jobs:
       - run: uv run mypy jamjet/cloud
 
   python-test:
-    name: Python tests
+    name: Python tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor (requires-python) through the newest version we support.
+        python-version: ["3.11", "3.12", "3.13"]
     defaults:
       run:
         working-directory: sdk/python
+    env:
+      # Make uv build the venv on this leg's interpreter, not one it finds first.
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install uv
+      - run: uv sync --all-extras
+      - run: uv run python -c "import sys; print(sys.version)"
+      - run: uv run pytest --tb=short --durations=10
+
+  # Install jamjet[model] the way a user does, with no lockfile, so CI tests the
+  # versions a fresh `pip install` really resolves. Then run the agent
+  # `jamjet create` scaffolds (against a stub Anthropic API) and the FastMCP
+  # example in the same environment.
+  python-first-run:
+    name: Python first run (no lockfile)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install uv
-      - run: uv sync --all-extras
-      - run: uv run pytest --tb=short
+      - name: Install jamjet[model] and the MCP example's requirements
+        run: |
+          python -m venv /tmp/firstrun
+          /tmp/firstrun/bin/pip install --upgrade pip
+          /tmp/firstrun/bin/pip install "./sdk/python[model]" -r examples/05-mcp-tool-call/requirements.txt
+          /tmp/firstrun/bin/pip list | grep -iE "^(jamjet|litellm|mcp) "
+      - name: Run the scaffolded agent against a stub provider
+        run: |
+          python .github/scripts/stub_model_provider.py 8765 &
+          for i in $(seq 1 20); do curl -s -o /dev/null -X POST -d '{}' http://127.0.0.1:8765/v1/messages && break; sleep 0.5; done
+          cd /tmp && /tmp/firstrun/bin/jamjet create firstrun-agent
+          cd /tmp/firstrun-agent
+          ANTHROPIC_API_BASE=http://127.0.0.1:8765 ANTHROPIC_API_KEY=stub /tmp/firstrun/bin/python agent.py | tee out.txt
+          grep -q "42" out.txt
+      - name: Run examples/05-mcp-tool-call (FastMCP, mcp 1.x)
+        working-directory: examples/05-mcp-tool-call
+        run: /tmp/firstrun/bin/python main.py
 
   # ── Java SDK ────────────────────────────────────────────────────────
   java-test:
@@ -140,7 +246,7 @@ jobs:
         run: mkdir -p web/dist && echo '<!DOCTYPE html><html><body></body></html>' > web/dist/index.html
       - name: Build runtime
         working-directory: runtime
-        run: cargo build -p jamjet-api --bin jamjet-server
+        run: cargo build -p jamjet-api --bin jamjet-server --locked
       - name: Start runtime in dev mode
         run: |
           mkdir -p "$RUNNER_TEMP/jamjet"
@@ -204,6 +310,26 @@ jobs:
           done
           echo "clean: no h2 0.3.x, no hyper 0.14"
 
+      # sqlx and reqwest both use rustls with aws-lc-rs. If ring is enabled
+      # too, rustls has no single default provider and any
+      # `ClientConfig::builder()` call panics. Checked positively: the step
+      # fails if it cannot read the aws-lc-rs feature at all.
+      - name: Assert rustls is built with one crypto provider
+        working-directory: runtime
+        run: |
+          features=$(cargo tree --workspace --target all -e features -i rustls --locked)
+          if ! echo "$features" | grep -q 'rustls feature "aws-lc-rs"'; then
+            echo "::error::could not find rustls's aws-lc-rs feature"
+            echo "$features"
+            exit 1
+          fi
+          if echo "$features" | grep -q 'rustls feature "ring"'; then
+            echo "::error::rustls is built with ring as well as aws-lc-rs"
+            echo "$features"
+            exit 1
+          fi
+          echo "clean: rustls uses aws-lc-rs only"
+
   python-audit:
     name: Python dependency audit
     runs-on: ubuntu-latest
@@ -261,7 +387,7 @@ jobs:
           workspaces: runtime -> target
       - name: Create web/dist placeholder for rust-embed
         run: mkdir -p ../web/dist && echo '<!DOCTYPE html><html><body></body></html>' > ../web/dist/index.html
-      - run: cargo build --release --workspace
+      - run: cargo build --release --workspace --locked
 
   # ── Wheel build check ───────────────────────────────────────────────
   wheel-check:

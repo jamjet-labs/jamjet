@@ -27,7 +27,7 @@ async fn workflow_runs_to_completion() {
     );
 
     // A trivial single-node workflow: a condition node that terminates (edge to
-    // the "end" sentinel). The worker runs it via the no-op stub, after which the
+    // the "end" sentinel). The condition executor passes it through (no branches), after which the
     // scheduler must detect completion.
     let ir = serde_json::json!({
         "workflow_id": "e2e-completion",
@@ -137,7 +137,12 @@ async fn workflow_runs_to_completion() {
     let scheduler = jamjet_scheduler::Scheduler::new(backend.clone())
         .with_poll_interval(Duration::from_millis(25));
     let sched_handle = tokio::spawn(async move { scheduler.run().await });
-    let worker_handles = jamjet_worker::default_pool(backend.clone()).spawn();
+    // The server's own pool, with the executors it registers.
+    let worker_handles = jamjet_worker::server_pool(
+        backend.clone(),
+        Arc::new(jamjet_models::ModelRegistry::new()),
+    )
+    .spawn();
 
     // Wait for a terminal state, bounded by a hard timeout so the test can never
     // hang the suite even if completion detection regresses.

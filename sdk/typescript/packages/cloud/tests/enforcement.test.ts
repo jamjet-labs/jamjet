@@ -146,7 +146,7 @@ describe('runEnforcedCall', () => {
     expect(recorded.agent_name).toBe('override_agent')
   })
 
-  it('streaming requests skip post-decision check but still record span', async () => {
+  it('streaming requests record the span once the stream has been read', async () => {
     const client = makeClient()
     client._policy.add('block', 'wire_*')
     let recorded: any
@@ -157,12 +157,15 @@ describe('runEnforcedCall', () => {
         yield { choices: [] }
       },
     })
-    await runEnforcedCall({
+    const stream = (await runEnforcedCall({
       client,
       vendor: 'openai',
       original,
       args: [{ model: 'gpt-4o', stream: true, messages: [], tools: [{ type: 'function', function: { name: 'wire_money' } }] }],
-    })
+    })) as AsyncIterable<unknown>
+    expect(recorded).toBeUndefined()
+    for await (const _ of stream) { /* drain */ }
     expect(recorded).toBeDefined()
+    expect(recorded.status).toBe('ok')
   })
 })

@@ -3,6 +3,7 @@ name = "jamjet-a2a-proto"
 description = "JamJet A2A protocol bridge — re-exports from jamjet-a2a crate + ProtocolAdapter"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

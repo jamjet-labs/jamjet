@@ -40,10 +40,7 @@ impl AnthropicLlmClient {
             api_key: api_key.into(),
             model: model.into(),
             max_tokens: 4096,
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-                .expect("reqwest client build"),
+            client: crate::http::client_or_panic(Some(std::time::Duration::from_secs(60))),
         }
     }
 

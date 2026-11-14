@@ -1,6 +1,6 @@
 package dev.jamjet.examples;
 
-import dev.jamjet.agent.Agent;
+import dev.jamjet.sdk.agent.Agent;
 import dev.jamjet.tool.Tool;
 import dev.jamjet.tool.ToolCall;
 

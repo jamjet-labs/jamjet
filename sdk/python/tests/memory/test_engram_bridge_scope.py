@@ -1,4 +1,8 @@
 import pytest
+
+# jamjet-engram (the `memory` extra) needs Python 3.12+; skip where it is absent.
+pytest.importorskip("engram")
+
 from engram import Engram
 from engram import Scope as EngramScope
 

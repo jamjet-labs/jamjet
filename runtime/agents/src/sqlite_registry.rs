@@ -212,7 +212,7 @@ impl AgentRegistry for SqliteAgentRegistry {
     #[instrument(skip(self), fields(url = url))]
     async fn discover_remote(&self, url: &str) -> Result<Agent, String> {
         let agent_card_url = format!("{url}/.well-known/agent.json");
-        let card: AgentCard = reqwest::Client::new()
+        let card: AgentCard = http_client()?
             .get(&agent_card_url)
             .send()
             .await
@@ -228,22 +228,29 @@ impl AgentRegistry for SqliteAgentRegistry {
     }
 }
 
+/// One client for every call: it holds the connection pool, and building one
+/// reads the system trust store. Only a built client is kept, so a failure is
+/// tried again on the next call.
+fn http_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let built = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("cannot build an HTTP client: {e}"))?;
+    Ok(CLIENT.get_or_init(|| built))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::card::{AgentCapabilities, AuthSpec, AutonomyLevel};
 
     async fn open_test_registry() -> SqliteAgentRegistry {
-        // Use the state migration to create the agents table.
-        let backend = jamjet_state::SqliteBackend::open("sqlite::memory:")
-            .await
-            .expect("failed to open in-memory db");
-        // Re-use the pool from SqliteBackend by connecting to the same in-memory URL.
-        // In-memory SQLite is connection-scoped, so we need a fresh connection here
-        // that shares the schema from migrations.
-        // For tests, connect to a named in-memory DB.
+        // The state migrations create the agents table; run them on this
+        // pool's own in-memory database.
         let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
-        // Run migrations manually.
         sqlx::migrate!("../state/migrations")
             .run(&pool)
             .await

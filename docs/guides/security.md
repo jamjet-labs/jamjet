@@ -4,19 +4,52 @@
 
 ## Authentication
 
-### API Tokens (v1)
-```bash
-# Generate a token
-jamjet auth token create --name my-service --scopes read,write
+### API tokens
 
-# Use in requests
+Outside dev mode every route except `GET /health` and `GET /.well-known/did.json`
+needs `Authorization: Bearer <token>`. The runtime checks the token against the
+`api_tokens` table in its SQLite database, by SHA-256 hash. There is no CLI
+command or API route that issues tokens, so you write the row yourself. Start
+the server once against the database file so the table exists, then:
+
+```bash
+python3 - .jamjet/runtime.db ci-deployer developer <<'EOF'
+import datetime, hashlib, secrets, sqlite3, sys, uuid
+
+db, name, role = sys.argv[1:4]
+token = "jj_" + secrets.token_hex(32)
+con = sqlite3.connect(db)
+con.execute(
+    "INSERT INTO api_tokens (id, token_hash, name, role, created_at) VALUES (?, ?, ?, ?, ?)",
+    (str(uuid.uuid4()), hashlib.sha256(token.encode()).hexdigest(), name, role,
+     datetime.datetime.now(datetime.timezone.utc).isoformat()),
+)
+con.commit()
+print(token)
+EOF
+```
+
+The arguments are the database path, a name and a role (see [RBAC](#rbac)).
+The token is printed once; only its hash is stored. To expire a token set
+`expires_at` (RFC 3339), and to revoke it set `revoked_at`. In the Docker image
+the database is wherever `DATABASE_URL` points (see
+[Deployment](deployment.md#docker)), and the same script runs inside the
+container with `docker exec -i <container> python3 - /data/runtime.db ...`. A
+server with `STORAGE_BACKEND=memory` has no table to write to, so it accepts no
+token.
+
+```bash
 curl -H "Authorization: Bearer $TOKEN" http://localhost:7700/executions
 ```
 
-Set token in Python SDK:
+The CLI and the Python client read the token from `JAMJET_TOKEN`, or take it
+directly:
+
 ```python
+import os
 from jamjet import JamjetClient
-client = JamjetClient(api_token=os.environ["JAMJET_TOKEN"])
+
+client = JamjetClient(base_url="http://localhost:7700", api_token=os.environ["JAMJET_TOKEN"])
 ```
 
 ---
@@ -67,63 +100,56 @@ have to carry the tenant first, and none does yet:
   tenant policy applies to them);
 - the agent registry (global today).
 
-The tenant policy is the one policy layer a developer cannot rewrite: workflow and node
-policies live in IR that a developer registers, and a developer can always register a
-new version. Put approval gates that must bind the people who start runs at tenant
-level, and make them catch-alls (`require_approval_for: ["*"]`): a pattern matches a
-name the IR author chose, and the same function can be reached under another name
-(a re-export or alias), so a narrow tenant pattern does not bind an author who writes
-their own IR.
+Tenant policy (`PUT /tenants/:id`, operator only) is not a floor under the
+policies in a workflow's IR. Layers are checked from the most specific to the
+least (node, then workflow, then tenant), and the first rule that matches
+decides. A developer who registers IR can therefore override the tenant layer
+for a name their own rule matches:
+
+- a node or workflow `require_approval_for` pattern turns a tenant block into
+  an approval request;
+- on a `model` node, a node or workflow `model_allowlist` that lists the model
+  allows the call before the tenant's allowlist is read.
+
+A tenant `require_approval_for: ["*"]` does gate every Python, Java and
+external step, since a rule in the IR can only block such a step or ask for
+the same approval. It does not gate `model`, `condition` or `human_approval`
+nodes: they have no tool name for a pattern to match. A narrow tenant pattern
+binds less than it seems. It matches a name the IR author chose, and the same
+function can be reached under another name (a re-export or an alias).
 
 ---
 
 ## Secrets
 
-**Never** put secrets in workflow YAML or Python code. Use environment variables:
+The server reads model provider keys and audit signing keys from its own
+environment (the Ed25519 key can also come from a file; see
+[Signing the audit log](#signing-the-audit-log)). It has no secrets backend,
+it does not expand `${NAME}` references in workflow payloads, and it does not
+redact secrets from logs or traces.
 
-```yaml
-# agents.yaml
-agents:
-  researcher:
-    mcp:
-      servers:
-        github:
-          auth:
-            type: bearer
-            token_env: GITHUB_TOKEN   # reads from environment
-```
-
-For production, use a secrets backend (Vault, AWS Secrets Manager) — pluggable in v2.
-
-Secrets are **redacted from logs and traces** automatically when referenced via `*_env` config keys.
+Keep secrets out of workflow YAML and out of run input. Both are stored in
+the SQLite database, and a run's input and state are returned by
+`GET /executions/:id` to any token with the `viewer` role.
 
 ---
 
-## Inter-Agent Security
+## MCP, A2A and OAuth
 
-### MCP
-- Bearer token or API key per MCP server connection
-- Configured per-server in `agents.yaml`
-
-### A2A
-- Bearer token (v1)
-- OAuth2 client credentials (v1)
-- mTLS for cross-org federation (Phase 4)
-
-All inter-agent communications are **audit logged**.
+The server does not call MCP servers or A2A agents from a workflow:
+registration refuses `mcp_tool` and `a2a_task` nodes, so per-server
+credentials in an `mcp:` or `a2a:` block are not used. Its own MCP endpoint,
+`/mcp`, takes the same Bearer tokens and roles as the REST routes. The server
+has no OAuth or mTLS support.
 
 ---
 
-## Tool Permissions
+## Tool permissions
 
-```yaml
-tools:
-  get_ticket:
-    permissions: [read_only]      # safe — read-only data access
-
-  delete_record:
-    permissions: [write, privileged]  # requires privileged worker
-```
+A tool's `permissions` (`@tool(permissions=[...])`, or `permissions:` on a tool
+definition) is recorded in the IR. The runtime does not check it. To limit what
+runs, use `blocked_tools` and `require_approval_for` policies, or an Agent
+Card's `allowed_tools`.
 
 An agent's `allowed_tools` (in its Agent Card's `constraints`) is enforced by the runtime, not just in prompts, on every node that acts for the agent: a workflow or node whose IR sets `agent_ref` to the card's `uri`. Such a node runs only if its tool is on the list. For an ADK agent's tool calls, both the name the model called and the code the call resolves to must be on it, while the run's `tools` map has an entry for the call. A node that chooses its target at run time (a coordinator, agent discovery, an `auto` agent tool) is refused under a list. A refused node fails with a policy violation recorded under scope `agent`, on both the HTTP claim route and the in-process worker. An absent or empty list restricts nothing, and a node that acts for no agent is not checked against any card. The list is an additional restriction: tenant, workflow and node policy still apply. A node acting for an agent that is not registered is refused. The card's `blocked_tools`, `require_approval_for` and `allowed_delegations` apply to the same nodes, and under a non-empty list a node that picks its target at run time is refused (or, for `require_approval_for`, gated); [What each constraint does](agent-model-guide.md#what-each-constraint-does) lists the rest of the card and how little of it is enforced.
 
@@ -133,17 +159,24 @@ An agent's `allowed_tools` (in its Agent Card's `constraints`) is enforced by th
 
 ---
 
-## Audit Trail
+## Audit trail
 
-All of the following are permanently logged with identity, timestamp, and decision:
-- Human approval decisions, and the approval requests they answer (with the
-  action digest and deadline each request bound), their expiries and their
-  escalations. These are sealed into the signed, hash-chained audit log, so
-  editing what was asked breaks verification as editing the decision does.
-- Privileged tool invocations
-- Agent-to-agent delegations
-- Policy violations
-- Authentication events
+The runtime keeps two records.
+
+- **The run's event log.** Every execution's events (node scheduled, started,
+  completed or failed, `policy_violation`, approval requests and decisions)
+  are appended in order and returned by `GET /executions/:id/events`. The log
+  is append-only through the API. It is not signed.
+- **The signed audit log** (`GET /audit`). It holds the approval records: each
+  approval request with the action digest and deadline it bound, each
+  decision with the principal that made it, and expiries and escalations. Each
+  entry is hash-chained to the one before it and, when a signing key is set,
+  signed, so editing what was asked breaks verification as editing the
+  decision does.
+
+Policy blocks, agent delegations and authentication attempts are not written
+to the signed audit log. A server with `STORAGE_BACKEND=memory` keeps no audit
+log.
 
 ### Signing the audit log
 

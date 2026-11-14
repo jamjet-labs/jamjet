@@ -18,6 +18,7 @@ use std::collections::{HashSet, VecDeque};
 /// 10. All remote agents referenced by a2a_task nodes are configured
 /// 11. Every ADK tool-dispatch node carries its `agent_tool_dispatch` marker
 /// 12. Every node id is in the safe set (see [`validate_node_ids`])
+/// 13. Every model node's inline prompt is a template the runtime can render
 pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_metadata(ir)?;
     validate_no_duplicate_nodes(ir)?;
@@ -28,9 +29,12 @@ pub fn validate_workflow(ir: &WorkflowIr) -> IrResult<()> {
     validate_refs(ir)?;
     validate_agent_tool_dispatch(ir)?;
     validate_condition_expressions(ir)?;
+    validate_prompt_templates(ir)?;
     validate_external_queues(ir)?;
     validate_node_ids(ir)?;
     validate_approval_deadlines(ir)?;
+    validate_human_approvals(ir)?;
+    validate_entry_points(ir)?;
     Ok(())
 }
 
@@ -56,6 +60,308 @@ pub fn validate_approval_deadlines(ir: &WorkflowIr) -> IrResult<()> {
         }
     }
     Ok(())
+}
+
+/// The identifier fields of a node kind: the names the engine records for
+/// a node (in approval requests, policy decisions and audit entries).
+const IDENTIFIER_FIELDS: &[&str] = &[
+    "tool_ref",
+    "module",
+    "function",
+    "class_name",
+    "method",
+    "handler",
+    "queue",
+    "server",
+    "tool",
+    "skill",
+    "remote_agent",
+    "agent_ref",
+    "model_ref",
+    "connector_ref",
+    "policy_ref",
+    "workflow_ref",
+];
+
+/// Whether an identifier may not hold `c`: a control character (Unicode
+/// `Cc`), an invisible format character (the `Cf` code points of Unicode
+/// 15.1: soft hyphen, zero-width space, joiners and marks, bidirectional
+/// embeddings, overrides and isolates, word joiner and invisible operators,
+/// byte-order mark, tag characters and the rest), or a line or paragraph
+/// separator (U+2028, U+2029).
+///
+/// A format character is invisible where a reviewer reads the name: `pay`
+/// followed by U+202E shows its tail reversed, and a zero-width space makes
+/// two names that look the same differ. Letters of any script, accents,
+/// emoji and U+00A0 (a visible space) are not refused. One consequence: an
+/// emoji ZWJ sequence or a tag-sequence flag holds a `Cf` character and is
+/// refused.
+pub fn is_forbidden_identifier_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08E2}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0001}'
+                | '\u{E0020}'..='\u{E007F}'
+        )
+}
+
+/// No identifier the engine records holds a control or invisible format
+/// character ([`is_forbidden_identifier_char`]): the workflow id and
+/// version, every node's and the workflow's `agent_ref`, and each node kind's
+/// handler, tool, agent and model names. They reach the audit log, whose v1
+/// entry hash joins fields with U+001F and no length prefix, the approval
+/// requests a reviewer reads, and the commands a reviewer pastes.
+pub fn validate_identifier_chars(ir: &WorkflowIr) -> IrResult<()> {
+    let bad = |v: &str| v.chars().any(is_forbidden_identifier_char);
+    let refuse = |what: String| Err(IrError::ControlCharacter(what));
+    if bad(&ir.workflow_id) {
+        return refuse("workflow_id".into());
+    }
+    if bad(&ir.version) {
+        return refuse("version".into());
+    }
+    if ir.agent_ref.as_deref().is_some_and(bad) {
+        return refuse("agent_ref".into());
+    }
+    let mut ids: Vec<&String> = ir.nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        let node = &ir.nodes[id];
+        if node.agent_ref.as_deref().is_some_and(bad) {
+            return refuse(format!("node '{id}' agent_ref"));
+        }
+        let kind = serde_json::to_value(&node.kind).unwrap_or_default();
+        for field in IDENTIFIER_FIELDS {
+            if kind.get(*field).and_then(|v| v.as_str()).is_some_and(bad) {
+                return refuse(format!("node '{id}' {field}"));
+            }
+        }
+        if kind
+            .get("agent")
+            .and_then(|a| a.get("explicit"))
+            .and_then(|v| v.as_str())
+            .is_some_and(bad)
+        {
+            return refuse(format!("node '{id}' agent"));
+        }
+    }
+    Ok(())
+}
+
+/// Every node but the start node is entered through an edge, and every node
+/// is reachable from the start node (following edges and `human_approval`
+/// fallbacks).
+///
+/// The scheduler runs a node whose every live in-edge is done, so a node with
+/// NO in-edge is a root: it runs as soon as the run starts. A step the author
+/// meant to come after something (a condition's branch target the compiler
+/// drew no edge to, a step after an approval) would run first, with nothing
+/// checked. A node unreachable from the start never runs at all. Both are
+/// refused, naming every such node.
+pub fn validate_entry_points(ir: &WorkflowIr) -> IrResult<()> {
+    use jamjet_core::node::NodeKind;
+    // A missing start node would make every node look unreachable; say what
+    // is actually wrong.
+    validate_start_node(ir)?;
+    let reachable = reachable_from(ir, &[ir.start_node.as_str()]);
+    let entered: HashSet<&str> = ir
+        .edges
+        .iter()
+        .map(|e| e.to.as_str())
+        .chain(ir.nodes.values().filter_map(|n| match &n.kind {
+            NodeKind::HumanApproval {
+                fallback_node: Some(f),
+                ..
+            } => Some(f.as_str()),
+            _ => None,
+        }))
+        .collect();
+    let mut ids: Vec<&String> = ir.nodes.keys().collect();
+    ids.sort();
+    let mut roots = Vec::new();
+    let mut unreachable = Vec::new();
+    for id in ids {
+        if *id == ir.start_node {
+            continue;
+        }
+        if !entered.contains(id.as_str()) {
+            roots.push(id.clone());
+        } else if !reachable.contains(id.as_str()) {
+            unreachable.push(id.clone());
+        }
+    }
+    if roots.is_empty() && unreachable.is_empty() {
+        return Ok(());
+    }
+    let list = |v: &[String]| {
+        v.iter()
+            .map(|n| format!("'{n}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut parts = Vec::new();
+    if !roots.is_empty() {
+        parts.push(format!(
+            "node(s) {} have no incoming edge, so they would run when the run starts; \
+             add an edge from the step each one follows (a condition's branch targets \
+             need edges from the condition too)",
+            list(&roots)
+        ));
+    }
+    if !unreachable.is_empty() {
+        parts.push(format!(
+            "node(s) {} cannot be reached from the start node '{}', so they would never run",
+            list(&unreachable),
+            ir.start_node
+        ));
+    }
+    Err(IrError::UnreachableNodes(parts.join("; ")))
+}
+
+/// Every `human_approval` node can be honoured: its `timeout_secs` is a
+/// deadline the engine accepts (1 second to a year, like a policy's
+/// `approval_timeout_secs`), and its `fallback_node` names another node of
+/// the workflow. A fallback that does not exist would turn an expiry into a
+/// run that can never finish.
+pub fn validate_human_approvals(ir: &WorkflowIr) -> IrResult<()> {
+    use crate::workflow::MAX_APPROVAL_TIMEOUT_SECS;
+    use jamjet_core::node::NodeKind;
+    let mut ids: Vec<&String> = ir.nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        let NodeKind::HumanApproval {
+            timeout_secs,
+            fallback_node,
+            ..
+        } = &ir.nodes[id].kind
+        else {
+            continue;
+        };
+        let invalid = |reason: String| IrError::InvalidHumanApproval {
+            node: id.clone(),
+            reason,
+        };
+        if let Some(t) = timeout_secs {
+            if !(1..=MAX_APPROVAL_TIMEOUT_SECS).contains(t) {
+                return Err(invalid(format!(
+                    "timeout_secs must be between 1 and {MAX_APPROVAL_TIMEOUT_SECS}, got {t}"
+                )));
+            }
+        }
+        if fallback_node.is_some() {
+            human_approval_fallback(ir, id).map_err(invalid)?;
+        }
+    }
+    Ok(())
+}
+
+/// The `fallback_node` that ends the run on expiry instead of naming a node.
+pub const FALLBACK_END: &str = "end";
+
+/// The `fallback_node` of the `human_approval` node `node_id`, if it names one
+/// the engine can route to: `Ok(None)` when it names none (or `node_id` is not
+/// a `human_approval` node), `Err` with the reason when it names one that
+/// cannot work. Registration refuses the `Err` cases; the scheduler treats
+/// them as no fallback, so an expiry fails the node (a version stored before
+/// this check existed).
+///
+/// A fallback must be another node of the workflow, and the approval node
+/// must not be reachable from it. The scheduler gives the fallback an in-edge
+/// from the approval node, so a fallback upstream of it (the start node, or a
+/// "redo the draft" step) would wait on the approval while the approval waited
+/// on it, and the run would end without anyone being asked. `end` (see
+/// [`FALLBACK_END`]) is accepted when no node has that id.
+pub fn human_approval_fallback<'a>(
+    ir: &'a WorkflowIr,
+    node_id: &str,
+) -> Result<Option<&'a str>, String> {
+    use jamjet_core::node::NodeKind;
+    let Some(NodeKind::HumanApproval {
+        fallback_node: Some(fallback),
+        ..
+    }) = ir.nodes.get(node_id).map(|n| &n.kind)
+    else {
+        return Ok(None);
+    };
+    if fallback == node_id {
+        return Err("fallback_node names the node itself".to_string());
+    }
+    // `fallback: end`, as edges spell the terminal: on expiry the run ends
+    // there, and the steps the approval guarded are skipped. Only when no
+    // node is actually called "end".
+    if fallback == FALLBACK_END && !ir.nodes.contains_key(fallback) {
+        return Ok(Some(FALLBACK_END));
+    }
+    if !ir.nodes.contains_key(fallback) {
+        return Err(format!(
+            "fallback_node '{fallback}' is not a node of this workflow"
+        ));
+    }
+    if reachable_from(ir, &[fallback.as_str()]).contains(node_id) {
+        return Err(format!(
+            "fallback_node '{fallback}' leads back to this node, so the run would wait on \
+             itself; a fallback must come after the approval, not before it"
+        ));
+    }
+    Ok(Some(fallback.as_str()))
+}
+
+/// Every node reachable from `starts` (included), following the IR's edges
+/// and each `human_approval` node's `fallback_node`, the in-edge the scheduler
+/// gives a fallback.
+pub fn reachable_from<'a>(ir: &'a WorkflowIr, starts: &[&str]) -> HashSet<&'a str> {
+    use jamjet_core::node::NodeKind;
+    let mut seen: HashSet<&'a str> = HashSet::new();
+    let mut queue: VecDeque<&'a str> = VecDeque::new();
+    for s in starts {
+        if let Some((id, _)) = ir.nodes.get_key_value(*s) {
+            if seen.insert(id.as_str()) {
+                queue.push_back(id.as_str());
+            }
+        }
+    }
+    while let Some(current) = queue.pop_front() {
+        let fallback = match ir.nodes.get(current).map(|n| &n.kind) {
+            Some(NodeKind::HumanApproval {
+                fallback_node: Some(f),
+                ..
+            }) => Some(f.as_str()),
+            _ => None,
+        };
+        for next in ir
+            .edges
+            .iter()
+            .filter(|e| e.from == current)
+            .map(|e| e.to.as_str())
+            .chain(fallback)
+        {
+            if let Some((id, _)) = ir.nodes.get_key_value(next) {
+                if seen.insert(id.as_str()) {
+                    queue.push_back(id.as_str());
+                }
+            }
+        }
+    }
+    seen
 }
 
 /// Refuse a non-null `timeouts.approval_timeout` in a raw IR document.
@@ -213,6 +519,31 @@ pub fn validate_condition_expressions(ir: &WorkflowIr) -> IrResult<()> {
     Ok(())
 }
 
+/// Every model node's inline prompt must be a template the runtime can
+/// render: text with `{{ state.<path> }}` substitutions and nothing else (see
+/// `jamjet_core::template`). A filter, statement or comment would fail every
+/// run that reaches the node, so it is refused here, once. A prompt FILE
+/// reference is not checked: the runtime cannot read it, and a node that
+/// reads the conversation in state still runs with one.
+pub fn validate_prompt_templates(ir: &WorkflowIr) -> IrResult<()> {
+    use jamjet_core::node::NodeKind;
+    use jamjet_core::template::{is_prompt_file_ref, validate_template};
+    let mut ids: Vec<&String> = ir.nodes.keys().collect();
+    ids.sort();
+    for id in ids {
+        if let NodeKind::Model { prompt_ref, .. } = &ir.nodes[id].kind {
+            if prompt_ref.trim().is_empty() || is_prompt_file_ref(prompt_ref) {
+                continue;
+            }
+            validate_template(prompt_ref).map_err(|reason| IrError::InvalidPromptTemplate {
+                node: id.clone(),
+                reason,
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// The longest queue name an `external_fn` node may use.
 pub const MAX_QUEUE_NAME_LEN: usize = 64;
 
@@ -282,12 +613,14 @@ fn validate_start_node(ir: &WorkflowIr) -> IrResult<()> {
         return Err(IrError::NoStartNode);
     }
     if !ir.nodes.contains_key(&ir.start_node) {
-        return Err(IrError::UnreachableNode(ir.start_node.clone()));
+        return Err(IrError::MissingStartNode(ir.start_node.clone()));
     }
     Ok(())
 }
 
-fn validate_edges(ir: &WorkflowIr) -> IrResult<()> {
+/// Every edge leads to a node of the workflow, or to `end`. An edge to a node
+/// that does not exist would route the run to nothing.
+pub fn validate_edges(ir: &WorkflowIr) -> IrResult<()> {
     for edge in &ir.edges {
         if !ir.nodes.contains_key(&edge.to) && edge.to != "end" {
             return Err(IrError::UnknownEdgeTarget {
@@ -348,8 +681,19 @@ fn validate_reachability(ir: &WorkflowIr) -> IrResult<()> {
     visited.insert(&ir.start_node);
 
     while let Some(current) = queue.pop_front() {
-        for edge in ir.edges_from(current) {
-            let next = edge.to.as_str();
+        // A `human_approval` node's fallback is reached through it on expiry.
+        let fallback = ir.nodes.get(current).and_then(|n| match &n.kind {
+            jamjet_core::node::NodeKind::HumanApproval { fallback_node, .. } => {
+                fallback_node.as_deref()
+            }
+            _ => None,
+        });
+        for next in ir
+            .edges_from(current)
+            .into_iter()
+            .map(|edge| edge.to.as_str())
+            .chain(fallback)
+        {
             if next != "end" && !visited.contains(next) {
                 visited.insert(next);
                 queue.push_back(next);
@@ -706,5 +1050,89 @@ mod tests {
         ir.version = "not-semver".into();
         let err = validate_workflow(&ir);
         assert!(matches!(err, Err(IrError::InvalidVersion(_))));
+    }
+
+    /// Format characters are refused in identifiers along with control
+    /// characters (review of #178, probe C: `pay\u{202e}lmth` and
+    /// `zero\u{200b}width` registered). Letters of any script, accents,
+    /// emoji and NBSP are not.
+    #[test]
+    fn identifiers_refuse_format_characters_and_keep_unicode_names() {
+        let refused = [
+            '\u{1f}',
+            '\t',
+            '\u{7f}',
+            '\u{85}',
+            '\u{ad}',
+            '\u{61c}',
+            '\u{180e}',
+            '\u{200b}',
+            '\u{200c}',
+            '\u{200d}',
+            '\u{200e}',
+            '\u{200f}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{202a}',
+            '\u{202b}',
+            '\u{202c}',
+            '\u{202d}',
+            '\u{202e}',
+            '\u{2060}',
+            '\u{2061}',
+            '\u{2064}',
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}',
+            '\u{feff}',
+            '\u{fff9}',
+            '\u{e0001}',
+            '\u{e0041}',
+            '\u{e007f}',
+        ];
+        for c in refused {
+            assert!(
+                is_forbidden_identifier_char(c),
+                "accepted U+{:04X}",
+                c as u32
+            );
+        }
+        for name in [
+            "数据_é_🙂",
+            "nbsp\u{a0}x",
+            "wf é",
+            "Ωmega",
+            "café",
+            "❤\u{fe0f}",
+            "a-b.c_d",
+        ] {
+            assert!(
+                !name.chars().any(is_forbidden_identifier_char),
+                "refused {name:?}"
+            );
+        }
+
+        let cond = NodeKind::Condition { branches: vec![] };
+        for bad in [
+            "pay\u{202e}lmth",
+            "zero\u{200b}width",
+            "\u{feff}wf",
+            "wf\u{2066}x",
+        ] {
+            let mut ir = make_ir("a", vec![("a", cond.clone())], vec![("a", "end")]);
+            ir.workflow_id = bad.into();
+            assert!(
+                matches!(
+                    validate_identifier_chars(&ir),
+                    Err(IrError::ControlCharacter(_))
+                ),
+                "accepted workflow_id {bad:?}"
+            );
+        }
+        let mut ir = make_ir("a", vec![("a", cond.clone())], vec![("a", "end")]);
+        ir.workflow_id = "数据_é_🙂".into();
+        ir.version = "0.1.0".into();
+        assert!(validate_identifier_chars(&ir).is_ok());
     }
 }

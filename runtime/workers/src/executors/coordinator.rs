@@ -10,7 +10,7 @@ use jamjet_scheduler::strategy_bridge::{
 };
 use jamjet_state::backend::WorkItem;
 use serde_json::{json, Value};
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument, warn, Span};
 
 pub struct CoordinatorExecutor {
     bridge: StrategyBridge,
@@ -26,7 +26,13 @@ impl CoordinatorExecutor {
 
 #[async_trait]
 impl NodeExecutor for CoordinatorExecutor {
-    #[instrument(skip(self, item), fields(node_id = %item.node_id))]
+    #[instrument(skip(self, item), fields(
+        node_id = %item.node_id,
+        jamjet.coordinator.candidates_count = tracing::field::Empty,
+        jamjet.coordinator.spread = tracing::field::Empty,
+        jamjet.coordinator.method = tracing::field::Empty,
+        jamjet.coordinator.selected_agent = tracing::field::Empty,
+    ))]
     async fn execute(&self, item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
         let start = std::time::Instant::now();
         let p = &item.payload;
@@ -111,6 +117,13 @@ impl NodeExecutor for CoordinatorExecutor {
                 "rejected": [],
             });
             let duration_ms = start.elapsed().as_millis() as u64;
+            jamjet_telemetry::record_coordinator_attrs(
+                &Span::current(),
+                0,
+                0.0,
+                "no_candidates",
+                None,
+            );
             return Ok(ExecutionResult {
                 output: json!(null),
                 state_patch: json!({
@@ -129,6 +142,13 @@ impl NodeExecutor for CoordinatorExecutor {
         if discover_resp.candidates.len() == 1 {
             let selected = discover_resp.candidates[0].uri.clone();
             let duration_ms = start.elapsed().as_millis() as u64;
+            jamjet_telemetry::record_coordinator_attrs(
+                &Span::current(),
+                1,
+                1.0,
+                "single_candidate",
+                Some(&selected),
+            );
             return Ok(ExecutionResult {
                 output: json!({ output_key: selected.clone() }),
                 state_patch: json!({
@@ -161,6 +181,7 @@ impl NodeExecutor for CoordinatorExecutor {
         }
 
         // Phase 2: Scoring
+        let candidates_count = discover_resp.candidates.len() as u64;
         let score_resp = self
             .bridge
             .score(ScoreRequest {
@@ -183,6 +204,13 @@ impl NodeExecutor for CoordinatorExecutor {
                 "rejected": [],
             });
             let duration_ms = start.elapsed().as_millis() as u64;
+            jamjet_telemetry::record_coordinator_attrs(
+                &Span::current(),
+                candidates_count,
+                score_resp.spread,
+                "no_candidates",
+                None,
+            );
             return Ok(ExecutionResult {
                 output: json!(null),
                 state_patch: json!({
@@ -307,7 +335,19 @@ impl NodeExecutor for CoordinatorExecutor {
             .get("selected")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let method = decide_result
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         let duration_ms = start.elapsed().as_millis() as u64;
+
+        jamjet_telemetry::record_coordinator_attrs(
+            &Span::current(),
+            candidates_count,
+            score_resp.spread,
+            method,
+            selected_uri.as_deref(),
+        );
 
         Ok(ExecutionResult {
             output: match &selected_uri {

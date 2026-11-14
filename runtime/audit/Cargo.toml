@@ -3,6 +3,7 @@ name = "jamjet-audit"
 description = "JamJet audit log — immutable, append-only record of all security-relevant events"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -23,7 +24,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
 sha2 = { workspace = true }
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
 # Ed25519 audit signing: third parties verify with the public key alone.
 ed25519-dalek = "2"

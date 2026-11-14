@@ -200,7 +200,7 @@ async fn start_on(
     let state = state_for(tb, backend.clone()).await;
     register(&state, cards).await;
     let wf = ir["workflow_id"].as_str().unwrap().to_string();
-    let eid = support::register_and_start(&state, ir.clone(), input.clone()).await;
+    let eid = support::store_and_start(&state, ir.clone(), input.clone()).await;
     let eid =
         ExecutionId(uuid::Uuid::parse_str(eid.strip_prefix("exec_").unwrap_or(&eid)).unwrap());
     Run {
@@ -241,6 +241,40 @@ impl Run {
             .queue_type()
             .as_str()
             .to_string();
+        // `POST /work-items` refuses a node the engine runs itself, so an
+        // engine node's item is queued the way the scheduler queues it.
+        if jamjet_worker::executable::ENGINE_QUEUES.contains(&queue.as_str()) {
+            let seq = self.backend.latest_sequence(&self.eid).await.unwrap() + 1;
+            self.backend
+                .append_event(jamjet_state::Event::new(
+                    self.eid.clone(),
+                    seq,
+                    EventKind::NodeScheduled {
+                        node_id: "n1".into(),
+                        queue_type: queue.clone(),
+                    },
+                ))
+                .await
+                .unwrap();
+            self.backend
+                .enqueue_work_item(jamjet_state::backend::WorkItem {
+                    id: uuid::Uuid::new_v4(),
+                    execution_id: self.eid.clone(),
+                    node_id: "n1".into(),
+                    queue_type: queue,
+                    payload,
+                    attempt: 0,
+                    max_attempts: 3,
+                    created_at: chrono::Utc::now(),
+                    lease_expires_at: None,
+                    worker_id: None,
+                    lease_fence: 0,
+                    tenant_id: jamjet_state::DEFAULT_TENANT.into(),
+                })
+                .await
+                .unwrap();
+            return;
+        }
         let (st, body) = support::post(
             &self.state,
             "/work-items",
@@ -406,6 +440,17 @@ async fn each() -> Vec<(String, support::TestBackend, Transport, String)> {
     out
 }
 
+/// `each` without the claim transport, for a node dispatched to one of the
+/// engine's queues (`general`, `model`), which external workers are not
+/// served.
+fn in_process_only(
+    all: Vec<(String, support::TestBackend, Transport, String)>,
+) -> Vec<(String, support::TestBackend, Transport, String)> {
+    all.into_iter()
+        .filter(|(_, _, t, _)| !matches!(t, Transport::Claim))
+        .collect()
+}
+
 /// The node was refused by `limit`, recorded, and failed for good.
 async fn assert_limit(run: &Run, ran: bool, limit: &str, value: Value, actual: Value, ctx: &str) {
     assert!(!ran, "{ctx}: the step past the limit ran");
@@ -467,7 +512,8 @@ fn agent_node(target: &str) -> Value {
 /// An `agent` node is a step of the agent it calls, attributed or not.
 #[tokio::test]
 async fn an_agent_node_charges_the_agent_it_calls() {
-    for (ctx, tb, t, wf) in each().await {
+    // The engine's queues are not served to external workers: in process only.
+    for (ctx, tb, t, wf) in in_process_only(each().await) {
         let mut run = start(
             &tb,
             &[card(json!({ "max_iterations": 1 }))],
@@ -484,7 +530,8 @@ async fn an_agent_node_charges_the_agent_it_calls() {
 /// A callee with no registered card has no limits to apply.
 #[tokio::test]
 async fn an_agent_node_calling_an_unregistered_agent_runs() {
-    for (ctx, tb, t, wf) in each().await {
+    // The engine's queues are not served to external workers: in process only.
+    for (ctx, tb, t, wf) in in_process_only(each().await) {
         let mut run = start(
             &tb,
             &[],
@@ -538,7 +585,8 @@ async fn a_dispatch_batch_counts_each_call() {
 /// A model step calls no tool, so a spent tool call budget does not stop it.
 #[tokio::test]
 async fn a_model_step_is_not_a_tool_call() {
-    for (ctx, tb, t, wf) in each().await {
+    // The engine's queues are not served to external workers: in process only.
+    for (ctx, tb, t, wf) in in_process_only(each().await) {
         let mut run = start(
             &tb,
             &[card(json!({ "max_tool_calls": 0 }))],
@@ -653,29 +701,48 @@ async fn a_negative_cost_is_refused() {
 
 // ── time_budget_secs ────────────────────────────────────────────────────────
 
+/// The guard reads the wall clock (`Utc::now()` against the first step's
+/// `created_at`), so this test sleeps for real. The sleeps are chosen so the
+/// outcome does not depend on how fast the machine is:
+///
+/// - The third step is refused however slow the machine is: it is checked
+///   at least `INSIDE + PAST` = `BUDGET` after the first step was recorded,
+///   and a sleep never returns early.
+/// - The second step is admitted unless the steps around the first sleep
+///   take longer than `BUDGET - INSIDE` (2 s) between them. With a 1 s budget
+///   and 600 ms sleeps that slack was 400 ms, which a loaded CI runner used
+///   up.
+/// - The third step is only `PAST` after the second, less than the budget,
+///   so a guard timing from the latest step would let it run. If a slow
+///   machine stretched that gap past the budget, the test still passes; it
+///   just stops telling the two apart for that run.
 #[tokio::test]
 async fn the_time_budget_runs_from_the_first_step() {
+    const BUDGET: u64 = 3;
+    const INSIDE: std::time::Duration = std::time::Duration::from_secs(1);
+    const PAST: std::time::Duration = std::time::Duration::from_secs(2);
+    assert_eq!((INSIDE + PAST).as_secs(), BUDGET);
     for (ctx, tb, t, wf) in each().await {
         let mut run = start(
             &tb,
-            &[card(json!({ "time_budget_secs": 1 }))],
+            &[card(json!({ "time_budget_secs": BUDGET }))],
             ir(&wf, mcp_tool(), Some(AGENT), None, None),
             json!({}),
         )
         .await;
         assert!(run.step(t, DONE).await, "{ctx}");
-        // The clock runs from the FIRST step, not the latest: 600 ms after
-        // the first step is inside the budget, 600 ms after that is not,
-        // though it is only 600 ms after the step before it.
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        // The clock runs from the FIRST step, not the latest: 1 s after the
+        // first step is inside the budget, 2 s after that is not, though it
+        // is only 2 s after the step before it.
+        tokio::time::sleep(INSIDE).await;
         assert!(run.step(t, DONE).await, "{ctx}: inside the budget");
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        tokio::time::sleep(PAST).await;
         let ran = run.step(t, DONE).await;
         assert!(!ran, "{ctx}: ran past the time budget");
         let limits = run.limits().await;
         assert_eq!(limits.len(), 1, "{ctx}: {limits:?}");
         assert_eq!(limits[0].0, "time_budget", "{ctx}");
-        assert_eq!(limits[0].1, json!(1), "{ctx}");
+        assert_eq!(limits[0].1, json!(BUDGET), "{ctx}");
         assert!(run.failed_for_good().await.is_some(), "{ctx}");
     }
 }

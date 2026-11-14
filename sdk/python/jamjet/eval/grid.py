@@ -504,6 +504,7 @@ class ExperimentGrid:
                     input=new_input,
                     expected=row.expected,
                     metadata=row.metadata,
+                    expected_trajectory=row.expected_trajectory,
                 )
             )
         return EvalDataset(modified_rows)

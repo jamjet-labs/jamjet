@@ -1,7 +1,6 @@
 # Rust
 /target/
 runtime/target/
-Cargo.lock
 
 # Java / Maven
 sdk/java/**/target/

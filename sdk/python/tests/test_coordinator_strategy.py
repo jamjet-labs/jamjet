@@ -75,6 +75,43 @@ class TestDimensionScores:
         )
         assert result == 0.0
 
+    def test_composite_partial_weights_stays_bounded(self):
+        """Partial weights must not produce a composite above 1.0."""
+        scores = DimensionScores(
+            capability_fit=1.0,
+            cost_fit=1.0,
+            latency_fit=1.0,
+            trust_compatibility=1.0,
+            historical_performance=1.0,
+        )
+        result = scores.composite({"cost_fit": 2.0})
+        assert 0.0 <= result <= 1.0
+
+    def test_composite_partial_weights_normalized(self):
+        """Missing dimensions default to weight 1.0 in both sums."""
+        scores = DimensionScores(
+            capability_fit=1.0,
+            cost_fit=0.0,
+            latency_fit=1.0,
+            trust_compatibility=1.0,
+            historical_performance=1.0,
+        )
+        # 4 dims at weight 1.0, cost_fit at 2.0 → total weight = 6
+        # numerator = (1*1 + 0*2 + 1*1 + 1*1 + 1*1) = 4 → 4/6
+        result = scores.composite({"cost_fit": 2.0})
+        assert result == pytest.approx(4.0 / 6.0)
+
+    def test_composite_ignores_unknown_keys(self):
+        scores = DimensionScores()
+        result_with_junk = scores.composite({"not_a_dimension": 999.0})
+        result_default = scores.composite()
+        assert result_with_junk == pytest.approx(result_default)
+
+    def test_composite_rejects_negative_weight(self):
+        scores = DimensionScores()
+        with pytest.raises(ValueError, match="Negative weight"):
+            scores.composite({"cost_fit": -1.0})
+
 
 class TestDefaultStrategy:
     @pytest.mark.asyncio
@@ -160,6 +197,26 @@ class TestDefaultStrategy:
         candidates, filtered = await strategy.discover("task", ["skill"], [], None, {})
         assert candidates == []
         assert filtered == []
+
+    @pytest.mark.asyncio
+    async def test_discovered_reasoning_modes_boost_capability(self):
+        registry = AsyncMock()
+        registry.list_agents.return_value = [
+            {"uri": "agent-default", "skills": ["analysis"]},
+            {"uri": "agent-react", "skills": ["analysis"], "reasoning_modes": ["react"]},
+        ]
+        strategy = DefaultCoordinatorStrategy(registry=registry)
+        context = {"preferred_reasoning_modes": ["react"]}
+
+        candidates, filtered = await strategy.discover("task", ["analysis"], [], None, context)
+        rankings, _ = await strategy.score("task", candidates, {}, context)
+
+        assert filtered == []
+        assert candidates[0].reasoning_modes == []
+        assert candidates[1].reasoning_modes == ["react"]
+        assert rankings[0].agent_uri == "agent-react"
+        assert rankings[0].scores.capability_fit == pytest.approx(0.4)
+        assert rankings[1].scores.capability_fit == pytest.approx(0.2)
 
     @pytest.mark.asyncio
     async def test_decide_skips_tiebreaker_when_spread_above_threshold(self, strategy):

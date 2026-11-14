@@ -45,6 +45,10 @@ async fn main() -> anyhow::Result<()> {
     // OTEL_EXPORTER_OTLP_ENDPOINT is set, otherwise falls back to plain tracing.
     let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
     jamjet_telemetry::init(config.dev_mode, otel_endpoint.as_deref());
+    // Fail here, saying what to install, rather than panic on first use:
+    // building an HTTP client reads the system CA bundle, and the model
+    // adapters, the OAuth exchange and the MCP and A2A clients all build one.
+    jamjet_models::http::client().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage_backend = std::env::var("STORAGE_BACKEND").unwrap_or_default();
     // Parse the failover generation up front so a misconfiguration fails startup
     // before we open any backend (rather than silently disabling failover-safety).
@@ -198,23 +202,11 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("model seam coverage guard failed: {e}"))?,
         );
-        let pool = jamjet_worker::default_pool(state.backend.clone())
+        // Exactly the kinds `POST /workflows` accepts as in-process
+        // (`jamjet_worker::executable::IN_PROCESS_KINDS`).
+        let pool = jamjet_worker::server_pool(state.backend.clone(), model_registry)
             .with_sealer(state.enricher.clone())
-            .with_agents(state.agents.clone())
-            .with_executor(
-                "model",
-                Arc::new(jamjet_worker::ModelNodeExecutor::new(
-                    model_registry.clone(),
-                )),
-            )
-            .with_executor(
-                "eval",
-                Arc::new(jamjet_worker::EvalExecutor::new(model_registry.clone())),
-            )
-            .with_executor(
-                "condition",
-                Arc::new(jamjet_worker::ConditionNodeExecutor::new()),
-            );
+            .with_agents(state.agents.clone());
         // Detaching the handles lets the workers run for the lifetime of the process
         // (same pattern as the scheduler above).
         let _worker_handles = pool.spawn();

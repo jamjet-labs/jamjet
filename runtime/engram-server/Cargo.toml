@@ -3,6 +3,7 @@ name = "jamjet-engram-server"
 description = "Engram MCP server — memory layer for AI agents. MCP stdio + REST API."
 version = "0.5.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

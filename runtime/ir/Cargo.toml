@@ -3,6 +3,7 @@ name = "jamjet-ir"
 description = "JamJet canonical Intermediate Representation — workflow IR, validation, serialization"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

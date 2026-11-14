@@ -24,6 +24,24 @@ class JamJetPolicyBlocked(Exception):
         super().__init__(f"Tool '{tool}' blocked by policy pattern '{pattern}'")
 
 
+class JamJetUnenforceableCall(JamJetPolicyBlocked):
+    """Raised for an SDK method this package does not enforce (for example the
+    OpenAI Responses API or Anthropic ``messages.stream()``) while a block or
+    require_approval rule is active. Subclasses JamJetPolicyBlocked so existing
+    handlers still catch it."""
+
+    def __init__(self, method: str) -> None:
+        super().__init__(tool=method, pattern="*")
+        self.method = method
+        self.args = (
+            f"{method} is not policy-enforced by jamjet.cloud, so it is refused while block or "
+            "require_approval rules are active. Use chat.completions.create or messages.create instead.",
+        )
+
+    def __str__(self) -> str:
+        return str(self.args[0])
+
+
 class JamJetPIIBlocked(JamJetPolicyBlocked):
     """Raised when a pre-LLM call is blocked because the request contained PII.
 
@@ -53,9 +71,14 @@ class JamJetApprovalRejected(Exception):
 
 
 class JamJetApprovalTimeout(Exception):
-    """Raised when a human-in-the-loop approval times out."""
+    """Raised when a human-in-the-loop approval times out, or when Cloud could
+    not be reached to create or poll it (``reason`` says which)."""
 
-    def __init__(self, approval_id: str, timeout_seconds: float) -> None:
+    def __init__(self, approval_id: str, timeout_seconds: float, reason: str | None = None) -> None:
         self.approval_id = approval_id
         self.timeout_seconds = timeout_seconds
-        super().__init__(f"Approval {approval_id} timed out after {timeout_seconds}s")
+        self.reason = reason
+        msg = f"Approval {approval_id} timed out after {timeout_seconds}s"
+        if reason:
+            msg = f"Approval {approval_id or '(not created)'} failed: {reason}"
+        super().__init__(msg)

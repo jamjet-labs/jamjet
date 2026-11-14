@@ -11,17 +11,83 @@ nodes:
   review_report:
     type: human_approval
     description: "Please review the generated report before publishing"
-    timeout: 72h          # optional: auto-route to fallback after timeout
-    fallback: auto_publish  # node to go to if timeout expires (optional)
+    timeout: 72h   # optional: the request expires after this
+    fallback: end  # optional: on expiry, stop here instead of failing
     next: publish
 ```
 
-When this node is reached:
-1. Workflow **pauses indefinitely** (or until timeout)
-2. The current workflow state is available via API for inspection
-3. A human approves or rejects the action via API or CLI
-4. The decision is **audit logged** with the human's identity and timestamp
-5. Workflow resumes
+When the run reaches this node, the engine records an approval request for
+it, the same request a policy's `require_approval_for` raises (see below),
+and the run waits there. Nothing after the node runs until someone decides.
+
+`fallback: end` makes an expiry end the run without publishing. Leave
+`fallback` out and an expiry fails the run instead. A fallback can also name
+a step, such as one that tells the report's owner it went unreviewed. Do not
+point it at a step that does what the approval guards (an `auto_publish`):
+an expiry means nobody approved, and that fallback would publish anyway.
+
+- The request is bound to this node and occurrence and to the run's state
+  when it was asked (its `action_digest`), apart from the engine's own keys
+  (`__budget`, `__approvals`). The pending listing shows that state, and the
+  request's context carries the node's `description`. It is listed by
+  `GET /executions/:id/approvals` and `jamjet approvals`. A state over 16 KiB
+  is shown bounded: its key structure is kept, nested objects included, and
+  only a value too large to show is replaced by its size and its first
+  characters (`{"preview_truncated": true, "bytes": ..., "head": ...}`). In a
+  state with so many keys that not all fit, an object whose keys were cut
+  says how many (`{"preview_truncated": true, "keys": ..., "keys_omitted":
+  ..., "shown": {...}}`). The digest still covers all of it.
+- The check runs when the approved node is dispatched again, not when it
+  completes. If the run's state changed in between (a parallel branch
+  wrote), the approval no longer covers it: the node asks again, showing
+  the new state. Another approval completing does not count as a change,
+  so two approvals waiting side by side are each asked once.
+- **Approved**: the node completes. Its output records the decision:
+  `decision`, `approved_by`, `principal`, `comment`, `decided_at` and the
+  sequences of the request and the decision. The decision is also written to
+  the run's state, under the engine's key `__approvals` and the node's id,
+  so later steps and prompts can read it:
+  `state.__approvals.review_report.approved` (`true`), `.approver`,
+  `.principal`, `.comment`, `.decided_at`. The run continues along `next`.
+- Only the engine writes `state.__approvals`. It is dropped from a run's
+  input (`POST /executions`), from the `state_patch` an external worker
+  reports (`POST /work-items/:id/complete`), and from the patch of any
+  in-process step but the approval node itself, so no step can forge the
+  record a later condition reads. It never overwrites a user key named like
+  the node.
+- **Rejected**: the node fails, and so does the run, as for any rejected
+  approval. The node has no "on rejected" route.
+- **Expired** (`timeout` passed with no decision): with a `fallback`, the node
+  completes with `decision: "expired"`, writes `approved: false` and
+  `decision: "expired"` to `state.__approvals.<node_id>`, and the run continues at
+  the fallback node (or ends, for `end`). Every step the approval guarded is
+  skipped: everything reachable from
+  its `next` that the fallback does not also lead to, including a step that
+  another branch leads into as well. Without a fallback, the node fails like
+  a rejection by `system:deadline`, and so does the run.
+- The fallback node needs no edge into it. It runs only if the request
+  expires; when the node is approved it is skipped.
+- `timeout` is a ceiling next to the policy chain's `approval_timeout_secs`
+  (see [Approval Deadlines](#approval-deadlines)), and the shorter applies; a
+  tenant or policy deadline can expire the request too. `timeout` must be
+  between 1 second and a year. `fallback` must be `end` or name another node
+  of the workflow that comes after the approval: one the approval node can
+  be reached from would wait on the approval while the approval waited on
+  it. Registration refuses anything else for a new version. A version stored
+  before these checks still re-registers; the engine treats a fallback it
+  cannot use as none, so an expiry fails the node.
+- The route to the fallback comes from the engine's own record of the
+  expiry, never from a node result a worker reports.
+- The decision is made through the same route and rules as every approval:
+  the approver is the API token, the token that started the run cannot
+  approve it, and an approval must echo the request's `action_digest`.
+- No external worker runs or reports this node: the engine's own workers do
+  (see "Workers cannot skip the gate" below).
+
+The engine runs `human_approval` nodes on its in-process workers (the server
+starts them with `jamjet dev`, or with `JAMJET_EMBED_WORKERS` set). Until
+2026-11 the node had no executor and a worker completed it without asking
+anyone; a release before that does not pause here.
 
 ---
 
@@ -112,6 +178,19 @@ Rules the runtime enforces:
   dev mode the result of a gated node must echo the `lease_fence` from its
   claim; the legacy unfenced completion is refused for it (409).
   `POST /work-items` (hand-enqueueing an item) is operator-only.
+- **External workers do not run the engine's node kinds.** `model`,
+  `condition`, `eval`, `human_approval` and `limit_exceeded` nodes run on the
+  engine's in-process workers. `POST /work-items/claim` does not serve their
+  queues (`general`, `model`; asking for them is not an error, they are left
+  out) and withholds such an item on any other queue, and
+  `POST /work-items/:id/complete` and `/fail` refuse a result for one (403).
+  Before this, any developer token could take an approved `human_approval`
+  node from `general` and complete it with a state patch of its own, or
+  choose a `condition` node's route. `POST /work-items` refuses to enqueue
+  one of these nodes (400). The in-process worker reads an item's workflow
+  from its execution, not its payload, and fails the node of an item whose
+  payload names another workflow, so a stray item ends the run visibly
+  instead of leaving it waiting.
 - **A workflow version is immutable.** Re-registering the same IR is a no-op;
   a different IR under the same version is a 409. Register a new version.
 
@@ -131,9 +210,10 @@ payload carries.
 | `mcp_tool` | its `tool` | no state |
 | `a2a_task` | its `skill` | no state |
 | `agent` | its `agent_ref` | no state |
-| `model` | none: governed by `model_allowlist` only | the conversation (`messages`) and the resolved model settings |
+| `model` | none: governed by `model_allowlist` only | the prompt as rendered against the run's state (a node with no prompt: the conversation in `messages`) and the resolved model settings |
 | `condition` | none | the run's state, as `state` |
-| `agent_tool`, `agent_discovery`, `coordinator`, `eval`, `human_approval`, `wait`, `parallel`, `join`, `subgraph`, `memory_retrieval`, `policy`, `finalizer`, `limit_exceeded` | none | no state |
+| `human_approval` | none: gated always | the run's state, as `input` (the digest leaves out `__budget` and `__approvals`) |
+| `agent_tool`, `agent_discovery`, `coordinator`, `eval`, `wait`, `parallel`, `join`, `subgraph`, `memory_retrieval`, `policy`, `finalizer`, `limit_exceeded` | none | no state |
 
 Kinds with no name cannot be gated or blocked by a pattern. `agent_tool` and
 `agent_discovery` make network calls in-process, so keep that in mind when
@@ -192,6 +272,9 @@ What an approval proves, and what it does not:
 
 Limits worth knowing:
 
+- An approval of a `human_approval` node covers the run's state when it was
+  asked, not what happens after the node completes. A parallel branch that
+  writes after the approval can still change what the guarded steps receive.
 - An approval covers the action including its retries. A retry, or a lease that
   expires and is reclaimed, fires again under the same approval; the tool-effect
   idempotency key limits double effects, and firing is at-least-once in v1.
@@ -326,6 +409,17 @@ once. Upgrade the engine to continue the run.
 
 ## Audit Log
 
+Identifiers that reach the audit log's hashed fields refuse control
+characters where they enter: worker ids (`POST /work-items/claim`, heartbeat),
+a dev-mode approver name, tenant ids, hand-enqueued node ids and queue names,
+and the workflow id, version and handler, tool, agent and model names at
+registration. The v1 entry hash joins its fields with U+001F and no length
+prefix, so a field holding that byte could move a field boundary. The
+verifier also refuses an entry whose text fields hold U+001F, and reading a
+stored entry whose `actor_type` is not `human`, `agent` or `system` fails
+instead of reading it as `system`. A length-prefixed v2 hash format is the
+real fix; the format is not changed here.
+
 Every human decision is recorded:
 - Who made it (the API token's name and `token:<id>`)
 - What decision was made, and which request it answered
@@ -368,10 +462,15 @@ jamjet events exec_01abc --type approval_received
 human_review:
   type: human_approval
   timeout: 48h
-  fallback: auto_approve   # route here if timeout expires
+  fallback: escalate_to_lead   # route here if the request expires
 ```
 
-If no `fallback` is specified and the timeout expires, the workflow fails with a `timeout_exceeded` event.
+When the timeout passes undecided, the scheduler records `approval_expired`
+(by `system:deadline`). With a `fallback`, the node completes with
+`decision: "expired"` and the run goes to the fallback node; `fallback: end`
+ends the run there instead. Without one, the node fails and the run fails.
+An expiry never approves anything, so do not point the fallback at the step
+the approval was guarding.
 
 ---
 

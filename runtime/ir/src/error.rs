@@ -27,6 +27,9 @@ pub enum IrError {
         reason: String,
     },
 
+    #[error("model node '{node}' prompt is not a template the runtime can render: {reason}")]
+    InvalidPromptTemplate { node: String, reason: String },
+
     #[error("external_fn node '{node}' queue `{queue}` is invalid: {reason}")]
     InvalidQueueName {
         node: String,
@@ -46,6 +49,9 @@ pub enum IrError {
     #[error("{scope} policy has an invalid approval deadline: {reason}")]
     InvalidApprovalDeadline { scope: String, reason: String },
 
+    #[error("human_approval node '{node}' is invalid: {reason}")]
+    InvalidHumanApproval { node: String, reason: String },
+
     #[error("timeouts.approval_timeout is retired and was never enforced; set approval_timeout_secs (and optionally escalate_after_secs) in the tenant, workflow or node policy instead")]
     RetiredApprovalTimeout,
 
@@ -63,8 +69,17 @@ pub enum IrError {
     #[error("node '{0}' is unreachable from the start node")]
     UnreachableNode(String),
 
+    #[error("{0}")]
+    UnreachableNodes(String),
+
+    #[error("{0} must not contain control characters or invisible format characters")]
+    ControlCharacter(String),
+
     #[error("workflow has no start node defined")]
     NoStartNode,
+
+    #[error("start node '{0}' does not exist")]
+    MissingStartNode(String),
 
     #[error("workflow has no terminal (end) path from node '{0}'")]
     NoTerminalPath(String),

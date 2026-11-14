@@ -16,7 +16,7 @@ COPY rust-toolchain.toml .
 COPY --from=web-builder /build/web/dist web/dist
 
 WORKDIR /build/runtime
-RUN cargo build --release --bin jamjet-server
+RUN cargo build --release --locked --bin jamjet-server
 
 # ── Stage 3: Final image ────────────────────────────────────────────
 FROM python:3.12-slim-bookworm

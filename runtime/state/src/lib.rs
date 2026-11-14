@@ -5,6 +5,7 @@
 // require explicit catch-all arms and duplicate destructuring.
 #![allow(clippy::collapsible_match, clippy::collapsible_if)]
 
+mod api_token;
 pub mod approvals;
 pub mod artifact;
 pub mod backend;

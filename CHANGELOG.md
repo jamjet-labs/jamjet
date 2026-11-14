@@ -415,6 +415,22 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Allow scoped local `DurableAgent` runs without the optional Engram package
+  when memory is absent, disabled, or configured with the `none` backend.
+
+- Reject malformed LLM judge ratings instead of coercing them or accepting scores
+  outside the documented 1–5 scale.
+
+- Fail trajectory evaluations when their event log cannot be fetched, instead of
+  silently passing them based on output scorers alone. Output-only evaluations
+  retain best-effort event collection.
+
+- Preserve dataset trajectory assertions when running experiment grids, so each
+  condition and seed is scored against the expected tool usage.
+
+- Preserve registry agents' reasoning modes during coordinator discovery so
+  matching `preferred_reasoning_modes` contributes to capability scores.
+
 - **Runtime: an unmatched API request is a JSON 404, not the web UI.** The SPA
   fallback answered every unmatched path, for every method, with `200 text/html`
   (`index.html`). A client on a wrong path saw a success, failed to parse the body,

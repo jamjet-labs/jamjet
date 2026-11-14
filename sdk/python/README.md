@@ -15,7 +15,7 @@ JamJet sits underneath your Python agent — Claude Code, OpenAI Agents SDK, MCP
 - 🛡️ **Block unsafe tool calls** at runtime (database deletes, payments, file writes)
 - ✋ **Pause for human approval** on risky actions, durably
 - 💸 **Cap cost** per agent, per run, per project
-- 📒 **Record an audit trail** that survives a regulator's review
+- 📒 **Record an audit trail** of every decision, with approvals signed and hash-chained
 - ⏪ **Replay or resume** crashed runs from the last checkpoint
 
 **Keep your agent framework. Add JamJet where tool calls need control.**
@@ -29,7 +29,7 @@ pip install jamjet
 jamjet demo unsafe-tool-call
 ```
 
-No API key. No Docker. No cloud account. The model is mocked; the enforcement path is real. Three more demos run the same way:
+No API key. No Docker. No cloud account. The model is mocked; the policy check is the SDK's own evaluator. The demos run in process and do not start the runtime. Three more demos run the same way:
 
 ```bash
 jamjet demo approval        # pause-for-approval flow
@@ -45,38 +45,46 @@ The rest of this README is the **Python authoring guide** — workflows, durabil
 
 - **`jamjet demo <scenario>`** — runnable enforcement demos with no setup
 - **Policy as code** — YAML beside your workflow OR `jamjet.cloud.policy(...)` in Python
-- **`@durable`** — exactly-once execution across crashes/restarts for any side-effecting tool, with shims for LangChain, CrewAI, ADK, OpenAI Agents SDK, Anthropic Agent SDK
+- **`@durable`** keeps a tool call that completed from running again after a crash or restart, with shims for LangChain, CrewAI, ADK, OpenAI Agents SDK, Anthropic Agent SDK
 - **`jamjet.cloud`** — optional two-line install for the hosted control plane (free tier: 5K traces/mo, single project)
 - **`jamjet.integrations.openai_guardrail`** — drop-in guardrail for the OpenAI Agents SDK that runs the same `policy.yaml`
-- **MCP client + A2A** — connect to MCP servers and delegate to external agents from a workflow; the runtime carries trace context across both protocols
+- **The runtime's MCP server** (`/mcp`) starts, inspects and approves runs, and `jamjet mcp connect` lists any MCP server's tools
 
 ---
 
 ## Quick Start
 
-**Requirements:** Python 3.11+
+**Requirements:** Python 3.11+ (the `memory` extra, which adds Engram, needs 3.12+)
 
 ```bash
-# Install the CLI (runtime binary included)
-pip install jamjet
+# Install the CLI, with the model client and the model sidecar
+pip install 'jamjet[model,sidecar]'
 
-# Option A — scaffold a new project
+# Option A: scaffold a new project
 jamjet init my-agent-project
 cd my-agent-project
 
-# Option B — add JamJet to an existing project (works like git init)
+# Option B: add JamJet to an existing project (works like git init)
 cd my-existing-project
 jamjet init
 
-# Start local dev runtime (SQLite, embedded — no server setup needed)
+# Start the local dev stack (SQLite, no server setup needed).
+# The starter workflow calls claude-haiku-4-5, so export a key first.
+export ANTHROPIC_API_KEY=sk-ant-...
 jamjet dev
 ```
 
-In another terminal:
+`jamjet dev` uses the `jamjet-server` on your `PATH`, or downloads the one
+published with the latest SDK release. The
+[Quickstart](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/quickstart.md)
+says which runtime it needs and how to build one.
+
+In another terminal, from the project directory:
 
 ```bash
-# Run the example workflow
-jamjet run examples/basic_tool_flow
+# Check, then run, the workflow the template created (it reads `query`)
+jamjet validate workflow.yaml
+jamjet run workflow.yaml --input '{"query": "What is JamJet?"}'
 ```
 
 ### Hello World — Python
@@ -112,95 +120,74 @@ async def summarize(state: ResearchState) -> ResearchState:
     ...
 ```
 
-### Hello World — YAML
+### Hello World: YAML, with a human in the loop
 
 ```yaml
 # workflow.yaml
 workflow:
-  id: research
+  id: refund-reply
   version: 0.1.0
-  state_schema: schemas.ResearchState
-  start: search
+  start: draft
 
 nodes:
-  search:
-    type: tool
-    tool_ref: tools.web_search
-    input:
-      query: "{{ state.question }}"
-    output_schema: schemas.SearchResult
-    next: summarize
-
-  summarize:
+  draft:
     type: model
-    model: default_chat
-    prompt: prompts/summarize.md
-    output_schema: schemas.Summary
+    model: claude-haiku-4-5-20251001
+    prompt: "Draft a reply to: {{ state.request }}"
+    next: review
+
+  review:
+    type: human_approval
+    description: Approve the draft before it is sent
+    timeout: 1h
+    fallback: end        # nobody decided in time: stop, do not send
+    next: send
+
+  send:
+    type: model
+    model: claude-haiku-4-5-20251001
+    prompt: "Send this: {{ state.last_model_output }}"
     next: end
 ```
 
 ```bash
 jamjet validate workflow.yaml
-jamjet run workflow.yaml --input '{"question": "What is JamJet?"}'
+jamjet run workflow.yaml --input '{"request": "refund order 42"}'
+
+# In another terminal, while the run waits at `review`:
+jamjet approvals <exec-id>     # what is waiting, and the exact approve command
 ```
+
+The run stops at `review` until someone decides. The decision is recorded in
+the run's state at `state.__approvals.review` (approved, approver, comment,
+time), which only the engine writes. If nobody decides within the hour, the
+approval expires, `send` is skipped and the run ends. Outside dev mode the
+person who started the run cannot approve it.
 
 When `jamjet run` follows a text-mode execution, it also prints the recorded
 terminal step results with known durations, proportional bars, and a clearly
 labelled recorded step-time total. Missing step timings are shown as unknown;
 JSON output keeps its existing event payload unchanged.
 
-### Connecting to an MCP Server
+### MCP and A2A
 
-```yaml
-# agents.yaml
-agents:
-  researcher:
-    model: default_chat
-    mcp:
-      servers:
-        github:
-          transport: http_sse
-          url: https://mcp.github.com/v1
-          auth:
-            type: bearer
-            token_env: GITHUB_TOKEN
-```
-
-```yaml
-# workflow.yaml (node using MCP tool)
-nodes:
-  search_github:
-    type: mcp_tool
-    server: github
-    tool: search_code
-    input:
-      query: "{{ state.search_query }}"
-    output_schema: schemas.SearchResults
-    retry_policy: io_default
-```
-
-### Delegating to an External Agent via A2A
-
-```yaml
-nodes:
-  code_review:
-    type: a2a_task
-    remote_agent: partner_reviewer   # defined in agents.yaml
-    skill: security_review
-    input:
-      code: "{{ state.generated_code }}"
-    stream: true
-    timeout: 300s
-    on_input_required: human_review
-```
+A workflow cannot call MCP tools or A2A agents: registration refuses
+`mcp_tool` and `a2a_task` nodes. The runtime itself is an MCP server at
+`/mcp`. See the
+[MCP guide](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/mcp-guide.md)
+and the
+[A2A guide](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/a2a-guide.md).
 
 ---
 
 ## Durability across frameworks
 
-Wrap any side-effecting tool with `@durable` to get exactly-once execution
-across crashes, restarts, and replays — regardless of which agent framework
-you're using.
+Wrap a side-effecting tool with `@durable` and its result is cached under a
+key built from the run id, the function and its arguments. After a crash or
+restart, a call that already completed returns the cached result instead of
+running again, whichever agent framework you use. A call that crashed before
+its result was stored runs again, so pass an idempotency key to the external
+system as well.
 
 ```python
 from jamjet import durable
@@ -237,9 +224,9 @@ AGENT_RUN_ID = "booking-agent-run-abc123"
 
 with durable_run(AGENT_RUN_ID):
     executor.invoke({"input": "book a flight to Tokyo"})
-    # If the process crashes mid-`charge_card` and restarts under the same
-    # AGENT_RUN_ID, the cached result is returned on replay — Stripe is
-    # never called twice.
+    # If the process crashes after `charge_card` returns and restarts under
+    # the same AGENT_RUN_ID, the cached result is returned on replay and
+    # Stripe is not called again.
 ```
 
 For framework-native run-identity (where you'd otherwise want `with durable_run(executor):`), see the per-shim docs in `jamjet/<framework>/__init__.py` — note that most frameworks expose `run_id` only per-invocation via callbacks, so threading a stable identity across crash boundaries is the user's responsibility.
@@ -270,12 +257,42 @@ Open [app.jamjet.dev/dashboard/traces](https://app.jamjet.dev/dashboard/traces) 
 Optional governance primitives:
 
 ```python
-jamjet.policy("block", "payments.*")              # filter tools by name
+jamjet.policy("block", "payments.*")              # strip matching tools, refuse matching tool calls
 jamjet.budget(max_cost_usd=5.00)                   # cap spend; raises BudgetExceeded
 approval = jamjet.require_approval(action="charge_card", context={...})
 @jamjet.trace                                       # decorate any function
 def lookup_customer(...): ...
 ```
+
+Policy and budget apply to the sync clients: OpenAI `chat.completions.create`,
+`.parse()`, `.stream()` and `with_raw_response`, and Anthropic `messages` and
+`beta.messages` `create` / `parse`, legacy OpenAI `functions` included.
+Blocked tools are stripped from the request, and a tool call the model returns
+for a blocked tool raises `JamJetPolicyBlocked`. With `stream=True`, text
+streams through as it arrives; once any policy rule is set, chunks from the
+first tool call onward are held until the stream ends and checked before your
+code sees them, and the streamed usage counts toward the budget. Server tools
+(such as web search) and MCP toolsets run on the vendor's side before a tool
+call could be refused, so a rule that could match them removes them from the
+request; Anthropic's own client tools (bash, text editor, computer, memory)
+are gated like any other tool. Not enforced, so they raise
+`JamJetUnenforceableCall` while any block or require_approval rule is set:
+OpenAI's Responses API, Anthropic's `messages.stream()`, the async clients
+(`AsyncOpenAI`, `AsyncAnthropic`), the batch APIs, and
+`with_raw_response` / `with_streaming_response` with `stream=True`.
+
+`jamjet.policy("require_approval", "payments.*")` keeps the tool available.
+When the model calls it, the SDK opens an approval in JamJet Cloud with the
+tool name, call id, arguments, model and rule, and waits for a reviewer's
+decision before returning the response. A rejection raises
+`JamJetApprovalRejected`. No decision within `approval_timeout_seconds`
+(a `configure()` argument, default 1 hour), or no way to reach Cloud, raises
+`JamJetApprovalTimeout`. The timeout is sent to Cloud as the approval's
+deadline (clamped to 1 minute to 24 hours); JamJet Cloud deployments since
+jamjet-cloud #87 refuse decisions after it. The approval shows the call's
+arguments with credentials always masked, PII masked when redaction is on
+(IBANs and card numbers keep their last 4), and an `arguments_sha256` that the
+SDK re-checks before releasing the approved call.
 
 Install with the LLM SDK you use:
 
@@ -293,30 +310,29 @@ Full guide: [Cloud Quickstart](https://docs.jamjet.dev/en/docs/cloud-quickstart)
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                     Authoring Layer                       │
-│              Python SDK  |  YAML  |  CLI                  │
+│                     Authoring Layer                      │
+│                Python SDK  |  YAML  |  CLI               │
 ├──────────────────────────────────────────────────────────┤
-│                 Compilation / Validation                   │
-│         Graph IR  |  Schema  |  Policy lint               │
+│                 Compilation / Validation                 │
+│           Graph IR  |  Schema  |  Policy lint            │
 ├────────────────────────────┬─────────────────────────────┤
-│      Rust Runtime Core     │      Protocol Layer          │
-│  Scheduler  |  State SM    │  MCP Client  |  MCP Server   │
-│  Event log  |  Snapshots   │  A2A Client  |  A2A Server   │
-│  Workers    |  Timers      │  Protocol Adapter Framework  │
+│      Rust Runtime Core     │      Protocol Layer         │
+│  Scheduler  |  State SM    │  MCP server (/mcp)          │
+│  Event log  |  Snapshots   │  Agent discovery            │
+│  Workers    |  Timers      │                             │
 ├────────────────────────────┴─────────────────────────────┤
-│                      Runtime Services                      │
-│  Model Adapters  |  Tool Execution  |  Memory/Retrieval   │
-│  Policy Engine   |  Observability   |  Secret Management  │
+│                        Governance                        │
+│    Policy  |  Approvals  |  RBAC  |  Signed audit log    │
 ├──────────────────────────────────────────────────────────┤
-│                    Control Plane / APIs                    │
-│        REST / gRPC  |  Agent Registry  |  Admin           │
+│                     Runtime Services                     │
+│    Model adapters  |  Model sidecar  |  External workers │
 ├──────────────────────────────────────────────────────────┤
-│                         Storage                           │
-│           Postgres (production)  |  SQLite (local)        │
+│                         Storage                          │
+│             SQLite  |  In-memory (ephemeral)             │
 └──────────────────────────────────────────────────────────┘
 ```
 
-Read more: [Architecture Overview](docs/architecture/overview.md)
+Read more: [Architecture Overview](https://github.com/jamjet-labs/jamjet/blob/main/docs/architecture/overview.md)
 
 ---
 
@@ -326,43 +342,43 @@ Read more: [Architecture Overview](docs/architecture/overview.md)
 
 | Guide | Description |
 |-------|-------------|
-| [Quickstart](docs/guides/quickstart.md) | Get a workflow running in 10 minutes |
-| [Core Concepts](docs/guides/concepts.md) | Agents, workflows, nodes, state, durability |
-| [Workflow Authoring](docs/guides/workflow-authoring.md) | YAML and Python authoring guide |
-| [Python SDK](docs/guides/python-sdk.md) | Full SDK reference |
-| [YAML Reference](docs/guides/yaml-reference.md) | Complete YAML spec |
+| [Quickstart](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/quickstart.md) | Get a workflow running in 10 minutes |
+| [Core Concepts](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/concepts.md) | Agents, workflows, nodes, state, durability |
+| [Workflow Authoring](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/workflow-authoring.md) | YAML and Python authoring guide |
+| [Python SDK](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/python-sdk.md) | Full SDK reference |
+| [YAML Reference](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/yaml-reference.md) | Complete YAML spec |
 
 ### Connect to other systems
 
 | Guide | Description |
 |-------|-------------|
-| [MCP Integration](docs/guides/mcp-guide.md) | Connect to MCP servers, expose tools |
-| [A2A Integration](docs/guides/a2a-guide.md) | Delegate to and serve external agents |
-| [Agent Model](docs/guides/agent-model-guide.md) | Agent Cards, lifecycle, autonomy levels |
-| [Human-in-the-Loop](docs/guides/hitl.md) | Approval nodes, state editing, audit |
-| [Observability](docs/guides/observability.md) | Traces, replay, cost attribution, OTel GenAI |
-| [Deployment](docs/guides/deployment.md) | Production deployment guide |
+| [MCP Integration](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/mcp-guide.md) | The runtime's MCP endpoint, and listing a server's tools |
+| [A2A Integration](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/a2a-guide.md) | Reading and registering Agent Cards |
+| [Agent Model](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/agent-model-guide.md) | Agent Cards, lifecycle, autonomy levels |
+| [Human-in-the-Loop](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/hitl.md) | Approval nodes, deadlines, separation of duties |
+| [Observability](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/observability.md) | Event timelines, replay, OpenTelemetry, token counts |
+| [Deployment](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/deployment.md) | Running the server: SQLite, tokens, workers, Docker |
 
 ### Advanced & enterprise
 
 | Guide | Description |
 |-------|-------------|
-| [Security](docs/guides/security.md) | Auth, secrets, RBAC, OAuth delegated agent auth |
-| [WASI Sandboxing](docs/guides/wasi-sandboxing.md) | Sandboxed tool execution via Wasmtime |
-| [Eval Node](docs/guides/eval.md) | Evaluation as a workflow primitive |
-| [ANP Discovery](docs/guides/anp.md) | Decentralized agent discovery via DID |
+| [Security](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/security.md) | Tokens, RBAC, tenant policy, secrets, signed audit log |
+| [Tool Sandboxing](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/wasi-sandboxing.md) | What runs where, and how to contain workers |
+| [Eval Node](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/eval.md) | Evaluation as a workflow primitive |
+| [ANP Discovery](https://github.com/jamjet-labs/jamjet/blob/main/docs/guides/anp.md) | Decentralized agent discovery via DID |
 
 ### Architecture deep-dives
 
 | Document | Description |
 |----------|-------------|
-| [Architecture Overview](docs/architecture/overview.md) | Full system architecture |
-| [Execution Model](docs/architecture/execution-model.md) | State machine, node types, IR |
-| [State & Durability](docs/architecture/state-and-durability.md) | Event sourcing, snapshotting, recovery |
-| [Agent Model](docs/architecture/agent-model.md) | Agent-native runtime design |
-| [MCP Architecture](docs/architecture/mcp-integration.md) | MCP client/server internals |
-| [A2A Architecture](docs/architecture/a2a-integration.md) | A2A protocol internals |
-| [Protocol Adapters](docs/architecture/protocol-adapters.md) | Extensible protocol layer |
+| [Architecture Overview](https://github.com/jamjet-labs/jamjet/blob/main/docs/architecture/overview.md) | Full system architecture |
+| [Execution Model](https://github.com/jamjet-labs/jamjet/blob/main/docs/architecture/execution-model.md) | State machine, node types, IR |
+| [State & Durability](https://github.com/jamjet-labs/jamjet/blob/main/docs/architecture/state-and-durability.md) | Event sourcing, snapshotting, recovery |
+| [Agent Model](https://github.com/jamjet-labs/jamjet/blob/main/docs/architecture/agent-model.md) | Agent-native runtime design |
+| [MCP Architecture](https://github.com/jamjet-labs/jamjet/blob/main/docs/architecture/mcp-integration.md) | MCP client/server internals |
+| [A2A Architecture](https://github.com/jamjet-labs/jamjet/blob/main/docs/architecture/a2a-integration.md) | A2A protocol internals |
+| [Protocol Adapters](https://github.com/jamjet-labs/jamjet/blob/main/docs/architecture/protocol-adapters.md) | Extensible protocol layer |
 
 ---
 
@@ -370,10 +386,10 @@ Read more: [Architecture Overview](docs/architecture/overview.md)
 
 We welcome contributions of all kinds — bug reports, feature requests, documentation, and code.
 
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) to get started
+- Read [CONTRIBUTING.md](https://github.com/jamjet-labs/jamjet/blob/main/CONTRIBUTING.md) to get started
 - Check open issues for `good first issue` tags
-- RFCs for major changes: see [docs/rfcs/](docs/rfcs/)
-- Architecture decisions: see [docs/adr/](docs/adr/)
+- RFCs for major changes: see [docs/rfcs/](https://github.com/jamjet-labs/jamjet/blob/main/docs/rfcs/)
+- Architecture decisions: see [docs/adr/](https://github.com/jamjet-labs/jamjet/blob/main/docs/adr/)
 
 ---
 
@@ -386,4 +402,4 @@ We welcome contributions of all kinds — bug reports, feature requests, documen
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0. See [LICENSE](https://github.com/jamjet-labs/jamjet/blob/main/LICENSE).

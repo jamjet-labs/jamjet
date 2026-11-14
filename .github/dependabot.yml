@@ -8,6 +8,14 @@ updates:
       day: monday
     open-pull-requests-limit: 10
     groups:
+      # These crates pass each other's types, so one bumped alone does not
+      # compile (#148, #151, #152, #153 all failed that way). Each group moves
+      # in one PR, major bumps included. A crate goes to the first group it
+      # matches, so these come before the catch-all.
+      opentelemetry:
+        patterns: ["opentelemetry*", "tracing-opentelemetry"]
+      rustcrypto-digests:
+        patterns: ["sha2", "hmac", "digest"]
       patch-updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
