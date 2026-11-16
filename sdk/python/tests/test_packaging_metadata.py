@@ -10,6 +10,7 @@ import pytest
 
 SDK_ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = SDK_ROOT.parents[1] / ".github" / "workflows" / "ci.yml"
+DEPENDABOT_CONFIG = SDK_ROOT.parents[1] / ".github" / "dependabot.yml"
 
 
 def _pyproject() -> dict:
@@ -33,6 +34,33 @@ def test_model_extra_keeps_litellm_below_the_mcp2_import() -> None:
     for r in model:
         if r.name == "mcp":
             assert "2.0.0" not in r.specifier, f"the model extra must not require mcp 2.x: {r}"
+
+
+def test_dependabot_ignores_litellm_only_while_it_is_capped() -> None:
+    # For a range like ours Dependabot can only propose raising the upper
+    # bound, and the test above fails every such PR. So the bound and the
+    # ignore go together: with the bound and no ignore, a red PR comes back
+    # every week; with the ignore and no bound, litellm updates stop coming.
+    import yaml
+    from packaging.requirements import Requirement
+
+    if not DEPENDABOT_CONFIG.is_file():
+        pytest.skip("Dependabot config not in this checkout")
+    updates = yaml.safe_load(DEPENDABOT_CONFIG.read_text())["updates"]
+    pip = [u for u in updates if u["package-ecosystem"] == "pip" and u["directory"] == "/sdk/python"]
+    assert len(pip) == 1, f"expected one pip entry for /sdk/python, got {len(pip)}"
+    # An entry with only a name ignores every version of that dependency.
+    ignored = [e["dependency-name"] for e in pip[0].get("ignore", []) if set(e) == {"dependency-name"}]
+
+    model = [Requirement(r) for r in _pyproject()["project"]["optional-dependencies"]["model"]]
+    litellm = [r for r in model if r.name == "litellm"]
+    assert len(litellm) == 1, f"expected one litellm requirement in the model extra: {model}"
+    capped = any(s.operator in ("<", "<=") for s in litellm[0].specifier)
+
+    if capped:
+        assert "litellm" in ignored, "litellm has an upper bound, so Dependabot must ignore it"
+    else:
+        assert "litellm" not in ignored, "litellm has no upper bound now; remove its Dependabot ignore"
 
 
 def test_supported_python_floor_agrees_everywhere() -> None:
