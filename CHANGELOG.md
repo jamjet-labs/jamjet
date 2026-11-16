@@ -415,6 +415,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Pass completed step results to subsequent steps of the local
+  `plan-and-execute` strategy so dependent steps can use earlier outputs.
+
 - Allow scoped local `DurableAgent` runs without the optional Engram package
   when memory is absent, disabled, or configured with the `none` backend.
 
