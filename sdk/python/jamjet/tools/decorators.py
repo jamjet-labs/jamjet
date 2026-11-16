@@ -93,7 +93,7 @@ def tool(
             if param_name in ("self", "cls"):
                 continue
             hint = hints.get(param_name, Any)
-            input_props[param_name] = _type_to_schema(hint)
+            input_props[param_name] = {"type": _type_to_schema(hint)}
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)
 
