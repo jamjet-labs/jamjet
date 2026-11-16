@@ -437,6 +437,15 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Generate JSON Schema objects for typed `@tool` parameters instead of bare
   type-name strings, including when compiling tools into an agent specification.
 
+- **Python SDK: `@tool` parameters that are not plain scalars get a real schema.**
+  `list[str]`, `dict[str, float]`, `Optional[...]`, `Literal[...]` and Pydantic
+  model parameters were all offered to the model as `{"type": "object"}`, so a
+  model was told to send an object where the tool takes a list. Pydantic now
+  describes them, with model definitions under `$defs` at the root of the
+  schema. A parameter with no annotation is `{}` (any value) instead of
+  `object`. Plain `str`, `int`, `float`, `bool` and `dict` parameters are
+  unchanged.
+
 - **Runtime: an unmatched API request is a JSON 404, not the web UI.** The SPA
   fallback answered every unmatched path, for every method, with `200 text/html`
   (`index.html`). A client on a wrong path saw a success, failed to parse the body,
