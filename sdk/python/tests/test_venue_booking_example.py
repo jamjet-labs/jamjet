@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 TEST_SIGNING_KEY = "venue-example-test-key"
 ROOT = Path(__file__).resolve().parents[3] / "examples" / "venue-booking-agent"
 
@@ -21,8 +23,13 @@ def run_step(
     script: str = "agent.py",
     env: dict[str, str] | None = None,
     clear_logs: bool = True,
+    allow_fail: bool = False,
 ) -> str:
-    """Run one script of a step folder and return its stdout."""
+    """Run one script of a step folder and return its stdout.
+
+    With allow_fail, a non-zero exit is expected: the result is stdout plus
+    stderr, and the caller checks the exit through the text it gets.
+    """
     cwd = ROOT / folder
     for log in ("payments.log", "cancellations.log") if clear_logs else ():
         (cwd / log).unlink(missing_ok=True)
@@ -37,6 +44,9 @@ def run_step(
         text=True,
         timeout=120,
     )
+    if allow_fail:
+        assert done.returncode != 0, f"{folder}/{script} should have failed\n{done.stdout}"
+        return done.stdout + done.stderr
     assert done.returncode == 0, f"{folder}/{script} exited {done.returncode}\n{done.stdout}\n{done.stderr[-3000:]}"
     return done.stdout
 
@@ -92,3 +102,22 @@ def test_step03_second_run_starts_with_a_fresh_log():
     run_step("step-03-pay-deposit")
     out = run_step("step-03-pay-deposit", clear_logs=False)
     assert out.splitlines()[-1] == "payments.log: 1 line(s)"
+
+
+def test_step04_budget_stops_the_loop():
+    out = run_step("step-04-budget")
+    assert out.splitlines()[0] == "model: scripted (no API key)"
+    assert normalise(out) == expected("step-04-budget")
+    script = yaml.safe_load((ROOT / "step-04-budget" / "script.yaml").read_text())
+    used = int(re.search(r"tokens (\d+) >= limit", out).group(1))
+    turns_run = used // 520
+    assert "budget exceeded" in out
+    assert 0 < turns_run < len(script["turns"])
+
+
+def test_step05_in_process_refuses():
+    out = run_step("step-05-ask-first", "try_in_process.py", allow_fail=True)
+    last = out.strip().splitlines()[-1]
+    assert normalise(last) == expected("step-05-ask-first", "expected-in-process.txt").strip()
+    assert "ApprovalNotEnforceableError" in last
+    assert not (ROOT / "step-05-ask-first" / "payments.log").exists()

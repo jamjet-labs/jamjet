@@ -1,0 +1,28 @@
+# A model stuck in a loop: it checks the same dates over and over and
+# never answers. Each turn reports 520 tokens. Twenty turns, then the
+# script runs out.
+turns:
+  - &again
+    tool_calls:
+      - name: check_dates
+        arguments: {venue: Casa do Rio}
+    usage: {input_tokens: 500, output_tokens: 20}
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
+  - *again
