@@ -200,3 +200,28 @@ async def test_run_durable_raises_on_failed_terminal(monkeypatch: pytest.MonkeyP
 
     with pytest.raises(RuntimeError, match="non-completed"):
         await _agent().run_durable("weather?", max_turns=3)
+
+
+async def test_run_durable_failed_run_error_carries_execution_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed run is the one to find: the id is in the message and on the exception."""
+    fake = _FakeDurableClient({"status": "failed", "detail": "boom", "current_state": {}})
+    _patch_client(monkeypatch, fake)
+
+    with pytest.raises(RuntimeError) as info:
+        await _agent().run_durable("weather in London?", max_turns=3)
+
+    assert "exec_test" in str(info.value)
+    assert info.value.execution_id == "exec_test"
+
+
+async def test_run_durable_timeout_error_carries_execution_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeDurableClient({"status": "running", "current_state": {}})
+    _patch_client(monkeypatch, fake)
+    agent = _agent()
+    agent.limits.timeout_seconds = 0
+
+    with pytest.raises(TimeoutError) as info:
+        await agent.run_durable("weather in London?", max_turns=3)
+
+    assert "exec_test" in str(info.value)
+    assert info.value.execution_id == "exec_test"

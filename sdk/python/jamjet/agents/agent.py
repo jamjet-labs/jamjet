@@ -726,7 +726,10 @@ class Agent:
             if not exec_id:
                 raise RuntimeError(f"start_execution returned no execution_id: {started!r}")
 
-            execution = await self._poll_to_terminal(client, exec_id)
+            try:
+                execution = await self._poll_to_terminal(client, exec_id)
+            except TimeoutError as exc:
+                raise _with_execution_id(exc, exec_id) from exc
             # Events carry artifact-resolved NodeCompleted outputs (server-side),
             # used only as a fallback if a spilled answer sentinel slips through.
             try:
@@ -735,7 +738,10 @@ class Agent:
                 events = []
 
         duration_us = int((time.monotonic() - t0) * 1_000_000)
-        result = self._extract_result(execution, events, ir, duration_us)
+        try:
+            result = self._extract_result(execution, events, ir, duration_us)
+        except RuntimeError as exc:
+            raise _with_execution_id(exc, exec_id) from exc
         result.execution_id = exec_id
         # Mint the turn receipt + emit the per-action signed audit chain from the
         # durable run's extracted result (both on by default), mirroring run().
@@ -1048,6 +1054,14 @@ class Agent:
 
     def __repr__(self) -> str:
         return f"Agent(name={self.name!r}, model={self.model!r}, tools={self.tool_names}, strategy={self.strategy!r})"
+
+
+def _with_execution_id(exc: Exception, exec_id: str) -> Exception:
+    """A copy of ``exc`` whose message names the execution and which carries
+    ``execution_id``, so a failed or timed-out run can still be found."""
+    new = type(exc)(f"{exc} (execution {exec_id})")
+    new.execution_id = exec_id  # type: ignore[attr-defined]
+    return new
 
 
 class AgentResult:

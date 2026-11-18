@@ -2855,6 +2855,12 @@ def _approval_covers(context: dict[str, Any]) -> str:
     return "-"
 
 
+def _unreachable(runtime: str, exc: Exception) -> None:
+    """One plain error line for an engine that cannot be reached, then exit 1."""
+    _print_error("", f"Cannot reach the runtime at {runtime}: {exc}")
+    raise typer.Exit(1)
+
+
 def _started_local(value: Any) -> str:
     """An ISO start time as local time to the second; the raw text if unparseable."""
     from datetime import datetime  # noqa: PLC0415
@@ -2876,7 +2882,10 @@ def executions(
 
     async def _list() -> None:
         async with _client(runtime) as c:
-            data = await c.list_executions(status=status, limit=limit)
+            try:
+                data = await c.list_executions(status=status, limit=limit)
+            except httpx.RequestError as exc:
+                _unreachable(runtime, exc)
         items = data.get("executions", [])
         if as_json:
             typer.echo(json.dumps(items, indent=2))
@@ -2909,11 +2918,25 @@ _WAITING_STATUS = "paused"
 
 async def _print_waiting_approvals(runtime: str, limit: int = 50) -> None:
     async with _client(runtime) as c:
-        waiting = (await c.list_executions(status=_WAITING_STATUS, limit=limit)).get("executions", [])
+        try:
+            waiting = (await c.list_executions(status=_WAITING_STATUS, limit=limit)).get("executions", [])
+        except httpx.RequestError as exc:
+            _unreachable(runtime, exc)
         found = 0
         for e in waiting:
             eid = e.get("execution_id", "")
-            data = await c.list_approvals(eid)
+            try:
+                data = await c.list_approvals(eid)
+            except httpx.HTTPStatusError as exc:
+                console.print(
+                    f"skipped {_safe(eid)}: the engine answered {exc.response.status_code}",
+                    style="dim",
+                    markup=False,
+                    soft_wrap=True,
+                )
+                continue
+            except httpx.RequestError as exc:
+                _unreachable(runtime, exc)
             for entry in data.get("pending", []):
                 found += 1
                 context = entry.get("context") or {}

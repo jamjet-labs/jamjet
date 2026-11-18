@@ -116,3 +116,53 @@ def test_executions_table_shows_start_time_to_the_second() -> None:
     with patch("jamjet.cli.main._client", return_value=_client([NEW])):
         result = runner.invoke(app, ["executions"])
     assert "2026-11-18" in result.output
+
+
+def _status_error(code: int):
+    import httpx
+
+    request = httpx.Request("GET", "http://x/executions/exec_gone/approvals")
+    return httpx.HTTPStatusError("gone", request=request, response=httpx.Response(code, request=request))
+
+
+def test_approvals_without_id_skips_an_execution_that_vanished() -> None:
+    gone = {**NEW, "execution_id": "exec_gone"}
+    fake = _client([NEW, gone], {"exec_new": {"pending": _pending(), "decided": []}})
+    inner = fake.list_approvals.side_effect
+
+    def fetch(eid):
+        if eid == "exec_gone":
+            raise _status_error(404)
+        return inner(eid)
+
+    fake.list_approvals = AsyncMock(side_effect=fetch)
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals"])
+    assert result.exit_code == 0
+    assert "jamjet approve exec_new" in result.output
+    assert "skipped exec_gone" in result.output
+    assert "404" in result.output
+
+
+def test_executions_unreachable_engine_prints_one_line() -> None:
+    import httpx
+
+    fake = _client([])
+    fake.list_executions = AsyncMock(side_effect=httpx.ConnectError("refused"))
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["executions", "--runtime", "http://nowhere:7700"])
+    assert result.exit_code == 1
+    assert "http://nowhere:7700" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_approvals_without_id_unreachable_engine_prints_one_line() -> None:
+    import httpx
+
+    fake = _client([])
+    fake.list_executions = AsyncMock(side_effect=httpx.ConnectError("refused"))
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "--runtime", "http://nowhere:7700"])
+    assert result.exit_code == 1
+    assert "http://nowhere:7700" in result.output
+    assert "Traceback" not in result.output
