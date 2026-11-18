@@ -35,8 +35,10 @@ fn chat_message_from_json(msg: &Value) -> ChatMessage {
             let id = msg
                 .get("tool_call_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
-            ChatMessage::tool(id, content)
+                .filter(|id| !id.is_empty());
+            let mut message = ChatMessage::tool("", content);
+            message.tool_call_id = id.map(str::to_string);
+            message
         }
         _ => ChatMessage::user(content),
     }
@@ -148,12 +150,18 @@ impl NodeExecutor for ModelNodeExecutor {
             return Err("ModelNodeExecutor: no prompt or messages provided".into());
         }
 
-        // A system message in the conversation already carries the prompt; do
-        // not send it a second time.
-        let system_prompt = if messages.iter().any(|m| matches!(m.role, ChatRole::System)) {
-            None
-        } else {
-            system_prompt
+        // A system message in the conversation with the same text already
+        // carries the prompt; do not send it a second time. A different system
+        // message keeps both.
+        let system_prompt = match system_prompt {
+            Some(sp)
+                if messages
+                    .iter()
+                    .any(|m| matches!(m.role, ChatRole::System) && m.content == sp) =>
+            {
+                None
+            }
+            other => other,
         };
 
         let config = ModelConfig {
@@ -674,5 +682,74 @@ mod tests {
         assert_eq!(calls[0].arguments, json!("{not json"));
         assert_eq!(calls[1].name, "g");
         assert_eq!(calls[1].arguments, json!({"a": 1}));
+    }
+    /// A system message with different text from the node's system prompt does
+    /// not replace it: both are sent.
+    #[tokio::test]
+    async fn executor_keeps_a_different_system_prompt() {
+        let (executor, captured) = capturing_executor();
+        let item = work_item(json!({
+            "model": "fake-model",
+            "system_prompt": "You book venues.",
+            "messages": [
+                {"role": "system", "content": "Answer in French."},
+                {"role": "user", "content": "hi"}
+            ]
+        }));
+        executor.execute(&item).await.expect("execute");
+        let req = captured.lock().unwrap().clone().expect("request captured");
+        assert_eq!(
+            req.config.system_prompt.as_deref(),
+            Some("You book venues.")
+        );
+        assert_eq!(req.messages[0].content, "Answer in French.");
+    }
+
+    /// A tool message with no (or an empty) `tool_call_id` has no id, not "".
+    #[tokio::test]
+    async fn executor_maps_a_missing_tool_call_id_to_none() {
+        let (executor, captured) = capturing_executor();
+        let item = work_item(json!({
+            "model": "fake-model",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "tool", "content": "no id"},
+                {"role": "tool", "tool_call_id": "", "content": "empty id"}
+            ]
+        }));
+        executor.execute(&item).await.expect("execute");
+        let req = captured.lock().unwrap().clone().expect("request captured");
+        assert_eq!(req.messages[1].tool_call_id, None);
+        assert_eq!(req.messages[2].tool_call_id, None);
+    }
+
+    /// Two tool calls followed by their two results keep their order and ids.
+    #[tokio::test]
+    async fn executor_keeps_the_order_of_two_calls_and_two_results() {
+        let (executor, captured) = capturing_executor();
+        let item = work_item(json!({
+            "model": "fake-model",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "name": "search_venues", "arguments": {}},
+                    {"id": "c2", "name": "pay_deposit", "arguments": {}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "first"},
+                {"role": "tool", "tool_call_id": "c2", "content": "second"}
+            ]
+        }));
+        executor.execute(&item).await.expect("execute");
+        let req = captured.lock().unwrap().clone().expect("request captured");
+        let ids: Vec<_> = req.messages[1]
+            .tool_calls
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(ids, ["c1", "c2"]);
+        assert_eq!(req.messages[2].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(req.messages[2].content, "first");
+        assert_eq!(req.messages[3].tool_call_id.as_deref(), Some("c2"));
+        assert_eq!(req.messages[3].content, "second");
     }
 }
