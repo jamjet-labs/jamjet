@@ -56,6 +56,16 @@ What runs, what waits for approval and what is blocked stay the same.
 In-process steps run with `python agent.py`. Durable steps need
 `jamjet dev` running, and their READMEs say how.
 
+## Challenge solutions
+
+Each episode ends with a challenge. Try it first, then compare.
+
+| Episode | Challenge | Solution |
+|---|---|---|
+| 1 | Add a weather tool | [solutions/ep1-weather-tool](solutions/ep1-weather-tool/) |
+| 2 | Ask for approval only above 300 | [solutions/ep2-approval-above-300](solutions/ep2-approval-above-300/) |
+| 3 | Kill the engine at a different moment | [step 08, "Try it yourself"](step-08-what-it-remembers/README.md#try-it-yourself) |
+
 ## If you fall behind
 
 Copy the folder for the step you are on and run it from inside that folder.
