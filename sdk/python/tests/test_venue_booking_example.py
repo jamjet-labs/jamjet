@@ -162,15 +162,23 @@ def test_steps_07_to_09_share_the_step_05_code():
 EP1 = "solutions/ep1-weather-tool"
 EP2 = "solutions/ep2-approval-above-300"
 
-# Calls pay_small_deposit directly, with the amount from the command line,
-# then prints the tool's answer and how many payments it wrote.
+# Calls pay_small_deposit directly, once per amount on the command line,
+# then prints each answer and how many payments were written.
 PAY_SMALL = """
 import asyncio, sys
 from venue_tools import PAYMENTS, pay_small_deposit
-amount = float(sys.argv[1])
-print(asyncio.run(pay_small_deposit(venue="Casa do Rio", amount=amount)))
+for amount in sys.argv[1:]:
+    pay = pay_small_deposit(venue="Casa do Rio", amount=float(amount))
+    print(asyncio.run(pay))
 print(len(PAYMENTS.read_text().splitlines()) if PAYMENTS.exists() else 0)
 """
+
+
+def refused(amount: str) -> str:
+    return (
+        f"Refused: {amount} for Casa do Rio. This tool pays a venue up to 300 in total."
+        " Use pay_deposit, which waits for approval."
+    )
 
 
 def test_solution_ep1_checks_the_weather_before_it_pays():
@@ -188,11 +196,18 @@ def test_solution_ep2_small_deposit_pays_up_to_300():
 
 def test_solution_ep2_small_deposit_refuses_over_300_in_code():
     out = run_step(EP2, "-c", args=(PAY_SMALL, "500"))
-    assert out.splitlines() == [
-        "Refused: 500.0 is over 300. Use pay_deposit, which waits for approval.",
-        "0",
-    ]
+    assert out.splitlines() == [refused("500.0"), "0"]
     assert not (ROOT / EP2 / "payments.log").exists()
+
+
+def test_solution_ep2_two_small_payments_cannot_pass_300():
+    out = run_step(EP2, "-c", args=(PAY_SMALL, "250", "250"))
+    assert out.splitlines() == ["Deposit of 250.0 paid for Casa do Rio.", refused("250.0"), "1"]
+
+
+def test_solution_ep2_refuses_amounts_that_are_not_positive():
+    out = run_step(EP2, "-c", args=(PAY_SMALL, "nan", "0", "-50"))
+    assert out.splitlines() == [refused("nan"), refused("0.0"), refused("-50.0"), "0"]
 
 
 def test_solution_ep2_keeps_the_approval_gate_on_pay_deposit():

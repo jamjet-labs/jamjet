@@ -17,8 +17,9 @@ Set it in every terminal you open below.
 arguments, so on its own it cannot say "only above 300". The solution
 splits the payment into two tools:
 
-- `pay_small_deposit` pays 300 or less, with no approval. Its own code
-  refuses anything over 300, whatever the model asks for.
+- `pay_small_deposit` pays with no approval while the venue's total
+  stays at 300 or less. Its own code refuses more, whatever the model
+  asks for.
 - `pay_deposit` pays more, and the policy still holds it for approval.
 
 In `venue_tools.py`:
@@ -26,16 +27,17 @@ In `venue_tools.py`:
     @tool
     def pay_small_deposit(venue: str, amount: float) -> str:
         """Pay a venue deposit of 300 or less. It needs no approval."""
-        if amount > SMALL_LIMIT:
-            return (
-                f"Refused: {amount} is over {SMALL_LIMIT}."
-                " Use pay_deposit, which waits for approval."
-            )
-        return record_payment(venue, amount)
+        total = paid_so_far(venue) + amount
+        # Two payments of 250 add up to 500, so the limit is on the total.
+        if 0 < amount and total <= SMALL_LIMIT:
+            return record_payment(venue, amount)
+        return (...)  # refused: use pay_deposit
 
 The limit is in code, not in the prompt. If the model sends 500 to
 `pay_small_deposit`, the tool refuses and nothing is written to
-`payments.log`.
+`payments.log`. Splitting it into two payments of 250 does not help:
+`paid_so_far` adds up what `payments.log` already holds for the venue,
+so the second 250 is refused too.
 
 In `agent.py`, `pay_small_deposit` joins the tools list, and the prompt
 asks for a 200 deposit. The policy line is the same as in step 05:
@@ -52,8 +54,10 @@ Terminal 2, the agent:
 
     python agent.py
 
-This time it does not wait. 200 is under the limit, so nothing needs
-approval.
+This time it does not wait. 200 is under the limit, so
+`pay_small_deposit` pays it with no approval. (A real model could pick
+`pay_deposit` for 200 instead. Then the run waits for approval, as in
+step 05.)
 
 ## Expected output
 
@@ -75,7 +79,5 @@ stays at 200.
 
 ## Notes
 
-- A limit on each call does not stop two calls of 250. A real system
-  would also cap the total for each booking.
 - With a real model, set the provider key in terminal 1 as well. The
   engine's worker makes the model call, not `agent.py`.

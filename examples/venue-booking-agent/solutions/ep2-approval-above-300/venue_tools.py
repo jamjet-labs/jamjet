@@ -4,8 +4,8 @@ Fake data: nothing is really booked or paid.
 
 Both payment tools add a line to payments.log each time they really
 run, so you can count how often the money moved. pay_small_deposit
-pays 300 or less with no approval. Its code refuses more, whatever the
-model asks for.
+pays with no approval while a venue's total stays at 300 or less. Its
+code refuses more, whatever the model asks for.
 """
 
 import json
@@ -49,15 +49,27 @@ def record_payment(venue: str, amount: float) -> str:
     return f"Deposit of {amount} paid for {venue}."
 
 
+def paid_so_far(venue: str) -> float:
+    """Add up what payments.log says this venue was paid."""
+    if not PAYMENTS.exists():
+        return 0.0
+    lines = PAYMENTS.read_text().splitlines()
+    mine = [line for line in lines if line.endswith(f" for {venue}")]
+    return sum(float(line.split()[1]) for line in mine)
+
+
 @tool
 def pay_small_deposit(venue: str, amount: float) -> str:
     """Pay a venue deposit of 300 or less. It needs no approval."""
-    if amount > SMALL_LIMIT:
-        return (
-            f"Refused: {amount} is over {SMALL_LIMIT}."
-            " Use pay_deposit, which waits for approval."
-        )
-    return record_payment(venue, amount)
+    total = paid_so_far(venue) + amount
+    # Two payments of 250 add up to 500, so the limit is on the total.
+    if 0 < amount and total <= SMALL_LIMIT:
+        return record_payment(venue, amount)
+    return (
+        f"Refused: {amount} for {venue}. This tool pays a venue"
+        f" up to {SMALL_LIMIT} in total. Use pay_deposit, which"
+        " waits for approval."
+    )
 
 
 @tool
