@@ -34,11 +34,20 @@ The first line the agent prints says which model it is using.
 
 ## Steps
 
-| Step | Episode | What it adds |
-|---|---|---|
-| [step-01-first-agent](step-01-first-agent/) | 1 | An agent: a model and instructions |
+| Step | Episode | What it adds | Runs |
+|---|---|---|---|
+| [step-01-first-agent](step-01-first-agent/) | 1 | An agent: a model and instructions | in-process |
+| [step-02-tools](step-02-tools/) | 1 | Two tools: search venues and check dates | in-process |
+| [step-03-pay-deposit](step-03-pay-deposit/) | 1 | A pay_deposit tool that pays with no checks | in-process |
+| [step-04-budget](step-04-budget/) | 2 | A token budget that stops a looping run | in-process |
+| [step-05-ask-first](step-05-ask-first/) | 2 | Approval before pay_deposit; the run pauses until you approve | durable |
+| [step-06-block](step-06-block/) | 2 | A blocked cancel_booking tool; the run fails and the audit says why | durable |
+| [step-07-engine-crash](step-07-engine-crash/) | 3 | Kill the engine while a payment waits; it still pays once | durable |
+| [step-08-what-it-remembers](step-08-what-it-remembers/) | 3 | Read the event log the engine resumed from | durable, read-only |
+| [step-09-audit](step-09-audit/) | 3 | Read the audit: who approved this? | durable, read-only |
 
-More steps are added as the series goes on.
+In-process steps run with `python agent.py`. Durable steps need
+`jamjet dev` running, and their READMEs say how.
 
 ## If you fall behind
 
