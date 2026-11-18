@@ -421,6 +421,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`examples/venue-booking-agent/`, the code-along series.** Nine steps that build one
+  venue-booking agent, pinned to jamjet 0.13.0. Every step runs with no API key on the
+  scripted model; `VENUE_MODEL` picks a real one.
 - **A scripted model, for running an agent with no API key.** Set
   `model="scripted/<path to YAML>"` and each model call is answered from the file. Only
   the model is scripted: policy, approval, budget and durability are the real ones. A

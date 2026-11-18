@@ -1,0 +1,4 @@
+model: scripted (no API key)
+run failed: durable agent run ended in non-completed state: failed (execution exec_<id>)
+execution: exec_<id>
+cancellations.log: 0 line(s)

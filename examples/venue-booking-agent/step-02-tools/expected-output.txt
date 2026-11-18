@@ -1,0 +1,4 @@
+model: scripted (no API key)
+Casa do Rio in Lisbon is free on 11 December. It is also free on 4 December.
+called search_venues(city='Lisbon', date='2026-12-11')
+called check_dates(venue='Casa do Rio')
