@@ -675,6 +675,8 @@ def dev(
         )
         raise typer.Exit(1)
 
+    if db:
+        Path(db).parent.mkdir(parents=True, exist_ok=True)
     db_url = f"sqlite://{db}" if db else None
 
     _print_logo()

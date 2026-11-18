@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "limit_exceeded"})
 # How often run_durable polls get_execution while waiting for a terminal state.
 _POLL_INTERVAL_SECONDS = 0.5
+_MAX_BACKOFF_SECONDS = 5.0
 # StrategyLimits requires a concrete cost figure and validates it > 0, so an
 # omitted ``max_cost_usd`` still needs one for the strategy runners' iteration
 # budget. This is ONLY that placeholder — it is deliberately not folded into
@@ -727,7 +729,7 @@ class Agent:
                 raise RuntimeError(f"start_execution returned no execution_id: {started!r}")
 
             try:
-                execution = await self._poll_to_terminal(client, exec_id)
+                execution = await self._poll_to_terminal(client, exec_id, runtime_url)
             except TimeoutError as exc:
                 raise _with_execution_id(exc, exec_id) from exc
             # Events carry artifact-resolved NodeCompleted outputs (server-side),
@@ -881,14 +883,46 @@ class Agent:
             cloud_governance=target.cloud_governance,
         )
 
-    async def _poll_to_terminal(self, client: Any, exec_id: str) -> dict[str, Any]:
-        """Poll ``get_execution`` until the execution reaches a terminal state."""
+    async def _poll_to_terminal(self, client: Any, exec_id: str, runtime_url: str = "") -> dict[str, Any]:
+        """Poll ``get_execution`` until the execution reaches a terminal state.
+
+        Transport errors (the engine is down or restarting) do not end the wait:
+        it backs off from 0.5 s to 5 s and tries again until the overall timeout.
+        HTTP status errors still propagate.
+        """
+        import httpx  # noqa: PLC0415 - already a dependency of the client
+
+        from jamjet.cli.audit_trail import display_id  # noqa: PLC0415 - avoid an import cycle
+
         timeout_s = self.limits.timeout_seconds
         # Monotonic deadline: time spent inside slow get_execution() calls counts
         # toward the timeout, so a stalled run can't blow past timeout_seconds.
         deadline = time.monotonic() + timeout_s
+        shown_id = display_id(exec_id)
+        down = False
+        backoff = _POLL_INTERVAL_SECONDS
         while True:
-            execution = await client.get_execution(exec_id)
+            try:
+                execution = await client.get_execution(exec_id)
+            except httpx.TransportError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"durable agent run {exec_id} did not reach a terminal state "
+                        f"within {timeout_s}s (the engine was unreachable)"
+                    ) from None
+                if not down:
+                    down = True
+                    print(
+                        f"jamjet: lost the engine at {runtime_url}; waiting for it to come back (execution {shown_id})",
+                        file=sys.stderr,
+                    )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
+                continue
+            if down:
+                down = False
+                backoff = _POLL_INTERVAL_SECONDS
+                print("jamjet: the engine is back; resuming the wait", file=sys.stderr)
             status = execution.get("status", "unknown")
             if status in _TERMINAL_STATUSES:
                 return execution

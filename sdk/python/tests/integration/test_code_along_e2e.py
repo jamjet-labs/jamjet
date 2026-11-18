@@ -26,7 +26,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
 import yaml
 
@@ -183,7 +182,7 @@ class DevStack:
             time.sleep(0.25)
 
     def engine_pid(self) -> int:
-        binary = os.environ["JAMJET_SERVER_PATH"]
+        binary = os.path.realpath(os.environ["JAMJET_SERVER_PATH"])
         assert self.proc is not None
         pids = [pid for pid, ppid, cmd in processes() if ppid == self.proc.pid and cmd.startswith(binary)]
         assert len(pids) == 1, f"expected one engine under jamjet dev, found {pids}"
@@ -211,7 +210,7 @@ class DevStack:
             if alive.get(pid) == command:
                 try:
                     os.killpg(pid, signal.SIGKILL)
-                except ProcessLookupError:
+                except OSError:
                     pass
 
     def jamjet(self, *args: str) -> str:
@@ -432,7 +431,8 @@ def test_step6_durable_run_pauses_for_approval(project: Path, tools: Any, booked
     say("step 6: answer", f"{booked['result'].output}\npayments.log: {booked['payments']}")
 
     exec_id = booked["exec_id"]
-    assert booked["listing"].startswith(f"{exec_id}  __tools_2__")
+    first = booked["listing"].splitlines()[0]
+    assert exec_id in first
     assert "pay_deposit" in booked["listing"]
     assert booked["paid_before_approval"] == []
     assert booked["approved"].startswith("approved")
@@ -443,7 +443,9 @@ def test_step6_durable_run_pauses_for_approval(project: Path, tools: Any, booked
     assert len(booked["payments"]) == 1
 
 
-def test_step7_engine_crash_then_approve_pays_once(stack: DevStack, project: Path, tools: Any) -> None:
+def test_step7_engine_crash_then_approve_pays_once(
+    stack: DevStack, project: Path, tools: Any, capfd: pytest.CaptureFixture[str]
+) -> None:
     tools.PAYMENTS.unlink(missing_ok=True)
     agent = venue_agent(
         project,
@@ -458,28 +460,39 @@ def test_step7_engine_crash_then_approve_pays_once(stack: DevStack, project: Pat
     exec_id, _ = wait_for_approval(stack, run)
 
     killed = stack.kill_engine()
-    run.join()
-    # Main: run_durable polls the engine with no retry, so this client gives up
-    # when the engine dies. The run itself is in the engine's database.
-    assert isinstance(run.error, httpx.TransportError), run.error
+    time.sleep(2)  # the client is now polling a dead engine and must not give up
+    assert run.thread.is_alive(), f"run_durable ended while the engine was down: {run.error!r}"
     assert lines(tools.PAYMENTS) == []
 
     stack.start()  # same project folder, so the same .jamjet/runtime.db
-    listing = stack.jamjet("approvals")
-    approved = stack.jamjet("approve", exec_id, "-d", "approved", "--as", "tester")
-    deadline = time.monotonic() + 60
-    while (execution := stack.execution(exec_id))["status"] not in ("completed", "failed", "cancelled"):
-        assert time.monotonic() < deadline, f"still {execution['status']} after the approval"
+    # The engine may not have recovered the run yet: wait until it lists it.
+    deadline = time.monotonic() + 30
+    while True:
+        listing = stack.jamjet("approvals")
+        if exec_id in listing:
+            break
+        assert time.monotonic() < deadline, f"{exec_id} never reappeared; last listing:\n{listing}"
         time.sleep(0.5)
+    approved = stack.jamjet("approve", exec_id, "-d", "approved", "--as", "tester")
+    run.join()
+    if run.error is not None:
+        raise run.error
+    execution = stack.execution(exec_id)
+    stderr = capfd.readouterr().err
     trail = stack.jamjet("audit", exec_id)
     say(
         "step 7",
-        f"kill -9 engine pid {killed}; client error: {run.error!r}\n"
+        f"kill -9 engine pid {killed}\nclient stderr:\n{stderr}\nclient answer: {run.result.output}\n"
         f"after restart, jamjet approvals:\n{listing}\n{approved}\n{trail}\n"
         f"payments.log: {lines(tools.PAYMENTS)}",
     )
 
-    assert exec_id in listing
+    shown = f"execution {exec_id})"
+    assert f"jamjet: lost the engine at {stack.url}; waiting for it to come back ({shown}" in stderr
+    assert stderr.count("jamjet: lost the engine at") == 1
+    assert stderr.count("jamjet: the engine is back; resuming the wait") == 1
+    assert run.result.execution_id == exec_id
+    assert run.result.output == answer(project, "book.yaml")
     assert execution["status"] == "completed"
     assert execution["current_state"]["last_model_output"] == answer(project, "book.yaml")
     assert len(lines(tools.PAYMENTS)) == 1
