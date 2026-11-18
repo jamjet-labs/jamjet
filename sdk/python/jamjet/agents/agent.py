@@ -901,24 +901,35 @@ class Agent:
         shown_id = display_id(exec_id)
         down = False
         backoff = _POLL_INTERVAL_SECONDS
+        last_transport_exc: Exception | None = None
+        last_status = "unknown"
         while True:
-            try:
-                execution = await client.get_execution(exec_id)
-            except httpx.TransportError as transport_exc:
-                if time.monotonic() >= deadline:
+            # Check expiry before each request, so none is issued after the deadline.
+            if time.monotonic() >= deadline:
+                if last_transport_exc is not None:
                     raise TimeoutError(
                         f"durable agent run {exec_id} did not reach a terminal state "
                         f"within {timeout_s}s (the engine was unreachable)"
-                    ) from transport_exc
+                    ) from last_transport_exc
+                raise TimeoutError(
+                    f"durable agent run {exec_id} did not reach a terminal state "
+                    f"within {timeout_s}s (last status: {last_status!r})"
+                )
+            try:
+                execution = await client.get_execution(exec_id)
+            except httpx.TransportError as transport_exc:
+                last_transport_exc = transport_exc
                 if not down:
                     down = True
                     print(
                         f"jamjet: lost the engine at {runtime_url}; waiting for it to come back (execution {shown_id})",
                         file=sys.stderr,
                     )
-                await asyncio.sleep(backoff)
+                # Never sleep past the deadline.
+                await asyncio.sleep(max(0.0, min(backoff, deadline - time.monotonic())))
                 backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
                 continue
+            last_transport_exc = None
             if down:
                 down = False
                 backoff = _POLL_INTERVAL_SECONDS
@@ -926,12 +937,8 @@ class Agent:
             status = execution.get("status", "unknown")
             if status in _TERMINAL_STATUSES:
                 return execution
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"durable agent run {exec_id} did not reach a terminal state "
-                    f"within {timeout_s}s (last status: {status!r})"
-                )
-            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+            last_status = status
+            await asyncio.sleep(max(0.0, min(_POLL_INTERVAL_SECONDS, deadline - time.monotonic())))
 
     def _extract_result(
         self,
