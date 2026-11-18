@@ -1,4 +1,4 @@
-"""Step 05 of the venue-booking example, on the real JamJet stack.
+"""Steps 05 and 06 of the venue-booking example, on the real JamJet stack.
 
 Opt-in. It copies the step folder to a temp dir, starts
 `jamjet dev --modules venue_tools` there on free ports, runs agent.py
@@ -131,3 +131,54 @@ def test_step05_durable_pauses_then_pays_once(
     assert normalise(out) == expected(STEP)
     assert len(lines(payments)) == 1
     assert "pay_deposit" in listing
+
+
+STEP06 = "step-06-block"
+
+
+@pytest.fixture(scope="module")
+def project06(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("venue_step06")
+    for name in ("agent.py", "venue_tools.py", "script.yaml"):
+        shutil.copy(ROOT / STEP06 / name, root)
+    (root / "home").mkdir()
+    return root
+
+
+@pytest.fixture(scope="module")
+def stack06(project06: Path, request: pytest.FixtureRequest) -> DevStack:
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.endswith(("_API_KEY", "_API_BASE", "_BASE_URL"))
+        and not (k.startswith("JAMJET_") and k != "JAMJET_SERVER_PATH")
+        and k not in ("DATABASE_URL", "VENUE_MODEL")
+    }
+    env.update(HOME=str(project06 / "home"), PYTHONUNBUFFERED="1", NO_COLOR="1", COLUMNS="200")
+    env["JAMJET_SERVER_PATH"] = os.path.realpath(os.environ["JAMJET_SERVER_PATH"])
+    env["JAMJET_AUDIT_SIGNING_KEY"] = TEST_SIGNING_KEY
+    dev = DevStack(project06, env)
+    request.addfinalizer(dev.stop)
+    dev.start()
+    return dev
+
+
+def test_step06_engine_blocks_the_cancellation(stack06: DevStack, project06: Path) -> None:
+    agent = AgentProcess(project06, stack06.env, stack06.url)
+    try:
+        out, err = agent.proc.communicate(timeout=120)
+    finally:
+        agent.stop()
+    say("step 06: agent.py stdout", out)
+
+    assert agent.proc.returncode == 0, f"agent.py exited {agent.proc.returncode}\n{out}\n{err[-3000:]}"
+    exec_id = EXEC_ID.search(out).group(0)
+    trail = stack06.jamjet("audit", exec_id)
+    say("step 06: jamjet audit", trail)
+
+    assert "run failed:" in out
+    assert out.rstrip().endswith("cancellations.log: 0 line(s)")
+    assert not (project06 / "cancellations.log").exists()
+    assert "cancel_booking blocked" in trail
+    assert stack06.execution(exec_id)["status"] == "failed"
+    assert normalise(out) == expected(STEP06)
