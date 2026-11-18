@@ -150,19 +150,15 @@ impl NodeExecutor for ModelNodeExecutor {
             return Err("ModelNodeExecutor: no prompt or messages provided".into());
         }
 
-        // A system message in the conversation with the same text already
-        // carries the prompt; do not send it a second time. A different system
-        // message keeps both.
-        let system_prompt = match system_prompt {
-            Some(sp)
-                if messages
-                    .iter()
-                    .any(|m| matches!(m.role, ChatRole::System) && m.content == sp) =>
-            {
-                None
-            }
-            other => other,
-        };
+        // A system message in the conversation with the same text as the node's
+        // prompt is a duplicate of it. Drop the message and keep the configured
+        // prompt, which adapters place first. A different system message stays.
+        if let Some(sp) = system_prompt.as_deref() {
+            messages.retain(|m| !(matches!(m.role, ChatRole::System) && m.content == sp));
+        }
+        if messages.is_empty() {
+            return Err("ModelNodeExecutor: no prompt or messages provided".into());
+        }
 
         let config = ModelConfig {
             model: Some(model.clone()),
@@ -626,19 +622,20 @@ mod tests {
             .iter()
             .map(|m| format!("{:?}", m.role))
             .collect();
-        assert_eq!(roles, ["System", "User", "Assistant", "Tool"]);
-        assert_eq!(req.messages[2].tool_calls.len(), 1);
-        assert_eq!(req.messages[2].tool_calls[0].id, "call_1");
-        assert_eq!(req.messages[2].tool_calls[0].name, "search_venues");
+        assert_eq!(roles, ["User", "Assistant", "Tool"]);
+        assert_eq!(req.messages[1].tool_calls.len(), 1);
+        assert_eq!(req.messages[1].tool_calls[0].id, "call_1");
+        assert_eq!(req.messages[1].tool_calls[0].name, "search_venues");
         assert_eq!(
-            req.messages[2].tool_calls[0].arguments,
+            req.messages[1].tool_calls[0].arguments,
             json!({"city": "Lisbon", "guests": 40})
         );
-        assert_eq!(req.messages[3].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(req.messages[3].content, "[\"Casa do Rio\"]");
-        assert!(
-            req.config.system_prompt.is_none(),
-            "messages hold the system prompt; do not send it twice"
+        assert_eq!(req.messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(req.messages[2].content, "[\"Casa do Rio\"]");
+        assert_eq!(
+            req.config.system_prompt.as_deref(),
+            Some("You book venues."),
+            "the configured prompt carries it; the duplicate message is removed"
         );
     }
 
@@ -703,6 +700,30 @@ mod tests {
             Some("You book venues.")
         );
         assert_eq!(req.messages[0].content, "Answer in French.");
+    }
+
+    /// An earlier different system message must not displace the configured
+    /// prompt, and the matching message is removed.
+    #[tokio::test]
+    async fn executor_keeps_config_prompt_after_a_different_system_message() {
+        let (executor, captured) = capturing_executor();
+        let item = work_item(json!({
+            "model": "fake-model",
+            "system_prompt": "You book venues.",
+            "messages": [
+                {"role": "system", "content": "Answer in French."},
+                {"role": "system", "content": "You book venues."},
+                {"role": "user", "content": "hi"}
+            ]
+        }));
+        executor.execute(&item).await.expect("execute");
+        let req = captured.lock().unwrap().clone().expect("request captured");
+        assert_eq!(
+            req.config.system_prompt.as_deref(),
+            Some("You book venues.")
+        );
+        let contents: Vec<_> = req.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["Answer in French.", "hi"]);
     }
 
     /// A tool message with no (or an empty) `tool_call_id` has no id, not "".

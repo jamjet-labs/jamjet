@@ -817,6 +817,15 @@ mod tests {
     }
 
     #[test]
+    fn build_messages_puts_one_system_message_first() {
+        let msgs = vec![ChatMessage::user("hi")];
+        let out = SidecarModelAdapter::build_messages(&msgs, Some("You book venues."));
+        let systems = out.iter().filter(|m| m["role"] == "system").count();
+        assert_eq!(systems, 1);
+        assert_eq!(out[0]["content"], "You book venues.");
+    }
+
+    #[test]
     fn build_messages_sends_openai_tool_shape() {
         let msgs = vec![
             ChatMessage::user("Find a venue."),
