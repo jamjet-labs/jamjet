@@ -301,6 +301,8 @@ async def test_run_durable_gives_up_on_timeout_when_engine_stays_down(monkeypatc
         await agent.run_durable("weather in London?", max_turns=3)
 
     assert info.value.execution_id == "exec_test"
+    assert isinstance(info.value.__cause__, httpx.ConnectError)
+    assert str(info.value).count("exec_test") == 1
 
 
 async def test_run_durable_does_not_retry_http_status_errors(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -428,9 +428,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which for a durable run is the sidecar that `jamjet dev` starts. See the Python README.
 
 - **`jamjet executions`** lists runs, and `AgentResult.execution_id` gives the id of a
-  durable run. Ids print as `exec_<hex>` everywhere.
+  durable run. Ids print as `exec_<hex>` in text output.
 
-- **`jamjet approvals` with no id** lists every run waiting for approval, each with a
+- **`jamjet approvals` with no id** lists the runs waiting for approval (it scans up to 50 runs), each with a
   command you can paste to approve it.
 
 - **`jamjet approve <id> -d approved --as <name>`** records who approved. A dev-mode
@@ -455,8 +455,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`run_durable` waits through an engine restart.** If the engine stops while a run is
   waiting, the call prints `jamjet: lost the engine at <url>; waiting for it to come back
   (execution <id>)`, then `jamjet: the engine is back; resuming the wait`. A worker that
-  is killed in the middle of a tool still fails the run.
-
+  is killed in the middle of a tool still fails the run. If the engine does not come
+  back within `timeout_seconds`, `run_durable` raises `TimeoutError` (with the connection
+  error as its cause) instead of `httpx.ConnectError`.
 
 - Pass completed step results to subsequent steps of the local
   `plan-and-execute` strategy so dependent steps can use earlier outputs.

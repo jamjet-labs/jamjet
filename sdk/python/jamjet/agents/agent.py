@@ -731,7 +731,7 @@ class Agent:
             try:
                 execution = await self._poll_to_terminal(client, exec_id, runtime_url)
             except TimeoutError as exc:
-                raise _with_execution_id(exc, exec_id) from exc
+                raise _with_execution_id(exc, exec_id)
             # Events carry artifact-resolved NodeCompleted outputs (server-side),
             # used only as a fallback if a spilled answer sentinel slips through.
             try:
@@ -743,7 +743,7 @@ class Agent:
         try:
             result = self._extract_result(execution, events, ir, duration_us)
         except RuntimeError as exc:
-            raise _with_execution_id(exc, exec_id) from exc
+            raise _with_execution_id(exc, exec_id)
         result.execution_id = exec_id
         # Mint the turn receipt + emit the per-action signed audit chain from the
         # durable run's extracted result (both on by default), mirroring run().
@@ -904,12 +904,12 @@ class Agent:
         while True:
             try:
                 execution = await client.get_execution(exec_id)
-            except httpx.TransportError:
+            except httpx.TransportError as transport_exc:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         f"durable agent run {exec_id} did not reach a terminal state "
                         f"within {timeout_s}s (the engine was unreachable)"
-                    ) from None
+                    ) from transport_exc
                 if not down:
                     down = True
                     print(
@@ -1091,11 +1091,13 @@ class Agent:
 
 
 def _with_execution_id(exc: Exception, exec_id: str) -> Exception:
-    """A copy of ``exc`` whose message names the execution and which carries
-    ``execution_id``, so a failed or timed-out run can still be found."""
-    new = type(exc)(f"{exc} (execution {exec_id})")
-    new.execution_id = exec_id  # type: ignore[attr-defined]
-    return new
+    """``exc`` with the execution named in its message (once) and carrying
+    ``execution_id``, so a failed or timed-out run can still be found. It is the
+    same exception, so a cause such as the last transport error is kept."""
+    if exec_id not in str(exc):
+        exc.args = (f"{exc} (execution {exec_id})", *exc.args[1:]) if exc.args else (f"execution {exec_id}",)
+    exc.execution_id = exec_id  # type: ignore[attr-defined]
+    return exc
 
 
 class AgentResult:
