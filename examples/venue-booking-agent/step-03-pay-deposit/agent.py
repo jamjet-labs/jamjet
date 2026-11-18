@@ -25,9 +25,15 @@ agent = Agent(
     model=MODEL,
     tools=[search_venues, check_dates, pay_deposit],
     strategy="react",
-    instructions="You book event venues for a product launch team.",
+    instructions=(
+        "You book event venues for a product launch team. "
+        "Reply in plain text, in 40 words or fewer."
+    ),
 )
-question = "Book a venue in Lisbon for 40 people on 2026-12-11."
+question = (
+    "Book a venue in Lisbon for 40 people on 2026-12-11"
+    " and pay a 500 deposit."
+)
 result = agent.run_sync(question)
 print(result.output)
 for call in result.tool_calls:

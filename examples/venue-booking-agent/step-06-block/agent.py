@@ -30,7 +30,10 @@ agent = Agent(
     model=MODEL,
     tools=[search_venues, check_dates, pay_deposit, cancel_booking],
     strategy="react",
-    instructions="You book event venues for a product launch team.",
+    instructions=(
+        "You book event venues for a product launch team. "
+        "Reply in plain text, in 40 words or fewer."
+    ),
     policy={
         "require_approval_for": ["pay_deposit"],
         "blocked_tools": ["cancel_*"],
