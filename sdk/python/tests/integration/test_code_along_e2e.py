@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -280,6 +281,17 @@ def wait_for_approval(stack: DevStack, run: DurableRun) -> tuple[str, str]:
     pytest.fail(f"no approval appeared; last listing:\n{listing}")
 
 
+def printed_approve_args(listing: str, exec_id: str) -> list[str]:
+    """The approve command `jamjet approvals` printed (digest and all) with
+    `--as tester` added, as the arguments after `jamjet`."""
+    lines_ = [ln.strip() for ln in listing.splitlines() if ln.strip().startswith("jamjet approve ")]
+    mine = [ln for ln in lines_ if exec_id in ln]
+    assert len(mine) == 1, f"expected one approve command for {exec_id}; listing:\n{listing}"
+    args = shlex.split(mine[0])
+    assert "--action-digest" in mine[0], mine[0]
+    return [*args[1:], "--as", "tester"]
+
+
 def book_with_approval(stack: DevStack, project: Path, tools: Any) -> dict[str, Any]:
     """Step 6: a durable booking that pauses at pay_deposit, then gets approved."""
     tools.PAYMENTS.unlink(missing_ok=True)
@@ -295,7 +307,7 @@ def book_with_approval(stack: DevStack, project: Path, tools: Any) -> dict[str, 
     run = DurableRun(agent, BOOK, stack.url)
     exec_id, listing = wait_for_approval(stack, run)
     paid_before_approval = lines(tools.PAYMENTS)
-    approved = stack.jamjet("approve", exec_id, "-d", "approved", "--as", "tester")
+    approved = stack.jamjet(*printed_approve_args(listing, exec_id))
     run.join()
     if run.error is not None:
         raise run.error

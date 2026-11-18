@@ -168,13 +168,15 @@ jobs:
         working-directory: binaries
         run: sha256sum jamjet-server-* > SHA256SUMS
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist/
-
+      # Before PyPI: an installed SDK downloads the engine from its own tag, so
+      # the binaries and SHA256SUMS must be on the release first.
       - name: Upload binaries to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: binaries/*
           fail_on_unmatched_files: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

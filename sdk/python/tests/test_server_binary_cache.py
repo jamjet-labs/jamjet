@@ -279,3 +279,24 @@ def test_download_without_sums_warns_once(
     _download_server_binary(str(tmp_path / "c"))
     out = " ".join(capsys.readouterr().out.split())
     assert out.count(_SUMS_MSG) == 1
+
+
+def test_download_sums_without_this_asset_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from jamjet.cli.main import _download_server_binary
+
+    digest = hashlib.sha256(_BINARY).hexdigest()
+    _setup_download(monkeypatch, sums=f"{digest}  jamjet-server-macos-arm64\n")
+    cache = tmp_path / "c"
+    with pytest.raises(FileNotFoundError, match="no entry"):
+        _download_server_binary(str(cache))
+    assert not cache.exists() or list(cache.iterdir()) == []
+
+
+def test_download_malformed_sums_line_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from jamjet.cli.main import _download_server_binary
+
+    _setup_download(monkeypatch, sums="not-a-digest  jamjet-server-linux-x86_64\n")
+    cache = tmp_path / "c"
+    with pytest.raises(FileNotFoundError, match="Checksum mismatch"):
+        _download_server_binary(str(cache))
+    assert not cache.exists() or list(cache.iterdir()) == []
