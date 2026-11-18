@@ -105,12 +105,11 @@ def test_turn_model_nodes_each_carry_both_tool_schemas():
         assert kind["prompt_ref"] == ""
         names = [s["function"]["name"] for s in kind["tools"]]
         assert names == ["get_weather", "search_web"]
-        # OpenAI function-schema shape; parameters are the tool's input_schema
-        # verbatim (this SDK's @tool maps a str param to the bare token "string").
+        # OpenAI function-schema shape; each parameter is a JSON Schema object.
         assert kind["tools"][0]["type"] == "function"
         params = kind["tools"][0]["function"]["parameters"]
         assert params["type"] == "object"
-        assert params["properties"]["city"] == "string"
+        assert params["properties"]["city"] == {"type": "string"}
         assert params["required"] == ["city"]
 
 

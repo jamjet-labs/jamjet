@@ -413,10 +413,73 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only under the key that signed it, so keep old public keys after a rotation. See
   docs/guides/security.md, "Signing the audit log".
 
+- **`jamjet dev` checks the engine download.** The downloaded `jamjet-server` is
+  checked against the release's `SHA256SUMS` file before it is used. A release with no
+  `SHA256SUMS` is refused. `jamjet dev` also downloads the engine release that matches the installed SDK
+  version (`python-sdk-v<version>`), and `JAMJET_SERVER_PATH` names a binary to use
+  instead.
+
+### Added
+
+- **A scripted model, for running an agent with no API key.** Set
+  `model="scripted/<path to YAML>"` and each model call is answered from the file. Only
+  the model is scripted: policy, approval, budget and durability are the real ones. A
+  relative path resolves against the working directory of the process that reads it,
+  which for a durable run is the sidecar that `jamjet dev` starts. See the Python README.
+
+- **`jamjet executions`** lists runs, and `AgentResult.execution_id` gives the id of a
+  durable run. Ids print as `exec_<hex>` in text output.
+
+- **`jamjet approvals` with no id** lists the runs waiting for approval (it scans up to 50 runs), each with a
+  command you can paste to approve it.
+
+- **`jamjet approve <id> -d approved --as <name>`** records who approved. A dev-mode
+  engine records the name you give; with an API token the engine records the token's
+  name.
+
+- **`jamjet audit <id>`** prints a run's audit trail as text, or as JSON with `--json`:
+  what the model asked for, what ran, what was blocked, and who approved.
+
+- `jamjet dev --db PATH` creates the folder for the database.
+
 ### Fixed
+
+- **A durable agent keeps its tool results.** After a tool ran, the next model call
+  could be made without the result. The engine now keeps it.
+
+- **Plain `def` tools work with `@tool`.**
+
+- **LiteLLM's debug banner is silent.** It no longer prints on every model call. Set
+  `JAMJET_LITELLM_DEBUG=1` to see it.
+
+- **`run_durable` waits through an engine restart.** If the engine stops while a run is
+  waiting, the call prints `jamjet: lost the engine at <url>; waiting for it to come back
+  (execution <id>)`, then `jamjet: the engine is back; resuming the wait`. A worker that
+  is killed in the middle of a tool still fails the run. If the engine does not come
+  back within `timeout_seconds`, `run_durable` raises `TimeoutError` (with the connection
+  error as its cause) instead of `httpx.ConnectError`.
+
+- Pass completed step results to subsequent steps of the local
+  `plan-and-execute` strategy so dependent steps can use earlier outputs.
+
+- Allow scoped local `DurableAgent` runs without the optional Engram package
+  when memory is absent, disabled, or configured with the `none` backend.
+
+- Reject malformed LLM judge ratings instead of coercing them or accepting scores
+  outside the documented 1–5 scale.
+
+- Fail trajectory evaluations when their event log cannot be fetched, instead of
+  silently passing them based on output scorers alone. Output-only evaluations
+  retain best-effort event collection.
+
+- Preserve dataset trajectory assertions when running experiment grids, so each
+  condition and seed is scored against the expected tool usage.
 
 - Preserve registry agents' reasoning modes during coordinator discovery so
   matching `preferred_reasoning_modes` contributes to capability scores.
+
+- Generate JSON Schema objects for typed `@tool` parameters instead of bare
+  type-name strings, including when compiling tools into an agent specification.
 
 - **Runtime: an unmatched API request is a JSON 404, not the web UI.** The SPA
   fallback answered every unmatched path, for every method, with `200 text/html`

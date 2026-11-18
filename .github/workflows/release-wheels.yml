@@ -163,13 +163,23 @@ jobs:
           path: binaries/
           merge-multiple: true
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist/
+      # jamjet dev downloads the engine and checks it against this file.
+      - name: Write SHA256SUMS for the binaries
+        working-directory: binaries
+        run: sha256sum jamjet-server-* > SHA256SUMS
 
+      # Before PyPI: an installed SDK downloads the engine from its own tag, so
+      # the binaries and SHA256SUMS must be on the release first. They go up in
+      # this one step, and a rerun replaces them together (overwrite_files), so
+      # a rerun cannot leave the release without SHA256SUMS.
       - name: Upload binaries to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: binaries/*
           fail_on_unmatched_files: true
+          overwrite_files: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

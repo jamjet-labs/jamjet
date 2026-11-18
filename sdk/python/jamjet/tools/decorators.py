@@ -17,6 +17,7 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 from collections.abc import Callable
@@ -68,6 +69,8 @@ def tool(
 
     The function must have typed parameters and a typed return value.
     If the return type is a Pydantic BaseModel, its JSON schema is used.
+    Plain functions run in a worker thread; to use the event loop, write the
+    tool as ``async def``.
 
     Usage::
 
@@ -93,7 +96,7 @@ def tool(
             if param_name in ("self", "cls"):
                 continue
             hint = hints.get(param_name, Any)
-            input_props[param_name] = _type_to_schema(hint)
+            input_props[param_name] = {"type": _type_to_schema(hint)}
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)
 
@@ -142,7 +145,13 @@ def tool(
                     # TypeError: input contains non-JSON-serializable values
                     #   (Pydantic model, datetime, bytes, etc.) — treat as cache miss.
                     pass  # Fall through to live execution.
-            return await fn(*args, **kwargs)
+            if inspect.iscoroutinefunction(fn):
+                return await fn(*args, **kwargs)
+            # Plain functions run in a worker thread so they never block the loop.
+            result = await asyncio.to_thread(fn, *args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
 
         wrapper._jamjet_tool = defn  # type: ignore[attr-defined]
         defn.wrapper = wrapper

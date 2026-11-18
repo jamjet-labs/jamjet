@@ -238,6 +238,22 @@ async def test_llm_judge_exact_min_score():
     assert result.passed is True
 
 
+@pytest.mark.parametrize("score", [0, 6, 3.5, True, None, "5"])
+async def test_llm_judge_rejects_invalid_scores(score):
+    """Malformed ratings must not pass or enter numeric score aggregates."""
+
+    async def fake_model(prompt: str) -> str:
+        return json.dumps({"score": score, "reason": "rating"})
+
+    scorer = LlmJudgeScorer(rubric="Rate quality 1-5", min_score=3, model_fn=fake_model)
+
+    result = await scorer.score("output")
+
+    assert result.passed is False
+    assert result.score is None
+    assert "judge failed" in result.message
+
+
 @pytest.mark.asyncio
 async def test_llm_judge_no_json_in_response():
     async def fake_model(prompt: str) -> str:

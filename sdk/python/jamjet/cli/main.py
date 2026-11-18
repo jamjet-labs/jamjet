@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import hashlib
 import importlib.metadata
 import json
 import math
@@ -50,6 +51,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from jamjet.cli.audit_trail import _BIDI_CONTROLS, display_id
 from jamjet.cli.demo import demo_app
 from jamjet.client import JamjetClient
 from jamjet.deploy import LOCAL_RUNTIME_URL
@@ -435,6 +437,13 @@ def _find_server_binary() -> str:
     import os
     import shutil
 
+    # 0. An explicit JAMJET_SERVER_PATH wins and never triggers a download.
+    explicit = os.environ.get("JAMJET_SERVER_PATH")
+    if explicit:
+        if os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+            return explicit
+        raise FileNotFoundError(f"JAMJET_SERVER_PATH is not an executable file: {explicit}")
+
     # 1. Check PATH first (installed wheel or symlinked)
     which = shutil.which("jamjet-server")
     if which:
@@ -491,8 +500,14 @@ def _download_server_binary(cache_dir: str) -> str:
     ext = ".exe" if system == "windows" else ""
     filename = f"jamjet-server-{system}-{arch}{ext}"
 
-    # Resolve the latest release tag from GitHub API.
-    api_url = "https://api.github.com/repos/jamjet-labs/jamjet/releases/latest"
+    # Pin the release to the installed SDK version. Never fall back to "latest":
+    # an engine from another release can disagree with this SDK.
+    import json as _json
+    import urllib.error
+
+    version = _sdk_version()
+    tag = f"python-sdk-v{version}"
+    api_url = f"https://api.github.com/repos/jamjet-labs/jamjet/releases/tags/{tag}"
     try:
         gh_headers = {
             "Accept": "application/vnd.github+json",
@@ -500,21 +515,54 @@ def _download_server_binary(cache_dir: str) -> str:
         }
         req = urllib.request.Request(api_url, headers=gh_headers)  # noqa: S310
         with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-            import json as _json
-
             release = _json.loads(resp.read())
-        tag = release["tag_name"]
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise FileNotFoundError(
+                f"No engine release for jamjet {version} (tag {tag}). "
+                "Build one with: jamjet dev --build, or set JAMJET_SERVER_PATH."
+            ) from exc
+        raise FileNotFoundError(
+            f"Could not fetch release info from GitHub ({exc}).\n"
+            "Build from source: cd runtime && cargo build -p jamjet-api\n"
+            "Or set JAMJET_SERVER_PATH to the binary path."
+        ) from exc
     except Exception as exc:
         raise FileNotFoundError(
-            f"Could not fetch latest release info from GitHub ({exc}).\n"
+            f"Could not fetch release info from GitHub ({exc}).\n"
             "Build from source: cd runtime && cargo build -p jamjet-api\n"
             "Or set JAMJET_SERVER_PATH to the binary path."
         ) from exc
 
-    url = f"https://github.com/jamjet-labs/jamjet/releases/download/{tag}/{filename}"
+    release_base = f"https://github.com/jamjet-labs/jamjet/releases/download/{tag}"
+    url = f"{release_base}/{filename}"
+    asset_names = {a.get("name") for a in release.get("assets", [])}
+
+    # The SDK downloads only the release for its own version, and every such
+    # release publishes SHA256SUMS. A release without it is an anomaly: fail
+    # closed. Fetch the list before the binary, so a bad list fails early.
+    if "SHA256SUMS" not in asset_names:
+        raise FileNotFoundError(
+            f"The jamjet {version} release has no SHA256SUMS, so the engine can't be verified. "
+            "Set JAMJET_SERVER_PATH to an engine you trust, or build one with: jamjet dev --build."
+        )
+    try:
+        with urllib.request.urlopen(f"{release_base}/SHA256SUMS", timeout=30) as sums_resp:  # noqa: S310
+            sums_text = sums_resp.read().decode("utf-8", "replace")
+    except Exception as exc:
+        raise FileNotFoundError(f"Could not fetch SHA256SUMS ({exc}).") from exc
+    expected_sha: str | None = None
+    for line in sums_text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("*") == filename:
+            expected_sha = parts[0].lower()
+            break
+    if expected_sha is None:
+        raise FileNotFoundError(f"SHA256SUMS has no entry for {filename}; refusing to use the download.")
     os.makedirs(cache_dir, exist_ok=True)
     dest = os.path.join(cache_dir, f"jamjet-server{ext}")
     dest_tmp = dest + ".tmp"
+    hasher = hashlib.sha256()
 
     console.print(f"[dim]Downloading jamjet-server {tag} for {system}/{arch}...[/dim]")
 
@@ -539,6 +587,7 @@ def _download_server_binary(cache_dir: str) -> str:
                         if not chunk:
                             break
                         out.write(chunk)
+                        hasher.update(chunk)
                         progress.advance(task, len(chunk))
     except Exception as exc:
         if os.path.exists(dest_tmp):
@@ -548,6 +597,13 @@ def _download_server_binary(cache_dir: str) -> str:
             "Build from source: cd runtime && cargo build -p jamjet-api\n"
             "Or set JAMJET_SERVER_PATH to the binary path."
         ) from exc
+
+    if hasher.hexdigest() != expected_sha:
+        os.remove(dest_tmp)
+        raise FileNotFoundError(
+            f"Checksum mismatch for {filename} ({tag}): expected {expected_sha}, "
+            f"got {hasher.hexdigest()}. The download was deleted."
+        )
 
     os.replace(dest_tmp, dest)
     os.chmod(dest, os.stat(dest).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -622,6 +678,8 @@ def dev(
         )
         raise typer.Exit(1)
 
+    if db:
+        Path(db).parent.mkdir(parents=True, exist_ok=True)
     db_url = f"sqlite://{db}" if db else None
 
     _print_logo()
@@ -2729,8 +2787,7 @@ def _effect_size_label(d: float) -> str:
 # ── approvals ─────────────────────────────────────────────────────────────────
 
 
-# Bidi controls that reorder what follows them on the terminal.
-_BIDI_CONTROLS = frozenset("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+# Bidi controls that reorder what follows them on the terminal (shared with the audit trail).
 
 
 def _safe(value: Any) -> str:
@@ -2785,7 +2842,10 @@ def _summary(data: dict[str, Any], limit: int = 240) -> str:
 _NODE_ID_SAFE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 
 
-def _approve_command(execution_id: str, node_id: str, binding: str) -> str | None:
+_DEFAULT_RUNTIME = "http://localhost:7700"
+
+
+def _approve_command(execution_id: str, node_id: str, binding: str, runtime: str | None = None) -> str | None:
     """The `jamjet approve` line for one pending request, safe to paste.
 
     The node id is chosen by whoever wrote the IR. Every argument is shell
@@ -2797,7 +2857,7 @@ def _approve_command(execution_id: str, node_id: str, binding: str) -> str | Non
     """
     import shlex  # noqa: PLC0415
 
-    values = (execution_id, node_id, binding)
+    values = (execution_id, node_id, binding) + ((runtime,) if runtime else ())
     if any(_safe(v) != str(v) for v in values) or not _NODE_ID_SAFE.fullmatch(node_id):
         return None
     args = [
@@ -2809,6 +2869,8 @@ def _approve_command(execution_id: str, node_id: str, binding: str) -> str | Non
         f"--node-id={node_id}",
         f"--action-digest={binding}",
     ]
+    if runtime:
+        args.append(f"--runtime={runtime}")
     return " ".join(shlex.quote(a) for a in args)
 
 
@@ -2855,9 +2917,159 @@ def _approval_covers(context: dict[str, Any]) -> str:
     return "-"
 
 
+def _unreachable(runtime: str, exc: Exception) -> None:
+    """One plain error line for an engine that cannot be reached, then exit 1."""
+    _print_error("", f"Cannot reach the runtime at {runtime}: {exc}")
+    raise typer.Exit(1)
+
+
+def _started_local(value: Any) -> str:
+    """An ISO start time as local time to the second; the raw text if unparseable."""
+    from datetime import datetime  # noqa: PLC0415
+
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return _safe(value)
+
+
+@app.command()
+def executions(
+    status: str | None = typer.Option(None, "--status", "-s", help="Only runs in this status (running, paused, ...)"),
+    limit: int = typer.Option(50, "--limit", "-n", help="How many runs to list"),
+    as_json: bool = typer.Option(False, "--json", help="Print the engine's items as JSON"),
+    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+) -> None:
+    """List recent executions, newest first."""
+
+    async def _list() -> None:
+        async with _client(runtime) as c:
+            try:
+                data = await c.list_executions(status=status, limit=limit)
+            except httpx.RequestError as exc:
+                _unreachable(runtime, exc)
+        items = data.get("executions", [])
+        if as_json:
+            typer.echo(json.dumps(items, indent=2))
+            return
+        items = sorted(items, key=lambda e: str(e.get("started_at", "")), reverse=True)
+        if not items:
+            console.print("No executions yet.", style="dim", markup=False)
+            return
+        t = Table()
+        t.add_column("execution", no_wrap=True)
+        t.add_column("agent")
+        t.add_column("status")
+        t.add_column("started (local)", no_wrap=True)
+        for e in items:
+            t.add_row(
+                _cell(display_id(e.get("execution_id", "-"))),
+                _cell(e.get("workflow_id", "-")),
+                _cell(e.get("status", "-")),
+                _started_local(e.get("started_at", "")),
+            )
+        console.print(t)
+
+    asyncio.run(_list())
+
+
+# A run waiting on a person can be `paused` (runtime/core WorkflowStatus; a
+# workflow approval node) or still `running`: an agent tool approval
+# (`tool_approval_required`) leaves the run reported as `running` while its
+# approvals endpoint lists the pending request. Scan both.
+_WAITING_STATUSES = ("running", "paused")
+
+
+# Most executions scanned per status. A large deployment must not loop forever.
+_WAITING_SCAN_CEILING = 1000
+
+
+def _print_basis(context: dict[str, Any]) -> None:
+    """Print the full action basis a pending digest covers."""
+    basis = context.get("action_basis")
+    if basis is None and context.get("calls_hash"):
+        basis = {"calls": context.get("calls"), "gated_tools": context.get("gated_tools")}
+    console.print(
+        json.dumps(basis, indent=2, sort_keys=True),
+        soft_wrap=True,
+        markup=False,
+        highlight=False,
+    )
+
+
+async def _print_waiting_approvals(runtime: str, page_size: int = 50, show_basis: bool = False) -> None:
+    shown_runtime = runtime if runtime != _DEFAULT_RUNTIME else None
+    async with _client(runtime) as c:
+        try:
+            waiting: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for status in _WAITING_STATUSES:
+                offset = 0
+                while True:
+                    page = (await c.list_executions(status=status, limit=page_size, offset=offset)).get(
+                        "executions", []
+                    )
+                    for e in page:
+                        if e.get("execution_id") not in seen:
+                            seen.add(e.get("execution_id"))
+                            waiting.append(e)
+                    offset += page_size
+                    if len(page) < page_size:
+                        break
+                    if offset >= _WAITING_SCAN_CEILING:
+                        console.print(
+                            f"Scan stopped after {_WAITING_SCAN_CEILING} {status} executions; "
+                            "older runs were not checked.",
+                            style="dim",
+                            markup=False,
+                        )
+                        break
+        except httpx.RequestError as exc:
+            _unreachable(runtime, exc)
+        found = 0
+        for e in waiting:
+            eid = e.get("execution_id", "")
+            try:
+                data = await c.list_approvals(eid)
+            except httpx.HTTPStatusError as exc:
+                console.print(
+                    f"skipped {_safe(eid)}: the engine answered {exc.response.status_code}",
+                    style="dim",
+                    markup=False,
+                    soft_wrap=True,
+                )
+                continue
+            except httpx.RequestError as exc:
+                _unreachable(runtime, exc)
+            for entry in data.get("pending", []):
+                found += 1
+                shown = display_id(eid)
+                context = entry.get("context") or {}
+                node = entry.get("node_id", "-")
+                console.print(f"{_safe(shown)}  {_safe(node)}", soft_wrap=True, markup=False, highlight=False)
+                console.print(f"  covers {_approval_covers(context)}", soft_wrap=True, markup=False, highlight=False)
+                binding = _approval_binding(context)
+                command = _approve_command(shown, node, binding, shown_runtime) if binding else None
+                if command:
+                    console.print(f"  {command}", soft_wrap=True, markup=False, highlight=False)
+                else:
+                    console.print(
+                        f"  no paste-ready command; run: jamjet approvals {_safe(shown)}",
+                        soft_wrap=True,
+                        markup=False,
+                        highlight=False,
+                    )
+                if show_basis:
+                    _print_basis(context)
+    if not found:
+        console.print("No approvals are waiting.", style="dim", markup=False)
+
+
 @app.command()
 def approvals(
-    execution_id: str = typer.Argument(..., help="Execution ID (exec_...)"),
+    execution_id: str | None = typer.Argument(
+        None, help="Execution ID (exec_...). Leave out to list every run waiting for a decision."
+    ),
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
     show_basis: bool = typer.Option(
         False,
@@ -2871,8 +3083,13 @@ def approvals(
     digest covers. Review the basis (`--show-basis`) before approving: the
     approval authorises exactly that payload, that occurrence and that node.
     """
+    if execution_id is None:
+        asyncio.run(_print_waiting_approvals(runtime, show_basis=show_basis))
+        return
+    execution_id_: str = execution_id
 
     async def _approvals() -> None:
+        execution_id = execution_id_
         async with _client(runtime) as c:
             data = await c.list_approvals(execution_id)
 
@@ -2911,7 +3128,12 @@ def approvals(
                     highlight=False,
                 )
                 if binding:
-                    command = _approve_command(execution_id, entry.get("node_id", ""), binding)
+                    command = _approve_command(
+                        execution_id,
+                        entry.get("node_id", ""),
+                        binding,
+                        runtime if runtime != _DEFAULT_RUNTIME else None,
+                    )
                     console.print(
                         f"{node}: approve with"
                         if command
@@ -2938,15 +3160,7 @@ def approvals(
                         highlight=False,
                     )
                 if show_basis:
-                    basis = context.get("action_basis")
-                    if basis is None and context.get("calls_hash"):
-                        basis = {"calls": context.get("calls"), "gated_tools": context.get("gated_tools")}
-                    console.print(
-                        json.dumps(basis, indent=2, sort_keys=True),
-                        soft_wrap=True,
-                        markup=False,
-                        highlight=False,
-                    )
+                    _print_basis(context)
 
         if decided:
             d = Table(title="Decided")
@@ -2984,6 +3198,12 @@ def approve(
         help="action_digest (or calls_hash) of the pending approval you reviewed, from "
         "`jamjet approvals`. Required to approve on a runtime with auth enabled.",
     ),
+    approver: str | None = typer.Option(
+        None,
+        "--as",
+        help="Name to record as the approver. A dev-mode engine records it as given; "
+        "with an API token the engine records the token's name instead.",
+    ),
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
 ) -> None:
     """Approve or reject a pending HITL gate on an execution."""
@@ -3004,6 +3224,7 @@ def approve(
                     node_id=node_id,
                     comment=comment,
                     action_digest=action_digest,
+                    user_id=approver,
                 )
             except httpx.HTTPStatusError as exc:
                 try:
@@ -3027,6 +3248,62 @@ def approve(
         )
 
     asyncio.run(_approve())
+
+
+# ── audit ─────────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def audit(
+    execution_id: str = typer.Argument(..., help="Execution ID (exec_...)"),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print the execution, the trail rows and the tool counts as JSON"
+    ),
+    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+) -> None:
+    """Show who proposed each tool call, who approved it, and what ran.
+
+    Built from the engine's event log and approval records for one execution.
+    """
+    from dataclasses import asdict  # noqa: PLC0415
+
+    from jamjet.cli.audit_trail import build_trail, render_trail  # noqa: PLC0415
+
+    async def _fetch() -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        async with _client(runtime) as c:
+            try:
+                execution = await c.get_execution(execution_id)
+            except httpx.HTTPStatusError as exc:
+                # 404 for an unknown id, 400 for one that is not an id at all.
+                if exc.response.status_code in (400, 404):
+                    console.print(
+                        f"No execution {_safe(execution_id)} on {_safe(runtime)}.",
+                        markup=False,
+                        highlight=False,
+                        soft_wrap=True,
+                    )
+                    raise typer.Exit(1) from exc
+                _print_error("Error:", exc)
+                raise typer.Exit(1) from exc
+            except httpx.RequestError as exc:
+                _unreachable(runtime, exc)
+            try:
+                events = (await c.get_events(execution_id)).get("events", [])
+                listing = await c.list_approvals(execution_id)
+            except httpx.HTTPStatusError as exc:
+                _print_error("Error:", exc)
+                raise typer.Exit(1) from exc
+            except httpx.RequestError as exc:
+                _unreachable(runtime, exc)
+        return execution, events, listing
+
+    execution, events, listing = asyncio.run(_fetch())
+    trail = build_trail(execution, events, listing.get("decided", []))
+    if as_json:
+        data = {"execution": execution, "rows": [asdict(r) for r in trail.rows], "tool_runs": trail.tool_runs}
+        typer.echo(json.dumps(data, indent=2))
+        return
+    typer.echo(render_trail(trail, execution))
 
 
 if __name__ == "__main__":
