@@ -538,21 +538,27 @@ def _download_server_binary(cache_dir: str) -> str:
     url = f"{release_base}/{filename}"
     asset_names = {a.get("name") for a in release.get("assets", [])}
 
-    # Fetch the published checksum list before the binary, so a bad list fails early.
+    # The SDK downloads only the release for its own version, and every such
+    # release publishes SHA256SUMS. A release without it is an anomaly: fail
+    # closed. Fetch the list before the binary, so a bad list fails early.
+    if "SHA256SUMS" not in asset_names:
+        raise FileNotFoundError(
+            f"The jamjet {version} release has no SHA256SUMS, so the engine can't be verified. "
+            "Set JAMJET_SERVER_PATH to an engine you trust, or build one with: jamjet dev --build."
+        )
+    try:
+        with urllib.request.urlopen(f"{release_base}/SHA256SUMS", timeout=30) as sums_resp:  # noqa: S310
+            sums_text = sums_resp.read().decode("utf-8", "replace")
+    except Exception as exc:
+        raise FileNotFoundError(f"Could not fetch SHA256SUMS ({exc}).") from exc
     expected_sha: str | None = None
-    if "SHA256SUMS" in asset_names:
-        try:
-            with urllib.request.urlopen(f"{release_base}/SHA256SUMS", timeout=30) as sums_resp:  # noqa: S310
-                sums_text = sums_resp.read().decode("utf-8", "replace")
-        except Exception as exc:
-            raise FileNotFoundError(f"Could not fetch SHA256SUMS ({exc}).") from exc
-        for line in sums_text.splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[1].lstrip("*") == filename:
-                expected_sha = parts[0].lower()
-                break
-        if expected_sha is None:
-            raise FileNotFoundError(f"SHA256SUMS has no entry for {filename}; refusing to use the download.")
+    for line in sums_text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("*") == filename:
+            expected_sha = parts[0].lower()
+            break
+    if expected_sha is None:
+        raise FileNotFoundError(f"SHA256SUMS has no entry for {filename}; refusing to use the download.")
     os.makedirs(cache_dir, exist_ok=True)
     dest = os.path.join(cache_dir, f"jamjet-server{ext}")
     dest_tmp = dest + ".tmp"
@@ -592,15 +598,12 @@ def _download_server_binary(cache_dir: str) -> str:
             "Or set JAMJET_SERVER_PATH to the binary path."
         ) from exc
 
-    if expected_sha is not None:
-        if hasher.hexdigest() != expected_sha:
-            os.remove(dest_tmp)
-            raise FileNotFoundError(
-                f"Checksum mismatch for {filename} ({tag}): expected {expected_sha}, "
-                f"got {hasher.hexdigest()}. The download was deleted."
-            )
-    else:
-        console.print("This release publishes no checksum; the engine was not verified.")
+    if hasher.hexdigest() != expected_sha:
+        os.remove(dest_tmp)
+        raise FileNotFoundError(
+            f"Checksum mismatch for {filename} ({tag}): expected {expected_sha}, "
+            f"got {hasher.hexdigest()}. The download was deleted."
+        )
 
     os.replace(dest_tmp, dest)
     os.chmod(dest, os.stat(dest).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -2839,7 +2842,10 @@ def _summary(data: dict[str, Any], limit: int = 240) -> str:
 _NODE_ID_SAFE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 
 
-def _approve_command(execution_id: str, node_id: str, binding: str) -> str | None:
+_DEFAULT_RUNTIME = "http://localhost:7700"
+
+
+def _approve_command(execution_id: str, node_id: str, binding: str, runtime: str | None = None) -> str | None:
     """The `jamjet approve` line for one pending request, safe to paste.
 
     The node id is chosen by whoever wrote the IR. Every argument is shell
@@ -2851,7 +2857,7 @@ def _approve_command(execution_id: str, node_id: str, binding: str) -> str | Non
     """
     import shlex  # noqa: PLC0415
 
-    values = (execution_id, node_id, binding)
+    values = (execution_id, node_id, binding) + ((runtime,) if runtime else ())
     if any(_safe(v) != str(v) for v in values) or not _NODE_ID_SAFE.fullmatch(node_id):
         return None
     args = [
@@ -2863,6 +2869,8 @@ def _approve_command(execution_id: str, node_id: str, binding: str) -> str | Non
         f"--node-id={node_id}",
         f"--action-digest={binding}",
     ]
+    if runtime:
+        args.append(f"--runtime={runtime}")
     return " ".join(shlex.quote(a) for a in args)
 
 
@@ -2972,13 +2980,50 @@ def executions(
 _WAITING_STATUSES = ("running", "paused")
 
 
-async def _print_waiting_approvals(runtime: str, limit: int = 50) -> None:
+# Most executions scanned per status. A large deployment must not loop forever.
+_WAITING_SCAN_CEILING = 1000
+
+
+def _print_basis(context: dict[str, Any]) -> None:
+    """Print the full action basis a pending digest covers."""
+    basis = context.get("action_basis")
+    if basis is None and context.get("calls_hash"):
+        basis = {"calls": context.get("calls"), "gated_tools": context.get("gated_tools")}
+    console.print(
+        json.dumps(basis, indent=2, sort_keys=True),
+        soft_wrap=True,
+        markup=False,
+        highlight=False,
+    )
+
+
+async def _print_waiting_approvals(runtime: str, page_size: int = 50, show_basis: bool = False) -> None:
+    shown_runtime = runtime if runtime != _DEFAULT_RUNTIME else None
     async with _client(runtime) as c:
         try:
-            waiting = []
+            waiting: list[dict[str, Any]] = []
+            seen: set[str] = set()
             for status in _WAITING_STATUSES:
-                waiting += (await c.list_executions(status=status, limit=limit)).get("executions", [])
-            waiting = waiting[:limit]
+                offset = 0
+                while True:
+                    page = (await c.list_executions(status=status, limit=page_size, offset=offset)).get(
+                        "executions", []
+                    )
+                    for e in page:
+                        if e.get("execution_id") not in seen:
+                            seen.add(e.get("execution_id"))
+                            waiting.append(e)
+                    offset += page_size
+                    if len(page) < page_size:
+                        break
+                    if offset >= _WAITING_SCAN_CEILING:
+                        console.print(
+                            f"Scan stopped after {_WAITING_SCAN_CEILING} {status} executions; "
+                            "older runs were not checked.",
+                            style="dim",
+                            markup=False,
+                        )
+                        break
         except httpx.RequestError as exc:
             _unreachable(runtime, exc)
         found = 0
@@ -3004,7 +3049,7 @@ async def _print_waiting_approvals(runtime: str, limit: int = 50) -> None:
                 console.print(f"{_safe(shown)}  {_safe(node)}", soft_wrap=True, markup=False, highlight=False)
                 console.print(f"  covers {_approval_covers(context)}", soft_wrap=True, markup=False, highlight=False)
                 binding = _approval_binding(context)
-                command = _approve_command(shown, node, binding) if binding else None
+                command = _approve_command(shown, node, binding, shown_runtime) if binding else None
                 if command:
                     console.print(f"  {command}", soft_wrap=True, markup=False, highlight=False)
                 else:
@@ -3014,6 +3059,8 @@ async def _print_waiting_approvals(runtime: str, limit: int = 50) -> None:
                         markup=False,
                         highlight=False,
                     )
+                if show_basis:
+                    _print_basis(context)
     if not found:
         console.print("No approvals are waiting.", style="dim", markup=False)
 
@@ -3037,7 +3084,7 @@ def approvals(
     approval authorises exactly that payload, that occurrence and that node.
     """
     if execution_id is None:
-        asyncio.run(_print_waiting_approvals(runtime))
+        asyncio.run(_print_waiting_approvals(runtime, show_basis=show_basis))
         return
     execution_id_: str = execution_id
 
@@ -3081,7 +3128,12 @@ def approvals(
                     highlight=False,
                 )
                 if binding:
-                    command = _approve_command(execution_id, entry.get("node_id", ""), binding)
+                    command = _approve_command(
+                        execution_id,
+                        entry.get("node_id", ""),
+                        binding,
+                        runtime if runtime != _DEFAULT_RUNTIME else None,
+                    )
                     console.print(
                         f"{node}: approve with"
                         if command
@@ -3108,15 +3160,7 @@ def approvals(
                         highlight=False,
                     )
                 if show_basis:
-                    basis = context.get("action_basis")
-                    if basis is None and context.get("calls_hash"):
-                        basis = {"calls": context.get("calls"), "gated_tools": context.get("gated_tools")}
-                    console.print(
-                        json.dumps(basis, indent=2, sort_keys=True),
-                        soft_wrap=True,
-                        markup=False,
-                        highlight=False,
-                    )
+                    _print_basis(context)
 
         if decided:
             d = Table(title="Decided")

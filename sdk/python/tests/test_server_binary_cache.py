@@ -155,7 +155,6 @@ import json  # noqa: E402
 import urllib.error  # noqa: E402
 
 _BINARY = b"engine-bytes"
-_SUMS_MSG = "This release publishes no checksum; the engine was not verified."
 
 
 class _Resp(io.BytesIO):
@@ -270,15 +269,19 @@ def test_download_mismatched_checksum_leaves_no_binary(tmp_path: Path, monkeypat
     assert not cache.exists() or list(cache.iterdir()) == []
 
 
-def test_download_without_sums_warns_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_download_without_sums_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from jamjet.cli.main import _download_server_binary
 
-    _setup_download(monkeypatch, sums=None)
-    _download_server_binary(str(tmp_path / "c"))
-    out = " ".join(capsys.readouterr().out.split())
-    assert out.count(_SUMS_MSG) == 1
+    urls = _setup_download(monkeypatch, sums=None)
+    cache = tmp_path / "c"
+    with pytest.raises(FileNotFoundError) as exc:
+        _download_server_binary(str(cache))
+    assert str(exc.value) == (
+        "The jamjet 0.12.0 release has no SHA256SUMS, so the engine can't be verified. "
+        "Set JAMJET_SERVER_PATH to an engine you trust, or build one with: jamjet dev --build."
+    )
+    assert not any(u.endswith("jamjet-server-linux-x86_64") for u in urls), "the binary is never downloaded"
+    assert not cache.exists() or list(cache.iterdir()) == []
 
 
 def test_download_sums_without_this_asset_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

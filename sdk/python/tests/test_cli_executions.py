@@ -177,7 +177,7 @@ def test_approvals_without_id_finds_a_running_run_with_a_pending_approval() -> N
     idle = {**NEW, "execution_id": "exec_idle", "status": "running"}
     fake = _client([running, idle], {"exec_run": {"pending": _pending(), "decided": []}})
 
-    async def by_status(status=None, limit=50):
+    async def by_status(status=None, limit=50, offset=0):
         return {"executions": [running, idle] if status == "running" else []}
 
     fake.list_executions = AsyncMock(side_effect=by_status)
@@ -206,3 +206,97 @@ def test_approvals_without_id_prints_the_exec_form_in_the_command() -> None:
         result = runner.invoke(app, ["approvals"])
     assert f"jamjet approve {DISPLAY}" in result.output
     assert UUID not in result.output
+
+
+def _paged_client(by_status: dict, approvals: dict | None = None):
+    """A fake whose list_executions honours status, limit and offset."""
+    fake = _client([], approvals)
+
+    async def list_executions(status=None, limit=50, offset=0):
+        return {"executions": by_status.get(status, [])[offset : offset + limit]}
+
+    fake.list_executions = AsyncMock(side_effect=list_executions)
+    return fake
+
+
+def _run(i: int, status: str) -> dict:
+    return {**NEW, "execution_id": f"exec_{status}_{i}", "status": status}
+
+
+def test_approvals_without_id_finds_a_paused_run_behind_many_running_runs() -> None:
+    running = [_run(i, "running") for i in range(50)]
+    paused = [_run(0, "paused")]
+    fake = _paged_client(
+        {"running": running, "paused": paused},
+        {"exec_paused_0": {"pending": _pending(), "decided": []}},
+    )
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals"])
+    assert result.exit_code == 0
+    assert "jamjet approve exec_paused_0" in result.output
+
+
+def test_approvals_without_id_reads_every_page_of_a_status() -> None:
+    running = [_run(i, "running") for i in range(75)]
+    fake = _paged_client(
+        {"running": running},
+        {"exec_running_70": {"pending": _pending(), "decided": []}},
+    )
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals"])
+    assert "jamjet approve exec_running_70" in result.output
+    offsets = [c.kwargs["offset"] for c in fake.list_executions.await_args_list if c.kwargs["status"] == "running"]
+    assert offsets == [0, 50]
+
+
+def test_approvals_without_id_stops_scanning_at_the_ceiling() -> None:
+    running = [_run(i, "running") for i in range(1200)]
+    fake = _paged_client({"running": running})
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals"])
+    assert result.exit_code == 0
+    assert "Scan stopped after 1000 running executions" in result.output
+    assert fake.list_approvals.await_count == 1000
+
+
+OTHER = "http://engine.example:9000"
+
+
+def test_approvals_without_id_prints_a_non_default_runtime_in_the_command() -> None:
+    fake = _client([NEW], {"exec_new": {"pending": _pending(), "decided": []}})
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "--runtime", OTHER])
+    assert f"--runtime={OTHER}" in result.output
+
+
+def test_approvals_without_id_leaves_the_default_runtime_out_of_the_command() -> None:
+    fake = _client([NEW], {"exec_new": {"pending": _pending(), "decided": []}})
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals"])
+    assert "--runtime" not in result.output
+
+
+def test_approvals_for_one_execution_prints_a_non_default_runtime_in_the_command() -> None:
+    fake = _client([NEW], {"exec_new": {"pending": _pending(), "decided": []}})
+    with patch("jamjet.cli.main._client", return_value=fake):
+        other = runner.invoke(app, ["approvals", "exec_new", "--runtime", OTHER])
+        default = runner.invoke(app, ["approvals", "exec_new"])
+    assert f"--runtime={OTHER}" in other.output
+    assert "--runtime" not in default.output
+
+
+def test_approve_command_refuses_an_unsafe_runtime() -> None:
+    from jamjet.cli.main import _approve_command
+
+    assert _approve_command("exec_1", "n", "sha256:a", "http://x\x1b[2J") is None
+    assert "--runtime=http://x:1" in _approve_command("exec_1", "n", "sha256:a", "http://x:1")
+
+
+def test_approvals_without_id_show_basis_prints_the_full_basis() -> None:
+    fake = _client([NEW], {"exec_new": {"pending": _pending(), "decided": []}})
+    with patch("jamjet.cli.main._client", return_value=fake):
+        plain = runner.invoke(app, ["approvals"])
+        shown = runner.invoke(app, ["approvals", "--show-basis"])
+    assert '"gated_tools"' not in plain.output
+    assert '"gated_tools"' in shown.output
+    assert '"amount": 500' in shown.output
