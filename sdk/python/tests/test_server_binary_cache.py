@@ -10,6 +10,15 @@ import pytest
 
 from jamjet.cli.main import _find_server_binary, _server_cache_dir
 
+
+@pytest.fixture(autouse=True)
+def _no_server_path_from_the_shell(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A JAMJET_SERVER_PATH exported in the shell (the e2e tests use one)
+    short-circuits the lookup these tests exercise. Tests that need it set
+    it themselves."""
+    monkeypatch.delenv("JAMJET_SERVER_PATH", raising=False)
+
+
 # ---------------------------------------------------------------------------
 # _server_cache_dir
 # ---------------------------------------------------------------------------
