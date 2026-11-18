@@ -158,3 +158,66 @@ def test_sidecar_serves_scripted_models(monkeypatch):
     body = resp.json()
     assert body["tool_calls"][0]["name"] == "search_venues"
     assert body["finish_reason"] == "tool_calls"
+
+
+# ── what a learner sees when the script is wrong ─────────────────────────────
+
+
+def _complete_with_path(path: str):
+    r = ModelRequest(ref=parse_model_ref(f"scripted/{path}"), messages=[{"role": "user", "content": "go"}], tools=TOOLS)
+    return run(r)
+
+
+def test_only_yaml_paths_are_read(tmp_path):
+    secret = tmp_path / "notes.txt"
+    secret.write_text("password: hunter2\n", encoding="utf-8")
+    with pytest.raises(ScriptedModelError, match=r"must end in \.yaml or \.yml") as info:
+        _complete_with_path(str(secret))
+    assert "hunter2" not in str(info.value)
+
+
+def test_a_yml_path_is_accepted(tmp_path):
+    script = tmp_path / "s.yml"
+    script.write_text("turns:\n  - content: hi\n", encoding="utf-8")
+    assert _complete_with_path(str(script)).message.content == "hi"
+
+
+def test_a_binary_file_is_not_a_valid_script(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_bytes(b"\xff\xfe\x00 secret-bytes")
+    with pytest.raises(ScriptedModelError, match="not a valid script") as info:
+        _complete_with_path(str(bad))
+    assert "secret-bytes" not in str(info.value)
+
+
+def test_a_yaml_error_does_not_echo_the_file(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("turns: [unclosed, hunter2\n  : :\n", encoding="utf-8")
+    with pytest.raises(ScriptedModelError, match="not a valid script") as info:
+        _complete_with_path(str(bad))
+    assert "hunter2" not in str(info.value)
+
+
+def test_a_relative_path_error_does_not_name_the_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ScriptedModelError) as info:
+        _complete_with_path("missing.yaml")
+    assert "missing.yaml" in str(info.value)
+    assert str(tmp_path) not in str(info.value)
+
+
+def test_sidecar_returns_script_errors_as_400(monkeypatch):
+    import sys
+
+    from fastapi.testclient import TestClient
+
+    import jamjet.model.sidecar_server as sidecar
+    from jamjet.model.seam import Model
+
+    monkeypatch.setitem(sys.modules, "litellm", None)
+    monkeypatch.setattr(sidecar, "_get_model", lambda: Model(ungoverned=True))
+    client = TestClient(sidecar.app)
+    messages = [{"role": "user", "content": "go"}] + [{"role": "assistant", "content": "x"} for _ in range(3)]
+    resp = client.post("/v1/complete", json={"model": f"scripted/{SCRIPT}", "messages": messages, "tools": TOOLS})
+    assert resp.status_code == 400
+    assert "the script has 3 turns" in resp.json()["error"]

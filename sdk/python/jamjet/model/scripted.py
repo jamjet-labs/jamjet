@@ -20,7 +20,10 @@ Script format::
         usage: {input_tokens: 900, output_tokens: 40}   # optional; default is an estimate
 
 The path is relative to the current working directory and is read on every
-call. The turn is the number of assistant messages already in the thread.
+call. The turn is the number of assistant messages already in the thread, so a
+script answers a fresh conversation: in a continued session the count includes
+the earlier assistant messages and the script can run out of turns. The path
+must end in ``.yaml`` or ``.yml``.
 Tool calls get the ids ``call_{turn}_{index}``, both 0-based. If a result for a
 scripted call is missing from the thread, the next call fails loudly.
 """
@@ -66,24 +69,32 @@ class _Message:
 
 
 def load_script(path: str) -> list[dict]:
-    """Read and validate a script file; return its turns."""
+    """Read and validate a script file; return its turns.
+
+    Errors name the path as the model string gave it and never repeat what the
+    file contains.
+    """
     file = Path(path).expanduser()
+    if file.suffix.lower() not in (".yaml", ".yml"):
+        raise ScriptedModelError(f"scripted model: the script path must end in .yaml or .yml (got {path})")
     absolute = file if file.is_absolute() else Path.cwd() / file
     try:
         text = absolute.read_text(encoding="utf-8")
     except OSError as exc:
         raise ScriptedModelError(
-            f"scripted model: cannot read the script at {absolute} ({exc.strerror or exc})"
+            f"scripted model: cannot read the script at {path} ({exc.strerror or 'error'})"
         ) from exc
+    except UnicodeDecodeError as exc:
+        raise ScriptedModelError(f"scripted model: {path} is not a valid script (not UTF-8 text)") from exc
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise ScriptedModelError(f"scripted model: {absolute} is not valid YAML: {exc}") from exc
+        raise ScriptedModelError(f"scripted model: {path} is not a valid script (not valid YAML)") from exc
     turns = data.get("turns") if isinstance(data, dict) else None
     if not isinstance(turns, list):
-        raise ScriptedModelError(f"scripted model: {absolute} needs a top-level 'turns' list")
+        raise ScriptedModelError(f"scripted model: {path} needs a top-level 'turns' list")
     for n, turn in enumerate(turns):
-        where = f"scripted model: {absolute}, turn {n}"
+        where = f"scripted model: {path}, turn {n}"
         if not isinstance(turn, dict):
             raise ScriptedModelError(f"{where}: a turn must be a mapping")
         calls = turn.get("tool_calls") or []
@@ -112,7 +123,7 @@ def _offered_names(tools: list[dict[str, Any]]) -> list[str]:
 
 def _build(request: ModelRequest) -> ModelResponse:
     turns = load_script(request.ref.model)
-    path = str(Path(request.ref.model).expanduser().absolute())
+    path = request.ref.model
     messages = request.messages
 
     n = sum(1 for m in messages if _get(m, "role") == "assistant")
