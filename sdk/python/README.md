@@ -57,9 +57,11 @@ The rest of this README is the **Python authoring guide** — workflows, durabil
 **Requirements:** Python 3.11 or newer (the `memory` extra, which adds Engram, needs 3.12+)
 
 ```bash
-# Install the CLI and the scripted model (no API key needed)
+# In-process runs, including the scripted model (no API key needed)
 pip install jamjet
-# For real providers, add the model client and the model sidecar
+# `jamjet dev` and durable runs also need the sidecar
+pip install 'jamjet[sidecar]'
+# Real providers need the model client too
 pip install 'jamjet[model,sidecar]'
 
 # Option A: scaffold a new project
@@ -115,19 +117,31 @@ turns:
 import json
 from jamjet import tool
 
+VENUES = {
+    "lisbon": [
+        {"venue": "Casa do Rio", "capacity": 120, "price_per_day": 2400},
+        {"venue": "Armazem 16", "capacity": 300, "price_per_day": 5200},
+    ],
+}
+FREE_DATES = {
+    "Casa do Rio": ["2026-12-04", "2026-12-11"],
+    "Armazem 16": ["2026-12-18"],
+}
+
 @tool
 def search_venues(city: str, date: str) -> str:
     """Find event venues in a city that are free on a date (YYYY-MM-DD)."""
-    return json.dumps([{"venue": "Casa do Rio", "capacity": 120}])
+    venues = VENUES.get(city.strip().lower(), [])
+    return json.dumps([v for v in venues if date in FREE_DATES[v["venue"]]])
 
 @tool
 def check_dates(venue: str) -> str:
     """List the free dates for one venue."""
-    return json.dumps(["2026-12-04", "2026-12-11"])
+    return json.dumps(FREE_DATES.get(venue, []))
 
 @tool
 def pay_deposit(venue: str, amount: float) -> str:
-    """Pay a booking deposit for a venue."""
+    """Pay a booking deposit for a venue. In production this moves real money."""
     return f"Deposit of {amount} paid for {venue}."
 ```
 
@@ -155,7 +169,7 @@ reads it. In a durable run that is the engine's sidecar, which `jamjet dev` star
 from the folder you run it in. Run `jamjet dev` from your project folder, or give
 an absolute path.
 
-Start the stack in one terminal, run `python book.py` in another. The run stops at
+`jamjet dev` needs `pip install 'jamjet[sidecar]'`. Start the stack in one terminal, run `python book.py` in another. The run stops at
 `pay_deposit` and waits. From a third terminal:
 
 ```bash

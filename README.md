@@ -110,8 +110,10 @@ pay_deposit ran 1 time, approved by tester at 03:09:24
 ```
 
 The full walkthrough, with the output of each command, is in the
-[Python guide](sdk/python/README.md). Python 3.11 or newer. Use
-`pip install 'jamjet[model]'` for real providers.
+[Python guide](sdk/python/README.md). Python 3.11 or newer.
+`pip install jamjet` is enough for in-process runs on the scripted model.
+`jamjet dev` and durable runs need `pip install 'jamjet[sidecar]'`.
+Real providers need `jamjet[model]` as well.
 
 Works alongside **Claude Code · OpenAI Agents SDK · MCP clients · LangChain · CrewAI · ADK · Spring AI · LangChain4j**.
 

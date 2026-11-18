@@ -1373,6 +1373,9 @@ pip install 'jamjet[model]'
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
+`jamjet dev` and durable runs also need the sidecar:
+`pip install 'jamjet[model,sidecar]'`.
+
 ## Run in-process
 
 ```bash
@@ -1384,7 +1387,8 @@ Runs the agent via `LocalRuntime` -- no server needed.
 ## Run with the durable engine
 
 `python agent.py` runs in this process. To run on the engine, call
-`run_durable` instead of `run`. Add this to `agent.py`:
+`run_durable` instead of `run`. In `main()` in `agent.py`, replace the
+`agent.run` call with:
 
 ```python
 result = await agent.run_durable("What is 7 plus 35?")
