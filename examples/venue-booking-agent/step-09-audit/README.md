@@ -10,7 +10,8 @@ Set it in every terminal you open below.
 ## What changed
 
 Nothing. The code is the step 05 code again. This step only reads, with
-the run from step 07 and the engine still running.
+the run from step 07 and the restarted engine still running in
+terminal 1.
 
 ## Who approved this?
 
@@ -19,7 +20,7 @@ agent printed:
 
     jamjet audit exec_...
 
-You see:
+You see this (a captured sample, so your ids and times will differ):
 
     Audit trail for exec_a66351f02255436598ab4986fb4db6d6
     Agent: venue-booker   Status: completed   Started: 2026-11-18 06:27:43

@@ -30,7 +30,11 @@ Terminal 3, check that the run is waiting at the gate:
 
     jamjet approvals
 
-Do not approve yet. Now kill the engine, hard. In terminal 3:
+Do not approve yet. Now kill the engine, hard. First, if another
+`jamjet-server` is running on your machine, the next command would kill
+it too, so run `pgrep -f jamjet-server` alone and check it prints one
+id. If it prints nothing, the engine is not running and `kill` only
+shows a usage message. Then, in terminal 3:
 
     kill -9 $(pgrep -f jamjet-server)
 
@@ -38,14 +42,12 @@ Do not approve yet. Now kill the engine, hard. In terminal 3:
 ends it with no chance to clean up. Terminal 1 shows `jamjet dev`
 stopping the rest of the stack.
 
-I ran this on macOS. The same line works on Linux, where `pgrep -f`
-matches the full command line the same way. If another `jamjet-server`
-is running on your machine, `pgrep` lists it too, so look at what it
-prints first.
+Tested on macOS. Not yet tested on Linux.
 
 ## The agent waits
 
-Terminal 2 prints two lines on stderr and keeps waiting. It does not
+Terminal 2 prints one line on stderr now, and another after the restart.
+It keeps waiting. It does not
 fail and it does not pay:
 
     jamjet: lost the engine at http://127.0.0.1:7700; waiting for it to come back (execution exec_...)

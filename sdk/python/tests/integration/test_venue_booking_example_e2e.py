@@ -13,6 +13,7 @@ point it at a free port. Learners leave it unset and get port 7700.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -282,6 +283,10 @@ def test_step09_audit_says_who_approved(crashed: dict[str, str], stack07: DevSta
 
     assert "pay_deposit ran 1 time, approved by tester at" in trail
     assert "tester" in as_json
+    last = [ln for ln in trail.splitlines() if ln.strip()][-1]
+    saved = [ln for ln in expected(STEP09).splitlines() if ln.strip()][-1]
+    assert normalise(last) == normalise(saved)
+    assert {"execution", "rows", "tool_runs"} <= set(json.loads(as_json))
 
 
 def test_steps_07_to_09_share_the_step_05_code() -> None:

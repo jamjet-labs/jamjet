@@ -11,7 +11,7 @@ Set it in every terminal you open below.
 
 Nothing. The code is the step 05 code again. This step only reads. Run
 step 07 first, so there is a finished run to look at, and keep the
-engine running in terminal 1.
+restarted engine running in terminal 1.
 
 ## List the runs
 
@@ -19,7 +19,7 @@ In another terminal, in this step folder:
 
     jamjet executions
 
-You see:
+You see this (a captured sample, so your ids and times will differ):
 
     ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┓
     ┃ execution                             ┃ agent        ┃ status    ┃ started (local)     ┃
@@ -61,24 +61,30 @@ Here is the part that matters, with the dull rows cut:
     │ 49  │ workflow_completed     │ —               │ 2026-11-18T06:28:04.853263Z │
     └─────┴────────────────────────┴─────────────────┴─────────────────────────────┘
 
-Row 25 is the run stopping at the gate. Row 26 is your approval. That
-is where the crash happened, between the two.
+Row 25 is the run stopping at the gate. Row 26 is your approval. The
+engine was killed and restarted somewhere between the two. The log
+does not mark the restart.
 
 ## Why it paid once
 
-When the engine started again, it replayed this log. The log said the
-search and the date check had finished, and that `pay_deposit` was
-waiting for a person. So it went back to waiting. It did not run the
-earlier steps again. After you approved, `pay_deposit` ran once and was
-written to the log, so `payments.log` has one line.
+After the restart the engine picked the run up from the state it keeps
+in `.jamjet/`. The search and the date check were done, and
+`pay_deposit` was waiting for a person, so it went back to waiting.
+Once you approved, `pay_deposit` ran once (rows 27 and 28), and
+`payments.log` has one line.
 
 ## Try it yourself
 
 Kill it at a different moment. Run step 07 again, but run `kill -9`
-at another time. Try it right after you start `python agent.py`, while
-the first tools are still running. Then restart the engine and look at
-`jamjet events` again. Where does the log stop, and what does the
-engine do next? Does it still pay exactly once?
+about a second and a half after you start `python agent.py`, while the
+first tool is still running. When I ran this, the agent printed the
+same two lines, the engine came back, `search_venues` ran once, and the
+run reached the approval gate and waited, as before. Approve it and
+check `payments.log` for one line.
+
+Try other moments too. Before you rerun, stop `jamjet dev` and
+delete the `.jamjet/` folder if you want a clean list. If you leave it,
+`jamjet approvals` also lists the old run from step 07.
 
 ## The limit
 
@@ -86,4 +92,5 @@ The engine surviving a crash is not the same as the worker surviving
 one. If you `kill -9` the worker in the middle of a tool, that run
 fails. JamJet 0.13.0 does not resume a tool that was cut off in the
 middle. The run waiting for approval in step 07 survived because
-nothing was running at the moment of the crash.
+nothing was running at the moment of the crash. My early kill above
+worked, but do not count on it for every tool.
