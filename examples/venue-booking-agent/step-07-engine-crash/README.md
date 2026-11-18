@@ -88,6 +88,26 @@ Terminal 2 then prints:
 One payment. The crash did not make it pay twice, and it did not lose
 the run. Step 08 shows why.
 
+## If you restart it from another folder
+
+The run lives in `.jamjet/`, in the folder where you started
+`jamjet dev`. Start the engine from another folder that has the tools,
+step 08's for example, and it has no record of the run. Terminal 3
+shows:
+
+    jamjet approvals
+    No approvals are waiting.
+
+and terminal 2 stops with an error that ends:
+
+    jamjet.client.JamjetAPIError: 404 Not Found for GET http://127.0.0.1:7700/executions/exec_...: execution exec_...
+
+The run is not lost. Stop that engine (Ctrl-C), start it again from
+this folder, and `jamjet approvals` lists the payment again. Approve it
+as before. `agent.py` has already stopped, so check the result with
+`jamjet audit exec_...`, using the id from the error. It shows
+`pay_deposit ran 1 time`, and `payments.log` has one line.
+
 ## Notes
 
 - With a real model, set the provider key in terminal 1 as well. The
