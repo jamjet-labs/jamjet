@@ -142,7 +142,7 @@ def test_seam_routes_scripted_refs_without_litellm(monkeypatch):
 def test_sidecar_serves_scripted_models(monkeypatch):
     import sys
 
-    from fastapi.testclient import TestClient
+    from starlette.testclient import TestClient
 
     import jamjet.model.sidecar_server as sidecar
     from jamjet.model.seam import Model
@@ -209,7 +209,7 @@ def test_a_relative_path_error_does_not_name_the_working_directory(tmp_path, mon
 def test_sidecar_returns_script_errors_as_400(monkeypatch):
     import sys
 
-    from fastapi.testclient import TestClient
+    from starlette.testclient import TestClient
 
     import jamjet.model.sidecar_server as sidecar
     from jamjet.model.seam import Model
@@ -221,3 +221,69 @@ def test_sidecar_returns_script_errors_as_400(monkeypatch):
     resp = client.post("/v1/complete", json={"model": f"scripted/{SCRIPT}", "messages": messages, "tools": TOOLS})
     assert resp.status_code == 400
     assert "the script has 3 turns" in resp.json()["error"]
+
+
+def _assistant(i, name):
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"id": f"call_{i}_0", "type": "function", "function": {"name": name, "arguments": "{}"}}],
+    }
+
+
+def test_an_earlier_missing_result_is_named():
+    msgs = [
+        {"role": "user", "content": "go"},
+        _assistant(0, "search_venues"),
+        _assistant(1, "check_dates"),
+        {"role": "tool", "tool_call_id": "call_1_0", "content": "ok"},
+    ]
+    with pytest.raises(ScriptedModelError, match="no result for call_0_0"):
+        run(req(msgs))
+
+
+def _load(tmp_path, body):
+    f = tmp_path / "s.yaml"
+    f.write_text(body)
+    from jamjet.model.scripted import load_script
+
+    return load_script(str(f))
+
+
+def test_an_unquoted_date_becomes_an_iso_string(tmp_path):
+    turns = _load(
+        tmp_path,
+        "turns:\n  - tool_calls:\n      - name: check_dates\n"
+        "        arguments: {date: 2026-12-11, when: [2026-12-12], q: '2026-12-13'}\n",
+    )
+    args = turns[0]["tool_calls"][0]["arguments"]
+    assert args == {"date": "2026-12-11", "when": ["2026-12-12"], "q": "2026-12-13"}
+    json.dumps(args)
+
+
+def test_a_non_json_argument_names_file_turn_and_call(tmp_path):
+    with pytest.raises(ScriptedModelError, match=r"s.yaml, turn 0, tool call 0.*set"):
+        _load(tmp_path, "turns:\n  - tool_calls:\n      - name: x\n        arguments: {a: !!set {b, c}}\n")
+
+
+@pytest.mark.parametrize(
+    "usage", ["520", "{input_tokens: '900'}", "{output_tokens: -1}", "{input_tokens: true}", "{input_tokens: 1.5}"]
+)
+def test_a_bad_usage_is_refused_with_context(tmp_path, usage):
+    with pytest.raises(ScriptedModelError, match=r"s.yaml, turn 0: usage"):
+        _load(tmp_path, f"turns:\n  - content: hi\n    usage: {usage}\n")
+
+
+def test_a_valid_explicit_usage_is_used(tmp_path):
+    f = tmp_path / "s.yaml"
+    f.write_text("turns:\n  - content: hi\n    usage: {input_tokens: 7, output_tokens: 0}\n")
+    r = ModelRequest(ref=parse_model_ref(f"scripted/{f}"), messages=[{"role": "user", "content": "go"}], tools=None)
+    resp = run(r)
+    assert (resp.input_tokens, resp.output_tokens) == (7, 0)
+
+
+def test_an_omitted_usage_keeps_the_estimate(tmp_path):
+    f = tmp_path / "s.yaml"
+    f.write_text("turns:\n  - content: hi\n")
+    r = ModelRequest(ref=parse_model_ref(f"scripted/{f}"), messages=[{"role": "user", "content": "go"}], tools=None)
+    assert run(r).input_tokens == len("go") // 4

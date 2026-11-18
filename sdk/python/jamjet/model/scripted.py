@@ -30,6 +30,7 @@ scripted call is missing from the thread, the next call fails loudly.
 
 from __future__ import annotations
 
+import datetime
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -66,6 +67,21 @@ class _Message:
     tool_calls: list[_ToolCall] | None
     finish_reason: str
     role: str = "assistant"
+
+
+def _json_safe(value: Any, where: str) -> Any:
+    """Turn YAML dates into ISO strings; refuse anything else JSON cannot hold."""
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_json_safe(v, where) for v in value]
+    if isinstance(value, dict):
+        if not all(isinstance(k, str) for k in value):
+            raise ScriptedModelError(f"{where}: argument keys must be strings")
+        return {k: _json_safe(v, where) for k, v in value.items()}
+    raise ScriptedModelError(f"{where}: argument values must be plain data (got {type(value).__name__})")
 
 
 def load_script(path: str) -> list[dict]:
@@ -105,6 +121,16 @@ def load_script(path: str) -> list[dict]:
                 raise ScriptedModelError(f"{where}, tool call {i}: needs a string 'name'")
             if not isinstance(call.get("arguments", {}), dict):
                 raise ScriptedModelError(f"{where}, tool call {i}: 'arguments' must be a mapping")
+            if "arguments" in call:
+                call["arguments"] = _json_safe(call["arguments"], f"{where}, tool call {i}")
+        if turn.get("usage") is not None:
+            usage = turn["usage"]
+            if not isinstance(usage, dict):
+                raise ScriptedModelError(f"{where}: usage must be a mapping")
+            for key in ("input_tokens", "output_tokens"):
+                count = usage.get(key)
+                if key in usage and (isinstance(count, bool) or not isinstance(count, int) or count < 0):
+                    raise ScriptedModelError(f"{where}: usage {key} must be a non-negative integer")
     return turns
 
 
@@ -130,11 +156,11 @@ def _build(request: ModelRequest) -> ModelResponse:
     if n >= len(turns):
         raise ScriptedModelError(f"the script has {len(turns)} turns; the agent asked for turn {n + 1}")
 
-    if n > 0:
-        answered = {_get(m, "tool_call_id") for m in messages if _get(m, "role") == "tool"}
-        prev = turns[n - 1].get("tool_calls") or []
-        for i, call in enumerate(prev):
-            call_id = f"call_{n - 1}_{i}"
+    # Every earlier scripted call needs a result; name the first one missing.
+    answered = {_get(m, "tool_call_id") for m in messages if _get(m, "role") == "tool"}
+    for t in range(n):
+        for i, call in enumerate(turns[t].get("tool_calls") or []):
+            call_id = f"call_{t}_{i}"
             if call_id not in answered:
                 raise ScriptedModelError(
                     f"scripted model, turn {n}: no result for {call_id} ({call['name']}). The agent lost a tool result."
