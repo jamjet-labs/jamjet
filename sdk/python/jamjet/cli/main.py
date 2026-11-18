@@ -50,6 +50,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from jamjet.cli.audit_trail import display_id
 from jamjet.cli.demo import demo_app
 from jamjet.client import JamjetClient
 from jamjet.deploy import LOCAL_RUNTIME_URL
@@ -2901,7 +2902,7 @@ def executions(
         t.add_column("started", no_wrap=True)
         for e in items:
             t.add_row(
-                _cell(e.get("execution_id", "-")),
+                _cell(display_id(e.get("execution_id", "-"))),
                 _cell(e.get("workflow_id", "-")),
                 _cell(e.get("status", "-")),
                 _started_local(e.get("started_at", "")),
@@ -2911,15 +2912,20 @@ def executions(
     asyncio.run(_list())
 
 
-# A run waiting on a person is `paused` (runtime/core WorkflowStatus; the
-# approvals endpoint only accepts a decision while the run is paused).
-_WAITING_STATUS = "paused"
+# A run waiting on a person can be `paused` (runtime/core WorkflowStatus; a
+# workflow approval node) or still `running`: an agent tool approval
+# (`tool_approval_required`) leaves the run reported as `running` while its
+# approvals endpoint lists the pending request. Scan both.
+_WAITING_STATUSES = ("running", "paused")
 
 
 async def _print_waiting_approvals(runtime: str, limit: int = 50) -> None:
     async with _client(runtime) as c:
         try:
-            waiting = (await c.list_executions(status=_WAITING_STATUS, limit=limit)).get("executions", [])
+            waiting = []
+            for status in _WAITING_STATUSES:
+                waiting += (await c.list_executions(status=status, limit=limit)).get("executions", [])
+            waiting = waiting[:limit]
         except httpx.RequestError as exc:
             _unreachable(runtime, exc)
         found = 0
@@ -2939,17 +2945,18 @@ async def _print_waiting_approvals(runtime: str, limit: int = 50) -> None:
                 _unreachable(runtime, exc)
             for entry in data.get("pending", []):
                 found += 1
+                shown = display_id(eid)
                 context = entry.get("context") or {}
                 node = entry.get("node_id", "-")
-                console.print(f"{_safe(eid)}  {_safe(node)}", soft_wrap=True, markup=False, highlight=False)
+                console.print(f"{_safe(shown)}  {_safe(node)}", soft_wrap=True, markup=False, highlight=False)
                 console.print(f"  covers {_approval_covers(context)}", soft_wrap=True, markup=False, highlight=False)
                 binding = _approval_binding(context)
-                command = _approve_command(eid, node, binding) if binding else None
+                command = _approve_command(shown, node, binding) if binding else None
                 if command:
                     console.print(f"  {command}", soft_wrap=True, markup=False, highlight=False)
                 else:
                     console.print(
-                        f"  no paste-ready command; run: jamjet approvals {_safe(eid)}",
+                        f"  no paste-ready command; run: jamjet approvals {_safe(shown)}",
                         soft_wrap=True,
                         markup=False,
                         highlight=False,

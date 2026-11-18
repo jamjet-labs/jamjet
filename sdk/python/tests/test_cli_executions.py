@@ -166,3 +166,43 @@ def test_approvals_without_id_unreachable_engine_prints_one_line() -> None:
     assert result.exit_code == 1
     assert "http://nowhere:7700" in result.output
     assert "Traceback" not in result.output
+
+
+UUID = "0b8e3c1a-2f4d-4e6a-9b7c-1d2e3f4a5b6c"
+DISPLAY = "exec_0b8e3c1a2f4d4e6a9b7c1d2e3f4a5b6c"
+
+
+def test_approvals_without_id_finds_a_running_run_with_a_pending_approval() -> None:
+    running = {**NEW, "execution_id": "exec_run", "status": "running"}
+    idle = {**NEW, "execution_id": "exec_idle", "status": "running"}
+    fake = _client([running, idle], {"exec_run": {"pending": _pending(), "decided": []}})
+
+    async def by_status(status=None, limit=50):
+        return {"executions": [running, idle] if status == "running" else []}
+
+    fake.list_executions = AsyncMock(side_effect=by_status)
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals"])
+    assert result.exit_code == 0
+    assert "jamjet approve exec_run" in result.output
+    assert "exec_idle" not in result.output
+    assert "No approvals are waiting." not in result.output
+
+
+def test_executions_table_shows_the_exec_form_but_json_stays_raw() -> None:
+    item = {**NEW, "execution_id": UUID}
+    with patch("jamjet.cli.main._client", return_value=_client([item])):
+        table = runner.invoke(app, ["executions"])
+        raw = runner.invoke(app, ["executions", "--json"])
+    assert DISPLAY in table.output
+    assert UUID not in table.output
+    assert json.loads(raw.output)[0]["execution_id"] == UUID
+
+
+def test_approvals_without_id_prints_the_exec_form_in_the_command() -> None:
+    item = {**NEW, "execution_id": UUID}
+    fake = _client([item], {UUID: {"pending": _pending(), "decided": []}})
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals"])
+    assert f"jamjet approve {DISPLAY}" in result.output
+    assert UUID not in result.output

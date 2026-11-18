@@ -374,6 +374,9 @@ def _display_id(value: Any) -> str:
         return text
 
 
+display_id = _display_id
+
+
 def _parse(value: Any) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
