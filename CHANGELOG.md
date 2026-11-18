@@ -430,7 +430,7 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`jamjet executions`** lists runs, and `AgentResult.execution_id` gives the id of a
   durable run. Ids print as `exec_<hex>` in text output.
 
-- **`jamjet approvals` with no id** lists the runs waiting for approval (it scans up to 50 runs), each with a
+- **`jamjet approvals` with no id** lists the runs waiting for approval (it checks up to 1000 runs per status), each with a
   command you can paste to approve it.
 
 - **`jamjet approve <id> -d approved --as <name>`** records who approved. A dev-mode

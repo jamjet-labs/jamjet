@@ -1355,7 +1355,7 @@ requires-python = ">=3.11"
 # The [model] extra pulls in litellm, which the in-process model seam uses to
 # call the agent's "anthropic/claude-sonnet-4-6" model. Without it `agent.run()`
 # raises at the first model call.
-dependencies = ["jamjet[model]>=0.10.0"]
+dependencies = ["jamjet[model]>=0.13.0"]
 
 [build-system]
 requires = ["hatchling"]
