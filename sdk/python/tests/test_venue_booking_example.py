@@ -63,3 +63,21 @@ def test_normalise_masks_ids_and_times_but_not_dates_or_amounts():
     assert normalise(text) == (
         "run exec_<id> id <uuid> at <timestamp> and <timestamp> or <time>; book 2026-12-11 pay 500"
     )
+
+
+def test_step02_tools_run_in_order_and_match_expected_output():
+    out = run_step("step-02-tools")
+    assert out.splitlines()[0] == "model: scripted (no API key)"
+    assert normalise(out) == expected("step-02-tools")
+    called = [line.split("(")[0] for line in out.splitlines() if line.startswith("called ")]
+    assert called == ["called search_venues", "called check_dates"]
+
+
+def test_step03_pay_deposit_pays_once_with_no_checks():
+    out = run_step("step-03-pay-deposit")
+    assert out.splitlines()[-1] == "payments.log: 1 line(s)"
+    assert normalise(out) == expected("step-03-pay-deposit")
+    lines = (ROOT / "step-03-pay-deposit" / "payments.log").read_text().splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("paid 500")
+    assert "Casa do Rio" in lines[0]

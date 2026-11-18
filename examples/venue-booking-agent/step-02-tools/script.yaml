@@ -1,0 +1,9 @@
+# A scripted model: find a venue, check its dates, then answer.
+turns:
+  - tool_calls:
+      - name: search_venues
+        arguments: {city: Lisbon, date: "2026-12-11"}
+  - tool_calls:
+      - name: check_dates
+        arguments: {venue: Casa do Rio}
+  - content: "Casa do Rio in Lisbon is free on 11 December. It is also free on 4 December."
