@@ -186,6 +186,8 @@ impl ModelAdapter for OpenAiAdapter {
         gen_ai.usage.output_tokens = tracing::field::Empty,
     ))]
     async fn chat(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        // Tool round trips (tool_calls, tool_call_id) go through the sidecar; this
+        // adapter maps role and content only.
         // Native adapter: tools are not forwarded to the provider. Warn (once) so
         // a tool-carrying call does not silently degenerate the agent loop.
         if !request.tools.is_empty() {

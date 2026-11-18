@@ -5,11 +5,65 @@
 
 use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use async_trait::async_trait;
+use jamjet_models::adapter::{ChatRole, ToolCall};
 use jamjet_models::{ChatMessage, ModelConfig, ModelError, ModelRegistry, ModelRequest};
 use jamjet_state::backend::WorkItem;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{debug, instrument};
+
+/// Map one conversation message from the payload (OpenAI shape) to a
+/// `ChatMessage`, keeping the assistant's tool calls and the tool call id.
+fn chat_message_from_json(msg: &Value) -> ChatMessage {
+    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+    let content = msg
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    match role {
+        "system" => ChatMessage::system(content),
+        "assistant" => {
+            let calls: Vec<ToolCall> = msg
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().map(tool_call_from_json).collect())
+                .unwrap_or_default();
+            ChatMessage::assistant_with_tool_calls(content, calls)
+        }
+        "tool" => {
+            let id = msg
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            ChatMessage::tool(id, content)
+        }
+        _ => ChatMessage::user(content),
+    }
+}
+
+/// Accepts the OpenAI shape `{id, function: {name, arguments}}` or a flat
+/// `{id, name, arguments}`. A string `arguments` is parsed as JSON and kept as
+/// a string when it does not parse.
+fn tool_call_from_json(tc: &Value) -> ToolCall {
+    let str_of = |v: Option<&Value>| v.and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let func = tc.get("function");
+    let name = str_of(func.and_then(|f| f.get("name")).or_else(|| tc.get("name")));
+    let raw = func
+        .and_then(|f| f.get("arguments"))
+        .or_else(|| tc.get("arguments"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let arguments = match raw {
+        Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::String(s)),
+        other => other,
+    };
+    ToolCall {
+        id: str_of(tc.get("id")),
+        name,
+        arguments,
+    }
+}
 
 /// Executor for `model` workflow nodes.
 pub struct ModelNodeExecutor {
@@ -85,17 +139,7 @@ impl NodeExecutor for ModelNodeExecutor {
             // Use any explicit messages array from payload.
             if let Some(msgs) = item.payload.get("messages").and_then(|v| v.as_array()) {
                 for msg in msgs {
-                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                    let content = msg
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    match role {
-                        "system" => messages.push(ChatMessage::system(content)),
-                        "assistant" => messages.push(ChatMessage::assistant(content)),
-                        _ => messages.push(ChatMessage::user(content)),
-                    }
+                    messages.push(chat_message_from_json(msg));
                 }
             }
         }
@@ -103,6 +147,14 @@ impl NodeExecutor for ModelNodeExecutor {
         if messages.is_empty() {
             return Err("ModelNodeExecutor: no prompt or messages provided".into());
         }
+
+        // A system message in the conversation already carries the prompt; do
+        // not send it a second time.
+        let system_prompt = if messages.iter().any(|m| matches!(m.role, ChatRole::System)) {
+            None
+        } else {
+            system_prompt
+        };
 
         let config = ModelConfig {
             model: Some(model.clone()),
@@ -516,17 +568,10 @@ mod tests {
         );
     }
 
-    /// 2j-4 G1: when the work-item payload carries a `messages` array (and no
-    /// inline `prompt`, as the agent-loop IR emits), the executor must build the
-    /// `ModelRequest.messages` (ChatMessage list) from it — preserving order and
-    /// content so each turn's model call sees the accumulated conversation.
-    /// (Role mapping: system->System, user->User, assistant->Assistant; any
-    /// other role, e.g. a `tool` result, flattens to User — a deliberate v1
-    /// simplification since ChatMessage carries only role + content.)
-    #[tokio::test]
-    async fn executor_maps_payload_messages_into_request() {
-        use jamjet_models::adapter::ChatRole;
-
+    fn capturing_executor() -> (
+        ModelNodeExecutor,
+        Arc<std::sync::Mutex<Option<ModelRequest>>>,
+    ) {
         let captured = Arc::new(std::sync::Mutex::new(None));
         let registry = Arc::new(
             ModelRegistry::new()
@@ -535,55 +580,99 @@ mod tests {
                 }))
                 .with_default("capturing"),
         );
-        let executor = ModelNodeExecutor::new(registry);
+        (ModelNodeExecutor::new(registry), captured)
+    }
 
-        let item = WorkItem {
-            id: uuid::Uuid::new_v4(),
-            execution_id: jamjet_core::workflow::ExecutionId::new(),
-            node_id: "model_step".into(),
-            queue_type: "model".into(),
-            payload: serde_json::json!({
-                "model": "fake-model",
-                "messages": [
-                    {"role": "system", "content": "You are helpful."},
-                    {"role": "user", "content": "What is the weather?"},
-                    {"role": "assistant", "content": "Let me check."},
-                    {"role": "tool", "content": "72F and sunny"}
-                ]
-            }),
-            attempt: 0,
-            max_attempts: 3,
-            created_at: chrono::Utc::now(),
-            lease_expires_at: None,
-            worker_id: None,
-            lease_fence: 0,
-            tenant_id: "default".into(),
-        };
+    fn work_item(payload: Value) -> WorkItem {
+        let mut item = make_item();
+        item.payload = payload;
+        item
+    }
 
+    /// B4: a durable agent turn must reach the model with the assistant's tool
+    /// calls and each tool result tied to its call id, and one system message.
+    #[tokio::test]
+    async fn executor_keeps_tool_calls_and_tool_results() {
+        let (executor, captured) = capturing_executor();
+        let item = work_item(json!({
+            "model": "openai/gpt-4o-mini",
+            "system_prompt": "You book venues.",
+            "messages": [
+                {"role": "system", "content": "You book venues."},
+                {"role": "user", "content": "Find a venue in Lisbon for 40."},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "search_venues", "arguments": "{\"city\": \"Lisbon\", \"guests\": 40}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "[\"Casa do Rio\"]"}
+            ]
+        }));
         executor
             .execute(&item)
             .await
-            .expect("execute with messages must not error");
+            .expect("execute must not error");
 
-        let req = captured
-            .lock()
-            .unwrap()
-            .take()
-            .expect("the adapter must have captured a request");
-
+        let req = captured.lock().unwrap().clone().expect("request captured");
+        let roles: Vec<_> = req
+            .messages
+            .iter()
+            .map(|m| format!("{:?}", m.role))
+            .collect();
+        assert_eq!(roles, ["System", "User", "Assistant", "Tool"]);
+        assert_eq!(req.messages[2].tool_calls.len(), 1);
+        assert_eq!(req.messages[2].tool_calls[0].id, "call_1");
+        assert_eq!(req.messages[2].tool_calls[0].name, "search_venues");
         assert_eq!(
-            req.messages.len(),
-            4,
-            "all 4 conversation messages must be threaded into the request"
+            req.messages[2].tool_calls[0].arguments,
+            json!({"city": "Lisbon", "guests": 40})
         );
-        assert!(matches!(req.messages[0].role, ChatRole::System));
-        assert_eq!(req.messages[0].content, "You are helpful.");
-        assert!(matches!(req.messages[1].role, ChatRole::User));
-        assert_eq!(req.messages[1].content, "What is the weather?");
-        assert!(matches!(req.messages[2].role, ChatRole::Assistant));
-        assert_eq!(req.messages[2].content, "Let me check.");
-        // `tool` role flattens to User; its content is still carried forward.
-        assert!(matches!(req.messages[3].role, ChatRole::User));
-        assert_eq!(req.messages[3].content, "72F and sunny");
+        assert_eq!(req.messages[3].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(req.messages[3].content, "[\"Casa do Rio\"]");
+        assert!(
+            req.config.system_prompt.is_none(),
+            "messages hold the system prompt; do not send it twice"
+        );
+    }
+
+    /// With no system message in the conversation, the node's system prompt is
+    /// still sent.
+    #[tokio::test]
+    async fn executor_sends_system_prompt_when_messages_have_none() {
+        let (executor, captured) = capturing_executor();
+        let item = work_item(json!({
+            "model": "fake-model",
+            "system_prompt": "You book venues.",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        executor.execute(&item).await.expect("execute");
+        let req = captured.lock().unwrap().clone().expect("request captured");
+        assert_eq!(
+            req.config.system_prompt.as_deref(),
+            Some("You book venues.")
+        );
+    }
+
+    /// Tool-call arguments that are not valid JSON are kept as a string; a flat
+    /// `{id, name, arguments}` entry is accepted too.
+    #[tokio::test]
+    async fn executor_keeps_unparseable_arguments_as_string() {
+        let (executor, captured) = capturing_executor();
+        let item = work_item(json!({
+            "model": "fake-model",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "f", "arguments": "{not json"}},
+                    {"id": "c2", "name": "g", "arguments": {"a": 1}}
+                ]}
+            ]
+        }));
+        executor.execute(&item).await.expect("execute");
+        let req = captured.lock().unwrap().clone().expect("request captured");
+        let calls = &req.messages[1].tool_calls;
+        assert_eq!(calls[0].arguments, json!("{not json"));
+        assert_eq!(calls[1].name, "g");
+        assert_eq!(calls[1].arguments, json!({"a": 1}));
     }
 }
