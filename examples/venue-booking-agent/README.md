@@ -10,6 +10,14 @@ Nothing is really booked or paid. The "payments" are lines in a log file.
 
     pip install "jamjet[sidecar]==0.13.0"
 
+## Before you start
+
+Set a signing key for the audit log:
+
+    export JAMJET_AUDIT_SIGNING_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
+
+It signs the agent's audit log. Without it, JamJet prints a warning.
+
 ## Pick a model
 
 By default every step runs on a scripted model. It answers from a YAML file

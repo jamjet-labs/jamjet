@@ -4,7 +4,8 @@ from pathlib import Path
 from jamjet import Agent
 
 HERE = Path(__file__).parent
-MODEL = os.environ.get("VENUE_MODEL") or f"scripted/{HERE / 'script.yaml'}"
+SCRIPT = HERE / "script.yaml"
+MODEL = os.environ.get("VENUE_MODEL") or f"scripted/{SCRIPT}"
 
 mode = "scripted (no API key)"
 if not MODEL.startswith("scripted/"):
