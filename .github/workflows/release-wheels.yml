@@ -163,6 +163,11 @@ jobs:
           path: binaries/
           merge-multiple: true
 
+      # jamjet dev downloads the engine and checks it against this file.
+      - name: Write SHA256SUMS for the binaries
+        working-directory: binaries
+        run: sha256sum jamjet-server-* > SHA256SUMS
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:

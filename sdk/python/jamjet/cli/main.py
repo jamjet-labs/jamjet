@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import hashlib
 import importlib.metadata
 import json
 import math
@@ -436,6 +437,13 @@ def _find_server_binary() -> str:
     import os
     import shutil
 
+    # 0. An explicit JAMJET_SERVER_PATH wins and never triggers a download.
+    explicit = os.environ.get("JAMJET_SERVER_PATH")
+    if explicit:
+        if os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+            return explicit
+        raise FileNotFoundError(f"JAMJET_SERVER_PATH is not an executable file: {explicit}")
+
     # 1. Check PATH first (installed wheel or symlinked)
     which = shutil.which("jamjet-server")
     if which:
@@ -492,8 +500,14 @@ def _download_server_binary(cache_dir: str) -> str:
     ext = ".exe" if system == "windows" else ""
     filename = f"jamjet-server-{system}-{arch}{ext}"
 
-    # Resolve the latest release tag from GitHub API.
-    api_url = "https://api.github.com/repos/jamjet-labs/jamjet/releases/latest"
+    # Pin the release to the installed SDK version. Never fall back to "latest":
+    # an engine from another release can disagree with this SDK.
+    import json as _json
+    import urllib.error
+
+    version = _sdk_version()
+    tag = f"python-sdk-v{version}"
+    api_url = f"https://api.github.com/repos/jamjet-labs/jamjet/releases/tags/{tag}"
     try:
         gh_headers = {
             "Accept": "application/vnd.github+json",
@@ -501,21 +515,48 @@ def _download_server_binary(cache_dir: str) -> str:
         }
         req = urllib.request.Request(api_url, headers=gh_headers)  # noqa: S310
         with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
-            import json as _json
-
             release = _json.loads(resp.read())
-        tag = release["tag_name"]
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise FileNotFoundError(
+                f"No engine release for jamjet {version} (tag {tag}). "
+                "Build one with: jamjet dev --build, or set JAMJET_SERVER_PATH."
+            ) from exc
+        raise FileNotFoundError(
+            f"Could not fetch release info from GitHub ({exc}).\n"
+            "Build from source: cd runtime && cargo build -p jamjet-api\n"
+            "Or set JAMJET_SERVER_PATH to the binary path."
+        ) from exc
     except Exception as exc:
         raise FileNotFoundError(
-            f"Could not fetch latest release info from GitHub ({exc}).\n"
+            f"Could not fetch release info from GitHub ({exc}).\n"
             "Build from source: cd runtime && cargo build -p jamjet-api\n"
             "Or set JAMJET_SERVER_PATH to the binary path."
         ) from exc
 
-    url = f"https://github.com/jamjet-labs/jamjet/releases/download/{tag}/{filename}"
+    release_base = f"https://github.com/jamjet-labs/jamjet/releases/download/{tag}"
+    url = f"{release_base}/{filename}"
+    asset_names = {a.get("name") for a in release.get("assets", [])}
+
+    # Fetch the published checksum list before the binary, so a bad list fails early.
+    expected_sha: str | None = None
+    if "SHA256SUMS" in asset_names:
+        try:
+            with urllib.request.urlopen(f"{release_base}/SHA256SUMS", timeout=30) as sums_resp:  # noqa: S310
+                sums_text = sums_resp.read().decode("utf-8", "replace")
+        except Exception as exc:
+            raise FileNotFoundError(f"Could not fetch SHA256SUMS ({exc}).") from exc
+        for line in sums_text.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].lstrip("*") == filename:
+                expected_sha = parts[0].lower()
+                break
+        if expected_sha is None:
+            raise FileNotFoundError(f"SHA256SUMS has no entry for {filename}; refusing to use the download.")
     os.makedirs(cache_dir, exist_ok=True)
     dest = os.path.join(cache_dir, f"jamjet-server{ext}")
     dest_tmp = dest + ".tmp"
+    hasher = hashlib.sha256()
 
     console.print(f"[dim]Downloading jamjet-server {tag} for {system}/{arch}...[/dim]")
 
@@ -540,6 +581,7 @@ def _download_server_binary(cache_dir: str) -> str:
                         if not chunk:
                             break
                         out.write(chunk)
+                        hasher.update(chunk)
                         progress.advance(task, len(chunk))
     except Exception as exc:
         if os.path.exists(dest_tmp):
@@ -549,6 +591,16 @@ def _download_server_binary(cache_dir: str) -> str:
             "Build from source: cd runtime && cargo build -p jamjet-api\n"
             "Or set JAMJET_SERVER_PATH to the binary path."
         ) from exc
+
+    if expected_sha is not None:
+        if hasher.hexdigest() != expected_sha:
+            os.remove(dest_tmp)
+            raise FileNotFoundError(
+                f"Checksum mismatch for {filename} ({tag}): expected {expected_sha}, "
+                f"got {hasher.hexdigest()}. The download was deleted."
+            )
+    else:
+        console.print("This release publishes no checksum; the engine was not verified.")
 
     os.replace(dest_tmp, dest)
     os.chmod(dest, os.stat(dest).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
