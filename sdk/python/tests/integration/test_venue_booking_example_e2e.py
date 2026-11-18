@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -182,3 +183,108 @@ def test_step06_engine_blocks_the_cancellation(stack06: DevStack, project06: Pat
     assert "cancel_booking blocked" in trail
     assert stack06.execution(exec_id)["status"] == "failed"
     assert normalise(out) == expected(STEP06)
+
+
+STEP07 = "step-07-engine-crash"
+STEP08 = "step-08-what-it-remembers"
+STEP09 = "step-09-audit"
+LOST = "jamjet: lost the engine at"
+BACK = "jamjet: the engine is back; resuming the wait"
+
+
+@pytest.fixture(scope="module")
+def project07(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("venue_step07")
+    for name in ("agent.py", "venue_tools.py", "script.yaml"):
+        shutil.copy(ROOT / STEP07 / name, root)
+    (root / "home").mkdir()
+    return root
+
+
+@pytest.fixture(scope="module")
+def stack07(project07: Path, request: pytest.FixtureRequest) -> DevStack:
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.endswith(("_API_KEY", "_API_BASE", "_BASE_URL"))
+        and not (k.startswith("JAMJET_") and k != "JAMJET_SERVER_PATH")
+        and k not in ("DATABASE_URL", "VENUE_MODEL")
+    }
+    env.update(HOME=str(project07 / "home"), PYTHONUNBUFFERED="1", NO_COLOR="1", COLUMNS="200")
+    env["JAMJET_SERVER_PATH"] = os.path.realpath(os.environ["JAMJET_SERVER_PATH"])
+    env["JAMJET_AUDIT_SIGNING_KEY"] = TEST_SIGNING_KEY
+    dev = DevStack(project07, env)
+    request.addfinalizer(dev.stop)
+    dev.start()
+    return dev
+
+
+@pytest.fixture(scope="module")
+def crashed(stack07: DevStack, project07: Path, request: pytest.FixtureRequest) -> dict[str, str]:
+    """Step 07: kill the engine while the approval waits, restart, approve."""
+    agent = AgentProcess(project07, stack07.env, stack07.url)
+    request.addfinalizer(agent.stop)
+    exec_id, _ = wait_for_approval(stack07, _Waiting(agent))  # type: ignore[arg-type]
+    assert lines(project07 / "payments.log") == []
+
+    killed = stack07.kill_engine()
+    time.sleep(2)  # agent.py is now polling a dead engine and must keep waiting
+    assert agent.alive(), "agent.py should keep waiting while the engine is down"
+
+    stack07.start()  # same folder, so the same .jamjet/runtime.db
+    deadline = time.monotonic() + 30
+    while True:
+        listing = stack07.jamjet("approvals")
+        if exec_id in listing:
+            break
+        assert time.monotonic() < deadline, f"{exec_id} never reappeared:\n{listing}"
+        time.sleep(0.5)
+    approved = stack07.jamjet(*printed_approve_args(listing, exec_id))
+    out, err = agent.proc.communicate(timeout=120)
+    say("step 07: kill -9 engine pid", str(killed))
+    say("step 07: agent.py stderr", err)
+    say("step 07: agent.py stdout", out)
+    return {"exec_id": exec_id, "out": out, "err": err, "rc": str(agent.proc.returncode), "approved": approved}
+
+
+def test_step07_engine_crash_then_approve_pays_once(
+    crashed: dict[str, str], project07: Path, stack07: DevStack
+) -> None:
+    out, err = crashed["out"], crashed["err"]
+    assert crashed["rc"] == "0", f"agent.py exited {crashed['rc']}\n{out}\n{err[-3000:]}"
+    assert err.count(LOST) == 1
+    assert err.count(BACK) == 1
+    assert f"{LOST} {stack07.url}; waiting for it to come back (execution {crashed['exec_id']})" in err
+    assert normalise(out) == expected(STEP07)
+    assert len(lines(project07 / "payments.log")) == 1
+
+
+def test_step08_executions_and_events_show_the_log(crashed: dict[str, str], stack07: DevStack) -> None:
+    exec_id = crashed["exec_id"]
+    listing = stack07.jamjet("executions")
+    events = stack07.jamjet("events", exec_id)
+    say("step 08: jamjet executions", listing)
+    say("step 08: jamjet events", events)
+
+    row = next(ln for ln in listing.splitlines() if exec_id in ln)
+    assert "completed" in row
+    assert "tool_approval_required" in events
+    assert "approval_received" in events
+    assert "workflow_completed" in events
+
+
+def test_step09_audit_says_who_approved(crashed: dict[str, str], stack07: DevStack) -> None:
+    exec_id = crashed["exec_id"]
+    trail = stack07.jamjet("audit", exec_id)
+    as_json = stack07.jamjet("audit", exec_id, "--json")
+    say("step 09: jamjet audit", trail)
+    say("step 09: jamjet audit --json", as_json)
+
+    assert "pay_deposit ran 1 time, approved by tester at" in trail
+    assert "tester" in as_json
+
+
+def test_steps_07_to_09_share_the_step_05_code() -> None:
+    for step in (STEP07, STEP08, STEP09):
+        for name in ("agent.py", "venue_tools.py", "script.yaml"):
+            assert (ROOT / step / name).read_bytes() == (ROOT / STEP / name).read_bytes(), (step, name)
