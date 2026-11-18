@@ -24,11 +24,13 @@ def run_step(
     env: dict[str, str] | None = None,
     clear_logs: bool = True,
     allow_fail: bool = False,
+    args: tuple[str, ...] = (),
 ) -> str:
     """Run one script of a step folder and return its stdout.
 
     With allow_fail, a non-zero exit is expected: the result is stdout plus
-    stderr, and the caller checks the exit through the text it gets.
+    stderr, and the caller checks the exit through the text it gets. args
+    follow the script on the command line, so script="-c" runs code.
     """
     cwd = ROOT / folder
     for log in ("payments.log", "cancellations.log") if clear_logs else ():
@@ -37,7 +39,7 @@ def run_step(
     child_env["JAMJET_AUDIT_SIGNING_KEY"] = TEST_SIGNING_KEY
     child_env.update(env or {})
     done = subprocess.run(
-        [sys.executable, script],
+        [sys.executable, script, *args],
         cwd=cwd,
         env=child_env,
         capture_output=True,
@@ -140,8 +142,11 @@ def test_long_line_check_catches_a_long_line(tmp_path):
 
 
 def test_example_code_stays_within_72_columns():
-    paths = sorted(ROOT.glob("*/*.py")) + sorted(ROOT.glob("*/script.yaml"))
-    assert paths
+    paths = []
+    for folders in ("*", "solutions/*"):
+        paths += sorted(ROOT.glob(f"{folders}/*.py"))
+        paths += sorted(ROOT.glob(f"{folders}/script.yaml"))
+    assert any("solutions" in path.parts for path in paths)
     assert long_lines(paths) == []
 
 
@@ -150,3 +155,65 @@ def test_steps_07_to_09_share_the_step_05_code():
         for name in ("agent.py", "venue_tools.py", "script.yaml"):
             same = (ROOT / step / name).read_bytes() == (ROOT / "step-05-ask-first" / name).read_bytes()
             assert same, (step, name)
+
+
+# ── Challenge solutions ───────────────────────────────────────────────────────
+
+EP1 = "solutions/ep1-weather-tool"
+EP2 = "solutions/ep2-approval-above-300"
+
+# Calls pay_small_deposit directly, once per amount on the command line,
+# then prints each answer and how many payments were written.
+PAY_SMALL = """
+import asyncio, sys
+from venue_tools import PAYMENTS, pay_small_deposit
+for amount in sys.argv[1:]:
+    pay = pay_small_deposit(venue="Casa do Rio", amount=float(amount))
+    print(asyncio.run(pay))
+print(len(PAYMENTS.read_text().splitlines()) if PAYMENTS.exists() else 0)
+"""
+
+
+def refused(amount: str) -> str:
+    return (
+        f"Refused: {amount} for Casa do Rio. This tool pays a venue up to 300 in total."
+        " Use pay_deposit, which waits for approval."
+    )
+
+
+def test_solution_ep1_checks_the_weather_before_it_pays():
+    out = run_step(EP1)
+    assert normalise(out) == expected(EP1)
+    called = [line.split("(")[0] for line in out.splitlines() if line.startswith("called ")]
+    assert called.index("called get_weather") < called.index("called pay_deposit")
+    assert "Rain is forecast" in out
+
+
+def test_solution_ep2_small_deposit_pays_up_to_300():
+    out = run_step(EP2, "-c", args=(PAY_SMALL, "300"))
+    assert out.splitlines() == ["Deposit of 300.0 paid for Casa do Rio.", "1"]
+
+
+def test_solution_ep2_small_deposit_refuses_over_300_in_code():
+    out = run_step(EP2, "-c", args=(PAY_SMALL, "500"))
+    assert out.splitlines() == [refused("500.0"), "0"]
+    assert not (ROOT / EP2 / "payments.log").exists()
+
+
+def test_solution_ep2_two_small_payments_cannot_pass_300():
+    out = run_step(EP2, "-c", args=(PAY_SMALL, "250", "250"))
+    assert out.splitlines() == ["Deposit of 250.0 paid for Casa do Rio.", refused("250.0"), "1"]
+
+
+def test_solution_ep2_refuses_amounts_that_are_not_positive():
+    out = run_step(EP2, "-c", args=(PAY_SMALL, "nan", "0", "-50"))
+    assert out.splitlines() == [refused("nan"), refused("0.0"), refused("-50.0"), "0"]
+
+
+def test_solution_ep2_keeps_the_approval_gate_on_pay_deposit():
+    code = (ROOT / EP2 / "agent.py").read_text()
+    assert 'policy={"require_approval_for": ["pay_deposit"]}' in code
+    assert "pay_small_deposit, pay_deposit]" in code
+    script = yaml.safe_load((ROOT / EP2 / "script.yaml").read_text())
+    paid = [c for turn in script["turns"] for c in turn.get("tool_calls", []) if c["name"].startswith("pay_")]
+    assert paid == [{"name": "pay_small_deposit", "arguments": {"venue": "Casa do Rio", "amount": 200}}]
