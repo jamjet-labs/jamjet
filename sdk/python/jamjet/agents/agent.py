@@ -736,6 +736,7 @@ class Agent:
 
         duration_us = int((time.monotonic() - t0) * 1_000_000)
         result = self._extract_result(execution, events, ir, duration_us)
+        result.execution_id = exec_id
         # Mint the turn receipt + emit the per-action signed audit chain from the
         # durable run's extracted result (both on by default), mirroring run().
         result.receipt = self._maybe_mint_receipt(prompt, result.output)
@@ -1067,6 +1068,7 @@ class AgentResult:
         duration_us: float = 0.0,
         receipt: dict[str, Any] | None = None,
         audit: list[Any] | None = None,
+        execution_id: str | None = None,
     ) -> None:
         self.output = output
         self.tool_calls = tool_calls
@@ -1077,6 +1079,9 @@ class AgentResult:
         # run (a list of jamjet.agents.audit.AuditAction), on by default; None
         # when ``audit=False``. ``jamjet.agents.audit.verify_chain`` accepts it.
         self.audit = audit
+        # The engine's execution id for a durable run (``run_durable``), so the
+        # run can be found with ``jamjet executions``; ``None`` for ``run()``.
+        self.execution_id = execution_id
 
     def __str__(self) -> str:
         return self.output

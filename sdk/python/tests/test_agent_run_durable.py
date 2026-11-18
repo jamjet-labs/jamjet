@@ -120,6 +120,16 @@ async def test_run_durable_extracts_final_answer(monkeypatch: pytest.MonkeyPatch
     assert result.output == "It is sunny in London."
 
 
+async def test_run_durable_sets_execution_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The result carries the engine's execution id, so a learner can find the run."""
+    fake = _FakeDurableClient(_completed_execution())
+    _patch_client(monkeypatch, fake)
+
+    result = await _agent().run_durable("weather in London?", max_turns=3)
+
+    assert result.execution_id == "exec_test"
+
+
 async def test_run_durable_reconstructs_tool_call_trace(monkeypatch: pytest.MonkeyPatch) -> None:
     """The tool calls made during the loop are reconstructed with in-process shape."""
     fake = _FakeDurableClient(_completed_execution())

@@ -2855,9 +2855,91 @@ def _approval_covers(context: dict[str, Any]) -> str:
     return "-"
 
 
+def _started_local(value: Any) -> str:
+    """An ISO start time as local time to the second; the raw text if unparseable."""
+    from datetime import datetime  # noqa: PLC0415
+
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return _safe(value)
+
+
+@app.command()
+def executions(
+    status: str | None = typer.Option(None, "--status", "-s", help="Only runs in this status (running, paused, ...)"),
+    limit: int = typer.Option(50, "--limit", "-n", help="How many runs to list"),
+    as_json: bool = typer.Option(False, "--json", help="Print the engine's items as JSON"),
+    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+) -> None:
+    """List recent executions, newest first."""
+
+    async def _list() -> None:
+        async with _client(runtime) as c:
+            data = await c.list_executions(status=status, limit=limit)
+        items = data.get("executions", [])
+        if as_json:
+            typer.echo(json.dumps(items, indent=2))
+            return
+        items = sorted(items, key=lambda e: str(e.get("started_at", "")), reverse=True)
+        if not items:
+            console.print("No executions yet.", style="dim", markup=False)
+            return
+        t = Table()
+        t.add_column("execution", no_wrap=True)
+        t.add_column("agent")
+        t.add_column("status")
+        t.add_column("started", no_wrap=True)
+        for e in items:
+            t.add_row(
+                _cell(e.get("execution_id", "-")),
+                _cell(e.get("workflow_id", "-")),
+                _cell(e.get("status", "-")),
+                _started_local(e.get("started_at", "")),
+            )
+        console.print(t)
+
+    asyncio.run(_list())
+
+
+# A run waiting on a person is `paused` (runtime/core WorkflowStatus; the
+# approvals endpoint only accepts a decision while the run is paused).
+_WAITING_STATUS = "paused"
+
+
+async def _print_waiting_approvals(runtime: str, limit: int = 50) -> None:
+    async with _client(runtime) as c:
+        waiting = (await c.list_executions(status=_WAITING_STATUS, limit=limit)).get("executions", [])
+        found = 0
+        for e in waiting:
+            eid = e.get("execution_id", "")
+            data = await c.list_approvals(eid)
+            for entry in data.get("pending", []):
+                found += 1
+                context = entry.get("context") or {}
+                node = entry.get("node_id", "-")
+                console.print(f"{_safe(eid)}  {_safe(node)}", soft_wrap=True, markup=False, highlight=False)
+                console.print(f"  covers {_approval_covers(context)}", soft_wrap=True, markup=False, highlight=False)
+                binding = _approval_binding(context)
+                command = _approve_command(eid, node, binding) if binding else None
+                if command:
+                    console.print(f"  {command}", soft_wrap=True, markup=False, highlight=False)
+                else:
+                    console.print(
+                        f"  no paste-ready command; run: jamjet approvals {_safe(eid)}",
+                        soft_wrap=True,
+                        markup=False,
+                        highlight=False,
+                    )
+    if not found:
+        console.print("No approvals are waiting.", style="dim", markup=False)
+
+
 @app.command()
 def approvals(
-    execution_id: str = typer.Argument(..., help="Execution ID (exec_...)"),
+    execution_id: str | None = typer.Argument(
+        None, help="Execution ID (exec_...). Leave out to list every run waiting for a decision."
+    ),
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
     show_basis: bool = typer.Option(
         False,
@@ -2871,8 +2953,13 @@ def approvals(
     digest covers. Review the basis (`--show-basis`) before approving: the
     approval authorises exactly that payload, that occurrence and that node.
     """
+    if execution_id is None:
+        asyncio.run(_print_waiting_approvals(runtime))
+        return
+    execution_id_: str = execution_id
 
     async def _approvals() -> None:
+        execution_id = execution_id_
         async with _client(runtime) as c:
             data = await c.list_approvals(execution_id)
 
