@@ -20,6 +20,11 @@ Where each row comes from (event kinds are in ``runtime/state/src/event.rs``):
 - ``budget stopped the run``: ``BudgetExceeded``, ``TokenBudgetExceeded``,
   ``CostBudgetExceeded``.
 - ``final answer`` / ``run failed: <reason>`` / ``run cancelled``.
+
+The closing "ran N time(s)" lines count the tool results the engine recorded.
+A tool whose worker died before its result was recorded is not counted, though
+the tool may still have had an effect (a payment, say). Keep your own record of
+effects that matter.
 """
 
 from __future__ import annotations
@@ -40,7 +45,7 @@ _BUDGET_EVENTS = ("budget_exceeded", "token_budget_exceeded", "cost_budget_excee
 # The engine's block rule: "tool 'cancel_booking' matches blocked pattern 'cancel_*'".
 _RULE_TOOL = re.compile(r"tool '([^']+)'")
 # Shown escaped: they could move the cursor or reorder the reviewer's lines.
-_BIDI_CONTROLS = frozenset("؜‎‏‪‫‬‭‮⁦⁧⁨⁩")
+_BIDI_CONTROLS = frozenset("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
 
 
 @dataclass

@@ -51,7 +51,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from jamjet.cli.audit_trail import display_id
+from jamjet.cli.audit_trail import _BIDI_CONTROLS, display_id
 from jamjet.cli.demo import demo_app
 from jamjet.client import JamjetClient
 from jamjet.deploy import LOCAL_RUNTIME_URL
@@ -2784,8 +2784,7 @@ def _effect_size_label(d: float) -> str:
 # ── approvals ─────────────────────────────────────────────────────────────────
 
 
-# Bidi controls that reorder what follows them on the terminal.
-_BIDI_CONTROLS = frozenset("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+# Bidi controls that reorder what follows them on the terminal (shared with the audit trail).
 
 
 def _safe(value: Any) -> str:
@@ -2953,7 +2952,7 @@ def executions(
         t.add_column("execution", no_wrap=True)
         t.add_column("agent")
         t.add_column("status")
-        t.add_column("started", no_wrap=True)
+        t.add_column("started (local)", no_wrap=True)
         for e in items:
             t.add_row(
                 _cell(display_id(e.get("execution_id", "-"))),

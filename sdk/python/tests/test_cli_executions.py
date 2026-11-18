@@ -40,7 +40,7 @@ def test_executions_lists_newest_first() -> None:
         result = runner.invoke(app, ["executions"])
     assert result.exit_code == 0
     assert result.output.index("exec_new") < result.output.index("exec_old")
-    for col in ("execution", "agent", "status", "started"):
+    for col in ("execution", "agent", "status", "started (local)"):
         assert col in result.output
     assert "venue_agent" in result.output
 

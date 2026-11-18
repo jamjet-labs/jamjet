@@ -101,9 +101,9 @@ async def test_approve_sends_user_id_when_given() -> None:
     )
 
     async with JamjetClient(base_url=BASE) as c:
-        await c.approve("exec-1", "approved", node_id="gated", user_id="sunil")
+        await c.approve("exec-1", "approved", node_id="gated", user_id="tester")
 
-    assert json.loads(route.calls[0].request.content)["user_id"] == "sunil"
+    assert json.loads(route.calls[0].request.content)["user_id"] == "tester"
 
 
 @respx.mock
@@ -565,10 +565,10 @@ def test_approve_as_passes_the_name_through_as_user_id() -> None:
     fake = _approve_client({"execution_id": "exec-1", "node_id": "gated", "accepted": True})
 
     with patch("jamjet.cli.main._client", return_value=fake):
-        result = runner.invoke(app, ["approve", "exec-1", "--decision", "approved", "--as", "sunil"])
+        result = runner.invoke(app, ["approve", "exec-1", "--decision", "approved", "--as", "tester"])
 
     assert result.exit_code == 0, result.output
-    assert fake.approve.call_args.kwargs.get("user_id") == "sunil"
+    assert fake.approve.call_args.kwargs.get("user_id") == "tester"
 
 
 def test_approve_without_as_sends_no_user_id() -> None:

@@ -1376,6 +1376,9 @@ export ANTHROPIC_API_KEY=sk-ant-...
 `jamjet dev` and durable runs also need the sidecar:
 `pip install 'jamjet[model,sidecar]'`.
 
+With a real model, set the provider key in the terminal where you run
+`jamjet dev`, because the sidecar makes the model calls.
+
 ## Run in-process
 
 ```bash

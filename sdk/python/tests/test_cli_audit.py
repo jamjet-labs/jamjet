@@ -157,10 +157,10 @@ def test_render_header_and_footer() -> None:
 
 def test_render_escapes_terminal_controls() -> None:
     fixture = copy.deepcopy(_load("approved_run.json"))
-    _event(fixture, "approval_received")["kind"]["comment"] = "ok\x1b[2J‮"
+    _event(fixture, "approval_received")["kind"]["comment"] = "ok\x1b[2J\u202e"
     text = render_trail(_trail(fixture), fixture["execution"])
     assert "\x1b" not in text
-    assert "‮" not in text
+    assert "\u202e" not in text
     assert "ok\\x1b[2J\\u202e" in text
 
 

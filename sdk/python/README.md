@@ -169,11 +169,17 @@ reads it. In a durable run that is the engine's sidecar, which `jamjet dev` star
 from the folder you run it in. Run `jamjet dev` from your project folder, or give
 an absolute path.
 
-`jamjet dev` needs `pip install 'jamjet[sidecar]'`. Start the stack in one terminal, run `python book.py` in another. The run stops at
-`pay_deposit` and waits. From a third terminal:
+`jamjet dev` needs `pip install 'jamjet[sidecar]'`. Start the stack in the first
+terminal, from the project folder:
 
 ```bash
-jamjet dev --modules venue_tools     # first terminal, from the project folder
+jamjet dev --modules venue_tools
+```
+
+Run `python book.py` in a second terminal. The run stops at `pay_deposit` and
+waits. From a third terminal:
+
+```bash
 jamjet executions                    # every run
 jamjet approvals                     # every run waiting for approval
 jamjet approve <id> -d approved --as <name>
@@ -215,6 +221,10 @@ search_venues ran 1 time
 check_dates ran 1 time
 pay_deposit ran 1 time, approved by tester at 03:09:24
 ```
+
+"ran N time(s)" counts the tool results the engine recorded. A tool whose worker
+died before its result was recorded is not counted, though it may still have had
+an effect. That is why the series keeps its own `payments.log`.
 
 In dev mode the engine records the name you pass. With an API token it records
 the token's name. If the engine stops while `run_durable` waits, the call keeps
