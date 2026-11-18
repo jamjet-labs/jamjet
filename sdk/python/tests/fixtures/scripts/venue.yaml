@@ -1,0 +1,12 @@
+# A scripted model for running an agent with no API key.
+# Turn N answers the agent's Nth model call in a run.
+turns:
+  - content: "Let me look for venues."
+    tool_calls:
+      - name: search_venues
+        arguments: {city: Lisbon, guests: 40}
+  - tool_calls:
+      - name: check_dates
+        arguments: {venue: Casa do Rio}
+  - content: "Casa do Rio is free on 4 December."
+    usage: {input_tokens: 900, output_tokens: 40}

@@ -143,3 +143,163 @@ def test_find_server_binary_uses_versioned_cache_when_present(
 
     assert download_calls == [], "Downloader should NOT have been called."
     assert result == str(versioned_bin)
+
+
+# ---------------------------------------------------------------------------
+# _download_server_binary: version pin, JAMJET_SERVER_PATH, checksum (B15)
+# ---------------------------------------------------------------------------
+
+import hashlib  # noqa: E402
+import io  # noqa: E402
+import json  # noqa: E402
+import urllib.error  # noqa: E402
+
+_BINARY = b"engine-bytes"
+
+
+class _Resp(io.BytesIO):
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.headers = {"Content-Length": str(len(data))}
+
+    def __enter__(self) -> _Resp:
+        return self
+
+    def __exit__(self, *a: object) -> None:
+        return None
+
+
+def _setup_download(monkeypatch: pytest.MonkeyPatch, *, sums: str | None, status: int = 200):
+    """Mock platform and urlopen. Returns the list of requested URLs."""
+    import platform
+
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr("jamjet.cli.main._sdk_version", lambda: "0.12.0")
+    name = "jamjet-server-linux-x86_64"
+    assets = [{"name": name}]
+    if sums is not None:
+        assets.append({"name": "SHA256SUMS"})
+    urls: list[str] = []
+
+    def fake_urlopen(req, timeout=None):  # noqa: ANN001
+        url = req if isinstance(req, str) else req.full_url
+        urls.append(url)
+        if "/releases/tags/" in url or url.endswith("/releases/latest"):
+            if status == 404:
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+            return _Resp(json.dumps({"tag_name": "python-sdk-v0.12.0", "assets": assets}).encode())
+        if url.endswith("/SHA256SUMS"):
+            assert sums is not None
+            return _Resp(sums.encode())
+        return _Resp(_BINARY)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    return urls
+
+
+def test_download_requests_the_sdk_version_tag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from jamjet.cli.main import _download_server_binary
+
+    digest = hashlib.sha256(_BINARY).hexdigest()
+    urls = _setup_download(monkeypatch, sums=f"{digest}  jamjet-server-linux-x86_64\n")
+    _download_server_binary(str(tmp_path / "c"))
+    assert urls[0] == "https://api.github.com/repos/jamjet-labs/jamjet/releases/tags/python-sdk-v0.12.0"
+    assert not any(u.endswith("/releases/latest") for u in urls)
+
+
+def test_download_404_names_the_tag_and_never_asks_for_latest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from jamjet.cli.main import _download_server_binary
+
+    urls = _setup_download(monkeypatch, sums=None, status=404)
+    with pytest.raises(FileNotFoundError) as exc:
+        _download_server_binary(str(tmp_path / "c"))
+    assert str(exc.value) == (
+        "No engine release for jamjet 0.12.0 (tag python-sdk-v0.12.0). "
+        "Build one with: jamjet dev --build, or set JAMJET_SERVER_PATH."
+    )
+    assert len(urls) == 1
+    assert not any("latest" in u for u in urls)
+
+
+def test_server_path_env_skips_the_network(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    binary = tmp_path / "my-server"
+    binary.write_bytes(b"x")
+    binary.chmod(0o755)
+    monkeypatch.setenv("JAMJET_SERVER_PATH", str(binary))
+
+    def boom(*a: object, **k: object) -> None:
+        raise AssertionError("network used")
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    monkeypatch.setattr("jamjet.cli.main._download_server_binary", boom)
+    assert _find_server_binary() == str(binary)
+
+
+def test_server_path_env_missing_fails_without_download(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    missing = tmp_path / "nope"
+    monkeypatch.setenv("JAMJET_SERVER_PATH", str(missing))
+
+    def boom(*a: object, **k: object) -> None:
+        raise AssertionError("download attempted")
+
+    monkeypatch.setattr("jamjet.cli.main._download_server_binary", boom)
+    with pytest.raises(FileNotFoundError) as exc:
+        _find_server_binary()
+    assert str(missing) in str(exc.value)
+    assert "\n" not in str(exc.value)
+
+
+def test_download_matching_checksum_passes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from jamjet.cli.main import _download_server_binary
+
+    digest = hashlib.sha256(_BINARY).hexdigest()
+    _setup_download(monkeypatch, sums=f"{digest}  jamjet-server-linux-x86_64\n")
+    dest = _download_server_binary(str(tmp_path / "c"))
+    assert Path(dest).read_bytes() == _BINARY
+
+
+def test_download_mismatched_checksum_leaves_no_binary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from jamjet.cli.main import _download_server_binary
+
+    _setup_download(monkeypatch, sums=f"{'0' * 64}  jamjet-server-linux-x86_64\n")
+    cache = tmp_path / "c"
+    with pytest.raises(FileNotFoundError, match="Checksum mismatch"):
+        _download_server_binary(str(cache))
+    assert not cache.exists() or list(cache.iterdir()) == []
+
+
+def test_download_without_sums_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from jamjet.cli.main import _download_server_binary
+
+    urls = _setup_download(monkeypatch, sums=None)
+    cache = tmp_path / "c"
+    with pytest.raises(FileNotFoundError) as exc:
+        _download_server_binary(str(cache))
+    assert str(exc.value) == (
+        "The jamjet 0.12.0 release has no SHA256SUMS, so the engine can't be verified. "
+        "Set JAMJET_SERVER_PATH to an engine you trust, or build one with: jamjet dev --build."
+    )
+    assert not any(u.endswith("jamjet-server-linux-x86_64") for u in urls), "the binary is never downloaded"
+    assert not cache.exists() or list(cache.iterdir()) == []
+
+
+def test_download_sums_without_this_asset_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from jamjet.cli.main import _download_server_binary
+
+    digest = hashlib.sha256(_BINARY).hexdigest()
+    _setup_download(monkeypatch, sums=f"{digest}  jamjet-server-macos-arm64\n")
+    cache = tmp_path / "c"
+    with pytest.raises(FileNotFoundError, match="no entry"):
+        _download_server_binary(str(cache))
+    assert not cache.exists() or list(cache.iterdir()) == []
+
+
+def test_download_malformed_sums_line_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from jamjet.cli.main import _download_server_binary
+
+    _setup_download(monkeypatch, sums="not-a-digest  jamjet-server-linux-x86_64\n")
+    cache = tmp_path / "c"
+    with pytest.raises(FileNotFoundError, match="Checksum mismatch"):
+        _download_server_binary(str(cache))
+    assert not cache.exists() or list(cache.iterdir()) == []

@@ -229,6 +229,7 @@ class JamjetClient:
         comment: str | None = None,
         state_patch: dict[str, Any] | None = None,
         action_digest: str | None = None,
+        user_id: str | None = None,
     ) -> dict[str, Any]:
         """Record a decision on a pending approval.
 
@@ -244,6 +245,10 @@ class JamjetClient:
         decision that carries one with HTTP 400 (approval edits are not
         supported: the action would not run on the edited state), and this
         method raises ``httpx.HTTPStatusError`` for it like any other refusal.
+
+        ``user_id`` is the name to record as the approver. A dev-mode engine
+        records it as given. With an API token the engine records the token's
+        name and ignores it. It is sent only when set.
         """
         body: dict[str, Any] = {"decision": decision}
         if node_id:
@@ -254,6 +259,8 @@ class JamjetClient:
             body["state_patch"] = state_patch
         if action_digest:
             body["action_digest"] = action_digest
+        if user_id:
+            body["user_id"] = user_id
         r = await self._client.post(f"/executions/{execution_id}/approve", json=body)
         _raise_for_status(r)
         return r.json()
