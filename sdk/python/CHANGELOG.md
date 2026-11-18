@@ -1,8 +1,42 @@
 # Changelog
 
-## Unreleased
+## 0.13.0 - 2026-11-18
+
+An agent built with JamJet now runs end to end with a real model or with no API key,
+and every step of it can be followed and checked from the command line. The engine
+binaries for this release are on the `python-sdk-v0.13.0` GitHub release, built from the
+same commit. `jamjet dev` downloads the ones that match the installed SDK and checks
+them against `SHA256SUMS`. Engine changes are listed under Unreleased in the root
+CHANGELOG.
+
+### Security
+
+- **`jamjet dev` checks the engine it downloads.** It fetches the release for the
+  installed SDK version, not the newest release, and refuses a binary whose SHA-256 does
+  not match the release's `SHA256SUMS`, or a release with no `SHA256SUMS`.
+  `JAMJET_SERVER_PATH` names a binary to use instead.
 
 ### Added
+
+- **A scripted model, for running an agent with no API key.** `model="scripted/<path to
+  YAML>"` answers each model call from the file. Only the model is scripted: policy,
+  approval, budget and durability are the real ones. It needs no key and no `[model]`
+  extra. Durable runs also need `jamjet[sidecar]`.
+- **`jamjet executions`** lists runs, and `AgentResult.execution_id` gives a durable
+  run's id. Errors from `run_durable` carry it too.
+- **`jamjet approvals` with no id** lists every run waiting for approval, each with a
+  command you can paste to approve it.
+- **`jamjet approve <id> -d approved --as <name>`** records who approved. A dev-mode
+  engine records the name you give; with an API token the engine records the token's
+  name.
+- **`jamjet audit <id>`** prints a run's audit trail, or JSON with `--json`: what the
+  model asked for, what was blocked, who approved and when, and what ran.
+- **`run_durable` waits through an engine restart.** It says on stderr when it loses the
+  engine and when it is back. If the engine does not come back within
+  `timeout_seconds`, it raises `TimeoutError` (with the connection error as its cause)
+  instead of `httpx.ConnectError`. A worker killed in the middle of a tool still fails
+  the run.
+- `jamjet dev --db PATH` creates the folder for the database.
 
 - **`agent_ref`: attribute a workflow or node to a registered Agent Card.**
   `Agent(..., agent_ref="jamjet://acme/researcher")` emits it on the durable path's
@@ -84,6 +118,14 @@
 
 ### Fixed
 
+- **A durable agent keeps its tool results.** The engine passed the model only each
+  message's role and text, so a real model never saw its own tool calls and repeated
+  them.
+- **Plain `def` tools work with `@tool`.** They run in a worker thread. To use the event
+  loop, write the tool as `async def`.
+- **`@tool` parameters get real JSON Schemas** for lists, `Optional`, `Literal`, dicts
+  and Pydantic models.
+- **LiteLLM's debug banner is off** unless `JAMJET_LITELLM_DEBUG=1`.
 - **`blocked_tools` is enforced on `agent.run()`.** It was enforced only on the durable
   path, so a tool the policy forbids ran normally in-process — silently, without even the
   warning `approval_required` gave. `blocked_tools` is a *tool* control, so the seam
