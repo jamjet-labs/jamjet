@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`jamjet dev` names the extra it needs.** Without uvicorn it told you to run
+  `pip install 'jamjet'`: Rich read `[sidecar]` as a style tag and dropped it. It now
+  prints `pip install 'jamjet[sidecar]'`.
+
 ## 0.13.0 - 2026-11-18
 
 An agent built with JamJet now runs end to end with a real model or with no API key,

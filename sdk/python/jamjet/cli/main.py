@@ -673,7 +673,8 @@ def dev(
     if enable_sidecar and importlib.util.find_spec("uvicorn") is None:
         console.print(
             "[red]Error:[/red] the model sidecar needs uvicorn.\n"
-            "  Install it:   [bold]pip install 'jamjet[sidecar]'[/bold]\n"
+            # `\[` keeps Rich from reading `[sidecar]` as a style tag and dropping it.
+            "  Install it:   [bold]pip install 'jamjet\\[sidecar]'[/bold]\n"
             "  Or skip it:   [bold]jamjet dev --no-sidecar[/bold]"
         )
         raise typer.Exit(1)

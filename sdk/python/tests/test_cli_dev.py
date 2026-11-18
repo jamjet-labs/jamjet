@@ -628,3 +628,23 @@ def test_dev_command_creates_the_parent_folder_of_db(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     assert db.parent.is_dir()
     assert captured["db_url"] == f"sqlite://{db}"
+
+
+def test_dev_without_uvicorn_names_the_sidecar_extra(monkeypatch):
+    """The install hint must print the extra; Rich markup ate `[sidecar]`."""
+    import jamjet.cli.main as cli
+
+    monkeypatch.setattr(cli, "_find_server_binary", lambda: "/fake/jamjet-server")
+    import importlib.util
+
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        "importlib.util.find_spec",
+        lambda name, *a: None if name == "uvicorn" else real_find_spec(name, *a),
+    )
+
+    from typer.testing import CliRunner
+
+    result = CliRunner().invoke(cli.app, ["dev"])
+    assert result.exit_code == 1
+    assert "pip install 'jamjet[sidecar]'" in result.output
