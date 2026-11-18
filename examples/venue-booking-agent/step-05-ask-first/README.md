@@ -5,6 +5,9 @@
     pip install "jamjet[sidecar]==0.13.0"
 
 Set the signing key from the series README, under "Before you start".
+Set it in every terminal you open below, and in the one where you run
+`python try_in_process.py`. An `export` in one terminal does not reach
+the others.
 
 ## The mistake
 
@@ -22,7 +25,7 @@ refuses to run it. Nothing is paid.
 ## Run it with approval
 
 The run is durable, so the engine holds it at the gate. You need three
-terminals, all in this folder.
+terminals. Open every one in this step folder, terminal 3 too.
 
 Terminal 1, the engine:
 
