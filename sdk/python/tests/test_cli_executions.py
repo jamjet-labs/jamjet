@@ -21,7 +21,7 @@ NEW = {
     "execution_id": "exec_new",
     "workflow_id": "venue_agent",
     "status": "paused",
-    "started_at": "2026-11-18T09:00:00Z",
+    "started_at": "2026-11-18T12:00:00Z",
 }
 
 
@@ -99,3 +99,20 @@ def test_approvals_without_id_none_waiting() -> None:
         result = runner.invoke(app, ["approvals"])
     assert result.exit_code == 0
     assert "No approvals are waiting." in result.output
+
+
+def test_approvals_without_id_pending_without_digest_points_to_the_detail_view() -> None:
+    pending = [{"node_id": "pay_deposit", "context": {}}]
+    fake = _client([NEW], {"exec_new": {"pending": pending, "decided": []}})
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals"])
+    assert result.exit_code == 0
+    assert "exec_new" in result.output
+    assert "jamjet approvals exec_new" in result.output
+    assert "jamjet approve exec_new" not in result.output
+
+
+def test_executions_table_shows_start_time_to_the_second() -> None:
+    with patch("jamjet.cli.main._client", return_value=_client([NEW])):
+        result = runner.invoke(app, ["executions"])
+    assert "2026-11-18" in result.output
