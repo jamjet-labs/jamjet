@@ -1,12 +1,16 @@
 import os
 from pathlib import Path
 
-from venue_tools import check_dates, pay_deposit, search_venues
-
 from jamjet import Agent
 
+from venue_tools import (
+    PAYMENTS,
+    check_dates,
+    pay_deposit,
+    search_venues,
+)
+
 HERE = Path(__file__).parent
-PAYMENTS = HERE / "payments.log"
 SCRIPT = HERE / "script.yaml"
 MODEL = os.environ.get("VENUE_MODEL") or f"scripted/{SCRIPT}"
 
@@ -14,6 +18,7 @@ mode = "scripted (no API key)"
 if not MODEL.startswith("scripted/"):
     mode = MODEL
 print(f"model: {mode}")
+PAYMENTS.unlink(missing_ok=True)  # start each run with a fresh log
 
 agent = Agent(
     "venue-booker",

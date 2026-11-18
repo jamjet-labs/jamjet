@@ -1,9 +1,9 @@
 import os
 from pathlib import Path
 
-from venue_tools import check_dates, search_venues
-
 from jamjet import Agent
+
+from venue_tools import check_dates, search_venues
 
 HERE = Path(__file__).parent
 SCRIPT = HERE / "script.yaml"

@@ -16,10 +16,15 @@ TEST_SIGNING_KEY = "venue-example-test-key"
 ROOT = Path(__file__).resolve().parents[3] / "examples" / "venue-booking-agent"
 
 
-def run_step(folder: str, script: str = "agent.py", env: dict[str, str] | None = None) -> str:
+def run_step(
+    folder: str,
+    script: str = "agent.py",
+    env: dict[str, str] | None = None,
+    clear_logs: bool = True,
+) -> str:
     """Run one script of a step folder and return its stdout."""
     cwd = ROOT / folder
-    for log in ("payments.log", "cancellations.log"):
+    for log in ("payments.log", "cancellations.log") if clear_logs else ():
         (cwd / log).unlink(missing_ok=True)
     child_env = {k: v for k, v in os.environ.items() if k != "VENUE_MODEL"}
     child_env["JAMJET_AUDIT_SIGNING_KEY"] = TEST_SIGNING_KEY
@@ -81,3 +86,9 @@ def test_step03_pay_deposit_pays_once_with_no_checks():
     assert len(lines) == 1
     assert lines[0].startswith("paid 500")
     assert "Casa do Rio" in lines[0]
+
+
+def test_step03_second_run_starts_with_a_fresh_log():
+    run_step("step-03-pay-deposit")
+    out = run_step("step-03-pay-deposit", clear_logs=False)
+    assert out.splitlines()[-1] == "payments.log: 1 line(s)"
