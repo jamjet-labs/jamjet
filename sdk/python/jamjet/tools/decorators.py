@@ -17,6 +17,7 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 from collections.abc import Callable
@@ -142,7 +143,13 @@ def tool(
                     # TypeError: input contains non-JSON-serializable values
                     #   (Pydantic model, datetime, bytes, etc.) — treat as cache miss.
                     pass  # Fall through to live execution.
-            return await fn(*args, **kwargs)
+            if inspect.iscoroutinefunction(fn):
+                return await fn(*args, **kwargs)
+            # Plain functions run in a worker thread so they never block the loop.
+            result = await asyncio.to_thread(fn, *args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
 
         wrapper._jamjet_tool = defn  # type: ignore[attr-defined]
         defn.wrapper = wrapper
