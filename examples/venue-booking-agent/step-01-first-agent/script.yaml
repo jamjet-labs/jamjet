@@ -1,0 +1,3 @@
+# A scripted model: turn 1 answers the agent's first model call.
+turns:
+  - content: "Tell me the exact dates, whether you need a stage or just seats, and your budget. I can then look for venues in Lisbon that fit 40 people."

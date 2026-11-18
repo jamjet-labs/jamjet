@@ -1,0 +1,52 @@
+"""The venue-booking code-along example: each step folder runs offline.
+
+Every step runs on the scripted model, with no API key. A step's stdout is
+compared with the expected-output.txt saved in its folder.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3] / "examples" / "venue-booking-agent"
+
+
+def run_step(folder: str, script: str = "agent.py", env: dict[str, str] | None = None) -> str:
+    """Run one script of a step folder and return its stdout."""
+    cwd = ROOT / folder
+    for log in ("payments.log", "cancellations.log"):
+        (cwd / log).unlink(missing_ok=True)
+    child_env = {k: v for k, v in os.environ.items() if k != "VENUE_MODEL"}
+    child_env.update(env or {})
+    done = subprocess.run(
+        [sys.executable, script],
+        cwd=cwd,
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert done.returncode == 0, f"{folder}/{script} exited {done.returncode}\n{done.stdout}\n{done.stderr[-3000:]}"
+    return done.stdout
+
+
+def normalise(text: str) -> str:
+    """Hide the parts of the output that change on every run."""
+    text = re.sub(r"exec_[0-9a-f]{32}", "exec_<id>", text)
+    text = re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<uuid>", text)
+    text = re.sub(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?", "<timestamp>", text)
+    return re.sub(r"\b\d{2}:\d{2}:\d{2}\b", "<time>", text)
+
+
+def expected(folder: str, name: str = "expected-output.txt") -> str:
+    return (ROOT / folder / name).read_text()
+
+
+def test_step01_first_agent_answers_from_the_script():
+    out = run_step("step-01-first-agent")
+    assert out.splitlines()[0] == "model: scripted (no API key)"
+    assert normalise(out) == expected("step-01-first-agent")

@@ -270,7 +270,7 @@ Want to build the official integration for *your* framework? **[Claim a slot](ht
 | [`claims-processing`](examples/claims-processing) | Insurance pipeline: 4 specialist agents + HITL + audit |
 | [`eval-harness`](examples/eval-harness) | Batch evaluation with LLM judge scoring |
 
-→ [All 33 examples](examples/)
+→ [All 34 examples](examples/)
 
 ## Engram
 
