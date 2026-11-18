@@ -3094,6 +3094,12 @@ def approve(
         help="action_digest (or calls_hash) of the pending approval you reviewed, from "
         "`jamjet approvals`. Required to approve on a runtime with auth enabled.",
     ),
+    approver: str | None = typer.Option(
+        None,
+        "--as",
+        help="Name to record as the approver. A dev-mode engine records it as given; "
+        "with an API token the engine records the token's name instead.",
+    ),
     runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
 ) -> None:
     """Approve or reject a pending HITL gate on an execution."""
@@ -3114,6 +3120,7 @@ def approve(
                     node_id=node_id,
                     comment=comment,
                     action_digest=action_digest,
+                    user_id=approver,
                 )
             except httpx.HTTPStatusError as exc:
                 try:
