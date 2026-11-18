@@ -1408,8 +1408,12 @@ jamjet dev --modules agent
 Then run the agent in a second terminal:
 
 ```bash
-python agent.py
+python -c 'import asyncio; from agent import main; asyncio.run(main())'
 ```
+
+Do not use `python agent.py` here. A tool defined in the script you run
+directly is named `__main__:add`, and the worker, which imports `agent`,
+can't find it.
 
 The engine records every step. Look at a run with its id:
 

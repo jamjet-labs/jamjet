@@ -69,6 +69,8 @@ def tool(
 
     The function must have typed parameters and a typed return value.
     If the return type is a Pydantic BaseModel, its JSON schema is used.
+    Plain functions run in a worker thread; to use the event loop, write the
+    tool as ``async def``.
 
     Usage::
 

@@ -413,9 +413,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only under the key that signed it, so keep old public keys after a rotation. See
   docs/guides/security.md, "Signing the audit log".
 
-- **`jamjet dev` checks the engine download.** When the release publishes a
-  `SHA256SUMS` file, the downloaded `jamjet-server` is checked against it before it is
-  used. `jamjet dev` also downloads the engine release that matches the installed SDK
+- **`jamjet dev` checks the engine download.** The downloaded `jamjet-server` is
+  checked against the release's `SHA256SUMS` file before it is used. A release with no
+  `SHA256SUMS` is refused. `jamjet dev` also downloads the engine release that matches the installed SDK
   version (`python-sdk-v<version>`), and `JAMJET_SERVER_PATH` names a binary to use
   instead.
 

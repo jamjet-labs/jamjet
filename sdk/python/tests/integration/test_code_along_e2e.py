@@ -75,6 +75,8 @@ def child_env(project: Path) -> dict[str, str]:
         and k != "DATABASE_URL"
     }
     env.update(HOME=str(project / "home"), PYTHONUNBUFFERED="1", NO_COLOR="1", COLUMNS="200")
+    # The CLI runs from the temp project; give it the engine's canonical path.
+    env["JAMJET_SERVER_PATH"] = os.path.realpath(os.environ["JAMJET_SERVER_PATH"])
     return env
 
 
