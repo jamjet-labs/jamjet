@@ -3146,5 +3146,61 @@ def approve(
     asyncio.run(_approve())
 
 
+# ── audit ─────────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def audit(
+    execution_id: str = typer.Argument(..., help="Execution ID (exec_...)"),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print the execution, the trail rows and the tool counts as JSON"
+    ),
+    runtime: str = typer.Option("http://localhost:7700", "--runtime", "-r"),
+) -> None:
+    """Show who proposed each tool call, who approved it, and what ran.
+
+    Built from the engine's event log and approval records for one execution.
+    """
+    from dataclasses import asdict  # noqa: PLC0415
+
+    from jamjet.cli.audit_trail import build_trail, render_trail  # noqa: PLC0415
+
+    async def _fetch() -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        async with _client(runtime) as c:
+            try:
+                execution = await c.get_execution(execution_id)
+            except httpx.HTTPStatusError as exc:
+                # 404 for an unknown id, 400 for one that is not an id at all.
+                if exc.response.status_code in (400, 404):
+                    console.print(
+                        f"No execution {_safe(execution_id)} on {_safe(runtime)}.",
+                        markup=False,
+                        highlight=False,
+                        soft_wrap=True,
+                    )
+                    raise typer.Exit(1) from exc
+                _print_error("Error:", exc)
+                raise typer.Exit(1) from exc
+            except httpx.RequestError as exc:
+                _unreachable(runtime, exc)
+            try:
+                events = (await c.get_events(execution_id)).get("events", [])
+                listing = await c.list_approvals(execution_id)
+            except httpx.HTTPStatusError as exc:
+                _print_error("Error:", exc)
+                raise typer.Exit(1) from exc
+            except httpx.RequestError as exc:
+                _unreachable(runtime, exc)
+        return execution, events, listing
+
+    execution, events, listing = asyncio.run(_fetch())
+    trail = build_trail(execution, events, listing.get("decided", []))
+    if as_json:
+        data = {"execution": execution, "rows": [asdict(r) for r in trail.rows], "tool_runs": trail.tool_runs}
+        typer.echo(json.dumps(data, indent=2))
+        return
+    typer.echo(render_trail(trail, execution))
+
+
 if __name__ == "__main__":
     app()
