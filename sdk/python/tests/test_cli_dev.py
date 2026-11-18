@@ -603,3 +603,28 @@ def test_dev_command_passes_sidecar_port_and_modules(monkeypatch):
     assert captured["modules"] == "myapp.tools"
     assert captured["enable_sidecar"] is True
     assert captured["enable_worker"] is True
+
+
+def test_dev_command_creates_the_parent_folder_of_db(monkeypatch, tmp_path):
+    import jamjet.cli.dev_stack as dev_stack
+    import jamjet.cli.main as cli
+
+    captured: dict = {}
+
+    class FakeStack:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli, "_find_server_binary", lambda: "/fake/jamjet-server")
+    monkeypatch.setattr(dev_stack, "DevStack", FakeStack)
+
+    from typer.testing import CliRunner
+
+    db = tmp_path / "missing" / "dir" / "runtime.db"
+    result = CliRunner().invoke(cli.app, ["dev", "--engine-only", "--db", str(db)])
+    assert result.exit_code == 0, result.output
+    assert db.parent.is_dir()
+    assert captured["db_url"] == f"sqlite://{db}"
