@@ -65,6 +65,25 @@ Row 25 is the run stopping at the gate. Row 26 is your approval. The
 engine was killed and restarted somewhere between the two. The log
 does not mark the restart.
 
+To see only the payment step, pass its node, the one on the
+`tool_approval_required` row:
+
+    jamjet events exec_... --node __tools_2__
+
+                   Events: exec_f349e0d53fe446ffa5d0002b7b1ac824
+    ┏━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+    ┃ Seq ┃ Type                   ┃ Node        ┃ Created at                  ┃
+    ┡━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+    │ 24  │ node_scheduled         │ __tools_2__ │ 2026-11-18T16:01:49.958883Z │
+    │ 25  │ tool_approval_required │ __tools_2__ │ 2026-11-18T16:01:50.479979Z │
+    │ 26  │ approval_received      │ __tools_2__ │ 2026-11-18T16:01:52.443873Z │
+    │ 27  │ node_scheduled         │ __tools_2__ │ 2026-11-18T16:01:52.473839Z │
+    │ 28  │ node_completed         │ __tools_2__ │ 2026-11-18T16:01:52.488477Z │
+    └─────┴────────────────────────┴─────────────┴─────────────────────────────┘
+
+The node number depends on the tools the model called first. A real
+model that skips `check_dates` gets `__tools_1__`.
+
 ## Why it paid once
 
 After the restart the engine picked the run up from the state it keeps
