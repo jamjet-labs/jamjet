@@ -121,3 +121,32 @@ def test_step05_in_process_refuses():
     assert normalise(last) == expected("step-05-ask-first", "expected-in-process.txt").strip()
     assert "ApprovalNotEnforceableError" in last
     assert not (ROOT / "step-05-ask-first" / "payments.log").exists()
+
+
+def long_lines(paths: list[Path], limit: int = 72) -> list[str]:
+    """Name every line over the limit, as file:line."""
+    found = []
+    for path in paths:
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            if len(line) > limit:
+                found.append(f"{path.name}:{n}")
+    return found
+
+
+def test_long_line_check_catches_a_long_line(tmp_path):
+    sample = tmp_path / "sample.py"
+    sample.write_text("short\n" + "x" * 73 + "\n")
+    assert long_lines([sample]) == ["sample.py:2"]
+
+
+def test_example_code_stays_within_72_columns():
+    paths = sorted(ROOT.glob("*/*.py")) + sorted(ROOT.glob("*/script.yaml"))
+    assert paths
+    assert long_lines(paths) == []
+
+
+def test_steps_07_to_09_share_the_step_05_code():
+    for step in ("step-07-engine-crash", "step-08-what-it-remembers", "step-09-audit"):
+        for name in ("agent.py", "venue_tools.py", "script.yaml"):
+            same = (ROOT / step / name).read_bytes() == (ROOT / "step-05-ask-first" / name).read_bytes()
+            assert same, (step, name)

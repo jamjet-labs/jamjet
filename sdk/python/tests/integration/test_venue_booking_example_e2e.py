@@ -287,9 +287,3 @@ def test_step09_audit_says_who_approved(crashed: dict[str, str], stack07: DevSta
     saved = [ln for ln in expected(STEP09).splitlines() if ln.strip()][-1]
     assert normalise(last) == normalise(saved)
     assert {"execution", "rows", "tool_runs"} <= set(json.loads(as_json))
-
-
-def test_steps_07_to_09_share_the_step_05_code() -> None:
-    for step in (STEP07, STEP08, STEP09):
-        for name in ("agent.py", "venue_tools.py", "script.yaml"):
-            assert (ROOT / step / name).read_bytes() == (ROOT / STEP / name).read_bytes(), (step, name)

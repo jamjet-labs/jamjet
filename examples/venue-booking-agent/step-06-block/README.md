@@ -27,7 +27,8 @@ prompt you pass, so the argument only matters with a real model.
 
 ## Run it
 
-Open two terminals, both in this step folder.
+Open two terminals, both in this step folder. If step 05's `jamjet dev`
+is still running, stop it first (Ctrl-C).
 
 Terminal 1, the engine:
 
@@ -70,8 +71,7 @@ You see:
 
 ## Notes
 
-- `agent.py` finds the engine at `http://127.0.0.1:7700`. To use another
-  address, set `JAMJET_RUNTIME_URL`.
 - With a real model, pass your own prompt: `python agent.py "your request"`.
 - With a real model, set the provider key in terminal 1 as well. The
   engine's worker makes the model call, not `agent.py`.
+- A connection error means terminal 1 is not running `jamjet dev`.

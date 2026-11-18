@@ -7,7 +7,6 @@ you can count how often the money moved.
 """
 
 import json
-import os
 from pathlib import Path
 
 from jamjet import tool
@@ -45,8 +44,5 @@ def check_dates(venue: str) -> str:
 def pay_deposit(venue: str, amount: float) -> str:
     """Pay a venue deposit. In production this moves real money."""
     with PAYMENTS.open("a") as f:
-        pid = os.getpid()
-        f.write(f"paid {amount} for {venue} (pid {pid})\n")
-        f.flush()
-        os.fsync(f.fileno())  # on disk even if killed next
+        f.write(f"paid {amount} for {venue}\n")
     return f"Deposit of {amount} paid for {venue}."

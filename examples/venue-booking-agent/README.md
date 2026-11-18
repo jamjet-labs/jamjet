@@ -8,6 +8,8 @@ Nothing is really booked or paid. The "payments" are lines in a log file.
 
 ## Install
 
+Python 3.11 or newer (checked on 3.12).
+
     pip install "jamjet[sidecar]==0.13.0"
 
 ## Before you start

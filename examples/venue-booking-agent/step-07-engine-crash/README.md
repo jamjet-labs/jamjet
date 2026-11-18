@@ -10,9 +10,10 @@ does not reach the others.
 
 ## What changed
 
-Nothing in the code. `agent.py`, `venue_tools.py` and `script.yaml` are
-the same as step 05. This step is about what happens to a run that is
-waiting for approval when the engine dies.
+The code goes back to step 05. Copy `agent.py`, `venue_tools.py` and
+`script.yaml` from `step-05-ask-first` into this folder. Stop step 06's
+`jamjet dev` first (Ctrl-C). This step is about what happens to a run
+that is waiting for approval when the engine dies.
 
 ## Run it
 
@@ -25,6 +26,9 @@ Terminal 1, the engine:
 Terminal 2, the agent. It prints the model line, then waits:
 
     python agent.py
+
+`agent.py` waits up to 5 minutes (the default `timeout_seconds=300`).
+If it gives up, run it again, or approve faster.
 
 Terminal 3, check that the run is waiting at the gate:
 
@@ -52,7 +56,8 @@ fail and it does not pay:
 
     jamjet: lost the engine at http://127.0.0.1:7700; waiting for it to come back (execution exec_...)
 
-Start the engine again, in terminal 1, in the same folder:
+Start the engine again, in terminal 1. Use the same folder, because
+`.jamjet/` holds the run:
 
     jamjet dev --modules venue_tools
 
@@ -85,7 +90,6 @@ the run. Step 08 shows why.
 
 ## Notes
 
-- `agent.py` finds the engine at `http://127.0.0.1:7700`. To use another
-  address, set `JAMJET_RUNTIME_URL`.
 - With a real model, set the provider key in terminal 1 as well. The
   engine's worker makes the model call, not `agent.py`.
+- A connection error means terminal 1 is not running `jamjet dev`.

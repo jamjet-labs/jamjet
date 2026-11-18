@@ -4,6 +4,8 @@
 
     pip install "jamjet[sidecar]==0.13.0"
 
+Set the signing key from the series README, under "Before you start".
+
 ## Run
 
     python agent.py

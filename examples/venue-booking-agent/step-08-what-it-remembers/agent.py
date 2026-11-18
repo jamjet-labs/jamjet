@@ -14,6 +14,7 @@ from venue_tools import (
 HERE = Path(__file__).parent
 SCRIPT = HERE / "script.yaml"
 MODEL = os.environ.get("VENUE_MODEL") or f"scripted/{SCRIPT}"
+# tests point this at their own engine
 RUNTIME = os.environ.get("JAMJET_RUNTIME_URL", "http://127.0.0.1:7700")
 
 mode = "scripted (no API key)"

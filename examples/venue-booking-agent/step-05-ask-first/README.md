@@ -9,9 +9,11 @@ Set it in every terminal you open below, and in the one where you run
 `python try_in_process.py`. An `export` in one terminal does not reach
 the others.
 
+This step starts from the step 03 agent. Step 04's budget is left out.
+
 ## The mistake
 
-The policy `require_approval_for=["pay_deposit"]` says a person must
+The policy `policy={"require_approval_for": ["pay_deposit"]}` says a person must
 approve that tool. Run it in process and see:
 
     python try_in_process.py
@@ -35,6 +37,9 @@ Terminal 2, the agent. It prints the model line, then waits:
 
     python agent.py
 
+`agent.py` waits up to 5 minutes (the default `timeout_seconds=300`).
+If it gives up, run it again, or approve faster.
+
 Terminal 3, the approval:
 
     jamjet approvals
@@ -42,7 +47,7 @@ Terminal 3, the approval:
 It lists the waiting run and prints a ready `jamjet approve` command.
 Paste it and add `--as` with your name:
 
-    jamjet approve exec_... --decision approved --node-id=... --action-digest=... --as sunil
+    jamjet approve exec_... --decision approved --node-id=... --action-digest=... --as alex
 
 ## Expected output
 
@@ -57,7 +62,6 @@ One payment, and only after you said yes.
 
 ## Notes
 
-- `agent.py` finds the engine at `http://127.0.0.1:7700`. To use another
-  address, set `JAMJET_RUNTIME_URL`.
 - With a real model, set the provider key in terminal 1 as well. The
   engine's worker makes the model call, not `agent.py`.
+- A connection error means terminal 1 is not running `jamjet dev`.

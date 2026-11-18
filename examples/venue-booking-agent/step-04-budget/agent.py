@@ -27,7 +27,6 @@ agent = Agent(
     tools=[search_venues, check_dates, pay_deposit],
     strategy="react",
     instructions="You book event venues for a product launch team.",
-    max_iterations=50,
     budget={"tokens": 2000},
 )
 question = "Keep checking dates until you find something."

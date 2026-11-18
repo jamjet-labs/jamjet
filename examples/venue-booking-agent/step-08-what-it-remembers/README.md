@@ -37,7 +37,7 @@ Use the id from the list:
 
     jamjet events exec_...
 
-The engine writes every step of a run to a log before it acts on it.
+The engine writes every step of a run to a log as it goes.
 Here is the part that matters, with the dull rows cut:
 
                      Events: exec_a66351f02255436598ab4986fb4db6d6
@@ -77,14 +77,15 @@ Once you approved, `pay_deposit` ran once (rows 27 and 28), and
 
 Kill it at a different moment. Run step 07 again, but run `kill -9`
 about a second and a half after you start `python agent.py`, while the
-first tool is still running. When I ran this, the agent printed the
-same two lines, the engine came back, `search_venues` ran once, and the
-run reached the approval gate and waited, as before. Approve it and
+run is still in its first steps. When I ran this, the engine came back,
+the audit showed `search_venues` ran once, after the restart, and the
+run reached the approval gate. Approve it and
 check `payments.log` for one line.
 
 Try other moments too. Before you rerun, stop `jamjet dev` and
-delete the `.jamjet/` folder if you want a clean list. If you leave it,
-`jamjet approvals` also lists the old run from step 07.
+delete the `.jamjet/` folder if you want a clean list. `jamjet
+executions` lists old runs. `jamjet approvals` lists any earlier run
+that is still waiting.
 
 ## The limit
 
