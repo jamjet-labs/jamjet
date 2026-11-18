@@ -23,7 +23,7 @@ import inspect
 from collections.abc import Callable
 from typing import Any, TypeVar, get_type_hints
 
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -90,21 +90,17 @@ def tool(
 
         # Build input schema from function signature
         sig = inspect.signature(fn)
-        input_props: dict[str, Any] = {}
-        required: list[str] = []
-        for param_name, param in sig.parameters.items():
-            if param_name in ("self", "cls"):
-                continue
-            hint = hints.get(param_name, Any)
-            input_props[param_name] = {"type": _type_to_schema(hint)}
-            if param.default is inspect.Parameter.empty:
-                required.append(param_name)
-
-        input_schema = {
+        params = [(n, p) for n, p in sig.parameters.items() if n not in ("self", "cls")]
+        schemas, definitions = _parameter_schemas([hints.get(n, Any) for n, _ in params])
+        input_schema: dict[str, Any] = {
             "type": "object",
-            "properties": input_props,
-            "required": required,
+            "properties": {n: schema for (n, _), schema in zip(params, schemas)},
+            "required": [n for n, p in params if p.default is inspect.Parameter.empty],
         }
+        if definitions:
+            # Model parameters refer to "#/$defs/<name>", which resolves from
+            # the root of the schema the model is shown.
+            input_schema["$defs"] = definitions
 
         # Build output schema
         if return_type is not None and isinstance(return_type, type) and issubclass(return_type, BaseModel):
@@ -170,8 +166,42 @@ def list_tools() -> list[ToolDefinition]:
     return list(_TOOL_REGISTRY.values())
 
 
+def _parameter_schemas(hints: list[Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """JSON Schemas for a tool's parameter types, in order, and the definitions they refer to.
+
+    All the types go through one Pydantic schema generation, as one tuple. A
+    model used by two parameters then gets one entry in the definitions, and
+    two models with the same class name get different entries.
+    """
+    if not hints:
+        return [], {}
+    described = [hint if _has_json_schema(hint) else Any for hint in hints]
+    whole = TypeAdapter(tuple[tuple(described)]).json_schema()
+    schemas: list[dict[str, Any]] = []
+    for hint, shown, schema in zip(hints, described, whole["prefixItems"]):
+        if shown is not hint:
+            # Pydantic has no schema for this type. Keep what @tool has always
+            # said about it.
+            schemas.append({"type": "object"})
+        elif schema == {"additionalProperties": True, "type": "object"}:
+            # A plain `dict`. `additionalProperties: true` is the default, so
+            # this is the same schema @tool emitted before.
+            schemas.append({"type": "object"})
+        else:
+            schemas.append(schema)
+    return schemas, whole.get("$defs", {})
+
+
+def _has_json_schema(hint: Any) -> bool:
+    try:
+        TypeAdapter(hint).json_schema()
+    except Exception:  # noqa: BLE001 - @tool has never rejected an annotation
+        return False
+    return True
+
+
 def _type_to_schema(t: Any) -> Any:
-    """Very basic type → JSON schema mapping."""
+    """Very basic type → JSON schema mapping, used for return types."""
     if t is str or t is type(None):
         return "string"
     if t is int:
