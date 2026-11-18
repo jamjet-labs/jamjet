@@ -16,7 +16,10 @@ agent = Agent(
     "venue-booker",
     model=MODEL,
     tools=[],
-    instructions="You book event venues for a product launch team.",
+    instructions=(
+        "You book event venues for a product launch team. "
+        "Reply in plain text, in 40 words or fewer."
+    ),
 )
 question = "We need a venue in Lisbon for 40 people in December."
 result = agent.run_sync(question + " What should I ask you?")

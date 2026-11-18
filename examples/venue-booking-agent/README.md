@@ -30,9 +30,14 @@ provider key:
 
     pip install "jamjet[sidecar,model]==0.13.0"
     export ANTHROPIC_API_KEY=...
-    VENUE_MODEL=anthropic/claude-sonnet-4-6 python agent.py
+    VENUE_MODEL=anthropic/claude-sonnet-5-5 python agent.py
 
 The first line the agent prints says which model it is using.
+
+Every step was checked on `anthropic/claude-sonnet-5-5`. A real model
+words its answers its own way and can call the tools in a different
+order, so its output will not match the expected output in each README.
+What runs, what waits for approval and what is blocked stay the same.
 
 ## Steps
 
