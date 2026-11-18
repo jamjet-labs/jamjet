@@ -1383,24 +1383,39 @@ Runs the agent via `LocalRuntime` -- no server needed.
 
 ## Run with the durable engine
 
-Start the local stack:
+`python agent.py` runs in this process. To run on the engine, call
+`run_durable` instead of `run`. Add this to `agent.py`:
 
-```bash
-jamjet dev
+```python
+result = await agent.run_durable("What is 7 plus 35?")
+print(result.output, result.execution_id)
 ```
 
-Then in a second terminal:
+Start the local stack in a first terminal, from this folder:
+
+```bash
+jamjet dev --modules agent
+```
+
+`--modules agent` lets the worker import the `add` tool from `agent.py`.
+Then run the agent in a second terminal:
 
 ```bash
 python agent.py
 ```
 
-The durable engine records every turn to SQLite so you can inspect, replay, and fork runs.
+The engine records every step. Look at a run with its id:
 
 ```bash
+jamjet executions
 jamjet inspect <execution-id>
 jamjet events  <execution-id>
+jamjet audit   <execution-id>
 ```
+
+If the engine stops while `run_durable` is waiting, the call keeps waiting and
+carries on when the engine is back. The run's record is kept in
+`.jamjet/runtime.db`.
 """,
     },
 }

@@ -54,10 +54,12 @@ The rest of this README is the **Python authoring guide** — workflows, durabil
 
 ## Quick Start
 
-**Requirements:** Python 3.11+ (the `memory` extra, which adds Engram, needs 3.12+)
+**Requirements:** Python 3.11 or newer (the `memory` extra, which adds Engram, needs 3.12+)
 
 ```bash
-# Install the CLI, with the model client and the model sidecar
+# Install the CLI and the scripted model (no API key needed)
+pip install jamjet
+# For real providers, add the model client and the model sidecar
 pip install 'jamjet[model,sidecar]'
 
 # Option A: scaffold a new project
@@ -86,6 +88,124 @@ In another terminal, from the project directory:
 jamjet validate workflow.yaml
 jamjet run workflow.yaml --input '{"query": "What is JamJet?"}'
 ```
+
+### Run an agent with no API key
+
+Set `model="scripted/<path to a YAML file>"` and each model call is answered from
+the file. Only the model is scripted. Policy, approval, budget and durability are
+the real ones.
+
+```yaml
+# scripts/book.yaml: turn N answers the agent's Nth model call
+turns:
+  - tool_calls:
+      - name: search_venues
+        arguments: {city: Lisbon, date: "2026-12-11"}
+  - tool_calls:
+      - name: check_dates
+        arguments: {venue: Casa do Rio}
+  - tool_calls:
+      - name: pay_deposit
+        arguments: {venue: Casa do Rio, amount: 500}
+  - content: "Booked Casa do Rio in Lisbon for 11 December. The 500 deposit is paid."
+```
+
+```python
+# venue_tools.py: plain `def` functions work with @tool
+import json
+from jamjet import tool
+
+@tool
+def search_venues(city: str, date: str) -> str:
+    """Find event venues in a city that are free on a date (YYYY-MM-DD)."""
+    return json.dumps([{"venue": "Casa do Rio", "capacity": 120}])
+
+@tool
+def check_dates(venue: str) -> str:
+    """List the free dates for one venue."""
+    return json.dumps(["2026-12-04", "2026-12-11"])
+
+@tool
+def pay_deposit(venue: str, amount: float) -> str:
+    """Pay a booking deposit for a venue."""
+    return f"Deposit of {amount} paid for {venue}."
+```
+
+```python
+# book.py
+import asyncio
+from jamjet import Agent
+from venue_tools import search_venues, check_dates, pay_deposit
+
+agent = Agent(
+    "venue-booker",
+    model="scripted/scripts/book.yaml",
+    tools=[search_venues, check_dates, pay_deposit],
+    instructions="You book event venues. Use the tools.",
+    strategy="react",
+    policy={"require_approval_for": ["pay_deposit"], "blocked_tools": ["cancel_*"]},
+)
+
+result = asyncio.run(agent.run_durable("Book a venue in Lisbon for 2026-12-11."))
+print(result.output, result.execution_id)
+```
+
+A relative script path is resolved from the working directory of the process that
+reads it. In a durable run that is the engine's sidecar, which `jamjet dev` starts
+from the folder you run it in. Run `jamjet dev` from your project folder, or give
+an absolute path.
+
+Start the stack in one terminal, run `python book.py` in another. The run stops at
+`pay_deposit` and waits. From a third terminal:
+
+```bash
+jamjet dev --modules venue_tools     # first terminal, from the project folder
+jamjet executions                    # every run
+jamjet approvals                     # every run waiting for approval
+jamjet approve <id> -d approved --as <name>
+jamjet audit <id>
+```
+
+`jamjet approvals` prints a command you can paste. This is what it printed
+on a real run:
+
+```
+exec_f89599febf784b7e908a8b596f608b88  __tools_2__
+  covers step 0; calls: pay_deposit -> venue_tools:pay_deposit({"amount": 500, "venue": "Casa do Rio"})
+  jamjet approve exec_f89599febf784b7e908a8b596f608b88 --decision approved --node-id=__tools_2__ --action-digest=d636deba2b4b63cf81995a39cbe5bc010a9bca9b7ab8a16425dcf007475c31a6
+```
+
+Add `--as <name>` to record who approved. Then:
+
+```
+approved  node=__tools_2__  execution=exec_f89599febf784b7e908a8b596f608b88
+```
+
+```
+$ jamjet audit exec_f89599febf784b7e908a8b596f608b88
+Audit trail for exec_f89599febf784b7e908a8b596f608b88
+Agent: venue-booker   Status: completed   Started: 2026-11-18 03:09:17
+Source: the engine's event log and approval records. Times are UTC.
+
+03:09:17  model asked for search_venues  call_0_0 {"city":"Lisbon","date":"2026-12-11"}
+03:09:19  ran search_venues              call_0_0 -> [{"venue": "Casa do Rio", "capacity": 120, "price_per_day": ...
+03:09:19  model asked for check_dates    call_1_0 {"venue":"Casa do Rio"}
+03:09:21  ran check_dates                call_1_0 -> ["2026-12-04", "2026-12-11"]
+03:09:21  model asked for pay_deposit    call_2_0 {"amount":500,"venue":"Casa do Rio"}
+03:09:23  pay_deposit needs approval     approver: human
+03:09:24  approved by tester             dev mode, name not verified
+03:09:25  ran pay_deposit                call_2_0 -> Deposit of 500 paid for Casa do Rio.
+03:09:27  final answer                   Booked Casa do Rio in Lisbon for 11 December. The 500 deposit is paid.
+
+search_venues ran 1 time
+check_dates ran 1 time
+pay_deposit ran 1 time, approved by tester at 03:09:24
+```
+
+In dev mode the engine records the name you pass. With an API token it records
+the token's name. If the engine stops while `run_durable` waits, the call keeps
+waiting and resumes when the engine is back. `kill -9` on the worker mid-tool
+is not handled: the run fails.
 
 ### Hello World — Python
 
