@@ -148,38 +148,17 @@ impl AuditBackend for SqliteAuditBackend {
     }
 
     async fn query(&self, q: &AuditQuery) -> Result<Vec<AuditLogEntry>, AuditError> {
-        let from_str;
-        let to_str;
-
-        let mut wheres = vec!["1=1".to_string()];
-        if let Some(from) = &q.from {
-            from_str = from.to_rfc3339();
-            wheres.push(format!("created_at >= '{from_str}'"));
-        }
-        if let Some(to) = &q.to {
-            to_str = to.to_rfc3339();
-            wheres.push(format!("created_at <= '{to_str}'"));
-        }
-        if let Some(actor) = &q.actor_id {
-            wheres.push(format!("actor_id = '{actor}'"));
-        }
-        if let Some(event_type) = &q.event_type {
-            wheres.push(format!("event_type = '{event_type}'"));
-        }
-        if let Some(exec_id) = &q.execution_id {
-            wheres.push(format!("execution_id = '{exec_id}'"));
-        }
-        if let Some(tid) = &q.tenant_id {
-            wheres.push(format!("tenant_id = '{tid}'"));
-        }
-
-        let where_clause = wheres.join(" AND ");
+        let (where_clause, values) = where_clause(q);
         let sql = format!(
             "SELECT * FROM audit_log WHERE {where_clause} ORDER BY created_at DESC LIMIT {} OFFSET {}",
             q.limit, q.offset
         );
 
-        let rows = sqlx::query_as::<_, AuditRow>(&sql)
+        let mut query = sqlx::query_as::<_, AuditRow>(&sql);
+        for value in &values {
+            query = query.bind(value.as_str());
+        }
+        let rows = query
             .fetch_all(&self.pool)
             .await
             .map_err(|e| AuditError::Database(e.to_string()))?;
@@ -188,36 +167,57 @@ impl AuditBackend for SqliteAuditBackend {
     }
 
     async fn count(&self, q: &AuditQuery) -> Result<u64, AuditError> {
-        let mut wheres = vec!["1=1".to_string()];
-        if let Some(from) = &q.from {
-            wheres.push(format!("created_at >= '{}'", from.to_rfc3339()));
-        }
-        if let Some(to) = &q.to {
-            wheres.push(format!("created_at <= '{}'", to.to_rfc3339()));
-        }
-        if let Some(actor) = &q.actor_id {
-            wheres.push(format!("actor_id = '{actor}'"));
-        }
-        if let Some(event_type) = &q.event_type {
-            wheres.push(format!("event_type = '{event_type}'"));
-        }
-        if let Some(exec_id) = &q.execution_id {
-            wheres.push(format!("execution_id = '{exec_id}'"));
-        }
-        if let Some(tid) = &q.tenant_id {
-            wheres.push(format!("tenant_id = '{tid}'"));
-        }
-
-        let where_clause = wheres.join(" AND ");
+        let (where_clause, values) = where_clause(q);
         let sql = format!("SELECT COUNT(*) FROM audit_log WHERE {where_clause}");
 
-        let count: (i64,) = sqlx::query_as(&sql)
+        let mut query = sqlx::query_as::<_, (i64,)>(&sql);
+        for value in &values {
+            query = query.bind(value.as_str());
+        }
+        let count = query
             .fetch_one(&self.pool)
             .await
             .map_err(|e| AuditError::Database(e.to_string()))?;
 
         Ok(count.0 as u64)
     }
+}
+
+/// The WHERE clause for `q`, with a `?` for each filter value, and the values
+/// to bind in placeholder order.
+///
+/// The values are bound, never written into the SQL text: `GET /audit` fills
+/// `q` from request query parameters, and a spliced value with a quote in it
+/// could end the string literal and rewrite the query. `limit` and `offset`
+/// are `u32`, so they stay in the statement text.
+fn where_clause(q: &AuditQuery) -> (String, Vec<String>) {
+    let mut wheres = vec!["1=1"];
+    let mut values = Vec::new();
+    if let Some(from) = &q.from {
+        wheres.push("created_at >= ?");
+        values.push(from.to_rfc3339());
+    }
+    if let Some(to) = &q.to {
+        wheres.push("created_at <= ?");
+        values.push(to.to_rfc3339());
+    }
+    if let Some(actor) = &q.actor_id {
+        wheres.push("actor_id = ?");
+        values.push(actor.clone());
+    }
+    if let Some(event_type) = &q.event_type {
+        wheres.push("event_type = ?");
+        values.push(event_type.clone());
+    }
+    if let Some(exec_id) = &q.execution_id {
+        wheres.push("execution_id = ?");
+        values.push(exec_id.clone());
+    }
+    if let Some(tid) = &q.tenant_id {
+        wheres.push("tenant_id = ?");
+        values.push(tid.clone());
+    }
+    (wheres.join(" AND "), values)
 }
 
 // ── Internal row type ─────────────────────────────────────────────────────
