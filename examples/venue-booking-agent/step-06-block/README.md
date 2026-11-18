@@ -22,7 +22,8 @@ The policy gains a second rule, and the agent gets a new tool:
 blocks every tool whose name starts with `cancel_`.
 
 `agent.py` takes an optional prompt. With none, it asks to cancel
-the booking at Casa do Rio.
+the booking at Casa do Rio. The scripted model asks to cancel whatever
+prompt you pass, so the argument only matters with a real model.
 
 ## Run it
 
@@ -51,7 +52,9 @@ The engine stopped the action, not the model. The model asked to
 cancel, and the engine refused before the tool ran. The model gets no
 turn to explain, so the run just ends as failed.
 
-Ask the engine why. Use the id the agent printed:
+The `run failed: ...` line from `run_durable` gives no reason. The
+reason, `matches blocked pattern 'cancel_*'`, appears only in
+`jamjet audit`, so ask the engine why. Use the id the agent printed:
 
     jamjet audit exec_...
 
@@ -69,7 +72,6 @@ You see:
 
 - `agent.py` finds the engine at `http://127.0.0.1:7700`. To use another
   address, set `JAMJET_RUNTIME_URL`.
-- The scripted model always asks to cancel. With a real model, you can
-  pass your own prompt: `python agent.py "your request"`.
+- With a real model, pass your own prompt: `python agent.py "your request"`.
 - With a real model, set the provider key in terminal 1 as well. The
   engine's worker makes the model call, not `agent.py`.
