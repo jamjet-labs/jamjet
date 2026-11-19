@@ -42,25 +42,44 @@ pub enum ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Tool calls the assistant made in this message (assistant role only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// The call a tool message answers (tool role only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
-    pub fn system(content: impl Into<String>) -> Self {
+    fn plain(role: ChatRole, content: impl Into<String>) -> Self {
         Self {
-            role: ChatRole::System,
+            role,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
+    }
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::plain(ChatRole::System, content)
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: ChatRole::User,
-            content: content.into(),
-        }
+        Self::plain(ChatRole::User, content)
     }
     pub fn assistant(content: impl Into<String>) -> Self {
+        Self::plain(ChatRole::Assistant, content)
+    }
+    /// An assistant message that requested tool calls.
+    pub fn assistant_with_tool_calls(content: impl Into<String>, calls: Vec<ToolCall>) -> Self {
         Self {
-            role: ChatRole::Assistant,
-            content: content.into(),
+            tool_calls: calls,
+            ..Self::plain(ChatRole::Assistant, content)
+        }
+    }
+    /// A tool result answering the call with id `call_id`.
+    pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: Some(call_id.into()),
+            ..Self::plain(ChatRole::Tool, content)
         }
     }
 }

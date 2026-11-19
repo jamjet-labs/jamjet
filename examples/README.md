@@ -6,6 +6,9 @@ before it runs and mints a verifiable AgentBoundary receipt. Deterministic by
 default (no API key), `--live` runs a real model. Source for the demo video; see
 its [`VIDEO-SCRIPT.md`](./database-guard/VIDEO-SCRIPT.md).
 
+**Also featured:** [`venue-booking-agent/`](./venue-booking-agent/) - the code-along
+series. Nine steps build one venue-booking agent with the JamJet SDK. No API key needed.
+
 Numbered examples in this directory:
 
 - `01-block-unsafe-tool/` - JamJet blocks a destructive tool call before execution.

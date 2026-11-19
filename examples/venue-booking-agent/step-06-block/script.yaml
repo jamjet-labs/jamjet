@@ -1,0 +1,11 @@
+# A scripted model: look up the booking, then ask to cancel it. The
+# engine blocks the cancel, so the last turn is never reached.
+turns:
+  - tool_calls:
+      - name: check_dates
+        arguments: {venue: Casa do Rio}
+  - tool_calls:
+      - name: cancel_booking
+        arguments: {venue: Casa do Rio}
+  - content: >-
+      Cancelled the booking at Casa do Rio.

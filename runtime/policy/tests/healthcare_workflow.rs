@@ -92,7 +92,7 @@ fn agent_cannot_delete_patient_records() {
         model_ref: None,
     };
 
-    let decision = evaluator.evaluate(&ctx, &[&global]);
+    let decision = evaluator.evaluate_ir(&ctx, &[&global]);
 
     match &decision {
         PolicyDecision::Block { reason } => {
@@ -129,7 +129,7 @@ fn wildcard_blocks_catch_novel_deletion_tools() {
             model_ref: None,
         };
 
-        let decision = evaluator.evaluate(&ctx, &[&global]);
+        let decision = evaluator.evaluate_ir(&ctx, &[&global]);
         assert!(
             matches!(decision, PolicyDecision::Block { .. }),
             "Tool '{tool}' should be blocked by wildcard 'delete_*'"
@@ -156,7 +156,7 @@ fn prescription_requires_pharmacist_approval() {
         model_ref: None,
     };
 
-    let decision = evaluator.evaluate(&ctx, &[&global]);
+    let decision = evaluator.evaluate_ir(&ctx, &[&global]);
 
     match &decision {
         PolicyDecision::RequireApproval { approver } => {
@@ -190,7 +190,7 @@ fn lab_orders_all_require_approval() {
             model_ref: None,
         };
 
-        let decision = evaluator.evaluate(&ctx, &[&global]);
+        let decision = evaluator.evaluate_ir(&ctx, &[&global]);
         assert!(
             matches!(decision, PolicyDecision::RequireApproval { .. }),
             "Tool '{tool}' should require approval"
@@ -218,7 +218,7 @@ fn unapproved_model_blocked_at_runtime() {
         model_ref: Some("gpt-4o".to_string()),
     };
 
-    let decision = evaluator.evaluate(&ctx, &[&global]);
+    let decision = evaluator.evaluate_ir(&ctx, &[&global]);
 
     match &decision {
         PolicyDecision::Block { reason } => {
@@ -244,7 +244,7 @@ fn approved_model_proceeds_normally() {
         model_ref: Some("claude-sonnet-4-6".to_string()),
     };
 
-    let decision = evaluator.evaluate(&ctx, &[&global]);
+    let decision = evaluator.evaluate_ir(&ctx, &[&global]);
     assert!(
         matches!(decision, PolicyDecision::Allow),
         "Approved model should be allowed"
@@ -273,7 +273,7 @@ fn triage_node_allows_finetuned_model() {
     };
 
     // Node-level policy is last (most specific) → checked first in reverse.
-    let decision = evaluator.evaluate(&ctx, &[&global, &triage]);
+    let decision = evaluator.evaluate_ir(&ctx, &[&global, &triage]);
     assert!(
         matches!(decision, PolicyDecision::Allow),
         "ft-triage-v3 should be allowed at the triage node"
@@ -289,7 +289,7 @@ fn triage_node_allows_finetuned_model() {
     };
 
     // Only global policy applies — no node-level override.
-    let decision2 = evaluator.evaluate(&ctx2, &[&global]);
+    let decision2 = evaluator.evaluate_ir(&ctx2, &[&global]);
     assert!(
         matches!(decision2, PolicyDecision::Block { .. }),
         "ft-triage-v3 should be BLOCKED outside the triage node"
@@ -317,7 +317,7 @@ fn workflow_policy_adds_restrictions() {
     };
 
     // Global allows it, but workflow blocks it.
-    let decision = evaluator.evaluate(&ctx, &[&global, &workflow]);
+    let decision = evaluator.evaluate_ir(&ctx, &[&global, &workflow]);
     assert!(
         matches!(decision, PolicyDecision::Block { .. }),
         "modify_insurance_claim should be blocked by intake workflow policy"
@@ -348,7 +348,7 @@ fn safe_tools_pass_through_all_policy_layers() {
             model_ref: None,
         };
 
-        let decision = evaluator.evaluate(&ctx, &[&global, &workflow]);
+        let decision = evaluator.evaluate_ir(&ctx, &[&global, &workflow]);
         assert!(
             matches!(decision, PolicyDecision::Allow),
             "Tool '{tool}' should be allowed — it's not blocked or gated"

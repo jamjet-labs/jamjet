@@ -150,17 +150,77 @@ pub async fn handle_context(memory: Arc<Memory>, args: Value) -> Result<String, 
     serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
 }
 
-/// memory_forget — soft-delete a fact by ID.
+/// Forget `fact_id` only if the fact lies within `scope`. A fact outside it
+/// reads as not found, so an id from another org (or user, when the scope
+/// names one) can neither be deleted nor confirmed to exist. `forget` used to
+/// take a bare id, so any caller could delete any fact.
+pub async fn forget_in_scope(
+    memory: &Memory,
+    fact_id: uuid::Uuid,
+    scope: &Scope,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let not_found = || format!("fact {fact_id} not found");
+    let fact = memory
+        .fact_store()
+        .get_fact(fact_id)
+        .await
+        .map_err(|_| not_found())?;
+    if !scope.contains(&fact.scope) {
+        return Err(not_found());
+    }
+    memory
+        .forget(fact_id, reason)
+        .await
+        .map_err(|e| format!("forget failed: {e}"))
+}
+
+/// Fact counts within `scope`. Entity and relationship totals are not kept
+/// per scope, so they are not reported: the store-wide numbers counted every
+/// org's data.
+pub async fn stats_in_scope(memory: &Memory, scope: &Scope) -> Result<Value, String> {
+    const PAGE: u32 = 1000;
+    let mut filter = engram::fact::FactFilter::new().with_scope(scope.clone());
+    filter.valid_only = false;
+    filter.limit = PAGE;
+    let now = chrono::Utc::now();
+    let (mut total, mut valid) = (0u64, 0u64);
+    loop {
+        let page = memory
+            .fact_store()
+            .list_facts(&filter)
+            .await
+            .map_err(|e| format!("stats failed: {e}"))?;
+        total += page.len() as u64;
+        valid += page
+            .iter()
+            .filter(|f| f.invalid_at.is_none_or(|t| t > now))
+            .count() as u64;
+        if (page.len() as u32) < PAGE {
+            break;
+        }
+        filter.offset += PAGE;
+    }
+    Ok(serde_json::json!({
+        "org_id": scope.org_id,
+        "user_id": scope.user_id,
+        "total_facts": total,
+        "valid_facts": valid,
+        "invalidated_facts": total - valid,
+        "total_entities": null,
+        "total_relationships": null,
+    }))
+}
+
+/// memory_forget — soft-delete a fact by ID, within the caller's scope
+/// (`org_id`, default `default`, and `user_id` when given).
 pub async fn handle_forget(memory: Arc<Memory>, args: Value) -> Result<String, String> {
     let fact_id_str = args["fact_id"].as_str().ok_or("fact_id is required")?;
     let fact_id =
         uuid::Uuid::parse_str(fact_id_str).map_err(|e| format!("invalid fact_id: {e}"))?;
     let reason = args["reason"].as_str().map(String::from);
 
-    memory
-        .forget(fact_id, reason.as_deref())
-        .await
-        .map_err(|e| format!("forget failed: {e}"))?;
+    forget_in_scope(&memory, fact_id, &parse_scope(&args), reason.as_deref()).await?;
 
     let result = serde_json::json!({
         "success": true,
@@ -200,20 +260,10 @@ pub async fn handle_search(memory: Arc<Memory>, args: Value) -> Result<String, S
     serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
 }
 
-/// memory_stats — return aggregate statistics.
-pub async fn handle_stats(memory: Arc<Memory>, _args: Value) -> Result<String, String> {
-    let stats = memory
-        .stats(None)
-        .await
-        .map_err(|e| format!("stats failed: {e}"))?;
-
-    let result = serde_json::json!({
-        "total_facts": stats.total_facts,
-        "valid_facts": stats.valid_facts,
-        "invalidated_facts": stats.invalidated_facts,
-        "total_entities": stats.total_entities,
-        "total_relationships": stats.total_relationships,
-    });
+/// memory_stats — fact counts within the caller's scope (`org_id`, default
+/// `default`, and `user_id` when given).
+pub async fn handle_stats(memory: Arc<Memory>, args: Value) -> Result<String, String> {
+    let result = stats_in_scope(&memory, &parse_scope(&args)).await?;
     serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
 }
 

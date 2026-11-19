@@ -54,6 +54,26 @@ enum Cli {
         #[arg(long, env = "ENGRAM_PORT", default_value = "9090")]
         port: u16,
 
+        /// Address the REST server listens on. Off loopback it needs
+        /// ENGRAM_AUTH_TOKEN (or --allow-unauthenticated).
+        #[arg(long, env = "ENGRAM_HOST", default_value = "127.0.0.1")]
+        host: String,
+
+        /// Bearer token every REST route but /health requires.
+        #[arg(long, env = "ENGRAM_AUTH_TOKEN", hide_env_values = true)]
+        auth_token: Option<String>,
+
+        /// Serve the REST API off loopback with no token. Anyone who can reach
+        /// the port can then read and delete every memory. The env var takes
+        /// 1/true/yes/on or 0/false/no/off.
+        #[arg(
+            long,
+            env = "ENGRAM_ALLOW_UNAUTHENTICATED",
+            action = clap::ArgAction::SetTrue,
+            value_parser = clap::builder::BoolishValueParser::new()
+        )]
+        allow_unauthenticated: bool,
+
         // ── LLM provider ──────────────────────────────────────────────
         /// LLM provider used for fact extraction
         #[arg(
@@ -216,12 +236,14 @@ fn tool_defs() -> Vec<McpToolDef> {
         },
         McpToolDef {
             name: "memory_forget".into(),
-            description: "Soft-delete a fact by ID".into(),
+            description: "Soft-delete a fact by ID. The fact must be in the given org (default \"default\") and, when user_id is given, belong to that user.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "fact_id": { "type": "string", "description": "UUID of the fact to forget" },
-                    "reason": { "type": "string", "description": "Reason for forgetting" }
+                    "reason": { "type": "string", "description": "Reason for forgetting" },
+                    "org_id": { "type": "string" },
+                    "user_id": { "type": "string" }
                 },
                 "required": ["fact_id"]
             }),
@@ -242,10 +264,13 @@ fn tool_defs() -> Vec<McpToolDef> {
         },
         McpToolDef {
             name: "memory_stats".into(),
-            description: "Return aggregate memory statistics".into(),
+            description: "Return fact counts for an org (default \"default\"), or one user in it".into(),
             input_schema: json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "org_id": { "type": "string" },
+                    "user_id": { "type": "string" }
+                }
             }),
         },
         McpToolDef {
@@ -405,6 +430,9 @@ async fn main() {
             db,
             mode,
             port,
+            host,
+            auth_token,
+            allow_unauthenticated,
             llm_provider,
             ollama_url,
             ollama_llm_model,
@@ -498,17 +526,46 @@ async fn main() {
 
             match mode.as_str() {
                 "rest" => {
+                    // Decided before anything listens: refuse an exposed,
+                    // unauthenticated server rather than start one.
+                    let auth = match engram_server::auth::rest_auth(
+                        &host,
+                        auth_token.as_deref(),
+                        allow_unauthenticated,
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            eprintln!("engram: {e}");
+                            std::process::exit(2);
+                        }
+                    };
+                    match &auth {
+                        engram_server::auth::RestAuth::Token(t) if t.len() < 32 => {
+                            eprintln!("engram: WARNING — ENGRAM_AUTH_TOKEN is under 32 characters");
+                        }
+                        engram_server::auth::RestAuth::Token(_) => {}
+                        engram_server::auth::RestAuth::Open { warning, .. } => {
+                            eprintln!("engram: WARNING — {warning}");
+                        }
+                    }
                     let state = AppState {
                         memory: memory.clone(),
                         llm_backend: config.llm.clone(),
                         extract_on_save,
                     };
-                    let app = rest::build_router(state);
-                    let addr = format!("0.0.0.0:{port}");
-                    eprintln!("engram: REST server listening on {addr}");
+                    let app = rest::build_router_with_auth(state, &auth);
+                    let addr = if host.contains(':') && !host.starts_with('[') {
+                        format!("[{host}]:{port}")
+                    } else {
+                        format!("{host}:{port}")
+                    };
                     let listener = tokio::net::TcpListener::bind(&addr)
                         .await
                         .expect("failed to bind");
+                    eprintln!(
+                        "engram: REST server listening on {}",
+                        listener.local_addr().map(|a| a.to_string()).unwrap_or(addr)
+                    );
                     axum::serve(listener, app).await.expect("server error");
                 }
                 _ => {

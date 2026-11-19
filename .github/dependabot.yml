@@ -19,6 +19,18 @@ updates:
       patch-updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+    ignore:
+      # engram/Cargo.toml pins ort to one exact release candidate, because
+      # the rcs change API between each other. A newer rc lands in the
+      # patch-updates group and fails the whole PR, which holds back the
+      # other crates in it (#206: rc.15 changed Session::builder and needs
+      # Rust 1.92). Only versions below 2.0.0 are ignored, so the stable
+      # release is still proposed when it ships. An entry with `versions`
+      # applies to security updates too: a fix released as another rc gets no
+      # Dependabot PR. The Rust dependency audit in CI reports an advisory
+      # against the pinned version either way.
+      - dependency-name: "ort"
+        versions: ["<2.0.0"]
 
   # Python SDK
   - package-ecosystem: pip
@@ -27,6 +39,17 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 10
+    ignore:
+      # The model extra caps litellm on purpose (the reason is beside the
+      # bound in sdk/python/pyproject.toml). For a range, Dependabot can only
+      # propose raising the bound, and test_packaging_metadata.py fails every
+      # such PR (#205). The same test file fails if this entry outlives the
+      # bound.
+      # Keep the entry to the name alone. That form ignores every version for
+      # version updates and nothing for security updates. `update-types`
+      # would ignore nothing here: Dependabot works those out from an x.y.z
+      # version in the requirement, and `<1.106,>=1.50` has none.
+      - dependency-name: "litellm"
 
   # GitHub Actions
   - package-ecosystem: github-actions
