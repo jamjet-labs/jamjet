@@ -19,6 +19,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from jamjet.model.defaults import default_model_middleware
+from jamjet.model.scripted import ScriptedModelError
 from jamjet.model.seam import Model
 from jamjet.model.types import ModelRequest, parse_model_ref
 
@@ -126,7 +127,8 @@ async def _handle_complete(request: Request) -> JSONResponse:
         body = await request.json()
         result = await _complete(body, _get_model())
         return JSONResponse(result)
-    except (KeyError, ValueError) as exc:
+    except (KeyError, ValueError, ScriptedModelError) as exc:
+        # A script that cannot answer is the caller's problem: say why.
         return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
         # Duck-typed check: litellm.exceptions.RateLimitError (and openai.RateLimitError)

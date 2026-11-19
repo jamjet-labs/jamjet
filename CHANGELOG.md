@@ -413,7 +413,58 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only under the key that signed it, so keep old public keys after a rotation. See
   docs/guides/security.md, "Signing the audit log".
 
+- **`jamjet dev` checks the engine download.** The downloaded `jamjet-server` is
+  checked against the release's `SHA256SUMS` file before it is used. A release with no
+  `SHA256SUMS` is refused. `jamjet dev` also downloads the engine release that matches the installed SDK
+  version (`python-sdk-v<version>`), and `JAMJET_SERVER_PATH` names a binary to use
+  instead.
+
+### Added
+
+- **`examples/venue-booking-agent/`, the code-along series.** Nine steps that build one
+  venue-booking agent, pinned to jamjet 0.13.0. Every step runs with no API key on the
+  scripted model; `VENUE_MODEL` picks a real one. The prompts ask for the deposit
+  outright and the instructions ask for short plain-text answers, so every step also
+  behaves on a real model (checked on Claude Sonnet 5.5). `solutions/` holds the
+  answers to the episode 1 and 2 challenges: a weather tool, and approval only for
+  deposits over 300 (a second payment tool whose code refuses more).
+- **A scripted model, for running an agent with no API key.** Set
+  `model="scripted/<path to YAML>"` and each model call is answered from the file. Only
+  the model is scripted: policy, approval, budget and durability are the real ones. A
+  relative path resolves against the working directory of the process that reads it,
+  which for a durable run is the sidecar that `jamjet dev` starts. See the Python README.
+
+- **`jamjet executions`** lists runs, and `AgentResult.execution_id` gives the id of a
+  durable run. Ids print as `exec_<hex>` in text output.
+
+- **`jamjet approvals` with no id** lists the runs waiting for approval (it checks up to 1000 runs per status), each with a
+  command you can paste to approve it.
+
+- **`jamjet approve <id> -d approved --as <name>`** records who approved. A dev-mode
+  engine records the name you give; with an API token the engine records the token's
+  name.
+
+- **`jamjet audit <id>`** prints a run's audit trail as text, or as JSON with `--json`:
+  what the model asked for, what ran, what was blocked, and who approved.
+
+- `jamjet dev --db PATH` creates the folder for the database.
+
 ### Fixed
+
+- **A durable agent keeps its tool results.** After a tool ran, the next model call
+  could be made without the result. The engine now keeps it.
+
+- **Plain `def` tools work with `@tool`.**
+
+- **LiteLLM's debug banner is silent.** It no longer prints on every model call. Set
+  `JAMJET_LITELLM_DEBUG=1` to see it.
+
+- **`run_durable` waits through an engine restart.** If the engine stops while a run is
+  waiting, the call prints `jamjet: lost the engine at <url>; waiting for it to come back
+  (execution <id>)`, then `jamjet: the engine is back; resuming the wait`. A worker that
+  is killed in the middle of a tool still fails the run. If the engine does not come
+  back within `timeout_seconds`, `run_durable` raises `TimeoutError` (with the connection
+  error as its cause) instead of `httpx.ConnectError`.
 
 - Pass completed step results to subsequent steps of the local
   `plan-and-execute` strategy so dependent steps can use earlier outputs.
@@ -436,6 +487,15 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Generate JSON Schema objects for typed `@tool` parameters instead of bare
   type-name strings, including when compiling tools into an agent specification.
+
+- **Python SDK: `@tool` parameters that are not plain scalars get a real schema.**
+  `list[str]`, `dict[str, float]`, `Optional[...]`, `Literal[...]` and Pydantic
+  model parameters were all offered to the model as `{"type": "object"}`, so a
+  model was told to send an object where the tool takes a list. Pydantic now
+  describes them, with model definitions under `$defs` at the root of the
+  schema. A parameter with no annotation is `{}` (any value) instead of
+  `object`. Plain `str`, `int`, `float`, `bool` and `dict` parameters are
+  unchanged.
 
 - **Runtime: an unmatched API request is a JSON 404, not the web UI.** The SPA
   fallback answered every unmatched path, for every method, with `200 text/html`

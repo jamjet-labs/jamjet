@@ -72,6 +72,7 @@ ELSEWHERE = {
     "03-budget-cap": "run against expected output in test_examples_run.py",
     "04-mcp-tool-policy": "run against expected output in test_examples_run.py",
     "trajectory-eval": "an evalset with no code; see test_trajectory_eval_fixture.py",
+    "venue-booking-agent": "one folder per series step, run in test_venue_booking_example.py",
 }
 
 # What makes a directory a Python-suite example: Python code anywhere, or a
