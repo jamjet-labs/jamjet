@@ -243,66 +243,54 @@ impl FactStore for PostgresFactStore {
     }
 
     async fn update_fact(&self, id: FactId, patch: FactPatch) -> Result<Fact, MemoryError> {
-        let mut set_clauses: Vec<String> = Vec::new();
-        let mut vals: Vec<String> = Vec::new();
-        let mut param_idx: usize = 1;
+        // Each value is bound as the column's own type. They used to be bound
+        // as text, and Postgres has no `uuid = text`: every patch failed.
+        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE facts SET ");
+        let mut set = query.separated(", ");
+        let mut changed = false;
 
         if let Some(ref text) = patch.text {
-            set_clauses.push(format!("text = ${param_idx}"));
-            vals.push(text.clone());
-            param_idx += 1;
+            set.push("text = ").push_bind_unseparated(text.clone());
+            changed = true;
         }
         if let Some(ref tier) = patch.tier {
-            set_clauses.push(format!("tier = ${param_idx}"));
-            vals.push(tier_to_str(tier).to_string());
-            param_idx += 1;
+            set.push("tier = ").push_bind_unseparated(tier_to_str(tier));
+            changed = true;
         }
         if let Some(ref category) = patch.category {
-            set_clauses.push(format!("category = ${param_idx}"));
-            vals.push(category.clone());
-            param_idx += 1;
+            set.push("category = ")
+                .push_bind_unseparated(category.clone());
+            changed = true;
         }
         if let Some(ref source) = patch.source {
-            set_clauses.push(format!("source = ${param_idx}"));
-            vals.push(source.clone());
-            param_idx += 1;
+            set.push("source = ").push_bind_unseparated(source.clone());
+            changed = true;
         }
         if let Some(confidence) = patch.confidence {
-            set_clauses.push(format!("confidence = ${param_idx}"));
-            vals.push((confidence as f64).to_string());
-            param_idx += 1;
+            set.push("confidence = ")
+                .push_bind_unseparated(f64::from(confidence));
+            changed = true;
         }
         if let Some(invalid_at) = patch.invalid_at {
-            set_clauses.push(format!("invalid_at = ${param_idx}"));
-            vals.push(invalid_at.to_rfc3339());
-            param_idx += 1;
+            set.push("invalid_at = ").push_bind_unseparated(invalid_at);
+            changed = true;
         }
         if let Some(superseded_by) = patch.superseded_by {
-            set_clauses.push(format!("superseded_by = ${param_idx}"));
-            vals.push(superseded_by.to_string());
-            param_idx += 1;
+            set.push("superseded_by = ")
+                .push_bind_unseparated(superseded_by);
+            changed = true;
         }
         if !patch.metadata.is_empty() {
-            let json = serde_json::to_string(&patch.metadata)
-                .map_err(|e| MemoryError::Serialization(e.to_string()))?;
-            set_clauses.push(format!("metadata = ${param_idx}::jsonb"));
-            vals.push(json);
-            param_idx += 1;
+            set.push("metadata = ")
+                .push_bind_unseparated(serde_json::Value::Object(patch.metadata.clone()));
+            changed = true;
         }
 
-        if !set_clauses.is_empty() {
-            // `set_clauses` holds only the `column = $n` fragments built
-            // above from literals and a counter; every value is bound.
-            let sql = format!(
-                "UPDATE facts SET {} WHERE id = ${param_idx}",
-                set_clauses.join(", ")
-            );
-            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
-            for v in &vals {
-                q = q.bind(v.as_str());
-            }
-            q = q.bind(id.to_string());
-            q.execute(&self.pool)
+        if changed {
+            query.push(" WHERE id = ").push_bind(id);
+            query
+                .build()
+                .execute(&self.pool)
                 .await
                 .map_err(|e| MemoryError::Database(e.to_string()))?;
         }

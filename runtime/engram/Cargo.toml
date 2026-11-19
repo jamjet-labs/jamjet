@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
+libsqlite3-sys = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 # `tokio::process` + async I/O are needed by CommandLlmClient.

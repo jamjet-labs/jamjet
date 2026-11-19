@@ -12,7 +12,8 @@
 
 use std::str::FromStr;
 
-use engram::fact::{Entity, Fact, FactFilter, FactId};
+use chrono::{Duration, Utc};
+use engram::fact::{Entity, Fact, FactFilter, FactId, FactPatch, MemoryTier, Relationship};
 use engram::graph::GraphStore;
 use engram::graph_postgres::PostgresGraphStore;
 use engram::graph_sqlite::SqliteGraphStore;
@@ -147,6 +148,17 @@ async fn facts_treat_values_as_data(store: &dyn FactStore) {
 async fn graph_treats_values_as_data(store: &dyn GraphStore) {
     let bystander = Entity::new("Bystander", Scope::org("bystander-org"));
     store.upsert_entity(&bystander).await.expect("upsert");
+    // A relationship too, so the delete from `relationships` has a row to
+    // take if a hostile scope ever widens it.
+    let friend = Entity::new("Friend", Scope::org("bystander-org"));
+    store.upsert_entity(&friend).await.expect("upsert");
+    let knows = Relationship::new(
+        bystander.id,
+        "knows",
+        friend.id,
+        Scope::org("bystander-org"),
+    );
+    store.upsert_relationship(&knows).await.expect("upsert");
 
     let mut own: Vec<Entity> = Vec::new();
     for (i, value) in HOSTILE.iter().enumerate() {
@@ -175,6 +187,15 @@ async fn graph_treats_values_as_data(store: &dyn GraphStore) {
         assert_eq!(deleted, 0, "delete_by_scope({value:?}) deleted rows");
     }
     assert!(store.get_entity(bystander.id).await.expect("get").is_some());
+    let kept = store
+        .neighbors(bystander.id, 1, None)
+        .await
+        .expect("neighbors");
+    assert_eq!(
+        kept.relationships.len(),
+        1,
+        "the bystander's relationship is gone"
+    );
     for entity in &own {
         assert!(store.get_entity(entity.id).await.expect("get").is_some());
         let deleted = store
@@ -202,6 +223,242 @@ async fn sqlite_graph_treats_values_as_data() {
         .expect("open");
     store.migrate().await.expect("migrate");
     graph_treats_values_as_data(&store).await;
+}
+
+/// Doubling quotes is an escape on SQLite, so no value in `HOSTILE` tells a
+/// bound parameter from one written into the text there. A NUL does: SQLite
+/// stops reading SQL text at it, so written into the text it ends the
+/// statement inside its own literal. As a bound value it is one more byte of
+/// data. (Postgres text cannot hold a NUL, so this case is SQLite's alone.)
+#[tokio::test]
+async fn sqlite_binds_scope_ids_rather_than_writing_them() {
+    let facts = SqliteFactStore::open("sqlite::memory:")
+        .await
+        .expect("open");
+    facts.migrate().await.expect("migrate");
+    let scope = Scope::full("a\0b", "agent\0x", "user\0y", "session\0z");
+    let id = facts
+        .insert_fact(Fact::new("held under ids with a NUL", scope.clone()))
+        .await
+        .expect("insert");
+    let listed = facts
+        .list_facts(&FactFilter::new().with_scope(scope.clone()))
+        .await
+        .expect("list by a scope with a NUL");
+    assert_eq!(ids(listed), vec![id]);
+    assert_eq!(
+        facts.delete_scope_returning(&scope).await.expect("delete"),
+        vec![id]
+    );
+    assert_eq!(
+        facts.delete_scope_data(&scope).await.expect("delete again"),
+        0
+    );
+
+    let graph = SqliteGraphStore::open("sqlite::memory:")
+        .await
+        .expect("open");
+    graph.migrate().await.expect("migrate");
+    let entity = Entity::new("Named", scope.clone());
+    graph.upsert_entity(&entity).await.expect("upsert");
+    assert_eq!(graph.delete_by_scope(&scope).await.expect("delete"), 1);
+}
+
+// ── Every rewritten query runs ───────────────────────────────────────────────
+
+/// The queries the stores build at run time, each run with every kind of
+/// value it binds: all four scope ids, a tier, a point in time, a page, a
+/// patch, and a delete that returns rows. On Postgres these are the first
+/// tests that send the typed values to a server.
+async fn fact_queries_run(store: &dyn FactStore) {
+    let scope = Scope::full("acme", "agent-1", "alice", "session-1");
+    let now = Utc::now();
+
+    let mut current = Fact::new("current knowledge", scope.clone());
+    current.tier = MemoryTier::Knowledge;
+    current.valid_from = now - Duration::hours(2);
+    let current_id = store.insert_fact(current).await.expect("insert");
+
+    let mut retired = Fact::new("retired knowledge", scope.clone());
+    retired.tier = MemoryTier::Knowledge;
+    retired.valid_from = now - Duration::hours(3);
+    retired.invalid_at = Some(now - Duration::hours(1));
+    let retired_id = store.insert_fact(retired).await.expect("insert");
+
+    let chat = Fact::new("small talk", scope.clone());
+    let chat_id = store.insert_fact(chat).await.expect("insert");
+
+    // Another session of the same user is outside the full scope.
+    let other = Fact::new(
+        "another session",
+        Scope::full("acme", "agent-1", "alice", "session-2"),
+    );
+    let other_id = store.insert_fact(other).await.expect("insert");
+
+    let in_scope = FactFilter::new().with_scope(scope.clone());
+
+    let listed = store.list_facts(&in_scope).await.expect("list");
+    let mut expected = vec![current_id, chat_id];
+    expected.sort();
+    assert_eq!(ids(listed), expected, "valid facts in the full scope");
+
+    let knowledge = store
+        .list_facts(&in_scope.clone().with_tier(MemoryTier::Knowledge))
+        .await
+        .expect("list by tier");
+    assert_eq!(ids(knowledge), vec![current_id], "tier");
+
+    // Ninety minutes ago the retired fact was still valid and the chat fact
+    // did not exist yet.
+    let mut then = in_scope.clone();
+    then.as_of = Some(now - Duration::minutes(90));
+    let mut expected = vec![current_id, retired_id];
+    expected.sort();
+    assert_eq!(
+        ids(store.list_facts(&then).await.expect("list as of")),
+        expected,
+        "as_of"
+    );
+
+    let mut page = in_scope.clone().include_invalid();
+    page.limit = 1;
+    let first = store.list_facts(&page).await.expect("first page");
+    page.offset = 1;
+    let second = store.list_facts(&page).await.expect("second page");
+    page.offset = 3;
+    let past_the_end = store.list_facts(&page).await.expect("past the end");
+    assert_eq!(
+        (first.len(), second.len(), past_the_end.len()),
+        (1, 1, 0),
+        "limit and offset"
+    );
+    assert_ne!(
+        first[0].id, second[0].id,
+        "the second page repeated the first"
+    );
+
+    let patch = FactPatch {
+        text: Some("current knowledge, revised".to_string()),
+        tier: Some(MemoryTier::Working),
+        category: Some("revised".to_string()),
+        source: Some("test".to_string()),
+        confidence: Some(0.5),
+        invalid_at: Some(now),
+        superseded_by: Some(chat_id),
+        metadata: [("reviewed".to_string(), serde_json::json!(true))]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let patched = store
+        .update_fact(current_id, patch)
+        .await
+        .expect("update_fact");
+    assert_eq!(patched.text, "current knowledge, revised");
+    assert_eq!(patched.tier, MemoryTier::Working);
+    assert_eq!(patched.category.as_deref(), Some("revised"));
+    assert_eq!(patched.source.as_deref(), Some("test"));
+    assert_eq!(patched.confidence, Some(0.5));
+    assert_eq!(patched.superseded_by, Some(chat_id));
+    assert!(patched.invalid_at.is_some());
+    assert_eq!(
+        patched.metadata.get("reviewed"),
+        Some(&serde_json::json!(true))
+    );
+
+    let mut deleted = store
+        .delete_scope_returning(&scope)
+        .await
+        .expect("delete returning");
+    deleted.sort();
+    let mut expected = vec![current_id, retired_id, chat_id];
+    expected.sort();
+    assert_eq!(deleted, expected, "delete_scope_returning");
+    store
+        .get_fact(other_id)
+        .await
+        .expect("the other session's fact is gone");
+    assert_eq!(
+        store
+            .delete_scope_data(&Scope::org("acme"))
+            .await
+            .expect("delete"),
+        1
+    );
+}
+
+async fn graph_queries_run(store: &dyn GraphStore) {
+    let scope = Scope::full("acme", "agent-1", "alice", "session-1");
+    let now = Utc::now();
+    let a = Entity::new("A", scope.clone());
+    let b = Entity::new("B", scope.clone());
+    let c = Entity::new("C", scope.clone());
+    for entity in [&a, &b, &c] {
+        store.upsert_entity(entity).await.expect("upsert");
+    }
+    let mut current = Relationship::new(a.id, "knows", b.id, scope.clone());
+    current.valid_from = now - Duration::hours(2);
+    store.upsert_relationship(&current).await.expect("upsert");
+    let mut retired = Relationship::new(a.id, "knew", c.id, scope.clone());
+    retired.valid_from = now - Duration::hours(3);
+    retired.invalid_at = Some(now - Duration::hours(1));
+    store.upsert_relationship(&retired).await.expect("upsert");
+
+    let names = |entities: Vec<Entity>| {
+        let mut names: Vec<String> = entities.into_iter().map(|e| e.name).collect();
+        names.sort();
+        names
+    };
+    let today = store.neighbors(a.id, 1, None).await.expect("neighbors");
+    assert_eq!(names(today.entities), ["B"], "neighbors now");
+    let then = store
+        .neighbors(a.id, 1, Some(now - Duration::minutes(90)))
+        .await
+        .expect("neighbors as of");
+    assert_eq!(names(then.entities), ["B", "C"], "neighbors as of");
+    assert_eq!(then.relationships.len(), 2);
+
+    // Two relationships and three entities.
+    assert_eq!(store.delete_by_scope(&scope).await.expect("delete"), 5);
+    assert!(store.get_entity(a.id).await.expect("get").is_none());
+}
+
+#[tokio::test]
+async fn sqlite_fact_queries_run() {
+    let store = SqliteFactStore::open("sqlite::memory:")
+        .await
+        .expect("open");
+    store.migrate().await.expect("migrate");
+    fact_queries_run(&store).await;
+}
+
+#[tokio::test]
+async fn sqlite_graph_queries_run() {
+    let store = SqliteGraphStore::open("sqlite::memory:")
+        .await
+        .expect("open");
+    store.migrate().await.expect("migrate");
+    graph_queries_run(&store).await;
+}
+
+#[tokio::test]
+async fn postgres_fact_queries_run() {
+    let Some(pool) = postgres_pool(true).await else {
+        return;
+    };
+    let store = PostgresFactStore::new(pool);
+    store.migrate().await.expect("migrate");
+    fact_queries_run(&store).await;
+}
+
+#[tokio::test]
+async fn postgres_graph_queries_run() {
+    let Some(pool) = postgres_pool(true).await else {
+        return;
+    };
+    let store = PostgresGraphStore::new(pool);
+    store.migrate().await.expect("migrate");
+    graph_queries_run(&store).await;
 }
 
 // ── Postgres ─────────────────────────────────────────────────────────────────

@@ -43,6 +43,13 @@ serde_yaml = "0.9"
 
 # Database
 sqlx = { version = "0.9.1", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "sqlite", "uuid", "chrono", "json"] }
+# A floor under the SQLite that sqlx links. sqlx 0.9.1 accepts libsqlite3-sys
+# from 0.30.1 up, and cargo keeps a locked version that still fits the range,
+# so a project upgrading these crates in place would stay on a SQLite with
+# RUSTSEC-2026-0459. 0.39.0 is the first release with the fix. No upper bound
+# here: sqlx sets it. Nothing imports the crate; each member that uses sqlx
+# lists it so the floor reaches whoever depends on that member.
+libsqlite3-sys = { version = ">=0.39.0", default-features = false }
 
 # HTTP / gRPC
 axum = { version = "0.7", features = ["json", "macros"] }
