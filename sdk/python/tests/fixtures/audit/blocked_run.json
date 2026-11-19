@@ -1,0 +1,279 @@
+{
+  "execution": {
+    "completed_at": "2026-11-18T02:14:40.826897Z",
+    "current_state": {
+      "__budget": {
+        "circuit_breaker_tripped": false,
+        "consecutive_error_count": 0,
+        "iteration_count": 0,
+        "tool_call_count": 0,
+        "total_cost_usd": 0.0,
+        "total_input_tokens": 19,
+        "total_output_tokens": 10
+      },
+      "last_model_finish_reason": "tool_calls",
+      "last_model_output": "",
+      "last_model_tool_calls": [
+        {
+          "arguments": {
+            "venue": "Casa do Rio"
+          },
+          "id": "call_0_0",
+          "name": "cancel_booking"
+        }
+      ],
+      "messages": [
+        {
+          "content": "You book event venues. Use the tools.",
+          "role": "system"
+        },
+        {
+          "content": "Please cancel my booking at Casa do Rio.",
+          "role": "user"
+        }
+      ],
+      "tools": {
+        "cancel_booking": "venue_tools:cancel_booking",
+        "check_dates": "venue_tools:check_dates",
+        "pay_deposit": "venue_tools:pay_deposit",
+        "search_venues": "venue_tools:search_venues"
+      }
+    },
+    "execution_id": "ea628a50-de75-4bfd-a169-8af79c819604",
+    "initial_input": {
+      "messages": [
+        {
+          "content": "You book event venues. Use the tools.",
+          "role": "system"
+        },
+        {
+          "content": "Please cancel my booking at Casa do Rio.",
+          "role": "user"
+        }
+      ],
+      "tools": {
+        "cancel_booking": "venue_tools:cancel_booking",
+        "check_dates": "venue_tools:check_dates",
+        "pay_deposit": "venue_tools:pay_deposit",
+        "search_venues": "venue_tools:search_venues"
+      }
+    },
+    "segment_number": 0,
+    "started_at": "2026-11-18T02:14:38.902347Z",
+    "status": "failed",
+    "updated_at": "2026-11-18T02:14:40.826897Z",
+    "workflow_id": "venue-booker",
+    "workflow_version": "0.1.0+b72267771e0a"
+  },
+  "events": [
+    {
+      "created_at": "2026-11-18T02:14:38.902898Z",
+      "execution_id": "ea628a50-de75-4bfd-a169-8af79c819604",
+      "id": "f6e35bc6-1192-4a81-af16-84735c79a193",
+      "kind": {
+        "initial_input": {
+          "messages": [
+            {
+              "content": "You book event venues. Use the tools.",
+              "role": "system"
+            },
+            {
+              "content": "Please cancel my booking at Casa do Rio.",
+              "role": "user"
+            }
+          ],
+          "tools": {
+            "cancel_booking": "venue_tools:cancel_booking",
+            "check_dates": "venue_tools:check_dates",
+            "pay_deposit": "venue_tools:pay_deposit",
+            "search_venues": "venue_tools:search_venues"
+          }
+        },
+        "type": "workflow_started",
+        "workflow_id": "venue-booker",
+        "workflow_version": "0.1.0+b72267771e0a"
+      },
+      "sequence": 1
+    },
+    {
+      "created_at": "2026-11-18T02:14:38.902999Z",
+      "execution_id": "ea628a50-de75-4bfd-a169-8af79c819604",
+      "id": "b4f82de3-2ee6-498c-9850-dc4e87ea0150",
+      "kind": {
+        "node_id": "__model_0__",
+        "queue_type": "model",
+        "type": "node_scheduled"
+      },
+      "sequence": 2
+    },
+    {
+      "created_at": "2026-11-18T02:14:39.312772Z",
+      "execution_id": "ea628a50-de75-4bfd-a169-8af79c819604",
+      "id": "f20a46bd-11ef-4f02-8215-95f7a4f0292c",
+      "kind": {
+        "attempt": 0,
+        "node_id": "__model_0__",
+        "type": "node_started",
+        "worker_id": "model-worker-1"
+      },
+      "sequence": 3
+    },
+    {
+      "created_at": "2026-11-18T02:14:39.324248Z",
+      "execution_id": "ea628a50-de75-4bfd-a169-8af79c819604",
+      "id": "d4f45f2e-d31d-417c-b901-d75352e86caa",
+      "kind": {
+        "duration_ms": 12,
+        "finish_reason": "tool_calls",
+        "gen_ai_model": "scripted//home/user/task6/cancel.yaml",
+        "gen_ai_system": "unknown",
+        "idempotency_key": "a4c061c8adfeb27730bb7f000650b320a717b5ab783c83c628b305f26a319271",
+        "input_tokens": 19,
+        "node_id": "__model_0__",
+        "output": {
+          "content": "",
+          "finish_reason": "tool_calls",
+          "model": "scripted//home/user/task6/cancel.yaml",
+          "tool_calls": [
+            {
+              "arguments": {
+                "venue": "Casa do Rio"
+              },
+              "id": "call_0_0",
+              "name": "cancel_booking"
+            }
+          ]
+        },
+        "output_tokens": 10,
+        "state_patch": {
+          "__budget": {
+            "circuit_breaker_tripped": false,
+            "consecutive_error_count": 0,
+            "iteration_count": 0,
+            "tool_call_count": 0,
+            "total_cost_usd": 0.0,
+            "total_input_tokens": 19,
+            "total_output_tokens": 10
+          },
+          "last_model_finish_reason": "tool_calls",
+          "last_model_output": "",
+          "last_model_tool_calls": [
+            {
+              "arguments": {
+                "venue": "Casa do Rio"
+              },
+              "id": "call_0_0",
+              "name": "cancel_booking"
+            }
+          ]
+        },
+        "type": "node_completed"
+      },
+      "sequence": 4
+    },
+    {
+      "created_at": "2026-11-18T02:14:39.815406Z",
+      "execution_id": "ea628a50-de75-4bfd-a169-8af79c819604",
+      "id": "a8472e01-36a2-4d91-a352-90be13de19f0",
+      "kind": {
+        "node_id": "__tool_gate_0__",
+        "queue_type": "general",
+        "type": "node_scheduled"
+      },
+      "sequence": 5
+    },
+    {
+      "created_at": "2026-11-18T02:14:39.869121Z",
+      "execution_id": "ea628a50-de75-4bfd-a169-8af79c819604",
+      "id": "5f69b038-f66f-4c6c-9ee6-d81c2382dbd9",
+      "kind": {
+        "attempt": 0,
+        "node_id": "__tool_gate_0__",
+        "type": "node_started",
+        "worker_id": "general-worker-1"
+      },
+      "sequence": 6
+    },
+    {
+      "created_at": "2026-11-18T02:14:39.876125Z",
+      "execution_id": "ea628a50-de75-4bfd-a169-8af79c819604",
+      "id": "ba78798a-a396-403a-b644-0f97f6a85f90",
+      "kind": {
+        "duration_ms": 7,
+        "idempotency_key": "45a4cbd28d85903a241b3f0a1b6718fcdb9da17cb436f3dceea3e6ab9bb6f041",
+        "node_id": "__tool_gate_0__",
+        "output": {
+          "branch_targets": [
+            "__tools_0__",
+            "end"
+          ],
+          "chosen_target": "__tools_0__"
+        },
+        "state_patch": {
+          "__budget": {
+            "circuit_breaker_tripped": false,
+            "consecutive_error_count": 0,
+            "iteration_count": 0,
+            "tool_call_count": 0,
+            "total_cost_usd": 0.0,
+            "total_input_tokens": 19,
+            "total_output_tokens": 10
+          }
+        },
+        "type": "node_completed"
+      },
+      "sequence": 7
+    },
+    {
+      "created_at": "2026-11-18T02:14:40.321350Z",
+      "execution_id": "ea628a50-de75-4bfd-a169-8af79c819604",
+      "id": "0e3e5503-6d40-4f9f-b81d-5961e88e572b",
+      "kind": {
+        "node_id": "__tools_0__",
+        "queue_type": "python_tool",
+        "type": "node_scheduled"
+      },
+      "sequence": 8
+    },
+    {
+      "created_at": "2026-11-18T02:14:40.431159Z",
+      "execution_id": "ea628a50-de75-4bfd-a169-8af79c819604",
+      "id": "73ea267d-d377-40c1-89b5-454ff0e30e5c",
+      "kind": {
+        "decision": "blocked",
+        "node_id": "__tools_0__",
+        "policy_scope": "workflow",
+        "rule": "tool 'cancel_booking' matches blocked pattern 'cancel_*'",
+        "type": "policy_violation"
+      },
+      "sequence": 9
+    },
+    {
+      "created_at": "2026-11-18T02:14:40.432392Z",
+      "execution_id": "ea628a50-de75-4bfd-a169-8af79c819604",
+      "id": "7c9fb8bd-a645-4d8b-aa46-f08175571c50",
+      "kind": {
+        "attempt": 0,
+        "error": "policy blocked: tool 'cancel_booking' matches blocked pattern 'cancel_*'",
+        "node_id": "__tools_0__",
+        "retryable": false,
+        "type": "node_failed"
+      },
+      "sequence": 10
+    },
+    {
+      "created_at": "2026-11-18T02:14:40.826811Z",
+      "execution_id": "ea628a50-de75-4bfd-a169-8af79c819604",
+      "id": "42584ea6-04d7-49e5-8c9b-600d4749c02f",
+      "kind": {
+        "error": "node(s) failed terminally: __tools_0__",
+        "type": "workflow_failed"
+      },
+      "sequence": 11
+    }
+  ],
+  "approvals": {
+    "decided": [],
+    "pending": []
+  }
+}

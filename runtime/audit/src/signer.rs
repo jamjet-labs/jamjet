@@ -40,8 +40,10 @@
 //! HMAC mode reads `JAMJET_AUDIT_SIGNING_KEY` (raw UTF-8 bytes are the key):
 //!
 //! * set (non-empty) -> sign with it (secure).
-//! * else `JAMJET_AUDIT_ALLOW_INSECURE_KEY` set -> sign with the **built-in,
-//!   publicly-known dev key**, logging loudly at `warn`.
+//! * else `JAMJET_AUDIT_ALLOW_INSECURE_KEY` on (`1`, `true`, `yes`, `on`) ->
+//!   sign with the **built-in, publicly-known dev key**, logging loudly at
+//!   `warn`. `jamjet-server` refuses to start on a value that is not a
+//!   boolean.
 //! * else -> the signer is **unsigned/refused**: it does NOT sign (entries are
 //!   left unsigned and [`crate::verify_chain`] reports them as `Unsigned`) and
 //!   [`AuditSigner::verify`] always returns `false`. It logs loudly at `warn`.
@@ -82,6 +84,15 @@ pub const ED25519_KEY_FILE_ENV: &str = "JAMJET_AUDIT_ED25519_KEY_FILE";
 
 /// The `spec` member of the statement an Ed25519 entry signature covers.
 pub const ED25519_SIG_SPEC: &str = "jamjet.audit.entry/v1";
+
+/// Whether `JAMJET_AUDIT_ALLOW_INSECURE_KEY`'s value opts into the built-in
+/// dev key, read as every switch is ([`jamjet_core::flag::parse_flag`]).
+/// `jamjet-server` refuses a value that is not a boolean at startup; here it
+/// does not opt in. This read any non-empty value as yes, so `=0` or
+/// `=false` signed the log with a key everyone knows.
+pub fn insecure_key_opt_in(value: &str) -> bool {
+    jamjet_core::flag::parse_flag(ALLOW_INSECURE_KEY_ENV, Some(value)).unwrap_or(false)
+}
 
 /// The prefix of a stored Ed25519 entry signature: `ed25519:<kid>:<hex>`.
 pub const ED25519_SIG_PREFIX: &str = "ed25519:";
@@ -310,12 +321,14 @@ impl AuditSigner {
     }
 
     /// The HMAC signer `from_env` builds in `hmac` mode.
+    ///
+    /// The insecure-key opt-in is read by [`insecure_key_opt_in`].
     fn hmac_from_env() -> Self {
         match std::env::var(SIGNING_KEY_ENV) {
             Ok(key) if !key.is_empty() => Self::new(key.into_bytes()),
             _ => {
                 let opted_in = std::env::var(ALLOW_INSECURE_KEY_ENV)
-                    .map(|v| !v.is_empty())
+                    .map(|v| insecure_key_opt_in(&v))
                     .unwrap_or(false);
                 if opted_in {
                     warn!(
@@ -590,5 +603,16 @@ mod tests {
         }
         assert!(signer.can_sign());
         assert!(signer.is_dev_key(), "explicit opt-in selects the dev key");
+    }
+
+    /// `0`, `false` and friends do not opt into the built-in dev key.
+    #[test]
+    fn only_a_yes_opts_into_the_insecure_key() {
+        for yes in ["1", "true", "TRUE", "yes", "on", " 1 "] {
+            assert!(insecure_key_opt_in(yes), "{yes:?}");
+        }
+        for no in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(!insecure_key_opt_in(no), "{no:?}");
+        }
     }
 }

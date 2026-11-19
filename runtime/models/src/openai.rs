@@ -27,7 +27,7 @@ pub struct OpenAiAdapter {
 impl OpenAiAdapter {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::model_client(),
             api_key: api_key.into(),
             base_url: OPENAI_API_BASE.into(),
             default_model: DEFAULT_MODEL.into(),
@@ -97,11 +97,11 @@ impl OpenAiAdapter {
             .map(|m| {
                 let role = match m.role {
                     ChatRole::System => "system",
-                    ChatRole::User => "user",
+                    // Tools are not sent by this adapter, so a tool result goes
+                    // out as a user message (as the Anthropic and Google adapters do).
+                    ChatRole::User | ChatRole::Tool => "user",
                     ChatRole::Assistant => "assistant",
-                    ChatRole::Tool => "tool",
                 };
-                // Prepend system_prompt as system message if provided.
                 json!({ "role": role, "content": m.content })
             })
             .collect();
@@ -186,6 +186,8 @@ impl ModelAdapter for OpenAiAdapter {
         gen_ai.usage.output_tokens = tracing::field::Empty,
     ))]
     async fn chat(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        // Tool round trips (tool_calls, tool_call_id) go through the sidecar; this
+        // adapter maps role and content only.
         // Native adapter: tools are not forwarded to the provider. Warn (once) so
         // a tool-carrying call does not silently degenerate the agent loop.
         if !request.tools.is_empty() {
@@ -252,5 +254,25 @@ impl ModelAdapter for OpenAiAdapter {
         response.structured = Some(structured);
 
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This adapter does not send tools, so a tool result goes out as a user
+    /// message (as in the Anthropic and Google adapters), never as a `tool`
+    /// message that the API would reject.
+    #[test]
+    fn tool_results_are_sent_as_user_messages() {
+        let adapter = OpenAiAdapter::new("test-key");
+        let messages = vec![
+            ChatMessage::user("find a venue"),
+            ChatMessage::tool("call_1", "[\"Casa do Rio\"]"),
+        ];
+        let body = adapter.build_request_body(&messages, &ModelConfig::default(), None);
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "[\"Casa do Rio\"]");
     }
 }

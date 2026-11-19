@@ -772,6 +772,12 @@ def send_email(to: str) -> str:
     return f"sent to {to}"
 
 
+@tool
+def send_wire(to: str) -> str:
+    """Send a wire."""
+    return f"wired {to}"
+
+
 class TestBlockedToolsParity:
     def _agent(self, **kw: object) -> Agent:
         return Agent(
@@ -812,6 +818,39 @@ class TestBlockedToolsParity:
             filtered = LocalRuntime._apply_blocked_tools(agent.compile(), agent.governance)
             names = {t.name for t in filtered.tools}
             assert ("send_email" not in names) is blocked, f"{pattern!r} should block={blocked}"
+
+    def test_tool_star_blocks_every_tool_in_process(self) -> None:
+        """``tool:*`` is every tool, as in the engine. Matched as written it
+        named no tool, so an agent run in-process kept a tool the durable run
+        refuses."""
+        from jamjet.runtime.local.executor import LocalRuntime
+
+        agent = Agent(
+            "a",
+            model="anthropic/claude-sonnet-4-6",
+            tools=[search, send_wire],
+            strategy="react",
+            policy={"blocked_tools": ["tool:*"]},
+        )
+        filtered = LocalRuntime._apply_blocked_tools(agent.compile(), agent.governance)
+        assert [t.name for t in filtered.tools] == []
+
+    @pytest.mark.parametrize(
+        "case",
+        json.loads((Path(__file__).parent / "fixtures" / "blocked_tool_patterns.json").read_text())["cases"],
+        ids=lambda c: f"{c['pattern']!r}-{c['tool']!r}",
+    )
+    def test_patterns_block_what_the_engine_blocks(self, case: dict) -> None:
+        """The cases ``runtime/policy/tests/tenant_policy.rs`` checks the engine on."""
+        from jamjet.runtime.local.executor import LocalRuntime
+        from jamjet.spec import ToolSpec
+
+        agent = self._agent(policy={"blocked_tools": [case["pattern"]]})
+        spec = agent.compile()
+        named = spec.model_copy(update={"tools": [spec.tools[0].model_copy(update={"name": case["tool"]})]})
+        assert isinstance(named.tools[0], ToolSpec)
+        filtered = LocalRuntime._apply_blocked_tools(named, agent.governance)
+        assert (filtered.tools == []) is case["blocks"]
 
     def test_no_policy_leaves_every_tool_reachable(self) -> None:
         """The dual: enforcement must not quietly drop tools nobody blocked."""

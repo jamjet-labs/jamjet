@@ -50,6 +50,77 @@ jamjet demo budget-cap      # $0.05 cost cap
 jamjet demo mcp-tool-policy # policy on an MCP-shaped request (no MCP server involved)
 ```
 
+## Run an agent with no API key
+
+Set `model="scripted/<path to a YAML file>"` and each model call is answered from
+the file. Only the model is scripted. Policy, approval, budget and durability are
+the real ones.
+
+```yaml
+# scripts/book.yaml: turn N answers the agent's Nth model call
+turns:
+  - tool_calls:
+      - name: search_venues
+        arguments: {city: Lisbon, date: "2026-12-11"}
+  - tool_calls:
+      - name: check_dates
+        arguments: {venue: Casa do Rio}
+  - tool_calls:
+      - name: pay_deposit
+        arguments: {venue: Casa do Rio, amount: 500}
+  - content: "Booked Casa do Rio in Lisbon for 11 December. The 500 deposit is paid."
+```
+
+```python
+# book.py
+import asyncio
+from jamjet import Agent
+from venue_tools import search_venues, check_dates, pay_deposit  # plain `def` functions under @tool
+
+agent = Agent(
+    "venue-booker",
+    model="scripted/scripts/book.yaml",
+    tools=[search_venues, check_dates, pay_deposit],
+    instructions="You book event venues. Use the tools.",
+    strategy="react",
+    policy={"require_approval_for": ["pay_deposit"], "blocked_tools": ["cancel_*"]},
+)
+
+result = asyncio.run(agent.run_durable("Book a venue in Lisbon for 2026-12-11."))
+print(result.output, result.execution_id)
+```
+
+A relative script path is resolved from the working directory of the process that
+reads it. Run `jamjet dev` from your project folder, or give an absolute path.
+
+Run `jamjet dev --modules venue_tools` in one terminal and `python book.py` in
+another. The run waits at `pay_deposit`. Then:
+
+```bash
+jamjet executions                    # every run
+jamjet approvals                     # every run waiting for approval
+jamjet approve <id> -d approved --as <name>
+jamjet audit <id>
+```
+
+On a real run, `jamjet audit` ended with:
+
+```
+pay_deposit ran 1 time, approved by tester at 03:09:24
+```
+
+The full walkthrough, with the output of each command, is in the
+[Python guide](sdk/python/README.md). Python 3.11 or newer.
+`pip install jamjet` is enough for in-process runs on the scripted model.
+`jamjet dev` and durable runs need `pip install 'jamjet[sidecar]'`.
+Real providers need `jamjet[model]` as well.
+
+### Watch it built
+
+<a href="https://www.youtube.com/watch?v=VVLrZosEwhE"><img src="https://img.youtube.com/vi/VVLrZosEwhE/maxresdefault.jpg" alt="Video: Build Your First AI Agent with JamJet, Python code-along part 1" width="480"></a>
+
+[Build Your First AI Agent with JamJet](https://www.youtube.com/watch?v=VVLrZosEwhE) is part 1 of the code-along, seven minutes long. It builds this venue-booking agent from an empty folder: an agent with instructions, two tools, then a `pay_deposit` tool that pays because the prompt said so. The code is in [`examples/venue-booking-agent`](examples/venue-booking-agent), one folder per step. The later steps there add approval before the payment, a blocked tool, and an engine killed while the payment waits.
+
 Works alongside **Claude Code · OpenAI Agents SDK · MCP clients · LangChain · CrewAI · ADK · Spring AI · LangChain4j**.
 
 ## On the JVM
@@ -198,6 +269,7 @@ Want to build the official integration for *your* framework? **[Claim a slot](ht
 | Example | What it shows |
 |---------|--------------|
 | [`01-block-unsafe-tool`](examples/01-block-unsafe-tool) | A destructive tool call blocked before execution |
+| [`venue-booking-agent`](examples/venue-booking-agent) | The video code-along: one agent in nine steps, from a first tool to approval, a blocked tool and `kill -9` |
 | [`hitl-approval`](examples/hitl-approval) | Human approval as a first-class workflow primitive |
 | [`react-agent-durable`](examples/react-agent-durable) | A ReAct agent on the durable engine: event log, replay, park-on-429 |
 | [`team-multi-agent`](examples/team-multi-agent) | Multi-agent Teams, each sub-agent its own governed run |
@@ -205,7 +277,7 @@ Want to build the official integration for *your* framework? **[Claim a slot](ht
 | [`claims-processing`](examples/claims-processing) | Insurance pipeline: 4 specialist agents + HITL + audit |
 | [`eval-harness`](examples/eval-harness) | Batch evaluation with LLM judge scoring |
 
-→ [All 33 examples](examples/)
+→ [All 34 examples](examples/)
 
 ## Engram
 

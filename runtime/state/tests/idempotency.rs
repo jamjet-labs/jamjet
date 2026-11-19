@@ -617,42 +617,71 @@ async fn only_one_worker_can_claim_an_idempotency_key() {
     }
 }
 
-/// The reservation is REENTRANT for its own holder.
+/// The reservation is renewed by the attempt that holds it (same owner, same
+/// fence), and another attempt waits for it, the same worker id's included.
 ///
-/// It exists to exclude a SECOND worker, not to lock a worker out of its own
-/// node. A retry is the same logical attempt: the item is re-claimed by the same
-/// worker and runs again, and a node that fails WITHOUT recording a tool effect
-/// leaves its reservation standing. Blocking the holder would stall every such
-/// retry for the whole TTL.
-///
-/// This was originally written to assert the opposite, and the engine's own
-/// continue-as-new retry tests caught it — they deadlocked against a reservation
-/// their own worker held.
+/// It was reentrant for the owner alone, and worker ids are fixed
+/// (`general-worker-0`): a worker that panicked after its effect took its own
+/// reservation straight back under the retry's new fence and fired again.
+/// An attempt that releases it (a park on a rate limit) lets the next one in
+/// at once.
 #[tokio::test]
-async fn a_reservation_is_reentrant_for_its_holder() {
-    let db = open_test_db().await;
-    let eid = ExecutionId::new();
-    let ttl = std::time::Duration::from_secs(300);
-
-    assert_eq!(
-        db.reserve_tool_effect("k2", &eid, "n1", "worker-A", 1, ttl)
+async fn a_reservation_is_renewed_only_by_the_attempt_that_holds_it() {
+    let sqlite = open_test_db().await;
+    let scoped = open_test_db().await.for_tenant(TenantId::default());
+    let memory = InMemoryBackend::new();
+    let backends: [(&str, &dyn StateBackend); 3] = [
+        ("sqlite", &sqlite),
+        ("tenant_scoped", &scoped),
+        ("memory", &memory),
+    ];
+    for (name, db) in backends {
+        let eid = ExecutionId::new();
+        let ttl = std::time::Duration::from_secs(300);
+        assert_eq!(
+            db.reserve_tool_effect("k2", &eid, "n1", "worker-A", 1, ttl)
+                .await
+                .unwrap(),
+            ReserveOutcome::Acquired,
+            "{name}"
+        );
+        assert_eq!(
+            db.reserve_tool_effect("k2", &eid, "n1", "worker-A", 1, ttl)
+                .await
+                .unwrap(),
+            ReserveOutcome::Acquired,
+            "{name}: the holder renews it"
+        );
+        assert!(
+            matches!(
+                db.reserve_tool_effect("k2", &eid, "n1", "worker-A", 2, ttl)
+                    .await
+                    .unwrap(),
+                ReserveOutcome::Held { .. }
+            ),
+            "{name}: the same worker id's next attempt took it back"
+        );
+        assert!(
+            matches!(
+                db.reserve_tool_effect("k2", &eid, "n1", "worker-B", 3, ttl)
+                    .await
+                    .unwrap(),
+                ReserveOutcome::Held { .. }
+            ),
+            "{name}"
+        );
+        // Released by its attempt, the next one takes it at once.
+        db.release_tool_reservation("k2", "worker-A", 1)
             .await
-            .unwrap(),
-        ReserveOutcome::Acquired
-    );
-    assert_eq!(
-        db.reserve_tool_effect("k2", &eid, "n1", "worker-A", 2, ttl)
-            .await
-            .unwrap(),
-        ReserveOutcome::Acquired,
-        "the holder must be able to retry its own node"
-    );
-    assert!(matches!(
-        db.reserve_tool_effect("k2", &eid, "n1", "worker-B", 3, ttl)
-            .await
-            .unwrap(),
-        ReserveOutcome::Held { .. }
-    ));
+            .unwrap();
+        assert_eq!(
+            db.reserve_tool_effect("k2", &eid, "n1", "worker-A", 2, ttl)
+                .await
+                .unwrap(),
+            ReserveOutcome::Acquired,
+            "{name}"
+        );
+    }
 }
 
 /// An EXPIRED reservation must be takeable, or a worker that dies mid-tool

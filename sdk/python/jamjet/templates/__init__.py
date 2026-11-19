@@ -1355,7 +1355,7 @@ requires-python = ">=3.11"
 # The [model] extra pulls in litellm, which the in-process model seam uses to
 # call the agent's "anthropic/claude-sonnet-4-6" model. Without it `agent.run()`
 # raises at the first model call.
-dependencies = ["jamjet[model]>=0.10.0"]
+dependencies = ["jamjet[model]>=0.13.0"]
 
 [build-system]
 requires = ["hatchling"]
@@ -1373,6 +1373,12 @@ pip install 'jamjet[model]'
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
+`jamjet dev` and durable runs also need the sidecar:
+`pip install 'jamjet[model,sidecar]'`.
+
+With a real model, set the provider key in the terminal where you run
+`jamjet dev`, because the sidecar makes the model calls.
+
 ## Run in-process
 
 ```bash
@@ -1383,24 +1389,44 @@ Runs the agent via `LocalRuntime` -- no server needed.
 
 ## Run with the durable engine
 
-Start the local stack:
+`python agent.py` runs in this process. To run on the engine, call
+`run_durable` instead of `run`. In `main()` in `agent.py`, replace the
+`agent.run` call with:
 
-```bash
-jamjet dev
+```python
+result = await agent.run_durable("What is 7 plus 35?")
+print(result.output, result.execution_id)
 ```
 
-Then in a second terminal:
+Start the local stack in a first terminal, from this folder:
 
 ```bash
-python agent.py
+jamjet dev --modules agent
 ```
 
-The durable engine records every turn to SQLite so you can inspect, replay, and fork runs.
+`--modules agent` lets the worker import the `add` tool from `agent.py`.
+Then run the agent in a second terminal:
 
 ```bash
+python -c 'import asyncio; from agent import main; asyncio.run(main())'
+```
+
+Do not use `python agent.py` here. A tool defined in the script you run
+directly is named `__main__:add`, and the worker, which imports `agent`,
+can't find it.
+
+The engine records every step. Look at a run with its id:
+
+```bash
+jamjet executions
 jamjet inspect <execution-id>
 jamjet events  <execution-id>
+jamjet audit   <execution-id>
 ```
+
+If the engine stops while `run_durable` is waiting, the call keeps waiting and
+carries on when the engine is back. The run's record is kept in
+`.jamjet/runtime.db`.
 """,
     },
 }

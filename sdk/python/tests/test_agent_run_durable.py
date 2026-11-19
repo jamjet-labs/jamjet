@@ -99,7 +99,7 @@ class _FakeDurableClient:
     async def get_execution(self, execution_id: str) -> dict[str, Any]:
         return self._execution
 
-    async def get_events(self, execution_id: str) -> dict[str, Any]:
+    async def get_events(self, execution_id: str, **_kwargs: Any) -> dict[str, Any]:
         return {"events": self._events}
 
 
@@ -118,6 +118,16 @@ async def test_run_durable_extracts_final_answer(monkeypatch: pytest.MonkeyPatch
 
     assert isinstance(result, AgentResult)
     assert result.output == "It is sunny in London."
+
+
+async def test_run_durable_sets_execution_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The result carries the engine's execution id, so a learner can find the run."""
+    fake = _FakeDurableClient(_completed_execution())
+    _patch_client(monkeypatch, fake)
+
+    result = await _agent().run_durable("weather in London?", max_turns=3)
+
+    assert result.execution_id == "exec_test"
 
 
 async def test_run_durable_reconstructs_tool_call_trace(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -190,3 +200,119 @@ async def test_run_durable_raises_on_failed_terminal(monkeypatch: pytest.MonkeyP
 
     with pytest.raises(RuntimeError, match="non-completed"):
         await _agent().run_durable("weather?", max_turns=3)
+
+
+async def test_run_durable_failed_run_error_carries_execution_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed run is the one to find: the id is in the message and on the exception."""
+    fake = _FakeDurableClient({"status": "failed", "detail": "boom", "current_state": {}})
+    _patch_client(monkeypatch, fake)
+
+    with pytest.raises(RuntimeError) as info:
+        await _agent().run_durable("weather in London?", max_turns=3)
+
+    assert "exec_test" in str(info.value)
+    assert info.value.execution_id == "exec_test"
+
+
+async def test_run_durable_timeout_error_carries_execution_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeDurableClient({"status": "running", "current_state": {}})
+    _patch_client(monkeypatch, fake)
+    agent = _agent()
+    agent.limits.timeout_seconds = 0
+
+    with pytest.raises(TimeoutError) as info:
+        await agent.run_durable("weather in London?", max_turns=3)
+
+    assert "exec_test" in str(info.value)
+    assert info.value.execution_id == "exec_test"
+
+
+class _FlakyClient(_FakeDurableClient):
+    """get_execution raises the given errors in order, then returns the executions."""
+
+    def __init__(self, script: list[Any]) -> None:
+        super().__init__({})
+        self._script = list(script)
+
+    async def get_execution(self, execution_id: str) -> dict[str, Any]:
+        item = self._script.pop(0) if len(self._script) > 1 else self._script[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr("jamjet.agents.agent.asyncio.sleep", fake_sleep)
+    return slept
+
+
+async def test_run_durable_waits_through_engine_restart(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import httpx
+
+    err = httpx.ConnectError("All connection attempts failed")
+    fake = _FlakyClient([err, err, {"status": "running", "current_state": {}}, _completed_execution()])
+    _patch_client(monkeypatch, fake)
+    slept = _no_sleep(monkeypatch)
+
+    result = await _agent().run_durable("weather in London?", max_turns=3, runtime_url="http://localhost:9999")
+
+    assert result.output == "It is sunny in London."
+    lines = capsys.readouterr().err.splitlines()
+    assert (
+        lines.count(
+            "jamjet: lost the engine at http://localhost:9999; waiting for it to come back (execution exec_test)"
+        )
+        == 1
+    )
+    assert lines.count("jamjet: the engine is back; resuming the wait") == 1
+    assert slept[:2] == [0.5, 1.0]
+
+
+async def test_run_durable_backoff_caps_at_five_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    err = httpx.ConnectError("down")
+    fake = _FlakyClient([err] * 8 + [_completed_execution()])
+    _patch_client(monkeypatch, fake)
+    slept = _no_sleep(monkeypatch)
+
+    await _agent().run_durable("weather in London?", max_turns=3)
+
+    assert slept == [0.5, 1.0, 2.0, 4.0, 5.0, 5.0, 5.0, 5.0]
+
+
+async def test_run_durable_gives_up_on_timeout_when_engine_stays_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    fake = _FlakyClient([httpx.ConnectError("down")])
+    _patch_client(monkeypatch, fake)
+    _no_sleep(monkeypatch)
+    agent = _agent()
+    agent.limits.timeout_seconds = 0.01
+
+    with pytest.raises(TimeoutError) as info:
+        await agent.run_durable("weather in London?", max_turns=3)
+
+    assert info.value.execution_id == "exec_test"
+    assert isinstance(info.value.__cause__, httpx.ConnectError)
+    assert str(info.value).count("exec_test") == 1
+
+
+async def test_run_durable_does_not_retry_http_status_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    request = httpx.Request("GET", "http://localhost/executions/x")
+    response = httpx.Response(500, request=request)
+    fake = _FlakyClient([httpx.HTTPStatusError("boom", request=request, response=response), _completed_execution()])
+    _patch_client(monkeypatch, fake)
+    _no_sleep(monkeypatch)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await _agent().run_durable("weather in London?", max_turns=3)

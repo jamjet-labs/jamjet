@@ -15,6 +15,7 @@ pub mod executors;
 pub mod heartbeat;
 pub mod node_guard;
 pub mod pool;
+pub mod shutdown;
 #[cfg(test)]
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -27,4 +28,5 @@ pub use executors::{
     HumanApprovalExecutor, LimitExceededExecutor, McpToolExecutor, ModelNodeExecutor,
 };
 pub use pool::{default_pool, server_pool, WorkerGroupConfig, WorkerPool};
+pub use shutdown::{shutdown, Shutdown, ShutdownTrigger};
 pub use worker::Worker;

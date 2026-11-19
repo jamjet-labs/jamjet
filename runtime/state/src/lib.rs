@@ -21,14 +21,14 @@ pub mod tenant;
 pub mod tenant_scoped;
 
 pub use artifact::{
-    artifact_threshold, resolve_value, spill_bytes, ArtifactRef, ARTIFACT_SENTINEL_KEY,
-    DEFAULT_SPILL_THRESHOLD,
+    artifact_threshold, resolve_value, resolve_value_budgeted, resolve_value_within, spill_bytes,
+    ArtifactRef, ARTIFACT_SENTINEL_KEY, DEFAULT_SPILL_THRESHOLD,
 };
 pub use backend::{
-    granted_lease_secs, ApiToken, ApprovalProjectionRow, BackendResult, ConditionalAppend,
-    ExecutionFinish, FailOutcome, LeaseRenewal, ReclaimResult, ReserveOutcome, StateBackend,
-    StateBackendError, TurnCommit, WorkItem, WorkItemId, WorkflowDefinition, DEFAULT_LEASE_SECS,
-    MAX_LEASE_SECS, MIN_LEASE_SECS,
+    granted_lease_secs, ApiToken, ApprovalProjectionRow, BackendResult, ClaimedWorkItem,
+    ConditionalAppend, ExecutionFinish, FailOutcome, LeaseRenewal, ReclaimResult, ReserveOutcome,
+    RunningPage, StateBackend, StateBackendError, TurnCommit, WorkItem, WorkItemId,
+    WorkflowDefinition, DEFAULT_LEASE_SECS, MAX_LEASE_SECS, MIN_LEASE_SECS,
 };
 pub use backend::{ClaimFilter, ExecutionClaim, GateMark, LeasedItem};
 pub use budget::{BudgetState, BudgetTrip};
@@ -43,6 +43,6 @@ pub use materializer::{
 pub use memory::InMemoryBackend;
 pub use segment::{segment_chain, start_next_segment};
 pub use snapshot::Snapshot;
-pub use sqlite::SqliteBackend;
+pub use sqlite::{RevokedToken, SqliteBackend};
 pub use tenant::{Tenant, TenantId, TenantLimits, TenantStatus, DEFAULT_TENANT};
 pub use tenant_scoped::TenantScopedSqliteBackend;

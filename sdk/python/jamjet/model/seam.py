@@ -14,6 +14,34 @@ from jamjet.model.middleware import ModelMiddleware
 from jamjet.model.types import ModelRequest, ModelResponse, StreamChunk
 
 
+class _DefaultBackend:
+    """Routes ``scripted/`` refs to the scripted model, the rest to LiteLLM.
+
+    The LiteLLM backend is created on first use, so scripted runs never import it.
+    """
+
+    def __init__(self) -> None:
+        from jamjet.model.scripted import ScriptedBackend
+
+        self._scripted = ScriptedBackend()
+        self._litellm: Any | None = None
+
+    def _pick(self, request: ModelRequest) -> Any:
+        if request.ref.provider == "scripted":
+            return self._scripted
+        if self._litellm is None:
+            from jamjet.model.litellm_backend import LiteLLMBackend
+
+            self._litellm = LiteLLMBackend()
+        return self._litellm
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        return await self._pick(request).complete(request)
+
+    def stream(self, request: ModelRequest) -> AsyncIterator[StreamChunk]:
+        return self._pick(request).stream(request)
+
+
 class Model:
     """The seam, governed by default.
 
@@ -41,9 +69,7 @@ class Model:
         ungoverned: bool = False,
     ) -> None:
         if backend is None:
-            from jamjet.model.litellm_backend import LiteLLMBackend
-
-            backend = LiteLLMBackend()
+            backend = _DefaultBackend()
         self._backend = backend
 
         if ungoverned and middleware is not None:

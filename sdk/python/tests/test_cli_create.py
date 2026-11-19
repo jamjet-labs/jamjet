@@ -198,3 +198,11 @@ def test_init_list_templates_still_works(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "hello-agent" in result.output
     assert "quickstart" in result.output
+
+
+def test_the_agent_template_quickstart_readme_starts_the_durable_run_through_an_import() -> None:
+    from jamjet.templates import get_template
+
+    readme = next(v for k, v in get_template("quickstart").items() if k.lower().startswith("readme"))
+    assert "from agent import main" in readme
+    assert "__main__:add" in readme

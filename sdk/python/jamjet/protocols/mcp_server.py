@@ -52,24 +52,6 @@ def serve_tools(
     )
 
 
-def _normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Normalize an input_schema so property values are proper JSON Schema objects.
-
-    The @tool decorator's _type_to_schema returns bare strings like "string"
-    for simple types.  MCP requires {"type": "string"}.
-    """
-    schema = dict(schema)  # shallow copy
-    if "properties" in schema:
-        props = {}
-        for key, val in schema["properties"].items():
-            if isinstance(val, str):
-                props[key] = {"type": val}
-            else:
-                props[key] = val
-        schema["properties"] = props
-    return schema
-
-
 class McpAsgiApp:
     """ASGI application implementing MCP Streamable HTTP transport."""
 
@@ -172,7 +154,7 @@ class McpAsgiApp:
         return {
             "name": defn.name,
             "description": defn.description or "",
-            "inputSchema": _normalize_schema(defn.input_schema),
+            "inputSchema": defn.input_schema,
         }
 
     async def _call_tool(self, params: dict[str, Any]) -> dict[str, Any] | None:

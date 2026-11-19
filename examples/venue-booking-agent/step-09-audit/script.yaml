@@ -1,0 +1,15 @@
+# A scripted model: find a venue, check its dates, pay the deposit,
+# answer.
+turns:
+  - tool_calls:
+      - name: search_venues
+        arguments: {city: Lisbon, date: "2026-12-11"}
+  - tool_calls:
+      - name: check_dates
+        arguments: {venue: Casa do Rio}
+  - tool_calls:
+      - name: pay_deposit
+        arguments: {venue: Casa do Rio, amount: 500}
+  - content: >-
+      Booked Casa do Rio in Lisbon for 11 December.
+      The 500 deposit is paid.

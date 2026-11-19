@@ -1,0 +1,2 @@
+model: scripted (no API key)
+Tell me the exact dates, whether you need a stage or just seats, and your budget. I can then look for venues in Lisbon that fit 40 people.

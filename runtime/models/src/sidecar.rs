@@ -34,7 +34,7 @@ impl SidecarModelAdapter {
     /// Create an adapter that POSTs to `base_url` (e.g. `http://127.0.0.1:4280`).
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::model_client(),
             base_url: base_url.into(),
         }
     }
@@ -158,12 +158,41 @@ impl SidecarModelAdapter {
             }
         }
         for m in messages {
-            let role = match m.role {
-                ChatRole::System => "system",
-                ChatRole::User | ChatRole::Tool => "user",
-                ChatRole::Assistant => "assistant",
-            };
-            out.push(json!({ "role": role, "content": m.content }));
+            match m.role {
+                ChatRole::System => out.push(json!({ "role": "system", "content": m.content })),
+                ChatRole::User => out.push(json!({ "role": "user", "content": m.content })),
+                ChatRole::Assistant if m.tool_calls.is_empty() => {
+                    out.push(json!({ "role": "assistant", "content": m.content }))
+                }
+                ChatRole::Assistant => {
+                    let calls: Vec<Value> = m
+                        .tool_calls
+                        .iter()
+                        .map(|tc| {
+                            let args = match &tc.arguments {
+                                Value::String(s) => s.clone(),
+                                other => serde_json::to_string(other).unwrap_or_default(),
+                            };
+                            json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": { "name": tc.name, "arguments": args },
+                            })
+                        })
+                        .collect();
+                    out.push(json!({
+                        "role": "assistant",
+                        "content": m.content,
+                        "tool_calls": calls,
+                    }));
+                }
+                ChatRole::Tool => match &m.tool_call_id {
+                    Some(id) => out
+                        .push(json!({ "role": "tool", "tool_call_id": id, "content": m.content })),
+                    // No call id: keep the old behaviour, a user message.
+                    None => out.push(json!({ "role": "user", "content": m.content })),
+                },
+            }
         }
         out
     }
@@ -314,6 +343,7 @@ pub async fn check_sidecar_health(
 mod tests {
     use super::*;
     use crate::adapter::ChatMessage;
+    use crate::adapter::ToolCall;
 
     #[tokio::test]
     async fn chat_maps_response_fields() {
@@ -783,6 +813,42 @@ mod tests {
         assert!(
             matches!(result, Err(ModelError::Serialization(_))),
             "missing input_tokens must produce Serialization error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_messages_puts_one_system_message_first() {
+        let msgs = vec![ChatMessage::user("hi")];
+        let out = SidecarModelAdapter::build_messages(&msgs, Some("You book venues."));
+        let systems = out.iter().filter(|m| m["role"] == "system").count();
+        assert_eq!(systems, 1);
+        assert_eq!(out[0]["content"], "You book venues.");
+    }
+
+    #[test]
+    fn build_messages_sends_openai_tool_shape() {
+        let msgs = vec![
+            ChatMessage::user("Find a venue."),
+            ChatMessage::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "search_venues".into(),
+                    arguments: json!({"city": "Lisbon"}),
+                }],
+            ),
+            ChatMessage::tool("call_1", "[\"Casa do Rio\"]"),
+        ];
+        let out = SidecarModelAdapter::build_messages(&msgs, None);
+        assert_eq!(
+            out[1],
+            json!({"role": "assistant", "content": "",
+                "tool_calls": [{"id": "call_1", "type": "function",
+                    "function": {"name": "search_venues", "arguments": "{\"city\":\"Lisbon\"}"}}]})
+        );
+        assert_eq!(
+            out[2],
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "[\"Casa do Rio\"]"})
         );
     }
 }

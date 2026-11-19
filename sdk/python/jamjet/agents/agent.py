@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "limit_exceeded"})
 # How often run_durable polls get_execution while waiting for a terminal state.
 _POLL_INTERVAL_SECONDS = 0.5
+_MAX_BACKOFF_SECONDS = 5.0
 # StrategyLimits requires a concrete cost figure and validates it > 0, so an
 # omitted ``max_cost_usd`` still needs one for the strategy runners' iteration
 # budget. This is ONLY that placeholder — it is deliberately not folded into
@@ -726,16 +728,26 @@ class Agent:
             if not exec_id:
                 raise RuntimeError(f"start_execution returned no execution_id: {started!r}")
 
-            execution = await self._poll_to_terminal(client, exec_id)
+            try:
+                execution = await self._poll_to_terminal(client, exec_id, runtime_url)
+            except TimeoutError as exc:
+                raise _with_execution_id(exc, exec_id)
             # Events carry artifact-resolved NodeCompleted outputs (server-side),
             # used only as a fallback if a spilled answer sentinel slips through.
             try:
-                events = (await client.get_events(exec_id)).get("events", [])
+                # Every output inlined: the fallback reads the final answer
+                # from them, and the runtime leaves large ones as references
+                # by default.
+                events = (await client.get_events(exec_id, inline_artifacts="all")).get("events", [])
             except Exception:  # noqa: BLE001 - events are a best-effort fallback
                 events = []
 
         duration_us = int((time.monotonic() - t0) * 1_000_000)
-        result = self._extract_result(execution, events, ir, duration_us)
+        try:
+            result = self._extract_result(execution, events, ir, duration_us)
+        except RuntimeError as exc:
+            raise _with_execution_id(exc, exec_id)
+        result.execution_id = exec_id
         # Mint the turn receipt + emit the per-action signed audit chain from the
         # durable run's extracted result (both on by default), mirroring run().
         result.receipt = self._maybe_mint_receipt(prompt, result.output)
@@ -874,23 +886,62 @@ class Agent:
             cloud_governance=target.cloud_governance,
         )
 
-    async def _poll_to_terminal(self, client: Any, exec_id: str) -> dict[str, Any]:
-        """Poll ``get_execution`` until the execution reaches a terminal state."""
+    async def _poll_to_terminal(self, client: Any, exec_id: str, runtime_url: str = "") -> dict[str, Any]:
+        """Poll ``get_execution`` until the execution reaches a terminal state.
+
+        Transport errors (the engine is down or restarting) do not end the wait:
+        it backs off from 0.5 s to 5 s and tries again until the overall timeout.
+        HTTP status errors still propagate.
+        """
+        import httpx  # noqa: PLC0415 - already a dependency of the client
+
+        from jamjet.cli.audit_trail import display_id  # noqa: PLC0415 - avoid an import cycle
+
         timeout_s = self.limits.timeout_seconds
         # Monotonic deadline: time spent inside slow get_execution() calls counts
         # toward the timeout, so a stalled run can't blow past timeout_seconds.
         deadline = time.monotonic() + timeout_s
+        shown_id = display_id(exec_id)
+        down = False
+        backoff = _POLL_INTERVAL_SECONDS
+        last_transport_exc: Exception | None = None
+        last_status = "unknown"
         while True:
-            execution = await client.get_execution(exec_id)
+            # Check expiry before each request, so none is issued after the deadline.
+            if time.monotonic() >= deadline:
+                if last_transport_exc is not None:
+                    raise TimeoutError(
+                        f"durable agent run {exec_id} did not reach a terminal state "
+                        f"within {timeout_s}s (the engine was unreachable)"
+                    ) from last_transport_exc
+                raise TimeoutError(
+                    f"durable agent run {exec_id} did not reach a terminal state "
+                    f"within {timeout_s}s (last status: {last_status!r})"
+                )
+            try:
+                execution = await client.get_execution(exec_id)
+            except httpx.TransportError as transport_exc:
+                last_transport_exc = transport_exc
+                if not down:
+                    down = True
+                    print(
+                        f"jamjet: lost the engine at {runtime_url}; waiting for it to come back (execution {shown_id})",
+                        file=sys.stderr,
+                    )
+                # Never sleep past the deadline.
+                await asyncio.sleep(max(0.0, min(backoff, deadline - time.monotonic())))
+                backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
+                continue
+            last_transport_exc = None
+            if down:
+                down = False
+                backoff = _POLL_INTERVAL_SECONDS
+                print("jamjet: the engine is back; resuming the wait", file=sys.stderr)
             status = execution.get("status", "unknown")
             if status in _TERMINAL_STATUSES:
                 return execution
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"durable agent run {exec_id} did not reach a terminal state "
-                    f"within {timeout_s}s (last status: {status!r})"
-                )
-            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+            last_status = status
+            await asyncio.sleep(max(0.0, min(_POLL_INTERVAL_SECONDS, deadline - time.monotonic())))
 
     def _extract_result(
         self,
@@ -1049,6 +1100,16 @@ class Agent:
         return f"Agent(name={self.name!r}, model={self.model!r}, tools={self.tool_names}, strategy={self.strategy!r})"
 
 
+def _with_execution_id(exc: Exception, exec_id: str) -> Exception:
+    """``exc`` with the execution named in its message (once) and carrying
+    ``execution_id``, so a failed or timed-out run can still be found. It is the
+    same exception, so a cause such as the last transport error is kept."""
+    if exec_id not in str(exc):
+        exc.args = (f"{exc} (execution {exec_id})", *exc.args[1:]) if exc.args else (f"execution {exec_id}",)
+    exc.execution_id = exec_id  # type: ignore[attr-defined]
+    return exc
+
+
 class AgentResult:
     """Result returned by Agent.run().
 
@@ -1067,6 +1128,7 @@ class AgentResult:
         duration_us: float = 0.0,
         receipt: dict[str, Any] | None = None,
         audit: list[Any] | None = None,
+        execution_id: str | None = None,
     ) -> None:
         self.output = output
         self.tool_calls = tool_calls
@@ -1077,6 +1139,9 @@ class AgentResult:
         # run (a list of jamjet.agents.audit.AuditAction), on by default; None
         # when ``audit=False``. ``jamjet.agents.audit.verify_chain`` accepts it.
         self.audit = audit
+        # The engine's execution id for a durable run (``run_durable``), so the
+        # run can be found with ``jamjet executions``; ``None`` for ``run()``.
+        self.execution_id = execution_id
 
     def __str__(self) -> str:
         return self.output

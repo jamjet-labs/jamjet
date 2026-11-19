@@ -394,6 +394,19 @@ impl FactStore for PostgresFactStore {
         Ok(result.rows_affected())
     }
 
+    async fn delete_scope_returning(&self, scope: &Scope) -> Result<Vec<FactId>, MemoryError> {
+        // One statement: the ids are exactly the rows this deleted.
+        let sql = format!(
+            "DELETE FROM facts WHERE {} RETURNING id",
+            scope_where(scope)
+        );
+        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| MemoryError::Database(e.to_string()))?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     async fn export(&self, filter: &FactFilter) -> Result<Vec<Fact>, MemoryError> {
         self.list_facts(filter).await
     }
@@ -529,4 +542,19 @@ impl FactStore for PostgresFactStore {
 
         rows.into_iter().map(row_to_fact).collect()
     }
+}
+
+/// The `WHERE` clause [`FactStore::delete_scope_data`] deletes by.
+fn scope_where(scope: &Scope) -> String {
+    let mut wheres = vec![format!("org_id = '{}'", scope.org_id.replace('\'', "''"))];
+    if let Some(ref user_id) = scope.user_id {
+        wheres.push(format!("user_id = '{}'", user_id.replace('\'', "''")));
+    }
+    if let Some(ref agent_id) = scope.agent_id {
+        wheres.push(format!("agent_id = '{}'", agent_id.replace('\'', "''")));
+    }
+    if let Some(ref session_id) = scope.session_id {
+        wheres.push(format!("session_id = '{}'", session_id.replace('\'', "''")));
+    }
+    wheres.join(" AND ")
 }

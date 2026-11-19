@@ -25,3 +25,6 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 dashmap = "6"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

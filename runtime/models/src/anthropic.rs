@@ -27,7 +27,7 @@ impl AnthropicAdapter {
     /// Create an adapter with the given API key.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::model_client(),
             api_key: api_key.into(),
             default_model: DEFAULT_MODEL.into(),
         }
@@ -176,6 +176,8 @@ impl ModelAdapter for AnthropicAdapter {
         gen_ai.usage.output_tokens = tracing::field::Empty,
     ))]
     async fn chat(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        // Tool round trips (tool_calls, tool_call_id) go through the sidecar; this
+        // adapter maps role and content only.
         // Native adapter: tools are not forwarded to the provider. Warn (once) so
         // a tool-carrying call does not silently degenerate the agent loop.
         if !request.tools.is_empty() {

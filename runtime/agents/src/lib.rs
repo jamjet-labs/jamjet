@@ -1,6 +1,7 @@
 pub mod card;
 pub mod lifecycle;
 pub mod memory_registry;
+pub mod outbound;
 pub mod registry;
 pub mod sqlite_registry;
 
