@@ -7,6 +7,7 @@ would show a long run's timeline cut short.
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from jamjet.client import JamjetClient
 
@@ -79,3 +80,34 @@ async def test_get_events_asks_for_inline_artifacts_on_every_page():
     finally:
         await client._client.aclose()
     assert seen == [(None, "all"), ("1", "all")]
+
+
+@pytest.mark.parametrize("body", [{}, {"error": "busy"}, {"events": None}, {"events": "none"}, []])
+async def test_get_events_refuses_an_answer_without_an_events_list(body):
+    """A 200 with no ``events`` list is no evidence about the run. Returned as
+    an empty log, it would let an eval's ``did_not_use`` check pass."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    client = await _client(handler)
+    try:
+        with pytest.raises(ValueError, match="no `events` list"):
+            await client.get_events("exec_1")
+    finally:
+        await client._client.aclose()
+
+
+async def test_get_events_refuses_a_later_page_without_an_events_list():
+    """A log cut short is not returned as the whole log."""
+    pages = {None: {"events": [{"sequence": 1}], "next_after": 1}, "1": {}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=pages[request.url.params.get("after")])
+
+    client = await _client(handler)
+    try:
+        with pytest.raises(ValueError, match="no `events` list"):
+            await client.get_events("exec_1")
+    finally:
+        await client._client.aclose()

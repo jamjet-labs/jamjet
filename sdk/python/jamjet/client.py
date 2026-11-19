@@ -233,7 +233,13 @@ class JamjetClient:
             r = await self._client.get(f"/executions/{execution_id}/events", params=params)
             _raise_for_status(r)
             page = r.json()
-            events.extend(page.get("events", []))
+            page_events = page.get("events") if isinstance(page, dict) else None
+            if not isinstance(page_events, list):
+                # Not a page of the log. Read as an empty one, it would say
+                # "nothing happened" where the runtime said nothing, and a
+                # check like an eval's `did_not_use` would pass on it.
+                raise ValueError(f"the answer to GET /executions/{execution_id}/events has no `events` list")
+            events.extend(page_events)
             next_after = page.get("next_after")
             if next_after is None:
                 return {"events": events}
