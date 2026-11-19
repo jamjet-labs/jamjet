@@ -1217,6 +1217,8 @@ impl Worker {
                 registry: self.agents.as_deref(),
             },
             Some(item_id),
+            // The in-process worker holds its lease for the whole step.
+            None,
         )
         .await;
         self.settle_outcome(

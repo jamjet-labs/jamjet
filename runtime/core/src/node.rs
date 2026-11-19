@@ -92,6 +92,14 @@ pub enum NodeKind {
         queue: String,
         handler: String,
         output_schema: String,
+        /// Who may claim this node's items. `by_execution`: only a claim
+        /// that names the execution (`POST /work-items/claim` with
+        /// `execution_id`), made by the run's initiator; the oldest-first
+        /// claim never hands them out. Left out when it is the default, so
+        /// existing node definitions, and the approvals bound to them, are
+        /// unchanged.
+        #[serde(default, skip_serializing_if = "ClaimMode::is_oldest_first")]
+        claim: ClaimMode,
     },
 
     /// Router — evaluates expressions and branches.
@@ -264,6 +272,29 @@ impl NodeKind {
         !matches!(self, Self::Condition { .. }) && !is_agent_discovery
     }
 }
+
+/// How an `external_fn` node's work items may be claimed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimMode {
+    /// Any worker on the queue, oldest item first.
+    #[default]
+    OldestFirst,
+    /// Only a claim naming the execution, by the run's initiator.
+    ByExecution,
+}
+
+impl ClaimMode {
+    pub fn is_oldest_first(&self) -> bool {
+        *self == Self::OldestFirst
+    }
+}
+
+/// The payload key, and its value, that mark a work item as claimable only
+/// by execution ([`ClaimMode::ByExecution`]). The scheduler writes it; the
+/// claim queries read it.
+pub const CLAIM_PAYLOAD_KEY: &str = "claim";
+pub const CLAIM_BY_EXECUTION: &str = "by_execution";
 
 /// Which queue a node's work item is dispatched to.
 ///

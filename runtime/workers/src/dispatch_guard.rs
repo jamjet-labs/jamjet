@@ -1285,6 +1285,7 @@ mod tests {
                 None,
                 Default::default(),
                 None,
+                None,
             )
             .await
         }
@@ -1317,6 +1318,7 @@ mod tests {
             &payload,
             None,
             Default::default(),
+            None,
             None,
         )
         .await;
@@ -1363,6 +1365,7 @@ mod tests {
             &payload,
             None,
             Default::default(),
+            None,
             None,
         )
         .await;
@@ -1448,6 +1451,7 @@ mod tests {
             &json!({ "workflow_id": "model-wf", "node_id": "n1", "prompt": "hi" }),
             None,
             Default::default(),
+            None,
             None,
         )
         .await;
@@ -1741,6 +1745,7 @@ mod tests {
             &json!({ "input": input_for(&["send_wire"]) }),
             Some(&sealer),
             Default::default(),
+            None,
             None,
         )
         .await;

@@ -49,6 +49,8 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
+# Paused time for tests of the claim route's bounded wait.
+tokio = { workspace = true, features = ["test-util"] }
 http-body-util = "0.1"
 tracing-subscriber = { workspace = true }
 # Route tests that assert a work item's DURABLE settle state read `work_items.status`

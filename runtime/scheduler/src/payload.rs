@@ -59,9 +59,18 @@ pub fn build_work_item_payload(
         }
         // Any external worker: the handler name it resolves itself, and the
         // state as input. The queue is routing, so it stays off the payload.
-        NodeKind::ExternalFn { handler, .. } => {
+        NodeKind::ExternalFn { handler, claim, .. } => {
             obj.insert("handler".into(), Value::String(handler.clone()));
             obj.insert("input".into(), Value::Object(state.clone()));
+            // The claim queries read this to keep the item away from the
+            // oldest-first claim. Only written for the opt-in, so other
+            // payloads (and the digests that bind them) are unchanged.
+            if *claim == jamjet_core::node::ClaimMode::ByExecution {
+                obj.insert(
+                    jamjet_core::node::CLAIM_PAYLOAD_KEY.into(),
+                    Value::String(jamjet_core::node::CLAIM_BY_EXECUTION.into()),
+                );
+            }
         }
         // The model worker needs the resolved model id, optional config
         // overrides, the node's prompt rendered against the run's state, its

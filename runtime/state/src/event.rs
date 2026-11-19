@@ -146,6 +146,15 @@ pub enum EventKind {
         node_id: NodeId,
         reason: String,
     },
+    /// The claim gate withheld a work item as not the engine's (its payload
+    /// names another workflow than its execution) and settled it. The node is
+    /// not failed, since the item was stray, and no run state changes: this
+    /// is on record so a claim says why (`refused`) the same way each time.
+    WorkItemRefused {
+        node_id: NodeId,
+        work_item_id: Uuid,
+        reason: String,
+    },
     NodeCancelled {
         node_id: NodeId,
     },
@@ -515,6 +524,7 @@ impl EventKind {
             | Self::NodeFailed { node_id, .. }
             | Self::NodeParked { node_id, .. }
             | Self::NodeSkipped { node_id, .. }
+            | Self::WorkItemRefused { node_id, .. }
             | Self::NodeCancelled { node_id }
             | Self::RetryScheduled { node_id, .. }
             | Self::InterruptRaised { node_id, .. }
