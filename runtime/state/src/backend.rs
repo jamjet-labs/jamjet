@@ -671,8 +671,16 @@ pub trait StateBackend: Send + Sync {
     }
 
     /// Get a tenant by ID.
+    ///
+    /// The default refuses rather than answering "no such tenant": the
+    /// tenant's policy is a ceiling every node is checked under, and a backend
+    /// that forgot this method would drop it silently. A backend with no
+    /// tenants returns `Ok(None)` on purpose.
     async fn get_tenant(&self, _id: &TenantId) -> BackendResult<Option<Tenant>> {
-        Ok(None)
+        Err(StateBackendError::Database(
+            "this backend cannot read tenants; refusing to evaluate without the tenant policy"
+                .into(),
+        ))
     }
 
     /// List all tenants.

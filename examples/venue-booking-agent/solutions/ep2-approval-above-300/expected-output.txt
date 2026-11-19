@@ -1,0 +1,4 @@
+model: scripted (no API key)
+Booked Casa do Rio in Lisbon for 11 December. The 200 deposit is paid.
+execution: exec_<id>
+payments.log: 1 line(s)

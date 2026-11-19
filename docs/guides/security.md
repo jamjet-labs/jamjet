@@ -100,23 +100,48 @@ have to carry the tenant first, and none does yet:
   tenant policy applies to them);
 - the agent registry (global today).
 
-Tenant policy (`PUT /tenants/:id`, operator only) is not a floor under the
-policies in a workflow's IR. Layers are checked from the most specific to the
-least (node, then workflow, then tenant), and the first rule that matches
-decides. A developer who registers IR can therefore override the tenant layer
-for a name their own rule matches:
+Tenant policy (`PUT /tenants/:id`, operator only) is a ceiling over the
+policies in a workflow's IR. No workflow or node rule can lift a tenant rule;
+it can only add to it:
 
-- a node or workflow `require_approval_for` pattern turns a tenant block into
-  an approval request;
-- on a `model` node, a node or workflow `model_allowlist` that lists the model
-  allows the call before the tenant's allowlist is read.
+- a tenant `blocked_tools` match blocks the node, whatever the workflow or node
+  policy says (an IR `require_approval_for` on the same name no longer turns it
+  into an approval request);
+- a tenant `require_approval_for` match holds a node the IR allows;
+- on a `model` node the model must be on the tenant's `model_allowlist` and on
+  the most specific IR allowlist that has one, so the IR can narrow the
+  tenant's list but not widen it. The model checked is the string the node
+  sends to the model registry: the IR's `models` entry the node names,
+  resolved to `provider/model`, not the alias. So an allowlist of bare names
+  (`claude-*`) does not match a resolved `anthropic/claude-...`; list the
+  provider (`anthropic`) or the full ref. The registry routes `anthropic/`,
+  `openai/` and `google/` refs and a few bare-name prefixes (`claude-`, `gpt-`,
+  `llama`, ...) to their adapters, and sends any other string to its default
+  adapter. An allowlist entry for a provider it has no route for, such as
+  `ollama/...`, therefore does not keep the call on that provider.
 
-A tenant `require_approval_for: ["*"]` does gate every Python, Java and
-external step, since a rule in the IR can only block such a step or ask for
-the same approval. It does not gate `model`, `condition` or `human_approval`
-nodes: they have no tool name for a pattern to match. A narrow tenant pattern
-binds less than it seems. It matches a name the IR author chose, and the same
-function can be reached under another name (a re-export or an alias).
+Inside the IR the most specific layer still wins: a node `require_approval_for`
+turns a workflow block into an approval request, and a node `model_allowlist`
+replaces the workflow's, since one author owns both.
+
+A tenant catch-all (`["*"]`) applies to every Python, Java and external step,
+and to `model` nodes too: tenant `require_approval_for: ["*"]` holds every
+`model` node for approval (in an agent loop, every turn) and
+`blocked_tools: ["*"]` blocks it. To cover every tool but not the model turns,
+write `["tool:*"]`: it matches what `*` matches inside the IR, every tool and
+no `model` node, in the tenant policy as in the IR.
+
+Upgrading: before the tenant policy was a ceiling, a tenant `*` matched tools
+only. A tenant policy that has `"*"` in `require_approval_for` now also holds
+each model turn, and one with `"*"` in `blocked_tools` blocks every model node.
+If you meant tools only, change it to `"tool:*"`. A model call a Python or Java step makes
+itself is not a `model` node and is not covered. Other patterns
+match tool names, which a model node does not have. In the IR, `["*"]` still
+means every tool and does not reach model nodes, so an agent compiled with
+`approval_required=True` is not asked to approve its own model calls. Neither
+gates `condition` or `human_approval` nodes. A narrow tenant pattern binds less
+than it seems. It matches a name the IR author chose, and the same function can
+be reached under another name (a re-export or an alias).
 
 ---
 

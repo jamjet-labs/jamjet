@@ -1,0 +1,1 @@
+jamjet.agents.governance.ApprovalNotEnforceableError: Agent 'venue-booker'.run(): an approval gate is declared (require_approval_for=['pay_deposit']), but the in-process path cannot hold a run at a gate. Use run_durable(), where the engine evaluates every tool call against policy before any worker receives the payload. To run without gates deliberately, remove the approval rules.
