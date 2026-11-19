@@ -6,6 +6,9 @@ can run any step on its own.
 
 Nothing is really booked or paid. The "payments" are lines in a log file.
 
+Watch it built: [Build an AI Agent with JamJet (Python Code-Along)](https://www.youtube.com/playlist?list=PLD5Bg9vUNgik)
+on YouTube. Part 1 covers steps 1 to 3.
+
 ## Install
 
 Python 3.11 or newer (checked on 3.12).
