@@ -1,0 +1,2 @@
+model: scripted (no API key)
+budget exceeded: tokens 2080 >= limit 2000

@@ -1,0 +1,1257 @@
+{
+  "execution": {
+    "completed_at": "2026-11-18T02:14:04.062574Z",
+    "current_state": {
+      "__budget": {
+        "circuit_breaker_tripped": false,
+        "consecutive_error_count": 0,
+        "iteration_count": 0,
+        "tool_call_count": 0,
+        "total_cost_usd": 0.0,
+        "total_input_tokens": 236,
+        "total_output_tokens": 60
+      },
+      "last_model_finish_reason": "stop",
+      "last_model_output": "Booked Casa do Rio in Lisbon for 11 December 2026. The 500 deposit is paid and the receipt is on file.",
+      "last_model_tool_calls": [],
+      "messages": [
+        {
+          "content": "You book event venues. Use the tools.",
+          "role": "system"
+        },
+        {
+          "content": "Book a venue in Lisbon for 2026-12-11 and pay a 500 deposit.",
+          "role": "user"
+        },
+        {
+          "content": "Let me look for venues.",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "function": {
+                "arguments": "{\"city\": \"Lisbon\", \"date\": \"2026-12-11\"}",
+                "name": "search_venues"
+              },
+              "id": "call_0_0",
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "content": "[{\"venue\": \"Casa do Rio\", \"capacity\": 120, \"price_per_day\": 2400}, {\"venue\": \"Armazem 16\", \"capacity\": 300, \"price_per_day\": 5200}]",
+          "name": "search_venues",
+          "role": "tool",
+          "tool_call_id": "call_0_0"
+        },
+        {
+          "content": "",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "function": {
+                "arguments": "{\"venue\": \"Casa do Rio\"}",
+                "name": "check_dates"
+              },
+              "id": "call_1_0",
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "content": "[\"2026-12-04\", \"2026-12-11\"]",
+          "name": "check_dates",
+          "role": "tool",
+          "tool_call_id": "call_1_0"
+        },
+        {
+          "content": "",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "function": {
+                "arguments": "{\"amount\": 500, \"venue\": \"Casa do Rio\"}",
+                "name": "pay_deposit"
+              },
+              "id": "call_2_0",
+              "type": "function"
+            }
+          ]
+        },
+        {
+          "content": "Deposit of 500 paid for Casa do Rio. Receipt #1",
+          "name": "pay_deposit",
+          "role": "tool",
+          "tool_call_id": "call_2_0"
+        }
+      ],
+      "tools": {
+        "cancel_booking": "venue_tools:cancel_booking",
+        "check_dates": "venue_tools:check_dates",
+        "pay_deposit": "venue_tools:pay_deposit",
+        "search_venues": "venue_tools:search_venues"
+      }
+    },
+    "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+    "initial_input": {
+      "messages": [
+        {
+          "content": "You book event venues. Use the tools.",
+          "role": "system"
+        },
+        {
+          "content": "Book a venue in Lisbon for 2026-12-11 and pay a 500 deposit.",
+          "role": "user"
+        }
+      ],
+      "tools": {
+        "cancel_booking": "venue_tools:cancel_booking",
+        "check_dates": "venue_tools:check_dates",
+        "pay_deposit": "venue_tools:pay_deposit",
+        "search_venues": "venue_tools:search_venues"
+      }
+    },
+    "segment_number": 0,
+    "started_at": "2026-11-18T02:12:31.239226Z",
+    "status": "completed",
+    "updated_at": "2026-11-18T02:14:04.062574Z",
+    "workflow_id": "venue-booker",
+    "workflow_version": "0.1.0+6dccec9be796"
+  },
+  "events": [
+    {
+      "created_at": "2026-11-18T02:12:31.239889Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "7dfb2eda-a04c-4a89-9df6-09dfec76f87f",
+      "kind": {
+        "initial_input": {
+          "messages": [
+            {
+              "content": "You book event venues. Use the tools.",
+              "role": "system"
+            },
+            {
+              "content": "Book a venue in Lisbon for 2026-12-11 and pay a 500 deposit.",
+              "role": "user"
+            }
+          ],
+          "tools": {
+            "cancel_booking": "venue_tools:cancel_booking",
+            "check_dates": "venue_tools:check_dates",
+            "pay_deposit": "venue_tools:pay_deposit",
+            "search_venues": "venue_tools:search_venues"
+          }
+        },
+        "type": "workflow_started",
+        "workflow_id": "venue-booker",
+        "workflow_version": "0.1.0+6dccec9be796"
+      },
+      "sequence": 1
+    },
+    {
+      "created_at": "2026-11-18T02:12:31.240016Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "f68eaa41-e6a1-4586-932e-08d8ac274b7c",
+      "kind": {
+        "node_id": "__model_0__",
+        "queue_type": "model",
+        "type": "node_scheduled"
+      },
+      "sequence": 2
+    },
+    {
+      "created_at": "2026-11-18T02:12:31.304718Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "423930c3-d3ca-4ff0-9dda-d2f558898611",
+      "kind": {
+        "attempt": 0,
+        "node_id": "__model_0__",
+        "type": "node_started",
+        "worker_id": "model-worker-0"
+      },
+      "sequence": 3
+    },
+    {
+      "created_at": "2026-11-18T02:12:31.313141Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "18cecb57-8054-4f36-bcab-aa9f5dd30b63",
+      "kind": {
+        "duration_ms": 8,
+        "finish_reason": "tool_calls",
+        "gen_ai_model": "scripted//home/user/task6/book.yaml",
+        "gen_ai_system": "unknown",
+        "idempotency_key": "29d893ad887165b8ce58f188b6ff9997486db5466bcad11e5963570aa1b71d76",
+        "input_tokens": 24,
+        "node_id": "__model_0__",
+        "output": {
+          "content": "Let me look for venues.",
+          "finish_reason": "tool_calls",
+          "model": "scripted//home/user/task6/book.yaml",
+          "tool_calls": [
+            {
+              "arguments": {
+                "city": "Lisbon",
+                "date": "2026-12-11"
+              },
+              "id": "call_0_0",
+              "name": "search_venues"
+            }
+          ]
+        },
+        "output_tokens": 15,
+        "state_patch": {
+          "__budget": {
+            "circuit_breaker_tripped": false,
+            "consecutive_error_count": 0,
+            "iteration_count": 0,
+            "tool_call_count": 0,
+            "total_cost_usd": 0.0,
+            "total_input_tokens": 24,
+            "total_output_tokens": 15
+          },
+          "last_model_finish_reason": "tool_calls",
+          "last_model_output": "Let me look for venues.",
+          "last_model_tool_calls": [
+            {
+              "arguments": {
+                "city": "Lisbon",
+                "date": "2026-12-11"
+              },
+              "id": "call_0_0",
+              "name": "search_venues"
+            }
+          ]
+        },
+        "type": "node_completed"
+      },
+      "sequence": 4
+    },
+    {
+      "created_at": "2026-11-18T02:12:31.806225Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "cf20849c-0fb0-4941-b22c-c6cda7cfbccc",
+      "kind": {
+        "node_id": "__tool_gate_0__",
+        "queue_type": "general",
+        "type": "node_scheduled"
+      },
+      "sequence": 5
+    },
+    {
+      "created_at": "2026-11-18T02:12:31.821691Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "926465dd-e10f-49d3-8e13-dd566965ce24",
+      "kind": {
+        "attempt": 0,
+        "node_id": "__tool_gate_0__",
+        "type": "node_started",
+        "worker_id": "general-worker-0"
+      },
+      "sequence": 6
+    },
+    {
+      "created_at": "2026-11-18T02:12:31.825743Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "4fb5356d-6fe1-4d94-a36a-cc3a21a4e6a0",
+      "kind": {
+        "duration_ms": 4,
+        "idempotency_key": "d4724aea9d698445a1fd0983fd1cb3cda997f08e188446b738059f322045830b",
+        "node_id": "__tool_gate_0__",
+        "output": {
+          "branch_targets": [
+            "__tools_0__",
+            "end"
+          ],
+          "chosen_target": "__tools_0__"
+        },
+        "state_patch": {
+          "__budget": {
+            "circuit_breaker_tripped": false,
+            "consecutive_error_count": 0,
+            "iteration_count": 0,
+            "tool_call_count": 0,
+            "total_cost_usd": 0.0,
+            "total_input_tokens": 24,
+            "total_output_tokens": 15
+          }
+        },
+        "type": "node_completed"
+      },
+      "sequence": 7
+    },
+    {
+      "created_at": "2026-11-18T02:12:32.314411Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "9032dd20-d7dc-4581-85bc-766c98127925",
+      "kind": {
+        "node_id": "__tools_0__",
+        "queue_type": "python_tool",
+        "type": "node_scheduled"
+      },
+      "sequence": 8
+    },
+    {
+      "created_at": "2026-11-18T02:12:33.986944Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "07c30b6f-5d64-44a0-b269-c58563a9fca4",
+      "kind": {
+        "duration_ms": 6,
+        "idempotency_key": "e489b81950d652678f5027eba67a1389a7b336bd72f33ffa50e0253e2983f1b6",
+        "node_id": "__tools_0__",
+        "output": {
+          "messages": [
+            {
+              "content": "You book event venues. Use the tools.",
+              "role": "system"
+            },
+            {
+              "content": "Book a venue in Lisbon for 2026-12-11 and pay a 500 deposit.",
+              "role": "user"
+            },
+            {
+              "content": "Let me look for venues.",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"city\": \"Lisbon\", \"date\": \"2026-12-11\"}",
+                    "name": "search_venues"
+                  },
+                  "id": "call_0_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "[{\"venue\": \"Casa do Rio\", \"capacity\": 120, \"price_per_day\": 2400}, {\"venue\": \"Armazem 16\", \"capacity\": 300, \"price_per_day\": 5200}]",
+              "name": "search_venues",
+              "role": "tool",
+              "tool_call_id": "call_0_0"
+            }
+          ]
+        },
+        "state_patch": {
+          "messages": [
+            {
+              "content": "You book event venues. Use the tools.",
+              "role": "system"
+            },
+            {
+              "content": "Book a venue in Lisbon for 2026-12-11 and pay a 500 deposit.",
+              "role": "user"
+            },
+            {
+              "content": "Let me look for venues.",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"city\": \"Lisbon\", \"date\": \"2026-12-11\"}",
+                    "name": "search_venues"
+                  },
+                  "id": "call_0_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "[{\"venue\": \"Casa do Rio\", \"capacity\": 120, \"price_per_day\": 2400}, {\"venue\": \"Armazem 16\", \"capacity\": 300, \"price_per_day\": 5200}]",
+              "name": "search_venues",
+              "role": "tool",
+              "tool_call_id": "call_0_0"
+            }
+          ]
+        },
+        "type": "node_completed"
+      },
+      "sequence": 9
+    },
+    {
+      "created_at": "2026-11-18T02:12:34.334037Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "60b65705-6007-4d2e-bacb-86928f78eaa8",
+      "kind": {
+        "node_id": "__model_1__",
+        "queue_type": "model",
+        "type": "node_scheduled"
+      },
+      "sequence": 10
+    },
+    {
+      "created_at": "2026-11-18T02:12:34.835903Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "a04a8afc-fdcb-400a-9b3c-1204d7eca366",
+      "kind": {
+        "attempt": 0,
+        "node_id": "__model_1__",
+        "type": "node_started",
+        "worker_id": "model-worker-0"
+      },
+      "sequence": 11
+    },
+    {
+      "created_at": "2026-11-18T02:12:34.846323Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "c400f2ba-0951-4514-99d4-d06e7638da77",
+      "kind": {
+        "duration_ms": 11,
+        "finish_reason": "tool_calls",
+        "gen_ai_model": "scripted//home/user/task6/book.yaml",
+        "gen_ai_system": "unknown",
+        "idempotency_key": "0b370e240ce8b55dda8b8f2b500db6bdabd47834e13d3ba6aa5fdae80f17c2f4",
+        "input_tokens": 62,
+        "node_id": "__model_1__",
+        "output": {
+          "content": "",
+          "finish_reason": "tool_calls",
+          "model": "scripted//home/user/task6/book.yaml",
+          "tool_calls": [
+            {
+              "arguments": {
+                "venue": "Casa do Rio"
+              },
+              "id": "call_1_0",
+              "name": "check_dates"
+            }
+          ]
+        },
+        "output_tokens": 10,
+        "state_patch": {
+          "__budget": {
+            "circuit_breaker_tripped": false,
+            "consecutive_error_count": 0,
+            "iteration_count": 0,
+            "tool_call_count": 0,
+            "total_cost_usd": 0.0,
+            "total_input_tokens": 86,
+            "total_output_tokens": 25
+          },
+          "last_model_finish_reason": "tool_calls",
+          "last_model_output": "",
+          "last_model_tool_calls": [
+            {
+              "arguments": {
+                "venue": "Casa do Rio"
+              },
+              "id": "call_1_0",
+              "name": "check_dates"
+            }
+          ]
+        },
+        "type": "node_completed"
+      },
+      "sequence": 12
+    },
+    {
+      "created_at": "2026-11-18T02:12:35.344122Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "408b9510-ac59-47c9-9704-0c13b5c9cc61",
+      "kind": {
+        "node_id": "__tool_gate_1__",
+        "queue_type": "general",
+        "type": "node_scheduled"
+      },
+      "sequence": 13
+    },
+    {
+      "created_at": "2026-11-18T02:12:35.351880Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "68fe2d47-60cf-40e9-a3fa-0943140297c1",
+      "kind": {
+        "attempt": 0,
+        "node_id": "__tool_gate_1__",
+        "type": "node_started",
+        "worker_id": "general-worker-1"
+      },
+      "sequence": 14
+    },
+    {
+      "created_at": "2026-11-18T02:12:35.357194Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "da7b3a2f-a990-469a-93cb-67dbf7571ab5",
+      "kind": {
+        "duration_ms": 5,
+        "idempotency_key": "c82b13c04246bca87c566141ffe8360b705f16da2279e4a613424770bb0b1243",
+        "node_id": "__tool_gate_1__",
+        "output": {
+          "branch_targets": [
+            "__tools_1__",
+            "end"
+          ],
+          "chosen_target": "__tools_1__"
+        },
+        "state_patch": {
+          "__budget": {
+            "circuit_breaker_tripped": false,
+            "consecutive_error_count": 0,
+            "iteration_count": 0,
+            "tool_call_count": 0,
+            "total_cost_usd": 0.0,
+            "total_input_tokens": 86,
+            "total_output_tokens": 25
+          }
+        },
+        "type": "node_completed"
+      },
+      "sequence": 15
+    },
+    {
+      "created_at": "2026-11-18T02:12:35.852313Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "21407b28-4fe7-41cc-8bcf-7e32bad333e6",
+      "kind": {
+        "node_id": "__tools_1__",
+        "queue_type": "python_tool",
+        "type": "node_scheduled"
+      },
+      "sequence": 16
+    },
+    {
+      "created_at": "2026-11-18T02:12:36.012637Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "5a21c138-5643-49a9-9c92-8f4b433b3c48",
+      "kind": {
+        "duration_ms": 0,
+        "idempotency_key": "c4e9a0daf8e7ff03f310df53537fe5061e9567763c40ed676e70c391c66421a7",
+        "node_id": "__tools_1__",
+        "output": {
+          "messages": [
+            {
+              "content": "You book event venues. Use the tools.",
+              "role": "system"
+            },
+            {
+              "content": "Book a venue in Lisbon for 2026-12-11 and pay a 500 deposit.",
+              "role": "user"
+            },
+            {
+              "content": "Let me look for venues.",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"city\": \"Lisbon\", \"date\": \"2026-12-11\"}",
+                    "name": "search_venues"
+                  },
+                  "id": "call_0_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "[{\"venue\": \"Casa do Rio\", \"capacity\": 120, \"price_per_day\": 2400}, {\"venue\": \"Armazem 16\", \"capacity\": 300, \"price_per_day\": 5200}]",
+              "name": "search_venues",
+              "role": "tool",
+              "tool_call_id": "call_0_0"
+            },
+            {
+              "content": "",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"venue\": \"Casa do Rio\"}",
+                    "name": "check_dates"
+                  },
+                  "id": "call_1_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "[\"2026-12-04\", \"2026-12-11\"]",
+              "name": "check_dates",
+              "role": "tool",
+              "tool_call_id": "call_1_0"
+            }
+          ]
+        },
+        "state_patch": {
+          "messages": [
+            {
+              "content": "You book event venues. Use the tools.",
+              "role": "system"
+            },
+            {
+              "content": "Book a venue in Lisbon for 2026-12-11 and pay a 500 deposit.",
+              "role": "user"
+            },
+            {
+              "content": "Let me look for venues.",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"city\": \"Lisbon\", \"date\": \"2026-12-11\"}",
+                    "name": "search_venues"
+                  },
+                  "id": "call_0_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "[{\"venue\": \"Casa do Rio\", \"capacity\": 120, \"price_per_day\": 2400}, {\"venue\": \"Armazem 16\", \"capacity\": 300, \"price_per_day\": 5200}]",
+              "name": "search_venues",
+              "role": "tool",
+              "tool_call_id": "call_0_0"
+            },
+            {
+              "content": "",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"venue\": \"Casa do Rio\"}",
+                    "name": "check_dates"
+                  },
+                  "id": "call_1_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "[\"2026-12-04\", \"2026-12-11\"]",
+              "name": "check_dates",
+              "role": "tool",
+              "tool_call_id": "call_1_0"
+            }
+          ]
+        },
+        "type": "node_completed"
+      },
+      "sequence": 17
+    },
+    {
+      "created_at": "2026-11-18T02:12:36.360405Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "0725960a-0e2b-4ffc-8dd2-44c8ed330f1e",
+      "kind": {
+        "node_id": "__model_2__",
+        "queue_type": "model",
+        "type": "node_scheduled"
+      },
+      "sequence": 18
+    },
+    {
+      "created_at": "2026-11-18T02:12:36.847846Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "1cd97c22-f301-4fb9-b6e6-0123ea72161e",
+      "kind": {
+        "attempt": 0,
+        "node_id": "__model_2__",
+        "type": "node_started",
+        "worker_id": "model-worker-1"
+      },
+      "sequence": 19
+    },
+    {
+      "created_at": "2026-11-18T02:12:36.851732Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "137c4cf3-f24c-4ceb-b25f-5c5768a2693f",
+      "kind": {
+        "duration_ms": 4,
+        "finish_reason": "tool_calls",
+        "gen_ai_model": "scripted//home/user/task6/book.yaml",
+        "gen_ai_system": "unknown",
+        "idempotency_key": "900b43f23ce3420368efbad6a294449f900439a9adc77be38c69bd896d74e277",
+        "input_tokens": 69,
+        "node_id": "__model_2__",
+        "output": {
+          "content": "",
+          "finish_reason": "tool_calls",
+          "model": "scripted//home/user/task6/book.yaml",
+          "tool_calls": [
+            {
+              "arguments": {
+                "amount": 500,
+                "venue": "Casa do Rio"
+              },
+              "id": "call_2_0",
+              "name": "pay_deposit"
+            }
+          ]
+        },
+        "output_tokens": 10,
+        "state_patch": {
+          "__budget": {
+            "circuit_breaker_tripped": false,
+            "consecutive_error_count": 0,
+            "iteration_count": 0,
+            "tool_call_count": 0,
+            "total_cost_usd": 0.0,
+            "total_input_tokens": 155,
+            "total_output_tokens": 35
+          },
+          "last_model_finish_reason": "tool_calls",
+          "last_model_output": "",
+          "last_model_tool_calls": [
+            {
+              "arguments": {
+                "amount": 500,
+                "venue": "Casa do Rio"
+              },
+              "id": "call_2_0",
+              "name": "pay_deposit"
+            }
+          ]
+        },
+        "type": "node_completed"
+      },
+      "sequence": 20
+    },
+    {
+      "created_at": "2026-11-18T02:12:36.869189Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "fa86f3ea-3d85-42c1-8781-f2c3a6a0b2ea",
+      "kind": {
+        "node_id": "__tool_gate_2__",
+        "queue_type": "general",
+        "type": "node_scheduled"
+      },
+      "sequence": 21
+    },
+    {
+      "created_at": "2026-11-18T02:12:37.365052Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "2709b368-9754-4ef8-82a9-5a22ab27666c",
+      "kind": {
+        "attempt": 0,
+        "node_id": "__tool_gate_2__",
+        "type": "node_started",
+        "worker_id": "general-worker-0"
+      },
+      "sequence": 22
+    },
+    {
+      "created_at": "2026-11-18T02:12:37.366942Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "8e15db54-0623-4b80-aaf6-ed603bfa987c",
+      "kind": {
+        "duration_ms": 2,
+        "idempotency_key": "9faee5c099446f08ff7310c2e9bbb7b19629f9d237be1ea907cb205cc2a5d990",
+        "node_id": "__tool_gate_2__",
+        "output": {
+          "branch_targets": [
+            "__tools_2__",
+            "end"
+          ],
+          "chosen_target": "__tools_2__"
+        },
+        "state_patch": {
+          "__budget": {
+            "circuit_breaker_tripped": false,
+            "consecutive_error_count": 0,
+            "iteration_count": 0,
+            "tool_call_count": 0,
+            "total_cost_usd": 0.0,
+            "total_input_tokens": 155,
+            "total_output_tokens": 35
+          }
+        },
+        "type": "node_completed"
+      },
+      "sequence": 23
+    },
+    {
+      "created_at": "2026-11-18T02:12:37.371471Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "1e207711-aff7-431f-8ed8-582432afeef2",
+      "kind": {
+        "node_id": "__tools_2__",
+        "queue_type": "python_tool",
+        "type": "node_scheduled"
+      },
+      "sequence": 24
+    },
+    {
+      "created_at": "2026-11-18T02:12:38.026333Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "598ba6e8-a785-48cb-9279-48b8d3f8396c",
+      "kind": {
+        "approver": "human",
+        "context": {
+          "action_basis": {
+            "node": {
+              "description": "agent turn 2 — dispatch tool calls",
+              "id": "__tools_2__",
+              "kind": {
+                "agent_tool_dispatch": true,
+                "function": "dispatch_tool_calls",
+                "module": "jamjet.agents.tool_runtime",
+                "output_schema": "",
+                "type": "python_fn"
+              },
+              "policy": null
+            },
+            "payload": {
+              "calls": [
+                {
+                  "arguments": {
+                    "amount": 500,
+                    "venue": "Casa do Rio"
+                  },
+                  "handler": "venue_tools:pay_deposit",
+                  "name": "pay_deposit"
+                }
+              ]
+            },
+            "payload_bytes": 119,
+            "payload_truncated": false,
+            "step": 0
+          },
+          "action_definition": "6c13bfb9a1428157a701081d4e2672f0bec6f699e92282afe6b6fae3655f03aa",
+          "action_digest": "7a96fa5b018e9acf5c18db44e232e73929cbca3cb44a0b1aa2b55b7362e5b44b",
+          "action_step": 0,
+          "calls": [
+            {
+              "arguments": {
+                "amount": 500,
+                "venue": "Casa do Rio"
+              },
+              "handler": "venue_tools:pay_deposit",
+              "name": "pay_deposit"
+            }
+          ],
+          "calls_hash": "b24643121acd4ea9ee54cb5f605b63bc99f2eaf711fccb84b5dc9fa13fa86ace",
+          "gated_tools": [
+            "pay_deposit"
+          ],
+          "node_id": "__tools_2__"
+        },
+        "node_id": "__tools_2__",
+        "tool_name": "pay_deposit",
+        "type": "tool_approval_required"
+      },
+      "sequence": 25
+    },
+    {
+      "created_at": "2026-11-18T02:14:01.400765Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "928fc0ef-efda-41ce-beb1-4b312a877b77",
+      "kind": {
+        "approved_digest": "7a96fa5b018e9acf5c18db44e232e73929cbca3cb44a0b1aa2b55b7362e5b44b",
+        "comment": "Deposit is within the event budget",
+        "decision": "approved",
+        "node_id": "__tools_2__",
+        "request_sequence": 25,
+        "state_patch": null,
+        "type": "approval_received",
+        "user_id": "tester"
+      },
+      "sequence": 26
+    },
+    {
+      "created_at": "2026-11-18T02:14:01.529869Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "ed9947ae-0611-4d84-850f-f1517cd1d1e8",
+      "kind": {
+        "node_id": "__tools_2__",
+        "queue_type": "python_tool",
+        "type": "node_scheduled"
+      },
+      "sequence": 27
+    },
+    {
+      "created_at": "2026-11-18T02:14:02.275898Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "f39815ac-b26f-4bca-8b9c-a9398fa61492",
+      "kind": {
+        "duration_ms": 3,
+        "idempotency_key": "36504b6baf3f85d9647a9d23c3bb4909a3a70a24a079ab92a373d4fccfff19b1",
+        "node_id": "__tools_2__",
+        "output": {
+          "messages": [
+            {
+              "content": "You book event venues. Use the tools.",
+              "role": "system"
+            },
+            {
+              "content": "Book a venue in Lisbon for 2026-12-11 and pay a 500 deposit.",
+              "role": "user"
+            },
+            {
+              "content": "Let me look for venues.",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"city\": \"Lisbon\", \"date\": \"2026-12-11\"}",
+                    "name": "search_venues"
+                  },
+                  "id": "call_0_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "[{\"venue\": \"Casa do Rio\", \"capacity\": 120, \"price_per_day\": 2400}, {\"venue\": \"Armazem 16\", \"capacity\": 300, \"price_per_day\": 5200}]",
+              "name": "search_venues",
+              "role": "tool",
+              "tool_call_id": "call_0_0"
+            },
+            {
+              "content": "",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"venue\": \"Casa do Rio\"}",
+                    "name": "check_dates"
+                  },
+                  "id": "call_1_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "[\"2026-12-04\", \"2026-12-11\"]",
+              "name": "check_dates",
+              "role": "tool",
+              "tool_call_id": "call_1_0"
+            },
+            {
+              "content": "",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"amount\": 500, \"venue\": \"Casa do Rio\"}",
+                    "name": "pay_deposit"
+                  },
+                  "id": "call_2_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "Deposit of 500 paid for Casa do Rio. Receipt #1",
+              "name": "pay_deposit",
+              "role": "tool",
+              "tool_call_id": "call_2_0"
+            }
+          ]
+        },
+        "state_patch": {
+          "messages": [
+            {
+              "content": "You book event venues. Use the tools.",
+              "role": "system"
+            },
+            {
+              "content": "Book a venue in Lisbon for 2026-12-11 and pay a 500 deposit.",
+              "role": "user"
+            },
+            {
+              "content": "Let me look for venues.",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"city\": \"Lisbon\", \"date\": \"2026-12-11\"}",
+                    "name": "search_venues"
+                  },
+                  "id": "call_0_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "[{\"venue\": \"Casa do Rio\", \"capacity\": 120, \"price_per_day\": 2400}, {\"venue\": \"Armazem 16\", \"capacity\": 300, \"price_per_day\": 5200}]",
+              "name": "search_venues",
+              "role": "tool",
+              "tool_call_id": "call_0_0"
+            },
+            {
+              "content": "",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"venue\": \"Casa do Rio\"}",
+                    "name": "check_dates"
+                  },
+                  "id": "call_1_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "[\"2026-12-04\", \"2026-12-11\"]",
+              "name": "check_dates",
+              "role": "tool",
+              "tool_call_id": "call_1_0"
+            },
+            {
+              "content": "",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"amount\": 500, \"venue\": \"Casa do Rio\"}",
+                    "name": "pay_deposit"
+                  },
+                  "id": "call_2_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "Deposit of 500 paid for Casa do Rio. Receipt #1",
+              "name": "pay_deposit",
+              "role": "tool",
+              "tool_call_id": "call_2_0"
+            }
+          ]
+        },
+        "type": "node_completed"
+      },
+      "sequence": 28
+    },
+    {
+      "created_at": "2026-11-18T02:14:02.540844Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "0c7d53c5-88cc-4b7c-ad57-0633852a8557",
+      "kind": {
+        "node_id": "__model_3__",
+        "queue_type": "model",
+        "type": "node_scheduled"
+      },
+      "sequence": 29
+    },
+    {
+      "created_at": "2026-11-18T02:14:02.549837Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "d249bf54-a851-4e40-85ff-678cd85c123b",
+      "kind": {
+        "attempt": 0,
+        "node_id": "__model_3__",
+        "type": "node_started",
+        "worker_id": "model-worker-1"
+      },
+      "sequence": 30
+    },
+    {
+      "created_at": "2026-11-18T02:14:02.558012Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "5f7937ef-4955-488c-910a-57c9e0ef7ab3",
+      "kind": {
+        "duration_ms": 8,
+        "finish_reason": "stop",
+        "gen_ai_model": "scripted//home/user/task6/book.yaml",
+        "gen_ai_system": "unknown",
+        "idempotency_key": "88d11473fa1aaff9191143248a010f76f732a08c070f9e6baab5c92810409781",
+        "input_tokens": 81,
+        "node_id": "__model_3__",
+        "output": {
+          "content": "Booked Casa do Rio in Lisbon for 11 December 2026. The 500 deposit is paid and the receipt is on file.",
+          "finish_reason": "stop",
+          "model": "scripted//home/user/task6/book.yaml",
+          "tool_calls": []
+        },
+        "output_tokens": 25,
+        "state_patch": {
+          "__budget": {
+            "circuit_breaker_tripped": false,
+            "consecutive_error_count": 0,
+            "iteration_count": 0,
+            "tool_call_count": 0,
+            "total_cost_usd": 0.0,
+            "total_input_tokens": 236,
+            "total_output_tokens": 60
+          },
+          "last_model_finish_reason": "stop",
+          "last_model_output": "Booked Casa do Rio in Lisbon for 11 December 2026. The 500 deposit is paid and the receipt is on file.",
+          "last_model_tool_calls": []
+        },
+        "type": "node_completed"
+      },
+      "sequence": 31
+    },
+    {
+      "created_at": "2026-11-18T02:14:03.048781Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "7df5b000-8828-4177-9866-026b079c3cd5",
+      "kind": {
+        "node_id": "__tool_gate_3__",
+        "queue_type": "general",
+        "type": "node_scheduled"
+      },
+      "sequence": 32
+    },
+    {
+      "created_at": "2026-11-18T02:14:03.551800Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "ab9828cc-cc2e-4a52-979c-17059fff23a5",
+      "kind": {
+        "attempt": 0,
+        "node_id": "__tool_gate_3__",
+        "type": "node_started",
+        "worker_id": "general-worker-0"
+      },
+      "sequence": 33
+    },
+    {
+      "created_at": "2026-11-18T02:14:03.563242Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "2bbc93f4-fdb9-436a-ab31-09d739f962bd",
+      "kind": {
+        "duration_ms": 12,
+        "idempotency_key": "7cdd7e1c15e03b7db693c23ef32e6a8916e2c7e7f940cc015a7c738480b1ac20",
+        "node_id": "__tool_gate_3__",
+        "output": {
+          "branch_targets": [
+            "__tools_3__",
+            "end"
+          ],
+          "chosen_target": "end"
+        },
+        "state_patch": {
+          "__budget": {
+            "circuit_breaker_tripped": false,
+            "consecutive_error_count": 0,
+            "iteration_count": 0,
+            "tool_call_count": 0,
+            "total_cost_usd": 0.0,
+            "total_input_tokens": 236,
+            "total_output_tokens": 60
+          }
+        },
+        "type": "node_completed"
+      },
+      "sequence": 34
+    },
+    {
+      "created_at": "2026-11-18T02:14:04.059193Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "07f0ccdf-3fdf-4b50-b756-39be7ff114d7",
+      "kind": {
+        "node_id": "__tools_3__",
+        "reason": "branch not taken",
+        "type": "node_skipped"
+      },
+      "sequence": 35
+    },
+    {
+      "created_at": "2026-11-18T02:14:04.061687Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "1411bded-23da-4e89-8c13-bc728c37a1ec",
+      "kind": {
+        "node_id": "__model_4__",
+        "reason": "branch not taken",
+        "type": "node_skipped"
+      },
+      "sequence": 36
+    },
+    {
+      "created_at": "2026-11-18T02:14:04.062423Z",
+      "execution_id": "881197f6-6625-4703-be3d-1c992ef78525",
+      "id": "9cfd9585-4071-406d-970f-7d285aebc2be",
+      "kind": {
+        "final_state": {
+          "__budget": {
+            "circuit_breaker_tripped": false,
+            "consecutive_error_count": 0,
+            "iteration_count": 0,
+            "tool_call_count": 0,
+            "total_cost_usd": 0.0,
+            "total_input_tokens": 236,
+            "total_output_tokens": 60
+          },
+          "last_model_finish_reason": "stop",
+          "last_model_output": "Booked Casa do Rio in Lisbon for 11 December 2026. The 500 deposit is paid and the receipt is on file.",
+          "last_model_tool_calls": [],
+          "messages": [
+            {
+              "content": "You book event venues. Use the tools.",
+              "role": "system"
+            },
+            {
+              "content": "Book a venue in Lisbon for 2026-12-11 and pay a 500 deposit.",
+              "role": "user"
+            },
+            {
+              "content": "Let me look for venues.",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"city\": \"Lisbon\", \"date\": \"2026-12-11\"}",
+                    "name": "search_venues"
+                  },
+                  "id": "call_0_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "[{\"venue\": \"Casa do Rio\", \"capacity\": 120, \"price_per_day\": 2400}, {\"venue\": \"Armazem 16\", \"capacity\": 300, \"price_per_day\": 5200}]",
+              "name": "search_venues",
+              "role": "tool",
+              "tool_call_id": "call_0_0"
+            },
+            {
+              "content": "",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"venue\": \"Casa do Rio\"}",
+                    "name": "check_dates"
+                  },
+                  "id": "call_1_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "[\"2026-12-04\", \"2026-12-11\"]",
+              "name": "check_dates",
+              "role": "tool",
+              "tool_call_id": "call_1_0"
+            },
+            {
+              "content": "",
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"amount\": 500, \"venue\": \"Casa do Rio\"}",
+                    "name": "pay_deposit"
+                  },
+                  "id": "call_2_0",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "content": "Deposit of 500 paid for Casa do Rio. Receipt #1",
+              "name": "pay_deposit",
+              "role": "tool",
+              "tool_call_id": "call_2_0"
+            }
+          ],
+          "tools": {
+            "cancel_booking": "venue_tools:cancel_booking",
+            "check_dates": "venue_tools:check_dates",
+            "pay_deposit": "venue_tools:pay_deposit",
+            "search_venues": "venue_tools:search_venues"
+          }
+        },
+        "type": "workflow_completed"
+      },
+      "sequence": 37
+    }
+  ],
+  "approvals": {
+    "decided": [
+      {
+        "approved_digest": "7a96fa5b018e9acf5c18db44e232e73929cbca3cb44a0b1aa2b55b7362e5b44b",
+        "node_id": "__tools_2__",
+        "sequence": 26,
+        "status": "approved",
+        "user_id": "tester"
+      }
+    ],
+    "pending": []
+  }
+}

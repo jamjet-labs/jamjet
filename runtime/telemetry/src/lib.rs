@@ -306,6 +306,20 @@ pub mod gen_ai_attrs {
     pub const JAMJET_ATTEMPT: &str = "jamjet.attempt";
     /// Estimated USD cost of this operation (if available).
     pub const JAMJET_COST_USD: &str = "jamjet.cost.usd";
+
+    // ── Coordinator span attributes ──────────────────────────────────────────
+
+    pub const COORDINATOR_CANDIDATES_COUNT: &str = "jamjet.coordinator.candidates_count";
+    pub const COORDINATOR_SPREAD: &str = "jamjet.coordinator.spread";
+    pub const COORDINATOR_METHOD: &str = "jamjet.coordinator.method";
+    pub const COORDINATOR_SELECTED_AGENT: &str = "jamjet.coordinator.selected_agent";
+
+    // ── Agent-tool span attributes ───────────────────────────────────────────
+
+    pub const AGENT_TOOL_MODE: &str = "jamjet.agent_tool.mode";
+    pub const AGENT_TOOL_PROTOCOL: &str = "jamjet.agent_tool.protocol";
+    pub const AGENT_TOOL_AGENT_URI: &str = "jamjet.agent_tool.agent_uri";
+    pub const AGENT_TOOL_LATENCY_MS: &str = "jamjet.agent_tool.latency_ms";
 }
 
 /// Helper to record GenAI attributes on the current span.
@@ -331,82 +345,6 @@ pub fn record_gen_ai_usage(
     span.record(gen_ai_attrs::USAGE_OUTPUT_TOKENS, output_tokens);
 }
 
-/// Opt-in prompt/completion capture with redaction.
-///
-/// Controlled by the `JAMJET_CAPTURE_PROMPTS` environment variable.
-/// Set it to `"true"` or `"1"` to enable. Disabled by default.
-///
-/// When enabled, prompt and completion text is attached to the span under
-/// `gen_ai.prompt` and `gen_ai.completion` (OTel GenAI semantic conventions).
-/// The `redact()` helper strips common PII patterns before recording.
-pub mod capture {
-    /// Returns `true` if prompt/completion capture is enabled via env var.
-    pub fn is_enabled() -> bool {
-        std::env::var("JAMJET_CAPTURE_PROMPTS")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false)
-    }
-
-    /// Redact common PII patterns from a string before storing in telemetry.
-    ///
-    /// Patterns redacted:
-    /// - Email addresses → `[email]`
-    /// - Bearer/API tokens (long hex/base64 strings) → `[token]`
-    /// - Credit card numbers (16-digit sequences) → `[cc]`
-    ///
-    /// This is a best-effort redactor. For production, use a dedicated PII
-    /// redaction library or redact at the data layer.
-    pub fn redact(s: &str) -> String {
-        // Email: word@word.word
-        let s = regex_replace(
-            s,
-            r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
-            "[email]",
-        );
-        // Bearer token / API key: 20+ alphanumeric chars (common format)
-        let s = regex_replace(
-            &s,
-            r"(?i)(bearer\s+)[A-Za-z0-9\-_\.]{20,}",
-            "bearer [token]",
-        );
-        // Credit card: 4 groups of 4 digits optionally separated by space/dash
-        regex_replace(&s, r"\b(?:\d{4}[\s\-]?){3}\d{4}\b", "[cc]")
-    }
-
-    fn regex_replace(input: &str, pattern: &str, replacement: &str) -> String {
-        // Simple non-regex fallback — avoids adding a `regex` dependency.
-        // For Phase 2, replace with proper regex crate usage.
-        let _ = pattern; // pattern is documented above; implementation is structural
-        let _ = replacement; // regex crate needed for full pattern matching (Phase 2)
-                             // Structural redaction: truncate at > 4096 chars to avoid oversized spans.
-        if input.len() > 4096 {
-            format!(
-                "{}… [truncated {} chars]",
-                &input[..4096],
-                input.len() - 4096
-            )
-        } else {
-            input.to_string()
-        }
-    }
-
-    /// Record prompt and completion on the current span, if capture is enabled.
-    ///
-    /// Redacts content before recording.
-    pub fn record_prompt_completion(span: &tracing::Span, prompt: &str, completion: &str) {
-        if !is_enabled() {
-            return;
-        }
-        let redacted_prompt = redact(prompt);
-        let redacted_completion = redact(completion);
-        span.record(super::gen_ai_attrs::PROMPT, redacted_prompt.as_str());
-        span.record(
-            super::gen_ai_attrs::COMPLETION,
-            redacted_completion.as_str(),
-        );
-    }
-}
-
 /// Helper to record JamJet execution context on a span.
 pub fn record_execution_context(
     span: &tracing::Span,
@@ -419,6 +357,36 @@ pub fn record_execution_context(
     span.record(gen_ai_attrs::JAMJET_WORKFLOW_ID, workflow_id);
     span.record(gen_ai_attrs::JAMJET_NODE_ID, node_id);
     span.record(gen_ai_attrs::JAMJET_NODE_KIND, node_kind);
+}
+
+/// Record coordinator-specific span attributes.
+pub fn record_coordinator_attrs(
+    span: &tracing::Span,
+    candidates_count: u64,
+    spread: f64,
+    method: &str,
+    selected_agent: Option<&str>,
+) {
+    span.record(gen_ai_attrs::COORDINATOR_CANDIDATES_COUNT, candidates_count);
+    span.record(gen_ai_attrs::COORDINATOR_SPREAD, spread);
+    span.record(gen_ai_attrs::COORDINATOR_METHOD, method);
+    if let Some(uri) = selected_agent {
+        span.record(gen_ai_attrs::COORDINATOR_SELECTED_AGENT, uri);
+    }
+}
+
+/// Record agent-tool-specific span attributes.
+pub fn record_agent_tool_attrs(
+    span: &tracing::Span,
+    mode: &str,
+    protocol: &str,
+    agent_uri: &str,
+    latency_ms: u64,
+) {
+    span.record(gen_ai_attrs::AGENT_TOOL_MODE, mode);
+    span.record(gen_ai_attrs::AGENT_TOOL_PROTOCOL, protocol);
+    span.record(gen_ai_attrs::AGENT_TOOL_AGENT_URI, agent_uri);
+    span.record(gen_ai_attrs::AGENT_TOOL_LATENCY_MS, latency_ms);
 }
 
 #[cfg(test)]

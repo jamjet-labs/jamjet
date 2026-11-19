@@ -1,0 +1,11 @@
+{
+  "comment": "Boolean switch values and how they read, shared by runtime/core/tests/bool_flags.rs and sdk/python/tests/test_flags.py.",
+  "on": ["1", "true", "TRUE", "True", "yes", "YES", "on", "On", " 1 ", "\ttrue\n", "\r\fyes\f"],
+  "off": ["0", "false", "FALSE", "no", "off", "OFF", "", "   ", " 0 ", "\n", "\tno\r"],
+  "error": [
+    "2", "-1", "maybe", "enabled", "set", "tru", "yes please", "1 1", "o n",
+    "\u001c1", "1\u001c", "\u001f0\u001f", "\u001dtrue", "\u001eoff",
+    "\u000b1", "1\u000b", " 1", "1 ", " 1", "　1", "\u00851",
+    "K", "ı", "trüe", "１", "1\u0000"
+  ]
+}

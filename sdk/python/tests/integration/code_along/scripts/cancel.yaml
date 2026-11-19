@@ -1,0 +1,6 @@
+# The model tries to cancel a booking, then answers.
+turns:
+  - tool_calls:
+      - name: cancel_booking
+        arguments: {venue: Casa do Rio}
+  - content: "I could not cancel the booking at Casa do Rio. Cancelling is blocked for me."

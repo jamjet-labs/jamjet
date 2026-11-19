@@ -19,9 +19,9 @@ hooks:
     @echo "Git hooks installed from .githooks/ (pre-commit: cargo fmt + ruff + clippy)"
 
 # ── Development ─────────────────────────────────────────────────────────
-# Start local runtime (SQLite mode)
+# Start local runtime (SQLite mode, dev mode: no auth, loopback only)
 dev:
-    cargo run --bin jamjet-server -- --dev
+    cd runtime && JAMJET_DEV_MODE=1 cargo run --bin jamjet-server
 
 # Build all Rust crates
 build:

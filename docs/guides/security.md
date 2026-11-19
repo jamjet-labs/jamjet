@@ -8,35 +8,43 @@
 
 Outside dev mode every route except `GET /health` and `GET /.well-known/did.json`
 needs `Authorization: Bearer <token>`. The runtime checks the token against the
-`api_tokens` table in its SQLite database, by SHA-256 hash. There is no CLI
-command or API route that issues tokens, so you write the row yourself. Start
-the server once against the database file so the table exists, then:
+`api_tokens` table in its SQLite database, by SHA-256 hash. Issue one with the
+server binary:
 
 ```bash
-python3 - .jamjet/runtime.db ci-deployer developer <<'EOF'
-import datetime, hashlib, secrets, sqlite3, sys, uuid
-
-db, name, role = sys.argv[1:4]
-token = "jj_" + secrets.token_hex(32)
-con = sqlite3.connect(db)
-con.execute(
-    "INSERT INTO api_tokens (id, token_hash, name, role, created_at) VALUES (?, ?, ?, ?, ?)",
-    (str(uuid.uuid4()), hashlib.sha256(token.encode()).hexdigest(), name, role,
-     datetime.datetime.now(datetime.timezone.utc).isoformat()),
-)
-con.commit()
-print(token)
-EOF
+TOKEN=$(jamjet-server token create --role developer --name ci-deployer)
 ```
 
-The arguments are the database path, a name and a role (see [RBAC](#rbac)).
-The token is printed once; only its hash is stored. To expire a token set
-`expires_at` (RFC 3339), and to revoke it set `revoked_at`. In the Docker image
-the database is wherever `DATABASE_URL` points (see
-[Deployment](deployment.md#docker)), and the same script runs inside the
-container with `docker exec -i <container> python3 - /data/runtime.db ...`. A
-server with `STORAGE_BACKEND=memory` has no table to write to, so it accepts no
-token.
+`--role` is required and is one of the [RBAC](#rbac) roles. `--name` labels the
+token (default `<role>-cli`), and `--tenant` issues it for another tenant, which
+must exist (the runtime refuses such tokens unless
+`JAMJET_TENANT_TOKENS_AS_DEFAULT=1`; see below). The command opens the database
+the server uses, `DATABASE_URL` or `.jamjet/runtime.db` in the working
+directory, so run it with the server's environment and working directory. It
+does not create a database or change its schema: start the server against it
+once first. It can run while the server is up. The token is printed once, on
+stdout; only its hash is stored. Its id and the database go to stderr.
+
+In the Docker image the environment already points at the volume:
+
+```bash
+docker exec <container> jamjet-server token create --role operator
+```
+
+A server with `STORAGE_BACKEND=memory` keeps tokens inside its own process, so
+the command refuses it and that server accepts no token.
+
+To revoke a token, pass its id:
+
+```bash
+jamjet-server token revoke <token id>
+```
+
+It is refused from the next request on. To make a token expire, set
+`expires_at` on its row in UTC, in the form `2026-12-31T23:59:59Z`: the check
+compares the text, so an offset such as `+05:30` is read wrong.
+
+Send the token as a Bearer header:
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" http://localhost:7700/executions
@@ -66,7 +74,64 @@ client = JamjetClient(base_url="http://localhost:7700", api_token=os.environ["JA
 Roles are ordered: each role can do everything the roles below it can. Outside dev
 mode every route below needs a Bearer token, and the role is enforced in code on the
 route, not by convention. Dev mode (`JAMJET_DEV_MODE=1`) has no tokens and enforces
-none of this.
+none of this, so dev mode has guards of its own:
+
+- It refuses to start unless it listens on loopback only.
+  `JAMJET_DEV_MODE_ALLOW_REMOTE=1` lets it listen elsewhere (Docker's
+  `0.0.0.0`), with a warning in the log: anyone who can reach the port then has
+  every role.
+- On any bind, it answers only requests addressed to `localhost`, a loopback
+  address or a name in `JAMJET_DEV_ALLOWED_HOSTS`. This stops a web page that
+  re-resolves its own host name to 127.0.0.1 (DNS rebinding) from driving the
+  runtime from your browser. `JAMJET_DEV_MODE_ALLOW_REMOTE` does not turn it off.
+- It refuses a request carrying `Forwarded` or any `X-Forwarded-*` header: a
+  tunnel such as ngrok with `--host-header=rewrite`, or cloudflared, rewrites
+  `Host` to `localhost` for a request from anywhere.
+- It refuses a request from a page of another site. With an `Origin`, the
+  origin decides: it must be an allowed host (`null` is not). Without one,
+  `Sec-Fetch-Site: cross-site` is refused. Any page can send a POST with no
+  body to 127.0.0.1, which is enough to cancel a run or deactivate an agent.
+
+What these guards trust:
+
+- Any page served from this machine, on any port. A dev UI on
+  `localhost:3000` is answered, and so is anything else you run locally that
+  serves pages, including a dev server for a project you just cloned.
+- Any request that reaches the port without a proxy header. A plain TCP
+  tunnel (`ssh -R`, `socat`, a port forward) adds no header and keeps the
+  client's `Host`, so a request through one passes as local. Don't expose a
+  dev-mode port that way; turn dev mode off and use a token.
+
+The model sidecar (`jamjet.model.sidecar_server`) has no token either and
+spends the provider keys in its environment. It answers only requests
+addressed to this machine (or a name in `JAMJET_SIDECAR_ALLOWED_HOSTS`),
+refuses requests through a proxy or from a page of another site by the same
+rules, and takes `POST /v1/complete` only as `application/json`. It trusts
+the same things.
+
+`jamjet-server token create` and `token revoke` seal `token_issued` and
+`token_revoked` into the audit log, with the token id, role, tenant and name.
+Separation of duties is keyed on the token id, so a reviewer token someone mints
+for themselves is on record. A token the log cannot record is revoked again and
+not printed. Run the commands with the audit signing settings the server uses.
+When the log's newest entry is signed and the command's environment has no key,
+another HMAC key or another Ed25519 key, `token create` refuses and creates
+nothing, and `token revoke` revokes the token and then reports that the log has
+no record of it. The token commands read one switch, `JAMJET_AUDIT_ALLOW_INSECURE_KEY`,
+after a revoke has revoked; the server's other switches don't stop them.
+
+After you rotate the audit key, start the server once with the new key before
+using the token commands with it. At start the server checks the log's newest
+entry, and when its key cannot verify it, it seals an `audit_key_changed`
+entry under the new key, naming the old and the new (`"previous": "Ed25519 key
+<kid>"`, `"current": ...`). That entry marks where one key's entries end on the
+chain.
+
+Each entry is dated after the one before it, so the log lists in chain order
+even when a writer's clock is behind. A newest entry dated in the future (a
+clock that ran ahead, then was corrected) holds every later entry's date just
+after it until real time catches up; the server logs a warning on each entry
+while the gap is over five minutes.
 
 | Route | Minimum role | Notes |
 |-------|--------------|-------|
@@ -100,23 +165,48 @@ have to carry the tenant first, and none does yet:
   tenant policy applies to them);
 - the agent registry (global today).
 
-Tenant policy (`PUT /tenants/:id`, operator only) is not a floor under the
-policies in a workflow's IR. Layers are checked from the most specific to the
-least (node, then workflow, then tenant), and the first rule that matches
-decides. A developer who registers IR can therefore override the tenant layer
-for a name their own rule matches:
+Tenant policy (`PUT /tenants/:id`, operator only) is a ceiling over the
+policies in a workflow's IR. No workflow or node rule can lift a tenant rule;
+it can only add to it:
 
-- a node or workflow `require_approval_for` pattern turns a tenant block into
-  an approval request;
-- on a `model` node, a node or workflow `model_allowlist` that lists the model
-  allows the call before the tenant's allowlist is read.
+- a tenant `blocked_tools` match blocks the node, whatever the workflow or node
+  policy says (an IR `require_approval_for` on the same name no longer turns it
+  into an approval request);
+- a tenant `require_approval_for` match holds a node the IR allows;
+- on a `model` node the model must be on the tenant's `model_allowlist` and on
+  the most specific IR allowlist that has one, so the IR can narrow the
+  tenant's list but not widen it. The model checked is the string the node
+  sends to the model registry: the IR's `models` entry the node names,
+  resolved to `provider/model`, not the alias. So an allowlist of bare names
+  (`claude-*`) does not match a resolved `anthropic/claude-...`; list the
+  provider (`anthropic`) or the full ref. The registry routes `anthropic/`,
+  `openai/` and `google/` refs and a few bare-name prefixes (`claude-`, `gpt-`,
+  `llama`, ...) to their adapters, and sends any other string to its default
+  adapter. An allowlist entry for a provider it has no route for, such as
+  `ollama/...`, therefore does not keep the call on that provider.
 
-A tenant `require_approval_for: ["*"]` does gate every Python, Java and
-external step, since a rule in the IR can only block such a step or ask for
-the same approval. It does not gate `model`, `condition` or `human_approval`
-nodes: they have no tool name for a pattern to match. A narrow tenant pattern
-binds less than it seems. It matches a name the IR author chose, and the same
-function can be reached under another name (a re-export or an alias).
+Inside the IR the most specific layer still wins: a node `require_approval_for`
+turns a workflow block into an approval request, and a node `model_allowlist`
+replaces the workflow's, since one author owns both.
+
+A tenant catch-all (`["*"]`) applies to every Python, Java and external step,
+and to `model` nodes too: tenant `require_approval_for: ["*"]` holds every
+`model` node for approval (in an agent loop, every turn) and
+`blocked_tools: ["*"]` blocks it. To cover every tool but not the model turns,
+write `["tool:*"]`: it matches what `*` matches inside the IR, every tool and
+no `model` node, in the tenant policy as in the IR.
+
+Upgrading: before the tenant policy was a ceiling, a tenant `*` matched tools
+only. A tenant policy that has `"*"` in `require_approval_for` now also holds
+each model turn, and one with `"*"` in `blocked_tools` blocks every model node.
+If you meant tools only, change it to `"tool:*"`. A model call a Python or Java step makes
+itself is not a `model` node and is not covered. Other patterns
+match tool names, which a model node does not have. In the IR, `["*"]` still
+means every tool and does not reach model nodes, so an agent compiled with
+`approval_required=True` is not asked to approve its own model calls. Neither
+gates `condition` or `human_approval` nodes. A narrow tenant pattern binds less
+than it seems. It matches a name the IR author chose, and the same function can
+be reached under another name (a re-export or an alias).
 
 ---
 
@@ -141,6 +231,28 @@ registration refuses `mcp_tool` and `a2a_task` nodes, so per-server
 credentials in an `mcp:` or `a2a:` block are not used. Its own MCP endpoint,
 `/mcp`, takes the same Bearer tokens and roles as the REST routes. The server
 has no OAuth or mTLS support.
+
+`POST /agents/discover` (and the MCP tool `jamjet_discover_agent`) fetches the
+Agent Card at a URL the caller gives, so it is guarded: the URL must be
+`https` with no credentials in it, and the host must resolve only to public
+addresses (no loopback, private, link-local, CGNAT or metadata ranges). The
+request is pinned to the addresses that were checked, ignores proxy
+environment variables (a proxy would resolve the name again), and does not
+follow redirects. The lookup, the connection and the read share one 10 s budget,
+the card URL is the base's scheme, host and port with the path
+`/.well-known/agent.json` (any other path, query or fragment is dropped),
+the card is capped at 256 KiB, and any fetch failure, including a name that
+resolves inward, returns the same message, so the route cannot be used to
+read internal services, map ports or list internal names. A URL refused for
+its scheme or host is a 400. For an agent on your own machine set
+`JAMJET_DISCOVERY_ALLOW_PRIVATE=1`, which also allows `http`. Cloud metadata
+addresses stay refused: link-local, 100.100.100.200, fd00:ec2::254,
+fd20:ce::254, fd00:c1::a9fe:a9fe, all of the local-use NAT64 prefix
+64:ff9b:1::/48, and an IPv6 address that carries one of those IPv4 addresses
+in one of these forms: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-translated
+(`::ffff:0:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), NAT64 (`64:ff9b::/96`),
+6to4 (`2002::/16`) or a Teredo client (`2001:0::/32`). The other limits
+stay.
 
 ---
 

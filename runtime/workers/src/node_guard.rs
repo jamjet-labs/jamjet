@@ -89,6 +89,10 @@ pub const ALLOWED_TOOLS_RULE: &str = "agent allowed_tools";
 /// with this.
 pub const BLOCKED_TOOLS_RULE: &str = "agent blocked_tools";
 
+/// The rule recorded when a `model` work item's payload names no model, so
+/// the model allowlists cannot be checked against what would run.
+pub const MODEL_UNNAMED_RULE: &str = "model work item names no model";
+
 /// Every rule recorded for a refusal by a card's `allowed_delegations` starts
 /// with this.
 pub const ALLOWED_DELEGATIONS_RULE: &str = "agent allowed_delegations";
@@ -155,8 +159,9 @@ struct CardGate {
 }
 
 /// Decide whether `node_def` may fire (or, in `Complete` mode, whether its
-/// result may be recorded), evaluating the tenant -> workflow -> node policy
-/// chain and, for an approval-gated node, the approval bound to the action.
+/// result may be recorded), evaluating the workflow and node policies under
+/// the tenant policy as a ceiling (`PolicyEvaluator::evaluate_chain`) and,
+/// for an approval-gated node, the approval bound to the action.
 ///
 /// `workflow_policy` is the IR's workflow-level policy and `payload` the work
 /// item's payload as the engine recorded it.
@@ -384,24 +389,45 @@ async fn guard_policy(
         }
     };
 
-    // tenant -> workflow -> node; the evaluator iterates in reverse, so the
-    // most specific layer wins.
+    // The IR's layers, workflow then node: the most specific wins between
+    // them. The tenant layer is a ceiling over both (`evaluate_chain`).
+    let mut layers: Vec<&PolicySetIr> = Vec::new();
+    if let Some(p) = workflow_policy {
+        layers.push(p);
+    }
+    if let Some(p) = &node_def.policy {
+        layers.push(p);
+    }
+    // The whole chain, tenant first, for the approval deadline: every level
+    // is a ceiling there already.
     let mut sets: Vec<&PolicySetIr> = Vec::new();
     if let Some(ref tp) = tenant_policy_set {
         sets.push(tp);
     }
-    if let Some(p) = workflow_policy {
-        sets.push(p);
+    sets.extend(layers.iter().copied());
+    // A model node is checked against the model its payload calls, not the
+    // IR alias it names. A payload with no model would leave the guard
+    // checking the alias while the executor called its built-in default, so
+    // it is refused. The scheduler always writes one.
+    if matches!(node_def.kind, NodeKind::Model { .. })
+        && payload.get("model").and_then(Value::as_str).is_none()
+    {
+        let reason = MODEL_UNNAMED_RULE.to_string();
+        if mode == GuardMode::Fire {
+            warn!(execution_id = %execution_id, node_id, "Model work item names no model; refusing");
+            dispatch_guard::record_policy_violation(
+                backend,
+                execution_id,
+                node_id,
+                reason.clone(),
+                "unknown".to_string(),
+            )
+            .await;
+        }
+        return GuardOutcome::Blocked { reason };
     }
-    if let Some(p) = &node_def.policy {
-        sets.push(p);
-    }
-    let ctx = EvaluationContext::from_node_kind(node_id, &node_def.kind);
-    let decision = if sets.is_empty() {
-        PolicyDecision::Allow
-    } else {
-        PolicyEvaluator.evaluate(&ctx, &sets)
-    };
+    let ctx = EvaluationContext::from_work_item(node_id, &node_def.kind, payload);
+    let decision = PolicyEvaluator.evaluate_chain(&ctx, tenant_policy_set.as_ref(), &layers);
     // A `human_approval` node is gated by what it is: it exists to wait for a
     // person. Until 2026-11 it had no executor and the worker completed it
     // with an empty output, so the run went on with nobody asked.
@@ -487,6 +513,28 @@ async fn guard_policy(
                             // What the reviewer is asked, as the author wrote it.
                             if let NodeKind::HumanApproval { description, .. } = &node_def.kind {
                                 c["description"] = Value::String(description.clone());
+                            }
+                            // A dispatch node held by its own name: approving
+                            // it releases every call in its batch, so the
+                            // request names them, as a per-call gate's does.
+                            if is_dispatch {
+                                if let Ok(calls) = jamjet_policy::dispatch::read_pending_tool_calls(
+                                    &dispatch_guard::payload_input(payload),
+                                ) {
+                                    let names: Vec<&str> =
+                                        calls.iter().map(|c| c.name.as_str()).collect();
+                                    c["gated_tools"] = serde_json::json!(names);
+                                    // Bounded as the payload is: a batch with
+                                    // a large argument is shown by its keys
+                                    // and sizes, not stored whole in the log.
+                                    let all = dispatch_guard::bound_calls(&calls);
+                                    let bytes =
+                                        serde_json::to_string(&all).map(|s| s.len()).unwrap_or(0);
+                                    let cut = bytes > ACTION_BASIS_STATE_CAP;
+                                    c["calls"] = if cut { bounded_preview(&all) } else { all };
+                                    c["calls_truncated"] = Value::Bool(cut);
+                                    c["calls_bytes"] = serde_json::json!(bytes);
+                                }
                             }
                             c
                         },

@@ -131,7 +131,9 @@ class LlmJudgeScorer(BaseScorer):
             if start == -1 or end == 0:
                 raise ValueError("No JSON found in judge response")
             parsed = json.loads(response_text[start:end])
-            raw_score = int(parsed.get("score", 0))
+            raw_score = parsed.get("score")
+            if isinstance(raw_score, bool) or not isinstance(raw_score, int) or not 1 <= raw_score <= 5:
+                raise ValueError("Judge score must be an integer from 1 to 5")
             reason = parsed.get("reason", "no reason")
             passed = raw_score >= self.min_score
             return ScorerResult(

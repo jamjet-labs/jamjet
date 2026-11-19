@@ -1,12 +1,12 @@
 pub mod approvals;
 pub mod auth;
+pub mod cli;
 pub mod config;
 pub mod cron;
 pub mod error;
 pub mod mcp_bridge;
-pub mod oauth;
 pub mod routes;
-pub mod secrets;
+pub mod startup;
 pub mod state;
 pub mod static_files;
 

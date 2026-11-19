@@ -49,6 +49,55 @@ pub struct SqliteAuditBackend {
     pool: SqlitePool,
 }
 
+const INSERT_COLUMNS: &str = "(id, event_id, execution_id, sequence, event_type, \
+     actor_id, actor_type, tool_call_hash, policy_decision, \
+     http_request_id, http_method, http_path, ip_address, \
+     created_at, raw_event, tenant_id, expires_at, redacted, \
+     prev_hash, entry_hash, signature)";
+
+const INSERT_PLACEHOLDERS: &str = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
+
+const INSERT_VALUES: &str = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+/// The newest entry's hash: the order `GET /audit` lists entries in, with
+/// insertion order breaking a tie.
+const HEAD_SQL: &str =
+    "SELECT entry_hash FROM audit_log ORDER BY created_at DESC, rowid DESC LIMIT 1";
+
+/// [`HEAD_SQL`] with the head's `created_at`.
+const HEAD_AT_SQL: &str =
+    "SELECT entry_hash, created_at FROM audit_log ORDER BY created_at DESC, rowid DESC LIMIT 1";
+
+/// Bind an entry's 21 columns, in [`INSERT_COLUMNS`] order.
+fn bind_entry<'q>(
+    q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    entry: &AuditLogEntry,
+) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>, AuditError> {
+    let raw = serde_json::to_string(&entry.raw_event)
+        .map_err(|e| AuditError::Serialization(e.to_string()))?;
+    Ok(q.bind(entry.id.to_string())
+        .bind(entry.event_id.to_string())
+        .bind(entry.execution_id.clone())
+        .bind(entry.sequence)
+        .bind(entry.event_type.clone())
+        .bind(entry.actor_id.clone())
+        .bind(actor_type_str(&entry.actor_type))
+        .bind(entry.tool_call_hash.clone())
+        .bind(entry.policy_decision.clone())
+        .bind(entry.http_request_id.clone())
+        .bind(entry.http_method.clone())
+        .bind(entry.http_path.clone())
+        .bind(entry.ip_address.clone())
+        .bind(entry.created_at.to_rfc3339())
+        .bind(raw)
+        .bind(entry.tenant_id.clone())
+        .bind(entry.expires_at.map(|dt| dt.to_rfc3339()))
+        .bind(entry.redacted as i32)
+        .bind(entry.prev_hash.clone())
+        .bind(entry.entry_hash.clone())
+        .bind(entry.signature.clone()))
+}
+
 impl SqliteAuditBackend {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -103,83 +152,72 @@ impl SqliteAuditBackend {
 #[async_trait]
 impl AuditBackend for SqliteAuditBackend {
     async fn append(&self, entry: AuditLogEntry) -> Result<(), AuditError> {
-        let raw = serde_json::to_string(&entry.raw_event)
-            .map_err(|e| AuditError::Serialization(e.to_string()))?;
-
-        let expires_at = entry.expires_at.map(|dt| dt.to_rfc3339());
-
-        sqlx::query(
-            r#"
-            INSERT OR IGNORE INTO audit_log
-                (id, event_id, execution_id, sequence, event_type,
-                 actor_id, actor_type, tool_call_hash, policy_decision,
-                 http_request_id, http_method, http_path, ip_address,
-                 created_at, raw_event, tenant_id, expires_at, redacted,
-                 prev_hash, entry_hash, signature)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(entry.id.to_string())
-        .bind(entry.event_id.to_string())
-        .bind(&entry.execution_id)
-        .bind(entry.sequence)
-        .bind(&entry.event_type)
-        .bind(&entry.actor_id)
-        .bind(actor_type_str(&entry.actor_type))
-        .bind(&entry.tool_call_hash)
-        .bind(&entry.policy_decision)
-        .bind(&entry.http_request_id)
-        .bind(&entry.http_method)
-        .bind(&entry.http_path)
-        .bind(&entry.ip_address)
-        .bind(entry.created_at.to_rfc3339())
-        .bind(raw)
-        .bind(&entry.tenant_id)
-        .bind(expires_at.as_deref())
-        .bind(entry.redacted as i32)
-        .bind(&entry.prev_hash)
-        .bind(&entry.entry_hash)
-        .bind(&entry.signature)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| AuditError::Database(e.to_string()))?;
+        let sql =
+            format!("INSERT OR IGNORE INTO audit_log {INSERT_COLUMNS} VALUES {INSERT_VALUES}");
+        bind_entry(sqlx::query(&sql), &entry)?
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AuditError::Database(e.to_string()))?;
 
         Ok(())
     }
 
-    async fn query(&self, q: &AuditQuery) -> Result<Vec<AuditLogEntry>, AuditError> {
-        let from_str;
-        let to_str;
-
-        let mut wheres = vec!["1=1".to_string()];
-        if let Some(from) = &q.from {
-            from_str = from.to_rfc3339();
-            wheres.push(format!("created_at >= '{from_str}'"));
-        }
-        if let Some(to) = &q.to {
-            to_str = to.to_rfc3339();
-            wheres.push(format!("created_at <= '{to_str}'"));
-        }
-        if let Some(actor) = &q.actor_id {
-            wheres.push(format!("actor_id = '{actor}'"));
-        }
-        if let Some(event_type) = &q.event_type {
-            wheres.push(format!("event_type = '{event_type}'"));
-        }
-        if let Some(exec_id) = &q.execution_id {
-            wheres.push(format!("execution_id = '{exec_id}'"));
-        }
-        if let Some(tid) = &q.tenant_id {
-            wheres.push(format!("tenant_id = '{tid}'"));
-        }
-
-        let where_clause = wheres.join(" AND ");
+    /// One statement, so SQLite's write lock makes the checks and the insert
+    /// atomic against every other writer of the file, in this process or
+    /// another. `created_at` is compared as stored, an RFC 3339 string in
+    /// UTC, which sorts as the time does (the order [`HEAD_SQL`] reads).
+    async fn append_linked(&self, entry: AuditLogEntry) -> Result<bool, AuditError> {
         let sql = format!(
-            "SELECT * FROM audit_log WHERE {where_clause} ORDER BY created_at DESC LIMIT {} OFFSET {}",
+            "INSERT OR IGNORE INTO audit_log {INSERT_COLUMNS} SELECT {INSERT_PLACEHOLDERS} \
+             WHERE ({HEAD_SQL}) IS ? \
+             AND NOT EXISTS (SELECT 1 FROM audit_log WHERE created_at >= ?)"
+        );
+        let prev = entry.prev_hash.clone();
+        let at = entry.created_at.to_rfc3339();
+        let done = bind_entry(sqlx::query(&sql), &entry)?
+            .bind(prev)
+            .bind(at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AuditError::Database(e.to_string()))?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn head_at(
+        &self,
+    ) -> Result<Option<(Option<String>, chrono::DateTime<chrono::Utc>)>, AuditError> {
+        let row: Option<(Option<String>, String)> = sqlx::query_as(HEAD_AT_SQL)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AuditError::Database(e.to_string()))?;
+        row.map(|(hash, at)| {
+            chrono::DateTime::parse_from_rfc3339(&at)
+                .map(|t| (hash, t.with_timezone(&chrono::Utc)))
+                .map_err(|e| AuditError::Database(format!("head created_at {at:?}: {e}")))
+        })
+        .transpose()
+    }
+
+    async fn head(&self) -> Result<Option<String>, AuditError> {
+        sqlx::query_scalar::<_, Option<String>>(HEAD_SQL)
+            .fetch_optional(&self.pool)
+            .await
+            .map(Option::flatten)
+            .map_err(|e| AuditError::Database(e.to_string()))
+    }
+
+    async fn query(&self, q: &AuditQuery) -> Result<Vec<AuditLogEntry>, AuditError> {
+        let (where_clause, values) = where_clause(q);
+        let sql = format!(
+            "SELECT * FROM audit_log WHERE {where_clause} ORDER BY created_at DESC, rowid DESC LIMIT {} OFFSET {}",
             q.limit, q.offset
         );
 
-        let rows = sqlx::query_as::<_, AuditRow>(&sql)
+        let mut query = sqlx::query_as::<_, AuditRow>(&sql);
+        for value in &values {
+            query = query.bind(value.as_str());
+        }
+        let rows = query
             .fetch_all(&self.pool)
             .await
             .map_err(|e| AuditError::Database(e.to_string()))?;
@@ -188,36 +226,57 @@ impl AuditBackend for SqliteAuditBackend {
     }
 
     async fn count(&self, q: &AuditQuery) -> Result<u64, AuditError> {
-        let mut wheres = vec!["1=1".to_string()];
-        if let Some(from) = &q.from {
-            wheres.push(format!("created_at >= '{}'", from.to_rfc3339()));
-        }
-        if let Some(to) = &q.to {
-            wheres.push(format!("created_at <= '{}'", to.to_rfc3339()));
-        }
-        if let Some(actor) = &q.actor_id {
-            wheres.push(format!("actor_id = '{actor}'"));
-        }
-        if let Some(event_type) = &q.event_type {
-            wheres.push(format!("event_type = '{event_type}'"));
-        }
-        if let Some(exec_id) = &q.execution_id {
-            wheres.push(format!("execution_id = '{exec_id}'"));
-        }
-        if let Some(tid) = &q.tenant_id {
-            wheres.push(format!("tenant_id = '{tid}'"));
-        }
-
-        let where_clause = wheres.join(" AND ");
+        let (where_clause, values) = where_clause(q);
         let sql = format!("SELECT COUNT(*) FROM audit_log WHERE {where_clause}");
 
-        let count: (i64,) = sqlx::query_as(&sql)
+        let mut query = sqlx::query_as::<_, (i64,)>(&sql);
+        for value in &values {
+            query = query.bind(value.as_str());
+        }
+        let count = query
             .fetch_one(&self.pool)
             .await
             .map_err(|e| AuditError::Database(e.to_string()))?;
 
         Ok(count.0 as u64)
     }
+}
+
+/// The WHERE clause for `q`, with a `?` for each filter value, and the values
+/// to bind in placeholder order.
+///
+/// The values are bound, never written into the SQL text: `GET /audit` fills
+/// `q` from request query parameters, and a spliced value with a quote in it
+/// could end the string literal and rewrite the query. `limit` and `offset`
+/// are `u32`, so they stay in the statement text.
+fn where_clause(q: &AuditQuery) -> (String, Vec<String>) {
+    let mut wheres = vec!["1=1"];
+    let mut values = Vec::new();
+    if let Some(from) = &q.from {
+        wheres.push("created_at >= ?");
+        values.push(from.to_rfc3339());
+    }
+    if let Some(to) = &q.to {
+        wheres.push("created_at <= ?");
+        values.push(to.to_rfc3339());
+    }
+    if let Some(actor) = &q.actor_id {
+        wheres.push("actor_id = ?");
+        values.push(actor.clone());
+    }
+    if let Some(event_type) = &q.event_type {
+        wheres.push("event_type = ?");
+        values.push(event_type.clone());
+    }
+    if let Some(exec_id) = &q.execution_id {
+        wheres.push("execution_id = ?");
+        values.push(exec_id.clone());
+    }
+    if let Some(tid) = &q.tenant_id {
+        wheres.push("tenant_id = ?");
+        values.push(tid.clone());
+    }
+    (wheres.join(" AND "), values)
 }
 
 // ── Internal row type ─────────────────────────────────────────────────────

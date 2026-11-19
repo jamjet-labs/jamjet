@@ -48,6 +48,7 @@ async def run(
 
     step_results: list[str] = []
     for step in steps[:max_iter]:
+        previous_results = "\n\n".join(f"Step {i + 1}: {result}" for i, result in enumerate(step_results))
         step_messages: list[Any] = [
             *seed_history(initial_messages, system),
             {
@@ -55,6 +56,7 @@ async def run(
                 "content": (
                     f"Overall goal: {prompt}\n\n"
                     f"Execute this step: {step}\n\n"
+                    f"Results from completed steps:\n{previous_results}\n\n"
                     "Use any available tools as needed. "
                     "Return the result of this step only."
                 ),

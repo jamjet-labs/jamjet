@@ -4,6 +4,7 @@ provider engine. Keep it that way: the seam is bypassable if this leaks.
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -19,6 +20,10 @@ def _import_litellm() -> Any:
         raise ImportError(_INSTALL_HINT) from exc
     if litellm is None:
         raise ImportError(_INSTALL_HINT)
+    # Keep LiteLLM's startup banner out of terminal output unless debugging.
+    if os.environ.get("JAMJET_LITELLM_DEBUG") != "1":
+        litellm.suppress_debug_info = True
+        litellm.set_verbose = False
     return litellm
 
 

@@ -1,0 +1,7 @@
+# Keeps the code short enough for a phone screen, and puts the library
+# import (jamjet) before the example's own module (venue_tools).
+extend = "../../sdk/python/pyproject.toml"
+line-length = 72
+
+[lint.isort]
+known-first-party = ["venue_tools"]

@@ -88,6 +88,12 @@ impl EvaluationContext {
     /// [`Self::policy_names`] as written, or, for a code-backed node, its
     /// canonical form matches [`Self::canonical_handler`].
     pub fn matches(&self, pattern: &str) -> Option<String> {
+        // `tool:*` is every tool, in every layer: the tools-only catch-all.
+        let pattern = if is_tools_catch_all(pattern) {
+            "*"
+        } else {
+            pattern
+        };
         if let Some(name) = self
             .policy_names()
             .into_iter()
@@ -98,6 +104,64 @@ impl EvaluationContext {
         let canonical = self.canonical_handler()?;
         glob_match(&canonical_pattern(pattern), &canonical).then_some(canonical)
     }
+
+    /// [`Self::matches`] for a tenant pattern. A tenant catch-all (a pattern
+    /// of only `*`, see [`is_catch_all`]) also names a model call, which has
+    /// no tool name of its own: the operator who writes `["*"]` means every
+    /// action. Inside the IR `["*"]` keeps its meaning of "every tool"
+    /// (`approval_required=True` compiles to it), so model calls are not
+    /// matched there.
+    fn matches_tenant(&self, pattern: &str) -> Option<String> {
+        if let Some(name) = self.matches(pattern) {
+            return Some(name);
+        }
+        (self.node_kind_tag == "model" && is_catch_all(pattern)).then(|| {
+            self.model_ref
+                .clone()
+                .unwrap_or_else(|| self.node_id.clone())
+        })
+    }
+
+    /// Whether the model this context calls is on `allowlist`. An empty list
+    /// allows every model, and a context that calls no model is not checked.
+    fn model_allowed(&self, allowlist: &[String]) -> bool {
+        if self.node_kind_tag != "model" || allowlist.is_empty() {
+            return true;
+        }
+        allowlist.iter().any(|pattern| {
+            self.model_ref
+                .as_deref()
+                .map(|m| model_matches(pattern, m))
+                .unwrap_or(false)
+        })
+    }
+
+    fn model_block(&self) -> PolicyDecision {
+        PolicyDecision::Block {
+            reason: format!(
+                "model '{}' is not in the allowlist",
+                self.model_ref.as_deref().unwrap_or("unknown")
+            ),
+        }
+    }
+}
+
+/// A pattern that matches every name: one or more `*` and nothing else. In a
+/// tenant policy it also matches every `model` node.
+pub fn is_catch_all(pattern: &str) -> bool {
+    !pattern.is_empty() && pattern.chars().all(|c| c == '*')
+}
+
+/// The prefix of the tools-only catch-all, [`is_tools_catch_all`].
+pub const TOOLS_ONLY_PREFIX: &str = "tool:";
+
+/// `tool:*`: every tool and never a `model` node, in the tenant layer as in
+/// the IR. A tenant `*` also covers model calls (a ceiling fails safe); an
+/// operator who means "every tool, but not each model turn" writes this.
+pub fn is_tools_catch_all(pattern: &str) -> bool {
+    pattern
+        .strip_prefix(TOOLS_ONLY_PREFIX)
+        .is_some_and(is_catch_all)
 }
 
 /// A handler pattern in canonical dotted form: `:` and `/` become `.`, so a
@@ -108,38 +172,110 @@ pub(crate) fn canonical_pattern(pattern: &str) -> String {
 
 // ── PolicyEvaluator ────────────────────────────────────────────────────────
 
-/// Merges policy sets from most-general (global) to most-specific (node) and
-/// returns the first matching decision. Returns `Allow` if no rule matches.
+/// Evaluates a node against its policy layers.
+///
+/// Two kinds of layer, with different precedence:
+///
+/// - The IR's own layers (workflow, then node), in [`Self::evaluate`]. The
+///   author of the IR owns both, so the most specific rule that matches
+///   decides: a node `require_approval_for` turns a workflow block into an
+///   approval request, and a node `model_allowlist` replaces the workflow's.
+/// - The tenant layer, in [`Self::evaluate_chain`]. The operator owns it and
+///   it is a ceiling over the IR: deny overrides. A tenant block stands
+///   whatever the IR says, a tenant approval gate holds a node the IR allows,
+///   and a model must be on the tenant's allowlist as well as the IR's.
 pub struct PolicyEvaluator;
 
 impl PolicyEvaluator {
-    /// Evaluate policy for a given node context.
+    /// Evaluate `ctx` under a tenant policy and the IR's layers. This is the
+    /// decision the engine enforces.
     ///
-    /// `policy_sets` is ordered from least-specific (global/workflow) to
-    /// most-specific (node). The first matching rule in the most-specific set
-    /// wins; we iterate in reverse so node-level rules take priority.
+    /// Deny overrides across the two: a block from either side blocks (the
+    /// tenant's is reported first), otherwise an approval gate from either
+    /// side holds the node, otherwise it is allowed. So no rule an IR author
+    /// writes can lift a tenant rule; it can only add to it.
+    pub fn evaluate_chain(
+        &self,
+        ctx: &EvaluationContext,
+        tenant: Option<&PolicySetIr>,
+        layers: &[&PolicySetIr],
+    ) -> PolicyDecision {
+        let ceiling = match tenant {
+            Some(t) => self.evaluate_tenant(ctx, t),
+            None => PolicyDecision::Allow,
+        };
+        if matches!(ceiling, PolicyDecision::Block { .. }) {
+            return ceiling;
+        }
+        match (ceiling, self.evaluate_ir(ctx, layers)) {
+            (_, block @ PolicyDecision::Block { .. }) => block,
+            (gate @ PolicyDecision::RequireApproval { .. }, _) => gate,
+            (_, gate @ PolicyDecision::RequireApproval { .. }) => gate,
+            _ => PolicyDecision::Allow,
+        }
+    }
+
+    /// The tenant layer on its own: its model allowlist, then its blocked
+    /// tools, then its approval gates. Unlike an IR layer, a model that is on
+    /// the allowlist does not skip the rest, so a tenant `blocked_tools` or
+    /// `require_approval_for` catch-all still applies to the call.
+    pub fn evaluate_tenant(&self, ctx: &EvaluationContext, tenant: &PolicySetIr) -> PolicyDecision {
+        if !ctx.model_allowed(&tenant.model_allowlist) {
+            return ctx.model_block();
+        }
+        for pattern in &tenant.blocked_tools {
+            if let Some(name) = ctx.matches_tenant(pattern) {
+                return PolicyDecision::Block {
+                    reason: format!("tool '{name}' matches blocked pattern '{pattern}'"),
+                };
+            }
+        }
+        if tenant
+            .require_approval_for
+            .iter()
+            .any(|pattern| ctx.matches_tenant(pattern).is_some())
+        {
+            return PolicyDecision::RequireApproval {
+                approver: "human".to_string(),
+            };
+        }
+        PolicyDecision::Allow
+    }
+
+    /// The IR's layers only: [`Self::evaluate_ir`]. Deprecated because the
+    /// name invites passing the tenant policy as one more layer, where an IR
+    /// rule can override it; the engine decides with [`Self::evaluate_chain`].
+    #[deprecated(
+        since = "0.6.0",
+        note = "use evaluate_chain (tenant ceiling and IR layers) or evaluate_ir (IR layers only)"
+    )]
     pub fn evaluate(
         &self,
         ctx: &EvaluationContext,
         policy_sets: &[&PolicySetIr],
     ) -> PolicyDecision {
-        // Iterate most-specific first (node → workflow → global).
+        self.evaluate_ir(ctx, policy_sets)
+    }
+
+    /// Evaluate `ctx` against the IR's own layers.
+    ///
+    /// `policy_sets` is ordered from least-specific (workflow) to
+    /// most-specific (node). The first matching rule in the most-specific set
+    /// wins; we iterate in reverse so node-level rules take priority.
+    ///
+    /// A tenant policy must not be passed here: in this list it would be one
+    /// more layer an IR rule can override. Use [`Self::evaluate_chain`].
+    pub fn evaluate_ir(
+        &self,
+        ctx: &EvaluationContext,
+        policy_sets: &[&PolicySetIr],
+    ) -> PolicyDecision {
+        // Iterate most-specific first (node → workflow).
         for policy in policy_sets.iter().rev() {
             // 1. Model allowlist check (for model nodes).
             if ctx.node_kind_tag == "model" && !policy.model_allowlist.is_empty() {
-                let allowed = policy.model_allowlist.iter().any(|pattern| {
-                    ctx.model_ref
-                        .as_deref()
-                        .map(|m| model_matches(pattern, m))
-                        .unwrap_or(false)
-                });
-                if !allowed {
-                    return PolicyDecision::Block {
-                        reason: format!(
-                            "model '{}' is not in the allowlist",
-                            ctx.model_ref.as_deref().unwrap_or("unknown")
-                        ),
-                    };
+                if !ctx.model_allowed(&policy.model_allowlist) {
+                    return ctx.model_block();
                 }
                 // Model matched this layer's allowlist — stop checking less-specific layers.
                 return PolicyDecision::Allow;
@@ -249,7 +385,7 @@ mod tests {
             model_ref: None,
         };
         let sets: &[&PolicySetIr] = &[];
-        assert!(matches!(ev.evaluate(&ctx, sets), PolicyDecision::Allow));
+        assert!(matches!(ev.evaluate_ir(&ctx, sets), PolicyDecision::Allow));
     }
 
     #[test]
@@ -263,7 +399,7 @@ mod tests {
             model_ref: None,
         };
         assert!(matches!(
-            ev.evaluate(&ctx, &[&p]),
+            ev.evaluate_ir(&ctx, &[&p]),
             PolicyDecision::Block { .. }
         ));
     }
@@ -279,7 +415,7 @@ mod tests {
             model_ref: None,
         };
         assert!(matches!(
-            ev.evaluate(&ctx, &[&p]),
+            ev.evaluate_ir(&ctx, &[&p]),
             PolicyDecision::Block { .. }
         ));
     }
@@ -295,7 +431,7 @@ mod tests {
             model_ref: None,
         };
         assert!(matches!(
-            ev.evaluate(&ctx, &[&p]),
+            ev.evaluate_ir(&ctx, &[&p]),
             PolicyDecision::RequireApproval { .. }
         ));
     }
@@ -311,7 +447,7 @@ mod tests {
             model_ref: Some("gpt-4".into()),
         };
         assert!(matches!(
-            ev.evaluate(&ctx, &[&p]),
+            ev.evaluate_ir(&ctx, &[&p]),
             PolicyDecision::Block { .. }
         ));
     }
@@ -326,7 +462,7 @@ mod tests {
             tool_name: None,
             model_ref: Some("claude-sonnet-4-6".into()),
         };
-        assert!(matches!(ev.evaluate(&ctx, &[&p]), PolicyDecision::Allow));
+        assert!(matches!(ev.evaluate_ir(&ctx, &[&p]), PolicyDecision::Allow));
     }
 
     #[test]
@@ -345,7 +481,7 @@ mod tests {
         // Node-level policy is checked first (most-specific wins in rev iteration).
         // Node has require_approval_for: ["delete_user"] — this fires first.
         // Result: RequireApproval (node-level overrides workflow-level block).
-        let decision = ev.evaluate(&ctx, &[&workflow_policy, &node_policy]);
+        let decision = ev.evaluate_ir(&ctx, &[&workflow_policy, &node_policy]);
         assert!(matches!(decision, PolicyDecision::RequireApproval { .. }));
     }
 
@@ -360,7 +496,7 @@ mod tests {
             model_ref: None,
         };
         // No node-level policy — workflow-level block applies.
-        let decision = ev.evaluate(&ctx, &[&workflow_policy]);
+        let decision = ev.evaluate_ir(&ctx, &[&workflow_policy]);
         assert!(matches!(decision, PolicyDecision::Block { .. }));
     }
 
@@ -401,7 +537,7 @@ mod tests {
         let p = policy(&[], &[], &["anthropic"]);
         assert!(
             matches!(
-                PolicyEvaluator.evaluate(&model_ctx("anthropic/claude-opus-4-8"), &[&p]),
+                PolicyEvaluator.evaluate_ir(&model_ctx("anthropic/claude-opus-4-8"), &[&p]),
                 PolicyDecision::Allow
             ),
             "policy=\"strict\" must allow Anthropic models, or it means the \
@@ -415,7 +551,7 @@ mod tests {
     fn a_provider_entry_still_denies_other_providers() {
         let p = policy(&[], &[], &["anthropic"]);
         assert!(matches!(
-            PolicyEvaluator.evaluate(&model_ctx("openai/gpt-4o"), &[&p]),
+            PolicyEvaluator.evaluate_ir(&model_ctx("openai/gpt-4o"), &[&p]),
             PolicyDecision::Block { .. }
         ));
     }
@@ -426,12 +562,12 @@ mod tests {
     fn a_full_ref_pattern_does_not_widen_to_the_provider() {
         let p = policy(&[], &[], &["anthropic/claude-opus-4-8"]);
         assert!(matches!(
-            PolicyEvaluator.evaluate(&model_ctx("anthropic/claude-opus-4-8"), &[&p]),
+            PolicyEvaluator.evaluate_ir(&model_ctx("anthropic/claude-opus-4-8"), &[&p]),
             PolicyDecision::Allow
         ));
         assert!(
             matches!(
-                PolicyEvaluator.evaluate(&model_ctx("anthropic/claude-haiku-4-5"), &[&p]),
+                PolicyEvaluator.evaluate_ir(&model_ctx("anthropic/claude-haiku-4-5"), &[&p]),
                 PolicyDecision::Block { .. }
             ),
             "pinning one model must not silently allow the provider's whole catalogue"
@@ -443,11 +579,11 @@ mod tests {
     fn provider_globs_still_match_the_full_ref() {
         let p = policy(&[], &[], &["anthropic/*"]);
         assert!(matches!(
-            PolicyEvaluator.evaluate(&model_ctx("anthropic/claude-opus-4-8"), &[&p]),
+            PolicyEvaluator.evaluate_ir(&model_ctx("anthropic/claude-opus-4-8"), &[&p]),
             PolicyDecision::Allow
         ));
         assert!(matches!(
-            PolicyEvaluator.evaluate(&model_ctx("openai/gpt-4o"), &[&p]),
+            PolicyEvaluator.evaluate_ir(&model_ctx("openai/gpt-4o"), &[&p]),
             PolicyDecision::Block { .. }
         ));
     }
@@ -457,7 +593,7 @@ mod tests {
     fn a_ref_without_a_provider_segment_matches_exactly() {
         let p = policy(&[], &[], &["gpt-4o"]);
         assert!(matches!(
-            PolicyEvaluator.evaluate(&model_ctx("gpt-4o"), &[&p]),
+            PolicyEvaluator.evaluate_ir(&model_ctx("gpt-4o"), &[&p]),
             PolicyDecision::Allow
         ));
     }
