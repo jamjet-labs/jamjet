@@ -115,6 +115,12 @@ The full walkthrough, with the output of each command, is in the
 `jamjet dev` and durable runs need `pip install 'jamjet[sidecar]'`.
 Real providers need `jamjet[model]` as well.
 
+### Watch it built
+
+<a href="https://www.youtube.com/watch?v=VVLrZosEwhE"><img src="https://img.youtube.com/vi/VVLrZosEwhE/maxresdefault.jpg" alt="Video: Build Your First AI Agent with JamJet, Python code-along part 1" width="480"></a>
+
+[Build Your First AI Agent with JamJet](https://www.youtube.com/watch?v=VVLrZosEwhE) is part 1 of the code-along, seven minutes long. It builds this venue-booking agent from an empty folder: an agent with instructions, two tools, then a `pay_deposit` tool that pays because the prompt said so. The code is in [`examples/venue-booking-agent`](examples/venue-booking-agent), one folder per step. The later steps there add approval before the payment, a blocked tool, and an engine killed while the payment waits.
+
 Works alongside **Claude Code · OpenAI Agents SDK · MCP clients · LangChain · CrewAI · ADK · Spring AI · LangChain4j**.
 
 ## On the JVM
@@ -263,6 +269,7 @@ Want to build the official integration for *your* framework? **[Claim a slot](ht
 | Example | What it shows |
 |---------|--------------|
 | [`01-block-unsafe-tool`](examples/01-block-unsafe-tool) | A destructive tool call blocked before execution |
+| [`venue-booking-agent`](examples/venue-booking-agent) | The video code-along: one agent in nine steps, from a first tool to approval, a blocked tool and `kill -9` |
 | [`hitl-approval`](examples/hitl-approval) | Human approval as a first-class workflow primitive |
 | [`react-agent-durable`](examples/react-agent-durable) | A ReAct agent on the durable engine: event log, replay, park-on-429 |
 | [`team-multi-agent`](examples/team-multi-agent) | Multi-agent Teams, each sub-agent its own governed run |
