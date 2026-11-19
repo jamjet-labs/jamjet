@@ -34,7 +34,7 @@ impl SidecarModelAdapter {
     /// Create an adapter that POSTs to `base_url` (e.g. `http://127.0.0.1:4280`).
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http::model_client(),
             base_url: base_url.into(),
         }
     }

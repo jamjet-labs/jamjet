@@ -193,8 +193,20 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
             async move {
                 let caller = resolve_caller(&ctx, &args, dev_mode, Role::Viewer)?;
                 let tenant_id = caller.tenant.clone();
-                let status = args.get("status").and_then(|v| v.as_str()).and_then(parse_status);
-                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
+                let status = match args.get("status").and_then(|v| v.as_str()) {
+                    None => None,
+                    Some(s) => Some(parse_status(s).ok_or_else(|| {
+                        format!(
+                            "unknown status {s:?}; use pending, running, paused, completed, \
+                             failed, cancelled or limit_exceeded"
+                        )
+                    })?),
+                };
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(50)
+                    .min(crate::routes::MAX_EXECUTIONS_PAGE as u64) as u32;
                 let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
                 let backend = s.backend_for(&tenant_id);
@@ -290,7 +302,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
         McpTool {
             name: "jamjet_get_events".into(),
             description: Some(concat!(
-                "Retrieve the full, ordered event log for a workflow execution. Read-only, no side effects. ",
+                "Retrieve the ordered event log for a workflow execution, up to 10000 events or 8 MiB per call (follow next_after for more). Read-only, no side effects. ",
                 "Use this to debug execution behavior, understand which nodes ran and in what order, or inspect approval decisions. ",
                 "Returns a JSON object with an 'events' array. Each event has: execution_id, sequence (monotonic counter), ",
                 "timestamp, and kind (one of: WorkflowStarted, NodeScheduled, NodeStarted, NodeCompleted, NodeFailed, ",
@@ -304,6 +316,10 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     "execution_id": {
                         "type": "string",
                         "description": "Execution ID to retrieve events for. Accepts 'exec_<uuid>' or bare UUID format."
+                    },
+                    "after": {
+                        "type": "integer",
+                        "description": "Only events with a sequence above this. A response holds at most 10000 events; when there are more, its 'next_after' is the value to pass here for the next page."
                     },
                     "tenant_id": {
                         "type": "string",
@@ -324,8 +340,20 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 let tenant_id = caller.tenant.clone();
                 let eid = parse_execution_id(id_str)?;
                 let backend = s.backend_for(&tenant_id);
-                let events = backend.get_events(&eid).await.map_err(|e| format!("{e}"))?;
-                let text = serde_json::to_string(&json!({"events": events}))
+                // A cursor that is not an integer is refused: read as 0, a
+                // caller passing "10000" would get page one forever.
+                let after = match args.get("after") {
+                    None | Some(Value::Null) => 0,
+                    Some(v) => v
+                        .as_i64()
+                        .ok_or_else(|| format!("after must be an integer sequence, not {v}"))?,
+                };
+                let limit = crate::routes::MAX_EVENTS_PAGE;
+                let (events, cut) = crate::routes::read_events_page(&*backend, &eid, after, limit)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                let next_after = crate::routes::events_next_after(&events, limit, cut);
+                let text = serde_json::to_string(&json!({"events": events, "next_after": next_after}))
                     .map_err(|e| format!("{e}"))?;
                 Ok(vec![McpContent::Text { text }])
             }
@@ -632,12 +660,8 @@ fn parse_execution_id(s: &str) -> Result<ExecutionId, String> {
     Ok(ExecutionId(uuid))
 }
 
+/// Any workflow status by its name. An unknown one used to mean no filter,
+/// so `"cancelled"` listed every run.
 fn parse_status(s: &str) -> Option<WorkflowStatus> {
-    match s {
-        "running" => Some(WorkflowStatus::Running),
-        "paused" => Some(WorkflowStatus::Paused),
-        "completed" => Some(WorkflowStatus::Completed),
-        "failed" => Some(WorkflowStatus::Failed),
-        _ => None,
-    }
+    serde_json::from_value(Value::String(s.to_string())).ok()
 }

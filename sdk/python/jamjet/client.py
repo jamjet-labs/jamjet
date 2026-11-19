@@ -216,10 +216,34 @@ class JamjetClient:
         _raise_for_status(r)
         return r.json()
 
-    async def get_events(self, execution_id: str) -> dict[str, Any]:
-        r = await self._client.get(f"/executions/{execution_id}/events")
-        _raise_for_status(r)
-        return r.json()
+    async def get_events(self, execution_id: str, *, inline_artifacts: str | None = None) -> dict[str, Any]:
+        """Return the run's whole event log as ``{"events": [...]}``.
+
+        The runtime returns the log in pages (10000 events at most, with a
+        ``next_after`` cursor when a page is full); this follows the cursor
+        until the last page. Spilled node outputs over 256 KiB come back as
+        ``$artifact`` references unless ``inline_artifacts="all"``.
+        """
+        events: list[Any] = []
+        base: dict[str, Any] = {}
+        if inline_artifacts is not None:
+            base["inline_artifacts"] = inline_artifacts
+        params: dict[str, Any] = dict(base)
+        while True:
+            r = await self._client.get(f"/executions/{execution_id}/events", params=params)
+            _raise_for_status(r)
+            page = r.json()
+            page_events = page.get("events") if isinstance(page, dict) else None
+            if not isinstance(page_events, list):
+                # Not a page of the log. Read as an empty one, it would say
+                # "nothing happened" where the runtime said nothing, and a
+                # check like an eval's `did_not_use` would pass on it.
+                raise ValueError(f"the answer to GET /executions/{execution_id}/events has no `events` list")
+            events.extend(page_events)
+            next_after = page.get("next_after")
+            if next_after is None:
+                return {"events": events}
+            params = {**base, "after": next_after}
 
     async def approve(
         self,

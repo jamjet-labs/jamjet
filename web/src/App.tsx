@@ -2,7 +2,6 @@ import { Shell } from '@/components/layout/Shell'
 import { WorkflowGraph } from '@/components/graph/WorkflowGraph'
 import { DetailSidebar } from '@/components/detail/DetailSidebar'
 import { EventTimeline } from '@/components/timeline/EventTimeline'
-import { ReplayControls } from '@/components/replay/ReplayControls'
 import { ErrorBoundary } from '@/components/layout/ErrorBoundary'
 
 export default function App() {
@@ -21,11 +20,6 @@ export default function App() {
       timeline={
         <ErrorBoundary label="event timeline">
           <EventTimeline />
-        </ErrorBoundary>
-      }
-      toolbar={
-        <ErrorBoundary label="replay toolbar">
-          <ReplayControls />
         </ErrorBoundary>
       }
     />

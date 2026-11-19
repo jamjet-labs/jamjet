@@ -106,9 +106,21 @@ act on them.
 | `agent` | Invoke a registered JamJet agent | refused at registration | `agent_ref`, `input`, `output_schema` |
 
 Every node may also carry `type`, `description`, `labels`, `policy`,
-`data_policy`, `retry_policy`, `timeout`, `acts_for` and `next`. On any node
-but `human_approval`, `timeout` and `data_policy` are recorded in the IR and
-not enforced; a `human_approval` node's `timeout` is its deadline. The
+`data_policy`, `retry_policy`, `timeout`, `acts_for` and `next`. A
+`human_approval` node's `timeout` is its approval deadline. On a node the
+engine's own workers run (`model`, `condition`, `eval`, `limit_exceeded`),
+`timeout` bounds the run: past it the node fails and is not retried (`0` is
+no limit). A timeout over 7 days is refused at registration; a workflow
+stored before that was enforced runs with its timeouts capped at 7 days, and
+the worker logs a warning when it caps one. A node an external worker runs
+is not timed out by the engine. On the engine's workers a node's effect
+reservation lasts its timeout plus 60 s (at least 5 minutes); an attempt
+parked on a rate limit gives it back. After a worker crashes mid-node, any
+other attempt, the same worker's own retry included, can take the node over
+only once the reservation has lapsed. A
+node with no limit renews its reservation while its lease is held, and is
+abandoned once the lease is lost.
+`data_policy` is recorded in the IR and not enforced. The
 `python_fn`, `java_fn` and `external_fn` kinds, which external workers run,
 come from the Python and Java SDKs rather than from YAML.
 
