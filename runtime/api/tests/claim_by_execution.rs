@@ -1724,9 +1724,20 @@ async fn a_gate_finishes_when_its_client_gives_up() {
         )
         .await;
         assert!(gave_up.is_err(), "{name}: the gate did not stall");
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
-        let leased = inner.leased_items(&[QUEUE], &by_this(&e)).await.unwrap();
+        // The gate runs on in its own task. Wait for it to decide instead of
+        // sleeping a fixed time: on a loaded runner 800 ms was not always
+        // enough. The limit is well inside the 30 s lease, so a gate that
+        // stopped with its request is still marked as gating when it ends.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let leased = loop {
+            let leased = inner.leased_items(&[QUEUE], &by_this(&e)).await.unwrap();
+            let decided = leased.len() == 1 && leased[0].gate == jamjet_state::GateMark::Released;
+            if decided || tokio::time::Instant::now() >= deadline {
+                break leased;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
         assert_eq!(leased.len(), 1, "{name}");
         assert_eq!(
             leased[0].gate,
