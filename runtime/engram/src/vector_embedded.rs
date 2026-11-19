@@ -53,6 +53,16 @@ impl EmbeddedVectorStore {
         }
     }
 
+    /// How many vectors the store holds.
+    pub fn len(&self) -> usize {
+        self.entries.read().map(|e| e.len()).unwrap_or(0)
+    }
+
+    /// Whether the store holds no vectors.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -168,17 +178,13 @@ impl VectorStore for EmbeddedVectorStore {
         Ok(())
     }
 
+    /// Refused: this store keeps no scope, so it cannot tell whose vectors
+    /// are whose. It used to clear every entry, every org's included. Delete
+    /// by fact id ([`VectorStore::delete`]), as `Memory::delete_user_data`
+    /// does.
     async fn delete_by_scope(&self, _scope: &Scope) -> Result<u64, MemoryError> {
-        // A full implementation would inspect stored metadata to find entries
-        // that belong to `scope`. For now we clear all entries — sufficient for
-        // the current use-cases and easily replaced once metadata carries typed
-        // scope fields.
-        let mut entries = self
-            .entries
-            .write()
-            .map_err(|e| MemoryError::Database(format!("lock poisoned: {e}")))?;
-        let count = entries.len() as u64;
-        entries.clear();
-        Ok(count)
+        Err(MemoryError::Database(
+            "the embedded vector store keeps no scope; delete vectors by fact id".into(),
+        ))
     }
 }

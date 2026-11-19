@@ -50,7 +50,7 @@ Pick one with `ENGRAM_LLM_PROVIDER=…` — the same binary handles all of them.
 | Agents lose memory across processes | **Durable by default** — SQLite or Postgres, crash-safe, portable |
 | MCP support is an afterthought | **MCP-native** — 7 tools exposed by a single binary |
 | No time-travel over what the agent knew | **Temporal knowledge graph** — every fact is scoped and timestamped |
-| Can't isolate memory per user or tenant | **First-class scopes** — org / user / session built into every query |
+| Memory for many users gets mixed up | **First-class scopes** — org / user / session built into every query (a rail, not isolation: see the REST notes) |
 
 ---
 
@@ -205,11 +205,13 @@ On Linux, the binary needs a system CA bundle (`ca-certificates` on Debian and U
 ### Option G — REST mode for testing
 
 ```bash
+export ENGRAM_AUTH_TOKEN=$(openssl rand -hex 32)
 engram serve --mode rest --port 9090
 ```
 
 ```bash
 curl -X POST http://localhost:9090/v1/memory \
+  -H "Authorization: Bearer $ENGRAM_AUTH_TOKEN" \
   -H 'content-type: application/json' \
   -d '{
     "user_id": "alice",
@@ -218,8 +220,31 @@ curl -X POST http://localhost:9090/v1/memory \
     ]
   }'
 
-curl 'http://localhost:9090/v1/memory/recall?q=food%20allergies&user_id=alice'
+curl -H "Authorization: Bearer $ENGRAM_AUTH_TOKEN" \
+  'http://localhost:9090/v1/memory/recall?q=food%20allergies&user_id=alice'
 ```
+
+REST mode listens on `127.0.0.1` unless `ENGRAM_HOST` says otherwise. With
+`ENGRAM_AUTH_TOKEN` set, every route but `/health` needs
+`Authorization: Bearer <token>`. Without a token it starts only on a loopback
+address, where it answers only requests addressed to `localhost` or a loopback
+address and refuses cross-site browser requests (so a web page cannot reach it
+by rebinding its own name to 127.0.0.1); any local process can still use it.
+Off loopback it refuses to start without a token unless you pass
+`--allow-unauthenticated` (`ENGRAM_ALLOW_UNAUTHENTICATED=1`), and it refuses a
+token shorter than 16 characters, with fewer than 5 distinct characters, or
+that looks like a placeholder. Prefer the env var to `--auth-token`, which
+other users can see in the process list. The Docker image sets
+`ENGRAM_HOST=0.0.0.0`, so REST mode there needs a token.
+
+Scopes are a safety rail, not isolation. The caller names the `org_id` and
+`user_id` on each request (in the query string or the MCP arguments), and
+the server takes them as given, so a scope keeps an honest caller's data
+apart, and nothing stops a caller from naming another org. The token is one
+shared secret, not bound to an org: whoever holds it can act in every org.
+One token is not safe to share between tenants; run one server per tenant to
+keep them apart. On a shared host or a CI runner, where other users or jobs
+can reach loopback, set `ENGRAM_AUTH_TOKEN` even on `127.0.0.1`.
 
 No server. No config. No Python sidecar. One binary.
 
@@ -260,8 +285,8 @@ Point it at the same `docker run` command, or at a locally-installed `engram ser
 | `memory_recall` | Semantic search over stored facts, scoped by `user_id` / `org_id` |
 | `memory_context` | Assemble a token-budgeted context block for an LLM prompt, with tier-aware selection |
 | `memory_search` | Keyword search over facts (SQLite FTS5 / Postgres full-text) |
-| `memory_forget` | Soft-delete a fact by ID with an optional reason |
-| `memory_stats` | Aggregate counts: total facts, valid facts, entities, relationships |
+| `memory_forget` | Soft-delete a fact by ID with an optional reason. The fact must be in the given `org_id` (default `default`) and, with `user_id`, that user's |
+| `memory_stats` | Fact counts (total, valid, invalidated) in the given `org_id`, or one user in it. Entity and relationship totals are not kept per org, so they are `null` |
 | `memory_consolidate` | Run a consolidation cycle — decay stale facts, promote high-value ones, dedup near-duplicates |
 
 All scoped by `(org_id, user_id, session_id)` — org is the coarsest, session the finest.
@@ -279,7 +304,7 @@ All scoped by `(org_id, user_id, session_id)` — org is the coarsest, session t
 
 ## REST API
 
-Thirteen endpoints, rooted at `/v1/memory`. Full OpenAPI-style surface:
+Twelve endpoints rooted at `/v1/memory`, plus `/health`. Full OpenAPI-style surface:
 
 | Method | Path | Handler |
 |--------|------|---------|
@@ -288,10 +313,10 @@ Thirteen endpoints, rooted at `/v1/memory`. Full OpenAPI-style surface:
 | GET | `/v1/memory/recall?q=…&user_id=…` | Semantic recall |
 | POST | `/v1/memory/context` | Token-budgeted context assembly |
 | GET | `/v1/memory/search?q=…&user_id=…` | Keyword search |
-| GET | `/v1/memory/stats` | Aggregate statistics |
+| GET | `/v1/memory/stats?org_id=…&user_id=…` | Fact counts in that org (or user) |
 | POST | `/v1/memory/consolidate` | Trigger consolidation |
-| DELETE | `/v1/memory/facts/:id` | Forget a fact |
-| DELETE | `/v1/memory/users/:id` | GDPR user-data delete |
+| DELETE | `/v1/memory/facts/:id?org_id=…&user_id=…` | Forget a fact in that org (or user); 404 for a fact outside it |
+| DELETE | `/v1/memory/users/:id?org_id=…` | GDPR user-data delete |
 | POST | `/v1/memory/messages` | Save messages for a conversation |
 | GET | `/v1/memory/messages` | List conversation IDs |
 | GET | `/v1/memory/messages/:id` | Get messages for a conversation |
@@ -311,6 +336,9 @@ All settings flow through CLI flags or environment variables. Env vars are the r
 | `--extract-on-save` | `ENGRAM_EXTRACT_ON_SAVE` | `true` | Enable fact extraction when saving chat messages |
 | `--mode` | `ENGRAM_MODE` | `mcp` | `mcp` (stdio) or `rest` (HTTP) |
 | `--port` | `ENGRAM_PORT` | `9090` | HTTP port in REST mode |
+| `--host` | `ENGRAM_HOST` | `127.0.0.1` (Docker image: `0.0.0.0`) | Address REST mode listens on |
+| `--auth-token` | `ENGRAM_AUTH_TOKEN` | unset | Bearer token for every REST route but `/health`. Required off loopback |
+| `--allow-unauthenticated` | `ENGRAM_ALLOW_UNAUTHENTICATED` | off | Serve REST off loopback with no token |
 | `--llm-provider` | `ENGRAM_LLM_PROVIDER` | `ollama` | `ollama`, `openai-compatible` (alias `openai`), `anthropic`, `google`, `command`, `mock` |
 | `--embedding-provider` | `ENGRAM_EMBEDDING_PROVIDER` | `ollama` | `ollama` or `mock` (cloud embedding providers are planned) |
 | `--embedding-model` | `ENGRAM_EMBEDDING_MODEL` | `nomic-embed-text` | Ollama embedding model |

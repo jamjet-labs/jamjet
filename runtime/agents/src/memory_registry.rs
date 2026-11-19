@@ -136,19 +136,11 @@ impl AgentRegistry for InMemoryAgentRegistry {
     }
 
     async fn discover_remote(&self, url: &str) -> Result<Agent, String> {
-        let card_url = if url.ends_with("/.well-known/agent.json") {
-            url.to_string()
-        } else {
-            format!("{}/.well-known/agent.json", url.trim_end_matches('/'))
-        };
-        let resp = reqwest::get(&card_url)
+        // The same egress guard as the SQLite registry.
+        let card = crate::outbound::discover_card(url, crate::outbound::private_allowed())
             .await
-            .map_err(|e| format!("failed to fetch agent card: {e}"))?;
-        let card: AgentCard = resp
-            .json()
-            .await
-            .map_err(|e| format!("failed to parse agent card: {e}"))?;
-        let id = self.register(card.clone()).await?;
+            .map_err(|e| e.to_string())?;
+        let id = self.register(card).await?;
         self.get(id)
             .await?
             .ok_or_else(|| "agent registered but not found".to_string())
