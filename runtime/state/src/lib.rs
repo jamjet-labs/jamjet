@@ -42,6 +42,6 @@ pub use materializer::{
 pub use memory::InMemoryBackend;
 pub use segment::{segment_chain, start_next_segment};
 pub use snapshot::Snapshot;
-pub use sqlite::SqliteBackend;
+pub use sqlite::{RevokedToken, SqliteBackend};
 pub use tenant::{Tenant, TenantId, TenantLimits, TenantStatus, DEFAULT_TENANT};
 pub use tenant_scoped::TenantScopedSqliteBackend;

@@ -149,7 +149,9 @@ def test_sidecar_serves_scripted_models(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "litellm", None)
     monkeypatch.setattr(sidecar, "_get_model", lambda: Model(ungoverned=True))
-    client = TestClient(sidecar.app)
+    # The sidecar answers only a caller on this machine; TestClient's default
+    # host is `testserver`.
+    client = TestClient(sidecar.app, base_url="http://127.0.0.1:4280")
     resp = client.post(
         "/v1/complete",
         json={"model": f"scripted/{SCRIPT}", "messages": [{"role": "user", "content": "go"}], "tools": TOOLS},
@@ -216,7 +218,9 @@ def test_sidecar_returns_script_errors_as_400(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "litellm", None)
     monkeypatch.setattr(sidecar, "_get_model", lambda: Model(ungoverned=True))
-    client = TestClient(sidecar.app)
+    # The sidecar answers only a caller on this machine; TestClient's default
+    # host is `testserver`.
+    client = TestClient(sidecar.app, base_url="http://127.0.0.1:4280")
     messages = [{"role": "user", "content": "go"}] + [{"role": "assistant", "content": "x"} for _ in range(3)]
     resp = client.post("/v1/complete", json={"model": f"scripted/{SCRIPT}", "messages": messages, "tools": TOOLS})
     assert resp.status_code == 400
