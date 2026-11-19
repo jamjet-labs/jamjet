@@ -14,7 +14,7 @@ from .strategy import AgentCandidate, CoordinatorStrategy, DimensionScores, Scor
 
 
 class StrategyServer:
-    """Expose discovery, scoring, and selection strategies over HTTP.
+    """Expose discovery, scoring, and selection to the Rust runtime over HTTP.
 
     Requests select a registered strategy with ``strategy_name``, defaulting to
     ``"default"``. The built-in default discovers no agents until a registry is

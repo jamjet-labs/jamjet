@@ -66,7 +66,9 @@
                 "name": "search_web",
                 "parameters": {
                   "properties": {
-                    "query": "string"
+                    "query": {
+                      "type": "string"
+                    }
                   },
                   "required": [
                     "query"
@@ -82,7 +84,9 @@
                 "name": "send_wire",
                 "parameters": {
                   "properties": {
-                    "to": "string"
+                    "to": {
+                      "type": "string"
+                    }
                   },
                   "required": [
                     "to"
@@ -181,7 +185,7 @@
       "workflow_timeout": 300
     },
     "tools": {},
-    "version": "0.1.0+14635497f9b5",
+    "version": "0.1.0+90a7c7ed7017",
     "workflow_id": "researcher"
   },
   "tools": {

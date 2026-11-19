@@ -1,0 +1,17 @@
+Audit trail for exec_a66351f02255436598ab4986fb4db6d6
+Agent: venue-booker   Status: completed   Started: 2026-11-18 06:27:43
+Source: the engine's event log and approval records. Times are UTC.
+
+06:27:44  model asked for search_venues  call_0_0 {"city":"Lisbon","date":"2026-12-11"}
+06:27:47  ran search_venues              call_0_0 -> [{"venue": "Casa do Rio", "capacity": 120, "price": 2400}]
+06:27:47  model asked for check_dates    call_1_0 {"venue":"Casa do Rio"}
+06:27:49  ran check_dates                call_1_0 -> ["2026-12-04", "2026-12-11"]
+06:27:49  model asked for pay_deposit    call_2_0 {"amount":500,"venue":"Casa do Rio"}
+06:27:51  pay_deposit needs approval     approver: human
+06:28:01  approved by tester             dev mode, name not verified
+06:28:03  ran pay_deposit                call_2_0 -> Deposit of 500 paid for Casa do Rio.
+06:28:04  final answer                   Booked Casa do Rio in Lisbon for 11 December. The 500 deposit is paid.
+
+search_venues ran 1 time
+check_dates ran 1 time
+pay_deposit ran 1 time, approved by tester at 06:28:01

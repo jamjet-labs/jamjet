@@ -94,6 +94,34 @@ async def test_approve_sends_the_action_digest_it_was_given() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_approve_sends_user_id_when_given() -> None:
+    """approve() sends the approver name as user_id when one is given."""
+    route = respx.post(f"{BASE}/executions/exec-1/approve").respond(
+        200, json={"execution_id": "exec-1", "node_id": "gated", "accepted": True}
+    )
+
+    async with JamjetClient(base_url=BASE) as c:
+        await c.approve("exec-1", "approved", node_id="gated", user_id="tester")
+
+    assert json.loads(route.calls[0].request.content)["user_id"] == "tester"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_approve_body_has_no_user_id_when_not_given() -> None:
+    """Without user_id the body is exactly what it was before: no user_id key."""
+    route = respx.post(f"{BASE}/executions/exec-1/approve").respond(
+        200, json={"execution_id": "exec-1", "node_id": "gated", "accepted": True}
+    )
+
+    async with JamjetClient(base_url=BASE) as c:
+        await c.approve("exec-1", "approved", node_id="gated")
+
+    assert json.loads(route.calls[0].request.content) == {"decision": "approved", "node_id": "gated"}
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_list_approvals_returns_parsed_dict() -> None:
     """list_approvals() GETs /executions/{id}/approvals and returns the body."""
     payload = {
@@ -530,6 +558,28 @@ def test_approve_passes_the_action_digest_option_through() -> None:
 
     assert result.exit_code == 0, result.output
     assert fake.approve.call_args.kwargs.get("action_digest") == "d-1"
+
+
+def test_approve_as_passes_the_name_through_as_user_id() -> None:
+    """jamjet approve --as NAME sends NAME to the client as the approver name."""
+    fake = _approve_client({"execution_id": "exec-1", "node_id": "gated", "accepted": True})
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approve", "exec-1", "--decision", "approved", "--as", "tester"])
+
+    assert result.exit_code == 0, result.output
+    assert fake.approve.call_args.kwargs.get("user_id") == "tester"
+
+
+def test_approve_without_as_sends_no_user_id() -> None:
+    """Without --as the CLI passes no user_id, so the request body is unchanged."""
+    fake = _approve_client({"execution_id": "exec-1", "node_id": "gated", "accepted": True})
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approve", "exec-1", "--decision", "approved"])
+
+    assert result.exit_code == 0, result.output
+    assert fake.approve.call_args.kwargs.get("user_id") is None
 
 
 def test_the_printed_approve_command_round_trips() -> None:
