@@ -88,7 +88,7 @@ impl SqliteFactStore {
         }
         // FTS5 DDL is handled separately because triggers contain `;` inside
         for stmt in FTS5_DDL {
-            sqlx::query(stmt).execute(&self.pool).await?;
+            sqlx::query(*stmt).execute(&self.pool).await?;
         }
         Ok(())
     }
@@ -322,8 +322,10 @@ impl FactStore for SqliteFactStore {
         }
 
         if !cols.is_empty() {
+            // `cols` holds only the literal `column = ?` fragments pushed
+            // above; every value is bound.
             let sql = format!("UPDATE facts SET {} WHERE id = ?", cols.join(", "));
-            let mut q = sqlx::query(&sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             for v in &vals {
                 q = q.bind(v.as_str());
             }
@@ -337,49 +339,46 @@ impl FactStore for SqliteFactStore {
     }
 
     async fn list_facts(&self, filter: &FactFilter) -> Result<Vec<Fact>, MemoryError> {
-        let mut wheres: Vec<String> = vec!["1=1".to_string()];
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT * FROM facts WHERE 1=1");
 
         if let Some(ref scope) = filter.scope {
-            wheres.push(format!("org_id = '{}'", scope.org_id.replace('\'', "''")));
-            if let Some(ref user_id) = scope.user_id {
-                wheres.push(format!("user_id = '{}'", user_id.replace('\'', "''")));
-            }
-            if let Some(ref agent_id) = scope.agent_id {
-                wheres.push(format!("agent_id = '{}'", agent_id.replace('\'', "''")));
-            }
-            if let Some(ref session_id) = scope.session_id {
-                wheres.push(format!("session_id = '{}'", session_id.replace('\'', "''")));
-            }
+            query.push(" AND ");
+            crate::sql::push_scope(&mut query, scope);
         }
 
         if let Some(ref tier) = filter.tier {
-            wheres.push(format!("tier = '{}'", tier_to_str(tier)));
+            query.push(" AND tier = ").push_bind(tier_to_str(tier));
         }
 
         if let Some(ref category) = filter.category {
-            wheres.push(format!("category = '{}'", category.replace('\'', "''")));
+            query.push(" AND category = ").push_bind(category.clone());
         }
 
         if let Some(as_of) = filter.as_of {
             let s = as_of.to_rfc3339();
-            wheres.push(format!("valid_from <= '{s}'"));
-            wheres.push(format!("(invalid_at IS NULL OR invalid_at > '{s}')"));
+            query.push(" AND valid_from <= ").push_bind(s.clone());
+            query
+                .push(" AND (invalid_at IS NULL OR invalid_at > ")
+                .push_bind(s)
+                .push(")");
         } else if filter.valid_only {
-            wheres.push("invalid_at IS NULL".to_string());
+            query.push(" AND invalid_at IS NULL");
         }
 
         if let Some(ref text_contains) = filter.text_contains {
-            let escaped = text_contains.replace('\'', "''");
-            wheres.push(format!("text LIKE '%{escaped}%'"));
+            query
+                .push(" AND text LIKE ")
+                .push_bind(format!("%{text_contains}%"));
         }
 
-        let where_clause = wheres.join(" AND ");
-        let sql = format!(
-            "SELECT * FROM facts WHERE {where_clause} ORDER BY created_at DESC LIMIT {} OFFSET {}",
-            filter.limit, filter.offset
-        );
+        query
+            .push(" ORDER BY created_at DESC LIMIT ")
+            .push_bind(i64::from(filter.limit))
+            .push(" OFFSET ")
+            .push_bind(i64::from(filter.offset));
 
-        let rows = sqlx::query_as::<_, FactRow>(&sql)
+        let rows = query
+            .build_query_as::<FactRow>()
             .fetch_all(&self.pool)
             .await
             .map_err(|e| MemoryError::Database(e.to_string()))?;
@@ -399,22 +398,11 @@ impl FactStore for SqliteFactStore {
     }
 
     async fn delete_scope_data(&self, scope: &Scope) -> Result<u64, MemoryError> {
-        let mut wheres = vec![format!("org_id = '{}'", scope.org_id.replace('\'', "''"))];
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("DELETE FROM facts WHERE ");
+        crate::sql::push_scope(&mut query, scope);
 
-        if let Some(ref user_id) = scope.user_id {
-            wheres.push(format!("user_id = '{}'", user_id.replace('\'', "''")));
-        }
-        if let Some(ref agent_id) = scope.agent_id {
-            wheres.push(format!("agent_id = '{}'", agent_id.replace('\'', "''")));
-        }
-        if let Some(ref session_id) = scope.session_id {
-            wheres.push(format!("session_id = '{}'", session_id.replace('\'', "''")));
-        }
-
-        let where_clause = wheres.join(" AND ");
-        let sql = format!("DELETE FROM facts WHERE {where_clause}");
-
-        let result = sqlx::query(&sql)
+        let result = query
+            .build()
             .execute(&self.pool)
             .await
             .map_err(|e| MemoryError::Database(e.to_string()))?;
@@ -424,11 +412,11 @@ impl FactStore for SqliteFactStore {
 
     async fn delete_scope_returning(&self, scope: &Scope) -> Result<Vec<FactId>, MemoryError> {
         // One statement: the ids are exactly the rows this deleted.
-        let sql = format!(
-            "DELETE FROM facts WHERE {} RETURNING id",
-            scope_where(scope)
-        );
-        let rows: Vec<(String,)> = sqlx::query_as(&sql)
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("DELETE FROM facts WHERE ");
+        crate::sql::push_scope(&mut query, scope);
+        query.push(" RETURNING id");
+        let rows: Vec<(String,)> = query
+            .build_query_as()
             .fetch_all(&self.pool)
             .await
             .map_err(|e| MemoryError::Database(e.to_string()))?;
@@ -607,21 +595,6 @@ fn normalize_fts_query(query: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// The `WHERE` clause [`FactStore::delete_scope_data`] deletes by.
-fn scope_where(scope: &Scope) -> String {
-    let mut wheres = vec![format!("org_id = '{}'", scope.org_id.replace('\'', "''"))];
-    if let Some(ref user_id) = scope.user_id {
-        wheres.push(format!("user_id = '{}'", user_id.replace('\'', "''")));
-    }
-    if let Some(ref agent_id) = scope.agent_id {
-        wheres.push(format!("agent_id = '{}'", agent_id.replace('\'', "''")));
-    }
-    if let Some(ref session_id) = scope.session_id {
-        wheres.push(format!("session_id = '{}'", session_id.replace('\'', "''")));
-    }
-    wheres.join(" AND ")
 }
 
 #[cfg(test)]

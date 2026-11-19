@@ -31,6 +31,7 @@ pub mod rerank;
 pub mod retrieve;
 pub mod scope;
 pub mod spreading;
+mod sql;
 pub mod store;
 pub mod store_postgres;
 pub mod store_sqlite;

@@ -70,9 +70,9 @@ const HEAD_AT_SQL: &str =
 
 /// Bind an entry's 21 columns, in [`INSERT_COLUMNS`] order.
 fn bind_entry<'q>(
-    q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
     entry: &AuditLogEntry,
-) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>, AuditError> {
+) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>, AuditError> {
     let raw = serde_json::to_string(&entry.raw_event)
         .map_err(|e| AuditError::Serialization(e.to_string()))?;
     Ok(q.bind(entry.id.to_string())
@@ -139,7 +139,10 @@ impl SqliteAuditBackend {
         // benign "duplicate column name" error we deliberately ignore.
         for col in ["prev_hash", "entry_hash", "signature"] {
             let sql = format!("ALTER TABLE audit_log ADD COLUMN {col} TEXT");
-            if let Err(e) = sqlx::query(&sql).execute(&self.pool).await {
+            if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&self.pool)
+                .await
+            {
                 if !e.to_string().to_lowercase().contains("duplicate column") {
                     return Err(e);
                 }
@@ -154,7 +157,7 @@ impl AuditBackend for SqliteAuditBackend {
     async fn append(&self, entry: AuditLogEntry) -> Result<(), AuditError> {
         let sql =
             format!("INSERT OR IGNORE INTO audit_log {INSERT_COLUMNS} VALUES {INSERT_VALUES}");
-        bind_entry(sqlx::query(&sql), &entry)?
+        bind_entry(sqlx::query(sqlx::AssertSqlSafe(sql)), &entry)?
             .execute(&self.pool)
             .await
             .map_err(|e| AuditError::Database(e.to_string()))?;
@@ -174,7 +177,7 @@ impl AuditBackend for SqliteAuditBackend {
         );
         let prev = entry.prev_hash.clone();
         let at = entry.created_at.to_rfc3339();
-        let done = bind_entry(sqlx::query(&sql), &entry)?
+        let done = bind_entry(sqlx::query(sqlx::AssertSqlSafe(sql)), &entry)?
             .bind(prev)
             .bind(at)
             .execute(&self.pool)
@@ -213,7 +216,7 @@ impl AuditBackend for SqliteAuditBackend {
             q.limit, q.offset
         );
 
-        let mut query = sqlx::query_as::<_, AuditRow>(&sql);
+        let mut query = sqlx::query_as::<_, AuditRow>(sqlx::AssertSqlSafe(sql));
         for value in &values {
             query = query.bind(value.as_str());
         }
@@ -229,7 +232,7 @@ impl AuditBackend for SqliteAuditBackend {
         let (where_clause, values) = where_clause(q);
         let sql = format!("SELECT COUNT(*) FROM audit_log WHERE {where_clause}");
 
-        let mut query = sqlx::query_as::<_, (i64,)>(&sql);
+        let mut query = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql));
         for value in &values {
             query = query.bind(value.as_str());
         }

@@ -1063,7 +1063,7 @@ impl StateBackend for SqliteBackend {
         max_bytes: usize,
     ) -> BackendResult<Vec<Event>> {
         let sql = events_page_sql(false);
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(execution_id_str(execution_id))
             .bind(after)
             .bind(limit as i64)
@@ -1562,7 +1562,7 @@ impl StateBackend for SqliteBackend {
                 ""
             },
         );
-        let mut q = sqlx::query(&query_str);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(query_str));
         for qt in queue_types {
             q = q.bind(*qt);
         }
@@ -2556,7 +2556,7 @@ pub(crate) async fn create_run_in(
           started_at, updated_at, completed_at, parent_execution_id, segment_number{tcol}) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{tval})"
     );
-    let mut q = sqlx::query(&sql)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(&exec_id_str)
         .bind(&execution.workflow_id)
         .bind(&execution.workflow_version)
@@ -2581,7 +2581,7 @@ pub(crate) async fn create_run_in(
               completed_nodes_json, active_nodes_json, last_sequence{tcol}) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{tval})"
         );
-        let mut q = sqlx::query(&sql)
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(snap.id.to_string())
             .bind(&exec_id_str)
             .bind(snap.at_sequence)
@@ -2613,7 +2613,7 @@ pub(crate) async fn create_run_in(
             "INSERT INTO events (id, execution_id, sequence, kind_json, created_at{tcol}) \
              VALUES (?, ?, ?, ?, ?{tval})"
         );
-        let mut q = sqlx::query(&sql)
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(Uuid::new_v4().to_string())
             .bind(&exec_id_str)
             .bind(seq)
@@ -2632,7 +2632,7 @@ pub(crate) async fn create_run_in(
           status, created_at{tcol}) \
          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?{tval})"
     );
-    let mut q = sqlx::query(&sql)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(work_item.id.to_string())
         .bind(execution_id_str(&work_item.execution_id))
         .bind(&work_item.node_id)
@@ -2692,7 +2692,7 @@ pub(crate) async fn finish_execution_in(
         "UPDATE workflow_executions SET status = ?, updated_at = ?, \
          completed_at = COALESCE(completed_at, ?) WHERE execution_id = ?{tenant_clause}"
     );
-    let mut q = sqlx::query(&update)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(update))
         .bind(status_to_str(&status))
         .bind(&now)
         .bind(&now)
@@ -2759,7 +2759,7 @@ pub(crate) async fn execution_tenant_in(
     };
     let select =
         format!("SELECT tenant_id FROM workflow_executions WHERE execution_id = ?{tenant_clause}");
-    let mut q = sqlx::query(&select).bind(execution_id_str(id));
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(select)).bind(execution_id_str(id));
     if let Some(t) = tenant_id {
         q = q.bind(t);
     }
@@ -2801,7 +2801,7 @@ pub(crate) async fn append_event_if_in(
 
     let select =
         format!("SELECT status FROM workflow_executions WHERE execution_id = ?{tenant_clause}");
-    let mut q = sqlx::query(&select).bind(&execution_id);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(select)).bind(&execution_id);
     if let Some(t) = tenant_id {
         q = q.bind(t);
     }
@@ -2840,7 +2840,7 @@ pub(crate) async fn append_event_if_in(
         },
         if tenant_id.is_some() { ", ?" } else { "" },
     );
-    let mut q = sqlx::query(&insert)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(insert))
         .bind(event.id.to_string())
         .bind(&execution_id)
         .bind(sequence)
@@ -2868,7 +2868,7 @@ pub(crate) async fn terminal_status_of(
     };
     let select =
         format!("SELECT status FROM workflow_executions WHERE execution_id = ?{tenant_clause}");
-    let mut q = sqlx::query(&select).bind(execution_id);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(select)).bind(execution_id);
     if let Some(t) = tenant_id {
         q = q.bind(t);
     }
@@ -2897,7 +2897,9 @@ pub(crate) async fn withdraw_claimed_item(
         "UPDATE work_items SET status = 'failed', worker_id = NULL, lease_expires_at = NULL \
          WHERE id = ? AND lease_fence = ? AND status = 'claimed'{tenant_clause}"
     );
-    let mut q = sqlx::query(&update).bind(item_id).bind(lease_fence);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(update))
+        .bind(item_id)
+        .bind(lease_fence);
     if let Some(t) = tenant_id {
         q = q.bind(t);
     }
@@ -2941,7 +2943,7 @@ pub(crate) async fn expire_stale_leases(
          LEFT JOIN workflow_executions e ON e.execution_id = w.execution_id \
          WHERE w.status = 'claimed' AND w.lease_expires_at < ?{tenant_clause}"
     );
-    let mut q = sqlx::query(&select).bind(&now);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(select)).bind(&now);
     if let Some(t) = tenant_id {
         q = q.bind(t);
     }
@@ -3117,7 +3119,7 @@ pub(crate) async fn reattach_lease(
          AND worker_id IS NULL AND last_worker_id = ? AND last_lease_fence = ? \
          AND lease_epoch = ?{tenant_clause}"
     );
-    let mut q = sqlx::query(&select)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(select))
         .bind(&id_str)
         .bind(worker_id)
         .bind(lost_fence)
@@ -3154,7 +3156,7 @@ pub(crate) async fn reattach_lease(
     );
     // A lease released under the lost fence stays released under the new
     // one: the reattach is the same holder carrying on.
-    let mut q = sqlx::query(&update)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(update))
         .bind(worker_id)
         .bind(&lease_expires_at)
         .bind(&claimed_at)
@@ -3214,7 +3216,7 @@ pub(crate) async fn leased_items_in(
             ""
         }
     );
-    let mut q = sqlx::query(&query_str);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(query_str));
     for qt in queue_types {
         q = q.bind(*qt);
     }
@@ -3271,7 +3273,7 @@ pub(crate) async fn mark_gate_in(
             ""
         }
     );
-    let mut q = sqlx::query(&sql)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(value)
         .bind(item_id.to_string())
         .bind(lease_fence);
@@ -3305,7 +3307,7 @@ pub(crate) async fn park_for_execution_in(
             ""
         }
     );
-    let mut q = sqlx::query(&sql)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(now)
         .bind(item_id.to_string())
         .bind(lease_fence);
@@ -3339,7 +3341,7 @@ pub(crate) async fn dead_letter_expired_in(
             ""
         }
     );
-    let mut q = sqlx::query(&sql)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(attempt as i64)
         .bind(id)
         .bind(lease_fence);
@@ -3370,7 +3372,7 @@ pub(crate) async fn requeue_expired_in(
             ""
         }
     );
-    let mut q = sqlx::query(&sql)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(attempt as i64)
         .bind(retry_after)
         .bind(id)
@@ -3462,7 +3464,7 @@ async fn swap_gate_renewing(
             ""
         }
     );
-    let mut q = sqlx::query(&sql).bind(value(to));
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(value(to));
     if let Some((_, expires)) = &renew {
         q = q.bind(expires.clone());
     }
@@ -3510,7 +3512,7 @@ pub(crate) async fn has_claimable_in(
             ""
         }
     );
-    let mut q = sqlx::query_scalar::<_, bool>(&sql);
+    let mut q = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql));
     for qt in queue_types {
         q = q.bind(*qt);
     }

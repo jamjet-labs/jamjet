@@ -57,6 +57,25 @@ jobs:
     defaults:
       run:
         working-directory: runtime
+    # Engram's Postgres stores had no test that ran against a server. The
+    # cases in engram/tests/values_are_data_test.rs need one, and with
+    # ENGRAM_REQUIRE_POSTGRES_TESTS set they fail instead of skipping when
+    # the URL is missing.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: engram-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ENGRAM_TEST_POSTGRES_URL: postgres://postgres:engram-ci@127.0.0.1:5432/postgres
+      ENGRAM_REQUIRE_POSTGRES_TESTS: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -286,46 +305,13 @@ jobs:
       - name: Audit dependencies
         run: |
           # --deny unsound: fail on CVEs/unsound advisories (not on unmaintained warnings)
-          # --ignore RUSTSEC-2023-0071: rsa Marvin Attack — no upstream fix available yet;
-          #   we use rsa only as a transitive dep of sqlx, not for key operations.
-          # --ignore RUSTSEC-2026-0459: SQLite before 3.54.0 can return uninitialized
-          #   memory when it opens a database beside a crafted -wal file
-          #   (CVE-2026-119375). The fix is in libsqlite3-sys 0.39.0, and no published
-          #   sqlx accepts that version: 0.8.6 needs ^0.30.1 and 0.9.0 stops below 0.38.
-          #   sqlx has raised the bound for 0.9.1 (launchbadge/sqlx#4502), which is not
-          #   released yet. As of this change the runtime opens SQLite files only at
-          #   paths the operator sets (DATABASE_URL, the config file, the .jamjet
-          #   default, engram-server's db setting); no API caller supplies one. The
-          #   next step fails once the lock holds a patched version, so this ignore
-          #   cannot outlive the upgrade.
-          # These are the only two suppressions. RUSTSEC-2026-0258 was dropped in #115
-          #   when the OTLP stack moved to opentelemetry 0.32 / tonic 0.14, taking
-          #   hyper 0.14 and h2 0.3.x out of the tree.
-          cargo audit --deny unsound \
-            --ignore RUSTSEC-2023-0071 \
-            --ignore RUSTSEC-2026-0459
-
-      # Guard the exception: RUSTSEC-2026-0459 is ignored only while the lock
-      # cannot hold a patched libsqlite3-sys. Left in place after the upgrade,
-      # the ignore would hide a later downgrade, so this step fails until the
-      # ignore above and this step are both removed. Checked positively: it
-      # also fails if it cannot read exactly one locked version.
-      - name: Assert the SQLite advisory exception is still needed
-        working-directory: runtime
-        run: |
-          patched=0.39.0
-          version=$(awk '/^name = "libsqlite3-sys"$/ { getline; gsub(/^version = "|"$/, ""); print }' Cargo.lock)
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::could not read one libsqlite3-sys version from Cargo.lock (got: '$version')."
-            echo "If SQLite has left the tree, remove the RUSTSEC-2026-0459 ignore and this step."
-            exit 1
-          fi
-          lowest=$(printf '%s\n' "$version" "$patched" | sort -V | head -n 1)
-          if [ "$lowest" = "$patched" ]; then
-            echo "::error::libsqlite3-sys $version is patched. Remove the RUSTSEC-2026-0459 ignore and this step."
-            exit 1
-          fi
-          echo "still needed: libsqlite3-sys $version is below $patched"
+          # No advisory is suppressed. The last two went with the move to sqlx
+          # 0.9.1: it takes libsqlite3-sys 0.39 or later, where RUSTSEC-2026-0459
+          # is fixed, and its MySQL driver no longer brings in rsa
+          # (RUSTSEC-2023-0071). If either comes back through a dependency
+          # change, this step fails. RUSTSEC-2026-0258 was dropped in #115 when
+          # the OTLP stack moved to opentelemetry 0.32 / tonic 0.14.
+          cargo audit --deny unsound
 
       # Guard the fix rather than the exception: the vulnerable line must not
       # return through a future dependency bump. `cargo audit` alone would not
