@@ -11,7 +11,7 @@ import respx
 from typer.testing import CliRunner
 
 from jamjet.cli.main import app
-from jamjet.client import JamjetClient
+from jamjet.client import JamjetAPIError, JamjetClient
 
 runner = CliRunner()
 
@@ -90,6 +90,22 @@ async def test_approve_sends_the_action_digest_it_was_given() -> None:
 
     assert json.loads(route.calls[0].request.content)["action_digest"] == "d-1"
     assert "action_digest" not in json.loads(route.calls[1].request.content)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_approve_sends_the_request_sequence_it_was_given() -> None:
+    """approve() names the request it answers when told, so a retry cannot decide a newer one."""
+    route = respx.post(f"{BASE}/executions/exec-1/approve").respond(
+        200, json={"execution_id": "exec-1", "node_id": "gated", "accepted": True}
+    )
+
+    async with JamjetClient(base_url=BASE) as c:
+        await c.approve("exec-1", "approved", node_id="gated", action_digest="d-1", request_sequence=7)
+        await c.approve("exec-1", "approved", node_id="gated", action_digest="d-1")
+
+    assert json.loads(route.calls[0].request.content)["request_sequence"] == 7
+    assert "request_sequence" not in json.loads(route.calls[1].request.content)
 
 
 @respx.mock
@@ -646,6 +662,64 @@ def test_a_long_key_cannot_push_the_values_out_of_the_summary() -> None:
     assert 'to="mallory"' in result.output
 
 
+@respx.mock
+@pytest.mark.asyncio
+async def test_list_pending_approvals_sends_the_cursor() -> None:
+    """list_pending_approvals() sends limit and after, and returns the answer unchanged."""
+    route = respx.get(f"{BASE}/approvals").respond(
+        200,
+        json={"approvals": [{"execution_id": "exec-1", "node_id": "pay"}], "next_after": "ab12"},
+    )
+
+    async with JamjetClient(base_url=BASE) as c:
+        page = await c.list_pending_approvals(limit=25, after="ab12")
+        await c.list_pending_approvals()
+
+    first = route.calls[0].request.url.params
+    assert first["limit"] == "25"
+    assert first["after"] == "ab12"
+    plain = route.calls[1].request.url.params
+    assert "limit" not in plain
+    assert "after" not in plain
+    assert page["next_after"] == "ab12"
+    assert page["approvals"][0]["node_id"] == "pay"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_list_pending_approvals_refuses_an_engine_without_the_list() -> None:
+    """An older engine answers GET /approvals with its web page; say so instead of returning it."""
+    respx.get(f"{BASE}/approvals").respond(200, text="<!DOCTYPE html><html></html>")
+
+    async with JamjetClient(base_url=BASE) as c:
+        with pytest.raises(JamjetAPIError, match="upgrade"):
+            await c.list_pending_approvals()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_approve_returns_the_repeat_fields_unchanged() -> None:
+    """approve() hands back repeat, sequence and waiting_for as the engine sent them."""
+    respx.post(f"{BASE}/executions/exec-1/approve").respond(
+        200,
+        json={
+            "execution_id": "exec-1",
+            "node_id": "pay",
+            "accepted": True,
+            "repeat": True,
+            "sequence": 7,
+            "waiting_for": "engine",
+        },
+    )
+
+    async with JamjetClient(base_url=BASE) as c:
+        result = await c.approve("exec-1", "approved", node_id="pay")
+
+    assert result["repeat"] is True
+    assert result["sequence"] == 7
+    assert result["waiting_for"] == "engine"
+
+
 # ---------------------------------------------------------------------------
 # Start by run_key
 # ---------------------------------------------------------------------------
@@ -678,8 +752,6 @@ async def test_start_without_a_key_sends_no_key_fields() -> None:
 @respx.mock
 @pytest.mark.asyncio
 async def test_start_with_run_key_against_an_old_engine_raises() -> None:
-    from jamjet.client import JamjetAPIError
-
     # An older engine drops run_key and starts a second run: no echo in the answer.
     respx.post(f"{BASE}/executions").respond(201, json={"execution_id": "exec_1"})
     async with JamjetClient(base_url=BASE) as c:
@@ -691,8 +763,6 @@ async def test_start_with_run_key_against_an_old_engine_raises() -> None:
 @respx.mock
 @pytest.mark.asyncio
 async def test_start_with_run_key_and_another_key_in_the_answer_raises() -> None:
-    from jamjet.client import JamjetAPIError
-
     # The echo must be the key that was sent, not just any key.
     respx.post(f"{BASE}/executions").respond(201, json={"execution_id": "exec_1", "run_key": "job:2"})
     async with JamjetClient(base_url=BASE) as c:

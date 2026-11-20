@@ -21,7 +21,9 @@ use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::backend::{StateBackend, WorkItem, WorkflowDefinition};
 use jamjet_state::event::EventKind;
 use jamjet_state::{Event, InMemoryBackend, DEFAULT_TENANT};
+use jamjet_testkit::{Hooks, Intercept, Op};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -1124,4 +1126,260 @@ async fn a_forged_execution_id_cannot_write_into_another_run() {
             .any(|e| matches!(&e.kind, EventKind::NodeCompleted { .. })),
         "our own terminal event went missing"
     );
+}
+
+// ── /fail: the settle and its events are ONE write ───────────────────────────
+
+/// A fresh in-memory backend and a fresh SQLite file.
+async fn fresh_backends() -> Vec<(&'static str, Arc<dyn StateBackend>)> {
+    let path = std::env::temp_dir().join(format!("jjtest-fail-{}.db", Uuid::new_v4()));
+    let sqlite = jamjet_state::SqliteBackend::open(&format!("sqlite://{}", path.display()))
+        .await
+        .expect("open sqlite");
+    vec![
+        ("memory", Arc::new(InMemoryBackend::new())),
+        ("sqlite", Arc::new(sqlite)),
+    ]
+}
+
+/// Refuses the first call `pick` matches, once, and counts the calls
+/// `watch` matches.
+struct FailOnce {
+    pick: fn(&Op<'_>) -> bool,
+    fired: AtomicUsize,
+    watch: fn(&Op<'_>) -> bool,
+    watched: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Hooks for FailOnce {
+    async fn before(&self, op: &Op<'_>) -> Option<jamjet_state::StateBackendError> {
+        if (self.watch)(op) {
+            self.watched.fetch_add(1, Ordering::SeqCst);
+        }
+        if (self.pick)(op)
+            && self
+                .fired
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return Some(jamjet_state::StateBackendError::Database(
+                "refused by the test".into(),
+            ));
+        }
+        None
+    }
+}
+
+/// A run of a one-node workflow, started as `POST /executions` starts one,
+/// whose `python_fn` node `n1` has one attempt, with its item claimed by an
+/// external worker. Returns the run, the item and its fence.
+async fn start_one_attempt_run(backend: &Arc<dyn StateBackend>) -> (ExecutionId, Uuid, i64) {
+    let now = chrono::Utc::now();
+    backend
+        .store_workflow(WorkflowDefinition {
+            workflow_id: "wf-one".into(),
+            version: "1.0.0".into(),
+            ir: json!({
+                "workflow_id": "wf-one",
+                "version": "1.0.0",
+                "name": null,
+                "description": null,
+                "state_schema": "",
+                "start_node": "n1",
+                "nodes": { "n1": {
+                    "id": "n1",
+                    "kind": { "type": "python_fn", "module": "m", "function": "f", "output_schema": "" },
+                    "retry_policy": "no_retry",
+                    "node_timeout_secs": null,
+                    "description": null,
+                    "labels": {}
+                } },
+                "edges": [],
+                "retry_policies": {},
+                "timeouts": {},
+                "models": {},
+                "tools": {},
+                "mcp_servers": {},
+                "remote_agents": {},
+                "labels": {}
+            }),
+            created_at: now,
+            tenant_id: DEFAULT_TENANT.into(),
+        })
+        .await
+        .expect("store_workflow");
+    let execution_id = ExecutionId::new();
+    let id = Uuid::new_v4();
+    backend
+        .start_execution_atomic(
+            WorkflowExecution {
+                execution_id: execution_id.clone(),
+                workflow_id: "wf-one".into(),
+                workflow_version: "1.0.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: json!({}),
+                current_state: json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            },
+            EventKind::WorkflowStarted {
+                workflow_id: "wf-one".into(),
+                workflow_version: "1.0.0".into(),
+                initial_input: json!({}),
+                initiated_by: None,
+                run_key: None,
+            },
+            EventKind::NodeScheduled {
+                node_id: "n1".into(),
+                queue_type: "python_tool".into(),
+            },
+            WorkItem {
+                id,
+                execution_id: execution_id.clone(),
+                node_id: "n1".into(),
+                queue_type: "python_tool".into(),
+                payload: json!({"node_id": "n1"}),
+                attempt: 0,
+                max_attempts: 1,
+                created_at: now,
+                lease_expires_at: None,
+                worker_id: None,
+                lease_fence: 0,
+                tenant_id: DEFAULT_TENANT.into(),
+            },
+        )
+        .await
+        .expect("start_execution_atomic");
+    let claimed = backend
+        .claim_work_item("external-python-worker-0", &["python_tool"])
+        .await
+        .expect("claim")
+        .expect("the run's item is claimable");
+    assert_eq!(claimed.id, id);
+    (execution_id, id, claimed.lease_fence)
+}
+
+/// The route failed the item under its fence and then appended the events
+/// that record the failure, in separate writes. When the append failed after
+/// a dead-letter (a busy database, a crash), the item was settled with
+/// nothing recorded: the worker's retry of the report found no lease of its
+/// own (409), and the run stayed `Running` for good.
+///
+/// Now the store writes the settle and the events in one step, and the
+/// route appends nothing itself. The store refuses the step that records
+/// the failure once, whichever call carries it: the recorded failure, or the
+/// `NodeFailed` append a split route would make. The worker reports again
+/// under the same lease, and the run ends.
+#[tokio::test]
+async fn a_failed_fail_event_does_not_strand_the_node() {
+    for (name, backend) in fresh_backends().await {
+        let hook = Arc::new(FailOnce {
+            pick: |op| {
+                matches!(op, Op::FailWorkItemFencedRecorded { .. })
+                    || matches!(op, Op::AppendEvent(e) if matches!(e.kind, EventKind::NodeFailed { .. }))
+            },
+            fired: AtomicUsize::new(0),
+            watch: |op| matches!(op, Op::FailWorkItemFenced { .. } | Op::AppendEvent(_)),
+            watched: AtomicUsize::new(0),
+        });
+        let (execution_id, id, fence) = start_one_attempt_run(&backend).await;
+        let state = make_state(Arc::new(Intercept::new(backend.clone(), hook.clone())));
+        let report = json!({"error": "tool raised ValueError", "lease_fence": fence});
+
+        let (first, body) = post_fail(&state, id, report.clone()).await;
+        assert_eq!(
+            first,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{name}: the refused write fails the report; {body}"
+        );
+        assert_eq!(hook.fired.load(Ordering::SeqCst), 1, "{name}");
+        let (second, body) = post_fail(&state, id, report).await;
+
+        let scheduler = jamjet_scheduler::Scheduler::new(backend.clone());
+        for _ in 0..5 {
+            scheduler.tick().await.unwrap();
+        }
+        let run = backend.get_execution(&execution_id).await.unwrap().unwrap();
+        let evs = events(&backend, &execution_id).await;
+        let failed = evs
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::NodeFailed {
+                        retryable: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            second == StatusCode::OK && run.status == WorkflowStatus::Failed && failed == 1,
+            "{name}: the second report lands and the run fails once; second {second} {body}, \
+             status {:?}, log {:?}",
+            run.status,
+            evs.iter()
+                .map(|e| serde_json::to_value(&e.kind).unwrap()["type"].clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hook.watched.load(Ordering::SeqCst),
+            0,
+            "{name}: the route failed or appended outside its recorded step"
+        );
+    }
+}
+
+/// What the route appended for a failure report before the store recorded
+/// it, written out by hand.
+#[tokio::test]
+async fn fail_route_events_match_the_old_trail() {
+    let retry = vec![
+        EventKind::NodeFailed {
+            node_id: "n1".into(),
+            error: "tool raised ValueError".into(),
+            attempt: 0,
+            retryable: true,
+        },
+        EventKind::RetryScheduled {
+            node_id: "n1".into(),
+            attempt: 1,
+            delay_ms: 2000,
+        },
+    ];
+    let exhausted = vec![EventKind::NodeFailed {
+        node_id: "n1".into(),
+        error: "still broken".into(),
+        attempt: 3,
+        retryable: false,
+    }];
+    for (attempt, error, expected) in [
+        (0, "tool raised ValueError", retry),
+        (2, "still broken", exhausted),
+    ] {
+        for (name, backend) in fresh_backends().await {
+            let (execution_id, id, fence) = seed_and_claim(&backend, 3, attempt).await;
+            let state = make_state(backend.clone());
+
+            let (status, body) =
+                post_fail(&state, id, json!({"error": error, "lease_fence": fence})).await;
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+
+            let logged: Vec<EventKind> = events(&backend, &execution_id)
+                .await
+                .into_iter()
+                .map(|e| e.kind)
+                .collect();
+            assert_eq!(
+                serde_json::to_value(&logged).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+                "{name}: attempt {attempt} of 3"
+            );
+        }
+    }
 }

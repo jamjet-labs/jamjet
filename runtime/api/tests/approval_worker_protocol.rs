@@ -283,6 +283,20 @@ async fn the_initiator_cannot_complete_a_gated_node_through_the_worker_protocol(
 async fn a_developer_cannot_enqueue_a_work_item() {
     let env = env().await;
     let (id, eid) = start(&env, approval_policy()).await;
+    // The engine's own item for the gate is settled first, as a worker that
+    // ran it would: a node that still has a pending or claimed item is
+    // refused a second one whoever asks, and this test is about who may ask.
+    let item = env
+        .backend
+        .claim_work_item("w", &["tool"])
+        .await
+        .unwrap()
+        .expect("the gate's item");
+    assert!(env
+        .backend
+        .complete_work_item_fenced(item.id, item.lease_fence)
+        .await
+        .unwrap());
     // The gate's own queue: `POST /work-items` refuses a node on a queue its
     // kind is not dispatched to, whoever asks.
     let body = json!({

@@ -2495,6 +2495,32 @@ impl StateBackend for TenantScopedSqliteBackend {
         Ok(())
     }
 
+    async fn list_pending_approvals(
+        &self,
+        after: Option<&crate::backend::ApprovalCursor>,
+        limit: u32,
+    ) -> BackendResult<Vec<crate::backend::PendingApprovalRow>> {
+        crate::features::approvals_list::list_pending_approvals_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            after,
+            limit,
+        )
+        .await
+    }
+
+    async fn open_work_items(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<Vec<crate::backend::OpenWorkItem>> {
+        crate::features::open_items::open_work_items_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            execution_id,
+        )
+        .await
+    }
+
     async fn start_execution_keyed(
         &self,
         execution: WorkflowExecution,
@@ -2521,6 +2547,37 @@ impl StateBackend for TenantScopedSqliteBackend {
     ) -> BackendResult<Option<crate::backend::RunKeyRecord>> {
         crate::features::run_keys::get_run_key_in(&self.pool, Some(&self.tenant_id.0), run_key)
             .await
+    }
+
+    // ── Storage lane ──────────────────────────────────────────────────────
+
+    async fn commit_scheduler_pass(
+        &self,
+        pass: crate::backend::SchedulerPass,
+    ) -> BackendResult<crate::backend::PassCommit> {
+        crate::sqlite::commit_scheduler_pass_in(&self.pool, Some(&self.tenant_id.0), pass).await
+    }
+
+    #[instrument(skip(self), fields(tenant = %self.tenant_id))]
+    async fn reclaim_expired_leases_recorded(&self) -> BackendResult<ReclaimResult> {
+        crate::sqlite::reclaim_expired_leases_recorded_in(&self.pool, Some(&self.tenant_id.0)).await
+    }
+
+    #[instrument(skip(self, error), fields(tenant = %self.tenant_id, item_id = %item_id, fence = lease_fence))]
+    async fn fail_work_item_fenced_recorded(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        crate::sqlite::fail_work_item_fenced_recorded_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            item_id,
+            lease_fence,
+            error,
+        )
+        .await
     }
 }
 

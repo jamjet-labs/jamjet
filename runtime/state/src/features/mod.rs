@@ -3,4 +3,6 @@
 //! `None` on the unscoped backend. SQL text is built only from literals
 //! chosen by those options; every value is bound.
 
+pub(crate) mod approvals_list;
+pub(crate) mod open_items;
 pub(crate) mod run_keys;

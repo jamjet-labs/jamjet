@@ -330,7 +330,7 @@ impl Run {
                         assert!(st.is_success(), "fail: {st} {body}");
                         // The engine's retry of a failed item: the test gives
                         // the node its next item itself, so drop the retry.
-                        self.drop_pending().await;
+                        self.drop_retry(id).await;
                     }
                 }
                 true
@@ -356,22 +356,13 @@ impl Run {
         }
     }
 
-    /// Settle every pending item of the run (the retry a failed item left).
-    async fn drop_pending(&self) {
-        loop {
-            let Some(wi) = self
-                .backend
-                .claim_work_item_with_lease("sweeper", &QUEUES, Some(30))
-                .await
-                .unwrap()
-            else {
-                return;
-            };
-            self.backend
-                .complete_work_item_fenced(wi.id, wi.lease_fence)
-                .await
-                .unwrap();
-        }
+    /// Settle the retry the engine queued for the failed item `id`: the
+    /// item itself, back in the queue. On SQLite it waits out a retry delay
+    /// and cannot be claimed yet, so it is settled by its id. Left pending,
+    /// it is a live item of the node, and the next hand enqueue is refused.
+    async fn drop_retry(&self, id: &str) {
+        let id = uuid::Uuid::parse_str(id).unwrap();
+        self.backend.complete_work_item(id).await.unwrap();
     }
 
     async fn events(&self) -> Vec<EventKind> {
@@ -905,6 +896,9 @@ async fn a_new_segment_keeps_the_counters() {
             .await
             .unwrap();
         run.eid = next;
+        // The segment starts with its own item for the node, so the next
+        // step takes that one, as a run's first step takes its start item.
+        run.started = false;
         let ran = run.step(t, DONE).await;
         assert_limit(&run, ran, "max_iterations", json!(1), json!(1), &ctx).await;
     }

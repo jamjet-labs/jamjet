@@ -4,6 +4,12 @@
 
 ### Added
 
+- **`client.list_pending_approvals(limit=None, after=None)`** lists pending approvals across runs
+  from `GET /approvals`. Against an engine without that list it raises `JamjetAPIError` and asks
+  for an upgrade. `approve()` returns the engine's `repeat`, `sequence` and `waiting_for`.
+- **`approve(request_sequence=...)`** names the request a decision answers. The engine refuses
+  the decision with 409 if the node has asked again since, so a retry cannot decide a newer
+  request.
 - **Start a run by key.** `start_execution(..., run_key=None, reuse=None)` sends a
   `run_key` so a retried start returns the same run. It raises `JamjetAPIError` if the
   engine does not echo the key: an older engine drops it and would start a second run.

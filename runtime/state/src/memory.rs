@@ -4,8 +4,8 @@
 //! quick prototyping where durability is not needed.
 
 use crate::backend::{
-    ApiToken, BackendResult, FailOutcome, ReclaimResult, ReserveOutcome, StateBackend,
-    StateBackendError, WorkItem, WorkItemId, WorkflowDefinition,
+    ApiToken, BackendResult, FailOutcome, PassCommit, ReclaimResult, ReserveOutcome, SchedulerPass,
+    StateBackend, StateBackendError, WorkItem, WorkItemId, WorkflowDefinition,
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
@@ -44,7 +44,9 @@ pub struct InMemoryBackend {
     /// Reservations: idempotency key -> (owner, lease_fence, expires_at).
     tool_reservations: DashMap<String, (String, i64, chrono::DateTime<Utc>)>,
     /// Projected approval read-model. Key = (execution_id as String, node_id).
-    proj_approvals: DashMap<(String, String), crate::backend::ApprovalProjectionRow>,
+    /// The text beside each row is when it was projected (RFC 3339), the
+    /// `updated_at` the SQLite table keeps.
+    proj_approvals: DashMap<(String, String), (crate::backend::ApprovalProjectionRow, String)>,
     /// Projector checkpoints. Key = (projection_name, execution_id as String).
     projector_checkpoints: DashMap<(String, String), i64>,
     /// Content-addressed artifact store. Key = (tenant_id, hash).
@@ -58,6 +60,14 @@ pub struct InMemoryBackend {
     last_lease: DashMap<WorkItemId, (String, i64)>,
     /// Run keys. Key = (tenant_id, run_key).
     run_keys: DashMap<(String, String), crate::backend::RunKeyRecord>,
+    /// Held by `commit_scheduler_pass` across its checks and its writes, and
+    /// by every method that appends an event, changes a run's status or
+    /// changes an item's status, so none of them lands between the two. This
+    /// backend's stand-in for SQLite's `BEGIN IMMEDIATE`. Taken once, at the
+    /// public entry and before any map guard; a locked method that needs
+    /// another one's work calls its `*_locked` helper, because the lock is
+    /// not re-entrant.
+    pass_lock: tokio::sync::Mutex<()>,
 }
 
 impl InMemoryBackend {
@@ -83,6 +93,7 @@ impl InMemoryBackend {
             released_fences: DashMap::new(),
             last_lease: DashMap::new(),
             run_keys: DashMap::new(),
+            pass_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -177,6 +188,266 @@ impl InMemoryBackend {
         self.executions.insert(exec_id, execution);
         self.work_items.insert(work_item.id, work_item);
     }
+
+    /// `withdraw_work_item_fenced`, for a caller that holds `pass_lock`.
+    fn withdraw_locked(&self, item_id: WorkItemId, lease_fence: i64) -> bool {
+        // Same guard as `complete_work_item_fenced`: held (claimed) under this
+        // fence, checked and removed in one step.
+        self.work_items
+            .remove_if(&item_id, |_k, entry| {
+                entry.worker_id.is_some() && entry.lease_fence == lease_fence
+            })
+            .is_some()
+    }
+
+    /// `park_work_item`, for a caller that holds `pass_lock`.
+    fn park_locked(&self, item_id: WorkItemId, lease_fence: i64, next_attempt: u32) -> bool {
+        match self.work_items.get_mut(&item_id) {
+            Some(mut entry) => {
+                // Fence guard: a stale worker (mismatched lease_fence) is a no-op.
+                if entry.lease_fence != lease_fence {
+                    return false;
+                }
+                // Reset to pending state, mirror the SQL SET columns.
+                entry.attempt = next_attempt;
+                entry.worker_id = None;
+                entry.lease_expires_at = None;
+                // Bump epoch so the next claim mints a strictly-greater fence.
+                let next_epoch = self
+                    .lease_epochs
+                    .get(&item_id)
+                    .map(|e| *e.value())
+                    .unwrap_or(0)
+                    + 1;
+                self.lease_epochs.insert(item_id, next_epoch);
+                // Clear the fence; next claim will mint a fresh one via term*2^32+epoch.
+                entry.lease_fence = 0;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `commit_turn`, for a caller that holds `pass_lock`.
+    fn commit_turn_locked(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        terminal_event: Event,
+        write_snapshot: bool,
+    ) -> BackendResult<EventSequence> {
+        // Validate terminal event kind BEFORE mutating state. A miswired
+        // caller (non-terminal event) fails loud instead of silently settling.
+        match &terminal_event.kind {
+            EventKind::NodeCompleted { .. } | EventKind::NodeFailed { .. } => {}
+            _ => {
+                return Err(StateBackendError::Database(
+                    "commit_turn requires a terminal event (NodeCompleted/NodeFailed)".into(),
+                ))
+            }
+        }
+        // Fenced settle: only the current holder (matching fence) may settle.
+        // Note: the fence check and remove are two DashMap operations rather than
+        // one atomic step. This is acceptable for the in-memory dev/test backend;
+        // the SQLite backends are the production path where atomicity is guaranteed
+        // by BEGIN IMMEDIATE.
+        match self.work_items.get(&item_id) {
+            Some(entry) if entry.lease_fence == lease_fence => {}
+            _ => return Err(StateBackendError::FenceLost(item_id.to_string())),
+        }
+        self.work_items.remove(&item_id);
+        let eid = terminal_event.execution_id.clone();
+
+        // Extract idempotency info BEFORE moving terminal_event into the event vec.
+        // INSERT OR IGNORE semantics: use `entry(...).or_insert(...)` to keep the
+        // first recorded result if the key is already present.
+        let idem_effect: Option<(String, serde_json::Value)> = if let EventKind::NodeCompleted {
+            ref output,
+            ref state_patch,
+            duration_ms,
+            ref gen_ai_system,
+            ref gen_ai_model,
+            input_tokens,
+            output_tokens,
+            ref finish_reason,
+            idempotency_key: Some(ref key),
+            ..
+        } = terminal_event.kind
+        {
+            let result_json = serde_json::json!({
+                "output": output,
+                "state_patch": state_patch,
+                "duration_ms": duration_ms,
+                "gen_ai_system": gen_ai_system,
+                "gen_ai_model": gen_ai_model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "finish_reason": finish_reason,
+            });
+            Some((key.clone(), result_json))
+        } else {
+            None
+        };
+
+        let seq = self.push_event(terminal_event);
+
+        // Record the idempotency effect if one was extracted above.
+        if let Some((key, result_json)) = idem_effect {
+            self.tool_effects.entry(key).or_insert(result_json);
+        }
+
+        if write_snapshot {
+            // Mirror the SQLite in-tx pattern: read latest snapshot (or seed from
+            // initial_input), fold all events since it (including the one just
+            // appended), then write a new snapshot.
+            let (base, base_sequence) = if let Some(snap) = self
+                .snapshots
+                .get(&eid)
+                .and_then(|r| r.value().iter().max_by_key(|s| s.at_sequence).cloned())
+            {
+                let at_seq = snap.at_sequence;
+                (
+                    crate::materializer::MaterializedState {
+                        current_state: snap.state,
+                        status: snap.status,
+                        completed_nodes: snap.completed_nodes,
+                        active_nodes: snap.active_nodes,
+                        last_sequence: snap.last_sequence,
+                    },
+                    at_seq,
+                )
+            } else {
+                let initial_input = self
+                    .executions
+                    .get(&eid)
+                    .map(|e| e.value().initial_input.clone())
+                    .unwrap_or(serde_json::json!({}));
+                (
+                    crate::materializer::MaterializedState {
+                        current_state: initial_input,
+                        status: jamjet_core::workflow::WorkflowStatus::Pending,
+                        completed_nodes: std::collections::HashMap::new(),
+                        active_nodes: std::collections::HashSet::new(),
+                        last_sequence: 0,
+                    },
+                    0,
+                )
+            };
+
+            let tail_events: Vec<crate::event::Event> = self
+                .events
+                .get(&eid)
+                .map(|r| {
+                    r.value()
+                        .iter()
+                        .filter(|e| e.sequence > base_sequence)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mat = crate::materializer::apply_events_seeded(base, &tail_events);
+            let snap = Snapshot::from_materialized(eid.clone(), &mat);
+            self.snapshots.entry(eid).or_default().push(snap);
+        }
+        Ok(seq)
+    }
+
+    /// `fail_work_item_fenced`, for a caller that holds `pass_lock`.
+    fn fail_locked(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> Option<FailOutcome> {
+        let mut entry = self.work_items.get_mut(&item_id)?;
+        // Same guard as `complete_work_item_fenced`: the fence AND still-claimed
+        // (`worker_id.is_some()`). Fence alone would let a forged `lease_fence: 0`
+        // match a never-claimed pending item, and would accept a stale fence after
+        // a reclaim, since reclaim clears `worker_id` but leaves `lease_fence`.
+        if entry.worker_id.is_none() || entry.lease_fence != lease_fence {
+            return None;
+        }
+
+        let new_attempt = entry.attempt + 1;
+        entry.attempt = new_attempt;
+        entry.worker_id = None;
+        entry.lease_expires_at = None;
+        if let Some(obj) = entry.payload.as_object_mut() {
+            obj.insert(
+                "last_error".into(),
+                serde_json::Value::String(error.to_string()),
+            );
+        }
+        // Bump the epoch so any re-claim mints a strictly greater fence than the
+        // token the failing worker still holds.
+        let next = self
+            .lease_epochs
+            .get(&item_id)
+            .map(|e| *e.value())
+            .unwrap_or(0)
+            + 1;
+        self.lease_epochs.insert(item_id, next);
+
+        let item = entry.clone();
+        let exhausted = new_attempt >= item.max_attempts;
+        drop(entry);
+
+        if exhausted {
+            // Mirror SQLite: a dead-lettered item leaves the live queue entirely,
+            // so it can never be claimed again.
+            self.work_items.remove(&item_id);
+            return Some(FailOutcome::Exhausted {
+                item: Box::new(item),
+            });
+        }
+        Some(FailOutcome::Retryable {
+            delay_ms: (1u64 << new_attempt.min(6)) * 1000,
+            item: Box::new(item),
+        })
+    }
+
+    /// `reclaim_expired_leases` at `now`, for a caller that holds `pass_lock`.
+    fn reclaim_locked(&self, now: chrono::DateTime<Utc>) -> ReclaimResult {
+        let mut result = ReclaimResult::default();
+        let mut to_dead_letter = vec![];
+
+        for mut entry in self.work_items.iter_mut() {
+            let item = entry.value_mut();
+            if let Some(expires) = item.lease_expires_at {
+                if expires < now && item.worker_id.is_some() {
+                    item.attempt += 1;
+                    if item.attempt < item.max_attempts {
+                        self.last_lease.insert(
+                            item.id,
+                            (item.worker_id.clone().unwrap_or_default(), item.lease_fence),
+                        );
+                        item.worker_id = None;
+                        item.lease_expires_at = None;
+                        // Bump epoch so a re-claim mints a strictly greater fence.
+                        let next = self
+                            .lease_epochs
+                            .get(&item.id)
+                            .map(|e| *e.value())
+                            .unwrap_or(0)
+                            + 1;
+                        self.lease_epochs.insert(item.id, next);
+                        result.retryable.push(item.clone());
+                    } else {
+                        to_dead_letter.push(item.clone());
+                    }
+                }
+            }
+        }
+
+        for item in to_dead_letter {
+            self.work_items.remove(&item.id);
+            result.exhausted.push(item.clone());
+            self.dead_letter.insert(item.id, item);
+        }
+
+        result
+    }
 }
 
 impl Default for InMemoryBackend {
@@ -249,6 +520,7 @@ impl StateBackend for InMemoryBackend {
         id: &ExecutionId,
         status: WorkflowStatus,
     ) -> BackendResult<()> {
+        let _pass = self.pass_lock.lock().await;
         match self.executions.get_mut(id) {
             Some(mut entry) => {
                 entry.status = status;
@@ -273,6 +545,7 @@ impl StateBackend for InMemoryBackend {
         // The execution's entry stays locked while the event is pushed, so a
         // reader of the status cannot see it terminal without the event, or
         // live with it.
+        let _pass = self.pass_lock.lock().await;
         let Some(mut entry) = self.executions.get_mut(&event.execution_id) else {
             return Err(StateBackendError::NotFound(event.execution_id.to_string()));
         };
@@ -295,6 +568,7 @@ impl StateBackend for InMemoryBackend {
         // Hold the execution's entry, then its log, across the check and the
         // push: the same lock order as `finish_execution`, so a termination
         // or another conditional append cannot land in between.
+        let _pass = self.pass_lock.lock().await;
         let Some(entry) = self.executions.get_mut(&event.execution_id) else {
             return Err(StateBackendError::NotFound(event.execution_id.to_string()));
         };
@@ -402,6 +676,7 @@ impl StateBackend for InMemoryBackend {
     // ── Event log ────────────────────────────────────────────────────
 
     async fn append_event(&self, event: Event) -> BackendResult<EventSequence> {
+        let _pass = self.pass_lock.lock().await;
         Ok(self.push_event(event))
     }
 
@@ -486,6 +761,7 @@ impl StateBackend for InMemoryBackend {
         scheduled_event: EventKind,
         work_item: WorkItem,
     ) -> BackendResult<()> {
+        let _pass = self.pass_lock.lock().await;
         self.create_run(
             execution,
             Some(seed_snapshot),
@@ -503,6 +779,7 @@ impl StateBackend for InMemoryBackend {
         scheduled_event: EventKind,
         work_item: WorkItem,
     ) -> BackendResult<()> {
+        let _pass = self.pass_lock.lock().await;
         self.create_run(execution, None, started_event, scheduled_event, work_item);
         Ok(())
     }
@@ -620,6 +897,7 @@ impl StateBackend for InMemoryBackend {
     // ── Work queue ───────────────────────────────────────────────────
 
     async fn enqueue_work_item(&self, item: WorkItem) -> BackendResult<WorkItemId> {
+        let _pass = self.pass_lock.lock().await;
         let id = item.id;
         self.work_items.insert(id, item);
         Ok(id)
@@ -721,11 +999,8 @@ impl StateBackend for InMemoryBackend {
         lease_fence: i64,
         attempt: u32,
     ) -> BackendResult<bool> {
-        let now = Utc::now().to_rfc3339();
-        if !self
-            .park_work_item(item_id, lease_fence, &now, attempt)
-            .await?
-        {
+        let _pass = self.pass_lock.lock().await;
+        if !self.park_locked(item_id, lease_fence, attempt) {
             return Ok(false);
         }
         if let Some(mut entry) = self.work_items.get_mut(&item_id) {
@@ -857,7 +1132,9 @@ impl StateBackend for InMemoryBackend {
         // The fast reclaim of expired leases, mirroring the SQLite claim path:
         // re-queue, remember the holder, charge the attempt, record the retry.
         // An item of a terminal execution is settled instead, with nothing
-        // recorded (PR #140 review, I4).
+        // recorded (PR #140 review, I4). Every claim entry ends here, so this
+        // is where the claim takes `pass_lock`.
+        let _pass = self.pass_lock.lock().await;
         let now = Utc::now();
         let mut expired: Vec<WorkItem> = Vec::new();
         let mut withdrawn: Vec<WorkItemId> = Vec::new();
@@ -897,9 +1174,8 @@ impl StateBackend for InMemoryBackend {
         }
         for item in &expired {
             for kind in crate::sqlite::lease_expiry_events(item) {
-                let seq = self.latest_sequence(&item.execution_id).await? + 1;
-                self.append_event(Event::new(item.execution_id.clone(), seq, kind))
-                    .await?;
+                // Pushed directly: `append_event` takes `pass_lock`, held here.
+                self.push_event(Event::new(item.execution_id.clone(), 0, kind));
             }
         }
 
@@ -981,6 +1257,8 @@ impl StateBackend for InMemoryBackend {
         worker_id: &str,
         lease_fence: i64,
     ) -> BackendResult<crate::backend::LeaseRenewal> {
+        // A re-attach takes a pending item back to claimed.
+        let _pass = self.pass_lock.lock().await;
         match self.renew_lease(item_id, worker_id, lease_fence).await {
             Ok(()) => {
                 return Ok(crate::backend::LeaseRenewal {
@@ -1049,6 +1327,7 @@ impl StateBackend for InMemoryBackend {
     }
 
     async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
+        let _pass = self.pass_lock.lock().await;
         self.work_items.remove(&item_id);
         Ok(())
     }
@@ -1058,6 +1337,7 @@ impl StateBackend for InMemoryBackend {
         item_id: WorkItemId,
         lease_fence: i64,
     ) -> BackendResult<bool> {
+        let _pass = self.pass_lock.lock().await;
         // Mirror the SQLite `status = 'claimed'` guard: only the current holder
         // of a still-CLAIMED item may settle. "Claimed" in memory is
         // `worker_id.is_some()` (the same predicate `claim_work_item` uses).
@@ -1089,124 +1369,12 @@ impl StateBackend for InMemoryBackend {
         terminal_event: Event,
         write_snapshot: bool,
     ) -> BackendResult<EventSequence> {
-        // Validate terminal event kind BEFORE mutating state. A miswired
-        // caller (non-terminal event) fails loud instead of silently settling.
-        match &terminal_event.kind {
-            EventKind::NodeCompleted { .. } | EventKind::NodeFailed { .. } => {}
-            _ => {
-                return Err(StateBackendError::Database(
-                    "commit_turn requires a terminal event (NodeCompleted/NodeFailed)".into(),
-                ))
-            }
-        }
-        // Fenced settle: only the current holder (matching fence) may settle.
-        // Note: the fence check and remove are two DashMap operations rather than
-        // one atomic step. This is acceptable for the in-memory dev/test backend;
-        // the SQLite backends are the production path where atomicity is guaranteed
-        // by BEGIN IMMEDIATE.
-        match self.work_items.get(&item_id) {
-            Some(entry) if entry.lease_fence == lease_fence => {}
-            _ => return Err(StateBackendError::FenceLost(item_id.to_string())),
-        }
-        self.work_items.remove(&item_id);
-        let eid = terminal_event.execution_id.clone();
-
-        // Extract idempotency info BEFORE moving terminal_event into the event vec.
-        // INSERT OR IGNORE semantics: use `entry(...).or_insert(...)` to keep the
-        // first recorded result if the key is already present.
-        let idem_effect: Option<(String, serde_json::Value)> = if let EventKind::NodeCompleted {
-            ref output,
-            ref state_patch,
-            duration_ms,
-            ref gen_ai_system,
-            ref gen_ai_model,
-            input_tokens,
-            output_tokens,
-            ref finish_reason,
-            idempotency_key: Some(ref key),
-            ..
-        } = terminal_event.kind
-        {
-            let result_json = serde_json::json!({
-                "output": output,
-                "state_patch": state_patch,
-                "duration_ms": duration_ms,
-                "gen_ai_system": gen_ai_system,
-                "gen_ai_model": gen_ai_model,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "finish_reason": finish_reason,
-            });
-            Some((key.clone(), result_json))
-        } else {
-            None
-        };
-
-        let seq = self.push_event(terminal_event);
-
-        // Record the idempotency effect if one was extracted above.
-        if let Some((key, result_json)) = idem_effect {
-            self.tool_effects.entry(key).or_insert(result_json);
-        }
-
-        if write_snapshot {
-            // Mirror the SQLite in-tx pattern: read latest snapshot (or seed from
-            // initial_input), fold all events since it (including the one just
-            // appended), then write a new snapshot.
-            let (base, base_sequence) = if let Some(snap) = self
-                .snapshots
-                .get(&eid)
-                .and_then(|r| r.value().iter().max_by_key(|s| s.at_sequence).cloned())
-            {
-                let at_seq = snap.at_sequence;
-                (
-                    crate::materializer::MaterializedState {
-                        current_state: snap.state,
-                        status: snap.status,
-                        completed_nodes: snap.completed_nodes,
-                        active_nodes: snap.active_nodes,
-                        last_sequence: snap.last_sequence,
-                    },
-                    at_seq,
-                )
-            } else {
-                let initial_input = self
-                    .executions
-                    .get(&eid)
-                    .map(|e| e.value().initial_input.clone())
-                    .unwrap_or(serde_json::json!({}));
-                (
-                    crate::materializer::MaterializedState {
-                        current_state: initial_input,
-                        status: jamjet_core::workflow::WorkflowStatus::Pending,
-                        completed_nodes: std::collections::HashMap::new(),
-                        active_nodes: std::collections::HashSet::new(),
-                        last_sequence: 0,
-                    },
-                    0,
-                )
-            };
-
-            let tail_events: Vec<crate::event::Event> = self
-                .events
-                .get(&eid)
-                .map(|r| {
-                    r.value()
-                        .iter()
-                        .filter(|e| e.sequence > base_sequence)
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let mat = crate::materializer::apply_events_seeded(base, &tail_events);
-            let snap = Snapshot::from_materialized(eid.clone(), &mat);
-            self.snapshots.entry(eid).or_default().push(snap);
-        }
-        Ok(seq)
+        let _pass = self.pass_lock.lock().await;
+        self.commit_turn_locked(item_id, lease_fence, terminal_event, write_snapshot)
     }
 
     async fn fail_work_item(&self, item_id: WorkItemId, error: &str) -> BackendResult<()> {
+        let _pass = self.pass_lock.lock().await;
         // Terminal, as on SQLite (`status = 'failed'`, which no claim or sweep
         // selects): the item leaves the live queue. This used to bump the
         // attempt and free the item, so it stayed claimable, and the claim
@@ -1226,53 +1394,8 @@ impl StateBackend for InMemoryBackend {
         lease_fence: i64,
         error: &str,
     ) -> BackendResult<Option<FailOutcome>> {
-        let Some(mut entry) = self.work_items.get_mut(&item_id) else {
-            return Ok(None);
-        };
-        // Same guard as `complete_work_item_fenced`: the fence AND still-claimed
-        // (`worker_id.is_some()`). Fence alone would let a forged `lease_fence: 0`
-        // match a never-claimed pending item, and would accept a stale fence after
-        // a reclaim, since reclaim clears `worker_id` but leaves `lease_fence`.
-        if entry.worker_id.is_none() || entry.lease_fence != lease_fence {
-            return Ok(None);
-        }
-
-        let new_attempt = entry.attempt + 1;
-        entry.attempt = new_attempt;
-        entry.worker_id = None;
-        entry.lease_expires_at = None;
-        if let Some(obj) = entry.payload.as_object_mut() {
-            obj.insert(
-                "last_error".into(),
-                serde_json::Value::String(error.to_string()),
-            );
-        }
-        // Bump the epoch so any re-claim mints a strictly greater fence than the
-        // token the failing worker still holds.
-        let next = self
-            .lease_epochs
-            .get(&item_id)
-            .map(|e| *e.value())
-            .unwrap_or(0)
-            + 1;
-        self.lease_epochs.insert(item_id, next);
-
-        let item = entry.clone();
-        let exhausted = new_attempt >= item.max_attempts;
-        drop(entry);
-
-        if exhausted {
-            // Mirror SQLite: a dead-lettered item leaves the live queue entirely,
-            // so it can never be claimed again.
-            self.work_items.remove(&item_id);
-            return Ok(Some(FailOutcome::Exhausted {
-                item: Box::new(item),
-            }));
-        }
-        Ok(Some(FailOutcome::Retryable {
-            delay_ms: (1u64 << new_attempt.min(6)) * 1000,
-            item: Box::new(item),
-        }))
+        let _pass = self.pass_lock.lock().await;
+        Ok(self.fail_locked(item_id, lease_fence, error))
     }
 
     async fn commit_turn_unless_terminal(
@@ -1282,22 +1405,21 @@ impl StateBackend for InMemoryBackend {
         terminal_event: Event,
         write_snapshot: bool,
     ) -> BackendResult<crate::backend::TurnCommit> {
-        // Not atomic with the commit below: the in-memory backend is the
-        // dev/test path, and its `commit_turn` is not one atomic step either.
-        // The SQLite backends make the check part of the transaction.
+        // Under `pass_lock`, like every status change here, so a cancel lands
+        // either before the check or after the commit.
+        let _pass = self.pass_lock.lock().await;
         let terminal = self
             .executions
             .get(&terminal_event.execution_id)
             .map(|e| e.value().status.clone())
             .filter(|status| status.is_terminal());
         if let Some(status) = terminal {
-            if !self.withdraw_work_item_fenced(item_id, lease_fence).await? {
+            if !self.withdraw_locked(item_id, lease_fence) {
                 return Err(StateBackendError::FenceLost(item_id.to_string()));
             }
             return Ok(crate::backend::TurnCommit::ExecutionTerminal(status));
         }
-        self.commit_turn(item_id, lease_fence, terminal_event, write_snapshot)
-            .await
+        self.commit_turn_locked(item_id, lease_fence, terminal_event, write_snapshot)
             .map(crate::backend::TurnCommit::Committed)
     }
 
@@ -1306,14 +1428,8 @@ impl StateBackend for InMemoryBackend {
         item_id: WorkItemId,
         lease_fence: i64,
     ) -> BackendResult<bool> {
-        // Same guard as `complete_work_item_fenced`: held (claimed) under this
-        // fence, checked and removed in one step.
-        Ok(self
-            .work_items
-            .remove_if(&item_id, |_k, entry| {
-                entry.worker_id.is_some() && entry.lease_fence == lease_fence
-            })
-            .is_some())
+        let _pass = self.pass_lock.lock().await;
+        Ok(self.withdraw_locked(item_id, lease_fence))
     }
 
     async fn park_work_item(
@@ -1328,30 +1444,8 @@ impl StateBackend for InMemoryBackend {
         // in-memory backend does not enforce the not-before window — it is a
         // dev/test backend. The WorkItem struct has no retry_after field.
         let _ = retry_after;
-        match self.work_items.get_mut(&item_id) {
-            Some(mut entry) => {
-                // Fence guard: a stale worker (mismatched lease_fence) is a no-op.
-                if entry.lease_fence != lease_fence {
-                    return Ok(false);
-                }
-                // Reset to pending state, mirror the SQL SET columns.
-                entry.attempt = next_attempt;
-                entry.worker_id = None;
-                entry.lease_expires_at = None;
-                // Bump epoch so the next claim mints a strictly-greater fence.
-                let next_epoch = self
-                    .lease_epochs
-                    .get(&item_id)
-                    .map(|e| *e.value())
-                    .unwrap_or(0)
-                    + 1;
-                self.lease_epochs.insert(item_id, next_epoch);
-                // Clear the fence; next claim will mint a fresh one via term*2^32+epoch.
-                entry.lease_fence = 0;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        let _pass = self.pass_lock.lock().await;
+        Ok(self.park_locked(item_id, lease_fence, next_attempt))
     }
 
     async fn finalize_rollover_fenced(
@@ -1360,6 +1454,7 @@ impl StateBackend for InMemoryBackend {
         work_item_id: WorkItemId,
         lease_fence: i64,
     ) -> BackendResult<bool> {
+        let _pass = self.pass_lock.lock().await;
         // Fence check: only the current holder may finalize.
         match self.work_items.get(&work_item_id) {
             Some(entry) if entry.lease_fence == lease_fence => {}
@@ -1378,45 +1473,8 @@ impl StateBackend for InMemoryBackend {
     }
 
     async fn reclaim_expired_leases(&self) -> BackendResult<ReclaimResult> {
-        let now = Utc::now();
-        let mut result = ReclaimResult::default();
-        let mut to_dead_letter = vec![];
-
-        for mut entry in self.work_items.iter_mut() {
-            let item = entry.value_mut();
-            if let Some(expires) = item.lease_expires_at {
-                if expires < now && item.worker_id.is_some() {
-                    item.attempt += 1;
-                    if item.attempt < item.max_attempts {
-                        self.last_lease.insert(
-                            item.id,
-                            (item.worker_id.clone().unwrap_or_default(), item.lease_fence),
-                        );
-                        item.worker_id = None;
-                        item.lease_expires_at = None;
-                        // Bump epoch so a re-claim mints a strictly greater fence.
-                        let next = self
-                            .lease_epochs
-                            .get(&item.id)
-                            .map(|e| *e.value())
-                            .unwrap_or(0)
-                            + 1;
-                        self.lease_epochs.insert(item.id, next);
-                        result.retryable.push(item.clone());
-                    } else {
-                        to_dead_letter.push(item.clone());
-                    }
-                }
-            }
-        }
-
-        for item in to_dead_letter {
-            self.work_items.remove(&item.id);
-            result.exhausted.push(item.clone());
-            self.dead_letter.insert(item.id, item);
-        }
-
-        Ok(result)
+        let _pass = self.pass_lock.lock().await;
+        Ok(self.reclaim_locked(Utc::now()))
     }
 
     async fn move_to_dead_letter(
@@ -1424,6 +1482,7 @@ impl StateBackend for InMemoryBackend {
         item_id: WorkItemId,
         _last_error: &str,
     ) -> BackendResult<()> {
+        let _pass = self.pass_lock.lock().await;
         if let Some((_, item)) = self.work_items.remove(&item_id) {
             self.dead_letter.insert(item_id, item);
         }
@@ -1461,7 +1520,8 @@ impl StateBackend for InMemoryBackend {
         // In-memory: no ACID atomicity, but both writes happen in the same
         // synchronous step so there is no observable gap in tests.
         let key = (row.execution_id.0.to_string(), row.node_id.clone());
-        self.proj_approvals.insert(key, row.clone());
+        self.proj_approvals
+            .insert(key, (row.clone(), Utc::now().to_rfc3339()));
         let cp_key = (projection_name.to_string(), row.execution_id.0.to_string());
         self.projector_checkpoints.insert(cp_key, new_checkpoint);
         Ok(())
@@ -1477,9 +1537,11 @@ impl StateBackend for InMemoryBackend {
         // In-memory: DashMap operations are individually atomic; we apply all
         // rows then the checkpoint in a tight synchronous sequence with no
         // await between them — sufficient for single-threaded test use.
+        // One time for the batch, as SQLite stamps it.
+        let now = Utc::now().to_rfc3339();
         for row in rows {
             let key = (row.execution_id.0.to_string(), row.node_id.clone());
-            self.proj_approvals.insert(key, row);
+            self.proj_approvals.insert(key, (row, now.clone()));
         }
         let cp_key = (projection_name.to_string(), execution_id.0.to_string());
         self.projector_checkpoints.insert(cp_key, new_checkpoint);
@@ -1495,7 +1557,7 @@ impl StateBackend for InMemoryBackend {
             .proj_approvals
             .iter()
             .filter(|e| e.key().0 == exec_str)
-            .map(|e| e.value().clone())
+            .map(|e| e.value().0.clone())
             .collect();
         rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         Ok(rows)
@@ -1525,6 +1587,64 @@ impl StateBackend for InMemoryBackend {
         Ok(())
     }
 
+    async fn list_pending_approvals(
+        &self,
+        after: Option<&crate::backend::ApprovalCursor>,
+        limit: u32,
+    ) -> BackendResult<Vec<crate::backend::PendingApprovalRow>> {
+        // The run's own row decides whether it is live, as the SQLite join
+        // does: a run that ended with a request open keeps a pending row.
+        let rows = self
+            .proj_approvals
+            .iter()
+            .filter_map(|entry| {
+                let (row, updated_at) = entry.value();
+                if row.status != "pending" {
+                    return None;
+                }
+                let run = self.executions.get(&row.execution_id)?;
+                let live = matches!(run.status, WorkflowStatus::Running | WorkflowStatus::Paused);
+                live.then(|| crate::backend::PendingApprovalRow {
+                    execution_id: row.execution_id.clone(),
+                    workflow_id: run.workflow_id.clone(),
+                    workflow_version: run.workflow_version.clone(),
+                    node_id: row.node_id.clone(),
+                    tool_name: row.tool_name.clone(),
+                    approver: row.approver.clone(),
+                    context: row.context.clone(),
+                    request_sequence: row.last_sequence,
+                    updated_at: updated_at.clone(),
+                })
+            })
+            .collect();
+        Ok(crate::features::approvals_list::page(rows, after, limit))
+    }
+
+    async fn open_work_items(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<Vec<crate::backend::OpenWorkItem>> {
+        // Settling an item removes it here and dead-lettering moves it out,
+        // so the queue holds only pending and claimed items.
+        let mut items: Vec<WorkItem> = self
+            .work_items
+            .iter()
+            .filter(|e| e.value().execution_id == *execution_id)
+            .map(|e| e.value().clone())
+            .collect();
+        items.sort_by_key(|i| (i.created_at, i.id));
+        Ok(items
+            .into_iter()
+            .map(|i| crate::backend::OpenWorkItem {
+                id: i.id,
+                node_id: i.node_id,
+                queue_type: i.queue_type,
+                claimed: i.worker_id.is_some(),
+                lease_expires_at: i.lease_expires_at,
+            })
+            .collect())
+    }
+
     async fn start_execution_keyed(
         &self,
         execution: WorkflowExecution,
@@ -1536,6 +1656,10 @@ impl StateBackend for InMemoryBackend {
         use crate::backend::{KeyedStart, RunKeyRecord};
         use dashmap::mapref::entry::Entry;
         let started_event = crate::features::run_keys::with_run_key(started_event, &key.run_key)?;
+        // A run's insert changes a run's status and an item's, so it takes
+        // `pass_lock` as `start_execution_atomic` does, before any map guard:
+        // a keyed start cannot land inside a scheduler pass.
+        let _pass = self.pass_lock.lock().await;
         // The key's entry is held, its shard locked, across the run's insert:
         // a second start with the key waits, then finds it taken.
         match self
@@ -1596,6 +1720,154 @@ impl StateBackend for InMemoryBackend {
     async fn update_tenant(&self, tenant: Tenant) -> BackendResult<()> {
         self.tenants.insert(tenant.id.clone(), tenant);
         Ok(())
+    }
+
+    // ── Storage lane ─────────────────────────────────────────────────
+
+    async fn commit_scheduler_pass(&self, pass: SchedulerPass) -> BackendResult<PassCommit> {
+        pass.check_shape()?;
+        if pass.is_empty() {
+            return Ok(PassCommit::Committed {
+                last_sequence: pass.seen_sequence,
+            });
+        }
+        // Every method that appends an event, changes a run's status or
+        // changes an item's status holds this too, so what the checks read
+        // still holds when the writes land.
+        let _pass = self.pass_lock.lock().await;
+        let id = pass.execution_id.clone();
+        let Some(status) = self.executions.get(&id).map(|e| e.value().status.clone()) else {
+            return Err(StateBackendError::NotFound(id.to_string()));
+        };
+        if status.is_terminal() {
+            return Ok(PassCommit::ExecutionTerminal(status));
+        }
+        let latest = self
+            .events
+            .get(&id)
+            .and_then(|log| log.value().last().map(|e| e.sequence))
+            .unwrap_or(0);
+        if latest != pass.seen_sequence {
+            return Ok(PassCommit::Stale {
+                latest_sequence: latest,
+            });
+        }
+        // Live means held: memory drops an item when it settles.
+        let live = self.work_items.iter().any(|held| {
+            held.execution_id == id && pass.work_items.iter().any(|i| i.node_id == held.node_id)
+        });
+        if live {
+            return Ok(PassCommit::Stale {
+                latest_sequence: latest,
+            });
+        }
+
+        let mut last_sequence = latest;
+        {
+            let mut log = self.events.entry(id.clone()).or_default();
+            for kind in pass.events {
+                last_sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+                log.push(Event {
+                    id: Uuid::new_v4(),
+                    execution_id: id.clone(),
+                    sequence: last_sequence,
+                    kind,
+                    created_at: Utc::now(),
+                });
+            }
+        }
+        for mut item in pass.work_items {
+            // Pending, under the run's tenant: this backend keeps none per
+            // run (see `execution_tenant`).
+            item.worker_id = None;
+            item.lease_expires_at = None;
+            item.lease_fence = 0;
+            item.tenant_id = crate::tenant::DEFAULT_TENANT.to_string();
+            self.work_items.insert(item.id, item);
+        }
+        if let Some((status, kind)) = pass.finish {
+            // As `finish_execution`: the run's entry stays locked while its
+            // terminal event is pushed.
+            if let Some(mut entry) = self.executions.get_mut(&id) {
+                let now = Utc::now();
+                entry.status = status;
+                entry.updated_at = now;
+                entry.completed_at.get_or_insert(now);
+                last_sequence = self.push_event(Event::new(id.clone(), 0, kind));
+            }
+        }
+        Ok(PassCommit::Committed { last_sequence })
+    }
+
+    async fn reclaim_expired_leases_recorded(&self) -> BackendResult<ReclaimResult> {
+        use crate::lease_events::{sweep_events, SweepOutcome};
+        // The settles and their events under one hold of the lock, so no
+        // pass, claim or status change lands between them.
+        let _pass = self.pass_lock.lock().await;
+        let now = Utc::now();
+        // An expired item of a finished run is settled and nothing is
+        // recorded, as the claim's fast reclaim settles it.
+        let finished: Vec<WorkItemId> = self
+            .work_items
+            .iter()
+            .filter(|held| {
+                held.worker_id.is_some()
+                    && held.lease_expires_at.is_some_and(|t| t < now)
+                    && self
+                        .executions
+                        .get(&held.execution_id)
+                        .is_some_and(|e| e.value().status.is_terminal())
+            })
+            .map(|held| held.id)
+            .collect();
+        for id in finished {
+            self.work_items.remove(&id);
+        }
+        let result = self.reclaim_locked(now);
+        for (items, outcome) in [
+            (&result.retryable, SweepOutcome::Retry),
+            (&result.exhausted, SweepOutcome::Exhausted),
+        ] {
+            for item in items {
+                for kind in sweep_events(item, outcome) {
+                    self.push_event(Event::new(item.execution_id.clone(), 0, kind));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn fail_work_item_fenced_recorded(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        let _pass = self.pass_lock.lock().await;
+        let Some(execution_id) = self
+            .work_items
+            .get(&item_id)
+            .map(|held| held.execution_id.clone())
+        else {
+            return Ok(None);
+        };
+        let terminal = self
+            .executions
+            .get(&execution_id)
+            .is_some_and(|e| e.value().status.is_terminal());
+        if terminal {
+            // The holder's item is settled and nothing is recorded, as
+            // `commit_turn_unless_terminal` withdraws it.
+            self.withdraw_locked(item_id, lease_fence);
+            return Ok(None);
+        }
+        let Some(outcome) = self.fail_locked(item_id, lease_fence, error) else {
+            return Ok(None);
+        };
+        for kind in crate::lease_events::fail_events(&outcome, error) {
+            self.push_event(Event::new(execution_id.clone(), 0, kind));
+        }
+        Ok(Some(outcome))
     }
 }
 

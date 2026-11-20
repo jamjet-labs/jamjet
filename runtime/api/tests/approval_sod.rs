@@ -470,6 +470,7 @@ async fn a_decision_without_a_principal_is_refused_outside_dev_mode() {
                 comment: None,
                 state_patch: None,
                 action_digest: None,
+                request_sequence: None,
                 dev_mode: false,
             },
             ApprovalPolicy {
