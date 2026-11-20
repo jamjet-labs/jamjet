@@ -233,9 +233,15 @@ one_of_each! {
         node_id: "n".into(),
         kind: "total_tokens".into(),
         limit: 100,
-        current: 120,
+        current: 0,
+        reason: Some("tokens_not_reported".into()),
     },
-    CostBudgetExceeded { node_id: "n".into(), limit_usd: 1.5, current_usd: 2.25 },
+    CostBudgetExceeded {
+        node_id: "n".into(),
+        limit_usd: 1.5,
+        current_usd: 0.75,
+        reason: Some("cost_not_reported".into()),
+    },
     AutonomyLimitReached {
         node_id: "n".into(),
         agent_ref: "agent".into(),

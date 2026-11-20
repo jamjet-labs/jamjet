@@ -10,6 +10,7 @@ pub mod approvals;
 pub mod artifact;
 pub mod backend;
 pub mod budget;
+pub mod caps;
 pub mod event;
 // Declared before `sqlite` and `tenant_scoped`, so `fault_point!` is in
 // scope in them.
@@ -26,6 +27,7 @@ pub mod snapshot;
 pub mod sqlite;
 pub mod tenant;
 pub mod tenant_scoped;
+pub mod usage;
 
 pub use artifact::{
     artifact_threshold, resolve_value, resolve_value_budgeted, resolve_value_within, spill_bytes,
@@ -42,6 +44,7 @@ pub use backend::{ClaimFilter, ExecutionClaim, GateMark, LeasedItem};
 pub use backend::{KeyedStart, RunKeyClaim, RunKeyRecord};
 pub use backend::{PassCommit, SchedulerPass};
 pub use budget::{BudgetState, BudgetTrip};
+pub use caps::{CapKind, CapTrip, RunCaps};
 pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};
 pub use hashing::{
     canonical_json, content_hash, derive_idempotency_key, idempotency_key, sha256_hex,
@@ -56,3 +59,4 @@ pub use snapshot::Snapshot;
 pub use sqlite::{RevokedToken, SqliteBackend};
 pub use tenant::{Tenant, TenantId, TenantLimits, TenantStatus, DEFAULT_TENANT};
 pub use tenant_scoped::TenantScopedSqliteBackend;
+pub use usage::{fold_run_usage, RunUsage};

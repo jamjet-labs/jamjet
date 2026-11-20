@@ -95,6 +95,10 @@ impl BudgetState {
     /// *next* call from that state. This is what stops a rollover child, which
     /// inherits the parent's pinned counters, from making one paid call per
     /// segment forever.
+    #[deprecated(
+        note = "reads the `__budget` snapshot key, which only the in-process worker keeps; \
+                use `jamjet_state::caps::may_fire` on `fold_run_usage`, which read the run's log"
+    )]
     pub fn exhausted(
         &self,
         token_budget: Option<&TokenBudgetIr>,
@@ -155,6 +159,7 @@ impl BudgetState {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use serde_json::json;

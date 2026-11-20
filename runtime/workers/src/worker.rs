@@ -1270,6 +1270,9 @@ impl Worker {
     /// means nothing.
     ///
     /// Returns `Some(Err(..))` to refuse, `None` to let the node fire.
+    // `BudgetState::exhausted` is deprecated for `jamjet_state::caps`, which
+    // reads the run's log. This check goes when the claim checks the caps.
+    #[allow(deprecated)]
     async fn check_budget_before_execution(
         &self,
         execution_id: &ExecutionId,
@@ -1301,6 +1304,7 @@ impl Worker {
                     node_id: node_id.to_string(),
                     limit_usd: trip.limit,
                     current_usd: trip.current,
+                    reason: None,
                 }
             } else {
                 EventKind::TokenBudgetExceeded {
@@ -1308,6 +1312,7 @@ impl Worker {
                     kind: trip.kind.clone(),
                     limit: trip.limit as u64,
                     current: trip.current as u64,
+                    reason: None,
                 }
             };
             let _ = self
@@ -1407,6 +1412,7 @@ impl Worker {
                             node_id: node_id.to_string(),
                             limit_usd: cost_limit,
                             current_usd: budget.total_cost_usd,
+                            reason: None,
                         },
                     ))
                     .await;
@@ -1441,6 +1447,7 @@ impl Worker {
                     kind: kind.to_string(),
                     limit,
                     current,
+                    reason: None,
                 },
             ))
             .await;
