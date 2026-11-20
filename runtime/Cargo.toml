@@ -18,6 +18,7 @@ members = [
     "protocols",
     "protocols/mcp",
     "protocols/a2a",
+    "testkit",
 ]
 
 [workspace.package]
