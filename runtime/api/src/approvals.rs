@@ -12,7 +12,8 @@
 //!    decision that does not name its request is never repeated);
 //! 2. D was made by the same principal (in dev mode: neither has one and the
 //!    recorded user is the same);
-//! 3. the same decision, and the same note (absent, empty or blank is none);
+//! 3. the same decision, the same choice, and the same note (absent, empty or
+//!    blank is none);
 //! 4. its echo passes the rule a new decision meets, against the request D
 //!    answered: missing on an approval outside dev mode is 400, a different
 //!    one is 409 stale, and a `request_sequence` that names another request
@@ -27,8 +28,21 @@
 //! agent's limit that fails asks again for its retry. A retry without
 //! `request_sequence` then matches the new request and decides it. A retry
 //! that names the request it answered can only answer that one.
+//!
+//! A request can offer options (a `human_approval` node's, listed in its
+//! context under `options`). Approving it needs a `choice`, one of their
+//! ids, byte for byte. A rejection, or a decision on a request without
+//! options, takes no choice. The options a request shows must be the ones
+//! the node declares in the workflow version the run is bound to: anything
+//! else is a doctored log or a bug, and nothing is recorded.
+//!
+//! Every decision can carry a note (`comment` is its old name): absent,
+//! empty or blank is no note; otherwise at most [`MAX_NOTE_BYTES`] bytes,
+//! with no control character but newline, carriage return and tab, and no
+//! invisible format character. It is checked before anything is read.
 
-use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
+use jamjet_core::node::ApprovalOption;
+use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::approvals::{
     answered_request, expired_by_deadline, node_approval_status, pending_approvals,
     pending_but_expired, run_initiator, still_open, NodeApprovalStatus, PendingApproval,
@@ -47,7 +61,13 @@ pub struct ApprovalSubmission {
     /// derive it from the transport's auth, never from request content.
     pub principal: Option<String>,
     pub decision: ApprovalDecision,
-    pub comment: Option<String>,
+    /// The id of the option the decider picked. Required to approve a request
+    /// that offers options, refused anywhere else.
+    pub choice: Option<String>,
+    /// The decider's note, as sent: a transport reads it with [`note_from`],
+    /// which takes `comment` as its old name. Checked first of all, and
+    /// recorded as the decision's `comment`.
+    pub note: Option<String>,
     /// Always refused when non-null: see [`SubmitError::EditsUnsupported`].
     /// Carried so both transports refuse it in one place rather than one of
     /// them dropping it silently.
@@ -139,8 +159,31 @@ pub enum SubmitError {
         node: String,
         by_caller: bool,
     },
+    /// An approval of a request that offers options named none. Holds the
+    /// ids offered, in order.
+    ChoiceRequired(Vec<String>),
+    /// The choice is not one of the ids the request offers, compared byte
+    /// for byte. Holds the ids offered; the caller's text is not echoed.
+    ChoiceNotOffered(Vec<String>),
+    /// A choice where none is taken: on a rejection, or on a request that
+    /// offers no options. Holds the reason.
+    ChoiceNotAllowed(&'static str),
+    /// The options the request shows are not the ones the run's workflow
+    /// declares for the node. Only a doctored log or a bug writes such a
+    /// request, so nothing is recorded, whatever the choice.
+    OptionsChanged,
+    /// The note breaks the note rule (see the module docs), or `note` and
+    /// `comment` were both sent and differ. Holds the reason.
+    BadNote(String),
     Backend(String),
 }
+
+/// The longest note a decision may carry, in bytes of UTF-8.
+pub const MAX_NOTE_BYTES: usize = 4096;
+
+const REJECTION_TAKES_NO_CHOICE: &str = "a rejection takes no choice";
+const NO_OPTIONS_TAKES_NO_CHOICE: &str =
+    "this request offers no options, so a decision on it takes no choice";
 
 /// What [`submit_approval`] recorded, or found on record.
 #[derive(Debug)]
@@ -228,6 +271,23 @@ impl std::fmt::Display for SubmitError {
             Self::AlreadyDecided {
                 by_caller: false, ..
             } => write!(f, "already decided by another approver"),
+            Self::ChoiceRequired(ids) => write!(
+                f,
+                "approving this request needs a choice, one of: {}",
+                ids.join(", ")
+            ),
+            Self::ChoiceNotOffered(ids) => write!(
+                f,
+                "the choice is not one of this request's options: {}",
+                ids.join(", ")
+            ),
+            Self::ChoiceNotAllowed(reason) => write!(f, "{reason}"),
+            Self::OptionsChanged => write!(
+                f,
+                "the options in this request are not the ones the run's workflow declares \
+                 for the node; nothing was recorded"
+            ),
+            Self::BadNote(reason) => write!(f, "{reason}"),
             Self::Backend(e) => write!(f, "backend error: {e}"),
         }
     }
@@ -245,6 +305,10 @@ impl std::fmt::Display for SubmitError {
 /// checked before the run's status, so a retry after the run ended still
 /// gets its answer.
 ///
+/// The note is checked before anything is read. The choice is checked after
+/// the deadline and the echo, so a late or stale decision is refused as that
+/// whatever its choice (the rules are in the module docs).
+///
 /// Separation of duties: an `Approved` decision whose principal is the run's
 /// initiator (`WorkflowStarted.initiated_by`) is refused with
 /// [`SubmitError::SelfApproval`] and nothing is appended, unless
@@ -258,9 +322,13 @@ impl std::fmt::Display for SubmitError {
 pub async fn submit_approval(
     backend: &Arc<dyn StateBackend>,
     execution_id: &ExecutionId,
-    submission: ApprovalSubmission,
+    mut submission: ApprovalSubmission,
     policy: ApprovalPolicy,
 ) -> Result<Submitted, SubmitError> {
+    // The note needs nothing read: checked first, and from here on it is
+    // the note as recorded (a blank one is none).
+    submission.note = checked_note(submission.note.take())?;
+
     // No edits, on either decision, before anything is read or written.
     if submission
         .state_patch
@@ -393,6 +461,16 @@ pub async fn submit_approval(
         return Err(refusal);
     }
 
+    // CHOICE. After the deadline and the echo, so a late or stale decision
+    // is told that, whatever its choice. The choice is checked against the
+    // options the request showed, and those against the node's options in
+    // the version the run is bound to.
+    let offered = request_options(&request.context)?;
+    let choice = checked_choice(&submission, &offered)?;
+    if offered != declared_options(backend.as_ref(), execution.as_ref(), &node_id).await? {
+        return Err(SubmitError::OptionsChanged);
+    }
+
     // What an approval authorises: exactly the requested action. If the state
     // has moved since the request, the worker finds a different digest at
     // resume and requests afresh. Requests with no digest (agent tool
@@ -416,12 +494,13 @@ pub async fn submit_approval(
             node_id: node_id.clone(),
             user_id: submission.user_id.clone(),
             decision: submission.decision.clone(),
-            comment: submission.comment.clone(),
+            comment: submission.note.clone(),
             // Refused above when non-null; never recorded.
             state_patch: None,
             principal: submission.principal.clone(),
             approved_digest,
             request_sequence,
+            choice,
         },
     );
     let answered = request.sequence;
@@ -488,6 +567,125 @@ fn latest_requested_node(events: &[Event]) -> Option<String> {
         EventKind::ToolApprovalRequired { node_id, .. } => Some(node_id.clone()),
         _ => None,
     })
+}
+
+/// The note of a decision that may send it as `note` or under its old name
+/// `comment`. Both sent and different, even only in blanks, is
+/// [`SubmitError::BadNote`]: which one was meant is not guessed.
+pub fn note_from(
+    note: Option<String>,
+    comment: Option<String>,
+) -> Result<Option<String>, SubmitError> {
+    match (note, comment) {
+        (Some(note), Some(comment)) if note != comment => Err(SubmitError::BadNote(
+            "note and comment differ; comment is the old name of note, send one of them"
+                .to_string(),
+        )),
+        (note, comment) => Ok(note.or(comment)),
+    }
+}
+
+/// The note as recorded. Absent, empty or blank is none. Any other note is
+/// kept exactly as sent, if it is at most [`MAX_NOTE_BYTES`] bytes and holds
+/// no [`jamjet_ir::is_forbidden_identifier_char`] other than a newline, a
+/// carriage return or a tab.
+fn checked_note(note: Option<String>) -> Result<Option<String>, SubmitError> {
+    let Some(note) = note.filter(|n| !n.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if note.len() > MAX_NOTE_BYTES {
+        return Err(SubmitError::BadNote(format!(
+            "the note is {} bytes; a note is at most {MAX_NOTE_BYTES} bytes",
+            note.len()
+        )));
+    }
+    if note
+        .chars()
+        .any(|c| !matches!(c, '\n' | '\r' | '\t') && jamjet_ir::is_forbidden_identifier_char(c))
+    {
+        return Err(SubmitError::BadNote(
+            "the note may not hold a control character other than newline, carriage return \
+             and tab, or an invisible format character"
+                .to_string(),
+        ));
+    }
+    Ok(Some(note))
+}
+
+/// The options a request shows, from its context, in order. None for a
+/// request without them, as every request before options existed. A list
+/// that is not exactly what the guard writes (one this build cannot read,
+/// or one with fields an option does not have) is
+/// [`SubmitError::OptionsChanged`].
+fn request_options(context: &serde_json::Value) -> Result<Vec<ApprovalOption>, SubmitError> {
+    let Some(raw) = context.get(jamjet_worker::node_guard::OPTIONS_KEY) else {
+        return Ok(Vec::new());
+    };
+    match serde_json::from_value::<Vec<ApprovalOption>>(raw.clone()) {
+        Ok(options) if serde_json::to_value(&options).ok().as_ref() == Some(raw) => Ok(options),
+        _ => Err(SubmitError::OptionsChanged),
+    }
+}
+
+/// The choice this decision records, given the options its request offers.
+/// An approval of a request with options names one of their ids, byte for
+/// byte: nothing is trimmed or case-folded. A rejection, and any decision on
+/// a request without options, takes none.
+fn checked_choice(
+    s: &ApprovalSubmission,
+    offered: &[ApprovalOption],
+) -> Result<Option<String>, SubmitError> {
+    let ids = || offered.iter().map(|o| o.id.clone()).collect::<Vec<_>>();
+    match (&s.decision, s.choice.as_deref()) {
+        (ApprovalDecision::Rejected, Some(_)) => {
+            Err(SubmitError::ChoiceNotAllowed(REJECTION_TAKES_NO_CHOICE))
+        }
+        (ApprovalDecision::Rejected, None) => Ok(None),
+        (ApprovalDecision::Approved, Some(_)) if offered.is_empty() => {
+            Err(SubmitError::ChoiceNotAllowed(NO_OPTIONS_TAKES_NO_CHOICE))
+        }
+        (ApprovalDecision::Approved, None) if offered.is_empty() => Ok(None),
+        (ApprovalDecision::Approved, None) => Err(SubmitError::ChoiceRequired(ids())),
+        (ApprovalDecision::Approved, Some(choice)) => {
+            if offered.iter().any(|o| o.id == choice) {
+                Ok(Some(choice.to_string()))
+            } else {
+                Err(SubmitError::ChoiceNotOffered(ids()))
+            }
+        }
+    }
+}
+
+/// The options `node` declares in the workflow version the run is bound to,
+/// held to the rule registration holds them to. None when the run, its
+/// version or the node is not in the store: then nothing is declared, so a
+/// request that shows options is refused. A node this build cannot read, or
+/// options that break the rule, are [`SubmitError::OptionsChanged`]: the
+/// guard raises no request for either.
+async fn declared_options(
+    backend: &dyn StateBackend,
+    execution: Option<&WorkflowExecution>,
+    node: &str,
+) -> Result<Vec<ApprovalOption>, SubmitError> {
+    let Some(execution) = execution else {
+        return Ok(Vec::new());
+    };
+    let definition = backend
+        .get_workflow(&execution.workflow_id, &execution.workflow_version)
+        .await
+        .map_err(|e| SubmitError::Backend(e.to_string()))?;
+    let Some(raw) = definition
+        .as_ref()
+        .and_then(|d| d.ir.get("nodes"))
+        .and_then(|nodes| nodes.get(node))
+    else {
+        return Ok(Vec::new());
+    };
+    let node_def: jamjet_ir::NodeDef =
+        serde_json::from_value(raw.clone()).map_err(|_| SubmitError::OptionsChanged)?;
+    jamjet_worker::node_guard::approval_options(&node_def.kind)
+        .map(<[ApprovalOption]>::to_vec)
+        .map_err(|_| SubmitError::OptionsChanged)
 }
 
 /// The refusal of an echo, for a decision on `request`; `None` when the echo
@@ -572,7 +770,9 @@ fn same_decider(principal: Option<&str>, user_id: &str, s: &ApprovalSubmission) 
 }
 
 /// A decision's note as a repeat compares it: absent, empty or blank is no
-/// note; any other text compares byte for byte, as sent.
+/// note; any other text compares byte for byte, as sent. A submission's note
+/// is already that ([`checked_note`]); a decision recorded before notes were
+/// checked may still hold a blank one.
 fn note_of(comment: Option<&str>) -> Option<&str> {
     comment.filter(|c| !c.trim().is_empty())
 }
@@ -598,6 +798,7 @@ fn check_repeat<'a>(events: &'a [Event], node: &str, s: &ApprovalSubmission) -> 
         decision: recorded,
         comment,
         principal,
+        choice,
         ..
     } = &decision.kind
     else {
@@ -610,7 +811,8 @@ fn check_repeat<'a>(events: &'a [Event], node: &str, s: &ApprovalSubmission) -> 
     );
     if !same_decider(principal.as_deref(), user_id, s)
         || !same_decision
-        || note_of(comment.as_deref()) != note_of(s.comment.as_deref())
+        || *choice != s.choice
+        || note_of(comment.as_deref()) != note_of(s.note.as_deref())
     {
         return RepeatCheck::No;
     }
@@ -738,7 +940,18 @@ pub async fn decision_answer(
 
 /// Pending + decided approval view for `GET /executions/:id/approvals`.
 pub fn approvals_view(events: &[Event]) -> serde_json::Value {
-    let pending = pending_approvals(events);
+    let pending: Vec<serde_json::Value> = pending_approvals(events)
+        .iter()
+        .map(|p| {
+            let mut item = serde_json::to_value(p).unwrap_or(serde_json::Value::Null);
+            show_options(&mut item, Some(&p.context));
+            item
+        })
+        .collect();
+    let pending_nodes: Vec<String> = pending_approvals(events)
+        .into_iter()
+        .map(|p| p.node_id)
+        .collect();
 
     // Collect every node that ever had a `ToolApprovalRequired`.
     let mut nodes: Vec<String> = events
@@ -753,19 +966,24 @@ pub fn approvals_view(events: &[Event]) -> serde_json::Value {
 
     let decided: Vec<serde_json::Value> = nodes
         .iter()
-        .filter(|n| !pending.iter().any(|p| &p.node_id == *n))
+        .filter(|n| !pending_nodes.contains(*n))
         .map(|n| match node_approval_status(events, n) {
             NodeApprovalStatus::Approved {
                 user_id,
                 sequence,
                 approved_digest,
-            } => serde_json::json!({
-                "node_id": n,
-                "status": "approved",
-                "user_id": user_id,
-                "sequence": sequence,
-                "approved_digest": approved_digest,
-            }),
+            } => {
+                let (choice, note) = decision_at(events, sequence);
+                serde_json::json!({
+                    "node_id": n,
+                    "status": "approved",
+                    "user_id": user_id,
+                    "sequence": sequence,
+                    "approved_digest": approved_digest,
+                    "choice": choice,
+                    "note": note,
+                })
+            }
             NodeApprovalStatus::Rejected {
                 user_id,
                 comment,
@@ -775,6 +993,8 @@ pub fn approvals_view(events: &[Event]) -> serde_json::Value {
                 "status": "rejected",
                 "user_id": user_id,
                 "comment": comment,
+                "note": comment,
+                "choice": serde_json::Value::Null,
                 "sequence": sequence,
             }),
             // Unreachable in practice: a node filtered out of `pending` has a
@@ -784,6 +1004,31 @@ pub fn approvals_view(events: &[Event]) -> serde_json::Value {
         .collect();
 
     serde_json::json!({ "pending": pending, "decided": decided })
+}
+
+/// Copy the options a request offers from its context to an `options` key of
+/// the listing item, so a reviewer finds them without reading the context.
+/// Nothing is added for a request without options.
+pub fn show_options(item: &mut serde_json::Value, context: Option<&serde_json::Value>) {
+    if let Some(options) = context.and_then(|c| c.get("options")) {
+        item["options"] = options.clone();
+    }
+}
+
+/// The `choice` and `note` of the decision recorded at `sequence`; null for
+/// each the decision does not carry.
+fn decision_at(events: &[Event], sequence: i64) -> (serde_json::Value, serde_json::Value) {
+    events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ApprovalReceived {
+                choice, comment, ..
+            } if e.sequence == sequence => {
+                Some((serde_json::json!(choice), serde_json::json!(comment)))
+            }
+            _ => None,
+        })
+        .unwrap_or((serde_json::Value::Null, serde_json::Value::Null))
 }
 
 /// One row of `GET /approvals`: a request waiting for a decision, and what a
@@ -804,7 +1049,7 @@ pub fn pending_row_view(row: &PendingApprovalRow) -> serde_json::Value {
         row.request_sequence,
     );
     let deadline = |key: &str| context.get(key).cloned().unwrap_or(serde_json::Value::Null);
-    serde_json::json!({
+    let mut view = serde_json::json!({
         "execution_id": row.execution_id.to_string(),
         "workflow_id": row.workflow_id,
         "workflow_version": row.workflow_version,
@@ -816,7 +1061,9 @@ pub fn pending_row_view(row: &PendingApprovalRow) -> serde_json::Value {
         "expires_at": deadline(EXPIRES_AT_KEY),
         "escalate_at": deadline(ESCALATE_AT_KEY),
         "context": row.context,
-    })
+    });
+    show_options(&mut view, row.context.as_ref());
+    view
 }
 
 /// The `next_after` of `GET /approvals`: lowercase hex of the cursor's JSON,

@@ -379,7 +379,8 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 "Sending the same decision again with the same token answers with the first one (repeat: true, the same sequence) and records nothing. ",
                 "To retry a lost answer safely, send node_id and request_sequence (the request's sequence from GET /approvals). With request_sequence a retry can only answer that request: if the node has asked again since, it is refused. ",
                 "Without it, a retry after the node asked again with the same action_digest decides the new request. Without node_id, a retry while another request is pending is refused, since it could be a decision on that request. ",
-                "Fails if execution_id is not found, if decision is not exactly 'approved' or 'rejected', if nothing is pending approval (or node_id does not match a pending approval), if request_sequence names another request, or if the request was already decided another way or by another approver. ",
+                "A request whose context lists options (a human_approval node's) is approved with choice, one of their ids exactly as listed. A rejection, or a decision on a request without options, takes no choice. ",
+                "Fails if execution_id is not found, if decision is not exactly 'approved' or 'rejected', if nothing is pending approval (or node_id does not match a pending approval), if request_sequence names another request, if choice is missing or not one of the request's option ids, if the note breaks its limits, or if the request was already decided another way or by another approver. ",
                 "Related: use jamjet_get_events to see the tool_approval_required event details before deciding."
             ).into()),
             input_schema: json!({
@@ -398,9 +399,17 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         "type": "string",
                         "description": "ID of the node that requested approval. Helps correlate the decision with the correct approval gate when a workflow has multiple."
                     },
+                    "choice": {
+                        "type": "string",
+                        "description": "The id of the option you pick, from the options in the context of the request you reviewed. Required to approve a request that lists options, compared exactly (no trimming, case matters). Not allowed on a rejection or on a request without options."
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Optional free-text note on the decision, recorded with it in the event log and the audit trail. At most 4096 bytes. Newlines and tabs are kept; other control characters and invisible format characters are refused. An empty or blank note is no note."
+                    },
                     "comment": {
                         "type": "string",
-                        "description": "Optional free-text comment explaining the decision. Recorded in the audit trail alongside the approval event."
+                        "description": "The old name of note, with the same limits. Send one of them; both with different text is refused."
                     },
                     "action_digest": {
                         "type": "string",
@@ -431,10 +440,16 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let comment = args
-                    .get("comment")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+                // A value of the wrong type is refused, never read as absent:
+                // a dropped choice or note would record a different decision.
+                let text = |field: &str| match args.get(field) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(s)) => Ok(Some(s.clone())),
+                    Some(v) => Err(format!("{field} must be a string, not {v}")),
+                };
+                let choice = text("choice")?;
+                let note = crate::approvals::note_from(text("note")?, text("comment")?)
+                    .map_err(|e| e.to_string())?;
                 let action_digest = match args.get("action_digest") {
                     None | Some(Value::Null) => None,
                     Some(Value::String(d)) => Some(d.clone()),
@@ -483,7 +498,8 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         user_id,
                         principal,
                         decision,
-                        comment,
+                        choice,
+                        note,
                         state_patch,
                         action_digest,
                         request_sequence,

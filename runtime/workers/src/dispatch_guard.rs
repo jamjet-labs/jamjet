@@ -1057,6 +1057,7 @@ mod tests {
             principal: None,
             approved_digest: None,
             request_sequence: None,
+            choice: None,
         }
     }
 
@@ -1070,6 +1071,7 @@ mod tests {
             principal: None,
             approved_digest: None,
             request_sequence: None,
+            choice: None,
         }
     }
 

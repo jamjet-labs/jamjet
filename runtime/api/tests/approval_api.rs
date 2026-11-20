@@ -487,6 +487,7 @@ async fn projection_driven_approvals_endpoint() {
                 principal: None,
                 approved_digest: None,
                 request_sequence: None,
+                choice: None,
             },
         ))
         .await

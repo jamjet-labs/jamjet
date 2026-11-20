@@ -172,6 +172,7 @@ impl Projector {
                     decision,
                     comment,
                     approved_digest,
+                    choice,
                     ..
                 } => {
                     // First-decision-wins: only transition a node that is
@@ -204,9 +205,16 @@ impl Projector {
                                 last_sequence: event.sequence,
                                 tool_name: None,
                                 approver: None,
-                                context: approved_digest
-                                    .as_ref()
-                                    .map(|d| serde_json::json!({ "approved_digest": d })),
+                                context: {
+                                    let mut kept = serde_json::Map::new();
+                                    if let Some(d) = approved_digest {
+                                        kept.insert("approved_digest".into(), d.clone().into());
+                                    }
+                                    if let Some(c) = choice {
+                                        kept.insert("choice".into(), c.clone().into());
+                                    }
+                                    (!kept.is_empty()).then_some(serde_json::Value::Object(kept))
+                                },
                             },
                         );
                     }
@@ -353,6 +361,7 @@ mod tests {
                 principal: None,
                 approved_digest: None,
                 request_sequence: None,
+                choice: None,
             },
         )
     }
@@ -850,6 +859,7 @@ mod tests {
                     principal: None,
                     approved_digest: None,
                     request_sequence: None,
+                    choice: None,
                 },
             ))
             .await
@@ -1186,6 +1196,7 @@ mod tests {
                 principal: None,
                 approved_digest: None,
                 request_sequence: None,
+                choice: None,
             },
         );
         let required_second = StateEvent::new(

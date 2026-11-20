@@ -43,23 +43,81 @@ an expiry means nobody approved, and that fallback would publish anyway.
   the new state. Another approval completing does not count as a change,
   so two approvals waiting side by side are each asked once.
 - **Approved**: the node completes. Its output records the decision:
-  `decision`, `approved_by`, `principal`, `comment`, `decided_at` and the
-  sequences of the request and the decision. The decision is also written to
-  the run's state, under the engine's key `__approvals` and the node's id,
-  so later steps and prompts can read it:
+  `decision`, `approved_by`, `principal`, `choice`, `note`, `decided_at` and
+  the sequences of the request and the decision. The decision is also
+  written to the run's state, under the engine's key `__approvals` and the
+  node's id, so later steps and prompts can read it:
   `state.__approvals.review_report.approved` (`true`), `.approver`,
-  `.principal`, `.comment`, `.decided_at`. The run continues along `next`.
+  `.principal`, `.choice`, `.note`, `.decided_at`. `choice` is the option
+  the reviewer picked, null for a node without options. `note` is the
+  reviewer's note, null when there is none. The output and the record also
+  carry it as `comment`, its old name. The run continues along `next`.
 - Only the engine writes `state.__approvals`. It is dropped from a run's
   input (`POST /executions`), from the `state_patch` an external worker
   reports (`POST /work-items/:id/complete`), and from the patch of any
   in-process step but the approval node itself, so no step can forge the
   record a later condition reads. It never overwrites a user key named like
   the node.
+- **Route on the choice.** A node that offers options (`options` in its IR,
+  each an `id` and a `label`) is approved with one of them as `choice`. A
+  `condition` after the node reads it from the record:
+
+  ```json
+  "route": {
+    "id": "route",
+    "kind": { "type": "condition", "branches": [
+      { "condition": "state.__approvals.pick_topic.choice == \"revise\"", "target": "revise_list" },
+      { "condition": "state.__approvals.pick_topic.choice == \"topic_2\"", "target": "write_post" }
+    ] }
+  }
+  ```
+
+  The engine takes the choice from the recorded decision, never from a
+  worker's result, so the route is the one the reviewer picked. The decision
+  is sealed into the audit log whole, its choice and note included.
+- **Options.** A node can list the choices a reviewer may make:
+
+  ```yaml
+  nodes:
+    pick_topic:
+      type: human_approval
+      description: "Which topic goes out this week?"
+      options:
+        - {id: topic_1, label: "Error handling in Rust"}
+        - {id: topic_2, label: "Durable timers"}
+        - {id: revise, label: "None of these, revise the list"}
+      next: route
+  ```
+
+  There are at most ten. An id is 1 to 32 characters of `a-z`, `0-9`, `_`
+  and `-`, and unique in the node. A label is 1 to 200 characters with no
+  control or invisible format character. Registration refuses anything else.
+  The pending request shows the options (`options` on the listing item, and
+  in the request's `context`).
+- **The choice rule.** Approving a node that has options needs a `choice`
+  that is one of the listed ids, compared byte for byte (`Topic_2` is not
+  `topic_2`). A node without options takes no choice, and neither does a
+  rejection: either is a 400. A 400 for a missing or unknown choice names the
+  ids. The `note` is free text of at most 4 KiB. It may hold newlines,
+  carriage returns and tabs, but no other control character and no invisible
+  format character (zero-width joiners and spaces, soft hyphens, bidi
+  controls). A note with one is a 400, and that includes an emoji sequence
+  joined by a zero-width joiner. `comment` is its old name, held to the same
+  rule; send one of the two, or both with the same text. Both listings show
+  a decided request's `choice` and `note`. The engine also checks the
+  options in the request against the node's options in the version the run
+  is bound to, and refuses the decision with a 409 if they differ.
+- **"Revise" is a run outcome.** The engine runs a node once per run, so an
+  option such as `revise` cannot send the run back to the approval for a new
+  list. Route it to a branch that ends the run (a step that records the note,
+  then `end`). The caller reads the note from `state.__approvals.<node>.note`
+  and starts the next run with it.
 - **Rejected**: the node fails, and so does the run, as for any rejected
   approval. The node has no "on rejected" route.
 - **Expired** (`timeout` passed with no decision): with a `fallback`, the node
   completes with `decision: "expired"`, writes `approved: false` and
-  `decision: "expired"` to `state.__approvals.<node_id>`, and the run continues at
+  `decision: "expired"` to `state.__approvals.<node_id>` (with no `choice`, so
+  a branch on the choice is not taken), and the run continues at
   the fallback node (or ends, for `end`). Every step the approval guarded is
   skipped: everything reachable from
   its `next` that the fallback does not also lead to, including a step that
@@ -177,8 +235,10 @@ curl -X POST http://localhost:7700/executions/exec_01abc/approve \
 From the CLI: `jamjet approvals exec_01abc` prints, for each pending request,
 what its digest covers and the exact `jamjet approve ... --action-digest <digest>`
 command; add `--show-basis` to print the full payload the digest binds. Then
-`jamjet approve exec_01abc --decision approved --action-digest <digest>`. From
-Python: `await client.approve(execution_id, "approved", action_digest=digest)`.
+`jamjet approve exec_01abc --decision approved --action-digest <digest>`. For a
+node with options add `--choice <id>`, and `--note <text>` for a note. From
+Python: `await client.approve(execution_id, "approved", action_digest=digest)`,
+with `choice=` and `note=` for a node with options.
 
 Rules the runtime enforces:
 
@@ -201,7 +261,7 @@ Rules the runtime enforces:
   (`request_sequence` in `GET /approvals`, `sequence` in
   `GET /executions/:id/approvals`). A decision that names any other request is
   a 409, so a retry can only answer the request you saw. If the same principal
-  sends the same decision (and the same comment) for a request that was already
+  sends the same decision (and the same choice and note) for a request that was already
   decided, the answer is 200 with `repeat: true` and the first decision's
   `sequence`. Nothing is recorded again. If the node has asked again since, the
   retry is a 409 and decides nothing. Without `request_sequence` a retry cannot

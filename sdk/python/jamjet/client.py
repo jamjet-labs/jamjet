@@ -291,6 +291,8 @@ class JamjetClient:
         action_digest: str | None = None,
         user_id: str | None = None,
         request_sequence: int | None = None,
+        choice: str | None = None,
+        note: str | None = None,
     ) -> dict[str, Any]:
         """Record a decision on a pending approval.
 
@@ -318,6 +320,14 @@ class JamjetClient:
         whose answer was lost: without it, a retry after the node asked again
         with the same digest decides the new request.
 
+        ``choice`` is the id of the option you picked. A ``human_approval``
+        node that declares ``options`` needs one on an approval, among the ids
+        the pending request lists (``options`` in :meth:`list_approvals` and
+        :meth:`list_pending_approvals`). A request without options, and a
+        rejection, take none. ``note`` is a free text of at most 4 KiB, kept
+        with the decision. ``comment`` is the old name of ``note`` and is sent
+        as it is; the engine refuses a request whose two differ.
+
         Returns the engine's answer unchanged: ``execution_id``, ``node_id``,
         ``accepted``, ``repeat`` (true when the same decision was already
         recorded; nothing is written again), ``sequence`` (the decision's place
@@ -328,6 +338,10 @@ class JamjetClient:
             body["node_id"] = node_id
         if comment:
             body["comment"] = comment
+        if note:
+            body["note"] = note
+        if choice is not None:
+            body["choice"] = choice
         if state_patch:
             body["state_patch"] = state_patch
         if action_digest:

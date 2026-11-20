@@ -24,6 +24,11 @@
 - **`approve(request_sequence=...)`** names the request a decision answers. The engine refuses
   the decision with 409 if the node has asked again since, so a retry cannot decide a newer
   request.
+- **`approve(choice=..., note=...)`** sends the option picked and a note. `comment` stays as
+  the old name of `note`. A node that declares options needs a `choice` to be approved; an
+  engine without options ignores both. `jamjet approve --choice <id> --note <text>`, and
+  `jamjet approvals` lists the options and shows a decided request's choice and note.
+- **`options` on a `human_approval` node** in a YAML workflow goes through to the IR.
 - **Start a run by key.** `start_execution(..., run_key=None, reuse=None)` sends a
   `run_key` so a retried start returns the same run. It raises `JamjetAPIError` if the
   engine does not echo the key: an older engine drops it and would start a second run.

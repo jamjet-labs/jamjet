@@ -9,7 +9,8 @@
 //!
 //! - Approved: the scheduler dispatches the node again, the guard finds the
 //!   approval covering it, and this executor completes the node with the
-//!   decision as its output.
+//!   decision as its output, and writes the decision, the option chosen and
+//!   the note into the run's state.
 //! - Rejected: the scheduler fails the node (and so the run), as for any
 //!   rejected approval.
 //! - Expired: with a `fallback_node`, the scheduler completes the node routed
@@ -64,22 +65,34 @@ impl NodeExecutor for HumanApprovalExecutor {
                 item.node_id
             )));
         };
-        let (principal, comment, decided_at) = events
+        // The choice and the note come from the decision on record, never from
+        // the work item: the approve route checked the choice against the
+        // request's options before it recorded it. The note is stored as the
+        // event's `comment`.
+        let (principal, note, choice, decided_at) = events
             .iter()
             .find_map(|e| match &e.kind {
                 EventKind::ApprovalReceived {
-                    principal, comment, ..
+                    principal,
+                    comment,
+                    choice,
+                    ..
                 } if e.sequence == sequence => Some((
                     principal.clone(),
                     comment.clone(),
-                    Some(
-                        e.created_at
-                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    ),
+                    choice.clone(),
+                    e.created_at
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 )),
                 _ => None,
             })
-            .unwrap_or((None, None, None));
+            .ok_or_else(|| {
+                ExecutorError::Fatal(format!(
+                    "human_approval node '{}': the decision at sequence {sequence} is not in \
+                     the run's log; refusing to complete it",
+                    item.node_id
+                ))
+            })?;
         // The approval must answer a request for THIS occurrence of the node
         // (the guard before this checked the same; this keeps the executor
         // closed on its own). A request records the node's completion count
@@ -115,12 +128,15 @@ impl NodeExecutor for HumanApprovalExecutor {
         let request_sequence = Some(request.sequence);
         // The decision also goes into the run's state, under the engine's own
         // key (`state.__approvals.<node_id>.approver`), so later steps and
-        // prompts can read it. Engine-owned: no worker or run input can write
-        // that key (`approvals::ENGINE_STATE_KEYS`), so the record cannot be
-        // forged, and it never overwrites a user key named like the node.
-        // Only an approval reaches here; a rejection fails the node, so
-        // nothing downstream sees `approved: false` except a fallback after
-        // an expiry.
+        // prompts can read it, and a condition can route on the option the
+        // reviewer chose (`state.__approvals.<node_id>.choice`). Engine-owned:
+        // no worker or run input can write that key
+        // (`approvals::ENGINE_STATE_KEYS`), so the record cannot be forged,
+        // and it never overwrites a user key named like the node. `choice` is
+        // null for a node without options; `comment` holds the note too, for
+        // readers from before `note`. Only an approval reaches here; a
+        // rejection fails the node, so nothing downstream sees
+        // `approved: false` except a fallback after an expiry.
         let mut record = serde_json::Map::new();
         record.insert(
             item.node_id.clone(),
@@ -129,7 +145,9 @@ impl NodeExecutor for HumanApprovalExecutor {
                 "decision": "approved",
                 "approver": user_id,
                 "principal": principal,
-                "comment": comment,
+                "comment": note,
+                "note": note,
+                "choice": choice,
                 "decided_at": decided_at,
             }),
         );
@@ -138,7 +156,9 @@ impl NodeExecutor for HumanApprovalExecutor {
                 "decision": "approved",
                 "approved_by": user_id,
                 "principal": principal,
-                "comment": comment,
+                "comment": note,
+                "note": note,
+                "choice": choice,
                 "decided_at": decided_at,
                 "request_sequence": request_sequence,
                 "decision_sequence": sequence,
@@ -212,6 +232,14 @@ mod tests {
 
     /// A log where `review` was asked at occurrence 0 and bob approved.
     async fn approved_log() -> (Arc<InMemoryBackend>, ExecutionId) {
+        approved_log_with(Some("ok"), None).await
+    }
+
+    /// [`approved_log`] with the decision's note and choice.
+    async fn approved_log_with(
+        note: Option<&str>,
+        choice: Option<&str>,
+    ) -> (Arc<InMemoryBackend>, ExecutionId) {
         let backend = Arc::new(InMemoryBackend::new());
         let eid = ExecutionId::new();
         append(
@@ -232,11 +260,12 @@ mod tests {
                 node_id: "review".into(),
                 user_id: "bob".into(),
                 decision: ApprovalDecision::Approved,
-                comment: Some("ok".into()),
+                comment: note.map(String::from),
                 state_patch: None,
                 principal: Some("token:b".into()),
                 approved_digest: None,
                 request_sequence: Some(1),
+                choice: choice.map(String::from),
             },
         )
         .await;
@@ -274,6 +303,65 @@ mod tests {
             1,
             "only this node's record"
         );
+    }
+
+    /// The decision's choice and note go into the record and the output, read
+    /// from the decision on record. The note is also kept as `comment`, its
+    /// old name.
+    #[tokio::test]
+    async fn an_approval_records_its_choice_and_note() {
+        let (backend, eid) =
+            approved_log_with(Some("Go with the second one."), Some("topic_2")).await;
+        let exec = HumanApprovalExecutor::new(backend.clone());
+        let result = exec.execute(&item(&eid)).await.unwrap();
+        let rec = &result.state_patch["__approvals"]["review"];
+        assert_eq!(rec["choice"], "topic_2", "{rec}");
+        assert_eq!(rec["note"], "Go with the second one.", "{rec}");
+        assert_eq!(rec["comment"], "Go with the second one.", "{rec}");
+        let mut keys: Vec<&str> = rec
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "approved",
+                "approver",
+                "choice",
+                "comment",
+                "decided_at",
+                "decision",
+                "note",
+                "principal"
+            ]
+        );
+        assert_eq!(result.output["choice"], "topic_2", "{}", result.output);
+        assert_eq!(
+            result.output["note"], "Go with the second one.",
+            "{}",
+            result.output
+        );
+    }
+
+    /// A decision with no choice and no note records both as null.
+    #[tokio::test]
+    async fn an_approval_without_a_choice_records_none() {
+        let (backend, eid) = approved_log_with(None, None).await;
+        let exec = HumanApprovalExecutor::new(backend.clone());
+        let result = exec.execute(&item(&eid)).await.unwrap();
+        let rec = &result.state_patch["__approvals"]["review"];
+        for key in ["choice", "note", "comment"] {
+            assert_eq!(rec.get(key), Some(&serde_json::Value::Null), "{key}: {rec}");
+            assert_eq!(
+                result.output.get(key),
+                Some(&serde_json::Value::Null),
+                "{key}: {}",
+                result.output
+            );
+        }
     }
 
     /// The approval on record answered a request for an earlier visit of the

@@ -110,6 +110,28 @@ async def test_approve_sends_the_request_sequence_it_was_given() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_approve_sends_choice_and_note() -> None:
+    """approve() sends the option picked and the note; comment still goes as comment."""
+    route = respx.post(f"{BASE}/executions/exec-1/approve").respond(
+        200, json={"execution_id": "exec-1", "node_id": "pick_topic", "accepted": True}
+    )
+
+    async with JamjetClient(base_url=BASE) as c:
+        await c.approve("exec-1", "approved", node_id="pick_topic", choice="topic_2", note="Go with the second one.")
+        await c.approve("exec-1", "approved", node_id="pick_topic", comment="old name")
+        await c.approve("exec-1", "approved", node_id="pick_topic")
+
+    first, second, third = (json.loads(call.request.content) for call in route.calls)
+    assert first["choice"] == "topic_2"
+    assert first["note"] == "Go with the second one."
+    assert "comment" not in first
+    assert second["comment"] == "old name"
+    assert "choice" not in second and "note" not in second
+    assert "choice" not in third and "note" not in third and "comment" not in third
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_approve_sends_user_id_when_given() -> None:
     """approve() sends the approver name as user_id when one is given."""
     route = respx.post(f"{BASE}/executions/exec-1/approve").respond(
@@ -262,6 +284,32 @@ def test_approvals_shows_the_full_digest_to_echo() -> None:
     assert result.exit_code == 0, result.output
     assert DIGEST in result.output
     assert f"--action-digest={DIGEST}" in result.output
+
+
+def test_approvals_lists_the_options_and_the_decided_choice() -> None:
+    """A pending request shows its option ids; a decided one shows the choice and the note."""
+    pending = _bound_pending()
+    pending[0]["options"] = [{"id": "topic_2", "label": "Durable timers"}, {"id": "revise", "label": "Revise"}]
+    decided = [
+        {
+            "node_id": "pick",
+            "status": "approved",
+            "user_id": "bob",
+            "choice": "topic_2",
+            "note": "Second.",
+            "sequence": 5,
+        }
+    ]
+    fake = _approvals_client(pending, decided)
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(app, ["approvals", "exec-1"])
+
+    assert result.exit_code == 0, result.output
+    assert "option topic_2: Durable timers" in result.output
+    assert "option revise: Revise" in result.output
+    assert "topic_2" in result.output.split("Decided")[1]
+    assert "Second." in result.output.split("Decided")[1]
 
 
 def test_approvals_summarises_what_the_digest_covers() -> None:
@@ -530,6 +578,21 @@ def test_approve_with_node_id_and_comment_passes_both() -> None:
     call_kwargs = fake.approve.call_args
     assert call_kwargs.kwargs.get("node_id") == "gated"
     assert call_kwargs.kwargs.get("comment") == "no"
+
+
+def test_approve_passes_choice_and_note_through() -> None:
+    """jamjet approve --choice ID --note TEXT sends both to the client."""
+    fake = _approve_client({"execution_id": "exec-1", "node_id": "gated", "accepted": True})
+
+    with patch("jamjet.cli.main._client", return_value=fake):
+        result = runner.invoke(
+            app,
+            ["approve", "exec-1", "--decision", "approved", "--choice", "topic_2", "--note", "Second one."],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert fake.approve.call_args.kwargs.get("choice") == "topic_2"
+    assert fake.approve.call_args.kwargs.get("note") == "Second one."
 
 
 def test_approve_409_exits_nonzero_with_error_text() -> None:

@@ -434,6 +434,7 @@ pub async fn decision_and_expiry_of_one_request_land_once(fx: &Fixture) {
                 principal: None,
                 approved_digest: None,
                 request_sequence: Some(request),
+                choice: None,
             },
         );
         let expiry = Event::new(

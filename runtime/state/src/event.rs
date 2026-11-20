@@ -202,6 +202,12 @@ pub enum EventKind {
         /// Sequence of the `ToolApprovalRequired` this decision answers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_sequence: Option<i64>,
+        /// The id of the option the approver picked, when the request offered
+        /// options: one of the ids in its context's `options`, byte for byte.
+        /// `None` on a rejection, on an approval of a request without
+        /// options, and on logs written before options existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choice: Option<String>,
     },
 
     // ── Timers ────────────────────────────────────────────────────────────

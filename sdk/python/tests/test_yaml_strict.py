@@ -196,6 +196,28 @@ def test_a_fallback_counts_as_an_incoming_edge() -> None:
     assert set(_compile_quietly(source)["nodes"]) == {"a", "b", "c"}
 
 
+def test_a_human_approval_node_passes_its_options_to_the_ir() -> None:
+    options = "[{id: topic_1, label: Error handling}, {id: revise, label: Revise the list}]"
+    source = (
+        "workflow: {id: w, start: a}\nnodes:\n"
+        f"  a: {{type: human_approval, description: pick, options: {options}, next: b}}\n"
+        "  b: {type: model, model: m}\n"
+    )
+    kind = _compile_quietly(source)["nodes"]["a"]["kind"]
+    assert kind["options"] == [
+        {"id": "topic_1", "label": "Error handling"},
+        {"id": "revise", "label": "Revise the list"},
+    ]
+
+
+def test_a_human_approval_node_without_options_has_no_options_key() -> None:
+    source = (
+        "workflow: {id: w, start: a}\nnodes:\n"
+        "  a: {type: human_approval, description: pick, next: b}\n  b: {type: model, model: m}\n"
+    )
+    assert "options" not in _compile_quietly(source)["nodes"]["a"]["kind"]
+
+
 def test_ir_shaped_branches_keep_their_targets() -> None:
     source = (
         HEADER + "nodes:\n  a:\n    type: condition\n    branches:\n"

@@ -239,9 +239,10 @@ pub fn validate_entry_points(ir: &WorkflowIr) -> IrResult<()> {
 
 /// Every `human_approval` node can be honoured: its `timeout_secs` is a
 /// deadline the engine accepts (1 second to a year, like a policy's
-/// `approval_timeout_secs`), and its `fallback_node` names another node of
-/// the workflow. A fallback that does not exist would turn an expiry into a
-/// run that can never finish.
+/// `approval_timeout_secs`), its `fallback_node` names another node of the
+/// workflow, and its `options` are ones a reviewer can read and a decision
+/// can name. A fallback that does not exist would turn an expiry into a run
+/// that can never finish.
 pub fn validate_human_approvals(ir: &WorkflowIr) -> IrResult<()> {
     use crate::workflow::MAX_APPROVAL_TIMEOUT_SECS;
     use jamjet_core::node::NodeKind;
@@ -251,6 +252,7 @@ pub fn validate_human_approvals(ir: &WorkflowIr) -> IrResult<()> {
         let NodeKind::HumanApproval {
             timeout_secs,
             fallback_node,
+            options,
             ..
         } = &ir.nodes[id].kind
         else {
@@ -269,6 +271,63 @@ pub fn validate_human_approvals(ir: &WorkflowIr) -> IrResult<()> {
         }
         if fallback_node.is_some() {
             human_approval_fallback(ir, id).map_err(invalid)?;
+        }
+        validate_approval_options(options).map_err(invalid)?;
+    }
+    Ok(())
+}
+
+/// The options of one `human_approval` node, in order: at most
+/// `MAX_APPROVAL_OPTIONS`; each id 1 to `MAX_APPROVAL_OPTION_ID_LEN` of
+/// `a-z`, `0-9`, `_` and `-`, and unique; each label 1 to
+/// `MAX_APPROVAL_OPTION_LABEL_CHARS` characters with no
+/// [`is_forbidden_identifier_char`]. A decision names the id byte for byte
+/// and a condition routes on it, so it has one spelling; the label is what a
+/// reviewer reads, so nothing in it may hide or reorder text. An empty list
+/// is no options.
+///
+/// Registration runs it on every new version. The engine runs it again
+/// before it shows a node's options, since a version stored before the rule
+/// existed may hold options it never checked.
+pub fn validate_approval_options(
+    options: &[jamjet_core::node::ApprovalOption],
+) -> Result<(), String> {
+    use jamjet_core::node::{
+        MAX_APPROVAL_OPTIONS, MAX_APPROVAL_OPTION_ID_LEN, MAX_APPROVAL_OPTION_LABEL_CHARS,
+    };
+    if options.len() > MAX_APPROVAL_OPTIONS {
+        return Err(format!(
+            "it declares {} options; at most {MAX_APPROVAL_OPTIONS} are allowed",
+            options.len()
+        ));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for option in options {
+        let id = option.id.as_str();
+        let valid_id = (1..=MAX_APPROVAL_OPTION_ID_LEN).contains(&id.len())
+            && id
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'));
+        if !valid_id {
+            return Err(format!(
+                "option id {id:?} is not allowed: an option id is 1 to \
+                 {MAX_APPROVAL_OPTION_ID_LEN} characters of a-z, 0-9, '_' or '-'"
+            ));
+        }
+        if !seen.insert(id) {
+            return Err(format!("option id '{id}' appears more than once"));
+        }
+        let chars = option.label.chars().count();
+        if !(1..=MAX_APPROVAL_OPTION_LABEL_CHARS).contains(&chars) {
+            return Err(format!(
+                "option '{id}': a label is 1 to {MAX_APPROVAL_OPTION_LABEL_CHARS} characters, \
+                 got {chars}"
+            ));
+        }
+        if option.label.chars().any(is_forbidden_identifier_char) {
+            return Err(format!(
+                "option '{id}': a label may not hold a control or invisible format character"
+            ));
         }
     }
     Ok(())

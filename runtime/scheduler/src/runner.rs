@@ -1683,6 +1683,7 @@ mod tests {
                 principal: None,
                 approved_digest: None,
                 request_sequence: None,
+                choice: None,
             },
         )
         .await;
@@ -1930,6 +1931,7 @@ mod tests {
                 principal: None,
                 approved_digest: None,
                 request_sequence: None,
+                choice: None,
             },
         ]);
         assert!(!progress.held.contains("a"));
@@ -1960,6 +1962,7 @@ mod tests {
                 principal: None,
                 approved_digest: None,
                 request_sequence: None,
+                choice: None,
             },
         ]);
         assert!(!progress.held.contains("a"));
@@ -2026,6 +2029,7 @@ mod tests {
                 principal: None,
                 approved_digest: None,
                 request_sequence: None,
+                choice: None,
             },
             EventKind::NodeFailed {
                 node_id: "a".into(),
@@ -2049,6 +2053,7 @@ mod tests {
             principal: None,
             approved_digest: None,
             request_sequence: None,
+            choice: None,
         }]);
         assert!(progress.held.is_empty());
         assert!(progress.rejected.is_empty());
@@ -2092,6 +2097,7 @@ mod tests {
                 principal: None,
                 approved_digest: None,
                 request_sequence: None,
+                choice: None,
             },
         )
         .await;
@@ -2188,6 +2194,7 @@ mod tests {
                 principal: None,
                 approved_digest: None,
                 request_sequence: None,
+                choice: None,
             },
         ]);
         assert!(
@@ -2234,6 +2241,7 @@ mod tests {
                 principal: None,
                 approved_digest: None,
                 request_sequence: None,
+                choice: None,
             },
         ]);
         let reason = progress.rejected.get("a").expect("rejected entry for a");
