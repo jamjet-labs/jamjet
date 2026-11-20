@@ -2642,19 +2642,20 @@ pub(crate) async fn create_run_in(
         .await
         .map_err(map_db_err)?;
 
-    // 0. The run key, before any row of the run: a key held for another run
+    // 1. The run key, before any row of the run: a key held for another run
     //    leaves this start with nothing written.
     if let Some(key) = key {
         let key_tenant = tenant_id.unwrap_or(&work_item.tenant_id);
         let held =
             crate::features::run_keys::claim_in(&mut tx, key_tenant, key, &exec_id_str).await?;
+        fault_point!("sqlite.create_run", 1);
         if let Some(held) = held {
             tx.rollback().await.map_err(map_db_err)?;
             return Ok(crate::backend::KeyedStart::Taken(held));
         }
     }
 
-    // 1. Execution row.
+    // 2. Execution row.
     let sql = format!(
         "INSERT INTO workflow_executions \
          (execution_id, workflow_id, workflow_version, status, initial_input, current_state, \
@@ -2677,9 +2678,9 @@ pub(crate) async fn create_run_in(
         q = q.bind(t);
     }
     q.execute(&mut *tx).await.map_err(map_db_err)?;
-    fault_point!("sqlite.create_run", 1);
+    fault_point!("sqlite.create_run", 2);
 
-    // 2. Seed snapshot, for a continuation segment.
+    // 3. Seed snapshot, for a continuation segment.
     if let Some(snap) = seed_snapshot {
         let sql = format!(
             "INSERT OR REPLACE INTO snapshots \
@@ -2701,10 +2702,10 @@ pub(crate) async fn create_run_in(
             q = q.bind(t);
         }
         q.execute(&mut *tx).await.map_err(map_db_err)?;
-        fault_point!("sqlite.create_run", 2);
+        fault_point!("sqlite.create_run", 3);
     }
 
-    // 3-4. WorkflowStarted, then NodeScheduled. The sequence is assigned like
+    // 4-5. WorkflowStarted, then NodeScheduled. The sequence is assigned like
     //      `append_event` does, inside the transaction.
     for kind in [started_event, scheduled_event] {
         let seq: i64 = sqlx::query(
@@ -2716,7 +2717,7 @@ pub(crate) async fn create_run_in(
         .map_err(map_db_err)?
         .try_get::<i64, _>("seq")
         .map_err(map_db_err)?;
-        fault_point!("sqlite.create_run", 3);
+        fault_point!("sqlite.create_run", 4);
         let sql = format!(
             "INSERT INTO events (id, execution_id, sequence, kind_json, created_at{tcol}) \
              VALUES (?, ?, ?, ?, ?{tval})"
@@ -2731,10 +2732,10 @@ pub(crate) async fn create_run_in(
             q = q.bind(t);
         }
         q.execute(&mut *tx).await.map_err(map_db_err)?;
-        fault_point!("sqlite.create_run", 4);
+        fault_point!("sqlite.create_run", 5);
     }
 
-    // 5. Start-node work item.
+    // 6. Start-node work item.
     let sql = format!(
         "INSERT INTO work_items \
          (id, execution_id, node_id, queue_type, payload_json, attempt, max_attempts, \
@@ -2754,7 +2755,7 @@ pub(crate) async fn create_run_in(
         q = q.bind(t);
     }
     q.execute(&mut *tx).await.map_err(map_db_err)?;
-    fault_point!("sqlite.create_run", 5);
+    fault_point!("sqlite.create_run", 6);
 
     tx.commit().await.map_err(map_db_err)?;
     Ok(crate::backend::KeyedStart::Started)

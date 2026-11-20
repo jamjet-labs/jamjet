@@ -29,8 +29,8 @@ use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::faults::{self, Fault, Scope, POINTS};
 use jamjet_state::{
     ApprovalProjectionRow, BackendResult, ConditionalAppend, Event, EventKind, ExecutionFinish,
-    FailOutcome, PassCommit, SchedulerPass, Snapshot, StateBackend, StateBackendError, TurnCommit,
-    WorkItem, DEFAULT_TENANT, MAX_LEASE_SECS,
+    FailOutcome, KeyedStart, PassCommit, RunKeyClaim, SchedulerPass, Snapshot, StateBackend,
+    StateBackendError, TurnCommit, WorkItem, DEFAULT_TENANT, MAX_LEASE_SECS,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -191,6 +191,9 @@ fn paths(operation: &str, last: bool) -> u32 {
     match operation {
         // Retried or out of attempts: the requeue, or the dead letter.
         "reclaim_expired_leases_recorded" | "fail_work_item_fenced_recorded" if last => 2,
+        // A segment's seed snapshot, a fresh run key, or a key moved from
+        // the run it named.
+        "create_run" if last => 3,
         _ => 1,
     }
 }
@@ -443,9 +446,58 @@ async fn prepare(fx: &Fixture, operation: &str, at: At) -> Call {
                 lands: &[("proj_approvals", 0, 2), ("projector_checkpoints", 0, 1)],
             }
         }
+        "create_run" if step == 1 || (at.last && at.path > 0) => {
+            // A keyed start: the only run that claims a key. Before the last
+            // commit, path 2 claims a key that is new and path 3 moves one
+            // from the run it named.
+            let key = format!("faults-{}", Uuid::new_v4().simple());
+            let replaces = if at.last && at.path == 2 {
+                Some(started_with_key(&b, &key).await)
+            } else {
+                None
+            };
+            let id = ExecutionId::new();
+            let item = pending(&id, 0, 3);
+            let lands: &'static [(&'static str, usize, usize)] = if replaces.is_some() {
+                &[
+                    ("events", 0, 2),
+                    ("run_keys", 1, 1),
+                    ("work_items", 0, 1),
+                    ("workflow_executions", 0, 1),
+                ]
+            } else {
+                &[
+                    ("events", 0, 2),
+                    ("run_keys", 0, 1),
+                    ("work_items", 0, 1),
+                    ("workflow_executions", 0, 1),
+                ]
+            };
+            Call {
+                run: call(move || {
+                    let (b, id, item) = (b.clone(), id.clone(), item.clone());
+                    let claim = key_claim(&key, replaces.clone());
+                    async move {
+                        let scheduled = scheduled(&item);
+                        let start = b
+                            .start_execution_keyed(
+                                run_row(&id),
+                                started_kind(),
+                                scheduled,
+                                item,
+                                claim,
+                            )
+                            .await?;
+                        assert_eq!(start, KeyedStart::Started);
+                        Ok(())
+                    }
+                }),
+                lands,
+            }
+        }
         "create_run" => {
             // A continuation segment: the only run with a seed snapshot, so
-            // the call runs every statement of the body.
+            // the call runs every statement of the body but the key's.
             let (parent, _) = started(&b, 0, 3).await;
             let id = ExecutionId::new();
             let mut segment = run_row(&id);
@@ -822,6 +874,35 @@ async fn started(
         .await
         .unwrap();
     (id, item)
+}
+
+/// A run started under a fresh claim of `key`, its start item pending.
+async fn started_with_key(b: &Arc<dyn StateBackend>, key: &str) -> ExecutionId {
+    let id = ExecutionId::new();
+    let item = pending(&id, 0, 3);
+    let start = b
+        .start_execution_keyed(
+            run_row(&id),
+            started_kind(),
+            scheduled(&item),
+            item,
+            key_claim(key, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start, KeyedStart::Started);
+    id
+}
+
+/// The claim of `key` for a run of [`run_row`]'s workflow and input.
+fn key_claim(key: &str, replaces: Option<ExecutionId>) -> RunKeyClaim {
+    RunKeyClaim {
+        run_key: key.into(),
+        workflow_id: "wf".into(),
+        workflow_version: "1.0.0".into(),
+        input_hash: "faults".into(),
+        replaces,
+    }
 }
 
 /// A started run whose start item [`WORKER`] holds, under a lease that
