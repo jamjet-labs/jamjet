@@ -1627,6 +1627,7 @@ dependencies = [
  "jamjet-scheduler",
  "jamjet-state",
  "jamjet-telemetry",
+ "jamjet-testkit",
  "jamjet-timers",
  "jamjet-worker",
  "libsqlite3-sys",
@@ -1811,6 +1812,7 @@ dependencies = [
  "jamjet-core",
  "jamjet-ir",
  "jamjet-state",
+ "jamjet-testkit",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
@@ -1855,6 +1857,17 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "jamjet-testkit"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "jamjet-core",
+ "jamjet-state",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

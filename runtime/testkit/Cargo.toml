@@ -1,0 +1,21 @@
+[package]
+name = "jamjet-testkit"
+description = "Test helpers for the JamJet engine: a state backend wrapper that lets a test act before and after each call"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Other crates take this kit as a path-only dev-dependency, which cargo drops
+# when it packages them, so nothing published depends on it.
+
+[dependencies]
+jamjet-core = { path = "../core" }
+jamjet-state = { path = "../state" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

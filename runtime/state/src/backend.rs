@@ -1011,6 +1011,90 @@ pub trait StateBackend: Send + Sync {
             "tenant management not supported".into(),
         ))
     }
+
+    // ── Storage lane ─────────────────────────────────────────────────────
+
+    /// Write one scheduler pass over one run in one atomic step: its events
+    /// in order, its work items, then its finish, or nothing at all.
+    ///
+    /// The step is refused, with nothing written, when the run is terminal
+    /// ([`PassCommit::ExecutionTerminal`]), when the run's log holds anything
+    /// after `pass.seen_sequence` ([`PassCommit::Stale`]), or when a node the
+    /// pass dispatches already has a pending or claimed item (also `Stale`).
+    /// The scheduler then folds the log again and builds a new pass. So two
+    /// engines that read the same log cannot both dispatch a node, skip it,
+    /// fail it or finish the run: the second pass finds the log moved.
+    ///
+    /// Each item is stamped with the run's tenant, read from the run's row,
+    /// and so are the events. A pass that does not hold together (an item of
+    /// another run, an item whose node the pass does not schedule, two items
+    /// for one node, a finish whose status is not terminal) is a
+    /// [`StateBackendError::Database`] error and writes nothing. An unknown
+    /// run is `NotFound`. An empty pass writes nothing and answers
+    /// `Committed { last_sequence: seen_sequence }` without taking a lock.
+    ///
+    /// The default writes in steps, as the scheduler did before this method:
+    /// `append_event` for each event, `enqueue_work_item` for each item, then
+    /// `finish_execution`. It refuses a pass that does not hold together, but
+    /// checks neither the log, nor live items, nor the run's status, leaves
+    /// the tenant to those methods, and a failure part way leaves what was
+    /// already written. It is there so a backend outside this repository
+    /// keeps compiling and behaving as it did; a backend that runs with more
+    /// than one engine must override it.
+    async fn commit_scheduler_pass(&self, pass: SchedulerPass) -> BackendResult<PassCommit> {
+        crate::legacy::scheduler_pass_in_steps(self, pass).await
+    }
+
+    /// [`reclaim_expired_leases`](Self::reclaim_expired_leases), with each
+    /// reclaimed item's events written in the same atomic step as its settle:
+    /// for a requeued item `NodeFailed { retryable: true }` and
+    /// `RetryScheduled`, for a dead-lettered one `NodeFailed { retryable:
+    /// false }`, as [`crate::lease_events::sweep_events`] builds them. One step
+    /// per item, so a failure leaves each item either reclaimed and recorded
+    /// or untouched, never settled with no history. The scheduler's sweep
+    /// calls this and appends nothing itself.
+    ///
+    /// Each item is read again inside its step, and reclaimed only while it
+    /// is still claimed under the lease that expired and that lease has not
+    /// been renewed since. An item whose run is terminal is settled failed
+    /// and records nothing, as the claim's fast reclaim does, and is left out
+    /// of the result. The result holds only the items that were requeued or
+    /// dead-lettered and recorded, with their new attempt numbers.
+    ///
+    /// The default reclaims with `reclaim_expired_leases` and then appends
+    /// the events one by one, as the scheduler did before this method: no
+    /// check of the run's status, and a failure part way leaves settled items
+    /// with no events. A backend that runs with more than one engine must
+    /// override it.
+    async fn reclaim_expired_leases_recorded(&self) -> BackendResult<ReclaimResult> {
+        crate::legacy::reclaim_in_steps(self).await
+    }
+
+    /// [`fail_work_item_fenced`](Self::fail_work_item_fenced), with its
+    /// `NodeFailed` (and, for a retry, `RetryScheduled`) written in the same
+    /// atomic step as the settle, as [`crate::lease_events::fail_events`]
+    /// builds them from the outcome and `error`. The fail route calls this
+    /// and appends nothing itself.
+    ///
+    /// `Ok(None)`, with nothing written, for a fence that does not match or
+    /// an item that is no longer claimed. When the item's run is terminal the
+    /// item is settled failed, nothing is recorded, and the answer is also
+    /// `Ok(None)`: a cancel that lands after the caller read the run cannot
+    /// be followed by a failure trail.
+    ///
+    /// The default fails the item with `fail_work_item_fenced` and then
+    /// appends the events one by one, as the fail route did before this
+    /// method: no check of the run's status, and a failure after the settle
+    /// leaves it with no events. A backend that runs with more than one
+    /// engine must override it.
+    async fn fail_work_item_fenced_recorded(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        crate::legacy::fail_in_steps(self, item_id, lease_fence, error).await
+    }
 }
 
 /// Metadata for an API token (does not contain the plaintext token).
@@ -1231,6 +1315,82 @@ pub enum FailOutcome {
         /// The item with its FINAL attempt number.
         item: Box<WorkItem>,
     },
+}
+
+// ── Storage lane ─────────────────────────────────────────────────────────────
+
+/// One scheduler pass over one run, written in one transaction by
+/// [`StateBackend::commit_scheduler_pass`].
+#[derive(Debug, Clone)]
+pub struct SchedulerPass {
+    pub execution_id: ExecutionId,
+    /// The highest sequence the pass folded. Refused if the log holds anything later.
+    pub seen_sequence: EventSequence,
+    /// Appended in this order; the backend assigns the sequences.
+    pub events: Vec<EventKind>,
+    /// Inserted with the events. Each item's execution is this run, its node has a
+    /// NodeScheduled in `events`, and the backend stamps the run's tenant from its row.
+    pub work_items: Vec<WorkItem>,
+    /// Ends the run after `events`: a terminal status and its terminal event.
+    pub finish: Option<(WorkflowStatus, EventKind)>,
+}
+
+impl SchedulerPass {
+    /// Nothing to write: no events, no items, no finish.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty() && self.work_items.is_empty() && self.finish.is_none()
+    }
+
+    /// The shape every backend refuses before writing anything: an item of
+    /// another run, an item whose node has no `NodeScheduled` in `events`,
+    /// two items for one node, a finish whose status is not terminal.
+    pub(crate) fn check_shape(&self) -> BackendResult<()> {
+        let refuse = |why: String| Err(StateBackendError::Database(why));
+        let mut nodes = std::collections::HashSet::new();
+        for item in &self.work_items {
+            if item.execution_id != self.execution_id {
+                return refuse(format!(
+                    "scheduler pass for {} carries an item of {}",
+                    self.execution_id, item.execution_id
+                ));
+            }
+            let scheduled = self.events.iter().any(|kind| {
+                matches!(kind, EventKind::NodeScheduled { node_id, .. } if *node_id == item.node_id)
+            });
+            if !scheduled {
+                return refuse(format!(
+                    "scheduler pass carries an item for {} with no NodeScheduled",
+                    item.node_id
+                ));
+            }
+            if !nodes.insert(item.node_id.as_str()) {
+                return refuse(format!(
+                    "scheduler pass carries two items for {}",
+                    item.node_id
+                ));
+            }
+        }
+        if let Some((status, _)) = &self.finish {
+            if !status.is_terminal() {
+                return refuse(format!(
+                    "scheduler pass finish requires a terminal status, got {status:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What [`StateBackend::commit_scheduler_pass`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PassCommit {
+    /// Everything landed; the pass's last event is at `last_sequence`.
+    Committed { last_sequence: EventSequence },
+    /// Nothing written: the log moved past `seen_sequence`, or a node in `work_items`
+    /// already has a pending or claimed item.
+    Stale { latest_sequence: EventSequence },
+    /// Nothing written: the run is terminal.
+    ExecutionTerminal(WorkflowStatus),
 }
 
 #[cfg(test)]

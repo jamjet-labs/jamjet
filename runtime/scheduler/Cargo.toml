@@ -24,3 +24,7 @@ reqwest = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+# Path only, no version: cargo drops it when it packages this crate.
+jamjet-testkit = { path = "../testkit" }

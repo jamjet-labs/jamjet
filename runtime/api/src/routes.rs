@@ -3628,25 +3628,16 @@ async fn enqueue_work_item(
         None => {}
     }
 
-    // Emit NodeScheduled event.
-    let seq = backend.latest_sequence(&execution_id).await? + 1;
-    backend
-        .append_event(jamjet_state::Event::new(
-            execution_id.clone(),
-            seq,
-            jamjet_state::EventKind::NodeScheduled {
-                node_id: body.node_id.clone(),
-                queue_type: body.queue_type.clone(),
-            },
-        ))
-        .await?;
-
-    // Enqueue the work item.
+    // The node's NodeScheduled and its item, in one write: the scheduler's
+    // pass. It is refused when the node already has a pending or claimed
+    // item (a second one would run the step twice) and when the run has
+    // finished. When only the log moved, the pass is tried again from the
+    // sequence the store gave back.
     let item = WorkItem {
         id: Uuid::new_v4(),
-        execution_id,
-        node_id: body.node_id,
-        queue_type: body.queue_type,
+        execution_id: execution_id.clone(),
+        node_id: body.node_id.clone(),
+        queue_type: body.queue_type.clone(),
         payload,
         attempt: 0,
         max_attempts: 3,
@@ -3656,12 +3647,44 @@ async fn enqueue_work_item(
         lease_fence: 0,
         tenant_id: tenant_id.0.clone(),
     };
-    let item_id = backend.enqueue_work_item(item).await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({ "work_item_id": item_id.to_string() })),
+    let item_id = item.id;
+    let mut seen = backend.latest_sequence(&execution_id).await?;
+    for _ in 0..HAND_ENQUEUE_TRIES {
+        let pass = jamjet_state::SchedulerPass {
+            execution_id: execution_id.clone(),
+            seen_sequence: seen,
+            events: vec![jamjet_state::EventKind::NodeScheduled {
+                node_id: body.node_id.clone(),
+                queue_type: body.queue_type.clone(),
+            }],
+            work_items: vec![item.clone()],
+            finish: None,
+        };
+        match backend.commit_scheduler_pass(pass).await? {
+            jamjet_state::PassCommit::Committed { .. } => {
+                return Ok((
+                    StatusCode::CREATED,
+                    Json(json!({ "work_item_id": item_id.to_string() })),
+                ));
+            }
+            jamjet_state::PassCommit::ExecutionTerminal(status) => {
+                return Err(ApiError::Conflict(format!("execution is {status:?}")));
+            }
+            // The log did not move, so the node's live item refused it.
+            jamjet_state::PassCommit::Stale { latest_sequence } if latest_sequence == seen => {
+                break;
+            }
+            jamjet_state::PassCommit::Stale { latest_sequence } => seen = latest_sequence,
+        }
+    }
+    Err(ApiError::Conflict(
+        "node already has a pending or claimed item".into(),
     ))
 }
+
+/// How many times `POST /work-items` tries its pass while other writers
+/// move the run's log.
+const HAND_ENQUEUE_TRIES: usize = 3;
 
 #[derive(Deserialize)]
 struct FailWorkItemRequest {
@@ -3822,8 +3845,13 @@ async fn fail_work_item(
         ));
     };
 
+    // The settle and the events that record it (`NodeFailed`, and
+    // `RetryScheduled` for a retry: the trail the scheduler's lease sweep
+    // writes for the same transition) land in one write, so a failure after
+    // the settle can no longer leave the node with no event. A run that went
+    // terminal after the check above records nothing and answers `None`.
     let Some(outcome) = backend
-        .fail_work_item_fenced(item_id, fence, &body.error)
+        .fail_work_item_fenced_recorded(item_id, fence, &body.error)
         .await?
     else {
         // Someone else owns it now — reclaimed, already settled, or a forged
@@ -3838,47 +3866,10 @@ async fn fail_work_item(
         ));
     };
 
-    // Emit exactly what `SchedulerRunner::reclaim_expired_leases` emits for the
-    // same transition, so the fold cannot tell the two apart.
-    let (item, retryable, delay_ms) = match &outcome {
-        FailOutcome::Retryable { item, delay_ms } => (item, true, Some(*delay_ms)),
-        FailOutcome::Exhausted { item } => (item, false, None),
+    let (item, retryable) = match &outcome {
+        FailOutcome::Retryable { item, .. } => (item, true),
+        FailOutcome::Exhausted { item } => (item, false),
     };
-
-    let seq = backend.latest_sequence(&item.execution_id).await? + 1;
-    backend
-        .append_event(jamjet_state::Event::new(
-            item.execution_id.clone(),
-            seq,
-            jamjet_state::EventKind::NodeFailed {
-                node_id: item.node_id.clone(),
-                error: body.error.clone(),
-                // Retryable reports the attempt that just failed; exhausted
-                // reports the final count. Mirrors the reclaimer's arithmetic.
-                attempt: if retryable {
-                    item.attempt.saturating_sub(1)
-                } else {
-                    item.attempt
-                },
-                retryable,
-            },
-        ))
-        .await?;
-
-    if let Some(delay_ms) = delay_ms {
-        let seq = backend.latest_sequence(&item.execution_id).await? + 1;
-        backend
-            .append_event(jamjet_state::Event::new(
-                item.execution_id.clone(),
-                seq,
-                jamjet_state::EventKind::RetryScheduled {
-                    node_id: item.node_id.clone(),
-                    attempt: item.attempt,
-                    delay_ms,
-                },
-            ))
-            .await?;
-    }
 
     warn!(
         execution_id = %item.execution_id,
