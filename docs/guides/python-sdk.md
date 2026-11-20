@@ -155,6 +155,100 @@ once: a policy block, or a prompt that does not render. There is no
 
 ---
 
+## Calling an engine: credentials and retries
+
+`JamjetClient` talks to the engine over HTTP. These parts are about what it
+sends, where it sends it, and when it sends a call again.
+
+### Credentials go to one address
+
+The JamJet token (`api_token=`, or `JAMJET_TOKEN`) and anything an `auth` hook
+adds go only to the client's own origin: the scheme, host and port of
+`base_url`. A request to any other address raises `CredentialScopeError`
+before anything is sent. Redirects are not followed; a redirect answer is
+raised as it is. Error messages and logs never contain a token.
+
+### An engine behind a platform identity check
+
+Some platforms check the caller's identity before a request reaches your
+engine. They want an identity token in a header, and the engine wants its own
+token in `Authorization`. Pass an `auth` hook for the first and keep
+`api_token` for the second:
+
+```python
+from jamjet import JamjetClient
+from jamjet.auth import GoogleIdTokenAuth
+
+auth = GoogleIdTokenAuth("https://engine.example")
+async with JamjetClient("https://engine.example", api_token=jamjet_token, auth=auth) as client:
+    await client.get_execution(execution_id)
+```
+
+`GoogleIdTokenAuth` needs `pip install 'jamjet[google-auth]'`. It gets an ID
+token for the audience from the metadata server or from the service account
+file `GOOGLE_APPLICATION_CREDENTIALS` names, and sends it in
+`X-Serverless-Authorization`. It keeps the token until about five minutes
+before it expires. The token goes over https only (loopback is allowed for
+tests), and only to the engine's origin.
+
+For any other token source, use `TokenSourceAuth`:
+
+```python
+from jamjet.auth import TokenSourceAuth
+
+auth = TokenSourceAuth(get_token, origin="https://engine.example", header="X-Platform-Token")
+```
+
+`get_token` is a function, sync or async, that returns the token string. The
+rules are the same:
+
+- A request is never sent without the token. If the source fails, you get
+  `IdentityTokenError` and nothing is sent.
+- A 401 from the platform gets one fresh token and one resend. A second 401
+  raises `PlatformAuthError`.
+- A 401 or 403 that does not carry the engine's JSON error body came from
+  something in front of the engine. It is raised as `PlatformAuthError`, a
+  subclass of `JamjetAPIError`, so existing handlers still catch it.
+- The hook cannot write `Authorization` while a JamJet token is set. The
+  client refuses that.
+
+The same flag exists on the command line: `jamjet ops tick
+--google-id-token-audience https://engine.example`.
+
+### Retries
+
+Retries are on by default: up to 3 sends, a random wait before each (up to
+0.2 s, then 0.4 s, capped at 5 s), or the wait an answer's `Retry-After` asks
+for, up to 30 s. A longer `Retry-After` is raised at once. Pass
+`retry=RetryPolicy(...)` to change the numbers, or `retry=RetryPolicy.off()` to
+send every call once.
+
+What is sent again depends on what could have happened:
+
+| What happened | A call that is safe to repeat | Any other call |
+|---------------|-------------------------------|----------------|
+| The request never left (no connection could be made) | sent again | sent again |
+| The engine answered 429 | sent again | sent again |
+| The engine answered 5xx | sent again | raised as the engine's error |
+| The answer was lost (timeout, broken connection) | sent again | raises `OutcomeUnknown`, never sent again |
+| Any other 4xx, 401 included | raised | raised |
+
+A call that may have taken effect and lost its answer raises
+`OutcomeUnknown`. Look at the engine before you repeat it. A call whose body
+can be read only once (a generator, a file that cannot seek) is sent once.
+
+Safe to repeat: `health`, `tick`, `create_workflow`, `list_cron_jobs`,
+`get_execution`, `list_executions`, `get_events`, `list_approvals`,
+`put_artifact`, `get_artifact`, `list_agents`, `get_agent`, a heartbeat, and a
+completion or failure that carries its lease fence (the engine refuses a
+second one with 409). Not safe: `start_execution`, `cancel_execution`,
+`approve`, `claim_work_item`, `create_cron_job`, `register_agent`,
+`activate_agent`, `deactivate_agent`, `discover_agent`, `send_external_event`,
+and a completion or failure with no fence. Anything not on the first list is
+treated as not safe.
+
+---
+
 ## Running locally
 
 ```bash

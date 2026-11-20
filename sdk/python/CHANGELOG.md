@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Added
+
+- **`JamjetClient(auth=...)`, an auth hook for an engine behind a platform identity
+  check.** The hook adds its own header, and the JamJet token keeps `Authorization`.
+  `jamjet.auth.GoogleIdTokenAuth` gets a Google ID token and sends it in
+  `X-Serverless-Authorization`. It needs `pip install 'jamjet[google-auth]'`.
+  `jamjet.auth.TokenSourceAuth` does the same for any token source.
+- **`PlatformAuthError`.** A 401 or 403 that does not carry the engine's error body came
+  from something in front of the engine. It is a subclass of `JamjetAPIError`, so existing
+  handlers still catch it.
+- **Retries are on by default, and `RetryPolicy.off()` turns them off.** A call that was
+  never sent is sent again. A call that is safe to repeat is sent again. An unsafe call
+  that may have taken effect raises `OutcomeUnknown` and is never sent again. The CLI
+  commands that start, approve or activate say so and exit 1.
+- **`jamjet ops tick`** runs one tick on an engine that has its background loops off. It
+  needs an engine whose `/health` lists `ops_tick`.
+
+### Changed
+
+- **Credentials go only to the engine's own address.** The JamJet token and anything an
+  auth hook adds are sent to the scheme, host and port of `base_url` and nowhere else. A
+  request to another address raises `CredentialScopeError` before anything is sent.
+  Redirects are raised, not followed.
+
 ### Fixed
 
 - **`jamjet dev` names the extra it needs.** Without uvicorn it told you to run
