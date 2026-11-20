@@ -58,6 +58,7 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
             "/executions/:id/approvals",
             get(list_approvals_for_execution),
         )
+        .route("/approvals", get(list_pending_approvals))
         .route("/executions/:id/external-event", post(send_external_event))
         // Artifacts (content-addressed store) — tenant-scoped developer API.
         // The POST carries an explicit body limit (see ARTIFACT_MAX_BODY_BYTES).
@@ -1074,6 +1075,88 @@ async fn list_approvals_for_execution(
         let events = backend.get_events(&execution_id).await?;
         Ok(Json(crate::approvals::approvals_view(&events)))
     }
+}
+
+/// The most rows one `GET /approvals` returns, whatever `limit` asks.
+pub const MAX_APPROVALS_PAGE: u32 = 200;
+/// The rows `GET /approvals` returns when `limit` is not given.
+pub const DEFAULT_APPROVALS_PAGE: u32 = 50;
+
+/// Query of `GET /approvals`. Each value is read as text, so a bad one is
+/// refused with the same JSON error as the rest of the API.
+#[derive(Deserialize)]
+struct PendingApprovalsQuery {
+    status: Option<String>,
+    limit: Option<String>,
+    after: Option<String>,
+}
+
+/// `GET /approvals`: every request waiting for a decision on the live runs of
+/// the caller's tenant, oldest projected first.
+///
+/// Any authenticated role may read it, viewers included. The rows come from
+/// the approvals read model, which the projector brings up to date once per
+/// tick, so a row lags the log by up to one tick: a request raised since the
+/// last tick is not listed yet, and one decided since is still listed. The
+/// approve route reads the log and decides; it refuses a listed request that
+/// was decided in the meantime with 409.
+///
+/// `status` may only be `pending` (the default). `limit` defaults to
+/// [`DEFAULT_APPROVALS_PAGE`] and is clamped to 1..=[`MAX_APPROVALS_PAGE`].
+/// A full page carries `next_after`; send it back as `after` for the next one.
+/// Each row's `action_digest` is the echo the approve route asks for.
+async fn list_pending_approvals(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Query(params): Query<PendingApprovalsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&tenant_id);
+    if let Some(status) = params.status.as_deref().filter(|s| *s != "pending") {
+        return Err(ApiError::BadRequest(format!(
+            "status must be pending, not {status:?}; decided requests are listed per run \
+             by GET /executions/{{id}}/approvals"
+        )));
+    }
+    let limit = match params.limit.as_deref() {
+        None => DEFAULT_APPROVALS_PAGE,
+        Some(text) => {
+            let asked: u64 = text.parse().map_err(|_| {
+                ApiError::BadRequest(format!("limit must be a whole number, not {text:?}"))
+            })?;
+            u32::try_from(asked)
+                .unwrap_or(u32::MAX)
+                .clamp(1, MAX_APPROVALS_PAGE)
+        }
+    };
+    let after = params
+        .after
+        .as_deref()
+        .map(|text| {
+            crate::approvals::decode_approval_cursor(text).ok_or_else(|| {
+                ApiError::BadRequest(
+                    "after is not a cursor of this list; send back a page's next_after".into(),
+                )
+            })
+        })
+        .transpose()?;
+
+    let rows = backend
+        .list_pending_approvals(after.as_ref(), limit)
+        .await?;
+    let next_after = match rows.last() {
+        Some(last) if rows.len() >= limit as usize => Some(
+            crate::approvals::encode_approval_cursor(&jamjet_state::ApprovalCursor::from(last))
+                .map_err(|e| ApiError::Internal(format!("encode cursor: {e}")))?,
+        ),
+        _ => None,
+    };
+    let approvals: Vec<Value> = rows
+        .iter()
+        .map(crate::approvals::pending_row_view)
+        .collect();
+    Ok(Json(
+        json!({ "approvals": approvals, "next_after": next_after }),
+    ))
 }
 
 #[derive(Deserialize)]

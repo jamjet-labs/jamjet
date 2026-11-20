@@ -555,6 +555,61 @@ async fn the_listed_digest_approves() {
     }
 }
 
+/// A row's `action_digest` is the echo the approve route accepts: the
+/// request's `action_digest`, else the `calls_hash` of an older agent tool
+/// dispatch request, else null for a legacy request that binds nothing.
+#[tokio::test]
+async fn the_listed_digest_is_the_requests_binding() {
+    for env in envs().await {
+        let eid = seed_requests(&env.backend, "wf-bind", &[]).await;
+        for (node, context) in [
+            (
+                "both",
+                json!({ "action_digest": "d-both", "calls_hash": "c-both" }),
+            ),
+            ("calls", json!({ "calls_hash": "c-calls" })),
+            ("legacy", json!({})),
+        ] {
+            env.backend
+                .append_event(Event::new(
+                    eid.clone(),
+                    0,
+                    EventKind::ToolApprovalRequired {
+                        node_id: node.into(),
+                        tool_name: "tool".into(),
+                        approver: "human".into(),
+                        context,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        project(&env.backend).await;
+
+        let page = list(&env, &env.bob, "").await;
+        let listed = rows(&page);
+        let digest = |node: &str| {
+            listed
+                .iter()
+                .find(|r| r["node_id"] == node)
+                .map(|r| r["action_digest"].clone())
+        };
+        assert_eq!(
+            digest("both"),
+            Some(json!("d-both")),
+            "{}: {page}",
+            env.name
+        );
+        assert_eq!(
+            digest("calls"),
+            Some(json!("c-calls")),
+            "{}: {page}",
+            env.name
+        );
+        assert_eq!(digest("legacy"), Some(Value::Null), "{}: {page}", env.name);
+    }
+}
+
 #[tokio::test]
 async fn a_row_decided_after_listing_is_refused_by_the_approve_route() {
     for env in envs().await {

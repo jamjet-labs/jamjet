@@ -3,16 +3,18 @@
 //! All approval decisions pass through `submit_approval` which folds the event log
 //! to verify something is actually pending before appending `ApprovalReceived`.
 //! The listing helper `approvals_view` builds the pending/decided payload for
-//! `GET /executions/:id/approvals`.
+//! `GET /executions/:id/approvals`, and `pending_row_view` one row of
+//! `GET /approvals`.
 
 use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use jamjet_state::approvals::{
     expired_by_deadline, node_approval_status, pending_approvals, pending_but_expired,
-    run_initiator, still_open, NodeApprovalStatus,
+    run_initiator, still_open, NodeApprovalStatus, PendingApproval, ESCALATE_AT_KEY,
+    EXPIRES_AT_KEY,
 };
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::{ApprovalDecision, EventKind};
-use jamjet_state::Event;
+use jamjet_state::{ApprovalCursor, Event, PendingApprovalRow};
 use std::sync::Arc;
 
 pub struct ApprovalSubmission {
@@ -470,4 +472,66 @@ pub fn approvals_view(events: &[Event]) -> serde_json::Value {
         .collect();
 
     serde_json::json!({ "pending": pending, "decided": decided })
+}
+
+/// One row of `GET /approvals`: a request waiting for a decision, and what a
+/// reviewer echoes to decide it.
+///
+/// `action_digest` is the request's binding, the echo the approve route
+/// accepts: its `action_digest`, or for an older agent tool dispatch request
+/// its `calls_hash`, or null for a legacy request that binds nothing. The two
+/// deadline keys are always there, null when the request's policy set none.
+/// `context` is the request's context, whole.
+pub fn pending_row_view(row: &PendingApprovalRow) -> serde_json::Value {
+    let context = row.context.clone().unwrap_or(serde_json::Value::Null);
+    let request = PendingApproval::from_request(
+        &row.node_id,
+        row.tool_name.as_deref().unwrap_or_default(),
+        row.approver.as_deref().unwrap_or_default(),
+        &context,
+        row.request_sequence,
+    );
+    let deadline = |key: &str| context.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "execution_id": row.execution_id.to_string(),
+        "workflow_id": row.workflow_id,
+        "workflow_version": row.workflow_version,
+        "node_id": row.node_id,
+        "tool_name": row.tool_name,
+        "approver": row.approver,
+        "request_sequence": row.request_sequence,
+        "action_digest": request.binding(),
+        "expires_at": deadline(EXPIRES_AT_KEY),
+        "escalate_at": deadline(ESCALATE_AT_KEY),
+        "context": row.context,
+    })
+}
+
+/// The `next_after` of `GET /approvals`: lowercase hex of the cursor's JSON,
+/// so it goes in a query string as it is.
+pub fn encode_approval_cursor(cursor: &ApprovalCursor) -> serde_json::Result<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let json = serde_json::to_vec(cursor)?;
+    let mut out = String::with_capacity(json.len() * 2);
+    for b in json {
+        out.push(char::from(HEX[usize::from(b >> 4)]));
+        out.push(char::from(HEX[usize::from(b & 0x0f)]));
+    }
+    Ok(out)
+}
+
+/// The cursor an `after` names. `None` for anything that is not an even
+/// number of hex digits spelling the JSON of an [`ApprovalCursor`].
+pub fn decode_approval_cursor(text: &str) -> Option<ApprovalCursor> {
+    let (pairs, odd) = text.as_bytes().as_chunks::<2>();
+    if !odd.is_empty() {
+        return None;
+    }
+    let nibble = |d: u8| char::from(d).to_digit(16);
+    let mut json = Vec::with_capacity(pairs.len());
+    for &[high, low] in pairs {
+        let byte = (nibble(high)? << 4) | nibble(low)?;
+        json.push(u8::try_from(byte).ok()?);
+    }
+    serde_json::from_slice(&json).ok()
 }
