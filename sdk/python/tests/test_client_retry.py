@@ -15,6 +15,7 @@ import logging
 import math
 import random
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -212,6 +213,30 @@ async def test_every_lost_answer_on_an_unsafe_call_is_outcome_unknown(failure: A
     assert start.call_count == 1
     assert waits == []
     assert exc.value.operation == "start_execution"
+
+
+GUIDE = Path(__file__).resolve().parents[3] / "docs" / "guides" / "python-sdk.md"
+
+
+def _guide_retry_table() -> dict[str, list[str]]:
+    """The guide's retry table: each row's first cell, then its other cells."""
+    section = GUIDE.read_text(encoding="utf-8").split("### Retries", 1)[1].split("\n## ", 1)[0]
+    rows: dict[str, list[str]] = {}
+    for line in section.splitlines():
+        if line.startswith("|") and not set(line) <= set("|- "):
+            first, *rest = (cell.strip() for cell in line.strip().strip("|").split("|"))
+            rows[first] = rest
+    return rows
+
+
+def test_the_guide_says_an_unsafe_call_raises_outcome_unknown_on_a_5xx_or_a_lost_answer() -> None:
+    # What the two tests above pin, as a caller reads it before writing an except clause.
+    rows = _guide_retry_table()
+    assert rows["The engine answered 5xx"] == ["sent again", "raises `OutcomeUnknown`, never sent again"]
+    assert rows["The answer was lost (timeout, broken connection)"] == [
+        "sent again",
+        "raises `OutcomeUnknown`, never sent again",
+    ]
 
 
 def test_the_safety_table_covers_every_call() -> None:

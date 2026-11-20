@@ -229,13 +229,15 @@ What is sent again depends on what could have happened:
 |---------------|-------------------------------|----------------|
 | The request never left (no connection could be made) | sent again | sent again |
 | The engine answered 429 | sent again | sent again |
-| The engine answered 5xx | sent again | raised as the engine's error |
+| The engine answered 5xx | sent again | raises `OutcomeUnknown`, never sent again |
 | The answer was lost (timeout, broken connection) | sent again | raises `OutcomeUnknown`, never sent again |
 | Any other 4xx, 401 included | raised | raised |
 
 A call that may have taken effect and lost its answer raises
-`OutcomeUnknown`. Look at the engine before you repeat it. A call whose body
-can be read only once (a generator, a file that cannot seek) is sent once.
+`OutcomeUnknown` (import it from `jamjet.transport`). It is a `RuntimeError`,
+not an httpx error, and the original error is on `__cause__`. Look at the
+engine before you repeat it. A call whose body can be read only once (a
+generator, a file that cannot seek) is sent once.
 
 Safe to repeat: `health`, `tick`, `create_workflow`, `list_cron_jobs`,
 `get_execution`, `list_executions`, `get_events`, `list_approvals`,

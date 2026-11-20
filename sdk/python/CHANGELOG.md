@@ -25,6 +25,12 @@
   auth hook adds are sent to the scheme, host and port of `base_url` and nowhere else. A
   request to another address raises `CredentialScopeError` before anything is sent.
   Redirects are raised, not followed.
+- **An unsafe call whose answer was lost raises `OutcomeUnknown`.** For `start_execution`,
+  `approve` and every other call that is not safe to repeat, a 5xx or a lost answer (a
+  timeout or a broken connection) now raises `OutcomeUnknown` in place of `JamjetAPIError`
+  or an httpx error. It is a `RuntimeError`, not an httpx error, so
+  `except httpx.HTTPError` does not catch it. The original error is on `__cause__`.
+  Import it from `jamjet.transport`.
 
 ### Fixed
 
