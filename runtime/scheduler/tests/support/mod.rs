@@ -190,6 +190,7 @@ pub async fn start_run(backend: &dyn StateBackend, ir: Value) -> ExecutionId {
                 workflow_version: VERSION.into(),
                 initial_input: json!({}),
                 initiated_by: None,
+                run_key: None,
             },
             EventKind::NodeScheduled {
                 node_id: start,

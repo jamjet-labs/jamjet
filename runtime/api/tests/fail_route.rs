@@ -1232,6 +1232,7 @@ async fn start_one_attempt_run(backend: &Arc<dyn StateBackend>) -> (ExecutionId,
                 workflow_version: "1.0.0".into(),
                 initial_input: json!({}),
                 initiated_by: None,
+                run_key: None,
             },
             EventKind::NodeScheduled {
                 node_id: "n1".into(),

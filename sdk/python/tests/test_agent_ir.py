@@ -453,3 +453,51 @@ class TestGovernanceIrCacheKey:
         base_version = compile_agent_to_ir(_agent(), "hi")["version"]
         approved_version = compile_agent_to_ir(_governed_agent(approval_required=["delete_*"]), "hi")["version"]
         assert base_version != approved_version
+
+
+# ── claim_by_execution ────────────────────────────────────────────────────────
+
+
+def test_compile_marks_dispatch_by_execution_only_when_asked():
+    ir = compile_agent_to_ir(_agent(), "hi", max_turns=3, claim_by_execution=True)
+    for t in range(3):
+        assert ir["nodes"][f"__tools_{t}__"]["kind"]["claim"] == "by_execution"
+    for node_id, node in ir["nodes"].items():
+        if not node_id.startswith("__tools_"):
+            assert "claim" not in node["kind"]
+
+
+def test_default_compile_is_byte_identical():
+    import hashlib
+    import json
+
+    ir = compile_agent_to_ir(_agent(), "hi", max_turns=2)
+    assert "claim" not in ir["nodes"]["__tools_0__"]["kind"]
+    assert ir["nodes"]["__tools_0__"]["kind"] == {
+        "type": "python_fn",
+        "module": "jamjet.agents.tool_runtime",
+        "function": "dispatch_tool_calls",
+        "output_schema": "",
+        "agent_tool_dispatch": True,
+        "input": {
+            "messages": "$state.messages",
+            "assistant_content": "$state.last_model_output",
+            "tool_calls": "$state.last_model_tool_calls",
+            "tools": {
+                "get_weather": f"{__name__}:get_weather",
+                "search_web": f"{__name__}:search_web",
+            },
+        },
+    }
+    # The digest of the whole IR, taken before claim_by_execution existed. Keys
+    # stay in the order the compiler wrote them, so a reordered dict fails too.
+    # The resolver maps name this test module, and the version suffix hashes them,
+    # so both are blanked before hashing.
+    ir["version"] = ""
+    for node in ir["nodes"].values():
+        if "tools" in node["kind"].get("input", {}):
+            node["kind"]["input"]["tools"] = {}
+    text = json.dumps(ir, separators=(",", ":"))
+    assert (
+        hashlib.sha256(text.encode()).hexdigest() == "cabac21833cb7acc4759b543b106e9cfa19dd3910be42d87ca21decd5995e02c"
+    )

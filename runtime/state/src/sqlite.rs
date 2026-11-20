@@ -1138,8 +1138,10 @@ impl StateBackend for SqliteBackend {
             started_event,
             scheduled_event,
             work_item,
+            None,
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn start_execution_atomic(
@@ -1157,8 +1159,10 @@ impl StateBackend for SqliteBackend {
             started_event,
             scheduled_event,
             work_item,
+            None,
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     #[instrument(skip(self), fields(execution_id = %execution_id))]
@@ -2535,6 +2539,33 @@ impl StateBackend for SqliteBackend {
         crate::features::open_items::open_work_items_in(&self.pool, None, execution_id).await
     }
 
+    async fn start_execution_keyed(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+        key: crate::backend::RunKeyClaim,
+    ) -> BackendResult<crate::backend::KeyedStart> {
+        crate::features::run_keys::start_keyed_in(
+            &self.pool,
+            None,
+            execution,
+            started_event,
+            scheduled_event,
+            work_item,
+            key,
+        )
+        .await
+    }
+
+    async fn get_run_key(
+        &self,
+        run_key: &str,
+    ) -> BackendResult<Option<crate::backend::RunKeyRecord>> {
+        crate::features::run_keys::get_run_key_in(&self.pool, None, run_key).await
+    }
+
     // ── Storage lane ──────────────────────────────────────────────────────
 
     #[instrument(skip(self, pass), fields(execution_id = %pass.execution_id, seen = pass.seen_sequence))]
@@ -2571,6 +2602,12 @@ pub(crate) use crate::backend::DEFAULT_LEASE_SECS;
 /// `NodeScheduled` scheduled the start node a second time. A failure rolls
 /// everything back, so no partial run is left behind. `tenant_id` stamps
 /// every row; `None` leaves the columns at their default.
+///
+/// With a `key`, the run key is claimed first under the same write lock
+/// (`StateBackend::start_execution_keyed`), under `tenant_id` or, unscoped,
+/// the work item's tenant. A key held for another run is
+/// [`KeyedStart::Taken`](crate::backend::KeyedStart::Taken) and nothing is
+/// written. Without a key the answer is always `Started`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_run_in(
     pool: &SqlitePool,
@@ -2580,7 +2617,8 @@ pub(crate) async fn create_run_in(
     started_event: EventKind,
     scheduled_event: EventKind,
     work_item: WorkItem,
-) -> BackendResult<()> {
+    key: Option<&crate::backend::RunKeyClaim>,
+) -> BackendResult<crate::backend::KeyedStart> {
     // Serialize everything before taking the write lock.
     let exec_id_str = execution_id_str(&execution.execution_id);
     let exec_status = status_to_str(&execution.status);
@@ -2604,7 +2642,20 @@ pub(crate) async fn create_run_in(
         .await
         .map_err(map_db_err)?;
 
-    // 1. Execution row.
+    // 1. The run key, before any row of the run: a key held for another run
+    //    leaves this start with nothing written.
+    if let Some(key) = key {
+        let key_tenant = tenant_id.unwrap_or(&work_item.tenant_id);
+        let held =
+            crate::features::run_keys::claim_in(&mut tx, key_tenant, key, &exec_id_str).await?;
+        fault_point!("sqlite.create_run", 1);
+        if let Some(held) = held {
+            tx.rollback().await.map_err(map_db_err)?;
+            return Ok(crate::backend::KeyedStart::Taken(held));
+        }
+    }
+
+    // 2. Execution row.
     let sql = format!(
         "INSERT INTO workflow_executions \
          (execution_id, workflow_id, workflow_version, status, initial_input, current_state, \
@@ -2627,9 +2678,9 @@ pub(crate) async fn create_run_in(
         q = q.bind(t);
     }
     q.execute(&mut *tx).await.map_err(map_db_err)?;
-    fault_point!("sqlite.create_run", 1);
+    fault_point!("sqlite.create_run", 2);
 
-    // 2. Seed snapshot, for a continuation segment.
+    // 3. Seed snapshot, for a continuation segment.
     if let Some(snap) = seed_snapshot {
         let sql = format!(
             "INSERT OR REPLACE INTO snapshots \
@@ -2651,10 +2702,10 @@ pub(crate) async fn create_run_in(
             q = q.bind(t);
         }
         q.execute(&mut *tx).await.map_err(map_db_err)?;
-        fault_point!("sqlite.create_run", 2);
+        fault_point!("sqlite.create_run", 3);
     }
 
-    // 3-4. WorkflowStarted, then NodeScheduled. The sequence is assigned like
+    // 4-5. WorkflowStarted, then NodeScheduled. The sequence is assigned like
     //      `append_event` does, inside the transaction.
     for kind in [started_event, scheduled_event] {
         let seq: i64 = sqlx::query(
@@ -2666,7 +2717,7 @@ pub(crate) async fn create_run_in(
         .map_err(map_db_err)?
         .try_get::<i64, _>("seq")
         .map_err(map_db_err)?;
-        fault_point!("sqlite.create_run", 3);
+        fault_point!("sqlite.create_run", 4);
         let sql = format!(
             "INSERT INTO events (id, execution_id, sequence, kind_json, created_at{tcol}) \
              VALUES (?, ?, ?, ?, ?{tval})"
@@ -2681,10 +2732,10 @@ pub(crate) async fn create_run_in(
             q = q.bind(t);
         }
         q.execute(&mut *tx).await.map_err(map_db_err)?;
-        fault_point!("sqlite.create_run", 4);
+        fault_point!("sqlite.create_run", 5);
     }
 
-    // 5. Start-node work item.
+    // 6. Start-node work item.
     let sql = format!(
         "INSERT INTO work_items \
          (id, execution_id, node_id, queue_type, payload_json, attempt, max_attempts, \
@@ -2704,10 +2755,10 @@ pub(crate) async fn create_run_in(
         q = q.bind(t);
     }
     q.execute(&mut *tx).await.map_err(map_db_err)?;
-    fault_point!("sqlite.create_run", 5);
+    fault_point!("sqlite.create_run", 6);
 
     tx.commit().await.map_err(map_db_err)?;
-    Ok(())
+    Ok(crate::backend::KeyedStart::Started)
 }
 
 /// [`StateBackend::finish_execution`] for both SQLite backends: the terminal
@@ -4342,6 +4393,7 @@ mod tests {
                 workflow_version: "1.0.0".to_string(),
                 initial_input: json!({"x": 1}),
                 initiated_by: None,
+                run_key: None,
             },
         );
         db.append_event(event).await.unwrap();

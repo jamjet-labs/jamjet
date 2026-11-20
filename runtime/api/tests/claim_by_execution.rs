@@ -1416,15 +1416,16 @@ async fn only_the_initiator_completes_fails_or_heartbeats() {
     let _ = std::fs::remove_file(path);
 }
 
-/// `claim` means something on `external_fn` only; anywhere else it is
-/// refused at registration rather than silently ignored.
+/// GUARD: passes before `python_fn` takes `claim`. `claim` means something
+/// on `external_fn` and `python_fn` only; anywhere else it is refused at
+/// registration rather than silently ignored.
 #[tokio::test]
-async fn claim_on_another_kind_is_refused_at_registration() {
+async fn claim_on_java_fn_is_still_refused_at_registration() {
     let state = make_state(Arc::new(InMemoryBackend::new()));
     let mut workflow = ir("wf-wrong", None, None);
     workflow["nodes"]["second"]["kind"] = json!({
-        "type": "python_fn", "module": "m", "function": "f", "output_schema": "",
-        "claim": "by_execution"
+        "type": "java_fn", "class_name": "com.example.Check", "method": "run",
+        "output_schema": "", "claim": "by_execution"
     });
     let (st, body) = send(
         &state,
@@ -2563,4 +2564,569 @@ async fn an_oldest_first_release_that_errs_hands_nothing_out() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let (_, body) = claim(&state, None, "w1", json!({})).await;
     assert_eq!(body, json!({ "claimed": false }));
+}
+
+// ── `python_fn` claimed by its own run ──────────────────────────────────────
+//
+// An agent's tool dispatch is a `python_fn` node per turn. Run by a run's own
+// worker, its calls must not be taken by another run's worker polling the
+// same `python_tool` queue, so the node takes the same opt-in as
+// `external_fn`.
+
+const PY_QUEUE: &str = "python_tool";
+
+/// `first -> second`, both `python_fn`; `claim` is put on both when given.
+fn py_ir(workflow_id: &str, claim: Option<&str>) -> Value {
+    let mut workflow = ir(workflow_id, None, None);
+    for id in ["first", "second"] {
+        let mut kind = json!({
+            "type": "python_fn", "module": "myapp.tools", "function": id, "output_schema": ""
+        });
+        if let Some(c) = claim {
+            kind["claim"] = json!(c);
+        }
+        workflow["nodes"][id]["kind"] = kind;
+    }
+    workflow
+}
+
+/// One agent tool-dispatch node claimable by its run only, under a workflow
+/// policy that blocks the tools in `blocked`.
+fn py_dispatch_ir(workflow_id: &str, blocked: &[&str]) -> Value {
+    let mut workflow = ir(workflow_id, None, Some(policy(blocked, &[])));
+    workflow["start_node"] = json!("dispatch");
+    workflow["nodes"] = json!({
+        "dispatch": {
+            "id": "dispatch",
+            "kind": {
+                "type": "python_fn",
+                "module": "jamjet.agents.tool_runtime",
+                "function": "dispatch_tool_calls",
+                "output_schema": "",
+                "agent_tool_dispatch": true,
+                "claim": "by_execution"
+            },
+            "retry_policy": null, "node_timeout_secs": null, "description": null, "labels": {}
+        }
+    });
+    workflow["edges"] = json!([{ "from": "dispatch", "to": "end", "condition": null }]);
+    workflow
+}
+
+/// [`claim`] on the `python_tool` queue.
+async fn py_claim(
+    state: &AppState,
+    token: Option<&str>,
+    worker: &str,
+    extra: Value,
+) -> (u16, Value) {
+    let mut req = json!({ "worker_id": worker, "queue_types": [PY_QUEUE] });
+    for (k, v) in extra.as_object().unwrap() {
+        req[k] = v.clone();
+    }
+    send(state, "POST", "/work-items/claim", token, req).await
+}
+
+/// [`start`] with `input`.
+async fn start_with(
+    state: &AppState,
+    token: Option<&str>,
+    workflow_id: &str,
+    input: Value,
+) -> String {
+    let (st, body) = send(
+        state,
+        "POST",
+        "/executions",
+        token,
+        json!({ "workflow_id": workflow_id, "workflow_version": "0.1.0", "input": input }),
+    )
+    .await;
+    assert!((200..300).contains(&st), "{st} {body}");
+    body["execution_id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn a_by_execution_python_fn_item_is_never_given_to_the_oldest_first_claim() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        register(&state, None, py_ir("wf-py-own", Some("by_execution"))).await;
+        let e = start(&state, None, "wf-py-own").await;
+        let (_, body) = py_claim(&state, None, "other-worker", json!({})).await;
+        assert_eq!(
+            body,
+            json!({ "claimed": false }),
+            "{name}: the oldest-first claim took a python_fn item claimable only by its run"
+        );
+        // Nor a claim that names the node but not the execution.
+        let by_node = backend
+            .claim_work_item_filtered(
+                "other-worker",
+                &[PY_QUEUE],
+                None,
+                &ClaimFilter {
+                    execution_id: None,
+                    node_id: Some("first".into()),
+                },
+            )
+            .await;
+        assert!(
+            !matches!(by_node, Ok(Some(_))),
+            "{name}: a node-only filter took an opted-in item"
+        );
+        let (_, body) = py_claim(&state, None, "owner", json!({ "execution_id": e })).await;
+        assert_eq!(body["claimed"], true, "{name}: {body}");
+        assert_eq!(
+            body["work_item"]["payload"]["claim"], "by_execution",
+            "{name}: {body}"
+        );
+        assert_eq!(
+            body["work_item"]["payload"]["module"], "myapp.tools",
+            "{name}: {body}"
+        );
+        assert_eq!(
+            body["work_item"]["payload"]["function"], "first",
+            "{name}: {body}"
+        );
+        cleanup(path);
+    }
+}
+
+/// Another developer's worker gets nothing, by id (`not_found`, as for a run
+/// that does not exist) or oldest-first.
+#[tokio::test]
+async fn only_the_initiator_claims_a_by_execution_python_fn_item() {
+    let (url, path) = sqlite_url();
+    let sqlite = Arc::new(SqliteBackend::open(&url).await.unwrap());
+    let (alice, _) = sqlite.create_token("alice", "developer").await.unwrap();
+    let (bob, _) = sqlite.create_token("bob", "developer").await.unwrap();
+    let backend: Arc<dyn StateBackend> = sqlite;
+    let state = make_state(backend);
+    register(
+        &state,
+        Some(&alice),
+        py_ir("wf-py-mine", Some("by_execution")),
+    )
+    .await;
+    let e = start(&state, Some(&alice), "wf-py-mine").await;
+
+    let (_, body) = py_claim(&state, Some(&bob), "bob-worker", json!({})).await;
+    assert_eq!(body, json!({ "claimed": false }), "oldest-first");
+    let (_, body) = py_claim(
+        &state,
+        Some(&bob),
+        "bob-worker",
+        json!({ "execution_id": e }),
+    )
+    .await;
+    assert_eq!(body, json!({ "claimed": false, "reason": "not_found" }));
+    let (_, body) = py_claim(
+        &state,
+        Some(&alice),
+        "alice-worker",
+        json!({ "execution_id": e }),
+    )
+    .await;
+    assert_eq!(body["claimed"], true, "{body}");
+    assert_eq!(
+        body["work_item"]["payload"]["claim"], "by_execution",
+        "{body}"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// Completing, failing or heartbeating the item takes the same right as
+/// claiming it: another token is answered as for an item that does not exist.
+#[tokio::test]
+async fn another_token_cannot_complete_fail_or_heartbeat_it() {
+    let (url, path) = sqlite_url();
+    let sqlite = Arc::new(SqliteBackend::open(&url).await.unwrap());
+    let (alice, _) = sqlite.create_token("alice", "developer").await.unwrap();
+    let (bob, _) = sqlite.create_token("bob", "developer").await.unwrap();
+    let backend: Arc<dyn StateBackend> = sqlite;
+    let state = make_state(backend);
+    register(
+        &state,
+        Some(&alice),
+        py_ir("wf-py-act", Some("by_execution")),
+    )
+    .await;
+    let e = start(&state, Some(&alice), "wf-py-act").await;
+    let (_, body) = py_claim(
+        &state,
+        Some(&alice),
+        "alice-worker",
+        json!({ "execution_id": e }),
+    )
+    .await;
+    assert_eq!(body["claimed"], true, "{body}");
+    let id = body["work_item"]["id"].as_str().unwrap().to_string();
+    let fence = body["work_item"]["lease_fence"].clone();
+
+    let (st, body) = send(
+        &state,
+        "POST",
+        &format!("/work-items/{id}/heartbeat"),
+        Some(&bob),
+        json!({ "worker_id": "alice-worker", "lease_fence": fence }),
+    )
+    .await;
+    assert_eq!(st, 404, "heartbeat: {body}");
+    let (st, body) = send(
+        &state,
+        "POST",
+        &format!("/work-items/{id}/fail"),
+        Some(&bob),
+        json!({ "error": "no", "lease_fence": fence }),
+    )
+    .await;
+    assert_eq!(st, 404, "fail: {body}");
+    for with_fence in [true, false] {
+        let mut req = json!({ "output": { "forged": true }, "state_patch": {} });
+        if with_fence {
+            req["lease_fence"] = fence.clone();
+        }
+        let (st, body) = send(
+            &state,
+            "POST",
+            &format!("/work-items/{id}/complete"),
+            Some(&bob),
+            req,
+        )
+        .await;
+        assert_eq!(st, 404, "complete, fence {with_fence}: {body}");
+    }
+    let (st, body) = send(
+        &state,
+        "POST",
+        &format!("/work-items/{id}/complete"),
+        Some(&alice),
+        json!({ "output": {}, "state_patch": {}, "lease_fence": fence }),
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    let _ = std::fs::remove_file(path);
+}
+
+/// An item of such a node that lost its marker is not handed out
+/// oldest-first. It is put back marked and unclaimed, and the claim by
+/// execution gets it.
+#[tokio::test]
+async fn an_unmarked_item_reached_by_the_oldest_first_claim_is_put_back() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        let workflow = py_ir("wf-py-unmarked", Some("by_execution"));
+        register(&state, None, workflow.clone()).await;
+        let e = start(&state, None, "wf-py-unmarked").await;
+        // Take the start item out of the way.
+        let (_, body) = py_claim(&state, None, "w", json!({ "execution_id": e })).await;
+        assert_eq!(body["claimed"], true, "{name}: {body}");
+        // `second`, enqueued without the marker, then a plain run's item.
+        let wf: WorkflowIr = serde_json::from_value(workflow).unwrap();
+        let mut payload = jamjet_scheduler::payload::build_work_item_payload(
+            &wf,
+            "second",
+            wf.node("second").unwrap(),
+            &serde_json::Map::new(),
+            &wf.workflow_id,
+            "0.1.0",
+        );
+        payload.as_object_mut().unwrap().remove("claim");
+        let unmarked = uuid::Uuid::new_v4();
+        backend
+            .enqueue_work_item(WorkItem {
+                id: unmarked,
+                execution_id: execution_id(&e),
+                node_id: "second".into(),
+                queue_type: PY_QUEUE.into(),
+                payload,
+                attempt: 0,
+                max_attempts: 3,
+                created_at: chrono::Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        register(&state, None, py_ir("wf-py-behind", None)).await;
+        let behind = start(&state, None, "wf-py-behind").await;
+
+        // Three polls: whatever order a backend hands items out in, each of
+        // the two pending items is looked at.
+        let mut handed = Vec::new();
+        for _ in 0..3 {
+            let (_, body) = py_claim(&state, None, "oldest-first", json!({})).await;
+            if body["claimed"] == true {
+                handed.push(body["work_item"]["execution_id"].clone());
+            }
+        }
+        assert_eq!(handed, vec![json!(behind)], "{name}");
+        let item = backend.get_work_item(unmarked).await.unwrap().unwrap();
+        assert_eq!(
+            item.payload["claim"], "by_execution",
+            "{name}: put back unmarked, it heads the queue for every poll"
+        );
+        assert!(item.worker_id.is_none(), "{name}");
+        let (_, body) = py_claim(
+            &state,
+            None,
+            "w",
+            json!({ "execution_id": e, "node_id": "second" }),
+        )
+        .await;
+        assert_eq!(body["claimed"], true, "{name}: {body}");
+        assert_eq!(body["work_item"]["attempt"], json!(0), "{name}: {body}");
+        cleanup(path);
+    }
+}
+
+/// `POST /work-items` marks a `python_fn` item from the IR as it does an
+/// `external_fn` one: sent without the marker, it is stored with it, before
+/// any claim has looked at it. A plain node's item loses a marker it was sent.
+#[tokio::test]
+async fn a_hand_enqueued_python_fn_item_is_marked_from_the_ir() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let state = make_state(backend.clone());
+    register(&state, None, py_ir("wf-py-hand", Some("by_execution"))).await;
+    let e = start(&state, None, "wf-py-hand").await;
+    // Take the start item out of the way.
+    let (_, body) = py_claim(&state, None, "w", json!({ "execution_id": e })).await;
+    assert_eq!(body["claimed"], true, "{body}");
+    let (st, body) = send(
+        &state,
+        "POST",
+        "/work-items",
+        None,
+        json!({
+            "execution_id": e, "node_id": "second", "queue_type": PY_QUEUE,
+            "payload": { "module": "myapp.tools", "function": "second" }
+        }),
+    )
+    .await;
+    assert_eq!(st, 201, "{body}");
+    let id = uuid::Uuid::parse_str(body["work_item_id"].as_str().unwrap()).unwrap();
+    let item = backend.get_work_item(id).await.unwrap().unwrap();
+    assert_eq!(item.payload["claim"], "by_execution", "{:?}", item.payload);
+    let (_, body) = py_claim(&state, None, "oldest-first", json!({})).await;
+    assert_eq!(body, json!({ "claimed": false }));
+
+    register(&state, None, py_ir("wf-py-hand-plain", None)).await;
+    let p = start(&state, None, "wf-py-hand-plain").await;
+    let (_, body) = py_claim(&state, None, "w", json!({ "execution_id": p })).await;
+    assert_eq!(body["claimed"], true, "{body}");
+    let (st, body) = send(
+        &state,
+        "POST",
+        "/work-items",
+        None,
+        json!({
+            "execution_id": p, "node_id": "second", "queue_type": PY_QUEUE,
+            "payload": { "module": "myapp.tools", "function": "second", "claim": "by_execution" }
+        }),
+    )
+    .await;
+    assert_eq!(st, 201, "{body}");
+    let (_, body) = py_claim(&state, None, "oldest-first", json!({})).await;
+    assert_eq!(body["claimed"], true, "{body}");
+    assert!(
+        body["work_item"]["payload"].get("claim").is_none(),
+        "{body}"
+    );
+}
+
+/// `POST /work-items` writes through the scheduler's pass and still marks
+/// the item: a `python_fn` item claimable only by its run is stored marked,
+/// a second hand enqueue of the node while that item is live is 409 and adds
+/// nothing, and a hand enqueue on a finished run is 409 too.
+#[tokio::test]
+async fn a_hand_enqueue_is_marked_and_refused_while_the_node_has_a_live_item() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        register(&state, None, py_ir("wf-py-twice", Some("by_execution"))).await;
+        let e = start(&state, None, "wf-py-twice").await;
+        // Take the start item out of the way.
+        let (_, body) = py_claim(&state, None, "w", json!({ "execution_id": e })).await;
+        assert_eq!(body["claimed"], true, "{name}: {body}");
+        let hand = json!({
+            "execution_id": e, "node_id": "second", "queue_type": PY_QUEUE,
+            "payload": { "module": "myapp.tools", "function": "second" }
+        });
+        let (st, body) = send(&state, "POST", "/work-items", None, hand.clone()).await;
+        assert_eq!(st, 201, "{name}: {body}");
+        let id = uuid::Uuid::parse_str(body["work_item_id"].as_str().unwrap()).unwrap();
+
+        let (st, body) = send(&state, "POST", "/work-items", None, hand.clone()).await;
+        assert_eq!(
+            (st, body),
+            (
+                409,
+                json!({ "error": "node already has a pending or claimed item" })
+            ),
+            "{name}"
+        );
+        let scheduled = count(
+            &event_kinds(&backend, &e).await,
+            |k| matches!(k, EventKind::NodeScheduled { node_id, .. } if node_id == "second"),
+        );
+        assert_eq!(scheduled, 1, "{name}: the refused enqueue logged nothing");
+        let item = backend.get_work_item(id).await.unwrap().unwrap();
+        assert_eq!(
+            item.payload["claim"], "by_execution",
+            "{name}: {:?}",
+            item.payload
+        );
+        let (_, body) = py_claim(&state, None, "oldest-first", json!({})).await;
+        assert_eq!(body, json!({ "claimed": false }), "{name}");
+        let (_, body) = py_claim(
+            &state,
+            None,
+            "w",
+            json!({ "execution_id": e, "node_id": "second" }),
+        )
+        .await;
+        assert_eq!(body["work_item"]["id"], id.to_string(), "{name}: {body}");
+        assert_eq!(
+            body["work_item"]["payload"]["claim"], "by_execution",
+            "{name}: {body}"
+        );
+
+        // Ended, the run takes no new item for a node, marked or not.
+        let (st, body) = send(
+            &state,
+            "POST",
+            &format!("/executions/{e}/cancel"),
+            None,
+            json!({}),
+        )
+        .await;
+        assert!((200..300).contains(&st), "{name}: cancel {st} {body}");
+        let (st, body) = send(&state, "POST", "/work-items", None, hand).await;
+        assert_eq!(
+            (st, body),
+            (409, json!({ "error": "execution is Cancelled" })),
+            "{name}"
+        );
+        cleanup(path);
+    }
+}
+
+/// Claimed by its run, an agent's dispatch node still has each tool call it
+/// carries checked: a blocked call is refused, an allowed one handed out.
+#[tokio::test]
+async fn a_by_execution_dispatch_node_still_runs_the_dispatch_guard() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        register(&state, None, py_dispatch_ir("wf-py-turn", &["send_wire"])).await;
+
+        let blocked = start_with(
+            &state,
+            None,
+            "wf-py-turn",
+            json!({ "tool_calls": [ { "id": "c1", "name": "send_wire", "arguments": { "amount": 10 } } ] }),
+        )
+        .await;
+        let (_, body) = py_claim(&state, None, "w", json!({ "execution_id": blocked })).await;
+        assert_eq!(
+            body,
+            json!({ "claimed": false, "reason": "blocked" }),
+            "{name}"
+        );
+        let kinds = event_kinds(&backend, &blocked).await;
+        assert_eq!(
+            count(
+                &kinds,
+                |k| matches!(k, EventKind::PolicyViolation { decision, .. } if decision == "blocked")
+            ),
+            1,
+            "{name}: {kinds:?}"
+        );
+
+        let allowed = start_with(
+            &state,
+            None,
+            "wf-py-turn",
+            json!({ "tool_calls": [ { "id": "c1", "name": "lookup", "arguments": {} } ] }),
+        )
+        .await;
+        let (_, body) = py_claim(&state, None, "w", json!({ "execution_id": allowed })).await;
+        assert_eq!(body["claimed"], true, "{name}: {body}");
+        assert_eq!(
+            body["work_item"]["payload"]["claim"], "by_execution",
+            "{name}: {body}"
+        );
+        cleanup(path);
+    }
+}
+
+/// GUARD: passes before `python_fn` takes `claim`. A node without `claim`
+/// serializes as it did, so its definition hash, which an approval in flight
+/// binds, is unchanged.
+#[tokio::test]
+async fn a_python_fn_without_claim_keeps_its_definition_hash() {
+    let plain = json!({
+        "id": "first",
+        "kind": { "type": "python_fn", "module": "myapp.tools", "function": "run_check", "output_schema": "" },
+        "retry_policy": null, "node_timeout_secs": null, "description": null, "labels": {}
+    });
+    let mut dispatch = plain.clone();
+    dispatch["kind"] = json!({
+        "type": "python_fn", "module": "jamjet.agents.tool_runtime",
+        "function": "dispatch_tool_calls", "output_schema": "", "agent_tool_dispatch": true
+    });
+    for (node, serialized, hash) in [
+        (
+            plain,
+            r#"{"description":null,"id":"first","kind":{"agent_tool_dispatch":false,"function":"run_check","module":"myapp.tools","output_schema":"","type":"python_fn"},"labels":{},"node_timeout_secs":null,"retry_policy":null}"#,
+            "956595089ddf39ef71f2ec95837aaa80ce1872457890efe7e3ab587c2ab9a3c6",
+        ),
+        (
+            dispatch,
+            r#"{"description":null,"id":"first","kind":{"agent_tool_dispatch":true,"function":"dispatch_tool_calls","module":"jamjet.agents.tool_runtime","output_schema":"","type":"python_fn"},"labels":{},"node_timeout_secs":null,"retry_policy":null}"#,
+            "463011c3f35fd4a6d5950ca9d0e284afa7cd7845ad30b33bf3b3d9dacb5dc684",
+        ),
+    ] {
+        let def: jamjet_ir::workflow::NodeDef = serde_json::from_value(node).unwrap();
+        let value = serde_json::to_value(&def).unwrap();
+        assert_eq!(jamjet_state::canonical_json(&value), serialized);
+        assert_eq!(
+            jamjet_state::approvals::definition_hash(&value),
+            hash,
+            "{serialized}"
+        );
+    }
+}
+
+/// In dev mode there is no principal to check, so any claim that names the
+/// run takes the item, even one whose run recorded an initiator. The
+/// oldest-first claim still does not.
+#[tokio::test]
+async fn dev_mode_lets_any_claimer_take_it() {
+    let (url, path) = sqlite_url();
+    let sqlite = Arc::new(SqliteBackend::open(&url).await.unwrap());
+    let (alice, _) = sqlite.create_token("alice", "developer").await.unwrap();
+    let backend: Arc<dyn StateBackend> = sqlite;
+    let state = make_state(backend);
+    register(
+        &state,
+        Some(&alice),
+        py_ir("wf-py-dev", Some("by_execution")),
+    )
+    .await;
+    let recorded = start(&state, Some(&alice), "wf-py-dev").await;
+    let unrecorded = start(&state, None, "wf-py-dev").await;
+
+    let (_, body) = py_claim(&state, None, "anyone", json!({})).await;
+    assert_eq!(body, json!({ "claimed": false }), "oldest-first");
+    for e in [recorded, unrecorded] {
+        let (_, body) = py_claim(&state, None, "anyone", json!({ "execution_id": e })).await;
+        assert_eq!(body["claimed"], true, "{e}: {body}");
+        assert_eq!(
+            body["work_item"]["payload"]["claim"], "by_execution",
+            "{e}: {body}"
+        );
+    }
+    let _ = std::fs::remove_file(path);
 }

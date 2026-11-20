@@ -187,6 +187,7 @@ impl jamjet_timers::CronLauncher for InProcessCronLauncher {
             Some(job.workflow_version.clone()),
             job.input.clone(),
             job.created_by.clone(),
+            None,
         )
         .await
         .map(|_| ())

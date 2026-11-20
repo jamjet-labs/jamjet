@@ -503,6 +503,7 @@ pub async fn scoped_start_naming_another_tenants_run_is_not_found(fx: &Fixture) 
         workflow_version: "1.0.0".into(),
         initial_input: json!({}),
         initiated_by: None,
+        run_key: None,
     };
     let scheduled = |start: &WorkItem| EventKind::NodeScheduled {
         node_id: start.node_id.clone(),

@@ -65,3 +65,56 @@ fn a_principal_round_trips_and_none_is_not_written() {
         "None must not be serialized: {v}"
     );
 }
+
+/// `WorkflowStarted.run_key` is optional on the wire: a log written before it
+/// existed reads as `None`.
+#[test]
+fn an_old_workflow_started_reads_without_a_run_key() {
+    let old = json!({
+        "type": "workflow_started",
+        "workflow_id": "wf",
+        "workflow_version": "1.0.0",
+        "initial_input": {"a": 1},
+        "initiated_by": "token:t1",
+    });
+    match serde_json::from_value::<EventKind>(old).expect("old shape must parse") {
+        EventKind::WorkflowStarted {
+            run_key,
+            initiated_by,
+            ..
+        } => {
+            assert_eq!(run_key, None);
+            assert_eq!(initiated_by.as_deref(), Some("token:t1"));
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
+/// A run key is written under `run_key`, and a start without one writes the
+/// JSON it always did.
+#[test]
+fn a_run_key_is_written_and_none_is_left_out() {
+    let keyed = EventKind::WorkflowStarted {
+        workflow_id: "wf".into(),
+        workflow_version: "1.0.0".into(),
+        initial_input: json!({"a": 1}),
+        initiated_by: None,
+        run_key: Some("order:1".into()),
+    };
+    assert_eq!(
+        serde_json::to_string(&keyed).unwrap(),
+        r#"{"type":"workflow_started","workflow_id":"wf","workflow_version":"1.0.0","initial_input":{"a":1},"run_key":"order:1"}"#
+    );
+
+    let plain = EventKind::WorkflowStarted {
+        workflow_id: "wf".into(),
+        workflow_version: "1.0.0".into(),
+        initial_input: json!({"a": 1}),
+        initiated_by: None,
+        run_key: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&plain).unwrap(),
+        r#"{"type":"workflow_started","workflow_id":"wf","workflow_version":"1.0.0","initial_input":{"a":1}}"#
+    );
+}

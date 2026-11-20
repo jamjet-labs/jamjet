@@ -24,6 +24,14 @@
 - **`approve(request_sequence=...)`** names the request a decision answers. The engine refuses
   the decision with 409 if the node has asked again since, so a retry cannot decide a newer
   request.
+- **Start a run by key.** `start_execution(..., run_key=None, reuse=None)` sends a
+  `run_key` so a retried start returns the same run. It raises `JamjetAPIError` if the
+  engine does not echo the key: an older engine drops it and would start a second run.
+- `compile_agent_to_ir(..., claim_by_execution=True)` marks each tool-dispatch node
+  `claim: by_execution`. The default output is unchanged. `jamjet worker` and
+  `claim_work_item` do not claim by execution yet, so they never get these steps and
+  the run waits with no error. The run's own worker has to call
+  `POST /work-items/claim` with `execution_id`.
 
 ### Changed
 

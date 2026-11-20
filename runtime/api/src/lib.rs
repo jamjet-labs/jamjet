@@ -6,6 +6,7 @@ pub mod cron;
 pub mod error;
 pub mod mcp_bridge;
 pub mod routes;
+pub mod run_key;
 pub mod startup;
 pub mod state;
 pub mod static_files;

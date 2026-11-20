@@ -1063,8 +1063,10 @@ impl StateBackend for TenantScopedSqliteBackend {
             started_event,
             scheduled_event,
             work_item,
+            None,
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn start_execution_atomic(
@@ -1083,8 +1085,10 @@ impl StateBackend for TenantScopedSqliteBackend {
             started_event,
             scheduled_event,
             work_item,
+            None,
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %execution_id))]
@@ -2590,6 +2594,38 @@ impl StateBackend for TenantScopedSqliteBackend {
             execution_id,
         )
         .await
+    }
+
+    async fn start_execution_keyed(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+        key: crate::backend::RunKeyClaim,
+    ) -> BackendResult<crate::backend::KeyedStart> {
+        // As `start_execution_atomic`: a start item of another tenant's run
+        // is refused. `key.replaces` needs no check: the key is claimed and
+        // moved under this tenant only, so it can name no other tenant's run.
+        self.own_runs_of_start(&execution, &work_item).await?;
+        crate::features::run_keys::start_keyed_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            execution,
+            started_event,
+            scheduled_event,
+            work_item,
+            key,
+        )
+        .await
+    }
+
+    async fn get_run_key(
+        &self,
+        run_key: &str,
+    ) -> BackendResult<Option<crate::backend::RunKeyRecord>> {
+        crate::features::run_keys::get_run_key_in(&self.pool, Some(&self.tenant_id.0), run_key)
+            .await
     }
 
     // ── Storage lane ──────────────────────────────────────────────────────

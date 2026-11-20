@@ -442,6 +442,7 @@ async fn a_decision_without_a_principal_is_refused_outside_dev_mode() {
                 workflow_version: "0.1.0".into(),
                 initial_input: json!({}),
                 initiated_by: Some("token:alice".into()),
+                run_key: None,
             },
             EventKind::ToolApprovalRequired {
                 node_id: "gate".into(),

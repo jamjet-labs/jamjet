@@ -195,6 +195,39 @@ pub fn version_conflict(workflow_id: &str, version: &str) -> StateBackendError {
     ))
 }
 
+/// The run key a start claims, with what it binds the key to
+/// ([`StateBackend::start_execution_keyed`]). The store compares only the key
+/// and `replaces`; whether the workflow, version and input match a key
+/// already held is the caller's to judge from the [`RunKeyRecord`].
+#[derive(Debug, Clone)]
+pub struct RunKeyClaim {
+    pub run_key: String,
+    pub workflow_id: String,
+    pub workflow_version: String,
+    pub input_hash: String,
+    /// failed_only: move the key from this run, and only from it.
+    pub replaces: Option<ExecutionId>,
+}
+
+/// What a run key names: the run it was last given to, and the workflow,
+/// version and input hash it was first claimed with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunKeyRecord {
+    pub execution_id: ExecutionId,
+    pub workflow_id: String,
+    pub workflow_version: String,
+    pub input_hash: String,
+}
+
+/// The answer of [`StateBackend::start_execution_keyed`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyedStart {
+    /// The run is stored and the key names it.
+    Started,
+    /// The key names another run, given here. Nothing was written.
+    Taken(RunKeyRecord),
+}
+
 /// Trait abstracting the durable state storage backend.
 ///
 /// Implementors: `SqliteBackend`, `PostgresBackend`.
@@ -1068,6 +1101,40 @@ pub trait StateBackend: Send + Sync {
         let _ = execution_id;
         Err(StateBackendError::Database(
             "this backend cannot list a run's open work items".into(),
+        ))
+    }
+
+    /// [`start_execution_atomic`](Self::start_execution_atomic) with the run
+    /// key claimed in the same step, so two starts with one key make one run.
+    ///
+    /// A key no one holds is given to this run. A key held for the run
+    /// `key.replaces` names moves to this run; the old run keeps its rows.
+    /// Any other held key is [`KeyedStart::Taken`], with what it names, and
+    /// nothing is written. A start that fails leaves neither the key nor the
+    /// run. The store writes `key.run_key` into the `WorkflowStarted`.
+    ///
+    /// Keys are per tenant: a scoped backend claims under its tenant, an
+    /// unscoped one under the work item's. The default refuses.
+    async fn start_execution_keyed(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+        key: RunKeyClaim,
+    ) -> BackendResult<KeyedStart> {
+        let _ = (execution, started_event, scheduled_event, work_item, key);
+        Err(StateBackendError::Database(
+            "this backend cannot start a run by key".into(),
+        ))
+    }
+
+    /// What `run_key` names in this backend's tenant, or `None`. An unscoped
+    /// backend reads the default tenant's keys. The default refuses.
+    async fn get_run_key(&self, run_key: &str) -> BackendResult<Option<RunKeyRecord>> {
+        let _ = run_key;
+        Err(StateBackendError::Database(
+            "this backend cannot look up a run key".into(),
         ))
     }
 

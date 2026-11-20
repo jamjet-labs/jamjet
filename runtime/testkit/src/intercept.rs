@@ -14,9 +14,9 @@ use jamjet_state::artifact::ArtifactRef;
 use jamjet_state::backend::{
     ApiToken, ApprovalCursor, ApprovalProjectionRow, BackendResult, ClaimFilter, ClaimedWorkItem,
     ConditionalAppend, EventCondition, ExecutionClaim, ExecutionFinish, FailOutcome, GateMark,
-    LeaseRenewal, LeasedItem, OpenWorkItem, PassCommit, PendingApprovalRow, ReclaimResult,
-    ReserveOutcome, RunningPage, SchedulerPass, StateBackend, StateBackendError, TurnCommit,
-    WorkItem, WorkItemId, WorkflowDefinition,
+    KeyedStart, LeaseRenewal, LeasedItem, OpenWorkItem, PassCommit, PendingApprovalRow,
+    ReclaimResult, ReserveOutcome, RunKeyClaim, RunKeyRecord, RunningPage, SchedulerPass,
+    StateBackend, StateBackendError, TurnCommit, WorkItem, WorkItemId, WorkflowDefinition,
 };
 use jamjet_state::event::{Event, EventKind, EventSequence};
 use jamjet_state::snapshot::Snapshot;
@@ -271,6 +271,12 @@ pub enum Op<'a> {
         limit: u32,
     },
     OpenWorkItems(&'a ExecutionId),
+    StartExecutionKeyed {
+        execution: &'a WorkflowExecution,
+        work_item: &'a WorkItem,
+        key: &'a RunKeyClaim,
+    },
+    GetRunKey(&'a str),
 
     // ── Tenants ──────────────────────────────────────────────────────────
     CreateTenant(&'a Tenant),
@@ -1226,6 +1232,39 @@ impl StateBackend for Intercept {
         )
     }
 
+    async fn start_execution_keyed(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+        key: RunKeyClaim,
+    ) -> BackendResult<KeyedStart> {
+        around!(
+            self,
+            Op::StartExecutionKeyed {
+                execution: &execution,
+                work_item: &work_item,
+                key: &key
+            },
+            self.inner.start_execution_keyed(
+                execution.clone(),
+                started_event,
+                scheduled_event,
+                work_item.clone(),
+                key.clone(),
+            )
+        )
+    }
+
+    async fn get_run_key(&self, run_key: &str) -> BackendResult<Option<RunKeyRecord>> {
+        around!(
+            self,
+            Op::GetRunKey(run_key),
+            self.inner.get_run_key(run_key)
+        )
+    }
+
     // ── Tenants ──────────────────────────────────────────────────────────
 
     async fn create_tenant(&self, tenant: Tenant) -> BackendResult<()> {
@@ -1381,6 +1420,82 @@ mod tests {
         assert_eq!(
             *hooks.after.lock().unwrap(),
             ["ListPendingApprovals", "OpenWorkItems"]
+        );
+    }
+
+    /// A keyed start and a run key read reach the inner backend. The trait's
+    /// defaults refuse both.
+    #[tokio::test]
+    async fn the_run_key_calls_reach_the_inner_backend() {
+        let inner: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+        let hooks = Arc::new(Recorder::default());
+        let intercept = Intercept::new(inner.clone(), hooks.clone());
+        let id = ExecutionId::new();
+        // Any time will do; the kit takes no clock of its own.
+        let now = Default::default();
+        let execution = WorkflowExecution {
+            execution_id: id.clone(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: serde_json::json!({}),
+            current_state: serde_json::json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        };
+        let item = WorkItem {
+            id: ExecutionId::new().0,
+            execution_id: id.clone(),
+            node_id: "a".into(),
+            queue_type: "general".into(),
+            payload: serde_json::json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: jamjet_state::DEFAULT_TENANT.into(),
+        };
+        let started = intercept
+            .start_execution_keyed(
+                execution,
+                EventKind::WorkflowStarted {
+                    workflow_id: "wf".into(),
+                    workflow_version: "1.0.0".into(),
+                    initial_input: serde_json::json!({}),
+                    initiated_by: None,
+                    run_key: None,
+                },
+                EventKind::NodeScheduled {
+                    node_id: "a".into(),
+                    queue_type: "general".into(),
+                },
+                item,
+                RunKeyClaim {
+                    run_key: "job:1".into(),
+                    workflow_id: "wf".into(),
+                    workflow_version: "1.0.0".into(),
+                    input_hash: "h".into(),
+                    replaces: None,
+                },
+            )
+            .await;
+        assert!(matches!(started, Ok(KeyedStart::Started)), "{started:?}");
+        let held = intercept.get_run_key("job:1").await;
+        assert!(
+            matches!(&held, Ok(Some(record)) if record.execution_id == id),
+            "{held:?}"
+        );
+        assert!(inner.get_execution(&id).await.unwrap().is_some());
+
+        assert_eq!(
+            *hooks.after.lock().unwrap(),
+            ["StartExecutionKeyed", "GetRunKey"]
         );
     }
 }
