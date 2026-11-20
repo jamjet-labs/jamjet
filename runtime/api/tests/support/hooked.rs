@@ -39,6 +39,9 @@ pub enum Write {
     HeartbeatLease,
     /// A read of an execution (after it returned).
     GetExecution,
+    /// A start with a run key is about to write (reported BEFORE it): the
+    /// gap between the start's judgement of the key and its write.
+    BeforeStartKeyed(ExecutionId),
     /// A start with a run key returned (after it did). `taken`: the key
     /// named another run, so nothing was written.
     StartKeyed {
@@ -694,6 +697,9 @@ impl StateBackend for HookedBackend {
         key: jamjet_state::RunKeyClaim,
     ) -> jamjet_state::backend::BackendResult<jamjet_state::KeyedStart> {
         let execution_id = execution.execution_id.clone();
+        self.hook
+            .after(Write::BeforeStartKeyed(execution_id.clone()))
+            .await;
         let out = self
             .inner
             .start_execution_keyed(execution, started_event, scheduled_event, work_item, key)

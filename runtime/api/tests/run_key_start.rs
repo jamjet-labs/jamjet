@@ -868,6 +868,256 @@ async fn two_starts_at_once_with_other_input_make_one_run_and_one_409() {
     }
 }
 
+/// Puts the keyed writes of racing starts in a set order, and ends as failed
+/// the first `end` runs they make, each right after its write. A start that
+/// then finds the key taken finds a run that has already ended.
+///
+/// Every start first waits at its key read until all `parties` have read the
+/// key. Starts are numbered from 0 by the order their first write arrives,
+/// and `order` lists the writes as (start, attempt), attempts counted from
+/// 1. A write past the end of `order` goes when it comes.
+struct EndsTheWinner {
+    inner: Arc<dyn StateBackend>,
+    reads: tokio::sync::Barrier,
+    order: Vec<(usize, usize)>,
+    end: usize,
+    ended: AtomicUsize,
+    taken: AtomicUsize,
+    turns: std::sync::Mutex<Turns>,
+    turn: tokio::sync::Notify,
+}
+
+/// Where the writes of an [`EndsTheWinner`] race stand.
+#[derive(Default)]
+struct Turns {
+    /// Each start's execution id, numbered by the order its first write came.
+    starts: Vec<ExecutionId>,
+    /// How many writes each start has sent.
+    attempts: Vec<usize>,
+    /// How many writes have returned.
+    done: usize,
+}
+
+impl EndsTheWinner {
+    fn new(
+        inner: Arc<dyn StateBackend>,
+        parties: usize,
+        order: Vec<(usize, usize)>,
+        end: usize,
+    ) -> Self {
+        Self {
+            inner,
+            reads: tokio::sync::Barrier::new(parties),
+            order,
+            end,
+            ended: AtomicUsize::new(0),
+            taken: AtomicUsize::new(0),
+            turns: std::sync::Mutex::new(Turns::default()),
+            turn: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Which start, and which of its attempts, a write is.
+    fn arrive(&self, id: ExecutionId) -> (usize, usize) {
+        let mut turns = self.turns.lock().unwrap();
+        let start = match turns.starts.iter().position(|s| *s == id) {
+            Some(n) => n,
+            None => {
+                turns.starts.push(id);
+                turns.attempts.push(0);
+                turns.starts.len() - 1
+            }
+        };
+        turns.attempts[start] += 1;
+        (start, turns.attempts[start])
+    }
+
+    fn is_turn_of(&self, write: (usize, usize)) -> bool {
+        let done = self.turns.lock().unwrap().done;
+        self.order.get(done).is_none_or(|w| *w == write)
+    }
+}
+
+#[async_trait::async_trait]
+impl AfterWrite for EndsTheWinner {
+    async fn after(&self, write: Write) {
+        let patience = std::time::Duration::from_secs(10);
+        match write {
+            Write::GetRunKey => {
+                tokio::time::timeout(patience, self.reads.wait())
+                    .await
+                    .expect("the racing starts did not all read the key");
+            }
+            Write::BeforeStartKeyed(id) => {
+                let me = self.arrive(id);
+                let wait = async {
+                    loop {
+                        let turn = self.turn.notified();
+                        tokio::pin!(turn);
+                        turn.as_mut().enable();
+                        if self.is_turn_of(me) {
+                            return;
+                        }
+                        turn.await;
+                    }
+                };
+                tokio::time::timeout(patience, wait)
+                    .await
+                    .unwrap_or_else(|_| panic!("write {me:?} never came in {:?}", self.order));
+            }
+            Write::StartKeyed {
+                execution_id,
+                taken,
+            } => {
+                if taken {
+                    self.taken.fetch_add(1, Ordering::SeqCst);
+                } else if self.ended.fetch_add(1, Ordering::SeqCst) < self.end {
+                    let id = execution_id.to_string();
+                    finish(&self.inner, &id, WorkflowStatus::Failed).await;
+                }
+                self.turns.lock().unwrap().done += 1;
+                self.turn.notify_waiters();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A state whose requests go through `hook`, over `backend`.
+fn racing_state(backend: &Arc<dyn StateBackend>, hook: &Arc<EndsTheWinner>) -> AppState {
+    support::make_state(Arc::new(HookedBackend::new(backend.clone(), hook.clone())))
+}
+
+/// A start that finds the key taken at its write decides again against the
+/// run that won, as a start that read the key held does. Here the winner's
+/// run has failed by the time the loser writes, so under `failed_only` the
+/// loser starts a run in its place: on a key both read free, and on a key
+/// both read naming a failed run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_loses_to_a_run_that_has_ended_decides_again() {
+    for (name, backend, state) in envs().await {
+        register(&state, "wf-ended", "1.0.0").await;
+        for round in 0..5 {
+            for held in [false, true] {
+                let key = format!("ended:{round}:{held}");
+                let what = format!("{name} round {round}, key held {held}");
+                let input = json!({ "round": round });
+                if held {
+                    let (st, answer) =
+                        start(&state, keyed("wf-ended", input.clone(), &key, None)).await;
+                    let old = assert_created(&what, st, &answer, &key);
+                    finish(&backend, &old, WorkflowStatus::Failed).await;
+                }
+
+                let hook = Arc::new(EndsTheWinner::new(
+                    backend.clone(),
+                    2,
+                    vec![(0, 1), (1, 1), (1, 2)],
+                    1,
+                ));
+                let body = keyed("wf-ended", input, &key, Some("failed_only"));
+                let answers = at_once(&racing_state(&backend, &hook), body.clone(), 2).await;
+                assert_eq!(
+                    hook.taken.load(Ordering::SeqCst),
+                    1,
+                    "{what}: the second start must find the key taken once: {answers:?}"
+                );
+                let mut ids = Vec::new();
+                for (st, answer) in &answers {
+                    ids.push(assert_created(&what, *st, answer, &key));
+                }
+                assert_ne!(ids[0], ids[1], "{what}");
+                let mut live = Vec::new();
+                let mut failed = 0;
+                for id in &ids {
+                    match status_of(&backend, id).await {
+                        WorkflowStatus::Running => live.push(id.clone()),
+                        WorkflowStatus::Failed => failed += 1,
+                        other => panic!("{what}: {id} is {other:?}"),
+                    }
+                }
+                assert_eq!(
+                    (live.len(), failed),
+                    (1, 1),
+                    "{what}: the winner's run failed, the other's runs"
+                );
+                let (st, answer) = start(&state, body).await;
+                assert_existing(&what, st, &answer, &key, &live[0], &live[0], "running");
+            }
+        }
+        assert_eq!(
+            runs(&backend).await,
+            5 * (2 + 3),
+            "{name}: two runs on a free key, three on a held one"
+        );
+    }
+}
+
+/// A start decides again once. Three restarts read the failed run. The first
+/// moves the key, and its run fails. The second finds the key taken, starts
+/// in its place, and its run fails too. The third finds the key taken twice:
+/// it does not write a third time, and answers 200 with the run that beat
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_decides_again_once_and_a_second_loss_answers_200() {
+    for (name, backend, state) in envs().await {
+        register(&state, "wf-once", "1.0.0").await;
+        for round in 0..5 {
+            let key = format!("once:{round}");
+            let what = format!("{name} round {round}");
+            let input = json!({ "round": round });
+            let (st, answer) = start(&state, keyed("wf-once", input.clone(), &key, None)).await;
+            let old = assert_created(&what, st, &answer, &key);
+            finish(&backend, &old, WorkflowStatus::Failed).await;
+
+            let hook = Arc::new(EndsTheWinner::new(
+                backend.clone(),
+                3,
+                vec![(0, 1), (1, 1), (2, 1), (1, 2), (2, 2)],
+                2,
+            ));
+            let body = keyed("wf-once", input, &key, Some("failed_only"));
+            let answers = at_once(&racing_state(&backend, &hook), body, 3).await;
+            assert_eq!(
+                hook.taken.load(Ordering::SeqCst),
+                3,
+                "{what}: the second start loses once, the third twice: {answers:?}"
+            );
+            let mut created = Vec::new();
+            for (st, answer) in answers.iter().filter(|(st, _)| *st == StatusCode::CREATED) {
+                created.push(assert_created(&what, *st, answer, &key));
+            }
+            assert_eq!(created.len(), 2, "{what}: {answers:?}");
+            for id in &created {
+                assert_eq!(
+                    status_of(&backend, id).await,
+                    WorkflowStatus::Failed,
+                    "{what}"
+                );
+            }
+
+            // The key names the second start's run, the one that beat the
+            // third start at its second write.
+            let (_, found) = lookup(&state, &key).await;
+            let named = uuid_of(&found["executions"][0]["execution_id"]);
+            let beat = created
+                .iter()
+                .find(|id| exec_id(id).0 == named)
+                .unwrap_or_else(|| panic!("{what}: the key names no run of this race: {found}"));
+            let (st, answer) = answers
+                .iter()
+                .find(|(st, _)| *st != StatusCode::CREATED)
+                .unwrap();
+            assert_existing(&what, *st, answer, &key, beat, beat, "failed");
+        }
+        assert_eq!(
+            runs(&backend).await,
+            5 * 3,
+            "{name}: a third write made a run"
+        );
+    }
+}
+
 // ── The key itself ──────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1136,6 +1386,80 @@ async fn lookup_of_another_tenants_key_is_empty() {
 
 // ── Continue-as-new ─────────────────────────────────────────────────────────
 
+/// Roll a run of `workflow_id` v1.0.0 over at `segment` as the worker does
+/// at a strategy ceiling: segment `number` first, then `SegmentBoundary` on
+/// `segment`, then `segment` ends `limit_exceeded` with its item settled.
+/// The only live item in the store must be `segment`'s start item. Returns
+/// the new segment.
+async fn roll_over(
+    name: &str,
+    backend: &Arc<dyn StateBackend>,
+    workflow_id: &str,
+    segment: &ExecutionId,
+    number: u32,
+) -> ExecutionId {
+    let item = backend
+        .claim_work_item("w", &["python_tool"])
+        .await
+        .unwrap()
+        .expect("the segment's start item");
+    assert_eq!(&item.execution_id, segment, "{name}");
+    let workflow: WorkflowIr = serde_json::from_value(ir(workflow_id, "1.0.0")).unwrap();
+    let start_node = workflow.node("py_start").unwrap();
+    let carried = jamjet_state::materialize(backend.as_ref(), segment)
+        .await
+        .unwrap();
+    let payload = jamjet_scheduler::build_work_item_payload(
+        &workflow,
+        "py_start",
+        start_node,
+        &carried
+            .current_state
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        workflow_id,
+        "1.0.0",
+    );
+    let next = jamjet_state::start_next_segment(
+        backend.as_ref(),
+        segment,
+        &carried,
+        workflow_id,
+        "1.0.0",
+        number,
+        "py_start",
+        "python_tool",
+        payload,
+        3,
+        jamjet_state::DEFAULT_TENANT,
+    )
+    .await
+    .unwrap();
+    let seq = backend.latest_sequence(segment).await.unwrap() + 1;
+    backend
+        .append_event(Event::new(
+            segment.clone(),
+            seq,
+            EventKind::SegmentBoundary {
+                segment_number: number,
+                next_execution_id: next.to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(backend
+        .finalize_rollover_fenced(segment, item.id, item.lease_fence)
+        .await
+        .unwrap());
+    assert_eq!(
+        status_of(backend, &segment.to_string()).await,
+        WorkflowStatus::LimitExceeded,
+        "{name}"
+    );
+    next
+}
+
 /// A run that rolled over is one run: the key names its first segment, and
 /// the answer points at the segment running now. The root ended
 /// `limit_exceeded` when it rolled over, which is not a failure of the run.
@@ -1146,69 +1470,7 @@ async fn a_rolled_over_run_answers_its_latest_segment() {
         let (st, body) = start(&state, keyed("wf-roll", json!({ "n": 1 }), "roll:1", None)).await;
         let root_id = assert_created(name, st, &body, "roll:1");
         let root = exec_id(&root_id);
-
-        // Roll the run over as the worker does at a strategy ceiling: the next
-        // segment first, then `SegmentBoundary` on the root, then the root
-        // ends `limit_exceeded` with its item settled.
-        let item = backend
-            .claim_work_item("w", &["python_tool"])
-            .await
-            .unwrap()
-            .expect("the start item");
-        assert_eq!(item.execution_id, root, "{name}");
-        let workflow: WorkflowIr = serde_json::from_value(ir("wf-roll", "1.0.0")).unwrap();
-        let start_node = workflow.node("py_start").unwrap();
-        let carried = jamjet_state::materialize(backend.as_ref(), &root)
-            .await
-            .unwrap();
-        let payload = jamjet_scheduler::build_work_item_payload(
-            &workflow,
-            "py_start",
-            start_node,
-            &carried
-                .current_state
-                .as_object()
-                .cloned()
-                .unwrap_or_default(),
-            "wf-roll",
-            "1.0.0",
-        );
-        let segment = jamjet_state::start_next_segment(
-            backend.as_ref(),
-            &root,
-            &carried,
-            "wf-roll",
-            "1.0.0",
-            1,
-            "py_start",
-            "python_tool",
-            payload,
-            3,
-            jamjet_state::DEFAULT_TENANT,
-        )
-        .await
-        .unwrap();
-        let seq = backend.latest_sequence(&root).await.unwrap() + 1;
-        backend
-            .append_event(Event::new(
-                root.clone(),
-                seq,
-                EventKind::SegmentBoundary {
-                    segment_number: 1,
-                    next_execution_id: segment.to_string(),
-                },
-            ))
-            .await
-            .unwrap();
-        assert!(backend
-            .finalize_rollover_fenced(&root, item.id, item.lease_fence)
-            .await
-            .unwrap());
-        assert_eq!(
-            status_of(&backend, &root_id).await,
-            WorkflowStatus::LimitExceeded,
-            "{name}"
-        );
+        let segment = roll_over(name, &backend, "wf-roll", &root, 1).await;
         let segment_id = segment.to_string();
 
         for reuse in [None, Some("never"), Some("failed_only")] {
@@ -1256,6 +1518,75 @@ async fn a_rolled_over_run_answers_its_latest_segment() {
         assert_ne!(new, segment_id, "{name}");
         let (st, body) = start(&state, keyed("wf-roll", json!({ "n": 1 }), "roll:1", None)).await;
         assert_existing(name, st, &body, "roll:1", &new, &new, "running");
+    }
+}
+
+/// A run that rolled over twice is judged by its third segment. The walk goes
+/// on past the first link, each link is checked against the segment before
+/// it, and every log on the way is read: the middle segment ended
+/// `limit_exceeded` too, so stopping there would let `failed_only` start a
+/// second live run beside the third segment.
+#[tokio::test]
+async fn a_run_that_rolled_over_twice_answers_its_last_segment() {
+    for (name, backend, state) in envs().await {
+        register(&state, "wf-roll2", "1.0.0").await;
+        let body = |reuse| keyed("wf-roll2", json!({ "n": 2 }), "roll:2", reuse);
+        let (st, answer) = start(&state, body(None)).await;
+        let root_id = assert_created(name, st, &answer, "roll:2");
+        let root = exec_id(&root_id);
+        let middle = roll_over(name, &backend, "wf-roll2", &root, 1).await;
+        let last = roll_over(name, &backend, "wf-roll2", &middle, 2).await;
+        let last_id = last.to_string();
+        assert_eq!(runs(&backend).await, 3, "{name}: the root and two segments");
+
+        for reuse in [None, Some("never"), Some("failed_only")] {
+            let (st, answer) = start(&state, body(reuse)).await;
+            assert_existing(
+                &format!("{name} reuse {reuse:?}"),
+                st,
+                &answer,
+                "roll:2",
+                &root_id,
+                &last_id,
+                "running",
+            );
+        }
+        assert_eq!(
+            runs(&backend).await,
+            3,
+            "{name}: a start made a run beside the live segment"
+        );
+        let (_, found) = lookup(&state, "roll:2").await;
+        let listed = found["executions"].as_array().cloned().unwrap_or_default();
+        assert_eq!(listed.len(), 1, "{name}: {found}");
+        assert_eq!(uuid_of(&listed[0]["execution_id"]), root.0, "{name}");
+        assert_eq!(
+            uuid_of(&listed[0]["current_execution_id"]),
+            last.0,
+            "{name}: {found}"
+        );
+        assert_eq!(listed[0]["current_status"], "running", "{name}: {found}");
+
+        // An event this build cannot read in the middle segment's log could
+        // be a link of its own, so which segment runs now is not known.
+        let seq = backend.latest_sequence(&middle).await.unwrap() + 1;
+        backend
+            .append_event(Event::new(middle.clone(), seq, EventKind::Unknown))
+            .await
+            .unwrap();
+        for reuse in [None, Some("failed_only")] {
+            let (st, answer) = start(&state, body(reuse)).await;
+            assert_eq!(
+                st,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{name} reuse {reuse:?}: {answer}"
+            );
+            let message = answer["error"].as_str().unwrap_or_default();
+            assert!(message.contains("cannot read"), "{name}: {answer}");
+        }
+        let (st, found) = lookup(&state, "roll:2").await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{name}: {found}");
+        assert_eq!(runs(&backend).await, 3, "{name}: a run was made");
     }
 }
 

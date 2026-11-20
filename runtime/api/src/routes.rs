@@ -443,7 +443,8 @@ async fn start_execution(
 /// With `key`, the key is claimed in that same step. A key that already
 /// names a run of the same workflow, version and input answers 200 with that
 /// run, unless `failed_only` lets a new run take it over; under another
-/// workflow, version or input it is 409.
+/// workflow, version or input it is 409. A start that loses a race for the
+/// key decides again, once, against the run that won.
 pub async fn start_run(
     state: &AppState,
     tenant_id: &TenantId,
@@ -464,7 +465,7 @@ pub async fn start_run(
     // A key someone holds is judged first: it answers with its run, or
     // refuses, before anything is built. The read is advisory; the claim in
     // the start's own write decides (see `start_execution_keyed` below).
-    let claim = match &key {
+    let keyed = match &key {
         None => None,
         Some(key) => {
             let mut claim = jamjet_state::RunKeyClaim {
@@ -482,7 +483,7 @@ pub async fn start_run(
                 }
                 claim.replaces = Some(run.record.execution_id);
             }
-            Some(claim)
+            Some((claim, key.reuse))
         }
     };
 
@@ -589,7 +590,7 @@ pub async fn start_run(
     // ONE write for the run's start (see `start_execution_atomic`): a
     // scheduler tick between separate writes found the run live with its
     // start node unscheduled and scheduled it a second time.
-    let Some(claim) = claim else {
+    let Some((mut claim, reuse)) = keyed else {
         backend
             .start_execution_atomic(execution, started, scheduled, work_item)
             .await?;
@@ -598,23 +599,39 @@ pub async fn start_run(
             Json(json!({ "execution_id": execution_id.to_string() })),
         ));
     };
-    match backend
-        .start_execution_keyed(execution, started, scheduled, work_item, claim.clone())
-        .await?
-    {
-        jamjet_state::KeyedStart::Started => Ok(crate::run_key::created_answer(
-            &claim.run_key,
-            &execution_id,
-        )),
-        // Another start with this key wrote first, after the read above.
-        // Its run answers this start, judged once more against what the key
-        // holds now. This start does not try again, so one request makes at
-        // most one run.
-        jamjet_state::KeyedStart::Taken(winner) => {
-            crate::run_key::check_binding(&claim, &winner)?;
-            let run = crate::run_key::KeyedRun::read(backend.as_ref(), winner).await?;
-            Ok(run.start_answer(&claim.run_key))
+    // `Taken`: another start with this key wrote first, after the read above,
+    // and nothing of this start was written. It decides again against the
+    // run that won, as a start that read the key held does: another binding
+    // is 409, `failed_only` takes the key over from a run that has already
+    // ended without success, and any other run answers 200. It decides
+    // again once: a second `Taken` answers 200 with the run that beat it.
+    let mut decided_again = false;
+    loop {
+        let written = backend
+            .start_execution_keyed(
+                execution.clone(),
+                started.clone(),
+                scheduled.clone(),
+                work_item.clone(),
+                claim.clone(),
+            )
+            .await?;
+        let winner = match written {
+            jamjet_state::KeyedStart::Started => {
+                return Ok(crate::run_key::created_answer(
+                    &claim.run_key,
+                    &execution_id,
+                ))
+            }
+            jamjet_state::KeyedStart::Taken(winner) => winner,
+        };
+        crate::run_key::check_binding(&claim, &winner)?;
+        let run = crate::run_key::KeyedRun::read(backend.as_ref(), winner).await?;
+        if decided_again || !run.may_restart(reuse) {
+            return Ok(run.start_answer(&claim.run_key));
         }
+        claim.replaces = Some(run.record.execution_id);
+        decided_again = true;
     }
 }
 
