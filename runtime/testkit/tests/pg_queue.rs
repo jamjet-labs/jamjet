@@ -2,8 +2,8 @@
 //! do not reach: a claim that skips rows another transaction holds, many
 //! claimers on one queue, leases and parks on the database's clock while
 //! this process's clock is an hour wrong, a fast reclaim that skips a run or
-//! an item someone holds, a run's open items, and a mixed load that must not
-//! deadlock.
+//! an item someone holds and leaves a lease granted after its scan, a run's
+//! open items, and a mixed load that must not deadlock.
 //!
 //! A raw connection holds a row with `SELECT ... FOR UPDATE`, as a second
 //! engine in the middle of a write would. The clock cases run again in a
@@ -544,6 +544,111 @@ async fn fast_reclaim_skips_a_held_item() {
         .unwrap()
         .is_none());
     assert_eq!(row_of(&pool, lapsed).await.0, "pending", "reclaimed");
+}
+
+/// How long the first engine's claim waits between its scan and its write.
+/// Everything the second engine does in the case below lands inside it.
+const SCAN_TO_WRITE: Duration = Duration::from_secs(2);
+
+/// Wait until a call in `scope` reached `label#1`.
+async fn until_reached(scope: &Scope, label: &'static str, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while scope.fired(label, 1) == 0 {
+        assert!(Instant::now() < deadline, "{what}: never reached {label}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The fast reclaim scans for lapsed leases without a lock and writes
+/// later, run by run. Engine A's claim scans, finds item X's lease lapsed,
+/// and waits before its write. Meanwhile engine B's claim reclaims X and
+/// takes it under a new fence. A's write must leave X to B, as it must when
+/// X's run ended in between, where the write settles the run's lapsed items
+/// failed. On the unscoped store and through a tenant's view.
+#[tokio::test]
+async fn fast_reclaim_leaves_a_lease_granted_after_its_scan() {
+    let Some(db) = TestDatabase::fresh().await else {
+        return jamjet_testkit::skip("fast_reclaim_leaves_a_lease_granted_after_its_scan");
+    };
+    let pool = db.pool().await;
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('acme', 'acme')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (engine_a, engine_b) = (store(&db, settings()).await, store(&db, settings()).await);
+    for (view, ended) in [
+        ("unscoped", false),
+        ("unscoped", true),
+        ("acme", false),
+        ("acme", true),
+    ] {
+        let case = format!("{view}, run ended in between: {ended}");
+        let (a, b) = match view {
+            "unscoped" => (engine_a.clone(), engine_b.clone()),
+            tenant => (
+                engine_a.for_tenant(TenantId::from(tenant)),
+                engine_b.for_tenant(TenantId::from(tenant)),
+            ),
+        };
+        let run = new_run(&b).await;
+        let queue = format!("lapsed-{}", run.0.simple());
+        let x = enqueue(&b, &run, "x", &queue).await;
+        b.claim_work_item("w1", &[queue.as_str()])
+            .await
+            .unwrap()
+            .expect("claimable");
+        expire_by_the_database_clock(&pool, x).await;
+
+        // A's wait sits at the start of its transaction for X's run, after
+        // the scan and before the run's lock.
+        let scope = Scope::new();
+        scope.arm(ATTEMPT, 1, Fault::Hang(SCAN_TO_WRITE));
+        let start = Instant::now();
+        let first = tokio::spawn({
+            let (scope, a) = (scope.clone(), a.clone());
+            async move {
+                scope
+                    .run(a.claim_work_item("w-a", &["queue-of-nothing"]))
+                    .await
+            }
+        });
+        until_reached(&scope, ATTEMPT, &case).await;
+        let taken = b
+            .claim_work_item("w2", &[queue.as_str()])
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{case}: B's claim reclaims X and takes it"));
+        assert_eq!((taken.id, taken.attempt), (x, 1), "{case}");
+        if ended {
+            b.update_execution_status(&run, WorkflowStatus::Cancelled)
+                .await
+                .unwrap();
+        }
+        assert!(
+            start.elapsed() < SCAN_TO_WRITE,
+            "{case}: B took {:?}, longer than A's wait, so A may have written first",
+            start.elapsed()
+        );
+
+        let a_took = first.await.unwrap().unwrap();
+        assert!(a_took.is_none(), "{case}: A's queue is empty");
+        assert_eq!(
+            row_of(&pool, x).await,
+            ("claimed".to_string(), 1, taken.lease_fence),
+            "{case}: X is still B's"
+        );
+        let held = b.get_work_item(x).await.unwrap().expect("X is there");
+        assert_eq!(held.worker_id.as_deref(), Some("w2"), "{case}");
+        assert!(
+            held.lease_expires_at.expect("a lease") > database_now(&pool).await,
+            "{case}: B's lease is live"
+        );
+        assert_eq!(
+            kinds_of(&b, &run).await,
+            ["node_failed", "retry_scheduled"],
+            "{case}: only B's reclaim recorded the lapse"
+        );
+    }
 }
 
 /// A run's pending and claimed items, oldest first, on the unscoped store
