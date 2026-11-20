@@ -603,6 +603,36 @@ async fn keys_are_per_tenant() {
         globex.get_run_key("shared:1").await.unwrap(),
         Some(record(&g.id()))
     );
+
+    // A globex start that names acme's run as `replaces` finds globex's own
+    // key, and acme's key stays where it was.
+    let stray = start("globex", "begin");
+    assert_eq!(
+        keyed(&globex, &stray, claim("shared:1", Some(&a.id())))
+            .await
+            .unwrap(),
+        KeyedStart::Taken(record(&g.id())),
+        "globex moved acme's key"
+    );
+    let globex_store = Store {
+        name: "scoped globex",
+        backend: Arc::new(file.for_tenant(TenantId::from("globex"))),
+        pool: Some(file.pool()),
+        tenant: "globex",
+    };
+    assert_absent(&globex_store, &stray).await;
+    assert_eq!(
+        acme.get_run_key("shared:1").await.unwrap(),
+        Some(record(&a.id())),
+        "acme's key was moved"
+    );
+    assert_eq!(
+        keyed(&acme, &start("acme", "begin"), claim("shared:1", None))
+            .await
+            .unwrap(),
+        KeyedStart::Taken(record(&a.id())),
+        "acme's retry"
+    );
     assert_eq!(
         key_rows(&file.pool(), "shared:1").await,
         vec![
@@ -614,11 +644,11 @@ async fn keys_are_per_tenant() {
     // The unscoped backends take the tenant from the work item.
     let sqlite = sqlite_file("tenants_base").await;
     let pool = sqlite.pool();
-    let unscoped: Vec<(&str, Arc<dyn StateBackend>)> = vec![
-        ("memory", Arc::new(InMemoryBackend::new())),
-        ("sqlite", Arc::new(sqlite)),
+    let unscoped: Vec<(&'static str, Arc<dyn StateBackend>, Option<SqlitePool>)> = vec![
+        ("memory", Arc::new(InMemoryBackend::new()), None),
+        ("sqlite", Arc::new(sqlite), Some(pool)),
     ];
-    for (name, b) in unscoped {
+    for (name, b, pool) in unscoped {
         let a = start("acme", "begin");
         let g = start("globex", "begin");
         assert_eq!(
@@ -631,15 +661,90 @@ async fn keys_are_per_tenant() {
             KeyedStart::Started,
             "{name}: globex's item found acme's key"
         );
-        if name == "sqlite" {
+
+        // A globex item that names acme's run as `replaces`.
+        let stray = start("globex", "begin");
+        assert_eq!(
+            keyed(&*b, &stray, claim("shared:2", Some(&a.id())))
+                .await
+                .unwrap(),
+            KeyedStart::Taken(record(&g.id())),
+            "{name}: globex's item moved acme's key"
+        );
+        let store = Store {
+            name,
+            backend: b.clone(),
+            pool: pool.clone(),
+            tenant: "globex",
+        };
+        assert_absent(&store, &stray).await;
+        assert_eq!(
+            keyed(&*b, &start("acme", "begin"), claim("shared:2", None))
+                .await
+                .unwrap(),
+            KeyedStart::Taken(record(&a.id())),
+            "{name}: acme's retry"
+        );
+
+        if let Some(pool) = &pool {
             assert_eq!(
-                key_rows(&pool, "shared:2").await,
+                key_rows(pool, "shared:2").await,
                 vec![
                     ("acme".to_string(), a.id().0.to_string()),
                     ("globex".to_string(), g.id().0.to_string()),
-                ]
+                ],
+                "{name}"
             );
         }
+    }
+}
+
+/// A scoped backend claims a key under its own tenant, whatever tenant the
+/// work item carries. Items stamped `default` are normal: the base backend
+/// stamps its items that way.
+#[tokio::test]
+async fn a_scoped_backend_claims_the_key_under_its_own_tenant() {
+    let file = sqlite_file("scope_tenant").await;
+    register_tenant(&file, "acme").await;
+    register_tenant(&file, "globex").await;
+    let acme = file.for_tenant(TenantId::from("acme"));
+    let globex = file.for_tenant(TenantId::from("globex"));
+
+    // (key, the tenant on acme's item, the tenant on globex's item)
+    for (key, acme_item, globex_item) in [
+        ("stamped:default", "default", "default"),
+        ("stamped:crossed", "globex", "acme"),
+    ] {
+        let a = start(acme_item, "begin");
+        let g = start(globex_item, "begin");
+        assert_eq!(
+            keyed(&acme, &a, claim(key, None)).await.unwrap(),
+            KeyedStart::Started,
+            "{key}"
+        );
+        assert_eq!(
+            keyed(&globex, &g, claim(key, None)).await.unwrap(),
+            KeyedStart::Started,
+            "{key}: globex found acme's key"
+        );
+        assert_eq!(
+            acme.get_run_key(key).await.unwrap(),
+            Some(record(&a.id())),
+            "{key}: acme"
+        );
+        assert_eq!(
+            globex.get_run_key(key).await.unwrap(),
+            Some(record(&g.id())),
+            "{key}: globex"
+        );
+        assert_eq!(
+            key_rows(&file.pool(), key).await,
+            vec![
+                ("acme".to_string(), a.id().0.to_string()),
+                ("globex".to_string(), g.id().0.to_string()),
+            ],
+            "{key}"
+        );
     }
 }
 
