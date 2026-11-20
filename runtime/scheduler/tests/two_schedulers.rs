@@ -155,7 +155,14 @@ impl Pair {
         }
     }
 
-    /// The race this file is about opened at least once.
+    /// Passes the store refused as stale, over both schedulers.
+    fn stale_passes(&self) -> u64 {
+        self.schedulers.iter().map(|s| s.stale_passes()).sum()
+    }
+
+    /// The race this file is about opened at least once: both schedulers
+    /// read the log before either wrote, and the store refused at least one
+    /// pass because the other's landed first.
     fn assert_the_race_opened(&self) {
         assert!(
             self.rendezvous.met() >= 1,
@@ -163,6 +170,11 @@ impl Pair {
              the test did not race them",
             self.store.name(),
             self.rendezvous.timed_out.load(Ordering::SeqCst)
+        );
+        assert!(
+            self.stale_passes() >= 1,
+            "{}: the store refused no pass as stale, so no two passes raced",
+            self.store.name()
         );
     }
 }
@@ -378,6 +390,7 @@ async fn two_schedulers_finish_a_run_once() {
             Some(true),
             "{name}: the run must finish in a round where both schedulers read it"
         );
+        pair.assert_the_race_opened();
         let events = backend.get_events(&execution_id).await.unwrap();
         let terminal = events
             .iter()

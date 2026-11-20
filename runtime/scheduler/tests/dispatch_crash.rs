@@ -1,11 +1,11 @@
 //! A store that refuses one write in the middle of a scheduler step.
 //!
-//! Each step below is two writes today: the scheduler appends an event and
-//! then enqueues the item, or the sweep settles an expired item and then
-//! appends the events that record it. When the second write fails (a busy
-//! database, a crash) the first stays, and the run holds half a step: a node
+//! A step that takes two writes leaves half of itself when the second write
+//! fails (a busy database, a crash), and nothing later repairs it: a node
 //! scheduled with no item, a dead-lettered item with no failure recorded, a
-//! failure with no retry. Nothing later repairs it.
+//! failure with no retry. The scheduler's dispatch is one write now (its
+//! pass). The sweep still settles an expired item and then appends the
+//! events that record it.
 //!
 //! The store refuses the chosen call once (`Intercept`'s `before` hook), and
 //! each test checks the refusal happened.
@@ -23,28 +23,44 @@ use support::{
     kinds, linear, node, once_each, per_node, scheduled, status, stores, workflow, Worker,
 };
 
-/// Refuses the first call `pick` matches, once.
+/// Refuses the first call `pick` matches, once, and counts the calls
+/// `watch` matches.
 struct FailOnce {
     pick: fn(&Op<'_>) -> bool,
     fired: AtomicUsize,
+    watch: fn(&Op<'_>) -> bool,
+    watched: AtomicUsize,
 }
 
 impl FailOnce {
     fn new(pick: fn(&Op<'_>) -> bool) -> Arc<Self> {
+        Self::watching(pick, |_| false)
+    }
+
+    fn watching(pick: fn(&Op<'_>) -> bool, watch: fn(&Op<'_>) -> bool) -> Arc<Self> {
         Arc::new(Self {
             pick,
             fired: AtomicUsize::new(0),
+            watch,
+            watched: AtomicUsize::new(0),
         })
     }
 
     fn fired(&self) -> usize {
         self.fired.load(Ordering::SeqCst)
     }
+
+    fn watched(&self) -> usize {
+        self.watched.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait::async_trait]
 impl Hooks for FailOnce {
     async fn before(&self, op: &Op<'_>) -> Option<StateBackendError> {
+        if (self.watch)(op) {
+            self.watched.fetch_add(1, Ordering::SeqCst);
+        }
         if (self.pick)(op)
             && self
                 .fired
@@ -59,12 +75,25 @@ impl Hooks for FailOnce {
 
 const TICKS: usize = 20;
 
+/// The dispatch was a `NodeScheduled` append and then an enqueue, and a
+/// failed enqueue stranded the node. Now both are in the scheduler's one
+/// pass, and the scheduler neither enqueues nor appends on its own, so there
+/// is no second write left to fail. The store refuses the pass instead:
+/// nothing of it lands, and a later tick dispatches the node again.
 #[tokio::test]
 async fn a_failed_enqueue_after_node_scheduled_does_not_strand_the_node() {
     for store in stores().await {
         let name = store.name();
         let backend = store.backend();
-        let hook = FailOnce::new(|op| matches!(op, Op::EnqueueWorkItem(_)));
+        let hook = FailOnce::watching(
+            |op| matches!(op, Op::CommitSchedulerPass(_)),
+            |op| {
+                matches!(
+                    op,
+                    Op::EnqueueWorkItem(_) | Op::AppendEvent(_) | Op::FinishExecution { .. }
+                )
+            },
+        );
         let scheduler = Scheduler::new(Arc::new(Intercept::new(backend.clone(), hook.clone())));
         let execution_id = support::start_run(backend.as_ref(), linear(&["a", "b", "c"])).await;
         let worker = Worker::default();
@@ -75,7 +104,12 @@ async fn a_failed_enqueue_after_node_scheduled_does_not_strand_the_node() {
                 break;
             }
         }
-        assert_eq!(hook.fired(), 1, "{name}: the store refused one enqueue");
+        assert_eq!(hook.fired(), 1, "{name}: the store refused one pass");
+        assert_eq!(
+            hook.watched(),
+            0,
+            "{name}: the scheduler wrote an event, an item or a finish outside its passes"
+        );
         let events = backend.get_events(&execution_id).await.unwrap();
         let state = status(backend.as_ref(), &execution_id).await;
         assert_eq!(
@@ -91,6 +125,12 @@ async fn a_failed_enqueue_after_node_scheduled_does_not_strand_the_node() {
             worker.items_per_node(),
             once_each(&["a", "b", "c"]),
             "{name}: every node has one item"
+        );
+        assert_eq!(
+            per_node(&events, scheduled),
+            once_each(&["a", "b", "c"]),
+            "{name}: every node is scheduled once; log {:?}",
+            kinds(&events)
         );
     }
 }

@@ -272,6 +272,16 @@ impl Worker {
         }
     }
 
+    /// The items the worker held for `node`.
+    pub fn items_of(&self, node: &str) -> BTreeSet<Uuid> {
+        self.seen
+            .lock()
+            .unwrap()
+            .get(node)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// How many distinct items the worker held for each node.
     pub fn items_per_node(&self) -> BTreeMap<String, usize> {
         self.seen

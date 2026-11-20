@@ -7,7 +7,9 @@ mod support;
 use axum::http::StatusCode;
 use jamjet_state::backend::StateBackend;
 use jamjet_state::InMemoryBackend;
+use jamjet_testkit::{Hooks, Intercept, Op};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use support::{make_state, post, register_and_start, TestBackend};
 
@@ -173,6 +175,175 @@ async fn hand_enqueue_of_a_node_with_a_live_item_is_refused() {
             st == StatusCode::CONFLICT && live == 1,
             "{name}: a hand enqueue of a node with a live item is refused and adds \
              nothing; got {st} {body}, {live} live items"
+        );
+        assert_eq!(
+            body,
+            json!({ "error": "node already has a pending or claimed item" }),
+            "{name}"
+        );
+    }
+}
+
+/// Take the node's item and settle it, as a worker that ran it would, so
+/// the node has no live item.
+async fn settle_the_start_item(backend: &dyn StateBackend, queue: &str) {
+    let item = backend
+        .claim_work_item("test-worker", &[queue])
+        .await
+        .unwrap()
+        .expect("the start node's item");
+    assert!(backend
+        .complete_work_item_fenced(item.id, item.lease_fence)
+        .await
+        .unwrap());
+}
+
+/// A finished run gets no new item: the hand enqueue's pass is refused, as
+/// the scheduler's is.
+#[tokio::test]
+async fn hand_enqueue_on_a_finished_run_is_refused() {
+    let ir = external_fn_ir();
+    let queue = ir["nodes"]["authorize"]["kind"]["queue"].clone();
+    for backend in support::backends().await {
+        let name = backend.name();
+        let state = make_state(backend.dyn_backend());
+        let execution_id = register_and_start(&state, ir.clone(), json!({})).await;
+        let store = backend.dyn_backend();
+        settle_the_start_item(store.as_ref(), queue.as_str().unwrap()).await;
+        let id = jamjet_core::workflow::ExecutionId(
+            uuid::Uuid::parse_str(execution_id.trim_start_matches("exec_")).unwrap(),
+        );
+        store
+            .finish_execution(
+                jamjet_state::Event::new(
+                    id.clone(),
+                    0,
+                    jamjet_state::EventKind::WorkflowCompleted {
+                        final_state: json!({}),
+                    },
+                ),
+                jamjet_core::workflow::WorkflowStatus::Completed,
+            )
+            .await
+            .unwrap();
+        let before = store.get_events(&id).await.unwrap().len();
+
+        let (st, body) = post(
+            &state,
+            "/work-items",
+            json!({
+                "execution_id": execution_id,
+                "node_id": "authorize",
+                "queue_type": queue,
+                "payload": {}
+            }),
+        )
+        .await;
+        assert_eq!(
+            (st, body),
+            (
+                StatusCode::CONFLICT,
+                json!({ "error": "execution is Completed" })
+            ),
+            "{name}"
+        );
+        assert_eq!(
+            live_items(&backend, &execution_id, "authorize").await,
+            0,
+            "{name}: no item"
+        );
+        assert_eq!(
+            store.get_events(&id).await.unwrap().len(),
+            before,
+            "{name}: nothing appended to the finished run"
+        );
+    }
+}
+
+/// Moves the run's log once, right after the route read its last sequence,
+/// as another writer landing between the read and the write would, and
+/// counts the passes the route sends.
+struct MoveTheLogOnce {
+    inner: Arc<dyn StateBackend>,
+    armed: AtomicBool,
+    passes: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Hooks for MoveTheLogOnce {
+    async fn before(&self, op: &Op<'_>) -> Option<jamjet_state::StateBackendError> {
+        if matches!(op, Op::CommitSchedulerPass(_)) {
+            self.passes.fetch_add(1, Ordering::SeqCst);
+        }
+        None
+    }
+
+    async fn after(&self, op: &Op<'_>) {
+        let Op::LatestSequence(execution_id) = op else {
+            return;
+        };
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.inner
+                .append_event(jamjet_state::Event::new(
+                    (*execution_id).clone(),
+                    0,
+                    jamjet_state::EventKind::NodeStarted {
+                        node_id: "authorize".into(),
+                        worker_id: "another-worker".into(),
+                        attempt: 0,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// A pass refused only because the log moved is sent again from the
+/// sequence the store gave back, and the hand enqueue goes through.
+#[tokio::test]
+async fn a_hand_enqueue_is_tried_again_when_the_log_moved() {
+    let ir = external_fn_ir();
+    let queue = ir["nodes"]["authorize"]["kind"]["queue"].clone();
+    for backend in support::backends().await {
+        let name = backend.name();
+        let hooks = Arc::new(MoveTheLogOnce {
+            inner: backend.dyn_backend(),
+            armed: AtomicBool::new(false),
+            passes: AtomicUsize::new(0),
+        });
+        let state = make_state(Arc::new(Intercept::new(
+            backend.dyn_backend(),
+            hooks.clone(),
+        )));
+        let execution_id = register_and_start(&state, ir.clone(), json!({})).await;
+        settle_the_start_item(backend.dyn_backend().as_ref(), queue.as_str().unwrap()).await;
+
+        hooks.armed.store(true, Ordering::SeqCst);
+        let (st, body) = post(
+            &state,
+            "/work-items",
+            json!({
+                "execution_id": execution_id,
+                "node_id": "authorize",
+                "queue_type": queue,
+                "payload": {}
+            }),
+        )
+        .await;
+        assert!(
+            !hooks.armed.load(Ordering::SeqCst),
+            "{name}: the log was moved"
+        );
+        assert_eq!(
+            (st, hooks.passes.load(Ordering::SeqCst)),
+            (StatusCode::CREATED, 2),
+            "{name}: the first pass is stale and the second lands; body {body}"
+        );
+        assert_eq!(
+            live_items(&backend, &execution_id, "authorize").await,
+            1,
+            "{name}: one new item"
         );
     }
 }

@@ -703,4 +703,15 @@ impl StateBackend for HookedBackend {
     ) -> jamjet_state::backend::BackendResult<()> {
         self.inner.update_tenant(tenant).await
     }
+
+    // ── Storage lane ─────────────────────────────────────────────────────
+
+    /// Delegated, so a scheduler on this wrapper writes its pass in the
+    /// wrapped backend's one step and not in the trait default's steps.
+    async fn commit_scheduler_pass(
+        &self,
+        pass: jamjet_state::SchedulerPass,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::PassCommit> {
+        self.inner.commit_scheduler_pass(pass).await
+    }
 }

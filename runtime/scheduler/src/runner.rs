@@ -1,9 +1,10 @@
 use jamjet_core::node::{NodeId, NodeKind};
 use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::WorkflowIr;
-use jamjet_state::backend::{StateBackend, WorkItem};
+use jamjet_state::backend::{PassCommit, SchedulerPass, StateBackend, WorkItem};
 use jamjet_state::event::EventKind;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
@@ -11,6 +12,10 @@ use uuid::Uuid;
 
 /// How many running executions the scheduler reads per page.
 const RUNNING_PAGE: u32 = 100;
+
+/// How many times one tick builds a run's pass: once, and again after each
+/// pass the store refused as stale, at most twice more.
+const PASS_TRIES: usize = 3;
 
 /// Configuration for the scheduler.
 #[derive(Debug, Clone)]
@@ -56,6 +61,8 @@ pub struct Scheduler {
     /// Seals the expiries and escalations the deadline sweep records into the
     /// audit chain.
     sealer: Option<Arc<dyn jamjet_state::approvals::ApprovalSealer>>,
+    /// Passes the store refused as stale. See [`Scheduler::stale_passes`].
+    stale_passes: AtomicU64,
 }
 
 impl Scheduler {
@@ -66,7 +73,17 @@ impl Scheduler {
             ir_cache: Mutex::new(HashMap::new()),
             progress: Mutex::new(HashMap::new()),
             sealer: None,
+            stale_passes: AtomicU64::new(0),
         }
+    }
+
+    /// How many of this scheduler's passes the store refused as stale: the
+    /// run's log moved after the pass read it (another engine, a worker or
+    /// an API call wrote to the run), or a node the pass dispatched still had
+    /// a pending or claimed item. Nothing of such a pass was written, and the
+    /// scheduler built it again from the log.
+    pub fn stale_passes(&self) -> u64 {
+        self.stale_passes.load(Ordering::Relaxed)
     }
 
     /// Seal the expiries and escalations the deadline sweep records into the
@@ -381,7 +398,18 @@ impl Scheduler {
         Ok(Some(ir))
     }
 
-    /// For a given execution, find all nodes that can now run and enqueue them.
+    /// For a given execution, decide what the log now calls for (nodes to
+    /// fail, skip or dispatch, or the run's end) and write it all in one
+    /// pass ([`StateBackend::commit_scheduler_pass`]).
+    ///
+    /// The store refuses a pass as stale, writing none of it, when the run's
+    /// log moved after the pass read it, or when a node it dispatches still
+    /// has a pending or claimed item. The pass is then built again from the
+    /// whole log, at most twice more this tick. So two engines that fold the
+    /// same log never both record a decision. A node whose old item is still
+    /// live (a held node approved after the sweep requeued its item) holds
+    /// back its run's whole pass until that item settles: a run waits up to
+    /// one lease for its pass while a worker holds the old item.
     #[instrument(skip(self), fields(execution_id = %execution_id))]
     async fn schedule_runnable_nodes(
         &self,
@@ -393,7 +421,29 @@ impl Scheduler {
             warn!(%workflow_id, %workflow_version, "Workflow definition not found; cannot schedule");
             return Ok(());
         };
+        for _ in 0..PASS_TRIES {
+            if self
+                .schedule_pass(execution_id, &ir, workflow_id, workflow_version)
+                .await?
+                == PassEnd::Done
+            {
+                return Ok(());
+            }
+            self.stale_passes.fetch_add(1, Ordering::Relaxed);
+            debug!(execution_id = %execution_id, "scheduler pass was stale");
+        }
+        Ok(())
+    }
 
+    /// One pass of [`schedule_runnable_nodes`](Self::schedule_runnable_nodes):
+    /// fold the log, decide, commit.
+    async fn schedule_pass(
+        &self,
+        execution_id: &ExecutionId,
+        ir: &WorkflowIr,
+        workflow_id: &str,
+        workflow_version: &str,
+    ) -> Result<PassEnd, Box<dyn std::error::Error + Send + Sync>> {
         // Fold only the events appended since the last tick into the cached
         // progress for this execution. Completed/failed nodes never revert and
         // the IR is immutable, so replaying the whole event log every tick is
@@ -447,7 +497,7 @@ impl Scheduler {
                     warn!(execution_id = %execution_id, "Run stalled: its log holds event kinds this build cannot read");
                 }
             }
-            return Ok(());
+            return Ok(PassEnd::Done);
         }
 
         // Approval deadlines. Only an execution holding a node on a request
@@ -459,18 +509,36 @@ impl Scheduler {
         // tick (an expiry then fails the node below, like a rejection).
         // A failed sweep leaves the request open until a later tick retries:
         // late, never approved.
+        //
+        // A sweep that recorded anything moved the log past what this pass
+        // read, so the pass would be stale: it ends here, and the next tick
+        // folds what the sweep wrote.
         if progress
             .held
             .iter()
             .any(|n| progress.deadline_requests.contains(n))
         {
-            if let Err(e) = self
+            match self
                 .sweep_approval_deadlines(execution_id, chrono::Utc::now())
                 .await
             {
-                warn!(execution_id = %execution_id, "Approval deadline sweep failed: {e}");
+                Ok(sweep) if !sweep.expired.is_empty() || !sweep.escalated.is_empty() => {
+                    return Ok(PassEnd::Done);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(execution_id = %execution_id, "Approval deadline sweep failed: {e}");
+                }
             }
         }
+
+        // Everything below is decided from the log as folded up to here,
+        // and written together in one pass at the end. `seen` is the last
+        // event the pass read; the store refuses the pass if the log holds
+        // anything later.
+        let seen = progress.last_sequence;
+        let mut events: Vec<EventKind> = Vec::new();
+        let mut work_items: Vec<WorkItem> = Vec::new();
 
         // Fail nodes whose approval was rejected. Guarded by terminal_failed so
         // the emission fires exactly once: the next tick folds the NodeFailed,
@@ -491,7 +559,7 @@ impl Scheduler {
             .collect::<Vec<_>>()
         {
             if let Some(expires_at) = progress.expired.get(&node_id).copied() {
-                if let Some(fallback) = fallback_of(&ir, &node_id) {
+                if let Some(fallback) = fallback_of(ir, &node_id) {
                     // The decision goes into state under the engine's key, as an
                     // approval's does, so the fallback can read why it runs.
                     let mut record = serde_json::Map::new();
@@ -504,56 +572,40 @@ impl Scheduler {
                                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                         }),
                     );
-                    let seq = self.backend.latest_sequence(execution_id).await? + 1;
-                    self.backend
-                        .append_event(jamjet_state::Event::new(
-                            execution_id.clone(),
-                            seq,
-                            EventKind::NodeCompleted {
-                                node_id: node_id.clone(),
-                                output: serde_json::json!({
-                                    "decision": "expired",
-                                    "reason": reason,
-                                    "chosen_target": fallback,
-                                }),
-                                state_patch: serde_json::Value::Object(
-                                    [(
-                                        jamjet_state::approvals::APPROVALS_STATE_KEY.to_string(),
-                                        serde_json::Value::Object(record),
-                                    )]
-                                    .into_iter()
-                                    .collect(),
-                                ),
-                                duration_ms: 0,
-                                gen_ai_system: None,
-                                gen_ai_model: None,
-                                input_tokens: None,
-                                output_tokens: None,
-                                finish_reason: None,
-                                cost_usd: None,
-                                provenance: None,
-                                idempotency_key: None,
-                            },
-                        ))
-                        .await?;
-                    info!(execution_id = %execution_id, node_id = %node_id, %fallback, "Approval expired — routed to the fallback node");
+                    events.push(EventKind::NodeCompleted {
+                        node_id: node_id.clone(),
+                        output: serde_json::json!({
+                            "decision": "expired",
+                            "reason": reason,
+                            "chosen_target": fallback,
+                        }),
+                        state_patch: serde_json::Value::Object(
+                            [(
+                                jamjet_state::approvals::APPROVALS_STATE_KEY.to_string(),
+                                serde_json::Value::Object(record),
+                            )]
+                            .into_iter()
+                            .collect(),
+                        ),
+                        duration_ms: 0,
+                        gen_ai_system: None,
+                        gen_ai_model: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        finish_reason: None,
+                        cost_usd: None,
+                        provenance: None,
+                        idempotency_key: None,
+                    });
                     continue;
                 }
             }
-            let seq = self.backend.latest_sequence(execution_id).await? + 1;
-            self.backend
-                .append_event(jamjet_state::Event::new(
-                    execution_id.clone(),
-                    seq,
-                    EventKind::NodeFailed {
-                        node_id: node_id.clone(),
-                        error: reason,
-                        attempt: 0,
-                        retryable: false,
-                    },
-                ))
-                .await?;
-            info!(execution_id = %execution_id, node_id = %node_id, "Approval rejected — node failed");
+            events.push(EventKind::NodeFailed {
+                node_id: node_id.clone(),
+                error: reason,
+                attempt: 0,
+                retryable: false,
+            });
         }
 
         // FDL-3 skip cascade (the dead-edge fixpoint). A node whose EVERY
@@ -567,7 +619,7 @@ impl Scheduler {
         // skips >= 1 new node or stops, so it converges well within the cap.
         // The path an expired approval guarded never runs, whatever else leads
         // into it: see `expiry_blocked`.
-        let blocked = expiry_blocked(&ir, &progress.expired_fallbacks);
+        let blocked = expiry_blocked(ir, &progress.expired_fallbacks);
         let max_passes = ir.nodes.len() + 1;
         for _ in 0..max_passes {
             // Collect the nodes that become skippable in this pass against the
@@ -594,12 +646,12 @@ impl Scheduler {
                 }
                 let mut has_in_edge = false;
                 let mut all_dead = true;
-                for from in in_edge_sources(&ir, n) {
+                for from in in_edge_sources(ir, n) {
                     has_in_edge = true;
                     if !edge_dead(
                         from,
                         n,
-                        &ir,
+                        ir,
                         &progress.completed,
                         &progress.skipped,
                         &progress.routes,
@@ -628,35 +680,22 @@ impl Scheduler {
             // Sort for deterministic event sequencing (ir.nodes is a HashMap).
             newly_skippable.sort();
             for (node_id, reason) in newly_skippable {
-                let seq = self.backend.latest_sequence(execution_id).await? + 1;
                 let skip_event = jamjet_state::Event::new(
                     execution_id.clone(),
-                    seq,
+                    0,
                     EventKind::NodeSkipped {
                         node_id: node_id.clone(),
                         reason: reason.to_string(),
                     },
                 );
-                self.backend.append_event(skip_event.clone()).await?;
                 // Fold the skip into LOCAL progress immediately so the next pass
                 // (and this tick's dispatch) sees it — reaching the fixpoint
-                // within one tick rather than one skip per tick.
+                // within one tick rather than one skip per tick. Its sequence
+                // is 0, so `last_sequence` stays the last event read.
                 progress.apply(&skip_event);
-                info!(
-                    execution_id = %execution_id,
-                    node_id = %node_id,
-                    %reason,
-                    "Skipped node"
-                );
+                events.push(skip_event.kind);
             }
         }
-
-        // Persist the cascade's advance (skips + last_sequence) so an early
-        // return below (e.g. the concurrency cap) doesn't replay the same delta.
-        self.progress
-            .lock()
-            .unwrap()
-            .insert(execution_id.clone(), progress.clone());
 
         let completed = &progress.completed;
         let scheduled = &progress.scheduled;
@@ -673,31 +712,32 @@ impl Scheduler {
             "Checking for runnable nodes"
         );
 
-        // Concurrency limit: if this execution is already at the cap, skip dispatch.
-        if scheduled.len() >= self.config.max_concurrent_nodes_per_execution {
+        // Concurrency limit: at the cap nothing is dispatched and the run is
+        // not finished. The failures and skips decided above are still written.
+        let at_cap = scheduled.len() >= self.config.max_concurrent_nodes_per_execution;
+        if at_cap {
             debug!(
                 execution_id = %execution_id,
                 active = scheduled.len(),
                 limit = self.config.max_concurrent_nodes_per_execution,
                 "Concurrency limit reached — skipping dispatch"
             );
-            return Ok(());
         }
 
-        // Find nodes that are runnable and enqueue them.
-        let mut enqueued = 0usize;
-        for (node_id, node) in &ir.nodes {
+        // Find nodes that are runnable and dispatch them: none at the cap.
+        for (node_id, node) in ir.nodes.iter().take_while(|_| !at_cap) {
             // Backpressure: stop dispatching if we've hit the per-tick cap or the
             // concurrency limit (accounting for nodes dispatched this tick).
-            if enqueued >= self.config.max_dispatch_per_tick {
+            if work_items.len() >= self.config.max_dispatch_per_tick {
                 debug!(
                     execution_id = %execution_id,
-                    dispatched = enqueued,
+                    dispatched = work_items.len(),
                     "Per-tick dispatch limit reached — deferring remaining nodes"
                 );
                 break;
             }
-            if scheduled.len() + enqueued >= self.config.max_concurrent_nodes_per_execution {
+            if scheduled.len() + work_items.len() >= self.config.max_concurrent_nodes_per_execution
+            {
                 break;
             }
             if terminal_failed.contains(node_id.as_str()) {
@@ -708,7 +748,7 @@ impl Scheduler {
             }
             if is_runnable(
                 node_id,
-                &ir,
+                ir,
                 completed,
                 scheduled,
                 skipped,
@@ -721,26 +761,19 @@ impl Scheduler {
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| "general".to_string());
 
-                // Append NodeScheduled event first (sequenced).
-                let seq = self.backend.latest_sequence(execution_id).await? + 1;
-                let sched_event = jamjet_state::Event::new(
-                    execution_id.clone(),
-                    seq,
-                    EventKind::NodeScheduled {
-                        node_id: node_id.clone(),
-                        queue_type: queue_type.clone(),
-                    },
-                );
-                self.backend.append_event(sched_event).await?;
+                // The node's NodeScheduled, and its item beside it.
+                events.push(EventKind::NodeScheduled {
+                    node_id: node_id.clone(),
+                    queue_type: queue_type.clone(),
+                });
 
-                // Enqueue work item.
                 // Attempt budget from the node's named retry policy (Phase 2: full policy resolution).
                 let max_attempts = crate::payload::max_attempts_for(node.retry_policy.as_deref());
 
                 // One builder for every node, shared with `POST /executions` so
                 // the start node carries the same enrichment as every later one.
                 let payload = crate::payload::build_work_item_payload(
-                    &ir,
+                    ir,
                     node_id,
                     node,
                     &progress.final_state,
@@ -748,7 +781,8 @@ impl Scheduler {
                     workflow_version,
                 );
 
-                let item = WorkItem {
+                // The store stamps the item with the run's own tenant.
+                work_items.push(WorkItem {
                     id: Uuid::new_v4(),
                     execution_id: execution_id.clone(),
                     node_id: node_id.clone(),
@@ -761,28 +795,16 @@ impl Scheduler {
                     worker_id: None,
                     lease_fence: 0,
                     tenant_id: jamjet_state::DEFAULT_TENANT.to_string(),
-                };
-                self.backend.enqueue_work_item(item).await?;
-                enqueued += 1;
-
-                info!(
-                    execution_id = %execution_id,
-                    node_id = %node_id,
-                    "Enqueued node for execution"
-                );
+                });
             }
-        }
-
-        if enqueued > 0 {
-            debug!(execution_id = %execution_id, enqueued, "Dispatch complete");
         }
 
         // Completion detection: if nothing is in flight (no scheduled/running nodes)
         // and nothing new was dispatched this tick, the execution has reached a
-        // terminal state. Emit the terminal event and flip the stored status so the
-        // execution drops out of the running set on the next tick (fires once).
-        if enqueued == 0 && scheduled.is_empty() {
-            let (status, event_kind) = if terminal_failed.is_empty() {
+        // terminal state. The pass records the terminal event and flips the stored
+        // status, so the execution drops out of the running set on the next tick.
+        let finish = (!at_cap && work_items.is_empty() && scheduled.is_empty()).then(|| {
+            if terminal_failed.is_empty() {
                 (
                     jamjet_core::workflow::WorkflowStatus::Completed,
                     EventKind::WorkflowCompleted {
@@ -799,32 +821,110 @@ impl Scheduler {
                         error: format!("node(s) failed terminally: {}", failed.join(", ")),
                     },
                 )
-            };
-
-            // Event and status in one write (PR #140 re-review, I-A). A run
-            // cancelled since this tick read it keeps its cancel: nothing is
-            // appended after `WorkflowCancelled`.
-            match self
-                .backend
-                .finish_execution(
-                    jamjet_state::Event::new(execution_id.clone(), 0, event_kind),
-                    status.clone(),
-                )
-                .await?
-            {
-                jamjet_state::ExecutionFinish::Finished(_) => {
-                    info!(execution_id = %execution_id, ?status, "Execution reached terminal state");
-                }
-                jamjet_state::ExecutionFinish::AlreadyTerminal(prior) => {
-                    debug!(execution_id = %execution_id, ?prior, "Execution already terminal; nothing to record");
-                }
             }
-            // Execution is terminal; drop its progress so the cache doesn't grow
-            // without bound as executions complete.
-            self.progress.lock().unwrap().remove(execution_id);
-        }
+        });
 
-        Ok(())
+        let pass = SchedulerPass {
+            execution_id: execution_id.clone(),
+            seen_sequence: seen,
+            events,
+            work_items,
+            finish,
+        };
+        if pass.is_empty() {
+            // Nothing to record, and the cache already holds this fold.
+            return Ok(PassEnd::Done);
+        }
+        let recorded = pass.events.clone();
+        let dispatched = pass.work_items.len();
+        let finished = pass.finish.as_ref().map(|(status, _)| status.clone());
+        match self.backend.commit_scheduler_pass(pass).await {
+            Ok(PassCommit::Committed { .. }) => {
+                log_recorded(execution_id, &recorded);
+                if dispatched > 0 {
+                    debug!(execution_id = %execution_id, dispatched, "Dispatch complete");
+                }
+                match finished {
+                    Some(status) => {
+                        info!(execution_id = %execution_id, ?status, "Execution reached terminal state");
+                        // Execution is terminal; drop its progress so the cache doesn't grow
+                        // without bound as executions complete.
+                        self.progress.lock().unwrap().remove(execution_id);
+                    }
+                    None => {
+                        // `last_sequence` is still the last event the pass read, so the
+                        // next tick reads this pass's events back from the log and folds
+                        // them. Folding the skips folded above again changes nothing.
+                        self.progress
+                            .lock()
+                            .unwrap()
+                            .insert(execution_id.clone(), progress);
+                    }
+                }
+                Ok(PassEnd::Done)
+            }
+            Ok(PassCommit::Stale { .. }) => {
+                // The next try folds the whole log again.
+                self.progress.lock().unwrap().remove(execution_id);
+                Ok(PassEnd::Stale)
+            }
+            Ok(PassCommit::ExecutionTerminal(prior)) => {
+                // A run cancelled since this pass read it keeps its cancel:
+                // nothing is appended after `WorkflowCancelled`.
+                debug!(execution_id = %execution_id, ?prior, "Execution already terminal; nothing to record");
+                self.progress.lock().unwrap().remove(execution_id);
+                Ok(PassEnd::Done)
+            }
+            Err(e) => {
+                // The next tick folds the whole log again.
+                self.progress.lock().unwrap().remove(execution_id);
+                Err(e.into())
+            }
+        }
+    }
+}
+
+/// How one pass of [`Scheduler::schedule_runnable_nodes`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum PassEnd {
+    /// The pass was written, had nothing to write, or found the run finished.
+    Done,
+    /// The store refused the pass as stale and wrote none of it.
+    Stale,
+}
+
+/// The log lines for what a committed pass recorded: the scheduler's pass
+/// holds a `NodeCompleted` only for an expired approval routed to its
+/// fallback, and a `NodeFailed` only for a rejected approval.
+fn log_recorded(execution_id: &ExecutionId, events: &[EventKind]) {
+    for kind in events {
+        match kind {
+            EventKind::NodeCompleted {
+                node_id, output, ..
+            } => {
+                let fallback = output["chosen_target"].as_str().unwrap_or_default();
+                info!(execution_id = %execution_id, node_id = %node_id, %fallback, "Approval expired — routed to the fallback node");
+            }
+            EventKind::NodeFailed { node_id, .. } => {
+                info!(execution_id = %execution_id, node_id = %node_id, "Approval rejected — node failed");
+            }
+            EventKind::NodeSkipped { node_id, reason } => {
+                info!(
+                    execution_id = %execution_id,
+                    node_id = %node_id,
+                    %reason,
+                    "Skipped node"
+                );
+            }
+            EventKind::NodeScheduled { node_id, .. } => {
+                info!(
+                    execution_id = %execution_id,
+                    node_id = %node_id,
+                    "Enqueued node for execution"
+                );
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1521,6 +1621,120 @@ mod tests {
             })
             .expect("WorkflowCompleted should be emitted");
         assert_eq!(final_state, serde_json::json!({ "x": 1, "y": 2 }));
+    }
+
+    /// A pass the store refused as stale is built again from the whole log,
+    /// not from the cache. The cache can hold what the log does not: here it
+    /// says it read events the log never got, as a store restored from a
+    /// backup, or a database that failed over before its last commits
+    /// reached the standby, would leave it. Every pass built from that cache
+    /// reads past the log's end and is refused.
+    #[tokio::test]
+    async fn a_stale_pass_refolds_from_the_log() {
+        let (s, b, e) = setup(linear_ir()).await;
+        tick(&s, &e).await; // schedules `a`
+        append(&b, &e, node_completed("a", serde_json::json!({}))).await;
+        s.progress
+            .lock()
+            .unwrap()
+            .get_mut(&e)
+            .expect("a running run is cached")
+            .last_sequence += 10;
+
+        tick(&s, &e).await;
+        assert_eq!(
+            s.stale_passes(),
+            1,
+            "the pass from the cache is refused once, the pass from the log lands"
+        );
+        let evs = b.get_events(&e).await.unwrap();
+        assert_eq!(
+            scheduled_nodes(&evs),
+            vec!["a".to_string(), "b".to_string()],
+            "folded from the log, `a` is done and `b` is dispatched"
+        );
+    }
+
+    /// One scheduler alone never has a pass refused. After a pass lands, the
+    /// cache keeps the last sequence the pass read, so the next tick folds
+    /// the pass's own `NodeScheduled` from the log and does not dispatch the
+    /// node again.
+    #[tokio::test]
+    async fn a_lone_scheduler_has_no_stale_pass() {
+        let (s, b, e) = setup(linear_ir()).await;
+        tick(&s, &e).await; // schedules `a`
+        tick(&s, &e).await; // nothing new
+        append(&b, &e, node_completed("a", serde_json::json!({}))).await;
+        tick(&s, &e).await; // schedules `b`
+        tick(&s, &e).await; // nothing new
+        append(&b, &e, node_completed("b", serde_json::json!({}))).await;
+        tick(&s, &e).await; // finishes the run
+        assert_eq!(status(&b, &e).await, WorkflowStatus::Completed);
+        assert_eq!(
+            scheduled_nodes(&b.get_events(&e).await.unwrap()),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(s.stale_passes(), 0);
+    }
+
+    /// At the concurrency cap nothing is dispatched, but a rejection decided
+    /// in the same pass is still written: the rejected node holds its slot
+    /// until its `NodeFailed` lands, so a run at its cap would otherwise
+    /// never fail it.
+    #[tokio::test]
+    async fn at_the_concurrency_cap_a_rejected_node_still_fails() {
+        let (_, b, e) = setup(linear_ir()).await;
+        let s = Scheduler::new(b.clone()).with_config(SchedulerConfig {
+            max_concurrent_nodes_per_execution: 1,
+            ..SchedulerConfig::default()
+        });
+        append(
+            &b,
+            &e,
+            EventKind::NodeScheduled {
+                node_id: "a".into(),
+                queue_type: "general".into(),
+            },
+        )
+        .await;
+        append(
+            &b,
+            &e,
+            EventKind::ToolApprovalRequired {
+                node_id: "a".into(),
+                tool_name: "t".into(),
+                approver: "human".into(),
+                context: serde_json::json!({}),
+            },
+        )
+        .await;
+        append(
+            &b,
+            &e,
+            EventKind::ApprovalReceived {
+                node_id: "a".into(),
+                user_id: "alice".into(),
+                decision: jamjet_state::event::ApprovalDecision::Rejected,
+                comment: None,
+                state_patch: None,
+                principal: None,
+                approved_digest: None,
+                request_sequence: None,
+            },
+        )
+        .await;
+
+        tick(&s, &e).await;
+        let failed = b
+            .get_events(&e)
+            .await
+            .unwrap()
+            .iter()
+            .filter(
+                |ev| matches!(&ev.kind, EventKind::NodeFailed { node_id, .. } if node_id == "a"),
+            )
+            .count();
+        assert_eq!(failed, 1, "the rejected node fails at the cap");
     }
 
     #[tokio::test]
