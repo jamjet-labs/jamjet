@@ -16,7 +16,9 @@
 //! 4. its echo passes the rule a new decision meets, against the request D
 //!    answered: missing on an approval outside dev mode is 400, a different
 //!    one is 409 stale;
-//! 5. with no `node_id`, exactly one node's decision matches.
+//! 5. with no `node_id`, exactly one node's decision matches and no request
+//!    is pending. A match beside a pending request could be either a retry
+//!    or a decision on that request, so it is 400 "specify node_id".
 //!
 //! Anything else on a decided request is 409 `AlreadyDecided`.
 
@@ -596,7 +598,8 @@ fn check_repeat<'a>(events: &'a [Event], node: &str, s: &ApprovalSubmission) -> 
 
 /// The decision on record that this submission repeats, if any, with its
 /// node. `Err` when it would repeat one but its echo is refused, and when it
-/// names no node and repeats the decisions of several.
+/// names no node and matches the decisions of several, or one while a
+/// request is pending.
 fn repeated_decision(
     events: &[Event],
     s: &ApprovalSubmission,
@@ -609,8 +612,9 @@ fn repeated_decision(
         };
     }
     // Rule 5: no node named. A repeat only if exactly one node's decision
-    // matches in full; otherwise the submission goes the usual way, which
-    // decides the one pending request if there is one.
+    // matches in full and no request is pending; with none matching, the
+    // submission goes the usual way, which decides the one pending request
+    // if there is one.
     let mut nodes: Vec<&str> = events
         .iter()
         .filter_map(|e| match &e.kind {
@@ -627,13 +631,24 @@ fn repeated_decision(
             _ => None,
         })
         .collect();
-    match repeats.len() {
-        0 => Ok(None),
-        1 => Ok(repeats.pop()),
-        _ => Err(SubmitError::MultiplePending(
-            repeats.into_iter().map(|(node, _)| node).collect(),
-        )),
+    if repeats.is_empty() {
+        return Ok(None);
     }
+    // A match while a request is pending could be a retry of the decision on
+    // record or a new decision on the pending request: the body cannot say
+    // which, so neither is assumed.
+    let pending = pending_approvals(events);
+    if repeats.len() == 1 && pending.is_empty() {
+        return Ok(repeats.pop());
+    }
+    let mut candidates: Vec<String> = repeats
+        .into_iter()
+        .map(|(node, _)| node)
+        .chain(pending.into_iter().map(|p| p.node_id))
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    Err(SubmitError::MultiplePending(candidates))
 }
 
 /// The refusal for a decision on `node` when its latest request is not

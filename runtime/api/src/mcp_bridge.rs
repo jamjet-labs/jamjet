@@ -371,7 +371,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 "Side effects: appends an ApprovalReceived event to the event log, recording the authenticated API token as the approver ('mcp-client' only in dev mode), and, if the execution is paused, ",
                 "resumes it to 'running' status so the next node can proceed. The decision is recorded in the immutable audit trail. ",
                 "Returns a JSON object with execution_id, node_id, accepted: true, repeat, sequence (the decision's place in the event log) and waiting_for (what the run waits for next). ",
-                "Sending the same decision again with the same token answers with the first one (repeat: true, the same sequence) and records nothing, so a lost answer is safe to retry. ",
+                "Sending the same decision again with the same token answers with the first one (repeat: true, the same sequence) and records nothing, so a lost answer is safe to retry. Name node_id when you retry: without it, a retry while another request is pending is refused, since it could be a decision on that request. ",
                 "Fails if execution_id is not found, if decision is not exactly 'approved' or 'rejected', if nothing is pending approval (or node_id does not match a pending approval), or if the request was already decided another way or by another approver. ",
                 "Related: use jamjet_get_events to see the ApprovalRequested event details before deciding."
             ).into()),

@@ -867,6 +867,85 @@ async fn without_a_node_id_a_repeat_must_match_one_node() {
     }
 }
 
+/// The nodes whose latest request is undecided.
+fn pending_nodes(events: &[Event]) -> Vec<String> {
+    jamjet_state::approvals::pending_approvals(events)
+        .into_iter()
+        .map(|p| p.node_id)
+        .collect()
+}
+
+/// With no `node_id`, a body that matches one node's decision while another
+/// request is pending could be a retry of that decision or a new decision on
+/// the pending request. The server cannot tell which, so it refuses, records
+/// nothing and leaves the pending request pending. Naming the node settles it.
+#[tokio::test]
+async fn without_a_node_id_a_repeat_while_a_request_is_pending_is_400() {
+    let refused_as_ambiguous = |name: &str, st: StatusCode, body: &Value| {
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{name}: {body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("specify node_id"),
+            "{name}: {body}"
+        );
+    };
+
+    // Outside dev mode: bob rejects `pay` unnamed, then `ship` asks.
+    for env in envs().await {
+        let (eid, _) = start_and_request(&env, "wf-pay").await;
+        let unnamed = json!({ "decision": "rejected" });
+        let (st, first) = decide(&env, &env.bob, &eid, unnamed.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{}: {first}", env.name);
+        assert_eq!(first["node_id"], "pay", "{}: {first}", env.name);
+        let sequence = the_decision(&env, &eid).await;
+        seed_request_for(&env.backend, &eid, "ship").await;
+        let before = events(&env, &eid).await.len();
+
+        let (st, body) = decide(&env, &env.bob, &eid, unnamed).await;
+        refused_as_ambiguous(env.name, st, &body);
+        let after = events(&env, &eid).await;
+        assert_eq!(after.len(), before, "{}: nothing recorded", env.name);
+        assert_eq!(pending_nodes(&after), ["ship"], "{}", env.name);
+
+        // Named, each one is answered.
+        let (st, again) = decide(&env, &env.bob, &eid, reject_body()).await;
+        assert_eq!(st, StatusCode::OK, "{}: {again}", env.name);
+        assert_repeat_of(&env, sequence, &again);
+        let (st, ship) = decide(
+            &env,
+            &env.bob,
+            &eid,
+            json!({ "decision": "rejected", "node_id": "ship" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {ship}", env.name);
+        assert_eq!(ship["repeat"], false, "{}: {ship}", env.name);
+        assert_eq!(ship["node_id"], "ship", "{}: {ship}", env.name);
+    }
+
+    // Dev mode: sam approves `pay` unnamed, then `ship` asks.
+    for tb in support::backends().await {
+        let backend = tb.dyn_backend();
+        let state = support::make_state(backend.clone());
+        let eid = seeded_request(&backend).await;
+        let path = format!("/executions/{}/approve", exec_path(&eid));
+        let unnamed = json!({ "decision": "approved", "user_id": "sam" });
+        let (st, first) = support::post(&state, &path, unnamed.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{}: {first}", tb.name());
+        assert_eq!(first["node_id"], "pay", "{}: {first}", tb.name());
+        seed_request_for(&backend, &eid, "ship").await;
+        let before = backend.get_events(&eid).await.unwrap().len();
+
+        let (st, body) = support::post(&state, &path, unnamed).await;
+        refused_as_ambiguous(tb.name(), st, &body);
+        let after = backend.get_events(&eid).await.unwrap();
+        assert_eq!(after.len(), before, "{}: nothing recorded", tb.name());
+        assert_eq!(pending_nodes(&after), ["ship"], "{}", tb.name());
+    }
+}
+
 /// A decided request refuses what does not repeat its decision, and says
 /// whose decision it is.
 #[tokio::test]
