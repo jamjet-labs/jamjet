@@ -89,6 +89,9 @@ pii = ["presidio-analyzer>=2.2,<3.0"]
 # jamjet-engram needs Python 3.12+. On 3.11 the extra installs nothing and
 # memory features raise an ImportError that says so.
 memory = ["jamjet-engram>=0.1,<0.3; python_version >= '3.12'"]
+# jamjet.auth.GoogleIdTokenAuth. google-auth fetches the ID token through its
+# requests transport, and requests is only an extra of google-auth.
+google-auth = ["google-auth[requests]>=2.0,<3"]
 
 [project.scripts]
 jamjet = "jamjet.cli.main:app"
