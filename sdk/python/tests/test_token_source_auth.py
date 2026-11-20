@@ -555,11 +555,15 @@ async def test_a_token_source_may_use_authorization_without_a_jamjet_token() -> 
     assert route.calls.last.request.headers.get_list("authorization") == [f"Bearer {FIRST}"]
 
 
-@pytest.mark.parametrize(
-    "url",
-    ["https://other.example/health", "http://engine.test/health", "https://engine.test:8443/health"],
-    ids=["other-host", "plain-http", "other-port"],
-)
+ELSEWHERE = {
+    "other-host": "https://other.example/health",
+    "plain-http": "http://engine.test/health",
+    "other-port": "https://engine.test:8443/health",
+}
+SAME_ORIGIN_WRITTEN_ANOTHER_WAY = "HTTPS://Engine.TEST:443/health"
+
+
+@pytest.mark.parametrize("url", list(ELSEWHERE.values()), ids=list(ELSEWHERE))
 async def test_the_token_goes_only_to_its_origin(url: str) -> None:
     source = Source()
     with respx.mock(assert_all_called=False) as mock:
@@ -570,7 +574,7 @@ async def test_the_token_goes_only_to_its_origin(url: str) -> None:
             assert source.calls == 0
             assert not anywhere.called
             # The same origin, written another way, gets it.
-            await plain.get("HTTPS://Engine.TEST:443/health")
+            await plain.get(SAME_ORIGIN_WRITTEN_ANOTHER_WAY)
     assert source.calls == 1
     assert anywhere.call_count == 1
     assert anywhere.calls.last.request.headers["x-serverless-authorization"] == f"Bearer {FIRST}"
@@ -611,6 +615,23 @@ def test_a_sync_client_works_with_a_sync_source(waits: list[float]) -> None:
     assert failing.calls == 3
     assert waits == [0.2, 0.5]
     assert not anywhere.called
+
+
+@pytest.mark.parametrize("url", list(ELSEWHERE.values()), ids=list(ELSEWHERE))
+def test_a_sync_client_sends_the_token_only_to_its_origin(url: str) -> None:
+    source = Source()
+    with respx.mock(assert_all_called=False) as mock:
+        anywhere = mock.route().respond(200, json={})
+        with httpx.Client(auth=TokenSourceAuth(source.get, origin=BASE)) as plain:
+            with pytest.raises(CredentialScopeError):
+                plain.get(url)
+            assert source.calls == 0
+            assert not anywhere.called
+            # The same origin, written another way, gets it.
+            plain.get(SAME_ORIGIN_WRITTEN_ANOTHER_WAY)
+    assert source.calls == 1
+    assert anywhere.call_count == 1
+    assert anywhere.calls.last.request.headers["x-serverless-authorization"] == f"Bearer {FIRST}"
 
 
 @pytest.mark.parametrize("kind", ["async-def", "returns-a-coroutine"])
