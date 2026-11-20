@@ -467,6 +467,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `claim` on any other kind is still refused at registration, and the message changed
     to name `external_fn` and `python_fn`.
   - `POST /work-items` now marks `python_fn` items from the node's kind.
+  - The Python `jamjet worker` and `claim_work_item` do not claim by execution yet, so
+    they never get these steps and the run waits with no error. The run's own worker has
+    to call `POST /work-items/claim` with `execution_id`.
 
 - **`examples/venue-booking-agent/`, the code-along series.** Nine steps that build one
   venue-booking agent, pinned to jamjet 0.13.0. Every step runs with no API key on the

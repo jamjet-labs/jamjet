@@ -164,7 +164,10 @@ for the claim that names its execution. One whose payload is not a JSON
 object cannot carry the mark, and its node is failed. A runtime from before
 this change refuses `claim` on a `python_fn` node at registration. In Python,
 `compile_agent_to_ir(agent, prompt, claim_by_execution=True)` sets it on an
-agent's tool-dispatch nodes.
+agent's tool-dispatch nodes. `jamjet worker` and `JamjetClient.claim_work_item`
+do not claim by execution yet. They claim oldest-first, so they never get these
+items: the step stays pending and the run waits, with no error. The run's own
+worker has to call `POST /work-items/claim` with the run's `execution_id`.
 
 This decides who runs the node and reports its result, not who can read the
 run: `GET /executions/:id` shows its state to any token of the tenant.

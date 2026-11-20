@@ -269,7 +269,11 @@ def compile_agent_to_ir(
     claim_by_execution:
         When true, each tool-dispatch node carries ``"claim": "by_execution"``:
         its work items are handed out only to a worker that names the run, never
-        to the oldest-first claim. The default output is unchanged.
+        to the oldest-first claim. ``jamjet worker`` and
+        ``JamjetClient.claim_work_item`` do not claim by execution yet, so they
+        never get these items and the run waits with no error. The run's own
+        worker has to call ``POST /work-items/claim`` with ``execution_id``.
+        The default output is unchanged.
 
     Returns
     -------
