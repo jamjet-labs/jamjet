@@ -333,6 +333,7 @@ async fn two_schedulers_fail_a_rejected_node_once() {
                     principal: None,
                     approved_digest: None,
                     request_sequence: None,
+                    choice: None,
                 },
             ))
             .await

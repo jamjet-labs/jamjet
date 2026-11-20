@@ -17,7 +17,7 @@
 
 use crate::dispatch_guard::{self, DispatchGuardOutcome};
 use jamjet_agents::AgentRegistry;
-use jamjet_core::node::NodeKind;
+use jamjet_core::node::{ApprovalOption, NodeKind};
 use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::workflow::{ApprovalDeadline, NodeDef, PolicySetIr};
 use jamjet_policy::{EvaluationContext, PolicyDecision, PolicyEvaluator};
@@ -532,6 +532,11 @@ async fn guard_policy(
                             Ok(d) => d,
                             Err(blocked) => return blocked,
                         };
+                    let options =
+                        match options_or_block(backend, execution_id, node_id, node_def).await {
+                            Ok(o) => o,
+                            Err(blocked) => return blocked,
+                        };
                     require_approval(
                         backend,
                         execution_id,
@@ -548,6 +553,12 @@ async fn guard_policy(
                             // What the reviewer is asked, as the author wrote it.
                             if let NodeKind::HumanApproval { description, .. } = &node_def.kind {
                                 c["description"] = Value::String(description.clone());
+                            }
+                            // What the reviewer picks from. Shown here and
+                            // checked against the node at the decision; the
+                            // action digest does not bind it.
+                            if !options.is_empty() {
+                                c[OPTIONS_KEY] = serde_json::json!(options);
                             }
                             // A dispatch node held by its own name: approving
                             // it releases every call in its batch, so the
@@ -612,6 +623,56 @@ fn human_approval_timeout(kind: &NodeKind) -> Option<PolicySetIr> {
             ..PolicySetIr::default()
         }),
         _ => None,
+    }
+}
+
+/// The key of an approval request's context that lists the options the
+/// reviewer picks from, as `[{"id", "label"}, ...]`. Absent when the node
+/// offers none.
+pub const OPTIONS_KEY: &str = "options";
+
+/// The options a `human_approval` node offers, in order. Empty for a node
+/// without options and for every other kind. `Err` when they break the rule
+/// registration holds them to ([`jamjet_ir::validate_approval_options`]):
+/// a version stored before that rule existed may hold such options, and they
+/// are never shown to a reviewer or accepted as a choice.
+pub fn approval_options(kind: &NodeKind) -> Result<&[ApprovalOption], String> {
+    match kind {
+        NodeKind::HumanApproval { options, .. } => {
+            jamjet_ir::validate_approval_options(options)?;
+            Ok(options)
+        }
+        _ => Ok(&[]),
+    }
+}
+
+/// [`approval_options`] for a node about to raise its request. Options that
+/// break the rule refuse the node, with a `PolicyViolation` on record, as an
+/// invalid deadline does ([`deadline_or_block`]).
+async fn options_or_block<'a>(
+    backend: &dyn StateBackend,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    node_def: &'a NodeDef,
+) -> Result<&'a [ApprovalOption], GuardOutcome> {
+    match approval_options(&node_def.kind) {
+        Ok(options) => Ok(options),
+        Err(cause) => {
+            let reason = format!(
+                "the node's options break the rule for options ({cause}); a reviewer is \
+                 never shown them, so the node is refused"
+            );
+            warn!(execution_id = %execution_id, node_id, %reason, "refusing node");
+            dispatch_guard::record_policy_violation(
+                backend,
+                execution_id,
+                node_id,
+                reason.clone(),
+                "unknown".to_string(),
+            )
+            .await;
+            Err(GuardOutcome::Blocked { reason })
+        }
     }
 }
 

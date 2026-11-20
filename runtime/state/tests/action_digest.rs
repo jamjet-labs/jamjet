@@ -161,6 +161,7 @@ fn an_old_approval_received_parses_with_no_binding() {
         principal: None,
         approved_digest: None,
         request_sequence: None,
+        choice: None,
     })
     .unwrap();
     assert!(

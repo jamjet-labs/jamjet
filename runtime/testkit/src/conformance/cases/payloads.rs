@@ -207,6 +207,7 @@ one_of_each! {
         principal: Some("token:t1".into()),
         approved_digest: Some("digest".into()),
         request_sequence: Some(3),
+        choice: Some("option_a".into()),
     },
     TimerCreated { node_id: "n".into(), fire_at: at(), correlation_key: Some("ck".into()) },
     TimerFired { node_id: "n".into(), correlation_key: None },

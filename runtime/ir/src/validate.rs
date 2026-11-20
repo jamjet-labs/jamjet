@@ -272,7 +272,7 @@ pub fn validate_human_approvals(ir: &WorkflowIr) -> IrResult<()> {
         if fallback_node.is_some() {
             human_approval_fallback(ir, id).map_err(invalid)?;
         }
-        approval_options(options).map_err(invalid)?;
+        validate_approval_options(options).map_err(invalid)?;
     }
     Ok(())
 }
@@ -285,7 +285,13 @@ pub fn validate_human_approvals(ir: &WorkflowIr) -> IrResult<()> {
 /// and a condition routes on it, so it has one spelling; the label is what a
 /// reviewer reads, so nothing in it may hide or reorder text. An empty list
 /// is no options.
-fn approval_options(options: &[jamjet_core::node::ApprovalOption]) -> Result<(), String> {
+///
+/// Registration runs it on every new version. The engine runs it again
+/// before it shows a node's options, since a version stored before the rule
+/// existed may hold options it never checked.
+pub fn validate_approval_options(
+    options: &[jamjet_core::node::ApprovalOption],
+) -> Result<(), String> {
     use jamjet_core::node::{
         MAX_APPROVAL_OPTIONS, MAX_APPROVAL_OPTION_ID_LEN, MAX_APPROVAL_OPTION_LABEL_CHARS,
     };

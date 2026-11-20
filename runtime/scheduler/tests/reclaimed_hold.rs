@@ -73,6 +73,7 @@ async fn a_reclaimed_hold_approved_while_its_item_is_pending_runs_once() {
                     principal: None,
                     approved_digest: None,
                     request_sequence: None,
+                    choice: None,
                 },
             ))
             .await

@@ -237,6 +237,7 @@ mod tests {
                 principal: Some("token:b".into()),
                 approved_digest: None,
                 request_sequence: Some(1),
+                choice: None,
             },
         )
         .await;

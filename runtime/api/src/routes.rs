@@ -933,6 +933,15 @@ struct ApproveRequest {
     decision: String,
     node_id: Option<String>,
     user_id: Option<String>,
+    /// The id of the option picked, when the request offers options (its
+    /// context's `options`). Required to approve such a request; refused on
+    /// a rejection and on a request without options.
+    #[serde(default)]
+    choice: Option<String>,
+    /// A free note on the decision, at most 4096 bytes, recorded with it.
+    #[serde(default)]
+    note: Option<String>,
+    /// The old name of `note`. Sending both with different text is a 400.
     comment: Option<String>,
     /// Refused with 400 when non-null: approval edits are not supported.
     state_patch: Option<Value>,
@@ -960,6 +969,10 @@ struct ApproveRequest {
 /// principal. No token and no marker is refused with 401.
 ///
 /// ROLE. `reviewer` and above may call this route; see `require_write_role`.
+///
+/// CHOICE AND NOTE. A request whose context lists `options` is approved with
+/// a `choice`, one of their ids. `note` (or its old name `comment`) is a free
+/// note on either decision, held to the rule in [`crate::approvals`].
 ///
 /// ANSWER. `execution_id`, `node_id`, `accepted: true`, `repeat`, the
 /// decision's `sequence` and the run's `waiting_for` after it. A caller that
@@ -999,6 +1012,7 @@ async fn approve_execution(
         (None, None) => return Err(ApiError::Unauthorized),
     };
     let actor_id = principal.clone().unwrap_or_else(|| user_id.clone());
+    let note = crate::approvals::note_from(body.note, body.comment).map_err(submit_refusal)?;
 
     let submitted = crate::approvals::submit_approval(
         &backend,
@@ -1008,7 +1022,8 @@ async fn approve_execution(
             user_id,
             principal,
             decision,
-            comment: body.comment,
+            choice: body.choice,
+            note,
             state_patch: body.state_patch,
             action_digest: body.action_digest,
             request_sequence: body.request_sequence,
@@ -1017,24 +1032,7 @@ async fn approve_execution(
         state.approval_policy,
     )
     .await
-    .map_err(|e| match e {
-        crate::approvals::SubmitError::SelfApproval
-        | crate::approvals::SubmitError::InitiatorUnknown
-        | crate::approvals::SubmitError::PrincipalMissing => ApiError::Forbidden(e.to_string()),
-        crate::approvals::SubmitError::MultiplePending(_) => ApiError::BadRequest(e.to_string()),
-        crate::approvals::SubmitError::NoPending
-        | crate::approvals::SubmitError::NodeNotPending(_)
-        | crate::approvals::SubmitError::ExecutionTerminal(_)
-        | crate::approvals::SubmitError::Expired(_)
-        | crate::approvals::SubmitError::Superseded(_)
-        | crate::approvals::SubmitError::UnreadableLog
-        | crate::approvals::SubmitError::AlreadyDecided { .. }
-        | crate::approvals::SubmitError::StaleDigest
-        | crate::approvals::SubmitError::StaleRequest => ApiError::Conflict(e.to_string()),
-        crate::approvals::SubmitError::EditsUnsupported
-        | crate::approvals::SubmitError::DigestRequired => ApiError::BadRequest(e.to_string()),
-        crate::approvals::SubmitError::Backend(msg) => ApiError::Internal(msg),
-    })?;
+    .map_err(submit_refusal)?;
 
     // Seal this approval into the signed, hash-chained audit log. This runs
     // *after* the event is durably appended, never fails the request
@@ -1066,6 +1064,34 @@ async fn approve_execution(
     Ok(Json(
         crate::approvals::decision_answer(backend.as_ref(), &execution_id, &submitted).await,
     ))
+}
+
+/// The answer of `POST /executions/:id/approve` to a refused decision.
+fn submit_refusal(e: crate::approvals::SubmitError) -> ApiError {
+    use crate::approvals::SubmitError;
+    match e {
+        SubmitError::SelfApproval
+        | SubmitError::InitiatorUnknown
+        | SubmitError::PrincipalMissing => ApiError::Forbidden(e.to_string()),
+        SubmitError::MultiplePending(_) => ApiError::BadRequest(e.to_string()),
+        SubmitError::NoPending
+        | SubmitError::NodeNotPending(_)
+        | SubmitError::ExecutionTerminal(_)
+        | SubmitError::Expired(_)
+        | SubmitError::Superseded(_)
+        | SubmitError::UnreadableLog
+        | SubmitError::AlreadyDecided { .. }
+        | SubmitError::StaleDigest
+        | SubmitError::StaleRequest
+        | SubmitError::OptionsChanged => ApiError::Conflict(e.to_string()),
+        SubmitError::EditsUnsupported
+        | SubmitError::DigestRequired
+        | SubmitError::ChoiceRequired(_)
+        | SubmitError::ChoiceNotOffered(_)
+        | SubmitError::ChoiceNotAllowed(_)
+        | SubmitError::BadNote(_) => ApiError::BadRequest(e.to_string()),
+        SubmitError::Backend(msg) => ApiError::Internal(msg),
+    }
 }
 
 async fn list_approvals_for_execution(
@@ -4557,6 +4583,8 @@ mod tests {
             decision: "approved".into(),
             node_id: Some("gate".into()),
             user_id: Some("mallory".into()),
+            choice: None,
+            note: None,
             comment: None,
             state_patch: None,
             action_digest: None,

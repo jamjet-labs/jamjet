@@ -68,6 +68,7 @@ async fn a_decided_approval_reports_its_digest_from_the_projection() {
             principal: Some("token:bob".into()),
             approved_digest: Some("d-1".into()),
             request_sequence: Some(seq),
+            choice: None,
         },
     )
     .await;
