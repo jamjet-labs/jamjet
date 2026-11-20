@@ -15,12 +15,18 @@
 //! 3. the same decision, and the same note (absent, empty or blank is none);
 //! 4. its echo passes the rule a new decision meets, against the request D
 //!    answered: missing on an approval outside dev mode is 400, a different
-//!    one is 409 stale;
+//!    one is 409 stale, and a `request_sequence` that names another request
+//!    is 409;
 //! 5. with no `node_id`, exactly one node's decision matches and no request
 //!    is pending. A match beside a pending request could be either a retry
 //!    or a decision on that request, so it is 400 "specify node_id".
 //!
 //! Anything else on a decided request is 409 `AlreadyDecided`.
+//!
+//! A node can ask again with the same digest: a step released past an
+//! agent's limit that fails asks again for its retry. A retry without
+//! `request_sequence` then matches the new request and decides it. A retry
+//! that names the request it answered can only answer that one.
 
 use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use jamjet_state::approvals::{
@@ -50,6 +56,10 @@ pub struct ApprovalSubmission {
     /// must equal the pending request's digest, or the decision is refused as
     /// stale (the request it was made against has been superseded).
     pub action_digest: Option<String>,
+    /// The sequence of the request the decider answers, echoed back. When
+    /// present it must be the sequence of the request this decision would
+    /// answer, or the decision is refused with [`SubmitError::StaleRequest`].
+    pub request_sequence: Option<i64>,
     /// The transport runs without authentication (dev mode). Outside it, an
     /// `Approved` decision must echo the request's binding.
     pub dev_mode: bool,
@@ -97,6 +107,9 @@ pub enum SubmitError {
     InitiatorUnknown,
     /// The echoed `action_digest` is not the pending request's digest.
     StaleDigest,
+    /// The echoed `request_sequence` is not the request this decision would
+    /// answer: the node has asked again since, or it names another request.
+    StaleRequest,
     /// Outside dev mode, an `Approved` decision on a request that binds an
     /// action did not echo the binding it was made against.
     DigestRequired,
@@ -173,6 +186,10 @@ impl std::fmt::Display for SubmitError {
             Self::StaleDigest => write!(
                 f,
                 "action_digest does not match the pending request; re-read the pending approval and decide again"
+            ),
+            Self::StaleRequest => write!(
+                f,
+                "request_sequence does not match the pending request; re-read the pending approvals and decide again"
             ),
             Self::DigestRequired => write!(
                 f,
@@ -370,13 +387,9 @@ pub async fn submit_approval(
         return Err(SubmitError::Expired(node_id));
     }
     let request_digest = request.action_digest().map(str::to_owned);
-    // What the request binds: its action digest, or for an agent tool dispatch
-    // its `calls_hash` if it predates dispatch digests. A legacy request binds
-    // nothing.
-    let binding = request.binding();
 
     // The echo of what the reviewer was shown: see `echo_refusal`.
-    if let Some(refusal) = echo_refusal(&submission, binding) {
+    if let Some(refusal) = echo_refusal(&submission, request) {
         return Err(refusal);
     }
 
@@ -477,12 +490,17 @@ fn latest_requested_node(events: &[Event]) -> Option<String> {
     })
 }
 
-/// The refusal of an echo, for a decision on the request that binds
-/// `binding`; `None` when the echo is fine. A new decision and a repeat meet
-/// the same rule.
+/// The refusal of an echo, for a decision on `request`; `None` when the echo
+/// is fine. A new decision and a repeat meet the same rule.
 ///
-/// Outside dev mode an approval must say which request it answers, so it can
-/// never land on a request that replaced the one the reviewer saw: no echo is
+/// A `request_sequence` that is sent must be `request`'s, on either decision,
+/// or it is [`SubmitError::StaleRequest`]. It is what keeps a retry from
+/// deciding a request the node raised since with the same binding.
+///
+/// What the request binds is its action digest, or for an agent tool dispatch
+/// its `calls_hash` if it predates dispatch digests. Outside dev mode an
+/// approval must say which request it answers, so it can never land on a
+/// request that replaced the one the reviewer saw: no echo is
 /// [`SubmitError::DigestRequired`]. Rejections need no echo: refusing to act
 /// is never the risk. A legacy request binds nothing, so there is nothing to
 /// echo; approving it authorises nothing by itself (the worker asks again
@@ -490,7 +508,13 @@ fn latest_requested_node(events: &[Event]) -> Option<String> {
 /// decision, or it is [`SubmitError::StaleDigest`]: the request has been
 /// superseded since the decider saw it. A request without a binding never
 /// matches one.
-fn echo_refusal(s: &ApprovalSubmission, binding: Option<&str>) -> Option<SubmitError> {
+fn echo_refusal(s: &ApprovalSubmission, request: &PendingApproval) -> Option<SubmitError> {
+    if s.request_sequence
+        .is_some_and(|seq| seq != request.sequence)
+    {
+        return Some(SubmitError::StaleRequest);
+    }
+    let binding = request.binding();
     match s.action_digest.as_deref() {
         Some(echoed) if binding != Some(echoed) => Some(SubmitError::StaleDigest),
         Some(_) => None,
@@ -590,7 +614,7 @@ fn check_repeat<'a>(events: &'a [Event], node: &str, s: &ApprovalSubmission) -> 
     {
         return RepeatCheck::No;
     }
-    match echo_refusal(s, request.binding()) {
+    match echo_refusal(s, &request) {
         Some(refusal) => RepeatCheck::Refused(refusal),
         None => RepeatCheck::Repeat(decision),
     }

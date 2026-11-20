@@ -94,6 +94,22 @@ async def test_approve_sends_the_action_digest_it_was_given() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_approve_sends_the_request_sequence_it_was_given() -> None:
+    """approve() names the request it answers when told, so a retry cannot decide a newer one."""
+    route = respx.post(f"{BASE}/executions/exec-1/approve").respond(
+        200, json={"execution_id": "exec-1", "node_id": "gated", "accepted": True}
+    )
+
+    async with JamjetClient(base_url=BASE) as c:
+        await c.approve("exec-1", "approved", node_id="gated", action_digest="d-1", request_sequence=7)
+        await c.approve("exec-1", "approved", node_id="gated", action_digest="d-1")
+
+    assert json.loads(route.calls[0].request.content)["request_sequence"] == 7
+    assert "request_sequence" not in json.loads(route.calls[1].request.content)
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_approve_sends_user_id_when_given() -> None:
     """approve() sends the approver name as user_id when one is given."""
     route = respx.post(f"{BASE}/executions/exec-1/approve").respond(

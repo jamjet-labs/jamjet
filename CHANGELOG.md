@@ -17,7 +17,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `GET /executions/:id` says what the run is waiting for: `approval`, `step`, `worker`,
   `engine`, or null once it has ended. `GET /executions?waiting_for=worker` lists by it.
 - The approve answer carries `repeat`, `sequence` and `waiting_for`.
-- Python: `client.list_pending_approvals(limit=None, after=None)`.
+- The approve route and the MCP approve tool take an optional `request_sequence`: the request
+  the decision answers. A decision that would answer another request is a 409. Send it when
+  you retry. A node can ask again with the same digest, and a retry without it decides the new
+  request.
+- Python: `client.list_pending_approvals(limit=None, after=None)`, and `request_sequence` on
+  `client.approve()`.
 
 ### Changed
 

@@ -113,7 +113,8 @@ curl http://localhost:7700/approvals?limit=50 \
 ```
 
 Each row has `execution_id`, `workflow_id`, `workflow_version`, `node_id`, `tool_name`, `approver`, `context`,
-`request_sequence`, `action_digest` (the value to echo when you approve),
+`request_sequence` (send it with your decision, see the rules below),
+`action_digest` (the value to echo when you approve),
 `expires_at` and `escalate_at` (null when the request has no deadline). A full
 page carries `next_after`; send it back as `after` for the next page. `limit`
 defaults to 50 and is capped at 200. Only `status=pending` is accepted. Decided
@@ -195,14 +196,23 @@ Rules the runtime enforces:
   fresh request. A state change that does not reach the payload is not a change
   to the action: a `tool` node, for example, is dispatched without the run's
   state. Engine bookkeeping (`__budget`) does not count as a change.
-- **Sending the same decision twice is safe.** If the same principal sends the
-  same decision (and the same comment) for a request that was already decided,
-  the answer is 200 with `repeat: true` and the first decision's `sequence`.
-  Nothing is recorded again. Name `node_id` when you retry: without it, a retry
-  while another request is pending is a 400, since it could be a decision on
-  that request. Outside dev mode an approval repeat still echoes the
-  `action_digest`; a missing one is a 400 and a different one a 409. A different
-  decision, another principal, or a request raised since is still a 409.
+- **Sending the same decision twice is safe when it names its request.** Send
+  `request_sequence`, the sequence of the request you reviewed
+  (`request_sequence` in `GET /approvals`, `sequence` in
+  `GET /executions/:id/approvals`). A decision that names any other request is
+  a 409, so a retry can only answer the request you saw. If the same principal
+  sends the same decision (and the same comment) for a request that was already
+  decided, the answer is 200 with `repeat: true` and the first decision's
+  `sequence`. Nothing is recorded again. If the node has asked again since, the
+  retry is a 409 and decides nothing. Without `request_sequence` a retry cannot
+  be told from a new decision: a node can ask again with the same
+  `action_digest` (a step released past an agent's limit that fails asks again
+  for its retry), and the retry then decides the new request. Name `node_id`
+  when you retry: without it, a retry while another request is pending is a
+  400, since it could be a decision on that request. Outside dev mode an
+  approval repeat still echoes the `action_digest`; a missing one is a 400 and
+  a different one a 409. A different decision or another principal is still a
+  409.
 - **Approval edits are not supported.** A decision carrying a `state_patch` is
   refused with 400. To change what runs, reject and re-run with different input.
 - **Separation of duties.** The token that started a run cannot approve it

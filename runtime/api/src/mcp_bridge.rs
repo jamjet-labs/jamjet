@@ -375,8 +375,10 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 "Side effects: appends an ApprovalReceived event to the event log, recording the authenticated API token as the approver ('mcp-client' only in dev mode). ",
                 "The run goes on at the engine's next pass. The decision is recorded in the immutable audit trail. ",
                 "Returns a JSON object with execution_id, node_id, accepted: true, repeat, sequence (the decision's place in the event log) and waiting_for (what the run waits for next). ",
-                "Sending the same decision again with the same token answers with the first one (repeat: true, the same sequence) and records nothing, so a lost answer is safe to retry. Name node_id when you retry: without it, a retry while another request is pending is refused, since it could be a decision on that request. ",
-                "Fails if execution_id is not found, if decision is not exactly 'approved' or 'rejected', if nothing is pending approval (or node_id does not match a pending approval), or if the request was already decided another way or by another approver. ",
+                "Sending the same decision again with the same token answers with the first one (repeat: true, the same sequence) and records nothing. ",
+                "To retry a lost answer safely, send node_id and request_sequence (the request's sequence from GET /approvals). With request_sequence a retry can only answer that request: if the node has asked again since, it is refused. ",
+                "Without it, a retry after the node asked again with the same action_digest decides the new request. Without node_id, a retry while another request is pending is refused, since it could be a decision on that request. ",
+                "Fails if execution_id is not found, if decision is not exactly 'approved' or 'rejected', if nothing is pending approval (or node_id does not match a pending approval), if request_sequence names another request, or if the request was already decided another way or by another approver. ",
                 "Related: use jamjet_get_events to see the tool_approval_required event details before deciding."
             ).into()),
             input_schema: json!({
@@ -402,6 +404,10 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     "action_digest": {
                         "type": "string",
                         "description": "The action_digest (or, for an agent tool dispatch, the calls_hash) from the context of the pending approval you reviewed. Required to approve outside dev mode. If the pending request has been superseded the decision is refused, so you never approve an action you did not see."
+                    },
+                    "request_sequence": {
+                        "type": "integer",
+                        "description": "The sequence of the request you reviewed: request_sequence in GET /approvals, or sequence in a pending entry of GET /executions/:id/approvals. Optional. If the node has asked again since, the decision is refused. Send it when you retry, so a retry can only answer the request you saw."
                     },
                     "tenant_id": {
                         "type": "string",
@@ -432,6 +438,12 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     None | Some(Value::Null) => None,
                     Some(Value::String(d)) => Some(d.clone()),
                     Some(_) => return Err("action_digest must be a string".into()),
+                };
+                let request_sequence = match args.get("request_sequence") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(v.as_i64().ok_or_else(|| {
+                        format!("request_sequence must be an integer, not {v}")
+                    })?),
                 };
                 // Forwarded so the shared submission refuses it exactly as the
                 // REST route does; silently dropping it would let a client
@@ -473,6 +485,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         comment,
                         state_patch,
                         action_digest,
+                        request_sequence,
                         dev_mode,
                     },
                     s.approval_policy,

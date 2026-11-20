@@ -254,6 +254,7 @@ class JamjetClient:
         state_patch: dict[str, Any] | None = None,
         action_digest: str | None = None,
         user_id: str | None = None,
+        request_sequence: int | None = None,
     ) -> dict[str, Any]:
         """Record a decision on a pending approval.
 
@@ -274,6 +275,13 @@ class JamjetClient:
         records it as given. With an API token the engine records the token's
         name and ignores it. It is sent only when set.
 
+        ``request_sequence`` is the sequence of the request you reviewed
+        (``request_sequence`` in :meth:`list_pending_approvals`, ``sequence``
+        in :meth:`list_approvals`). The engine refuses the decision with 409
+        if the node has asked again since. Send it when you retry a decision
+        whose answer was lost: without it, a retry after the node asked again
+        with the same digest decides the new request.
+
         Returns the engine's answer unchanged: ``execution_id``, ``node_id``,
         ``accepted``, ``repeat`` (true when the same decision was already
         recorded; nothing is written again), ``sequence`` (the decision's place
@@ -290,6 +298,8 @@ class JamjetClient:
             body["action_digest"] = action_digest
         if user_id:
             body["user_id"] = user_id
+        if request_sequence is not None:
+            body["request_sequence"] = request_sequence
         r = await self._client.post(f"/executions/{execution_id}/approve", json=body)
         _raise_for_status(r)
         return r.json()

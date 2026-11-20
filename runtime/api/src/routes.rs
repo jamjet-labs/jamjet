@@ -942,6 +942,12 @@ struct ApproveRequest {
     /// a 409: the decider was looking at a superseded request.
     #[serde(default)]
     action_digest: Option<String>,
+    /// The sequence of the request this decision answers: `request_sequence`
+    /// in `GET /approvals`, `sequence` in `GET /executions/:id/approvals`.
+    /// Optional. When sent, a decision that would answer any other request
+    /// is a 409, so a retry never decides a request the node raised since.
+    #[serde(default)]
+    request_sequence: Option<i64>,
 }
 
 /// `POST /executions/:id/approve` — record a decision on a pending approval.
@@ -1005,6 +1011,7 @@ async fn approve_execution(
             comment: body.comment,
             state_patch: body.state_patch,
             action_digest: body.action_digest,
+            request_sequence: body.request_sequence,
             dev_mode: dev_mode.is_some(),
         },
         state.approval_policy,
@@ -1022,7 +1029,8 @@ async fn approve_execution(
         | crate::approvals::SubmitError::Superseded(_)
         | crate::approvals::SubmitError::UnreadableLog
         | crate::approvals::SubmitError::AlreadyDecided { .. }
-        | crate::approvals::SubmitError::StaleDigest => ApiError::Conflict(e.to_string()),
+        | crate::approvals::SubmitError::StaleDigest
+        | crate::approvals::SubmitError::StaleRequest => ApiError::Conflict(e.to_string()),
         crate::approvals::SubmitError::EditsUnsupported
         | crate::approvals::SubmitError::DigestRequired => ApiError::BadRequest(e.to_string()),
         crate::approvals::SubmitError::Backend(msg) => ApiError::Internal(msg),
@@ -1181,7 +1189,9 @@ struct PendingApprovalsQuery {
 /// `status` may only be `pending` (the default). `limit` defaults to
 /// [`DEFAULT_APPROVALS_PAGE`] and is clamped to 1..=[`MAX_APPROVALS_PAGE`].
 /// A full page carries `next_after`; send it back as `after` for the next one.
-/// Each row's `action_digest` is the echo the approve route asks for.
+/// Each row's `action_digest` is the echo the approve route asks for, and its
+/// `request_sequence` the one that ties a decision, and any retry of it, to
+/// that request.
 async fn list_pending_approvals(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
@@ -4559,6 +4569,7 @@ mod tests {
             comment: None,
             state_patch: None,
             action_digest: None,
+            request_sequence: None,
         };
 
         let refused = approve_execution(

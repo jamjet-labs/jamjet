@@ -1026,3 +1026,256 @@ async fn the_mcp_approve_tool_answers_a_repeat_like_the_route() {
         assert_eq!(events(&env, &eid).await.len(), before, "{}", env.name);
     }
 }
+
+/// The sequence of the latest request.
+fn latest_request_sequence(events: &[Event]) -> i64 {
+    events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. }))
+        .expect("an approval request")
+        .sequence
+}
+
+/// The node asks again with the request it made last, digest and all, as the
+/// guard does when a step released past an agent's limit fails and its retry
+/// needs a new approval. Returns the new request's sequence.
+async fn ask_again(backend: &Arc<dyn StateBackend>, eid: &ExecutionId) -> i64 {
+    let last = backend
+        .get_events(eid)
+        .await
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. }))
+        .expect("an approval request");
+    backend
+        .append_event(Event::new(eid.clone(), 0, last.kind))
+        .await
+        .unwrap()
+}
+
+fn assert_names_another_request(name: &str, st: StatusCode, body: &Value) {
+    assert_eq!(st, StatusCode::CONFLICT, "{name}: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("request_sequence does not match"),
+        "{name}: {body}"
+    );
+}
+
+/// A reviewer approves a request and loses the answer. The node asks again
+/// with the same digest. A retry that names the request it answered is
+/// refused for the new one, so one review never decides two requests. Naming
+/// the new request decides it.
+#[tokio::test]
+async fn a_retry_that_names_its_request_never_decides_a_newer_one() {
+    for env in envs().await {
+        let (eid, digest) = start_and_request(&env, "wf-pay").await;
+        let first_request = latest_request_sequence(&events(&env, &eid).await);
+        let naming = |request: i64| {
+            let mut body = approve_body(&digest);
+            body["request_sequence"] = json!(request);
+            body
+        };
+        let (st, first) = decide(&env, &env.bob, &eid, naming(first_request)).await;
+        assert_eq!(st, StatusCode::OK, "{}: {first}", env.name);
+        assert_eq!(first["repeat"], false, "{}: {first}", env.name);
+        let decided = the_decision(&env, &eid).await;
+
+        let next_request = ask_again(&env.backend, &eid).await;
+        let evs = events(&env, &eid).await;
+        assert_eq!(
+            request_context(&evs)["action_digest"],
+            json!(digest),
+            "{}: the new request binds the same action",
+            env.name
+        );
+        let before = evs.len();
+
+        // The retry, with and without node_id.
+        let mut unnamed_node = naming(first_request);
+        unnamed_node.as_object_mut().unwrap().remove("node_id");
+        for body in [naming(first_request), unnamed_node] {
+            let (st, resp) = decide(&env, &env.bob, &eid, body.clone()).await;
+            assert_names_another_request(env.name, st, &resp);
+        }
+        let after = events(&env, &eid).await;
+        assert_eq!(after.len(), before, "{}: nothing recorded", env.name);
+        assert_eq!(decisions(&after), [decided], "{}", env.name);
+        assert_eq!(pending_nodes(&after), ["pay"], "{}", env.name);
+
+        // Naming the new request decides it, and its retry is a repeat.
+        let (st, second) = decide(&env, &env.bob, &eid, naming(next_request)).await;
+        assert_eq!(st, StatusCode::OK, "{}: {second}", env.name);
+        assert_eq!(second["repeat"], false, "{}: {second}", env.name);
+        let (st, again) = decide(&env, &env.bob, &eid, naming(next_request)).await;
+        assert_eq!(st, StatusCode::OK, "{}: {again}", env.name);
+        assert_repeat_of(&env, second["sequence"].as_i64().unwrap(), &again);
+
+        // The first request's retry is not answered with the second decision.
+        let (st, resp) = decide(&env, &env.bob, &eid, naming(first_request)).await;
+        assert_names_another_request(env.name, st, &resp);
+        assert_eq!(
+            decisions(&events(&env, &eid).await).len(),
+            2,
+            "{}",
+            env.name
+        );
+    }
+
+    // Dev mode needs no digest, so without the echo any retry would decide
+    // the new request.
+    for tb in support::backends().await {
+        let backend = tb.dyn_backend();
+        let state = support::make_state(backend.clone());
+        let eid = seeded_request(&backend).await;
+        let path = format!("/executions/{}/approve", exec_path(&eid));
+        let first_request = latest_request_sequence(&backend.get_events(&eid).await.unwrap());
+        let body = json!({ "decision": "approved", "node_id": "pay", "user_id": "sam",
+                           "request_sequence": first_request });
+        let (st, first) = support::post(&state, &path, body.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{}: {first}", tb.name());
+        ask_again(&backend, &eid).await;
+        let before = backend.get_events(&eid).await.unwrap().len();
+
+        let (st, resp) = support::post(&state, &path, body).await;
+        assert_names_another_request(tb.name(), st, &resp);
+        let after = backend.get_events(&eid).await.unwrap();
+        assert_eq!(after.len(), before, "{}: nothing recorded", tb.name());
+        assert_eq!(pending_nodes(&after), ["pay"], "{}", tb.name());
+    }
+}
+
+/// A decision that names a request other than the pending one is refused
+/// and records nothing, on either decision.
+#[tokio::test]
+async fn a_decision_that_names_another_request_is_409() {
+    for env in envs().await {
+        let (eid, digest) = start_and_request(&env, "wf-pay").await;
+        let request = latest_request_sequence(&events(&env, &eid).await);
+        let before = events(&env, &eid).await.len();
+
+        let mut approve = approve_body(&digest);
+        approve["request_sequence"] = json!(request + 1);
+        let mut reject = reject_body();
+        reject["request_sequence"] = json!(request - 1);
+        for body in [approve, reject] {
+            let (st, resp) = decide(&env, &env.bob, &eid, body).await;
+            assert_names_another_request(env.name, st, &resp);
+        }
+        // Not a number: the body is refused before anything is read.
+        let mut text = approve_body(&digest);
+        text["request_sequence"] = json!(request.to_string());
+        let (st, resp) = decide(&env, &env.bob, &eid, text).await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{}: {resp}", env.name);
+        assert_eq!(events(&env, &eid).await.len(), before, "{}", env.name);
+
+        let mut right = approve_body(&digest);
+        right["request_sequence"] = json!(request);
+        let (st, resp) = decide(&env, &env.bob, &eid, right).await;
+        assert_eq!(st, StatusCode::OK, "{}: {resp}", env.name);
+        assert_eq!(resp["repeat"], false, "{}: {resp}", env.name);
+    }
+}
+
+/// GUARD: passed before `request_sequence` was read. Two identical decisions
+/// at once that name their request: one recorded, both answered, one of them
+/// as the repeat. The one that loses the append must still match its echo.
+#[tokio::test]
+async fn two_identical_decisions_that_name_their_request_at_once_record_one() {
+    for tb in support::backends().await {
+        let hook = Arc::new(MeetBeforeAppend::default());
+        let hooked: Arc<dyn StateBackend> =
+            Arc::new(HookedBackend::new(tb.dyn_backend(), hook.clone()));
+        let env = env_on(tb.name(), hooked).await;
+
+        for round in 0..20 {
+            let (eid, digest) = start_and_request(&env, "wf-pay").await;
+            let mut body = approve_body(&digest);
+            body["request_sequence"] = json!(latest_request_sequence(&events(&env, &eid).await));
+            hook.reports.store(0, Ordering::SeqCst);
+            *hook.armed.lock().unwrap() =
+                Some((eid.clone(), Arc::new(tokio::sync::Barrier::new(2))));
+            let ((st_a, a), (st_b, b)) = tokio::join!(
+                decide(&env, &env.bob, &eid, body.clone()),
+                decide(&env, &env.bob, &eid, body.clone()),
+            );
+            *hook.armed.lock().unwrap() = None;
+
+            assert_eq!(
+                hook.reports.load(Ordering::SeqCst),
+                2,
+                "{} round {round}: the race did not open",
+                env.name
+            );
+            let sequence = the_decision(&env, &eid).await;
+            assert_eq!(st_a, StatusCode::OK, "{} round {round}: {a}", env.name);
+            assert_eq!(st_b, StatusCode::OK, "{} round {round}: {b}", env.name);
+            let repeats = [&a, &b].iter().filter(|r| r["repeat"] == true).count();
+            assert_eq!(repeats, 1, "{} round {round}: {a} {b}", env.name);
+            assert_eq!(a["sequence"], sequence, "{} round {round}: {a}", env.name);
+            assert_eq!(b["sequence"], sequence, "{} round {round}: {b}", env.name);
+        }
+    }
+}
+
+/// The MCP tool takes `request_sequence` too, and refuses a retry for a
+/// request raised since.
+#[tokio::test]
+async fn the_mcp_approve_tool_takes_the_request_sequence() {
+    for env in envs().await {
+        let (eid, digest) = start_and_request(&env, "wf-pay").await;
+        let first_request = latest_request_sequence(&events(&env, &eid).await);
+        let approve = |request_sequence: Value| {
+            call(
+                &env.app,
+                "POST",
+                "/mcp",
+                &env.bob,
+                Some(json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "jamjet_approve", "arguments": {
+                        "execution_id": exec_path(&eid), "decision": "approved",
+                        "node_id": "pay", "action_digest": digest,
+                        "request_sequence": request_sequence,
+                    }},
+                })),
+            )
+        };
+        let text = |resp: &Value| {
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        let (st, resp) = approve(json!(first_request)).await;
+        assert_eq!(st, StatusCode::OK, "{}: {resp}", env.name);
+        assert_eq!(resp["result"]["isError"], false, "{}: {resp}", env.name);
+        let decided = the_decision(&env, &eid).await;
+        ask_again(&env.backend, &eid).await;
+        let before = events(&env, &eid).await.len();
+
+        let (st, resp) = approve(json!(first_request)).await;
+        assert_eq!(st, StatusCode::OK, "{}: {resp}", env.name);
+        assert_eq!(resp["result"]["isError"], true, "{}: {resp}", env.name);
+        assert!(
+            text(&resp).contains("request_sequence does not match"),
+            "{}: {resp}",
+            env.name
+        );
+        let (_, resp) = approve(json!(first_request.to_string())).await;
+        assert_eq!(resp["result"]["isError"], true, "{}: {resp}", env.name);
+        assert!(
+            text(&resp).contains("request_sequence must be an integer"),
+            "{}: {resp}",
+            env.name
+        );
+        let after = events(&env, &eid).await;
+        assert_eq!(after.len(), before, "{}: nothing recorded", env.name);
+        assert_eq!(decisions(&after), [decided], "{}", env.name);
+    }
+}
