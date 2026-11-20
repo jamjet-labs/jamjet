@@ -33,6 +33,58 @@ pub struct ApprovalProjectionRow {
     pub context: Option<serde_json::Value>,
 }
 
+/// Where a page of [`StateBackend::list_pending_approvals`] starts: the sort
+/// key of the last row of the page before, `(updated_at, execution_id,
+/// node_id)`, compared as the stored text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalCursor {
+    pub updated_at: String,
+    /// The hyphenated uuid, as the execution id is stored.
+    pub execution_id: String,
+    pub node_id: String,
+}
+
+impl From<&PendingApprovalRow> for ApprovalCursor {
+    /// The cursor of the page after the one `row` ends.
+    fn from(row: &PendingApprovalRow) -> Self {
+        Self {
+            updated_at: row.updated_at.clone(),
+            execution_id: row.execution_id.0.to_string(),
+            node_id: row.node_id.clone(),
+        }
+    }
+}
+
+/// A request waiting for a decision, from
+/// [`StateBackend::list_pending_approvals`]: the projected row and the run's
+/// workflow.
+#[derive(Debug, Clone)]
+pub struct PendingApprovalRow {
+    pub execution_id: ExecutionId,
+    pub workflow_id: String,
+    pub workflow_version: String,
+    pub node_id: String,
+    pub tool_name: Option<String>,
+    pub approver: Option<String>,
+    pub context: Option<serde_json::Value>,
+    /// The sequence of the `ToolApprovalRequired` the row was projected from.
+    pub request_sequence: i64,
+    /// When the row was projected, as stored.
+    pub updated_at: String,
+}
+
+/// A pending or claimed item of a run, from [`StateBackend::open_work_items`].
+#[derive(Debug, Clone)]
+pub struct OpenWorkItem {
+    pub id: WorkItemId,
+    pub node_id: String,
+    pub queue_type: String,
+    /// Leased to a worker. The lease may have lapsed and not yet been taken
+    /// back: see `lease_expires_at`.
+    pub claimed: bool,
+    pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Workflow definition stored in the registry (the compiled IR as JSON).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowDefinition {
@@ -977,6 +1029,46 @@ pub trait StateBackend: Send + Sync {
         execution_id: &ExecutionId,
         new_checkpoint: i64,
     ) -> BackendResult<()>;
+
+    // ── Features lane ───────────────────────────────────────────────────
+
+    /// Pending rows of live runs (running or paused), oldest projected first,
+    /// after `after`, at most `limit`.
+    ///
+    /// A scoped backend lists its tenant's runs only, judged by the run's own
+    /// row (`workflow_executions.tenant_id`). The projection's `tenant_id`
+    /// column is never read: the projector writes `default` there for every
+    /// row. Whether a run is live comes from its row too: a run that ended
+    /// with a request open keeps a `pending` row the projector no longer
+    /// visits.
+    ///
+    /// The rows lag the event log by up to one projector tick. The default
+    /// refuses.
+    async fn list_pending_approvals(
+        &self,
+        after: Option<&ApprovalCursor>,
+        limit: u32,
+    ) -> BackendResult<Vec<PendingApprovalRow>> {
+        let _ = (after, limit);
+        Err(StateBackendError::Database(
+            "this backend cannot list pending approvals across runs".into(),
+        ))
+    }
+
+    /// The run's pending and claimed items, oldest first. Settled, failed and
+    /// dead-lettered ones are left out. A scoped backend answers for its
+    /// tenant's runs only, judged by the run's own row: the items the
+    /// scheduler enqueues carry `default` in their own tenant column. An
+    /// unknown run, or another tenant's, has none. The default refuses.
+    async fn open_work_items(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<Vec<OpenWorkItem>> {
+        let _ = execution_id;
+        Err(StateBackendError::Database(
+            "this backend cannot list a run's open work items".into(),
+        ))
+    }
 
     // ── Tenant management ───────────────────────────────────────────────
 

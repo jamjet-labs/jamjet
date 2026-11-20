@@ -2504,6 +2504,22 @@ impl StateBackend for SqliteBackend {
         .map_err(map_db_err)?;
         Ok(())
     }
+
+    async fn list_pending_approvals(
+        &self,
+        after: Option<&crate::backend::ApprovalCursor>,
+        limit: u32,
+    ) -> BackendResult<Vec<crate::backend::PendingApprovalRow>> {
+        crate::features::approvals_list::list_pending_approvals_in(&self.pool, None, after, limit)
+            .await
+    }
+
+    async fn open_work_items(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<Vec<crate::backend::OpenWorkItem>> {
+        crate::features::open_items::open_work_items_in(&self.pool, None, execution_id).await
+    }
 }
 
 pub(crate) use crate::backend::DEFAULT_LEASE_SECS;

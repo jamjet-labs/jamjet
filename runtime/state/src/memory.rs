@@ -44,7 +44,9 @@ pub struct InMemoryBackend {
     /// Reservations: idempotency key -> (owner, lease_fence, expires_at).
     tool_reservations: DashMap<String, (String, i64, chrono::DateTime<Utc>)>,
     /// Projected approval read-model. Key = (execution_id as String, node_id).
-    proj_approvals: DashMap<(String, String), crate::backend::ApprovalProjectionRow>,
+    /// The text beside each row is when it was projected (RFC 3339), the
+    /// `updated_at` the SQLite table keeps.
+    proj_approvals: DashMap<(String, String), (crate::backend::ApprovalProjectionRow, String)>,
     /// Projector checkpoints. Key = (projection_name, execution_id as String).
     projector_checkpoints: DashMap<(String, String), i64>,
     /// Content-addressed artifact store. Key = (tenant_id, hash).
@@ -1458,7 +1460,8 @@ impl StateBackend for InMemoryBackend {
         // In-memory: no ACID atomicity, but both writes happen in the same
         // synchronous step so there is no observable gap in tests.
         let key = (row.execution_id.0.to_string(), row.node_id.clone());
-        self.proj_approvals.insert(key, row.clone());
+        self.proj_approvals
+            .insert(key, (row.clone(), Utc::now().to_rfc3339()));
         let cp_key = (projection_name.to_string(), row.execution_id.0.to_string());
         self.projector_checkpoints.insert(cp_key, new_checkpoint);
         Ok(())
@@ -1474,9 +1477,11 @@ impl StateBackend for InMemoryBackend {
         // In-memory: DashMap operations are individually atomic; we apply all
         // rows then the checkpoint in a tight synchronous sequence with no
         // await between them — sufficient for single-threaded test use.
+        // One time for the batch, as SQLite stamps it.
+        let now = Utc::now().to_rfc3339();
         for row in rows {
             let key = (row.execution_id.0.to_string(), row.node_id.clone());
-            self.proj_approvals.insert(key, row);
+            self.proj_approvals.insert(key, (row, now.clone()));
         }
         let cp_key = (projection_name.to_string(), execution_id.0.to_string());
         self.projector_checkpoints.insert(cp_key, new_checkpoint);
@@ -1492,7 +1497,7 @@ impl StateBackend for InMemoryBackend {
             .proj_approvals
             .iter()
             .filter(|e| e.key().0 == exec_str)
-            .map(|e| e.value().clone())
+            .map(|e| e.value().0.clone())
             .collect();
         rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         Ok(rows)
@@ -1520,6 +1525,64 @@ impl StateBackend for InMemoryBackend {
         let key = (projection_name.to_string(), execution_id.0.to_string());
         self.projector_checkpoints.insert(key, new_checkpoint);
         Ok(())
+    }
+
+    async fn list_pending_approvals(
+        &self,
+        after: Option<&crate::backend::ApprovalCursor>,
+        limit: u32,
+    ) -> BackendResult<Vec<crate::backend::PendingApprovalRow>> {
+        // The run's own row decides whether it is live, as the SQLite join
+        // does: a run that ended with a request open keeps a pending row.
+        let rows = self
+            .proj_approvals
+            .iter()
+            .filter_map(|entry| {
+                let (row, updated_at) = entry.value();
+                if row.status != "pending" {
+                    return None;
+                }
+                let run = self.executions.get(&row.execution_id)?;
+                let live = matches!(run.status, WorkflowStatus::Running | WorkflowStatus::Paused);
+                live.then(|| crate::backend::PendingApprovalRow {
+                    execution_id: row.execution_id.clone(),
+                    workflow_id: run.workflow_id.clone(),
+                    workflow_version: run.workflow_version.clone(),
+                    node_id: row.node_id.clone(),
+                    tool_name: row.tool_name.clone(),
+                    approver: row.approver.clone(),
+                    context: row.context.clone(),
+                    request_sequence: row.last_sequence,
+                    updated_at: updated_at.clone(),
+                })
+            })
+            .collect();
+        Ok(crate::features::approvals_list::page(rows, after, limit))
+    }
+
+    async fn open_work_items(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<Vec<crate::backend::OpenWorkItem>> {
+        // Settling an item removes it here and dead-lettering moves it out,
+        // so the queue holds only pending and claimed items.
+        let mut items: Vec<WorkItem> = self
+            .work_items
+            .iter()
+            .filter(|e| e.value().execution_id == *execution_id)
+            .map(|e| e.value().clone())
+            .collect();
+        items.sort_by_key(|i| (i.created_at, i.id));
+        Ok(items
+            .into_iter()
+            .map(|i| crate::backend::OpenWorkItem {
+                id: i.id,
+                node_id: i.node_id,
+                queue_type: i.queue_type,
+                claimed: i.worker_id.is_some(),
+                lease_expires_at: i.lease_expires_at,
+            })
+            .collect())
     }
 
     // ── Tenants ──────────────────────────────────────────────────────
