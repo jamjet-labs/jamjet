@@ -19,7 +19,7 @@ use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
 use jamjet_api::routes::build_router_with_opts;
-use jamjet_core::workflow::ExecutionId;
+use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_scheduler::Scheduler;
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::EventKind;
@@ -275,7 +275,7 @@ fn assert_refused(env: &Env, (st, body): (StatusCode, Value), status: StatusCode
 
 /// Append a request for `pick_topic` through the backend, the way a doctored
 /// log or a bug would: `context` is the parked request's, changed by `edit`.
-/// Returns the new request's sequence.
+/// Returns the sequence the backend gave the new request.
 async fn append_request(env: &Env, parked: &Parked, edit: impl FnOnce(&mut Value)) -> i64 {
     let mut context = parked.context.clone();
     edit(&mut context);
@@ -292,8 +292,39 @@ async fn append_request(env: &Env, parked: &Parked, edit: impl FnOnce(&mut Value
             },
         ))
         .await
-        .unwrap();
-    seq
+        .unwrap()
+}
+
+/// Each decision is refused with 409 `OPTIONS_CHANGED` on the request at
+/// `sequence`, nothing is recorded, and then the same request appended
+/// without options is approved with no choice.
+async fn options_refused_then_plain_decided(env: &Env, parked: &Parked, sequence: i64) {
+    for (label, mut body) in [
+        (
+            "an approval naming an offered id",
+            approval(&parked.digest, json!({ "choice": "topic_2" })),
+        ),
+        ("a rejection", rejection(json!({}))),
+    ] {
+        body["request_sequence"] = json!(sequence);
+        let (st, answer) = decide(env, parked, body).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{}: {label}: {answer}", env.name);
+        assert_eq!(answer["error"], OPTIONS_CHANGED, "{}: {label}", env.name);
+    }
+    assert!(decisions(env, &parked.eid).await.is_empty(), "{}", env.name);
+
+    // Control: the same request without the options is decided.
+    let sequence = append_request(env, parked, |c| {
+        c.as_object_mut().unwrap().remove("options");
+    })
+    .await;
+    let mut body = approval(&parked.digest, json!({}));
+    body["request_sequence"] = json!(sequence);
+    let (st, answer) = decide(env, parked, body).await;
+    assert_eq!(st, StatusCode::OK, "{}: {answer}", env.name);
+    let decision = the_decision(env, &parked.eid).await;
+    assert_eq!(decision["request_sequence"], sequence, "{}", env.name);
+    assert!(decision.get("choice").is_none(), "{}: {decision}", env.name);
 }
 
 #[tokio::test]
@@ -681,6 +712,87 @@ async fn options_changed_between_request_and_decision_is_409() {
             "{}",
             env.name
         );
+    }
+}
+
+/// The other way round: a request appended through the backend that shows
+/// options on a node whose workflow declares none. An approval naming one of
+/// them is refused, and so is a rejection.
+#[tokio::test]
+async fn options_on_a_request_for_a_node_that_declares_none_is_409() {
+    for env in envs().await {
+        let parked = park(&env, &ir(None, None)).await;
+        let sequence = append_request(&env, &parked, |c| c["options"] = topics()).await;
+        options_refused_then_plain_decided(&env, &parked, sequence).await;
+    }
+}
+
+/// A run whose workflow version is not in the store declares no options, so
+/// a request on it that shows options is refused. One that shows none is
+/// decided, as before options existed.
+#[tokio::test]
+async fn options_on_a_request_of_a_run_whose_version_is_missing_is_409() {
+    for env in envs().await {
+        // The initiator and the request context as the API writes them.
+        let model = park(&env, &ir(None, None)).await;
+        let initiated_by = events(&env, &model.eid)
+            .await
+            .into_iter()
+            .find_map(|e| match e.kind {
+                EventKind::WorkflowStarted { initiated_by, .. } => initiated_by,
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{}: the run records who started it", env.name));
+
+        let eid = ExecutionId::new();
+        let now = Utc::now();
+        env.backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "wf-gone".into(),
+                workflow_version: "0.1.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: json!({}),
+                current_state: json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        env.backend
+            .append_event(Event::new(
+                eid.clone(),
+                1,
+                EventKind::WorkflowStarted {
+                    workflow_id: "wf-gone".into(),
+                    workflow_version: "0.1.0".into(),
+                    initial_input: json!({}),
+                    initiated_by: Some(initiated_by),
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(
+            env.backend
+                .get_workflow("wf-gone", "0.1.0")
+                .await
+                .unwrap()
+                .is_none(),
+            "{}: the version is not in the store",
+            env.name
+        );
+
+        let parked = Parked {
+            eid,
+            context: model.context.clone(),
+            digest: model.digest.clone(),
+        };
+        let sequence = append_request(&env, &parked, |c| c["options"] = topics()).await;
+        options_refused_then_plain_decided(&env, &parked, sequence).await;
     }
 }
 
