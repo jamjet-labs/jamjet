@@ -20,7 +20,8 @@
 //! makes another run's pass meanwhile. SQLite has one writer per file, so
 //! the other pass waits for the hang to end and lands within the busy
 //! timeout. The Postgres half, where the other pass commits during the
-//! hang, comes with the Postgres backend.
+//! hang, comes with the Postgres backend; until then the case fails on
+//! Postgres rather than pass there unrun. Both cases skip memory only.
 
 use crate::conformance::cases::support::skipped;
 use crate::conformance::{Fixture, StoreKind, StoreRows};
@@ -44,9 +45,10 @@ use StoreKind::{Sqlite, SqliteScoped};
 const WORKER: &str = "worker-1";
 
 /// The first part of the labels of points inside a store's own
-/// transactions, which are this module's. Points elsewhere, at seams
-/// between components, are tested by the tests that drive those components.
-const STORE_CODE: &[&str] = &["sqlite", "sqlite_scoped"];
+/// transactions, which are this module's: `pg` is the Postgres backend's.
+/// Points elsewhere, at seams between components, are tested by the tests
+/// that drive those components.
+const STORE_CODE: &[&str] = &["sqlite", "sqlite_scoped", "pg"];
 
 /// The stores whose code holds a label's points. A store's label missing
 /// here fails the error case on every store: a point no operation reaches
@@ -105,7 +107,16 @@ pub async fn an_error_at_any_step_leaves_no_partial_write(fx: &Fixture) {
         .filter(|(label, _)| stores_of(label).is_some_and(|kinds| kinds.contains(&fx.kind)))
         .collect();
     if points.is_empty() {
-        return skipped(fx, "the store's code has no fault points");
+        // Only memory has no transactions to stop. Any other store with no
+        // point here would pass this case without failing one.
+        assert_eq!(
+            fx.kind,
+            StoreKind::Memory,
+            "{:?}: no point in faults::POINTS belongs to this store, so this case would \
+             stop none of its transactions: give its labels their stores in stores_of",
+            fx.kind
+        );
+        return skipped(fx, "memory has no transactions to stop");
     }
 
     for (label, step) in points {
@@ -198,12 +209,14 @@ pub async fn a_hang_inside_a_transaction_blocks_only_its_run(fx: &Fixture) {
     const STEP: u32 = 2;
     // Shorter than the SQLite busy timeout, so the waiting pass lands.
     const HANG: Duration = Duration::from_secs(2);
-    if !matches!(fx.kind, Sqlite | SqliteScoped) {
-        return skipped(
-            fx,
-            "the hang is held inside a SQLite transaction here; the Postgres half comes with \
-             the Postgres backend, and memory has no transactions",
-        );
+    match fx.kind {
+        Sqlite | SqliteScoped => {}
+        StoreKind::Memory => return skipped(fx, "memory has no transactions to hold"),
+        StoreKind::Postgres | StoreKind::PostgresScoped => panic!(
+            "{:?}: the Postgres half of this case is not written, so it would pass here \
+             without holding a transaction; it comes with the Postgres backend",
+            fx.kind
+        ),
     }
     assert!(
         faults::enabled(),

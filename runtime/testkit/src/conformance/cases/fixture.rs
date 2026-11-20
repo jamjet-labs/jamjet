@@ -1,10 +1,12 @@
 //! The fixture's own contract: every handle and hook reaches the same
 //! store, and the hooks read and write what the backend does.
 
-use crate::conformance::{Fixture, StoreKind};
+use crate::conformance::{Fixture, StoreKind, StoredJson};
 use chrono::{Duration, Utc};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
-use jamjet_state::{Tenant, TenantId, TenantStatus, WorkItem, WorkItemId, DEFAULT_TENANT};
+use jamjet_state::{
+    Event, EventKind, Tenant, TenantId, TenantStatus, WorkItem, WorkItemId, DEFAULT_TENANT,
+};
 use serde_json::json;
 
 const QUEUE: &str = "general";
@@ -221,6 +223,160 @@ pub async fn a_reopened_store_keeps_what_was_written(fx: &Fixture) {
             fx.kind
         ),
     }
+}
+
+/// The hooks that read a store's rows or write one answer on every store
+/// that keeps rows, and answer with the store's own text. The payload,
+/// event-compat, running-page and faults cases make their check only where
+/// the hook answers, so a store whose hooks answered as memory's do would
+/// pass those checks without running them. Memory keeps parsed values and
+/// no rows; it is the one store let off, and there the hooks must say so.
+pub async fn the_row_hooks_answer_wherever_the_store_keeps_rows(fx: &Fixture) {
+    // The stores with no rows for these hooks to read or write.
+    const NO_ROWS: &[StoreKind] = &[StoreKind::Memory];
+    let keeps_rows = !NO_ROWS.contains(&fx.kind);
+
+    let id = ExecutionId::new();
+    let mut started = run(&id);
+    let input = json!({ "input": "kept as written" });
+    started.initial_input = input.clone();
+    fx.backend.create_execution(started).await.unwrap();
+    let payload = json!({ "payload": "kept as written" });
+    let item = fx
+        .backend
+        .enqueue_work_item(WorkItem {
+            id: uuid::Uuid::new_v4(),
+            execution_id: id.clone(),
+            node_id: "step".into(),
+            queue_type: QUEUE.into(),
+            payload: payload.clone(),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: DEFAULT_TENANT.into(),
+        })
+        .await
+        .unwrap();
+    let kind = EventKind::NodeSkipped {
+        node_id: "step".into(),
+        reason: "kept as written".into(),
+    };
+    let sequence = fx
+        .backend
+        .append_event(Event::new(id.clone(), 0, kind.clone()))
+        .await
+        .unwrap();
+    let raw = EventKind::NodeSkipped {
+        node_id: "raw".into(),
+        reason: "written as text".into(),
+    };
+    let raw_text = serde_json::to_string(&raw).unwrap();
+    let damaged = ExecutionId::new();
+    fx.backend.create_execution(run(&damaged)).await.unwrap();
+
+    let stored_input = fx.hooks.stored_json(StoredJson::RunInput(id.clone())).await;
+    let stored_payload = fx.hooks.stored_json(StoredJson::ItemPayload(item)).await;
+    let stored_event = fx
+        .hooks
+        .stored_json(StoredJson::Event {
+            execution: id.clone(),
+            sequence,
+        })
+        .await;
+    let rows = fx.hooks.every_row().await;
+    let inserted = fx
+        .hooks
+        .insert_event_json(&id, sequence + 1, &raw_text)
+        .await;
+    let made_unreadable = fx.hooks.make_execution_unreadable(&damaged).await;
+    for (hook, answered) in [
+        ("stored_json of a run's input", stored_input.is_some()),
+        ("stored_json of an item's payload", stored_payload.is_some()),
+        ("stored_json of an event", stored_event.is_some()),
+        ("every_row", rows.is_some()),
+        ("insert_event_json", inserted),
+        ("make_execution_unreadable", made_unreadable),
+    ] {
+        if keeps_rows {
+            assert!(
+                answered,
+                "{:?}: {hook} did not answer, so the cases that check what it reads \
+                 or writes would pass here without checking",
+                fx.kind
+            );
+        } else {
+            assert!(
+                !answered,
+                "{:?}: {hook} answered on a store with no rows",
+                fx.kind
+            );
+        }
+    }
+    if !keeps_rows {
+        return;
+    }
+
+    let text = |value: &serde_json::Value| serde_json::to_string(value).unwrap();
+    assert_eq!(
+        stored_input,
+        Some(text(&input)),
+        "{:?}: the run's input",
+        fx.kind
+    );
+    assert_eq!(
+        stored_payload,
+        Some(text(&payload)),
+        "{:?}: the item's payload",
+        fx.kind
+    );
+    assert_eq!(
+        stored_event,
+        Some(serde_json::to_string(&kind).unwrap()),
+        "{:?}: the event",
+        fx.kind
+    );
+    let rows = rows.unwrap();
+    let holds = |table: &str, needle: &str| {
+        rows.get(table)
+            .is_some_and(|found| found.iter().any(|row| row.contains(needle)))
+    };
+    assert!(
+        holds("workflow_executions", &id.0.to_string()),
+        "{:?}: every_row lacks the run",
+        fx.kind
+    );
+    assert!(
+        holds("work_items", &item.to_string()),
+        "{:?}: every_row lacks the item",
+        fx.kind
+    );
+    assert!(
+        holds("events", "kept as written"),
+        "{:?}: every_row lacks the event",
+        fx.kind
+    );
+    let events = fx.backend.get_events(&id).await.unwrap();
+    let read: Vec<(i64, String)> = events
+        .iter()
+        .map(|e| (e.sequence, serde_json::to_string(&e.kind).unwrap()))
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            (sequence, serde_json::to_string(&kind).unwrap()),
+            (sequence + 1, raw_text)
+        ],
+        "{:?}: the event insert_event_json wrote",
+        fx.kind
+    );
+    assert!(
+        fx.backend.get_execution(&damaged).await.is_err(),
+        "{:?}: the run make_execution_unreadable damaged still reads back",
+        fx.kind
+    );
 }
 
 pub async fn a_scoped_handle_sees_only_its_tenant(fx: &Fixture) {

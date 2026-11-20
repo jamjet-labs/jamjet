@@ -108,6 +108,7 @@ macro_rules! for_each_case {
                 artifact_rows_count_one_copy_per_tenant,
                 a_token_moved_to_another_tenant_validates_there,
                 a_reopened_store_keeps_what_was_written,
+                the_row_hooks_answer_wherever_the_store_keeps_rows,
                 a_scoped_handle_sees_only_its_tenant,
             ]
         );
