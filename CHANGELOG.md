@@ -49,9 +49,13 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The MCP tool text no longer says to filter by `paused` to find approvals. A run waiting for
   one stays `running`. `jamjet_get_execution` now carries `waiting_for`, as
   `GET /executions/:id` does.
-- A decision's note (`comment`) is at most 4 KiB and refuses control characters other than
-  newlines and tabs. The MCP approve tool refuses a `comment` that is not a string; it used to
-  drop it. Each decision reads the run's workflow once more, to check the options.
+- A decision's note (`comment`) is at most 4 KiB. It refuses control characters other than
+  newline, carriage return and tab, and invisible format characters: zero-width joiners and
+  spaces, soft hyphens, bidi controls. A `comment` with one of them was accepted before and is
+  now a 400: an emoji sequence joined by a zero-width joiner, Persian text with a zero-width
+  non-joiner, a soft hyphen pasted from a word processor. The MCP approve tool refuses a
+  `comment` that is not a string; it used to drop it. Each decision reads the run's workflow
+  once more, to check the options.
 - A request raised by an older build, for a version whose stored definition has options, is
   answered 409 `OptionsChanged` by every decision, a rejection included.
 - Migration 0017 adds an index for the approvals list. A build from before it will not open

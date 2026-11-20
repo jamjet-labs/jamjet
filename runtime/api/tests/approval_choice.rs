@@ -559,6 +559,57 @@ async fn a_note_with_a_nul_or_a_bidi_override_is_400() {
     }
 }
 
+/// The note refuses every invisible format character, not only control
+/// characters: zero-width joiners and spaces, soft hyphens and bidi controls.
+/// So does `comment`, which older clients send, and an emoji sequence joined
+/// by a zero-width joiner, accepted before notes had a rule, is now a 400.
+/// The same emoji without the joiner is kept.
+#[tokio::test]
+async fn a_note_with_a_zero_width_joiner_or_a_soft_hyphen_is_400() {
+    for env in envs().await {
+        let parked = park(&env, &ir(Some(topics()), None)).await;
+        for note in [
+            "Ship it \u{1f468}\u{200d}\u{1f4bb}",
+            "\u{645}\u{6cc}\u{200c}\u{62e}\u{648}\u{627}\u{647}\u{645}",
+            "co\u{ad}operate",
+            "Fine\u{feff}",
+            "Fine\u{200f}",
+            "Fine \u{2067}txt\u{2069}",
+        ] {
+            for field in ["note", "comment"] {
+                let answer = decide(
+                    &env,
+                    &parked,
+                    approval(&parked.digest, json!({ "choice": "topic_1", field: note })),
+                )
+                .await;
+                assert_refused(&env, answer, StatusCode::BAD_REQUEST, BAD_CHARACTER);
+                let answer = decide(&env, &parked, rejection(json!({ field: note }))).await;
+                assert_refused(&env, answer, StatusCode::BAD_REQUEST, BAD_CHARACTER);
+            }
+        }
+        assert!(
+            decisions(&env, &parked.eid).await.is_empty(),
+            "{}",
+            env.name
+        );
+
+        let kept = "Ship it \u{1f468}\u{1f4bb}";
+        let (st, body) = decide(
+            &env,
+            &parked,
+            approval(
+                &parked.digest,
+                json!({ "choice": "topic_1", "comment": kept }),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+        let decision = the_decision(&env, &parked.eid).await;
+        assert_eq!(decision["comment"], kept, "{}", env.name);
+    }
+}
+
 #[tokio::test]
 async fn a_note_with_newlines_and_tabs_is_kept() {
     for env in envs().await {

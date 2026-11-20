@@ -98,12 +98,15 @@ an expiry means nobody approved, and that fallback would publish anyway.
   that is one of the listed ids, compared byte for byte (`Topic_2` is not
   `topic_2`). A node without options takes no choice, and neither does a
   rejection: either is a 400. A 400 for a missing or unknown choice names the
-  ids. The `note` is free text of at most 4 KiB, with no control characters
-  other than newlines and tabs. `comment` is its old name; send one of the
-  two, or both with the same text. Both listings show a decided request's
-  `choice` and `note`. The engine also checks the options in the request
-  against the node's options in the version the run is bound to, and refuses
-  the decision with a 409 if they differ.
+  ids. The `note` is free text of at most 4 KiB. It may hold newlines,
+  carriage returns and tabs, but no other control character and no invisible
+  format character (zero-width joiners and spaces, soft hyphens, bidi
+  controls). A note with one is a 400, and that includes an emoji sequence
+  joined by a zero-width joiner. `comment` is its old name, held to the same
+  rule; send one of the two, or both with the same text. Both listings show
+  a decided request's `choice` and `note`. The engine also checks the
+  options in the request against the node's options in the version the run
+  is bound to, and refuses the decision with a 409 if they differ.
 - **"Revise" is a run outcome.** The engine runs a node once per run, so an
   option such as `revise` cannot send the run back to the approval for a new
   list. Route it to a branch that ends the run (a step that records the note,
