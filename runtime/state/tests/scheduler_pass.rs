@@ -12,6 +12,7 @@ use jamjet_state::{
 };
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Instant;
 
 fn sqlite_url(tag: &str) -> String {
     let mut p = std::env::temp_dir();
@@ -22,20 +23,21 @@ fn sqlite_url(tag: &str) -> String {
     format!("sqlite://{}", p.display())
 }
 
-fn acme() -> TenantId {
-    TenantId::from("acme")
+async fn scoped_to_acme(base: &SqliteBackend) -> TenantScopedSqliteBackend {
+    scoped_to(base, "acme").await
 }
 
-/// A view of `base` scoped to tenant `acme`, with the tenant row created
-/// (SQLite refuses an unknown tenant on every tenant column).
-async fn scoped_to_acme(base: &SqliteBackend) -> TenantScopedSqliteBackend {
-    let scoped = base.for_tenant(acme());
-    if scoped.get_tenant(&acme()).await.unwrap().is_none() {
+/// A view of `base` scoped to `tenant`, with the tenant row created (SQLite
+/// refuses an unknown tenant on every tenant column).
+async fn scoped_to(base: &SqliteBackend, tenant: &str) -> TenantScopedSqliteBackend {
+    let id = TenantId::from(tenant);
+    let scoped = base.for_tenant(id.clone());
+    if scoped.get_tenant(&id).await.unwrap().is_none() {
         let now = chrono::Utc::now();
         scoped
             .create_tenant(Tenant {
-                id: acme(),
-                name: "acme".into(),
+                id,
+                name: tenant.into(),
                 status: TenantStatus::Active,
                 policy: None,
                 limits: None,
@@ -498,6 +500,48 @@ async fn a_pass_stamps_items_with_the_runs_tenant() {
     }
 }
 
+/// A scoped view finds only its own tenant's runs. `acme`'s view, given a
+/// pass with the right `seen` for a run of `beta` or of `default`, answers
+/// `NotFound` and writes nothing into that run. The run's own store then
+/// commits the same pass, so the refusal came from the scope.
+#[tokio::test]
+async fn a_scoped_pass_for_a_run_of_another_tenant_is_not_found() {
+    let base = SqliteBackend::open(&sqlite_url("other_tenant"))
+        .await
+        .unwrap();
+    let in_acme = scoped_to(&base, "acme").await;
+    let in_beta = scoped_to(&base, "beta").await;
+    let beta: &dyn StateBackend = &in_beta;
+    let default: &dyn StateBackend = &base;
+    for (owner, own_store) in [("beta", beta), ("default", default)] {
+        let id = ExecutionId::new();
+        let seen = start(own_store, &id).await;
+        let before = log(&base, &id).await;
+
+        let pass = dispatch(&id, seen, "b");
+        let items = pass.work_items.clone();
+        let out = in_acme.commit_scheduler_pass(pass).await;
+        assert!(
+            matches!(out, Err(StateBackendError::NotFound(_))),
+            "acme's view, a run of {owner}: {out:?}"
+        );
+        assert_eq!(log(&base, &id).await, before, "a run of {owner}: the log");
+        assert_nothing_written(owner, &base, &items, &id, seen).await;
+
+        let out = own_store
+            .commit_scheduler_pass(dispatch(&id, seen, "b"))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            PassCommit::Committed {
+                last_sequence: seen + 1
+            },
+            "the run's own store, {owner}"
+        );
+    }
+}
+
 /// Two stores that write one database, as two engine instances do.
 async fn pairs() -> Vec<(&'static str, Arc<dyn StateBackend>, Arc<dyn StateBackend>)> {
     let memory = Arc::new(InMemoryBackend::new());
@@ -520,12 +564,36 @@ async fn pairs() -> Vec<(&'static str, Arc<dyn StateBackend>, Arc<dyn StateBacke
     ]
 }
 
-/// Run `a` and `b` at once. Each runs on a thread of its own that spins
-/// until both are ready, so the two start within nanoseconds. Woken by a
-/// barrier instead, the second starts a wake-up later, by which time an
-/// in-memory write (no await between its checks and its writes) has
-/// finished, and the race never opens.
-async fn race<A, B>(a: A, b: B) -> (A::Output, B::Output)
+/// When a call started and when it returned.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    start: Instant,
+    end: Instant,
+}
+
+impl Span {
+    /// Both calls had started before either returned.
+    fn overlaps(self, other: Span) -> bool {
+        self.start.max(other.start) < self.end.min(other.end)
+    }
+}
+
+async fn timed<F: std::future::Future>(work: F) -> (F::Output, Span) {
+    let start = Instant::now();
+    let out = work.await;
+    let end = Instant::now();
+    (out, Span { start, end })
+}
+
+/// Run `a` and `b` at once, and say whether they overlapped: both started
+/// before either returned. Each runs on a thread of its own that spins until
+/// both are ready, so the two start within nanoseconds. Woken by a barrier
+/// instead, the second starts a wake-up later, by which time an in-memory
+/// write (no await between its checks and its writes) has finished, and the
+/// race never opens. Two calls run one after the other give the answers the
+/// race tests accept, so a round that did not overlap shows nothing; each
+/// race test asserts that some rounds did.
+async fn race<A, B>(a: A, b: B) -> (A::Output, B::Output, bool)
 where
     A: std::future::Future + Send + 'static,
     A::Output: Send + 'static,
@@ -537,7 +605,7 @@ where
         work: F,
         ready: Arc<AtomicUsize>,
         go: Arc<AtomicBool>,
-    ) -> tokio::task::JoinHandle<F::Output>
+    ) -> tokio::task::JoinHandle<(F::Output, Span)>
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
@@ -548,7 +616,7 @@ where
             while !go.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }
-            runtime.block_on(work)
+            runtime.block_on(timed(work))
         })
     }
     let ready = Arc::new(AtomicUsize::new(0));
@@ -559,16 +627,20 @@ where
         tokio::task::yield_now().await;
     }
     go.store(true, Ordering::Release);
-    (a.await.unwrap(), b.await.unwrap())
+    let (x, a_span) = a.await.unwrap();
+    let (y, b_span) = b.await.unwrap();
+    (x, y, a_span.overlaps(b_span))
 }
 
 /// Two schedulers that read the same log build the same pass. Released at
 /// once, exactly one commits and the other is told it is stale: the node is
-/// scheduled once and has one item.
+/// scheduled once and has one item. In a round where the two calls
+/// overlapped, the second ran while the first held the lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_concurrent_passes_at_one_sequence_commit_once() {
     const ROUNDS: usize = 200;
     for (name, first, second) in pairs().await {
+        let mut overlapped = 0;
         for round in 0..ROUNDS {
             let id = ExecutionId::new();
             let seen = start(&*first, &id).await;
@@ -576,11 +648,12 @@ async fn two_concurrent_passes_at_one_sequence_commit_once() {
             let items: Vec<WorkItem> = passes.iter().map(|p| p.work_items[0].clone()).collect();
             let [one, two] = passes;
             let (a, b) = (first.clone(), second.clone());
-            let (x, y) = race(
+            let (x, y, at_once) = race(
                 async move { a.commit_scheduler_pass(one).await },
                 async move { b.commit_scheduler_pass(two).await },
             )
             .await;
+            overlapped += usize::from(at_once);
             let outcomes = [x.unwrap(), y.unwrap()];
 
             let committed: Vec<i64> = outcomes
@@ -620,17 +693,23 @@ async fn two_concurrent_passes_at_one_sequence_commit_once() {
             }
             assert_eq!(landed, 1, "{name}, round {round}: items for b");
         }
+        assert!(
+            overlapped > 0,
+            "{name}: the two passes never overlapped in {ROUNDS} rounds, so no round raced"
+        );
     }
 }
 
 /// A worker's commit and a scheduler's pass that read the log before it,
 /// released at once, land one after the other: the pass first and the
 /// commit after it, or the commit first and the pass stale. Never the pass
-/// checked before the commit and written after it.
+/// checked before the commit and written after it. Some rounds must
+/// overlap, or either order could come from two calls in turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pass_and_a_worker_commit_racing_land_one_after_the_other() {
     const ROUNDS: usize = 200;
     for (name, scheduler, worker) in pairs().await {
+        let mut overlapped = 0;
         for round in 0..ROUNDS {
             let id = ExecutionId::new();
             let seen = start(&*scheduler, &id).await;
@@ -659,7 +738,7 @@ async fn a_pass_and_a_worker_commit_racing_land_one_after_the_other() {
             );
             let pass = dispatch(&id, seen, "b");
             let (s, w) = (scheduler.clone(), worker.clone());
-            let (passed, committed) = race(
+            let (passed, committed, at_once) = race(
                 async move { s.commit_scheduler_pass(pass).await },
                 async move {
                     w.commit_turn(held.id, held.lease_fence, failed, false)
@@ -667,6 +746,7 @@ async fn a_pass_and_a_worker_commit_racing_land_one_after_the_other() {
                 },
             )
             .await;
+            overlapped += usize::from(at_once);
             let (passed, committed) = (passed.unwrap(), committed.unwrap());
             let one_after_the_other = match passed {
                 PassCommit::Committed { last_sequence } => {
@@ -683,5 +763,10 @@ async fn a_pass_and_a_worker_commit_racing_land_one_after_the_other() {
                 log(&*scheduler, &id).await
             );
         }
+        assert!(
+            overlapped > 0,
+            "{name}: the pass and the commit never overlapped in {ROUNDS} rounds, \
+             so no round raced"
+        );
     }
 }
