@@ -27,6 +27,7 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import hashlib
 import importlib.metadata
@@ -35,7 +36,7 @@ import math
 import re
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -55,6 +56,7 @@ from jamjet.cli.audit_trail import _BIDI_CONTROLS, display_id
 from jamjet.cli.demo import demo_app
 from jamjet.client import JamjetClient
 from jamjet.deploy import LOCAL_RUNTIME_URL
+from jamjet.transport import OutcomeUnknown
 
 # ── Logo — block letter J  (0=bg  1=yellow#f5c518  2=orange#ea580c) ──────────
 # 6×7 grid: clean J — top bar + vertical stem + orange hook at base.
@@ -153,6 +155,20 @@ console = Console()
 
 def _client(runtime: str = LOCAL_RUNTIME_URL, token: str | None = None) -> JamjetClient:
     return JamjetClient(base_url=runtime, api_token=token)
+
+
+@contextlib.contextmanager
+def _unknown_outcome() -> Iterator[None]:
+    """Turn a lost answer to an unsafe call into a message and exit 1.
+
+    The call may have taken effect and is never sent a second time, so the
+    command stops and tells the person to look before they repeat it.
+    """
+    try:
+        yield
+    except OutcomeUnknown as exc:
+        _print_error("Error:", exc)
+        raise typer.Exit(1) from exc
 
 
 # ── Protocol trace helpers ───────────────────────────────────────────────────
@@ -888,14 +904,15 @@ def deploy(
                 await c.create_workflow(ir)
                 console.print(f"[green]registered[/green] {ir['workflow_id']} v{ir['version']}")
             for job in bundle.cron_jobs:
-                res = await c.create_cron_job(
-                    name=job.name,
-                    cron_expression=job.cron_expression,
-                    workflow_id=job.workflow_id,
-                    workflow_version=job.workflow_version,
-                    input=job.input,
-                    enabled=job.enabled,
-                )
+                with _unknown_outcome():
+                    res = await c.create_cron_job(
+                        name=job.name,
+                        cron_expression=job.cron_expression,
+                        workflow_id=job.workflow_id,
+                        workflow_version=job.workflow_version,
+                        input=job.input,
+                        enabled=job.enabled,
+                    )
                 console.print(
                     f"[green]scheduled[/green] {job.name} [{job.cron_expression}] next={res.get('next_run_at', '?')}"
                 )
@@ -1085,9 +1102,10 @@ def run(
                             f"[dim]Registered[/dim] [bold]{workflow_ref}[/bold] [dim]v{workflow_version or '?'}[/dim]"
                         )
 
-            result = await c.start_execution(
-                workflow_id=workflow_ref, input=input_data, workflow_version=workflow_version
-            )
+            with _unknown_outcome():
+                result = await c.start_execution(
+                    workflow_id=workflow_ref, input=input_data, workflow_version=workflow_version
+                )
             exec_id = result.get("execution_id", "unknown")
 
             if not json_output:
@@ -1560,7 +1578,8 @@ def agents_activate(
 
     async def _activate() -> None:
         async with _client(runtime) as c:
-            data = await c.activate_agent(agent_id)
+            with _unknown_outcome():
+                data = await c.activate_agent(agent_id)
             console.print(f"[green]Activated:[/green] {agent_id} → {data.get('status')}")
 
     asyncio.run(_activate())
@@ -1864,11 +1883,12 @@ def replay(
             console.print(f"Replaying execution [cyan]{execution_id}[/cyan]...")
 
             # 5. Start a new execution.
-            result = await c.start_execution(
-                workflow_id=workflow_id,
-                input=replay_input,
-                workflow_version=workflow_version,
-            )
+            with _unknown_outcome():
+                result = await c.start_execution(
+                    workflow_id=workflow_id,
+                    input=replay_input,
+                    workflow_version=workflow_version,
+                )
             new_id = result.get("execution_id", "unknown")
 
             # Truncate input display for readability.
@@ -1963,11 +1983,12 @@ def fork(
             console.print(f"Forking execution [cyan]{execution_id}[/cyan]...")
 
             # 5. Start a new execution with modified input.
-            result = await c.start_execution(
-                workflow_id=workflow_id,
-                input=fork_input,
-                workflow_version=workflow_version,
-            )
+            with _unknown_outcome():
+                result = await c.start_execution(
+                    workflow_id=workflow_id,
+                    input=fork_input,
+                    workflow_version=workflow_version,
+                )
             new_id = result.get("execution_id", "unknown")
 
             # Show what changed.
@@ -3241,14 +3262,15 @@ def approve(
 
         async with _client(runtime) as c:
             try:
-                result = await c.approve(
-                    execution_id,
-                    decision,
-                    node_id=node_id,
-                    comment=comment,
-                    action_digest=action_digest,
-                    user_id=approver,
-                )
+                with _unknown_outcome():
+                    result = await c.approve(
+                        execution_id,
+                        decision,
+                        node_id=node_id,
+                        comment=comment,
+                        action_digest=action_digest,
+                        user_id=approver,
+                    )
             except httpx.HTTPStatusError as exc:
                 try:
                     msg = exc.response.json().get("error") or exc.response.text
