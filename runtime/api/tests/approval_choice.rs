@@ -13,18 +13,28 @@
 //!
 //! The deadline and the digest are checked before the choice, so a late
 //! decision with a bad choice is still expired.
+//!
+//! The approval node writes the choice and the note into the run's state
+//! (`state.__approvals.<node>.choice`, `.note`), read from the decision on
+//! record, so a condition can route on the choice and no worker can change
+//! it. The decision is sealed into the audit log whole, choice included.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
 use jamjet_api::routes::build_router_with_opts;
+use jamjet_api::state::AppState;
+use jamjet_audit::{
+    verify_chain, AuditBackend, AuditEnricher, AuditLogEntry, AuditQuery, AuditSigner, ChainError,
+    SqliteAuditBackend,
+};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
-use jamjet_scheduler::Scheduler;
-use jamjet_state::backend::StateBackend;
+use jamjet_scheduler::{Projector, Scheduler};
+use jamjet_state::backend::{StateBackend, WorkItem};
 use jamjet_state::event::EventKind;
 use jamjet_state::Event;
-use jamjet_worker::Worker;
+use jamjet_worker::{ExecutionResult, ExecutorError, NodeExecutor, Worker};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -115,26 +125,36 @@ struct Env {
 async fn envs() -> Vec<Env> {
     let mut out = Vec::new();
     for tb in support::backends().await {
-        let backend = tb.dyn_backend();
-        let app = build_router_with_opts(support::make_state(backend.clone()), false);
-        let (alice, _) = backend.create_token("alice", "developer").await.unwrap();
-        let (bob, _) = backend.create_token("bob", "reviewer").await.unwrap();
-        let engine = jamjet_worker::server_pool(
-            backend.clone(),
-            Arc::new(jamjet_models::ModelRegistry::new()),
-        )
-        .build_worker("engine".into(), vec!["general".into()]);
-        out.push(Env {
-            name: tb.name(),
-            scheduler: Scheduler::new(backend.clone()),
-            backend,
-            app,
-            alice,
-            bob,
-            engine,
-        });
+        let state = support::make_state(tb.dyn_backend());
+        out.push(env_on(tb.name(), state, false).await);
     }
     out
+}
+
+/// An environment serving `state`. With `seal_requests` the engine seals the
+/// requests it raises into the state's audit log, as the server does.
+async fn env_on(name: &'static str, state: AppState, seal_requests: bool) -> Env {
+    let backend = state.backend.clone();
+    let mut engine = jamjet_worker::server_pool(
+        backend.clone(),
+        Arc::new(jamjet_models::ModelRegistry::new()),
+    )
+    .build_worker("engine".into(), vec!["general".into()]);
+    if seal_requests {
+        engine = engine.with_sealer(state.enricher.clone());
+    }
+    let app = build_router_with_opts(state, false);
+    let (alice, _) = backend.create_token("alice", "developer").await.unwrap();
+    let (bob, _) = backend.create_token("bob", "reviewer").await.unwrap();
+    Env {
+        name,
+        scheduler: Scheduler::new(backend.clone()),
+        backend,
+        app,
+        alice,
+        bob,
+        engine,
+    }
 }
 
 async fn call(env: &Env, uri: &str, token: &str, body: Value) -> (StatusCode, Value) {
@@ -1152,4 +1172,560 @@ async fn stored_options_that_break_the_rule_refuse_the_node() {
             );
         }
     }
+}
+
+// ── The choice in state, in the audit, in the route ────────────────────────
+
+/// A node of the test workflows.
+fn node(id: &str, kind: Value) -> Value {
+    json!({ "id": id, "kind": kind, "retry_policy": null, "node_timeout_secs": null,
+            "description": null, "labels": {} })
+}
+
+/// A `python_fn` step, which an external worker claims.
+fn step(id: &str) -> Value {
+    node(
+        id,
+        json!({ "type": "python_fn", "module": "myapp.posts", "function": id, "output_schema": "" }),
+    )
+}
+
+/// `pick_topic` offers `topics()`; then each of `steps` runs in turn; then
+/// `route` reads the choice: `revise` goes to `revise_list`, either topic to
+/// `write_post`. No branch is taken without a choice.
+fn routed_ir(workflow_id: &str, steps: &[&str]) -> Value {
+    let on = |choice: &str, target: &str| {
+        json!({
+            "condition": format!("state.__approvals.pick_topic.choice == \"{choice}\""),
+            "target": target
+        })
+    };
+    let mut nodes = serde_json::Map::new();
+    nodes.insert(
+        "pick_topic".into(),
+        node(
+            "pick_topic",
+            json!({ "type": "human_approval", "description": "Which topic goes out this week?",
+                    "timeout_secs": null, "fallback_node": null, "options": topics() }),
+        ),
+    );
+    for s in steps {
+        nodes.insert(s.to_string(), step(s));
+    }
+    nodes.insert(
+        "route".into(),
+        node(
+            "route",
+            json!({ "type": "condition", "branches": [
+                on("revise", "revise_list"),
+                on("topic_1", "write_post"),
+                on("topic_2", "write_post")
+            ] }),
+        ),
+    );
+    nodes.insert("revise_list".into(), step("revise_list"));
+    nodes.insert("write_post".into(), step("write_post"));
+    let mut chain = vec!["pick_topic"];
+    chain.extend_from_slice(steps);
+    chain.push("route");
+    let mut edges: Vec<(&str, &str)> = chain.windows(2).map(|w| (w[0], w[1])).collect();
+    edges.extend([
+        ("route", "revise_list"),
+        ("route", "write_post"),
+        ("revise_list", "end"),
+        ("write_post", "end"),
+    ]);
+    let edges: Vec<Value> = edges
+        .into_iter()
+        .map(|(from, to)| json!({ "from": from, "to": to, "condition": null }))
+        .collect();
+    json!({
+        "workflow_id": workflow_id, "version": "0.1.0", "name": null, "description": null,
+        "state_schema": "", "start_node": "pick_topic", "nodes": nodes, "edges": edges,
+        "retry_policies": {}, "timeouts": {}, "models": {}, "tools": {},
+        "mcp_servers": {}, "remote_agents": {}, "labels": {}
+    })
+}
+
+async fn get(env: &Env, uri: &str, token: &str) -> (StatusCode, Value) {
+    let resp = env
+        .app
+        .clone()
+        .oneshot(
+            Request::get(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Claim the next `python_fn` step over HTTP, as an external worker does.
+async fn claim_step(env: &Env) -> Value {
+    let (st, body) = call(
+        env,
+        "/work-items/claim",
+        &env.alice,
+        json!({ "worker_id": "ext", "queue_types": ["python_tool"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+    assert_eq!(body["claimed"], true, "{}: a step waits: {body}", env.name);
+    body["work_item"].clone()
+}
+
+/// Report a claimed step done over HTTP, with `state_patch`.
+async fn complete_step(env: &Env, item: &Value, state_patch: Value) {
+    let (st, body) = call(
+        env,
+        &format!("/work-items/{}/complete", item["id"].as_str().unwrap()),
+        &env.alice,
+        json!({ "output": {}, "state_patch": state_patch, "lease_fence": item["lease_fence"] }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+}
+
+/// The state patch the run's log records for `node`.
+fn recorded_patch(events: &[Event], node: &str) -> Value {
+    events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::NodeCompleted {
+                node_id,
+                state_patch,
+                ..
+            } if node_id == node => Some(state_patch.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{node} completed: {events:#?}"))
+}
+
+/// The run completed through `reached`, with `skipped` skipped. Returns its
+/// final state.
+async fn ended_through(env: &Env, eid: &ExecutionId, reached: &str, skipped: &str) -> Value {
+    let evs = events(env, eid).await;
+    let completed = |n: &str| {
+        evs.iter()
+            .any(|e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == n))
+    };
+    assert!(completed(reached), "{}: {reached} ran: {evs:#?}", env.name);
+    assert!(!completed(skipped), "{}: {skipped} ran: {evs:#?}", env.name);
+    assert!(
+        evs.iter().any(
+            |e| matches!(&e.kind, EventKind::NodeSkipped { node_id, .. } if node_id == skipped)
+        ),
+        "{}: {skipped} is skipped: {evs:#?}",
+        env.name
+    );
+    evs.iter()
+        .find_map(|e| match &e.kind {
+            EventKind::WorkflowCompleted { final_state } => Some(final_state.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{}: the run completes: {evs:#?}", env.name))
+}
+
+/// The keys of a JSON object, sorted.
+fn keys_of(record: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = record
+        .as_object()
+        .unwrap_or_else(|| panic!("an object: {record}"))
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// A condition reads the choice from the run's state: `revise` reaches the
+/// end of the revise branch, `topic_2` the end of the other.
+#[tokio::test]
+async fn a_condition_on_the_choice_routes_the_run() {
+    for env in envs().await {
+        let ir = routed_ir("wf-route", &[]);
+        for (choice, reached, skipped) in [
+            ("revise", "revise_list", "write_post"),
+            ("topic_2", "write_post", "revise_list"),
+        ] {
+            let parked = park(&env, &ir).await;
+            let note = format!("Picked {choice}.");
+            let (st, body) = decide(
+                &env,
+                &parked,
+                approval(&parked.digest, json!({ "choice": choice, "note": note })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+            settle(&env).await;
+
+            let item = claim_step(&env).await;
+            assert_eq!(item["node_id"], reached, "{}: {choice}: {item}", env.name);
+            let record = &item["payload"]["input"]["__approvals"]["pick_topic"];
+            assert_eq!(record["choice"], choice, "{}: {record}", env.name);
+            assert_eq!(record["note"], note.as_str(), "{}: {record}", env.name);
+            assert_eq!(record["comment"], note.as_str(), "{}: {record}", env.name);
+            complete_step(&env, &item, json!({})).await;
+            settle(&env).await;
+
+            let state = ended_through(&env, &parked.eid, reached, skipped).await;
+            assert_eq!(
+                state["__approvals"]["pick_topic"]["choice"], choice,
+                "{}: {state}",
+                env.name
+            );
+            let output = events(&env, &parked.eid)
+                .await
+                .into_iter()
+                .find_map(|e| match e.kind {
+                    EventKind::NodeCompleted {
+                        node_id, output, ..
+                    } if node_id == "pick_topic" => Some(output),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(output["choice"], choice, "{}: {output}", env.name);
+            assert_eq!(output["note"], note.as_str(), "{}: {output}", env.name);
+        }
+    }
+}
+
+/// The decision is sealed into the audit log whole: its choice and note are in
+/// the entry, the chain verifies, and an edit of the stored choice breaks it.
+#[tokio::test]
+async fn the_choice_and_note_are_in_the_sealed_audit_entry() {
+    let note = "Go with the second one.";
+    for (env, sealed) in sealed_envs().await {
+        let parked = park(&env, &ir(Some(topics()), None)).await;
+        let (st, body) = decide(
+            &env,
+            &parked,
+            approval(&parked.digest, json!({ "choice": "topic_2", "note": note })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+        let (sequence, logged) = events(&env, &parked.eid)
+            .await
+            .into_iter()
+            .find_map(|e| match e.kind {
+                EventKind::ApprovalReceived { .. } => {
+                    Some((e.sequence, serde_json::to_value(&e.kind).unwrap()))
+                }
+                _ => None,
+            })
+            .unwrap();
+
+        let entries = sealed.entries().await;
+        let types: Vec<&str> = entries.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(
+            types,
+            ["tool_approval_required", "approval_received"],
+            "{}",
+            env.name
+        );
+        let index = 1;
+        let entry = &entries[index];
+        assert_eq!(entry.sequence, sequence, "{}", env.name);
+        assert_eq!(entry.raw_event["choice"], "topic_2", "{}", env.name);
+        assert_eq!(entry.raw_event["comment"], note, "{}", env.name);
+        assert_eq!(entry.raw_event, logged, "{}: sealed whole", env.name);
+        assert_eq!(
+            verify_chain(&entries, &sealed.signer),
+            Ok(()),
+            "{}",
+            env.name
+        );
+
+        sealed.edit_stored_choice("revise").await;
+        let edited = sealed.entries().await;
+        assert_eq!(edited[index].raw_event["choice"], "revise", "{}", env.name);
+        assert_eq!(
+            verify_chain(&edited, &sealed.signer),
+            Err(ChainError::HashMismatch { index }),
+            "{}",
+            env.name
+        );
+    }
+}
+
+/// Runs a `python_fn` step in process, reporting `state_patch`.
+struct Reports(Value);
+
+#[async_trait::async_trait]
+impl NodeExecutor for Reports {
+    async fn execute(&self, _item: &WorkItem) -> Result<ExecutionResult, ExecutorError> {
+        Ok(ExecutionResult {
+            output: json!({}),
+            state_patch: self.0.clone(),
+            duration_ms: 0,
+            gen_ai_system: None,
+            gen_ai_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            finish_reason: None,
+        })
+    }
+}
+
+/// A step between the approval and the route reports an approval record that
+/// names another option. The record is dropped from its patch, over HTTP and
+/// in process, and the route follows the choice on record.
+#[tokio::test]
+async fn a_worker_cannot_forge_the_choice_in_state() {
+    let patch = json!({
+        "draft": "A post on durable timers.",
+        "__approvals": { "pick_topic": {
+            "approved": true, "decision": "approved", "choice": "revise", "note": "Forged."
+        } }
+    });
+    for env in envs().await {
+        let ir = routed_ir("wf-forge", &["draft"]);
+        for transport in ["http", "in process"] {
+            let parked = park(&env, &ir).await;
+            let (st, body) = decide(
+                &env,
+                &parked,
+                approval(
+                    &parked.digest,
+                    json!({ "choice": "topic_2", "note": "Go with the second one." }),
+                ),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+            settle(&env).await;
+
+            if transport == "http" {
+                let item = claim_step(&env).await;
+                assert_eq!(item["node_id"], "draft", "{}: {item}", env.name);
+                complete_step(&env, &item, patch.clone()).await;
+            } else {
+                let worker = Worker::new(
+                    "forger".into(),
+                    env.backend.clone(),
+                    vec!["python_tool".into()],
+                )
+                .register_executor("python_fn", Arc::new(Reports(patch.clone())));
+                assert!(
+                    worker.poll_and_execute().await.unwrap(),
+                    "{}: draft runs",
+                    env.name
+                );
+            }
+            // The step's own key is kept and the record is dropped. (The
+            // in-process worker adds its `__budget` bookkeeping to the patch.)
+            let recorded = recorded_patch(&events(&env, &parked.eid).await, "draft");
+            assert_eq!(
+                recorded["draft"], "A post on durable timers.",
+                "{}: {transport}: {recorded}",
+                env.name
+            );
+            assert!(
+                recorded.get("__approvals").is_none(),
+                "{}: {transport}: the record is dropped: {recorded}",
+                env.name
+            );
+            settle(&env).await;
+
+            let item = claim_step(&env).await;
+            assert_eq!(
+                item["node_id"], "write_post",
+                "{}: {transport}: routed on a forged choice: {item}",
+                env.name
+            );
+            let record = &item["payload"]["input"]["__approvals"]["pick_topic"];
+            assert_eq!(record["choice"], "topic_2", "{}: {record}", env.name);
+            assert_eq!(
+                record["note"], "Go with the second one.",
+                "{}: {record}",
+                env.name
+            );
+            complete_step(&env, &item, json!({})).await;
+            settle(&env).await;
+            let state = ended_through(&env, &parked.eid, "write_post", "revise_list").await;
+            assert_eq!(
+                state["__approvals"]["pick_topic"]["choice"], "topic_2",
+                "{}: {transport}: {state}",
+                env.name
+            );
+        }
+    }
+}
+
+/// Both listings show a waiting request's options: they hand out the
+/// request's context whole. The per-run listing reads the run's log until the
+/// projector has seen the request, and the read model after; both show them.
+#[tokio::test]
+async fn the_per_run_and_cross_run_listings_show_the_options() {
+    for env in envs().await {
+        let parked = park(&env, &ir(Some(topics()), None)).await;
+        let run = format!("exec_{}", parked.eid.0.simple());
+        let per_run = format!("/executions/{run}/approvals");
+
+        for read in ["from the log", "from the read model"] {
+            if read == "from the read model" {
+                Projector::new(env.backend.clone()).tick().await.unwrap();
+            }
+            let (st, listed) = get(&env, &per_run, &env.bob).await;
+            assert_eq!(st, StatusCode::OK, "{}: {listed}", env.name);
+            let pending = listed["pending"].as_array().unwrap();
+            assert_eq!(pending.len(), 1, "{}: {read}: {listed}", env.name);
+            assert_eq!(pending[0]["node_id"], "pick_topic", "{}", env.name);
+            assert_eq!(
+                pending[0]["context"]["options"],
+                topics(),
+                "{}: {read}",
+                env.name
+            );
+        }
+
+        let (st, listed) = get(&env, "/approvals", &env.bob).await;
+        assert_eq!(st, StatusCode::OK, "{}: {listed}", env.name);
+        let rows = listed["approvals"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{}: {listed}", env.name);
+        assert_eq!(rows[0]["execution_id"], run.as_str(), "{}", env.name);
+        assert_eq!(rows[0]["node_id"], "pick_topic", "{}", env.name);
+        assert_eq!(rows[0]["context"]["options"], topics(), "{}", env.name);
+    }
+}
+
+/// An expiry routed to the fallback writes a record with no choice and no
+/// note, and a late approval naming an option changes nothing.
+#[tokio::test]
+async fn an_expiry_fallback_record_has_no_choice() {
+    const EXPIRED: &str = "the approval request for node 'pick_topic' expired at its deadline \
+         and can no longer be decided; it was rejected by system:deadline";
+    for env in envs().await {
+        let mut ir = ir(Some(topics()), Some(60));
+        ir["workflow_id"] = json!("wf-expiry");
+        ir["nodes"]["pick_topic"]["kind"]["fallback_node"] = json!("tell_owner");
+        ir["nodes"]["tell_owner"] = step("tell_owner");
+        ir["edges"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "from": "tell_owner", "to": "end", "condition": null }));
+        let parked = park(&env, &ir).await;
+        let expires_at: DateTime<Utc> = parked.context["expires_at"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        env.scheduler
+            .sweep_approval_deadlines(&parked.eid, expires_at)
+            .await
+            .unwrap();
+        settle(&env).await;
+
+        let answer = decide(
+            &env,
+            &parked,
+            approval(&parked.digest, json!({ "choice": "topic_2" })),
+        )
+        .await;
+        assert_refused(&env, answer, StatusCode::CONFLICT, EXPIRED);
+        assert!(
+            decisions(&env, &parked.eid).await.is_empty(),
+            "{}",
+            env.name
+        );
+
+        let item = claim_step(&env).await;
+        assert_eq!(item["node_id"], "tell_owner", "{}: {item}", env.name);
+        let record = &item["payload"]["input"]["__approvals"]["pick_topic"];
+        assert_eq!(
+            keys_of(record),
+            ["approved", "decided_at", "decision"],
+            "{}: {record}",
+            env.name
+        );
+        assert_eq!(record["approved"], false, "{}", env.name);
+        assert_eq!(record["decision"], "expired", "{}", env.name);
+        complete_step(&env, &item, json!({})).await;
+        settle(&env).await;
+
+        let state = ended_through(&env, &parked.eid, "tell_owner", "publish").await;
+        assert_eq!(
+            keys_of(&state["__approvals"]["pick_topic"]),
+            ["approved", "decided_at", "decision"],
+            "{}: {state}",
+            env.name
+        );
+    }
+}
+
+/// Where an environment's audit entries go: a SQLite audit log of its own,
+/// and the key that signs them.
+struct Sealed {
+    audit: Arc<SqliteAuditBackend>,
+    url: String,
+    signer: AuditSigner,
+}
+
+impl Sealed {
+    /// Every stored entry, oldest first (the chain's order).
+    async fn entries(&self) -> Vec<AuditLogEntry> {
+        let mut query = AuditQuery::new();
+        query.limit = 100;
+        let mut entries = self.audit.query(&query).await.unwrap();
+        entries.reverse();
+        entries
+    }
+
+    /// Rewrite the stored decision's `choice` in the database, as someone
+    /// with write access to it could.
+    async fn edit_stored_choice(&self, choice: &str) {
+        let pool = sqlx::SqlitePool::connect(&self.url).await.unwrap();
+        let (raw,): (String,) = sqlx::query_as(
+            "SELECT raw_event FROM audit_log WHERE event_type = 'approval_received'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut raw: Value = serde_json::from_str(&raw).unwrap();
+        raw["choice"] = json!(choice);
+        let done = sqlx::query(
+            "UPDATE audit_log SET raw_event = ? WHERE event_type = 'approval_received'",
+        )
+        .bind(raw.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(done.rows_affected(), 1);
+        pool.close().await;
+    }
+}
+
+/// [`envs`] with the audit log on disk: the approve route seals each decision
+/// into it and the engine each request it raises.
+async fn sealed_envs() -> Vec<(Env, Sealed)> {
+    let mut out = Vec::new();
+    for tb in support::backends().await {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "jamjet_choice_audit_{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let audit = Arc::new(SqliteAuditBackend::open(&url).await.unwrap());
+        audit.migrate().await.unwrap();
+        let signer = AuditSigner::new(b"approval-choice-audit-key".to_vec());
+        let audit_dyn: Arc<dyn AuditBackend> = audit.clone();
+        let mut state = support::make_state(tb.dyn_backend());
+        state.enricher = Arc::new(AuditEnricher::with_signer(
+            audit_dyn.clone(),
+            signer.clone(),
+        ));
+        state.audit = audit_dyn;
+        out.push((
+            env_on(tb.name(), state, true).await,
+            Sealed { audit, url, signer },
+        ));
+    }
+    out
 }

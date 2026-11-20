@@ -43,23 +43,46 @@ an expiry means nobody approved, and that fallback would publish anyway.
   the new state. Another approval completing does not count as a change,
   so two approvals waiting side by side are each asked once.
 - **Approved**: the node completes. Its output records the decision:
-  `decision`, `approved_by`, `principal`, `comment`, `decided_at` and the
-  sequences of the request and the decision. The decision is also written to
-  the run's state, under the engine's key `__approvals` and the node's id,
-  so later steps and prompts can read it:
+  `decision`, `approved_by`, `principal`, `choice`, `note`, `decided_at` and
+  the sequences of the request and the decision. The decision is also
+  written to the run's state, under the engine's key `__approvals` and the
+  node's id, so later steps and prompts can read it:
   `state.__approvals.review_report.approved` (`true`), `.approver`,
-  `.principal`, `.comment`, `.decided_at`. The run continues along `next`.
+  `.principal`, `.choice`, `.note`, `.decided_at`. `choice` is the option
+  the reviewer picked, null for a node without options. `note` is the
+  reviewer's note, null when there is none. The output and the record also
+  carry it as `comment`, its old name. The run continues along `next`.
 - Only the engine writes `state.__approvals`. It is dropped from a run's
   input (`POST /executions`), from the `state_patch` an external worker
   reports (`POST /work-items/:id/complete`), and from the patch of any
   in-process step but the approval node itself, so no step can forge the
   record a later condition reads. It never overwrites a user key named like
   the node.
+- **Route on the choice.** A node that offers options (`options` in its IR,
+  each an `id` and a `label`) is approved with one of them as `choice`. A
+  `condition` after the node reads it from the record:
+
+  ```json
+  "route": {
+    "id": "route",
+    "kind": { "type": "condition", "branches": [
+      { "condition": "state.__approvals.pick_topic.choice == \"revise\"", "target": "revise_list" },
+      { "condition": "state.__approvals.pick_topic.choice == \"topic_2\"", "target": "write_post" }
+    ] }
+  }
+  ```
+
+  The engine takes the choice from the recorded decision, never from a
+  worker's result, so the route is the one the reviewer picked. The decision
+  is sealed into the audit log whole, its choice and note included. The YAML
+  compiler does not read `options` yet; register the IR with
+  `POST /workflows`.
 - **Rejected**: the node fails, and so does the run, as for any rejected
   approval. The node has no "on rejected" route.
 - **Expired** (`timeout` passed with no decision): with a `fallback`, the node
   completes with `decision: "expired"`, writes `approved: false` and
-  `decision: "expired"` to `state.__approvals.<node_id>`, and the run continues at
+  `decision: "expired"` to `state.__approvals.<node_id>` (with no `choice`, so
+  a branch on the choice is not taken), and the run continues at
   the fallback node (or ends, for `end`). Every step the approval guarded is
   skipped: everything reachable from
   its `next` that the fallback does not also lead to, including a step that
