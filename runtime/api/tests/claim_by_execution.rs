@@ -1528,7 +1528,7 @@ enum Expire {
 impl Expire {
     async fn sql(url: &str, sql: &str, id: uuid::Uuid, at: Option<String>) {
         let pool = sqlx::SqlitePool::connect(url).await.unwrap();
-        let mut q = sqlx::query(sql);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
         if let Some(at) = at {
             q = q.bind(at);
         }

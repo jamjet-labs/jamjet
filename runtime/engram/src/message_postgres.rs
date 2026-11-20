@@ -57,7 +57,7 @@ impl PostgresMessageStore {
     /// Apply the DDL. Safe to call multiple times (uses `IF NOT EXISTS`).
     pub async fn migrate(&self) -> Result<(), sqlx::Error> {
         for stmt in PG_MESSAGE_STORE_DDL {
-            sqlx::query(stmt).execute(&self.pool).await?;
+            sqlx::query(*stmt).execute(&self.pool).await?;
         }
         Ok(())
     }

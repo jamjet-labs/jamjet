@@ -11,6 +11,31 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **Engram: scope ids, categories and search text are bound parameters, not SQL text.**
+  The SQLite and Postgres stores wrote these values into the query with their
+  single quotes doubled. That is not an escape on a Postgres server with
+  `standard_conforming_strings` off: a scope id containing `\'` closed its own
+  literal, so `delete_scope_data` for one organisation deleted every
+  organisation's facts, and a listing by scope returned them. SQLite, and Postgres
+  with the default setting (on), were not affected. The graph store's
+  `delete_by_scope` and `neighbors` and the fact store's `list_facts`,
+  `delete_scope_data` and `delete_scope_returning` bind every value now.
+
+- **Engram on Postgres: `update_fact` works.** It bound every value as text,
+  and Postgres has no `uuid = text`, so every patch failed with "operator does
+  not exist". Consolidation ignores that error in places, so superseded-by
+  links and the summarized marker were never saved on Postgres. Each value is
+  bound as its column's type now.
+
+- **SQLite 3.54.1, through `sqlx` 0.9.1** (RUSTSEC-2026-0459, CVE-2026-119375:
+  SQLite before 3.54.0 can return uninitialized memory when it opens a database
+  beside a crafted `-wal` file). `libsqlite3-sys` moves from 0.30.1 to 0.40.0.
+  sqlx 0.9 no longer brings in `rsa`, so RUSTSEC-2023-0071 leaves the tree too,
+  and the dependency audit runs with no advisory suppressed.
+  The crates that use sqlx require `libsqlite3-sys` 0.39.0 or later, so a
+  project that upgrades them with an older lockfile gets the fixed SQLite too.
+  **The minimum Rust version is now 1.94**, up from 1.89: sqlx 0.9 requires it.
+
 - **Approvals are bound to the approver, the run's initiator and the exact action.**
   Behaviour changes to plan for when upgrading:
   - The MCP bridge requires a Bearer token outside dev mode, for every method.

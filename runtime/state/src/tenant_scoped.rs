@@ -934,7 +934,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         max_bytes: usize,
     ) -> BackendResult<Vec<Event>> {
         let sql = crate::sqlite::events_page_sql(true);
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(execution_id_str(execution_id))
             .bind(&self.tenant_id.0)
             .bind(after)
@@ -1456,7 +1456,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             },
             if filter.node_id.is_some() { " AND node_id = ?" } else { "" },
         );
-        let mut q = sqlx::query(&query_str);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(query_str));
         for qt in queue_types {
             q = q.bind(*qt);
         }
