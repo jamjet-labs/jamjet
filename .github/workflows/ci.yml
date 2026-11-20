@@ -60,7 +60,9 @@ jobs:
     # Engram's Postgres stores had no test that ran against a server. The
     # cases in engram/tests/values_are_data_test.rs need one, and with
     # ENGRAM_REQUIRE_POSTGRES_TESTS set they fail instead of skipping when
-    # the URL is missing.
+    # the URL is missing. The testkit's Postgres tests use the same server,
+    # each on a database of its own, and JAMJET_REQUIRE_POSTGRES_TESTS makes
+    # a missing URL fail them too.
     services:
       postgres:
         image: postgres:16-alpine
@@ -76,6 +78,8 @@ jobs:
     env:
       ENGRAM_TEST_POSTGRES_URL: postgres://postgres:engram-ci@127.0.0.1:5432/postgres
       ENGRAM_REQUIRE_POSTGRES_TESTS: "1"
+      JAMJET_TEST_POSTGRES_URL: postgres://postgres:engram-ci@127.0.0.1:5432/postgres
+      JAMJET_REQUIRE_POSTGRES_TESTS: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -166,11 +170,12 @@ jobs:
       - run: uv sync --all-extras
       - run: uv run ruff format --check .
       - run: uv run ruff check .
-      # mypy is scoped to jamjet.cloud (the actively-maintained surface).
-      # Framework-level type issues in jamjet/llm/* and similar legacy modules
-      # are tracked separately; treating them as CI blockers would prevent any
-      # cloud-related PR from merging.
-      - run: uv run mypy jamjet/cloud
+      # mypy is scoped to jamjet.cloud, jamjet.auth and jamjet/transport.py
+      # (the actively-maintained surface, and the code that decides where
+      # credentials go). Framework-level type issues in jamjet/llm/* and
+      # similar legacy modules are tracked separately; treating them as CI
+      # blockers would prevent any cloud-related PR from merging.
+      - run: uv run mypy jamjet/cloud jamjet/auth jamjet/transport.py
 
   python-test:
     name: Python tests (${{ matrix.python-version }})

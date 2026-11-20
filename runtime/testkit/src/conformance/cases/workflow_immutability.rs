@@ -7,10 +7,9 @@
 //! a no-op (deployments re-register on every boot); a differing one is refused
 //! with `VersionConflict` and the stored IR is left as it was.
 
+use crate::conformance::Fixture;
 use chrono::Utc;
-use jamjet_state::backend::{StateBackend, StateBackendError, WorkflowDefinition};
-use jamjet_state::tenant::TenantId;
-use jamjet_state::{InMemoryBackend, SqliteBackend};
+use jamjet_state::backend::{StateBackendError, WorkflowDefinition};
 use serde_json::{json, Value};
 
 fn def(ir: Value) -> WorkflowDefinition {
@@ -31,7 +30,9 @@ fn ungated() -> Value {
     json!({ "workflow_id": "wf", "nodes": { "n": {} } })
 }
 
-async fn check(backend: &dyn StateBackend, name: &str) {
+pub async fn the_backend_refuses_to_replace_a_version(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
+    let name = format!("{:?}", fx.kind);
     backend.store_workflow(def(gated())).await.unwrap();
 
     // Same content, keys in a different order: canonical JSON is equal.
@@ -54,22 +55,4 @@ async fn check(backend: &dyn StateBackend, name: &str) {
         gated(),
         "{name}: the stored IR must be unchanged"
     );
-}
-
-#[tokio::test]
-async fn the_memory_backend_refuses_to_replace_a_version() {
-    check(&InMemoryBackend::new(), "memory").await;
-}
-
-#[tokio::test]
-async fn the_sqlite_backend_refuses_to_replace_a_version() {
-    let db = SqliteBackend::open("sqlite::memory:").await.unwrap();
-    check(&db, "sqlite").await;
-}
-
-#[tokio::test]
-async fn the_tenant_scoped_backend_refuses_to_replace_a_version() {
-    let db = SqliteBackend::open("sqlite::memory:").await.unwrap();
-    let scoped = db.for_tenant(TenantId::default());
-    check(&scoped, "tenant_scoped").await;
 }

@@ -1,0 +1,806 @@
+//! Tests for the `tool_effects` idempotency cache.
+//!
+//! `commit_turn` records a `tool_effects` row atomically when the terminal
+//! event is `NodeCompleted` with `idempotency_key = Some(_)`.
+//! `get_tool_effect(key)` returns the recorded result JSON or `None`.
+//!
+//! TDD: test was written RED (before the field and trait method existed),
+//! turned GREEN after adding `idempotency_key` to `NodeCompleted` and
+//! implementing `get_tool_effect` + the commit_turn recording.
+
+use crate::conformance::cases::support::{not_on, tenant_view, without_tenant_views};
+use crate::conformance::{Fixture, StoreKind};
+use chrono::Utc;
+use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+use jamjet_state::{
+    backend::{StateBackend, WorkItem},
+    Event, EventKind, ReserveOutcome,
+};
+use serde_json::json;
+use uuid::Uuid;
+
+fn sample_execution(id: &ExecutionId) -> WorkflowExecution {
+    let now = Utc::now();
+    WorkflowExecution {
+        execution_id: id.clone(),
+        workflow_id: "test-wf".into(),
+        workflow_version: "1.0.0".into(),
+        status: WorkflowStatus::Running,
+        initial_input: json!({}),
+        current_state: json!({}),
+        started_at: now,
+        updated_at: now,
+        completed_at: None,
+        session_type: None,
+        parent_execution_id: None,
+        segment_number: 0,
+    }
+}
+
+fn sample_item(execution_id: &ExecutionId, node_id: &str) -> WorkItem {
+    WorkItem {
+        id: Uuid::new_v4(),
+        execution_id: execution_id.clone(),
+        node_id: node_id.into(),
+        queue_type: "model".into(),
+        payload: json!({}),
+        attempt: 0,
+        max_attempts: 3,
+        created_at: Utc::now(),
+        lease_expires_at: None,
+        worker_id: None,
+        tenant_id: "default".into(),
+        lease_fence: 0,
+    }
+}
+
+/// `commit_turn` with `NodeCompleted { idempotency_key: Some("k1") }` records
+/// a tool_effect; `get_tool_effect("k1")` returns the result JSON with the
+/// expected output and state_patch; `get_tool_effect("nope")` returns None.
+pub async fn tool_effect_round_trip(fx: &Fixture) {
+    let db = fx.backend.as_ref();
+    let exec_id = ExecutionId::new();
+    db.create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
+    db.enqueue_work_item(sample_item(&exec_id, "n1"))
+        .await
+        .unwrap();
+
+    let item = db
+        .claim_work_item("worker-1", &["model"])
+        .await
+        .unwrap()
+        .expect("item must be claimed");
+
+    let event = Event::new(
+        exec_id.clone(),
+        0, // sequence assigned inside commit_turn
+        EventKind::NodeCompleted {
+            node_id: "n1".into(),
+            output: json!({"result": "hello"}),
+            state_patch: json!({"key": "val"}),
+            duration_ms: 42,
+            gen_ai_system: Some("anthropic".into()),
+            gen_ai_model: Some("claude-3".into()),
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            finish_reason: Some("stop".into()),
+            cost_usd: None,
+            provenance: None,
+            idempotency_key: Some("k1".into()),
+        },
+    );
+
+    db.commit_turn(item.id, item.lease_fence, event, false)
+        .await
+        .expect("commit_turn must succeed");
+
+    // k1 must be recorded with the correct result JSON fields.
+    let recorded = db
+        .get_tool_effect("k1")
+        .await
+        .expect("get_tool_effect must not error");
+    assert!(recorded.is_some(), "expected Some for key k1");
+    let val = recorded.unwrap();
+    assert_eq!(val["output"], json!({"result": "hello"}), "output mismatch");
+    assert_eq!(
+        val["state_patch"],
+        json!({"key": "val"}),
+        "state_patch mismatch"
+    );
+    assert_eq!(val["duration_ms"], json!(42u64), "duration_ms mismatch");
+    assert_eq!(
+        val["gen_ai_system"],
+        json!("anthropic"),
+        "gen_ai_system mismatch"
+    );
+    assert_eq!(
+        val["gen_ai_model"],
+        json!("claude-3"),
+        "gen_ai_model mismatch"
+    );
+    assert_eq!(val["input_tokens"], json!(10u64), "input_tokens mismatch");
+    assert_eq!(val["output_tokens"], json!(20u64), "output_tokens mismatch");
+    assert_eq!(
+        val["finish_reason"],
+        json!("stop"),
+        "finish_reason mismatch"
+    );
+
+    // Unknown key must return None.
+    let none_val = db
+        .get_tool_effect("nope")
+        .await
+        .expect("get_tool_effect must not error for unknown key");
+    assert!(none_val.is_none(), "expected None for unknown key");
+}
+
+/// A NodeCompleted WITHOUT an idempotency_key records NO tool_effect row.
+pub async fn no_key_no_effect_recorded(fx: &Fixture) {
+    let db = fx.backend.as_ref();
+    let exec_id = ExecutionId::new();
+    db.create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
+    db.enqueue_work_item(sample_item(&exec_id, "n1"))
+        .await
+        .unwrap();
+
+    let item = db
+        .claim_work_item("worker-1", &["model"])
+        .await
+        .unwrap()
+        .expect("item must be claimed");
+
+    let event = Event::new(
+        exec_id.clone(),
+        0,
+        EventKind::NodeCompleted {
+            node_id: "n1".into(),
+            output: json!("out"),
+            state_patch: json!({}),
+            duration_ms: 1,
+            gen_ai_system: None,
+            gen_ai_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            finish_reason: None,
+            cost_usd: None,
+            provenance: None,
+            idempotency_key: None, // no key
+        },
+    );
+
+    db.commit_turn(item.id, item.lease_fence, event, false)
+        .await
+        .expect("commit_turn must succeed without idempotency key");
+
+    // Nothing recorded for any key.
+    let none_val = db.get_tool_effect("anything").await.unwrap();
+    assert!(
+        none_val.is_none(),
+        "no tool_effect should be recorded when idempotency_key is None"
+    );
+}
+
+/// Concurrent winner: INSERT OR IGNORE means a second commit with the SAME key
+/// keeps the first result intact (the second insert is silently dropped).
+pub async fn concurrent_winner_insert_or_ignore(fx: &Fixture) {
+    let db = fx.backend.as_ref();
+    let exec_id = ExecutionId::new();
+    db.create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
+
+    // Enqueue two items for the same key.
+    for node in ["n1", "n2"] {
+        db.enqueue_work_item(sample_item(&exec_id, node))
+            .await
+            .unwrap();
+    }
+
+    let item1 = db
+        .claim_work_item("w1", &["model"])
+        .await
+        .unwrap()
+        .expect("item1 must be claimed");
+    let item2 = db
+        .claim_work_item("w2", &["model"])
+        .await
+        .unwrap()
+        .expect("item2 must be claimed");
+
+    // First commit records output "first".
+    db.commit_turn(
+        item1.id,
+        item1.lease_fence,
+        Event::new(
+            exec_id.clone(),
+            0,
+            EventKind::NodeCompleted {
+                node_id: item1.node_id.clone(),
+                output: json!("first"),
+                state_patch: json!({}),
+                duration_ms: 1,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+                idempotency_key: Some("shared-key".into()),
+            },
+        ),
+        false,
+    )
+    .await
+    .expect("first commit must succeed");
+
+    // Second commit with same key: INSERT OR IGNORE keeps "first".
+    db.commit_turn(
+        item2.id,
+        item2.lease_fence,
+        Event::new(
+            exec_id.clone(),
+            0,
+            EventKind::NodeCompleted {
+                node_id: item2.node_id.clone(),
+                output: json!("second"),
+                state_patch: json!({}),
+                duration_ms: 1,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+                idempotency_key: Some("shared-key".into()),
+            },
+        ),
+        false,
+    )
+    .await
+    .expect("second commit with duplicate key must not error (INSERT OR IGNORE)");
+
+    // The first result must be the one that survives.
+    let val = db.get_tool_effect("shared-key").await.unwrap().unwrap();
+    assert_eq!(
+        val["output"],
+        json!("first"),
+        "INSERT OR IGNORE must keep the first result"
+    );
+}
+
+// ── Restart-survival test ─────────────────────────────────────────────────────
+
+/// A tool_effect written to the store is readable through a new pool on it,
+/// as after a process restart.
+pub async fn tool_effect_survives_reopen(fx: &Fixture) {
+    if not_on(fx, &[StoreKind::Memory], "memory cannot be reopened") {
+        return;
+    }
+    // First "process": commit a NodeCompleted with an idempotency key.
+    {
+        let db = fx.backend.as_ref();
+
+        let exec_id = ExecutionId::new();
+        db.create_execution(sample_execution(&exec_id))
+            .await
+            .unwrap();
+        db.enqueue_work_item(sample_item(&exec_id, "n1"))
+            .await
+            .unwrap();
+
+        let item = db
+            .claim_work_item("worker-1", &["model"])
+            .await
+            .unwrap()
+            .expect("item must be claimed");
+
+        let event = Event::new(
+            exec_id.clone(),
+            0,
+            EventKind::NodeCompleted {
+                node_id: "n1".into(),
+                output: json!({"answer": 99}),
+                state_patch: json!({}),
+                duration_ms: 1,
+                gen_ai_system: None,
+                gen_ai_model: None,
+                input_tokens: None,
+                output_tokens: None,
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+                idempotency_key: Some("restart-key".into()),
+            },
+        );
+
+        db.commit_turn(item.id, item.lease_fence, event, false)
+            .await
+            .expect("commit_turn must succeed");
+        // The case stops using the first handle here.
+    }
+
+    // Second "process": reopen the same file and verify the effect survived.
+    {
+        let db2 = fx
+            .hooks
+            .reopen()
+            .await
+            .expect("a store that can be reopened");
+
+        let recorded = db2
+            .get_tool_effect("restart-key")
+            .await
+            .expect("get_tool_effect must not error after reopen");
+        assert!(
+            recorded.is_some(),
+            "tool_effect must survive process restart (db reopen)"
+        );
+        let val = recorded.unwrap();
+        assert_eq!(
+            val["output"],
+            json!({"answer": 99}),
+            "output must survive db reopen"
+        );
+    }
+}
+
+// ── Tenant views ─────────────────────────────────────────────────────────────
+
+/// A tenant view: tool_effect is scoped by tenant_id.
+/// A lookup from a different tenant must return None.
+pub async fn tenant_scoped_tool_effect_round_trip(fx: &Fixture) {
+    let (Some(backend_a), Some(backend_b)) = (
+        tenant_view(fx, "tenant-a").await,
+        tenant_view(fx, "tenant-b").await,
+    ) else {
+        return without_tenant_views(fx);
+    };
+
+    let exec_id = ExecutionId::new();
+    // Create execution as tenant-a (uses shared executions table with tenant_id).
+    backend_a
+        .create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
+    backend_a
+        .enqueue_work_item(sample_item(&exec_id, "n1"))
+        .await
+        .unwrap();
+
+    let item = backend_a
+        .claim_work_item("w", &["model"])
+        .await
+        .unwrap()
+        .expect("item must be claimed by tenant-a");
+
+    let event = Event::new(
+        exec_id.clone(),
+        0,
+        EventKind::NodeCompleted {
+            node_id: "n1".into(),
+            output: json!("tenant-out"),
+            state_patch: json!({}),
+            duration_ms: 1,
+            gen_ai_system: None,
+            gen_ai_model: None,
+            input_tokens: None,
+            output_tokens: None,
+            finish_reason: None,
+            cost_usd: None,
+            provenance: None,
+            idempotency_key: Some("tenant-key".into()),
+        },
+    );
+
+    backend_a
+        .commit_turn(item.id, item.lease_fence, event, false)
+        .await
+        .expect("commit_turn must succeed for tenant-a");
+
+    // tenant-a can read it.
+    let recorded = backend_a.get_tool_effect("tenant-key").await.unwrap();
+    assert!(recorded.is_some(), "tenant-a must see its own tool_effect");
+    assert_eq!(recorded.unwrap()["output"], json!("tenant-out"));
+
+    // tenant-b must NOT see tenant-a's tool_effect.
+    let other = backend_b.get_tool_effect("tenant-key").await.unwrap();
+    assert!(
+        other.is_none(),
+        "tenant-b must not see tenant-a's tool_effect"
+    );
+}
+
+// ── Reserve-before-fire (spec Move 4b) ───────────────────────────────────────
+
+/// Two workers racing for one idempotency key: exactly one may fire.
+///
+/// `get_tool_effect` only answers "did this run to COMPLETION", so before the
+/// reservation existed both workers read `None` and both ran the effect. That is
+/// check-then-fire, and duplicate live items for one node are producible today
+/// (retry crash window, approval-hold resurrection, public POST /work-items).
+pub async fn only_one_worker_can_claim_an_idempotency_key(fx: &Fixture) {
+    let db = fx.backend.as_ref();
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    let first = db
+        .reserve_tool_effect("k1", &eid, "n1", "worker-A", 1, ttl)
+        .await
+        .unwrap();
+    assert_eq!(first, ReserveOutcome::Acquired);
+
+    let second = db
+        .reserve_tool_effect("k1", &eid, "n1", "worker-B", 2, ttl)
+        .await
+        .unwrap();
+    match second {
+        ReserveOutcome::Held { owner, .. } => assert_eq!(owner, "worker-A"),
+        ReserveOutcome::Acquired => {
+            panic!("two workers acquired the same key: the effect will fire twice")
+        }
+    }
+}
+
+/// The reservation is renewed by the attempt that holds it (same owner, same
+/// fence), and another attempt waits for it, the same worker id's included.
+///
+/// It was reentrant for the owner alone, and worker ids are fixed
+/// (`general-worker-0`): a worker that panicked after its effect took its own
+/// reservation straight back under the retry's new fence and fired again.
+/// An attempt that releases it (a park on a rate limit) lets the next one in
+/// at once.
+pub async fn a_reservation_is_renewed_only_by_the_attempt_that_holds_it(fx: &Fixture) {
+    let name = format!("{:?}", fx.kind);
+    let db = fx.backend.as_ref();
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+    assert_eq!(
+        db.reserve_tool_effect("k2", &eid, "n1", "worker-A", 1, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired,
+        "{name}"
+    );
+    assert_eq!(
+        db.reserve_tool_effect("k2", &eid, "n1", "worker-A", 1, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired,
+        "{name}: the holder renews it"
+    );
+    assert!(
+        matches!(
+            db.reserve_tool_effect("k2", &eid, "n1", "worker-A", 2, ttl)
+                .await
+                .unwrap(),
+            ReserveOutcome::Held { .. }
+        ),
+        "{name}: the same worker id's next attempt took it back"
+    );
+    assert!(
+        matches!(
+            db.reserve_tool_effect("k2", &eid, "n1", "worker-B", 3, ttl)
+                .await
+                .unwrap(),
+            ReserveOutcome::Held { .. }
+        ),
+        "{name}"
+    );
+    // Released by its attempt, the next one takes it at once.
+    db.release_tool_reservation("k2", "worker-A", 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.reserve_tool_effect("k2", &eid, "n1", "worker-A", 2, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired,
+        "{name}"
+    );
+}
+
+/// An EXPIRED reservation must be takeable, or a worker that dies mid-tool
+/// leaves the key unrunnable forever, a worse failure than the double-fire the
+/// reservation replaced.
+pub async fn an_expired_reservation_can_be_taken_over(fx: &Fixture) {
+    let db = fx.backend.as_ref();
+    let eid = ExecutionId::new();
+
+    // A TTL of zero is already lapsed by the time the next call reads it.
+    assert_eq!(
+        db.reserve_tool_effect(
+            "k3",
+            &eid,
+            "n1",
+            "worker-dead",
+            1,
+            std::time::Duration::ZERO
+        )
+        .await
+        .unwrap(),
+        ReserveOutcome::Acquired
+    );
+
+    let taken = db
+        .reserve_tool_effect(
+            "k3",
+            &eid,
+            "n1",
+            "worker-B",
+            2,
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        taken,
+        ReserveOutcome::Acquired,
+        "a lapsed reservation must be reclaimable, or a dead worker wedges the key"
+    );
+
+    // And having taken it, B now holds it against everyone else.
+    assert!(matches!(
+        db.reserve_tool_effect(
+            "k3",
+            &eid,
+            "n1",
+            "worker-C",
+            3,
+            std::time::Duration::from_secs(300)
+        )
+        .await
+        .unwrap(),
+        ReserveOutcome::Held { .. }
+    ));
+}
+
+/// Different keys never contend: the reservation is per idempotency key, not a
+/// global lock on the node or the execution.
+pub async fn distinct_keys_do_not_contend(fx: &Fixture) {
+    let db = fx.backend.as_ref();
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    for key in ["a", "b", "c"] {
+        assert_eq!(
+            db.reserve_tool_effect(key, &eid, "n1", "worker-A", 1, ttl)
+                .await
+                .unwrap(),
+            ReserveOutcome::Acquired,
+            "key {key} should not have contended"
+        );
+    }
+}
+
+/// Concurrency, not just sequence: 32 workers race for one key and exactly one
+/// may win. A sequential test cannot distinguish a real atomic claim from a
+/// get-then-insert that simply has not been raced yet.
+pub async fn exactly_one_of_many_concurrent_claimants_wins(fx: &Fixture) {
+    let db = fx.backend.clone();
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    let mut handles = Vec::new();
+    for i in 0..32 {
+        let db = db.clone();
+        let eid = eid.clone();
+        handles.push(tokio::spawn(async move {
+            matches!(
+                db.reserve_tool_effect("hot", &eid, "n1", &format!("worker-{i}"), i, ttl)
+                    .await
+                    .unwrap(),
+                ReserveOutcome::Acquired
+            )
+        }));
+    }
+
+    let mut winners = 0;
+    for h in handles {
+        if h.await.unwrap() {
+            winners += 1;
+        }
+    }
+    assert_eq!(
+        winners, 1,
+        "exactly one worker may fire the effect; {winners} were told the key was theirs"
+    );
+}
+
+/// A released reservation is immediately available to another worker.
+///
+/// Parking or failing ends an attempt WITHOUT recording an effect, so the
+/// reservation must not outlive it. It is reentrant for its holder and lapses on
+/// its TTL either way, but until then a DIFFERENT worker picking the node up
+/// would wait out the remaining TTL for a key nobody is working on.
+pub async fn releasing_a_reservation_frees_it_immediately(fx: &Fixture) {
+    let db = fx.backend.as_ref();
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    assert_eq!(
+        db.reserve_tool_effect("rel", &eid, "n1", "worker-A", 1, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired
+    );
+    assert!(matches!(
+        db.reserve_tool_effect("rel", &eid, "n1", "worker-B", 2, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Held { .. }
+    ));
+
+    db.release_tool_reservation("rel", "worker-A", 1)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.reserve_tool_effect("rel", &eid, "n1", "worker-B", 2, ttl)
+            .await
+            .unwrap(),
+        ReserveOutcome::Acquired,
+        "a released key must be takeable at once, not after the TTL"
+    );
+}
+
+/// Only the holder may release. A worker whose lease was stolen must not be able
+/// to free the key for the worker that took over. That would hand a live
+/// reservation to a third party.
+pub async fn a_non_holder_cannot_release_someone_elses_reservation(fx: &Fixture) {
+    let db = fx.backend.as_ref();
+    let eid = ExecutionId::new();
+    let ttl = std::time::Duration::from_secs(300);
+
+    db.reserve_tool_effect("guarded", &eid, "n1", "worker-A", 1, ttl)
+        .await
+        .unwrap();
+
+    // A stale worker tries to free it.
+    db.release_tool_reservation("guarded", "worker-stale", 1)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            db.reserve_tool_effect("guarded", &eid, "n1", "worker-C", 3, ttl)
+                .await
+                .unwrap(),
+            ReserveOutcome::Held { .. }
+        ),
+        "a non-holder's release must be a no-op: A still owns this key"
+    );
+}
+
+// ── #131: counting in SQL must equal counting by scan ───────────────────────
+
+/// The SQL `COUNT` must return exactly what materialising and filtering returns.
+///
+/// `step` is a component of a PERSISTED identity. A count that is off by one, or
+/// that silently returns 0 because the JSON predicate stopped matching the serde
+/// representation, changes every idempotency key ever derived, which orphans
+/// every recorded effect and re-fires every in-flight tool. Nothing else in the
+/// system would report that; the keys would simply stop matching.
+///
+/// So the optimisation is pinned against the thing it replaced, over a log that
+/// contains the shapes most likely to break the predicate: other event types,
+/// the same event type on a different node, and repeats.
+pub async fn count_node_completions_matches_the_scan(fx: &Fixture) {
+    // BOTH SQL backends carry their own copy of this query, so the unscoped
+    // and the scoped suites each pin one. Mutating the query in one file and
+    // watching the other file's case stay green is exactly how a half-fix
+    // survives.
+    check_count_parity(fx.backend.as_ref()).await;
+}
+
+async fn check_count_parity(backend: &dyn StateBackend) {
+    let execution_id = ExecutionId::new();
+    let now = chrono::Utc::now();
+    backend
+        .create_execution(WorkflowExecution {
+            execution_id: execution_id.clone(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: json!({}),
+            current_state: json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        })
+        .await
+        .unwrap();
+
+    let completed = |node: &str| EventKind::NodeCompleted {
+        node_id: node.into(),
+        output: json!({"big": "payload".repeat(50)}),
+        state_patch: json!({}),
+        duration_ms: 1,
+        gen_ai_system: None,
+        gen_ai_model: None,
+        input_tokens: None,
+        output_tokens: None,
+        finish_reason: None,
+        cost_usd: None,
+        provenance: None,
+        idempotency_key: None,
+    };
+
+    let kinds = vec![
+        EventKind::NodeScheduled {
+            node_id: "n1".into(),
+            queue_type: "general".into(),
+        },
+        completed("n1"),
+        EventKind::NodeStarted {
+            node_id: "n1".into(),
+            worker_id: "w".into(),
+            attempt: 0,
+        },
+        completed("other"), // same type, different node
+        completed("n1"),
+        EventKind::NodeScheduled {
+            node_id: "other".into(),
+            queue_type: "general".into(),
+        },
+    ];
+    for (i, kind) in kinds.into_iter().enumerate() {
+        backend
+            .append_event(Event::new(execution_id.clone(), (i + 1) as i64, kind))
+            .await
+            .unwrap();
+    }
+
+    for node in ["n1", "other", "never-ran"] {
+        let scanned = backend
+            .get_events(&execution_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(
+                |e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == node),
+            )
+            .count() as u64;
+        let counted = backend
+            .count_node_completions(&execution_id, node)
+            .await
+            .unwrap();
+        assert_eq!(
+            counted, scanned,
+            "SQL count disagreed with the scan for {node:?}: every idempotency key \
+             derived from this execution would change"
+        );
+    }
+
+    // Spelled out, so a predicate that matches nothing cannot pass by agreeing
+    // with a scan that also broke.
+    assert_eq!(
+        backend
+            .count_node_completions(&execution_id, "n1")
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        backend
+            .count_node_completions(&execution_id, "other")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .count_node_completions(&execution_id, "never-ran")
+            .await
+            .unwrap(),
+        0
+    );
+}

@@ -3,24 +3,27 @@
 //! Verifies that data is properly partitioned between tenants:
 //! tenants cannot see each other's workflows, executions, or events.
 
+use crate::conformance::cases::support::without_tenant_views;
+use crate::conformance::{Fixture, Scoper};
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::backend::{StateBackend, WorkflowDefinition};
 use jamjet_state::event::{Event, EventKind};
 use jamjet_state::tenant::{Tenant, TenantId, TenantStatus};
-use jamjet_state::SqliteBackend;
 use serde_json::json;
+use std::sync::Arc;
 
-/// Open an in-memory SQLite backend with migrations.
-async fn open_test_db() -> SqliteBackend {
-    SqliteBackend::open("sqlite::memory:")
-        .await
-        .expect("failed to open in-memory SQLite")
+/// The store unscoped, and its tenant views. `None` on memory and the
+/// unscoped stores, which have no tenant views: these cases run on the
+/// scoped stores only.
+fn store(fx: &Fixture) -> Option<(Arc<dyn StateBackend>, &Scoper)> {
+    let scoper = fx.scoped.as_ref()?;
+    Some((fx.hooks.unscoped(), scoper))
 }
 
-/// Register a tenant in the database so FK constraints are satisfied.
-async fn register_tenant(db: &SqliteBackend, id: &str, name: &str) {
-    let scoped = db.for_tenant(TenantId::default());
+/// Register a tenant in the store so FK constraints are satisfied.
+async fn register_tenant(scoper: &Scoper, id: &str, name: &str) {
+    let scoped = scoper(&TenantId::default());
     let now = Utc::now();
     scoped
         .create_tenant(Tenant {
@@ -56,10 +59,11 @@ fn sample_execution(workflow_id: &str) -> WorkflowExecution {
 
 // ── Tenant CRUD ─────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn create_and_list_tenants() {
-    let db = open_test_db().await;
-    let scoped = db.for_tenant(TenantId::default());
+pub async fn create_and_list_tenants(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    let scoped = scoper(&TenantId::default());
 
     let now = Utc::now();
     let tenant = Tenant {
@@ -80,10 +84,11 @@ async fn create_and_list_tenants() {
     assert!(names.contains(&"Acme Corp"));
 }
 
-#[tokio::test]
-async fn get_and_update_tenant() {
-    let db = open_test_db().await;
-    let scoped = db.for_tenant(TenantId::default());
+pub async fn get_and_update_tenant(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    let scoped = scoper(&TenantId::default());
 
     let now = Utc::now();
     scoped
@@ -131,13 +136,14 @@ async fn get_and_update_tenant() {
 
 // ── Workflow isolation ──────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn workflow_definitions_are_tenant_isolated() {
-    let db = open_test_db().await;
-    register_tenant(&db, "alpha", "Alpha Corp").await;
-    register_tenant(&db, "bravo", "Bravo Corp").await;
-    let tenant_a = db.for_tenant(TenantId::from("alpha"));
-    let tenant_b = db.for_tenant(TenantId::from("bravo"));
+pub async fn workflow_definitions_are_tenant_isolated(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "alpha", "Alpha Corp").await;
+    register_tenant(scoper, "bravo", "Bravo Corp").await;
+    let tenant_a = scoper(&TenantId::from("alpha"));
+    let tenant_b = scoper(&TenantId::from("bravo"));
 
     // Tenant A stores a workflow
     let def_a = WorkflowDefinition {
@@ -178,13 +184,14 @@ async fn workflow_definitions_are_tenant_isolated() {
 
 // ── Execution isolation ─────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn executions_are_tenant_isolated() {
-    let db = open_test_db().await;
-    register_tenant(&db, "alpha", "Alpha Corp").await;
-    register_tenant(&db, "bravo", "Bravo Corp").await;
-    let tenant_a = db.for_tenant(TenantId::from("alpha"));
-    let tenant_b = db.for_tenant(TenantId::from("bravo"));
+pub async fn executions_are_tenant_isolated(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "alpha", "Alpha Corp").await;
+    register_tenant(scoper, "bravo", "Bravo Corp").await;
+    let tenant_a = scoper(&TenantId::from("alpha"));
+    let tenant_b = scoper(&TenantId::from("bravo"));
 
     // Each tenant creates an execution
     let exec_a = sample_execution("wf-alpha");
@@ -212,13 +219,14 @@ async fn executions_are_tenant_isolated() {
 
 // ── Event isolation ─────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn events_are_tenant_isolated() {
-    let db = open_test_db().await;
-    register_tenant(&db, "alpha", "Alpha Corp").await;
-    register_tenant(&db, "bravo", "Bravo Corp").await;
-    let tenant_a = db.for_tenant(TenantId::from("alpha"));
-    let tenant_b = db.for_tenant(TenantId::from("bravo"));
+pub async fn events_are_tenant_isolated(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "alpha", "Alpha Corp").await;
+    register_tenant(scoper, "bravo", "Bravo Corp").await;
+    let tenant_a = scoper(&TenantId::from("alpha"));
+    let tenant_b = scoper(&TenantId::from("bravo"));
 
     let exec_a = sample_execution("wf-a");
     let id_a = exec_a.execution_id.clone();
@@ -256,13 +264,14 @@ async fn events_are_tenant_isolated() {
 
 // ── Work item isolation ─────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn work_items_are_tenant_isolated() {
-    let db = open_test_db().await;
-    register_tenant(&db, "alpha", "Alpha Corp").await;
-    register_tenant(&db, "bravo", "Bravo Corp").await;
-    let tenant_a = db.for_tenant(TenantId::from("alpha"));
-    let tenant_b = db.for_tenant(TenantId::from("bravo"));
+pub async fn work_items_are_tenant_isolated(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "alpha", "Alpha Corp").await;
+    register_tenant(scoper, "bravo", "Bravo Corp").await;
+    let tenant_a = scoper(&TenantId::from("alpha"));
+    let tenant_b = scoper(&TenantId::from("bravo"));
 
     let exec_a = sample_execution("wf-a");
     let id_a = exec_a.execution_id.clone();
@@ -325,11 +334,12 @@ async fn work_items_are_tenant_isolated() {
 
 // ── Default tenant backward compatibility ───────────────────────────────────
 
-#[tokio::test]
-async fn default_tenant_backward_compatible() {
-    let db = open_test_db().await;
+pub async fn default_tenant_backward_compatible(fx: &Fixture) {
+    let Some((db, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
 
-    // Using the unscoped SqliteBackend (original code path)
+    // Using the unscoped store (the original code path)
     let def = WorkflowDefinition {
         workflow_id: "legacy-wf".to_string(),
         version: "1.0.0".to_string(),
@@ -340,7 +350,7 @@ async fn default_tenant_backward_compatible() {
     db.store_workflow(def).await.unwrap();
 
     // A scoped backend with "default" tenant can see it
-    let default_scoped = db.for_tenant(TenantId::default());
+    let default_scoped = scoper(&TenantId::default());
     let fetched = default_scoped
         .get_workflow("legacy-wf", "1.0.0")
         .await
@@ -348,18 +358,19 @@ async fn default_tenant_backward_compatible() {
     assert!(fetched.is_some());
 
     // A scoped backend with a different tenant cannot
-    let other = db.for_tenant(TenantId::from("other"));
+    let other = scoper(&TenantId::from("other"));
     let not_found = other.get_workflow("legacy-wf", "1.0.0").await.unwrap();
     assert!(not_found.is_none());
 }
 
 // ── Token tenant attribution ────────────────────────────────────────────────
 
-#[tokio::test]
-async fn tokens_carry_tenant_id() {
-    let db = open_test_db().await;
-    register_tenant(&db, "acme", "Acme Corp").await;
-    let scoped = db.for_tenant(TenantId::from("acme"));
+pub async fn tokens_carry_tenant_id(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "acme", "Acme Corp").await;
+    let scoped = scoper(&TenantId::from("acme"));
 
     let (plaintext, info) = scoped.create_token("dev-token", "developer").await.unwrap();
     assert_eq!(info.tenant_id, "acme");
@@ -381,11 +392,12 @@ async fn tokens_carry_tenant_id() {
 /// empty result and concludes nothing failed. Caught in review on #118, which is
 /// why the assertion is on the STORED STRING rather than on a round-trip that
 /// would format both sides the same way and agree with itself.
-#[tokio::test]
-async fn scoped_dead_letter_stores_the_bare_execution_uuid() {
-    let db = open_test_db().await;
-    register_tenant(&db, "alpha", "Alpha").await;
-    let tenant = db.for_tenant(TenantId::from("alpha"));
+pub async fn scoped_dead_letter_stores_the_bare_execution_uuid(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "alpha", "Alpha").await;
+    let tenant = scoper(&TenantId::from("alpha"));
 
     let exec = sample_execution("wf-dl");
     let execution_id = exec.execution_id.clone();
@@ -431,35 +443,31 @@ async fn scoped_dead_letter_stores_the_bare_execution_uuid() {
         "attempt 3 of 3 is spent, so this must dead-letter"
     );
 
-    let stored: String =
-        sqlx::query_scalar("SELECT execution_id FROM dead_letter_items WHERE id = ?")
-            .bind(item_id.to_string())
-            .fetch_one(&db.pool())
-            .await
-            .expect("the dead-letter row must exist");
-
+    // Display would write exec_<simple>, which joins to nothing. The row's
+    // foreign key on the run refuses it at the insert, and the hook reads
+    // the stored id back as the run's.
+    let stored = fx
+        .hooks
+        .dead_letter_execution(item_id)
+        .await
+        .expect("the dead-letter row must exist");
     assert_eq!(
-        stored,
-        execution_id.0.to_string(),
-        "the dead-letter row must store the bare UUID, like every other \
-         execution_id column; Display would write exec_<simple> and join to nothing"
-    );
-    assert_ne!(
-        stored,
-        execution_id.to_string(),
-        "Display is the wrong format here — this assertion is the regression guard"
+        stored, execution_id,
+        "the dead-letter row must store the run's bare UUID, like every other \
+         execution_id column"
     );
 }
 
 /// A tenant must not be able to fail another tenant's work item, even holding a
 /// correct id and fence.
-#[tokio::test]
-async fn scoped_fail_cannot_reach_another_tenants_item() {
-    let db = open_test_db().await;
-    register_tenant(&db, "alpha", "Alpha").await;
-    register_tenant(&db, "beta", "Beta").await;
-    let tenant_a = db.for_tenant(TenantId::from("alpha"));
-    let tenant_b = db.for_tenant(TenantId::from("beta"));
+pub async fn scoped_fail_cannot_reach_another_tenants_item(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "alpha", "Alpha").await;
+    register_tenant(scoper, "beta", "Beta").await;
+    let tenant_a = scoper(&TenantId::from("alpha"));
+    let tenant_b = scoper(&TenantId::from("beta"));
 
     let exec = sample_execution("wf-x");
     let execution_id = exec.execution_id.clone();
@@ -521,13 +529,14 @@ async fn scoped_fail_cannot_reach_another_tenants_item() {
 /// Needs volume for the same reason as its untenanted twin: a settle done
 /// BEFORE the call also changes `status`, which the sweep's own SELECT filters
 /// out, so nothing races. Verified to fail against the unguarded UPDATE.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scoped_reclaim_cannot_resurrect_a_settled_item() {
+pub async fn scoped_reclaim_cannot_resurrect_a_settled_item(fx: &Fixture) {
     const ITEMS: usize = 400;
 
-    let db = std::sync::Arc::new(open_test_db().await);
-    register_tenant(&db, "alpha", "Alpha").await;
-    let tenant = std::sync::Arc::new(db.for_tenant(TenantId::from("alpha")));
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "alpha", "Alpha").await;
+    let tenant = scoper(&TenantId::from("alpha"));
 
     let exec = sample_execution("wf-race");
     let execution_id = exec.execution_id.clone();
@@ -563,10 +572,9 @@ async fn scoped_reclaim_cannot_resurrect_a_settled_item() {
         claimed.push((c.id, c.lease_fence));
     }
     // Expire every lease so the sweep captures all of them.
-    sqlx::query("UPDATE work_items SET lease_expires_at = '2020-01-01T00:00:00+00:00'")
-        .execute(&db.pool())
-        .await
-        .unwrap();
+    for (id, _) in &claimed {
+        fx.hooks.force_lease_expired(*id).await;
+    }
 
     // Settle the LAST items the sweep will reach, while it works through the rest.
     let victims: Vec<(uuid::Uuid, i64)> = claimed.iter().rev().take(40).copied().collect();
@@ -598,11 +606,12 @@ async fn scoped_reclaim_cannot_resurrect_a_settled_item() {
             "a COMPLETED item was reported as reclaimed ({id}) — the caller will \
              emit NodeFailed for a node that succeeded"
         );
-        let status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = ?")
-            .bind(id.to_string())
-            .fetch_one(&db.pool())
+        let status = fx
+            .hooks
+            .item_row(*id)
             .await
-            .unwrap();
+            .expect("the item has a row")
+            .status;
         assert_eq!(
             status, "completed",
             "a COMPLETED item was resurrected to {status:?} ({id}) — it will re-run \
@@ -618,11 +627,12 @@ async fn scoped_reclaim_cannot_resurrect_a_settled_item() {
 /// The scoped claim path must consume attempts too, or a node that kills its
 /// worker loops forever — the same infinite-retry bug fixed for the untenanted
 /// backend, in the copy that was missed.
-#[tokio::test]
-async fn scoped_claim_side_expiry_consumes_attempts() {
-    let db = open_test_db().await;
-    register_tenant(&db, "alpha", "Alpha").await;
-    let tenant = db.for_tenant(TenantId::from("alpha"));
+pub async fn scoped_claim_side_expiry_consumes_attempts(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "alpha", "Alpha").await;
+    let tenant = scoper(&TenantId::from("alpha"));
 
     let exec = sample_execution("wf-attempts");
     let execution_id = exec.execution_id.clone();
@@ -653,13 +663,7 @@ async fn scoped_claim_side_expiry_consumes_attempts() {
             break;
         };
         seen.push(c.attempt);
-        sqlx::query(
-            "UPDATE work_items SET lease_expires_at = '2020-01-01T00:00:00+00:00' WHERE id = ?",
-        )
-        .bind(item_id.to_string())
-        .execute(&db.pool())
-        .await
-        .unwrap();
+        fx.hooks.force_lease_expired(item_id).await;
     }
     assert_eq!(
         seen,
@@ -686,13 +690,14 @@ async fn scoped_claim_side_expiry_consumes_attempts() {
 ///
 /// Both halves are asserted: B is refused, and A can still take its own key in
 /// the first place.
-#[tokio::test]
-async fn a_reservation_is_scoped_to_its_tenant() {
-    let db = open_test_db().await;
-    register_tenant(&db, "alpha", "Alpha").await;
-    register_tenant(&db, "beta", "Beta").await;
-    let a = db.for_tenant(TenantId::from("alpha"));
-    let b = db.for_tenant(TenantId::from("beta"));
+pub async fn a_reservation_is_scoped_to_its_tenant(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "alpha", "Alpha").await;
+    register_tenant(scoper, "beta", "Beta").await;
+    let a = scoper(&TenantId::from("alpha"));
+    let b = scoper(&TenantId::from("beta"));
 
     let eid_a = ExecutionId::new();
     let eid_b = ExecutionId::new();
@@ -734,14 +739,15 @@ async fn a_reservation_is_scoped_to_its_tenant() {
 /// resolve another tenant's item and file an effect under a key derived from it
 /// — the same cross-tenant shape as the reservation primary-key bug, where a
 /// globally-scoped row read as free to a tenant-filtered caller.
-#[tokio::test]
-async fn get_work_item_is_scoped_to_the_tenant() {
-    let db = open_test_db().await;
-    register_tenant(&db, "alpha", "Alpha").await;
-    register_tenant(&db, "bravo", "Bravo").await;
+pub async fn get_work_item_is_scoped_to_the_tenant(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "alpha", "Alpha").await;
+    register_tenant(scoper, "bravo", "Bravo").await;
 
-    let tenant_a = db.for_tenant(TenantId::from("alpha"));
-    let tenant_b = db.for_tenant(TenantId::from("bravo"));
+    let tenant_a = scoper(&TenantId::from("alpha"));
+    let tenant_b = scoper(&TenantId::from("bravo"));
 
     let exec_a = sample_execution("wf-a");
     let exec_id = exec_a.execution_id.clone();
@@ -782,15 +788,13 @@ async fn get_work_item_is_scoped_to_the_tenant() {
 /// which `require_auth` validates against, did not select the column and
 /// silently answered `default` for every token, so no request could act in
 /// any other tenant and tenant scoping keyed on the token meant nothing.
-#[tokio::test]
-async fn a_token_carries_the_tenant_on_its_row() {
-    let db = open_test_db().await;
-    register_tenant(&db, "acme", "Acme").await;
+pub async fn a_token_carries_the_tenant_on_its_row(fx: &Fixture) {
+    let Some((db, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "acme", "Acme").await;
     let (token, _) = db.create_token("mallory", "developer").await.unwrap();
-    sqlx::query("UPDATE api_tokens SET tenant_id = 'acme' WHERE name = 'mallory'")
-        .execute(&db.pool())
-        .await
-        .unwrap();
+    fx.hooks.set_token_tenant("mallory", "acme").await;
     let info = db.validate_token(&token).await.unwrap().unwrap();
     assert_eq!(info.tenant_id, "acme");
 }

@@ -4,6 +4,20 @@
 
 ### Added
 
+- **`JamjetClient(auth=...)`, an auth hook for an engine behind a platform identity
+  check.** The hook adds its own header, and the JamJet token keeps `Authorization`.
+  `jamjet.auth.GoogleIdTokenAuth` gets a Google ID token and sends it in
+  `X-Serverless-Authorization`. It needs `pip install 'jamjet[google-auth]'`.
+  `jamjet.auth.TokenSourceAuth` does the same for any token source.
+- **`PlatformAuthError`.** A 401 or 403 that does not carry the engine's error body came
+  from something in front of the engine. It is a subclass of `JamjetAPIError`, so existing
+  handlers still catch it.
+- **Retries are on by default, and `RetryPolicy.off()` turns them off.** A call that was
+  never sent is sent again. A call that is safe to repeat is sent again. An unsafe call
+  that may have taken effect raises `OutcomeUnknown` and is never sent again. The CLI
+  commands that start, approve or activate say so and exit 1.
+- **`jamjet ops tick`** runs one tick on an engine that has its background loops off. It
+  needs an engine whose `/health` lists `ops_tick`.
 - **`client.list_pending_approvals(limit=None, after=None)`** lists pending approvals across runs
   from `GET /approvals`. Against an engine without that list it raises `JamjetAPIError` and asks
   for an upgrade. `approve()` returns the engine's `repeat`, `sequence` and `waiting_for`.
@@ -19,8 +33,29 @@
   the run waits with no error. The run's own worker has to call
   `POST /work-items/claim` with `execution_id`.
 
+### Changed
+
+- **Credentials go only to the engine's own address.** The JamJet token and anything an
+  auth hook adds are sent to the scheme, host and port of `base_url` and nowhere else. A
+  request to another address raises `CredentialScopeError` before anything is sent.
+  Redirects are raised, not followed.
+- **An unsafe call whose answer was lost raises `OutcomeUnknown`.** For `start_execution`,
+  `approve` and every other call that is not safe to repeat, a 5xx or a lost answer (a
+  timeout or a broken connection) now raises `OutcomeUnknown` in place of `JamjetAPIError`
+  or an httpx error. It is a `RuntimeError`, not an httpx error, so
+  `except httpx.HTTPError` does not catch it. The original error is on `__cause__`.
+  Import it from `jamjet.transport`.
+
 ### Fixed
 
+- **A JamJet token that cannot go in a header is refused, and not shown.** A token with
+  a line break, a NUL or a space at one end, as a token read from a file often has, made
+  every call fail with an httpx error that quoted the whole token, and `jamjet` commands
+  printed it. The client now refuses such a token, and one with any other control
+  character, with a `ValueError` when it is built. An `auth` hook's value of that kind is
+  refused before the request is sent. A transport error no longer quotes a credential,
+  and a request httpx could not write is raised at once, not sent again and not reported
+  as `OutcomeUnknown`.
 - **`jamjet dev` names the extra it needs.** Without uvicorn it told you to run
   `pip install 'jamjet'`: Rich read `[sidecar]` as a style tag and dropped it. It now
   prints `pip install 'jamjet[sidecar]'`.

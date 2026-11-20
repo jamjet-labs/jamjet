@@ -27,6 +27,7 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import hashlib
 import importlib.metadata
@@ -35,7 +36,7 @@ import math
 import re
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -55,6 +56,7 @@ from jamjet.cli.audit_trail import _BIDI_CONTROLS, display_id
 from jamjet.cli.demo import demo_app
 from jamjet.client import JamjetClient
 from jamjet.deploy import LOCAL_RUNTIME_URL
+from jamjet.transport import OutcomeUnknown
 
 # ── Logo — block letter J  (0=bg  1=yellow#f5c518  2=orange#ea580c) ──────────
 # 6×7 grid: clean J — top bar + vertical stem + orange hook at base.
@@ -145,12 +147,28 @@ app.add_typer(mcp_app, name="mcp")
 app.add_typer(a2a_app, name="a2a")
 app.add_typer(eval_app, name="eval")
 app.add_typer(demo_app, name="demo")
+ops_app = typer.Typer(help="Operate an engine", no_args_is_help=True)
+app.add_typer(ops_app, name="ops")
 
 console = Console()
 
 
 def _client(runtime: str = LOCAL_RUNTIME_URL, token: str | None = None) -> JamjetClient:
     return JamjetClient(base_url=runtime, api_token=token)
+
+
+@contextlib.contextmanager
+def _unknown_outcome() -> Iterator[None]:
+    """Turn a lost answer to an unsafe call into a message and exit 1.
+
+    The call may have taken effect and is never sent a second time, so the
+    command stops and tells the person to look before they repeat it.
+    """
+    try:
+        yield
+    except OutcomeUnknown as exc:
+        _print_error("Error:", exc)
+        raise typer.Exit(1) from exc
 
 
 # ── Protocol trace helpers ───────────────────────────────────────────────────
@@ -886,14 +904,15 @@ def deploy(
                 await c.create_workflow(ir)
                 console.print(f"[green]registered[/green] {ir['workflow_id']} v{ir['version']}")
             for job in bundle.cron_jobs:
-                res = await c.create_cron_job(
-                    name=job.name,
-                    cron_expression=job.cron_expression,
-                    workflow_id=job.workflow_id,
-                    workflow_version=job.workflow_version,
-                    input=job.input,
-                    enabled=job.enabled,
-                )
+                with _unknown_outcome():
+                    res = await c.create_cron_job(
+                        name=job.name,
+                        cron_expression=job.cron_expression,
+                        workflow_id=job.workflow_id,
+                        workflow_version=job.workflow_version,
+                        input=job.input,
+                        enabled=job.enabled,
+                    )
                 console.print(
                     f"[green]scheduled[/green] {job.name} [{job.cron_expression}] next={res.get('next_run_at', '?')}"
                 )
@@ -1083,9 +1102,10 @@ def run(
                             f"[dim]Registered[/dim] [bold]{workflow_ref}[/bold] [dim]v{workflow_version or '?'}[/dim]"
                         )
 
-            result = await c.start_execution(
-                workflow_id=workflow_ref, input=input_data, workflow_version=workflow_version
-            )
+            with _unknown_outcome():
+                result = await c.start_execution(
+                    workflow_id=workflow_ref, input=input_data, workflow_version=workflow_version
+                )
             exec_id = result.get("execution_id", "unknown")
 
             if not json_output:
@@ -1558,7 +1578,8 @@ def agents_activate(
 
     async def _activate() -> None:
         async with _client(runtime) as c:
-            data = await c.activate_agent(agent_id)
+            with _unknown_outcome():
+                data = await c.activate_agent(agent_id)
             console.print(f"[green]Activated:[/green] {agent_id} → {data.get('status')}")
 
     asyncio.run(_activate())
@@ -1862,11 +1883,12 @@ def replay(
             console.print(f"Replaying execution [cyan]{execution_id}[/cyan]...")
 
             # 5. Start a new execution.
-            result = await c.start_execution(
-                workflow_id=workflow_id,
-                input=replay_input,
-                workflow_version=workflow_version,
-            )
+            with _unknown_outcome():
+                result = await c.start_execution(
+                    workflow_id=workflow_id,
+                    input=replay_input,
+                    workflow_version=workflow_version,
+                )
             new_id = result.get("execution_id", "unknown")
 
             # Truncate input display for readability.
@@ -1961,11 +1983,12 @@ def fork(
             console.print(f"Forking execution [cyan]{execution_id}[/cyan]...")
 
             # 5. Start a new execution with modified input.
-            result = await c.start_execution(
-                workflow_id=workflow_id,
-                input=fork_input,
-                workflow_version=workflow_version,
-            )
+            with _unknown_outcome():
+                result = await c.start_execution(
+                    workflow_id=workflow_id,
+                    input=fork_input,
+                    workflow_version=workflow_version,
+                )
             new_id = result.get("execution_id", "unknown")
 
             # Show what changed.
@@ -3239,14 +3262,15 @@ def approve(
 
         async with _client(runtime) as c:
             try:
-                result = await c.approve(
-                    execution_id,
-                    decision,
-                    node_id=node_id,
-                    comment=comment,
-                    action_digest=action_digest,
-                    user_id=approver,
-                )
+                with _unknown_outcome():
+                    result = await c.approve(
+                        execution_id,
+                        decision,
+                        node_id=node_id,
+                        comment=comment,
+                        action_digest=action_digest,
+                        user_id=approver,
+                    )
             except httpx.HTTPStatusError as exc:
                 try:
                     msg = exc.response.json().get("error") or exc.response.text
@@ -3269,6 +3293,75 @@ def approve(
         )
 
     asyncio.run(_approve())
+
+
+# ── ops ───────────────────────────────────────────────────────────────────────
+
+
+@ops_app.command("tick")
+def ops_tick(
+    runtime: str = typer.Option(LOCAL_RUNTIME_URL, "--runtime", "-r", help="Engine URL"),
+    google_id_token_audience: str | None = typer.Option(
+        None,
+        "--google-id-token-audience",
+        help="Send a Google ID token for this audience in X-Serverless-Authorization, for an engine "
+        "behind a platform that checks identity. Needs jamjet[google-auth].",
+    ),
+    budget_ms: int | None = typer.Option(None, "--budget-ms", help="Time budget for one tick; the engine checks it"),
+    until_complete: bool = typer.Option(False, "--until-complete", help="Tick again until the engine reports complete"),
+    max_calls: int = typer.Option(10, "--max-calls", min=1, help="Most ticks to send with --until-complete"),
+    as_json: bool = typer.Option(False, "--json", help="Print the last answer as JSON"),
+) -> None:
+    """Run one tick on an engine that has its background loops off.
+
+    The JamJet token comes from JAMJET_TOKEN and needs the operator role.
+    Exit 0 when a tick ran or another was running, 1 on an error, 2 when the
+    engine has no tick route.
+    """
+    import os
+
+    from jamjet.transport import EngineFeatureMissing
+
+    token = os.environ.get("JAMJET_TOKEN")
+    if not token:
+        console.print("Error: JAMJET_TOKEN is not set. A tick needs an operator token. Nothing was sent.", style="red")
+        raise typer.Exit(1)
+
+    async def _run() -> dict[str, Any]:
+        auth = None
+        if google_id_token_audience:
+            from jamjet.auth import GoogleIdTokenAuth
+
+            auth = GoogleIdTokenAuth(google_id_token_audience, origin=runtime)
+        last: dict[str, Any] = {}
+        calls = 0
+        async with JamjetClient(base_url=runtime, api_token=token, auth=auth) as c:
+            while calls < max_calls:
+                last = await c.tick(budget_ms=budget_ms)
+                calls += 1
+                if not until_complete or last.get("ran") is not True or last.get("complete") is True:
+                    break
+        return {**last, "calls": calls}
+
+    try:
+        result = asyncio.run(_run())
+    except EngineFeatureMissing as exc:
+        console.print(f"Error: {_safe(str(exc))}", style="red", markup=False, highlight=False, soft_wrap=True)
+        raise typer.Exit(2) from exc
+    except Exception as exc:  # noqa: BLE001 - one exit code for anything that went wrong
+        detail = getattr(exc, "detail", None) or str(exc) or type(exc).__name__
+        console.print("Error:", style="red", end=" ")
+        console.print(_safe(str(detail)), markup=False, highlight=False, soft_wrap=True)
+        raise typer.Exit(1) from exc
+
+    if as_json:
+        typer.echo(json.dumps(result))
+    elif result.get("ran") is False:
+        console.print(f"another tick is running ({_safe(str(result.get('reason', 'busy')))})", markup=False)
+    else:
+        state = "complete" if result.get("complete") else "stopped before complete"
+        limit = " at --max-calls" if until_complete and not result.get("complete") else ""
+        console.print(f"tick ran: {state}{limit}, {result['calls']} call(s)", markup=False)
 
 
 # ── audit ─────────────────────────────────────────────────────────────────────

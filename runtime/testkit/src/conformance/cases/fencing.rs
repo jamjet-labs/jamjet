@@ -1,27 +1,16 @@
 //! Lease-fencing tests: a zombie worker cannot double-commit; the fence is
 //! monotonic across reclaim and survives a simulated store failover.
 
+use crate::conformance::cases::support::{finding, not_on};
+use crate::conformance::{Fixture, StoreKind};
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::{
-    backend::{StateBackend, StateBackendError, WorkItem},
-    Event, EventKind, InMemoryBackend, SqliteBackend, TenantId,
+    backend::{StateBackendError, WorkItem},
+    Event, EventKind,
 };
 use serde_json::json;
-use std::path::{Path, PathBuf};
 use uuid::Uuid;
-
-fn temp_db_path() -> PathBuf {
-    let mut path = std::env::temp_dir();
-    let unique = Uuid::new_v4().to_string().replace('-', "");
-    path.push(format!("jamjet_fence_{unique}.db"));
-    path
-}
-
-async fn open_db(path: &Path) -> SqliteBackend {
-    let url = format!("sqlite://{}", path.display());
-    SqliteBackend::open(&url).await.expect("open test db")
-}
 
 fn sample_execution(id: &ExecutionId) -> WorkflowExecution {
     let now = Utc::now();
@@ -58,10 +47,8 @@ fn sample_item(execution_id: &ExecutionId) -> WorkItem {
     }
 }
 
-#[tokio::test]
-async fn claim_mints_nonzero_fence() {
-    let path = temp_db_path();
-    let db = open_db(&path).await;
+pub async fn claim_mints_nonzero_fence(fx: &Fixture) {
+    let db = fx.backend.as_ref();
     let eid = ExecutionId::new();
     db.create_execution(sample_execution(&eid)).await.unwrap();
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
@@ -72,8 +59,6 @@ async fn claim_mints_nonzero_fence() {
         .unwrap()
         .unwrap();
     assert!(claimed.lease_fence > 0, "claim must mint a non-zero fence");
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// Verify that a re-claim (after a stale/expired lease) mints a strictly
@@ -82,14 +67,12 @@ async fn claim_mints_nonzero_fence() {
 ///
 /// Adaptation from brief: `fail_work_item` sets status='failed' (not
 /// 'pending') in the SQLite backend, so we cannot use it to make the item
-/// re-claimable. Instead we use `force_lease_expired_for_test` to backdate the
+/// re-claimable. Instead we use the hooks' `force_lease_expired` to backdate the
 /// lease_expires_at, then call `claim_work_item` which has a built-in
 /// stale-expiry UPDATE that bumps `lease_epoch + 1` and resets to 'pending'
 /// before the second claim.
-#[tokio::test]
-async fn reclaim_bumps_fence() {
-    let path = temp_db_path();
-    let db = open_db(&path).await;
+pub async fn reclaim_bumps_fence(fx: &Fixture) {
+    let db = fx.backend.as_ref();
     let eid = ExecutionId::new();
     db.create_execution(sample_execution(&eid)).await.unwrap();
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
@@ -108,7 +91,7 @@ async fn reclaim_bumps_fence() {
     // Backdate the lease so the stale-expiry path inside claim_work_item fires.
     // (fail_work_item sets status='failed', not 'pending', so it is not
     //  directly re-claimable — see adaptation note above.)
-    db.force_lease_expired_for_test(first.id).await.unwrap();
+    fx.hooks.force_lease_expired(first.id).await;
 
     // Re-claim: claim_work_item's stale-expiry UPDATE bumps lease_epoch+1 and
     // resets status='pending'; the subsequent INSERT mints a strictly greater fence.
@@ -123,8 +106,6 @@ async fn reclaim_bumps_fence() {
         second.lease_fence,
         first.lease_fence
     );
-
-    std::fs::remove_file(&path).ok();
 }
 
 fn node_completed(node: &str) -> EventKind {
@@ -153,10 +134,8 @@ fn node_failed(node: &str) -> EventKind {
     }
 }
 
-#[tokio::test]
-async fn commit_succeeds_with_correct_fence() {
-    let path = temp_db_path();
-    let db = open_db(&path).await;
+pub async fn commit_succeeds_with_correct_fence(fx: &Fixture) {
+    let db = fx.backend.as_ref();
     let eid = ExecutionId::new();
     db.create_execution(sample_execution(&eid)).await.unwrap();
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
@@ -182,14 +161,10 @@ async fn commit_succeeds_with_correct_fence() {
         .await
         .unwrap()
         .is_none());
-
-    std::fs::remove_file(&path).ok();
 }
 
-#[tokio::test]
-async fn commit_fails_closed_with_stale_fence() {
-    let path = temp_db_path();
-    let db = open_db(&path).await;
+pub async fn commit_fails_closed_with_stale_fence(fx: &Fixture) {
+    let db = fx.backend.as_ref();
     let eid = ExecutionId::new();
     db.create_execution(sample_execution(&eid)).await.unwrap();
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
@@ -203,7 +178,7 @@ async fn commit_fails_closed_with_stale_fence() {
         .await
         .unwrap()
         .unwrap();
-    db.force_lease_expired_for_test(zombie.id).await.unwrap();
+    fx.hooks.force_lease_expired(zombie.id).await;
     let _b = db
         .claim_work_item("worker-B", &["model"])
         .await
@@ -222,8 +197,6 @@ async fn commit_fails_closed_with_stale_fence() {
 
     // The zombie's commit emitted NOTHING.
     assert_eq!(db.get_events(&eid).await.unwrap().len(), before);
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// Simulates a lost-tail failover: the primary store drops while a worker
@@ -237,21 +210,18 @@ async fn commit_fails_closed_with_stale_fence() {
 /// `AND lease_fence = ?` WHERE clause in commit_node_terminal will find zero
 /// rows -> FenceLost, zero events written.
 ///
-/// Mechanics note: rather than copying a DB file (the brief's two-file sketch),
-/// we drop the `SqliteBackend` handle (simulating the primary going away) and
-/// re-open the same on-disk file as the "promoted" store. The data persists
-/// because SQLite WAL files survive the connection close. This is deterministic
-/// without filesystem copies.
-#[tokio::test]
-async fn fence_survives_lost_tail_failover() {
-    let path = temp_db_path();
+/// Mechanics note: rather than copying a store (the brief's two-file sketch),
+/// the case stops using its first handle (the primary going away) and opens
+/// the same store through a new pool as the "promoted" one. Memory cannot be
+/// reopened, so there the same handle stands for the promoted store.
+pub async fn fence_survives_lost_tail_failover(fx: &Fixture) {
     let eid = ExecutionId::new();
     let zombie_fence: i64;
     let zombie_item_id: Uuid;
 
     // --- Primary store: claim under term 0 ---
     {
-        let primary = open_db(&path).await;
+        let primary = fx.backend.as_ref();
         primary
             .create_execution(sample_execution(&eid))
             .await
@@ -264,22 +234,25 @@ async fn fence_survives_lost_tail_failover() {
             .unwrap();
         zombie_fence = z.lease_fence; // term=0, epoch=1 -> value=1
         assert!(zombie_fence > 0, "zombie fence must be nonzero");
-        // Primary "crashes" here: SqliteBackend dropped, item still in 'claimed'
-        // state on disk (no commit was issued).
+        // Primary "crashes" here: the case stops using it, item still in
+        // 'claimed' state (no commit was issued).
     }
 
     // --- Promoted store: same file, bump failover generation to term=1 ---
-    let promoted = open_db(&path).await;
-    let new_term = promoted.bump_store_term().await.unwrap();
+    // Memory cannot be reopened; there the same handle stands for the
+    // promoted store, since the fence check does not need a restart.
+    let promoted = fx
+        .hooks
+        .reopen()
+        .await
+        .unwrap_or_else(|| fx.backend.clone());
+    let new_term = fx.hooks.set_store_term_at_least(1).await;
     assert_eq!(new_term, 1, "term must be 1 after first promotion");
 
     // Expire the stale lease (worker-A is gone). The backdated lease_expires_at
     // causes claim_work_item's built-in stale-expiry UPDATE to reset the item
     // to 'pending' with a bumped epoch before the fresh claim.
-    promoted
-        .force_lease_expired_for_test(zombie_item_id)
-        .await
-        .unwrap();
+    fx.hooks.force_lease_expired(zombie_item_id).await;
     let fresh = promoted
         .claim_work_item("worker-B", &["model"])
         .await
@@ -312,8 +285,6 @@ async fn fence_survives_lost_tail_failover() {
         before,
         "zombie must emit zero events"
     );
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// Negative control: proves the fence check catches a bad fence value even
@@ -321,10 +292,8 @@ async fn fence_survives_lost_tail_failover() {
 /// is one higher than the real fence; commit_node_terminal must reject it with
 /// FenceLost and emit zero events. This demonstrates the test would catch a
 /// regression that removed the fence check.
-#[tokio::test]
-async fn term_pin_reopens_window_negative_control() {
-    let path = temp_db_path();
-    let db = open_db(&path).await;
+pub async fn term_pin_reopens_window_negative_control(fx: &Fixture) {
+    let db = fx.backend.as_ref();
     let eid = ExecutionId::new();
     db.create_execution(sample_execution(&eid)).await.unwrap();
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
@@ -351,28 +320,24 @@ async fn term_pin_reopens_window_negative_control() {
         0,
         "wrong-fence commit must emit zero events"
     );
-
-    std::fs::remove_file(&path).ok();
 }
 
-/// Crash-injection exactly-once-commit: worker A claims but crashes (the
-/// SqliteBackend is dropped) before committing. The lease is force-expired and
+/// Crash-injection exactly-once-commit: worker A claims but crashes (the case
+/// stops using its handle) before committing. The lease is force-expired and
 /// worker B re-claims the same item. B's commit must succeed, and exactly one
 /// NodeCompleted event must exist in the log — no double-write, no ghost event.
 ///
 /// Mechanics: the item id is captured at enqueue so it can be threaded into
-/// force_lease_expired_for_test after the re-open (no db_first_item_id helper
+/// `force_lease_expired` after the re-open (no db_first_item_id helper
 /// needed). The stale-expiry path inside claim_work_item resets the item to
 /// 'pending' with a bumped epoch before the re-claim.
-#[tokio::test]
-async fn crash_before_commit_then_reclaim_yields_exactly_one_terminal() {
-    let path = temp_db_path();
+pub async fn crash_before_commit_then_reclaim_yields_exactly_one_terminal(fx: &Fixture) {
     let eid = ExecutionId::new();
     let item_id: Uuid;
 
-    // Worker A claims but "crashes" before commit (SqliteBackend dropped).
+    // Worker A claims but "crashes" before commit (its handle is abandoned).
     {
-        let db = open_db(&path).await;
+        let db = fx.backend.as_ref();
         db.create_execution(sample_execution(&eid)).await.unwrap();
         item_id = db.enqueue_work_item(sample_item(&eid)).await.unwrap();
         let _a = db
@@ -380,13 +345,19 @@ async fn crash_before_commit_then_reclaim_yields_exactly_one_terminal() {
             .await
             .unwrap()
             .unwrap();
-        // db dropped here; item remains in 'claimed' state, no events written.
+        // The case stops using it here; item remains in 'claimed' state, no
+        // events written.
     }
 
-    // New "process": re-open the same DB, expire worker-A's stale lease,
-    // re-claim as worker B, commit.
-    let db = open_db(&path).await;
-    db.force_lease_expired_for_test(item_id).await.unwrap();
+    // New "process": re-open the same store, expire worker-A's stale lease,
+    // re-claim as worker B, commit. Memory cannot be reopened; there the
+    // same handle goes on.
+    let db = fx
+        .hooks
+        .reopen()
+        .await
+        .unwrap_or_else(|| fx.backend.clone());
+    fx.hooks.force_lease_expired(item_id).await;
     let b = db
         .claim_work_item("worker-B", &["model"])
         .await
@@ -409,17 +380,13 @@ async fn crash_before_commit_then_reclaim_yields_exactly_one_terminal() {
         completions, 1,
         "exactly one NodeCompleted must exist after crash-then-reclaim; got {completions}"
     );
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// `commit_node_terminal` with a `NodeFailed` event and the correct fence must
 /// succeed, settle the item as failed (lease_expires_at=NULL, worker_id=NULL,
 /// completed_at=NULL), and append exactly one NodeFailed event to the log.
-#[tokio::test]
-async fn commit_node_terminal_node_failed_settles_failed() {
-    let path = temp_db_path();
-    let db = open_db(&path).await;
+pub async fn commit_node_terminal_node_failed_settles_failed(fx: &Fixture) {
+    let db = fx.backend.as_ref();
     let eid = ExecutionId::new();
     db.create_execution(sample_execution(&eid)).await.unwrap();
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
@@ -448,16 +415,12 @@ async fn commit_node_terminal_node_failed_settles_failed() {
         "the committed event must be NodeFailed, got {:?}",
         events[0].kind
     );
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// A zombie (stale fence) attempting to commit a `NodeFailed` event must be
 /// rejected with `FenceLost` and must write zero events to the log.
-#[tokio::test]
-async fn commit_node_terminal_node_failed_stale_fence_fails_closed() {
-    let path = temp_db_path();
-    let db = open_db(&path).await;
+pub async fn commit_node_terminal_node_failed_stale_fence_fails_closed(fx: &Fixture) {
+    let db = fx.backend.as_ref();
     let eid = ExecutionId::new();
     db.create_execution(sample_execution(&eid)).await.unwrap();
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
@@ -468,7 +431,7 @@ async fn commit_node_terminal_node_failed_stale_fence_fails_closed() {
         .await
         .unwrap()
         .unwrap();
-    db.force_lease_expired_for_test(zombie.id).await.unwrap();
+    fx.hooks.force_lease_expired(zombie.id).await;
     let _b = db
         .claim_work_item("worker-B", &["model"])
         .await
@@ -493,142 +456,12 @@ async fn commit_node_terminal_node_failed_stale_fence_fails_closed() {
         before,
         "zombie NodeFailed commit must emit zero events"
     );
-
-    std::fs::remove_file(&path).ok();
 }
 
-// ── Cross-backend helpers ─────────────────────────────────────────────────────
-
-/// Generic helper: asserts that `commit_node_terminal` with the CORRECT fence
-/// succeeds and appends exactly one event. Backend-agnostic.
-async fn assert_fence_commit_succeeds(backend: &dyn StateBackend) {
-    let eid = ExecutionId::new();
-    backend
-        .create_execution(sample_execution(&eid))
-        .await
-        .unwrap();
-    backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
-    let item = backend
-        .claim_work_item("worker-A", &["model"])
-        .await
-        .unwrap()
-        .unwrap();
-    let ev = Event::new(eid.clone(), 0, node_completed("n1"));
-    let seq = backend
-        .commit_turn(item.id, item.lease_fence, ev, false)
-        .await
-        .expect("commit with correct fence must succeed");
-    assert!(seq >= 1, "sequence must be at least 1");
-    assert_eq!(
-        backend.get_events(&eid).await.unwrap().len(),
-        1,
-        "exactly one event must exist after successful commit"
-    );
-}
-
-/// Generic helper: asserts that `commit_node_terminal` with a FABRICATED wrong
-/// fence returns FenceLost and writes zero events. Backend-agnostic.
-async fn assert_fence_commit_fails_stale(backend: &dyn StateBackend) {
-    let eid = ExecutionId::new();
-    backend
-        .create_execution(sample_execution(&eid))
-        .await
-        .unwrap();
-    backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
-    let item = backend
-        .claim_work_item("worker-A", &["model"])
-        .await
-        .unwrap()
-        .unwrap();
-    let wrong_fence = item.lease_fence + 1; // fabricated — one higher than real
-    let ev = Event::new(eid.clone(), 0, node_completed("n1"));
-    let err = backend
-        .commit_turn(item.id, wrong_fence, ev, false)
-        .await
-        .expect_err("fabricated wrong fence must be rejected");
-    assert!(
-        matches!(err, StateBackendError::FenceLost(_)),
-        "expected FenceLost, got {err:?}"
-    );
-    assert_eq!(
-        backend.get_events(&eid).await.unwrap().len(),
-        0,
-        "stale-fence commit must emit zero events"
-    );
-}
-
-// ── InMemoryBackend cross-backend tests ───────────────────────────────────────
-
-#[tokio::test]
-async fn commit_succeeds_with_correct_fence_inmemory() {
-    let backend = InMemoryBackend::new();
-    assert_fence_commit_succeeds(&backend).await;
-}
-
-#[tokio::test]
-async fn commit_fails_closed_with_stale_fence_inmemory() {
-    let backend = InMemoryBackend::new();
-    assert_fence_commit_fails_stale(&backend).await;
-}
-
-// ── TenantScopedSqliteBackend cross-backend tests ─────────────────────────────
-
-#[tokio::test]
-async fn commit_succeeds_with_correct_fence_tenant_scoped() {
-    let path = temp_db_path();
-    // open_db runs migrations; for_tenant creates a scoped view over the same pool.
-    let base = open_db(&path).await;
-    let backend = base.for_tenant(TenantId::default_tenant());
-    assert_fence_commit_succeeds(&backend).await;
-    std::fs::remove_file(&path).ok();
-}
-
-#[tokio::test]
-async fn commit_fails_closed_with_stale_fence_tenant_scoped() {
-    let path = temp_db_path();
-    let base = open_db(&path).await;
-    let backend = base.for_tenant(TenantId::default_tenant());
-    assert_fence_commit_fails_stale(&backend).await;
-    std::fs::remove_file(&path).ok();
-}
-
-// ── NodeFailed cross-backend helpers ─────────────────────────────────────────
-
-/// Generic helper: asserts that `commit_node_terminal` with a `NodeFailed` event
-/// and the CORRECT fence succeeds and appends exactly one NodeFailed event.
-async fn assert_fence_node_failed_succeeds(backend: &dyn StateBackend) {
-    let eid = ExecutionId::new();
-    backend
-        .create_execution(sample_execution(&eid))
-        .await
-        .unwrap();
-    backend.enqueue_work_item(sample_item(&eid)).await.unwrap();
-    let item = backend
-        .claim_work_item("worker-A", &["model"])
-        .await
-        .unwrap()
-        .unwrap();
-    let ev = Event::new(eid.clone(), 0, node_failed("n1"));
-    let seq = backend
-        .commit_turn(item.id, item.lease_fence, ev, false)
-        .await
-        .expect("NodeFailed commit with correct fence must succeed");
-    assert!(seq >= 1, "sequence must be at least 1");
-    let events = backend.get_events(&eid).await.unwrap();
-    assert_eq!(
-        events.len(),
-        1,
-        "exactly one event must exist after NodeFailed commit"
-    );
-    assert!(
-        matches!(events[0].kind, EventKind::NodeFailed { .. }),
-        "the committed event must be NodeFailed"
-    );
-}
-
-/// Generic helper: asserts that `commit_node_terminal` with a `NodeFailed` event
-/// and a FABRICATED wrong fence returns FenceLost and writes zero events.
-async fn assert_fence_node_failed_stale_fails(backend: &dyn StateBackend) {
+/// A `NodeFailed` commit under a fabricated wrong fence is refused with
+/// `FenceLost` and writes zero events.
+pub async fn commit_node_failed_stale_fence_fails_closed(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let eid = ExecutionId::new();
     backend
         .create_execution(sample_execution(&eid))
@@ -657,53 +490,17 @@ async fn assert_fence_node_failed_stale_fails(backend: &dyn StateBackend) {
     );
 }
 
-// ── NodeFailed — InMemoryBackend ──────────────────────────────────────────────
-
-#[tokio::test]
-async fn commit_node_failed_succeeds_with_correct_fence_inmemory() {
-    let backend = InMemoryBackend::new();
-    assert_fence_node_failed_succeeds(&backend).await;
-}
-
-#[tokio::test]
-async fn commit_node_failed_stale_fence_fails_closed_inmemory() {
-    let backend = InMemoryBackend::new();
-    assert_fence_node_failed_stale_fails(&backend).await;
-}
-
-// ── NodeFailed — TenantScopedSqliteBackend ────────────────────────────────────
-
-#[tokio::test]
-async fn commit_node_failed_succeeds_with_correct_fence_tenant_scoped() {
-    let path = temp_db_path();
-    let base = open_db(&path).await;
-    let backend = base.for_tenant(TenantId::default_tenant());
-    assert_fence_node_failed_succeeds(&backend).await;
-    std::fs::remove_file(&path).ok();
-}
-
-#[tokio::test]
-async fn commit_node_failed_stale_fence_fails_closed_tenant_scoped() {
-    let path = temp_db_path();
-    let base = open_db(&path).await;
-    let backend = base.for_tenant(TenantId::default_tenant());
-    assert_fence_node_failed_stale_fails(&backend).await;
-    std::fs::remove_file(&path).ok();
-}
-
-#[tokio::test]
-async fn set_store_term_at_least_is_monotonic_and_lifts_the_fence() {
-    let path = temp_db_path();
-    let db = open_db(&path).await;
+pub async fn set_store_term_at_least_is_monotonic_and_lifts_the_fence(fx: &Fixture) {
+    let db = fx.backend.as_ref();
     let eid = ExecutionId::new();
     db.create_execution(sample_execution(&eid)).await.unwrap();
 
     // Term starts at 0; lift to 5 (e.g. the promotion generation at startup).
-    assert_eq!(db.set_store_term_at_least(5).await.unwrap(), 5);
+    assert_eq!(fx.hooks.set_store_term_at_least(5).await, 5);
     // Monotonic: a lower value is a no-op.
-    assert_eq!(db.set_store_term_at_least(3).await.unwrap(), 5);
+    assert_eq!(fx.hooks.set_store_term_at_least(3).await, 5);
     // Equal is a no-op.
-    assert_eq!(db.set_store_term_at_least(5).await.unwrap(), 5);
+    assert_eq!(fx.hooks.set_store_term_at_least(5).await, 5);
 
     // A fence minted now carries term 5: fence == 5 * 2^32 + epoch (epoch >= 1).
     db.enqueue_work_item(sample_item(&eid)).await.unwrap();
@@ -716,16 +513,8 @@ async fn set_store_term_at_least_is_monotonic_and_lifts_the_fence() {
         5 * BAND,
         6 * BAND
     );
-    std::fs::remove_file(&path).ok();
-}
-
-#[tokio::test]
-async fn set_store_term_at_least_monotonic_in_memory() {
-    use jamjet_state::InMemoryBackend;
-    let db = InMemoryBackend::new();
-    assert_eq!(db.set_store_term_at_least(7), 7);
-    assert_eq!(db.set_store_term_at_least(4), 7); // lower is a no-op
-    assert_eq!(db.set_store_term_at_least(9), 9);
+    // And it keeps rising.
+    assert_eq!(fx.hooks.set_store_term_at_least(9).await, 9);
 }
 
 // ── Work-item lifecycle: attempts and the reclaim race ───────────────────────
@@ -738,10 +527,8 @@ async fn set_store_term_at_least_monotonic_in_memory() {
 /// interval. When it reset the item without incrementing, the item came back at
 /// attempt 0 forever: max_attempts unreachable, dead-letter never entered, loop
 /// unbounded. This walks the exact loop and asserts it terminates.
-#[tokio::test]
-async fn claim_side_lease_expiry_consumes_attempts() {
-    let path = temp_db_path();
-    let db = open_db(&path).await;
+pub async fn claim_side_lease_expiry_consumes_attempts(fx: &Fixture) {
+    let db = fx.backend.as_ref();
     let eid = ExecutionId::new();
     db.create_execution(sample_execution(&eid)).await.unwrap();
     let mut item = sample_item(&eid);
@@ -756,7 +543,7 @@ async fn claim_side_lease_expiry_consumes_attempts() {
         .unwrap()
         .expect("first claim");
     assert_eq!(first.attempt, 0);
-    db.force_lease_expired_for_test(item_id).await.unwrap();
+    fx.hooks.force_lease_expired(item_id).await;
 
     // Attempt 1: the claim-side expiry must have consumed an attempt.
     let second = db
@@ -768,7 +555,7 @@ async fn claim_side_lease_expiry_consumes_attempts() {
         second.attempt, 1,
         "the claim-side lease expiry must consume an attempt, or the node loops forever"
     );
-    db.force_lease_expired_for_test(item_id).await.unwrap();
+    fx.hooks.force_lease_expired(item_id).await;
 
     // Attempt 2 is the last one under max_attempts = 3.
     let third = db
@@ -777,7 +564,7 @@ async fn claim_side_lease_expiry_consumes_attempts() {
         .unwrap()
         .expect("third claim");
     assert_eq!(third.attempt, 2);
-    db.force_lease_expired_for_test(item_id).await.unwrap();
+    fx.hooks.force_lease_expired(item_id).await;
 
     // Budget spent: the fast path must NOT resurrect it. The item stays
     // 'claimed' with an expired lease, which is exactly what the reclaim sweep
@@ -796,8 +583,6 @@ async fn claim_side_lease_expiry_consumes_attempts() {
         "the sweep must dead-letter it so a NodeFailed is emitted"
     );
     assert!(reclaimed.retryable.is_empty());
-
-    let _ = std::fs::remove_file(&path);
 }
 
 /// The reclaim sweep must never resurrect an item settled under it.
@@ -813,12 +598,17 @@ async fn claim_side_lease_expiry_consumes_attempts() {
 /// nothing races. With many expired items the update loop is long enough for a
 /// concurrent settle to land inside it, against a row the SELECT already
 /// captured. Verified to fail against the unguarded UPDATE before being kept.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reclaim_cannot_resurrect_an_item_settled_under_it() {
+pub async fn reclaim_cannot_resurrect_an_item_settled_under_it(fx: &Fixture) {
+    if not_on(
+        fx,
+        &[StoreKind::Memory],
+        "memory's sweep has no await between its scan and its writes, so no settle lands inside it",
+    ) {
+        return;
+    }
     const ITEMS: usize = 400;
 
-    let path = temp_db_path();
-    let db = std::sync::Arc::new(open_db(&path).await);
+    let db = fx.backend.clone();
     let eid = ExecutionId::new();
     db.create_execution(sample_execution(&eid)).await.unwrap();
 
@@ -838,7 +628,7 @@ async fn reclaim_cannot_resurrect_an_item_settled_under_it() {
             .unwrap()
             .expect("claim");
         fences.push((c.id, c.lease_fence));
-        db.force_lease_expired_for_test(c.id).await.unwrap();
+        fx.hooks.force_lease_expired(c.id).await;
     }
 
     // Settle the LAST items the sweep will reach, while it is still working
@@ -876,13 +666,14 @@ async fn reclaim_cannot_resurrect_an_item_settled_under_it() {
             "a COMPLETED item was reported as reclaimed ({id}) — its node \
              succeeded, and the caller will now emit NodeFailed for it"
         );
-        let status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = ?")
-            .bind(id.to_string())
-            .fetch_one(&db.pool())
-            .await
-            .unwrap();
+        // Memory keeps no row for a completed item.
+        let status = fx.hooks.item_row(*id).await.map(|r| r.status);
+        let expected = match fx.kind {
+            StoreKind::Memory => None,
+            _ => Some("completed".to_string()),
+        };
         assert_eq!(
-            status, "completed",
+            status, expected,
             "a COMPLETED item was resurrected to {status:?} ({id}) — it will be \
              re-claimed and fire its side effect a second time"
         );
@@ -891,8 +682,6 @@ async fn reclaim_cannot_resurrect_an_item_settled_under_it() {
         !settled.is_empty(),
         "the race never opened; the test proved nothing"
     );
-
-    let _ = std::fs::remove_file(&path);
 }
 
 // ── Stale fences after a requeue ─────────────────────────────────────────────
@@ -908,10 +697,17 @@ async fn reclaim_cannot_resurrect_an_item_settled_under_it() {
 /// Two independent guards now close it: the requeue clears the fence (as
 /// `park_work_item` itself always did), and park requires the item to still be
 /// claimed.
-#[tokio::test]
-async fn a_failed_worker_cannot_park_its_requeued_item() {
-    let path = temp_db_path();
-    let db = open_db(&path).await;
+pub async fn a_failed_worker_cannot_park_its_requeued_item(fx: &Fixture) {
+    // Memory has neither guard: its requeue keeps the failing worker's
+    // fence, and its park checks only the fence.
+    if finding(
+        fx,
+        &[StoreKind::Memory],
+        "a worker that failed its item can still park the requeue",
+    ) {
+        return;
+    }
+    let db = fx.backend.as_ref();
     let eid = ExecutionId::new();
     db.create_execution(sample_execution(&eid)).await.unwrap();
     let item = sample_item(&eid);
@@ -955,12 +751,12 @@ async fn a_failed_worker_cannot_park_its_requeued_item() {
     // re-claiming: the retryable branch sets a backoff, so the item is
     // deliberately NOT claimable yet, and a claim here would test the backoff
     // instead of the clobber.
-    let (status, attempt, fence): (String, i64, i64) =
-        sqlx::query_as("SELECT status, attempt, lease_fence FROM work_items WHERE id = ?")
-            .bind(item_id.to_string())
-            .fetch_one(&db.pool())
-            .await
-            .unwrap();
+    let row = fx
+        .hooks
+        .item_row(item_id)
+        .await
+        .expect("the item has a row");
+    let (status, attempt, fence) = (row.status, row.attempt, row.lease_fence);
     assert_eq!(status, "pending", "the item is requeued");
     assert_eq!(
         attempt, 1,
@@ -971,6 +767,4 @@ async fn a_failed_worker_cannot_park_its_requeued_item() {
         fence, 0,
         "the requeue must clear the stale fence, exactly as park_work_item does"
     );
-
-    let _ = std::fs::remove_file(&path);
 }

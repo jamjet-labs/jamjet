@@ -50,6 +50,8 @@ from jamjet.runtime.local import LocalRuntime
 from jamjet.tools.decorators import ToolDefinition
 
 if TYPE_CHECKING:
+    import httpx
+
     from jamjet.deploy import DeployResult
     from jamjet.memory.engram_bridge import AgentMemory
     from jamjet.spec import AgentSpec
@@ -653,8 +655,13 @@ class Agent:
         max_turns: int = 8,
         runtime_url: str = "http://127.0.0.1:7700",
         session: Session | str | None = None,
+        auth: httpx.Auth | None = None,
     ) -> AgentResult:
         """Run the agent durably on the JamJet engine, mirroring :meth:`run`.
+
+        *auth* is an ``httpx.Auth`` for whatever stands in front of the engine
+        (see :class:`~jamjet.client.JamjetClient`); it is passed to the client
+        as it is.
 
         Compiles the agent to an agent-loop IR (``model -> tools -> model``,
         statically unrolled and bounded by *max_turns*), registers it, then
@@ -719,7 +726,7 @@ class Agent:
         workflow_version: str | None = ir.get("version")
 
         t0 = time.monotonic()
-        async with JamjetClient(runtime_url) as client:
+        async with JamjetClient(runtime_url, auth=auth) as client:
             # Register the compiled IR, then start an execution seeded with the
             # running messages + tool-resolver map (build_initial_state).
             await client.create_workflow(ir)

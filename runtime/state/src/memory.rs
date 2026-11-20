@@ -136,6 +136,33 @@ impl InMemoryBackend {
             entry.lease_expires_at = Some(at);
         }
     }
+
+    /// Test helper: a work item's lease epoch (0 before its first claim).
+    /// The SQL stores keep it in `work_items.lease_epoch`.
+    pub fn lease_epoch_for_test(&self, item_id: WorkItemId) -> i64 {
+        self.lease_epochs
+            .get(&item_id)
+            .map(|e| *e.value())
+            .unwrap_or(0)
+    }
+
+    /// Test helper: the copy of a work item in the dead-letter queue.
+    pub fn dead_letter_item_for_test(&self, item_id: WorkItemId) -> Option<WorkItem> {
+        self.dead_letter.get(&item_id).map(|e| e.value().clone())
+    }
+
+    /// Test helper: move every token named `name` to `tenant`. Returns how
+    /// many it moved.
+    pub fn set_token_tenant_for_test(&self, name: &str, tenant: &str) -> usize {
+        let mut moved = 0;
+        for mut entry in self.tokens.iter_mut() {
+            if entry.value().name == name {
+                entry.value_mut().tenant_id = tenant.to_string();
+                moved += 1;
+            }
+        }
+        moved
+    }
 }
 
 impl InMemoryBackend {

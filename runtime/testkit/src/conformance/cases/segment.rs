@@ -1,30 +1,27 @@
 //! TDD tests for segment lineage columns and `SegmentBoundary` event.
 //!
-//! Tests written RED before the model fields existed; turned GREEN after:
+//! The scoped stores run the lineage and rollover cases in a tenant other
+//! than the default, as the tenant-scoped tests did.
+//!
+//! First written RED before the model fields existed; turned GREEN after:
 //! - `WorkflowExecution::parent_execution_id` and `::segment_number`
 //! - `EventKind::SegmentBoundary { segment_number, next_execution_id }`
 //! - migration 0007_segment_links.sql
 //! - `create_execution` / `get_execution` wired to the two new DB columns
 //! - `apply_events_seeded` explicit no-op arm for `SegmentBoundary`
 
+use crate::conformance::cases::support::{in_tenant, not_on};
+use crate::conformance::{Fixture, StoreKind};
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::{
     backend::{StateBackend, WorkItem},
     content_hash, materialize, segment_chain, start_next_segment, Event, EventKind,
-    InMemoryBackend, MaterializedState, Snapshot, SqliteBackend,
+    MaterializedState, Snapshot,
 };
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
-
-// ── Shared helpers ────────────────────────────────────────────────────────────
-
-async fn open_sqlite() -> SqliteBackend {
-    SqliteBackend::open("sqlite::memory:")
-        .await
-        .expect("failed to open in-memory SQLite for segment tests")
-}
 
 fn root_execution(id: &ExecutionId) -> WorkflowExecution {
     let now = Utc::now();
@@ -66,13 +63,12 @@ fn child_execution(
     }
 }
 
-// ── SQLite backend ────────────────────────────────────────────────────────────
+// ── Lineage columns ───────────────────────────────────────────────────────────
 
 /// A child execution (segment 1) carries `parent_execution_id` and
-/// `segment_number=1` round-trip through SQLite.
-#[tokio::test]
-async fn sqlite_linked_execution_round_trips() {
-    let db = open_sqlite().await;
+/// `segment_number=1` round-trip through the store.
+pub async fn linked_execution_round_trips(fx: &Fixture) {
+    let db = &*in_tenant(fx, "acme").await;
 
     let parent_id = ExecutionId::new();
     db.create_execution(root_execution(&parent_id))
@@ -103,10 +99,9 @@ async fn sqlite_linked_execution_round_trips() {
 }
 
 /// A root execution (no parent) reads back `segment_number=0` and
-/// `parent_execution_id=None` from SQLite.
-#[tokio::test]
-async fn sqlite_root_execution_has_defaults() {
-    let db = open_sqlite().await;
+/// `parent_execution_id=None` from the store.
+pub async fn root_execution_has_defaults(fx: &Fixture) {
+    let db = fx.backend.as_ref();
 
     let root_id = ExecutionId::new();
     db.create_execution(root_execution(&root_id))
@@ -128,9 +123,8 @@ async fn sqlite_root_execution_has_defaults() {
 
 /// Appending a `SegmentBoundary` event then materializing the OLD execution
 /// does NOT change `current_state` — it is a pure audit record.
-#[tokio::test]
-async fn sqlite_segment_boundary_event_is_materialize_noop() {
-    let db = open_sqlite().await;
+pub async fn segment_boundary_event_is_materialize_noop(fx: &Fixture) {
+    let db = fx.backend.as_ref();
 
     let exec_id = ExecutionId::new();
     let next_id = ExecutionId::new();
@@ -154,9 +148,7 @@ async fn sqlite_segment_boundary_event_is_materialize_noop() {
     .expect("append WorkflowStarted");
 
     // Materialize before SegmentBoundary.
-    let before = materialize(&db, &exec_id)
-        .await
-        .expect("materialize before");
+    let before = materialize(db, &exec_id).await.expect("materialize before");
     let state_before = before.current_state.clone();
 
     // Append the SegmentBoundary audit event.
@@ -172,118 +164,13 @@ async fn sqlite_segment_boundary_event_is_materialize_noop() {
     .expect("append SegmentBoundary");
 
     // Materialize after SegmentBoundary — state must be unchanged.
-    let after = materialize(&db, &exec_id).await.expect("materialize after");
+    let after = materialize(db, &exec_id).await.expect("materialize after");
     assert_eq!(
         after.current_state, state_before,
         "SegmentBoundary must not mutate current_state"
     );
     assert_eq!(after.last_sequence, 2, "last_sequence must advance to 2");
 }
-
-// ── In-memory backend ─────────────────────────────────────────────────────────
-
-/// Same linked-execution round-trip, but on the in-memory backend.
-#[tokio::test]
-async fn memory_linked_execution_round_trips() {
-    let backend = InMemoryBackend::new();
-
-    let parent_id = ExecutionId::new();
-    backend
-        .create_execution(root_execution(&parent_id))
-        .await
-        .expect("create root");
-
-    let child_id = ExecutionId::new();
-    backend
-        .create_execution(child_execution(&child_id, &parent_id, 1))
-        .await
-        .expect("create child");
-
-    let fetched = backend
-        .get_execution(&child_id)
-        .await
-        .expect("get_execution")
-        .expect("child must exist");
-
-    assert_eq!(fetched.segment_number, 1);
-    assert_eq!(fetched.parent_execution_id.as_ref(), Some(&parent_id));
-}
-
-/// Root execution defaults on the in-memory backend.
-#[tokio::test]
-async fn memory_root_execution_has_defaults() {
-    let backend = InMemoryBackend::new();
-
-    let root_id = ExecutionId::new();
-    backend
-        .create_execution(root_execution(&root_id))
-        .await
-        .expect("create root");
-
-    let fetched = backend
-        .get_execution(&root_id)
-        .await
-        .expect("get_execution")
-        .expect("root must exist");
-
-    assert_eq!(fetched.segment_number, 0);
-    assert!(fetched.parent_execution_id.is_none());
-}
-
-/// `SegmentBoundary` is a materialize no-op on the in-memory backend.
-#[tokio::test]
-async fn memory_segment_boundary_event_is_materialize_noop() {
-    let backend = InMemoryBackend::new();
-
-    let exec_id = ExecutionId::new();
-    let next_id = ExecutionId::new();
-    backend
-        .create_execution(root_execution(&exec_id))
-        .await
-        .expect("create root");
-
-    backend
-        .append_event(Event::new(
-            exec_id.clone(),
-            1,
-            EventKind::WorkflowStarted {
-                workflow_id: "seg-wf".into(),
-                workflow_version: "1.0.0".into(),
-                initial_input: json!({ "counter": 0 }),
-                initiated_by: None,
-                run_key: None,
-            },
-        ))
-        .await
-        .expect("append WorkflowStarted");
-
-    let before = materialize(&backend, &exec_id)
-        .await
-        .expect("materialize before");
-    let state_before = before.current_state.clone();
-
-    backend
-        .append_event(Event::new(
-            exec_id.clone(),
-            2,
-            EventKind::SegmentBoundary {
-                segment_number: 1,
-                next_execution_id: next_id.to_string(),
-            },
-        ))
-        .await
-        .expect("append SegmentBoundary");
-
-    let after = materialize(&backend, &exec_id)
-        .await
-        .expect("materialize after");
-    assert_eq!(
-        after.current_state, state_before,
-        "SegmentBoundary must not mutate current_state"
-    );
-}
-
-// ── Tenant-scoped backend ─────────────────────────────────────────────────────
 
 // ── start_next_segment helpers ────────────────────────────────────────────────
 
@@ -304,7 +191,8 @@ fn carried_materialized_state() -> MaterializedState {
 }
 
 /// Run the full `start_next_segment` assertion suite against any `StateBackend`.
-async fn assert_start_next_segment(backend: &dyn StateBackend) {
+pub async fn start_next_segment_creates_a_linked_seeded_continuation(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let parent_id = ExecutionId::new();
     // Parent execution must exist (FK-safe even though column is nullable TEXT).
     backend
@@ -426,73 +314,7 @@ async fn assert_start_next_segment(backend: &dyn StateBackend) {
     );
 }
 
-// ── start_next_segment tests — SQLite ─────────────────────────────────────────
-
-/// `start_next_segment` creates the linked, state-seeded continuation on SQLite.
-#[tokio::test]
-async fn sqlite_start_next_segment() {
-    let db = open_sqlite().await;
-    assert_start_next_segment(&db).await;
-}
-
-// ── start_next_segment tests — in-memory ──────────────────────────────────────
-
-/// `start_next_segment` creates the linked, state-seeded continuation in memory.
-#[tokio::test]
-async fn memory_start_next_segment() {
-    let backend = InMemoryBackend::new();
-    assert_start_next_segment(&backend).await;
-}
-
-// ── Same linked-execution round-trip on the tenant-scoped SQLite backend.
-#[tokio::test]
-async fn tenant_scoped_linked_execution_round_trips() {
-    use jamjet_state::tenant::{Tenant, TenantId, TenantStatus};
-
-    let db = open_sqlite().await;
-
-    // Register a non-default tenant.
-    let tenant_id = TenantId::from("acme");
-    let scoped_admin = db.for_tenant(TenantId::default());
-    let now = Utc::now();
-    scoped_admin
-        .create_tenant(Tenant {
-            id: tenant_id.clone(),
-            name: "Acme".into(),
-            status: TenantStatus::Active,
-            policy: None,
-            limits: None,
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .expect("register tenant");
-
-    let scoped = db.for_tenant(tenant_id);
-
-    let parent_id = ExecutionId::new();
-    scoped
-        .create_execution(root_execution(&parent_id))
-        .await
-        .expect("create root");
-
-    let child_id = ExecutionId::new();
-    scoped
-        .create_execution(child_execution(&child_id, &parent_id, 1))
-        .await
-        .expect("create child");
-
-    let fetched = scoped
-        .get_execution(&child_id)
-        .await
-        .expect("get_execution")
-        .expect("child must exist");
-
-    assert_eq!(fetched.segment_number, 1);
-    assert_eq!(fetched.parent_execution_id.as_ref(), Some(&parent_id));
-}
-
-// ── segment_chain helper ──────────────────────────────────────────────────────
+// ── 2g-4 Task 1: segment_chain ────────────────────────────────────────────────
 
 /// Appends `count` minimal events to `exec_id` starting at sequence `start_seq`.
 /// Uses bare `NodeCompleted` events with a null state_patch (no state mutation).
@@ -531,7 +353,8 @@ async fn append_many_events(
 /// Generic lineage test: root -> seg1 -> seg2.
 /// `segment_chain(backend, &seg2_id)` must return [root_id, seg1_id, seg2_id],
 /// each with the correct segment_number (0, 1, 2).
-async fn assert_segment_chain_lineage(backend: &dyn StateBackend) {
+pub async fn segment_chain_lineage(fx: &Fixture) {
+    let backend = &*in_tenant(fx, "chain-acme").await;
     let root_id = ExecutionId::new();
     backend
         .create_execution(root_execution(&root_id))
@@ -632,46 +455,7 @@ async fn assert_segment_chain_lineage(backend: &dyn StateBackend) {
     }
 }
 
-// ── 2g-4 Task 1: segment_chain — SQLite, in-memory, tenant-scoped ─────────────
-
-#[tokio::test]
-async fn sqlite_segment_chain_lineage() {
-    let db = open_sqlite().await;
-    assert_segment_chain_lineage(&db).await;
-}
-
-#[tokio::test]
-async fn memory_segment_chain_lineage() {
-    let backend = InMemoryBackend::new();
-    assert_segment_chain_lineage(&backend).await;
-}
-
-#[tokio::test]
-async fn tenant_scoped_segment_chain_lineage() {
-    use jamjet_state::tenant::{Tenant, TenantId, TenantStatus};
-
-    let db = open_sqlite().await;
-    let tenant_id = TenantId::from("chain-acme");
-    let scoped_admin = db.for_tenant(TenantId::default());
-    let now = Utc::now();
-    scoped_admin
-        .create_tenant(Tenant {
-            id: tenant_id.clone(),
-            name: "ChainAcme".into(),
-            status: TenantStatus::Active,
-            policy: None,
-            limits: None,
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .expect("register tenant");
-
-    let scoped = db.for_tenant(tenant_id);
-    assert_segment_chain_lineage(&scoped).await;
-}
-
-// ── 2g-4 Task 2: bounded-replay proof (SQLite; event count independence) ──────
+// ── 2g-4 Task 2: bounded-replay proof (event count independence) ──────────────
 
 /// THE proof of 2g: adding 50 events to the root execution must NOT inflate
 /// the new segment's event count or replay cost.
@@ -680,9 +464,8 @@ async fn tenant_scoped_segment_chain_lineage() {
 /// `start_next_segment` seeds seg1 with root's materialized state.
 /// `get_events(seg1).len()` must equal 2 (WorkflowStarted + NodeScheduled).
 /// `materialize(seg1).current_state` must equal the carried state.
-#[tokio::test]
-async fn sqlite_bounded_replay_independent_of_root_event_count() {
-    let db = open_sqlite().await;
+pub async fn bounded_replay_independent_of_root_event_count(fx: &Fixture) {
+    let db = fx.backend.as_ref();
 
     let root_id = ExecutionId::new();
     db.create_execution(root_execution(&root_id))
@@ -690,16 +473,16 @@ async fn sqlite_bounded_replay_independent_of_root_event_count() {
         .expect("create root");
 
     // Give the root a large event log (50 events, seq 1..=50).
-    append_many_events(&db, &root_id, 1, 50).await;
+    append_many_events(db, &root_id, 1, 50).await;
 
     let root_events = db.get_events(&root_id).await.expect("get_events root");
     assert_eq!(root_events.len(), 50, "root must have 50 events");
 
     // The root's terminal materialized state (after all 50 events).
-    let root_mat = materialize(&db, &root_id).await.expect("materialize root");
+    let root_mat = materialize(db, &root_id).await.expect("materialize root");
 
     let seg1_id = start_next_segment(
-        &db,
+        db,
         &root_id,
         &root_mat,
         "seg-wf",
@@ -743,7 +526,7 @@ async fn sqlite_bounded_replay_independent_of_root_event_count() {
     );
 
     // materialize(seg1) returns the carried state WITHOUT reading root's 50 events.
-    let seg1_mat = materialize(&db, &seg1_id).await.expect("materialize seg1");
+    let seg1_mat = materialize(db, &seg1_id).await.expect("materialize seg1");
     assert_eq!(
         seg1_mat.current_state, root_mat.current_state,
         "seg1.current_state must equal the carried root state"
@@ -766,9 +549,8 @@ async fn sqlite_bounded_replay_independent_of_root_event_count() {
 /// A late event appended to the OLD (terminal) execution after rollover must NOT
 /// change `materialize(seg1).current_state`. Proves the inert-old-segment
 /// invariant stated in the Global Constraints.
-#[tokio::test]
-async fn sqlite_inert_old_segment_does_not_leak() {
-    let db = open_sqlite().await;
+pub async fn inert_old_segment_does_not_leak(fx: &Fixture) {
+    let db = fx.backend.as_ref();
 
     let root_id = ExecutionId::new();
     db.create_execution(root_execution(&root_id))
@@ -790,10 +572,10 @@ async fn sqlite_inert_old_segment_does_not_leak() {
     .await
     .expect("append WorkflowStarted to root");
 
-    let root_mat = materialize(&db, &root_id).await.expect("materialize root");
+    let root_mat = materialize(db, &root_id).await.expect("materialize root");
 
     let seg1_id = start_next_segment(
-        &db,
+        db,
         &root_id,
         &root_mat,
         "seg-wf",
@@ -819,7 +601,7 @@ async fn sqlite_inert_old_segment_does_not_leak() {
     );
 
     // Capture seg1's state BEFORE the late commit.
-    let seg1_before = materialize(&db, &seg1_id)
+    let seg1_before = materialize(db, &seg1_id)
         .await
         .expect("materialize seg1 before late commit");
 
@@ -847,7 +629,7 @@ async fn sqlite_inert_old_segment_does_not_leak() {
     .expect("late append on old execution must succeed (appends to closed log)");
 
     // seg1's materialized state is UNCHANGED.
-    let seg1_after = materialize(&db, &seg1_id)
+    let seg1_after = materialize(db, &seg1_id)
         .await
         .expect("materialize seg1 after late commit");
 
@@ -866,8 +648,9 @@ async fn sqlite_inert_old_segment_does_not_leak() {
 
 /// Carry a non-trivial nested JSON state through TWO rollovers (root -> seg1 ->
 /// seg2). The state must arrive byte-identical at seg2 (`content_hash` equal
-/// end-to-end). Tested on SQLite, in-memory, and tenant-scoped backends.
-async fn assert_two_rollover_byte_identity(backend: &dyn StateBackend) {
+/// end-to-end). Runs on every backend.
+pub async fn two_rollover_byte_identity(fx: &Fixture) {
+    let backend = &*in_tenant(fx, "bytecheck-acme").await;
     let nested_state = json!({
         "counter": 7,
         "items": [{"k": "v"}, {"k": "w"}],
@@ -994,43 +777,6 @@ async fn assert_two_rollover_byte_identity(backend: &dyn StateBackend) {
     );
 }
 
-#[tokio::test]
-async fn sqlite_two_rollover_byte_identity() {
-    let db = open_sqlite().await;
-    assert_two_rollover_byte_identity(&db).await;
-}
-
-#[tokio::test]
-async fn memory_two_rollover_byte_identity() {
-    let backend = InMemoryBackend::new();
-    assert_two_rollover_byte_identity(&backend).await;
-}
-
-#[tokio::test]
-async fn tenant_scoped_two_rollover_byte_identity() {
-    use jamjet_state::tenant::{Tenant, TenantId, TenantStatus};
-
-    let db = open_sqlite().await;
-    let tenant_id = TenantId::from("bytecheck-acme");
-    let scoped_admin = db.for_tenant(TenantId::default());
-    let now = Utc::now();
-    scoped_admin
-        .create_tenant(Tenant {
-            id: tenant_id.clone(),
-            name: "ByteCheckAcme".into(),
-            status: TenantStatus::Active,
-            policy: None,
-            limits: None,
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .expect("register tenant");
-
-    let scoped = db.for_tenant(tenant_id);
-    assert_two_rollover_byte_identity(&scoped).await;
-}
-
 // ── C2 regression: SQLite child forward-progress after rollover ───────────────
 
 /// Regression test for the "frozen child state" bug on SQLite.
@@ -1047,9 +793,8 @@ async fn tenant_scoped_two_rollover_byte_identity() {
 /// FIX: `Snapshot::seed_for_segment` anchors the seed at `at_sequence = 0`.
 /// `get_events_since(seg1, 0)` returns all child events; the patch is applied;
 /// `materialize(seg1).current_state["counter"]` must equal 100.
-#[tokio::test]
-async fn sqlite_child_forward_progress_after_rollover() {
-    let db = open_sqlite().await;
+pub async fn child_forward_progress_after_rollover(fx: &Fixture) {
+    let db = fx.backend.as_ref();
 
     let parent_id = ExecutionId::new();
     db.create_execution(root_execution(&parent_id))
@@ -1057,7 +802,7 @@ async fn sqlite_child_forward_progress_after_rollover() {
         .expect("create parent");
 
     // Give the parent 50 events so its event log is large.
-    append_many_events(&db, &parent_id, 1, 50).await;
+    append_many_events(db, &parent_id, 1, 50).await;
 
     // Build carried state with last_sequence = 50 — this is exactly the
     // value that Snapshot::from_materialized would have copied into at_sequence,
@@ -1071,7 +816,7 @@ async fn sqlite_child_forward_progress_after_rollover() {
     };
 
     let seg1_id = start_next_segment(
-        &db,
+        db,
         &parent_id,
         &carried,
         "seg-wf",
@@ -1122,7 +867,7 @@ async fn sqlite_child_forward_progress_after_rollover() {
 
     // Before fix: returns {"counter": 0} (frozen — at_sequence=50 dropped seq 1/2/3).
     // After fix:  returns {"counter": 100} (at_sequence=0 folds all child events).
-    let mat = materialize(&db, &seg1_id).await.expect("materialize child");
+    let mat = materialize(db, &seg1_id).await.expect("materialize child");
 
     assert_eq!(
         mat.current_state["counter"], 100,
@@ -1151,9 +896,8 @@ async fn sqlite_child_forward_progress_after_rollover() {
 /// with identical arguments and asserting:
 /// - Both calls return the SAME child `ExecutionId`.
 /// - Exactly ONE work item is enqueued (the second call was a no-op).
-#[tokio::test]
-async fn sqlite_idempotent_start_next_segment_prevents_double_roll() {
-    let db = open_sqlite().await;
+pub async fn idempotent_start_next_segment_prevents_double_roll(fx: &Fixture) {
+    let db = fx.backend.as_ref();
 
     let parent_id = ExecutionId::new();
     db.create_execution(root_execution(&parent_id))
@@ -1164,7 +908,7 @@ async fn sqlite_idempotent_start_next_segment_prevents_double_roll() {
 
     // First invocation: creates the child execution + seed + 2 events + work item.
     let id1 = start_next_segment(
-        &db,
+        db,
         &parent_id,
         &carried,
         "seg-wf",
@@ -1182,7 +926,7 @@ async fn sqlite_idempotent_start_next_segment_prevents_double_roll() {
     // Second invocation: simulates re-run after a crash before SegmentBoundary.
     // Must return the SAME id and must NOT enqueue a duplicate work item.
     let id2 = start_next_segment(
-        &db,
+        db,
         &parent_id,
         &carried,
         "seg-wf",
@@ -1227,7 +971,8 @@ async fn sqlite_idempotent_start_next_segment_prevents_double_roll() {
 /// Generic helper: after `start_next_segment`, ALL 5 artifacts (execution, snapshot,
 /// WorkflowStarted seq1, NodeScheduled seq2, claimable work item) must exist.
 /// This is the regression guard that proves the partial-creation gap is closed.
-async fn assert_all_artifacts_present(backend: &dyn StateBackend) {
+pub async fn all_artifacts_present_after_start_next_segment(fx: &Fixture) {
+    let backend = &*in_tenant(fx, "artifacts-acme").await;
     let parent_id = ExecutionId::new();
     backend
         .create_execution(root_execution(&parent_id))
@@ -1303,47 +1048,6 @@ async fn assert_all_artifacts_present(backend: &dyn StateBackend) {
     );
 }
 
-/// Regression guard — SQLite: child always has a claimable work item (partial-creation
-/// gap is closed).
-#[tokio::test]
-async fn sqlite_all_artifacts_present_after_start_next_segment() {
-    let db = open_sqlite().await;
-    assert_all_artifacts_present(&db).await;
-}
-
-/// Regression guard — in-memory: child always has a claimable work item.
-#[tokio::test]
-async fn memory_all_artifacts_present_after_start_next_segment() {
-    let backend = InMemoryBackend::new();
-    assert_all_artifacts_present(&backend).await;
-}
-
-/// Regression guard — tenant-scoped: child always has a claimable work item.
-#[tokio::test]
-async fn tenant_scoped_all_artifacts_present_after_start_next_segment() {
-    use jamjet_state::tenant::{Tenant, TenantId, TenantStatus};
-
-    let db = open_sqlite().await;
-    let tenant_id = TenantId::from("artifacts-acme");
-    let scoped_admin = db.for_tenant(TenantId::default());
-    let now = Utc::now();
-    scoped_admin
-        .create_tenant(Tenant {
-            id: tenant_id.clone(),
-            name: "ArtifactsAcme".into(),
-            status: TenantStatus::Active,
-            policy: None,
-            limits: None,
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .expect("register tenant");
-
-    let scoped = db.for_tenant(tenant_id);
-    assert_all_artifacts_present(&scoped).await;
-}
-
 /// Atomic rollback: if the work item INSERT fails (duplicate id conflict), the
 /// execution row (and snapshot + events) must be rolled back — no partial child.
 ///
@@ -1355,9 +1059,15 @@ async fn tenant_scoped_all_artifacts_present_after_start_next_segment() {
 /// (by design — the in-memory backend has no crash-durability guarantee). The
 /// all-artifacts tests + SQLite transaction code review cover atomicity for the
 /// durable path.
-#[tokio::test]
-async fn sqlite_segment_atomic_rollback_on_work_item_conflict() {
-    let db = open_sqlite().await;
+pub async fn segment_atomic_rollback_on_work_item_conflict(fx: &Fixture) {
+    if not_on(
+        fx,
+        &[StoreKind::Memory],
+        "memory's inserts have no rollback, by design",
+    ) {
+        return;
+    }
+    let db = fx.backend.as_ref();
     let parent_id = ExecutionId::new();
     db.create_execution(root_execution(&parent_id))
         .await

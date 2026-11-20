@@ -277,6 +277,55 @@ Images on Docker Hub (`jamjetdev/jamjet`) are built from crate release tags.
 
 ---
 
+## Behind a platform identity check
+
+Some serverless container platforms check the caller's identity before a
+request reaches your service. The caller then sends two credentials: the
+platform's identity token and the engine's own token. They need two headers.
+The platform's token goes in `X-Serverless-Authorization`, and the JamJet token
+stays in `Authorization`, because the engine reads that one.
+
+From Python, pass an auth hook next to the token. The hook sends its token
+only to the engine's address:
+
+```python
+from jamjet import JamjetClient
+from jamjet.auth import GoogleIdTokenAuth  # pip install 'jamjet[google-auth]'
+
+auth = GoogleIdTokenAuth("https://engine.example")
+async with JamjetClient("https://engine.example", api_token=jamjet_token, auth=auth) as client:
+    print(await client.health())
+```
+
+For a scheduled job, `jamjet ops tick` takes the same flag and reads the JamJet
+token from `JAMJET_TOKEN`:
+
+```bash
+JAMJET_TOKEN=<operator token> jamjet ops tick \
+  --runtime https://engine.example \
+  --google-id-token-audience https://engine.example
+```
+
+`jamjet ops tick` needs an engine whose `/health` lists `ops_tick`, and exits 2
+when the engine has none.
+
+With curl, send both headers yourself:
+
+```bash
+curl https://engine.example/health \
+  -H "X-Serverless-Authorization: Bearer $(gcloud auth print-identity-token --audiences=https://engine.example)" \
+  -H "Authorization: Bearer $JAMJET_TOKEN"
+```
+
+A 401 or 403 that does not carry the engine's JSON error body came from the
+platform, not the engine. The Python client raises it as `PlatformAuthError`.
+The usual causes are a token for the wrong audience and a caller without
+permission to call the service. See the
+[Python SDK reference](python-sdk.md#calling-an-engine-credentials-and-retries)
+for retries and for what the client does after a lost answer.
+
+---
+
 ## Environment variables
 
 These are the variables that change what the server does.
