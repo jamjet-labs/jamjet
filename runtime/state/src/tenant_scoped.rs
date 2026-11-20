@@ -49,6 +49,39 @@ impl TenantScopedSqliteBackend {
             .map_err(map_db_err)?;
         row.try_get::<i64, _>("term").map_err(map_db_err)
     }
+
+    /// Refuse a write that names a run this tenant does not own. The error
+    /// is the `NotFound` that `append_event_if` and `finish_execution` give
+    /// for such a run, and a run of another tenant gets the same answer as
+    /// a run nobody holds. A run's tenant never changes and a run is never
+    /// deleted, so a run that is this tenant's here is still its own when
+    /// the write lands.
+    async fn own_run(&self, execution_id: &ExecutionId) -> BackendResult<()> {
+        let tenant =
+            crate::sqlite::execution_tenant_in(&self.pool, Some(&self.tenant_id.0), execution_id)
+                .await?;
+        match tenant {
+            Some(_) => Ok(()),
+            None => Err(StateBackendError::NotFound(execution_id_str(execution_id))),
+        }
+    }
+
+    /// The runs a start names besides the one it creates: the parent of a
+    /// segment, and the start item's run where that is not the new run.
+    /// Each must be this tenant's.
+    async fn own_runs_of_start(
+        &self,
+        execution: &WorkflowExecution,
+        work_item: &WorkItem,
+    ) -> BackendResult<()> {
+        if let Some(parent) = &execution.parent_execution_id {
+            self.own_run(parent).await?;
+        }
+        if work_item.execution_id != execution.execution_id {
+            self.own_run(&work_item.execution_id).await?;
+        }
+        Ok(())
+    }
 }
 
 // ── Helpers (re-use sqlite.rs parsers) ────────────────────────────────────────
@@ -226,6 +259,9 @@ impl TenantScopedSqliteBackend {
                 ))
             }
         };
+        // The item is checked against this tenant below, but the event names
+        // its run on its own.
+        self.own_run(&terminal_event.execution_id).await?;
 
         let mut tx = self
             .pool
@@ -234,17 +270,20 @@ impl TenantScopedSqliteBackend {
             .map_err(map_db_err)?;
 
         if refuse_terminal {
-            if let Some(status) =
-                terminal_status_of(&mut tx, Some(&self.tenant_id.0), &execution_id).await?
-            {
+            let terminal =
+                terminal_status_of(&mut tx, Some(&self.tenant_id.0), &execution_id).await?;
+            fault_point!("sqlite_scoped.commit_turn", 1);
+            if let Some(status) = terminal {
                 // Fence first: only the holder may withdraw, and a stale or
                 // forged fence must leave the item exactly as it is.
-                if !withdraw_claimed_item(&mut tx, Some(&self.tenant_id.0), &id_str, lease_fence)
-                    .await?
-                {
+                let withdrawn =
+                    withdraw_claimed_item(&mut tx, Some(&self.tenant_id.0), &id_str, lease_fence)
+                        .await?;
+                if !withdrawn {
                     tx.rollback().await.map_err(map_db_err)?;
                     return Err(StateBackendError::FenceLost(id_str));
                 }
+                fault_point!("sqlite_scoped.commit_turn", 2);
                 tx.commit().await.map_err(map_db_err)?;
                 return Ok(TurnCommit::ExecutionTerminal(status));
             }
@@ -279,6 +318,7 @@ impl TenantScopedSqliteBackend {
             .map_err(map_db_err)?
             .rows_affected()
         };
+        fault_point!("sqlite_scoped.commit_turn", 3);
 
         if rows == 0 {
             tx.rollback().await.map_err(map_db_err)?;
@@ -293,6 +333,7 @@ impl TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?;
         let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.commit_turn", 4);
 
         sqlx::query(
             r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at, tenant_id)
@@ -307,6 +348,7 @@ impl TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.commit_turn", 5);
 
         // 2b) If the terminal event is NodeCompleted with an idempotency key,
         //     record the result in tool_effects in the SAME transaction (tenant-scoped).
@@ -350,6 +392,7 @@ impl TenantScopedSqliteBackend {
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite_scoped.commit_turn", 6);
         }
 
         // Optionally compute and write the snapshot IN-TX from committed state (tenant-scoped).
@@ -364,6 +407,7 @@ impl TenantScopedSqliteBackend {
             .fetch_optional(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite_scoped.commit_turn", 7);
 
             let (base, base_sequence) = if let Some(row) = snap_row {
                 let at_seq: i64 = row.try_get("at_sequence").map_err(map_db_err)?;
@@ -412,6 +456,7 @@ impl TenantScopedSqliteBackend {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(map_db_err)?;
+                fault_point!("sqlite_scoped.commit_turn", 8);
                 let initial_input: serde_json::Value = serde_json::from_str(
                     exec_row
                         .try_get::<&str, _>("initial_input")
@@ -440,6 +485,7 @@ impl TenantScopedSqliteBackend {
             .fetch_all(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite_scoped.commit_turn", 9);
 
             let tail_events: Vec<crate::event::Event> = event_rows
                 .iter()
@@ -477,8 +523,10 @@ impl TenantScopedSqliteBackend {
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite_scoped.commit_turn", 10);
         }
 
+        fault_point!("sqlite_scoped.commit_turn", 11);
         tx.commit().await.map_err(map_db_err)?;
         Ok(TurnCommit::Committed(sequence))
     }
@@ -716,21 +764,14 @@ impl StateBackend for TenantScopedSqliteBackend {
         key: &str,
         value: serde_json::Value,
     ) -> BackendResult<()> {
-        let exec = self
-            .get_execution(execution_id)
-            .await?
-            .ok_or_else(|| StateBackendError::NotFound(format!("execution {execution_id}")))?;
-        let mut state = exec.current_state.clone();
-        let arr = state
-            .as_object_mut()
-            .ok_or_else(|| StateBackendError::Database("state is not a JSON object".into()))?
-            .entry(key)
-            .or_insert_with(|| serde_json::json!([]));
-        arr.as_array_mut()
-            .ok_or_else(|| StateBackendError::Database(format!("{key} is not an array")))?
-            .push(value);
-        self.update_execution_current_state(execution_id, &state)
-            .await
+        crate::sqlite::patch_append_array_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            execution_id,
+            key,
+            value,
+        )
+        .await
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id))]
@@ -815,6 +856,9 @@ impl StateBackend for TenantScopedSqliteBackend {
         let execution_id = execution_id_str(&event.execution_id);
         let kind_json = serde_json::to_string(&event.kind)?;
         let created_at = event.created_at.to_rfc3339();
+        // The row is stamped with this tenant whatever run it names, and the
+        // unscoped engine reads the run's log across tenants.
+        self.own_run(&event.execution_id).await?;
 
         // Assign the sequence atomically (see SqliteBackend::append_event). The
         // MAX is scoped to the execution only (not the tenant), so it agrees with
@@ -835,6 +879,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?;
         let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.append_event", 1);
 
         sqlx::query(
             r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at, tenant_id)
@@ -849,6 +894,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.append_event", 2);
         tx.commit().await.map_err(map_db_err)?;
 
         Ok(sequence)
@@ -965,6 +1011,9 @@ impl StateBackend for TenantScopedSqliteBackend {
 
     #[instrument(skip(self, snapshot), fields(tenant = %self.tenant_id, execution_id = %snapshot.execution_id))]
     async fn write_snapshot(&self, snapshot: Snapshot) -> BackendResult<()> {
+        // A snapshot of another tenant's run would replace that tenant's at
+        // the same sequence, and the unscoped engine materializes from it.
+        self.own_run(&snapshot.execution_id).await?;
         let id = snapshot.id.to_string();
         let execution_id = execution_id_str(&snapshot.execution_id);
         let state_json = serde_json::to_string(&snapshot.state)?;
@@ -1003,6 +1052,9 @@ impl StateBackend for TenantScopedSqliteBackend {
         scheduled_event: EventKind,
         work_item: WorkItem,
     ) -> BackendResult<()> {
+        // A segment of another tenant's run would take the id that run's own
+        // next segment derives.
+        self.own_runs_of_start(&execution, &work_item).await?;
         crate::sqlite::create_run_in(
             &self.pool,
             Some(&self.tenant_id.0),
@@ -1022,6 +1074,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         scheduled_event: EventKind,
         work_item: WorkItem,
     ) -> BackendResult<()> {
+        self.own_runs_of_start(&execution, &work_item).await?;
         crate::sqlite::create_run_in(
             &self.pool,
             Some(&self.tenant_id.0),
@@ -1278,6 +1331,9 @@ impl StateBackend for TenantScopedSqliteBackend {
 
     #[instrument(skip(self, item), fields(tenant = %self.tenant_id, execution_id = %item.execution_id))]
     async fn enqueue_work_item(&self, mut item: WorkItem) -> BackendResult<WorkItemId> {
+        // Workers claim across tenants, so an item queued in another
+        // tenant's run would run a node of that run.
+        self.own_run(&item.execution_id).await?;
         item.tenant_id = self.tenant_id.0.clone();
         let id = item.id.to_string();
         let execution_id = execution_id_str(&item.execution_id);
@@ -1469,6 +1525,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             q = q.bind(n.as_str());
         }
         let row = q.fetch_optional(&mut *tx).await.map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.claim_work_item", 1);
 
         let Some(row) = row else {
             tx.rollback().await.map_err(map_db_err)?;
@@ -1482,6 +1539,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         let claimed_at = Utc::now().to_rfc3339();
 
         let term = self.current_term(&mut tx).await?;
+        fault_point!("sqlite_scoped.claim_work_item", 2);
         let current_epoch: i64 = row.try_get::<i64, _>("lease_epoch").unwrap_or(0);
         let new_epoch = current_epoch + 1;
         let new_fence = term * 4_294_967_296_i64 + new_epoch;
@@ -1507,6 +1565,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.claim_work_item", 3);
 
         tx.commit().await.map_err(map_db_err)?;
 
@@ -1681,7 +1740,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         // `tenant_id` is on every statement below, not just the read: a scoped
         // backend must never settle another tenant's item even if an id and fence
         // were somehow guessed.
-        let Some(row) = sqlx::query(
+        let row = sqlx::query(
             "SELECT * FROM work_items \
              WHERE id = ? AND tenant_id = ? AND lease_fence = ? AND status = 'claimed'",
         )
@@ -1690,8 +1749,9 @@ impl StateBackend for TenantScopedSqliteBackend {
         .bind(lease_fence)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(map_db_err)?
-        else {
+        .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.fail_work_item_fenced", 1);
+        let Some(row) = row else {
             return Ok(None);
         };
 
@@ -1712,6 +1772,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             .await
             .map_err(map_db_err)?
             .rows_affected();
+            fault_point!("sqlite_scoped.fail_work_item_fenced", 2);
             if rows == 0 {
                 return Ok(None);
             }
@@ -1738,6 +1799,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite_scoped.fail_work_item_fenced", 3);
 
             tx.commit().await.map_err(map_db_err)?;
             let mut exhausted = item;
@@ -1768,6 +1830,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             return Ok(None);
         }
 
+        fault_point!("sqlite_scoped.fail_work_item_fenced", 4);
         tx.commit().await.map_err(map_db_err)?;
         let mut retried = item;
         retried.attempt = new_attempt;
@@ -1856,6 +1919,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?
         .rows_affected();
+        fault_point!("sqlite_scoped.finalize_rollover_fenced", 1);
 
         if rows == 0 {
             tx.rollback().await.map_err(map_db_err)?;
@@ -1876,6 +1940,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.finalize_rollover_fenced", 2);
 
         tx.commit().await.map_err(map_db_err)?;
         Ok(true)
@@ -2252,6 +2317,9 @@ impl StateBackend for TenantScopedSqliteBackend {
         projection_name: &str,
         new_checkpoint: i64,
     ) -> BackendResult<()> {
+        // The row and the checkpoint are keyed by run, not by tenant: written
+        // for another tenant's run they would overwrite that tenant's.
+        self.own_run(&row.execution_id).await?;
         let exec_id_str = execution_id_str(&row.execution_id);
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -2296,6 +2364,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.apply_approval_projection", 1);
 
         sqlx::query(
             r#"INSERT INTO projector_checkpoints
@@ -2313,6 +2382,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.apply_approval_projection", 2);
 
         tx.commit().await.map_err(map_db_err)?;
         Ok(())
@@ -2325,6 +2395,8 @@ impl StateBackend for TenantScopedSqliteBackend {
         execution_id: &ExecutionId,
         new_checkpoint: i64,
     ) -> BackendResult<()> {
+        // Every row is written under `execution_id`, whatever run it names.
+        self.own_run(execution_id).await?;
         let exec_id_str = execution_id_str(execution_id);
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -2370,6 +2442,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite_scoped.apply_approval_projection_batch", 1);
         }
 
         // Advance checkpoint once for the whole batch.
@@ -2389,6 +2462,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.apply_approval_projection_batch", 2);
 
         tx.commit().await.map_err(map_db_err)?;
         Ok(())
@@ -2470,6 +2544,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         execution_id: &ExecutionId,
         new_checkpoint: i64,
     ) -> BackendResult<()> {
+        self.own_run(execution_id).await?;
         let id_str = execution_id_str(execution_id);
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(

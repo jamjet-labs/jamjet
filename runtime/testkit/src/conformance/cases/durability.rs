@@ -3,33 +3,18 @@
 //!
 //! Test F.4: "Workflow resumes correctly after runtime kill (SQLite)"
 
+use crate::conformance::cases::support::{finding, not_on};
+use crate::conformance::{Fixture, StoreKind};
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::{
-    backend::StateBackend,
     event::{Event, EventKind},
     materializer::materialize,
     snapshot::Snapshot,
-    SqliteBackend,
 };
 use serde_json::json;
-use std::path::{Path, PathBuf};
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-fn temp_db_path() -> PathBuf {
-    let mut path = std::env::temp_dir();
-    let unique = uuid::Uuid::new_v4().to_string().replace('-', "");
-    path.push(format!("jamjet_test_{unique}.db"));
-    path
-}
-
-async fn open_db(path: &Path) -> SqliteBackend {
-    let url = format!("sqlite://{}", path.display());
-    SqliteBackend::open(&url)
-        .await
-        .expect("failed to open test db")
-}
+const NO_RESTART: &str = "memory cannot be reopened";
 
 fn sample_execution(id: &ExecutionId) -> WorkflowExecution {
     let now = Utc::now();
@@ -52,10 +37,8 @@ fn sample_execution(id: &ExecutionId) -> WorkflowExecution {
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 /// F.2 — State machine transitions are persisted and queryable.
-#[tokio::test]
-async fn test_state_machine_transitions() {
-    let path = temp_db_path();
-    let db = open_db(&path).await;
+pub async fn test_state_machine_transitions(fx: &Fixture) {
+    let db = fx.backend.as_ref();
     let id = ExecutionId::new();
     db.create_execution(sample_execution(&id)).await.unwrap();
 
@@ -82,21 +65,26 @@ async fn test_state_machine_transitions() {
         .unwrap();
     let exec = db.get_execution(&id).await.unwrap().unwrap();
     assert_eq!(exec.status, WorkflowStatus::Completed);
-    assert!(exec.completed_at.is_some());
-
-    std::fs::remove_file(&path).ok();
+    if !finding(
+        fx,
+        &[StoreKind::Memory],
+        "update_execution_status to completed leaves completed_at unset",
+    ) {
+        assert!(exec.completed_at.is_some());
+    }
 }
 
-/// F.4 — Crash recovery: write events to SQLite, drop the connection (simulating a crash),
-/// reopen the database, reload from events, verify state is intact.
-#[tokio::test]
-async fn test_crash_recovery_from_event_log() {
-    let path = temp_db_path();
+/// F.4. Crash recovery: write events, stop using the handle (simulating a crash),
+/// open the store again, reload from events, verify state is intact.
+pub async fn test_crash_recovery_from_event_log(fx: &Fixture) {
+    if not_on(fx, &[StoreKind::Memory], NO_RESTART) {
+        return;
+    }
     let id = ExecutionId::new();
 
-    // ── Phase 1: write state to SQLite ──────────────────────────────────────
+    // ── Phase 1: write state ────────────────────────────────────────────────
     {
-        let db = open_db(&path).await;
+        let db = fx.backend.as_ref();
         db.create_execution(sample_execution(&id)).await.unwrap();
 
         let events = vec![
@@ -160,12 +148,16 @@ async fn test_crash_recovery_from_event_log() {
             db.append_event(event).await.unwrap();
         }
 
-        // db is dropped here — simulates crash (connection closed)
+        // The case stops using the first handle here, as a crash would.
     }
 
-    // ── Phase 2: recover from SQLite ────────────────────────────────────────
+    // ── Phase 2: recover through a new pool ─────────────────────────────────
     {
-        let db = open_db(&path).await;
+        let db = fx
+            .hooks
+            .reopen()
+            .await
+            .expect("a store that can be reopened");
 
         // Execution record is still there.
         let exec = db.get_execution(&id).await.unwrap().unwrap();
@@ -177,7 +169,7 @@ async fn test_crash_recovery_from_event_log() {
         assert_eq!(db.latest_sequence(&id).await.unwrap(), 5);
 
         // Materialize state from events.
-        let mat = materialize(&db, &id).await.unwrap();
+        let mat = materialize(&*db, &id).await.unwrap();
 
         // step1 completed, step2 scheduled but not completed.
         assert_eq!(mat.current_state["greeting"], "hello");
@@ -186,18 +178,17 @@ async fn test_crash_recovery_from_event_log() {
         assert_eq!(mat.status, WorkflowStatus::Running);
         assert_eq!(mat.last_sequence, 5);
     }
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// Snapshot + delta recovery.
-#[tokio::test]
-async fn test_recovery_with_snapshot() {
-    let path = temp_db_path();
+pub async fn test_recovery_with_snapshot(fx: &Fixture) {
+    if not_on(fx, &[StoreKind::Memory], NO_RESTART) {
+        return;
+    }
     let id = ExecutionId::new();
 
     {
-        let db = open_db(&path).await;
+        let db = fx.backend.as_ref();
         db.create_execution(sample_execution(&id)).await.unwrap();
 
         // Write 5 events, then snapshot, then 2 more events.
@@ -265,8 +256,12 @@ async fn test_recovery_with_snapshot() {
 
     // Re-open and recover.
     {
-        let db = open_db(&path).await;
-        let mat = materialize(&db, &id).await.unwrap();
+        let db = fx
+            .hooks
+            .reopen()
+            .await
+            .expect("a store that can be reopened");
+        let mat = materialize(&*db, &id).await.unwrap();
 
         // WorkflowCompleted at seq 7 replaces current_state with final_state.
         // The intermediate state (n1..n6 from snapshot + delta) is superseded.
@@ -276,15 +271,11 @@ async fn test_recovery_with_snapshot() {
         assert!(mat.completed_nodes.contains_key("n6"));
         assert_eq!(mat.last_sequence, 7);
     }
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// F.1 — IR graph validation tests (already in ir/src/validate.rs — cross-check here).
-#[tokio::test]
-async fn test_event_sequencing() {
-    let path = temp_db_path();
-    let db = open_db(&path).await;
+pub async fn test_event_sequencing(fx: &Fixture) {
+    let db = fx.backend.as_ref();
     let id = ExecutionId::new();
     db.create_execution(sample_execution(&id)).await.unwrap();
 
@@ -312,6 +303,4 @@ async fn test_event_sequencing() {
     let since = db.get_events_since(&id, 1).await.unwrap();
     assert_eq!(since.len(), 2);
     assert_eq!(since[0].sequence, 2);
-
-    std::fs::remove_file(&path).ok();
 }

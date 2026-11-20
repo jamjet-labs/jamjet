@@ -381,13 +381,17 @@ impl SqliteBackend {
             .map_err(map_db_err)?;
 
         if refuse_terminal {
-            if let Some(status) = terminal_status_of(&mut tx, None, &execution_id).await? {
+            let terminal = terminal_status_of(&mut tx, None, &execution_id).await?;
+            fault_point!("sqlite.commit_turn", 1);
+            if let Some(status) = terminal {
                 // Fence first: only the holder may withdraw, and a stale or
                 // forged fence must leave the item exactly as it is.
-                if !withdraw_claimed_item(&mut tx, None, &id_str, lease_fence).await? {
+                let withdrawn = withdraw_claimed_item(&mut tx, None, &id_str, lease_fence).await?;
+                if !withdrawn {
                     tx.rollback().await.map_err(map_db_err)?;
                     return Err(StateBackendError::FenceLost(id_str));
                 }
+                fault_point!("sqlite.commit_turn", 2);
                 tx.commit().await.map_err(map_db_err)?;
                 return Ok(TurnCommit::ExecutionTerminal(status));
             }
@@ -420,6 +424,7 @@ impl SqliteBackend {
             .map_err(map_db_err)?
             .rows_affected()
         };
+        fault_point!("sqlite.commit_turn", 3);
 
         if rows == 0 {
             tx.rollback().await.map_err(map_db_err)?;
@@ -435,6 +440,7 @@ impl SqliteBackend {
         .await
         .map_err(map_db_err)?;
         let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+        fault_point!("sqlite.commit_turn", 4);
 
         sqlx::query(
             r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at)
@@ -448,6 +454,7 @@ impl SqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite.commit_turn", 5);
 
         // 2b) If the terminal event is NodeCompleted with an idempotency key,
         //     record the result in tool_effects in the SAME transaction.
@@ -490,6 +497,7 @@ impl SqliteBackend {
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite.commit_turn", 6);
         }
 
         // 3) Optionally compute and write the snapshot IN-TX from committed state.
@@ -504,6 +512,7 @@ impl SqliteBackend {
             .fetch_optional(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite.commit_turn", 7);
 
             let (base, base_sequence) = if let Some(row) = snap_row {
                 let at_seq: i64 = row.try_get("at_sequence").map_err(map_db_err)?;
@@ -551,6 +560,7 @@ impl SqliteBackend {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(map_db_err)?;
+                fault_point!("sqlite.commit_turn", 8);
                 let initial_input: serde_json::Value = serde_json::from_str(
                     exec_row
                         .try_get::<&str, _>("initial_input")
@@ -578,6 +588,7 @@ impl SqliteBackend {
             .fetch_all(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite.commit_turn", 9);
 
             let tail_events: Vec<crate::event::Event> = event_rows
                 .iter()
@@ -614,8 +625,10 @@ impl SqliteBackend {
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite.commit_turn", 10);
         }
 
+        fault_point!("sqlite.commit_turn", 11);
         tx.commit().await.map_err(map_db_err)?;
         Ok(TurnCommit::Committed(sequence))
     }
@@ -850,21 +863,7 @@ impl StateBackend for SqliteBackend {
         key: &str,
         value: serde_json::Value,
     ) -> BackendResult<()> {
-        let exec = self
-            .get_execution(execution_id)
-            .await?
-            .ok_or_else(|| StateBackendError::NotFound(format!("execution {execution_id}")))?;
-        let mut state = exec.current_state.clone();
-        let arr = state
-            .as_object_mut()
-            .ok_or_else(|| StateBackendError::Database("state is not a JSON object".into()))?
-            .entry(key)
-            .or_insert_with(|| serde_json::json!([]));
-        arr.as_array_mut()
-            .ok_or_else(|| StateBackendError::Database(format!("{key} is not an array")))?
-            .push(value);
-        self.update_execution_current_state(execution_id, &state)
-            .await
+        patch_append_array_in(&self.pool, None, execution_id, key, value).await
     }
 
     #[instrument(skip(self))]
@@ -970,6 +969,7 @@ impl StateBackend for SqliteBackend {
         .await
         .map_err(map_db_err)?;
         let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+        fault_point!("sqlite.append_event", 1);
 
         sqlx::query(
             r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at)
@@ -983,6 +983,7 @@ impl StateBackend for SqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite.append_event", 2);
         tx.commit().await.map_err(map_db_err)?;
 
         Ok(sequence)
@@ -1574,6 +1575,7 @@ impl StateBackend for SqliteBackend {
             q = q.bind(n.as_str());
         }
         let row = q.fetch_optional(&mut *tx).await.map_err(map_db_err)?;
+        fault_point!("sqlite.claim_work_item", 1);
 
         let Some(row) = row else {
             tx.rollback().await.map_err(map_db_err)?;
@@ -1587,6 +1589,7 @@ impl StateBackend for SqliteBackend {
         let claimed_at = Utc::now().to_rfc3339();
 
         let term = self.current_term(&mut tx).await?;
+        fault_point!("sqlite.claim_work_item", 2);
         let current_epoch: i64 = row.try_get::<i64, _>("lease_epoch").unwrap_or(0);
         let new_epoch = current_epoch + 1;
         let new_fence = term * 4_294_967_296_i64 + new_epoch;
@@ -1612,6 +1615,7 @@ impl StateBackend for SqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite.claim_work_item", 3);
 
         tx.commit().await.map_err(map_db_err)?;
 
@@ -1795,15 +1799,16 @@ impl StateBackend for SqliteBackend {
         // The fence + status guard lives on the READ as well as the write. Reading
         // an item this worker no longer owns and then refusing is correct but
         // wasteful; refusing here keeps the not-ours case to a single statement.
-        let Some(row) = sqlx::query(
+        let row = sqlx::query(
             "SELECT * FROM work_items WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
         )
         .bind(&id_str)
         .bind(lease_fence)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(map_db_err)?
-        else {
+        .map_err(map_db_err)?;
+        fault_point!("sqlite.fail_work_item_fenced", 1);
+        let Some(row) = row else {
             return Ok(None);
         };
 
@@ -1826,6 +1831,7 @@ impl StateBackend for SqliteBackend {
             .await
             .map_err(map_db_err)?
             .rows_affected();
+            fault_point!("sqlite.fail_work_item_fenced", 2);
             if rows == 0 {
                 return Ok(None);
             }
@@ -1849,6 +1855,7 @@ impl StateBackend for SqliteBackend {
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite.fail_work_item_fenced", 3);
 
             tx.commit().await.map_err(map_db_err)?;
             let mut exhausted = item;
@@ -1879,6 +1886,7 @@ impl StateBackend for SqliteBackend {
             return Ok(None);
         }
 
+        fault_point!("sqlite.fail_work_item_fenced", 4);
         tx.commit().await.map_err(map_db_err)?;
         let mut retried = item;
         retried.attempt = new_attempt;
@@ -1947,6 +1955,7 @@ impl StateBackend for SqliteBackend {
         .await
         .map_err(map_db_err)?
         .rows_affected();
+        fault_point!("sqlite.finalize_rollover_fenced", 1);
 
         if rows == 0 {
             tx.rollback().await.map_err(map_db_err)?;
@@ -1966,6 +1975,7 @@ impl StateBackend for SqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite.finalize_rollover_fenced", 2);
 
         tx.commit().await.map_err(map_db_err)?;
         Ok(true)
@@ -2316,6 +2326,7 @@ impl StateBackend for SqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite.apply_approval_projection", 1);
 
         sqlx::query(
             r#"INSERT INTO projector_checkpoints
@@ -2332,6 +2343,7 @@ impl StateBackend for SqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite.apply_approval_projection", 2);
 
         tx.commit().await.map_err(map_db_err)?;
         Ok(())
@@ -2388,6 +2400,7 @@ impl StateBackend for SqliteBackend {
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite.apply_approval_projection_batch", 1);
         }
 
         // Advance checkpoint once for the whole batch.
@@ -2406,6 +2419,7 @@ impl StateBackend for SqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite.apply_approval_projection_batch", 2);
 
         tx.commit().await.map_err(map_db_err)?;
         Ok(())
@@ -2613,6 +2627,7 @@ pub(crate) async fn create_run_in(
         q = q.bind(t);
     }
     q.execute(&mut *tx).await.map_err(map_db_err)?;
+    fault_point!("sqlite.create_run", 1);
 
     // 2. Seed snapshot, for a continuation segment.
     if let Some(snap) = seed_snapshot {
@@ -2636,6 +2651,7 @@ pub(crate) async fn create_run_in(
             q = q.bind(t);
         }
         q.execute(&mut *tx).await.map_err(map_db_err)?;
+        fault_point!("sqlite.create_run", 2);
     }
 
     // 3-4. WorkflowStarted, then NodeScheduled. The sequence is assigned like
@@ -2650,6 +2666,7 @@ pub(crate) async fn create_run_in(
         .map_err(map_db_err)?
         .try_get::<i64, _>("seq")
         .map_err(map_db_err)?;
+        fault_point!("sqlite.create_run", 3);
         let sql = format!(
             "INSERT INTO events (id, execution_id, sequence, kind_json, created_at{tcol}) \
              VALUES (?, ?, ?, ?, ?{tval})"
@@ -2664,6 +2681,7 @@ pub(crate) async fn create_run_in(
             q = q.bind(t);
         }
         q.execute(&mut *tx).await.map_err(map_db_err)?;
+        fault_point!("sqlite.create_run", 4);
     }
 
     // 5. Start-node work item.
@@ -2686,6 +2704,7 @@ pub(crate) async fn create_run_in(
         q = q.bind(t);
     }
     q.execute(&mut *tx).await.map_err(map_db_err)?;
+    fault_point!("sqlite.create_run", 5);
 
     tx.commit().await.map_err(map_db_err)?;
     Ok(())
@@ -2724,7 +2743,9 @@ pub(crate) async fn finish_execution_in(
         .await
         .map_err(map_db_err)?;
 
-    if let Some(prior) = terminal_status_of(&mut tx, tenant_id, &execution_id).await? {
+    let prior = terminal_status_of(&mut tx, tenant_id, &execution_id).await?;
+    fault_point!("sqlite.finish_execution", 1);
+    if let Some(prior) = prior {
         tx.rollback().await.map_err(map_db_err)?;
         return Ok(ExecutionFinish::AlreadyTerminal(prior));
     }
@@ -2741,12 +2762,13 @@ pub(crate) async fn finish_execution_in(
     if let Some(t) = tenant_id {
         q = q.bind(t);
     }
-    if q.execute(&mut *tx)
+    let updated = q
+        .execute(&mut *tx)
         .await
         .map_err(map_db_err)?
-        .rows_affected()
-        == 0
-    {
+        .rows_affected();
+    fault_point!("sqlite.finish_execution", 2);
+    if updated == 0 {
         tx.rollback().await.map_err(map_db_err)?;
         return Err(StateBackendError::NotFound(execution_id));
     }
@@ -2759,6 +2781,7 @@ pub(crate) async fn finish_execution_in(
     .await
     .map_err(map_db_err)?;
     let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+    fault_point!("sqlite.finish_execution", 3);
 
     let insert = match tenant_id {
         Some(t) => sqlx::query(
@@ -2782,6 +2805,7 @@ pub(crate) async fn finish_execution_in(
         .bind(&created_at),
     };
     insert.execute(&mut *tx).await.map_err(map_db_err)?;
+    fault_point!("sqlite.finish_execution", 4);
     tx.commit().await.map_err(map_db_err)?;
     Ok(ExecutionFinish::Finished(sequence))
 }
@@ -2846,7 +2870,9 @@ pub(crate) async fn append_event_if_in(
     if let Some(t) = tenant_id {
         q = q.bind(t);
     }
-    let Some(row) = q.fetch_optional(&mut *tx).await.map_err(map_db_err)? else {
+    let row = q.fetch_optional(&mut *tx).await.map_err(map_db_err)?;
+    fault_point!("sqlite.append_event_if", 1);
+    let Some(row) = row else {
         tx.rollback().await.map_err(map_db_err)?;
         return Err(StateBackendError::NotFound(execution_id));
     };
@@ -2861,6 +2887,7 @@ pub(crate) async fn append_event_if_in(
         .fetch_all(&mut *tx)
         .await
         .map_err(map_db_err)?;
+    fault_point!("sqlite.append_event_if", 2);
     let log = rows
         .iter()
         .map(row_to_event)
@@ -2891,6 +2918,7 @@ pub(crate) async fn append_event_if_in(
         q = q.bind(t);
     }
     q.execute(&mut *tx).await.map_err(map_db_err)?;
+    fault_point!("sqlite.append_event_if", 3);
     tx.commit().await.map_err(map_db_err)?;
     Ok(ConditionalAppend::Appended(sequence))
 }
@@ -2989,6 +3017,7 @@ pub(crate) async fn expire_stale_leases(
         q = q.bind(t);
     }
     let rows = q.fetch_all(&mut *tx).await.map_err(map_db_err)?;
+    fault_point!("sqlite.expire_stale_leases", 1);
     if rows.is_empty() {
         tx.rollback().await.map_err(map_db_err)?;
         return Ok(());
@@ -3011,6 +3040,7 @@ pub(crate) async fn expire_stale_leases(
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite.expire_stale_leases", 2);
             continue;
         }
         if item.attempt + 1 >= item.max_attempts {
@@ -3028,13 +3058,16 @@ pub(crate) async fn expire_stale_leases(
         .await
         .map_err(map_db_err)?
         .rows_affected();
+        fault_point!("sqlite.expire_stale_leases", 3);
         if requeued == 0 {
             continue;
         }
         for kind in lease_expiry_events(&item) {
             insert_event_in_tx(&mut tx, &item, kind).await?;
+            fault_point!("sqlite.expire_stale_leases", 4);
         }
     }
+    fault_point!("sqlite.expire_stale_leases", 5);
     tx.commit().await.map_err(map_db_err)?;
     Ok(())
 }
@@ -3168,7 +3201,9 @@ pub(crate) async fn reattach_lease(
     if let Some(t) = tenant_id {
         q = q.bind(t);
     }
-    let Some(row) = q.fetch_optional(&mut *tx).await.map_err(map_db_err)? else {
+    let row = q.fetch_optional(&mut *tx).await.map_err(map_db_err)?;
+    fault_point!("sqlite.reattach_lease", 1);
+    let Some(row) = row else {
         tx.rollback().await.map_err(map_db_err)?;
         return Err(StateBackendError::FenceLost(id_str));
     };
@@ -3178,6 +3213,7 @@ pub(crate) async fn reattach_lease(
         .map_err(map_db_err)?
         .try_get::<i64, _>("term")
         .map_err(map_db_err)?;
+    fault_point!("sqlite.reattach_lease", 2);
     let current_epoch: i64 = row.try_get::<i64, _>("lease_epoch").unwrap_or(0);
     let lease_len: i64 = row
         .try_get::<Option<i64>, _>("lease_secs")
@@ -3218,6 +3254,7 @@ pub(crate) async fn reattach_lease(
         tx.rollback().await.map_err(map_db_err)?;
         return Err(StateBackendError::FenceLost(id_str));
     }
+    fault_point!("sqlite.reattach_lease", 3);
     tx.commit().await.map_err(map_db_err)?;
     Ok(crate::backend::LeaseRenewal {
         lease_fence: new_fence,
@@ -3626,7 +3663,9 @@ pub(crate) async fn commit_scheduler_pass_in(
     if let Some(t) = tenant_id {
         q = q.bind(t);
     }
-    let Some(row) = q.fetch_optional(&mut *tx).await.map_err(map_db_err)? else {
+    let row = q.fetch_optional(&mut *tx).await.map_err(map_db_err)?;
+    fault_point!("sqlite.commit_scheduler_pass", 1);
+    let Some(row) = row else {
         tx.rollback().await.map_err(map_db_err)?;
         return Err(StateBackendError::NotFound(execution_id));
     };
@@ -3645,6 +3684,7 @@ pub(crate) async fn commit_scheduler_pass_in(
             .map_err(map_db_err)?
             .try_get::<i64, _>("seq")
             .map_err(map_db_err)?;
+    fault_point!("sqlite.commit_scheduler_pass", 2);
     if latest != pass.seen_sequence {
         tx.rollback().await.map_err(map_db_err)?;
         return Ok(PassCommit::Stale {
@@ -3662,6 +3702,7 @@ pub(crate) async fn commit_scheduler_pass_in(
         .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite.commit_scheduler_pass", 3);
         if live {
             tx.rollback().await.map_err(map_db_err)?;
             return Ok(PassCommit::Stale {
@@ -3673,6 +3714,7 @@ pub(crate) async fn commit_scheduler_pass_in(
     let mut last_sequence = latest;
     for event in &events {
         last_sequence = append_kind_in_tx(&mut tx, &execution_id, &run_tenant, event).await?;
+        fault_point!("sqlite.commit_scheduler_pass", 4);
     }
     for (item, payload_json) in pass.work_items.iter().zip(&payloads) {
         sqlx::query(
@@ -3693,6 +3735,7 @@ pub(crate) async fn commit_scheduler_pass_in(
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite.commit_scheduler_pass", 5);
     }
     if let Some((status, event)) = &finish {
         let now = Utc::now().to_rfc3339();
@@ -3707,9 +3750,12 @@ pub(crate) async fn commit_scheduler_pass_in(
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite.commit_scheduler_pass", 6);
         last_sequence = append_kind_in_tx(&mut tx, &execution_id, &run_tenant, event).await?;
+        fault_point!("sqlite.commit_scheduler_pass", 7);
     }
 
+    fault_point!("sqlite.commit_scheduler_pass", 8);
     tx.commit().await.map_err(map_db_err)?;
     Ok(PassCommit::Committed { last_sequence })
 }
@@ -3827,20 +3873,22 @@ pub(crate) async fn reclaim_one_recorded(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(map_db_err)?;
-    let Some((mut item, terminal)) = read_claimed_in_tx(
+    let claimed = read_claimed_in_tx(
         &mut tx,
         tenant_id,
         &id_str,
         candidate.lease_fence,
         Some(now),
     )
-    .await?
-    else {
+    .await?;
+    fault_point!("sqlite.reclaim_expired_leases_recorded", 1);
+    let Some((mut item, terminal)) = claimed else {
         tx.rollback().await.map_err(map_db_err)?;
         return Ok(None);
     };
     if terminal {
         settle_failed_in_tx(&mut tx, &id_str, item.lease_fence).await?;
+        fault_point!("sqlite.reclaim_expired_leases_recorded", 2);
         tx.commit().await.map_err(map_db_err)?;
         return Ok(None);
     }
@@ -3858,6 +3906,7 @@ pub(crate) async fn reclaim_one_recorded(
         .await
         .map_err(map_db_err)?
         .rows_affected();
+        fault_point!("sqlite.reclaim_expired_leases_recorded", 3);
         (SweepOutcome::Exhausted, settled)
     } else {
         let backoff_secs = 1u64 << new_attempt.min(6);
@@ -3877,6 +3926,7 @@ pub(crate) async fn reclaim_one_recorded(
         .await
         .map_err(map_db_err)?
         .rows_affected();
+        fault_point!("sqlite.reclaim_expired_leases_recorded", 4);
         (SweepOutcome::Retry, settled)
     };
     if settled == 0 {
@@ -3888,10 +3938,13 @@ pub(crate) async fn reclaim_one_recorded(
     item.attempt = new_attempt;
     if outcome == SweepOutcome::Exhausted {
         insert_dead_letter_in_tx(&mut tx, &item, "lease expired: worker dead").await?;
+        fault_point!("sqlite.reclaim_expired_leases_recorded", 5);
     }
     for kind in sweep_events(&item, outcome) {
         insert_event_in_tx(&mut tx, &item, kind).await?;
+        fault_point!("sqlite.reclaim_expired_leases_recorded", 6);
     }
+    fault_point!("sqlite.reclaim_expired_leases_recorded", 7);
     tx.commit().await.map_err(map_db_err)?;
     Ok(Some((outcome, item)))
 }
@@ -3915,14 +3968,15 @@ pub(crate) async fn fail_work_item_fenced_recorded_in(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(map_db_err)?;
-    let Some((mut item, terminal)) =
-        read_claimed_in_tx(&mut tx, tenant_id, &id_str, lease_fence, None).await?
-    else {
+    let claimed = read_claimed_in_tx(&mut tx, tenant_id, &id_str, lease_fence, None).await?;
+    fault_point!("sqlite.fail_work_item_fenced_recorded", 1);
+    let Some((mut item, terminal)) = claimed else {
         tx.rollback().await.map_err(map_db_err)?;
         return Ok(None);
     };
     if terminal {
         settle_failed_in_tx(&mut tx, &id_str, lease_fence).await?;
+        fault_point!("sqlite.fail_work_item_fenced_recorded", 2);
         tx.commit().await.map_err(map_db_err)?;
         return Ok(None);
     }
@@ -3931,7 +3985,7 @@ pub(crate) async fn fail_work_item_fenced_recorded_in(
     let exhausted = new_attempt >= item.max_attempts;
     let backoff_secs = 1u64 << new_attempt.min(6);
     let settled = if exhausted {
-        sqlx::query(
+        let settled = sqlx::query(
             "UPDATE work_items SET status = 'dead_lettered', attempt = ?, lease_expires_at = NULL, \
              worker_id = NULL WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
         )
@@ -3941,11 +3995,13 @@ pub(crate) async fn fail_work_item_fenced_recorded_in(
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?
-        .rows_affected()
+        .rows_affected();
+        fault_point!("sqlite.fail_work_item_fenced_recorded", 3);
+        settled
     } else {
         let retry_after =
             (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
-        sqlx::query(
+        let settled = sqlx::query(
             "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, \
              lease_expires_at = NULL, retry_after = ?, lease_epoch = lease_epoch + 1, \
              lease_fence = 0 WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
@@ -3957,7 +4013,9 @@ pub(crate) async fn fail_work_item_fenced_recorded_in(
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?
-        .rows_affected()
+        .rows_affected();
+        fault_point!("sqlite.fail_work_item_fenced_recorded", 4);
+        settled
     };
     if settled == 0 {
         tx.rollback().await.map_err(map_db_err)?;
@@ -3966,6 +4024,7 @@ pub(crate) async fn fail_work_item_fenced_recorded_in(
     item.attempt = new_attempt;
     let outcome = if exhausted {
         insert_dead_letter_in_tx(&mut tx, &item, error).await?;
+        fault_point!("sqlite.fail_work_item_fenced_recorded", 5);
         FailOutcome::Exhausted {
             item: Box::new(item.clone()),
         }
@@ -3977,7 +4036,9 @@ pub(crate) async fn fail_work_item_fenced_recorded_in(
     };
     for kind in crate::lease_events::fail_events(&outcome, error) {
         insert_event_in_tx(&mut tx, &item, kind).await?;
+        fault_point!("sqlite.fail_work_item_fenced_recorded", 6);
     }
+    fault_point!("sqlite.fail_work_item_fenced_recorded", 7);
     tx.commit().await.map_err(map_db_err)?;
     Ok(Some(outcome))
 }
@@ -4073,6 +4134,69 @@ async fn insert_dead_letter_in_tx(
     .execute(&mut **tx)
     .await
     .map_err(map_db_err)?;
+    Ok(())
+}
+
+/// [`StateBackend::patch_append_array`] for both SQLite backends: the read
+/// of the run's state, the append and the write back in one `BEGIN
+/// IMMEDIATE` transaction. Done as a read and a separate write, two appends
+/// that read the same state each wrote back only their own value, and one
+/// was lost. `tenant_id` scopes the run on the tenant-scoped backend.
+pub(crate) async fn patch_append_array_in(
+    pool: &SqlitePool,
+    tenant_id: Option<&str>,
+    execution_id: &ExecutionId,
+    key: &str,
+    value: serde_json::Value,
+) -> BackendResult<()> {
+    let id_str = execution_id_str(execution_id);
+    let tenant_clause = if tenant_id.is_some() {
+        " AND tenant_id = ?"
+    } else {
+        ""
+    };
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(map_db_err)?;
+
+    let select = format!("SELECT * FROM workflow_executions WHERE execution_id = ?{tenant_clause}");
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(select)).bind(&id_str);
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    let row = q.fetch_optional(&mut *tx).await.map_err(map_db_err)?;
+    fault_point!("sqlite.patch_append_array", 1);
+    let Some(row) = row else {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Err(StateBackendError::NotFound(format!(
+            "execution {execution_id}"
+        )));
+    };
+    let mut state = row_to_execution(&row)?.current_state;
+    let arr = state
+        .as_object_mut()
+        .ok_or_else(|| StateBackendError::Database("state is not a JSON object".into()))?
+        .entry(key)
+        .or_insert_with(|| serde_json::json!([]));
+    arr.as_array_mut()
+        .ok_or_else(|| StateBackendError::Database(format!("{key} is not an array")))?
+        .push(value);
+
+    let update = format!(
+        "UPDATE workflow_executions SET current_state = ?, updated_at = ? \
+         WHERE execution_id = ?{tenant_clause}"
+    );
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(update))
+        .bind(serde_json::to_string(&state)?)
+        .bind(Utc::now().to_rfc3339())
+        .bind(&id_str);
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    q.execute(&mut *tx).await.map_err(map_db_err)?;
+    fault_point!("sqlite.patch_append_array", 2);
+    tx.commit().await.map_err(map_db_err)?;
     Ok(())
 }
 

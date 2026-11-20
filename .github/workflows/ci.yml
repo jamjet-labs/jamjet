@@ -60,7 +60,9 @@ jobs:
     # Engram's Postgres stores had no test that ran against a server. The
     # cases in engram/tests/values_are_data_test.rs need one, and with
     # ENGRAM_REQUIRE_POSTGRES_TESTS set they fail instead of skipping when
-    # the URL is missing.
+    # the URL is missing. The testkit's Postgres tests use the same server,
+    # each on a database of its own, and JAMJET_REQUIRE_POSTGRES_TESTS makes
+    # a missing URL fail them too.
     services:
       postgres:
         image: postgres:16-alpine
@@ -76,6 +78,8 @@ jobs:
     env:
       ENGRAM_TEST_POSTGRES_URL: postgres://postgres:engram-ci@127.0.0.1:5432/postgres
       ENGRAM_REQUIRE_POSTGRES_TESTS: "1"
+      JAMJET_TEST_POSTGRES_URL: postgres://postgres:engram-ci@127.0.0.1:5432/postgres
+      JAMJET_REQUIRE_POSTGRES_TESTS: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

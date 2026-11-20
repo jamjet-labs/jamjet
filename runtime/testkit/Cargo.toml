@@ -1,6 +1,6 @@
 [package]
 name = "jamjet-testkit"
-description = "Test helpers for the JamJet engine: a state backend wrapper that lets a test act before and after each call"
+description = "Test helpers for the JamJet engine: a state backend wrapper with hooks around each call, a store fixture for every backend, and Postgres test databases"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,15 @@ publish = false
 jamjet-core = { path = "../core" }
 jamjet-state = { path = "../state" }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
+sqlx = { workspace = true }
+libsqlite3-sys = { workspace = true }
 tokio = { workspace = true }
+uuid = { workspace = true }
+
+# The fault points are on for the kit's own tests only. As a normal
+# dependency the feature would reach every crate built beside the kit,
+# release builds of the server included.
+[dev-dependencies]
+jamjet-state = { path = "../state", features = ["test-hooks"] }
