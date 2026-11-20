@@ -370,8 +370,9 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 "Use this when jamjet_list_executions shows a 'paused' execution or jamjet_get_events shows an ApprovalRequested event. ",
                 "Side effects: appends an ApprovalReceived event to the event log, recording the authenticated API token as the approver ('mcp-client' only in dev mode), and, if the execution is paused, ",
                 "resumes it to 'running' status so the next node can proceed. The decision is recorded in the immutable audit trail. ",
-                "Returns a JSON object with execution_id and accepted: true. ",
-                "Fails if execution_id is not found, if decision is not exactly 'approved' or 'rejected', or if nothing is pending approval (or node_id does not match a pending approval). ",
+                "Returns a JSON object with execution_id, node_id, accepted: true, repeat, sequence (the decision's place in the event log) and waiting_for (what the run waits for next). ",
+                "Sending the same decision again with the same token answers with the first one (repeat: true, the same sequence) and records nothing, so a lost answer is safe to retry. ",
+                "Fails if execution_id is not found, if decision is not exactly 'approved' or 'rejected', if nothing is pending approval (or node_id does not match a pending approval), or if the request was already decided another way or by another approver. ",
                 "Related: use jamjet_get_events to see the ApprovalRequested event details before deciding."
             ).into()),
             input_schema: json!({
@@ -453,7 +454,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 };
                 let actor_id = principal.clone().unwrap_or_else(|| user_id.clone());
 
-                let (resolved_node, event) = crate::approvals::submit_approval(
+                let submitted = crate::approvals::submit_approval(
                     &backend,
                     &eid,
                     crate::approvals::ApprovalSubmission {
@@ -478,21 +479,34 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 // Seal the approval into the signed, hash-chained audit log,
                 // mirroring the REST approve path: best-effort, after the
                 // durable event write, off the worker's fenced commit path.
-                let audit_ctx = jamjet_audit::RequestContext {
-                    actor_id,
-                    actor_type: jamjet_audit::ActorType::Human,
-                    tenant_id: tenant_id.0.clone(),
-                    method: Some("POST".to_string()),
-                    path: Some("/mcp/tools/jamjet_approve".to_string()),
-                    ..Default::default()
-                };
-                if let Err(e) = s.enricher.try_enrich_and_append(&event, Some(&audit_ctx)).await {
-                    jamjet_state::approvals::record_seal_gap(backend.as_ref(), &event, e).await;
+                // A repeat appended nothing and was sealed the first time.
+                if !submitted.repeat {
+                    let audit_ctx = jamjet_audit::RequestContext {
+                        actor_id,
+                        actor_type: jamjet_audit::ActorType::Human,
+                        tenant_id: tenant_id.0.clone(),
+                        method: Some("POST".to_string()),
+                        path: Some("/mcp/tools/jamjet_approve".to_string()),
+                        ..Default::default()
+                    };
+                    if let Err(e) = s
+                        .enricher
+                        .try_enrich_and_append(&submitted.event, Some(&audit_ctx))
+                        .await
+                    {
+                        jamjet_state::approvals::record_seal_gap(
+                            backend.as_ref(),
+                            &submitted.event,
+                            e,
+                        )
+                        .await;
+                    }
                 }
 
+                let answer =
+                    crate::approvals::decision_answer(backend.as_ref(), &eid, &submitted).await;
                 Ok(vec![McpContent::Text {
-                    text: json!({"execution_id": id_str, "node_id": resolved_node, "accepted": true})
-                        .to_string(),
+                    text: answer.to_string(),
                 }])
             }
         },

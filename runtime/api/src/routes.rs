@@ -944,6 +944,12 @@ struct ApproveRequest {
 /// principal. No token and no marker is refused with 401.
 ///
 /// ROLE. `reviewer` and above may call this route; see `require_write_role`.
+///
+/// ANSWER. `execution_id`, `node_id`, `accepted: true`, `repeat`, the
+/// decision's `sequence` and the run's `waiting_for` after it. A caller that
+/// sends its own decision again gets the first one's answer with
+/// `repeat: true`, and nothing is recorded; the rules are in
+/// [`crate::approvals`].
 async fn approve_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
@@ -978,7 +984,7 @@ async fn approve_execution(
     };
     let actor_id = principal.clone().unwrap_or_else(|| user_id.clone());
 
-    let (node_id, event) = crate::approvals::submit_approval(
+    let submitted = crate::approvals::submit_approval(
         &backend,
         &execution_id,
         crate::approvals::ApprovalSubmission {
@@ -1005,6 +1011,7 @@ async fn approve_execution(
         | crate::approvals::SubmitError::Expired(_)
         | crate::approvals::SubmitError::Superseded(_)
         | crate::approvals::SubmitError::UnreadableLog
+        | crate::approvals::SubmitError::AlreadyDecided { .. }
         | crate::approvals::SubmitError::StaleDigest => ApiError::Conflict(e.to_string()),
         crate::approvals::SubmitError::EditsUnsupported
         | crate::approvals::SubmitError::DigestRequired => ApiError::BadRequest(e.to_string()),
@@ -1019,24 +1026,27 @@ async fn approve_execution(
     // answers was sealed when it was raised (`node_guard::record_request`).
     // The per-node worker events emitted through the fenced `commit_turn` path
     // are not yet routed through the enricher; tracked as F-t3-audit-emit.
-    let ctx = jamjet_audit::RequestContext {
-        actor_id,
-        actor_type: jamjet_audit::ActorType::Human,
-        tenant_id: tenant_id.0.clone(),
-        method: Some("POST".to_string()),
-        path: Some(format!("/executions/{id}/approve")),
-        ..Default::default()
-    };
-    if let Err(e) = state
-        .enricher
-        .try_enrich_and_append(&event, Some(&ctx))
-        .await
-    {
-        jamjet_state::approvals::record_seal_gap(backend.as_ref(), &event, e).await;
+    // A repeat appended nothing, and its decision was sealed the first time.
+    if !submitted.repeat {
+        let ctx = jamjet_audit::RequestContext {
+            actor_id,
+            actor_type: jamjet_audit::ActorType::Human,
+            tenant_id: tenant_id.0.clone(),
+            method: Some("POST".to_string()),
+            path: Some(format!("/executions/{id}/approve")),
+            ..Default::default()
+        };
+        if let Err(e) = state
+            .enricher
+            .try_enrich_and_append(&submitted.event, Some(&ctx))
+            .await
+        {
+            jamjet_state::approvals::record_seal_gap(backend.as_ref(), &submitted.event, e).await;
+        }
     }
 
     Ok(Json(
-        json!({ "execution_id": id, "node_id": node_id, "accepted": true }),
+        crate::approvals::decision_answer(backend.as_ref(), &execution_id, &submitted).await,
     ))
 }
 
@@ -1155,7 +1165,8 @@ struct PendingApprovalsQuery {
 /// tick, so a row lags the log by up to one tick: a request raised since the
 /// last tick is not listed yet, and one decided since is still listed. The
 /// approve route reads the log and decides; it refuses a listed request that
-/// was decided in the meantime with 409.
+/// was decided in the meantime with 409, unless the caller sends again the
+/// decision it made itself, which answers 200 with `repeat: true`.
 ///
 /// `status` may only be `pending` (the default). `limit` defaults to
 /// [`DEFAULT_APPROVALS_PAGE`] and is clamped to 1..=[`MAX_APPROVALS_PAGE`].

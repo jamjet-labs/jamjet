@@ -243,8 +243,10 @@ async fn approve_multiple_pending_requires_node_id() {
     );
 }
 
+/// The same approval sent twice is answered with the first one and records
+/// nothing. A different decision on the decided request is still 409.
 #[tokio::test]
-async fn double_approve_returns_409() {
+async fn double_approve_answers_the_first_decision() {
     let state = make_state();
     let backend = state.backend.clone();
     let router = build_router_with_opts(state, true);
@@ -252,36 +254,42 @@ async fn double_approve_returns_409() {
     let execution_id = create_execution(&backend).await;
     seed_approval_required(&backend, &execution_id, "a").await;
     let id_str = execution_id.to_string();
+    let decide = |decision: &'static str| {
+        router.clone().oneshot(
+            Request::post(format!("/executions/{id_str}/approve"))
+                .header("content-type", "application/json")
+                .body(approve_body(decision, Some("a")))
+                .unwrap(),
+        )
+    };
 
     // First approval — must succeed.
-    let resp1 = router
-        .clone()
-        .oneshot(
-            Request::post(format!("/executions/{id_str}/approve"))
-                .header("content-type", "application/json")
-                .body(approve_body("approved", Some("a")))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let resp1 = decide("approved").await.unwrap();
     assert_eq!(resp1.status(), StatusCode::OK);
+    let first = body_json(resp1.into_body()).await;
+    assert_eq!(first["repeat"], false, "{first}");
+    let recorded = backend.get_events(&execution_id).await.unwrap();
 
-    // Second identical approval — must 409.
-    let resp2 = router
-        .oneshot(
-            Request::post(format!("/executions/{id_str}/approve"))
-                .header("content-type", "application/json")
-                .body(approve_body("approved", Some("a")))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp2.status(), StatusCode::CONFLICT);
-    let json = body_json(resp2.into_body()).await;
+    // Second identical approval — the first one's answer.
+    let resp2 = decide("approved").await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let again = body_json(resp2.into_body()).await;
+    assert_eq!(again["repeat"], true, "{again}");
+    assert_eq!(again["sequence"], first["sequence"], "{again}");
+    assert_eq!(
+        backend.get_events(&execution_id).await.unwrap().len(),
+        recorded.len(),
+        "a repeat records nothing"
+    );
+
+    // A different decision — must 409.
+    let resp3 = decide("rejected").await.unwrap();
+    assert_eq!(resp3.status(), StatusCode::CONFLICT);
+    let json = body_json(resp3.into_body()).await;
     let error = json["error"].as_str().unwrap_or("");
-    assert!(
-        error.contains("no pending approval"),
-        "double-approve error must mention 'no pending approval', got: {error}"
+    assert_eq!(
+        error, "already decided by you with a different decision",
+        "{json}"
     );
 }
 

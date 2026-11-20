@@ -773,6 +773,136 @@ async fn a_dev_mode_repeat_matches_by_user_id() {
     }
 }
 
+/// A second request on `node`, written at store level.
+async fn seed_request_for(backend: &Arc<dyn StateBackend>, eid: &ExecutionId, node: &str) {
+    backend
+        .append_event(Event::new(
+            eid.clone(),
+            0,
+            EventKind::ToolApprovalRequired {
+                node_id: node.into(),
+                tool_name: format!("tool_{node}"),
+                approver: "human".into(),
+                context: json!({ "action": node }),
+            },
+        ))
+        .await
+        .unwrap();
+}
+
+/// With no `node_id`, a decision repeats only if exactly one node's decision
+/// matches it; with several, the caller must name the node.
+#[tokio::test]
+async fn without_a_node_id_a_repeat_must_match_one_node() {
+    for tb in support::backends().await {
+        let backend = tb.dyn_backend();
+        let state = support::make_state(backend.clone());
+        let decide = |eid: &ExecutionId, body: Value| {
+            let path = format!("/executions/{}/approve", exec_path(eid));
+            let state = state.clone();
+            async move { support::post(&state, &path, body).await }
+        };
+        let unnamed = |decision: &str| json!({ "decision": decision, "user_id": "sam" });
+        let named = |decision: &str, node: &str| json!({ "decision": decision, "node_id": node, "user_id": "sam" });
+
+        // `pay` approved, `ship` rejected: each repeat finds its one node.
+        let eid = seeded_request(&backend).await;
+        let (st, pay) = decide(&eid, unnamed("approved")).await;
+        assert_eq!(st, StatusCode::OK, "{}: {pay}", tb.name());
+        assert_eq!(pay["node_id"], "pay", "{}: {pay}", tb.name());
+        seed_request_for(&backend, &eid, "ship").await;
+        let (st, ship) = decide(&eid, named("rejected", "ship")).await;
+        assert_eq!(st, StatusCode::OK, "{}: {ship}", tb.name());
+        let before = backend.get_events(&eid).await.unwrap().len();
+
+        let (st, again) = decide(&eid, unnamed("approved")).await;
+        assert_eq!(st, StatusCode::OK, "{}: {again}", tb.name());
+        assert_eq!(again["repeat"], true, "{}: {again}", tb.name());
+        assert_eq!(again["node_id"], "pay", "{}: {again}", tb.name());
+        assert_eq!(again["sequence"], pay["sequence"], "{}: {again}", tb.name());
+        let (st, again) = decide(&eid, unnamed("rejected")).await;
+        assert_eq!(st, StatusCode::OK, "{}: {again}", tb.name());
+        assert_eq!(again["node_id"], "ship", "{}: {again}", tb.name());
+        assert_eq!(
+            again["sequence"],
+            ship["sequence"],
+            "{}: {again}",
+            tb.name()
+        );
+        assert_eq!(
+            backend.get_events(&eid).await.unwrap().len(),
+            before,
+            "{}",
+            tb.name()
+        );
+
+        // Both approved: the same body repeats two decisions, so it is refused.
+        let eid = seeded_request(&backend).await;
+        let (st, body) = decide(&eid, unnamed("approved")).await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", tb.name());
+        seed_request_for(&backend, &eid, "ship").await;
+        let (st, body) = decide(&eid, named("approved", "ship")).await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", tb.name());
+        let before = backend.get_events(&eid).await.unwrap().len();
+
+        let (st, body) = decide(&eid, unnamed("approved")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{}: {body}", tb.name());
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("specify node_id"),
+            "{}: {body}",
+            tb.name()
+        );
+        let (st, body) = decide(&eid, named("approved", "ship")).await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", tb.name());
+        assert_eq!(body["repeat"], true, "{}: {body}", tb.name());
+        assert_eq!(
+            backend.get_events(&eid).await.unwrap().len(),
+            before,
+            "{}",
+            tb.name()
+        );
+    }
+}
+
+/// A decided request refuses what does not repeat its decision, and says
+/// whose decision it is.
+#[tokio::test]
+async fn a_decided_request_names_whose_decision_it_is() {
+    for env in envs().await {
+        let (eid, digest) = start_and_request(&env, "wf-pay").await;
+        let (st, body) = decide(&env, &env.bob, &eid, approve_body(&digest)).await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+
+        let mut noted = approve_body(&digest);
+        noted["comment"] = json!("looks fine");
+        for (token, body, expected) in [
+            (
+                &env.bob,
+                reject_body(),
+                "already decided by you with a different decision",
+            ),
+            // Another note is another decision too.
+            (
+                &env.bob,
+                noted,
+                "already decided by you with a different decision",
+            ),
+            (
+                &env.carol,
+                approve_body(&digest),
+                "already decided by another approver",
+            ),
+        ] {
+            let (st, resp) = decide(&env, token, &eid, body.clone()).await;
+            assert_eq!(st, StatusCode::CONFLICT, "{}: {body}: {resp}", env.name);
+            assert_eq!(resp["error"], expected, "{}: {body}: {resp}", env.name);
+        }
+    }
+}
+
 #[tokio::test]
 async fn the_mcp_approve_tool_answers_a_repeat_like_the_route() {
     for env in envs().await {
@@ -781,6 +911,7 @@ async fn the_mcp_approve_tool_answers_a_repeat_like_the_route() {
         assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
         let sequence = the_decision(&env, &eid).await;
         let before = events(&env, &eid).await.len();
+        let sealed = audit_entries(&env).await;
 
         let (st, resp) = call(
             &env.app,
@@ -803,6 +934,12 @@ async fn the_mcp_approve_tool_answers_a_repeat_like_the_route() {
             .unwrap_or_else(|| panic!("{}: {resp}", env.name));
         let answer: Value = serde_json::from_str(text).unwrap();
         assert_repeat_of(&env, sequence, &answer);
+        assert_eq!(
+            audit_entries(&env).await,
+            sealed,
+            "{}: a repeat through the tool seals nothing",
+            env.name
+        );
 
         let (st, route) = decide(&env, &env.bob, &eid, approve_body(&digest)).await;
         assert_eq!(st, StatusCode::OK, "{}: {route}", env.name);
