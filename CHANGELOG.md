@@ -29,8 +29,18 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Sending the same decision twice answers 200 with the first decision's sequence and records
   nothing. A different decision on a decided request is still 409. A decision on a decided
   request by another principal now says it was already decided, not that nothing is pending.
+- The approve answer's `execution_id` is always the `exec_<uuid>` form `POST /executions`
+  returns. It used to echo the id as sent, so a client that sends a bare UUID and compares
+  the echo gets a different string.
+- An approval sent again by the same principal without its `action_digest`, on a run that
+  has ended, is now 400 (the digest is required), not 409 (the run has ended). The repeat
+  check runs before the run's status is read. With the digest it answers 200.
+- A decision without `node_id` that matches the caller's decision on another node, while a
+  request is pending, is now 400 ("specify node_id"). It could be a retry or a decision on
+  the pending request. Before, it decided the pending request.
 - The MCP tool text no longer says to filter by `paused` to find approvals. A run waiting for
-  one stays `running`.
+  one stays `running`. `jamjet_get_execution` now carries `waiting_for`, as
+  `GET /executions/:id` does.
 - Migration 0017 adds an index for the approvals list. A build from before it will not open
   a store that has run it, so there is no rollback past this release.
 
