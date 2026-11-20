@@ -622,6 +622,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   after a dead-letter left the node scheduled and the run stuck. The scheduler's sweep
   and the fail route each settle the item and write its events in one transaction
   (`reclaim_expired_leases_recorded`, `fail_work_item_fenced_recorded`).
+- **`patch_append_array` on SQLite keeps every value.** It read the run's state and
+  wrote it back in two statements, so two appends at once could each write back only
+  their own value, and one was lost. The read and the write are one transaction now.
 
 ### Changed
 
