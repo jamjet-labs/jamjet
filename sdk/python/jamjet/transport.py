@@ -166,6 +166,13 @@ def show_origin(origin: Origin) -> str:
     return f"{scheme}://{host}" if port is None else f"{scheme}://{host}:{port}"
 
 
+def _fits_a_header(value: str) -> bool:
+    """True when a value can go in a header as it is: no line break, NUL or
+    other control character, and no space at either end. h11 refuses some of
+    these and quotes the whole value in its error."""
+    return value.isprintable() and value == value.strip()
+
+
 class EngineAuth(httpx.Auth):
     """The client's auth flow: the JamJet token, and a caller's ``auth`` run
     inside it, for requests to the engine's own origin only.
@@ -174,10 +181,17 @@ class EngineAuth(httpx.Auth):
     caller's hook runs and before anything is sent. Every request the hook
     yields is checked again. The token goes into ``Authorization`` last; when a
     hook or the request itself put another value there, the request is refused,
-    so two credentials never share one header.
+    so two credentials never share one header. A token, or a value the hook
+    writes, that cannot go in a header is refused without being quoted.
     """
 
     def __init__(self, base_url: httpx.URL | str, *, token: str | None, auth: httpx.Auth | None) -> None:
+        if token and not (isinstance(token, str) and token.isascii() and _fits_a_header(token)):
+            raise ValueError(
+                "The JamJet token cannot go in a header as it is: it has a line break, another control character "
+                "or a character that is not ASCII, or a space at one end. A token read from a file often ends "
+                "with a line break. The token is not shown."
+            )
         if token and auth is not None:
             # Imported here: that module imports this one.
             from jamjet.auth.token_source import TokenSourceAuth
@@ -230,8 +244,17 @@ class EngineAuth(httpx.Auth):
             outgoing = await flow.__anext__()
             while True:
                 self._admit(outgoing)
-                written = (name for name, value in outgoing.headers.multi_items() if (name, value) not in before)
-                self._written.update(written)
+                written = [
+                    (name, value) for name, value in outgoing.headers.multi_items() if (name, value) not in before
+                ]
+                for name, value in written:
+                    if not _fits_a_header(value):
+                        raise ValueError(
+                            f"The auth hook put a value in {_clean_detail(name)} that cannot go in a header: "
+                            "it has a line break or another control character, or a space at one end. "
+                            "The value is not shown. The request was not sent."
+                        )
+                self._written.update(name for name, _ in written)
                 self._add_token(outgoing)
                 response = yield outgoing
                 if self._auth.requires_response_body:
@@ -261,6 +284,37 @@ def _redact(text: str, secrets: Iterable[str]) -> str:
     for secret in secrets:
         text = text.replace(secret, _REDACTED)
     return text
+
+
+def _scrub(error: BaseException, secrets: Iterable[str]) -> None:
+    """Replace each secret in the message of ``error`` and of every exception
+    it holds or chains to, in place, so no traceback of any of them shows one.
+
+    A secret is matched as it is and as Python quotes it, the way h11 quotes a
+    header value it refuses.
+    """
+    forms = sorted({form for s in secrets for form in (s, repr(s)[1:-1]) if form}, key=len, reverse=True)
+    if not forms:
+        return
+    seen: set[int] = set()
+    todo = [error]
+    while todo:
+        current = todo.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        current.args = tuple(_redact(arg, forms) if isinstance(arg, str) else arg for arg in current.args)
+        linked = (current.__cause__, current.__context__, *current.args)
+        todo.extend(e for e in linked if isinstance(e, BaseException))
+
+
+def _request_secrets(error: httpx.RequestError, credential_headers: Iterable[str]) -> list[str]:
+    """The credentials on the request ``error`` is about, or none when it names no request."""
+    try:
+        request = error.request
+    except RuntimeError:  # httpx sets it on every error from a send; this is in case it did not
+        return []
+    return _credential_values(request, credential_headers)
 
 
 def _clean_detail(text: str) -> str:
@@ -433,6 +487,7 @@ async def send_with_retries(
     replayable: bool,
     operation: str,
     policy: RetryPolicy,
+    credential_headers: Callable[[], Iterable[str]] = tuple,
 ) -> httpx.Response:
     """Send a call, and send it again while ``policy`` and the failure allow.
 
@@ -442,7 +497,8 @@ async def send_with_retries(
     whose body is not ``replayable`` (see ``body_is_replayable``) is sent once.
     After the last send the last failure is raised as it is. A 401 is never
     sent again here: an auth hook that refreshes a token sends its own one
-    resend.
+    resend. A transport error has the value of ``Authorization`` and of each
+    of ``credential_headers()`` replaced in its message and its chain.
     """
     # Such a body is not sent again even when the request never left: an auth
     # hook may have read it before the connection was tried.
@@ -453,8 +509,13 @@ async def send_with_retries(
         try:
             response = await send()
         except httpx.RequestError as exc:
-            if isinstance(exc, httpx.UnsupportedProtocol):
-                raise  # a URL the client cannot send to: nothing left, and nothing would change
+            _scrub(exc, _request_secrets(exc, credential_headers()))
+            # Nothing left, and a second send would fail the same way: a URL the
+            # client cannot send to, or a request h11 would not write. Over
+            # HTTP/1.1, the only protocol this client speaks, httpx raises
+            # LocalProtocolError only before the first byte of the request.
+            if isinstance(exc, httpx.UnsupportedProtocol | httpx.LocalProtocolError):
+                raise
             if not safe and not isinstance(exc, _NOT_SENT):
                 raise _outcome_unknown(operation, f"its answer was lost ({type(exc).__name__})") from exc
             if sends >= attempts:

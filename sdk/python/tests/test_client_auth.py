@@ -12,17 +12,20 @@ import inspect
 import json
 import logging
 import threading
+import traceback
 from collections.abc import Awaitable, Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import httpcore
 import httpx
 import pytest
 import respx
 
+from jamjet import transport
 from jamjet.client import JamjetAPIError, JamjetClient
-from jamjet.transport import CredentialScopeError, PlatformAuthError, is_engine_error_body
+from jamjet.transport import CredentialScopeError, OutcomeUnknown, PlatformAuthError, is_engine_error_body
 
 BASE = "http://engine.test:7700"
 TOKEN = "jj-test-token-5d1e"
@@ -456,6 +459,145 @@ async def test_no_credential_text_in_errors_repr_or_logs(loopback: str, caplog: 
     for text in texts:
         assert TOKEN_SENTINEL not in text
         assert ID_SENTINEL not in text
+
+
+# ── a credential that cannot go in a header ──────────────────────────────────
+
+UNSENDABLE = {
+    "line-break-at-the-end": f"{TOKEN_SENTINEL}\n",
+    "crlf-and-a-header": f"{TOKEN_SENTINEL}\r\nX-Injected: 1",
+    "nul": f"{TOKEN_SENTINEL}\x00",
+    "tab-inside": f"jj\t{TOKEN_SENTINEL}",
+    "delete": f"{TOKEN_SENTINEL}\x7f",
+    "space-at-the-start": f" {TOKEN_SENTINEL}",
+    "space-at-the-end": f"{TOKEN_SENTINEL} ",
+    "not-ascii": f"{TOKEN_SENTINEL}é",
+}
+UNSENDABLE_TOKEN = (
+    "The JamJet token cannot go in a header as it is: it has a line break, another control character or a "
+    "character that is not ASCII, or a space at one end. A token read from a file often ends with a line break. "
+    "The token is not shown."
+)
+
+
+@pytest.fixture
+def attempts(monkeypatch: pytest.MonkeyPatch) -> list[httpx.Request]:
+    """Every request that reached the real transport, h11 included."""
+    seen: list[httpx.Request] = []
+    real = httpx.AsyncHTTPTransport.handle_async_request
+
+    async def counting(self: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return await real(self, request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", counting)
+    return seen
+
+
+@pytest.fixture
+def no_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(transport, "_sleep", no_sleep)
+
+
+def _every_text(error: BaseException) -> str:
+    """The traceback of ``error`` with its whole chain, and the repr of each exception in it."""
+    parts = ["".join(traceback.format_exception(error))]
+    seen: set[int] = set()
+    todo: list[BaseException] = [error]
+    while todo:
+        current = todo.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        parts += [str(current), repr(current)]
+        todo += [e for e in (current.__cause__, current.__context__, *current.args) if isinstance(e, BaseException)]
+    return "\n".join(parts)
+
+
+@pytest.mark.parametrize("token", list(UNSENDABLE.values()), ids=list(UNSENDABLE))
+async def test_a_token_that_cannot_go_in_a_header_is_refused_and_not_shown(
+    token: str, loopback: str, attempts: list[httpx.Request], no_waits: None
+) -> None:
+    # Against a real server, so h11 checks the header as it would in production.
+    with pytest.raises(ValueError) as exc:
+        async with JamjetClient(loopback, api_token=token) as client:
+            await client.health()
+    assert str(exc.value) == UNSENDABLE_TOKEN
+    assert attempts == []
+    assert TOKEN_SENTINEL not in _every_text(exc.value)
+
+
+def test_a_jamjet_token_env_ending_in_a_line_break_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JAMJET_TOKEN", f"{TOKEN_SENTINEL}\n")
+    with pytest.raises(ValueError) as exc:
+        JamjetClient(BASE)
+    assert str(exc.value) == UNSENDABLE_TOKEN
+
+
+async def test_a_hook_value_that_cannot_go_in_a_header_is_refused_before_anything_is_sent(
+    loopback: str, attempts: list[httpx.Request], no_waits: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    for name in (None, "httpx", "httpcore"):
+        caplog.set_level(logging.DEBUG, logger=name)
+    auth = HeaderAuth(value=f"Bearer {ID_SENTINEL}\n")
+    async with JamjetClient(loopback, api_token=TOKEN, auth=auth) as client:
+        with pytest.raises(ValueError) as exc:
+            await client.health()
+    assert str(exc.value) == (
+        "The auth hook put a value in x-serverless-authorization that cannot go in a header: it has a line break "
+        "or another control character, or a space at one end. The value is not shown. The request was not sent."
+    )
+    assert attempts == []
+    assert ID_SENTINEL not in _every_text(exc.value)
+    assert ID_SENTINEL not in caplog.text
+
+
+async def test_a_request_that_h11_refuses_is_raised_at_once_and_is_not_outcome_unknown(
+    loopback: str, attempts: list[httpx.Request], no_waits: None
+) -> None:
+    # A header of the caller's own that h11 will not write: nothing left, and
+    # a second send would fail the same way.
+    bad = {"X-Trace": "a\nb"}
+    async with JamjetClient(loopback, api_token=TOKEN) as client:
+        with pytest.raises(httpx.LocalProtocolError):
+            await client.get("/health", headers=bad)
+        assert len(attempts) == 1
+        with pytest.raises(httpx.LocalProtocolError) as unsafe:
+            await client.post("/custom/route", json={}, headers=bad)
+    assert len(attempts) == 2
+    assert not isinstance(unsafe.value, OutcomeUnknown)
+
+
+@pytest.mark.parametrize("call", ["health", "start_execution"], ids=["safe", "unsafe"])
+async def test_a_transport_error_that_quotes_a_credential_is_redacted_with_its_chain(
+    call: str, no_waits: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sends: list[httpx.Request] = []
+
+    async def quoting(self: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
+        # Shaped as httpcore and h11 shape theirs: the lowest error quotes the
+        # value as bytes and is held only as the middle one's argument.
+        sends.append(request)
+        said = f"{request.headers['authorization']} {request.headers['x-serverless-authorization']}"
+        low = RuntimeError(f"the peer quoted {said.encode()!r}")
+        raise httpx.ReadError(f"the connection was lost after {said}") from httpcore.ReadError(low)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", quoting)
+    # A backslash, so the quoted form differs from the value as it is.
+    auth = HeaderAuth(value=f"Bearer {ID_SENTINEL}\\x")
+    async with JamjetClient(BASE, api_token=TOKEN_SENTINEL, auth=auth) as client:
+        with pytest.raises((httpx.ReadError, OutcomeUnknown)) as exc:
+            await (client.health() if call == "health" else client.start_execution("w", {}))
+    assert len(sends) == (3 if call == "health" else 1)
+    text = _every_text(exc.value)
+    # The test can fail: each level did quote both credentials.
+    assert "the connection was lost after [redacted] [redacted]" in text
+    assert "the peer quoted b'[redacted] [redacted]'" in text
+    assert TOKEN_SENTINEL not in text
+    assert ID_SENTINEL not in text
 
 
 # ── every call keeps its method, path and body (refactor guard) ──────────────

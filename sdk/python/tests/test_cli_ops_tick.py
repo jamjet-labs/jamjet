@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from typing import Any
 
 import httpx
@@ -10,6 +11,7 @@ import pytest
 import respx
 from typer.testing import CliRunner
 
+from jamjet import transport
 from jamjet.cli.main import app
 from jamjet.client import JamjetClient
 from jamjet.transport import EngineFeatureMissing
@@ -150,6 +152,34 @@ def test_an_engine_error_exits_1_and_shows_no_token() -> None:
     assert result.exit_code == 1
     assert "operator role required" in result.output
     assert TOKEN not in result.output
+
+
+def test_a_token_ending_in_a_line_break_is_refused_and_not_printed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A token read from a file or a mounted secret often ends in a line break.
+    secret = "operator-secret-4c19e2"
+    monkeypatch.setenv("JAMJET_TOKEN", f"{secret}\n")
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(transport, "_sleep", no_sleep)
+    attempts: list[httpx.Request] = []
+    real = httpx.AsyncHTTPTransport.handle_async_request
+
+    async def counting(self: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        return await real(self, request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", counting)
+    # A real listening socket, so h11 sees the header as it would in production.
+    with socket.socket() as engine:
+        engine.bind(("127.0.0.1", 0))
+        engine.listen(8)
+        result = runner.invoke(app, ["ops", "tick", "--runtime", f"http://127.0.0.1:{engine.getsockname()[1]}"])
+    assert secret not in result.output
+    assert result.exit_code == 1
+    assert "line break" in result.output
+    assert attempts == []
 
 
 def test_a_lost_connection_exits_1() -> None:

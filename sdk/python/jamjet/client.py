@@ -108,10 +108,14 @@ class JamjetClient:
             ),
             operation=operation,
             policy=self._retry,
+            credential_headers=self._credential_headers,
         )
 
+    def _credential_headers(self) -> frozenset[str]:
+        return self._auth.credential_headers if self._auth is not None else frozenset()
+
     def _check(self, response: httpx.Response) -> None:
-        _raise_for_status(response, credential_headers=self._auth.credential_headers if self._auth is not None else ())
+        _raise_for_status(response, credential_headers=self._credential_headers())
 
     # ── Health ────────────────────────────────────────────────────────────
 

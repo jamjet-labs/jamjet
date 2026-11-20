@@ -394,6 +394,21 @@ async def test_a_url_the_client_cannot_send_to_is_not_retried(waits: list[float]
     assert waits == []
 
 
+@pytest.mark.parametrize("call", CALLS, ids=[c.name for c in CALLS])
+async def test_a_request_that_cannot_be_written_is_raised_at_once_for_every_call(
+    call: Call, waits: list[float]
+) -> None:
+    # httpx raises LocalProtocolError when h11 will not write the request:
+    # nothing left, so it is not OutcomeUnknown, and a second try fails alike.
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.route().mock(side_effect=httpx.LocalProtocolError("Illegal header value b'a\\nb'"))
+        async with _client() as client:
+            with pytest.raises(httpx.LocalProtocolError):
+                await call.call(client)
+    assert route.call_count == 1
+    assert waits == []
+
+
 # ── a body that can be read only once ────────────────────────────────────────
 
 

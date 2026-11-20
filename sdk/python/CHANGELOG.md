@@ -34,6 +34,14 @@
 
 ### Fixed
 
+- **A JamJet token that cannot go in a header is refused, and not shown.** A token with
+  a line break, a NUL or a space at one end, as a token read from a file often has, made
+  every call fail with an httpx error that quoted the whole token, and `jamjet` commands
+  printed it. The client now refuses such a token, and one with any other control
+  character, with a `ValueError` when it is built. An `auth` hook's value of that kind is
+  refused before the request is sent. A transport error no longer quotes a credential,
+  and a request httpx could not write is raised at once, not sent again and not reported
+  as `OutcomeUnknown`.
 - **`jamjet dev` names the extra it needs.** Without uvicorn it told you to run
   `pip install 'jamjet'`: Rich read `[sidecar]` as a style tag and dropped it. It now
   prints `pip install 'jamjet[sidecar]'`.

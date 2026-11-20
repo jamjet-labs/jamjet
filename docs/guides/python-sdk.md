@@ -168,6 +168,12 @@ adds go only to the client's own origin: the scheme, host and port of
 before anything is sent. Redirects are not followed; a redirect answer is
 raised as it is. Error messages and logs never contain a token.
 
+A token with a line break, another control character or a space at one end
+cannot go in a header. The client refuses it when it is built, with a
+`ValueError` that does not show it, and refuses such a value from an `auth`
+hook before the request is sent. A token read from a file often ends with a
+line break, so strip it first.
+
 ### An engine behind a platform identity check
 
 Some platforms check the caller's identity before a request reaches your
