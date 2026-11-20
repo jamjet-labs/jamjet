@@ -1595,20 +1595,48 @@ async fn the_per_run_and_cross_run_listings_show_the_options() {
     }
 }
 
+const FROM_THE_LOG: &str = "from the log";
+const FROM_THE_READ_MODEL: &str = "from the read model";
+
+/// `GET /executions/:id/approvals` for `eid`, after checking that it is
+/// served `read`: from the read model once the projector has written a row
+/// for the run, from the run's log while it holds none.
+async fn per_run_listing(env: &Env, eid: &ExecutionId, read: &str) -> Value {
+    let rows = env.backend.get_approval_projection(eid).await.unwrap();
+    match read {
+        FROM_THE_LOG => assert!(
+            rows.is_empty(),
+            "{}: {read}: the read model holds {rows:?}",
+            env.name
+        ),
+        FROM_THE_READ_MODEL => assert!(!rows.is_empty(), "{}: {read}: no rows", env.name),
+        _ => unreachable!("{read}"),
+    }
+    let (st, listed) = get(
+        env,
+        &format!("/executions/exec_{}/approvals", eid.0.simple()),
+        &env.bob,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}: {read}: {listed}", env.name);
+    listed
+}
+
 /// A pending item lists the options at its top level, and a decided item the
-/// choice and the note, from the log and from the read model, per run.
+/// choice and the note, per run, from the log and from the read model. The
+/// listing reads the log while the read model holds nothing for the run: a
+/// run the projector has not visited yet, or one that ended between its
+/// passes, since it visits running runs only.
 #[tokio::test]
 async fn the_listings_show_options_choice_and_note() {
     for env in envs().await {
         let parked = park(&env, &ir(Some(topics()), None)).await;
-        let run = format!("exec_{}", parked.eid.0.simple());
-        let per_run = format!("/executions/{run}/approvals");
 
-        for read in ["from the log", "from the read model"] {
-            if read == "from the read model" {
+        for read in [FROM_THE_LOG, FROM_THE_READ_MODEL] {
+            if read == FROM_THE_READ_MODEL {
                 Projector::new(env.backend.clone()).tick().await.unwrap();
             }
-            let (_, listed) = get(&env, &per_run, &env.bob).await;
+            let listed = per_run_listing(&env, &parked.eid, read).await;
             assert_eq!(
                 listed["pending"][0]["options"],
                 topics(),
@@ -1624,6 +1652,7 @@ async fn the_listings_show_options_choice_and_note() {
             env.name
         );
 
+        // Decided, from the read model.
         let (st, body) = decide(
             &env,
             &parked,
@@ -1634,32 +1663,72 @@ async fn the_listings_show_options_choice_and_note() {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+        Projector::new(env.backend.clone()).tick().await.unwrap();
+        let listed = per_run_listing(&env, &parked.eid, FROM_THE_READ_MODEL).await;
+        let decided = &listed["decided"][0];
+        assert_eq!(decided["status"], "approved", "{}: {listed}", env.name);
+        assert_eq!(decided["choice"], "topic_2", "{}: {listed}", env.name);
+        assert_eq!(
+            decided["note"], "Go with the second one.",
+            "{}: {listed}",
+            env.name
+        );
 
-        for read in ["from the read model", "from the log"] {
-            if read == "from the read model" {
-                Projector::new(env.backend.clone()).tick().await.unwrap();
-            } else {
-                // Rebuild the answer from the log alone: the run has ended.
-                settle(&env).await;
-            }
-            let (_, listed) = get(&env, &per_run, &env.bob).await;
-            let decided = &listed["decided"][0];
-            assert_eq!(
-                decided["status"], "approved",
-                "{}: {read}: {listed}",
-                env.name
-            );
-            assert_eq!(
-                decided["choice"], "topic_2",
-                "{}: {read}: {listed}",
-                env.name
-            );
-            assert_eq!(
-                decided["note"], "Go with the second one.",
-                "{}: {read}: {listed}",
-                env.name
-            );
-        }
+        // Decided, from the log. A run rejected and failed before any
+        // projector pass, which the next pass does not visit.
+        let rejected = park(&env, &ir(Some(topics()), None)).await;
+        let (st, body) = decide(
+            &env,
+            &rejected,
+            rejection(json!({ "note": "Neither fits this week." })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+        settle(&env).await;
+        let run = env.backend.get_execution(&rejected.eid).await.unwrap();
+        assert_eq!(
+            run.map(|r| r.status),
+            Some(WorkflowStatus::Failed),
+            "{}",
+            env.name
+        );
+        Projector::new(env.backend.clone()).tick().await.unwrap();
+        let listed = per_run_listing(&env, &rejected.eid, FROM_THE_LOG).await;
+        let decided = &listed["decided"][0];
+        assert_eq!(decided["status"], "rejected", "{}: {listed}", env.name);
+        assert_eq!(decided["choice"], Value::Null, "{}: {listed}", env.name);
+        assert_eq!(
+            decided["note"], "Neither fits this week.",
+            "{}: {listed}",
+            env.name
+        );
+        assert_eq!(
+            decided["comment"], "Neither fits this week.",
+            "{}: {listed}",
+            env.name
+        );
+
+        // And a run approved before the projector visits it.
+        let approved = park(&env, &ir(Some(topics()), None)).await;
+        let (st, body) = decide(
+            &env,
+            &approved,
+            approval(
+                &approved.digest,
+                json!({ "choice": "topic_1", "note": "Take the first one." }),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+        let listed = per_run_listing(&env, &approved.eid, FROM_THE_LOG).await;
+        let decided = &listed["decided"][0];
+        assert_eq!(decided["status"], "approved", "{}: {listed}", env.name);
+        assert_eq!(decided["choice"], "topic_1", "{}: {listed}", env.name);
+        assert_eq!(
+            decided["note"], "Take the first one.",
+            "{}: {listed}",
+            env.name
+        );
     }
 }
 
