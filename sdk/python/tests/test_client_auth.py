@@ -665,12 +665,28 @@ CALLS = [
     ),
     Call(
         "approve",
-        lambda c: c.approve("exec_1", "approved", node_id="gate", comment="ok", action_digest="d1", user_id="ana"),
+        lambda c: c.approve(
+            "exec_1", "approved", node_id="gate", comment="ok", action_digest="d1", user_id="ana", request_sequence=7
+        ),
         "POST",
         "/executions/exec_1/approve",
-        {"decision": "approved", "node_id": "gate", "comment": "ok", "action_digest": "d1", "user_id": "ana"},
+        {
+            "decision": "approved",
+            "node_id": "gate",
+            "comment": "ok",
+            "action_digest": "d1",
+            "user_id": "ana",
+            "request_sequence": 7,
+        },
     ),
     Call("list_approvals", lambda c: c.list_approvals("exec_1"), "GET", "/executions/exec_1/approvals"),
+    Call(
+        "list_pending_approvals",
+        lambda c: c.list_pending_approvals(limit=25, after="ab12"),
+        "GET",
+        "/approvals",
+        params={"limit": "25", "after": "ab12"},
+    ),
     Call(
         "send_external_event",
         lambda c: c.send_external_event("exec_1", "order-7", {"paid": True}),
@@ -777,6 +793,8 @@ def _answer(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"hello")
     if path.endswith("/events"):
         return httpx.Response(200, json={"events": []})
+    if path == "/approvals":
+        return httpx.Response(200, json={"approvals": [], "next_after": None})
     return httpx.Response(200, json={"ok": True})
 
 

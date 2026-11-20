@@ -80,7 +80,7 @@ impl PostgresGraphStore {
     /// Apply the DDL. Safe to call multiple times (uses `IF NOT EXISTS`).
     pub async fn migrate(&self) -> Result<(), sqlx::Error> {
         for stmt in PG_GRAPH_STORE_DDL {
-            sqlx::query(stmt).execute(&self.pool).await?;
+            sqlx::query(*stmt).execute(&self.pool).await?;
         }
         Ok(())
     }
@@ -269,15 +269,6 @@ impl GraphStore for PostgresGraphStore {
         depth: u8,
         as_of: Option<DateTime<Utc>>,
     ) -> Result<SubGraph, MemoryError> {
-        // Build the temporal validity filter for relationships.
-        let validity_clause = match as_of {
-            Some(t) => {
-                let s = t.to_rfc3339();
-                format!("valid_from <= '{s}' AND (invalid_at IS NULL OR invalid_at > '{s}')")
-            }
-            None => "invalid_at IS NULL".to_string(),
-        };
-
         let mut visited_entities: HashSet<EntityId> = HashSet::new();
         visited_entities.insert(id);
 
@@ -294,13 +285,31 @@ impl GraphStore for PostgresGraphStore {
             }
 
             // Fetch all valid relationships where current_id is source or target.
-            let sql = format!(
-                "SELECT * FROM relationships WHERE (source_id = $1 OR target_id = $2) AND {validity_clause}"
+            let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                "SELECT * FROM relationships WHERE (source_id = ",
             );
+            query
+                .push_bind(current_id)
+                .push(" OR target_id = ")
+                .push_bind(current_id)
+                .push(") AND ");
+            // The temporal validity filter for relationships.
+            match as_of {
+                Some(t) => {
+                    query
+                        .push("valid_from <= ")
+                        .push_bind(t)
+                        .push(" AND (invalid_at IS NULL OR invalid_at > ")
+                        .push_bind(t)
+                        .push(")");
+                }
+                None => {
+                    query.push("invalid_at IS NULL");
+                }
+            }
 
-            let rel_rows = sqlx::query_as::<_, RelationshipRow>(&sql)
-                .bind(current_id)
-                .bind(current_id)
+            let rel_rows = query
+                .build_query_as::<RelationshipRow>()
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| MemoryError::Database(e.to_string()))?;
@@ -352,31 +361,22 @@ impl GraphStore for PostgresGraphStore {
     }
 
     async fn delete_by_scope(&self, scope: &Scope) -> Result<u64, MemoryError> {
-        // Build WHERE clause matching the scope fields.
-        let mut wheres = vec![format!("org_id = '{}'", scope.org_id.replace('\'', "''"))];
-
-        if let Some(ref user_id) = scope.user_id {
-            wheres.push(format!("user_id = '{}'", user_id.replace('\'', "''")));
-        }
-        if let Some(ref agent_id) = scope.agent_id {
-            wheres.push(format!("agent_id = '{}'", agent_id.replace('\'', "''")));
-        }
-        if let Some(ref session_id) = scope.session_id {
-            wheres.push(format!("session_id = '{}'", session_id.replace('\'', "''")));
-        }
-
-        let where_clause = wheres.join(" AND ");
-
         // Delete relationships first.
-        let rel_sql = format!("DELETE FROM relationships WHERE {where_clause}");
-        let rel_result = sqlx::query(&rel_sql)
+        let mut rel_query =
+            sqlx::QueryBuilder::<sqlx::Postgres>::new("DELETE FROM relationships WHERE ");
+        crate::sql::push_scope(&mut rel_query, scope);
+        let rel_result = rel_query
+            .build()
             .execute(&self.pool)
             .await
             .map_err(|e| MemoryError::Database(e.to_string()))?;
 
         // Then delete entities.
-        let ent_sql = format!("DELETE FROM entities WHERE {where_clause}");
-        let ent_result = sqlx::query(&ent_sql)
+        let mut ent_query =
+            sqlx::QueryBuilder::<sqlx::Postgres>::new("DELETE FROM entities WHERE ");
+        crate::sql::push_scope(&mut ent_query, scope);
+        let ent_result = ent_query
+            .build()
             .execute(&self.pool)
             .await
             .map_err(|e| MemoryError::Database(e.to_string()))?;

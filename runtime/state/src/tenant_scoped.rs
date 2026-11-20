@@ -934,7 +934,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         max_bytes: usize,
     ) -> BackendResult<Vec<Event>> {
         let sql = crate::sqlite::events_page_sql(true);
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(execution_id_str(execution_id))
             .bind(&self.tenant_id.0)
             .bind(after)
@@ -1456,7 +1456,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             },
             if filter.node_id.is_some() { " AND node_id = ?" } else { "" },
         );
-        let mut q = sqlx::query(&query_str);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(query_str));
         for qt in queue_types {
             q = q.bind(*qt);
         }
@@ -2489,6 +2489,63 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?;
         Ok(())
+    }
+
+    async fn list_pending_approvals(
+        &self,
+        after: Option<&crate::backend::ApprovalCursor>,
+        limit: u32,
+    ) -> BackendResult<Vec<crate::backend::PendingApprovalRow>> {
+        crate::features::approvals_list::list_pending_approvals_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            after,
+            limit,
+        )
+        .await
+    }
+
+    async fn open_work_items(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<Vec<crate::backend::OpenWorkItem>> {
+        crate::features::open_items::open_work_items_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            execution_id,
+        )
+        .await
+    }
+
+    // ── Storage lane ──────────────────────────────────────────────────────
+
+    async fn commit_scheduler_pass(
+        &self,
+        pass: crate::backend::SchedulerPass,
+    ) -> BackendResult<crate::backend::PassCommit> {
+        crate::sqlite::commit_scheduler_pass_in(&self.pool, Some(&self.tenant_id.0), pass).await
+    }
+
+    #[instrument(skip(self), fields(tenant = %self.tenant_id))]
+    async fn reclaim_expired_leases_recorded(&self) -> BackendResult<ReclaimResult> {
+        crate::sqlite::reclaim_expired_leases_recorded_in(&self.pool, Some(&self.tenant_id.0)).await
+    }
+
+    #[instrument(skip(self, error), fields(tenant = %self.tenant_id, item_id = %item_id, fence = lease_fence))]
+    async fn fail_work_item_fenced_recorded(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        crate::sqlite::fail_work_item_fenced_recorded_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            item_id,
+            lease_fence,
+            error,
+        )
+        .await
     }
 }
 

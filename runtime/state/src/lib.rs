@@ -11,7 +11,10 @@ pub mod artifact;
 pub mod backend;
 pub mod budget;
 pub mod event;
+mod features;
 pub mod hashing;
+pub mod lease_events;
+mod legacy;
 pub mod materializer;
 pub mod memory;
 pub mod segment;
@@ -30,7 +33,9 @@ pub use backend::{
     RunningPage, StateBackend, StateBackendError, TurnCommit, WorkItem, WorkItemId,
     WorkflowDefinition, DEFAULT_LEASE_SECS, MAX_LEASE_SECS, MIN_LEASE_SECS,
 };
+pub use backend::{ApprovalCursor, OpenWorkItem, PendingApprovalRow};
 pub use backend::{ClaimFilter, ExecutionClaim, GateMark, LeasedItem};
+pub use backend::{PassCommit, SchedulerPass};
 pub use budget::{BudgetState, BudgetTrip};
 pub use event::{Event, EventKind, EventSequence, ProvenanceMetadata};
 pub use hashing::{

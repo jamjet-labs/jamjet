@@ -18,6 +18,12 @@
   commands that start, approve or activate say so and exit 1.
 - **`jamjet ops tick`** runs one tick on an engine that has its background loops off. It
   needs an engine whose `/health` lists `ops_tick`.
+- **`client.list_pending_approvals(limit=None, after=None)`** lists pending approvals across runs
+  from `GET /approvals`. Against an engine without that list it raises `JamjetAPIError` and asks
+  for an upgrade. `approve()` returns the engine's `repeat`, `sequence` and `waiting_for`.
+- **`approve(request_sequence=...)`** names the request a decision answers. The engine refuses
+  the decision with 409 if the node has asked again since, so a retry cannot decide a newer
+  request.
 
 ### Changed
 

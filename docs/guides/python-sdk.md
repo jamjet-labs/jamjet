@@ -251,7 +251,8 @@ generator, a file that cannot seek) is sent once.
 
 Safe to repeat: `health`, `tick`, `create_workflow`, `list_cron_jobs`,
 `get_execution`, `list_executions`, `get_events`, `list_approvals`,
-`put_artifact`, `get_artifact`, `list_agents`, `get_agent`, a heartbeat, and a
+`list_pending_approvals`, `put_artifact`, `get_artifact`, `list_agents`,
+`get_agent`, a heartbeat, and a
 completion or failure that carries its lease fence (the engine refuses a
 second one with 409). Not safe: `start_execution`, `cancel_execution`,
 `approve`, `claim_work_item`, `create_cron_job`, `register_agent`,

@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
+libsqlite3-sys = { workspace = true }
 sha2 = { workspace = true }
 hmac = "0.13"
 hex = "0.4"

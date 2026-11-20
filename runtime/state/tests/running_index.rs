@@ -6,7 +6,7 @@ use jamjet_state::SqliteBackend;
 
 async fn plan(pool: &sqlx::SqlitePool, sql: &str, binds: &[&str]) -> Vec<String> {
     let explain = format!("EXPLAIN QUERY PLAN {sql}");
-    let mut q = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+    let mut q = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain));
     for b in binds {
         q = q.bind(*b);
     }

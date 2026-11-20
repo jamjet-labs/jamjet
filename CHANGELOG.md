@@ -9,7 +9,67 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `GET /approvals` lists pending approvals across runs, oldest first, with the digest to echo
+  and the deadline. It reads the approvals read model, which can lag the log by one projector
+  tick; the approve route still decides.
+- `GET /executions/:id` says what the run is waiting for: `approval`, `step`, `worker`,
+  `engine`, or null once it has ended. `GET /executions?waiting_for=worker` lists by it.
+- The approve answer carries `repeat`, `sequence` and `waiting_for`.
+- The approve route and the MCP approve tool take an optional `request_sequence`: the request
+  the decision answers. A decision that would answer another request is a 409. Send it when
+  you retry. A node can ask again with the same digest, and a retry without it decides the new
+  request.
+- Python: `client.list_pending_approvals(limit=None, after=None)`, and `request_sequence` on
+  `client.approve()`.
+
+### Changed
+
+- Sending the same decision twice answers 200 with the first decision's sequence and records
+  nothing. A different decision on a decided request is still 409. A decision on a decided
+  request by another principal now says it was already decided, not that nothing is pending.
+- The approve answer's `execution_id` is always the `exec_<uuid>` form `POST /executions`
+  returns. It used to echo the id as sent, so a client that sends a bare UUID and compares
+  the echo gets a different string.
+- An approval sent again by the same principal without its `action_digest`, on a run that
+  has ended, is now 400 (the digest is required), not 409 (the run has ended). The repeat
+  check runs before the run's status is read. With the digest it answers 200.
+- A decision without `node_id` that matches the caller's decision on another node, while a
+  request is pending, is now 400 ("specify node_id"). It could be a retry or a decision on
+  the pending request. Before, it decided the pending request.
+- The MCP tool text no longer says to filter by `paused` to find approvals. A run waiting for
+  one stays `running`. `jamjet_get_execution` now carries `waiting_for`, as
+  `GET /executions/:id` does.
+- Migration 0017 adds an index for the approvals list. A build from before it will not open
+  a store that has run it, so there is no rollback past this release.
+
 ### Security
+
+- **Engram: scope ids, categories and search text are bound parameters, not SQL text.**
+  The SQLite and Postgres stores wrote these values into the query with their
+  single quotes doubled. That is not an escape on a Postgres server with
+  `standard_conforming_strings` off: a scope id containing `\'` closed its own
+  literal, so `delete_scope_data` for one organisation deleted every
+  organisation's facts, and a listing by scope returned them. SQLite, and Postgres
+  with the default setting (on), were not affected. The graph store's
+  `delete_by_scope` and `neighbors` and the fact store's `list_facts`,
+  `delete_scope_data` and `delete_scope_returning` bind every value now.
+
+- **Engram on Postgres: `update_fact` works.** It bound every value as text,
+  and Postgres has no `uuid = text`, so every patch failed with "operator does
+  not exist". Consolidation ignores that error in places, so superseded-by
+  links and the summarized marker were never saved on Postgres. Each value is
+  bound as its column's type now.
+
+- **SQLite 3.54.1, through `sqlx` 0.9.1** (RUSTSEC-2026-0459, CVE-2026-119375:
+  SQLite before 3.54.0 can return uninitialized memory when it opens a database
+  beside a crafted `-wal` file). `libsqlite3-sys` moves from 0.30.1 to 0.40.0.
+  sqlx 0.9 no longer brings in `rsa`, so RUSTSEC-2023-0071 leaves the tree too,
+  and the dependency audit runs with no advisory suppressed.
+  The crates that use sqlx require `libsqlite3-sys` 0.39.0 or later, so a
+  project that upgrades them with an older lockfile gets the fixed SQLite too.
+  **The minimum Rust version is now 1.94**, up from 1.89: sqlx 0.9 requires it.
 
 - **Approvals are bound to the approver, the run's initiator and the exact action.**
   Behaviour changes to plan for when upgrading:
@@ -551,6 +611,34 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   load. The four are now one write, `StateBackend::start_execution_atomic`, on every
   backend (a new trait method: a custom backend must implement it). A run whose start
   node does not exist is now refused before anything is written.
+- **A node is dispatched once.** The scheduler wrote a node's `NodeScheduled` event and
+  its work item as two writes. Two schedulers on one database could both dispatch the
+  node, and a crash between the writes left it scheduled with no work item, so the run
+  waited for ever. Skips, rejections and the run's end went the same way. A scheduler
+  pass is one write now: `StateBackend::commit_scheduler_pass` refuses it when the
+  run's log has moved on, when a node it dispatches already has a pending or claimed
+  item, or when the run is finished, and the scheduler folds the log again.
+- **Lease reclaims and worker failures record their events in the same write.** A crash
+  after a dead-letter left the node scheduled and the run stuck. The scheduler's sweep
+  and the fail route each settle the item and write its events in one transaction
+  (`reclaim_expired_leases_recorded`, `fail_work_item_fenced_recorded`).
+
+### Changed
+
+- `StateBackend` has three new methods, `commit_scheduler_pass`,
+  `reclaim_expired_leases_recorded` and `fail_work_item_fenced_recorded`. Each has a
+  default that keeps the old two-step behaviour, so a backend outside this repository
+  still compiles and behaves as before. A backend that runs with more than one engine
+  must override them. New public items: `SchedulerPass`, `PassCommit`, the
+  `jamjet_state::lease_events` module and `Scheduler::stale_passes`.
+- `POST /work-items` answers 409 for a node that already has a pending or claimed item,
+  and for a run that has finished.
+- A failure report that races a cancel answers 409 and records nothing.
+- The scheduler's sweep records nothing for an item of a finished run. It settles the
+  item as failed. A lease renewed after the sweep read it is no longer taken.
+- Work items and scheduler events on SQLite carry the run's tenant. Unscoped SQLite
+  used to stamp `default` on events written by the scheduler's pass and by the sweep,
+  and on dead-letter rows.
 
 ---
 

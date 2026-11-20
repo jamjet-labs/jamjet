@@ -45,6 +45,7 @@ SAFE = {
     "get_events": True,
     "approve": False,
     "list_approvals": True,
+    "list_pending_approvals": True,
     "send_external_event": False,
     "put_artifact": True,
     "get_artifact": True,

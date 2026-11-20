@@ -3,16 +3,40 @@
 //! All approval decisions pass through `submit_approval` which folds the event log
 //! to verify something is actually pending before appending `ApprovalReceived`.
 //! The listing helper `approvals_view` builds the pending/decided payload for
-//! `GET /executions/:id/approvals`.
+//! `GET /executions/:id/approvals`, and `pending_row_view` one row of
+//! `GET /approvals`.
+//!
+//! A decision sent again is answered with the first one and records nothing.
+//! It repeats the decision D on record for node N only when all hold:
+//! 1. D answers N's latest request (an expiry is not a decision, and a
+//!    decision that does not name its request is never repeated);
+//! 2. D was made by the same principal (in dev mode: neither has one and the
+//!    recorded user is the same);
+//! 3. the same decision, and the same note (absent, empty or blank is none);
+//! 4. its echo passes the rule a new decision meets, against the request D
+//!    answered: missing on an approval outside dev mode is 400, a different
+//!    one is 409 stale, and a `request_sequence` that names another request
+//!    is 409;
+//! 5. with no `node_id`, exactly one node's decision matches and no request
+//!    is pending. A match beside a pending request could be either a retry
+//!    or a decision on that request, so it is 400 "specify node_id".
+//!
+//! Anything else on a decided request is 409 `AlreadyDecided`.
+//!
+//! A node can ask again with the same digest: a step released past an
+//! agent's limit that fails asks again for its retry. A retry without
+//! `request_sequence` then matches the new request and decides it. A retry
+//! that names the request it answered can only answer that one.
 
 use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use jamjet_state::approvals::{
-    expired_by_deadline, node_approval_status, pending_approvals, pending_but_expired,
-    run_initiator, still_open, NodeApprovalStatus,
+    answered_request, expired_by_deadline, node_approval_status, pending_approvals,
+    pending_but_expired, run_initiator, still_open, NodeApprovalStatus, PendingApproval,
+    ESCALATE_AT_KEY, EXPIRES_AT_KEY,
 };
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::{ApprovalDecision, EventKind};
-use jamjet_state::Event;
+use jamjet_state::{ApprovalCursor, Event, PendingApprovalRow};
 use std::sync::Arc;
 
 pub struct ApprovalSubmission {
@@ -32,6 +56,10 @@ pub struct ApprovalSubmission {
     /// must equal the pending request's digest, or the decision is refused as
     /// stale (the request it was made against has been superseded).
     pub action_digest: Option<String>,
+    /// The sequence of the request the decider answers, echoed back. When
+    /// present it must be the sequence of the request this decision would
+    /// answer, or the decision is refused with [`SubmitError::StaleRequest`].
+    pub request_sequence: Option<i64>,
     /// The transport runs without authentication (dev mode). Outside it, an
     /// `Approved` decision must echo the request's binding.
     pub dev_mode: bool,
@@ -79,6 +107,9 @@ pub enum SubmitError {
     InitiatorUnknown,
     /// The echoed `action_digest` is not the pending request's digest.
     StaleDigest,
+    /// The echoed `request_sequence` is not the request this decision would
+    /// answer: the node has asked again since, or it names another request.
+    StaleRequest,
     /// Outside dev mode, an `Approved` decision on a request that binds an
     /// action did not echo the binding it was made against.
     DigestRequired,
@@ -101,7 +132,27 @@ pub enum SubmitError {
     /// The request was decided, expired or replaced between this decision's
     /// read and its append. Nothing is recorded.
     Superseded(String),
+    /// The node's latest request already has a decision this one does not
+    /// repeat: a different decision or note by the same principal
+    /// (`by_caller`), or any decision by another. Nothing is recorded.
+    AlreadyDecided {
+        node: String,
+        by_caller: bool,
+    },
     Backend(String),
+}
+
+/// What [`submit_approval`] recorded, or found on record.
+#[derive(Debug)]
+pub struct Submitted {
+    /// The node the decision answers.
+    pub node_id: String,
+    /// The `ApprovalReceived` on record, with its sequence: the one just
+    /// appended, or for a repeat the first one.
+    pub event: Event,
+    /// The same decision was already on record: nothing was appended, sealed
+    /// or resumed.
+    pub repeat: bool,
 }
 
 impl std::fmt::Display for SubmitError {
@@ -136,6 +187,10 @@ impl std::fmt::Display for SubmitError {
                 f,
                 "action_digest does not match the pending request; re-read the pending approval and decide again"
             ),
+            Self::StaleRequest => write!(
+                f,
+                "request_sequence does not match the pending request; re-read the pending approvals and decide again"
+            ),
             Self::DigestRequired => write!(
                 f,
                 "action_digest is required to approve: echo the action_digest (or, for an \
@@ -167,6 +222,12 @@ impl std::fmt::Display for SubmitError {
                  this decision was being made; nothing was recorded, re-read the pending \
                  approvals"
             ),
+            Self::AlreadyDecided {
+                by_caller: true, ..
+            } => write!(f, "already decided by you with a different decision"),
+            Self::AlreadyDecided {
+                by_caller: false, ..
+            } => write!(f, "already decided by another approver"),
             Self::Backend(e) => write!(f, "backend error: {e}"),
         }
     }
@@ -177,6 +238,12 @@ impl std::fmt::Display for SubmitError {
 /// Returns the resolved `node_id` and the `ApprovalReceived` event that was
 /// appended, so callers can seal it into the signed, hash-chained audit log
 /// (via `AuditEnricher::enrich_and_append`) after the durable event write.
+///
+/// A submission that repeats the decision on record (the rules in the module
+/// docs) returns that decision with `repeat: true`. Nothing is appended and
+/// the run is not resumed, so callers seal nothing for it. The repeat is
+/// checked before the run's status, so a retry after the run ended still
+/// gets its answer.
 ///
 /// Separation of duties: an `Approved` decision whose principal is the run's
 /// initiator (`WorkflowStarted.initiated_by`) is refused with
@@ -193,7 +260,7 @@ pub async fn submit_approval(
     execution_id: &ExecutionId,
     submission: ApprovalSubmission,
     policy: ApprovalPolicy,
-) -> Result<(String, Event), SubmitError> {
+) -> Result<Submitted, SubmitError> {
     // No edits, on either decision, before anything is read or written.
     if submission
         .state_patch
@@ -201,6 +268,25 @@ pub async fn submit_approval(
         .is_some_and(|p| !p.is_null())
     {
         return Err(SubmitError::EditsUnsupported);
+    }
+
+    let events = backend
+        .get_events(execution_id)
+        .await
+        .map_err(|e| SubmitError::Backend(e.to_string()))?;
+    // Fail closed on a log this build cannot fully read: an unreadable event
+    // may have revoked or decided what the listing still shows as pending.
+    if jamjet_state::approvals::has_unreadable_events(&events) {
+        return Err(SubmitError::UnreadableLog);
+    }
+
+    // The same decision sent again: answer with the one on record.
+    if let Some((node_id, event)) = repeated_decision(&events, &submission)? {
+        return Ok(Submitted {
+            node_id,
+            event,
+            repeat: true,
+        });
     }
 
     // Refuse decisions on terminal executions up front. The event-derived
@@ -227,24 +313,16 @@ pub async fn submit_approval(
         None => false,
     };
 
-    let events = backend
-        .get_events(execution_id)
-        .await
-        .map_err(|e| SubmitError::Backend(e.to_string()))?;
-    // Fail closed on a log this build cannot fully read: an unreadable event
-    // may have revoked or decided what the listing still shows as pending.
-    if jamjet_state::approvals::has_unreadable_events(&events) {
-        return Err(SubmitError::UnreadableLog);
-    }
     let pending = pending_approvals(&events);
 
-    let node_id = match submission.node_id.filter(|n| !n.is_empty()) {
+    let node_id = match submission.node_id.clone().filter(|n| !n.is_empty()) {
         Some(n) => {
             if !pending.iter().any(|p| p.node_id == n) {
                 if expired_by_deadline(&events, &n) {
                     return Err(SubmitError::Expired(n));
                 }
-                return Err(SubmitError::NodeNotPending(n));
+                let not_pending = SubmitError::NodeNotPending(n.clone());
+                return Err(refuse_decided(&events, &n, &submission, not_pending));
             }
             n
         }
@@ -253,7 +331,8 @@ pub async fn submit_approval(
             [] => {
                 return Err(match latest_requested_node(&events) {
                     Some(n) if expired_by_deadline(&events, &n) => SubmitError::Expired(n),
-                    _ => SubmitError::NoPending,
+                    Some(n) => refuse_decided(&events, &n, &submission, SubmitError::NoPending),
+                    None => SubmitError::NoPending,
                 })
             }
             [only] => only.node_id.clone(),
@@ -308,30 +387,10 @@ pub async fn submit_approval(
         return Err(SubmitError::Expired(node_id));
     }
     let request_digest = request.action_digest().map(str::to_owned);
-    // What the request binds: its action digest, or for an agent tool dispatch
-    // its `calls_hash` if it predates dispatch digests. A legacy request binds
-    // nothing.
-    let binding = request.binding();
 
-    // Outside dev mode an approval must say which request it answers, so it
-    // can never land on a request that replaced the one the reviewer saw.
-    // Rejections need no echo: refusing to act is never the risk. A legacy
-    // request binds nothing, so there is nothing to echo; approving it
-    // authorises nothing by itself (the worker asks again with a digest).
-    if !submission.dev_mode
-        && matches!(submission.decision, ApprovalDecision::Approved)
-        && binding.is_some()
-        && submission.action_digest.is_none()
-    {
-        return Err(SubmitError::DigestRequired);
-    }
-
-    // A decider that echoes the binding it was shown is refused if the request
-    // has since been superseded. A request without a binding can never match.
-    if let Some(echoed) = submission.action_digest.as_deref() {
-        if binding != Some(echoed) {
-            return Err(SubmitError::StaleDigest);
-        }
+    // The echo of what the reviewer was shown: see `echo_refusal`.
+    if let Some(refusal) = echo_refusal(&submission, request) {
+        return Err(refusal);
     }
 
     // What an approval authorises: exactly the requested action. If the state
@@ -355,12 +414,12 @@ pub async fn submit_approval(
         0,
         EventKind::ApprovalReceived {
             node_id: node_id.clone(),
-            user_id: submission.user_id,
-            decision: submission.decision,
-            comment: submission.comment,
+            user_id: submission.user_id.clone(),
+            decision: submission.decision.clone(),
+            comment: submission.comment.clone(),
             // Refused above when non-null; never recorded.
             state_patch: None,
-            principal: submission.principal,
+            principal: submission.principal.clone(),
             approved_digest,
             request_sequence,
         },
@@ -387,15 +446,20 @@ pub async fn submit_approval(
                 .get_events(execution_id)
                 .await
                 .map_err(|e| SubmitError::Backend(e.to_string()))?;
-            return Err(
-                if expired_by_deadline(&latest, &node_id)
-                    || pending_but_expired(&latest, &node_id, chrono::Utc::now())
-                {
-                    SubmitError::Expired(node_id)
-                } else {
-                    SubmitError::Superseded(node_id)
-                },
-            );
+            if expired_by_deadline(&latest, &node_id)
+                || pending_but_expired(&latest, &node_id, chrono::Utc::now())
+            {
+                return Err(SubmitError::Expired(node_id));
+            }
+            // The same decision, sent twice at once: the other one landed.
+            if let RepeatCheck::Repeat(first) = check_repeat(&latest, &node_id, &submission) {
+                return Ok(Submitted {
+                    node_id,
+                    event: first.clone(),
+                    repeat: true,
+                });
+            }
+            return Err(SubmitError::Superseded(node_id));
         }
         jamjet_state::ConditionalAppend::ExecutionTerminal(status) => {
             return Err(SubmitError::ExecutionTerminal(format!("{status:?}")));
@@ -411,7 +475,11 @@ pub async fn submit_approval(
             .map_err(|e| SubmitError::Backend(e.to_string()))?;
     }
 
-    Ok((node_id, event))
+    Ok(Submitted {
+        node_id,
+        event,
+        repeat: false,
+    })
 }
 
 /// The node of the run's latest approval request, if any.
@@ -420,6 +488,252 @@ fn latest_requested_node(events: &[Event]) -> Option<String> {
         EventKind::ToolApprovalRequired { node_id, .. } => Some(node_id.clone()),
         _ => None,
     })
+}
+
+/// The refusal of an echo, for a decision on `request`; `None` when the echo
+/// is fine. A new decision and a repeat meet the same rule.
+///
+/// A `request_sequence` that is sent must be `request`'s, on either decision,
+/// or it is [`SubmitError::StaleRequest`]. It is what keeps a retry from
+/// deciding a request the node raised since with the same binding.
+///
+/// What the request binds is its action digest, or for an agent tool dispatch
+/// its `calls_hash` if it predates dispatch digests. Outside dev mode an
+/// approval must say which request it answers, so it can never land on a
+/// request that replaced the one the reviewer saw: no echo is
+/// [`SubmitError::DigestRequired`]. Rejections need no echo: refusing to act
+/// is never the risk. A legacy request binds nothing, so there is nothing to
+/// echo; approving it authorises nothing by itself (the worker asks again
+/// with a digest). An echo that is sent must be the binding, on either
+/// decision, or it is [`SubmitError::StaleDigest`]: the request has been
+/// superseded since the decider saw it. A request without a binding never
+/// matches one.
+fn echo_refusal(s: &ApprovalSubmission, request: &PendingApproval) -> Option<SubmitError> {
+    if s.request_sequence
+        .is_some_and(|seq| seq != request.sequence)
+    {
+        return Some(SubmitError::StaleRequest);
+    }
+    let binding = request.binding();
+    match s.action_digest.as_deref() {
+        Some(echoed) if binding != Some(echoed) => Some(SubmitError::StaleDigest),
+        Some(_) => None,
+        None if !s.dev_mode
+            && matches!(s.decision, ApprovalDecision::Approved)
+            && binding.is_some() =>
+        {
+            Some(SubmitError::DigestRequired)
+        }
+        None => None,
+    }
+}
+
+/// The `ApprovalReceived` that decided `node`'s latest request: `None` while
+/// that request is pending, never requested, or expired by its deadline.
+fn latest_decision<'a>(events: &'a [Event], node: &str) -> Option<&'a Event> {
+    let sequence = match node_approval_status(events, node) {
+        NodeApprovalStatus::Approved { sequence, .. }
+        | NodeApprovalStatus::Rejected { sequence, .. } => sequence,
+        _ => return None,
+    };
+    // An expiry resolves a request as a rejection too; it is not a decision.
+    events
+        .iter()
+        .find(|e| e.sequence == sequence && matches!(e.kind, EventKind::ApprovalReceived { .. }))
+}
+
+/// Rule 1: the decision on `node`'s latest request, and that request. The
+/// decision must name the request it answered; one from a log written before
+/// decisions did is never repeated.
+fn decision_on_latest_request<'a>(
+    events: &'a [Event],
+    node: &str,
+) -> Option<(&'a Event, PendingApproval)> {
+    let decision = latest_decision(events, node)?;
+    let request = answered_request(events, node)?;
+    match decision.kind {
+        EventKind::ApprovalReceived {
+            request_sequence: Some(answered),
+            ..
+        } if answered == request.sequence => Some((decision, request)),
+        _ => None,
+    }
+}
+
+/// Rule 2: the decision on record was made by this caller. Both carry the
+/// same principal; or, in dev mode, neither carries one and the recorded user
+/// is the same. One with a principal and one without never match.
+fn same_decider(principal: Option<&str>, user_id: &str, s: &ApprovalSubmission) -> bool {
+    match (principal, s.principal.as_deref()) {
+        (Some(recorded), Some(caller)) => recorded == caller,
+        (None, None) => s.dev_mode && user_id == s.user_id,
+        _ => false,
+    }
+}
+
+/// A decision's note as a repeat compares it: absent, empty or blank is no
+/// note; any other text compares byte for byte, as sent.
+fn note_of(comment: Option<&str>) -> Option<&str> {
+    comment.filter(|c| !c.trim().is_empty())
+}
+
+/// What a submission is to the decision on record for one node.
+enum RepeatCheck<'a> {
+    /// Not a repeat: no decision on record for the latest request, or one
+    /// that differs from this submission.
+    No,
+    /// The same decision, but its echo is refused (rule 4).
+    Refused(SubmitError),
+    /// The decision on record that this submission repeats.
+    Repeat(&'a Event),
+}
+
+/// Rules 1 to 4 for `node`.
+fn check_repeat<'a>(events: &'a [Event], node: &str, s: &ApprovalSubmission) -> RepeatCheck<'a> {
+    let Some((decision, request)) = decision_on_latest_request(events, node) else {
+        return RepeatCheck::No;
+    };
+    let EventKind::ApprovalReceived {
+        user_id,
+        decision: recorded,
+        comment,
+        principal,
+        ..
+    } = &decision.kind
+    else {
+        return RepeatCheck::No;
+    };
+    let same_decision = matches!(
+        (recorded, &s.decision),
+        (ApprovalDecision::Approved, ApprovalDecision::Approved)
+            | (ApprovalDecision::Rejected, ApprovalDecision::Rejected)
+    );
+    if !same_decider(principal.as_deref(), user_id, s)
+        || !same_decision
+        || note_of(comment.as_deref()) != note_of(s.comment.as_deref())
+    {
+        return RepeatCheck::No;
+    }
+    match echo_refusal(s, &request) {
+        Some(refusal) => RepeatCheck::Refused(refusal),
+        None => RepeatCheck::Repeat(decision),
+    }
+}
+
+/// The decision on record that this submission repeats, if any, with its
+/// node. `Err` when it would repeat one but its echo is refused, and when it
+/// names no node and matches the decisions of several, or one while a
+/// request is pending.
+fn repeated_decision(
+    events: &[Event],
+    s: &ApprovalSubmission,
+) -> Result<Option<(String, Event)>, SubmitError> {
+    if let Some(node) = s.node_id.as_deref().filter(|n| !n.is_empty()) {
+        return match check_repeat(events, node, s) {
+            RepeatCheck::No => Ok(None),
+            RepeatCheck::Refused(refusal) => Err(refusal),
+            RepeatCheck::Repeat(first) => Ok(Some((node.to_string(), first.clone()))),
+        };
+    }
+    // Rule 5: no node named. A repeat only if exactly one node's decision
+    // matches in full and no request is pending; with none matching, the
+    // submission goes the usual way, which decides the one pending request
+    // if there is one.
+    let mut nodes: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ToolApprovalRequired { node_id, .. } => Some(node_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+    let mut repeats: Vec<(String, Event)> = nodes
+        .into_iter()
+        .filter_map(|node| match check_repeat(events, node, s) {
+            RepeatCheck::Repeat(first) => Some((node.to_string(), first.clone())),
+            _ => None,
+        })
+        .collect();
+    if repeats.is_empty() {
+        return Ok(None);
+    }
+    // A match while a request is pending could be a retry of the decision on
+    // record or a new decision on the pending request: the body cannot say
+    // which, so neither is assumed.
+    let pending = pending_approvals(events);
+    if repeats.len() == 1 && pending.is_empty() {
+        return Ok(repeats.pop());
+    }
+    let mut candidates: Vec<String> = repeats
+        .into_iter()
+        .map(|(node, _)| node)
+        .chain(pending.into_iter().map(|p| p.node_id))
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    Err(SubmitError::MultiplePending(candidates))
+}
+
+/// The refusal for a decision on `node` when its latest request is not
+/// pending and did not expire: [`SubmitError::AlreadyDecided`] if someone
+/// decided it (`by_caller` by rule 2), else `otherwise`. The same decision
+/// with a refused echo gets the echo's refusal: it is not a different one.
+fn refuse_decided(
+    events: &[Event],
+    node: &str,
+    s: &ApprovalSubmission,
+    otherwise: SubmitError,
+) -> SubmitError {
+    let Some(decision) = latest_decision(events, node) else {
+        return otherwise;
+    };
+    if let RepeatCheck::Refused(refusal) = check_repeat(events, node, s) {
+        return refusal;
+    }
+    let by_caller = match &decision.kind {
+        EventKind::ApprovalReceived {
+            principal, user_id, ..
+        } => same_decider(principal.as_deref(), user_id, s),
+        _ => false,
+    };
+    SubmitError::AlreadyDecided {
+        node: node.to_string(),
+        by_caller,
+    }
+}
+
+/// The answer to a decision, the same from the REST route and the MCP tool,
+/// first time and repeat alike. `sequence` is the decision's on record.
+/// `waiting_for` is read after it ([`crate::waiting::waiting_for`]); if that
+/// read fails the field is left out, since the decision is recorded either way.
+pub async fn decision_answer(
+    backend: &dyn StateBackend,
+    execution_id: &ExecutionId,
+    submitted: &Submitted,
+) -> serde_json::Value {
+    let mut answer = serde_json::json!({
+        "execution_id": execution_id.to_string(),
+        "node_id": submitted.node_id,
+        "accepted": true,
+        "repeat": submitted.repeat,
+        "sequence": submitted.event.sequence,
+    });
+    let waiting = match backend.get_execution(execution_id).await {
+        Ok(Some(execution)) => crate::waiting::waiting_for(backend, &execution, chrono::Utc::now())
+            .await
+            .map_err(|e| e.to_string()),
+        Ok(None) => Err("the execution was not found".to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    match waiting {
+        Ok(waiting) => answer["waiting_for"] = serde_json::json!(waiting),
+        Err(e) => tracing::warn!(
+            execution_id = %execution_id,
+            "decision answered without waiting_for: {e}"
+        ),
+    }
+    answer
 }
 
 /// Pending + decided approval view for `GET /executions/:id/approvals`.
@@ -470,4 +784,66 @@ pub fn approvals_view(events: &[Event]) -> serde_json::Value {
         .collect();
 
     serde_json::json!({ "pending": pending, "decided": decided })
+}
+
+/// One row of `GET /approvals`: a request waiting for a decision, and what a
+/// reviewer echoes to decide it.
+///
+/// `action_digest` is the request's binding, the echo the approve route
+/// accepts: its `action_digest`, or for an older agent tool dispatch request
+/// its `calls_hash`, or null for a legacy request that binds nothing. The two
+/// deadline keys are always there, null when the request's policy set none.
+/// `context` is the request's context, whole.
+pub fn pending_row_view(row: &PendingApprovalRow) -> serde_json::Value {
+    let context = row.context.clone().unwrap_or(serde_json::Value::Null);
+    let request = PendingApproval::from_request(
+        &row.node_id,
+        row.tool_name.as_deref().unwrap_or_default(),
+        row.approver.as_deref().unwrap_or_default(),
+        &context,
+        row.request_sequence,
+    );
+    let deadline = |key: &str| context.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "execution_id": row.execution_id.to_string(),
+        "workflow_id": row.workflow_id,
+        "workflow_version": row.workflow_version,
+        "node_id": row.node_id,
+        "tool_name": row.tool_name,
+        "approver": row.approver,
+        "request_sequence": row.request_sequence,
+        "action_digest": request.binding(),
+        "expires_at": deadline(EXPIRES_AT_KEY),
+        "escalate_at": deadline(ESCALATE_AT_KEY),
+        "context": row.context,
+    })
+}
+
+/// The `next_after` of `GET /approvals`: lowercase hex of the cursor's JSON,
+/// so it goes in a query string as it is.
+pub fn encode_approval_cursor(cursor: &ApprovalCursor) -> serde_json::Result<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let json = serde_json::to_vec(cursor)?;
+    let mut out = String::with_capacity(json.len() * 2);
+    for b in json {
+        out.push(char::from(HEX[usize::from(b >> 4)]));
+        out.push(char::from(HEX[usize::from(b & 0x0f)]));
+    }
+    Ok(out)
+}
+
+/// The cursor an `after` names. `None` for anything that is not an even
+/// number of hex digits spelling the JSON of an [`ApprovalCursor`].
+pub fn decode_approval_cursor(text: &str) -> Option<ApprovalCursor> {
+    let (pairs, odd) = text.as_bytes().as_chunks::<2>();
+    if !odd.is_empty() {
+        return None;
+    }
+    let nibble = |d: u8| char::from(d).to_digit(16);
+    let mut json = Vec::with_capacity(pairs.len());
+    for &[high, low] in pairs {
+        let byte = (nibble(high)? << 4) | nibble(low)?;
+        json.push(u8::try_from(byte).ok()?);
+    }
+    serde_json::from_slice(&json).ok()
 }

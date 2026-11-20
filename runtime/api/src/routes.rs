@@ -58,6 +58,7 @@ pub fn build_router_with_opts(state: AppState, dev_mode: bool) -> Router {
             "/executions/:id/approvals",
             get(list_approvals_for_execution),
         )
+        .route("/approvals", get(list_pending_approvals))
         .route("/executions/:id/external-event", post(send_external_event))
         // Artifacts (content-addressed store) — tenant-scoped developer API.
         // The POST carries an explicit body limit (see ARTIFACT_MAX_BODY_BYTES).
@@ -564,6 +565,8 @@ struct ListExecutionsQuery {
     status: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
+    waiting_for: Option<String>,
+    after: Option<String>,
 }
 
 /// The most executions one `GET /executions` returns, whatever `limit` asks.
@@ -575,6 +578,14 @@ async fn list_executions(
     Query(params): Query<ListExecutionsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
+    if let Some(wanted) = params.waiting_for.as_deref() {
+        return list_waiting_for(backend.as_ref(), wanted, &params).await;
+    }
+    if params.after.is_some() {
+        return Err(ApiError::BadRequest(
+            "after pages the waiting_for filter; send waiting_for with it".into(),
+        ));
+    }
     // An unknown status is refused: it used to mean no filter, so
     // `?status=cancelled` listed every run.
     let status = match params.status.as_deref() {
@@ -600,6 +611,50 @@ async fn list_executions(
     Ok(Json(json!({ "executions": executions })))
 }
 
+/// `GET /executions?waiting_for=<v>`: one page of running runs, each derived
+/// with [`crate::waiting::waiting_for`], and the ones in state `wanted`. A
+/// page may hold fewer than `limit`, or none, while `next_after` is set; pass
+/// it back as `after` until it is absent.
+async fn list_waiting_for(
+    backend: &dyn jamjet_state::StateBackend,
+    wanted: &str,
+    params: &ListExecutionsQuery,
+) -> Result<Json<Value>, ApiError> {
+    let wanted = crate::waiting::WaitingFor::parse(wanted).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "unknown waiting_for {wanted:?}; use approval, step, worker or engine"
+        ))
+    })?;
+    if params.status.as_deref().is_some_and(|s| s != "running") {
+        return Err(ApiError::BadRequest(
+            "waiting_for lists running executions; status must be running".into(),
+        ));
+    }
+    if params.offset.is_some() {
+        return Err(ApiError::BadRequest(
+            "waiting_for pages with after, not offset".into(),
+        ));
+    }
+    let limit = params.limit.unwrap_or(50).clamp(1, MAX_EXECUTIONS_PAGE);
+    let page = backend
+        .list_running_executions_after(params.after.as_deref(), limit)
+        .await?;
+    let now = Utc::now();
+    let mut executions = Vec::new();
+    for execution in page.executions {
+        if crate::waiting::waiting_for(backend, &execution, now).await? != Some(wanted) {
+            continue;
+        }
+        let mut row = serde_json::to_value(&execution)
+            .map_err(|e| ApiError::Internal(format!("serialize execution: {e}")))?;
+        row["waiting_for"] = json!(wanted);
+        executions.push(row);
+    }
+    Ok(Json(
+        json!({ "executions": executions, "next_after": page.next_after }),
+    ))
+}
+
 async fn get_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
@@ -611,10 +666,22 @@ async fn get_execution(
         .get_execution(&execution_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("execution {id}")))?;
-    let execution = with_derived_state(backend.as_ref(), execution).await;
-    Ok(Json(serde_json::to_value(execution).map_err(|e| {
-        ApiError::Internal(format!("serialize execution: {e}"))
-    })?))
+    Ok(Json(execution_view(backend.as_ref(), execution).await?))
+}
+
+/// One run as `GET /executions/:id` and the MCP `jamjet_get_execution` tool
+/// show it: its state derived from the log ([`with_derived_state`]) and what
+/// it is waiting for ([`crate::waiting::waiting_for`]).
+pub(crate) async fn execution_view(
+    backend: &dyn jamjet_state::StateBackend,
+    execution: WorkflowExecution,
+) -> Result<Value, ApiError> {
+    let waiting = crate::waiting::waiting_for(backend, &execution, Utc::now()).await?;
+    let execution = with_derived_state(backend, execution).await;
+    let mut body = serde_json::to_value(execution)
+        .map_err(|e| ApiError::Internal(format!("serialize execution: {e}")))?;
+    body["waiting_for"] = json!(waiting);
+    Ok(body)
 }
 
 /// `execution` with its `current_state` re-derived from the event log (the
@@ -875,6 +942,12 @@ struct ApproveRequest {
     /// a 409: the decider was looking at a superseded request.
     #[serde(default)]
     action_digest: Option<String>,
+    /// The sequence of the request this decision answers: `request_sequence`
+    /// in `GET /approvals`, `sequence` in `GET /executions/:id/approvals`.
+    /// Optional. When sent, a decision that would answer any other request
+    /// is a 409, so a retry never decides a request the node raised since.
+    #[serde(default)]
+    request_sequence: Option<i64>,
 }
 
 /// `POST /executions/:id/approve` — record a decision on a pending approval.
@@ -887,6 +960,12 @@ struct ApproveRequest {
 /// principal. No token and no marker is refused with 401.
 ///
 /// ROLE. `reviewer` and above may call this route; see `require_write_role`.
+///
+/// ANSWER. `execution_id`, `node_id`, `accepted: true`, `repeat`, the
+/// decision's `sequence` and the run's `waiting_for` after it. A caller that
+/// sends its own decision again gets the first one's answer with
+/// `repeat: true`, and nothing is recorded; the rules are in
+/// [`crate::approvals`].
 async fn approve_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
@@ -921,7 +1000,7 @@ async fn approve_execution(
     };
     let actor_id = principal.clone().unwrap_or_else(|| user_id.clone());
 
-    let (node_id, event) = crate::approvals::submit_approval(
+    let submitted = crate::approvals::submit_approval(
         &backend,
         &execution_id,
         crate::approvals::ApprovalSubmission {
@@ -932,6 +1011,7 @@ async fn approve_execution(
             comment: body.comment,
             state_patch: body.state_patch,
             action_digest: body.action_digest,
+            request_sequence: body.request_sequence,
             dev_mode: dev_mode.is_some(),
         },
         state.approval_policy,
@@ -948,7 +1028,9 @@ async fn approve_execution(
         | crate::approvals::SubmitError::Expired(_)
         | crate::approvals::SubmitError::Superseded(_)
         | crate::approvals::SubmitError::UnreadableLog
-        | crate::approvals::SubmitError::StaleDigest => ApiError::Conflict(e.to_string()),
+        | crate::approvals::SubmitError::AlreadyDecided { .. }
+        | crate::approvals::SubmitError::StaleDigest
+        | crate::approvals::SubmitError::StaleRequest => ApiError::Conflict(e.to_string()),
         crate::approvals::SubmitError::EditsUnsupported
         | crate::approvals::SubmitError::DigestRequired => ApiError::BadRequest(e.to_string()),
         crate::approvals::SubmitError::Backend(msg) => ApiError::Internal(msg),
@@ -962,24 +1044,27 @@ async fn approve_execution(
     // answers was sealed when it was raised (`node_guard::record_request`).
     // The per-node worker events emitted through the fenced `commit_turn` path
     // are not yet routed through the enricher; tracked as F-t3-audit-emit.
-    let ctx = jamjet_audit::RequestContext {
-        actor_id,
-        actor_type: jamjet_audit::ActorType::Human,
-        tenant_id: tenant_id.0.clone(),
-        method: Some("POST".to_string()),
-        path: Some(format!("/executions/{id}/approve")),
-        ..Default::default()
-    };
-    if let Err(e) = state
-        .enricher
-        .try_enrich_and_append(&event, Some(&ctx))
-        .await
-    {
-        jamjet_state::approvals::record_seal_gap(backend.as_ref(), &event, e).await;
+    // A repeat appended nothing, and its decision was sealed the first time.
+    if !submitted.repeat {
+        let ctx = jamjet_audit::RequestContext {
+            actor_id,
+            actor_type: jamjet_audit::ActorType::Human,
+            tenant_id: tenant_id.0.clone(),
+            method: Some("POST".to_string()),
+            path: Some(format!("/executions/{id}/approve")),
+            ..Default::default()
+        };
+        if let Err(e) = state
+            .enricher
+            .try_enrich_and_append(&submitted.event, Some(&ctx))
+            .await
+        {
+            jamjet_state::approvals::record_seal_gap(backend.as_ref(), &submitted.event, e).await;
+        }
     }
 
     Ok(Json(
-        json!({ "execution_id": id, "node_id": node_id, "accepted": true }),
+        crate::approvals::decision_answer(backend.as_ref(), &execution_id, &submitted).await,
     ))
 }
 
@@ -1074,6 +1159,91 @@ async fn list_approvals_for_execution(
         let events = backend.get_events(&execution_id).await?;
         Ok(Json(crate::approvals::approvals_view(&events)))
     }
+}
+
+/// The most rows one `GET /approvals` returns, whatever `limit` asks.
+pub const MAX_APPROVALS_PAGE: u32 = 200;
+/// The rows `GET /approvals` returns when `limit` is not given.
+pub const DEFAULT_APPROVALS_PAGE: u32 = 50;
+
+/// Query of `GET /approvals`. Each value is read as text, so a bad one is
+/// refused with the same JSON error as the rest of the API.
+#[derive(Deserialize)]
+struct PendingApprovalsQuery {
+    status: Option<String>,
+    limit: Option<String>,
+    after: Option<String>,
+}
+
+/// `GET /approvals`: every request waiting for a decision on the live runs of
+/// the caller's tenant, oldest projected first.
+///
+/// Any authenticated role may read it, viewers included. The rows come from
+/// the approvals read model, which the projector brings up to date once per
+/// tick, so a row lags the log by up to one tick: a request raised since the
+/// last tick is not listed yet, and one decided since is still listed. The
+/// approve route reads the log and decides; it refuses a listed request that
+/// was decided in the meantime with 409, unless the caller sends again the
+/// decision it made itself, which answers 200 with `repeat: true`.
+///
+/// `status` may only be `pending` (the default). `limit` defaults to
+/// [`DEFAULT_APPROVALS_PAGE`] and is clamped to 1..=[`MAX_APPROVALS_PAGE`].
+/// A full page carries `next_after`; send it back as `after` for the next one.
+/// Each row's `action_digest` is the echo the approve route asks for, and its
+/// `request_sequence` the one that ties a decision, and any retry of it, to
+/// that request.
+async fn list_pending_approvals(
+    State(state): State<AppState>,
+    Extension(tenant_id): Extension<TenantId>,
+    Query(params): Query<PendingApprovalsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let backend = state.backend_for(&tenant_id);
+    if let Some(status) = params.status.as_deref().filter(|s| *s != "pending") {
+        return Err(ApiError::BadRequest(format!(
+            "status must be pending, not {status:?}; decided requests are listed per run \
+             by GET /executions/{{id}}/approvals"
+        )));
+    }
+    let limit = match params.limit.as_deref() {
+        None => DEFAULT_APPROVALS_PAGE,
+        Some(text) => {
+            let asked: u64 = text.parse().map_err(|_| {
+                ApiError::BadRequest(format!("limit must be a whole number, not {text:?}"))
+            })?;
+            u32::try_from(asked)
+                .unwrap_or(u32::MAX)
+                .clamp(1, MAX_APPROVALS_PAGE)
+        }
+    };
+    let after = params
+        .after
+        .as_deref()
+        .map(|text| {
+            crate::approvals::decode_approval_cursor(text).ok_or_else(|| {
+                ApiError::BadRequest(
+                    "after is not a cursor of this list; send back a page's next_after".into(),
+                )
+            })
+        })
+        .transpose()?;
+
+    let rows = backend
+        .list_pending_approvals(after.as_ref(), limit)
+        .await?;
+    let next_after = match rows.last() {
+        Some(last) if rows.len() >= limit as usize => Some(
+            crate::approvals::encode_approval_cursor(&jamjet_state::ApprovalCursor::from(last))
+                .map_err(|e| ApiError::Internal(format!("encode cursor: {e}")))?,
+        ),
+        _ => None,
+    };
+    let approvals: Vec<Value> = rows
+        .iter()
+        .map(crate::approvals::pending_row_view)
+        .collect();
+    Ok(Json(
+        json!({ "approvals": approvals, "next_after": next_after }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -3628,25 +3798,16 @@ async fn enqueue_work_item(
         None => {}
     }
 
-    // Emit NodeScheduled event.
-    let seq = backend.latest_sequence(&execution_id).await? + 1;
-    backend
-        .append_event(jamjet_state::Event::new(
-            execution_id.clone(),
-            seq,
-            jamjet_state::EventKind::NodeScheduled {
-                node_id: body.node_id.clone(),
-                queue_type: body.queue_type.clone(),
-            },
-        ))
-        .await?;
-
-    // Enqueue the work item.
+    // The node's NodeScheduled and its item, in one write: the scheduler's
+    // pass. It is refused when the node already has a pending or claimed
+    // item (a second one would run the step twice) and when the run has
+    // finished. When only the log moved, the pass is tried again from the
+    // sequence the store gave back.
     let item = WorkItem {
         id: Uuid::new_v4(),
-        execution_id,
-        node_id: body.node_id,
-        queue_type: body.queue_type,
+        execution_id: execution_id.clone(),
+        node_id: body.node_id.clone(),
+        queue_type: body.queue_type.clone(),
         payload,
         attempt: 0,
         max_attempts: 3,
@@ -3656,12 +3817,44 @@ async fn enqueue_work_item(
         lease_fence: 0,
         tenant_id: tenant_id.0.clone(),
     };
-    let item_id = backend.enqueue_work_item(item).await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({ "work_item_id": item_id.to_string() })),
+    let item_id = item.id;
+    let mut seen = backend.latest_sequence(&execution_id).await?;
+    for _ in 0..HAND_ENQUEUE_TRIES {
+        let pass = jamjet_state::SchedulerPass {
+            execution_id: execution_id.clone(),
+            seen_sequence: seen,
+            events: vec![jamjet_state::EventKind::NodeScheduled {
+                node_id: body.node_id.clone(),
+                queue_type: body.queue_type.clone(),
+            }],
+            work_items: vec![item.clone()],
+            finish: None,
+        };
+        match backend.commit_scheduler_pass(pass).await? {
+            jamjet_state::PassCommit::Committed { .. } => {
+                return Ok((
+                    StatusCode::CREATED,
+                    Json(json!({ "work_item_id": item_id.to_string() })),
+                ));
+            }
+            jamjet_state::PassCommit::ExecutionTerminal(status) => {
+                return Err(ApiError::Conflict(format!("execution is {status:?}")));
+            }
+            // The log did not move, so the node's live item refused it.
+            jamjet_state::PassCommit::Stale { latest_sequence } if latest_sequence == seen => {
+                break;
+            }
+            jamjet_state::PassCommit::Stale { latest_sequence } => seen = latest_sequence,
+        }
+    }
+    Err(ApiError::Conflict(
+        "node already has a pending or claimed item".into(),
     ))
 }
+
+/// How many times `POST /work-items` tries its pass while other writers
+/// move the run's log.
+const HAND_ENQUEUE_TRIES: usize = 3;
 
 #[derive(Deserialize)]
 struct FailWorkItemRequest {
@@ -3822,8 +4015,13 @@ async fn fail_work_item(
         ));
     };
 
+    // The settle and the events that record it (`NodeFailed`, and
+    // `RetryScheduled` for a retry: the trail the scheduler's lease sweep
+    // writes for the same transition) land in one write, so a failure after
+    // the settle can no longer leave the node with no event. A run that went
+    // terminal after the check above records nothing and answers `None`.
     let Some(outcome) = backend
-        .fail_work_item_fenced(item_id, fence, &body.error)
+        .fail_work_item_fenced_recorded(item_id, fence, &body.error)
         .await?
     else {
         // Someone else owns it now — reclaimed, already settled, or a forged
@@ -3838,47 +4036,10 @@ async fn fail_work_item(
         ));
     };
 
-    // Emit exactly what `SchedulerRunner::reclaim_expired_leases` emits for the
-    // same transition, so the fold cannot tell the two apart.
-    let (item, retryable, delay_ms) = match &outcome {
-        FailOutcome::Retryable { item, delay_ms } => (item, true, Some(*delay_ms)),
-        FailOutcome::Exhausted { item } => (item, false, None),
+    let (item, retryable) = match &outcome {
+        FailOutcome::Retryable { item, .. } => (item, true),
+        FailOutcome::Exhausted { item } => (item, false),
     };
-
-    let seq = backend.latest_sequence(&item.execution_id).await? + 1;
-    backend
-        .append_event(jamjet_state::Event::new(
-            item.execution_id.clone(),
-            seq,
-            jamjet_state::EventKind::NodeFailed {
-                node_id: item.node_id.clone(),
-                error: body.error.clone(),
-                // Retryable reports the attempt that just failed; exhausted
-                // reports the final count. Mirrors the reclaimer's arithmetic.
-                attempt: if retryable {
-                    item.attempt.saturating_sub(1)
-                } else {
-                    item.attempt
-                },
-                retryable,
-            },
-        ))
-        .await?;
-
-    if let Some(delay_ms) = delay_ms {
-        let seq = backend.latest_sequence(&item.execution_id).await? + 1;
-        backend
-            .append_event(jamjet_state::Event::new(
-                item.execution_id.clone(),
-                seq,
-                jamjet_state::EventKind::RetryScheduled {
-                    node_id: item.node_id.clone(),
-                    attempt: item.attempt,
-                    delay_ms,
-                },
-            ))
-            .await?;
-    }
 
     warn!(
         execution_id = %item.execution_id,
@@ -4399,6 +4560,7 @@ mod tests {
             comment: None,
             state_patch: None,
             action_digest: None,
+            request_sequence: None,
         };
 
         let refused = approve_execution(
