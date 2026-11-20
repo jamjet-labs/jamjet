@@ -12,80 +12,9 @@ from typing import Any
 
 import httpx
 
-# How much of an error body goes into the exception message. Runtime errors can
-# quote the request back (a value, a key), so keep only the start of it.
-_MAX_ERROR_DETAIL = 500
-_BIDI_CONTROLS = frozenset("\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
-
-
-def _clean_detail(text: str) -> str:
-    """One line of plain text: control and bidi characters shown escaped,
-    whitespace collapsed, capped at ``_MAX_ERROR_DETAIL`` characters."""
-    out = []
-    for ch in text:
-        code = ord(ch)
-        if ch in "\n\r\t":
-            out.append(" ")
-        elif code < 0x20 or 0x7F <= code <= 0x9F:
-            out.append(f"\\x{code:02x}")
-        elif ch in _BIDI_CONTROLS:
-            out.append(f"\\u{code:04x}")
-        else:
-            out.append(ch)
-    cleaned = " ".join("".join(out).split())
-    if len(cleaned) > _MAX_ERROR_DETAIL:
-        cleaned = cleaned[:_MAX_ERROR_DETAIL] + "..."
-    return cleaned
-
-
-class JamjetAPIError(httpx.HTTPStatusError):
-    """A non-2xx answer from the runtime, with the server's reason attached.
-
-    A subclass of ``httpx.HTTPStatusError``, so existing ``except`` clauses and
-    ``.response.status_code`` checks keep working. ``detail`` holds the server's
-    message (the ``error`` field of its JSON body, or the body text) as one line
-    of at most 500 characters with control characters escaped. The raw body is
-    still on ``.response``.
-    """
-
-    def __init__(self, message: str, *, request: httpx.Request, response: httpx.Response, detail: str) -> None:
-        super().__init__(message, request=request, response=response)
-        self.detail = detail
-
-
-def _error_detail(response: httpx.Response) -> str:
-    """The server's reason for a failed request, or "" when the body is empty."""
-    try:
-        text = response.text.strip()
-    except Exception:  # an undecodable body is no reason to hide the status
-        return ""
-    if not text:
-        return ""
-    try:
-        body = response.json()
-    except ValueError:
-        body = None
-    if isinstance(body, dict):
-        for key in ("error", "detail", "message"):
-            value = body.get(key)
-            if isinstance(value, str) and value.strip():
-                text = value.strip()
-                break
-    return _clean_detail(text)
-
-
-def _raise_for_status(response: httpx.Response) -> None:
-    """``response.raise_for_status()``, but the raised error carries the
-    server's message instead of only the status line."""
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        detail = _error_detail(response)
-        request = response.request
-        message = f"{response.status_code} {response.reason_phrase} for {request.method} {request.url}"
-        if detail:
-            message = f"{message}: {detail}"
-        raise JamjetAPIError(message, request=request, response=response, detail=detail) from exc
+from jamjet.transport import EngineAuth
+from jamjet.transport import JamjetAPIError as JamjetAPIError
+from jamjet.transport import raise_for_status as _raise_for_status
 
 
 @dataclass(frozen=True)
@@ -110,6 +39,13 @@ class JamjetClient:
     HTTP client for the JamJet runtime REST API.
 
     Defaults to http://localhost:7700 (the default `jamjet dev` address).
+
+    ``api_token`` (or ``JAMJET_TOKEN``) goes in ``Authorization: Bearer``.
+    ``auth`` is an ``httpx.Auth`` for whatever stands in front of the engine,
+    such as a platform that checks an identity token; it must use a header of
+    its own while a JamJet token is set. Both go only to the origin of
+    ``base_url``: a request to any other scheme, host or port raises
+    ``CredentialScopeError`` and is not sent. Redirects are never followed.
     """
 
     def __init__(
@@ -117,32 +53,47 @@ class JamjetClient:
         base_url: str = "http://localhost:7700",
         api_token: str | None = None,
         timeout: float = 30.0,
+        *,
+        auth: httpx.Auth | None = None,
     ) -> None:
+        if auth is not None and not isinstance(auth, httpx.Auth):
+            raise TypeError("auth must be an httpx.Auth")
         self.base_url = base_url.rstrip("/")
-        self._token = api_token or os.environ.get("JAMJET_TOKEN")
+        token = api_token or os.environ.get("JAMJET_TOKEN")
+        self._auth = EngineAuth(self.base_url, token=token, auth=auth) if token or auth is not None else None
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,
-            headers=self._auth_headers(),
+            auth=self._auth,
+            follow_redirects=False,
         )
 
-    def _auth_headers(self) -> dict[str, str]:
-        if self._token:
-            return {"Authorization": f"Bearer {self._token}"}
-        return {}
+    async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        """Send one request and raise ``JamjetAPIError`` for a non-2xx answer.
+
+        Every call goes through here. Credentials come from the client's own
+        auth flow, so a call cannot bring its own ``auth`` or follow a redirect.
+        """
+        refused = [name for name in ("auth", "follow_redirects") if name in kwargs]
+        if refused:
+            raise TypeError(
+                f"JamjetClient calls do not take {' or '.join(refused)}: credentials come from the client, "
+                "and redirects are never followed"
+            )
+        response = await self._client.request(method, url, follow_redirects=False, **kwargs)
+        _raise_for_status(response, credential_headers=self._auth.credential_headers if self._auth is not None else ())
+        return response
 
     # ── Health ────────────────────────────────────────────────────────────
 
     async def health(self) -> dict[str, Any]:
-        r = await self._client.get("/health")
-        _raise_for_status(r)
+        r = await self._request("GET", "/health")
         return r.json()
 
     # ── Workflows ─────────────────────────────────────────────────────────
 
     async def create_workflow(self, ir: dict[str, Any]) -> dict[str, Any]:
-        r = await self._client.post("/workflows", json={"ir": ir})
-        _raise_for_status(r)
+        r = await self._request("POST", "/workflows", json={"ir": ir})
         return r.json()
 
     # ── Cron schedules ────────────────────────────────────────────────────
@@ -169,13 +120,11 @@ class JamjetClient:
         }
         if input is not None:
             body["input"] = input
-        r = await self._client.post("/cron", json=body)
-        _raise_for_status(r)
+        r = await self._request("POST", "/cron", json=body)
         return r.json()
 
     async def list_cron_jobs(self) -> dict[str, Any]:
-        r = await self._client.get("/cron")
-        _raise_for_status(r)
+        r = await self._request("GET", "/cron")
         return r.json()
 
     # ── Executions ────────────────────────────────────────────────────────
@@ -189,13 +138,11 @@ class JamjetClient:
         body: dict[str, Any] = {"workflow_id": workflow_id, "input": input}
         if workflow_version:
             body["workflow_version"] = workflow_version
-        r = await self._client.post("/executions", json=body)
-        _raise_for_status(r)
+        r = await self._request("POST", "/executions", json=body)
         return r.json()
 
     async def get_execution(self, execution_id: str) -> dict[str, Any]:
-        r = await self._client.get(f"/executions/{execution_id}")
-        _raise_for_status(r)
+        r = await self._request("GET", f"/executions/{execution_id}")
         return r.json()
 
     async def list_executions(
@@ -207,13 +154,11 @@ class JamjetClient:
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if status:
             params["status"] = status
-        r = await self._client.get("/executions", params=params)
-        _raise_for_status(r)
+        r = await self._request("GET", "/executions", params=params)
         return r.json()
 
     async def cancel_execution(self, execution_id: str) -> dict[str, Any]:
-        r = await self._client.post(f"/executions/{execution_id}/cancel")
-        _raise_for_status(r)
+        r = await self._request("POST", f"/executions/{execution_id}/cancel")
         return r.json()
 
     async def get_events(self, execution_id: str, *, inline_artifacts: str | None = None) -> dict[str, Any]:
@@ -230,8 +175,7 @@ class JamjetClient:
             base["inline_artifacts"] = inline_artifacts
         params: dict[str, Any] = dict(base)
         while True:
-            r = await self._client.get(f"/executions/{execution_id}/events", params=params)
-            _raise_for_status(r)
+            r = await self._request("GET", f"/executions/{execution_id}/events", params=params)
             page = r.json()
             page_events = page.get("events") if isinstance(page, dict) else None
             if not isinstance(page_events, list):
@@ -285,8 +229,7 @@ class JamjetClient:
             body["action_digest"] = action_digest
         if user_id:
             body["user_id"] = user_id
-        r = await self._client.post(f"/executions/{execution_id}/approve", json=body)
-        _raise_for_status(r)
+        r = await self._request("POST", f"/executions/{execution_id}/approve", json=body)
         return r.json()
 
     async def list_approvals(self, execution_id: str) -> dict[str, Any]:
@@ -295,8 +238,7 @@ class JamjetClient:
         Returns ``{"pending": [...], "decided": [...]}`` as served by
         ``GET /executions/{id}/approvals``.
         """
-        r = await self._client.get(f"/executions/{execution_id}/approvals")
-        _raise_for_status(r)
+        r = await self._request("GET", f"/executions/{execution_id}/approvals")
         return r.json()
 
     async def send_external_event(
@@ -305,11 +247,11 @@ class JamjetClient:
         correlation_key: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        r = await self._client.post(
+        r = await self._request(
+            "POST",
             f"/executions/{execution_id}/external-event",
             json={"correlation_key": correlation_key, "payload": payload},
         )
-        _raise_for_status(r)
         return r.json()
 
     # ── Artifacts (content-addressed store) ───────────────────────────────
@@ -326,8 +268,7 @@ class JamjetClient:
         and echoed back on the returned ref.
         """
         headers = {"Content-Type": media_type} if media_type else None
-        r = await self._client.post("/artifacts", content=data, headers=headers)
-        _raise_for_status(r)
+        r = await self._request("POST", "/artifacts", content=data, headers=headers)
         j = r.json()
         return ArtifactRef(
             hash=j["hash"],
@@ -341,40 +282,33 @@ class JamjetClient:
         Raises ``httpx.HTTPStatusError`` (404) when no artifact with that hash
         exists for the caller's tenant.
         """
-        r = await self._client.get(f"/artifacts/{hash}")
-        _raise_for_status(r)
+        r = await self._request("GET", f"/artifacts/{hash}")
         return r.content
 
     # ── Agents ────────────────────────────────────────────────────────────
 
     async def register_agent(self, card: dict[str, Any]) -> dict[str, Any]:
-        r = await self._client.post("/agents", json=card)
-        _raise_for_status(r)
+        r = await self._request("POST", "/agents", json=card)
         return r.json()
 
     async def list_agents(self) -> dict[str, Any]:
-        r = await self._client.get("/agents")
-        _raise_for_status(r)
+        r = await self._request("GET", "/agents")
         return r.json()
 
     async def get_agent(self, agent_id: str) -> dict[str, Any]:
-        r = await self._client.get(f"/agents/{agent_id}")
-        _raise_for_status(r)
+        r = await self._request("GET", f"/agents/{agent_id}")
         return r.json()
 
     async def activate_agent(self, agent_id: str) -> dict[str, Any]:
-        r = await self._client.post(f"/agents/{agent_id}/activate")
-        _raise_for_status(r)
+        r = await self._request("POST", f"/agents/{agent_id}/activate")
         return r.json()
 
     async def deactivate_agent(self, agent_id: str) -> dict[str, Any]:
-        r = await self._client.post(f"/agents/{agent_id}/deactivate")
-        _raise_for_status(r)
+        r = await self._request("POST", f"/agents/{agent_id}/deactivate")
         return r.json()
 
     async def discover_agent(self, url: str) -> dict[str, Any]:
-        r = await self._client.post("/agents/discover", json={"url": url})
-        _raise_for_status(r)
+        r = await self._request("POST", "/agents/discover", json={"url": url})
         return r.json()
 
     # ── Work items (worker protocol) ────────────────────────────────────
@@ -395,8 +329,7 @@ class JamjetClient:
         body: dict[str, Any] = {"worker_id": worker_id, "queue_types": queue_types}
         if lease_secs is not None:
             body["lease_secs"] = int(lease_secs)
-        r = await self._client.post("/work-items/claim", json=body)
-        _raise_for_status(r)
+        r = await self._request("POST", "/work-items/claim", json=body)
         data = r.json()
         if not data.get("claimed"):
             return None
@@ -461,11 +394,11 @@ class JamjetClient:
             # would turn a malformed key into "no key" — the failure mode this
             # whole change exists to remove, and invisible at the call site.
             body["idempotency_key"] = idempotency_key
-        r = await self._client.post(
+        await self._request(
+            "POST",
             f"/work-items/{item_id}/complete",
             json=body,
         )
-        _raise_for_status(r)
 
     async def fail_work_item(self, item_id: str, error: str, lease_fence: int = 0) -> None:
         """Report that this work item's node failed.
@@ -482,11 +415,11 @@ class JamjetClient:
         body: dict[str, Any] = {"error": error}
         if lease_fence:
             body["lease_fence"] = lease_fence
-        r = await self._client.post(
+        await self._request(
+            "POST",
             f"/work-items/{item_id}/fail",
             json=body,
         )
-        _raise_for_status(r)
 
     async def heartbeat_work_item(
         self,
@@ -502,11 +435,11 @@ class JamjetClient:
         The answer carries ``cancel_requested`` once the execution has been
         cancelled; the worker loop acts on it.
         """
-        r = await self._client.post(
+        r = await self._request(
+            "POST",
             f"/work-items/{item_id}/heartbeat",
             json={"worker_id": worker_id, "lease_fence": lease_fence},
         )
-        _raise_for_status(r)
         try:
             body = r.json()
         except ValueError:
@@ -516,13 +449,11 @@ class JamjetClient:
     # ── Generic helpers (for one-off API paths not covered above) ─────────
 
     async def post(self, path: str, **kwargs: Any) -> dict[str, Any]:
-        r = await self._client.post(path, **kwargs)
-        _raise_for_status(r)
+        r = await self._request("POST", path, **kwargs)
         return r.json()
 
     async def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
-        r = await self._client.get(path, **kwargs)
-        _raise_for_status(r)
+        r = await self._request("GET", path, **kwargs)
         return r.json()
 
     async def __aenter__(self) -> JamjetClient:

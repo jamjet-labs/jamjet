@@ -13,6 +13,7 @@ No live runtime is required; a _StubClient records all outbound calls.
 
 from __future__ import annotations
 
+import json
 import time as _time
 from typing import Any
 
@@ -489,27 +490,25 @@ async def test_client_sends_a_present_key_even_when_falsy() -> None:
     """
     sent: dict[str, Any] = {}
 
-    class _Resp:
-        def raise_for_status(self) -> None:
-            return None
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(200, json={})
 
-    class _HTTP:
-        async def post(self, url: str, json: dict[str, Any]) -> _Resp:
-            sent.update(json)
-            return _Resp()
-
-    client = JamjetClient.__new__(JamjetClient)
-    client._client = _HTTP()  # type: ignore[attr-defined]
-
-    await client.complete_work_item(
-        "item-1",
-        execution_id="exec-1",
-        node_id="n1",
-        output={},
-        state_patch={},
-        duration_ms=1,
-        idempotency_key="",
-    )
+    client = JamjetClient(base_url="http://test")
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(handler))
+    try:
+        await client.complete_work_item(
+            "item-1",
+            execution_id="exec-1",
+            node_id="n1",
+            output={},
+            state_patch={},
+            duration_ms=1,
+            idempotency_key="",
+        )
+    finally:
+        await client._client.aclose()
     assert "idempotency_key" in sent, "a present key must be sent, not judged for truthiness"
     assert sent["idempotency_key"] == ""
 
