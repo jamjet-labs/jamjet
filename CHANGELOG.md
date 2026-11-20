@@ -611,6 +611,34 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   load. The four are now one write, `StateBackend::start_execution_atomic`, on every
   backend (a new trait method: a custom backend must implement it). A run whose start
   node does not exist is now refused before anything is written.
+- **A node is dispatched once.** The scheduler wrote a node's `NodeScheduled` event and
+  its work item as two writes. Two schedulers on one database could both dispatch the
+  node, and a crash between the writes left it scheduled with no work item, so the run
+  waited for ever. Skips, rejections and the run's end went the same way. A scheduler
+  pass is one write now: `StateBackend::commit_scheduler_pass` refuses it when the
+  run's log has moved on, when a node it dispatches already has a pending or claimed
+  item, or when the run is finished, and the scheduler folds the log again.
+- **Lease reclaims and worker failures record their events in the same write.** A crash
+  after a dead-letter left the node scheduled and the run stuck. The scheduler's sweep
+  and the fail route each settle the item and write its events in one transaction
+  (`reclaim_expired_leases_recorded`, `fail_work_item_fenced_recorded`).
+
+### Changed
+
+- `StateBackend` has three new methods, `commit_scheduler_pass`,
+  `reclaim_expired_leases_recorded` and `fail_work_item_fenced_recorded`. Each has a
+  default that keeps the old two-step behaviour, so a backend outside this repository
+  still compiles and behaves as before. A backend that runs with more than one engine
+  must override them. New public items: `SchedulerPass`, `PassCommit`, the
+  `jamjet_state::lease_events` module and `Scheduler::stale_passes`.
+- `POST /work-items` answers 409 for a node that already has a pending or claimed item,
+  and for a run that has finished.
+- A failure report that races a cancel answers 409 and records nothing.
+- The scheduler's sweep records nothing for an item of a finished run. It settles the
+  item as failed. A lease renewed after the sweep read it is no longer taken.
+- Work items and scheduler events on SQLite carry the run's tenant. Unscoped SQLite
+  used to stamp `default` on events written by the scheduler's pass and by the sweep,
+  and on dead-letter rows.
 
 ---
 

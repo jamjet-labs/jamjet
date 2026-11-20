@@ -7,8 +7,8 @@ use jamjet_core::workflow::ExecutionId;
 use sqlx::{Row, SqlitePool};
 
 /// The run's pending and claimed items, oldest first. Scoped to `tenant_id`
-/// by the run's own row when given, never by the item's: the scheduler
-/// enqueues unscoped, so an item's own column says `default`.
+/// by the run's own row when given, never by the item's: items the scheduler
+/// wrote before its pass stamped the run's tenant say `default` there.
 pub(crate) async fn open_work_items_in(
     pool: &SqlitePool,
     tenant_id: Option<&str>,

@@ -2,8 +2,9 @@
 //! run or running.
 //!
 //! On a scoped backend the run's own row decides whose items they are. The
-//! engine enqueues every item after the first through its unscoped handle,
-//! so an item's own tenant column says `default` whoever's run it belongs to.
+//! scheduler's pass stamps the run's tenant on its items, but items it wrote
+//! before that, through its unscoped handle, say `default` in their own
+//! tenant column whoever's run they belong to.
 //!
 //! The shared case runs on memory, SQLite and tenant-scoped SQLite. The
 //! tenant cases need a scoped store, so they run on SQLite only.
@@ -215,8 +216,8 @@ async fn open_work_items_lists_pending_and_claimed_only(fx: &Fixture) {
 // ── Tenants (scoped SQLite) ───────────────────────────────────────────────────
 
 /// An acme run's items, one enqueued under acme and one unscoped as the
-/// scheduler does: another tenant sees none of them, the default tenant
-/// included, whose name the unscoped item carries.
+/// scheduler did before its pass: another tenant sees none of them, the
+/// default tenant included, whose name the unscoped item carries.
 #[tokio::test]
 async fn open_work_items_of_another_tenants_run_is_empty() {
     let base = open().await;
@@ -241,8 +242,9 @@ async fn open_work_items_of_another_tenants_run_is_empty() {
     }
 }
 
-/// Items the scheduler enqueued unscoped carry `default` in their own
-/// tenant column. They are still the acme run's, and acme lists them.
+/// Items enqueued unscoped, as the scheduler did before its pass stamped the
+/// run's tenant, carry `default` in their own tenant column. They are still
+/// the acme run's, and acme lists them.
 #[tokio::test]
 async fn a_scoped_backend_lists_its_runs_items_stored_as_default() {
     let base = open().await;

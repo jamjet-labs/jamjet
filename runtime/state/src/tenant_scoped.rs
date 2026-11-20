@@ -2516,6 +2516,37 @@ impl StateBackend for TenantScopedSqliteBackend {
         )
         .await
     }
+
+    // ── Storage lane ──────────────────────────────────────────────────────
+
+    async fn commit_scheduler_pass(
+        &self,
+        pass: crate::backend::SchedulerPass,
+    ) -> BackendResult<crate::backend::PassCommit> {
+        crate::sqlite::commit_scheduler_pass_in(&self.pool, Some(&self.tenant_id.0), pass).await
+    }
+
+    #[instrument(skip(self), fields(tenant = %self.tenant_id))]
+    async fn reclaim_expired_leases_recorded(&self) -> BackendResult<ReclaimResult> {
+        crate::sqlite::reclaim_expired_leases_recorded_in(&self.pool, Some(&self.tenant_id.0)).await
+    }
+
+    #[instrument(skip(self, error), fields(tenant = %self.tenant_id, item_id = %item_id, fence = lease_fence))]
+    async fn fail_work_item_fenced_recorded(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        crate::sqlite::fail_work_item_fenced_recorded_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            item_id,
+            lease_fence,
+            error,
+        )
+        .await
+    }
 }
 
 /// Parse a datetime that might be either RFC 3339 or SQLite's `datetime('now')` format.
