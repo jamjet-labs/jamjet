@@ -2883,6 +2883,60 @@ async fn an_unmarked_item_reached_by_the_oldest_first_claim_is_put_back() {
     }
 }
 
+/// `POST /work-items` marks a `python_fn` item from the IR as it does an
+/// `external_fn` one: sent without the marker, it is stored with it, before
+/// any claim has looked at it. A plain node's item loses a marker it was sent.
+#[tokio::test]
+async fn a_hand_enqueued_python_fn_item_is_marked_from_the_ir() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let state = make_state(backend.clone());
+    register(&state, None, py_ir("wf-py-hand", Some("by_execution"))).await;
+    let e = start(&state, None, "wf-py-hand").await;
+    // Take the start item out of the way.
+    let (_, body) = py_claim(&state, None, "w", json!({ "execution_id": e })).await;
+    assert_eq!(body["claimed"], true, "{body}");
+    let (st, body) = send(
+        &state,
+        "POST",
+        "/work-items",
+        None,
+        json!({
+            "execution_id": e, "node_id": "second", "queue_type": PY_QUEUE,
+            "payload": { "module": "myapp.tools", "function": "second" }
+        }),
+    )
+    .await;
+    assert_eq!(st, 201, "{body}");
+    let id = uuid::Uuid::parse_str(body["work_item_id"].as_str().unwrap()).unwrap();
+    let item = backend.get_work_item(id).await.unwrap().unwrap();
+    assert_eq!(item.payload["claim"], "by_execution", "{:?}", item.payload);
+    let (_, body) = py_claim(&state, None, "oldest-first", json!({})).await;
+    assert_eq!(body, json!({ "claimed": false }));
+
+    register(&state, None, py_ir("wf-py-hand-plain", None)).await;
+    let p = start(&state, None, "wf-py-hand-plain").await;
+    let (_, body) = py_claim(&state, None, "w", json!({ "execution_id": p })).await;
+    assert_eq!(body["claimed"], true, "{body}");
+    let (st, body) = send(
+        &state,
+        "POST",
+        "/work-items",
+        None,
+        json!({
+            "execution_id": p, "node_id": "second", "queue_type": PY_QUEUE,
+            "payload": { "module": "myapp.tools", "function": "second", "claim": "by_execution" }
+        }),
+    )
+    .await;
+    assert_eq!(st, 201, "{body}");
+    let (_, body) = py_claim(&state, None, "oldest-first", json!({})).await;
+    assert_eq!(body["claimed"], true, "{body}");
+    assert!(
+        body["work_item"]["payload"].get("claim").is_none(),
+        "{body}"
+    );
+}
+
 /// Claimed by its run, an agent's dispatch node still has each tool call it
 /// carries checked: a blocked call is refused, an allowed one handed out.
 #[tokio::test]

@@ -280,9 +280,9 @@ async fn create_workflow(
     // then evaluate false forever, with only a WARN in the engine log to say so.
     jamjet_ir::validate_condition_expressions(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
-    // `claim` means something on `external_fn` only. On another kind serde
-    // drops it, and the author would believe items are claimable only by
-    // execution when any claimer gets them.
+    // `claim` means something on `external_fn` and `python_fn` only. On
+    // another kind serde drops it, and the author would believe items are
+    // claimable only by execution when any claimer gets them.
     if let Some(nodes) = body.ir.get("nodes").and_then(Value::as_object) {
         for (id, node) in nodes {
             let kind = node.get("kind");
@@ -290,9 +290,10 @@ async fn create_workflow(
                 .and_then(|k| k.get(jamjet_core::node::CLAIM_PAYLOAD_KEY))
                 .is_some();
             let tag = kind.and_then(|k| k.get("type")).and_then(Value::as_str);
-            if has_claim && tag != Some("external_fn") {
+            if has_claim && !matches!(tag, Some("external_fn" | "python_fn")) {
                 return Err(ApiError::BadRequest(format!(
-                    "invalid workflow IR: node {id}: `claim` applies to external_fn nodes only"
+                    "invalid workflow IR: node {id}: `claim` applies to external_fn and \
+                     python_fn nodes only"
                 )));
             }
         }
@@ -2830,15 +2831,7 @@ async fn gate_claimed_item(
     // claim: its item lost the marker every enqueue path writes from the IR.
     // Not handed out. It goes back to pending, uncharged and marked, for a
     // claim that names its execution.
-    if !named
-        && matches!(
-            &kind,
-            jamjet_core::NodeKind::ExternalFn {
-                claim: jamjet_core::node::ClaimMode::ByExecution,
-                ..
-            }
-        )
-    {
+    if !named && jamjet_core::node::claim_mode(&kind) == jamjet_core::node::ClaimMode::ByExecution {
         tracing::error!(
             execution_id = %wi.execution_id,
             node_id = %wi.node_id,
@@ -3691,13 +3684,8 @@ async fn enqueue_work_item(
     // as the scheduler's payload has it, never from the caller: an item sent
     // without the marker would otherwise go to any oldest-first claimer.
     let mut payload = body.payload;
-    let by_execution = matches!(
-        &kind,
-        jamjet_core::NodeKind::ExternalFn {
-            claim: jamjet_core::node::ClaimMode::ByExecution,
-            ..
-        }
-    );
+    let by_execution =
+        jamjet_core::node::claim_mode(&kind) == jamjet_core::node::ClaimMode::ByExecution;
     match payload.as_object_mut() {
         Some(obj) if by_execution => {
             obj.insert(
