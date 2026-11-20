@@ -565,6 +565,8 @@ struct ListExecutionsQuery {
     status: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
+    waiting_for: Option<String>,
+    after: Option<String>,
 }
 
 /// The most executions one `GET /executions` returns, whatever `limit` asks.
@@ -576,6 +578,14 @@ async fn list_executions(
     Query(params): Query<ListExecutionsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
+    if let Some(wanted) = params.waiting_for.as_deref() {
+        return list_waiting_for(backend.as_ref(), wanted, &params).await;
+    }
+    if params.after.is_some() {
+        return Err(ApiError::BadRequest(
+            "after pages the waiting_for filter; send waiting_for with it".into(),
+        ));
+    }
     // An unknown status is refused: it used to mean no filter, so
     // `?status=cancelled` listed every run.
     let status = match params.status.as_deref() {
@@ -601,6 +611,50 @@ async fn list_executions(
     Ok(Json(json!({ "executions": executions })))
 }
 
+/// `GET /executions?waiting_for=<v>`: one page of running runs, each derived
+/// with [`crate::waiting::waiting_for`], and the ones in state `wanted`. A
+/// page may hold fewer than `limit`, or none, while `next_after` is set; pass
+/// it back as `after` until it is absent.
+async fn list_waiting_for(
+    backend: &dyn jamjet_state::StateBackend,
+    wanted: &str,
+    params: &ListExecutionsQuery,
+) -> Result<Json<Value>, ApiError> {
+    let wanted = crate::waiting::WaitingFor::parse(wanted).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "unknown waiting_for {wanted:?}; use approval, step, worker or engine"
+        ))
+    })?;
+    if params.status.as_deref().is_some_and(|s| s != "running") {
+        return Err(ApiError::BadRequest(
+            "waiting_for lists running executions; status must be running".into(),
+        ));
+    }
+    if params.offset.is_some() {
+        return Err(ApiError::BadRequest(
+            "waiting_for pages with after, not offset".into(),
+        ));
+    }
+    let limit = params.limit.unwrap_or(50).clamp(1, MAX_EXECUTIONS_PAGE);
+    let page = backend
+        .list_running_executions_after(params.after.as_deref(), limit)
+        .await?;
+    let now = Utc::now();
+    let mut executions = Vec::new();
+    for execution in page.executions {
+        if crate::waiting::waiting_for(backend, &execution, now).await? != Some(wanted) {
+            continue;
+        }
+        let mut row = serde_json::to_value(&execution)
+            .map_err(|e| ApiError::Internal(format!("serialize execution: {e}")))?;
+        row["waiting_for"] = json!(wanted);
+        executions.push(row);
+    }
+    Ok(Json(
+        json!({ "executions": executions, "next_after": page.next_after }),
+    ))
+}
+
 async fn get_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
@@ -612,10 +666,12 @@ async fn get_execution(
         .get_execution(&execution_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("execution {id}")))?;
+    let waiting = crate::waiting::waiting_for(backend.as_ref(), &execution, Utc::now()).await?;
     let execution = with_derived_state(backend.as_ref(), execution).await;
-    Ok(Json(serde_json::to_value(execution).map_err(|e| {
-        ApiError::Internal(format!("serialize execution: {e}"))
-    })?))
+    let mut body = serde_json::to_value(execution)
+        .map_err(|e| ApiError::Internal(format!("serialize execution: {e}")))?;
+    body["waiting_for"] = json!(waiting);
+    Ok(Json(body))
 }
 
 /// `execution` with its `current_state` re-derived from the event log (the

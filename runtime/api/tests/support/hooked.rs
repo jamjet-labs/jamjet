@@ -685,6 +685,13 @@ impl StateBackend for HookedBackend {
         self.inner.list_pending_approvals(after, limit).await
     }
 
+    async fn open_work_items(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> jamjet_state::backend::BackendResult<Vec<jamjet_state::OpenWorkItem>> {
+        self.inner.open_work_items(execution_id).await
+    }
+
     async fn create_tenant(
         &self,
         tenant: jamjet_state::Tenant,

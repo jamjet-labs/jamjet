@@ -9,6 +9,7 @@ pub mod routes;
 pub mod startup;
 pub mod state;
 pub mod static_files;
+pub mod waiting;
 
 pub use auth::{require_auth, require_write_role, AuthState, Role};
 pub use config::ApiConfig;
