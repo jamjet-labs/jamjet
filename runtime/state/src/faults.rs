@@ -7,9 +7,18 @@
 //! after the second statement of the SQLite scheduler pass. A call to a
 //! helper that runs statements of its own counts as one statement. A point
 //! inside a loop is reached on every pass, so an armed error stops the
-//! transaction on the first. [`POINTS`] lists every point the code declares,
-//! and `testkit/tests/fault_points_listed.rs` checks it against the
-//! `fault_point!` calls in the sources.
+//! transaction on the first.
+//!
+//! Each commit has a point on the line before it, outside any loop or branch
+//! the commit is not in. Where the last statement's point is not there
+//! already, it sits after the check of what that statement did, or the
+//! commit has a point of its own, numbered after the rest. An error armed
+//! there stops the call once every statement before the commit has run, so
+//! it finds a write that a commit split off anywhere earlier in the body, in
+//! a loop's later passes too. [`POINTS`] lists every point the code
+//! declares, and `testkit/tests/fault_points_listed.rs` checks it against
+//! the `fault_point!` calls in the sources, and checks that each commit has
+//! its point.
 //!
 //! This module is compiled in every build, so callers compile either way.
 //! Only the `test-hooks` feature of this crate makes a point do anything:
@@ -52,6 +61,7 @@ pub const POINTS: &[(&str, u32)] = &[
     ("sqlite.commit_turn", 8),
     ("sqlite.commit_turn", 9),
     ("sqlite.commit_turn", 10),
+    ("sqlite.commit_turn", 11),
     ("sqlite.append_event", 1),
     ("sqlite.append_event", 2),
     ("sqlite.claim_work_item", 1),
@@ -84,6 +94,7 @@ pub const POINTS: &[(&str, u32)] = &[
     ("sqlite.expire_stale_leases", 2),
     ("sqlite.expire_stale_leases", 3),
     ("sqlite.expire_stale_leases", 4),
+    ("sqlite.expire_stale_leases", 5),
     ("sqlite.reattach_lease", 1),
     ("sqlite.reattach_lease", 2),
     ("sqlite.reattach_lease", 3),
@@ -94,18 +105,21 @@ pub const POINTS: &[(&str, u32)] = &[
     ("sqlite.commit_scheduler_pass", 5),
     ("sqlite.commit_scheduler_pass", 6),
     ("sqlite.commit_scheduler_pass", 7),
+    ("sqlite.commit_scheduler_pass", 8),
     ("sqlite.reclaim_expired_leases_recorded", 1),
     ("sqlite.reclaim_expired_leases_recorded", 2),
     ("sqlite.reclaim_expired_leases_recorded", 3),
     ("sqlite.reclaim_expired_leases_recorded", 4),
     ("sqlite.reclaim_expired_leases_recorded", 5),
     ("sqlite.reclaim_expired_leases_recorded", 6),
+    ("sqlite.reclaim_expired_leases_recorded", 7),
     ("sqlite.fail_work_item_fenced_recorded", 1),
     ("sqlite.fail_work_item_fenced_recorded", 2),
     ("sqlite.fail_work_item_fenced_recorded", 3),
     ("sqlite.fail_work_item_fenced_recorded", 4),
     ("sqlite.fail_work_item_fenced_recorded", 5),
     ("sqlite.fail_work_item_fenced_recorded", 6),
+    ("sqlite.fail_work_item_fenced_recorded", 7),
     ("sqlite.patch_append_array", 1),
     ("sqlite.patch_append_array", 2),
     // tenant_scoped.rs: the scoped copies of the unscoped bodies.
@@ -119,6 +133,7 @@ pub const POINTS: &[(&str, u32)] = &[
     ("sqlite_scoped.commit_turn", 8),
     ("sqlite_scoped.commit_turn", 9),
     ("sqlite_scoped.commit_turn", 10),
+    ("sqlite_scoped.commit_turn", 11),
     ("sqlite_scoped.append_event", 1),
     ("sqlite_scoped.append_event", 2),
     ("sqlite_scoped.claim_work_item", 1),

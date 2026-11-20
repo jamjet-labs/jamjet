@@ -387,11 +387,11 @@ impl SqliteBackend {
                 // Fence first: only the holder may withdraw, and a stale or
                 // forged fence must leave the item exactly as it is.
                 let withdrawn = withdraw_claimed_item(&mut tx, None, &id_str, lease_fence).await?;
-                fault_point!("sqlite.commit_turn", 2);
                 if !withdrawn {
                     tx.rollback().await.map_err(map_db_err)?;
                     return Err(StateBackendError::FenceLost(id_str));
                 }
+                fault_point!("sqlite.commit_turn", 2);
                 tx.commit().await.map_err(map_db_err)?;
                 return Ok(TurnCommit::ExecutionTerminal(status));
             }
@@ -628,6 +628,7 @@ impl SqliteBackend {
             fault_point!("sqlite.commit_turn", 10);
         }
 
+        fault_point!("sqlite.commit_turn", 11);
         tx.commit().await.map_err(map_db_err)?;
         Ok(TurnCommit::Committed(sequence))
     }
@@ -1881,11 +1882,11 @@ impl StateBackend for SqliteBackend {
         .await
         .map_err(map_db_err)?
         .rows_affected();
-        fault_point!("sqlite.fail_work_item_fenced", 4);
         if rows == 0 {
             return Ok(None);
         }
 
+        fault_point!("sqlite.fail_work_item_fenced", 4);
         tx.commit().await.map_err(map_db_err)?;
         let mut retried = item;
         retried.attempt = new_attempt;
@@ -3066,6 +3067,7 @@ pub(crate) async fn expire_stale_leases(
             fault_point!("sqlite.expire_stale_leases", 4);
         }
     }
+    fault_point!("sqlite.expire_stale_leases", 5);
     tx.commit().await.map_err(map_db_err)?;
     Ok(())
 }
@@ -3248,11 +3250,11 @@ pub(crate) async fn reattach_lease(
         .await
         .map_err(map_db_err)?
         .rows_affected();
-    fault_point!("sqlite.reattach_lease", 3);
     if rows == 0 {
         tx.rollback().await.map_err(map_db_err)?;
         return Err(StateBackendError::FenceLost(id_str));
     }
+    fault_point!("sqlite.reattach_lease", 3);
     tx.commit().await.map_err(map_db_err)?;
     Ok(crate::backend::LeaseRenewal {
         lease_fence: new_fence,
@@ -3753,6 +3755,7 @@ pub(crate) async fn commit_scheduler_pass_in(
         fault_point!("sqlite.commit_scheduler_pass", 7);
     }
 
+    fault_point!("sqlite.commit_scheduler_pass", 8);
     tx.commit().await.map_err(map_db_err)?;
     Ok(PassCommit::Committed { last_sequence })
 }
@@ -3941,6 +3944,7 @@ pub(crate) async fn reclaim_one_recorded(
         insert_event_in_tx(&mut tx, &item, kind).await?;
         fault_point!("sqlite.reclaim_expired_leases_recorded", 6);
     }
+    fault_point!("sqlite.reclaim_expired_leases_recorded", 7);
     tx.commit().await.map_err(map_db_err)?;
     Ok(Some((outcome, item)))
 }
@@ -4034,6 +4038,7 @@ pub(crate) async fn fail_work_item_fenced_recorded_in(
         insert_event_in_tx(&mut tx, &item, kind).await?;
         fault_point!("sqlite.fail_work_item_fenced_recorded", 6);
     }
+    fault_point!("sqlite.fail_work_item_fenced_recorded", 7);
     tx.commit().await.map_err(map_db_err)?;
     Ok(Some(outcome))
 }

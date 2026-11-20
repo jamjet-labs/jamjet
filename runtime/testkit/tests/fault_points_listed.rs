@@ -80,6 +80,79 @@ fn every_point_in_the_code_is_listed() {
     }
 }
 
+/// Each commit in a function that has fault points has one right before it,
+/// at the commit's own indentation, so not inside a loop or a branch the
+/// commit is outside of. An error armed there stops the call after every
+/// statement before the commit has run, so it finds a write that a commit
+/// split off anywhere earlier. A point inside a loop cannot: an error armed
+/// there stops the first pass, and no armed point is reached after the
+/// passes that follow.
+#[test]
+fn every_commit_has_a_point_right_before_it() {
+    let runtime = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the kit sits in runtime/");
+    let mut missing = Vec::new();
+    for tree in TREES {
+        for file in rust_files(&runtime.join(tree)) {
+            missing.extend(commits_without_a_point(&file));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "a commit with no fault_point! on the line before it, at its own indentation: \
+         {missing:#?}"
+    );
+}
+
+/// The commits in `file`, in a function that has a `fault_point!` call before
+/// them, whose line before (blank and comment lines aside) is not a
+/// `fault_point!` call indented as the commit is.
+fn commits_without_a_point(file: &Path) -> Vec<String> {
+    let text =
+        std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+    let lines: Vec<&str> = text.lines().collect();
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let is_code = |line: &str| {
+        let code = line.trim_start();
+        !code.is_empty() && !code.starts_with("//")
+    };
+    let mut missing = Vec::new();
+    // Whether the function the scan is in has a point so far.
+    let mut pointed = false;
+    for (n, line) in lines.iter().enumerate() {
+        if !is_code(line) {
+            continue;
+        }
+        let code = line.trim_start();
+        if starts_a_function(code) {
+            pointed = false;
+        }
+        if code.contains(CALL) {
+            pointed = true;
+        }
+        if pointed && code.contains(".commit()") {
+            let before = lines[..n].iter().rev().find(|l| is_code(l));
+            let ok = before
+                .is_some_and(|b| b.trim_start().starts_with(CALL) && indent(b) == indent(line));
+            if !ok {
+                missing.push(format!("{}:{}", file.display(), n + 1));
+            }
+        }
+    }
+    missing
+}
+
+/// Whether a trimmed line declares a function: `fn`, `async fn`, either
+/// after a `pub` or `pub(..)`.
+fn starts_a_function(code: &str) -> bool {
+    let code = match code.strip_prefix("pub") {
+        Some(rest) if rest.starts_with([' ', '(']) => rest.split_once(' ').map_or(rest, |(_, r)| r),
+        _ => code,
+    };
+    code.starts_with("fn ") || code.starts_with("async fn ")
+}
+
 /// Every `.rs` file under `dir`, in a stable order.
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();

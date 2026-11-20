@@ -10,6 +10,12 @@
 //! call of it writes. Each call runs in a [`Scope`] of its own, so the fault
 //! never reaches the other cases running in the same binary.
 //!
+//! The point right before a body's last commit is failed on a setup that
+//! runs every statement of the body, or once per path where the paths to
+//! the commit each run a statement the others do not. So a write that a
+//! commit split off anywhere in the body, in a branch or in a loop's later
+//! passes, is still there when the error stops the call.
+//!
 //! The hang case holds one run's scheduler pass inside its transaction and
 //! makes another run's pass meanwhile. SQLite has one writer per file, so
 //! the other pass waits for the hang to end and lands within the busy
@@ -103,48 +109,88 @@ pub async fn an_error_at_any_step_leaves_no_partial_write(fx: &Fixture) {
     }
 
     for (label, step) in points {
-        let point = format!("{label}#{step}");
         let (_, operation) = label
             .split_once('.')
             .expect("a label is <store>.<operation>");
-        let call = prepare(fx, operation, step).await;
-        let before = every_row(fx).await;
+        let last = step == last_step(label);
+        let paths = paths(operation, last);
+        for path in 0..paths {
+            let point = if paths > 1 {
+                format!("{label}#{step} (path {} of {paths})", path + 1)
+            } else {
+                format!("{label}#{step}")
+            };
+            let at = At { step, last, path };
+            let call = prepare(fx, operation, at).await;
+            let before = every_row(fx).await;
 
-        let scope = Scope::new();
-        scope.arm(label, step, Fault::Error);
-        let failed = scope.run((call.run)()).await;
-        let injected = format!("fault injected at {point}");
-        match &failed {
-            Err(StateBackendError::Database(message)) if *message == injected => {}
-            other => panic!("{point}: the call did not stop there, it returned {other:?}"),
+            let scope = Scope::new();
+            scope.arm(label, step, Fault::Error);
+            let failed = scope.run((call.run)()).await;
+            let injected = format!("fault injected at {label}#{step}");
+            match &failed {
+                Err(StateBackendError::Database(message)) if *message == injected => {}
+                other => panic!("{point}: the call did not stop there, it returned {other:?}"),
+            }
+            assert_eq!(scope.fired(label, step), 1, "{point}: fired once");
+            let after_failure = every_row(fx).await;
+            let partial = changes(&before, &after_failure);
+            assert!(
+                partial.is_empty(),
+                "{point}: the failed call left a partial write: {partial:#?}"
+            );
+
+            (call.run)()
+                .await
+                .unwrap_or_else(|e| panic!("{point}: the same call made again: {e}"));
+            let landed = changes(&before, &every_row(fx).await);
+            let counts: BTreeMap<String, (usize, usize)> = landed
+                .iter()
+                .map(|(table, change)| (table.clone(), (change.gone.len(), change.new.len())))
+                .collect();
+            let expected: BTreeMap<String, (usize, usize)> = call
+                .lands
+                .iter()
+                .map(|(table, gone, new)| (table.to_string(), (*gone, *new)))
+                .collect();
+            assert_eq!(
+                counts, expected,
+                "{point}: the call made again did not write what one call writes \
+                 (rows gone, rows new, per table): {landed:#?}"
+            );
         }
-        assert_eq!(scope.fired(label, step), 1, "{point}: fired once");
-        let after_failure = every_row(fx).await;
-        let partial = changes(&before, &after_failure);
-        assert!(
-            partial.is_empty(),
-            "{point}: the failed call left a partial write: {partial:#?}"
-        );
-
-        (call.run)()
-            .await
-            .unwrap_or_else(|e| panic!("{point}: the same call made again: {e}"));
-        let landed = changes(&before, &every_row(fx).await);
-        let counts: BTreeMap<String, (usize, usize)> = landed
-            .iter()
-            .map(|(table, change)| (table.clone(), (change.gone.len(), change.new.len())))
-            .collect();
-        let expected: BTreeMap<String, (usize, usize)> = call
-            .lands
-            .iter()
-            .map(|(table, gone, new)| (table.to_string(), (*gone, *new)))
-            .collect();
-        assert_eq!(
-            counts, expected,
-            "{point}: the call made again did not write what one call writes \
-             (rows gone, rows new, per table): {landed:#?}"
-        );
     }
+}
+
+/// The highest step of `label`: the point right before its body's last
+/// commit.
+fn last_step(label: &str) -> u32 {
+    POINTS
+        .iter()
+        .filter(|(l, _)| *l == label)
+        .map(|(_, s)| *s)
+        .max()
+        .expect("a label in POINTS has a step")
+}
+
+/// How many setups a point is failed on: one, or for the point before the
+/// last commit of a body whose paths to that commit each run a statement the
+/// other does not, one per path.
+fn paths(operation: &str, last: bool) -> u32 {
+    match operation {
+        // Retried or out of attempts: the requeue, or the dead letter.
+        "reclaim_expired_leases_recorded" | "fail_work_item_fenced_recorded" if last => 2,
+        _ => 1,
+    }
+}
+
+/// Which point a setup is for: its step, whether it is the point before the
+/// body's last commit, and which of that point's [`paths`] to take.
+#[derive(Debug, Clone, Copy)]
+struct At {
+    step: u32,
+    last: bool,
+    path: u32,
 }
 
 pub async fn a_hang_inside_a_transaction_blocks_only_its_run(fx: &Fixture) {
@@ -252,11 +298,13 @@ where
     Box::new(move || Box::pin(f()))
 }
 
-/// Set up the store so `operation` reaches `step`, and return the call.
-/// Where a step lies on one branch of the operation, the setup takes that
-/// branch.
-async fn prepare(fx: &Fixture, operation: &str, step: u32) -> Call {
+/// Set up the store so `operation` reaches the point `at`, and return the
+/// call. Where a step lies on one branch of the operation, the setup takes
+/// that branch. For the point before the last commit, the setup runs every
+/// statement of the body, or takes the path `at` names.
+async fn prepare(fx: &Fixture, operation: &str, at: At) -> Call {
     let b = fx.backend.clone();
+    let step = at.step;
     match operation {
         "commit_turn" if step <= 2 => {
             // The run is over: the commit withdraws the item, records nothing.
@@ -337,7 +385,7 @@ async fn prepare(fx: &Fixture, operation: &str, step: u32) -> Call {
         }
         "fail_work_item_fenced" | "fail_work_item_fenced_recorded" => {
             let recorded = operation == "fail_work_item_fenced_recorded";
-            fail(&b, recorded, step).await
+            fail(&b, recorded, at).await
         }
         "finalize_rollover_fenced" => {
             let (run, item) = claimed(&b, 0, 3).await;
@@ -382,8 +430,9 @@ async fn prepare(fx: &Fixture, operation: &str, step: u32) -> Call {
                 lands: &[("proj_approvals", 0, 2), ("projector_checkpoints", 0, 1)],
             }
         }
-        "create_run" if step == 2 => {
-            // A continuation segment: the only run with a seed snapshot.
+        "create_run" => {
+            // A continuation segment: the only run with a seed snapshot, so
+            // the call runs every statement of the body.
             let (parent, _) = started(&b, 0, 3).await;
             let id = ExecutionId::new();
             let mut segment = run_row(&id);
@@ -404,25 +453,6 @@ async fn prepare(fx: &Fixture, operation: &str, step: u32) -> Call {
                 lands: &[
                     ("events", 0, 2),
                     ("snapshots", 0, 1),
-                    ("work_items", 0, 1),
-                    ("workflow_executions", 0, 1),
-                ],
-            }
-        }
-        "create_run" => {
-            let id = ExecutionId::new();
-            let item = pending(&id, 0, 3);
-            Call {
-                run: call(move || {
-                    let (b, id, item) = (b.clone(), id.clone(), item.clone());
-                    async move {
-                        let scheduled = scheduled(&item);
-                        b.start_execution_atomic(run_row(&id), started_kind(), scheduled, item)
-                            .await
-                    }
-                }),
-                lands: &[
-                    ("events", 0, 2),
                     ("work_items", 0, 1),
                     ("workflow_executions", 0, 1),
                 ],
@@ -470,14 +500,27 @@ async fn prepare(fx: &Fixture, operation: &str, step: u32) -> Call {
         }
         "expire_stale_leases" => {
             // The claim's fast reclaim, run by a claim that finds nothing
-            // else to take. Step 2 settles an item of a finished run.
-            let (run, item) = claimed(&b, 0, 3).await;
-            fx.hooks.force_lease_expired(item.id).await;
-            let lands: &'static [(&'static str, usize, usize)] = if step == 2 {
-                cancel(&b, &run).await;
-                &[("work_items", 1, 1)]
-            } else {
-                &[("events", 0, 2), ("work_items", 1, 1)]
+            // else to take. Step 2 settles an item of a finished run; the
+            // others requeue an item and record its retry. The point before
+            // the commit has one of each, so the call runs both branches.
+            let finished = step == 2 || at.last;
+            let retried = step != 2;
+            // Every item is claimed before any lease lapses: a claim runs
+            // the fast reclaim first.
+            let mut held = Vec::new();
+            for _ in 0..usize::from(finished) + usize::from(retried) {
+                held.push(claimed(&b, 0, 3).await);
+            }
+            for (_, item) in &held {
+                fx.hooks.force_lease_expired(item.id).await;
+            }
+            if finished {
+                cancel(&b, &held[0].0).await;
+            }
+            let lands: &'static [(&'static str, usize, usize)] = match (finished, retried) {
+                (true, true) => &[("events", 0, 2), ("work_items", 2, 2)],
+                (true, false) => &[("work_items", 1, 1)],
+                _ => &[("events", 0, 2), ("work_items", 1, 1)],
             };
             Call {
                 run: call(move || {
@@ -508,46 +551,46 @@ async fn prepare(fx: &Fixture, operation: &str, step: u32) -> Call {
                 lands: &[("work_items", 1, 1)],
             }
         }
-        "commit_scheduler_pass" if step >= 6 => {
-            // A pass that ends the run.
-            let (run, _) = started(&b, 0, 3).await;
-            let pass = SchedulerPass {
-                seen_sequence: b.latest_sequence(&run).await.unwrap(),
-                execution_id: run,
-                events: vec![skipped_node("b")],
-                work_items: vec![],
-                finish: Some((
+        "commit_scheduler_pass" => {
+            // A pass that dispatches a node. From step 6 on it also ends
+            // the run, so it reaches the steps of the finish, and the point
+            // before the commit follows every statement of the body.
+            let (_, mut pass) = dispatch_pass(&b).await;
+            let lands: &'static [(&'static str, usize, usize)] = if step >= 6 {
+                pass.finish = Some((
                     WorkflowStatus::Completed,
                     EventKind::WorkflowCompleted {
                         final_state: json!({}),
                     },
-                )),
+                ));
+                &[
+                    ("events", 0, 2),
+                    ("work_items", 0, 1),
+                    ("workflow_executions", 1, 1),
+                ]
+            } else {
+                &[("events", 0, 1), ("work_items", 0, 1)]
             };
             Call {
                 run: pass_call(b, pass),
-                lands: &[("events", 0, 2), ("workflow_executions", 1, 1)],
-            }
-        }
-        "commit_scheduler_pass" => {
-            let (_, pass) = dispatch_pass(&b).await;
-            Call {
-                run: pass_call(b, pass),
-                lands: &[("events", 0, 1), ("work_items", 0, 1)],
+                lands,
             }
         }
         "reclaim_expired_leases_recorded" => {
             // Step 2 is an item of a finished run; 3 and 5 an item out of
-            // attempts; the rest an item that is retried.
-            let max_attempts = if matches!(step, 3 | 5) { 1 } else { 3 };
+            // attempts; the rest an item that is retried. The point before
+            // the commit takes both of the last two, one per path.
+            let exhausted = matches!(step, 3 | 5) || (at.last && at.path == 1);
+            let max_attempts = if exhausted { 1 } else { 3 };
             let (run, item) = claimed(&b, 0, max_attempts).await;
             fx.hooks.force_lease_expired(item.id).await;
             let (lands, retried, exhausted): (&'static [(&'static str, usize, usize)], _, _) =
-                match step {
-                    2 => {
+                match (step, exhausted) {
+                    (2, _) => {
                         cancel(&b, &run).await;
                         (&[("work_items", 1, 1)], 0, 0)
                     }
-                    3 | 5 => (
+                    (_, true) => (
                         &[
                             ("dead_letter_items", 0, 1),
                             ("events", 0, 1),
@@ -591,11 +634,13 @@ async fn prepare(fx: &Fixture, operation: &str, step: u32) -> Call {
 /// A worker's failure report, fenced, plain or with its events recorded.
 /// Step 2 of the recorded one is an item of a finished run; steps 2 and 3
 /// of the plain one, and 3 and 5 of the recorded one, an item out of
-/// attempts; the rest an item that is retried.
-async fn fail(b: &Arc<dyn StateBackend>, recorded: bool, step: u32) -> Call {
+/// attempts; the rest an item that is retried. The recorded one's point
+/// before its last commit takes both of the last two, one per path.
+async fn fail(b: &Arc<dyn StateBackend>, recorded: bool, at: At) -> Call {
+    let step = at.step;
     let finished = recorded && step == 2;
     let exhausted = if recorded {
-        matches!(step, 3 | 5)
+        matches!(step, 3 | 5) || (at.last && at.path == 1)
     } else {
         matches!(step, 2 | 3)
     };

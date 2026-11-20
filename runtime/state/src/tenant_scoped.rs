@@ -243,11 +243,11 @@ impl TenantScopedSqliteBackend {
                 let withdrawn =
                     withdraw_claimed_item(&mut tx, Some(&self.tenant_id.0), &id_str, lease_fence)
                         .await?;
-                fault_point!("sqlite_scoped.commit_turn", 2);
                 if !withdrawn {
                     tx.rollback().await.map_err(map_db_err)?;
                     return Err(StateBackendError::FenceLost(id_str));
                 }
+                fault_point!("sqlite_scoped.commit_turn", 2);
                 tx.commit().await.map_err(map_db_err)?;
                 return Ok(TurnCommit::ExecutionTerminal(status));
             }
@@ -490,6 +490,7 @@ impl TenantScopedSqliteBackend {
             fault_point!("sqlite_scoped.commit_turn", 10);
         }
 
+        fault_point!("sqlite_scoped.commit_turn", 11);
         tx.commit().await.map_err(map_db_err)?;
         Ok(TurnCommit::Committed(sequence))
     }
@@ -1776,11 +1777,11 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?
         .rows_affected();
-        fault_point!("sqlite_scoped.fail_work_item_fenced", 4);
         if rows == 0 {
             return Ok(None);
         }
 
+        fault_point!("sqlite_scoped.fail_work_item_fenced", 4);
         tx.commit().await.map_err(map_db_err)?;
         let mut retried = item;
         retried.attempt = new_attempt;
