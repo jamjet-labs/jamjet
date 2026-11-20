@@ -145,11 +145,18 @@ cd sdk/python
 uv run pytest
 ```
 
-### Integration tests (requires Postgres)
+### Postgres tests
+
+Some tests in `runtime/testkit` need a Postgres server. Each makes a database of its own and drops it when done. Without a server they skip and print how to start one:
 
 ```bash
-just test-integration
+docker pull postgres:16-alpine     # once; the script never pulls
+runtime/scripts/pg-test.sh up      # Postgres on 127.0.0.1:55440, prints the export line
+export JAMJET_TEST_POSTGRES_URL=postgres://postgres:jamjet-test@127.0.0.1:55440/postgres
+cd runtime && cargo test -p jamjet-testkit
 ```
+
+`pg-test.sh reset` drops the databases a crashed run left behind, and `pg-test.sh down` removes the container. CI sets `JAMJET_REQUIRE_POSTGRES_TESTS=1`, so a missing URL fails there instead of skipping.
 
 ### Specific test categories
 

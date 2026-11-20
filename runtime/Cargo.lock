@@ -1864,10 +1864,14 @@ name = "jamjet-testkit"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "jamjet-core",
  "jamjet-state",
+ "libsqlite3-sys",
  "serde_json",
+ "sqlx",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
