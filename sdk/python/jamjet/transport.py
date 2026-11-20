@@ -121,6 +121,19 @@ class OutcomeUnknown(RuntimeError):  # noqa: N818 - the name the SDK's callers m
         self.operation = operation
 
 
+class EngineFeatureMissing(RuntimeError):  # noqa: N818 - the name the SDK's callers match on
+    """The engine does not have a feature this call needs.
+
+    ``feature`` is the name an engine lists in ``/health``. ``engine_commit`` is
+    the commit it reported, when it reported one.
+    """
+
+    def __init__(self, feature: str, *, engine_commit: str | None = None) -> None:
+        super().__init__(f"This engine does not have {feature!r}. Run an engine that lists it in /health features.")
+        self.feature = feature
+        self.engine_commit = engine_commit
+
+
 def is_engine_error_body(response: httpx.Response) -> bool:
     """True when the body is the engine's own error: JSON, an object, with a string ``error``.
 

@@ -145,6 +145,8 @@ app.add_typer(mcp_app, name="mcp")
 app.add_typer(a2a_app, name="a2a")
 app.add_typer(eval_app, name="eval")
 app.add_typer(demo_app, name="demo")
+ops_app = typer.Typer(help="Operate an engine", no_args_is_help=True)
+app.add_typer(ops_app, name="ops")
 
 console = Console()
 
@@ -3269,6 +3271,75 @@ def approve(
         )
 
     asyncio.run(_approve())
+
+
+# ── ops ───────────────────────────────────────────────────────────────────────
+
+
+@ops_app.command("tick")
+def ops_tick(
+    runtime: str = typer.Option(LOCAL_RUNTIME_URL, "--runtime", "-r", help="Engine URL"),
+    google_id_token_audience: str | None = typer.Option(
+        None,
+        "--google-id-token-audience",
+        help="Send a Google ID token for this audience in X-Serverless-Authorization, for an engine "
+        "behind a platform that checks identity. Needs jamjet[google-auth].",
+    ),
+    budget_ms: int | None = typer.Option(None, "--budget-ms", help="Time budget for one tick; the engine checks it"),
+    until_complete: bool = typer.Option(False, "--until-complete", help="Tick again until the engine reports complete"),
+    max_calls: int = typer.Option(10, "--max-calls", min=1, help="Most ticks to send with --until-complete"),
+    as_json: bool = typer.Option(False, "--json", help="Print the last answer as JSON"),
+) -> None:
+    """Run one tick on an engine that has its background loops off.
+
+    The JamJet token comes from JAMJET_TOKEN and needs the operator role.
+    Exit 0 when a tick ran or another was running, 1 on an error, 2 when the
+    engine has no tick route.
+    """
+    import os
+
+    from jamjet.transport import EngineFeatureMissing
+
+    token = os.environ.get("JAMJET_TOKEN")
+    if not token:
+        console.print("Error: JAMJET_TOKEN is not set. A tick needs an operator token. Nothing was sent.", style="red")
+        raise typer.Exit(1)
+
+    async def _run() -> dict[str, Any]:
+        auth = None
+        if google_id_token_audience:
+            from jamjet.auth import GoogleIdTokenAuth
+
+            auth = GoogleIdTokenAuth(google_id_token_audience, origin=runtime)
+        last: dict[str, Any] = {}
+        calls = 0
+        async with JamjetClient(base_url=runtime, api_token=token, auth=auth) as c:
+            while calls < max_calls:
+                last = await c.tick(budget_ms=budget_ms)
+                calls += 1
+                if not until_complete or last.get("ran") is not True or last.get("complete") is True:
+                    break
+        return {**last, "calls": calls}
+
+    try:
+        result = asyncio.run(_run())
+    except EngineFeatureMissing as exc:
+        console.print(f"Error: {_safe(str(exc))}", style="red", markup=False, highlight=False, soft_wrap=True)
+        raise typer.Exit(2) from exc
+    except Exception as exc:  # noqa: BLE001 - one exit code for anything that went wrong
+        detail = getattr(exc, "detail", None) or str(exc) or type(exc).__name__
+        console.print("Error:", style="red", end=" ")
+        console.print(_safe(str(detail)), markup=False, highlight=False, soft_wrap=True)
+        raise typer.Exit(1) from exc
+
+    if as_json:
+        typer.echo(json.dumps(result))
+    elif result.get("ran") is False:
+        console.print(f"another tick is running ({_safe(str(result.get('reason', 'busy')))})", markup=False)
+    else:
+        state = "complete" if result.get("complete") else "stopped before complete"
+        limit = " at --max-calls" if until_complete and not result.get("complete") else ""
+        console.print(f"tick ran: {state}{limit}, {result['calls']} call(s)", markup=False)
 
 
 # ── audit ─────────────────────────────────────────────────────────────────────

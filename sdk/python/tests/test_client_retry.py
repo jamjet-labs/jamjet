@@ -57,6 +57,8 @@ SAFE = {
     "complete_work_item": True,
     "fail_work_item": True,
     "heartbeat_work_item": True,
+    "tick": True,
+    "engine_features": True,
     "post": False,
     "get": True,
 }

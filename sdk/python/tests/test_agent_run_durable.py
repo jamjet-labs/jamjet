@@ -109,6 +109,23 @@ def _patch_client(monkeypatch: pytest.MonkeyPatch, fake: _FakeDurableClient) -> 
     monkeypatch.setattr("jamjet.client.JamjetClient", lambda *a, **k: fake)
 
 
+async def test_run_durable_passes_auth_to_its_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    fake = _FakeDurableClient(_completed_execution())
+    seen: list[dict[str, Any]] = []
+
+    def factory(*args: Any, **kwargs: Any) -> _FakeDurableClient:
+        seen.append(kwargs)
+        return fake
+
+    monkeypatch.setattr("jamjet.client.JamjetClient", factory)
+    auth = httpx.BasicAuth("u", "p")
+    await _agent().run_durable("hi", auth=auth)
+    assert len(seen) == 1
+    assert seen[0]["auth"] is auth
+
+
 async def test_run_durable_extracts_final_answer(monkeypatch: pytest.MonkeyPatch) -> None:
     """run_durable returns an AgentResult whose final content is last_model_output."""
     fake = _FakeDurableClient(_completed_execution())

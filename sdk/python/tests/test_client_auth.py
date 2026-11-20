@@ -612,6 +612,8 @@ CALLS = [
         "/work-items/wi-1/heartbeat",
         {"worker_id": "wk-1", "lease_fence": 3},
     ),
+    Call("tick", lambda c: c.tick(budget_ms=5000), "POST", "/ops/tick", {"budget_ms": 5000}),
+    Call("engine_features", lambda c: c.engine_features(), "GET", "/health"),
     Call("post", lambda c: c.post("/custom/route", json={"k": "v"}), "POST", "/custom/route", {"k": "v"}),
     Call(
         "get",

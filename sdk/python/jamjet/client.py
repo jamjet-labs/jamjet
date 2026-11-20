@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from jamjet.transport import EngineAuth, RetryPolicy
+from jamjet.transport import EngineAuth, EngineFeatureMissing, RetryPolicy
 from jamjet.transport import JamjetAPIError as JamjetAPIError
 from jamjet.transport import body_is_replayable as _body_is_replayable
 from jamjet.transport import raise_for_status as _raise_for_status
@@ -74,6 +74,7 @@ class JamjetClient:
         if retry is not None and not isinstance(retry, RetryPolicy):
             raise TypeError("retry must be a RetryPolicy")
         self._retry = RetryPolicy() if retry is None else retry
+        self._health: dict[str, Any] | None = None
         self.base_url = base_url.rstrip("/")
         token = api_token or os.environ.get("JAMJET_TOKEN")
         self._auth = EngineAuth(self.base_url, token=token, auth=auth) if token or auth is not None else None
@@ -116,6 +117,39 @@ class JamjetClient:
 
     async def health(self) -> dict[str, Any]:
         r = await self._request("GET", "/health", safe=True, operation="health")
+        return r.json()
+
+    async def engine_features(self) -> frozenset[str]:
+        """The features the engine lists in ``/health``, read once per client.
+
+        An engine that lists none (an older build) gives an empty set.
+        """
+        if self._health is None:
+            self._health = await self.health()
+        listed = self._health.get("features") if isinstance(self._health, dict) else None
+        if not isinstance(listed, list):
+            return frozenset()
+        return frozenset(f for f in listed if isinstance(f, str))
+
+    # ── Request-driven mode ───────────────────────────────────────────────
+
+    async def tick(self, *, budget_ms: int | None = None) -> dict[str, Any]:
+        """Ask an engine with its loops off to do one round of background work.
+
+        ``POST /ops/tick`` needs the operator role. A tick that is already
+        running elsewhere answers ``{"ran": false, "reason": "busy", ...}``.
+        A repeated tick is harmless, so a lost answer is retried. Raises
+        ``EngineFeatureMissing("ops_tick")`` when the engine has no such route.
+        """
+        body: dict[str, Any] = {} if budget_ms is None else {"budget_ms": budget_ms}
+        try:
+            r = await self._request("POST", "/ops/tick", json=body, safe=True, operation="tick")
+        except JamjetAPIError as exc:
+            if exc.response.status_code == 404:
+                commit = (self._health or {}).get("commit")
+                engine_commit = commit if isinstance(commit, str) else None
+                raise EngineFeatureMissing("ops_tick", engine_commit=engine_commit) from exc
+            raise
         return r.json()
 
     # ── Workflows ─────────────────────────────────────────────────────────
