@@ -1938,4 +1938,93 @@ mod tests {
         let item = backend.get_work_item(id).await.unwrap().expect("item");
         assert!(item.worker_id.is_none(), "the zombie holds the item");
     }
+
+    /// A keyed start writes its run under `pass_lock`, as
+    /// `start_execution_atomic` does: while a scheduler pass holds the lock
+    /// the start writes neither the run nor the key, and it lands once the
+    /// lock is let go.
+    #[tokio::test]
+    async fn a_keyed_start_waits_for_the_pass_lock() {
+        let backend = std::sync::Arc::new(InMemoryBackend::new());
+        let id = ExecutionId::new();
+        let now = Utc::now();
+        let execution = WorkflowExecution {
+            execution_id: id.clone(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: serde_json::json!({}),
+            current_state: serde_json::json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        };
+        let started = EventKind::WorkflowStarted {
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            initial_input: serde_json::json!({}),
+            initiated_by: None,
+            run_key: None,
+        };
+        let scheduled = EventKind::NodeScheduled {
+            node_id: "a".into(),
+            queue_type: "general".into(),
+        };
+        let item = WorkItem {
+            id: Uuid::new_v4(),
+            execution_id: id.clone(),
+            node_id: "a".into(),
+            queue_type: "general".into(),
+            payload: serde_json::json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: crate::DEFAULT_TENANT.into(),
+        };
+        let key = crate::backend::RunKeyClaim {
+            run_key: "job:1".into(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            input_hash: "h".into(),
+            replaces: None,
+        };
+
+        let pass = backend.pass_lock.lock().await;
+        let start = tokio::spawn({
+            let backend = backend.clone();
+            async move {
+                backend
+                    .start_execution_keyed(execution, started, scheduled, item, key)
+                    .await
+            }
+        });
+        // The test runtime has one thread: each yield lets the start run
+        // until it waits. With no wait for the lock it would finish on its
+        // first turn.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!start.is_finished(), "the keyed start ran inside a pass");
+        assert!(backend.executions.get(&id).is_none(), "the run was written");
+        assert!(backend.run_keys.is_empty(), "the key was claimed");
+
+        drop(pass);
+        let out = start.await.unwrap().unwrap();
+        assert_eq!(out, crate::backend::KeyedStart::Started);
+        assert!(backend.executions.get(&id).is_some());
+        assert_eq!(
+            backend
+                .get_run_key("job:1")
+                .await
+                .unwrap()
+                .map(|r| r.execution_id),
+            Some(id)
+        );
+    }
 }

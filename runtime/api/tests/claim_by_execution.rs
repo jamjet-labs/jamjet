@@ -2937,6 +2937,82 @@ async fn a_hand_enqueued_python_fn_item_is_marked_from_the_ir() {
     );
 }
 
+/// `POST /work-items` writes through the scheduler's pass and still marks
+/// the item: a `python_fn` item claimable only by its run is stored marked,
+/// a second hand enqueue of the node while that item is live is 409 and adds
+/// nothing, and a hand enqueue on a finished run is 409 too.
+#[tokio::test]
+async fn a_hand_enqueue_is_marked_and_refused_while_the_node_has_a_live_item() {
+    for (name, backend, path) in backends().await {
+        let state = make_state(backend.clone());
+        register(&state, None, py_ir("wf-py-twice", Some("by_execution"))).await;
+        let e = start(&state, None, "wf-py-twice").await;
+        // Take the start item out of the way.
+        let (_, body) = py_claim(&state, None, "w", json!({ "execution_id": e })).await;
+        assert_eq!(body["claimed"], true, "{name}: {body}");
+        let hand = json!({
+            "execution_id": e, "node_id": "second", "queue_type": PY_QUEUE,
+            "payload": { "module": "myapp.tools", "function": "second" }
+        });
+        let (st, body) = send(&state, "POST", "/work-items", None, hand.clone()).await;
+        assert_eq!(st, 201, "{name}: {body}");
+        let id = uuid::Uuid::parse_str(body["work_item_id"].as_str().unwrap()).unwrap();
+
+        let (st, body) = send(&state, "POST", "/work-items", None, hand.clone()).await;
+        assert_eq!(
+            (st, body),
+            (
+                409,
+                json!({ "error": "node already has a pending or claimed item" })
+            ),
+            "{name}"
+        );
+        let scheduled = count(
+            &event_kinds(&backend, &e).await,
+            |k| matches!(k, EventKind::NodeScheduled { node_id, .. } if node_id == "second"),
+        );
+        assert_eq!(scheduled, 1, "{name}: the refused enqueue logged nothing");
+        let item = backend.get_work_item(id).await.unwrap().unwrap();
+        assert_eq!(
+            item.payload["claim"], "by_execution",
+            "{name}: {:?}",
+            item.payload
+        );
+        let (_, body) = py_claim(&state, None, "oldest-first", json!({})).await;
+        assert_eq!(body, json!({ "claimed": false }), "{name}");
+        let (_, body) = py_claim(
+            &state,
+            None,
+            "w",
+            json!({ "execution_id": e, "node_id": "second" }),
+        )
+        .await;
+        assert_eq!(body["work_item"]["id"], id.to_string(), "{name}: {body}");
+        assert_eq!(
+            body["work_item"]["payload"]["claim"], "by_execution",
+            "{name}: {body}"
+        );
+
+        // Ended, the run takes no new item for a node, marked or not.
+        let (st, body) = send(
+            &state,
+            "POST",
+            &format!("/executions/{e}/cancel"),
+            None,
+            json!({}),
+        )
+        .await;
+        assert!((200..300).contains(&st), "{name}: cancel {st} {body}");
+        let (st, body) = send(&state, "POST", "/work-items", None, hand).await;
+        assert_eq!(
+            (st, body),
+            (409, json!({ "error": "execution is Cancelled" })),
+            "{name}"
+        );
+        cleanup(path);
+    }
+}
+
 /// Claimed by its run, an agent's dispatch node still has each tool call it
 /// carries checked: a blocked call is refused, an allowed one handed out.
 #[tokio::test]

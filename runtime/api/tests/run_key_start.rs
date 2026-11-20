@@ -1272,7 +1272,13 @@ async fn lookup_by_key_returns_the_run_or_nothing() {
 
         // A key is a lookup, not one more filter: nothing beside it is
         // silently ignored.
-        for other in ["status=running", "limit=10", "offset=0"] {
+        for other in [
+            "status=running",
+            "limit=10",
+            "offset=0",
+            "waiting_for=worker",
+            "after=x",
+        ] {
             let (st, body) =
                 support::get(&state, &format!("/executions?run_key=find%3A2&{other}")).await;
             assert_refused(
