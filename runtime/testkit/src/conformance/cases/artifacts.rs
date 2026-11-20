@@ -48,7 +48,7 @@ pub async fn put_same_bytes_twice_dedupes(fx: &Fixture) {
     // Same hash returned both times.
     assert_eq!(ref1.hash, ref2.hash);
 
-    // Only one row in the table — verify via a raw count.
+    // Only one row in the table: verify via a raw count.
     let rows = fx.hooks.artifact_rows(&ref1.hash, None).await;
     assert_eq!(rows, 1, "expected exactly one row after two identical puts");
 }
@@ -62,7 +62,7 @@ pub async fn get_missing_hash_returns_none(fx: &Fixture) {
     assert_eq!(result, None);
 }
 
-// ── Tenant views — isolation + per-tenant dedupe ─────────────────────────────
+// ── Tenant views: isolation + per-tenant dedupe ──────────────────────────────
 
 pub async fn tenant_scoped_isolation_a_cannot_read_b_artifact(fx: &Fixture) {
     let (Some(backend_a), Some(backend_b)) = (
@@ -123,7 +123,7 @@ pub async fn tenant_scoped_put_dedupes_within_same_tenant(fx: &Fixture) {
 
 // ── resolve_value ────────────────────────────────────────────────────────────
 
-/// Finding 1 — a non-conforming `$artifact` object must be returned UNCHANGED
+/// Finding 1: a non-conforming `$artifact` object must be returned UNCHANGED
 /// by `resolve_value`, NOT treated as `unresolved` or yielding a NotFound error.
 /// This covers the case where a model emits an object with a `$artifact` key
 /// that does not satisfy the strict-shape check (missing size, short hash, etc.).
@@ -138,7 +138,7 @@ pub async fn resolve_value_non_conforming_artifact_key_returns_unchanged(fx: &Fi
         "non-conforming $artifact must pass through unchanged"
     );
 
-    // Object with $artifact key but no size — also non-conforming.
+    // Object with $artifact key but no size: also non-conforming.
     let v2 = json!({"$artifact": {"not": "a ref"}});
     let result2 = resolve_value(&v2, backend).await.unwrap();
     assert_eq!(
@@ -146,7 +146,7 @@ pub async fn resolve_value_non_conforming_artifact_key_returns_unchanged(fx: &Fi
         "missing-fields $artifact must pass through unchanged"
     );
 
-    // Plain string inside $artifact — non-conforming.
+    // Plain string inside $artifact: non-conforming.
     let v3 = json!({"$artifact": "just a string"});
     let result3 = resolve_value(&v3, backend).await.unwrap();
     assert_eq!(
@@ -228,7 +228,7 @@ pub async fn resolve_value_walks_object_one_level(fx: &Fixture) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Task 2i-4 — new coverage only; does NOT duplicate any 2i-1/2/3 tests.
+// Task 2i-4: new coverage only; does NOT duplicate any 2i-1/2/3 tests.
 //
 // Not re-tested here (already covered):
 //   - put/get basics + basic 2-put dedupe (2i-1: put_*/get_*)
@@ -242,7 +242,7 @@ pub async fn resolve_value_walks_object_one_level(fx: &Fixture) {
 //   - worker spill path (2i-2: worker.rs)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// == Group A: Round-trip fidelity — four value shapes =========================
+// == Group A: Round-trip fidelity, four value shapes ==========================
 //
 // Each shape is exercised through the full chain:
 //   spill_bytes → put_artifact → to_sentinel → resolve_value → original value
@@ -362,7 +362,7 @@ pub async fn round_trip_unicode_and_special_chars_above_threshold(fx: &Fixture) 
 pub async fn dedupe_at_scale_fifty_kb_blob_put_ten_times(fx: &Fixture) {
     let db = fx.backend.as_ref();
 
-    // 50 KB of repeating bytes — realistic large model-output size.
+    // 50 KB of repeating bytes: realistic large model-output size.
     let blob: Vec<u8> = (0u8..=255).cycle().take(50 * 1024).collect();
     let mut reference_hash = String::new();
 
@@ -381,7 +381,7 @@ pub async fn dedupe_at_scale_fifty_kb_blob_put_ten_times(fx: &Fixture) {
         }
     }
 
-    // Exactly one row — INSERT OR IGNORE deduped all subsequent writes.
+    // Exactly one row: INSERT OR IGNORE deduped all subsequent writes.
     let rows = fx.hooks.artifact_rows(&reference_hash, None).await;
     assert_eq!(
         rows, 1,
@@ -409,7 +409,7 @@ pub async fn dedupe_two_distinct_blobs_produce_two_rows_and_different_hashes(fx:
     assert_eq!(rows, 2, "two distinct blobs must occupy two separate rows");
 }
 
-// == Group D: Tenant isolation hard case — resolve_value cross-tenant =========
+// == Group D: Tenant isolation hard case, resolve_value cross-tenant ==========
 //
 // 2i-1 tested get_artifact isolation. 2i-4 adds the resolve_value path:
 // tenant-B resolving tenant-A's sentinel must fail (no cross-tenant read).
@@ -493,7 +493,7 @@ pub async fn tenant_scoped_dangling_ref_returns_error_no_panic(fx: &Fixture) {
 //
 // put_artifact is INSERT OR IGNORE on (tenant_id, hash): a second put of the
 // SAME bytes with a DIFFERENT media_type keeps the original row, so the
-// returned ArtifactRef must carry the FIRST (stored) media_type — never the
+// returned ArtifactRef must carry the FIRST (stored) media_type, never the
 // new request's value that was never persisted. Covers all three backends.
 
 pub async fn deduped_put_returns_stored_media_type(fx: &Fixture) {
@@ -517,7 +517,7 @@ pub async fn deduped_put_returns_stored_media_type(fx: &Fixture) {
 }
 
 /// First store with NO media_type, then re-put the same bytes WITH one: the
-/// stored value (NULL) wins, so the returned ref must be None — exercises the
+/// stored value (NULL) wins, so the returned ref must be None. It exercises the
 /// nullable read-back path.
 pub async fn deduped_put_returns_stored_null_media_type(fx: &Fixture) {
     let db = fx.backend.as_ref();

@@ -442,7 +442,7 @@ pub async fn only_one_worker_can_claim_an_idempotency_key(fx: &Fixture) {
     match second {
         ReserveOutcome::Held { owner, .. } => assert_eq!(owner, "worker-A"),
         ReserveOutcome::Acquired => {
-            panic!("two workers acquired the same key — the effect will fire twice")
+            panic!("two workers acquired the same key: the effect will fire twice")
         }
     }
 }
@@ -506,7 +506,7 @@ pub async fn a_reservation_is_renewed_only_by_the_attempt_that_holds_it(fx: &Fix
 }
 
 /// An EXPIRED reservation must be takeable, or a worker that dies mid-tool
-/// leaves the key unrunnable forever — a worse failure than the double-fire the
+/// leaves the key unrunnable forever, a worse failure than the double-fire the
 /// reservation replaced.
 pub async fn an_expired_reservation_can_be_taken_over(fx: &Fixture) {
     let db = fx.backend.as_ref();
@@ -560,7 +560,7 @@ pub async fn an_expired_reservation_can_be_taken_over(fx: &Fixture) {
     ));
 }
 
-/// Different keys never contend — the reservation is per idempotency key, not a
+/// Different keys never contend: the reservation is per idempotency key, not a
 /// global lock on the node or the execution.
 pub async fn distinct_keys_do_not_contend(fx: &Fixture) {
     let db = fx.backend.as_ref();
@@ -650,7 +650,7 @@ pub async fn releasing_a_reservation_frees_it_immediately(fx: &Fixture) {
 }
 
 /// Only the holder may release. A worker whose lease was stolen must not be able
-/// to free the key for the worker that took over — that would hand a live
+/// to free the key for the worker that took over. That would hand a live
 /// reservation to a third party.
 pub async fn a_non_holder_cannot_release_someone_elses_reservation(fx: &Fixture) {
     let db = fx.backend.as_ref();
@@ -673,7 +673,7 @@ pub async fn a_non_holder_cannot_release_someone_elses_reservation(fx: &Fixture)
                 .unwrap(),
             ReserveOutcome::Held { .. }
         ),
-        "a non-holder's release must be a no-op — A still owns this key"
+        "a non-holder's release must be a no-op: A still owns this key"
     );
 }
 
@@ -683,7 +683,7 @@ pub async fn a_non_holder_cannot_release_someone_elses_reservation(fx: &Fixture)
 ///
 /// `step` is a component of a PERSISTED identity. A count that is off by one, or
 /// that silently returns 0 because the JSON predicate stopped matching the serde
-/// representation, changes every idempotency key ever derived — which orphans
+/// representation, changes every idempotency key ever derived, which orphans
 /// every recorded effect and re-fires every in-flight tool. Nothing else in the
 /// system would report that; the keys would simply stop matching.
 ///
@@ -775,7 +775,7 @@ async fn check_count_parity(backend: &dyn StateBackend) {
             .unwrap();
         assert_eq!(
             counted, scanned,
-            "SQL count disagreed with the scan for {node:?} — every idempotency key \
+            "SQL count disagreed with the scan for {node:?}: every idempotency key \
              derived from this execution would change"
         );
     }

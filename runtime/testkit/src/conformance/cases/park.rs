@@ -300,7 +300,7 @@ pub async fn park_past_retry_after_is_immediately_claimable(fx: &Fixture) {
         .expect("item must be claimable");
     let fence = claimed.lease_fence;
 
-    // Park with a timestamp in the PAST — item should be visible on the next claim.
+    // Park with a timestamp in the PAST: item should be visible on the next claim.
     let parked = db
         .park_work_item(item_id, fence, &past_retry_after(), 1)
         .await

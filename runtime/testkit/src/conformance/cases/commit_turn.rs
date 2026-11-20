@@ -775,7 +775,7 @@ pub async fn concurrent_sibling_commits_no_write_skew(fx: &Fixture) {
         .await
         .expect("B commit must succeed");
 
-    // The final snapshot must contain BOTH patches — no write-skew.
+    // The final snapshot must contain BOTH patches: no write-skew.
     let snap = db
         .latest_snapshot(&exec_id)
         .await
@@ -808,7 +808,7 @@ pub async fn concurrent_sibling_commits_no_write_skew(fx: &Fixture) {
 /// one handle of the store. A `Barrier` forces both tasks to reach
 /// the commit point before either proceeds, maximising BEGIN IMMEDIATE
 /// contention. Both commits must succeed (busy_timeout serialises them), and
-/// the final snapshot must contain BOTH patches — proving the in-tx snapshot
+/// the final snapshot must contain BOTH patches, proving the in-tx snapshot
 /// computation closes the write-skew even under real concurrent writers.
 pub async fn concurrent_sibling_commits_race(fx: &Fixture) {
     let db = fx.backend.clone();
@@ -948,7 +948,7 @@ pub async fn concurrent_sibling_commits_race(fx: &Fixture) {
     );
 
     // Latest snapshot (written by whichever task committed second) must also
-    // contain both patches — this is the write-skew invariant.
+    // contain both patches. This is the write-skew invariant.
     let snap = db
         .latest_snapshot(&exec_id)
         .await

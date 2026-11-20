@@ -74,7 +74,7 @@ pub async fn test_state_machine_transitions(fx: &Fixture) {
     }
 }
 
-/// F.4 — Crash recovery: write events, stop using the handle (simulating a crash),
+/// F.4. Crash recovery: write events, stop using the handle (simulating a crash),
 /// open the store again, reload from events, verify state is intact.
 pub async fn test_crash_recovery_from_event_log(fx: &Fixture) {
     if not_on(fx, &[StoreKind::Memory], NO_RESTART) {
