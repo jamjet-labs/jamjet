@@ -2,11 +2,10 @@
 //! reach every running run. Checked on each backend that implements it (the
 //! trait default, which the test doubles use, is not covered here).
 
+use crate::conformance::cases::support::{not_on, skipped};
+use crate::conformance::{Fixture, StoreKind};
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
-use jamjet_state::backend::StateBackend;
-use jamjet_state::tenant::TenantId;
-use jamjet_state::{InMemoryBackend, SqliteBackend};
 
 fn execution(status: WorkflowStatus) -> WorkflowExecution {
     let now = Utc::now();
@@ -27,7 +26,8 @@ fn execution(status: WorkflowStatus) -> WorkflowExecution {
 }
 
 /// 7 running and 2 completed runs; walk pages of 3 and collect the ids.
-async fn walk(backend: &dyn StateBackend) {
+pub async fn pages_every_running_run(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let mut running: Vec<String> = Vec::new();
     for _ in 0..7 {
         let e = execution(WorkflowStatus::Running);
@@ -67,41 +67,25 @@ async fn walk(backend: &dyn StateBackend) {
     assert_eq!(pages, 4);
 }
 
-#[tokio::test]
-async fn sqlite_pages_every_running_run() {
-    let b = SqliteBackend::open("sqlite::memory:").await.unwrap();
-    walk(&b).await;
-}
-
-#[tokio::test]
-async fn tenant_scoped_sqlite_pages_every_running_run() {
-    let b = SqliteBackend::open("sqlite::memory:").await.unwrap();
-    walk(&b.for_tenant(TenantId::from("default"))).await;
-}
-
-#[tokio::test]
-async fn memory_pages_every_running_run() {
-    walk(&InMemoryBackend::new()).await;
-}
-
 /// A running row that does not parse is skipped, and the rows after it are
 /// still reached. The page used to fail as a whole, so one bad row stopped
 /// the scheduler's walk at it on every tick.
-#[tokio::test]
-async fn an_unreadable_row_does_not_hide_the_rows_after_it() {
-    let b = SqliteBackend::open("sqlite::memory:").await.unwrap();
-    let mut ids: Vec<String> = Vec::new();
+pub async fn an_unreadable_row_does_not_hide_the_rows_after_it(fx: &Fixture) {
+    if not_on(fx, &[StoreKind::Memory], "memory holds no unreadable row") {
+        return;
+    }
+    let b = fx.backend.as_ref();
+    let mut ids: Vec<ExecutionId> = Vec::new();
     for _ in 0..3 {
         let e = execution(WorkflowStatus::Running);
-        ids.push(e.execution_id.0.to_string());
+        ids.push(e.execution_id.clone());
         b.create_execution(e).await.unwrap();
     }
-    ids.sort();
-    sqlx::query("UPDATE workflow_executions SET started_at = 'not a time' WHERE execution_id = ?")
-        .bind(&ids[1])
-        .execute(&b.pool())
-        .await
-        .unwrap();
+    ids.sort_by_key(|id| id.0.to_string());
+    if !fx.hooks.make_execution_unreadable(&ids[1]).await {
+        return skipped(fx, "the store cannot hold an unreadable run row");
+    }
+    let ids: Vec<String> = ids.iter().map(|id| id.0.to_string()).collect();
 
     let mut seen: Vec<String> = Vec::new();
     let mut after: Option<String> = None;

@@ -1,12 +1,15 @@
-//! Integration tests for InMemoryBackend.
+//! The trait-level tests first written for `InMemoryBackend`: workflow and
+//! run records, the event log, snapshots, the queue and fenced settles,
+//! array patches and tokens.
 
+use crate::conformance::{Fixture, StoreKind};
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::{
-    backend::{StateBackend, WorkflowDefinition},
+    backend::WorkflowDefinition,
     event::{Event, EventKind},
     snapshot::Snapshot,
-    InMemoryBackend, WorkItem,
+    WorkItem,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -29,9 +32,8 @@ fn sample_execution(id: &ExecutionId) -> WorkflowExecution {
     }
 }
 
-#[tokio::test]
-async fn test_workflow_crud() {
-    let backend = InMemoryBackend::new();
+pub async fn test_workflow_crud(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let def = WorkflowDefinition {
         workflow_id: "wf-1".into(),
         version: "1.0.0".into(),
@@ -50,9 +52,8 @@ async fn test_workflow_crud() {
         .is_none());
 }
 
-#[tokio::test]
-async fn test_execution_lifecycle() {
-    let backend = InMemoryBackend::new();
+pub async fn test_execution_lifecycle(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let id = ExecutionId::new();
     backend
         .create_execution(sample_execution(&id))
@@ -68,9 +69,8 @@ async fn test_execution_lifecycle() {
     assert_eq!(exec.status, WorkflowStatus::Completed);
 }
 
-#[tokio::test]
-async fn test_list_executions_with_filter() {
-    let backend = InMemoryBackend::new();
+pub async fn test_list_executions_with_filter(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     for _ in 0..3 {
         backend
             .create_execution(sample_execution(&ExecutionId::new()))
@@ -95,10 +95,14 @@ async fn test_list_executions_with_filter() {
     assert_eq!(page2.len(), 1);
 }
 
-#[tokio::test]
-async fn test_event_log() {
-    let backend = InMemoryBackend::new();
+pub async fn test_event_log(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let exec_id = ExecutionId::new();
+    // The SQL stores refuse rows of a run they do not have.
+    backend
+        .create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
 
     let e1 = Event::new(
         exec_id.clone(),
@@ -135,10 +139,14 @@ async fn test_event_log() {
     assert_eq!(latest, seq2);
 }
 
-#[tokio::test]
-async fn test_snapshots() {
-    let backend = InMemoryBackend::new();
+pub async fn test_snapshots(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let exec_id = ExecutionId::new();
+    // The SQL stores refuse rows of a run they do not have.
+    backend
+        .create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
     assert!(backend.latest_snapshot(&exec_id).await.unwrap().is_none());
     let snap = Snapshot::new(exec_id.clone(), 5, json!({"state": "checkpoint"}));
     backend.write_snapshot(snap).await.unwrap();
@@ -146,10 +154,14 @@ async fn test_snapshots() {
     assert_eq!(latest.at_sequence, 5);
 }
 
-#[tokio::test]
-async fn test_work_queue() {
-    let backend = InMemoryBackend::new();
+pub async fn test_work_queue(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let exec_id = ExecutionId::new();
+    // The SQL stores refuse rows of a run they do not have.
+    backend
+        .create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
     let item = WorkItem {
         id: Uuid::new_v4(),
         execution_id: exec_id.clone(),
@@ -181,10 +193,14 @@ async fn test_work_queue() {
     backend.complete_work_item(item_id).await.unwrap();
 }
 
-#[tokio::test]
-async fn test_complete_work_item_fenced() {
-    let backend = InMemoryBackend::new();
+pub async fn test_complete_work_item_fenced(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let exec_id = ExecutionId::new();
+    // The SQL stores refuse rows of a run they do not have.
+    backend
+        .create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
     let item = WorkItem {
         id: Uuid::new_v4(),
         execution_id: exec_id,
@@ -245,10 +261,14 @@ fn pending_item(exec_id: &ExecutionId) -> WorkItem {
 /// Reclaim fail-open: after `reclaim_expired_leases` hands a claimed item back
 /// to the queue it clears `worker_id` but LEAVES `lease_fence` set. A zombie
 /// worker presenting that now-stale fence must NOT settle the item.
-#[tokio::test]
-async fn fenced_complete_rejects_stale_fence_after_reclaim() {
-    let backend = InMemoryBackend::new();
+pub async fn fenced_complete_rejects_stale_fence_after_reclaim(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let exec_id = ExecutionId::new();
+    // The SQL stores refuse rows of a run they do not have.
+    backend
+        .create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
     let item_id = backend
         .enqueue_work_item(pending_item(&exec_id))
         .await
@@ -263,7 +283,7 @@ async fn fenced_complete_rejects_stale_fence_after_reclaim() {
 
     // Force the lease to expire and run the REAL reclaim sweep (the same path
     // the scheduler drives). It clears worker_id but leaves lease_fence = F1.
-    backend.force_lease_expired_for_test(item_id);
+    fx.hooks.force_lease_expired(item_id).await;
     let reclaimed = backend.reclaim_expired_leases().await.unwrap();
     assert_eq!(
         reclaimed.retryable.len(),
@@ -283,23 +303,38 @@ async fn fenced_complete_rejects_stale_fence_after_reclaim() {
     );
 
     // The item must survive the rejected settle and remain re-claimable.
-    assert!(
-        backend
-            .claim_work_item("w2", &["default"])
-            .await
-            .unwrap()
-            .is_some(),
-        "the item must still be claimable after the stale-fence settle was rejected"
+    // Asserted on the row: the SQL stores hold a reclaimed item back for its
+    // retry backoff, so a claim now would test the backoff. Memory has no
+    // backoff filter, so there the claim takes it at once.
+    let row = fx.hooks.item_row(item_id).await;
+    assert_eq!(
+        row.map(|r| r.status).as_deref(),
+        Some("pending"),
+        "the item must survive the stale-fence settle"
     );
+    if fx.kind == StoreKind::Memory {
+        assert!(
+            backend
+                .claim_work_item("w2", &["default"])
+                .await
+                .unwrap()
+                .is_some(),
+            "the item must still be claimable after the stale-fence settle was rejected"
+        );
+    }
 }
 
 /// Forged-fence-0 fail-open: a never-claimed pending item carries
 /// `lease_fence == 0`. A forged `lease_fence: 0` (the value an attacker can put
 /// on the HTTP complete request) must NOT settle it.
-#[tokio::test]
-async fn fenced_complete_rejects_forged_fence_zero_on_pending_item() {
-    let backend = InMemoryBackend::new();
+pub async fn fenced_complete_rejects_forged_fence_zero_on_pending_item(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let exec_id = ExecutionId::new();
+    // The SQL stores refuse rows of a run they do not have.
+    backend
+        .create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
     let item_id = backend
         .enqueue_work_item(pending_item(&exec_id))
         .await
@@ -324,10 +359,14 @@ async fn fenced_complete_rejects_forged_fence_zero_on_pending_item() {
 
 /// Happy path: a currently-claimed item settled with its matching fence returns
 /// true (the worker_id-is-some guard must not block the legitimate holder).
-#[tokio::test]
-async fn fenced_complete_settles_claimed_item_with_matching_fence() {
-    let backend = InMemoryBackend::new();
+pub async fn fenced_complete_settles_claimed_item_with_matching_fence(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let exec_id = ExecutionId::new();
+    // The SQL stores refuse rows of a run they do not have.
+    backend
+        .create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
     let item_id = backend
         .enqueue_work_item(pending_item(&exec_id))
         .await
@@ -351,13 +390,17 @@ async fn fenced_complete_settles_claimed_item_with_matching_fence() {
 /// uses DashMap's `remove_if`, so the claimed+fence-match check and the delete are
 /// one atomic step — the get-then-remove TOCTOU where two racers both observe the
 /// item and both remove it (double-settle) cannot happen.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fenced_complete_is_atomic_under_concurrency() {
+pub async fn fenced_complete_is_atomic_under_concurrency(fx: &Fixture) {
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
-    let backend = Arc::new(InMemoryBackend::new());
+    let backend = fx.backend.clone();
     let exec_id = ExecutionId::new();
+    // The SQL stores refuse rows of a run they do not have.
+    backend
+        .create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
     let item_id = backend
         .enqueue_work_item(pending_item(&exec_id))
         .await
@@ -399,9 +442,8 @@ async fn fenced_complete_is_atomic_under_concurrency() {
     );
 }
 
-#[tokio::test]
-async fn test_patch_append_array() {
-    let backend = InMemoryBackend::new();
+pub async fn test_patch_append_array(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let id = ExecutionId::new();
     backend
         .create_execution(sample_execution(&id))
@@ -422,9 +464,8 @@ async fn test_patch_append_array() {
     assert_eq!(results[1], json!("second"));
 }
 
-#[tokio::test]
-async fn test_api_tokens() {
-    let backend = InMemoryBackend::new();
+pub async fn test_api_tokens(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
     let (plaintext, token) = backend.create_token("test-token", "admin").await.unwrap();
     assert!(plaintext.starts_with("jj_"));
     assert_eq!(token.name, "test-token");

@@ -49,6 +49,29 @@ pub trait StoreHooks: Send + Sync {
     /// A new handle on the same store through a new pool, as after a
     /// restart, scoped like the fixture's backend. `None` for memory.
     async fn reopen(&self) -> Option<Arc<dyn StateBackend>>;
+    /// The same store with no tenant scope, on the fixture's first pool, as
+    /// the engine's scheduler holds it. On memory, the backend itself.
+    fn unscoped(&self) -> Arc<dyn StateBackend>;
+    /// The tenant on the item's dead-letter row, if it has one.
+    async fn dead_letter_tenant(&self, item: WorkItemId) -> Option<String>;
+    /// The hash stored for the token. `None` where the store keeps no hash
+    /// (memory) or there is no such token.
+    async fn stored_token_hash(&self, token_id: &str) -> Option<String>;
+    /// Write a token row by its hash, in the default tenant, as an earlier
+    /// build did. `false` where the store keeps no hash (memory).
+    async fn insert_token_row(&self, id: &str, token_hash: &str, name: &str, role: &str) -> bool;
+    /// Write an event of the run whose kind is `kind_json` as stored text,
+    /// as a later release might. `false` where the store keeps parsed
+    /// events (memory).
+    async fn insert_event_json(
+        &self,
+        execution: &ExecutionId,
+        sequence: i64,
+        kind_json: &str,
+    ) -> bool;
+    /// Damage the run's row so it no longer reads back. `false` where the
+    /// store cannot hold such a row (memory).
+    async fn make_execution_unreadable(&self, execution: &ExecutionId) -> bool;
 }
 
 /// Hooks on an [`InMemoryBackend`].
@@ -134,6 +157,42 @@ impl StoreHooks for MemoryHooks {
 
     async fn reopen(&self) -> Option<Arc<dyn StateBackend>> {
         None
+    }
+
+    fn unscoped(&self) -> Arc<dyn StateBackend> {
+        self.0.clone()
+    }
+
+    async fn dead_letter_tenant(&self, item: WorkItemId) -> Option<String> {
+        self.0.dead_letter_item_for_test(item).map(|w| w.tenant_id)
+    }
+
+    async fn stored_token_hash(&self, _token_id: &str) -> Option<String> {
+        // Memory keys tokens by their plaintext.
+        None
+    }
+
+    async fn insert_token_row(
+        &self,
+        _id: &str,
+        _token_hash: &str,
+        _name: &str,
+        _role: &str,
+    ) -> bool {
+        false
+    }
+
+    async fn insert_event_json(
+        &self,
+        _execution: &ExecutionId,
+        _sequence: i64,
+        _kind_json: &str,
+    ) -> bool {
+        false
+    }
+
+    async fn make_execution_unreadable(&self, _execution: &ExecutionId) -> bool {
+        false
     }
 }
 
@@ -256,6 +315,71 @@ impl StoreHooks for SqliteHooks {
             Some(tenant) => Arc::new(again.for_tenant(tenant.clone())),
             None => Arc::new(again),
         })
+    }
+
+    fn unscoped(&self) -> Arc<dyn StateBackend> {
+        self.base.clone()
+    }
+
+    async fn dead_letter_tenant(&self, item: WorkItemId) -> Option<String> {
+        sqlx::query_scalar("SELECT tenant_id FROM dead_letter_items WHERE id = ?")
+            .bind(item.to_string())
+            .fetch_optional(&self.base.pool())
+            .await
+            .unwrap_or_else(|e| panic!("read the dead letter of {item}: {e}"))
+    }
+
+    async fn stored_token_hash(&self, token_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT token_hash FROM api_tokens WHERE id = ?")
+            .bind(token_id)
+            .fetch_optional(&self.base.pool())
+            .await
+            .unwrap_or_else(|e| panic!("read token {token_id}: {e}"))
+    }
+
+    async fn insert_token_row(&self, id: &str, token_hash: &str, name: &str, role: &str) -> bool {
+        // The columns an earlier build wrote; the tenant takes its default.
+        let query = sqlx::query(
+            "INSERT INTO api_tokens (id, token_hash, name, role, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(token_hash)
+        .bind(name)
+        .bind(role)
+        .bind(Utc::now().to_rfc3339());
+        self.update_one(&format!("insert token {id}"), query).await;
+        true
+    }
+
+    async fn insert_event_json(
+        &self,
+        execution: &ExecutionId,
+        sequence: i64,
+        kind_json: &str,
+    ) -> bool {
+        let query = sqlx::query(
+            "INSERT INTO events (id, execution_id, sequence, kind_json, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(execution.0.to_string())
+        .bind(sequence)
+        .bind(kind_json)
+        .bind(Utc::now().to_rfc3339());
+        self.update_one(&format!("insert event {sequence} of {execution}"), query)
+            .await;
+        true
+    }
+
+    async fn make_execution_unreadable(&self, execution: &ExecutionId) -> bool {
+        let query = sqlx::query(
+            "UPDATE workflow_executions SET started_at = 'not a time' WHERE execution_id = ?",
+        )
+        .bind(execution.0.to_string());
+        self.update_one(&format!("damage run {execution}"), query)
+            .await;
+        true
     }
 }
 

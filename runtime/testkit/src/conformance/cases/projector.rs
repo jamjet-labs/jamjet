@@ -1,4 +1,4 @@
-//! TDD tests for the async read-model projector (Task 2h-1).
+//! The async read-model projector's backend side.
 //!
 //! Covers:
 //! (a) apply_approval_projection then read-back: row present, checkpoint advanced.
@@ -6,21 +6,12 @@
 //!     row, checkpoint advances.
 //! (c) get_projector_checkpoint for an unseen execution returns 0.
 //!
-//! Run on SQLite, in-memory, and tenant-scoped backends.
-//!
-//! Written RED (trait stubs only, no impls) before the implementations existed;
-//! turned GREEN after adding the three backend methods.
+//! The scoped stores run these in a tenant other than the default.
 
+use crate::conformance::cases::support::{in_tenant, tenant_view, without_tenant_views};
+use crate::conformance::Fixture;
 use jamjet_core::workflow::ExecutionId;
-use jamjet_state::{backend::StateBackend, ApprovalProjectionRow, InMemoryBackend, SqliteBackend};
-
-// ── Shared helpers ────────────────────────────────────────────────────────────
-
-async fn open_sqlite() -> SqliteBackend {
-    SqliteBackend::open("sqlite::memory:")
-        .await
-        .expect("failed to open in-memory SQLite for projector tests")
-}
+use jamjet_state::ApprovalProjectionRow;
 
 fn granted_row(execution_id: ExecutionId) -> ApprovalProjectionRow {
     ApprovalProjectionRow {
@@ -36,11 +27,10 @@ fn granted_row(execution_id: ExecutionId) -> ApprovalProjectionRow {
     }
 }
 
-// ── Generic test body (runs against any StateBackend) ────────────────────────
-
 /// (a) apply then get_approval_projection returns the row;
 ///     get_projector_checkpoint returns the checkpoint.
-async fn assert_apply_and_read(backend: &dyn StateBackend) {
+pub async fn apply_and_read(fx: &Fixture) {
+    let backend = &*in_tenant(fx, "proj-acme").await;
     let exec = ExecutionId::new();
     let row = granted_row(exec.clone());
 
@@ -70,7 +60,8 @@ async fn assert_apply_and_read(backend: &dyn StateBackend) {
 
 /// (b) Re-apply for same (exec, nodeA) with updated status/checkpoint:
 ///     still ONE row (UPSERT idempotency), status updated, checkpoint advanced.
-async fn assert_upsert_idempotency(backend: &dyn StateBackend) {
+pub async fn upsert_idempotency(fx: &Fixture) {
+    let backend = &*in_tenant(fx, "proj-acme").await;
     let exec = ExecutionId::new();
 
     // First apply: granted at seq 5.
@@ -115,7 +106,8 @@ async fn assert_upsert_idempotency(backend: &dyn StateBackend) {
 }
 
 /// (c) get_projector_checkpoint for an unseen execution returns 0 (not an error).
-async fn assert_unknown_checkpoint_is_zero(backend: &dyn StateBackend) {
+pub async fn unknown_checkpoint_is_zero(fx: &Fixture) {
+    let backend = &*in_tenant(fx, "proj-acme").await;
     let unseen = ExecutionId::new();
     let cp = backend
         .get_projector_checkpoint("approvals", &unseen)
@@ -125,7 +117,8 @@ async fn assert_unknown_checkpoint_is_zero(backend: &dyn StateBackend) {
 }
 
 /// Two nodes in the same execution each get their own row.
-async fn assert_two_nodes_same_execution(backend: &dyn StateBackend) {
+pub async fn two_nodes_same_execution(fx: &Fixture) {
+    let backend = &*in_tenant(fx, "proj-acme").await;
     let exec = ExecutionId::new();
 
     let row_a = ApprovalProjectionRow {
@@ -177,129 +170,14 @@ async fn assert_two_nodes_same_execution(backend: &dyn StateBackend) {
     assert_eq!(cp, 7);
 }
 
-// ── SQLite backend ────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn sqlite_apply_and_read() {
-    let db = open_sqlite().await;
-    assert_apply_and_read(&db).await;
-}
-
-#[tokio::test]
-async fn sqlite_upsert_idempotency() {
-    let db = open_sqlite().await;
-    assert_upsert_idempotency(&db).await;
-}
-
-#[tokio::test]
-async fn sqlite_unknown_checkpoint_is_zero() {
-    let db = open_sqlite().await;
-    assert_unknown_checkpoint_is_zero(&db).await;
-}
-
-#[tokio::test]
-async fn sqlite_two_nodes_same_execution() {
-    let db = open_sqlite().await;
-    assert_two_nodes_same_execution(&db).await;
-}
-
-// ── In-memory backend ─────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn memory_apply_and_read() {
-    let backend = InMemoryBackend::new();
-    assert_apply_and_read(&backend).await;
-}
-
-#[tokio::test]
-async fn memory_upsert_idempotency() {
-    let backend = InMemoryBackend::new();
-    assert_upsert_idempotency(&backend).await;
-}
-
-#[tokio::test]
-async fn memory_unknown_checkpoint_is_zero() {
-    let backend = InMemoryBackend::new();
-    assert_unknown_checkpoint_is_zero(&backend).await;
-}
-
-#[tokio::test]
-async fn memory_two_nodes_same_execution() {
-    let backend = InMemoryBackend::new();
-    assert_two_nodes_same_execution(&backend).await;
-}
-
-// ── Tenant-scoped backend ─────────────────────────────────────────────────────
-
-async fn open_tenant_scoped() -> jamjet_state::TenantScopedSqliteBackend {
-    use chrono::Utc;
-    use jamjet_state::tenant::{Tenant, TenantId, TenantStatus};
-
-    let db = open_sqlite().await;
-    let tenant_id = TenantId::from("proj-acme");
-    let scoped_admin = db.for_tenant(TenantId::default());
-    let now = Utc::now();
-    scoped_admin
-        .create_tenant(Tenant {
-            id: tenant_id.clone(),
-            name: "ProjAcme".into(),
-            status: TenantStatus::Active,
-            policy: None,
-            limits: None,
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .expect("register tenant");
-
-    db.for_tenant(tenant_id)
-}
-
-#[tokio::test]
-async fn tenant_apply_and_read() {
-    let scoped = open_tenant_scoped().await;
-    assert_apply_and_read(&scoped).await;
-}
-
-#[tokio::test]
-async fn tenant_upsert_idempotency() {
-    let scoped = open_tenant_scoped().await;
-    assert_upsert_idempotency(&scoped).await;
-}
-
-#[tokio::test]
-async fn tenant_unknown_checkpoint_is_zero() {
-    let scoped = open_tenant_scoped().await;
-    assert_unknown_checkpoint_is_zero(&scoped).await;
-}
-
-#[tokio::test]
-async fn tenant_isolation() {
+pub async fn tenant_isolation(fx: &Fixture) {
     // Two tenants with the same execution_id must not see each other's rows.
-    use chrono::Utc;
-    use jamjet_state::tenant::{Tenant, TenantId, TenantStatus};
-
-    let db = open_sqlite().await;
-    let admin = db.for_tenant(TenantId::default());
-    let now = Utc::now();
-
-    for name in ["alpha", "beta"] {
-        admin
-            .create_tenant(Tenant {
-                id: TenantId::from(name),
-                name: name.into(),
-                status: TenantStatus::Active,
-                policy: None,
-                limits: None,
-                created_at: now,
-                updated_at: now,
-            })
-            .await
-            .expect("register tenant");
-    }
-
-    let alpha = db.for_tenant(TenantId::from("alpha"));
-    let beta = db.for_tenant(TenantId::from("beta"));
+    let (Some(alpha), Some(beta)) = (
+        tenant_view(fx, "alpha").await,
+        tenant_view(fx, "beta").await,
+    ) else {
+        return without_tenant_views(fx);
+    };
 
     // Use the SAME execution_id string in both tenants.
     let shared_exec = ExecutionId::new();
