@@ -316,6 +316,7 @@ async fn started_before_the_check(env: &Env, ir: &Value) -> ExecutionId {
                 workflow_version: typed.version.clone(),
                 initial_input: json!({}),
                 initiated_by: Some("token:alice".into()),
+                run_key: None,
             },
             EventKind::NodeScheduled {
                 node_id: start,

@@ -1011,8 +1011,10 @@ impl StateBackend for TenantScopedSqliteBackend {
             started_event,
             scheduled_event,
             work_item,
+            None,
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn start_execution_atomic(
@@ -1030,8 +1032,10 @@ impl StateBackend for TenantScopedSqliteBackend {
             started_event,
             scheduled_event,
             work_item,
+            None,
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id, execution_id = %execution_id))]
@@ -2489,6 +2493,34 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?;
         Ok(())
+    }
+
+    async fn start_execution_keyed(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+        key: crate::backend::RunKeyClaim,
+    ) -> BackendResult<crate::backend::KeyedStart> {
+        crate::features::run_keys::start_keyed_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            execution,
+            started_event,
+            scheduled_event,
+            work_item,
+            key,
+        )
+        .await
+    }
+
+    async fn get_run_key(
+        &self,
+        run_key: &str,
+    ) -> BackendResult<Option<crate::backend::RunKeyRecord>> {
+        crate::features::run_keys::get_run_key_in(&self.pool, Some(&self.tenant_id.0), run_key)
+            .await
     }
 }
 

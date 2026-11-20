@@ -100,6 +100,7 @@ async fn pending_execution(backend: &Arc<InMemoryBackend>) -> ExecutionId {
             // Started by someone other than any approver in these tests, so
             // separation of duties holds and is provable.
             initiated_by: Some("token:the-initiator".into()),
+            run_key: None,
         },
         EventKind::ToolApprovalRequired {
             node_id: "gate".into(),

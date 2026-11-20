@@ -56,6 +56,8 @@ pub struct InMemoryBackend {
     /// Who held an expired lease and with which fence, so a late heartbeat
     /// from that worker can re-attach instead of losing the work.
     last_lease: DashMap<WorkItemId, (String, i64)>,
+    /// Run keys. Key = (tenant_id, run_key).
+    run_keys: DashMap<(String, String), crate::backend::RunKeyRecord>,
 }
 
 impl InMemoryBackend {
@@ -80,6 +82,7 @@ impl InMemoryBackend {
             lease_secs: DashMap::new(),
             released_fences: DashMap::new(),
             last_lease: DashMap::new(),
+            run_keys: DashMap::new(),
         }
     }
 
@@ -1520,6 +1523,59 @@ impl StateBackend for InMemoryBackend {
         let key = (projection_name.to_string(), execution_id.0.to_string());
         self.projector_checkpoints.insert(key, new_checkpoint);
         Ok(())
+    }
+
+    async fn start_execution_keyed(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+        key: crate::backend::RunKeyClaim,
+    ) -> BackendResult<crate::backend::KeyedStart> {
+        use crate::backend::{KeyedStart, RunKeyRecord};
+        use dashmap::mapref::entry::Entry;
+        let started_event = crate::features::run_keys::with_run_key(started_event, &key.run_key)?;
+        // The key's entry is held, its shard locked, across the run's insert:
+        // a second start with the key waits, then finds it taken.
+        match self
+            .run_keys
+            .entry((work_item.tenant_id.clone(), key.run_key.clone()))
+        {
+            Entry::Vacant(slot) => {
+                let record = RunKeyRecord {
+                    execution_id: execution.execution_id.clone(),
+                    workflow_id: key.workflow_id,
+                    workflow_version: key.workflow_version,
+                    input_hash: key.input_hash,
+                };
+                self.create_run(execution, None, started_event, scheduled_event, work_item);
+                slot.insert(record);
+            }
+            Entry::Occupied(mut held) => {
+                // Moved only from the run `replaces` names. The workflow,
+                // version and input hash stay as first claimed.
+                if key.replaces.as_ref() != Some(&held.get().execution_id) {
+                    return Ok(KeyedStart::Taken(held.get().clone()));
+                }
+                let id = execution.execution_id.clone();
+                self.create_run(execution, None, started_event, scheduled_event, work_item);
+                held.get_mut().execution_id = id;
+            }
+        }
+        Ok(KeyedStart::Started)
+    }
+
+    async fn get_run_key(
+        &self,
+        run_key: &str,
+    ) -> BackendResult<Option<crate::backend::RunKeyRecord>> {
+        // Unscoped, as the SQLite base backend: the default tenant's keys.
+        let key = (
+            crate::tenant::DEFAULT_TENANT.to_string(),
+            run_key.to_string(),
+        );
+        Ok(self.run_keys.get(&key).map(|r| r.value().clone()))
     }
 
     // ── Tenants ──────────────────────────────────────────────────────

@@ -483,6 +483,7 @@ pub async fn start_run(
         workflow_version: version.clone(),
         initial_input: input.clone(),
         initiated_by,
+        run_key: None,
     };
 
     // Immediately enqueue the start node as a work item, built by the same
@@ -4375,6 +4376,7 @@ mod tests {
                     workflow_version: "0.1.0".into(),
                     initial_input: json!({}),
                     initiated_by: Some("token:someone".into()),
+                    run_key: None,
                 },
             ))
             .await
