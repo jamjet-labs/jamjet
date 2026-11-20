@@ -2490,6 +2490,15 @@ impl StateBackend for TenantScopedSqliteBackend {
         .map_err(map_db_err)?;
         Ok(())
     }
+
+    // ── Storage lane ──────────────────────────────────────────────────────
+
+    async fn commit_scheduler_pass(
+        &self,
+        pass: crate::backend::SchedulerPass,
+    ) -> BackendResult<crate::backend::PassCommit> {
+        crate::sqlite::commit_scheduler_pass_in(&self.pool, Some(&self.tenant_id.0), pass).await
+    }
 }
 
 /// Parse a datetime that might be either RFC 3339 or SQLite's `datetime('now')` format.

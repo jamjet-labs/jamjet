@@ -2504,6 +2504,16 @@ impl StateBackend for SqliteBackend {
         .map_err(map_db_err)?;
         Ok(())
     }
+
+    // ── Storage lane ──────────────────────────────────────────────────────
+
+    #[instrument(skip(self, pass), fields(execution_id = %pass.execution_id, seen = pass.seen_sequence))]
+    async fn commit_scheduler_pass(
+        &self,
+        pass: crate::backend::SchedulerPass,
+    ) -> BackendResult<crate::backend::PassCommit> {
+        commit_scheduler_pass_in(&self.pool, None, pass).await
+    }
 }
 
 pub(crate) use crate::backend::DEFAULT_LEASE_SECS;
@@ -3527,6 +3537,201 @@ pub(crate) async fn has_claimable_in(
         .fetch_one(pool)
         .await
         .map_err(map_db_err)
+}
+
+// ── Storage lane ──────────────────────────────────────────────────────────────
+
+/// [`StateBackend::commit_scheduler_pass`] for both SQLite backends, in one
+/// `BEGIN IMMEDIATE` transaction: the run's status and tenant are read, the
+/// log's last sequence and the live items of the pass's nodes are checked,
+/// then the events, the items and the finish are written, all under the one
+/// write lock. Another writer's append, claim or settle lands either before
+/// the checks or after the commit. `tenant_id` scopes the run on the
+/// tenant-scoped backend; the rows are stamped with the run's own tenant.
+pub(crate) async fn commit_scheduler_pass_in(
+    pool: &SqlitePool,
+    tenant_id: Option<&str>,
+    pass: crate::backend::SchedulerPass,
+) -> BackendResult<crate::backend::PassCommit> {
+    use crate::backend::PassCommit;
+    pass.check_shape()?;
+    if pass.is_empty() {
+        // No write lock for a run with nothing to record.
+        return Ok(PassCommit::Committed {
+            last_sequence: pass.seen_sequence,
+        });
+    }
+    // Serialize everything before taking the write lock.
+    let execution_id = execution_id_str(&pass.execution_id);
+    let events = pass
+        .events
+        .iter()
+        .map(EventRow::new)
+        .collect::<BackendResult<Vec<_>>>()?;
+    let finish = match &pass.finish {
+        Some((status, kind)) => Some((status_to_str(status), EventRow::new(kind)?)),
+        None => None,
+    };
+    let payloads = pass
+        .work_items
+        .iter()
+        .map(|item| serde_json::to_string(&item.payload))
+        .collect::<Result<Vec<_>, _>>()?;
+    let tenant_clause = if tenant_id.is_some() {
+        " AND tenant_id = ?"
+    } else {
+        ""
+    };
+
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(map_db_err)?;
+
+    let select = format!(
+        "SELECT status, tenant_id FROM workflow_executions WHERE execution_id = ?{tenant_clause}"
+    );
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(select)).bind(&execution_id);
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    let Some(row) = q.fetch_optional(&mut *tx).await.map_err(map_db_err)? else {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Err(StateBackendError::NotFound(execution_id));
+    };
+    let status = str_to_status(row.try_get::<&str, _>("status").map_err(map_db_err)?)?;
+    let run_tenant: String = row.try_get("tenant_id").map_err(map_db_err)?;
+    if status.is_terminal() {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Ok(PassCommit::ExecutionTerminal(status));
+    }
+
+    let latest: i64 =
+        sqlx::query("SELECT COALESCE(MAX(sequence), 0) AS seq FROM events WHERE execution_id = ?")
+            .bind(&execution_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            .try_get::<i64, _>("seq")
+            .map_err(map_db_err)?;
+    if latest != pass.seen_sequence {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Ok(PassCommit::Stale {
+            latest_sequence: latest,
+        });
+    }
+
+    for item in &pass.work_items {
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM work_items WHERE execution_id = ? AND node_id = ? \
+             AND status IN ('pending', 'claimed'))",
+        )
+        .bind(&execution_id)
+        .bind(&item.node_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        if live {
+            tx.rollback().await.map_err(map_db_err)?;
+            return Ok(PassCommit::Stale {
+                latest_sequence: latest,
+            });
+        }
+    }
+
+    let mut last_sequence = latest;
+    for event in &events {
+        last_sequence = append_kind_in_tx(&mut tx, &execution_id, &run_tenant, event).await?;
+    }
+    for (item, payload_json) in pass.work_items.iter().zip(&payloads) {
+        sqlx::query(
+            "INSERT INTO work_items \
+             (id, execution_id, node_id, queue_type, payload_json, attempt, max_attempts, \
+              status, created_at, tenant_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+        )
+        .bind(item.id.to_string())
+        .bind(&execution_id)
+        .bind(&item.node_id)
+        .bind(&item.queue_type)
+        .bind(payload_json)
+        .bind(item.attempt as i64)
+        .bind(item.max_attempts as i64)
+        .bind(item.created_at.to_rfc3339())
+        .bind(&run_tenant)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+    }
+    if let Some((status, event)) = &finish {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE workflow_executions SET status = ?, updated_at = ?, \
+             completed_at = COALESCE(completed_at, ?) WHERE execution_id = ?",
+        )
+        .bind(*status)
+        .bind(&now)
+        .bind(&now)
+        .bind(&execution_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        last_sequence = append_kind_in_tx(&mut tx, &execution_id, &run_tenant, event).await?;
+    }
+
+    tx.commit().await.map_err(map_db_err)?;
+    Ok(PassCommit::Committed { last_sequence })
+}
+
+/// An event's columns, serialized before a transaction takes the write lock.
+struct EventRow {
+    id: String,
+    kind_json: String,
+    created_at: String,
+}
+
+impl EventRow {
+    fn new(kind: &EventKind) -> BackendResult<Self> {
+        Ok(Self {
+            id: Uuid::new_v4().to_string(),
+            kind_json: serde_json::to_string(kind)?,
+            created_at: Utc::now().to_rfc3339(),
+        })
+    }
+}
+
+/// Append `event` to `execution_id`'s log inside the caller's transaction,
+/// under `tenant_id`, at the next sequence. Returns the sequence. The run's
+/// counterpart of `insert_event_in_tx`, which takes both from an item.
+async fn append_kind_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    execution_id: &str,
+    tenant_id: &str,
+    event: &EventRow,
+) -> BackendResult<EventSequence> {
+    let sequence: i64 = sqlx::query(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM events WHERE execution_id = ?",
+    )
+    .bind(execution_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(map_db_err)?
+    .try_get::<i64, _>("seq")
+    .map_err(map_db_err)?;
+    sqlx::query(
+        "INSERT INTO events (id, execution_id, sequence, kind_json, created_at, tenant_id) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&event.id)
+    .bind(execution_id)
+    .bind(sequence)
+    .bind(&event.kind_json)
+    .bind(&event.created_at)
+    .bind(tenant_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(map_db_err)?;
+    Ok(sequence)
 }
 
 #[cfg(test)]

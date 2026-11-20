@@ -14,8 +14,9 @@ use jamjet_state::artifact::ArtifactRef;
 use jamjet_state::backend::{
     ApiToken, ApprovalProjectionRow, BackendResult, ClaimFilter, ClaimedWorkItem,
     ConditionalAppend, EventCondition, ExecutionClaim, ExecutionFinish, FailOutcome, GateMark,
-    LeaseRenewal, LeasedItem, ReclaimResult, ReserveOutcome, RunningPage, StateBackend,
-    StateBackendError, TurnCommit, WorkItem, WorkItemId, WorkflowDefinition,
+    LeaseRenewal, LeasedItem, PassCommit, ReclaimResult, ReserveOutcome, RunningPage,
+    SchedulerPass, StateBackend, StateBackendError, TurnCommit, WorkItem, WorkItemId,
+    WorkflowDefinition,
 };
 use jamjet_state::event::{Event, EventKind, EventSequence};
 use jamjet_state::snapshot::Snapshot;
@@ -269,6 +270,9 @@ pub enum Op<'a> {
     GetTenant(&'a TenantId),
     ListTenants,
     UpdateTenant(&'a Tenant),
+
+    // ── Storage lane ─────────────────────────────────────────────────────
+    CommitSchedulerPass(&'a ExecutionId),
 }
 
 /// What a test does around each call [`Intercept`] delegates.
@@ -1207,6 +1211,16 @@ impl StateBackend for Intercept {
             self,
             Op::UpdateTenant(&tenant),
             self.inner.update_tenant(tenant.clone())
+        )
+    }
+
+    // ── Storage lane ─────────────────────────────────────────────────────
+
+    async fn commit_scheduler_pass(&self, pass: SchedulerPass) -> BackendResult<PassCommit> {
+        around!(
+            self,
+            Op::CommitSchedulerPass(&pass.execution_id),
+            self.inner.commit_scheduler_pass(pass.clone())
         )
     }
 }
