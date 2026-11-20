@@ -11,6 +11,10 @@ pub mod artifact;
 pub mod backend;
 pub mod budget;
 pub mod event;
+// Declared before `sqlite` and `tenant_scoped`, so `fault_point!` is in
+// scope in them.
+#[macro_use]
+pub mod faults;
 mod features;
 pub mod hashing;
 pub mod lease_events;

@@ -6,7 +6,8 @@
 //! integration tests, ported so every backend runs them. `concurrency`,
 //! `payloads`, `terminal` and `tenancy` are written for the suite: what two
 //! engines on one store, large or unusual values, a finished run and a
-//! tenant's scope must do on every backend.
+//! tenant's scope must do on every backend. `faults` stops each of the
+//! store's transactions between two statements.
 
 pub mod api_token_hash;
 pub mod append_event_if;
@@ -16,6 +17,7 @@ pub mod concurrency;
 pub mod durability;
 pub mod event_compat;
 pub mod events_page;
+pub mod faults;
 pub mod fencing;
 pub mod fixture;
 pub mod idempotency;

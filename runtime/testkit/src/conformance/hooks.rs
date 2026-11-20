@@ -8,9 +8,15 @@ use jamjet_core::workflow::ExecutionId;
 use jamjet_state::{
     InMemoryBackend, SqliteBackend, StateBackend, TenantId, WorkItem, WorkItemId, DEFAULT_TENANT,
 };
-use sqlx::sqlite::{Sqlite, SqliteArguments};
+use sqlx::sqlite::{Sqlite, SqliteArguments, SqliteRow};
 use sqlx::Row;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Every row of a store, by table. Each row is one line of text naming its
+/// columns, and a table's rows are sorted, so two reads of an unchanged
+/// store compare equal.
+pub type StoreRows = BTreeMap<String, Vec<String>>;
 
 /// A JSON value the store keeps as text, named by the row that holds it.
 #[derive(Debug, Clone)]
@@ -89,6 +95,10 @@ pub trait StoreHooks: Send + Sync {
     /// The JSON text the store holds for `what`, exactly as stored. `None`
     /// where the store keeps parsed values (memory); a missing row panics.
     async fn stored_json(&self, what: StoredJson) -> Option<String>;
+    /// Every row of every table the store holds, across tenants. `None`
+    /// where the store keeps no rows (memory). Panics on a table it does not
+    /// know, so a new table cannot drop out of the comparison unseen.
+    async fn every_row(&self) -> Option<StoreRows>;
 }
 
 /// Hooks on an [`InMemoryBackend`].
@@ -215,6 +225,73 @@ impl StoreHooks for MemoryHooks {
     async fn stored_json(&self, _what: StoredJson) -> Option<String> {
         None
     }
+
+    async fn every_row(&self) -> Option<StoreRows> {
+        None
+    }
+}
+
+/// The tables of the SQLite state schema, every one of which
+/// [`StoreHooks::every_row`] reads. SQLite's own `sqlite_*` tables and the
+/// migration log are left out.
+const SQLITE_TABLES: &[&str] = &[
+    "agents",
+    "api_tokens",
+    "artifacts",
+    "cron_jobs",
+    "dead_letter_items",
+    "events",
+    "proj_approvals",
+    "projector_checkpoints",
+    "snapshots",
+    "store_identity",
+    "tenants",
+    "timers",
+    "tool_effects",
+    "tool_reservations",
+    "work_items",
+    "workflow_definitions",
+    "workflow_executions",
+];
+
+/// A row as `column=value` pairs: text and numbers quoted as Rust would
+/// print them, blobs in hex, `NULL` for null.
+fn row_text(row: &SqliteRow) -> String {
+    use sqlx::{Column, TypeInfo, ValueRef};
+    row.columns()
+        .iter()
+        .map(|column| {
+            let i = column.ordinal();
+            let raw = row
+                .try_get_raw(i)
+                .unwrap_or_else(|e| panic!("read {}: {e}", column.name()));
+            let kind = raw.type_info().name().to_string();
+            let value = if raw.is_null() {
+                "NULL".to_string()
+            } else {
+                match kind.as_str() {
+                    "INTEGER" => value_at::<i64>(row, i).to_string(),
+                    "REAL" => value_at::<f64>(row, i).to_string(),
+                    "BLOB" => {
+                        let hex: String = value_at::<Vec<u8>>(row, i)
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect();
+                        format!("x'{hex}'")
+                    }
+                    _ => format!("{:?}", value_at::<String>(row, i)),
+                }
+            };
+            format!("{}={value}", column.name())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Column `i` of `row`, read as the type its value is stored as.
+fn value_at<'r, T: sqlx::Decode<'r, Sqlite>>(row: &'r SqliteRow, i: usize) -> T {
+    row.try_get_unchecked::<T, _>(i)
+        .unwrap_or_else(|e| panic!("read column {i}: {e}"))
 }
 
 /// Hooks on a SQLite file, through the fixture's first pool.
@@ -435,6 +512,33 @@ impl StoreHooks for SqliteHooks {
         }
         .unwrap_or_else(|e| panic!("read {what:?}: {e}"));
         Some(text.unwrap_or_else(|| panic!("no row for {what:?}")))
+    }
+
+    async fn every_row(&self) -> Option<StoreRows> {
+        let pool = self.base.pool();
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' \
+             AND name NOT LIKE 'sqlite%' AND name != '_sqlx_migrations' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("list the tables: {e}"));
+        assert_eq!(
+            tables, SQLITE_TABLES,
+            "the schema's tables are not the ones every_row reads: add the new one to SQLITE_TABLES"
+        );
+        let mut rows = StoreRows::new();
+        for table in SQLITE_TABLES {
+            // `table` is one of the literal names above.
+            let found = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT * FROM {table}")))
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("read {table}: {e}"));
+            let mut texts: Vec<String> = found.iter().map(row_text).collect();
+            texts.sort();
+            rows.insert(table.to_string(), texts);
+        }
+        Some(rows)
     }
 }
 

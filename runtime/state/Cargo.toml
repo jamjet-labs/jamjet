@@ -11,6 +11,13 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Fault points for tests: a test can make the store fail, hang or abort the
+# process between two statements of a transaction. Off by default and in
+# every release build. Test builds get it through a dev-dependency
+# (runtime/testkit), never through a normal one.
+test-hooks = []
+
 [dependencies]
 jamjet-core = { path = "../core", version = "=0.5.0" }
 jamjet-ir = { path = "../ir", version = "=0.5.0" }

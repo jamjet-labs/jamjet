@@ -20,7 +20,7 @@ mod factories;
 mod hooks;
 
 pub use factories::{MemoryFactory, SqliteFactory, SqliteScopedFactory};
-pub use hooks::{ItemRow, StoreHooks, StoredJson};
+pub use hooks::{ItemRow, StoreHooks, StoreRows, StoredJson};
 
 use async_trait::async_trait;
 use jamjet_state::{StateBackend, TenantId};
@@ -423,6 +423,14 @@ macro_rules! for_each_case {
                 scoped_fast_reclaim_touches_its_own_tenant_only,
                 scoped_append_to_another_tenants_run_is_not_found,
                 scoped_reads_of_another_tenants_rows_are_empty,
+            ]
+        );
+        $m!(
+            $factory,
+            faults,
+            [
+                an_error_at_any_step_leaves_no_partial_write,
+                a_hang_inside_a_transaction_blocks_only_its_run,
             ]
         );
     };

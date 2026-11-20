@@ -234,14 +234,17 @@ impl TenantScopedSqliteBackend {
             .map_err(map_db_err)?;
 
         if refuse_terminal {
-            if let Some(status) =
-                terminal_status_of(&mut tx, Some(&self.tenant_id.0), &execution_id).await?
-            {
+            let terminal =
+                terminal_status_of(&mut tx, Some(&self.tenant_id.0), &execution_id).await?;
+            fault_point!("sqlite_scoped.commit_turn", 1);
+            if let Some(status) = terminal {
                 // Fence first: only the holder may withdraw, and a stale or
                 // forged fence must leave the item exactly as it is.
-                if !withdraw_claimed_item(&mut tx, Some(&self.tenant_id.0), &id_str, lease_fence)
-                    .await?
-                {
+                let withdrawn =
+                    withdraw_claimed_item(&mut tx, Some(&self.tenant_id.0), &id_str, lease_fence)
+                        .await?;
+                fault_point!("sqlite_scoped.commit_turn", 2);
+                if !withdrawn {
                     tx.rollback().await.map_err(map_db_err)?;
                     return Err(StateBackendError::FenceLost(id_str));
                 }
@@ -279,6 +282,7 @@ impl TenantScopedSqliteBackend {
             .map_err(map_db_err)?
             .rows_affected()
         };
+        fault_point!("sqlite_scoped.commit_turn", 3);
 
         if rows == 0 {
             tx.rollback().await.map_err(map_db_err)?;
@@ -293,6 +297,7 @@ impl TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?;
         let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.commit_turn", 4);
 
         sqlx::query(
             r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at, tenant_id)
@@ -307,6 +312,7 @@ impl TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.commit_turn", 5);
 
         // 2b) If the terminal event is NodeCompleted with an idempotency key,
         //     record the result in tool_effects in the SAME transaction (tenant-scoped).
@@ -350,6 +356,7 @@ impl TenantScopedSqliteBackend {
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite_scoped.commit_turn", 6);
         }
 
         // Optionally compute and write the snapshot IN-TX from committed state (tenant-scoped).
@@ -364,6 +371,7 @@ impl TenantScopedSqliteBackend {
             .fetch_optional(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite_scoped.commit_turn", 7);
 
             let (base, base_sequence) = if let Some(row) = snap_row {
                 let at_seq: i64 = row.try_get("at_sequence").map_err(map_db_err)?;
@@ -412,6 +420,7 @@ impl TenantScopedSqliteBackend {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(map_db_err)?;
+                fault_point!("sqlite_scoped.commit_turn", 8);
                 let initial_input: serde_json::Value = serde_json::from_str(
                     exec_row
                         .try_get::<&str, _>("initial_input")
@@ -440,6 +449,7 @@ impl TenantScopedSqliteBackend {
             .fetch_all(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite_scoped.commit_turn", 9);
 
             let tail_events: Vec<crate::event::Event> = event_rows
                 .iter()
@@ -477,6 +487,7 @@ impl TenantScopedSqliteBackend {
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite_scoped.commit_turn", 10);
         }
 
         tx.commit().await.map_err(map_db_err)?;
@@ -828,6 +839,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?;
         let sequence: i64 = seq_row.try_get::<i64, _>("seq").map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.append_event", 1);
 
         sqlx::query(
             r#"INSERT INTO events (id, execution_id, sequence, kind_json, created_at, tenant_id)
@@ -842,6 +854,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.append_event", 2);
         tx.commit().await.map_err(map_db_err)?;
 
         Ok(sequence)
@@ -1462,6 +1475,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             q = q.bind(n.as_str());
         }
         let row = q.fetch_optional(&mut *tx).await.map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.claim_work_item", 1);
 
         let Some(row) = row else {
             tx.rollback().await.map_err(map_db_err)?;
@@ -1475,6 +1489,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         let claimed_at = Utc::now().to_rfc3339();
 
         let term = self.current_term(&mut tx).await?;
+        fault_point!("sqlite_scoped.claim_work_item", 2);
         let current_epoch: i64 = row.try_get::<i64, _>("lease_epoch").unwrap_or(0);
         let new_epoch = current_epoch + 1;
         let new_fence = term * 4_294_967_296_i64 + new_epoch;
@@ -1500,6 +1515,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.claim_work_item", 3);
 
         tx.commit().await.map_err(map_db_err)?;
 
@@ -1674,7 +1690,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         // `tenant_id` is on every statement below, not just the read: a scoped
         // backend must never settle another tenant's item even if an id and fence
         // were somehow guessed.
-        let Some(row) = sqlx::query(
+        let row = sqlx::query(
             "SELECT * FROM work_items \
              WHERE id = ? AND tenant_id = ? AND lease_fence = ? AND status = 'claimed'",
         )
@@ -1683,8 +1699,9 @@ impl StateBackend for TenantScopedSqliteBackend {
         .bind(lease_fence)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(map_db_err)?
-        else {
+        .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.fail_work_item_fenced", 1);
+        let Some(row) = row else {
             return Ok(None);
         };
 
@@ -1705,6 +1722,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             .await
             .map_err(map_db_err)?
             .rows_affected();
+            fault_point!("sqlite_scoped.fail_work_item_fenced", 2);
             if rows == 0 {
                 return Ok(None);
             }
@@ -1731,6 +1749,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite_scoped.fail_work_item_fenced", 3);
 
             tx.commit().await.map_err(map_db_err)?;
             let mut exhausted = item;
@@ -1757,6 +1776,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?
         .rows_affected();
+        fault_point!("sqlite_scoped.fail_work_item_fenced", 4);
         if rows == 0 {
             return Ok(None);
         }
@@ -1849,6 +1869,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?
         .rows_affected();
+        fault_point!("sqlite_scoped.finalize_rollover_fenced", 1);
 
         if rows == 0 {
             tx.rollback().await.map_err(map_db_err)?;
@@ -1869,6 +1890,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.finalize_rollover_fenced", 2);
 
         tx.commit().await.map_err(map_db_err)?;
         Ok(true)
@@ -2289,6 +2311,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.apply_approval_projection", 1);
 
         sqlx::query(
             r#"INSERT INTO projector_checkpoints
@@ -2306,6 +2329,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.apply_approval_projection", 2);
 
         tx.commit().await.map_err(map_db_err)?;
         Ok(())
@@ -2363,6 +2387,7 @@ impl StateBackend for TenantScopedSqliteBackend {
             .execute(&mut *tx)
             .await
             .map_err(map_db_err)?;
+            fault_point!("sqlite_scoped.apply_approval_projection_batch", 1);
         }
 
         // Advance checkpoint once for the whole batch.
@@ -2382,6 +2407,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
+        fault_point!("sqlite_scoped.apply_approval_projection_batch", 2);
 
         tx.commit().await.map_err(map_db_err)?;
         Ok(())
