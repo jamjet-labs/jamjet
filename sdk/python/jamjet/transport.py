@@ -7,11 +7,23 @@ the client's base URL. That covers the JamJet token and anything a caller's
 never followed. A 401 or 403 that does not carry the engine's JSON error body
 came from something in front of the engine and is raised as
 ``PlatformAuthError``.
+
+A call is sent again only when that cannot do it twice: when the request never
+left, when the answer was a 429, or when the call is safe to repeat. An unsafe
+call whose answer was lost raises ``OutcomeUnknown`` (see ``RetryPolicy``).
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Generator, Iterable
+import asyncio
+import email.utils
+import logging
+import math
+import random
+import time
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterable
+from dataclasses import dataclass
+from datetime import UTC
 
 import httpx
 
@@ -22,7 +34,54 @@ _BIDI_CONTROLS = frozenset("\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u20
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 _REDACTED = "[redacted]"
 
+# Nothing reached the engine: no connection was made, or none was free.
+_NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+_log = logging.getLogger(__name__)
+
 Origin = tuple[str, str, int | None]
+
+# Seams for tests: how the send loop waits, draws its jitter, and reads the
+# wall clock to turn a Retry-After date into seconds.
+_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+_random: Callable[[], float] = random.random
+_wall_clock: Callable[[], float] = time.time
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """How often the client sends a call again, and how long it waits first.
+
+    A request that never left (no connection could be made, or none was free)
+    is sent again for every call, and so is a 429, which the engine did not
+    process. After a lost answer (a timeout or a broken connection once the
+    request may have gone out, or a 5xx) only a call that is safe to repeat is
+    sent again; any other raises ``OutcomeUnknown``. Nothing else is retried.
+
+    ``attempts`` counts every send, the first included. Before send ``n + 1``
+    the client waits a random time between 0 and
+    ``min(max_delay_s, base_delay_s * 2 ** (n - 1))``, or what the answer's
+    ``Retry-After`` asks for. A ``Retry-After`` above ``max_retry_after_s`` is
+    raised at once. ``RetryPolicy.off()`` sends every call once.
+    """
+
+    attempts: int = 3  # total sends for a retryable failure
+    base_delay_s: float = 0.2  # doubling, with full jitter
+    max_delay_s: float = 5.0
+    max_retry_after_s: float = 30.0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.attempts, bool) or not isinstance(self.attempts, int) or self.attempts < 1:
+            raise ValueError(f"attempts must be a whole number, 1 or more, not {self.attempts!r}")
+        for name in ("base_delay_s", "max_delay_s", "max_retry_after_s"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite number of seconds, 0 or more, not {value!r}")
+
+    @classmethod
+    def off(cls) -> RetryPolicy:
+        """Send every call once."""
+        return cls(attempts=1)
 
 
 class JamjetAPIError(httpx.HTTPStatusError):
@@ -251,3 +310,98 @@ def raise_for_status(response: httpx.Response, *, credential_headers: Iterable[s
         if detail:
             message = f"{message}: {detail}"
         raise JamjetAPIError(message, request=request, response=response, detail=detail) from exc
+
+
+def _retry_after(response: httpx.Response) -> float | None:
+    """The wait an answer's ``Retry-After`` asks for, in seconds.
+
+    The header holds whole seconds or an HTTP date; a date in the past asks for
+    no wait. None when there is no header or it cannot be read.
+    """
+    value = response.headers.get("retry-after", "").strip()
+    if not value:
+        return None
+    if value.isascii() and value.isdigit():
+        return float(value) if len(value) <= 15 else math.inf
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when.tzinfo is None:  # no zone, or "-0000": an HTTP date is in GMT
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, when.timestamp() - _wall_clock())
+
+
+def _backoff(policy: RetryPolicy, sends: int) -> float:
+    """Full jitter: a uniform draw up to the delay for this retry, which doubles from ``base_delay_s``."""
+    ceiling = min(policy.max_delay_s, policy.base_delay_s * 2.0 ** min(sends - 1, 64))
+    return ceiling * _random()
+
+
+def _outcome_unknown(operation: str, what: str) -> OutcomeUnknown:
+    return OutcomeUnknown(
+        f"{operation} may have taken effect, but {what}. It was not sent again, because a second send could do "
+        "it twice. Check whether it took effect before you repeat it.",
+        operation=operation,
+    )
+
+
+async def send_with_retries(
+    send: Callable[[], Awaitable[httpx.Response]],
+    *,
+    check: Callable[[httpx.Response], None],
+    safe: bool,
+    operation: str,
+    policy: RetryPolicy,
+) -> httpx.Response:
+    """Send a call, and send it again while ``policy`` and the failure allow.
+
+    ``send`` makes one attempt and ``check`` raises ``JamjetAPIError`` for an
+    answer that is not 2xx. ``safe`` says the call may be repeated after it may
+    have taken effect; ``operation`` names it in ``OutcomeUnknown``. After the
+    last send the last failure is raised as it is. A 401 is never sent again
+    here: an auth hook that refreshes a token sends its own one resend.
+    """
+    sends = 0
+    while True:
+        sends += 1
+        try:
+            response = await send()
+        except httpx.RequestError as exc:
+            if isinstance(exc, httpx.UnsupportedProtocol):
+                raise  # a URL the client cannot send to: nothing left, and nothing would change
+            if not safe and not isinstance(exc, _NOT_SENT):
+                raise _outcome_unknown(operation, f"its answer was lost ({type(exc).__name__})") from exc
+            if sends >= policy.attempts:
+                raise
+            reason = type(exc).__name__
+            wait = _backoff(policy, sends)
+        else:
+            try:
+                check(response)
+                return response
+            except JamjetAPIError as exc:
+                status = response.status_code
+                if status != 429 and status < 500:
+                    raise
+                if status >= 500 and not safe:
+                    raise _outcome_unknown(
+                        operation,
+                        f"the answer was {status} {response.reason_phrase}, which does not say whether it did",
+                    ) from exc
+                asked = _retry_after(response)
+                if asked is not None and asked > policy.max_retry_after_s:
+                    raise
+                if sends >= policy.attempts:
+                    raise
+                reason = str(status)
+                wait = _backoff(policy, sends) if asked is None else asked
+        _log.debug(
+            "%s failed (%s); sending it again in %.2f s, send %d of %d",
+            operation,
+            reason,
+            wait,
+            sends + 1,
+            policy.attempts,
+        )
+        await _sleep(wait)

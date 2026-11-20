@@ -12,9 +12,10 @@ from typing import Any
 
 import httpx
 
-from jamjet.transport import EngineAuth
+from jamjet.transport import EngineAuth, RetryPolicy
 from jamjet.transport import JamjetAPIError as JamjetAPIError
 from jamjet.transport import raise_for_status as _raise_for_status
+from jamjet.transport import send_with_retries as _send_with_retries
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,14 @@ class JamjetClient:
     its own while a JamJet token is set. Both go only to the origin of
     ``base_url``: a request to any other scheme, host or port raises
     ``CredentialScopeError`` and is not sent. Redirects are never followed.
+
+    ``retry`` (a ``RetryPolicy``; ``RetryPolicy.off()`` sends every call once)
+    sends a call again when that cannot do it twice. A request that never left
+    and a 429 are sent again for every call. A call that is safe to repeat
+    (every GET, a heartbeat, a complete or fail with a lease fence, registering
+    a workflow, storing an artifact) is also sent again after a lost answer or
+    a 5xx. Any other call whose answer was lost raises ``OutcomeUnknown`` and
+    is not sent again: check whether it took effect before you repeat it.
     """
 
     def __init__(
@@ -55,9 +64,13 @@ class JamjetClient:
         timeout: float = 30.0,
         *,
         auth: httpx.Auth | None = None,
+        retry: RetryPolicy | None = None,
     ) -> None:
         if auth is not None and not isinstance(auth, httpx.Auth):
             raise TypeError("auth must be an httpx.Auth")
+        if retry is not None and not isinstance(retry, RetryPolicy):
+            raise TypeError("retry must be a RetryPolicy")
+        self._retry = RetryPolicy() if retry is None else retry
         self.base_url = base_url.rstrip("/")
         token = api_token or os.environ.get("JAMJET_TOKEN")
         self._auth = EngineAuth(self.base_url, token=token, auth=auth) if token or auth is not None else None
@@ -68,11 +81,13 @@ class JamjetClient:
             follow_redirects=False,
         )
 
-    async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        """Send one request and raise ``JamjetAPIError`` for a non-2xx answer.
+    async def _request(self, method: str, url: str, *, safe: bool, operation: str, **kwargs: Any) -> httpx.Response:
+        """Send one call and raise ``JamjetAPIError`` for a non-2xx answer.
 
         Every call goes through here. Credentials come from the client's own
         auth flow, so a call cannot bring its own ``auth`` or follow a redirect.
+        ``safe`` says whether the call may be sent again after it may have
+        taken effect; ``operation`` names it in ``OutcomeUnknown``.
         """
         refused = [name for name in ("auth", "follow_redirects") if name in kwargs]
         if refused:
@@ -80,20 +95,28 @@ class JamjetClient:
                 f"JamjetClient calls do not take {' or '.join(refused)}: credentials come from the client, "
                 "and redirects are never followed"
             )
-        response = await self._client.request(method, url, follow_redirects=False, **kwargs)
+        return await _send_with_retries(
+            lambda: self._client.request(method, url, follow_redirects=False, **kwargs),
+            check=self._check,
+            safe=safe,
+            operation=operation,
+            policy=self._retry,
+        )
+
+    def _check(self, response: httpx.Response) -> None:
         _raise_for_status(response, credential_headers=self._auth.credential_headers if self._auth is not None else ())
-        return response
 
     # ── Health ────────────────────────────────────────────────────────────
 
     async def health(self) -> dict[str, Any]:
-        r = await self._request("GET", "/health")
+        r = await self._request("GET", "/health", safe=True, operation="health")
         return r.json()
 
     # ── Workflows ─────────────────────────────────────────────────────────
 
     async def create_workflow(self, ir: dict[str, Any]) -> dict[str, Any]:
-        r = await self._request("POST", "/workflows", json={"ir": ir})
+        # Registering the same IR again changes nothing.
+        r = await self._request("POST", "/workflows", json={"ir": ir}, safe=True, operation="create_workflow")
         return r.json()
 
     # ── Cron schedules ────────────────────────────────────────────────────
@@ -120,11 +143,11 @@ class JamjetClient:
         }
         if input is not None:
             body["input"] = input
-        r = await self._request("POST", "/cron", json=body)
+        r = await self._request("POST", "/cron", json=body, safe=False, operation="create_cron_job")
         return r.json()
 
     async def list_cron_jobs(self) -> dict[str, Any]:
-        r = await self._request("GET", "/cron")
+        r = await self._request("GET", "/cron", safe=True, operation="list_cron_jobs")
         return r.json()
 
     # ── Executions ────────────────────────────────────────────────────────
@@ -138,11 +161,12 @@ class JamjetClient:
         body: dict[str, Any] = {"workflow_id": workflow_id, "input": input}
         if workflow_version:
             body["workflow_version"] = workflow_version
-        r = await self._request("POST", "/executions", json=body)
+        # Sent again, it could start a second run.
+        r = await self._request("POST", "/executions", json=body, safe=False, operation="start_execution")
         return r.json()
 
     async def get_execution(self, execution_id: str) -> dict[str, Any]:
-        r = await self._request("GET", f"/executions/{execution_id}")
+        r = await self._request("GET", f"/executions/{execution_id}", safe=True, operation="get_execution")
         return r.json()
 
     async def list_executions(
@@ -154,11 +178,11 @@ class JamjetClient:
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if status:
             params["status"] = status
-        r = await self._request("GET", "/executions", params=params)
+        r = await self._request("GET", "/executions", params=params, safe=True, operation="list_executions")
         return r.json()
 
     async def cancel_execution(self, execution_id: str) -> dict[str, Any]:
-        r = await self._request("POST", f"/executions/{execution_id}/cancel")
+        r = await self._request("POST", f"/executions/{execution_id}/cancel", safe=False, operation="cancel_execution")
         return r.json()
 
     async def get_events(self, execution_id: str, *, inline_artifacts: str | None = None) -> dict[str, Any]:
@@ -175,7 +199,9 @@ class JamjetClient:
             base["inline_artifacts"] = inline_artifacts
         params: dict[str, Any] = dict(base)
         while True:
-            r = await self._request("GET", f"/executions/{execution_id}/events", params=params)
+            r = await self._request(
+                "GET", f"/executions/{execution_id}/events", params=params, safe=True, operation="get_events"
+            )
             page = r.json()
             page_events = page.get("events") if isinstance(page, dict) else None
             if not isinstance(page_events, list):
@@ -229,7 +255,9 @@ class JamjetClient:
             body["action_digest"] = action_digest
         if user_id:
             body["user_id"] = user_id
-        r = await self._request("POST", f"/executions/{execution_id}/approve", json=body)
+        r = await self._request(
+            "POST", f"/executions/{execution_id}/approve", json=body, safe=False, operation="approve"
+        )
         return r.json()
 
     async def list_approvals(self, execution_id: str) -> dict[str, Any]:
@@ -238,7 +266,7 @@ class JamjetClient:
         Returns ``{"pending": [...], "decided": [...]}`` as served by
         ``GET /executions/{id}/approvals``.
         """
-        r = await self._request("GET", f"/executions/{execution_id}/approvals")
+        r = await self._request("GET", f"/executions/{execution_id}/approvals", safe=True, operation="list_approvals")
         return r.json()
 
     async def send_external_event(
@@ -251,6 +279,8 @@ class JamjetClient:
             "POST",
             f"/executions/{execution_id}/external-event",
             json={"correlation_key": correlation_key, "payload": payload},
+            safe=False,
+            operation="send_external_event",
         )
         return r.json()
 
@@ -268,7 +298,10 @@ class JamjetClient:
         and echoed back on the returned ref.
         """
         headers = {"Content-Type": media_type} if media_type else None
-        r = await self._request("POST", "/artifacts", content=data, headers=headers)
+        # Content-addressed: the same bytes stored twice are one artifact.
+        r = await self._request(
+            "POST", "/artifacts", content=data, headers=headers, safe=True, operation="put_artifact"
+        )
         j = r.json()
         return ArtifactRef(
             hash=j["hash"],
@@ -282,33 +315,33 @@ class JamjetClient:
         Raises ``httpx.HTTPStatusError`` (404) when no artifact with that hash
         exists for the caller's tenant.
         """
-        r = await self._request("GET", f"/artifacts/{hash}")
+        r = await self._request("GET", f"/artifacts/{hash}", safe=True, operation="get_artifact")
         return r.content
 
     # ── Agents ────────────────────────────────────────────────────────────
 
     async def register_agent(self, card: dict[str, Any]) -> dict[str, Any]:
-        r = await self._request("POST", "/agents", json=card)
+        r = await self._request("POST", "/agents", json=card, safe=False, operation="register_agent")
         return r.json()
 
     async def list_agents(self) -> dict[str, Any]:
-        r = await self._request("GET", "/agents")
+        r = await self._request("GET", "/agents", safe=True, operation="list_agents")
         return r.json()
 
     async def get_agent(self, agent_id: str) -> dict[str, Any]:
-        r = await self._request("GET", f"/agents/{agent_id}")
+        r = await self._request("GET", f"/agents/{agent_id}", safe=True, operation="get_agent")
         return r.json()
 
     async def activate_agent(self, agent_id: str) -> dict[str, Any]:
-        r = await self._request("POST", f"/agents/{agent_id}/activate")
+        r = await self._request("POST", f"/agents/{agent_id}/activate", safe=False, operation="activate_agent")
         return r.json()
 
     async def deactivate_agent(self, agent_id: str) -> dict[str, Any]:
-        r = await self._request("POST", f"/agents/{agent_id}/deactivate")
+        r = await self._request("POST", f"/agents/{agent_id}/deactivate", safe=False, operation="deactivate_agent")
         return r.json()
 
     async def discover_agent(self, url: str) -> dict[str, Any]:
-        r = await self._request("POST", "/agents/discover", json={"url": url})
+        r = await self._request("POST", "/agents/discover", json={"url": url}, safe=False, operation="discover_agent")
         return r.json()
 
     # ── Work items (worker protocol) ────────────────────────────────────
@@ -329,7 +362,8 @@ class JamjetClient:
         body: dict[str, Any] = {"worker_id": worker_id, "queue_types": queue_types}
         if lease_secs is not None:
             body["lease_secs"] = int(lease_secs)
-        r = await self._request("POST", "/work-items/claim", json=body)
+        # Sent again, it could claim a second item while the first one's lease runs.
+        r = await self._request("POST", "/work-items/claim", json=body, safe=False, operation="claim_work_item")
         data = r.json()
         if not data.get("claimed"):
             return None
@@ -394,10 +428,14 @@ class JamjetClient:
             # would turn a malformed key into "no key" — the failure mode this
             # whole change exists to remove, and invisible at the call site.
             body["idempotency_key"] = idempotency_key
+        # Fenced, a second send cannot complete the node twice: once the first
+        # lands, the engine refuses the fence with 409. Unfenced, it could.
         await self._request(
             "POST",
             f"/work-items/{item_id}/complete",
             json=body,
+            safe=bool(lease_fence),
+            operation="complete_work_item",
         )
 
     async def fail_work_item(self, item_id: str, error: str, lease_fence: int = 0) -> None:
@@ -415,10 +453,13 @@ class JamjetClient:
         body: dict[str, Any] = {"error": error}
         if lease_fence:
             body["lease_fence"] = lease_fence
+        # Fenced, a second send is refused with 409 once the first lands.
         await self._request(
             "POST",
             f"/work-items/{item_id}/fail",
             json=body,
+            safe=bool(lease_fence),
+            operation="fail_work_item",
         )
 
     async def heartbeat_work_item(
@@ -439,6 +480,8 @@ class JamjetClient:
             "POST",
             f"/work-items/{item_id}/heartbeat",
             json={"worker_id": worker_id, "lease_fence": lease_fence},
+            safe=True,
+            operation="heartbeat_work_item",
         )
         try:
             body = r.json()
@@ -449,11 +492,12 @@ class JamjetClient:
     # ── Generic helpers (for one-off API paths not covered above) ─────────
 
     async def post(self, path: str, **kwargs: Any) -> dict[str, Any]:
-        r = await self._request("POST", path, **kwargs)
+        """POST to any engine path. Never sent again once it may have taken effect."""
+        r = await self._request("POST", path, safe=False, operation=_operation("POST", path), **kwargs)
         return r.json()
 
     async def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
-        r = await self._request("GET", path, **kwargs)
+        r = await self._request("GET", path, safe=True, operation=_operation("GET", path), **kwargs)
         return r.json()
 
     async def __aenter__(self) -> JamjetClient:
@@ -461,3 +505,8 @@ class JamjetClient:
 
     async def __aexit__(self, *args: Any) -> None:
         await self._client.aclose()
+
+
+def _operation(method: str, path: str) -> str:
+    """How ``OutcomeUnknown`` names a generic call: the method and the path, without host or query."""
+    return f"{method} {httpx.URL(path).path}"
