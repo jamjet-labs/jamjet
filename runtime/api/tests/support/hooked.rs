@@ -714,4 +714,23 @@ impl StateBackend for HookedBackend {
     ) -> jamjet_state::backend::BackendResult<jamjet_state::PassCommit> {
         self.inner.commit_scheduler_pass(pass).await
     }
+
+    /// Delegated for the same reason: the wrapped backend's one step, not
+    /// the default's settle-then-append.
+    async fn reclaim_expired_leases_recorded(
+        &self,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::backend::ReclaimResult> {
+        self.inner.reclaim_expired_leases_recorded().await
+    }
+
+    async fn fail_work_item_fenced_recorded(
+        &self,
+        item_id: jamjet_state::backend::WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::backend::FailOutcome>> {
+        self.inner
+            .fail_work_item_fenced_recorded(item_id, lease_fence, error)
+            .await
+    }
 }

@@ -347,6 +347,102 @@ impl InMemoryBackend {
         }
         Ok(seq)
     }
+
+    /// `fail_work_item_fenced`, for a caller that holds `pass_lock`.
+    fn fail_locked(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> Option<FailOutcome> {
+        let mut entry = self.work_items.get_mut(&item_id)?;
+        // Same guard as `complete_work_item_fenced`: the fence AND still-claimed
+        // (`worker_id.is_some()`). Fence alone would let a forged `lease_fence: 0`
+        // match a never-claimed pending item, and would accept a stale fence after
+        // a reclaim, since reclaim clears `worker_id` but leaves `lease_fence`.
+        if entry.worker_id.is_none() || entry.lease_fence != lease_fence {
+            return None;
+        }
+
+        let new_attempt = entry.attempt + 1;
+        entry.attempt = new_attempt;
+        entry.worker_id = None;
+        entry.lease_expires_at = None;
+        if let Some(obj) = entry.payload.as_object_mut() {
+            obj.insert(
+                "last_error".into(),
+                serde_json::Value::String(error.to_string()),
+            );
+        }
+        // Bump the epoch so any re-claim mints a strictly greater fence than the
+        // token the failing worker still holds.
+        let next = self
+            .lease_epochs
+            .get(&item_id)
+            .map(|e| *e.value())
+            .unwrap_or(0)
+            + 1;
+        self.lease_epochs.insert(item_id, next);
+
+        let item = entry.clone();
+        let exhausted = new_attempt >= item.max_attempts;
+        drop(entry);
+
+        if exhausted {
+            // Mirror SQLite: a dead-lettered item leaves the live queue entirely,
+            // so it can never be claimed again.
+            self.work_items.remove(&item_id);
+            return Some(FailOutcome::Exhausted {
+                item: Box::new(item),
+            });
+        }
+        Some(FailOutcome::Retryable {
+            delay_ms: (1u64 << new_attempt.min(6)) * 1000,
+            item: Box::new(item),
+        })
+    }
+
+    /// `reclaim_expired_leases` at `now`, for a caller that holds `pass_lock`.
+    fn reclaim_locked(&self, now: chrono::DateTime<Utc>) -> ReclaimResult {
+        let mut result = ReclaimResult::default();
+        let mut to_dead_letter = vec![];
+
+        for mut entry in self.work_items.iter_mut() {
+            let item = entry.value_mut();
+            if let Some(expires) = item.lease_expires_at {
+                if expires < now && item.worker_id.is_some() {
+                    item.attempt += 1;
+                    if item.attempt < item.max_attempts {
+                        self.last_lease.insert(
+                            item.id,
+                            (item.worker_id.clone().unwrap_or_default(), item.lease_fence),
+                        );
+                        item.worker_id = None;
+                        item.lease_expires_at = None;
+                        // Bump epoch so a re-claim mints a strictly greater fence.
+                        let next = self
+                            .lease_epochs
+                            .get(&item.id)
+                            .map(|e| *e.value())
+                            .unwrap_or(0)
+                            + 1;
+                        self.lease_epochs.insert(item.id, next);
+                        result.retryable.push(item.clone());
+                    } else {
+                        to_dead_letter.push(item.clone());
+                    }
+                }
+            }
+        }
+
+        for item in to_dead_letter {
+            self.work_items.remove(&item.id);
+            result.exhausted.push(item.clone());
+            self.dead_letter.insert(item.id, item);
+        }
+
+        result
+    }
 }
 
 impl Default for InMemoryBackend {
@@ -1294,53 +1390,7 @@ impl StateBackend for InMemoryBackend {
         error: &str,
     ) -> BackendResult<Option<FailOutcome>> {
         let _pass = self.pass_lock.lock().await;
-        let Some(mut entry) = self.work_items.get_mut(&item_id) else {
-            return Ok(None);
-        };
-        // Same guard as `complete_work_item_fenced`: the fence AND still-claimed
-        // (`worker_id.is_some()`). Fence alone would let a forged `lease_fence: 0`
-        // match a never-claimed pending item, and would accept a stale fence after
-        // a reclaim, since reclaim clears `worker_id` but leaves `lease_fence`.
-        if entry.worker_id.is_none() || entry.lease_fence != lease_fence {
-            return Ok(None);
-        }
-
-        let new_attempt = entry.attempt + 1;
-        entry.attempt = new_attempt;
-        entry.worker_id = None;
-        entry.lease_expires_at = None;
-        if let Some(obj) = entry.payload.as_object_mut() {
-            obj.insert(
-                "last_error".into(),
-                serde_json::Value::String(error.to_string()),
-            );
-        }
-        // Bump the epoch so any re-claim mints a strictly greater fence than the
-        // token the failing worker still holds.
-        let next = self
-            .lease_epochs
-            .get(&item_id)
-            .map(|e| *e.value())
-            .unwrap_or(0)
-            + 1;
-        self.lease_epochs.insert(item_id, next);
-
-        let item = entry.clone();
-        let exhausted = new_attempt >= item.max_attempts;
-        drop(entry);
-
-        if exhausted {
-            // Mirror SQLite: a dead-lettered item leaves the live queue entirely,
-            // so it can never be claimed again.
-            self.work_items.remove(&item_id);
-            return Ok(Some(FailOutcome::Exhausted {
-                item: Box::new(item),
-            }));
-        }
-        Ok(Some(FailOutcome::Retryable {
-            delay_ms: (1u64 << new_attempt.min(6)) * 1000,
-            item: Box::new(item),
-        }))
+        Ok(self.fail_locked(item_id, lease_fence, error))
     }
 
     async fn commit_turn_unless_terminal(
@@ -1419,45 +1469,7 @@ impl StateBackend for InMemoryBackend {
 
     async fn reclaim_expired_leases(&self) -> BackendResult<ReclaimResult> {
         let _pass = self.pass_lock.lock().await;
-        let now = Utc::now();
-        let mut result = ReclaimResult::default();
-        let mut to_dead_letter = vec![];
-
-        for mut entry in self.work_items.iter_mut() {
-            let item = entry.value_mut();
-            if let Some(expires) = item.lease_expires_at {
-                if expires < now && item.worker_id.is_some() {
-                    item.attempt += 1;
-                    if item.attempt < item.max_attempts {
-                        self.last_lease.insert(
-                            item.id,
-                            (item.worker_id.clone().unwrap_or_default(), item.lease_fence),
-                        );
-                        item.worker_id = None;
-                        item.lease_expires_at = None;
-                        // Bump epoch so a re-claim mints a strictly greater fence.
-                        let next = self
-                            .lease_epochs
-                            .get(&item.id)
-                            .map(|e| *e.value())
-                            .unwrap_or(0)
-                            + 1;
-                        self.lease_epochs.insert(item.id, next);
-                        result.retryable.push(item.clone());
-                    } else {
-                        to_dead_letter.push(item.clone());
-                    }
-                }
-            }
-        }
-
-        for item in to_dead_letter {
-            self.work_items.remove(&item.id);
-            result.exhausted.push(item.clone());
-            self.dead_letter.insert(item.id, item);
-        }
-
-        Ok(result)
+        Ok(self.reclaim_locked(Utc::now()))
     }
 
     async fn move_to_dead_letter(
@@ -1662,6 +1674,77 @@ impl StateBackend for InMemoryBackend {
             }
         }
         Ok(PassCommit::Committed { last_sequence })
+    }
+
+    async fn reclaim_expired_leases_recorded(&self) -> BackendResult<ReclaimResult> {
+        use crate::lease_events::{sweep_events, SweepOutcome};
+        // The settles and their events under one hold of the lock, so no
+        // pass, claim or status change lands between them.
+        let _pass = self.pass_lock.lock().await;
+        let now = Utc::now();
+        // An expired item of a finished run is settled and nothing is
+        // recorded, as the claim's fast reclaim settles it.
+        let finished: Vec<WorkItemId> = self
+            .work_items
+            .iter()
+            .filter(|held| {
+                held.worker_id.is_some()
+                    && held.lease_expires_at.is_some_and(|t| t < now)
+                    && self
+                        .executions
+                        .get(&held.execution_id)
+                        .is_some_and(|e| e.value().status.is_terminal())
+            })
+            .map(|held| held.id)
+            .collect();
+        for id in finished {
+            self.work_items.remove(&id);
+        }
+        let result = self.reclaim_locked(now);
+        for (items, outcome) in [
+            (&result.retryable, SweepOutcome::Retry),
+            (&result.exhausted, SweepOutcome::Exhausted),
+        ] {
+            for item in items {
+                for kind in sweep_events(item, outcome) {
+                    self.push_event(Event::new(item.execution_id.clone(), 0, kind));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn fail_work_item_fenced_recorded(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        let _pass = self.pass_lock.lock().await;
+        let Some(execution_id) = self
+            .work_items
+            .get(&item_id)
+            .map(|held| held.execution_id.clone())
+        else {
+            return Ok(None);
+        };
+        let terminal = self
+            .executions
+            .get(&execution_id)
+            .is_some_and(|e| e.value().status.is_terminal());
+        if terminal {
+            // The holder's item is settled and nothing is recorded, as
+            // `commit_turn_unless_terminal` withdraws it.
+            self.withdraw_locked(item_id, lease_fence);
+            return Ok(None);
+        }
+        let Some(outcome) = self.fail_locked(item_id, lease_fence, error) else {
+            return Ok(None);
+        };
+        for kind in crate::lease_events::fail_events(&outcome, error) {
+            self.push_event(Event::new(execution_id.clone(), 0, kind));
+        }
+        Ok(Some(outcome))
     }
 }
 

@@ -1044,6 +1044,57 @@ pub trait StateBackend: Send + Sync {
     async fn commit_scheduler_pass(&self, pass: SchedulerPass) -> BackendResult<PassCommit> {
         crate::legacy::scheduler_pass_in_steps(self, pass).await
     }
+
+    /// [`reclaim_expired_leases`](Self::reclaim_expired_leases), with each
+    /// reclaimed item's events written in the same atomic step as its settle:
+    /// for a requeued item `NodeFailed { retryable: true }` and
+    /// `RetryScheduled`, for a dead-lettered one `NodeFailed { retryable:
+    /// false }`, as [`crate::lease_events::sweep_events`] builds them. One step
+    /// per item, so a failure leaves each item either reclaimed and recorded
+    /// or untouched, never settled with no history. The scheduler's sweep
+    /// calls this and appends nothing itself.
+    ///
+    /// Each item is read again inside its step, and reclaimed only while it
+    /// is still claimed under the lease that expired and that lease has not
+    /// been renewed since. An item whose run is terminal is settled failed
+    /// and records nothing, as the claim's fast reclaim does, and is left out
+    /// of the result. The result holds only the items that were requeued or
+    /// dead-lettered and recorded, with their new attempt numbers.
+    ///
+    /// The default reclaims with `reclaim_expired_leases` and then appends
+    /// the events one by one, as the scheduler did before this method: no
+    /// check of the run's status, and a failure part way leaves settled items
+    /// with no events. A backend that runs with more than one engine must
+    /// override it.
+    async fn reclaim_expired_leases_recorded(&self) -> BackendResult<ReclaimResult> {
+        crate::legacy::reclaim_in_steps(self).await
+    }
+
+    /// [`fail_work_item_fenced`](Self::fail_work_item_fenced), with its
+    /// `NodeFailed` (and, for a retry, `RetryScheduled`) written in the same
+    /// atomic step as the settle, as [`crate::lease_events::fail_events`]
+    /// builds them from the outcome and `error`. The fail route calls this
+    /// and appends nothing itself.
+    ///
+    /// `Ok(None)`, with nothing written, for a fence that does not match or
+    /// an item that is no longer claimed. When the item's run is terminal the
+    /// item is settled failed, nothing is recorded, and the answer is also
+    /// `Ok(None)`: a cancel that lands after the caller read the run cannot
+    /// be followed by a failure trail.
+    ///
+    /// The default fails the item with `fail_work_item_fenced` and then
+    /// appends the events one by one, as the fail route did before this
+    /// method: no check of the run's status, and a failure after the settle
+    /// leaves it with no events. A backend that runs with more than one
+    /// engine must override it.
+    async fn fail_work_item_fenced_recorded(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        crate::legacy::fail_in_steps(self, item_id, lease_fence, error).await
+    }
 }
 
 /// Metadata for an API token (does not contain the plaintext token).

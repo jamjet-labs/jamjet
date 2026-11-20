@@ -3845,8 +3845,13 @@ async fn fail_work_item(
         ));
     };
 
+    // The settle and the events that record it (`NodeFailed`, and
+    // `RetryScheduled` for a retry: the trail the scheduler's lease sweep
+    // writes for the same transition) land in one write, so a failure after
+    // the settle can no longer leave the node with no event. A run that went
+    // terminal after the check above records nothing and answers `None`.
     let Some(outcome) = backend
-        .fail_work_item_fenced(item_id, fence, &body.error)
+        .fail_work_item_fenced_recorded(item_id, fence, &body.error)
         .await?
     else {
         // Someone else owns it now — reclaimed, already settled, or a forged
@@ -3861,47 +3866,10 @@ async fn fail_work_item(
         ));
     };
 
-    // Emit exactly what `SchedulerRunner::reclaim_expired_leases` emits for the
-    // same transition, so the fold cannot tell the two apart.
-    let (item, retryable, delay_ms) = match &outcome {
-        FailOutcome::Retryable { item, delay_ms } => (item, true, Some(*delay_ms)),
-        FailOutcome::Exhausted { item } => (item, false, None),
+    let (item, retryable) = match &outcome {
+        FailOutcome::Retryable { item, .. } => (item, true),
+        FailOutcome::Exhausted { item } => (item, false),
     };
-
-    let seq = backend.latest_sequence(&item.execution_id).await? + 1;
-    backend
-        .append_event(jamjet_state::Event::new(
-            item.execution_id.clone(),
-            seq,
-            jamjet_state::EventKind::NodeFailed {
-                node_id: item.node_id.clone(),
-                error: body.error.clone(),
-                // Retryable reports the attempt that just failed; exhausted
-                // reports the final count. Mirrors the reclaimer's arithmetic.
-                attempt: if retryable {
-                    item.attempt.saturating_sub(1)
-                } else {
-                    item.attempt
-                },
-                retryable,
-            },
-        ))
-        .await?;
-
-    if let Some(delay_ms) = delay_ms {
-        let seq = backend.latest_sequence(&item.execution_id).await? + 1;
-        backend
-            .append_event(jamjet_state::Event::new(
-                item.execution_id.clone(),
-                seq,
-                jamjet_state::EventKind::RetryScheduled {
-                    node_id: item.node_id.clone(),
-                    attempt: item.attempt,
-                    delay_ms,
-                },
-            ))
-            .await?;
-    }
 
     warn!(
         execution_id = %item.execution_id,

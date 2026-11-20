@@ -273,6 +273,12 @@ pub enum Op<'a> {
 
     // ── Storage lane ─────────────────────────────────────────────────────
     CommitSchedulerPass(&'a ExecutionId),
+    ReclaimExpiredLeasesRecorded,
+    FailWorkItemFencedRecorded {
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &'a str,
+    },
 }
 
 /// What a test does around each call [`Intercept`] delegates.
@@ -1221,6 +1227,32 @@ impl StateBackend for Intercept {
             self,
             Op::CommitSchedulerPass(&pass.execution_id),
             self.inner.commit_scheduler_pass(pass.clone())
+        )
+    }
+
+    async fn reclaim_expired_leases_recorded(&self) -> BackendResult<ReclaimResult> {
+        around!(
+            self,
+            Op::ReclaimExpiredLeasesRecorded,
+            self.inner.reclaim_expired_leases_recorded()
+        )
+    }
+
+    async fn fail_work_item_fenced_recorded(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        around!(
+            self,
+            Op::FailWorkItemFencedRecorded {
+                item_id,
+                lease_fence,
+                error
+            },
+            self.inner
+                .fail_work_item_fenced_recorded(item_id, lease_fence, error)
         )
     }
 }

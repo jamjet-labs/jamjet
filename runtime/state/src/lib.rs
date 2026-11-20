@@ -12,6 +12,7 @@ pub mod backend;
 pub mod budget;
 pub mod event;
 pub mod hashing;
+pub mod lease_events;
 mod legacy;
 pub mod materializer;
 pub mod memory;

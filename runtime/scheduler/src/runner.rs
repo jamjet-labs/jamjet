@@ -305,37 +305,14 @@ impl Scheduler {
         }
     }
 
-    /// Reclaim expired work item leases and emit appropriate events.
+    /// Reclaim expired work item leases. The store records each reclaim's
+    /// events (`NodeFailed`, and `RetryScheduled` for a retry) in the same
+    /// write as its settle, so the sweep appends nothing itself, and an item
+    /// of a finished run is settled with nothing recorded.
     async fn reclaim_expired_leases(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let reclaimed = self.backend.reclaim_expired_leases().await?;
+        let reclaimed = self.backend.reclaim_expired_leases_recorded().await?;
 
         for item in &reclaimed.retryable {
-            // Emit NodeFailed{retryable: true} + RetryScheduled
-            let seq = self.backend.latest_sequence(&item.execution_id).await? + 1;
-            let failed_event = jamjet_state::Event::new(
-                item.execution_id.clone(),
-                seq,
-                jamjet_state::event::EventKind::NodeFailed {
-                    node_id: item.node_id.clone(),
-                    error: "lease expired: worker presumed dead".into(),
-                    attempt: item.attempt.saturating_sub(1),
-                    retryable: true,
-                },
-            );
-            self.backend.append_event(failed_event).await?;
-
-            let seq = self.backend.latest_sequence(&item.execution_id).await? + 1;
-            let retry_event = jamjet_state::Event::new(
-                item.execution_id.clone(),
-                seq,
-                jamjet_state::event::EventKind::RetryScheduled {
-                    node_id: item.node_id.clone(),
-                    attempt: item.attempt,
-                    delay_ms: (1u64 << item.attempt.min(6)) * 1000,
-                },
-            );
-            self.backend.append_event(retry_event).await?;
-
             warn!(
                 execution_id = %item.execution_id,
                 node_id = %item.node_id,
@@ -345,20 +322,6 @@ impl Scheduler {
         }
 
         for item in &reclaimed.exhausted {
-            // Emit NodeFailed{retryable: false} — permanently dead
-            let seq = self.backend.latest_sequence(&item.execution_id).await? + 1;
-            let failed_event = jamjet_state::Event::new(
-                item.execution_id.clone(),
-                seq,
-                jamjet_state::event::EventKind::NodeFailed {
-                    node_id: item.node_id.clone(),
-                    error: format!("exhausted {} attempts: lease expired", item.max_attempts),
-                    attempt: item.attempt,
-                    retryable: false,
-                },
-            );
-            self.backend.append_event(failed_event).await?;
-
             warn!(
                 execution_id = %item.execution_id,
                 node_id = %item.node_id,

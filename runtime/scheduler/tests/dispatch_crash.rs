@@ -4,8 +4,8 @@
 //! fails (a busy database, a crash), and nothing later repairs it: a node
 //! scheduled with no item, a dead-lettered item with no failure recorded, a
 //! failure with no retry. The scheduler's dispatch is one write now (its
-//! pass). The sweep still settles an expired item and then appends the
-//! events that record it.
+//! pass), and so is its lease sweep: the store settles each expired item and
+//! records its events in the same step.
 //!
 //! The store refuses the chosen call once (`Intercept`'s `before` hook), and
 //! each test checks the refusal happened.
@@ -33,10 +33,6 @@ struct FailOnce {
 }
 
 impl FailOnce {
-    fn new(pick: fn(&Op<'_>) -> bool) -> Arc<Self> {
-        Self::watching(pick, |_| false)
-    }
-
     fn watching(pick: fn(&Op<'_>) -> bool, watch: fn(&Op<'_>) -> bool) -> Arc<Self> {
         Arc::new(Self {
             pick,
@@ -135,8 +131,22 @@ async fn a_failed_enqueue_after_node_scheduled_does_not_strand_the_node() {
     }
 }
 
+/// The sweep's own writes: the reclaim it calls, and any event it appends.
+/// It calls `reclaim_expired_leases_recorded` and appends nothing, so in a
+/// sweep that records in one step none of these goes through.
+fn split_sweep_write(op: &Op<'_>) -> bool {
+    matches!(op, Op::ReclaimExpiredLeases | Op::AppendEvent(_))
+}
+
 /// One attempt only: an expired lease dead-letters the item, and the sweep
 /// records `NodeFailed { retryable: false }`, which fails the run.
+///
+/// The sweep dead-lettered the item and then appended the `NodeFailed`; a
+/// refused append left the item settled with nothing recorded, and the run
+/// `Running` for good. Now both are one step. The store refuses the step
+/// that records the failure, whichever call carries it, once: the recorded
+/// reclaim, or the append a split sweep would make. Nothing of a refused
+/// recorded reclaim lands, and the next tick reclaims the item again.
 #[tokio::test]
 async fn a_failed_lease_event_after_dead_letter_does_not_strand_the_node() {
     let ir = workflow(
@@ -151,8 +161,12 @@ async fn a_failed_lease_event_after_dead_letter_does_not_strand_the_node() {
     for store in stores().await {
         let name = store.name();
         let backend = store.backend();
-        let hook = FailOnce::new(
-            |op| matches!(op, Op::AppendEvent(e) if matches!(e.kind, EventKind::NodeFailed { .. })),
+        let hook = FailOnce::watching(
+            |op| {
+                matches!(op, Op::ReclaimExpiredLeasesRecorded)
+                    || matches!(op, Op::AppendEvent(e) if matches!(e.kind, EventKind::NodeFailed { .. }))
+            },
+            split_sweep_write,
         );
         let scheduler = Scheduler::new(Arc::new(Intercept::new(backend.clone(), hook.clone())));
         let execution_id = support::start_run(backend.as_ref(), ir.clone()).await;
@@ -190,11 +204,22 @@ async fn a_failed_lease_event_after_dead_letter_does_not_strand_the_node() {
              status {state:?}, log {:?}",
             kinds(&events)
         );
+        assert_eq!(
+            hook.watched(),
+            0,
+            "{name}: the sweep reclaimed or appended outside its recorded step"
+        );
     }
 }
 
 /// Three attempts: an expired lease puts the item back, and the sweep
 /// records `NodeFailed { retryable: true }` then `RetryScheduled`.
+///
+/// The sweep requeued the item and then appended the two events one by
+/// one; a refused second append left a failure with no retry. Now the
+/// requeue and both events are one step. The store refuses the step that
+/// records the retry, whichever call carries it, once: the recorded
+/// reclaim, or the `RetryScheduled` append a split sweep would make.
 #[tokio::test]
 async fn a_failed_retry_event_after_requeue_is_never_half_recorded() {
     let ir = workflow(
@@ -209,8 +234,12 @@ async fn a_failed_retry_event_after_requeue_is_never_half_recorded() {
     for store in stores().await {
         let name = store.name();
         let backend = store.backend();
-        let hook = FailOnce::new(
-            |op| matches!(op, Op::AppendEvent(e) if matches!(e.kind, EventKind::RetryScheduled { .. })),
+        let hook = FailOnce::watching(
+            |op| {
+                matches!(op, Op::ReclaimExpiredLeasesRecorded)
+                    || matches!(op, Op::AppendEvent(e) if matches!(e.kind, EventKind::RetryScheduled { .. }))
+            },
+            split_sweep_write,
         );
         let scheduler = Scheduler::new(Arc::new(Intercept::new(backend.clone(), hook.clone())));
         let execution_id = support::start_run(backend.as_ref(), ir.clone()).await;
@@ -261,5 +290,10 @@ async fn a_failed_retry_event_after_requeue_is_never_half_recorded() {
                 kinds(&events)
             );
         }
+        assert_eq!(
+            hook.watched(),
+            0,
+            "{name}: the sweep reclaimed or appended outside its recorded step"
+        );
     }
 }

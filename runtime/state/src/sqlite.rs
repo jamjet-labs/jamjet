@@ -2514,6 +2514,21 @@ impl StateBackend for SqliteBackend {
     ) -> BackendResult<crate::backend::PassCommit> {
         commit_scheduler_pass_in(&self.pool, None, pass).await
     }
+
+    #[instrument(skip(self))]
+    async fn reclaim_expired_leases_recorded(&self) -> BackendResult<ReclaimResult> {
+        reclaim_expired_leases_recorded_in(&self.pool, None).await
+    }
+
+    #[instrument(skip(self, error), fields(item_id = %item_id, fence = lease_fence))]
+    async fn fail_work_item_fenced_recorded(
+        &self,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> BackendResult<Option<FailOutcome>> {
+        fail_work_item_fenced_recorded_in(&self.pool, None, item_id, lease_fence, error).await
+    }
 }
 
 pub(crate) use crate::backend::DEFAULT_LEASE_SECS;
@@ -3734,6 +3749,317 @@ async fn append_kind_in_tx(
     Ok(sequence)
 }
 
+/// [`StateBackend::reclaim_expired_leases_recorded`] for both SQLite
+/// backends. One read finds the claimed items whose lease has expired, then
+/// [`reclaim_one_recorded`] reclaims each in a transaction of its own, with
+/// its events. `tenant_id` scopes the items on the tenant-scoped backend.
+pub(crate) async fn reclaim_expired_leases_recorded_in(
+    pool: &SqlitePool,
+    tenant_id: Option<&str>,
+) -> BackendResult<ReclaimResult> {
+    let now = Utc::now().to_rfc3339();
+    let select = format!(
+        "SELECT * FROM work_items WHERE status = 'claimed' AND lease_expires_at < ?{} \
+         ORDER BY created_at ASC",
+        if tenant_id.is_some() {
+            " AND tenant_id = ?"
+        } else {
+            ""
+        }
+    );
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(select)).bind(&now);
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    let rows = q.fetch_all(pool).await.map_err(map_db_err)?;
+
+    let mut result = ReclaimResult::default();
+    for row in &rows {
+        let candidate = row_to_work_item(row)?;
+        match reclaim_one_recorded(pool, tenant_id, &candidate, &now).await? {
+            Some((crate::lease_events::SweepOutcome::Retry, item)) => result.retryable.push(item),
+            Some((crate::lease_events::SweepOutcome::Exhausted, item)) => {
+                result.exhausted.push(item)
+            }
+            None => {}
+        }
+    }
+    Ok(result)
+}
+
+/// Reclaim one item the sweep's read found expired, in one `BEGIN
+/// IMMEDIATE` transaction: read it again, settle it, and record it.
+///
+/// The read runs in a statement of its own, so by now a heartbeat may have
+/// renewed the lease, a worker may have settled the item, or a claim's fast
+/// reclaim may have requeued it and another worker leased it. So the item is
+/// reclaimed only while it is still claimed under the lease the read saw
+/// (`lease_fence`) and that lease is still expired at `now`. An item whose
+/// run is terminal is settled `'failed'` and nothing is recorded. Otherwise
+/// it is requeued or dead-lettered as `reclaim_expired_leases` does it, and
+/// [`crate::lease_events::sweep_events`] are appended. Returns what was done
+/// and the item with its new attempt, or `None` when nothing was recorded.
+pub(crate) async fn reclaim_one_recorded(
+    pool: &SqlitePool,
+    tenant_id: Option<&str>,
+    candidate: &WorkItem,
+    now: &str,
+) -> BackendResult<Option<(crate::lease_events::SweepOutcome, WorkItem)>> {
+    use crate::lease_events::{sweep_events, SweepOutcome};
+    let id_str = candidate.id.to_string();
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(map_db_err)?;
+    let Some((mut item, terminal)) = read_claimed_in_tx(
+        &mut tx,
+        tenant_id,
+        &id_str,
+        candidate.lease_fence,
+        Some(now),
+    )
+    .await?
+    else {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Ok(None);
+    };
+    if terminal {
+        settle_failed_in_tx(&mut tx, &id_str, item.lease_fence).await?;
+        tx.commit().await.map_err(map_db_err)?;
+        return Ok(None);
+    }
+
+    let new_attempt = item.attempt + 1;
+    let (outcome, settled) = if new_attempt >= item.max_attempts {
+        let settled = sqlx::query(
+            "UPDATE work_items SET status = 'dead_lettered', attempt = ?, lease_expires_at = NULL, \
+             worker_id = NULL WHERE id = ? AND status = 'claimed' AND lease_fence = ?",
+        )
+        .bind(new_attempt as i64)
+        .bind(&id_str)
+        .bind(item.lease_fence)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+        (SweepOutcome::Exhausted, settled)
+    } else {
+        let backoff_secs = 1u64 << new_attempt.min(6);
+        let retry_after =
+            (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
+        let settled = sqlx::query(
+            "UPDATE work_items SET status = 'pending', attempt = ?, last_worker_id = worker_id, \
+             last_lease_fence = lease_fence, worker_id = NULL, lease_expires_at = NULL, \
+             retry_after = ?, lease_epoch = lease_epoch + 1, lease_fence = 0 \
+             WHERE id = ? AND status = 'claimed' AND lease_fence = ?",
+        )
+        .bind(new_attempt as i64)
+        .bind(&retry_after)
+        .bind(&id_str)
+        .bind(item.lease_fence)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected();
+        (SweepOutcome::Retry, settled)
+    };
+    if settled == 0 {
+        // Unreachable while the write lock is held since the read; kept so
+        // a later change to the read cannot record a settle that missed.
+        tx.rollback().await.map_err(map_db_err)?;
+        return Ok(None);
+    }
+    item.attempt = new_attempt;
+    if outcome == SweepOutcome::Exhausted {
+        insert_dead_letter_in_tx(&mut tx, &item, "lease expired: worker dead").await?;
+    }
+    for kind in sweep_events(&item, outcome) {
+        insert_event_in_tx(&mut tx, &item, kind).await?;
+    }
+    tx.commit().await.map_err(map_db_err)?;
+    Ok(Some((outcome, item)))
+}
+
+/// [`StateBackend::fail_work_item_fenced_recorded`] for both SQLite
+/// backends, in one `BEGIN IMMEDIATE` transaction: the item is read under
+/// its fence, still claimed, with its run's status; then it is retried or
+/// dead-lettered as `fail_work_item_fenced` does it, and
+/// [`crate::lease_events::fail_events`] are appended. An item whose run is
+/// terminal is settled `'failed'` with nothing recorded, and the answer is
+/// `None`, as for a fence that does not match.
+pub(crate) async fn fail_work_item_fenced_recorded_in(
+    pool: &SqlitePool,
+    tenant_id: Option<&str>,
+    item_id: WorkItemId,
+    lease_fence: i64,
+    error: &str,
+) -> BackendResult<Option<FailOutcome>> {
+    let id_str = item_id.to_string();
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(map_db_err)?;
+    let Some((mut item, terminal)) =
+        read_claimed_in_tx(&mut tx, tenant_id, &id_str, lease_fence, None).await?
+    else {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Ok(None);
+    };
+    if terminal {
+        settle_failed_in_tx(&mut tx, &id_str, lease_fence).await?;
+        tx.commit().await.map_err(map_db_err)?;
+        return Ok(None);
+    }
+
+    let new_attempt = item.attempt + 1;
+    let exhausted = new_attempt >= item.max_attempts;
+    let backoff_secs = 1u64 << new_attempt.min(6);
+    let settled = if exhausted {
+        sqlx::query(
+            "UPDATE work_items SET status = 'dead_lettered', attempt = ?, lease_expires_at = NULL, \
+             worker_id = NULL WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
+        )
+        .bind(new_attempt as i64)
+        .bind(&id_str)
+        .bind(lease_fence)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected()
+    } else {
+        let retry_after =
+            (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
+        sqlx::query(
+            "UPDATE work_items SET status = 'pending', attempt = ?, worker_id = NULL, \
+             lease_expires_at = NULL, retry_after = ?, lease_epoch = lease_epoch + 1, \
+             lease_fence = 0 WHERE id = ? AND lease_fence = ? AND status = 'claimed'",
+        )
+        .bind(new_attempt as i64)
+        .bind(&retry_after)
+        .bind(&id_str)
+        .bind(lease_fence)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?
+        .rows_affected()
+    };
+    if settled == 0 {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Ok(None);
+    }
+    item.attempt = new_attempt;
+    let outcome = if exhausted {
+        insert_dead_letter_in_tx(&mut tx, &item, error).await?;
+        FailOutcome::Exhausted {
+            item: Box::new(item.clone()),
+        }
+    } else {
+        FailOutcome::Retryable {
+            item: Box::new(item.clone()),
+            delay_ms: backoff_secs * 1000,
+        }
+    };
+    for kind in crate::lease_events::fail_events(&outcome, error) {
+        insert_event_in_tx(&mut tx, &item, kind).await?;
+    }
+    tx.commit().await.map_err(map_db_err)?;
+    Ok(Some(outcome))
+}
+
+/// The item `id` if it is claimed under `lease_fence` (and, with `expired_at`,
+/// its lease ended before that time), in `tenant_id` when scoped, with
+/// whether its run is terminal. Read inside the caller's transaction.
+async fn read_claimed_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tenant_id: Option<&str>,
+    id: &str,
+    lease_fence: i64,
+    expired_at: Option<&str>,
+) -> BackendResult<Option<(WorkItem, bool)>> {
+    let select = format!(
+        "SELECT w.*, e.status AS execution_status FROM work_items w \
+         LEFT JOIN workflow_executions e ON e.execution_id = w.execution_id \
+         WHERE w.id = ? AND w.status = 'claimed' AND w.lease_fence = ?{}{}",
+        if expired_at.is_some() {
+            " AND w.lease_expires_at < ?"
+        } else {
+            ""
+        },
+        if tenant_id.is_some() {
+            " AND w.tenant_id = ?"
+        } else {
+            ""
+        }
+    );
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(select))
+        .bind(id)
+        .bind(lease_fence);
+    if let Some(at) = expired_at {
+        q = q.bind(at);
+    }
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    let Some(row) = q.fetch_optional(&mut **tx).await.map_err(map_db_err)? else {
+        return Ok(None);
+    };
+    let terminal = row
+        .try_get::<Option<&str>, _>("execution_status")
+        .map_err(map_db_err)?
+        .map(str_to_status)
+        .transpose()?
+        .is_some_and(|s| s.is_terminal());
+    Ok(Some((row_to_work_item(&row)?, terminal)))
+}
+
+/// Settle a claimed item of a terminal run as `'failed'`, recording nothing,
+/// inside the caller's transaction.
+async fn settle_failed_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    lease_fence: i64,
+) -> BackendResult<()> {
+    sqlx::query(
+        "UPDATE work_items SET status = 'failed', worker_id = NULL, lease_expires_at = NULL \
+         WHERE id = ? AND status = 'claimed' AND lease_fence = ?",
+    )
+    .bind(id)
+    .bind(lease_fence)
+    .execute(&mut **tx)
+    .await
+    .map_err(map_db_err)?;
+    Ok(())
+}
+
+/// The dead-letter row for `item` (with its final attempt), under the
+/// item's tenant, inside the caller's transaction.
+async fn insert_dead_letter_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    item: &WorkItem,
+    last_error: &str,
+) -> BackendResult<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO dead_letter_items \
+         (id, execution_id, node_id, queue_type, payload_json, attempt, last_error, created_at, \
+          dead_lettered_at, tenant_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(item.id.to_string())
+    .bind(execution_id_str(&item.execution_id))
+    .bind(&item.node_id)
+    .bind(&item.queue_type)
+    .bind(serde_json::to_string(&item.payload)?)
+    .bind(item.attempt as i64)
+    .bind(last_error)
+    .bind(item.created_at.to_rfc3339())
+    .bind(Utc::now().to_rfc3339())
+    .bind(&item.tenant_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(map_db_err)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4187,5 +4513,110 @@ mod tests {
             WorkflowStatus::Running,
             "execution must remain Running after stale-fence finalize attempt"
         );
+    }
+
+    /// The recorded sweep reads each item again inside its own transaction.
+    /// Between the sweep's scan and that read, a claim's expiry pass may
+    /// requeue the item and another worker lease it, or the holder's
+    /// heartbeat may renew the lease the scan saw expired. Either way the
+    /// item is no longer the expired lease the scan read, and the sweep must
+    /// leave it and record nothing. An item still as the scan read it is
+    /// reclaimed and recorded.
+    #[tokio::test]
+    async fn the_recorded_sweep_skips_a_lease_taken_or_renewed_since_its_scan() {
+        for tenant in [None, Some("default")] {
+            let db = open_test_db().await;
+            let exec = sample_execution();
+            let eid = exec.execution_id.clone();
+            db.create_execution(exec).await.unwrap();
+            let enqueue = |node: &str| WorkItem {
+                id: uuid::Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: node.into(),
+                queue_type: "q".into(),
+                payload: json!({}),
+                attempt: 0,
+                max_attempts: 3,
+                created_at: Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            };
+
+            // Taken: the scan saw w1's expired lease. A claim requeued the
+            // item and w2 leased it. w2's lease lapses too (below, after the
+            // claims), so only the fence tells the two leases apart.
+            let taken = db.enqueue_work_item(enqueue("taken")).await.unwrap();
+            db.claim_work_item("w1", &["q"]).await.unwrap().unwrap();
+            db.force_lease_expired_for_test(taken).await.unwrap();
+            let taken_scanned = db.get_work_item(taken).await.unwrap().unwrap();
+            let taken_live = db.claim_work_item("w2", &["q"]).await.unwrap().unwrap();
+            assert_eq!(taken_live.id, taken);
+            assert_ne!(taken_live.lease_fence, taken_scanned.lease_fence);
+
+            // Renewed: the scan saw the lease expired, then its holder's
+            // heartbeat renewed it under the same fence.
+            let renewed = db.enqueue_work_item(enqueue("renewed")).await.unwrap();
+            let held = db.claim_work_item("w3", &["q"]).await.unwrap().unwrap();
+            assert_eq!(held.id, renewed);
+            db.force_lease_expired_for_test(renewed).await.unwrap();
+            let renewed_scanned = db.get_work_item(renewed).await.unwrap().unwrap();
+            db.renew_lease(renewed, "w3", held.lease_fence)
+                .await
+                .unwrap();
+
+            // Untouched since the scan.
+            let lapsed = db.enqueue_work_item(enqueue("lapsed")).await.unwrap();
+            let lapsed_held = db.claim_work_item("w4", &["q"]).await.unwrap().unwrap();
+            assert_eq!(lapsed_held.id, lapsed);
+            db.force_lease_expired_for_test(lapsed).await.unwrap();
+            let lapsed_scanned = db.get_work_item(lapsed).await.unwrap().unwrap();
+            // After the claims, whose own expiry pass would requeue it.
+            db.force_lease_expired_for_test(taken).await.unwrap();
+
+            let before = db.get_events(&eid).await.unwrap().len();
+            let now = Utc::now().to_rfc3339();
+            for scanned in [&taken_scanned, &renewed_scanned] {
+                let out = reclaim_one_recorded(&db.pool, tenant, scanned, &now)
+                    .await
+                    .unwrap();
+                assert!(out.is_none(), "{tenant:?} {}: {out:?}", scanned.node_id);
+            }
+            let still = db.get_work_item(taken).await.unwrap().unwrap();
+            assert_eq!(
+                (still.worker_id.as_deref(), still.lease_fence),
+                (Some("w2"), taken_live.lease_fence),
+                "{tenant:?}: w2's lease is not the one the scan read"
+            );
+            let still = db.get_work_item(renewed).await.unwrap().unwrap();
+            assert_eq!(
+                (still.worker_id.as_deref(), still.lease_fence),
+                (Some("w3"), held.lease_fence),
+                "{tenant:?}: the renewed lease stays with its holder"
+            );
+            assert_eq!(
+                db.get_events(&eid).await.unwrap().len(),
+                before,
+                "{tenant:?}: nothing recorded for a lease the sweep left"
+            );
+
+            let out = reclaim_one_recorded(&db.pool, tenant, &lapsed_scanned, &now)
+                .await
+                .unwrap();
+            assert!(
+                matches!(&out, Some((crate::lease_events::SweepOutcome::Retry, item)) if item.attempt == 1),
+                "{tenant:?}: {out:?}"
+            );
+            assert_eq!(db.get_events(&eid).await.unwrap().len(), before + 2);
+
+            // A second sweep that scanned the same lease (another engine)
+            // finds it reclaimed and records nothing.
+            let again = reclaim_one_recorded(&db.pool, tenant, &lapsed_scanned, &now)
+                .await
+                .unwrap();
+            assert!(again.is_none(), "{tenant:?}: {again:?}");
+            assert_eq!(db.get_events(&eid).await.unwrap().len(), before + 2);
+        }
     }
 }
