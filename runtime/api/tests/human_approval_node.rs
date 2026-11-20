@@ -850,3 +850,176 @@ async fn a_stored_version_with_an_upstream_fallback_still_re_registers() {
         assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
     }
 }
+
+// ── Options ─────────────────────────────────────────────────────────────────
+
+/// `ir(None, false, null)` with `review` declaring `options`.
+fn with_options(options: Value) -> Value {
+    let mut ir = ir(None, false, Value::Null);
+    ir["nodes"]["review"]["kind"]["options"] = options;
+    ir
+}
+
+/// `n` well-formed options, `topic_1` to `topic_<n>`.
+fn topics(n: usize) -> Vec<Value> {
+    (1..=n)
+        .map(|i| json!({ "id": format!("topic_{i}"), "label": format!("Topic {i}") }))
+        .collect()
+}
+
+/// Registering each `options` list on `review` is refused with exactly its
+/// reason, on every backend.
+async fn assert_refused(cases: &[(Value, String)]) {
+    for env in envs().await {
+        for (options, reason) in cases {
+            let ir = with_options(options.clone());
+            let (st, body) =
+                call(&env, "POST", "/workflows", &env.alice, json!({ "ir": ir })).await;
+            assert_eq!(
+                st,
+                StatusCode::BAD_REQUEST,
+                "{}: {options}: {body}",
+                env.name
+            );
+            assert_eq!(
+                body["error"],
+                format!("invalid workflow IR: human_approval node 'review' is invalid: {reason}"),
+                "{}: {options}",
+                env.name
+            );
+        }
+    }
+}
+
+/// GUARD: passes before `options` exists. A node without options serializes
+/// as it did, so its definition hash, which an approval in flight binds, is
+/// unchanged. An empty list is no options.
+#[tokio::test]
+async fn a_human_approval_node_without_options_keeps_its_definition_hash() {
+    const PLAIN: &str = r#"{"description":null,"id":"review","kind":{"description":"Ship release 1.4 to customers?","fallback_node":null,"timeout_secs":null,"type":"human_approval"},"labels":{},"node_timeout_secs":null,"retry_policy":null}"#;
+    const PLAIN_HASH: &str = "835752da0fdac2ca2925ad66a83e22027de7e6d5995fcab0bcf0e7d26060036d";
+    for (node, serialized, hash) in [
+        (ir(None, false, Value::Null), PLAIN, PLAIN_HASH),
+        (
+            ir(Some(60), true, Value::Null),
+            r#"{"description":null,"id":"review","kind":{"description":"Ship release 1.4 to customers?","fallback_node":"hold","timeout_secs":60,"type":"human_approval"},"labels":{},"node_timeout_secs":null,"retry_policy":null}"#,
+            "29e80e1cb6672dedf8642659698aab3c33b51dfa9e2c340714df387553d0a27e",
+        ),
+        (with_options(json!([])), PLAIN, PLAIN_HASH),
+    ] {
+        let def: jamjet_ir::NodeDef =
+            serde_json::from_value(node["nodes"]["review"].clone()).unwrap();
+        let value = serde_json::to_value(&def).unwrap();
+        assert_eq!(jamjet_state::canonical_json(&value), serialized);
+        assert_eq!(
+            jamjet_state::approvals::definition_hash(&value),
+            hash,
+            "{serialized}"
+        );
+    }
+    // The hash a live request binds, read from the request itself.
+    for env in envs().await {
+        let (_, ctx) = park(&env, ir(None, false, Value::Null)).await;
+        assert_eq!(ctx["action_definition"], PLAIN_HASH, "{}: {ctx}", env.name);
+    }
+}
+
+#[tokio::test]
+async fn eleven_options_are_refused() {
+    assert_refused(&[(
+        json!(topics(11)),
+        "it declares 11 options; at most 10 are allowed".to_string(),
+    )])
+    .await;
+}
+
+#[tokio::test]
+async fn duplicate_option_ids_are_refused() {
+    let mut options = topics(2);
+    options.push(json!({ "id": "topic_1", "label": "Topic 1 again" }));
+    assert_refused(&[(
+        json!(options),
+        "option id 'topic_1' appears more than once".to_string(),
+    )])
+    .await;
+}
+
+/// An option id is `[a-z0-9_-]{1,32}`: the bad one comes second, so the
+/// check reads past the first.
+#[tokio::test]
+async fn option_ids_out_of_pattern_are_refused() {
+    let long = "a".repeat(33);
+    let cases: Vec<(Value, String)> = ["Topic", "a b", long.as_str(), "", "caf\u{e9}"]
+        .iter()
+        .map(|id| {
+            (
+                json!([topics(1)[0], { "id": id, "label": "Bad id" }]),
+                format!(
+                    "option id {id:?} is not allowed: an option id is 1 to 32 characters \
+                     of a-z, 0-9, '_' or '-'"
+                ),
+            )
+        })
+        .collect();
+    assert_refused(&cases).await;
+}
+
+/// A label is 1 to 200 characters with no control or invisible format
+/// character. Characters, not bytes: `ten_options_register` keeps 200
+/// three-byte ones.
+#[tokio::test]
+async fn labels_out_of_rule_are_refused() {
+    let long = "\u{20ac}".repeat(201);
+    let cases: Vec<(Value, String)> = [
+        ("", "a label is 1 to 200 characters, got 0"),
+        (long.as_str(), "a label is 1 to 200 characters, got 201"),
+        (
+            "Go\u{0}on",
+            "a label may not hold a control or invisible format character",
+        ),
+        (
+            "Go\u{202e}on",
+            "a label may not hold a control or invisible format character",
+        ),
+    ]
+    .iter()
+    .map(|(label, reason)| {
+        (
+            json!([topics(1)[0], { "id": "topic_2", "label": label }]),
+            format!("option 'topic_2': {reason}"),
+        )
+    })
+    .collect();
+    assert_refused(&cases).await;
+}
+
+/// Ten options at the edges of the rules register, and the engine reads
+/// them back in order from the stored version.
+#[tokio::test]
+async fn ten_options_register() {
+    let mut options = topics(8);
+    options.push(json!({ "id": "revise-0123456789_abcdefghijklmn", "label": "Revise" }));
+    options.push(json!({ "id": "topic_9", "label": "\u{20ac}".repeat(200) }));
+    let options = json!(options);
+    assert_eq!(options[8]["id"].as_str().unwrap().len(), 32);
+    for env in envs().await {
+        let (st, body) = call(
+            &env,
+            "POST",
+            "/workflows",
+            &env.alice,
+            json!({ "ir": with_options(options.clone()) }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{}: {body}", env.name);
+        let stored = env
+            .backend
+            .get_workflow("wf-release", "0.1.0")
+            .await
+            .unwrap()
+            .expect("stored");
+        let parsed: jamjet_ir::WorkflowIr = serde_json::from_value(stored.ir).unwrap();
+        let kind = serde_json::to_value(&parsed.nodes["review"].kind).unwrap();
+        assert_eq!(kind["options"], options, "{}: {kind}", env.name);
+    }
+}

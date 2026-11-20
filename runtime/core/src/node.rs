@@ -119,6 +119,12 @@ pub enum NodeKind {
         description: String,
         timeout_secs: Option<u64>,
         fallback_node: Option<NodeId>,
+        /// The choices a reviewer picks one of when approving, in the order
+        /// shown. Empty means a plain approve or reject. Left out when
+        /// empty, so a node without options serializes as it did, and the
+        /// approvals bound to its definition are unchanged.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<ApprovalOption>,
     },
 
     /// Suspends until a timer fires or external event arrives.
@@ -272,6 +278,25 @@ impl NodeKind {
         !matches!(self, Self::Condition { .. }) && !is_agent_discovery
     }
 }
+
+/// One choice a `human_approval` node offers. `id` is what a decision names
+/// and a condition routes on; `label` is what the reviewer reads.
+/// Registration holds `id` to 1 to [`MAX_APPROVAL_OPTION_ID_LEN`] of `a-z`,
+/// `0-9`, `_` and `-`, unique in the node, and `label` to 1 to
+/// [`MAX_APPROVAL_OPTION_LABEL_CHARS`] characters with no control or
+/// invisible format character.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalOption {
+    pub id: String,
+    pub label: String,
+}
+
+/// The most options one `human_approval` node may declare.
+pub const MAX_APPROVAL_OPTIONS: usize = 10;
+/// The longest option id, in bytes (an id is ASCII).
+pub const MAX_APPROVAL_OPTION_ID_LEN: usize = 32;
+/// The longest option label, in characters.
+pub const MAX_APPROVAL_OPTION_LABEL_CHARS: usize = 200;
 
 /// How an `external_fn` node's work items may be claimed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
