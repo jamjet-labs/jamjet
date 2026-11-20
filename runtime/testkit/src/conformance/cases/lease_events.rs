@@ -97,6 +97,7 @@ async fn start_claimed(
             workflow_version: "1.0.0".into(),
             initial_input: json!({}),
             initiated_by: None,
+            run_key: None,
         },
         EventKind::NodeScheduled {
             node_id: "a".into(),

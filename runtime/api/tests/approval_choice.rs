@@ -843,6 +843,7 @@ async fn options_on_a_request_of_a_run_whose_version_is_missing_is_409() {
                     workflow_version: "0.1.0".into(),
                     initial_input: json!({}),
                     initiated_by: Some(initiated_by),
+                    run_key: None,
                 },
             ))
             .await

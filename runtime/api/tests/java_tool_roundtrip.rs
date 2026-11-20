@@ -156,6 +156,7 @@ async fn java_tool_claim_complete_round_trip_advances_durably() {
                 workflow_version: "0.1.0".into(),
                 initial_input: serde_json::json!({}),
                 initiated_by: None,
+                run_key: None,
             },
         ))
         .await
@@ -416,6 +417,7 @@ async fn seed_claimable_java_item(backend: &Arc<dyn StateBackend>) -> ExecutionI
                 workflow_version: "0.1.0".into(),
                 initial_input: serde_json::json!({}),
                 initiated_by: None,
+                run_key: None,
             },
         ))
         .await

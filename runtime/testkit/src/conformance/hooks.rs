@@ -243,6 +243,7 @@ const SQLITE_TABLES: &[&str] = &[
     "events",
     "proj_approvals",
     "projector_checkpoints",
+    "run_keys",
     "snapshots",
     "store_identity",
     "tenants",

@@ -141,6 +141,7 @@ pub async fn segment_boundary_event_is_materialize_noop(fx: &Fixture) {
             workflow_version: "1.0.0".into(),
             initial_input: json!({ "counter": 0 }),
             initiated_by: None,
+            run_key: None,
         },
     ))
     .await
@@ -565,6 +566,7 @@ pub async fn inert_old_segment_does_not_leak(fx: &Fixture) {
             workflow_version: "1.0.0".into(),
             initial_input: json!({ "counter": 0 }),
             initiated_by: None,
+            run_key: None,
         },
     ))
     .await
@@ -1114,6 +1116,7 @@ pub async fn segment_atomic_rollback_on_work_item_conflict(fx: &Fixture) {
         workflow_version: "1.0.0".into(),
         initial_input: carried.current_state.clone(),
         initiated_by: None,
+        run_key: None,
     };
     let scheduled = EventKind::NodeScheduled {
         node_id: "start".into(),

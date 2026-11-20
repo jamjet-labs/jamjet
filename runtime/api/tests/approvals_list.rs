@@ -289,6 +289,7 @@ async fn seed_requests(
                 workflow_version: "0.1.0".into(),
                 initial_input: json!({}),
                 initiated_by: Some("token:the-initiator".into()),
+                run_key: None,
             },
         ))
         .await

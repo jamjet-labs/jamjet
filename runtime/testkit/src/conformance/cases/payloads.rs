@@ -159,6 +159,7 @@ one_of_each! {
         workflow_version: "1.0.0".into(),
         initial_input: json!({ "order": 7 }),
         initiated_by: Some("token:t1".into()),
+        run_key: None,
     },
     WorkflowCompleted { final_state: json!({ "done": true }) },
     WorkflowFailed { error: "boom".into() },

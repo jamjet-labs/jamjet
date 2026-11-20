@@ -76,6 +76,7 @@ async fn start(b: &dyn StateBackend, id: &ExecutionId) -> i64 {
             workflow_version: "1.0.0".into(),
             initial_input: json!({}),
             initiated_by: None,
+            run_key: None,
         },
         scheduled("a"),
         item(id, "a"),

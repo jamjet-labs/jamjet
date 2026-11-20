@@ -2567,6 +2567,7 @@ mod tests {
                 "tools": {"get_weather": "myapp.tools:get_weather"}
             }),
             initiated_by: None,
+            run_key: None,
         }]);
 
         assert_eq!(
@@ -2605,6 +2606,7 @@ mod tests {
                     ]
                 }),
                 initiated_by: None,
+                run_key: None,
             },
         )
         .await;

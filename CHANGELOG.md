@@ -498,6 +498,31 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Start a run by key.** `POST /executions` takes `run_key` and `reuse` (`never` by
+  default, or `failed_only`). The same key with the same workflow, version and input
+  answers 200 with the same run; with anything else it is 409. `GET /executions?run_key=`
+  finds it. Keys are per tenant, 1 to 200 bytes of `A-Z a-z 0-9 . _ : / @ + = -`. The
+  Python client takes `run_key` and `reuse` on `start_execution`, and raises if the
+  engine does not echo the key, because an older engine drops it and starts a second run.
+  - Migration `0018_run_keys.sql` adds a table. An older build will not open a store after
+    it, so do not roll back below this release once it has run.
+  - `WorkflowStarted` gains an optional `run_key`. Old logs read as before.
+  - `GET /executions?run_key=` takes no other filter. It answers
+    `{"run_key": ..., "executions": [...]}`. In that row `execution_id` is the
+    hyphenated id of the first run and `current_execution_id` is the `exec_` form of
+    the segment running now.
+- **`python_fn` nodes take `claim: by_execution`**, as `external_fn` nodes do. Only a
+  worker that names the run can claim the step. `compile_agent_to_ir(...,
+  claim_by_execution=True)` sets it on the tool-dispatch nodes. A `python_fn` node
+  without `claim` keeps its definition hash, so approvals in flight stay valid. An older
+  build refuses `claim` on `python_fn` at registration.
+  - `claim` on any other kind is still refused at registration, and the message changed
+    to name `external_fn` and `python_fn`.
+  - `POST /work-items` now marks `python_fn` items from the node's kind.
+  - The Python `jamjet worker` and `claim_work_item` do not claim by execution yet, so
+    they never get these steps and the run waits with no error. The run's own worker has
+    to call `POST /work-items/claim` with `execution_id`.
+
 - **`examples/venue-booking-agent/`, the code-along series.** Nine steps that build one
   venue-booking agent, pinned to jamjet 0.13.0. Every step runs with no API key on the
   scripted model; `VENUE_MODEL` picks a real one. The prompts ask for the deposit

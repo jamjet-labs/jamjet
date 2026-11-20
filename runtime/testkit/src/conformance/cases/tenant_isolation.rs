@@ -241,6 +241,7 @@ pub async fn events_are_tenant_isolated(fx: &Fixture) {
             workflow_version: "1.0.0".to_string(),
             initial_input: json!({}),
             initiated_by: None,
+            run_key: None,
         },
     );
     tenant_a.append_event(event).await.unwrap();

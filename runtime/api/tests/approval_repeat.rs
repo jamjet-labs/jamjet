@@ -725,6 +725,7 @@ async fn seeded_request(backend: &Arc<dyn StateBackend>) -> ExecutionId {
             workflow_version: "0.1.0".into(),
             initial_input: json!({}),
             initiated_by: None,
+            run_key: None,
         },
         EventKind::ToolApprovalRequired {
             node_id: "pay".into(),

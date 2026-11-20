@@ -152,11 +152,14 @@ pub async fn start_next_segment(
     // rather than starting a segment with the initiator silently dropped.
     let initiated_by = crate::approvals::run_initiator(&backend.get_events(parent_id).await?);
 
+    // The run key stays on the first segment's `WorkflowStarted`: the key
+    // names the first segment, and a reader follows the links from there.
     let started_event = EventKind::WorkflowStarted {
         workflow_id: workflow_id.to_string(),
         workflow_version: workflow_version.to_string(),
         initial_input: carried_state.current_state.clone(),
         initiated_by,
+        run_key: None,
     };
 
     let scheduled_event = EventKind::NodeScheduled {

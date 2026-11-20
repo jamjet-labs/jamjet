@@ -1674,8 +1674,8 @@ impl StateBackend for FailFirstGetEvents {
 
     // ── Features and storage lanes ───────────────────────────────────────
     // Delegated, so this wrapper answers as the backend it wraps: the
-    // trait's defaults refuse the two reads and write the other three in
-    // separate steps.
+    // trait's defaults refuse the keyed start and the three reads, and write
+    // the other three in separate steps.
 
     async fn list_pending_approvals(
         &self,
@@ -1690,6 +1690,26 @@ impl StateBackend for FailFirstGetEvents {
         execution_id: &ExecutionId,
     ) -> jamjet_state::backend::BackendResult<Vec<jamjet_state::OpenWorkItem>> {
         self.inner.open_work_items(execution_id).await
+    }
+
+    async fn start_execution_keyed(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+        key: jamjet_state::RunKeyClaim,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::KeyedStart> {
+        self.inner
+            .start_execution_keyed(execution, started_event, scheduled_event, work_item, key)
+            .await
+    }
+
+    async fn get_run_key(
+        &self,
+        run_key: &str,
+    ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::RunKeyRecord>> {
+        self.inner.get_run_key(run_key).await
     }
 
     async fn commit_scheduler_pass(

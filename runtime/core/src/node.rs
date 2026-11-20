@@ -63,6 +63,14 @@ pub enum NodeKind {
         /// deserialize to `false` and behave exactly as they did before.
         #[serde(default)]
         agent_tool_dispatch: bool,
+        /// Who may claim this node's items, as for
+        /// [`NodeKind::ExternalFn::claim`]. `by_execution` keeps a run's
+        /// steps with the run's own worker: another run's worker polling the
+        /// same `python_tool` queue never gets them. Left out when it is the
+        /// default, so existing node definitions, and the approvals bound to
+        /// them, are unchanged.
+        #[serde(default, skip_serializing_if = "ClaimMode::is_oldest_first")]
+        claim: ClaimMode,
     },
 
     /// Arbitrary Java method executed by an external Java tool-worker.
@@ -298,7 +306,7 @@ pub const MAX_APPROVAL_OPTION_ID_LEN: usize = 32;
 /// The longest option label, in characters.
 pub const MAX_APPROVAL_OPTION_LABEL_CHARS: usize = 200;
 
-/// How an `external_fn` node's work items may be claimed.
+/// How an `external_fn` or `python_fn` node's work items may be claimed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimMode {
@@ -312,6 +320,19 @@ pub enum ClaimMode {
 impl ClaimMode {
     pub fn is_oldest_first(&self) -> bool {
         *self == Self::OldestFirst
+    }
+}
+
+/// How `kind`'s work items may be claimed. `external_fn` and `python_fn`
+/// nodes say so themselves; every other kind is oldest-first.
+///
+/// The one place this is decided: the payload builder writes the marker
+/// from it, `POST /work-items` sets the marker from it, and the claim gate
+/// reads it to keep an unmarked item from the oldest-first claim.
+pub fn claim_mode(kind: &NodeKind) -> ClaimMode {
+    match kind {
+        NodeKind::ExternalFn { claim, .. } | NodeKind::PythonFn { claim, .. } => *claim,
+        _ => ClaimMode::OldestFirst,
     }
 }
 

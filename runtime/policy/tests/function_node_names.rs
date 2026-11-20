@@ -32,6 +32,7 @@ fn python_fn() -> NodeKind {
         function: "transfer".into(),
         output_schema: String::new(),
         agent_tool_dispatch: false,
+        claim: Default::default(),
     }
 }
 
@@ -167,6 +168,7 @@ fn python_at(module: &str, function: &str) -> NodeKind {
         function: function.into(),
         output_schema: String::new(),
         agent_tool_dispatch: false,
+        claim: Default::default(),
     }
 }
 

@@ -59,18 +59,9 @@ pub fn build_work_item_payload(
         }
         // Any external worker: the handler name it resolves itself, and the
         // state as input. The queue is routing, so it stays off the payload.
-        NodeKind::ExternalFn { handler, claim, .. } => {
+        NodeKind::ExternalFn { handler, .. } => {
             obj.insert("handler".into(), Value::String(handler.clone()));
             obj.insert("input".into(), Value::Object(state.clone()));
-            // The claim queries read this to keep the item away from the
-            // oldest-first claim. Only written for the opt-in, so other
-            // payloads (and the digests that bind them) are unchanged.
-            if *claim == jamjet_core::node::ClaimMode::ByExecution {
-                obj.insert(
-                    jamjet_core::node::CLAIM_PAYLOAD_KEY.into(),
-                    Value::String(jamjet_core::node::CLAIM_BY_EXECUTION.into()),
-                );
-            }
         }
         // The model worker needs the resolved model id, optional config
         // overrides, the node's prompt rendered against the run's state, its
@@ -151,6 +142,16 @@ pub fn build_work_item_payload(
             obj.insert("input".into(), Value::Object(state.clone()));
         }
         _ => {}
+    }
+
+    // The claim queries read this to keep the item away from the
+    // oldest-first claim. Only written for the opt-in, so other payloads
+    // (and the digests that bind them) are unchanged.
+    if jamjet_core::node::claim_mode(&node.kind) == jamjet_core::node::ClaimMode::ByExecution {
+        obj.insert(
+            jamjet_core::node::CLAIM_PAYLOAD_KEY.into(),
+            Value::String(jamjet_core::node::CLAIM_BY_EXECUTION.into()),
+        );
     }
 
     payload
@@ -419,6 +420,27 @@ mod tests {
             p.get("queue").is_none(),
             "the queue is routing, not payload"
         );
+    }
+
+    /// `claim: by_execution` on an `external_fn` or a `python_fn` node puts
+    /// the marker on its payload; without it, no marker.
+    #[test]
+    fn the_claim_marker_is_written_for_an_opted_in_node_only() {
+        let kinds = [
+            json!({ "type": "external_fn", "queue": "app-calls", "handler": "run", "output_schema": "" }),
+            json!({ "type": "python_fn", "module": "myapp.tools", "function": "run", "output_schema": "" }),
+        ];
+        for kind in kinds {
+            let ir = ir_with(node(kind.clone()));
+            let p = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
+            assert!(p.get("claim").is_none(), "{p}");
+
+            let mut opted = kind;
+            opted["claim"] = json!("by_execution");
+            let ir = ir_with(node(opted));
+            let p = build_work_item_payload(&ir, "n", &ir.nodes["n"], &state(), "wf", "0.1.0");
+            assert_eq!(p["claim"], "by_execution", "{p}");
+        }
     }
 
     #[test]

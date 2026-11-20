@@ -201,13 +201,35 @@ class JamjetClient:
         workflow_id: str,
         input: dict[str, Any],
         workflow_version: str | None = None,
+        run_key: str | None = None,
+        reuse: str | None = None,
     ) -> dict[str, Any]:
+        """Start a run.
+
+        With ``run_key``, a retried start returns the same run instead of a
+        second one (201 for the first start, 200 after). ``reuse`` is
+        ``"never"`` (the default) or ``"failed_only"``. An engine that does
+        not know ``run_key`` drops it and starts a second run, so an answer
+        that does not echo the key raises ``JamjetAPIError``.
+        """
         body: dict[str, Any] = {"workflow_id": workflow_id, "input": input}
         if workflow_version:
             body["workflow_version"] = workflow_version
+        if run_key is not None:
+            body["run_key"] = run_key
+        if reuse is not None:
+            body["reuse"] = reuse
         # Sent again, it could start a second run.
         r = await self._request("POST", "/executions", json=body, safe=False, operation="start_execution")
-        return r.json()
+        answer = r.json()
+        if run_key is not None and not (isinstance(answer, dict) and answer.get("run_key") == run_key):
+            raise JamjetAPIError(
+                "this engine does not support run_key; upgrade it before relying on it",
+                request=r.request,
+                response=r,
+                detail="this engine does not support run_key; upgrade it before relying on it",
+            )
+        return answer
 
     async def get_execution(self, execution_id: str) -> dict[str, Any]:
         r = await self._request("GET", f"/executions/{execution_id}", safe=True, operation="get_execution")

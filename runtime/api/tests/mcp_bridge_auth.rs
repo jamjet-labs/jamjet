@@ -70,6 +70,7 @@ async fn pending_execution(backend: &Arc<InMemoryBackend>) -> ExecutionId {
                 initial_input: json!({}),
                 // A principal no test token has, so SoD is provable.
                 initiated_by: Some("token:the-initiator".into()),
+                run_key: None,
             },
         ))
         .await

@@ -281,9 +281,9 @@ async fn create_workflow(
     // then evaluate false forever, with only a WARN in the engine log to say so.
     jamjet_ir::validate_condition_expressions(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
-    // `claim` means something on `external_fn` only. On another kind serde
-    // drops it, and the author would believe items are claimable only by
-    // execution when any claimer gets them.
+    // `claim` means something on `external_fn` and `python_fn` only. On
+    // another kind serde drops it, and the author would believe items are
+    // claimable only by execution when any claimer gets them.
     if let Some(nodes) = body.ir.get("nodes").and_then(Value::as_object) {
         for (id, node) in nodes {
             let kind = node.get("kind");
@@ -291,9 +291,10 @@ async fn create_workflow(
                 .and_then(|k| k.get(jamjet_core::node::CLAIM_PAYLOAD_KEY))
                 .is_some();
             let tag = kind.and_then(|k| k.get("type")).and_then(Value::as_str);
-            if has_claim && tag != Some("external_fn") {
+            if has_claim && !matches!(tag, Some("external_fn" | "python_fn")) {
                 return Err(ApiError::BadRequest(format!(
-                    "invalid workflow IR: node {id}: `claim` applies to external_fn nodes only"
+                    "invalid workflow IR: node {id}: `claim` applies to external_fn and \
+                     python_fn nodes only"
                 )));
             }
         }
@@ -401,6 +402,12 @@ struct StartExecutionRequest {
     workflow_id: String,
     workflow_version: Option<String>,
     input: Value,
+    /// The caller's name for the run: a retried start with the same key
+    /// answers with the run the first one started (`crate::run_key`).
+    run_key: Option<String>,
+    /// `never` (the default) or `failed_only`; only with `run_key`. Read as
+    /// text so an unknown value is 400 like every other bad key field.
+    reuse: Option<String>,
 }
 
 async fn start_execution(
@@ -409,6 +416,7 @@ async fn start_execution(
     token: Option<Extension<jamjet_state::ApiToken>>,
     Json(body): Json<StartExecutionRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let key = crate::run_key::StartKey::from_request(body.run_key, body.reuse)?;
     // Who started the run, for separation of duties at approval time. Only the
     // authenticated token counts; dev mode has none.
     let initiated_by = token
@@ -421,6 +429,7 @@ async fn start_execution(
         body.workflow_version,
         body.input,
         initiated_by,
+        key,
     )
     .await
 }
@@ -432,6 +441,12 @@ async fn start_execution(
 /// in-process cron launcher (whose runs take the job's creator as initiator),
 /// so the start item, its payload and the initiator cannot diverge by
 /// transport.
+///
+/// With `key`, the key is claimed in that same step. A key that already
+/// names a run of the same workflow, version and input answers 200 with that
+/// run, unless `failed_only` lets a new run take it over; under another
+/// workflow, version or input it is 409. A start that loses a race for the
+/// key decides again, once, against the run that won.
 pub async fn start_run(
     state: &AppState,
     tenant_id: &TenantId,
@@ -439,6 +454,7 @@ pub async fn start_run(
     workflow_version: Option<String>,
     input: Value,
     initiated_by: Option<String>,
+    key: Option<crate::run_key::StartKey>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     // The engine's bookkeeping keys (`__budget`) are not the caller's to set.
     // The budget enforcer reads them back, and the approval digest leaves
@@ -447,6 +463,31 @@ pub async fn start_run(
     let input = jamjet_state::approvals::action_state(&input);
     let backend = state.backend_for(tenant_id);
     let version = workflow_version.unwrap_or_else(|| "1.0.0".into());
+
+    // A key someone holds is judged first: it answers with its run, or
+    // refuses, before anything is built. The read is advisory; the claim in
+    // the start's own write decides (see `start_execution_keyed` below).
+    let keyed = match &key {
+        None => None,
+        Some(key) => {
+            let mut claim = jamjet_state::RunKeyClaim {
+                run_key: key.run_key.clone(),
+                workflow_id: workflow_id.clone(),
+                workflow_version: version.clone(),
+                input_hash: crate::run_key::input_hash(&input),
+                replaces: None,
+            };
+            if let Some(held) = backend.get_run_key(&key.run_key).await? {
+                crate::run_key::check_binding(&claim, &held)?;
+                let run = crate::run_key::KeyedRun::read(backend.as_ref(), held).await?;
+                if !run.may_restart(key.reuse) {
+                    return Ok(run.start_answer(&key.run_key));
+                }
+                claim.replaces = Some(run.record.execution_id);
+            }
+            Some((claim, key.reuse))
+        }
+    };
 
     // Verify the workflow definition exists (within this tenant).
     let def = backend
@@ -484,6 +525,7 @@ pub async fn start_run(
         workflow_version: version.clone(),
         initial_input: input.clone(),
         initiated_by,
+        run_key: None,
     };
 
     // Immediately enqueue the start node as a work item, built by the same
@@ -550,14 +592,49 @@ pub async fn start_run(
     // ONE write for the run's start (see `start_execution_atomic`): a
     // scheduler tick between separate writes found the run live with its
     // start node unscheduled and scheduled it a second time.
-    backend
-        .start_execution_atomic(execution, started, scheduled, work_item)
-        .await?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({ "execution_id": execution_id.to_string() })),
-    ))
+    let Some((mut claim, reuse)) = keyed else {
+        backend
+            .start_execution_atomic(execution, started, scheduled, work_item)
+            .await?;
+        return Ok((
+            StatusCode::CREATED,
+            Json(json!({ "execution_id": execution_id.to_string() })),
+        ));
+    };
+    // `Taken`: another start with this key wrote first, after the read above,
+    // and nothing of this start was written. It decides again against the
+    // run that won, as a start that read the key held does: another binding
+    // is 409, `failed_only` takes the key over from a run that has already
+    // ended without success, and any other run answers 200. It decides
+    // again once: a second `Taken` answers 200 with the run that beat it.
+    let mut decided_again = false;
+    loop {
+        let written = backend
+            .start_execution_keyed(
+                execution.clone(),
+                started.clone(),
+                scheduled.clone(),
+                work_item.clone(),
+                claim.clone(),
+            )
+            .await?;
+        let winner = match written {
+            jamjet_state::KeyedStart::Started => {
+                return Ok(crate::run_key::created_answer(
+                    &claim.run_key,
+                    &execution_id,
+                ))
+            }
+            jamjet_state::KeyedStart::Taken(winner) => winner,
+        };
+        crate::run_key::check_binding(&claim, &winner)?;
+        let run = crate::run_key::KeyedRun::read(backend.as_ref(), winner).await?;
+        if decided_again || !run.may_restart(reuse) {
+            return Ok(run.start_answer(&claim.run_key));
+        }
+        claim.replaces = Some(run.record.execution_id);
+        decided_again = true;
+    }
 }
 
 #[derive(Deserialize)]
@@ -567,6 +644,8 @@ struct ListExecutionsQuery {
     offset: Option<u32>,
     waiting_for: Option<String>,
     after: Option<String>,
+    /// A lookup, not a filter: the one run the key names, or none.
+    run_key: Option<String>,
 }
 
 /// The most executions one `GET /executions` returns, whatever `limit` asks.
@@ -578,6 +657,23 @@ async fn list_executions(
     Query(params): Query<ListExecutionsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
+    if let Some(run_key) = params.run_key.as_deref() {
+        // Nothing beside a key is silently ignored.
+        if params.status.is_some()
+            || params.limit.is_some()
+            || params.offset.is_some()
+            || params.waiting_for.is_some()
+            || params.after.is_some()
+        {
+            return Err(ApiError::BadRequest(
+                "run_key is a lookup and takes no status, limit, offset, waiting_for or after"
+                    .into(),
+            ));
+        }
+        return Ok(Json(
+            crate::run_key::lookup(backend.as_ref(), run_key).await?,
+        ));
+    }
     if let Some(wanted) = params.waiting_for.as_deref() {
         return list_waiting_for(backend.as_ref(), wanted, &params).await;
     }
@@ -2947,15 +3043,7 @@ async fn gate_claimed_item(
     // claim: its item lost the marker every enqueue path writes from the IR.
     // Not handed out. It goes back to pending, uncharged and marked, for a
     // claim that names its execution.
-    if !named
-        && matches!(
-            &kind,
-            jamjet_core::NodeKind::ExternalFn {
-                claim: jamjet_core::node::ClaimMode::ByExecution,
-                ..
-            }
-        )
-    {
+    if !named && jamjet_core::node::claim_mode(&kind) == jamjet_core::node::ClaimMode::ByExecution {
         tracing::error!(
             execution_id = %wi.execution_id,
             node_id = %wi.node_id,
@@ -3808,13 +3896,8 @@ async fn enqueue_work_item(
     // as the scheduler's payload has it, never from the caller: an item sent
     // without the marker would otherwise go to any oldest-first claimer.
     let mut payload = body.payload;
-    let by_execution = matches!(
-        &kind,
-        jamjet_core::NodeKind::ExternalFn {
-            claim: jamjet_core::node::ClaimMode::ByExecution,
-            ..
-        }
-    );
+    let by_execution =
+        jamjet_core::node::claim_mode(&kind) == jamjet_core::node::ClaimMode::ByExecution;
     match payload.as_object_mut() {
         Some(obj) if by_execution => {
             obj.insert(
@@ -4572,6 +4655,7 @@ mod tests {
                     workflow_version: "0.1.0".into(),
                     initial_input: json!({}),
                     initiated_by: Some("token:someone".into()),
+                    run_key: None,
                 },
             ))
             .await

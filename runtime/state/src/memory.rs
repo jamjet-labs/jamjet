@@ -58,6 +58,8 @@ pub struct InMemoryBackend {
     /// Who held an expired lease and with which fence, so a late heartbeat
     /// from that worker can re-attach instead of losing the work.
     last_lease: DashMap<WorkItemId, (String, i64)>,
+    /// Run keys. Key = (tenant_id, run_key).
+    run_keys: DashMap<(String, String), crate::backend::RunKeyRecord>,
     /// Held by `commit_scheduler_pass` across its checks and its writes, and
     /// by every method that appends an event, changes a run's status or
     /// changes an item's status, so none of them lands between the two. This
@@ -90,6 +92,7 @@ impl InMemoryBackend {
             lease_secs: DashMap::new(),
             released_fences: DashMap::new(),
             last_lease: DashMap::new(),
+            run_keys: DashMap::new(),
             pass_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -1669,6 +1672,63 @@ impl StateBackend for InMemoryBackend {
             .collect())
     }
 
+    async fn start_execution_keyed(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+        key: crate::backend::RunKeyClaim,
+    ) -> BackendResult<crate::backend::KeyedStart> {
+        use crate::backend::{KeyedStart, RunKeyRecord};
+        use dashmap::mapref::entry::Entry;
+        let started_event = crate::features::run_keys::with_run_key(started_event, &key.run_key)?;
+        // A run's insert changes a run's status and an item's, so it takes
+        // `pass_lock` as `start_execution_atomic` does, before any map guard:
+        // a keyed start cannot land inside a scheduler pass.
+        let _pass = self.pass_lock.lock().await;
+        // The key's entry is held, its shard locked, across the run's insert:
+        // a second start with the key waits, then finds it taken.
+        match self
+            .run_keys
+            .entry((work_item.tenant_id.clone(), key.run_key.clone()))
+        {
+            Entry::Vacant(slot) => {
+                let record = RunKeyRecord {
+                    execution_id: execution.execution_id.clone(),
+                    workflow_id: key.workflow_id,
+                    workflow_version: key.workflow_version,
+                    input_hash: key.input_hash,
+                };
+                self.create_run(execution, None, started_event, scheduled_event, work_item);
+                slot.insert(record);
+            }
+            Entry::Occupied(mut held) => {
+                // Moved only from the run `replaces` names. The workflow,
+                // version and input hash stay as first claimed.
+                if key.replaces.as_ref() != Some(&held.get().execution_id) {
+                    return Ok(KeyedStart::Taken(held.get().clone()));
+                }
+                let id = execution.execution_id.clone();
+                self.create_run(execution, None, started_event, scheduled_event, work_item);
+                held.get_mut().execution_id = id;
+            }
+        }
+        Ok(KeyedStart::Started)
+    }
+
+    async fn get_run_key(
+        &self,
+        run_key: &str,
+    ) -> BackendResult<Option<crate::backend::RunKeyRecord>> {
+        // Unscoped, as the SQLite base backend: the default tenant's keys.
+        let key = (
+            crate::tenant::DEFAULT_TENANT.to_string(),
+            run_key.to_string(),
+        );
+        Ok(self.run_keys.get(&key).map(|r| r.value().clone()))
+    }
+
     // ── Tenants ──────────────────────────────────────────────────────
 
     async fn create_tenant(&self, tenant: Tenant) -> BackendResult<()> {
@@ -1904,5 +1964,94 @@ mod tests {
         );
         let item = backend.get_work_item(id).await.unwrap().expect("item");
         assert!(item.worker_id.is_none(), "the zombie holds the item");
+    }
+
+    /// A keyed start writes its run under `pass_lock`, as
+    /// `start_execution_atomic` does: while a scheduler pass holds the lock
+    /// the start writes neither the run nor the key, and it lands once the
+    /// lock is let go.
+    #[tokio::test]
+    async fn a_keyed_start_waits_for_the_pass_lock() {
+        let backend = std::sync::Arc::new(InMemoryBackend::new());
+        let id = ExecutionId::new();
+        let now = Utc::now();
+        let execution = WorkflowExecution {
+            execution_id: id.clone(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: serde_json::json!({}),
+            current_state: serde_json::json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        };
+        let started = EventKind::WorkflowStarted {
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            initial_input: serde_json::json!({}),
+            initiated_by: None,
+            run_key: None,
+        };
+        let scheduled = EventKind::NodeScheduled {
+            node_id: "a".into(),
+            queue_type: "general".into(),
+        };
+        let item = WorkItem {
+            id: Uuid::new_v4(),
+            execution_id: id.clone(),
+            node_id: "a".into(),
+            queue_type: "general".into(),
+            payload: serde_json::json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: crate::DEFAULT_TENANT.into(),
+        };
+        let key = crate::backend::RunKeyClaim {
+            run_key: "job:1".into(),
+            workflow_id: "wf".into(),
+            workflow_version: "1.0.0".into(),
+            input_hash: "h".into(),
+            replaces: None,
+        };
+
+        let pass = backend.pass_lock.lock().await;
+        let start = tokio::spawn({
+            let backend = backend.clone();
+            async move {
+                backend
+                    .start_execution_keyed(execution, started, scheduled, item, key)
+                    .await
+            }
+        });
+        // The test runtime has one thread: each yield lets the start run
+        // until it waits. With no wait for the lock it would finish on its
+        // first turn.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!start.is_finished(), "the keyed start ran inside a pass");
+        assert!(backend.executions.get(&id).is_none(), "the run was written");
+        assert!(backend.run_keys.is_empty(), "the key was claimed");
+
+        drop(pass);
+        let out = start.await.unwrap().unwrap();
+        assert_eq!(out, crate::backend::KeyedStart::Started);
+        assert!(backend.executions.get(&id).is_some());
+        assert_eq!(
+            backend
+                .get_run_key("job:1")
+                .await
+                .unwrap()
+                .map(|r| r.execution_id),
+            Some(id)
+        );
     }
 }

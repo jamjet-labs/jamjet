@@ -65,6 +65,11 @@ pub enum EventKind {
         /// its run's initiator forward. `None` in dev mode and on old logs.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         initiated_by: Option<String>,
+        /// The caller's key the run was started with
+        /// (`StateBackend::start_execution_keyed`). Only the run's first
+        /// segment carries it. `None` without a key and on old logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_key: Option<String>,
     },
     WorkflowCompleted {
         final_state: serde_json::Value,

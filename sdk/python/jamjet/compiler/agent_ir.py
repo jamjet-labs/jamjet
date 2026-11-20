@@ -243,7 +243,12 @@ def _compile_governance_ir(agent: Agent) -> dict[str, Any]:
     return out
 
 
-def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[str, Any]:
+def compile_agent_to_ir(
+    agent: Agent,
+    prompt: str,
+    max_turns: int = 8,
+    claim_by_execution: bool = False,
+) -> dict[str, Any]:
     """Compile *agent* + *prompt* into a durable agent-loop ``WorkflowIr`` dict.
 
     Parameters
@@ -261,6 +266,14 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
         Static unroll bound — the maximum number of ``model -> tools`` turns.
         Must be ``>= 1``. The compiled graph has ``max_turns`` tool turns plus a
         final model node that produces the answer.
+    claim_by_execution:
+        When true, each tool-dispatch node carries ``"claim": "by_execution"``:
+        its work items are handed out only to a worker that names the run, never
+        to the oldest-first claim. ``jamjet worker`` and
+        ``JamjetClient.claim_work_item`` do not claim by execution yet, so they
+        never get these items and the run waits with no error. The run's own
+        worker has to call ``POST /work-items/claim`` with ``execution_id``.
+        The default output is unchanged.
 
     Returns
     -------
@@ -318,31 +331,34 @@ def compile_agent_to_ir(agent: Agent, prompt: str, max_turns: int = 8) -> dict[s
         # no_retry: the dispatch runs user @tool functions (possible
         # non-idempotent external writes), so the scheduler must not re-run an
         # already-succeeded dispatch on a retry (runner.rs no_retry -> 1 attempt).
+        tools_kind: dict[str, Any] = {
+            "type": "python_fn",
+            "module": _DISPATCH_MODULE,
+            "function": _DISPATCH_FUNCTION,
+            "output_schema": "",
+            # Tells the engine this python_fn runs a whole turn's
+            # model-chosen tool calls, so tool policy and approval must be
+            # evaluated against the pending calls in the work-item payload
+            # rather than against this node's (nameless) static kind.  Where
+            # that evaluation happens, and why: `Agent.run`.
+            "agent_tool_dispatch": True,
+            # Descriptor of the data the dispatch coroutine consumes. The
+            # engine passes the full accumulated state to PythonFn nodes
+            # (no per-node input mapping), so `dispatch_tool_calls` reads
+            # these keys from state at runtime; this records intent + carries
+            # the {name: "module:function"} resolver map.
+            "input": {
+                "messages": "$state.messages",
+                "assistant_content": "$state.last_model_output",
+                "tool_calls": "$state.last_model_tool_calls",
+                "tools": tools_map,
+            },
+        }
+        if claim_by_execution:
+            tools_kind["claim"] = "by_execution"
         nodes[tools_id] = _node(
             tools_id,
-            {
-                "type": "python_fn",
-                "module": _DISPATCH_MODULE,
-                "function": _DISPATCH_FUNCTION,
-                "output_schema": "",
-                # Tells the engine this python_fn runs a whole turn's
-                # model-chosen tool calls, so tool policy and approval must be
-                # evaluated against the pending calls in the work-item payload
-                # rather than against this node's (nameless) static kind.  Where
-                # that evaluation happens, and why: `Agent.run`.
-                "agent_tool_dispatch": True,
-                # Descriptor of the data the dispatch coroutine consumes. The
-                # engine passes the full accumulated state to PythonFn nodes
-                # (no per-node input mapping), so `dispatch_tool_calls` reads
-                # these keys from state at runtime; this records intent + carries
-                # the {name: "module:function"} resolver map.
-                "input": {
-                    "messages": "$state.messages",
-                    "assistant_content": "$state.last_model_output",
-                    "tool_calls": "$state.last_model_tool_calls",
-                    "tools": tools_map,
-                },
-            },
+            tools_kind,
             retry_policy=_TOOLS_RETRY_POLICY,
             description=f"agent turn {t} — dispatch tool calls",
             labels={"jamjet.agent.loop": "tools", "jamjet.agent.turn": str(t)},

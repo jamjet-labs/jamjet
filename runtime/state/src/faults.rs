@@ -83,6 +83,7 @@ pub const POINTS: &[(&str, u32)] = &[
     ("sqlite.create_run", 3),
     ("sqlite.create_run", 4),
     ("sqlite.create_run", 5),
+    ("sqlite.create_run", 6),
     ("sqlite.finish_execution", 1),
     ("sqlite.finish_execution", 2),
     ("sqlite.finish_execution", 3),

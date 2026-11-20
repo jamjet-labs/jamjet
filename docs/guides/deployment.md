@@ -150,9 +150,10 @@ on the queues, to any worker that polls. A client that may meet one should
 check that the item it got is the one it asked for (its `execution_id` and
 `node_id`), or check the runtime version first.
 
-An `external_fn` node can require this: with `"claim": "by_execution"` in its
-kind, its items are handed out only to a claim that names the execution, never
-to the oldest-first claim, whoever polls the queue. Such an item is also
+An `external_fn` or `python_fn` node can require this: with
+`"claim": "by_execution"` in its kind, its items are handed out only to a claim that
+names the execution, never to the oldest-first claim, whoever polls the queue. A worker
+for such a step must claim by execution. Such an item is also
 completed, failed and heartbeated only by a caller who may claim it; anyone
 else is answered `404`, as for an item that does not exist (a `lease_fence` is
 a counter, not a credential). `POST /work-items` marks the item from the
@@ -160,7 +161,13 @@ node's kind, whatever the payload says. `claim` on any other kind is refused
 at registration. An item of such a node that lost its mark (enqueued straight
 into the store) is still not handed out oldest-first: it is put back, marked,
 for the claim that names its execution. One whose payload is not a JSON
-object cannot carry the mark, and its node is failed.
+object cannot carry the mark, and its node is failed. A runtime from before
+this change refuses `claim` on a `python_fn` node at registration. In Python,
+`compile_agent_to_ir(agent, prompt, claim_by_execution=True)` sets it on an
+agent's tool-dispatch nodes. `jamjet worker` and `JamjetClient.claim_work_item`
+do not claim by execution yet. They claim oldest-first, so they never get these
+items: the step stays pending and the run waits, with no error. The run's own
+worker has to call `POST /work-items/claim` with the run's `execution_id`.
 
 This decides who runs the node and reports its result, not who can read the
 run: `GET /executions/:id` shows its state to any token of the tenant.
@@ -177,6 +184,40 @@ JAMJET_TOKEN=jj_... jamjet run workflow.yaml --runtime http://your-runtime:7700
 
 `POST /workflows` refuses a workflow with a node kind nothing executes, or with
 a node that nothing leads to. See [Node types](yaml-reference.md#node-types).
+
+### 5. Start a run by key
+
+A start request can carry a `run_key`, so a retry returns the same run instead of a
+second one.
+
+```bash
+curl -X POST $RUNTIME/executions -H "Authorization: Bearer $JAMJET_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"workflow_id":"w","workflow_version":"1.0.0","input":{"n":1},"run_key":"nightly:2026-11-20","reuse":"never"}'
+# 201 {"execution_id":"exec_...","run_key":"nightly:2026-11-20","created":true}
+# again: 200 {"execution_id":"exec_...","current_execution_id":"exec_...","run_key":"...","created":false,"status":"running"}
+```
+
+#### When a key may be reused
+
+- `reuse: "never"` (the default): never. A key names one run for good. The same key with the same workflow, version and input always answers 200 with that run, whatever its status, finished runs included.
+- `reuse: "failed_only"`: only after the run the key names ended without success (its latest segment is `failed`, `cancelled`, or `limit_exceeded` with no next segment), and only with the same workflow, version and input. A new run starts and the key names it from then on. The old run keeps its id, its log and the key in its `WorkflowStarted`.
+- In every mode: another workflow, version or input under the same key is 409, for good. Keys are per tenant. Input is compared by `content_hash` of its canonical JSON with the engine's keys dropped (`action_state`), so key order in the input does not matter. An omitted version is `1.0.0` before hashing.
+
+A key is 1 to 200 bytes of `A-Z a-z 0-9 . _ : / @ + = -`. It is compared as sent, with
+no trimming or case folding. `reuse` without a `run_key`, or a value other than `never`
+or `failed_only`, is 400.
+
+`GET /executions?run_key=<key>` finds the run: `{"run_key":"<key>","executions":[...]}`,
+with an empty list when the tenant holds no such key. It takes no other filter. In the
+row, `execution_id` is the first run's id in hyphenated form and `current_execution_id`
+is the `exec_` form of the segment running now (a run that continues as new has
+several). Compare them after converting one form to the other. `current_status` is that
+segment's status.
+
+A runtime from before this change ignores `run_key` and starts a second run. The Python
+client checks for the echo of the key in the answer and raises `JamjetAPIError` when it
+is missing.
 
 ---
 

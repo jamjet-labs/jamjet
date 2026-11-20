@@ -109,6 +109,7 @@ async fn complete_work_item_threads_gen_ai_fields() {
                 workflow_version: "0.1.0".into(),
                 initial_input: serde_json::json!({}),
                 initiated_by: None,
+                run_key: None,
             },
         ))
         .await
@@ -251,6 +252,7 @@ async fn complete_work_item_without_gen_ai_fields_keeps_backward_compat() {
                 workflow_version: "0.1.0".into(),
                 initial_input: serde_json::json!({}),
                 initiated_by: None,
+                run_key: None,
             },
         ))
         .await

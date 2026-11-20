@@ -96,6 +96,7 @@ pub async fn test_crash_recovery_from_event_log(fx: &Fixture) {
                     workflow_version: "1.0.0".into(),
                     initial_input: json!({ "x": 1 }),
                     initiated_by: None,
+                    run_key: None,
                 },
             ),
             Event::new(
