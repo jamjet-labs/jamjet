@@ -115,7 +115,8 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 "Retrieve the full details of a single workflow execution. Read-only, no side effects. ",
                 "Use this to check an execution's current status, inspect its state, or confirm completion after running jamjet_run_workflow. ",
                 "Returns a JSON object with: execution_id, workflow_id, workflow_version, status (one of: running, paused, completed, failed, cancelled), ",
-                "initial_input, current_state, started_at, updated_at, and completed_at (null if still running). ",
+                "initial_input, current_state, started_at, updated_at, completed_at (null if still running), ",
+                "and waiting_for: what a live run waits for (approval, step, worker or engine), null once it has ended. ",
                 "Fails with 'execution not found' if the ID does not exist in the specified tenant. ",
                 "For the full event history, use jamjet_get_events instead."
             ).into()),
@@ -144,9 +145,12 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 let backend = s.backend_for(&tenant_id);
                 let exec = backend.get_execution(&eid).await.map_err(|e| format!("{e}"))?
                     .ok_or_else(|| format!("execution {id_str} not found"))?;
-                // The same view as `GET /executions/:id`: state from the log.
-                let exec = crate::routes::with_derived_state(backend.as_ref(), exec).await;
-                let text = serde_json::to_string(&exec).map_err(|e| format!("{e}"))?;
+                // The same view as `GET /executions/:id`: state from the log
+                // and `waiting_for`.
+                let view = crate::routes::execution_view(backend.as_ref(), exec)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let text = serde_json::to_string(&view).map_err(|e| format!("{e}"))?;
                 Ok(vec![McpContent::Text { text }])
             }
         },
@@ -159,8 +163,8 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
             name: "jamjet_list_executions".into(),
             description: Some(concat!(
                 "List workflow executions with optional status filtering and pagination. Read-only, no side effects. ",
-                "Use this to find executions that need attention — for example, filter by 'paused' to find executions awaiting approval via jamjet_approve, ",
-                "or filter by 'running' to monitor active workflows. ",
+                "Use this to find executions that need attention. For example, filter by 'running' to monitor active workflows. ",
+                "A run waiting for an approval stays 'running': no run reads 'paused' for one. To find approvals, read GET /approvals (pending approvals across runs, each with the action_digest jamjet_approve needs), or read waiting_for on jamjet_get_execution. ",
                 "Returns a JSON object with an 'executions' array, where each entry has the same fields as jamjet_get_execution. ",
                 "Results are ordered by creation time (newest first). Supports offset-based pagination via limit and offset parameters. ",
                 "All parameters are optional — calling with no arguments returns the 50 most recent executions across all statuses."
@@ -366,20 +370,23 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
         McpTool {
             name: "jamjet_approve".into(),
             description: Some(concat!(
-                "Submit an approval or rejection decision for a workflow execution that is paused and waiting for human review. ",
-                "Use this when jamjet_list_executions shows a 'paused' execution or jamjet_get_events shows an ApprovalRequested event. ",
-                "Side effects: appends an ApprovalReceived event to the event log, recording the authenticated API token as the approver ('mcp-client' only in dev mode), and, if the execution is paused, ",
-                "resumes it to 'running' status so the next node can proceed. The decision is recorded in the immutable audit trail. ",
-                "Returns a JSON object with execution_id and accepted: true. ",
-                "Fails if execution_id is not found, if decision is not exactly 'approved' or 'rejected', or if nothing is pending approval (or node_id does not match a pending approval). ",
-                "Related: use jamjet_get_events to see the ApprovalRequested event details before deciding."
+                "Submit an approval or rejection decision on a request waiting for human review. ",
+                "Use this for a request listed by GET /approvals, a run whose jamjet_get_execution answer has waiting_for 'approval', or a tool_approval_required event from jamjet_get_events. ",
+                "Side effects: appends an ApprovalReceived event to the event log, recording the authenticated API token as the approver ('mcp-client' only in dev mode). ",
+                "The run goes on at the engine's next pass. The decision is recorded in the immutable audit trail. ",
+                "Returns a JSON object with execution_id, node_id, accepted: true, repeat, sequence (the decision's place in the event log) and waiting_for (what the run waits for next). ",
+                "Sending the same decision again with the same token answers with the first one (repeat: true, the same sequence) and records nothing. ",
+                "To retry a lost answer safely, send node_id and request_sequence (the request's sequence from GET /approvals). With request_sequence a retry can only answer that request: if the node has asked again since, it is refused. ",
+                "Without it, a retry after the node asked again with the same action_digest decides the new request. Without node_id, a retry while another request is pending is refused, since it could be a decision on that request. ",
+                "Fails if execution_id is not found, if decision is not exactly 'approved' or 'rejected', if nothing is pending approval (or node_id does not match a pending approval), if request_sequence names another request, or if the request was already decided another way or by another approver. ",
+                "Related: use jamjet_get_events to see the tool_approval_required event details before deciding."
             ).into()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "execution_id": {
                         "type": "string",
-                        "description": "Execution ID of the paused workflow awaiting approval. Accepts 'exec_<uuid>' or bare UUID format."
+                        "description": "Execution ID of the run with the request to decide. Accepts 'exec_<uuid>' or bare UUID format."
                     },
                     "decision": {
                         "type": "string",
@@ -397,6 +404,10 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     "action_digest": {
                         "type": "string",
                         "description": "The action_digest (or, for an agent tool dispatch, the calls_hash) from the context of the pending approval you reviewed. Required to approve outside dev mode. If the pending request has been superseded the decision is refused, so you never approve an action you did not see."
+                    },
+                    "request_sequence": {
+                        "type": "integer",
+                        "description": "The sequence of the request you reviewed: request_sequence in GET /approvals, or sequence in a pending entry of GET /executions/:id/approvals. Optional. If the node has asked again since, the decision is refused. Send it when you retry, so a retry can only answer the request you saw."
                     },
                     "tenant_id": {
                         "type": "string",
@@ -428,6 +439,12 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     Some(Value::String(d)) => Some(d.clone()),
                     Some(_) => return Err("action_digest must be a string".into()),
                 };
+                let request_sequence = match args.get("request_sequence") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(v.as_i64().ok_or_else(|| {
+                        format!("request_sequence must be an integer, not {v}")
+                    })?),
+                };
                 // Forwarded so the shared submission refuses it exactly as the
                 // REST route does; silently dropping it would let a client
                 // believe its edit was recorded.
@@ -453,7 +470,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 };
                 let actor_id = principal.clone().unwrap_or_else(|| user_id.clone());
 
-                let (resolved_node, event) = crate::approvals::submit_approval(
+                let submitted = crate::approvals::submit_approval(
                     &backend,
                     &eid,
                     crate::approvals::ApprovalSubmission {
@@ -468,6 +485,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         comment,
                         state_patch,
                         action_digest,
+                        request_sequence,
                         dev_mode,
                     },
                     s.approval_policy,
@@ -478,21 +496,34 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 // Seal the approval into the signed, hash-chained audit log,
                 // mirroring the REST approve path: best-effort, after the
                 // durable event write, off the worker's fenced commit path.
-                let audit_ctx = jamjet_audit::RequestContext {
-                    actor_id,
-                    actor_type: jamjet_audit::ActorType::Human,
-                    tenant_id: tenant_id.0.clone(),
-                    method: Some("POST".to_string()),
-                    path: Some("/mcp/tools/jamjet_approve".to_string()),
-                    ..Default::default()
-                };
-                if let Err(e) = s.enricher.try_enrich_and_append(&event, Some(&audit_ctx)).await {
-                    jamjet_state::approvals::record_seal_gap(backend.as_ref(), &event, e).await;
+                // A repeat appended nothing and was sealed the first time.
+                if !submitted.repeat {
+                    let audit_ctx = jamjet_audit::RequestContext {
+                        actor_id,
+                        actor_type: jamjet_audit::ActorType::Human,
+                        tenant_id: tenant_id.0.clone(),
+                        method: Some("POST".to_string()),
+                        path: Some("/mcp/tools/jamjet_approve".to_string()),
+                        ..Default::default()
+                    };
+                    if let Err(e) = s
+                        .enricher
+                        .try_enrich_and_append(&submitted.event, Some(&audit_ctx))
+                        .await
+                    {
+                        jamjet_state::approvals::record_seal_gap(
+                            backend.as_ref(),
+                            &submitted.event,
+                            e,
+                        )
+                        .await;
+                    }
                 }
 
+                let answer =
+                    crate::approvals::decision_answer(backend.as_ref(), &eid, &submitted).await;
                 Ok(vec![McpContent::Text {
-                    text: json!({"execution_id": id_str, "node_id": resolved_node, "accepted": true})
-                        .to_string(),
+                    text: answer.to_string(),
                 }])
             }
         },

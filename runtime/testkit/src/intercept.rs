@@ -12,11 +12,11 @@ use async_trait::async_trait;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::artifact::ArtifactRef;
 use jamjet_state::backend::{
-    ApiToken, ApprovalProjectionRow, BackendResult, ClaimFilter, ClaimedWorkItem,
+    ApiToken, ApprovalCursor, ApprovalProjectionRow, BackendResult, ClaimFilter, ClaimedWorkItem,
     ConditionalAppend, EventCondition, ExecutionClaim, ExecutionFinish, FailOutcome, GateMark,
-    LeaseRenewal, LeasedItem, PassCommit, ReclaimResult, ReserveOutcome, RunningPage,
-    SchedulerPass, StateBackend, StateBackendError, TurnCommit, WorkItem, WorkItemId,
-    WorkflowDefinition,
+    LeaseRenewal, LeasedItem, OpenWorkItem, PassCommit, PendingApprovalRow, ReclaimResult,
+    ReserveOutcome, RunningPage, SchedulerPass, StateBackend, StateBackendError, TurnCommit,
+    WorkItem, WorkItemId, WorkflowDefinition,
 };
 use jamjet_state::event::{Event, EventKind, EventSequence};
 use jamjet_state::snapshot::Snapshot;
@@ -264,6 +264,13 @@ pub enum Op<'a> {
         execution_id: &'a ExecutionId,
         new_checkpoint: i64,
     },
+
+    // ── Features lane ────────────────────────────────────────────────────
+    ListPendingApprovals {
+        after: Option<&'a ApprovalCursor>,
+        limit: u32,
+    },
+    OpenWorkItems(&'a ExecutionId),
 
     // ── Tenants ──────────────────────────────────────────────────────────
     CreateTenant(&'a Tenant),
@@ -1194,6 +1201,31 @@ impl StateBackend for Intercept {
         )
     }
 
+    // ── Features lane ────────────────────────────────────────────────────
+
+    async fn list_pending_approvals(
+        &self,
+        after: Option<&ApprovalCursor>,
+        limit: u32,
+    ) -> BackendResult<Vec<PendingApprovalRow>> {
+        around!(
+            self,
+            Op::ListPendingApprovals { after, limit },
+            self.inner.list_pending_approvals(after, limit)
+        )
+    }
+
+    async fn open_work_items(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> BackendResult<Vec<OpenWorkItem>> {
+        around!(
+            self,
+            Op::OpenWorkItems(execution_id),
+            self.inner.open_work_items(execution_id)
+        )
+    }
+
     // ── Tenants ──────────────────────────────────────────────────────────
 
     async fn create_tenant(&self, tenant: Tenant) -> BackendResult<()> {
@@ -1326,6 +1358,29 @@ mod tests {
             *hooks.after.lock().unwrap(),
             ["GetEvents"],
             "after runs only for a call that returned Ok"
+        );
+    }
+
+    /// The approvals list and a run's open items reach the inner backend. The
+    /// trait's defaults refuse both, so a wrapper that left them to the
+    /// default would answer an error the engine's backends never give.
+    #[tokio::test]
+    async fn the_features_lane_reads_reach_the_inner_backend() {
+        let inner: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+        let hooks = Arc::new(Recorder::default());
+        let intercept = Intercept::new(inner, hooks.clone());
+
+        let pending = intercept.list_pending_approvals(None, 10).await;
+        assert!(
+            matches!(&pending, Ok(rows) if rows.is_empty()),
+            "{pending:?}"
+        );
+        let open = intercept.open_work_items(&ExecutionId::new()).await;
+        assert!(matches!(&open, Ok(items) if items.is_empty()), "{open:?}");
+
+        assert_eq!(
+            *hooks.after.lock().unwrap(),
+            ["ListPendingApprovals", "OpenWorkItems"]
         );
     }
 }

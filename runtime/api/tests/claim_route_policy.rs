@@ -1670,6 +1670,50 @@ impl StateBackend for FailFirstGetEvents {
     ) -> jamjet_state::backend::BackendResult<()> {
         self.inner.update_tenant(tenant).await
     }
+
+    // ── Features and storage lanes ───────────────────────────────────────
+    // Delegated, so this wrapper answers as the backend it wraps: the
+    // trait's defaults refuse the two reads and write the other three in
+    // separate steps.
+
+    async fn list_pending_approvals(
+        &self,
+        after: Option<&jamjet_state::ApprovalCursor>,
+        limit: u32,
+    ) -> jamjet_state::backend::BackendResult<Vec<jamjet_state::PendingApprovalRow>> {
+        self.inner.list_pending_approvals(after, limit).await
+    }
+
+    async fn open_work_items(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> jamjet_state::backend::BackendResult<Vec<jamjet_state::OpenWorkItem>> {
+        self.inner.open_work_items(execution_id).await
+    }
+
+    async fn commit_scheduler_pass(
+        &self,
+        pass: jamjet_state::SchedulerPass,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::PassCommit> {
+        self.inner.commit_scheduler_pass(pass).await
+    }
+
+    async fn reclaim_expired_leases_recorded(
+        &self,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::backend::ReclaimResult> {
+        self.inner.reclaim_expired_leases_recorded().await
+    }
+
+    async fn fail_work_item_fenced_recorded(
+        &self,
+        item_id: jamjet_state::backend::WorkItemId,
+        lease_fence: i64,
+        error: &str,
+    ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::backend::FailOutcome>> {
+        self.inner
+            .fail_work_item_fenced_recorded(item_id, lease_fence, error)
+            .await
+    }
 }
 
 /// A backend failure must withhold the payload, audit NOTHING, and settle

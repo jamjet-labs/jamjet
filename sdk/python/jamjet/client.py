@@ -254,6 +254,7 @@ class JamjetClient:
         state_patch: dict[str, Any] | None = None,
         action_digest: str | None = None,
         user_id: str | None = None,
+        request_sequence: int | None = None,
     ) -> dict[str, Any]:
         """Record a decision on a pending approval.
 
@@ -273,6 +274,18 @@ class JamjetClient:
         ``user_id`` is the name to record as the approver. A dev-mode engine
         records it as given. With an API token the engine records the token's
         name and ignores it. It is sent only when set.
+
+        ``request_sequence`` is the sequence of the request you reviewed
+        (``request_sequence`` in :meth:`list_pending_approvals`, ``sequence``
+        in :meth:`list_approvals`). The engine refuses the decision with 409
+        if the node has asked again since. Send it when you retry a decision
+        whose answer was lost: without it, a retry after the node asked again
+        with the same digest decides the new request.
+
+        Returns the engine's answer unchanged: ``execution_id``, ``node_id``,
+        ``accepted``, ``repeat`` (true when the same decision was already
+        recorded; nothing is written again), ``sequence`` (the decision's place
+        in the log) and ``waiting_for`` (what the run waits for next, or null).
         """
         body: dict[str, Any] = {"decision": decision}
         if node_id:
@@ -285,6 +298,8 @@ class JamjetClient:
             body["action_digest"] = action_digest
         if user_id:
             body["user_id"] = user_id
+        if request_sequence is not None:
+            body["request_sequence"] = request_sequence
         r = await self._client.post(f"/executions/{execution_id}/approve", json=body)
         _raise_for_status(r)
         return r.json()
@@ -298,6 +313,39 @@ class JamjetClient:
         r = await self._client.get(f"/executions/{execution_id}/approvals")
         _raise_for_status(r)
         return r.json()
+
+    async def list_pending_approvals(self, limit: int | None = None, after: str | None = None) -> dict[str, Any]:
+        """Pending approvals across runs, oldest first.
+
+        Returns ``{"approvals": [...], "next_after": ...}`` as served by
+        ``GET /approvals``. Each row carries the ``action_digest`` to echo in
+        :meth:`approve`. ``next_after`` is set when a page is full; pass it back
+        as ``after`` for the next page. The list reads the approvals read model,
+        which can lag the log by one projector tick; :meth:`approve` decides.
+
+        An engine from before this list answers ``GET /approvals`` with its web
+        page. That raises :class:`JamjetAPIError` asking for an upgrade.
+        """
+        params: dict[str, Any] = {}
+        if limit is not None:
+            params["limit"] = limit
+        if after is not None:
+            params["after"] = after
+        r = await self._client.get("/approvals", params=params)
+        _raise_for_status(r)
+        try:
+            body = r.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict) or not isinstance(body.get("approvals"), list):
+            detail = "this engine does not list approvals across runs; upgrade it"
+            raise JamjetAPIError(
+                f"GET /approvals: {detail}",
+                request=r.request,
+                response=r,
+                detail=detail,
+            )
+        return body
 
     async def send_external_event(
         self,

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- **`client.list_pending_approvals(limit=None, after=None)`** lists pending approvals across runs
+  from `GET /approvals`. Against an engine without that list it raises `JamjetAPIError` and asks
+  for an upgrade. `approve()` returns the engine's `repeat`, `sequence` and `waiting_for`.
+- **`approve(request_sequence=...)`** names the request a decision answers. The engine refuses
+  the decision with 409 if the node has asked again since, so a retry cannot decide a newer
+  request.
+
 ### Fixed
 
 - **`jamjet dev` names the extra it needs.** Without uvicorn it told you to run
