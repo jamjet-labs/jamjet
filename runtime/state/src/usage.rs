@@ -5,10 +5,12 @@
 //! model or reports tokens or a cost. Its cost is usable when
 //! [`cost_to_nanos`] takes it; a stored cost that is not (a negative one in
 //! an old log, a non-finite one built in memory, one above
-//! [`MAX_REPORTED_COST_USD`]) counts as unknown. Its tokens are unknown when
-//! it reports neither count. The caps read these counts
-//! (`crate::caps`): an unknown cost under a dollar cap, or unknown tokens
-//! under a token cap, stops the run.
+//! [`MAX_REPORTED_COST_USD`]) counts as unknown. A token count it does not
+//! report is unknown, each count on its own: a step that reports its input
+//! tokens and not its output tokens leaves the output unknown. A step that
+//! never has a count reports 0 for it. The caps read these counts
+//! (`crate::caps`): an unknown cost under a dollar cap, or an unknown token
+//! count under a token cap that reads it, stops the run.
 //!
 //! Costs are summed as integer nano-dollars, so that $0.10 and $0.20 reach a
 //! $0.30 cap exactly. Summed as `f64` they land at 0.30000000000000004 and
@@ -47,8 +49,14 @@ pub struct RunUsage {
     pub billable_steps: u64,
     /// Billable steps with no usable cost.
     pub cost_unknown_steps: u64,
-    /// Billable steps that reported no tokens at all.
+    /// Billable steps that reported neither token count.
     pub tokens_unknown_steps: u64,
+    /// Billable steps that did not report their input tokens. An input or
+    /// total token cap cannot be checked while this is above 0.
+    pub input_tokens_unknown_steps: u64,
+    /// Billable steps that did not report their output tokens. An output or
+    /// total token cap cannot be checked while this is above 0.
+    pub output_tokens_unknown_steps: u64,
     /// The node of the last billable step folded.
     #[serde(skip)]
     pub last_billable_node: Option<String>,
@@ -108,6 +116,12 @@ impl RunUsage {
         self.output_tokens = self
             .output_tokens
             .saturating_add(output_tokens.unwrap_or(0));
+        if input_tokens.is_none() {
+            self.input_tokens_unknown_steps = self.input_tokens_unknown_steps.saturating_add(1);
+        }
+        if output_tokens.is_none() {
+            self.output_tokens_unknown_steps = self.output_tokens_unknown_steps.saturating_add(1);
+        }
         if input_tokens.is_none() && output_tokens.is_none() {
             self.tokens_unknown_steps = self.tokens_unknown_steps.saturating_add(1);
         }
@@ -145,6 +159,12 @@ impl RunUsage {
             tokens_unknown_steps: self
                 .tokens_unknown_steps
                 .saturating_add(later.tokens_unknown_steps),
+            input_tokens_unknown_steps: self
+                .input_tokens_unknown_steps
+                .saturating_add(later.input_tokens_unknown_steps),
+            output_tokens_unknown_steps: self
+                .output_tokens_unknown_steps
+                .saturating_add(later.output_tokens_unknown_steps),
             last_billable_node: later
                 .last_billable_node
                 .clone()
@@ -349,9 +369,11 @@ pub(crate) mod tests {
             (
                 u.billable_steps,
                 u.cost_unknown_steps,
-                u.tokens_unknown_steps
+                u.tokens_unknown_steps,
+                u.input_tokens_unknown_steps,
+                u.output_tokens_unknown_steps
             ),
-            (1, 1, 1)
+            (1, 1, 1, 1, 1)
         );
         assert_eq!(u.last_billable_node.as_deref(), Some("m"));
     }
@@ -371,6 +393,19 @@ pub(crate) mod tests {
             (both.input_tokens, both.total_tokens(), both.billable_steps),
             (u64::MAX, u64::MAX, 4)
         );
+        let many = RunUsage {
+            input_tokens_unknown_steps: u64::MAX,
+            output_tokens_unknown_steps: u64::MAX,
+            ..Default::default()
+        };
+        let more = many.plus(&many);
+        assert_eq!(
+            (
+                more.input_tokens_unknown_steps,
+                more.output_tokens_unknown_steps
+            ),
+            (u64::MAX, u64::MAX)
+        );
     }
 
     #[test]
@@ -387,6 +422,15 @@ pub(crate) mod tests {
                 both.tokens_unknown_steps
             ),
             (10, 1, 750_000_000, 2, 1)
+        );
+        // Each side's missing counts are added.
+        let twice = later.plus(&later);
+        assert_eq!(
+            (
+                twice.input_tokens_unknown_steps,
+                twice.output_tokens_unknown_steps
+            ),
+            (2, 2)
         );
         assert_eq!(both.last_billable_node.as_deref(), Some("b"));
         // A later segment without a billable step keeps the earlier node.

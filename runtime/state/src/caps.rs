@@ -12,8 +12,13 @@
 //!
 //! | Cap | `may_fire` is `Ok` only if | `past_cap` trips unless |
 //! |---|---|---|
-//! | token cap L (total, input or output) | no step left its tokens unknown, and the count is `< L` | no step left its tokens unknown, and the count is `<= L` |
+//! | token cap L (total, input or output) | no step left a count the cap reads unknown, and the count is `< L` | no step left a count the cap reads unknown, and the count is `<= L` |
 //! | `cost_budget_usd` C | no step left its cost unknown, C is a cost a step may report, and the nano-dollar sum is `< C` | the same with `<= C` |
+//!
+//! An input cap reads the input tokens, an output cap the output tokens, and
+//! a total cap both. A token count already past its cap trips as that cap
+//! even when a count it reads is unknown: what a step left out can only add
+//! to it. Only otherwise does the unknown count trip `TokensNotReported`.
 //!
 //! A cap that is not a cost a step may report (NaN, negative, above
 //! `MAX_REPORTED_COST_USD`) refuses every spending step and fails the run.
@@ -37,7 +42,7 @@ pub enum CapKind {
     TotalTokens,
     InputTokens,
     OutputTokens,
-    /// A token cap is set and a step reported no tokens.
+    /// A token cap is set and a step did not report a token count it reads.
     TokensNotReported,
     CostUsd,
     /// A dollar cap is set and a step reported no usable cost.
@@ -92,40 +97,46 @@ impl Bound {
 /// The first cap that does not let the run through, token caps first.
 fn first_trip(caps: &RunCaps, u: &RunUsage, bound: Bound) -> Option<CapTrip> {
     if let Some(tb) = &caps.token_budget {
+        let input_known = u.input_tokens_unknown_steps == 0;
+        let output_known = u.output_tokens_unknown_steps == 0;
+        // (the cap's name, its kind, its limit, the count, whether every
+        // count the cap reads is known)
         let token_caps = [
             (
                 "total_tokens",
                 CapKind::TotalTokens,
                 tb.total_tokens,
                 u.total_tokens(),
+                input_known && output_known,
             ),
             (
                 "input_tokens",
                 CapKind::InputTokens,
                 tb.input_tokens,
                 u.input_tokens,
+                input_known,
             ),
             (
                 "output_tokens",
                 CapKind::OutputTokens,
                 tb.output_tokens,
                 u.output_tokens,
+                output_known,
             ),
         ];
-        for (cap, kind, limit, count) in token_caps {
+        for (cap, kind, limit, count, known) in token_caps {
             let Some(limit) = limit.map(u64::from) else {
                 continue;
             };
-            let known = u.tokens_unknown_steps == 0;
-            if known && bound.holds(count, limit) {
+            let kind = if !bound.holds(count, limit) {
+                kind
+            } else if !known {
+                CapKind::TokensNotReported
+            } else {
                 continue;
-            }
+            };
             return Some(CapTrip {
-                kind: if known {
-                    kind
-                } else {
-                    CapKind::TokensNotReported
-                },
+                kind,
                 limit: limit as f64,
                 current: count as f64,
                 cap,
@@ -208,7 +219,7 @@ impl CapTrip {
                 self.cap, self.current, self.limit
             ),
             CapKind::TokensNotReported => format!(
-                "token budget cannot be checked: a step reported no tokens ({} cap {})",
+                "token budget cannot be checked: a step did not report the tokens this cap counts ({} cap {})",
                 self.cap, self.limit
             ),
             CapKind::CostUsd if self.cap_is_invalid() => format!(
@@ -415,13 +426,97 @@ mod tests {
             json!({"type":"token_budget_exceeded","node_id":"step","kind":"output_tokens","limit":50,"current":0,"reason":"tokens_not_reported"})
         );
 
-        // One count is enough for the tokens to be known.
-        let known = fold(&[completion("step", Some(10), None, Some(0.2), None)]);
-        assert_eq!(known.tokens_unknown_steps, 0);
-        assert_eq!(may_fire(&caps, &known), Ok(()));
         // Without a token cap, unknown tokens are fine.
         assert_eq!(may_fire(&dollars(1.0), &u), Ok(()));
         assert_eq!(past_cap(&dollars(1.0), &u), None);
+    }
+
+    #[test]
+    fn a_missing_count_is_unknown_for_every_cap_that_reads_it() {
+        let input_only = fold(&[completion("step", Some(500), None, Some(0.2), None)]);
+        let output_only = fold(&[completion("step", None, Some(40), Some(0.2), None)]);
+        let missing = |u: &RunUsage| {
+            (
+                u.input_tokens_unknown_steps,
+                u.output_tokens_unknown_steps,
+                u.tokens_unknown_steps,
+            )
+        };
+        assert_eq!(missing(&input_only), (0, 1, 0));
+        assert_eq!(missing(&output_only), (1, 0, 0));
+        assert_eq!(
+            serde_json::to_value(&input_only).unwrap(),
+            json!({"input_tokens":500,"output_tokens":0,"billable_steps":1,"cost_unknown_steps":0,"tokens_unknown_steps":0,"input_tokens_unknown_steps":0,"output_tokens_unknown_steps":1})
+        );
+
+        // (usage, caps, the event's `kind` and `current` when the cap reads
+        // the missing count; None when it does not)
+        let cases = [
+            (&input_only, tokens(None, Some(1000), None), None),
+            (
+                &input_only,
+                tokens(None, None, Some(1000)),
+                Some(("output_tokens", 0)),
+            ),
+            (
+                &input_only,
+                tokens(Some(1000), None, None),
+                Some(("total_tokens", 500)),
+            ),
+            (&output_only, tokens(None, None, Some(1000)), None),
+            (
+                &output_only,
+                tokens(None, Some(1000), None),
+                Some(("input_tokens", 0)),
+            ),
+            (
+                &output_only,
+                tokens(Some(1000), None, None),
+                Some(("total_tokens", 40)),
+            ),
+        ];
+        for (u, caps, unknown) in cases {
+            let Some((cap, current)) = unknown else {
+                assert_eq!(may_fire(&caps, u), Ok(()), "{caps:?}");
+                assert_eq!(past_cap(&caps, u), None, "{caps:?}");
+                continue;
+            };
+            let expected = json!({"type":"token_budget_exceeded","node_id":"step","kind":cap,"limit":1000,"current":current,"reason":"tokens_not_reported"});
+            let refused = may_fire(&caps, u).expect_err("a missing count refuses");
+            assert_eq!(
+                kind_limit_current(&refused),
+                (CapKind::TokensNotReported, 1000.0, current as f64),
+                "{cap}"
+            );
+            assert_eq!(json_of(&refused, "step"), expected);
+            let failed = past_cap(&caps, u).expect("a missing count fails the run");
+            assert_eq!(json_of(&failed, "step"), expected);
+        }
+
+        // A count already past its cap trips as that cap, with no reason:
+        // what it left out can only add to it.
+        let past = fold(&[completion("a", Some(10), None, None, Some("k"))]);
+        let caps = tokens(Some(5), None, None);
+        let trip = past_cap(&caps, &past).expect("10 tokens are past 5");
+        assert_eq!(
+            json_of(&trip, "a"),
+            json!({"type":"token_budget_exceeded","node_id":"a","kind":"total_tokens","limit":5,"current":10})
+        );
+        assert_eq!(
+            may_fire(&caps, &past).unwrap_err().kind,
+            CapKind::TotalTokens
+        );
+        // Exactly at the cap with a count missing: the next step is refused
+        // at the cap, and the run fails because the cap cannot be checked.
+        let caps = tokens(Some(500), None, None);
+        assert_eq!(
+            may_fire(&caps, &input_only).unwrap_err().kind,
+            CapKind::TotalTokens
+        );
+        assert_eq!(
+            past_cap(&caps, &input_only).map(|t| t.kind),
+            Some(CapKind::TokensNotReported)
+        );
     }
 
     #[test]
@@ -509,7 +604,7 @@ mod tests {
             may_fire(&tokens(None, Some(100), None), &unknown)
                 .unwrap_err()
                 .describe(),
-            "token budget cannot be checked: a step reported no tokens (input_tokens cap 100)"
+            "token budget cannot be checked: a step did not report the tokens this cap counts (input_tokens cap 100)"
         );
         assert_eq!(
             may_fire(&dollars(-1.0), &Default::default())
