@@ -210,6 +210,10 @@ rules are the same:
 
 - A request is never sent without the token. If the source fails, you get
   `IdentityTokenError` and nothing is sent.
+- A source that does not answer within the client's `timeout` (or
+  `fetch_timeout_s=`, when you pass it) counts as failed. It is tried twice
+  more, then the call and every call waiting on the same token get
+  `IdentityTokenError`.
 - A 401 from the platform gets one fresh token and one resend. A second 401
   raises `PlatformAuthError`.
 - A 401 or 403 that does not carry the engine's JSON error body came from

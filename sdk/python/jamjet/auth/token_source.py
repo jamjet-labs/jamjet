@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import inspect
 import json
 import logging
@@ -44,6 +45,9 @@ from jamjet.transport import (
 
 # The waits before the second and the third try of a fetch that failed in transit.
 _FETCH_WAITS = (0.2, 0.5)
+# How long one try of a fetch may take when neither fetch_timeout_s nor the
+# request's timeout sets it.
+_FETCH_TIMEOUT_S = 30.0
 _BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
 _HTTP_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # a header name, or a scheme such as Bearer
 
@@ -58,6 +62,51 @@ _sleep_sync: Callable[[float], None] = time.sleep
 
 class IdentityTokenError(RuntimeError):
     """The token source failed or gave something that is not a token. Nothing was sent."""
+
+
+class _FetchTimeoutError(TimeoutError):
+    """A try of the fetch ran past its limit. A TimeoutError, so it is tried again like one."""
+
+    def __init__(self, limit: float) -> None:
+        super().__init__(f"the token source did not answer within {limit:g} s")
+        self.limit = limit
+
+
+def _on_own_thread(fetch: Callable[[], Any]) -> concurrent.futures.Future[Any]:
+    """Start ``fetch`` on a daemon thread of its own.
+
+    One that never returns then holds up no thread pool that other work needs,
+    and not the program's exit.
+    """
+    future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+
+    def run() -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            value = fetch()
+        except BaseException as exc:  # handed to the waiter as it is
+            future.set_exception(exc)
+        else:
+            future.set_result(value)
+
+    threading.Thread(target=run, name="jamjet-token-source", daemon=True).start()
+    return future
+
+
+async def _within(future: asyncio.Future[Any], limit: float) -> Any:
+    """What ``future`` gives, or ``_FetchTimeoutError`` once ``limit`` seconds pass.
+
+    A future still running then is cancelled, and not waited for.
+    """
+    try:
+        done, _ = await asyncio.wait({future}, timeout=limit)
+    finally:
+        if not future.done():
+            future.cancel()
+    if not done:
+        raise _FetchTimeoutError(limit)
+    return future.result()
 
 
 @dataclass(frozen=True)
@@ -75,6 +124,10 @@ def _seconds(value: Any) -> float | None:
     except OverflowError:
         return None
     return seconds if math.isfinite(seconds) else None
+
+
+def _positive_seconds(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int | float) and math.isfinite(value) and value > 0
 
 
 def _claims(value: Any) -> tuple[float, float] | None:
@@ -117,9 +170,9 @@ class TokenSourceAuth(httpx.Auth):
     """An identity token from ``fetch``, in ``header``, on every request to ``origin``.
 
     ``fetch`` takes no arguments and returns the token, or an awaitable of it.
-    Under an async client a plain function runs on a worker thread, so a slow
-    source does not hold up the event loop. A sync client (``httpx.Client``)
-    needs a plain function.
+    A plain function runs on a thread of its own, so a slow source does not
+    hold up the event loop. A sync client (``httpx.Client``) needs a plain
+    function.
 
     The token is kept for its own lifetime, ``exp - iat`` from its claims,
     counted on the monotonic clock from the start of the fetch, so a wall clock
@@ -135,6 +188,14 @@ class TokenSourceAuth(httpx.Auth):
     after 0.2 s and 0.5 s. After that, at once for any other error, and for
     something that is not a token, ``IdentityTokenError`` is raised and the
     request is not sent.
+
+    Each try may take ``fetch_timeout_s`` seconds. By default that is the
+    timeout of the request that needs the token, its longest part when its
+    parts differ, so the client's ``timeout`` covers the fetch too; 30 s when
+    the request has none. A try that runs past it counts as one that failed
+    in transit, and the requests waiting on it get the same error. An async
+    source that runs past it is cancelled. A plain function cannot be
+    stopped: its thread runs on until it returns, but nothing waits for it.
 
     A request to any other origin raises ``CredentialScopeError`` before a
     token is fetched. Use it on a client that does not follow redirects
@@ -157,6 +218,7 @@ class TokenSourceAuth(httpx.Auth):
         header: str = "X-Serverless-Authorization",
         scheme: str = "Bearer",
         refresh_margin_s: float = 300.0,
+        fetch_timeout_s: float | None = None,
     ) -> None:
         if not callable(fetch):
             raise TypeError("fetch must be a function that returns a token")
@@ -170,7 +232,11 @@ class TokenSourceAuth(httpx.Auth):
         margin = refresh_margin_s
         if isinstance(margin, bool) or not isinstance(margin, int | float) or not math.isfinite(margin) or margin < 0:
             raise ValueError(f"refresh_margin_s must be a finite number of seconds, 0 or more, not {margin!r}")
+        limit = fetch_timeout_s
+        if limit is not None and not _positive_seconds(limit):
+            raise ValueError(f"fetch_timeout_s must be a finite number of seconds above 0, or None, not {limit!r}")
         self._fetch: Callable[[], Any] = fetch
+        self._fetch_timeout = None if limit is None else float(limit)
         self._fetch_is_async = inspect.iscoroutinefunction(fetch)
         self._origin = origin_of(url)
         self._header = header
@@ -207,7 +273,8 @@ class TokenSourceAuth(httpx.Auth):
     async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
         self._admit(request)
         await request.aread()
-        token = await self._token_async(stale=None)
+        limit = self._limit_for(request)
+        token = await self._token_async(stale=None, limit=limit)
         self._put(request, token)
         response = yield request
         if response.status_code != 401:
@@ -216,7 +283,7 @@ class TokenSourceAuth(httpx.Auth):
         if not _platform_refused(response):
             return
         _log.debug("the platform refused the identity token (401); fetching a fresh one and sending once more")
-        self._put(request, await self._token_async(stale=token))
+        self._put(request, await self._token_async(stale=token, limit=limit))
         response = yield request
         if response.status_code == 401:
             await response.aread()
@@ -226,7 +293,8 @@ class TokenSourceAuth(httpx.Auth):
     def sync_auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
         self._admit(request)
         request.read()
-        token = self._token_sync(stale=None)
+        limit = self._limit_for(request)
+        token = self._token_sync(stale=None, limit=limit)
         self._put(request, token)
         response = yield request
         if response.status_code != 401:
@@ -235,7 +303,7 @@ class TokenSourceAuth(httpx.Auth):
         if not _platform_refused(response):
             return
         _log.debug("the platform refused the identity token (401); fetching a fresh one and sending once more")
-        self._put(request, self._token_sync(stale=token))
+        self._put(request, self._token_sync(stale=token, limit=limit))
         response = yield request
         if response.status_code == 401:
             response.read()
@@ -249,6 +317,14 @@ class TokenSourceAuth(httpx.Auth):
                 f"Refused to send the identity token to {show_origin(origin)}. It goes only to {self.origin}. "
                 "The request was not sent."
             )
+
+    def _limit_for(self, request: httpx.Request) -> float:
+        """How long one try of the fetch may take for ``request``."""
+        if self._fetch_timeout is not None:
+            return self._fetch_timeout
+        parts = request.extensions.get("timeout")
+        seconds = [float(v) for v in parts.values() if _positive_seconds(v)] if isinstance(parts, dict) else []
+        return max(seconds, default=_FETCH_TIMEOUT_S)
 
     def _put(self, request: httpx.Request, token: str) -> None:
         request.headers[self._header] = f"{self._scheme} {token}" if self._scheme else token
@@ -286,7 +362,7 @@ class TokenSourceAuth(httpx.Auth):
             lock = self._loop_locks[loop] = asyncio.Lock()
         return lock
 
-    async def _token_async(self, *, stale: str | None) -> str:
+    async def _token_async(self, *, stale: str | None, limit: float) -> str:
         again = stale is not None
         token = self._usable(stale)
         if token is not None:
@@ -306,7 +382,7 @@ class TokenSourceAuth(httpx.Auth):
                     tried += 1
                     started = _monotonic()
                     try:
-                        value = await self._call_async()
+                        value = await self._call_async(limit)
                     except Exception as exc:
                         await _sleep(self._wait_or_raise(exc, tried, again=again))
                     else:
@@ -314,7 +390,7 @@ class TokenSourceAuth(httpx.Auth):
             finally:
                 self._rounds += 1
 
-    def _token_sync(self, *, stale: str | None) -> str:
+    def _token_sync(self, *, stale: str | None, limit: float) -> str:
         again = stale is not None
         if self._fetch_is_async:
             raise IdentityTokenError(
@@ -339,7 +415,7 @@ class TokenSourceAuth(httpx.Auth):
                     tried += 1
                     started = _monotonic()
                     try:
-                        value = self._call_sync()
+                        value = self._call_sync(limit)
                     except Exception as exc:
                         _sleep_sync(self._wait_or_raise(exc, tried, again=again))
                     else:
@@ -347,17 +423,22 @@ class TokenSourceAuth(httpx.Auth):
             finally:
                 self._rounds += 1
 
-    async def _call_async(self) -> Any:
+    async def _call_async(self, limit: float) -> Any:
         if self._fetch_is_async:
-            value = await self._fetch()
+            value = await _within(asyncio.ensure_future(self._fetch()), limit)
         else:
-            value = await asyncio.to_thread(self._fetch)
+            value = await _within(asyncio.wrap_future(_on_own_thread(self._fetch)), limit)
         if inspect.isawaitable(value):
-            value = await value
+            value = await _within(asyncio.ensure_future(value), limit)
         return value
 
-    def _call_sync(self) -> Any:
-        value = self._fetch()
+    def _call_sync(self, limit: float) -> Any:
+        future = _on_own_thread(self._fetch)
+        done, _ = concurrent.futures.wait([future], timeout=limit)
+        if not done:
+            future.cancel()
+            raise _FetchTimeoutError(limit)
+        value = future.result()
         if inspect.isawaitable(value):
             if inspect.iscoroutine(value):
                 value.close()
@@ -373,22 +454,25 @@ class TokenSourceAuth(httpx.Auth):
         if isinstance(exc, IdentityTokenError):
             reason, cause = str(exc), None
         else:
-            name = type(exc).__name__
+            if isinstance(exc, _FetchTimeoutError):
+                what = f"did not answer within {exc.limit:g} s"
+            else:
+                what = f"failed ({type(exc).__name__})"
             in_transit = isinstance(exc, self._retry_on) and not isinstance(exc, self._fail_on)
             if in_transit and tried <= len(_FETCH_WAITS):
                 wait = _FETCH_WAITS[tried - 1]
                 _log.debug(
-                    "the identity token source failed (%s); trying again in %.1f s, try %d of %d",
-                    name,
+                    "the identity token source %s; trying again in %.1f s, try %d of %d",
+                    what,
                     wait,
                     tried + 1,
                     len(_FETCH_WAITS) + 1,
                 )
                 return wait
             if in_transit:
-                reason = f"The identity token source failed ({name}) on each of {tried} tries."
+                reason = f"The identity token source {what} on each of {tried} tries."
             else:
-                reason = f"The identity token source failed ({name})."
+                reason = f"The identity token source {what}."
             cause = exc
         self._failure = (reason, cause)
         raise IdentityTokenError(f"{reason} {_not_sent(again)}") from cause

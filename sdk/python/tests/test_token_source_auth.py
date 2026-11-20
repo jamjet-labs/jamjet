@@ -12,10 +12,13 @@ import asyncio
 import base64
 import json
 import logging
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -469,6 +472,162 @@ async def test_requests_waiting_on_a_failed_fetch_share_its_error(waits: list[fl
     assert not anywhere.called
 
 
+# ── a source that hangs ──────────────────────────────────────────────────────
+
+
+class Hang:
+    """A token source that never answers: until ``release()``, for the thread kind."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.cancelled = 0
+        self._gate = threading.Event()
+
+    async def aget(self) -> str:
+        self.calls += 1
+        try:
+            await asyncio.sleep(1000)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        return FIRST
+
+    def get(self) -> str:
+        self.calls += 1
+        self._gate.wait(60)
+        return FIRST
+
+    def release(self) -> None:
+        self._gate.set()
+
+
+@pytest.fixture
+def hang() -> Iterator[Hang]:
+    source = Hang()
+    try:
+        yield source
+    finally:
+        source.release()
+
+
+def _did_not_answer(seconds: str) -> str:
+    return f"The identity token source did not answer within {seconds} s on each of 3 tries. Nothing was sent."
+
+
+@pytest.mark.parametrize("kind", ["async", "sync"])
+async def test_a_source_that_hangs_is_cut_off_at_the_client_timeout_and_frees_the_waiters(
+    kind: str, hang: Hang, waits: list[float]
+) -> None:
+    fetch = hang.aget if kind == "async" else hang.get
+    with respx.mock(assert_all_called=False) as mock:
+        anywhere = mock.route().respond(200, json={})
+        auth = TokenSourceAuth(fetch, origin=BASE)
+        async with JamjetClient(BASE, api_token=JJ, auth=auth, timeout=0.3) as c:
+            started = time.monotonic()
+            results = await asyncio.wait_for(asyncio.gather(c.health(), c.health(), return_exceptions=True), 10)
+            took = time.monotonic() - started
+            await spin()
+    # One round of three tries, each cut off at the client's 0.3 s; the second
+    # call waited on that round and shares its error.
+    assert [type(r) for r in results] == [IdentityTokenError, IdentityTokenError]
+    assert [str(r) for r in results] == [_did_not_answer("0.3")] * 2
+    assert hang.calls == 3
+    assert waits == [0.2, 0.5]
+    assert not anywhere.called
+    assert took < 5
+    if kind == "async":
+        assert hang.cancelled == 3
+
+
+async def test_fetch_timeout_s_sets_the_limit_for_each_try(hang: Hang, waits: list[float]) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        anywhere = mock.route().respond(200, json={})
+        auth = TokenSourceAuth(hang.aget, origin=BASE, fetch_timeout_s=0.2)
+        async with JamjetClient(BASE, api_token=JJ, auth=auth) as c:  # the client's own timeout is 30 s
+            with pytest.raises(IdentityTokenError) as exc:
+                await asyncio.wait_for(c.health(), 10)
+    assert str(exc.value) == _did_not_answer("0.2")
+    assert hang.calls == 3
+    assert not anywhere.called
+
+
+async def test_a_slow_source_that_answers_within_the_limit_is_used(waits: list[float]) -> None:
+    async def slow() -> str:
+        await asyncio.sleep(0.05)
+        return FIRST
+
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.get(f"{BASE}/health").mock(side_effect=lambda _: ok())
+        async with client(TokenSourceAuth(slow, origin=BASE, fetch_timeout_s=5)) as c:
+            await c.health()
+    assert route.calls.last.request.headers["x-serverless-authorization"] == f"Bearer {FIRST}"
+    assert waits == []
+
+
+def test_a_program_whose_sync_source_hangs_still_exits() -> None:
+    # A plain function runs on a thread, and one that never returns must not
+    # keep asyncio.run from returning or the program from exiting, as a
+    # scheduled `jamjet ops tick` needs. Run as a program of its own to see it.
+    code = """
+import asyncio, threading
+from jamjet.auth import IdentityTokenError, TokenSourceAuth
+from jamjet.client import JamjetClient
+
+def never_answers():
+    threading.Event().wait()
+
+async def main():
+    auth = TokenSourceAuth(never_answers, origin="https://engine.test")
+    async with JamjetClient("https://engine.test", api_token="t", auth=auth, timeout=0.2) as client:
+        try:
+            await client.health()
+        except IdentityTokenError as exc:
+            print(exc)
+
+asyncio.run(main())
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60, cwd=Path(__file__).parents[1]
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == _did_not_answer("0.2")
+
+
+def test_a_sync_client_cuts_off_a_source_that_hangs_at_its_longest_timeout(hang: Hang, waits: list[float]) -> None:
+    outcome: list[BaseException] = []
+
+    def call() -> None:
+        with respx.mock(assert_all_called=False) as mock:
+            mock.route().respond(200, json={})
+            timeout = httpx.Timeout(0.2, read=0.4)
+            with httpx.Client(auth=TokenSourceAuth(hang.get, origin=BASE), timeout=timeout) as plain:
+                try:
+                    plain.get(f"{BASE}/health")
+                except IdentityTokenError as exc:
+                    outcome.append(exc)
+
+    caller = threading.Thread(target=call, daemon=True)
+    caller.start()
+    caller.join(10)
+    assert not caller.is_alive(), "the sync client was still waiting on the source"
+    assert [str(e) for e in outcome] == [_did_not_answer("0.4")]
+    assert hang.calls == 3
+    assert waits == [0.2, 0.5]
+
+
+async def test_a_request_without_a_timeout_gets_the_fallback_limit(
+    hang: Hang, waits: list[float], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(token_source, "_FETCH_TIMEOUT_S", 0.2)
+    with respx.mock(assert_all_called=False) as mock:
+        anywhere = mock.route().respond(200, json={})
+        async with httpx.AsyncClient(auth=TokenSourceAuth(hang.aget, origin=BASE), timeout=None) as plain:
+            with pytest.raises(IdentityTokenError) as exc:
+                await asyncio.wait_for(plain.get(f"{BASE}/health"), 10)
+    assert str(exc.value) == _did_not_answer("0.2")
+    assert not anywhere.called
+
+
 MALFORMED = {
     "one-part": "eyJhbGciOiJSUzI1NiJ9",
     "not-base64url": "eyJhbGciOiJSUzI1NiJ9.eyJpYXQiOjE3OTUxNjg4MDB9.c2ln+/=",
@@ -685,6 +844,12 @@ def test_one_auth_serves_two_event_loops(clock: Clock) -> None:
         ({"refresh_margin_s": -1}, ValueError),
         ({"refresh_margin_s": float("nan")}, ValueError),
         ({"refresh_margin_s": True}, ValueError),
+        ({"fetch_timeout_s": 0}, ValueError),
+        ({"fetch_timeout_s": -1}, ValueError),
+        ({"fetch_timeout_s": float("inf")}, ValueError),
+        ({"fetch_timeout_s": float("nan")}, ValueError),
+        ({"fetch_timeout_s": True}, ValueError),
+        ({"fetch_timeout_s": "10"}, ValueError),
     ],
     ids=[
         "fetch-not-callable",
@@ -697,6 +862,12 @@ def test_one_auth_serves_two_event_loops(clock: Clock) -> None:
         "margin-negative",
         "margin-nan",
         "margin-a-bool",
+        "fetch-timeout-zero",
+        "fetch-timeout-negative",
+        "fetch-timeout-infinite",
+        "fetch-timeout-nan",
+        "fetch-timeout-a-bool",
+        "fetch-timeout-a-string",
     ],
 )
 def test_a_bad_setting_is_refused_at_construction(kwargs: dict[str, Any], error: type) -> None:
