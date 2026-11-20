@@ -18,7 +18,7 @@ import httpx
 # How much of an error body goes into the exception message. Runtime errors can
 # quote the request back (a value, a key), so keep only the start of it.
 _MAX_ERROR_DETAIL = 500
-_BIDI_CONTROLS = frozenset("‎‏‪‫‬‭‮⁦⁧⁨⁩")
+_BIDI_CONTROLS = frozenset("\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 _REDACTED = "[redacted]"
 

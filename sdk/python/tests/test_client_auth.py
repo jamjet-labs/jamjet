@@ -289,6 +289,38 @@ def test_is_engine_error_body(content_type: str, body: bytes, expected: bool) ->
     assert is_engine_error_body(response) is expected
 
 
+# ── error text ───────────────────────────────────────────────────────────────
+
+# Written as escapes on purpose: the raw characters are invisible in an editor.
+BIDI_CONTROLS = [
+    "\u200e",
+    "\u200f",
+    "\u202a",
+    "\u202b",
+    "\u202c",
+    "\u202d",
+    "\u202e",
+    "\u2066",
+    "\u2067",
+    "\u2068",
+    "\u2069",
+]
+
+
+@pytest.mark.parametrize("char", BIDI_CONTROLS, ids=[f"U+{ord(c):04X}" for c in BIDI_CONTROLS])
+async def test_a_bidi_control_in_an_error_is_shown_escaped(char: str) -> None:
+    """A server's error text could carry a bidi override that reorders what the
+    terminal shows. The detail shows it as an escape instead."""
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(f"{BASE}/executions/exec_1").respond(400, json={"error": f"no file 'report{char}fdp.exe'"})
+        async with JamjetClient(BASE, api_token=TOKEN) as client:
+            with pytest.raises(JamjetAPIError) as exc:
+                await client.get_execution("exec_1")
+    escaped = f"\\u{ord(char):04x}"
+    assert exc.value.detail == f"no file 'report{escaped}fdp.exe'"
+    assert char not in str(exc.value)
+
+
 # ── two credentials, one header ──────────────────────────────────────────────
 
 
