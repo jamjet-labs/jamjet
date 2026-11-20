@@ -423,6 +423,12 @@ macro_rules! for_each_case {
                 scoped_claim_for_execution_of_another_tenant_is_nothing,
                 scoped_fast_reclaim_touches_its_own_tenant_only,
                 scoped_append_to_another_tenants_run_is_not_found,
+                scoped_commit_into_another_tenants_run_is_not_found,
+                scoped_snapshot_of_another_tenants_run_is_not_found,
+                scoped_enqueue_into_another_tenants_run_is_not_found,
+                scoped_projection_of_another_tenants_run_is_not_found,
+                scoped_start_naming_another_tenants_run_is_not_found,
+                scoped_checked_writes_to_another_tenants_run_are_not_found,
                 scoped_reads_of_another_tenants_rows_are_empty,
             ]
         );

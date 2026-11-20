@@ -6,12 +6,38 @@
 //!     row, checkpoint advances.
 //! (c) get_projector_checkpoint for an unseen execution returns 0.
 //!
-//! The scoped stores run these in a tenant other than the default.
+//! The scoped stores run these in a tenant other than the default. A scoped
+//! store projects only its own tenant's runs, so each case starts its run
+//! first.
 
 use crate::conformance::cases::support::{in_tenant, tenant_view, without_tenant_views};
 use crate::conformance::Fixture;
-use jamjet_core::workflow::ExecutionId;
-use jamjet_state::ApprovalProjectionRow;
+use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
+use jamjet_state::{ApprovalProjectionRow, StateBackend};
+
+/// A running run, created through `backend`.
+async fn new_run(backend: &dyn StateBackend) -> ExecutionId {
+    let id = ExecutionId::new();
+    let now = chrono::Utc::now();
+    backend
+        .create_execution(WorkflowExecution {
+            execution_id: id.clone(),
+            workflow_id: "wf-projector".into(),
+            workflow_version: "1.0.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: serde_json::json!({}),
+            current_state: serde_json::json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        })
+        .await
+        .unwrap();
+    id
+}
 
 fn granted_row(execution_id: ExecutionId) -> ApprovalProjectionRow {
     ApprovalProjectionRow {
@@ -31,7 +57,7 @@ fn granted_row(execution_id: ExecutionId) -> ApprovalProjectionRow {
 ///     get_projector_checkpoint returns the checkpoint.
 pub async fn apply_and_read(fx: &Fixture) {
     let backend = &*in_tenant(fx, "proj-acme").await;
-    let exec = ExecutionId::new();
+    let exec = new_run(backend).await;
     let row = granted_row(exec.clone());
 
     backend
@@ -62,7 +88,7 @@ pub async fn apply_and_read(fx: &Fixture) {
 ///     still ONE row (UPSERT idempotency), status updated, checkpoint advanced.
 pub async fn upsert_idempotency(fx: &Fixture) {
     let backend = &*in_tenant(fx, "proj-acme").await;
-    let exec = ExecutionId::new();
+    let exec = new_run(backend).await;
 
     // First apply: granted at seq 5.
     backend
@@ -119,7 +145,7 @@ pub async fn unknown_checkpoint_is_zero(fx: &Fixture) {
 /// Two nodes in the same execution each get their own row.
 pub async fn two_nodes_same_execution(fx: &Fixture) {
     let backend = &*in_tenant(fx, "proj-acme").await;
-    let exec = ExecutionId::new();
+    let exec = new_run(backend).await;
 
     let row_a = ApprovalProjectionRow {
         execution_id: exec.clone(),
@@ -179,8 +205,8 @@ pub async fn tenant_isolation(fx: &Fixture) {
         return without_tenant_views(fx);
     };
 
-    // Use the SAME execution_id string in both tenants.
-    let shared_exec = ExecutionId::new();
+    // Alpha's run, read through beta by the same execution_id.
+    let shared_exec = new_run(&*alpha).await;
 
     alpha
         .apply_approval_projection(
