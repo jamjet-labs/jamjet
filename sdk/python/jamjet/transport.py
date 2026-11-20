@@ -21,9 +21,10 @@ import logging
 import math
 import random
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC
+from typing import Any
 
 import httpx
 
@@ -57,6 +58,8 @@ class RetryPolicy:
     process. After a lost answer (a timeout or a broken connection once the
     request may have gone out, or a 5xx) only a call that is safe to repeat is
     sent again; any other raises ``OutcomeUnknown``. Nothing else is retried.
+    A call whose body can be read only once (an iterator, or a file that cannot
+    seek) is sent once, since a second send would carry what was left of it.
 
     ``attempts`` counts every send, the first included. Before send ``n + 1``
     the client waits a random time between 0 and
@@ -332,6 +335,41 @@ def _retry_after(response: httpx.Response) -> float | None:
     return max(0.0, when.timestamp() - _wall_clock())
 
 
+def body_is_replayable(*, content: Any = None, data: Any = None, files: Any = None) -> bool:
+    """True when every send of a request built from these httpx arguments
+    carries the same body.
+
+    bytes, str, ``json`` and form fields are encoded again for each send, and
+    so are multipart files given as bytes, str or a file that can seek. An
+    iterator, or a file that cannot seek, is read once: a second send would go
+    out short or empty. The rules follow the order httpx reads the arguments in.
+    """
+    if data is not None and not isinstance(data, Mapping):
+        content = data  # httpx sends a data= that is not a form as raw content
+    if content is not None:
+        return isinstance(content, bytes | str)
+    if not files:
+        return True
+    try:
+        values = files.values() if isinstance(files, Mapping) else [value for _, value in files]
+        return all(_reads_again(value[1] if isinstance(value, tuple) else value) for value in values)
+    except (TypeError, ValueError, IndexError):  # not files httpx can send; it raises its own error
+        return False
+
+
+def _reads_again(file: Any) -> bool:
+    """True for multipart file content that httpx reads from the start on every send."""
+    if isinstance(file, bytes | str):
+        return True
+    seekable = getattr(file, "seekable", None)
+    if not callable(seekable) or not callable(getattr(file, "seek", None)):
+        return False
+    try:
+        return bool(seekable())
+    except (OSError, ValueError):  # a closed file
+        return False
+
+
 def _backoff(policy: RetryPolicy, sends: int) -> float:
     """Full jitter: a uniform draw up to the delay for this retry, which doubles from ``base_delay_s``."""
     ceiling = min(policy.max_delay_s, policy.base_delay_s * 2.0 ** min(sends - 1, 64))
@@ -351,6 +389,7 @@ async def send_with_retries(
     *,
     check: Callable[[httpx.Response], None],
     safe: bool,
+    replayable: bool,
     operation: str,
     policy: RetryPolicy,
 ) -> httpx.Response:
@@ -358,10 +397,15 @@ async def send_with_retries(
 
     ``send`` makes one attempt and ``check`` raises ``JamjetAPIError`` for an
     answer that is not 2xx. ``safe`` says the call may be repeated after it may
-    have taken effect; ``operation`` names it in ``OutcomeUnknown``. After the
-    last send the last failure is raised as it is. A 401 is never sent again
-    here: an auth hook that refreshes a token sends its own one resend.
+    have taken effect; ``operation`` names it in ``OutcomeUnknown``. A call
+    whose body is not ``replayable`` (see ``body_is_replayable``) is sent once.
+    After the last send the last failure is raised as it is. A 401 is never
+    sent again here: an auth hook that refreshes a token sends its own one
+    resend.
     """
+    # Such a body is not sent again even when the request never left: an auth
+    # hook may have read it before the connection was tried.
+    attempts = policy.attempts if replayable else 1
     sends = 0
     while True:
         sends += 1
@@ -372,7 +416,7 @@ async def send_with_retries(
                 raise  # a URL the client cannot send to: nothing left, and nothing would change
             if not safe and not isinstance(exc, _NOT_SENT):
                 raise _outcome_unknown(operation, f"its answer was lost ({type(exc).__name__})") from exc
-            if sends >= policy.attempts:
+            if sends >= attempts:
                 raise
             reason = type(exc).__name__
             wait = _backoff(policy, sends)
@@ -392,7 +436,7 @@ async def send_with_retries(
                 asked = _retry_after(response)
                 if asked is not None and asked > policy.max_retry_after_s:
                     raise
-                if sends >= policy.attempts:
+                if sends >= attempts:
                     raise
                 reason = str(status)
                 wait = _backoff(policy, sends) if asked is None else asked
@@ -402,6 +446,6 @@ async def send_with_retries(
             reason,
             wait,
             sends + 1,
-            policy.attempts,
+            attempts,
         )
         await _sleep(wait)

@@ -14,6 +14,7 @@ import httpx
 
 from jamjet.transport import EngineAuth, RetryPolicy
 from jamjet.transport import JamjetAPIError as JamjetAPIError
+from jamjet.transport import body_is_replayable as _body_is_replayable
 from jamjet.transport import raise_for_status as _raise_for_status
 from jamjet.transport import send_with_retries as _send_with_retries
 
@@ -54,7 +55,9 @@ class JamjetClient:
     (every GET, a heartbeat, a complete or fail with a lease fence, registering
     a workflow, storing an artifact) is also sent again after a lost answer or
     a 5xx. Any other call whose answer was lost raises ``OutcomeUnknown`` and
-    is not sent again: check whether it took effect before you repeat it.
+    is not sent again: check whether it took effect before you repeat it. A
+    call whose body can be read only once (an iterator, or a file that cannot
+    seek) is sent once.
     """
 
     def __init__(
@@ -99,6 +102,9 @@ class JamjetClient:
             lambda: self._client.request(method, url, follow_redirects=False, **kwargs),
             check=self._check,
             safe=safe,
+            replayable=_body_is_replayable(
+                content=kwargs.get("content"), data=kwargs.get("data"), files=kwargs.get("files")
+            ),
             operation=operation,
             policy=self._retry,
         )

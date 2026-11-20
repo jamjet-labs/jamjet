@@ -3,15 +3,18 @@
 A request that never left is sent again for every call, and so is a 429. A
 call that is safe to repeat is also sent again after a lost answer or a 5xx.
 Any other call whose answer was lost raises ``OutcomeUnknown`` and is never
-sent again. No other 4xx is retried.
+sent again. No other 4xx is retried. A call whose body can be read only once
+is sent once.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import io
 import logging
 import math
 import random
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -20,7 +23,7 @@ import respx
 
 from jamjet import transport
 from jamjet.client import JamjetAPIError, JamjetClient
-from jamjet.transport import OutcomeUnknown, PlatformAuthError, RetryPolicy
+from jamjet.transport import OutcomeUnknown, PlatformAuthError, RetryPolicy, body_is_replayable
 from tests.test_client_auth import BASE, CALLS, TOKEN, Call, _answer
 
 # 2026-11-20 10:00:00 UTC
@@ -362,6 +365,154 @@ async def test_a_url_the_client_cannot_send_to_is_not_retried(waits: list[float]
                 await client.health()
     assert route.call_count == 1
     assert waits == []
+
+
+# ── a body that can be read only once ────────────────────────────────────────
+
+
+async def _stream() -> AsyncIterator[bytes]:
+    yield b"hello "
+    yield b"world"
+
+
+class _OneWay(io.RawIOBase):
+    """A file that can be read once and cannot seek, like a pipe."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = io.BytesIO(data)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        return self._data.readinto(buffer)
+
+
+def _busy() -> httpx.Response:
+    return httpx.Response(429, headers={"Retry-After": "0"}, json={"error": "busy"})
+
+
+def _without_boundary(request: httpx.Request) -> bytes:
+    boundary = request.headers["content-type"].split("boundary=", 1)[1].encode()
+    return request.content.replace(boundary, b"")
+
+
+async def test_a_streamed_body_on_a_429_is_sent_once_and_the_429_raised(waits: list[float]) -> None:
+    # A second send would read the spent stream and store an empty artifact.
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post(f"{BASE}/artifacts")
+        route.side_effect = [_busy(), httpx.Response(200, json={"hash": "h", "size": 11})]
+        async with _client() as client:
+            with pytest.raises(JamjetAPIError) as exc:
+                await client.post("/artifacts", content=_stream())
+    assert exc.value.response.status_code == 429
+    assert route.call_count == 1
+    assert waits == []
+    assert route.calls.last.request.content == b"hello world"
+
+
+@pytest.mark.parametrize(
+    ("failure", "raised"),
+    [
+        (httpx.ConnectError, httpx.ConnectError),
+        (httpx.ReadTimeout, httpx.ReadTimeout),
+        (httpx.Response(503, json={"error": "draining"}), JamjetAPIError),
+        (httpx.Response(429, headers={"Retry-After": "0"}, json={"error": "busy"}), JamjetAPIError),
+    ],
+    ids=["ConnectError", "ReadTimeout", "503", "429"],
+)
+async def test_a_streamed_artifact_is_sent_once_even_though_the_call_is_safe(
+    failure: Any, raised: type[Exception], waits: list[float]
+) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post(f"{BASE}/artifacts")
+        route.side_effect = [failure, httpx.Response(200, json={"hash": "h", "size": 11})]
+        async with _client() as client:
+            with pytest.raises(raised) as exc:
+                await client.put_artifact(_stream())  # type: ignore[arg-type]
+    assert type(exc.value) is raised
+    assert route.call_count == 1
+    assert waits == []
+
+
+async def test_a_file_that_cannot_seek_is_sent_once(waits: list[float]) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post(f"{BASE}/artifacts")
+        route.side_effect = [_busy(), httpx.Response(200, json={})]
+        async with _client() as client:
+            with pytest.raises(JamjetAPIError) as exc:
+                await client.post("/artifacts", files={"f": ("a.bin", _OneWay(b"hello world"))})
+    assert exc.value.response.status_code == 429
+    assert route.call_count == 1
+    assert waits == []
+    assert b"\r\n\r\nhello world\r\n" in route.calls.last.request.content
+
+
+@pytest.mark.parametrize(
+    "make_file",
+    [lambda: io.BytesIO(b"hello world"), lambda: b"hello world"],
+    ids=["file-that-can-seek", "bytes"],
+)
+async def test_a_multipart_body_that_reads_again_is_sent_again_whole(make_file: Any, waits: list[float]) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post(f"{BASE}/artifacts")
+        route.side_effect = [_busy(), httpx.Response(200, json={})]
+        async with _client() as client:
+            assert await client.post("/artifacts", files={"f": ("a.bin", make_file())}) == {}
+    assert route.call_count == 2
+    first, second = (_without_boundary(c.request) for c in route.calls)
+    assert first == second
+    assert b"\r\n\r\nhello world\r\n" in second
+
+
+def _closed_file() -> io.BytesIO:
+    file = io.BytesIO(b"x")
+    file.close()
+    return file
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({}, True),
+        ({"content": b"x"}, True),
+        ({"content": "x"}, True),
+        ({"content": [b"x"]}, False),
+        ({"content": _stream()}, False),
+        ({"data": {"k": "v"}}, True),
+        # httpx sends a data= that is not a form as raw content, ahead of content=.
+        ({"data": b"x", "content": _stream()}, True),
+        ({"data": _stream(), "content": b"x"}, False),
+        ({"content": b"x", "files": {"f": _OneWay(b"x")}}, True),
+        ({"files": {}}, True),
+        ({"files": {"f": b"x", "g": "y"}}, True),
+        ({"files": [("f", ("a.bin", io.BytesIO(b"x"), "text/plain"))]}, True),
+        ({"files": [("f", io.BytesIO(b"x")), ("g", _OneWay(b"y"))]}, False),
+        ({"files": {"f": ("a.bin", _OneWay(b"x"))}}, False),
+        ({"files": {"f": _closed_file()}}, False),
+        ({"files": "not files"}, False),
+    ],
+    ids=[
+        "no-body",
+        "bytes",
+        "str",
+        "iterable",
+        "async-iterator",
+        "form",
+        "raw-data-wins-over-content",
+        "streamed-data-wins-over-content",
+        "content-wins-over-files",
+        "no-files",
+        "bytes-and-str-files",
+        "file-list-that-can-seek",
+        "file-list-with-one-that-cannot",
+        "file-that-cannot-seek",
+        "closed-file",
+        "files-of-the-wrong-shape",
+    ],
+)
+def test_which_bodies_are_replayable(body: dict[str, Any], expected: bool) -> None:
+    assert body_is_replayable(**body) is expected
 
 
 # ── how many sends, and how long between them ────────────────────────────────
