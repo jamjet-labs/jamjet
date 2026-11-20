@@ -666,12 +666,22 @@ async fn get_execution(
         .get_execution(&execution_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("execution {id}")))?;
-    let waiting = crate::waiting::waiting_for(backend.as_ref(), &execution, Utc::now()).await?;
-    let execution = with_derived_state(backend.as_ref(), execution).await;
+    Ok(Json(execution_view(backend.as_ref(), execution).await?))
+}
+
+/// One run as `GET /executions/:id` and the MCP `jamjet_get_execution` tool
+/// show it: its state derived from the log ([`with_derived_state`]) and what
+/// it is waiting for ([`crate::waiting::waiting_for`]).
+pub(crate) async fn execution_view(
+    backend: &dyn jamjet_state::StateBackend,
+    execution: WorkflowExecution,
+) -> Result<Value, ApiError> {
+    let waiting = crate::waiting::waiting_for(backend, &execution, Utc::now()).await?;
+    let execution = with_derived_state(backend, execution).await;
     let mut body = serde_json::to_value(execution)
         .map_err(|e| ApiError::Internal(format!("serialize execution: {e}")))?;
     body["waiting_for"] = json!(waiting);
-    Ok(Json(body))
+    Ok(body)
 }
 
 /// `execution` with its `current_state` re-derived from the event log (the

@@ -115,7 +115,8 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 "Retrieve the full details of a single workflow execution. Read-only, no side effects. ",
                 "Use this to check an execution's current status, inspect its state, or confirm completion after running jamjet_run_workflow. ",
                 "Returns a JSON object with: execution_id, workflow_id, workflow_version, status (one of: running, paused, completed, failed, cancelled), ",
-                "initial_input, current_state, started_at, updated_at, and completed_at (null if still running). ",
+                "initial_input, current_state, started_at, updated_at, completed_at (null if still running), ",
+                "and waiting_for: what a live run waits for (approval, step, worker or engine), null once it has ended. ",
                 "Fails with 'execution not found' if the ID does not exist in the specified tenant. ",
                 "For the full event history, use jamjet_get_events instead."
             ).into()),
@@ -144,9 +145,12 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 let backend = s.backend_for(&tenant_id);
                 let exec = backend.get_execution(&eid).await.map_err(|e| format!("{e}"))?
                     .ok_or_else(|| format!("execution {id_str} not found"))?;
-                // The same view as `GET /executions/:id`: state from the log.
-                let exec = crate::routes::with_derived_state(backend.as_ref(), exec).await;
-                let text = serde_json::to_string(&exec).map_err(|e| format!("{e}"))?;
+                // The same view as `GET /executions/:id`: state from the log
+                // and `waiting_for`.
+                let view = crate::routes::execution_view(backend.as_ref(), exec)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let text = serde_json::to_string(&view).map_err(|e| format!("{e}"))?;
                 Ok(vec![McpContent::Text { text }])
             }
         },
@@ -366,21 +370,21 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
         McpTool {
             name: "jamjet_approve".into(),
             description: Some(concat!(
-                "Submit an approval or rejection decision for a workflow execution that is paused and waiting for human review. ",
-                "Use this when jamjet_list_executions shows a 'paused' execution or jamjet_get_events shows an ApprovalRequested event. ",
-                "Side effects: appends an ApprovalReceived event to the event log, recording the authenticated API token as the approver ('mcp-client' only in dev mode), and, if the execution is paused, ",
-                "resumes it to 'running' status so the next node can proceed. The decision is recorded in the immutable audit trail. ",
+                "Submit an approval or rejection decision on a request waiting for human review. ",
+                "Use this for a request listed by GET /approvals, a run whose jamjet_get_execution answer has waiting_for 'approval', or a tool_approval_required event from jamjet_get_events. ",
+                "Side effects: appends an ApprovalReceived event to the event log, recording the authenticated API token as the approver ('mcp-client' only in dev mode). ",
+                "The run goes on at the engine's next pass. The decision is recorded in the immutable audit trail. ",
                 "Returns a JSON object with execution_id, node_id, accepted: true, repeat, sequence (the decision's place in the event log) and waiting_for (what the run waits for next). ",
                 "Sending the same decision again with the same token answers with the first one (repeat: true, the same sequence) and records nothing, so a lost answer is safe to retry. Name node_id when you retry: without it, a retry while another request is pending is refused, since it could be a decision on that request. ",
                 "Fails if execution_id is not found, if decision is not exactly 'approved' or 'rejected', if nothing is pending approval (or node_id does not match a pending approval), or if the request was already decided another way or by another approver. ",
-                "Related: use jamjet_get_events to see the ApprovalRequested event details before deciding."
+                "Related: use jamjet_get_events to see the tool_approval_required event details before deciding."
             ).into()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "execution_id": {
                         "type": "string",
-                        "description": "Execution ID of the paused workflow awaiting approval. Accepts 'exec_<uuid>' or bare UUID format."
+                        "description": "Execution ID of the run with the request to decide. Accepts 'exec_<uuid>' or bare UUID format."
                     },
                     "decision": {
                         "type": "string",

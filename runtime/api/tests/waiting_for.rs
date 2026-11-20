@@ -563,3 +563,115 @@ async fn a_waiting_for_filter_with_status_completed_is_400() {
         assert!(body["executions"].is_array(), "{}: {body}", env.name);
     }
 }
+
+/// One JSON-RPC call to the MCP bridge, as alice: its `result`.
+async fn mcp(env: &Env, method: &str, params: Value) -> Value {
+    let (st, resp) = call(
+        &env.app,
+        "POST",
+        "/mcp",
+        &env.alice,
+        Some(json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}: {resp}", env.name);
+    resp["result"].clone()
+}
+
+/// `jamjet_get_execution` for `eid`: the tool's JSON.
+async fn mcp_get_execution(env: &Env, eid: &ExecutionId) -> Value {
+    let result = mcp(
+        env,
+        "tools/call",
+        json!({ "name": "jamjet_get_execution",
+                "arguments": { "execution_id": exec_path(eid) } }),
+    )
+    .await;
+    assert_eq!(result["isError"], false, "{}: {result}", env.name);
+    let text = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}: {result}", env.name));
+    serde_json::from_str(text).unwrap()
+}
+
+/// The MCP tool answers with the route's view, `waiting_for` included, so a
+/// client on either transport finds the runs that need it.
+#[tokio::test]
+async fn the_mcp_get_execution_tool_carries_waiting_for_like_the_route() {
+    for env in envs().await {
+        let approval = start(&env, "wf-gate").await;
+        raise_request(&env).await;
+        let step = start(&env, "wf-plain").await;
+        take_step(&env).await;
+        let worker = start(&env, "wf-plain").await;
+        let engine = start(&env, "wf-model").await;
+        let finished = start(&env, "wf-plain").await;
+        let (st, body) = call(
+            &env.app,
+            "POST",
+            &format!("/executions/{}/cancel", exec_path(&finished)),
+            &env.alice,
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+
+        for (expected, eid) in [
+            (json!("approval"), &approval),
+            (json!("step"), &step),
+            (json!("worker"), &worker),
+            (json!("engine"), &engine),
+            (Value::Null, &finished),
+        ] {
+            let tool = mcp_get_execution(&env, eid).await;
+            assert_eq!(
+                tool.get("waiting_for"),
+                Some(&expected),
+                "{}: {expected}: {tool}",
+                env.name
+            );
+            let (st, route) = call(
+                &env.app,
+                "GET",
+                &format!("/executions/{}", exec_path(eid)),
+                &env.alice,
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{}: {route}", env.name);
+            assert_eq!(tool, route, "{}: {expected}: the same view", env.name);
+        }
+    }
+}
+
+/// The tool text sends a client to `waiting_for` and the approvals list.
+/// No run waiting for an approval reads `paused`, so the approve tool must
+/// not tell a client to look for one.
+#[tokio::test]
+async fn the_mcp_tool_text_names_waiting_for_and_not_paused() {
+    for env in envs().await {
+        let listed = mcp(&env, "tools/list", json!({})).await;
+        let tools = listed["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}: {listed}", env.name));
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{}: no {name}: {listed}", env.name))
+                .clone()
+        };
+
+        let get = tool("jamjet_get_execution");
+        let described = get["description"].as_str().unwrap_or_default();
+        assert!(described.contains("waiting_for"), "{}: {get}", env.name);
+
+        let approve = tool("jamjet_approve").to_string();
+        assert!(!approve.contains("paused"), "{}: {approve}", env.name);
+        assert!(
+            approve.contains("GET /approvals"),
+            "{}: {approve}",
+            env.name
+        );
+    }
+}
