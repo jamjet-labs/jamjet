@@ -26,7 +26,9 @@ use jamjet_state::{
     Event, EventKind, ExecutionFinish, SqliteBackend, Tenant, TenantId, TenantStatus,
 };
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use support::hooked::{AfterWrite, HookedBackend, Write};
 use tower::ServiceExt;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -47,6 +49,64 @@ async fn envs() -> Vec<(&'static str, Arc<dyn StateBackend>, AppState)> {
         .map(|b| {
             let backend = b.dyn_backend();
             (b.name(), backend.clone(), support::make_state(backend))
+        })
+        .collect()
+}
+
+/// Counts the keyed starts that found their key taken: the starts that lost
+/// a race with another start of the same key.
+///
+/// While `hold` is set, each key lookup waits until `parties` lookups have
+/// returned, so every racing start judges the same record before any of them
+/// writes.
+struct RaceHook {
+    taken: AtomicUsize,
+    hold: AtomicBool,
+    reads: tokio::sync::Barrier,
+}
+
+impl RaceHook {
+    fn new(parties: usize) -> Self {
+        Self {
+            taken: AtomicUsize::new(0),
+            hold: AtomicBool::new(false),
+            reads: tokio::sync::Barrier::new(parties),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AfterWrite for RaceHook {
+    async fn after(&self, write: Write) {
+        match write {
+            Write::StartKeyed { taken: true, .. } => {
+                self.taken.fetch_add(1, Ordering::SeqCst);
+            }
+            Write::GetRunKey if self.hold.load(Ordering::SeqCst) => {
+                tokio::time::timeout(std::time::Duration::from_secs(10), self.reads.wait())
+                    .await
+                    .expect("the racing starts did not all read the key");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// [`envs`] with every request going through a [`HookedBackend`] with a
+/// [`RaceHook`] for `parties` racing starts. The backend returned is the
+/// inner one.
+async fn hooked_envs(
+    parties: usize,
+) -> Vec<(&'static str, Arc<dyn StateBackend>, AppState, Arc<RaceHook>)> {
+    support::backends()
+        .await
+        .into_iter()
+        .map(|b| {
+            let backend = b.dyn_backend();
+            let hook = Arc::new(RaceHook::new(parties));
+            let hooked: Arc<dyn StateBackend> =
+                Arc::new(HookedBackend::new(backend.clone(), hook.clone()));
+            (b.name(), backend, support::make_state(hooked), hook)
         })
         .collect()
 }
@@ -403,6 +463,48 @@ async fn omitting_the_version_equals_sending_1_0_0() {
     }
 }
 
+/// The key stores the SHA-256 of the input's canonical JSON (keys sorted, no
+/// whitespace, UTF-8 as is) without the engine's keys. The value is stored,
+/// so a release that hashed differently would turn every retry across the
+/// upgrade into a 409. The literal was computed outside the engine:
+/// `printf '%s' '{"note":"café","order":{"id":7,"lines":[{"qty":2,"sku":"x-1"}]}}' | shasum -a 256`.
+#[tokio::test]
+async fn the_key_stores_the_hash_of_the_input_without_the_engine_keys() {
+    for (name, backend, state) in envs().await {
+        register(&state, "wf-hash", "1.0.0").await;
+        let mut body = keyed(
+            "wf-hash",
+            json!({
+                "order": { "lines": [{ "sku": "x-1", "qty": 2 }], "id": 7 },
+                "note": "caf\u{e9}",
+                "__budget": { "total_tokens": 10 },
+                "__approvals": {},
+            }),
+            "hash:1",
+            None,
+        );
+        body.as_object_mut().unwrap().remove("workflow_version");
+        let (st, answer) = start(&state, body).await;
+        let id = assert_created(name, st, &answer, "hash:1");
+        let held = backend
+            .get_run_key("hash:1")
+            .await
+            .unwrap()
+            .expect("the key is stored");
+        assert_eq!(
+            held,
+            jamjet_state::RunKeyRecord {
+                execution_id: exec_id(&id),
+                workflow_id: "wf-hash".into(),
+                workflow_version: "1.0.0".into(),
+                input_hash: "6ed7f11dbed9cd291fa18c6b279e83369ab10bb303f9d2b6211a214c0086f6a3"
+                    .into(),
+            },
+            "{name}"
+        );
+    }
+}
+
 // ── Finished runs and `reuse` ───────────────────────────────────────────────
 
 #[tokio::test]
@@ -597,11 +699,17 @@ async fn failed_only_with_other_input_after_failure_is_409() {
 
 /// `n` starts with `body`, released together.
 async fn at_once(state: &AppState, body: Value, n: usize) -> Vec<(StatusCode, Value)> {
-    let barrier = Arc::new(tokio::sync::Barrier::new(n));
-    let tasks: Vec<_> = (0..n)
-        .map(|_| {
+    at_once_each(state, vec![body; n]).await
+}
+
+/// One start with each of `bodies`, released together; the answers in the
+/// same order.
+async fn at_once_each(state: &AppState, bodies: Vec<Value>) -> Vec<(StatusCode, Value)> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(bodies.len()));
+    let tasks: Vec<_> = bodies
+        .into_iter()
+        .map(|body| {
             let state = state.clone();
-            let body = body.clone();
             let barrier = barrier.clone();
             tokio::spawn(async move {
                 barrier.wait().await;
@@ -616,9 +724,13 @@ async fn at_once(state: &AppState, body: Value, n: usize) -> Vec<(StatusCode, Va
     answers
 }
 
+/// The eight callers are left to race as they will, so a round mixes starts
+/// that read the key already held (answered at once) and starts that read it
+/// free and found it taken at their write (`KeyedStart::Taken`). At least one
+/// of the latter per backend shows the race opened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn eight_callers_at_once_make_one_run() {
-    for (name, backend, state) in envs().await {
+    for (name, backend, state, hook) in hooked_envs(8).await {
         register(&state, "wf-race", "1.0.0").await;
         for round in 0..50 {
             let key = format!("race:{round}");
@@ -645,12 +757,22 @@ async fn eight_callers_at_once_make_one_run() {
             }
         }
         assert_eq!(runs(&backend).await, 50, "{name}");
+        let taken = hook.taken.load(Ordering::SeqCst);
+        eprintln!("{name}: {taken} of 350 losing starts found the key taken at their write");
+        assert!(
+            taken > 0,
+            "{name}: no start found the key taken, so the race never opened"
+        );
     }
 }
 
+/// Both restarts read the key while it still names the failed run (each
+/// lookup waits for the other), so both choose to restart and both write
+/// with `replaces` naming it. The key moves once; the other start finds it
+/// taken and answers with the new run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_failed_only_restarts_at_once_make_one_new_run() {
-    for (name, backend, state) in envs().await {
+    for (name, backend, state, hook) in hooked_envs(2).await {
         register(&state, "wf-twice", "1.0.0").await;
         for round in 0..25 {
             let key = format!("twice:{round}");
@@ -660,12 +782,20 @@ async fn two_failed_only_restarts_at_once_make_one_new_run() {
             let old = assert_created(&what, st, &body, &key);
             finish(&backend, &old, WorkflowStatus::Failed).await;
 
+            let taken_before = hook.taken.load(Ordering::SeqCst);
+            hook.hold.store(true, Ordering::SeqCst);
             let answers = at_once(
                 &state,
                 keyed("wf-twice", input, &key, Some("failed_only")),
                 2,
             )
             .await;
+            hook.hold.store(false, Ordering::SeqCst);
+            assert_eq!(
+                hook.taken.load(Ordering::SeqCst) - taken_before,
+                1,
+                "{what}: one of the two restarts must find the key taken: {answers:?}"
+            );
             let created: Vec<_> = answers
                 .iter()
                 .filter(|(st, _)| *st == StatusCode::CREATED)
@@ -684,6 +814,57 @@ async fn two_failed_only_restarts_at_once_make_one_new_run() {
             50,
             "{name}: one old and one new run per round"
         );
+    }
+}
+
+/// Two starts with one key and different input, both reading the key free
+/// (each lookup waits for the other). One makes the run. The other finds the
+/// key taken at its write and is judged against the run that won, so it is
+/// 409, never a 200 naming a run of other input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_starts_at_once_with_other_input_make_one_run_and_one_409() {
+    for (name, backend, state, hook) in hooked_envs(2).await {
+        register(&state, "wf-split", "1.0.0").await;
+        for round in 0..10 {
+            let key = format!("split:{round}");
+            let what = format!("{name} round {round}");
+            let taken_before = hook.taken.load(Ordering::SeqCst);
+            hook.hold.store(true, Ordering::SeqCst);
+            let answers = at_once_each(
+                &state,
+                vec![
+                    keyed("wf-split", json!({ "side": "a" }), &key, None),
+                    keyed("wf-split", json!({ "side": "b" }), &key, None),
+                ],
+            )
+            .await;
+            hook.hold.store(false, Ordering::SeqCst);
+            assert_eq!(
+                hook.taken.load(Ordering::SeqCst) - taken_before,
+                1,
+                "{what}: both starts must read the key free: {answers:?}"
+            );
+            let created: Vec<_> = answers
+                .iter()
+                .filter(|(st, _)| *st == StatusCode::CREATED)
+                .collect();
+            assert_eq!(created.len(), 1, "{what}: {answers:?}");
+            let id = assert_created(&what, created[0].0, &created[0].1, &key);
+            let (st, body) = answers
+                .iter()
+                .find(|(st, _)| *st != StatusCode::CREATED)
+                .unwrap();
+            assert_other_run(&what, *st, body, &key);
+            let (_, found) = lookup(&state, &key).await;
+            let listed = found["executions"].as_array().cloned().unwrap_or_default();
+            assert_eq!(listed.len(), 1, "{what}: {found}");
+            assert_eq!(
+                uuid_of(&listed[0]["execution_id"]),
+                exec_id(&id).0,
+                "{what}"
+            );
+        }
+        assert_eq!(runs(&backend).await, 10, "{name}");
     }
 }
 
@@ -829,6 +1010,7 @@ async fn lookup_by_key_returns_the_run_or_nothing() {
         );
         assert_eq!(listed[0]["workflow_id"], "wf-find", "{name}: {found}");
         assert_eq!(listed[0]["status"], "running", "{name}: {found}");
+        assert_eq!(listed[0]["current_status"], "running", "{name}: {found}");
 
         let (st, none) = lookup(&state, "nobody:1").await;
         assert_eq!(st, StatusCode::OK, "{name}: {none}");
@@ -838,9 +1020,23 @@ async fn lookup_by_key_returns_the_run_or_nothing() {
             "{name}"
         );
 
-        // A key is a lookup, not one more filter.
-        let (st, body) = support::get(&state, "/executions?run_key=find%3A2&status=running").await;
-        assert_refused(&format!("{name}: run_key and status"), st, &body, "run_key");
+        // A key is a lookup, not one more filter: nothing beside it is
+        // silently ignored.
+        for other in ["status=running", "limit=10", "offset=0"] {
+            let (st, body) =
+                support::get(&state, &format!("/executions?run_key=find%3A2&{other}")).await;
+            assert_refused(
+                &format!("{name}: run_key and {other}"),
+                st,
+                &body,
+                "run_key",
+            );
+        }
+        // The lookup holds a key to the start's rule.
+        for bad in ["", "a%20b", "%20find%3A2", &"k".repeat(201)] {
+            let (st, body) = support::get(&state, &format!("/executions?run_key={bad}")).await;
+            assert_refused(&format!("{name}: lookup of {bad:?}"), st, &body, "run_key");
+        }
     }
 }
 
@@ -1041,6 +1237,10 @@ async fn a_rolled_over_run_answers_its_latest_segment() {
             segment.0,
             "{name}: {found}"
         );
+        // The row is the first segment's, as stored; the run's own status is
+        // the latest segment's.
+        assert_eq!(listed[0]["status"], "limit_exceeded", "{name}: {found}");
+        assert_eq!(listed[0]["current_status"], "running", "{name}: {found}");
 
         // Once the latest segment fails, the run has failed.
         finish(&backend, &segment_id, WorkflowStatus::Failed).await;
@@ -1056,6 +1256,77 @@ async fn a_rolled_over_run_answers_its_latest_segment() {
         assert_ne!(new, segment_id, "{name}");
         let (st, body) = start(&state, keyed("wf-roll", json!({ "n": 1 }), "roll:1", None)).await;
         assert_existing(name, st, &body, "roll:1", &new, &new, "running");
+    }
+}
+
+/// An event this build cannot read (`Unknown`, from a later release) could
+/// be the link to a next segment, so the segment running now is not known.
+/// The key's answers fail closed: no restart, no guessed segment.
+#[tokio::test]
+async fn a_log_this_build_cannot_read_answers_an_error_and_starts_nothing() {
+    for (name, backend, state) in envs().await {
+        register(&state, "wf-unread", "1.0.0").await;
+        let (st, body) = start(&state, keyed("wf-unread", json!({}), "unread:1", None)).await;
+        let id = assert_created(name, st, &body, "unread:1");
+        let eid = exec_id(&id);
+        let seq = backend.latest_sequence(&eid).await.unwrap() + 1;
+        backend
+            .append_event(Event::new(eid, seq, EventKind::Unknown))
+            .await
+            .unwrap();
+        finish(&backend, &id, WorkflowStatus::Failed).await;
+
+        for reuse in [None, Some("failed_only")] {
+            let (st, body) = start(&state, keyed("wf-unread", json!({}), "unread:1", reuse)).await;
+            assert_eq!(
+                st,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{name} reuse {reuse:?}: {body}"
+            );
+            let message = body["error"].as_str().unwrap_or_default();
+            assert!(message.contains("cannot read"), "{name}: {body}");
+        }
+        let (st, body) = lookup(&state, "unread:1").await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{name}: {body}");
+        assert_eq!(runs(&backend).await, 1, "{name}: a restart was made");
+    }
+}
+
+/// A `SegmentBoundary` is followed only to the run that is its segment's
+/// next one (the run's `parent_execution_id` names the segment linking to
+/// it), so a stray link never makes the key answer with an unrelated run.
+#[tokio::test]
+async fn a_link_to_a_run_that_is_not_the_next_segment_is_refused() {
+    for (name, backend, state) in envs().await {
+        register(&state, "wf-link", "1.0.0").await;
+        let (st, body) = start(&state, keyed("wf-link", json!({}), "link:1", None)).await;
+        let id = assert_created(name, st, &body, "link:1");
+        let (st, other) = start(
+            &state,
+            json!({ "workflow_id": "wf-link", "workflow_version": "1.0.0", "input": {} }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{name}: {other}");
+        let eid = exec_id(&id);
+        let seq = backend.latest_sequence(&eid).await.unwrap() + 1;
+        backend
+            .append_event(Event::new(
+                eid,
+                seq,
+                EventKind::SegmentBoundary {
+                    segment_number: 1,
+                    next_execution_id: other["execution_id"].as_str().unwrap().to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let (st, body) = start(&state, keyed("wf-link", json!({}), "link:1", None)).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{name}: {body}");
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(message.contains("not one"), "{name}: {body}");
+        let (st, body) = lookup(&state, "link:1").await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{name}: {body}");
     }
 }
 

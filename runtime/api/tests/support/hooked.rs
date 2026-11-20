@@ -39,6 +39,14 @@ pub enum Write {
     HeartbeatLease,
     /// A read of an execution (after it returned).
     GetExecution,
+    /// A start with a run key returned (after it did). `taken`: the key
+    /// named another run, so nothing was written.
+    StartKeyed {
+        execution_id: ExecutionId,
+        taken: bool,
+    },
+    /// A run key was looked up (after the read returned).
+    GetRunKey,
 }
 
 #[async_trait::async_trait]
@@ -675,6 +683,38 @@ impl StateBackend for HookedBackend {
         self.inner
             .set_projector_checkpoint(projection_name, execution_id, new_checkpoint)
             .await
+    }
+
+    async fn start_execution_keyed(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+        key: jamjet_state::RunKeyClaim,
+    ) -> jamjet_state::backend::BackendResult<jamjet_state::KeyedStart> {
+        let execution_id = execution.execution_id.clone();
+        let out = self
+            .inner
+            .start_execution_keyed(execution, started_event, scheduled_event, work_item, key)
+            .await?;
+        let taken = matches!(out, jamjet_state::KeyedStart::Taken(_));
+        self.hook
+            .after(Write::StartKeyed {
+                execution_id,
+                taken,
+            })
+            .await;
+        Ok(out)
+    }
+
+    async fn get_run_key(
+        &self,
+        run_key: &str,
+    ) -> jamjet_state::backend::BackendResult<Option<jamjet_state::RunKeyRecord>> {
+        let record = self.inner.get_run_key(run_key).await?;
+        self.hook.after(Write::GetRunKey).await;
+        Ok(record)
     }
 
     async fn create_tenant(

@@ -95,6 +95,7 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     Some(version),
                     input,
                     initiated_by,
+                    None,
                 )
                 .await
                 .map_err(|e| e.to_string())?;
