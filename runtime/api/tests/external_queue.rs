@@ -347,3 +347,103 @@ async fn a_hand_enqueue_is_tried_again_when_the_log_moved() {
         );
     }
 }
+
+/// Counts the passes the route sends.
+struct CountPasses(AtomicUsize);
+
+#[async_trait::async_trait]
+impl Hooks for CountPasses {
+    async fn before(&self, op: &Op<'_>) -> Option<jamjet_state::StateBackendError> {
+        if matches!(op, Op::CommitSchedulerPass(_)) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        None
+    }
+}
+
+/// On a backend scoped to one tenant, `latest_sequence` counts only that
+/// tenant's events, while the pass checks the run's whole log. An event
+/// appended through the unscoped backend, as the lease and deadline sweeps
+/// write, keeps the column's default tenant, so the scoped read misses it.
+/// The route's second pass starts from the sequence the store gave back,
+/// not from another scoped read, and the hand enqueue goes through.
+#[tokio::test]
+async fn a_scoped_hand_enqueue_is_tried_again_from_the_stores_sequence() {
+    let ir = external_fn_ir();
+    let queue = ir["nodes"]["authorize"]["kind"]["queue"].clone();
+    let mut path = std::env::temp_dir();
+    path.push(format!("jamjet_route_{}.db", uuid::Uuid::new_v4().simple()));
+    let url = format!("sqlite://{}", path.display());
+    let base = Arc::new(
+        jamjet_state::SqliteBackend::open(&url)
+            .await
+            .expect("open test db"),
+    );
+    let acme = jamjet_state::TenantId::from("acme");
+    let scoped: Arc<dyn StateBackend> = Arc::new(base.for_tenant(acme.clone()));
+    let now = chrono::Utc::now();
+    scoped
+        .create_tenant(jamjet_state::Tenant {
+            id: acme,
+            name: "acme".into(),
+            status: jamjet_state::TenantStatus::Active,
+            policy: None,
+            limits: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+    // The routes get the scoped backend; the engine keeps the unscoped one.
+    let passes = Arc::new(CountPasses(AtomicUsize::new(0)));
+    let routed: Arc<dyn StateBackend> = Arc::new(Intercept::new(scoped.clone(), passes.clone()));
+    let mut state = make_state(base.clone() as Arc<dyn StateBackend>);
+    state.backend_for_fn = Arc::new(move |_t: &jamjet_state::TenantId| routed.clone());
+    let execution_id = register_and_start(&state, ir.clone(), json!({})).await;
+    settle_the_start_item(scoped.as_ref(), queue.as_str().unwrap()).await;
+
+    let id = jamjet_core::workflow::ExecutionId(
+        uuid::Uuid::parse_str(execution_id.trim_start_matches("exec_")).unwrap(),
+    );
+    base.append_event(jamjet_state::Event::new(
+        id.clone(),
+        0,
+        jamjet_state::EventKind::NodeStarted {
+            node_id: "authorize".into(),
+            worker_id: "another-worker".into(),
+            attempt: 0,
+        },
+    ))
+    .await
+    .unwrap();
+    let in_tenant = scoped.latest_sequence(&id).await.unwrap();
+    let whole = base.latest_sequence(&id).await.unwrap();
+    assert!(
+        in_tenant < whole,
+        "the scoped read misses the unscoped append: {in_tenant} of {whole}"
+    );
+
+    let (st, body) = post(
+        &state,
+        "/work-items",
+        json!({
+            "execution_id": execution_id,
+            "node_id": "authorize",
+            "queue_type": queue,
+            "payload": {}
+        }),
+    )
+    .await;
+    assert_eq!(
+        (st, passes.0.load(Ordering::SeqCst)),
+        (StatusCode::CREATED, 2),
+        "the first pass is stale and the second lands; body {body}"
+    );
+    let store = TestBackend::Sqlite { backend: base, url };
+    assert_eq!(
+        live_items(&store, &execution_id, "authorize").await,
+        1,
+        "one new item"
+    );
+}
