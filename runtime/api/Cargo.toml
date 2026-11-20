@@ -58,6 +58,6 @@ tracing-subscriber = { workspace = true }
 # tell `fail_work_item` from `complete_work_item`.
 sqlx = { workspace = true }
 libsqlite3-sys = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 # Path only, no version: cargo drops it when it packages this crate.
 jamjet-testkit = { path = "../testkit" }
