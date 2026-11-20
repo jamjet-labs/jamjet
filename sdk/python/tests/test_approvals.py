@@ -644,3 +644,45 @@ def test_a_long_key_cannot_push_the_values_out_of_the_summary() -> None:
 
     assert result.exit_code == 0, result.output
     assert 'to="mallory"' in result.output
+
+
+# ---------------------------------------------------------------------------
+# Start by run_key
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_start_with_run_key_sends_key_and_reuse() -> None:
+    route = respx.post(f"{BASE}/executions").respond(
+        201, json={"execution_id": "exec_1", "run_key": "job:1", "created": True}
+    )
+    async with JamjetClient(base_url=BASE) as c:
+        result = await c.start_execution("w", {"a": 1}, run_key="job:1", reuse="failed_only")
+    body = json.loads(route.calls[0].request.content)
+    assert body["run_key"] == "job:1"
+    assert body["reuse"] == "failed_only"
+    assert result["created"] is True
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_start_without_a_key_sends_no_key_fields() -> None:
+    route = respx.post(f"{BASE}/executions").respond(201, json={"execution_id": "exec_1"})
+    async with JamjetClient(base_url=BASE) as c:
+        await c.start_execution("w", {})
+    body = json.loads(route.calls[0].request.content)
+    assert "run_key" not in body and "reuse" not in body
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_start_with_run_key_against_an_old_engine_raises() -> None:
+    from jamjet.client import JamjetAPIError
+
+    # An older engine drops run_key and starts a second run: no echo in the answer.
+    respx.post(f"{BASE}/executions").respond(201, json={"execution_id": "exec_1"})
+    async with JamjetClient(base_url=BASE) as c:
+        with pytest.raises(JamjetAPIError) as exc:
+            await c.start_execution("w", {}, run_key="job:1")
+    assert "this engine does not support run_key; upgrade it before relying on it" in str(exc.value)

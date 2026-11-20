@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **Start a run by key.** `start_execution(..., run_key=None, reuse=None)` sends a
+  `run_key` so a retried start returns the same run. It raises `JamjetAPIError` if the
+  engine does not echo the key: an older engine drops it and would start a second run.
+- `compile_agent_to_ir(..., claim_by_execution=True)` marks each tool-dispatch node
+  `claim: by_execution`. The default output is unchanged.
+
 ### Fixed
 
 - **`jamjet dev` names the extra it needs.** Without uvicorn it told you to run
