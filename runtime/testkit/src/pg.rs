@@ -85,20 +85,18 @@ impl TestDatabase {
     pub async fn fresh() -> Option<TestDatabase> {
         let admin = admin_url()?;
         let template = template(&admin).await;
-        let name = ident(format!("jj_t_{}", uuid::Uuid::new_v4().simple()));
-        let mut conn = connect_admin(&admin).await;
-        sqlx::raw_sql(AssertSqlSafe(format!(
-            r#"CREATE DATABASE "{name}" TEMPLATE "{template}""#
-        )))
-        .execute(&mut conn)
-        .await
-        .unwrap_or_else(|e| panic!("create test database {name}: {e}"));
-        let _ = conn.close().await;
-        Some(TestDatabase {
-            url: with_database(&admin, &name),
-            name,
-            admin,
-        })
+        Some(create(admin, Some(template)).await)
+    }
+
+    /// A new database with no schema at all, for tests of what the store
+    /// does before it is migrated. `None` as for [`Self::fresh`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::fresh`].
+    pub async fn empty() -> Option<TestDatabase> {
+        let admin = admin_url()?;
+        Some(create(admin, None).await)
     }
 
     /// The database's name.
@@ -166,10 +164,32 @@ impl Drop for TestDatabase {
     }
 }
 
-/// What a fresh database holds before a test touches it. Empty until the
-/// Postgres store has migrations of its own.
-fn schema() -> Migrator {
-    Migrator::with_migrations(Vec::new())
+/// A database of its own on the server at `admin`, a copy of `template`, or
+/// of the server's default template when there is none.
+async fn create(admin: String, template: Option<&str>) -> TestDatabase {
+    let name = ident(format!("jj_t_{}", uuid::Uuid::new_v4().simple()));
+    let mut conn = connect_admin(&admin).await;
+    let sql = match template {
+        Some(template) => format!(r#"CREATE DATABASE "{name}" TEMPLATE "{template}""#),
+        None => format!(r#"CREATE DATABASE "{name}""#),
+    };
+    // Both names passed `ident`.
+    sqlx::raw_sql(AssertSqlSafe(sql))
+        .execute(&mut conn)
+        .await
+        .unwrap_or_else(|e| panic!("create test database {name}: {e}"));
+    let _ = conn.close().await;
+    TestDatabase {
+        url: with_database(&admin, &name),
+        name,
+        admin,
+    }
+}
+
+/// What a fresh database holds before a test touches it: the Postgres state
+/// store's schema.
+fn schema() -> &'static Migrator {
+    &jamjet_state::postgres::MIGRATOR
 }
 
 /// The template for [`schema`], made by the first test in this binary that
@@ -184,7 +204,7 @@ async fn template(admin: &str) -> &'static str {
 /// so a run that dies halfway never leaves a template that looks finished.
 async fn make_template(admin: &str) -> String {
     let migrator = schema();
-    let name = ident(format!("jj_tmpl_{}", &schema_checksum(&migrator)[..12]));
+    let name = ident(format!("jj_tmpl_{}", &schema_checksum(migrator)[..12]));
     let mut conn = connect_admin(admin).await;
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(TEMPLATE_LOCK)
@@ -203,17 +223,11 @@ async fn make_template(admin: &str) -> String {
             .execute(&mut conn)
             .await
             .unwrap_or_else(|e| panic!("create template {building}: {e}"));
-        let pool = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&with_database(admin, &building))
-            .await
-            .unwrap_or_else(|e| panic!("connect to template {building}: {e}"));
-        migrator
-            .run(&pool)
+        // `migrate` closes its connection when done: a template must have
+        // none when it is renamed or copied.
+        jamjet_state::postgres::migrate(&with_database(admin, &building))
             .await
             .unwrap_or_else(|e| panic!("migrate template {building}: {e}"));
-        // A template must have no connections when it is copied or renamed.
-        pool.close().await;
         sqlx::raw_sql(AssertSqlSafe(format!(
             r#"ALTER DATABASE "{building}" RENAME TO "{name}""#
         )))
@@ -297,9 +311,12 @@ mod tests {
     }
 
     #[test]
-    fn the_empty_schema_has_a_fixed_template_name() {
-        // SHA-256 of no bytes.
-        assert_eq!(&schema_checksum(&schema())[..12], "e3b0c44298fc");
+    fn the_template_name_follows_the_schema() {
+        // SHA-256 of no bytes: the name of a template with no migrations.
+        let empty = Migrator::with_migrations(Vec::new());
+        assert_eq!(&schema_checksum(&empty)[..12], "e3b0c44298fc");
+        assert!(schema().iter().count() > 0, "the store has migrations");
+        assert_ne!(schema_checksum(schema()), schema_checksum(&empty));
     }
 
     #[test]

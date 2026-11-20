@@ -22,6 +22,7 @@ pub mod lease_events;
 mod legacy;
 pub mod materializer;
 pub mod memory;
+pub mod postgres;
 pub mod segment;
 pub mod snapshot;
 pub mod sqlite;
@@ -54,6 +55,7 @@ pub use materializer::{
     MaterializedState,
 };
 pub use memory::InMemoryBackend;
+pub use postgres::{PgBackend, PgSettings, SchemaState};
 pub use segment::{segment_chain, start_next_segment};
 pub use snapshot::Snapshot;
 pub use sqlite::{RevokedToken, SqliteBackend};

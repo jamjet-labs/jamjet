@@ -124,6 +124,13 @@ pub enum StateBackendError {
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// The store could not answer now: a deadlock or a lock timeout that
+    /// outlasted its retries, a lost connection, a timeout, or no free
+    /// connection. A commit whose outcome is unknown answers this too, so the
+    /// call may have landed. Worth a retry later; the API answers 503.
+    #[error("store unavailable: {0}")]
+    Unavailable(String),
 }
 
 pub type BackendResult<T> = Result<T, StateBackendError>;

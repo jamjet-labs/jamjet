@@ -19,7 +19,9 @@ pub mod cases;
 mod factories;
 mod hooks;
 
-pub use factories::{MemoryFactory, SqliteFactory, SqliteScopedFactory};
+pub use factories::{
+    MemoryFactory, PostgresFactory, PostgresScopedFactory, SqliteFactory, SqliteScopedFactory,
+};
 pub use hooks::{ItemRow, StoreHooks, StoreRows, StoredJson};
 
 use async_trait::async_trait;

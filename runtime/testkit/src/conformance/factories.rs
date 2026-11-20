@@ -1,9 +1,10 @@
 //! A factory per backend. Each fixture is a store no other case uses.
 
-use super::hooks::{MemoryHooks, SqliteHooks};
+use super::hooks::{MemoryHooks, PgHooks, SqliteHooks};
 use super::{Fixture, Scoper, StoreFactory, StoreKind};
+use crate::pg::{TestDatabase, POOL_SIZE};
 use async_trait::async_trait;
-use jamjet_state::{InMemoryBackend, SqliteBackend, StateBackend, TenantId};
+use jamjet_state::{InMemoryBackend, PgBackend, PgSettings, SqliteBackend, StateBackend, TenantId};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -75,6 +76,91 @@ impl StoreFactory for SqliteScopedFactory {
             keep: Box::new(file.dir),
         })
     }
+}
+
+/// A fresh Postgres database of its own, connected twice: `backend` and
+/// `second` are two pools on it, as two engine instances would hold. `None`
+/// when no Postgres server is configured.
+pub struct PostgresFactory;
+
+#[async_trait]
+impl StoreFactory for PostgresFactory {
+    async fn fresh(&self) -> Option<Fixture> {
+        let db = PgDatabase::new().await?;
+        Some(Fixture {
+            backend: db.first.clone(),
+            second: Some(db.second.clone()),
+            scoped: None,
+            hooks: Arc::new(PgHooks {
+                base: db.first.clone(),
+                url: db.keep.url().to_string(),
+                scope: None,
+            }),
+            kind: StoreKind::Postgres,
+            keep: Box::new(db.keep),
+        })
+    }
+}
+
+/// As [`PostgresFactory`], seen through a tenant: `backend` and `second` are
+/// the default tenant's views on the two pools, and `scoped` gives any
+/// tenant's view on the first.
+pub struct PostgresScopedFactory;
+
+#[async_trait]
+impl StoreFactory for PostgresScopedFactory {
+    async fn fresh(&self) -> Option<Fixture> {
+        let db = PgDatabase::new().await?;
+        let tenant = TenantId::default();
+        let first = db.first.clone();
+        let scoped: Scoper = Arc::new(move |t: &TenantId| {
+            Arc::new(first.for_tenant(t.clone())) as Arc<dyn StateBackend>
+        });
+        Some(Fixture {
+            backend: Arc::new(db.first.for_tenant(tenant.clone())),
+            second: Some(Arc::new(db.second.for_tenant(tenant.clone()))),
+            scoped: Some(scoped),
+            hooks: Arc::new(PgHooks {
+                base: db.first.clone(),
+                url: db.keep.url().to_string(),
+                scope: Some(tenant),
+            }),
+            kind: StoreKind::PostgresScoped,
+            keep: Box::new(db.keep),
+        })
+    }
+}
+
+/// A test database holding the schema, and two pools on it.
+struct PgDatabase {
+    keep: TestDatabase,
+    first: Arc<PgBackend>,
+    second: Arc<PgBackend>,
+}
+
+impl PgDatabase {
+    async fn new() -> Option<Self> {
+        let keep = TestDatabase::fresh().await?;
+        let first = Arc::new(connect_pg(keep.url()).await);
+        let second = Arc::new(connect_pg(keep.url()).await);
+        Some(Self {
+            keep,
+            first,
+            second,
+        })
+    }
+}
+
+/// Connect to the test database at `url`, checking its schema as the
+/// engine does, on a pool of at most [`POOL_SIZE`] connections.
+pub(crate) async fn connect_pg(url: &str) -> PgBackend {
+    let settings = PgSettings {
+        pool_size: POOL_SIZE,
+        ..PgSettings::default()
+    };
+    PgBackend::connect(url, settings)
+        .await
+        .unwrap_or_else(|e| panic!("connect to the test database: {e}"))
 }
 
 /// A migrated SQLite file and two pools on it.
