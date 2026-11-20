@@ -5,6 +5,7 @@
 use jamjet_state::postgres::{migrate, SchemaState};
 use jamjet_state::{PgBackend, PgSettings, TenantId};
 use jamjet_testkit::pg::{TestDatabase, POOL_SIZE};
+use sqlx::{AssertSqlSafe, Connection, PgConnection};
 use std::time::Duration;
 
 fn small() -> PgSettings {
@@ -58,11 +59,77 @@ async fn connect_refuses_a_schema_that_is_not_current() {
     assert!(refused.contains("migration 1"), "{refused}");
 }
 
+/// The seven settings the store sets on each connection, in this order:
+/// application_name, TimeZone, standard_conforming_strings,
+/// default_transaction_isolation, statement_timeout, lock_timeout and
+/// idle_in_transaction_session_timeout.
+async fn session_of(conn: &mut PgConnection) -> [String; 7] {
+    let (a, b, c, d, e, f, g): (String, String, String, String, String, String, String) =
+        sqlx::query_as(
+            "SELECT current_setting('application_name'), current_setting('TimeZone'), \
+                    current_setting('standard_conforming_strings'), \
+                    current_setting('default_transaction_isolation'), \
+                    current_setting('statement_timeout'), current_setting('lock_timeout'), \
+                    current_setting('idle_in_transaction_session_timeout')",
+        )
+        .fetch_one(conn)
+        .await
+        .unwrap();
+    [a, b, c, d, e, f, g]
+}
+
 #[tokio::test]
 async fn every_connection_starts_with_the_session_settings() {
     let Some(db) = TestDatabase::fresh().await else {
         return jamjet_testkit::skip("every_connection_starts_with_the_session_settings");
     };
+    // A database whose own defaults differ from the store's in every setting,
+    // as a managed database's may. Each statement names the test database,
+    // which passed the kit's name check.
+    let setup = db.pool().await;
+    for setting in [
+        "application_name = 'set_by_the_database'",
+        "TimeZone = 'Asia/Kolkata'",
+        "standard_conforming_strings = off",
+        "default_transaction_isolation = 'repeatable read'",
+        "statement_timeout = '41s'",
+        "lock_timeout = '42s'",
+        "idle_in_transaction_session_timeout = '43s'",
+    ] {
+        sqlx::raw_sql(AssertSqlSafe(format!(
+            r#"ALTER DATABASE "{}" SET {setting}"#,
+            db.name()
+        )))
+        .execute(&setup)
+        .await
+        .unwrap();
+    }
+    setup.close().await;
+
+    // A connection without the store's session gets the database's values.
+    // TimeZone is the exception: sqlx sends `TimeZone=UTC` in its startup
+    // message, which outranks a database setting, so this test cannot tell
+    // the store's own `TimeZone` setting from the driver's.
+    let mut plain = PgConnection::connect_with(&db.connect_options())
+        .await
+        .unwrap();
+    let mut theirs = session_of(&mut plain).await;
+    plain.close().await.unwrap();
+    theirs[1] = "(not compared)".to_string();
+    assert_eq!(
+        theirs,
+        [
+            "set_by_the_database",
+            "(not compared)",
+            "off",
+            "repeatable read",
+            "41s",
+            "42s",
+            "43s",
+        ],
+        "the database's own defaults took"
+    );
+
     let settings = PgSettings {
         pool_size: 2,
         acquire_timeout: Duration::from_millis(1_500),
@@ -72,33 +139,31 @@ async fn every_connection_starts_with_the_session_settings() {
     };
     let store = PgBackend::connect(db.url(), settings).await.unwrap();
     let pool = store.pool();
-    // Hold one connection so the second read is on a connection of its own.
-    let held = pool.acquire().await.unwrap();
-    for _ in 0..2 {
-        let row: (String, String, String, String, String, String, String) = sqlx::query_as(
-            "SELECT current_setting('application_name'), current_setting('TimeZone'), \
-                    current_setting('standard_conforming_strings'), \
-                    current_setting('default_transaction_isolation'), \
-                    current_setting('statement_timeout'), current_setting('lock_timeout'), \
-                    current_setting('idle_in_transaction_session_timeout')",
-        )
-        .fetch_one(&pool)
+    // Both connections the pool may hold, checked out at once so they are
+    // two sessions.
+    let mut first = pool.acquire().await.unwrap();
+    let mut second = pool.acquire().await.unwrap();
+    let pid = "SELECT pg_backend_pid()";
+    let first_pid: i32 = sqlx::query_scalar(pid)
+        .fetch_one(&mut *first)
         .await
         .unwrap();
-        assert_eq!(
-            row,
-            (
-                "jamjet".to_string(),
-                "UTC".to_string(),
-                "on".to_string(),
-                "read committed".to_string(),
-                "1234ms".to_string(),
-                "567ms".to_string(),
-                "8910ms".to_string(),
-            )
-        );
-    }
-    drop(held);
+    let second_pid: i32 = sqlx::query_scalar(pid)
+        .fetch_one(&mut *second)
+        .await
+        .unwrap();
+    assert_ne!(first_pid, second_pid, "two connections");
+    let ours = [
+        "jamjet",
+        "UTC",
+        "on",
+        "read committed",
+        "1234ms",
+        "567ms",
+        "8910ms",
+    ];
+    assert_eq!(session_of(&mut first).await, ours, "the first connection");
+    assert_eq!(session_of(&mut second).await, ours, "the second connection");
 }
 
 #[tokio::test]
