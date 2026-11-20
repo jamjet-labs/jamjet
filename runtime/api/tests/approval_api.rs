@@ -263,14 +263,14 @@ async fn double_approve_answers_the_first_decision() {
         )
     };
 
-    // First approval — must succeed.
+    // The first approval must succeed.
     let resp1 = decide("approved").await.unwrap();
     assert_eq!(resp1.status(), StatusCode::OK);
     let first = body_json(resp1.into_body()).await;
     assert_eq!(first["repeat"], false, "{first}");
     let recorded = backend.get_events(&execution_id).await.unwrap();
 
-    // Second identical approval — the first one's answer.
+    // The same approval again gets the first one's answer.
     let resp2 = decide("approved").await.unwrap();
     assert_eq!(resp2.status(), StatusCode::OK);
     let again = body_json(resp2.into_body()).await;
@@ -282,7 +282,7 @@ async fn double_approve_answers_the_first_decision() {
         "a repeat records nothing"
     );
 
-    // A different decision — must 409.
+    // A different decision must be a 409.
     let resp3 = decide("rejected").await.unwrap();
     assert_eq!(resp3.status(), StatusCode::CONFLICT);
     let json = body_json(resp3.into_body()).await;
