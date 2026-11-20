@@ -2604,6 +2604,10 @@ impl StateBackend for TenantScopedSqliteBackend {
         work_item: WorkItem,
         key: crate::backend::RunKeyClaim,
     ) -> BackendResult<crate::backend::KeyedStart> {
+        // As `start_execution_atomic`: a start item of another tenant's run
+        // is refused. `key.replaces` needs no check: the key is claimed and
+        // moved under this tenant only, so it can name no other tenant's run.
+        self.own_runs_of_start(&execution, &work_item).await?;
         crate::features::run_keys::start_keyed_in(
             &self.pool,
             Some(&self.tenant_id.0),

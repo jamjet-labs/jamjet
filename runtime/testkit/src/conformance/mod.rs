@@ -434,6 +434,16 @@ macro_rules! for_each_case {
         );
         $m!(
             $factory,
+            run_keys,
+            [
+                a_key_started_twice_makes_one_run,
+                two_starts_with_one_key_at_once_make_one_run,
+                scoped_lookup_of_another_tenants_key_finds_nothing,
+                scoped_keyed_start_naming_another_tenants_run_is_not_found,
+            ]
+        );
+        $m!(
+            $factory,
             faults,
             [
                 an_error_at_any_step_leaves_no_partial_write,
