@@ -23,6 +23,14 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   request.
 - Python: `client.list_pending_approvals(limit=None, after=None)`, and `request_sequence` on
   `client.approve()`.
+- **Approvals carry a choice and a note.** A `human_approval` node can declare up to ten
+  `options`; approving it needs a `choice` among them. The choice and the note are sealed
+  into the audit entry and written to `state.__approvals.<node>`, so a condition can route
+  on the choice. The pending request lists the options, in its `context` and as `options` on
+  the item. A decided request in `GET /executions/:id/approvals` shows its `choice` and
+  `note`. The YAML compiler reads `options`. `jamjet approve` takes `--choice` and `--note`.
+  The `ApprovalReceived` event gains an optional `choice`. An older build ignores it, so a
+  condition on the choice never matches there: do not roll back while such a run is live.
 
 ### Changed
 
@@ -41,6 +49,11 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The MCP tool text no longer says to filter by `paused` to find approvals. A run waiting for
   one stays `running`. `jamjet_get_execution` now carries `waiting_for`, as
   `GET /executions/:id` does.
+- A decision's note (`comment`) is at most 4 KiB and refuses control characters other than
+  newlines and tabs. The MCP approve tool refuses a `comment` that is not a string; it used to
+  drop it. Each decision reads the run's workflow once more, to check the options.
+- A request raised by an older build, for a version whose stored definition has options, is
+  answered 409 `OptionsChanged` by every decision, a rejection included.
 - Migration 0017 adds an index for the approvals list. A build from before it will not open
   a store that has run it, so there is no rollback past this release.
 

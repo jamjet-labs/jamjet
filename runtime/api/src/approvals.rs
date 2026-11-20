@@ -940,7 +940,18 @@ pub async fn decision_answer(
 
 /// Pending + decided approval view for `GET /executions/:id/approvals`.
 pub fn approvals_view(events: &[Event]) -> serde_json::Value {
-    let pending = pending_approvals(events);
+    let pending: Vec<serde_json::Value> = pending_approvals(events)
+        .iter()
+        .map(|p| {
+            let mut item = serde_json::to_value(p).unwrap_or(serde_json::Value::Null);
+            show_options(&mut item, Some(&p.context));
+            item
+        })
+        .collect();
+    let pending_nodes: Vec<String> = pending_approvals(events)
+        .into_iter()
+        .map(|p| p.node_id)
+        .collect();
 
     // Collect every node that ever had a `ToolApprovalRequired`.
     let mut nodes: Vec<String> = events
@@ -955,19 +966,24 @@ pub fn approvals_view(events: &[Event]) -> serde_json::Value {
 
     let decided: Vec<serde_json::Value> = nodes
         .iter()
-        .filter(|n| !pending.iter().any(|p| &p.node_id == *n))
+        .filter(|n| !pending_nodes.contains(*n))
         .map(|n| match node_approval_status(events, n) {
             NodeApprovalStatus::Approved {
                 user_id,
                 sequence,
                 approved_digest,
-            } => serde_json::json!({
-                "node_id": n,
-                "status": "approved",
-                "user_id": user_id,
-                "sequence": sequence,
-                "approved_digest": approved_digest,
-            }),
+            } => {
+                let (choice, note) = decision_at(events, sequence);
+                serde_json::json!({
+                    "node_id": n,
+                    "status": "approved",
+                    "user_id": user_id,
+                    "sequence": sequence,
+                    "approved_digest": approved_digest,
+                    "choice": choice,
+                    "note": note,
+                })
+            }
             NodeApprovalStatus::Rejected {
                 user_id,
                 comment,
@@ -977,6 +993,8 @@ pub fn approvals_view(events: &[Event]) -> serde_json::Value {
                 "status": "rejected",
                 "user_id": user_id,
                 "comment": comment,
+                "note": comment,
+                "choice": serde_json::Value::Null,
                 "sequence": sequence,
             }),
             // Unreachable in practice: a node filtered out of `pending` has a
@@ -986,6 +1004,31 @@ pub fn approvals_view(events: &[Event]) -> serde_json::Value {
         .collect();
 
     serde_json::json!({ "pending": pending, "decided": decided })
+}
+
+/// Copy the options a request offers from its context to an `options` key of
+/// the listing item, so a reviewer finds them without reading the context.
+/// Nothing is added for a request without options.
+pub fn show_options(item: &mut serde_json::Value, context: Option<&serde_json::Value>) {
+    if let Some(options) = context.and_then(|c| c.get("options")) {
+        item["options"] = options.clone();
+    }
+}
+
+/// The `choice` and `note` of the decision recorded at `sequence`; null for
+/// each the decision does not carry.
+fn decision_at(events: &[Event], sequence: i64) -> (serde_json::Value, serde_json::Value) {
+    events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ApprovalReceived {
+                choice, comment, ..
+            } if e.sequence == sequence => {
+                Some((serde_json::json!(choice), serde_json::json!(comment)))
+            }
+            _ => None,
+        })
+        .unwrap_or((serde_json::Value::Null, serde_json::Value::Null))
 }
 
 /// One row of `GET /approvals`: a request waiting for a decision, and what a
@@ -1006,7 +1049,7 @@ pub fn pending_row_view(row: &PendingApprovalRow) -> serde_json::Value {
         row.request_sequence,
     );
     let deadline = |key: &str| context.get(key).cloned().unwrap_or(serde_json::Value::Null);
-    serde_json::json!({
+    let mut view = serde_json::json!({
         "execution_id": row.execution_id.to_string(),
         "workflow_id": row.workflow_id,
         "workflow_version": row.workflow_version,
@@ -1018,7 +1061,9 @@ pub fn pending_row_view(row: &PendingApprovalRow) -> serde_json::Value {
         "expires_at": deadline(EXPIRES_AT_KEY),
         "escalate_at": deadline(ESCALATE_AT_KEY),
         "context": row.context,
-    })
+    });
+    show_options(&mut view, row.context.as_ref());
+    view
 }
 
 /// The `next_after` of `GET /approvals`: lowercase hex of the cursor's JSON,

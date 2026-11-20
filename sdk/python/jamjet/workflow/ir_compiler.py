@@ -79,7 +79,7 @@ _NODE_TYPE_KEYS: dict[str, frozenset[str]] = {
     "tool": frozenset({"tool_ref", "input", "output_schema"}),
     "mcp_tool": frozenset({"server", "tool", "input", "output_schema"}),
     "a2a_task": frozenset({"remote_agent", "skill", "input", "output_schema", "stream", "on_input_required"}),
-    "human_approval": frozenset({"fallback"}),
+    "human_approval": frozenset({"fallback", "options"}),
     "agent": frozenset({"agent_ref", "input", "output_schema"}),
     "condition": frozenset({"conditions", "default"}),
     "branch": frozenset({"conditions", "default"}),
@@ -915,12 +915,22 @@ def _yaml_node_to_kind(
             "timeout_secs": _parse_timeout(data.get("timeout")),
         }
     if node_type == "human_approval":
-        return {
+        kind: dict[str, Any] = {
             "type": "human_approval",
             "description": data.get("description", f"Approval required for {node_id}"),
             "timeout_secs": _parse_timeout(data.get("timeout")),
             "fallback_node": data.get("fallback"),
         }
+        options = data.get("options")
+        if options is not None:
+            if not isinstance(options, list):
+                raise ValueError(f"node '{node_id}': options must be a list of {{id, label}} entries")
+            # The engine checks the ids and labels at registration. Leave the
+            # key out when there are none: the node's definition hash must not
+            # change for a node that offers no options.
+            if options:
+                kind["options"] = options
+        return kind
     if node_type == "agent":
         return {
             "type": "agent",

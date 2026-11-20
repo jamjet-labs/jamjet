@@ -1595,6 +1595,74 @@ async fn the_per_run_and_cross_run_listings_show_the_options() {
     }
 }
 
+/// A pending item lists the options at its top level, and a decided item the
+/// choice and the note, from the log and from the read model, per run.
+#[tokio::test]
+async fn the_listings_show_options_choice_and_note() {
+    for env in envs().await {
+        let parked = park(&env, &ir(Some(topics()), None)).await;
+        let run = format!("exec_{}", parked.eid.0.simple());
+        let per_run = format!("/executions/{run}/approvals");
+
+        for read in ["from the log", "from the read model"] {
+            if read == "from the read model" {
+                Projector::new(env.backend.clone()).tick().await.unwrap();
+            }
+            let (_, listed) = get(&env, &per_run, &env.bob).await;
+            assert_eq!(
+                listed["pending"][0]["options"],
+                topics(),
+                "{}: {read}: {listed}",
+                env.name
+            );
+        }
+        let (_, listed) = get(&env, "/approvals", &env.bob).await;
+        assert_eq!(
+            listed["approvals"][0]["options"],
+            topics(),
+            "{}: {listed}",
+            env.name
+        );
+
+        let (st, body) = decide(
+            &env,
+            &parked,
+            approval(
+                &parked.digest,
+                json!({ "choice": "topic_2", "note": "Go with the second one." }),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+
+        for read in ["from the read model", "from the log"] {
+            if read == "from the read model" {
+                Projector::new(env.backend.clone()).tick().await.unwrap();
+            } else {
+                // Rebuild the answer from the log alone: the run has ended.
+                settle(&env).await;
+            }
+            let (_, listed) = get(&env, &per_run, &env.bob).await;
+            let decided = &listed["decided"][0];
+            assert_eq!(
+                decided["status"], "approved",
+                "{}: {read}: {listed}",
+                env.name
+            );
+            assert_eq!(
+                decided["choice"], "topic_2",
+                "{}: {read}: {listed}",
+                env.name
+            );
+            assert_eq!(
+                decided["note"], "Go with the second one.",
+                "{}: {read}: {listed}",
+                env.name
+            );
+        }
+    }
+}
+
 /// An expiry routed to the fallback writes a record with no choice and no
 /// note, and a late approval naming an option changes nothing.
 #[tokio::test]

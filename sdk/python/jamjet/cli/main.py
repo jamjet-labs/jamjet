@@ -2918,6 +2918,16 @@ def _approve_command(execution_id: str, node_id: str, binding: str, runtime: str
     return " ".join(shlex.quote(a) for a in args)
 
 
+def _print_options(options: Any) -> None:
+    """The options a pending request offers, one per line, for `--choice`."""
+    if not isinstance(options, list):
+        return
+    for option in options:
+        if isinstance(option, dict):
+            line = f"  option {_safe(option.get('id', '?'))}: {_safe(option.get('label', ''))}"
+            console.print(line, soft_wrap=True, markup=False, highlight=False)
+
+
 def _approval_binding(context: dict[str, Any]) -> str | None:
     """The value `jamjet approve --action-digest` must echo for a pending request:
     its action digest, or for an agent tool dispatch its calls hash."""
@@ -3092,6 +3102,7 @@ async def _print_waiting_approvals(runtime: str, page_size: int = 50, show_basis
                 node = entry.get("node_id", "-")
                 console.print(f"{_safe(shown)}  {_safe(node)}", soft_wrap=True, markup=False, highlight=False)
                 console.print(f"  covers {_approval_covers(context)}", soft_wrap=True, markup=False, highlight=False)
+                _print_options(entry.get("options"))
                 binding = _approval_binding(context)
                 command = _approve_command(shown, node, binding, shown_runtime) if binding else None
                 if command:
@@ -3171,6 +3182,7 @@ def approvals(
                     markup=False,
                     highlight=False,
                 )
+                _print_options(entry.get("options"))
                 if binding:
                     command = _approve_command(
                         execution_id,
@@ -3211,15 +3223,17 @@ def approvals(
             d.add_column("Node", style="bold")
             d.add_column("Status")
             d.add_column("User")
-            d.add_column("Comment")
+            d.add_column("Choice")
+            d.add_column("Note")
             d.add_column("Seq", style="dim", justify="right")
             for entry in decided:
-                comment = entry.get("comment", "")
+                note = entry.get("note") or entry.get("comment") or ""
                 d.add_row(
                     _cell(entry.get("node_id", "-")),
                     _cell(entry.get("status", "-")),
                     _cell(entry.get("user_id", "-")),
-                    _cell(comment if comment else ""),
+                    _cell(entry.get("choice") or ""),
+                    _cell(note),
                     _cell(entry.get("sequence", "")),
                 )
             console.print(d)
@@ -3235,7 +3249,13 @@ def approve(
     execution_id: str = typer.Argument(..., help="Execution ID (exec_...)"),
     decision: str = typer.Option(..., "--decision", "-d", help="approved or rejected"),
     node_id: str | None = typer.Option(None, "--node-id", help="Node to approve (inferred when one is pending)"),
-    comment: str | None = typer.Option(None, "--comment", "-c", help="Optional comment"),
+    comment: str | None = typer.Option(None, "--comment", "-c", help="Optional comment (the old name of --note)"),
+    choice: str | None = typer.Option(
+        None,
+        "--choice",
+        help="Id of the option you pick. Needed to approve a node that lists options (see `jamjet approvals`).",
+    ),
+    note: str | None = typer.Option(None, "--note", help="Free text kept with the decision, at most 4 KiB"),
     action_digest: str | None = typer.Option(
         None,
         "--action-digest",
@@ -3270,6 +3290,8 @@ def approve(
                         comment=comment,
                         action_digest=action_digest,
                         user_id=approver,
+                        choice=choice,
+                        note=note,
                     )
             except httpx.HTTPStatusError as exc:
                 try:

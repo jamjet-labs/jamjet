@@ -1143,6 +1143,7 @@ async fn list_approvals_for_execution(
                             item[key] = v.clone();
                         }
                     }
+                    crate::approvals::show_options(&mut item, row.context.as_ref());
                     pending.push(item);
                 }
                 "approved" => {
@@ -1158,6 +1159,13 @@ async fn list_approvals_for_execution(
                             .and_then(|c| c.get("approved_digest"))
                             .cloned()
                             .unwrap_or(Value::Null),
+                        "choice": row
+                            .context
+                            .as_ref()
+                            .and_then(|c| c.get("choice"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                        "note": row.comment,
                     }));
                 }
                 "rejected" => {
@@ -1166,6 +1174,8 @@ async fn list_approvals_for_execution(
                         "status":   "rejected",
                         "user_id":  row.user_id,
                         "comment":  row.comment,
+                        "note":     row.comment,
+                        "choice":   Value::Null,
                         "sequence": row.last_sequence,
                     }));
                 }
