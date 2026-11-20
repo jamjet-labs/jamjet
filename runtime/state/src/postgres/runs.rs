@@ -70,11 +70,11 @@ pub(super) fn parse_status(s: &str) -> BackendResult<WorkflowStatus> {
 }
 
 /// A column that does not read as the type asked for.
-fn decode(e: sqlx::Error) -> StateBackendError {
+pub(super) fn decode(e: sqlx::Error) -> StateBackendError {
     StateBackendError::Database(e.to_string())
 }
 
-fn to_i32(what: &str, n: u32) -> BackendResult<i32> {
+pub(super) fn to_i32(what: &str, n: u32) -> BackendResult<i32> {
     i32::try_from(n).map_err(|_| StateBackendError::Database(format!("{what} {n} is too large")))
 }
 

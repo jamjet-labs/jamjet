@@ -173,9 +173,36 @@ pub const POINTS: &[(&str, u32)] = &[
     ("pg.commit_scheduler_pass", 8),
     ("pg.patch_append_array", 1),
     ("pg.patch_append_array", 2),
-    // postgres/tx.rs: a seam, the start of each attempt of a transaction,
-    // before its `BEGIN`.
+    // postgres/queue.rs: one body serves the unscoped and the scoped store.
+    ("pg.expire_stale_leases", 1),
+    ("pg.expire_stale_leases", 2),
+    ("pg.expire_stale_leases", 3),
+    ("pg.expire_stale_leases", 4),
+    ("pg.expire_stale_leases", 5),
+    ("pg.fail_work_item_fenced", 1),
+    ("pg.fail_work_item_fenced", 2),
+    ("pg.fail_work_item_fenced", 3),
+    ("pg.fail_work_item_fenced", 4),
+    ("pg.fail_work_item_fenced", 5),
+    ("pg.fail_work_item_fenced_recorded", 1),
+    ("pg.fail_work_item_fenced_recorded", 2),
+    ("pg.fail_work_item_fenced_recorded", 3),
+    ("pg.fail_work_item_fenced_recorded", 4),
+    ("pg.fail_work_item_fenced_recorded", 5),
+    ("pg.fail_work_item_fenced_recorded", 6),
+    ("pg.finalize_rollover_fenced", 1),
+    ("pg.finalize_rollover_fenced", 2),
+    ("pg.finalize_rollover_fenced", 3),
+    ("pg.reclaim_expired_leases_recorded", 1),
+    ("pg.reclaim_expired_leases_recorded", 2),
+    ("pg.reclaim_expired_leases_recorded", 3),
+    ("pg.reclaim_expired_leases_recorded", 4),
+    ("pg.reclaim_expired_leases_recorded", 5),
+    ("pg.reclaim_expired_leases_recorded", 6),
+    // postgres/tx.rs: seams, the start of each attempt of a transaction,
+    // before its `BEGIN`, and the start of each retry.
     ("pg_tx.attempt", 1),
+    ("pg_tx.retry", 1),
 ];
 
 /// A fault point: the boundary after statement `$step` of the transaction

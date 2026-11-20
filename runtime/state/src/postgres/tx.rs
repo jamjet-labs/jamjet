@@ -21,7 +21,8 @@
 //! a write that landed.
 //!
 //! Each attempt starts at the fault point `pg_tx.attempt#1`, where a test
-//! counts the attempts a call made.
+//! counts the attempts a call made, and each retry passes `pg_tx.retry#1`
+//! first, where a test counts the retries.
 
 use crate::backend::{BackendResult, StateBackendError};
 use rand::RngExt as _;
@@ -181,6 +182,7 @@ where
         match classify(&failed, false) {
             Retry::Again { attempts } if attempt < attempts => {
                 tracing::debug!(op, attempt, error = %failed, "retrying a Postgres transaction");
+                retry_starts().await?;
                 tokio::time::sleep(backoff(attempt)).await;
             }
             retry => return Err(answer(retry, &failed, attempt)),
@@ -192,6 +194,13 @@ where
 /// Not a point inside a transaction: nothing has run when it fires.
 async fn attempt_starts() -> BackendResult<()> {
     fault_point!("pg_tx.attempt", 1);
+    Ok(())
+}
+
+/// The seam before each retry of a transaction, after the attempt that
+/// failed was rolled back, where a test counts the retries a load made.
+async fn retry_starts() -> BackendResult<()> {
+    fault_point!("pg_tx.retry", 1);
     Ok(())
 }
 

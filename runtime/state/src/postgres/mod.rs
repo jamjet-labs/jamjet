@@ -13,6 +13,7 @@
 //!
 //! A method that answers `not yet` is still to be written.
 
+mod queue;
 mod runs;
 mod schema;
 mod settings;
@@ -408,98 +409,101 @@ impl StateBackend for PgBackend {
         not_yet("artifact_size")
     }
 
-    async fn enqueue_work_item(&self, _item: WorkItem) -> BackendResult<WorkItemId> {
-        not_yet("enqueue_work_item")
+    async fn enqueue_work_item(&self, item: WorkItem) -> BackendResult<WorkItemId> {
+        queue::enqueue_work_item(self, item).await
     }
 
     async fn claim_work_item(
         &self,
-        _worker_id: &str,
-        _queue_types: &[&str],
+        worker_id: &str,
+        queue_types: &[&str],
     ) -> BackendResult<Option<WorkItem>> {
-        not_yet("claim_work_item")
+        let all = ClaimFilter::default();
+        queue::claim_work_item_filtered(self, worker_id, queue_types, None, &all).await
     }
 
     async fn renew_lease(
         &self,
-        _item_id: WorkItemId,
-        _worker_id: &str,
-        _lease_fence: i64,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
     ) -> BackendResult<()> {
-        not_yet("renew_lease")
+        queue::renew_lease(self, item_id, worker_id, lease_fence).await
     }
 
     async fn claim_work_item_with_lease(
         &self,
-        _worker_id: &str,
-        _queue_types: &[&str],
-        _lease_secs: Option<u64>,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
     ) -> BackendResult<Option<WorkItem>> {
-        not_yet("claim_work_item_with_lease")
+        let all = ClaimFilter::default();
+        queue::claim_work_item_filtered(self, worker_id, queue_types, lease_secs, &all).await
     }
 
     async fn claim_work_item_filtered(
         &self,
-        _worker_id: &str,
-        _queue_types: &[&str],
-        _lease_secs: Option<u64>,
-        _filter: &ClaimFilter,
+        worker_id: &str,
+        queue_types: &[&str],
+        lease_secs: Option<u64>,
+        filter: &ClaimFilter,
     ) -> BackendResult<Option<WorkItem>> {
-        not_yet("claim_work_item_filtered")
+        queue::claim_work_item_filtered(self, worker_id, queue_types, lease_secs, filter).await
     }
 
     async fn leased_items(
         &self,
-        _queue_types: &[&str],
-        _filter: &ClaimFilter,
+        queue_types: &[&str],
+        filter: &ClaimFilter,
     ) -> BackendResult<Vec<LeasedItem>> {
-        not_yet("leased_items")
+        queue::leased_items(self, queue_types, filter).await
     }
 
     async fn mark_gate(
         &self,
-        _item_id: WorkItemId,
-        _lease_fence: i64,
-        _mark: GateMark,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        mark: GateMark,
     ) -> BackendResult<bool> {
-        not_yet("mark_gate")
+        queue::mark_gate(self, item_id, lease_fence, mark).await
     }
 
     async fn swap_gate(
         &self,
-        _item_id: WorkItemId,
-        _lease_fence: i64,
-        _from: GateMark,
-        _to: GateMark,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: GateMark,
+        to: GateMark,
     ) -> BackendResult<bool> {
-        not_yet("swap_gate")
+        queue::swap_gate(self, item_id, lease_fence, from, to, None).await
     }
 
     async fn release_lease(
         &self,
-        _item_id: WorkItemId,
-        _lease_fence: i64,
-        _from: GateMark,
-        _lease_secs: u64,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        from: GateMark,
+        lease_secs: u64,
     ) -> BackendResult<bool> {
-        not_yet("release_lease")
+        let to = GateMark::Released;
+        queue::swap_gate(self, item_id, lease_fence, from, to, Some(lease_secs)).await
     }
 
     async fn has_claimable(
         &self,
-        _queue_types: &[&str],
-        _filter: &ClaimFilter,
+        queue_types: &[&str],
+        filter: &ClaimFilter,
     ) -> BackendResult<bool> {
-        not_yet("has_claimable")
+        queue::has_claimable(self, queue_types, filter).await
     }
 
     async fn heartbeat_lease(
         &self,
-        _item_id: WorkItemId,
-        _worker_id: &str,
-        _lease_fence: i64,
+        item_id: WorkItemId,
+        worker_id: &str,
+        lease_fence: i64,
     ) -> BackendResult<LeaseRenewal> {
-        not_yet("heartbeat_lease")
+        queue::heartbeat_lease(self, item_id, worker_id, lease_fence).await
     }
 
     async fn count_node_completions(
@@ -510,33 +514,34 @@ impl StateBackend for PgBackend {
         runs::count_node_completions(self, execution_id, node_id).await
     }
 
-    async fn get_work_item(&self, _item_id: WorkItemId) -> BackendResult<Option<WorkItem>> {
-        not_yet("get_work_item")
+    async fn get_work_item(&self, item_id: WorkItemId) -> BackendResult<Option<WorkItem>> {
+        queue::get_work_item(self, item_id).await
     }
 
-    async fn complete_work_item(&self, _item_id: WorkItemId) -> BackendResult<()> {
-        not_yet("complete_work_item")
+    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
+        queue::complete_work_item(self, item_id).await
     }
 
     async fn complete_work_item_fenced(
         &self,
-        _item_id: WorkItemId,
-        _lease_fence: i64,
+        item_id: WorkItemId,
+        lease_fence: i64,
     ) -> BackendResult<bool> {
-        not_yet("complete_work_item_fenced")
+        queue::complete_work_item_fenced(self, item_id, lease_fence).await
     }
 
-    async fn fail_work_item(&self, _item_id: WorkItemId, _error: &str) -> BackendResult<()> {
-        not_yet("fail_work_item")
+    async fn fail_work_item(&self, item_id: WorkItemId, _error: &str) -> BackendResult<()> {
+        // The error is the caller's to record; this settles the item only.
+        queue::fail_work_item(self, item_id).await
     }
 
     async fn fail_work_item_fenced(
         &self,
-        _item_id: WorkItemId,
-        _lease_fence: i64,
-        _error: &str,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
     ) -> BackendResult<Option<FailOutcome>> {
-        not_yet("fail_work_item_fenced")
+        queue::fail_work_item_fenced(self, item_id, lease_fence, error).await
     }
 
     async fn commit_turn(
@@ -561,50 +566,51 @@ impl StateBackend for PgBackend {
 
     async fn withdraw_work_item_fenced(
         &self,
-        _item_id: WorkItemId,
-        _lease_fence: i64,
+        item_id: WorkItemId,
+        lease_fence: i64,
     ) -> BackendResult<bool> {
-        not_yet("withdraw_work_item_fenced")
+        queue::withdraw_work_item_fenced(self, item_id, lease_fence).await
     }
 
     async fn park_work_item(
         &self,
-        _item_id: WorkItemId,
-        _lease_fence: i64,
-        _retry_after: &str,
-        _next_attempt: u32,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        retry_after: &str,
+        next_attempt: u32,
     ) -> BackendResult<bool> {
-        not_yet("park_work_item")
+        queue::park_work_item(self, item_id, lease_fence, retry_after, next_attempt).await
     }
 
     async fn park_for_execution(
         &self,
-        _item_id: WorkItemId,
-        _lease_fence: i64,
+        item_id: WorkItemId,
+        lease_fence: i64,
         _attempt: u32,
     ) -> BackendResult<bool> {
-        not_yet("park_for_execution")
+        // The attempt stays as it is, as on SQLite.
+        queue::park_for_execution(self, item_id, lease_fence).await
     }
 
     async fn finalize_rollover_fenced(
         &self,
-        _execution_id: &ExecutionId,
-        _work_item_id: WorkItemId,
-        _lease_fence: i64,
+        execution_id: &ExecutionId,
+        work_item_id: WorkItemId,
+        lease_fence: i64,
     ) -> BackendResult<bool> {
-        not_yet("finalize_rollover_fenced")
+        queue::finalize_rollover_fenced(self, execution_id, work_item_id, lease_fence).await
     }
 
     async fn reclaim_expired_leases(&self) -> BackendResult<ReclaimResult> {
-        not_yet("reclaim_expired_leases")
+        queue::reclaim_expired_leases(self).await
     }
 
     async fn move_to_dead_letter(
         &self,
-        _item_id: WorkItemId,
-        _last_error: &str,
+        item_id: WorkItemId,
+        last_error: &str,
     ) -> BackendResult<()> {
-        not_yet("move_to_dead_letter")
+        queue::move_to_dead_letter(self, item_id, last_error).await
     }
 
     async fn create_token(&self, _name: &str, _role: &str) -> BackendResult<(String, ApiToken)> {
@@ -668,9 +674,9 @@ impl StateBackend for PgBackend {
 
     async fn open_work_items(
         &self,
-        _execution_id: &ExecutionId,
+        execution_id: &ExecutionId,
     ) -> BackendResult<Vec<OpenWorkItem>> {
-        not_yet("open_work_items")
+        queue::open_work_items(self, execution_id).await
     }
 
     async fn create_tenant(&self, _tenant: Tenant) -> BackendResult<()> {
@@ -694,15 +700,15 @@ impl StateBackend for PgBackend {
     }
 
     async fn reclaim_expired_leases_recorded(&self) -> BackendResult<ReclaimResult> {
-        not_yet("reclaim_expired_leases_recorded")
+        queue::reclaim_expired_leases_recorded(self).await
     }
 
     async fn fail_work_item_fenced_recorded(
         &self,
-        _item_id: WorkItemId,
-        _lease_fence: i64,
-        _error: &str,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        error: &str,
     ) -> BackendResult<Option<FailOutcome>> {
-        not_yet("fail_work_item_fenced_recorded")
+        queue::fail_work_item_fenced_recorded(self, item_id, lease_fence, error).await
     }
 }
