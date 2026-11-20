@@ -285,6 +285,7 @@ macro_rules! for_each_case {
             idempotency,
             [
                 tool_effect_round_trip,
+                a_recorded_effect_keeps_its_cost,
                 no_key_no_effect_recorded,
                 concurrent_winner_insert_or_ignore,
                 tool_effect_survives_reopen,

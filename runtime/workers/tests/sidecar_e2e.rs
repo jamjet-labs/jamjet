@@ -5,8 +5,9 @@
 //! metering in `ExecutionResult`. This is a node-level test (not registry-level)
 //! — the full `execute()` path runs, identical to the durable worker call path.
 //!
-//! The last test runs whole steps through a worker and the scheduler, to show
-//! the sidecar's cost reaching a run's dollar cap.
+//! The tests after it run whole steps through a worker and the scheduler: the
+//! sidecar's cost reaching the step's `NodeCompleted` and a run's dollar cap,
+//! and a cost the engine cannot count failing the step.
 
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_models::{ModelRegistry, SidecarModelAdapter};
@@ -132,6 +133,16 @@ const PRICED_ANSWER: &str = r#"{
 
 /// `m1 -> m2 -> m3 -> end`, three model steps, under `cost_budget_usd: 1.0`.
 fn priced_ir() -> Value {
+    steps_ir(
+        "wf-priced",
+        &["m1", "m2", "m3"],
+        json!({ "cost_budget_usd": 1.0 }),
+    )
+}
+
+/// `ids[0] -> ids[1] -> ... -> end`, every node a model step, with the keys
+/// of `extra` set on the workflow.
+fn steps_ir(workflow_id: &str, ids: &[&str], extra: Value) -> Value {
     let step = |id: &str| {
         json!({
             "id": id,
@@ -147,28 +158,34 @@ fn priced_ir() -> Value {
             "labels": {}
         })
     };
-    json!({
-        "workflow_id": "wf-priced",
+    let nodes: serde_json::Map<String, Value> =
+        ids.iter().map(|id| (id.to_string(), step(id))).collect();
+    let mut edges: Vec<Value> = ids
+        .windows(2)
+        .map(|w| json!({ "from": w[0], "to": w[1], "condition": null }))
+        .collect();
+    edges.push(json!({ "from": ids[ids.len() - 1], "to": "end", "condition": null }));
+    let mut ir = json!({
+        "workflow_id": workflow_id,
         "version": "0.1.0",
         "name": null,
         "description": null,
         "state_schema": "",
-        "start_node": "m1",
-        "nodes": { "m1": step("m1"), "m2": step("m2"), "m3": step("m3") },
-        "edges": [
-            { "from": "m1", "to": "m2", "condition": null },
-            { "from": "m2", "to": "m3", "condition": null },
-            { "from": "m3", "to": "end", "condition": null }
-        ],
+        "start_node": ids[0],
+        "nodes": nodes,
+        "edges": edges,
         "retry_policies": {},
         "timeouts": {},
         "models": {},
         "tools": {},
         "mcp_servers": {},
         "remote_agents": {},
-        "labels": {},
-        "cost_budget_usd": 1.0
-    })
+        "labels": {}
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        ir[key] = value.clone();
+    }
+    ir
 }
 
 /// Store `ir` and start one run of it as `POST /executions` does: the run,
@@ -333,5 +350,197 @@ async fn the_in_process_dollar_cap_trips_on_sidecar_cost() {
         server.received_requests().await.unwrap().len(),
         2,
         "no model call after the cap is passed"
+    );
+}
+
+// ── The sidecar's cost, in process ───────────────────────────────────────────
+
+/// A sidecar answer with a few tokens and `cost` spliced in after them: a
+/// JSON fragment such as `, "cost_usd": 0.0123`, or nothing.
+fn answer_with(cost: &str) -> String {
+    format!(
+        r#"{{"message": {{"content": "ok", "role": "assistant"}},
+            "input_tokens": 3, "output_tokens": 2{cost},
+            "model": "anthropic/claude-sonnet-4-6", "finish_reason": "stop"}}"#
+    )
+}
+
+/// One run of `m1 -> end`, no cap, in process through a sidecar that gives
+/// `answer` to every call. Returns the run's log and its status. The step
+/// calls the sidecar once, whatever it answers.
+async fn one_step(answer: String) -> (Vec<EventKind>, WorkflowStatus) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/complete"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(answer))
+        .mount(&server)
+        .await;
+    let registry = Arc::new(
+        ModelRegistry::new()
+            .register(Arc::new(SidecarModelAdapter::new(server.uri())))
+            .with_default("sidecar"),
+    );
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let eid = start_run(backend.as_ref(), steps_ir("wf-cost", &["m1"], json!({}))).await;
+    let worker = Worker::new("w".into(), backend.clone(), vec!["model".into()])
+        .register_executor("model", Arc::new(ModelNodeExecutor::new(registry)));
+    let scheduler = Scheduler::new(backend.clone());
+    for _ in 0..6 {
+        scheduler.tick().await.expect("scheduler tick");
+        if backend
+            .get_execution(&eid)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .is_terminal()
+        {
+            break;
+        }
+        let _ = worker.poll_and_execute().await;
+    }
+    let events: Vec<EventKind> = backend
+        .get_events(&eid)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    let status = backend.get_execution(&eid).await.unwrap().unwrap().status;
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "the step calls the sidecar once"
+    );
+    (events, status)
+}
+
+/// Each `NodeCompleted` in `events`, as its node and the event's JSON.
+fn completions(events: &[EventKind]) -> Vec<(String, Value)> {
+    events
+        .iter()
+        .filter_map(|k| match k {
+            EventKind::NodeCompleted { node_id, .. } => {
+                Some((node_id.clone(), serde_json::to_value(k).unwrap()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Each `NodeFailed` in `events`: node, error, retryable.
+fn failures(events: &[EventKind]) -> Vec<(String, String, bool)> {
+    events
+        .iter()
+        .filter_map(|k| match k {
+            EventKind::NodeFailed {
+                node_id,
+                error,
+                retryable,
+                ..
+            } => Some((node_id.clone(), error.clone(), *retryable)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The sidecar's `cost_usd` is recorded on the step's `NodeCompleted`, where
+/// a run's dollar cap counts it. It used to be dropped by the adapter.
+#[tokio::test]
+async fn the_sidecar_cost_reaches_node_completed() {
+    let (events, status) = one_step(answer_with(r#", "cost_usd": 0.0123"#)).await;
+    let done = completions(&events);
+    assert_eq!(done.len(), 1, "{events:?}");
+    assert_eq!(done[0].0, "m1");
+    assert_eq!(done[0].1["cost_usd"], json!(0.0123), "{}", done[0].1);
+    assert!(
+        matches!(
+            events.iter().find(|k| matches!(k, EventKind::NodeCompleted { .. })),
+            Some(EventKind::NodeCompleted { cost_usd: Some(c), .. }) if *c == 0.0123
+        ),
+        "{events:?}"
+    );
+    assert_eq!(status, WorkflowStatus::Completed);
+}
+
+/// A cost the engine cannot count is not dropped and not read as no cost:
+/// a negative one, or one sent as a string, fails the step for good, and
+/// the run with it.
+#[tokio::test]
+async fn a_sidecar_cost_that_is_negative_or_a_string_fails_the_node() {
+    for (cost, why) in [
+        (r#", "cost_usd": -0.5"#, "-0.5 is outside 0 to 10000"),
+        (r#", "cost_usd": "0.01""#, "a string, not a number"),
+    ] {
+        let (events, status) = one_step(answer_with(cost)).await;
+        assert_eq!(
+            failures(&events),
+            vec![(
+                "m1".to_string(),
+                format!("Model call failed: serialization error: sidecar cost_usd invalid: {why}"),
+                false
+            )],
+            "{cost}: {events:?}"
+        );
+        assert!(completions(&events).is_empty(), "{cost}: {events:?}");
+        assert_eq!(status, WorkflowStatus::Failed, "{cost}");
+    }
+}
+
+/// A sidecar that sends no cost, or a null one, records no cost: `None` on
+/// the event, not a zero, so a dollar cap reads the step as unpriced.
+#[tokio::test]
+async fn a_sidecar_without_cost_records_none() {
+    for cost in ["", r#", "cost_usd": null"#] {
+        let (events, status) = one_step(answer_with(cost)).await;
+        let recorded: Vec<(String, Option<f64>)> = events
+            .iter()
+            .filter_map(|k| match k {
+                EventKind::NodeCompleted {
+                    node_id, cost_usd, ..
+                } => Some((node_id.clone(), *cost_usd)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded, vec![("m1".to_string(), None)], "{cost:?}");
+        let done = completions(&events);
+        assert_eq!(done[0].1.get("cost_usd"), None, "{cost:?}: {}", done[0].1);
+        assert_eq!(status, WorkflowStatus::Completed, "{cost:?}");
+    }
+}
+
+/// A cost in another currency is not a cost the engine can count in USD:
+/// the step fails for good.
+#[tokio::test]
+async fn a_sidecar_cost_in_eur_fails_the_node() {
+    let (events, status) =
+        one_step(answer_with(r#", "cost_usd": 0.01, "cost_currency": "EUR""#)).await;
+    assert_eq!(
+        failures(&events),
+        vec![(
+            "m1".to_string(),
+            "Model call failed: serialization error: sidecar cost_usd invalid: \
+             cost_currency must be \"USD\""
+                .to_string(),
+            false
+        )],
+        "{events:?}"
+    );
+    assert!(completions(&events).is_empty(), "{events:?}");
+    assert_eq!(status, WorkflowStatus::Failed);
+}
+
+/// The sidecar takes a cost up to the same per-call ceiling the usage fold
+/// counts, so a cost the adapter lets through is never one the fold reads as
+/// unknown.
+#[test]
+fn the_sidecar_ceiling_is_the_fold_ceiling() {
+    assert_eq!(
+        jamjet_models::adapter::MAX_REPORTED_COST_USD,
+        jamjet_state::usage::MAX_REPORTED_COST_USD
+    );
+    assert_eq!(
+        jamjet_state::usage::cost_to_nanos(jamjet_models::adapter::MAX_REPORTED_COST_USD),
+        Some(10_000_000_000_000)
     );
 }

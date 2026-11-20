@@ -304,6 +304,7 @@ impl NodeExecutor for EvalExecutor {
             input_tokens: None,
             output_tokens: None,
             finish_reason: Some(if overall_passed { "pass" } else { action }.to_string()),
+            cost_usd: None,
         })
     }
 }

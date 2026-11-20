@@ -145,7 +145,7 @@ impl GoogleAdapter {
         body
     }
 
-    fn parse_response(&self, resp: Value) -> Result<ModelResponse, ModelError> {
+    pub(crate) fn parse_response(&self, resp: Value) -> Result<ModelResponse, ModelError> {
         // Extract text from candidates[0].content.parts[0].text
         let candidate = resp["candidates"]
             .as_array()
@@ -186,6 +186,8 @@ impl GoogleAdapter {
             output_tokens,
             structured: None,
             tool_calls: vec![],
+            // No price is read from the answer.
+            cost_usd: None,
         })
     }
 }

@@ -169,7 +169,15 @@ pub struct ModelResponse {
     pub structured: Option<serde_json::Value>,
     /// Tool calls requested by the model.  Empty when finish_reason != "tool_calls".
     pub tool_calls: Vec<ToolCall>,
+    /// What the call cost in USD, as the adapter's source reports it. `None`
+    /// when it reports no cost: the native adapters never do, and a run
+    /// under a dollar cap then stops, since its spend cannot be counted.
+    pub cost_usd: Option<f64>,
 }
+
+/// The largest cost one call may report, in USD. The same ceiling as the
+/// one a run's usage fold counts up to (`jamjet_state::usage`).
+pub const MAX_REPORTED_COST_USD: f64 = 10_000.0;
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
 

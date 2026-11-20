@@ -469,6 +469,7 @@ impl SqliteBackend {
             input_tokens,
             output_tokens,
             ref finish_reason,
+            cost_usd,
             idempotency_key: Some(ref idem_key),
             ..
         } = terminal_event.kind
@@ -482,6 +483,7 @@ impl SqliteBackend {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "finish_reason": finish_reason,
+                "cost_usd": cost_usd,
             });
             let result_json_str = serde_json::to_string(&result_json)?;
             sqlx::query(

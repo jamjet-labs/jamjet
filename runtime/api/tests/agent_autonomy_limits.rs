@@ -154,6 +154,7 @@ impl NodeExecutor for Scripted {
                 input_tokens: Some(tokens),
                 output_tokens: Some(0),
                 finish_reason: None,
+                cost_usd: None,
             }),
             Act::Fail => Err(ExecutorError::Fatal("tool down".into())),
         }

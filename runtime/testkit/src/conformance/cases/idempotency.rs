@@ -136,6 +136,51 @@ pub async fn tool_effect_round_trip(fx: &Fixture) {
     assert!(none_val.is_none(), "expected None for unknown key");
 }
 
+/// The recorded result keeps the step's `cost_usd`, so a replay of it
+/// reports what the step cost; a step with no cost records `null`.
+pub async fn a_recorded_effect_keeps_its_cost(fx: &Fixture) {
+    let db = fx.backend.as_ref();
+    let exec_id = ExecutionId::new();
+    db.create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
+    for (node, key, cost) in [("n1", "priced-k", Some(0.0123)), ("n2", "free-k", None)] {
+        db.enqueue_work_item(sample_item(&exec_id, node))
+            .await
+            .unwrap();
+        let item = db
+            .claim_work_item("worker-1", &["model"])
+            .await
+            .unwrap()
+            .expect("item must be claimed");
+        let event = Event::new(
+            exec_id.clone(),
+            0,
+            EventKind::NodeCompleted {
+                node_id: node.into(),
+                output: json!({}),
+                state_patch: json!({}),
+                duration_ms: 1,
+                gen_ai_system: None,
+                gen_ai_model: Some("m".into()),
+                input_tokens: Some(3),
+                output_tokens: Some(2),
+                finish_reason: None,
+                cost_usd: cost,
+                provenance: None,
+                idempotency_key: Some(key.into()),
+            },
+        );
+        db.commit_turn(item.id, item.lease_fence, event, false)
+            .await
+            .expect("commit_turn must succeed");
+    }
+    let priced = db.get_tool_effect("priced-k").await.unwrap().unwrap();
+    assert_eq!(priced.get("cost_usd"), Some(&json!(0.0123)), "{priced}");
+    let free = db.get_tool_effect("free-k").await.unwrap().unwrap();
+    assert_eq!(free.get("cost_usd"), Some(&json!(null)), "{free}");
+}
+
 /// A NodeCompleted WITHOUT an idempotency_key records NO tool_effect row.
 pub async fn no_key_no_effect_recorded(fx: &Fixture) {
     let db = fx.backend.as_ref();

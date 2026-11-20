@@ -297,6 +297,7 @@ impl InMemoryBackend {
             input_tokens,
             output_tokens,
             ref finish_reason,
+            cost_usd,
             idempotency_key: Some(ref key),
             ..
         } = terminal_event.kind
@@ -310,6 +311,7 @@ impl InMemoryBackend {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "finish_reason": finish_reason,
+                "cost_usd": cost_usd,
             });
             Some((key.clone(), result_json))
         } else {

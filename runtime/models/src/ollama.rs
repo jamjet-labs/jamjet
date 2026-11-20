@@ -124,7 +124,7 @@ impl OllamaAdapter {
         body
     }
 
-    fn parse_response(&self, resp: Value) -> Result<ModelResponse, ModelError> {
+    pub(crate) fn parse_response(&self, resp: Value) -> Result<ModelResponse, ModelError> {
         let model = resp["model"]
             .as_str()
             .unwrap_or(&self.default_model)
@@ -150,6 +150,8 @@ impl OllamaAdapter {
             output_tokens,
             structured: None,
             tool_calls: vec![],
+            // No price is read from the answer.
+            cost_usd: None,
         })
     }
 }

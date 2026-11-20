@@ -135,6 +135,7 @@ impl NodeExecutor for CoordinatorExecutor {
                 input_tokens: None,
                 output_tokens: None,
                 finish_reason: None,
+                cost_usd: None,
             });
         }
 
@@ -177,6 +178,7 @@ impl NodeExecutor for CoordinatorExecutor {
                 input_tokens: None,
                 output_tokens: None,
                 finish_reason: None,
+                cost_usd: None,
             });
         }
 
@@ -231,6 +233,7 @@ impl NodeExecutor for CoordinatorExecutor {
                 input_tokens: None,
                 output_tokens: None,
                 finish_reason: None,
+                cost_usd: None,
             });
         }
 
@@ -363,6 +366,7 @@ impl NodeExecutor for CoordinatorExecutor {
             input_tokens: None,
             output_tokens: None,
             finish_reason: None,
+            cost_usd: None,
         })
     }
 }

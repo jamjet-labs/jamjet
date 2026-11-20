@@ -84,6 +84,9 @@ fn replayed_result(rec: &serde_json::Value) -> ExecutionResult {
             .get("finish_reason")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        // A record from before costs were recorded has none: `None`, which a
+        // dollar cap reads as unpriced, never as free.
+        cost_usd: rec.get("cost_usd").and_then(|v| v.as_f64()),
     }
 }
 
@@ -678,6 +681,10 @@ impl Worker {
                                     &mut budget,
                                     result.input_tokens,
                                     result.output_tokens,
+                                    // Not the step's cost: a trip here throws
+                                    // a paid result away, and the retry pays
+                                    // again. The cost goes on the step's
+                                    // `NodeCompleted`, where the caps read it.
                                     None,
                                     &mut result.state_patch,
                                 )
@@ -773,7 +780,7 @@ impl Worker {
                         input_tokens: exec_result.input_tokens,
                         output_tokens: exec_result.output_tokens,
                         finish_reason: exec_result.finish_reason,
-                        cost_usd: None,
+                        cost_usd: exec_result.cost_usd,
                         provenance: None,
                         idempotency_key: computed_key,
                     },
@@ -1801,6 +1808,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 finish_reason: None,
+                cost_usd: None,
             })
         }
     }
@@ -3315,6 +3323,7 @@ mod tests {
                     input_tokens: None,
                     output_tokens: None,
                     finish_reason: None,
+                    cost_usd: None,
                 })
             }
         }
@@ -3537,6 +3546,7 @@ mod tests {
                 input_tokens: Some(2), // exceeds the total_tokens: 1 ceiling
                 output_tokens: None,
                 finish_reason: None,
+                cost_usd: None,
             })
         }
     }
@@ -4143,6 +4153,7 @@ mod tests {
                 input_tokens: Some(2),
                 output_tokens: None,
                 finish_reason: None,
+                cost_usd: None,
             })
         }
     }
@@ -4368,6 +4379,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 finish_reason: None,
+                cost_usd: None,
             })
         }
     }
@@ -4480,6 +4492,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 finish_reason: None,
+                cost_usd: None,
             })
         }
     }
@@ -4737,6 +4750,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 finish_reason: None,
+                cost_usd: None,
             })
         }
     }

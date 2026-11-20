@@ -88,6 +88,7 @@ impl NodeExecutor for Ran {
             input_tokens: None,
             output_tokens: None,
             finish_reason: None,
+            cost_usd: None,
         })
     }
 }

@@ -3494,9 +3494,13 @@ struct CompleteWorkItemRequest {
     #[serde(default)]
     finish_reason: Option<String>,
     /// Estimated USD cost of this node, as the worker reports it. Counted
-    /// toward an agent card's `cost_budget_usd`.
+    /// toward the run's `cost_budget_usd` and an agent card's. A number from
+    /// 0 to 10,000; anything else is refused.
     #[serde(default)]
     cost_usd: Option<f64>,
+    /// The currency of `cost_usd`. Optional; when sent, it must be `"USD"`.
+    #[serde(default)]
+    cost_currency: Option<String>,
 }
 
 /// `POST /work-items/:id/complete` — mark a work item as completed and emit NodeCompleted event.
@@ -3579,12 +3583,24 @@ async fn complete_work_item(
     // write. The budget enforcer reads them back, and the approval digest
     // leaves them out as engine-written, so a reported value would be a budget
     // reset and a change to later nodes' input that no approval covers.
-    // A reported cost is summed into agent cost budgets, so it must be a
-    // spend: a negative one would refund the budget.
-    if body.cost_usd.is_some_and(|c| !(c.is_finite() && c >= 0.0)) {
-        return Err(ApiError::BadRequest(
-            "cost_usd must be a non-negative number".to_string(),
-        ));
+    // A reported cost is summed into the run's dollar cap and agent cost
+    // budgets, so it must be a spend the engine can count: a number from 0
+    // to the per-call ceiling, in USD. A negative one would refund a budget.
+    if let Some(problem) = uncountable_cost(body.cost_usd, body.cost_currency.as_deref()) {
+        // The step ran, so it may have paid. Under a dollar cap its spend
+        // cannot be counted, and a retry would pay again with nothing
+        // recorded: the holder's step fails for good instead. The fence
+        // shows the caller holds the item; without one nothing is written.
+        if let (Some(wi), Some(fence)) = (recorded.as_ref(), body.lease_fence.filter(|f| *f > 0)) {
+            if fail_uncounted_step(backend.as_ref(), wi, fence, &problem, state.agents.as_ref())
+                .await
+            {
+                return Err(ApiError::BadRequest(format!(
+                    "{problem}; the run has a dollar cap, so the step failed"
+                )));
+            }
+        }
+        return Err(ApiError::BadRequest(problem));
     }
 
     let state_patch = jamjet_state::approvals::action_state(&body.state_patch);
@@ -3823,6 +3839,100 @@ async fn complete_work_item(
     Ok((
         StatusCode::OK,
         Json(json!({ "completed": true, "work_item_id": id })),
+    ))
+}
+
+/// Why a reported cost cannot be counted, or `None` when it can: `cost_usd`
+/// absent, or a number from 0 to the per-call ceiling, and `cost_currency`
+/// absent or `"USD"`.
+fn uncountable_cost(cost_usd: Option<f64>, cost_currency: Option<&str>) -> Option<String> {
+    if cost_currency.is_some_and(|c| c != "USD") {
+        return Some("cost_currency must be \"USD\"".to_string());
+    }
+    if cost_usd.is_some_and(|c| jamjet_state::usage::cost_to_nanos(c).is_none()) {
+        return Some(format!(
+            "cost_usd must be a number from 0 to {}",
+            jamjet_state::usage::MAX_REPORTED_COST_USD
+        ));
+    }
+    None
+}
+
+/// Fail for good the step of `wi`, whose reported cost cannot be counted,
+/// when its run has a dollar cap. Returns whether the step failed.
+///
+/// One fenced `commit_turn_unless_terminal` settles the item and appends
+/// `NodeFailed { retryable: false }`, as a claim refusal does, and the
+/// scheduler fails the run. Only for an item whose result the completion
+/// gate would record: the same rules decide what may be written for it. A
+/// run or workflow that cannot be read writes nothing, as the gate would.
+async fn fail_uncounted_step(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+    fence: i64,
+    problem: &str,
+    agents: &dyn jamjet_agents::AgentRegistry,
+) -> bool {
+    match dollar_capped(backend, wi).await {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(e) => {
+            warn!(work_item_id = %wi.id, error = %e, "complete: could not read the run's dollar cap");
+            return false;
+        }
+    }
+    if let Err((_, reason)) = completion_gate(backend, wi, agents).await {
+        warn!(work_item_id = %wi.id, %reason, "complete: an uncountable cost on a step the gate refuses");
+        return false;
+    }
+    let terminal = jamjet_state::Event::new(
+        wi.execution_id.clone(),
+        0,
+        jamjet_state::EventKind::NodeFailed {
+            node_id: wi.node_id.clone(),
+            error: format!("the step reported a cost the run's dollar cap cannot count: {problem}"),
+            attempt: wi.attempt,
+            retryable: false,
+        },
+    );
+    match backend
+        .commit_turn_unless_terminal(wi.id, fence, terminal, false)
+        .await
+    {
+        Ok(jamjet_state::TurnCommit::Committed(_)) => true,
+        Ok(jamjet_state::TurnCommit::ExecutionTerminal(_)) => false,
+        Err(jamjet_state::StateBackendError::FenceLost(_)) => false,
+        Err(e) => {
+            warn!(work_item_id = %wi.id, error = %e, "complete: could not fail a step with an uncountable cost");
+            false
+        }
+    }
+}
+
+/// Whether the run of `wi` has a dollar cap: `cost_budget_usd` set in its
+/// stored IR, whatever its value.
+async fn dollar_capped(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+) -> Result<bool, String> {
+    let execution = backend
+        .get_execution(&wi.execution_id)
+        .await
+        .map_err(|e| format!("execution unreadable: {e}"))?
+        .ok_or_else(|| "execution not found".to_string())?;
+    let def = backend
+        .get_workflow(&execution.workflow_id, &execution.workflow_version)
+        .await
+        .map_err(|e| format!("workflow unreadable: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "workflow {} v{} not found",
+                execution.workflow_id, execution.workflow_version
+            )
+        })?;
+    Ok(!matches!(
+        def.ir.get("cost_budget_usd"),
+        None | Some(Value::Null)
     ))
 }
 

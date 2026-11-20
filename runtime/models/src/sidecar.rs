@@ -7,10 +7,13 @@
 //! Sidecar contract:
 //! - `POST /v1/complete` — `{model, messages, temperature?, max_tokens?}`
 //!   → `{message:{content,role}, input_tokens, output_tokens, cost_usd, model, finish_reason}`
+//!   `cost_usd` is optional (absent or null: no cost) and must otherwise be a
+//!   number from 0 to 10,000; `cost_currency`, if sent, must be `"USD"`.
 //! - `GET /health` → `{ok:true}`
 
 use crate::adapter::{
     ChatRole, ModelAdapter, ModelError, ModelRequest, ModelResponse, StructuredRequest, ToolCall,
+    MAX_REPORTED_COST_USD,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -20,6 +23,44 @@ const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-6";
 /// Cap a provider-supplied Retry-After so an untrusted/huge value can't overflow
 /// the timestamp math or push the backoff into the past. One hour is plenty.
 const MAX_RETRY_AFTER_SECS: u64 = 3_600;
+
+/// The call's cost from a sidecar answer, read strictly.
+///
+/// `cost_usd` absent or null is no cost (`None`). A number from 0 to
+/// [`MAX_REPORTED_COST_USD`] is the cost. Anything else, or a
+/// `cost_currency` other than `"USD"`, fails the call: a cost the engine
+/// cannot count must not pass for no cost, or for one it is not.
+fn parse_cost(json: &Value) -> Result<Option<f64>, ModelError> {
+    let invalid =
+        |why: String| ModelError::Serialization(format!("sidecar cost_usd invalid: {why}"));
+    match json.get("cost_currency") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(c)) if c == "USD" => {}
+        Some(_) => return Err(invalid("cost_currency must be \"USD\"".to_string())),
+    }
+    match json.get("cost_usd") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => match n.as_f64() {
+            Some(c) if c.is_finite() && (0.0..=MAX_REPORTED_COST_USD).contains(&c) => Ok(Some(c)),
+            _ => Err(invalid(format!(
+                "{n} is outside 0 to {MAX_REPORTED_COST_USD}"
+            ))),
+        },
+        // The kind only: the value itself is the sidecar's text.
+        Some(other) => Err(invalid(format!("{}, not a number", json_kind(other)))),
+    }
+}
+
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
 
 /// Routes durable-path model calls to the Python model-seam sidecar via HTTP.
 ///
@@ -83,9 +124,7 @@ impl SidecarModelAdapter {
 
         // I4: parse token counts strictly — a missing or wrong-type field means the
         // metering data is corrupt; fail closed rather than silently zeroing the count.
-        // Cost is recorded by the Python MeteringMiddleware after C1; cost_usd is not
-        // threaded to the Rust event here.
-        // F-2e-cost: cost_usd from the Python MeteringMiddleware is not yet threaded to the Rust event.
+        let cost_usd = parse_cost(&json)?;
         let input_tokens = json["input_tokens"].as_u64().ok_or_else(|| {
             ModelError::Serialization(
                 "sidecar response missing or invalid 'input_tokens' field".to_string(),
@@ -143,6 +182,7 @@ impl SidecarModelAdapter {
             output_tokens,
             structured: None,
             tool_calls,
+            cost_usd,
         })
     }
 
@@ -345,6 +385,85 @@ mod tests {
     use crate::adapter::ChatMessage;
     use crate::adapter::ToolCall;
 
+    /// What the adapter makes of a sidecar answer with `extra` merged in.
+    fn cost_of(extra: Value) -> Result<Option<f64>, String> {
+        let mut answer = json!({
+            "message": {"content": "ok", "role": "assistant"},
+            "input_tokens": 3,
+            "output_tokens": 2,
+            "model": "anthropic/claude-sonnet-4-6",
+            "finish_reason": "stop"
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            answer[k] = v.clone();
+        }
+        match SidecarModelAdapter::new("http://127.0.0.1:1").parse_response(answer) {
+            Ok(r) => Ok(r.cost_usd),
+            Err(ModelError::Serialization(m)) => Err(m),
+            Err(other) => panic!("not a serialization error: {other:?}"),
+        }
+    }
+
+    /// The sidecar's `cost_usd` is read strictly: absent or null is no cost,
+    /// a number from 0 to the per-call ceiling is the cost, and anything
+    /// else, or a currency other than USD, fails the call.
+    #[test]
+    fn sidecar_cost_is_read_strictly() {
+        let read = [
+            (json!({}), None),
+            (json!({"cost_usd": null}), None),
+            (json!({"cost_usd": 0}), Some(0.0)),
+            (json!({"cost_usd": 0.0123}), Some(0.0123)),
+            (json!({"cost_usd": 10000}), Some(10000.0)),
+            (json!({"cost_usd": 0.5, "cost_currency": "USD"}), Some(0.5)),
+            (json!({"cost_usd": 0.5, "cost_currency": null}), Some(0.5)),
+        ];
+        for (extra, want) in read {
+            assert_eq!(cost_of(extra.clone()), Ok(want), "{extra}");
+        }
+        let refused = [
+            (
+                json!({"cost_usd": -0.5}),
+                "sidecar cost_usd invalid: -0.5 is outside 0 to 10000",
+            ),
+            (
+                json!({"cost_usd": 10000.01}),
+                "sidecar cost_usd invalid: 10000.01 is outside 0 to 10000",
+            ),
+            (
+                json!({"cost_usd": "0.01"}),
+                "sidecar cost_usd invalid: a string, not a number",
+            ),
+            (
+                json!({"cost_usd": true}),
+                "sidecar cost_usd invalid: a boolean, not a number",
+            ),
+            (
+                json!({"cost_usd": {"amount": 0.01}}),
+                "sidecar cost_usd invalid: an object, not a number",
+            ),
+            (
+                json!({"cost_usd": 0.01, "cost_currency": "EUR"}),
+                "sidecar cost_usd invalid: cost_currency must be \"USD\"",
+            ),
+            (
+                json!({"cost_usd": 0.01, "cost_currency": "usd"}),
+                "sidecar cost_usd invalid: cost_currency must be \"USD\"",
+            ),
+            (
+                json!({"cost_usd": 0.01, "cost_currency": 840}),
+                "sidecar cost_usd invalid: cost_currency must be \"USD\"",
+            ),
+            (
+                json!({"cost_currency": "EUR"}),
+                "sidecar cost_usd invalid: cost_currency must be \"USD\"",
+            ),
+        ];
+        for (extra, want) in refused {
+            assert_eq!(cost_of(extra.clone()), Err(want.to_string()), "{extra}");
+        }
+    }
+
     #[tokio::test]
     async fn chat_maps_response_fields() {
         let mut server = mockito::Server::new_async().await;
@@ -376,6 +495,7 @@ mod tests {
         assert_eq!(resp.model, "anthropic/claude-sonnet-4-6");
         assert_eq!(resp.finish_reason, "stop");
         assert!(resp.structured.is_none());
+        assert_eq!(resp.cost_usd, Some(0.001));
     }
 
     #[tokio::test]

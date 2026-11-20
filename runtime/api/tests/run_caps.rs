@@ -6,8 +6,15 @@
 //! there threw the paid result away and left the item leased, so the retry
 //! paid for the call again, and a failed log read in that check let the turn
 //! through. An HTTP worker's reported tokens and cost were stored and never
-//! checked. Each test here pins what must hold instead, and the last one
-//! that both transports stop a run at the same step for the same spend.
+//! checked. Each test here pins what must hold instead, and
+//! `both_transports_fail_at_the_same_step` that both transports stop a run at
+//! the same step for the same spend.
+//!
+//! The tests after it pin the cost a step reports. Over HTTP it must be a
+//! number from 0 to 10,000 in USD, or the completion is refused, and under a
+//! dollar cap the refused step also fails for good, so it is never paid for
+//! again unrecorded. In process, a replayed result keeps the cost it was
+//! recorded with. Either way a step is counted once.
 //!
 //! Runs are driven by hand, on memory and on SQLite: a scheduler tick, then
 //! one worker poll (in process) or one claim and completion (HTTP), until the
@@ -17,6 +24,7 @@
 
 mod support;
 
+use axum::http::StatusCode;
 use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use jamjet_models::{
     ModelAdapter, ModelError, ModelRegistry, ModelRequest, ModelResponse, StructuredRequest,
@@ -24,6 +32,7 @@ use jamjet_models::{
 use jamjet_scheduler::Scheduler;
 use jamjet_state::backend::{StateBackend, StateBackendError, WorkItem};
 use jamjet_state::event::EventKind;
+use jamjet_state::{caps, fold_run_usage, RunCaps};
 use jamjet_testkit::{Hooks, Intercept, Op};
 use jamjet_worker::{ExecutionResult, ExecutorError, ModelNodeExecutor, NodeExecutor, Worker};
 use serde_json::{json, Value};
@@ -303,6 +312,7 @@ fn spent(input_tokens: u64) -> ExecutionResult {
         input_tokens: Some(input_tokens),
         output_tokens: Some(0),
         finish_reason: Some("stop".into()),
+        cost_usd: None,
     }
 }
 
@@ -363,6 +373,7 @@ impl ModelAdapter for FakeModel {
             output_tokens: 0,
             structured: None,
             tool_calls: vec![],
+            cost_usd: None,
         })
     }
     async fn structured_output(&self, _: StructuredRequest) -> Result<ModelResponse, ModelError> {
@@ -679,5 +690,575 @@ async fn both_transports_fail_at_the_same_step() {
             },
             "{name}"
         );
+    }
+}
+
+// ── The cost a step reports ──────────────────────────────────────────────────
+
+impl Run {
+    /// Tick, then claim the `python_fn` step that is ready, over HTTP.
+    async fn claim_http(&self) -> Value {
+        self.scheduler.tick().await.expect("scheduler tick");
+        let (st, claimed) = support::post(
+            &self.state,
+            "/work-items/claim",
+            json!({ "worker_id": "http-w", "queue_types": ["python_tool"] }),
+        )
+        .await;
+        assert!(
+            st.is_success() && claimed["claimed"] == json!(true),
+            "{}: claim: {st} {claimed}",
+            self.name
+        );
+        claimed["work_item"].clone()
+    }
+
+    /// Complete the claimed `wi` with the keys of `report` in the body.
+    async fn complete_http(&self, wi: &Value, report: Value) -> (StatusCode, Value) {
+        let mut body = json!({
+            "output": {},
+            "state_patch": {},
+            "lease_fence": wi["lease_fence"],
+            "idempotency_key": wi["idempotency_key"]
+        });
+        for (key, value) in report.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        support::post(
+            &self.state,
+            &format!("/work-items/{}/complete", wi["id"].as_str().unwrap()),
+            body,
+        )
+        .await
+    }
+
+    /// Complete `wi` with `body` sent as it is, so it can hold JSON that a
+    /// `Value` cannot (a number out of range).
+    async fn complete_raw(&self, wi: &Value, body: String) -> StatusCode {
+        use tower::ServiceExt;
+        jamjet_api::routes::build_router_with_opts(self.state.clone(), true)
+            .oneshot(
+                axum::http::Request::post(format!(
+                    "/work-items/{}/complete",
+                    wi["id"].as_str().unwrap()
+                ))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// The log entries that settle a step: `node_completed(..)` and
+    /// `node_failed(..)`.
+    async fn settled(&self) -> Vec<String> {
+        self.log()
+            .await
+            .into_iter()
+            .filter(|e| e.starts_with("node_completed") || e.starts_with("node_failed"))
+            .collect()
+    }
+
+    async fn item_status(&self, wi: &Value) -> String {
+        self.tb
+            .item_status(uuid::Uuid::parse_str(wi["id"].as_str().unwrap()).unwrap())
+            .await
+    }
+}
+
+/// A reported cost above the per-call ceiling of $10,000, or in a currency
+/// other than USD, cannot be counted: the completion is 400 and nothing is
+/// recorded. Without a dollar cap the item stays the worker's, and a
+/// completion with a cost the engine can count is then recorded; the ceiling
+/// itself is a cost it can count.
+#[tokio::test]
+async fn http_cost_above_the_ceiling_or_in_eur_is_400() {
+    for tb in support::backends().await {
+        let run = start(tb, linear_ir("wf-cost-400", &["a"], python_fn(), json!({}))).await;
+        let name = run.name;
+        let wi = run.claim_http().await;
+        for (report, error) in [
+            (
+                json!({ "cost_usd": 10000.01 }),
+                "cost_usd must be a number from 0 to 10000",
+            ),
+            (
+                json!({ "cost_usd": 0.01, "cost_currency": "EUR" }),
+                "cost_currency must be \"USD\"",
+            ),
+            (
+                json!({ "cost_usd": 0.01, "cost_currency": "usd" }),
+                "cost_currency must be \"USD\"",
+            ),
+            (
+                json!({ "cost_usd": -1.0 }),
+                "cost_usd must be a number from 0 to 10000",
+            ),
+        ] {
+            let (st, body) = run.complete_http(&wi, report.clone()).await;
+            assert_eq!(
+                (st, body),
+                (StatusCode::BAD_REQUEST, json!({ "error": error })),
+                "{name}: {report}"
+            );
+            assert_eq!(
+                run.settled().await,
+                Vec::<String>::new(),
+                "{name}: {report}"
+            );
+            assert_eq!(run.item_status(&wi).await, "claimed", "{name}: {report}");
+        }
+        let (st, body) = run
+            .complete_http(&wi, json!({ "cost_usd": 10000.0, "cost_currency": "USD" }))
+            .await;
+        assert_eq!(st, StatusCode::OK, "{name}: {body}");
+        assert_eq!(run.settled().await, vec!["node_completed(a)"], "{name}");
+    }
+}
+
+/// A cost sent as a string is refused by the JSON extractor (422) before
+/// the route runs, with or without a dollar cap: nothing is recorded and the
+/// item stays the worker's.
+///
+/// GUARD: passes before this change too; it pins that a string is never
+/// read as a cost or as no cost.
+#[tokio::test]
+async fn http_cost_as_a_string_is_422() {
+    for caps in [json!({}), json!({ "cost_budget_usd": 1.0 })] {
+        for tb in support::backends().await {
+            let run = start(
+                tb,
+                linear_ir("wf-cost-string", &["a"], python_fn(), caps.clone()),
+            )
+            .await;
+            let name = run.name;
+            let wi = run.claim_http().await;
+            let (st, body) = run.complete_http(&wi, json!({ "cost_usd": "0.5" })).await;
+            assert_eq!(
+                st,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{name} {caps}: {body}"
+            );
+            assert_eq!(run.settled().await, Vec::<String>::new(), "{name} {caps}");
+            assert_eq!(run.item_status(&wi).await, "claimed", "{name} {caps}");
+        }
+    }
+}
+
+/// `1e999` is past what an `f64` holds. It is refused, never read as
+/// infinity or as no cost: nothing is recorded and the item stays the
+/// worker's, with or without a dollar cap.
+///
+/// GUARD: passes before this change too. The JSON parser refuses the number
+/// before the route runs; the route's own range check is the second line if
+/// a parser ever reads it as infinity.
+#[tokio::test]
+async fn http_cost_1e999_is_refused() {
+    for caps in [json!({}), json!({ "cost_budget_usd": 1.0 })] {
+        for tb in support::backends().await {
+            let run = start(
+                tb,
+                linear_ir("wf-cost-huge", &["a"], python_fn(), caps.clone()),
+            )
+            .await;
+            let name = run.name;
+            let wi = run.claim_http().await;
+            let st = run
+                .complete_raw(
+                    &wi,
+                    format!(
+                        r#"{{"output": {{}}, "state_patch": {{}}, "lease_fence": {}, "cost_usd": 1e999}}"#,
+                        wi["lease_fence"]
+                    ),
+                )
+                .await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{name} {caps}");
+            assert_eq!(run.settled().await, Vec::<String>::new(), "{name} {caps}");
+            assert_eq!(run.item_status(&wi).await, "claimed", "{name} {caps}");
+        }
+    }
+}
+
+/// `a -> b` under `cost_budget_usd: 1.0`. A worker ran `a`, so it may have
+/// paid, and reports a cost the engine cannot count. The completion is 400
+/// and the step fails for good in the same fenced write: a retry would pay
+/// again with nothing recorded. The worker's next completion of the item is
+/// refused, the run fails and `b` never runs.
+#[tokio::test]
+async fn a_malformed_cost_under_a_dollar_cap_fails_the_node_for_good() {
+    for (report, problem) in [
+        (
+            json!({ "cost_usd": -0.5 }),
+            "cost_usd must be a number from 0 to 10000",
+        ),
+        (
+            json!({ "cost_usd": 20000.0 }),
+            "cost_usd must be a number from 0 to 10000",
+        ),
+        (
+            json!({ "cost_usd": 0.2, "cost_currency": "EUR" }),
+            "cost_currency must be \"USD\"",
+        ),
+    ] {
+        for tb in support::backends().await {
+            let run = start(
+                tb,
+                linear_ir(
+                    "wf-bad-cost",
+                    &["a", "b"],
+                    python_fn(),
+                    json!({ "cost_budget_usd": 1.0 }),
+                ),
+            )
+            .await;
+            let name = run.name;
+            let wi = run.claim_http().await;
+            let (st, body) = run.complete_http(&wi, report.clone()).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{name}: {report}: {body}");
+            let failed: Vec<(String, String, bool)> = run
+                .events()
+                .await
+                .into_iter()
+                .filter_map(|k| match k {
+                    EventKind::NodeFailed {
+                        node_id,
+                        error,
+                        retryable,
+                        ..
+                    } => Some((node_id, error, retryable)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                failed,
+                vec![(
+                    "a".to_string(),
+                    format!(
+                        "the step reported a cost the run's dollar cap cannot count: {problem}"
+                    ),
+                    false
+                )],
+                "{name}: {report}"
+            );
+            assert_eq!(
+                body,
+                json!({
+                    "error": format!("{problem}; the run has a dollar cap, so the step failed")
+                }),
+                "{name}: {report}"
+            );
+            assert!(run.completed().await.is_empty(), "{name}: {report}");
+            assert_ne!(run.item_status(&wi).await, "claimed", "{name}: {report}");
+            let (st, body) = run.complete_http(&wi, json!({ "cost_usd": 0.2 })).await;
+            assert_eq!(st, StatusCode::CONFLICT, "{name}: {report}: {body}");
+            run.scheduler.tick().await.expect("scheduler tick");
+            assert_eq!(
+                run.status().await,
+                WorkflowStatus::Failed,
+                "{name}: {report}"
+            );
+            assert_eq!(run.scheduled().await, vec!["a"], "{name}: {report}");
+            assert!(run.completed().await.is_empty(), "{name}: {report}");
+        }
+    }
+}
+
+/// Under a dollar cap, a completion with a cost the engine cannot count
+/// fails the step only for the caller that holds the item, and only for a
+/// step whose result it could report. With no fence, with a fence that is
+/// not the item's, or for a step the engine runs itself, the answer is 400
+/// and nothing is written: the item stays as it was.
+#[tokio::test]
+async fn a_malformed_cost_fails_only_a_step_the_caller_may_complete() {
+    let caps = json!({ "cost_budget_usd": 1.0 });
+    let plain = json!({ "error": "cost_usd must be a number from 0 to 10000" });
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            linear_ir("wf-bad-cost-holder", &["a"], python_fn(), caps.clone()),
+        )
+        .await;
+        let name = run.name;
+        let wi = run.claim_http().await;
+        let fence = wi["lease_fence"].as_i64().unwrap();
+        for (case, body) in [
+            (
+                "no fence",
+                json!({ "output": {}, "state_patch": {}, "cost_usd": -1.0 }),
+            ),
+            (
+                "another fence",
+                json!({ "output": {}, "state_patch": {}, "lease_fence": fence + 1, "cost_usd": -1.0 }),
+            ),
+        ] {
+            let (st, answer) = support::post(
+                &run.state,
+                &format!("/work-items/{}/complete", wi["id"].as_str().unwrap()),
+                body,
+            )
+            .await;
+            assert_eq!(
+                (st, answer),
+                (StatusCode::BAD_REQUEST, plain.clone()),
+                "{name}: {case}"
+            );
+            assert_eq!(run.settled().await, Vec::<String>::new(), "{name}: {case}");
+            assert_eq!(run.item_status(&wi).await, "claimed", "{name}: {case}");
+        }
+    }
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            linear_ir("wf-bad-cost-engine", &["m"], model(), caps.clone()),
+        )
+        .await;
+        let name = run.name;
+        run.scheduler.tick().await.expect("scheduler tick");
+        // The engine's own worker holds the step; its fence reaches the route.
+        let item = run
+            .backend
+            .claim_work_item(WORKER, &["model"])
+            .await
+            .unwrap()
+            .expect("the model step is ready");
+        let (st, answer) = support::post(
+            &run.state,
+            &format!("/work-items/{}/complete", item.id),
+            json!({ "output": {}, "state_patch": {}, "lease_fence": item.lease_fence, "cost_usd": -1.0 }),
+        )
+        .await;
+        assert_eq!(
+            (st, answer),
+            (StatusCode::BAD_REQUEST, plain.clone()),
+            "{name}"
+        );
+        assert_eq!(run.settled().await, Vec::<String>::new(), "{name}");
+        assert_eq!(run.tb.item_status(item.id).await, "claimed", "{name}");
+    }
+}
+
+/// A worker completes a step with `cost_usd: 0.4` and the answer is lost on
+/// the way back, so it sends the same completion again. The second one is
+/// 409 and the step counts once.
+///
+/// GUARD: passes before this change too; it pins that the fence, not the
+/// usage fold, refuses the repeat (on SQLite the repeat derives another
+/// idempotency key, so the fold's dedupe would not catch it).
+#[tokio::test]
+async fn a_completion_retried_after_a_lost_answer_counts_once() {
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            linear_ir(
+                "wf-lost-answer",
+                &["a", "b"],
+                python_fn(),
+                json!({ "cost_budget_usd": 1.0 }),
+            ),
+        )
+        .await;
+        let name = run.name;
+        let wi = run.claim_http().await;
+        let report = json!({ "cost_usd": 0.4, "input_tokens": 3, "output_tokens": 1 });
+        let (st, body) = run.complete_http(&wi, report.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{name}: {body}");
+        let (st, body) = run.complete_http(&wi, report).await;
+        assert_eq!(
+            (st, body),
+            (
+                StatusCode::CONFLICT,
+                json!({ "completed": false, "reason": "stale or invalid lease fence" })
+            ),
+            "{name}"
+        );
+        assert_eq!(run.completed().await, vec!["a"], "{name}");
+        let usage = fold_run_usage(run.backend.as_ref(), &run.eid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (usage.billable_steps, usage.cost_nanos, usage.input_tokens),
+            (1, 400_000_000, 3),
+            "{name}"
+        );
+    }
+}
+
+/// A model that waits for the test before it answers, so a second worker can
+/// reach the same step meanwhile. Each call reports 4 tokens and
+/// `cost_usd: 0.0123`.
+struct GatedModel {
+    calls: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl ModelAdapter for GatedModel {
+    fn system_name(&self) -> &'static str {
+        "fake"
+    }
+    fn default_model(&self) -> &str {
+        "fake-model"
+    }
+    async fn chat(&self, _req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(ModelResponse {
+            content: "ok".into(),
+            model: "fake-model".into(),
+            finish_reason: "stop".into(),
+            input_tokens: 4,
+            output_tokens: 0,
+            structured: None,
+            tool_calls: vec![],
+            cost_usd: Some(0.0123),
+        })
+    }
+    async fn structured_output(&self, _: StructuredRequest) -> Result<ModelResponse, ModelError> {
+        unimplemented!()
+    }
+}
+
+/// Tells the test when `owner` has found the step's reservation held twice:
+/// it then waits for the holder's result instead of calling the model.
+struct WaitsOnHolder {
+    owner: &'static str,
+    held: AtomicUsize,
+    waiting: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Hooks for WaitsOnHolder {
+    async fn after(&self, op: &Op<'_>) {
+        if let Op::ReserveToolEffect { owner, .. } = op {
+            if *owner == self.owner && self.held.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                self.waiting.notify_one();
+            }
+        }
+    }
+}
+
+/// Two items for one model step, as a crash window or a hand enqueue makes.
+/// The first worker calls the model, which costs $0.0123. The second derives
+/// the same idempotency key, finds it reserved, waits, and replays the
+/// recorded result instead of calling the model. The replayed completion
+/// must keep the cost it was recorded with, and the run's usage must count
+/// the step once: under a $0.02 cap, counting it twice would pass the cap.
+#[tokio::test]
+async fn a_replayed_result_keeps_its_cost_and_counts_once() {
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            linear_ir(
+                "wf-replay",
+                &["n1"],
+                model(),
+                json!({ "cost_budget_usd": 0.02 }),
+            ),
+        )
+        .await;
+        let name = run.name;
+        run.scheduler.tick().await.expect("scheduler tick");
+        let open = run.backend.open_work_items(&run.eid).await.unwrap();
+        assert_eq!(open.len(), 1, "{name}: {open:?}");
+        let first = run
+            .backend
+            .get_work_item(open[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        run.backend
+            .enqueue_work_item(WorkItem {
+                id: uuid::Uuid::new_v4(),
+                created_at: chrono::Utc::now(),
+                ..first
+            })
+            .await
+            .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let registry = Arc::new(
+            ModelRegistry::new()
+                .register(Arc::new(GatedModel {
+                    calls: calls.clone(),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                }))
+                .with_default("fake"),
+        );
+        let executor: Arc<dyn NodeExecutor> = Arc::new(ModelNodeExecutor::new(registry));
+        let hooks = Arc::new(WaitsOnHolder {
+            owner: "w2",
+            held: AtomicUsize::new(0),
+            waiting: Arc::new(tokio::sync::Notify::new()),
+        });
+        let first_worker = Worker::new("w1".into(), run.backend.clone(), vec!["model".into()])
+            .register_executor("model", executor.clone());
+        let second_worker = Worker::new(
+            "w2".into(),
+            Arc::new(Intercept::new(run.backend.clone(), hooks.clone())),
+            vec!["model".into()],
+        )
+        .register_executor("model", executor);
+
+        let (one, two) = tokio::join!(first_worker.poll_and_execute(), async {
+            entered.notified().await;
+            let (two, ()) = tokio::join!(second_worker.poll_and_execute(), async {
+                hooks.waiting.notified().await;
+                release.notify_one();
+            });
+            two
+        });
+        assert!(
+            matches!(one, Ok(true)) && matches!(two, Ok(true)),
+            "{name}: {one:?} {two:?}"
+        );
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "{name}: the replay called the model"
+        );
+        let recorded: Vec<(Option<String>, Option<f64>)> = run
+            .events()
+            .await
+            .into_iter()
+            .filter_map(|k| match k {
+                EventKind::NodeCompleted {
+                    idempotency_key,
+                    cost_usd,
+                    ..
+                } => Some((idempotency_key, cost_usd)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded.len(), 2, "{name}: {:?}", run.log().await);
+        assert!(recorded[0].0.is_some(), "{name}: {recorded:?}");
+        assert_eq!(
+            recorded[1], recorded[0],
+            "{name}: the replay must carry the key and the cost it was recorded with"
+        );
+        assert_eq!(recorded[0].1, Some(0.0123), "{name}");
+
+        let usage = fold_run_usage(run.backend.as_ref(), &run.eid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (usage.billable_steps, usage.cost_nanos, usage.input_tokens),
+            (1, 12_300_000, 4),
+            "{name}"
+        );
+        let cap = RunCaps {
+            token_budget: None,
+            cost_budget_usd: Some(0.02),
+        };
+        assert_eq!(caps::past_cap(&cap, &usage), None, "{name}");
     }
 }
