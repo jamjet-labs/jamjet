@@ -91,15 +91,57 @@ anyone; a release before that does not pause here.
 
 ---
 
-## Inspecting Paused Workflows
+## Inspecting Waiting Workflows
+
+A run waiting for an approval stays `running`. It does not read `paused`, so
+filtering by that status finds nothing. Use the approvals list below, or read
+`waiting_for` on the run.
 
 ```bash
-# List all paused workflows waiting for approval
-jamjet executions list --status paused
-
-# Inspect the state of a paused workflow
+# Inspect a run
 jamjet inspect exec_01abc
 ```
+
+### Every waiting approval, across runs
+
+`GET /approvals` lists the requests waiting for a decision on the live runs of
+your tenant, oldest first. Any role can read it, viewers included.
+
+```bash
+curl http://localhost:7700/approvals?limit=50 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Each row has `execution_id`, `workflow_id`, `workflow_version`, `node_id`, `tool_name`, `approver`, `context`,
+`request_sequence`, `action_digest` (the value to echo when you approve),
+`expires_at` and `escalate_at` (null when the request has no deadline). A full
+page carries `next_after`; send it back as `after` for the next page. `limit`
+defaults to 50 and is capped at 200. Only `status=pending` is accepted. Decided
+requests of one run are at `GET /executions/:id/approvals`.
+
+The list reads the approvals read model, which the projector updates once per
+tick (about half a second). A request raised in the last moment may not be
+listed yet, and one decided in the last moment may still be. The approve route
+reads the log and decides, so a stale row never approves anything it should not.
+From Python: `await client.list_pending_approvals(limit=50, after=cursor)`.
+
+### What a run is waiting for
+
+`GET /executions/:id` carries `waiting_for`. It is null once the run has ended,
+and one of four strings while it is live:
+
+| Value | The run waits for |
+|---|---|
+| `approval` | a reviewer's decision, with the deadline not yet passed |
+| `step` | a step a worker holds under a live lease |
+| `worker` | a worker to claim the next step |
+| `engine` | the engine: its own steps, or its next pass |
+
+`GET /executions?waiting_for=worker` lists running runs in that state. It reads
+one page of `limit` runs (`after` continues from `next_after`), so a page can be
+short or empty while `next_after` is set; keep going until it is absent.
+It combines with `status=running`, `limit` and `after`, not with `offset`. A caller that starts a
+worker on demand can poll for `worker`.
 
 ---
 
@@ -153,6 +195,14 @@ Rules the runtime enforces:
   fresh request. A state change that does not reach the payload is not a change
   to the action: a `tool` node, for example, is dispatched without the run's
   state. Engine bookkeeping (`__budget`) does not count as a change.
+- **Sending the same decision twice is safe.** If the same principal sends the
+  same decision (and the same comment) for a request that was already decided,
+  the answer is 200 with `repeat: true` and the first decision's `sequence`.
+  Nothing is recorded again. Name `node_id` when you retry: without it, a retry
+  while another request is pending is a 400, since it could be a decision on
+  that request. Outside dev mode an approval repeat still echoes the
+  `action_digest`; a missing one is a 400 and a different one a 409. A different
+  decision, another principal, or a request raised since is still a 409.
 - **Approval edits are not supported.** A decision carrying a `state_patch` is
   refused with 400. To change what runs, reject and re-run with different input.
 - **Separation of duties.** The token that started a run cannot approve it

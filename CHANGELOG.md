@@ -9,6 +9,26 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `GET /approvals` lists pending approvals across runs, oldest first, with the digest to echo
+  and the deadline. It reads the approvals read model, which can lag the log by one projector
+  tick; the approve route still decides.
+- `GET /executions/:id` says what the run is waiting for: `approval`, `step`, `worker`,
+  `engine`, or null once it has ended. `GET /executions?waiting_for=worker` lists by it.
+- The approve answer carries `repeat`, `sequence` and `waiting_for`.
+- Python: `client.list_pending_approvals(limit=None, after=None)`.
+
+### Changed
+
+- Sending the same decision twice answers 200 with the first decision's sequence and records
+  nothing. A different decision on a decided request is still 409. A decision on a decided
+  request by another principal now says it was already decided, not that nothing is pending.
+- The MCP tool text no longer says to filter by `paused` to find approvals. A run waiting for
+  one stays `running`.
+- Migration 0017 adds an index for the approvals list. A build from before it will not open
+  a store that has run it, so there is no rollback past this release.
+
 ### Security
 
 - **Engram: scope ids, categories and search text are bound parameters, not SQL text.**

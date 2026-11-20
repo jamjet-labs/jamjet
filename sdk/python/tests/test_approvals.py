@@ -11,7 +11,7 @@ import respx
 from typer.testing import CliRunner
 
 from jamjet.cli.main import app
-from jamjet.client import JamjetClient
+from jamjet.client import JamjetAPIError, JamjetClient
 
 runner = CliRunner()
 
@@ -644,3 +644,61 @@ def test_a_long_key_cannot_push_the_values_out_of_the_summary() -> None:
 
     assert result.exit_code == 0, result.output
     assert 'to="mallory"' in result.output
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_list_pending_approvals_sends_the_cursor() -> None:
+    """list_pending_approvals() sends limit and after, and returns the answer unchanged."""
+    route = respx.get(f"{BASE}/approvals").respond(
+        200,
+        json={"approvals": [{"execution_id": "exec-1", "node_id": "pay"}], "next_after": "ab12"},
+    )
+
+    async with JamjetClient(base_url=BASE) as c:
+        page = await c.list_pending_approvals(limit=25, after="ab12")
+        await c.list_pending_approvals()
+
+    first = route.calls[0].request.url.params
+    assert first["limit"] == "25"
+    assert first["after"] == "ab12"
+    plain = route.calls[1].request.url.params
+    assert "limit" not in plain
+    assert "after" not in plain
+    assert page["next_after"] == "ab12"
+    assert page["approvals"][0]["node_id"] == "pay"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_list_pending_approvals_refuses_an_engine_without_the_list() -> None:
+    """An older engine answers GET /approvals with its web page; say so instead of returning it."""
+    respx.get(f"{BASE}/approvals").respond(200, text="<!DOCTYPE html><html></html>")
+
+    async with JamjetClient(base_url=BASE) as c:
+        with pytest.raises(JamjetAPIError, match="upgrade"):
+            await c.list_pending_approvals()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_approve_returns_the_repeat_fields_unchanged() -> None:
+    """approve() hands back repeat, sequence and waiting_for as the engine sent them."""
+    respx.post(f"{BASE}/executions/exec-1/approve").respond(
+        200,
+        json={
+            "execution_id": "exec-1",
+            "node_id": "pay",
+            "accepted": True,
+            "repeat": True,
+            "sequence": 7,
+            "waiting_for": "engine",
+        },
+    )
+
+    async with JamjetClient(base_url=BASE) as c:
+        result = await c.approve("exec-1", "approved", node_id="pay")
+
+    assert result["repeat"] is True
+    assert result["sequence"] == 7
+    assert result["waiting_for"] == "engine"

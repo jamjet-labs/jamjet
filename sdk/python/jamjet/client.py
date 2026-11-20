@@ -273,6 +273,11 @@ class JamjetClient:
         ``user_id`` is the name to record as the approver. A dev-mode engine
         records it as given. With an API token the engine records the token's
         name and ignores it. It is sent only when set.
+
+        Returns the engine's answer unchanged: ``execution_id``, ``node_id``,
+        ``accepted``, ``repeat`` (true when the same decision was already
+        recorded; nothing is written again), ``sequence`` (the decision's place
+        in the log) and ``waiting_for`` (what the run waits for next, or null).
         """
         body: dict[str, Any] = {"decision": decision}
         if node_id:
@@ -298,6 +303,39 @@ class JamjetClient:
         r = await self._client.get(f"/executions/{execution_id}/approvals")
         _raise_for_status(r)
         return r.json()
+
+    async def list_pending_approvals(self, limit: int | None = None, after: str | None = None) -> dict[str, Any]:
+        """Pending approvals across runs, oldest first.
+
+        Returns ``{"approvals": [...], "next_after": ...}`` as served by
+        ``GET /approvals``. Each row carries the ``action_digest`` to echo in
+        :meth:`approve`. ``next_after`` is set when a page is full; pass it back
+        as ``after`` for the next page. The list reads the approvals read model,
+        which can lag the log by one projector tick; :meth:`approve` decides.
+
+        An engine from before this list answers ``GET /approvals`` with its web
+        page. That raises :class:`JamjetAPIError` asking for an upgrade.
+        """
+        params: dict[str, Any] = {}
+        if limit is not None:
+            params["limit"] = limit
+        if after is not None:
+            params["after"] = after
+        r = await self._client.get("/approvals", params=params)
+        _raise_for_status(r)
+        try:
+            body = r.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict) or not isinstance(body.get("approvals"), list):
+            detail = "this engine does not list approvals across runs; upgrade it"
+            raise JamjetAPIError(
+                f"GET /approvals: {detail}",
+                request=r.request,
+                response=r,
+                detail=detail,
+            )
+        return body
 
     async def send_external_event(
         self,

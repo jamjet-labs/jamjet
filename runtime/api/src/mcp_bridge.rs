@@ -159,8 +159,8 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
             name: "jamjet_list_executions".into(),
             description: Some(concat!(
                 "List workflow executions with optional status filtering and pagination. Read-only, no side effects. ",
-                "Use this to find executions that need attention — for example, filter by 'paused' to find executions awaiting approval via jamjet_approve, ",
-                "or filter by 'running' to monitor active workflows. ",
+                "Use this to find executions that need attention. For example, filter by 'running' to monitor active workflows. ",
+                "A run waiting for an approval stays 'running': no run reads 'paused' for one. To find approvals, read GET /approvals (pending approvals across runs, each with the action_digest jamjet_approve needs), or read waiting_for on jamjet_get_execution. ",
                 "Returns a JSON object with an 'executions' array, where each entry has the same fields as jamjet_get_execution. ",
                 "Results are ordered by creation time (newest first). Supports offset-based pagination via limit and offset parameters. ",
                 "All parameters are optional — calling with no arguments returns the 50 most recent executions across all statuses."
