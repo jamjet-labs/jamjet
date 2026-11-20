@@ -13,6 +13,7 @@
 //!
 //! A method that answers `not yet` is still to be written.
 
+mod runs;
 mod schema;
 mod settings;
 mod tx;
@@ -102,6 +103,11 @@ impl PgBackend {
     /// The pool, shared with every clone and tenant view.
     pub fn pool(&self) -> PgPool {
         self.pool.clone()
+    }
+
+    /// The tenant of this view, `None` for the unscoped store.
+    fn scope(&self) -> Option<&str> {
+        self.scope.as_ref().map(|t| t.as_str())
     }
 
     /// Revoke the API token with this id, returning what was revoked (its
@@ -200,152 +206,165 @@ fn not_yet<T>(method: &'static str) -> BackendResult<T> {
 
 #[async_trait]
 impl StateBackend for PgBackend {
-    async fn store_workflow(&self, _def: WorkflowDefinition) -> BackendResult<()> {
-        not_yet("store_workflow")
+    async fn store_workflow(&self, def: WorkflowDefinition) -> BackendResult<()> {
+        runs::store_workflow(self, def).await
     }
 
     async fn get_workflow(
         &self,
-        _workflow_id: &str,
-        _version: &str,
+        workflow_id: &str,
+        version: &str,
     ) -> BackendResult<Option<WorkflowDefinition>> {
-        not_yet("get_workflow")
+        runs::get_workflow(self, workflow_id, version).await
     }
 
-    async fn create_execution(&self, _execution: WorkflowExecution) -> BackendResult<()> {
-        not_yet("create_execution")
+    async fn create_execution(&self, execution: WorkflowExecution) -> BackendResult<()> {
+        runs::create_execution(self, execution).await
     }
 
-    async fn get_execution(&self, _id: &ExecutionId) -> BackendResult<Option<WorkflowExecution>> {
-        not_yet("get_execution")
+    async fn get_execution(&self, id: &ExecutionId) -> BackendResult<Option<WorkflowExecution>> {
+        runs::get_execution(self, id).await
     }
 
-    async fn execution_tenant(&self, _id: &ExecutionId) -> BackendResult<Option<TenantId>> {
-        not_yet("execution_tenant")
+    async fn execution_tenant(&self, id: &ExecutionId) -> BackendResult<Option<TenantId>> {
+        runs::execution_tenant(self, id).await
     }
 
     async fn update_execution_status(
         &self,
-        _id: &ExecutionId,
-        _status: WorkflowStatus,
+        id: &ExecutionId,
+        status: WorkflowStatus,
     ) -> BackendResult<()> {
-        not_yet("update_execution_status")
+        runs::update_execution_status(self, id, status).await
     }
 
     async fn finish_execution(
         &self,
-        _event: Event,
-        _status: WorkflowStatus,
+        event: Event,
+        status: WorkflowStatus,
     ) -> BackendResult<ExecutionFinish> {
-        not_yet("finish_execution")
+        runs::finish_execution(self, event, status).await
     }
 
     async fn append_event_if(
         &self,
-        _event: Event,
-        _condition: &crate::backend::EventCondition,
+        event: Event,
+        condition: &crate::backend::EventCondition,
     ) -> BackendResult<ConditionalAppend> {
-        not_yet("append_event_if")
+        runs::append_event_if(self, event, condition).await
     }
 
     async fn update_execution_current_state(
         &self,
-        _id: &ExecutionId,
-        _current_state: &serde_json::Value,
+        id: &ExecutionId,
+        current_state: &serde_json::Value,
     ) -> BackendResult<()> {
-        not_yet("update_execution_current_state")
+        runs::update_execution_current_state(self, id, current_state).await
     }
 
     async fn patch_append_array(
         &self,
-        _execution_id: &ExecutionId,
-        _key: &str,
-        _value: serde_json::Value,
+        execution_id: &ExecutionId,
+        key: &str,
+        value: serde_json::Value,
     ) -> BackendResult<()> {
-        not_yet("patch_append_array")
+        runs::patch_append_array(self, execution_id, key, value).await
     }
 
     async fn list_executions(
         &self,
-        _status: Option<WorkflowStatus>,
-        _limit: u32,
-        _offset: u32,
+        status: Option<WorkflowStatus>,
+        limit: u32,
+        offset: u32,
     ) -> BackendResult<Vec<WorkflowExecution>> {
-        not_yet("list_executions")
+        runs::list_executions(self, status, limit, offset).await
     }
 
     async fn list_running_executions_after(
         &self,
-        _after: Option<&str>,
-        _limit: u32,
+        after: Option<&str>,
+        limit: u32,
     ) -> BackendResult<RunningPage> {
-        not_yet("list_running_executions_after")
+        runs::list_running_executions_after(self, after, limit).await
     }
 
-    async fn append_event(&self, _event: Event) -> BackendResult<EventSequence> {
-        not_yet("append_event")
+    async fn append_event(&self, event: Event) -> BackendResult<EventSequence> {
+        runs::append_event(self, event).await
     }
 
-    async fn get_events(&self, _execution_id: &ExecutionId) -> BackendResult<Vec<Event>> {
-        not_yet("get_events")
+    async fn get_events(&self, execution_id: &ExecutionId) -> BackendResult<Vec<Event>> {
+        runs::get_events(self, execution_id).await
     }
 
     async fn get_events_since(
         &self,
-        _execution_id: &ExecutionId,
-        _since_sequence: EventSequence,
+        execution_id: &ExecutionId,
+        since_sequence: EventSequence,
     ) -> BackendResult<Vec<Event>> {
-        not_yet("get_events_since")
+        runs::get_events_since(self, execution_id, since_sequence).await
     }
 
     async fn get_events_page(
         &self,
-        _execution_id: &ExecutionId,
-        _after: EventSequence,
-        _limit: u32,
-        _max_bytes: usize,
+        execution_id: &ExecutionId,
+        after: EventSequence,
+        limit: u32,
+        max_bytes: usize,
     ) -> BackendResult<Vec<Event>> {
-        not_yet("get_events_page")
+        runs::get_events_page(self, execution_id, after, limit, max_bytes).await
     }
 
-    async fn latest_sequence(&self, _execution_id: &ExecutionId) -> BackendResult<EventSequence> {
-        not_yet("latest_sequence")
+    async fn latest_sequence(&self, execution_id: &ExecutionId) -> BackendResult<EventSequence> {
+        runs::latest_sequence(self, execution_id).await
     }
 
-    async fn list_claimed_work_items(&self, _limit: u32) -> BackendResult<Vec<ClaimedWorkItem>> {
-        not_yet("list_claimed_work_items")
+    async fn list_claimed_work_items(&self, limit: u32) -> BackendResult<Vec<ClaimedWorkItem>> {
+        runs::list_claimed_work_items(self, limit).await
     }
 
-    async fn write_snapshot(&self, _snapshot: Snapshot) -> BackendResult<()> {
-        not_yet("write_snapshot")
+    async fn write_snapshot(&self, snapshot: Snapshot) -> BackendResult<()> {
+        runs::write_snapshot(self, snapshot).await
     }
 
-    async fn latest_snapshot(
-        &self,
-        _execution_id: &ExecutionId,
-    ) -> BackendResult<Option<Snapshot>> {
-        not_yet("latest_snapshot")
+    async fn latest_snapshot(&self, execution_id: &ExecutionId) -> BackendResult<Option<Snapshot>> {
+        runs::latest_snapshot(self, execution_id).await
     }
 
     async fn create_segment_atomic(
         &self,
-        _execution: WorkflowExecution,
-        _seed_snapshot: Snapshot,
-        _started_event: EventKind,
-        _scheduled_event: EventKind,
-        _work_item: WorkItem,
+        execution: WorkflowExecution,
+        seed_snapshot: Snapshot,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
     ) -> BackendResult<()> {
-        not_yet("create_segment_atomic")
+        runs::create_run(
+            self,
+            execution,
+            Some(seed_snapshot),
+            started_event,
+            scheduled_event,
+            work_item,
+        )
+        .await
     }
 
     async fn start_execution_atomic(
         &self,
-        _execution: WorkflowExecution,
-        _started_event: EventKind,
-        _scheduled_event: EventKind,
-        _work_item: WorkItem,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
     ) -> BackendResult<()> {
-        not_yet("start_execution_atomic")
+        runs::create_run(
+            self,
+            execution,
+            None,
+            started_event,
+            scheduled_event,
+            work_item,
+        )
+        .await
     }
 
     async fn get_tool_effect(&self, _key: &str) -> BackendResult<Option<serde_json::Value>> {
@@ -485,10 +504,10 @@ impl StateBackend for PgBackend {
 
     async fn count_node_completions(
         &self,
-        _execution_id: &ExecutionId,
-        _node_id: &str,
+        execution_id: &ExecutionId,
+        node_id: &str,
     ) -> BackendResult<u64> {
-        not_yet("count_node_completions")
+        runs::count_node_completions(self, execution_id, node_id).await
     }
 
     async fn get_work_item(&self, _item_id: WorkItemId) -> BackendResult<Option<WorkItem>> {
@@ -670,8 +689,8 @@ impl StateBackend for PgBackend {
         not_yet("update_tenant")
     }
 
-    async fn commit_scheduler_pass(&self, _pass: SchedulerPass) -> BackendResult<PassCommit> {
-        not_yet("commit_scheduler_pass")
+    async fn commit_scheduler_pass(&self, pass: SchedulerPass) -> BackendResult<PassCommit> {
+        runs::commit_scheduler_pass(self, pass).await
     }
 
     async fn reclaim_expired_leases_recorded(&self) -> BackendResult<ReclaimResult> {

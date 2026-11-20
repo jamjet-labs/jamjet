@@ -150,6 +150,32 @@ pub const POINTS: &[(&str, u32)] = &[
     ("sqlite_scoped.apply_approval_projection", 2),
     ("sqlite_scoped.apply_approval_projection_batch", 1),
     ("sqlite_scoped.apply_approval_projection_batch", 2),
+    // postgres/runs.rs: one body serves the unscoped and the scoped store.
+    ("pg.append_event", 1),
+    ("pg.append_event", 2),
+    ("pg.create_run", 1),
+    ("pg.create_run", 2),
+    ("pg.create_run", 3),
+    ("pg.create_run", 4),
+    ("pg.finish_execution", 1),
+    ("pg.finish_execution", 2),
+    ("pg.finish_execution", 3),
+    ("pg.append_event_if", 1),
+    ("pg.append_event_if", 2),
+    ("pg.append_event_if", 3),
+    ("pg.commit_scheduler_pass", 1),
+    ("pg.commit_scheduler_pass", 2),
+    ("pg.commit_scheduler_pass", 3),
+    ("pg.commit_scheduler_pass", 4),
+    ("pg.commit_scheduler_pass", 5),
+    ("pg.commit_scheduler_pass", 6),
+    ("pg.commit_scheduler_pass", 7),
+    ("pg.commit_scheduler_pass", 8),
+    ("pg.patch_append_array", 1),
+    ("pg.patch_append_array", 2),
+    // postgres/tx.rs: a seam, the start of each attempt of a transaction,
+    // before its `BEGIN`.
+    ("pg_tx.attempt", 1),
 ];
 
 /// A fault point: the boundary after statement `$step` of the transaction

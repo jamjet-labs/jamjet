@@ -15,7 +15,13 @@
 //! | anything else, and every error the closure returns itself | no | `Database`, or the closure's error |
 //!
 //! A retry runs the closure again from `BEGIN`, so a closure must have no
-//! effect outside its transaction.
+//! effect outside its transaction. A closure returns every statement's error
+//! with `?`: Postgres answers the `COMMIT` of a transaction whose statement
+//! failed with a rollback and no error, so a swallowed error would look like
+//! a write that landed.
+//!
+//! Each attempt starts at the fault point `pg_tx.attempt#1`, where a test
+//! counts the attempts a call made.
 
 use crate::backend::{BackendResult, StateBackendError};
 use rand::RngExt as _;
@@ -111,6 +117,15 @@ pub(crate) fn classify(e: &sqlx::Error, at_commit: bool) -> Retry {
     }
 }
 
+/// The answer to a statement's error outside any transaction, as a read
+/// runs: what [`classify`] says, and `Unavailable` where it would retry.
+pub(crate) fn statement_error(e: sqlx::Error) -> StateBackendError {
+    match classify(&e, false) {
+        Retry::Never(answer) => answer,
+        Retry::Again { .. } => StateBackendError::Unavailable(e.to_string()),
+    }
+}
+
 /// Refuse `v` if it holds a NUL, which Postgres text cannot store. `what`
 /// names the value in the log line.
 pub(crate) fn no_nul(what: &str, v: &str) -> BackendResult<()> {
@@ -133,6 +148,7 @@ where
     let mut attempt = 0u32;
     loop {
         attempt += 1;
+        attempt_starts().await?;
         let failed = match pool.begin().await {
             Err(e) => e,
             Ok(tx) => {
@@ -170,6 +186,13 @@ where
             retry => return Err(answer(retry, &failed, attempt)),
         }
     }
+}
+
+/// The seam at the start of each attempt of a transaction, before `BEGIN`.
+/// Not a point inside a transaction: nothing has run when it fires.
+async fn attempt_starts() -> BackendResult<()> {
+    fault_point!("pg_tx.attempt", 1);
+    Ok(())
 }
 
 /// The error to answer with when no attempt is left.
