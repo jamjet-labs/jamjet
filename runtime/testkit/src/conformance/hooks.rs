@@ -12,6 +12,20 @@ use sqlx::sqlite::{Sqlite, SqliteArguments};
 use sqlx::Row;
 use std::sync::Arc;
 
+/// A JSON value the store keeps as text, named by the row that holds it.
+#[derive(Debug, Clone)]
+pub enum StoredJson {
+    /// The kind of the run's event at `sequence`.
+    Event {
+        execution: ExecutionId,
+        sequence: i64,
+    },
+    /// The work item's payload.
+    ItemPayload(WorkItemId),
+    /// The run's input.
+    RunInput(ExecutionId),
+}
+
 /// A work item as the store keeps it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemRow {
@@ -72,6 +86,9 @@ pub trait StoreHooks: Send + Sync {
     /// Damage the run's row so it no longer reads back. `false` where the
     /// store cannot hold such a row (memory).
     async fn make_execution_unreadable(&self, execution: &ExecutionId) -> bool;
+    /// The JSON text the store holds for `what`, exactly as stored. `None`
+    /// where the store keeps parsed values (memory); a missing row panics.
+    async fn stored_json(&self, what: StoredJson) -> Option<String>;
 }
 
 /// Hooks on an [`InMemoryBackend`].
@@ -193,6 +210,10 @@ impl StoreHooks for MemoryHooks {
 
     async fn make_execution_unreadable(&self, _execution: &ExecutionId) -> bool {
         false
+    }
+
+    async fn stored_json(&self, _what: StoredJson) -> Option<String> {
+        None
     }
 }
 
@@ -380,6 +401,40 @@ impl StoreHooks for SqliteHooks {
         self.update_one(&format!("damage run {execution}"), query)
             .await;
         true
+    }
+
+    async fn stored_json(&self, what: StoredJson) -> Option<String> {
+        let pool = self.base.pool();
+        let text: Option<String> = match &what {
+            StoredJson::Event {
+                execution,
+                sequence,
+            } => {
+                sqlx::query_scalar(
+                    "SELECT kind_json FROM events WHERE execution_id = ? AND sequence = ?",
+                )
+                .bind(execution.0.to_string())
+                .bind(sequence)
+                .fetch_optional(&pool)
+                .await
+            }
+            StoredJson::ItemPayload(item) => {
+                sqlx::query_scalar("SELECT payload_json FROM work_items WHERE id = ?")
+                    .bind(item.to_string())
+                    .fetch_optional(&pool)
+                    .await
+            }
+            StoredJson::RunInput(execution) => {
+                sqlx::query_scalar(
+                    "SELECT initial_input FROM workflow_executions WHERE execution_id = ?",
+                )
+                .bind(execution.0.to_string())
+                .fetch_optional(&pool)
+                .await
+            }
+        }
+        .unwrap_or_else(|e| panic!("read {what:?}: {e}"));
+        Some(text.unwrap_or_else(|| panic!("no row for {what:?}")))
     }
 }
 

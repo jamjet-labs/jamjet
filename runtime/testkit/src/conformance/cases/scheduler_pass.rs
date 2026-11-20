@@ -4,7 +4,7 @@
 //! claimed item, or when the run is over; a pass that does not hold together
 //! is an error. Two passes built from the same read commit once.
 
-use crate::conformance::cases::support::{in_tenant, tenant_view, without_tenant_views};
+use crate::conformance::cases::support::{in_tenant, race, tenant_view, without_tenant_views};
 use crate::conformance::Fixture;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::{
@@ -13,7 +13,6 @@ use jamjet_state::{
 };
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Instant;
 
 /// The backend under test. The scoped stores run in a tenant other than the
 /// default. A fixture is a fresh store and each case starts one run in it,
@@ -505,74 +504,6 @@ fn pair(fx: &Fixture) -> (String, Arc<dyn StateBackend>, Arc<dyn StateBackend>) 
         .clone()
         .expect("every factory here has a second handle");
     (format!("{:?}", fx.kind), fx.backend.clone(), second)
-}
-
-/// When a call started and when it returned.
-#[derive(Debug, Clone, Copy)]
-struct Span {
-    start: Instant,
-    end: Instant,
-}
-
-impl Span {
-    /// Both calls had started before either returned.
-    fn overlaps(self, other: Span) -> bool {
-        self.start.max(other.start) < self.end.min(other.end)
-    }
-}
-
-async fn timed<F: std::future::Future>(work: F) -> (F::Output, Span) {
-    let start = Instant::now();
-    let out = work.await;
-    let end = Instant::now();
-    (out, Span { start, end })
-}
-
-/// Run `a` and `b` at once, and say whether they overlapped: both started
-/// before either returned. Each runs on a thread of its own that spins until
-/// both are ready, so the two start within nanoseconds. Woken by a barrier
-/// instead, the second starts a wake-up later, by which time an in-memory
-/// write (no await between its checks and its writes) has finished, and the
-/// race never opens. Two calls run one after the other give the answers the
-/// race tests accept, so a round that did not overlap shows nothing; each
-/// race test asserts that some rounds did.
-async fn race<A, B>(a: A, b: B) -> (A::Output, B::Output, bool)
-where
-    A: std::future::Future + Send + 'static,
-    A::Output: Send + 'static,
-    B: std::future::Future + Send + 'static,
-    B::Output: Send + 'static,
-{
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    fn spin_then_run<F>(
-        work: F,
-        ready: Arc<AtomicUsize>,
-        go: Arc<AtomicBool>,
-    ) -> tokio::task::JoinHandle<(F::Output, Span)>
-    where
-        F: std::future::Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        let runtime = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            ready.fetch_add(1, Ordering::AcqRel);
-            while !go.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-            }
-            runtime.block_on(timed(work))
-        })
-    }
-    let ready = Arc::new(AtomicUsize::new(0));
-    let go = Arc::new(AtomicBool::new(false));
-    let a = spin_then_run(a, ready.clone(), go.clone());
-    let b = spin_then_run(b, ready.clone(), go.clone());
-    while ready.load(Ordering::Acquire) < 2 {
-        tokio::task::yield_now().await;
-    }
-    go.store(true, Ordering::Release);
-    let (x, a_span) = a.await.unwrap();
-    let (y, b_span) = b.await.unwrap();
-    (x, y, a_span.overlaps(b_span))
 }
 
 /// Two schedulers that read the same log build the same pass. Released at

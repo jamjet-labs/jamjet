@@ -850,21 +850,7 @@ impl StateBackend for SqliteBackend {
         key: &str,
         value: serde_json::Value,
     ) -> BackendResult<()> {
-        let exec = self
-            .get_execution(execution_id)
-            .await?
-            .ok_or_else(|| StateBackendError::NotFound(format!("execution {execution_id}")))?;
-        let mut state = exec.current_state.clone();
-        let arr = state
-            .as_object_mut()
-            .ok_or_else(|| StateBackendError::Database("state is not a JSON object".into()))?
-            .entry(key)
-            .or_insert_with(|| serde_json::json!([]));
-        arr.as_array_mut()
-            .ok_or_else(|| StateBackendError::Database(format!("{key} is not an array")))?
-            .push(value);
-        self.update_execution_current_state(execution_id, &state)
-            .await
+        patch_append_array_in(&self.pool, None, execution_id, key, value).await
     }
 
     #[instrument(skip(self))]
@@ -4073,6 +4059,66 @@ async fn insert_dead_letter_in_tx(
     .execute(&mut **tx)
     .await
     .map_err(map_db_err)?;
+    Ok(())
+}
+
+/// [`StateBackend::patch_append_array`] for both SQLite backends: the read
+/// of the run's state, the append and the write back in one `BEGIN
+/// IMMEDIATE` transaction. Done as a read and a separate write, two appends
+/// that read the same state each wrote back only their own value, and one
+/// was lost. `tenant_id` scopes the run on the tenant-scoped backend.
+pub(crate) async fn patch_append_array_in(
+    pool: &SqlitePool,
+    tenant_id: Option<&str>,
+    execution_id: &ExecutionId,
+    key: &str,
+    value: serde_json::Value,
+) -> BackendResult<()> {
+    let id_str = execution_id_str(execution_id);
+    let tenant_clause = if tenant_id.is_some() {
+        " AND tenant_id = ?"
+    } else {
+        ""
+    };
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(map_db_err)?;
+
+    let select = format!("SELECT * FROM workflow_executions WHERE execution_id = ?{tenant_clause}");
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(select)).bind(&id_str);
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    let Some(row) = q.fetch_optional(&mut *tx).await.map_err(map_db_err)? else {
+        tx.rollback().await.map_err(map_db_err)?;
+        return Err(StateBackendError::NotFound(format!(
+            "execution {execution_id}"
+        )));
+    };
+    let mut state = row_to_execution(&row)?.current_state;
+    let arr = state
+        .as_object_mut()
+        .ok_or_else(|| StateBackendError::Database("state is not a JSON object".into()))?
+        .entry(key)
+        .or_insert_with(|| serde_json::json!([]));
+    arr.as_array_mut()
+        .ok_or_else(|| StateBackendError::Database(format!("{key} is not an array")))?
+        .push(value);
+
+    let update = format!(
+        "UPDATE workflow_executions SET current_state = ?, updated_at = ? \
+         WHERE execution_id = ?{tenant_clause}"
+    );
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(update))
+        .bind(serde_json::to_string(&state)?)
+        .bind(Utc::now().to_rfc3339())
+        .bind(&id_str);
+    if let Some(t) = tenant_id {
+        q = q.bind(t);
+    }
+    q.execute(&mut *tx).await.map_err(map_db_err)?;
+    tx.commit().await.map_err(map_db_err)?;
     Ok(())
 }
 

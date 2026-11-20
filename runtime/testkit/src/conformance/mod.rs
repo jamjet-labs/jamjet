@@ -20,7 +20,7 @@ mod factories;
 mod hooks;
 
 pub use factories::{MemoryFactory, SqliteFactory, SqliteScopedFactory};
-pub use hooks::{ItemRow, StoreHooks};
+pub use hooks::{ItemRow, StoreHooks, StoredJson};
 
 use async_trait::async_trait;
 use jamjet_state::{StateBackend, TenantId};
@@ -380,19 +380,66 @@ macro_rules! for_each_case {
                 a_token_carries_the_tenant_on_its_row,
             ]
         );
+        $m!(
+            $factory,
+            concurrency,
+            [
+                two_handles_claim_one_item_once,
+                late_completion_after_reclaim_is_refused_by_fence,
+                late_heartbeat_after_another_claim_cannot_reattach,
+                two_finishes_record_one_terminal_event,
+                decision_and_expiry_of_one_request_land_once,
+                concurrent_appends_keep_sequences_dense,
+                concurrent_array_appends_keep_every_value,
+                #[ignore = "fixed in piece 9"]
+                a_stale_projection_batch_never_regresses,
+            ]
+        );
+        $m!(
+            $factory,
+            payloads,
+            [
+                nul_in_json_round_trips_byte_equal,
+                event_json_reads_back_byte_equal,
+                a_16_mib_event_round_trips,
+                #[ignore = "finding: SQLite page budget counts characters"]
+                events_page_keeps_its_byte_budget_with_multibyte_text,
+            ]
+        );
+        $m!(
+            $factory,
+            terminal,
+            [
+                plain_append_on_a_finished_run_changes_nothing,
+                commit_turn_on_a_finished_run_withdraws,
+            ]
+        );
+        $m!(
+            $factory,
+            tenancy,
+            [
+                scoped_claim_never_takes_another_tenants_item,
+                scoped_claim_for_execution_of_another_tenant_is_nothing,
+                scoped_fast_reclaim_touches_its_own_tenant_only,
+                scoped_append_to_another_tenants_run_is_not_found,
+                scoped_reads_of_another_tenants_rows_are_empty,
+            ]
+        );
     };
 }
 
-/// One module of tests, one per case, each on a fresh fixture.
+/// One module of tests, one per case, each on a fresh fixture. Attributes
+/// written before a case in the list (`#[ignore = "..."]`) go on its test.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __conformance_module {
-    ($factory:expr, $module:ident, [$($case:ident),* $(,)?]) => {
+    ($factory:expr, $module:ident, [$($(#[$meta:meta])* $case:ident),* $(,)?]) => {
         mod $module {
             #[allow(unused_imports)]
             use super::*;
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+                $(#[$meta])*
                 async fn $case() {
                     let Some(fx) = $crate::conformance::StoreFactory::fresh(&$factory).await else {
                         return $crate::skip(stringify!($case));

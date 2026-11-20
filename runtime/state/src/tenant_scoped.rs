@@ -716,21 +716,14 @@ impl StateBackend for TenantScopedSqliteBackend {
         key: &str,
         value: serde_json::Value,
     ) -> BackendResult<()> {
-        let exec = self
-            .get_execution(execution_id)
-            .await?
-            .ok_or_else(|| StateBackendError::NotFound(format!("execution {execution_id}")))?;
-        let mut state = exec.current_state.clone();
-        let arr = state
-            .as_object_mut()
-            .ok_or_else(|| StateBackendError::Database("state is not a JSON object".into()))?
-            .entry(key)
-            .or_insert_with(|| serde_json::json!([]));
-        arr.as_array_mut()
-            .ok_or_else(|| StateBackendError::Database(format!("{key} is not an array")))?
-            .push(value);
-        self.update_execution_current_state(execution_id, &state)
-            .await
+        crate::sqlite::patch_append_array_in(
+            &self.pool,
+            Some(&self.tenant_id.0),
+            execution_id,
+            key,
+            value,
+        )
+        .await
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id))]
