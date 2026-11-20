@@ -15,8 +15,8 @@ use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::faults::{Fault, Scope};
 use jamjet_state::{
     ClaimFilter, Event, EventKind, ExecutionClaim, FailOutcome, GateMark, LeasedItem, PassCommit,
-    PgBackend, PgSettings, SchedulerPass, StateBackend, StateBackendError, TenantId, WorkItem,
-    WorkItemId, DEFAULT_TENANT,
+    PgBackend, PgSettings, SchedulerPass, StateBackend, StateBackendError, TenantId, TurnCommit,
+    WorkItem, WorkItemId, DEFAULT_TENANT,
 };
 use jamjet_testkit::conformance::{
     Fixture, PostgresFactory, PostgresScopedFactory, SqliteFactory, SqliteScopedFactory,
@@ -1042,6 +1042,8 @@ async fn a_call_waiting_for_its_run_holds_no_item_lock() {
     let b = Arc::new(store(&db, settings()).await);
     let pool = db.pool().await;
     for what in [
+        "commit_turn",
+        "commit_turn_unless_terminal",
         "fail_work_item_fenced",
         "fail_work_item_fenced_recorded",
         "finalize_rollover_fenced",
@@ -1061,7 +1063,16 @@ async fn a_call_waiting_for_its_run_holds_no_item_lock() {
         let call = tokio::spawn({
             let (b, run, id, fence) = (b.clone(), run.clone(), held.id, held.lease_fence);
             async move {
+                let done = Event::new(run.clone(), 0, completion("step"));
                 match what {
+                    "commit_turn" => b
+                        .commit_turn(id, fence, done, true)
+                        .await
+                        .map(|sequence| format!("{sequence}")),
+                    "commit_turn_unless_terminal" => b
+                        .commit_turn_unless_terminal(id, fence, done, true)
+                        .await
+                        .map(|commit| format!("{commit:?}")),
                     "fail_work_item_fenced" => {
                         b.fail_work_item_fenced(id, fence, "boom").await.map(|o| {
                             format!(
@@ -1110,6 +1121,8 @@ async fn a_call_waiting_for_its_run_holds_no_item_lock() {
             .unwrap()
             .unwrap_or_else(|e| panic!("{what}: {e}"));
         let expected = match what {
+            "commit_turn" => "1",
+            "commit_turn_unless_terminal" => "Committed(1)",
             "fail_work_item_fenced" | "fail_work_item_fenced_recorded" => "Some(true)",
             "finalize_rollover_fenced" => "true",
             "move_to_dead_letter" => "moved",
@@ -1181,8 +1194,8 @@ fn completion(node: &str) -> EventKind {
 }
 
 /// One task of the load: until `until`, a mix of scheduler passes, claims,
-/// heartbeats, settles, failures, lapsed leases, sweeps, fast reclaims and
-/// rollovers, on `b`, over `runs`.
+/// heartbeats, commits of a turn, failures, lapsed leases, sweeps, fast
+/// reclaims and rollovers, on `b`, over `runs`.
 async fn load_task(
     task: u64,
     b: Arc<PgBackend>,
@@ -1272,19 +1285,30 @@ async fn load_task(
                     Err(e) => unexpected(&tally, "heartbeat_lease", e),
                 }
             }
-            // A held item settled, and its completion recorded.
+            // A held item's turn committed: the settle, its completion and,
+            // every other time, the run's snapshot, in one write. Half the
+            // commits refuse a run that has ended.
             55..=69 if !held.is_empty() => {
                 let h = held.swap_remove(rng.below(held.len() as u64) as usize);
-                match b.complete_work_item_fenced(h.id, h.fence).await {
-                    Ok(true) => {
-                        let event = Event::new(h.run.clone(), 0, completion(&h.node));
-                        match b.append_event(event).await {
-                            Ok(_) => tally.lock().unwrap().count("settle"),
-                            Err(e) => unexpected(&tally, "append_event", e),
-                        }
+                let event = Event::new(h.run.clone(), 0, completion(&h.node));
+                let snapshot = rng.below(2) == 0;
+                let commit = if rng.below(2) == 0 {
+                    b.commit_turn_unless_terminal(h.id, h.fence, event, snapshot)
+                        .await
+                } else {
+                    b.commit_turn(h.id, h.fence, event, snapshot)
+                        .await
+                        .map(TurnCommit::Committed)
+                };
+                match commit {
+                    Ok(TurnCommit::Committed(_)) => tally.lock().unwrap().count("settle"),
+                    Ok(TurnCommit::ExecutionTerminal(_)) => {
+                        tally.lock().unwrap().count("settle on an ended run")
                     }
-                    Ok(false) => tally.lock().unwrap().count("settle refused"),
-                    Err(e) => unexpected(&tally, "complete_work_item_fenced", e),
+                    Err(StateBackendError::FenceLost(_)) => {
+                        tally.lock().unwrap().count("settle refused")
+                    }
+                    Err(e) => unexpected(&tally, "commit_turn", e),
                 }
             }
             // A held item failed, with its events.
@@ -1412,8 +1436,8 @@ async fn violations(pool: &PgPool) -> Vec<String> {
     found
 }
 
-/// 10 s of 8 tasks on two engines mixing claims, heartbeats, settles,
-/// failures, lapsed leases, fast reclaims, sweeps, scheduler passes and
+/// 10 s of 8 tasks on two engines mixing claims, heartbeats, commits of a
+/// turn, failures, lapsed leases, fast reclaims, sweeps, scheduler passes and
 /// rollovers on 20 runs: no call answers an error it should not, under 1
 /// percent of the transactions' attempts are retries, and what must hold
 /// of the store holds.

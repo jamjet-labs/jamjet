@@ -79,6 +79,9 @@ CREATE TABLE tool_reservations (tenant_id text NOT NULL DEFAULT 'default', idemp
 CREATE TABLE proj_approvals (execution_id uuid NOT NULL, node_id text NOT NULL, status text NOT NULL, user_id text,
   comment text, last_sequence bigint NOT NULL, tool_name text, approver text, context_json text,
   tenant_id text NOT NULL DEFAULT 'default', updated_at timestamptz NOT NULL, PRIMARY KEY (execution_id, node_id));
+-- The pending list's order, with node ids compared bytewise as SQLite does.
+CREATE INDEX proj_approvals_pending ON proj_approvals (updated_at, execution_id, node_id COLLATE "C")
+  WHERE status = 'pending';
 
 CREATE TABLE projector_checkpoints (projection_name text NOT NULL, execution_id uuid NOT NULL,
   last_sequence bigint NOT NULL, tenant_id text NOT NULL DEFAULT 'default', updated_at timestamptz NOT NULL,

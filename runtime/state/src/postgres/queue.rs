@@ -169,7 +169,7 @@ async fn lock_claimed(
 // and has checked its state, and `tenant` is the item's own.
 
 /// Settle the item of a run that has ended: failed, nothing recorded.
-async fn settle_failed(
+pub(super) async fn settle_failed(
     conn: &mut PgConnection,
     item: WorkItemId,
     tenant: &str,

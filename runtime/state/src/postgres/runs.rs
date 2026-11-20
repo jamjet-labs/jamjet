@@ -469,7 +469,7 @@ pub(super) async fn get_workflow(
 // ── Runs ─────────────────────────────────────────────────────────────────────
 
 /// The tenant a new row of this view takes: the view's, or the default.
-fn new_row_tenant(b: &PgBackend) -> &str {
+pub(super) fn new_row_tenant(b: &PgBackend) -> &str {
     b.scope().unwrap_or(DEFAULT_TENANT)
 }
 
@@ -1046,12 +1046,16 @@ pub(super) async fn latest_snapshot(
         .fetch_optional(&b.pool)
         .await
         .map_err(statement_error)?;
-    let Some(row) = row else { return Ok(None) };
+    row.map(|r| row_to_snapshot(&r)).transpose()
+}
+
+/// A snapshot's row.
+pub(super) fn row_to_snapshot(row: &PgRow) -> BackendResult<Snapshot> {
     let state: String = row.try_get("state_json").map_err(decode)?;
     let completed: String = row.try_get("completed_nodes_json").map_err(decode)?;
     let active: String = row.try_get("active_nodes_json").map_err(decode)?;
     let status: String = row.try_get("status").map_err(decode)?;
-    Ok(Some(Snapshot {
+    Ok(Snapshot {
         id: row.try_get("id").map_err(decode)?,
         execution_id: ExecutionId(row.try_get("execution_id").map_err(decode)?),
         at_sequence: row.try_get("at_sequence").map_err(decode)?,
@@ -1062,7 +1066,7 @@ pub(super) async fn latest_snapshot(
         active_nodes: serde_json::from_str(&active)?,
         last_sequence: row.try_get("last_sequence").map_err(decode)?,
         created_at: row.try_get("created_at").map_err(decode)?,
-    }))
+    })
 }
 
 // ── Starting a run ───────────────────────────────────────────────────────────

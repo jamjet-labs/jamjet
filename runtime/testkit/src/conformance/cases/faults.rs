@@ -69,7 +69,9 @@ fn stores_of(label: &str) -> Option<&'static [StoreKind]> {
         | "pg.fail_work_item_fenced"
         | "pg.fail_work_item_fenced_recorded"
         | "pg.finalize_rollover_fenced"
-        | "pg.reclaim_expired_leases_recorded" => POSTGRES,
+        | "pg.reclaim_expired_leases_recorded"
+        | "pg.commit_turn"
+        | "pg.apply_approval_projection" => POSTGRES,
         "sqlite.commit_turn"
         | "sqlite.append_event"
         | "sqlite.claim_work_item"

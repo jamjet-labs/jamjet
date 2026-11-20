@@ -10,13 +10,15 @@
 //! A [`PgBackend`] does not migrate its database: [`migrate`] does, once per
 //! deploy, and [`PgBackend::connect`] refuses a schema that is not the one
 //! this build knows.
-//!
-//! A method that answers `not yet` is still to be written.
 
+mod commit;
+mod effects;
+mod projection;
 mod queue;
 mod runs;
 mod schema;
 mod settings;
+mod tokens;
 mod tx;
 
 pub use schema::{migrate, schema_state, MigrateReport, SchemaState, MIGRATOR};
@@ -200,11 +202,6 @@ async fn set_session(
     Ok(())
 }
 
-/// The answer of a method this store does not have yet.
-fn not_yet<T>(method: &'static str) -> BackendResult<T> {
-    Err(StateBackendError::Database(format!("not yet: {method}")))
-}
-
 #[async_trait]
 impl StateBackend for PgBackend {
     async fn store_workflow(&self, def: WorkflowDefinition) -> BackendResult<()> {
@@ -368,45 +365,46 @@ impl StateBackend for PgBackend {
         .await
     }
 
-    async fn get_tool_effect(&self, _key: &str) -> BackendResult<Option<serde_json::Value>> {
-        not_yet("get_tool_effect")
+    async fn get_tool_effect(&self, key: &str) -> BackendResult<Option<serde_json::Value>> {
+        effects::get_tool_effect(self, key).await
     }
 
     async fn reserve_tool_effect(
         &self,
-        _key: &str,
-        _execution_id: &ExecutionId,
-        _node_id: &str,
-        _owner: &str,
-        _lease_fence: i64,
-        _ttl: std::time::Duration,
+        key: &str,
+        execution_id: &ExecutionId,
+        node_id: &str,
+        owner: &str,
+        lease_fence: i64,
+        ttl: std::time::Duration,
     ) -> BackendResult<ReserveOutcome> {
-        not_yet("reserve_tool_effect")
+        effects::reserve_tool_effect(self, key, execution_id, node_id, owner, lease_fence, ttl)
+            .await
     }
 
     async fn release_tool_reservation(
         &self,
-        _key: &str,
-        _owner: &str,
-        _lease_fence: i64,
+        key: &str,
+        owner: &str,
+        lease_fence: i64,
     ) -> BackendResult<()> {
-        not_yet("release_tool_reservation")
+        effects::release_tool_reservation(self, key, owner, lease_fence).await
     }
 
     async fn put_artifact(
         &self,
-        _bytes: &[u8],
-        _media_type: Option<&str>,
+        bytes: &[u8],
+        media_type: Option<&str>,
     ) -> BackendResult<ArtifactRef> {
-        not_yet("put_artifact")
+        effects::put_artifact(self, bytes, media_type).await
     }
 
-    async fn get_artifact(&self, _hash: &str) -> BackendResult<Option<Vec<u8>>> {
-        not_yet("get_artifact")
+    async fn get_artifact(&self, hash: &str) -> BackendResult<Option<Vec<u8>>> {
+        effects::get_artifact(self, hash).await
     }
 
-    async fn artifact_size(&self, _hash: &str) -> BackendResult<Option<u64>> {
-        not_yet("artifact_size")
+    async fn artifact_size(&self, hash: &str) -> BackendResult<Option<u64>> {
+        effects::artifact_size(self, hash).await
     }
 
     async fn enqueue_work_item(&self, item: WorkItem) -> BackendResult<WorkItemId> {
@@ -546,22 +544,45 @@ impl StateBackend for PgBackend {
 
     async fn commit_turn(
         &self,
-        _item_id: WorkItemId,
-        _lease_fence: i64,
-        _terminal_event: Event,
-        _write_snapshot: bool,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        terminal_event: Event,
+        write_snapshot: bool,
     ) -> BackendResult<EventSequence> {
-        not_yet("commit_turn")
+        let commit = commit::commit_turn(
+            self,
+            item_id,
+            lease_fence,
+            terminal_event,
+            write_snapshot,
+            false,
+        )
+        .await?;
+        match commit {
+            TurnCommit::Committed(sequence) => Ok(sequence),
+            // Not reached: the run's status is checked only when asked.
+            TurnCommit::ExecutionTerminal(status) => Err(StateBackendError::Database(format!(
+                "commit_turn refused for a {status:?} execution"
+            ))),
+        }
     }
 
     async fn commit_turn_unless_terminal(
         &self,
-        _item_id: WorkItemId,
-        _lease_fence: i64,
-        _terminal_event: Event,
-        _write_snapshot: bool,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        terminal_event: Event,
+        write_snapshot: bool,
     ) -> BackendResult<TurnCommit> {
-        not_yet("commit_turn_unless_terminal")
+        commit::commit_turn(
+            self,
+            item_id,
+            lease_fence,
+            terminal_event,
+            write_snapshot,
+            true,
+        )
+        .await
     }
 
     async fn withdraw_work_item_fenced(
@@ -613,63 +634,71 @@ impl StateBackend for PgBackend {
         queue::move_to_dead_letter(self, item_id, last_error).await
     }
 
-    async fn create_token(&self, _name: &str, _role: &str) -> BackendResult<(String, ApiToken)> {
-        not_yet("create_token")
+    async fn create_token(&self, name: &str, role: &str) -> BackendResult<(String, ApiToken)> {
+        tokens::create_token(self, name, role).await
     }
 
-    async fn validate_token(&self, _token: &str) -> BackendResult<Option<ApiToken>> {
-        not_yet("validate_token")
+    async fn validate_token(&self, token: &str) -> BackendResult<Option<ApiToken>> {
+        tokens::validate_token(self, token).await
     }
 
     async fn apply_approval_projection(
         &self,
-        _row: ApprovalProjectionRow,
-        _projection_name: &str,
-        _new_checkpoint: i64,
+        row: ApprovalProjectionRow,
+        projection_name: &str,
+        new_checkpoint: i64,
     ) -> BackendResult<()> {
-        not_yet("apply_approval_projection")
+        projection::apply_approval_projection(self, row, projection_name, new_checkpoint).await
     }
 
     async fn apply_approval_projection_batch(
         &self,
-        _rows: Vec<ApprovalProjectionRow>,
-        _projection_name: &str,
-        _execution_id: &ExecutionId,
-        _new_checkpoint: i64,
+        rows: Vec<ApprovalProjectionRow>,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+        new_checkpoint: i64,
     ) -> BackendResult<()> {
-        not_yet("apply_approval_projection_batch")
+        projection::apply_approval_projection_batch(
+            self,
+            rows,
+            projection_name,
+            execution_id,
+            new_checkpoint,
+        )
+        .await
     }
 
     async fn get_approval_projection(
         &self,
-        _execution_id: &ExecutionId,
+        execution_id: &ExecutionId,
     ) -> BackendResult<Vec<ApprovalProjectionRow>> {
-        not_yet("get_approval_projection")
+        projection::get_approval_projection(self, execution_id).await
     }
 
     async fn get_projector_checkpoint(
         &self,
-        _projection_name: &str,
-        _execution_id: &ExecutionId,
+        projection_name: &str,
+        execution_id: &ExecutionId,
     ) -> BackendResult<i64> {
-        not_yet("get_projector_checkpoint")
+        projection::get_projector_checkpoint(self, projection_name, execution_id).await
     }
 
     async fn set_projector_checkpoint(
         &self,
-        _projection_name: &str,
-        _execution_id: &ExecutionId,
-        _new_checkpoint: i64,
+        projection_name: &str,
+        execution_id: &ExecutionId,
+        new_checkpoint: i64,
     ) -> BackendResult<()> {
-        not_yet("set_projector_checkpoint")
+        projection::set_projector_checkpoint(self, projection_name, execution_id, new_checkpoint)
+            .await
     }
 
     async fn list_pending_approvals(
         &self,
-        _after: Option<&ApprovalCursor>,
-        _limit: u32,
+        after: Option<&ApprovalCursor>,
+        limit: u32,
     ) -> BackendResult<Vec<PendingApprovalRow>> {
-        not_yet("list_pending_approvals")
+        projection::list_pending_approvals(self, after, limit).await
     }
 
     async fn open_work_items(
@@ -679,20 +708,20 @@ impl StateBackend for PgBackend {
         queue::open_work_items(self, execution_id).await
     }
 
-    async fn create_tenant(&self, _tenant: Tenant) -> BackendResult<()> {
-        not_yet("create_tenant")
+    async fn create_tenant(&self, tenant: Tenant) -> BackendResult<()> {
+        tokens::create_tenant(self, tenant).await
     }
 
-    async fn get_tenant(&self, _id: &TenantId) -> BackendResult<Option<Tenant>> {
-        not_yet("get_tenant")
+    async fn get_tenant(&self, id: &TenantId) -> BackendResult<Option<Tenant>> {
+        tokens::get_tenant(self, id).await
     }
 
     async fn list_tenants(&self) -> BackendResult<Vec<Tenant>> {
-        not_yet("list_tenants")
+        tokens::list_tenants(self).await
     }
 
-    async fn update_tenant(&self, _tenant: Tenant) -> BackendResult<()> {
-        not_yet("update_tenant")
+    async fn update_tenant(&self, tenant: Tenant) -> BackendResult<()> {
+        tokens::update_tenant(self, tenant).await
     }
 
     async fn commit_scheduler_pass(&self, pass: SchedulerPass) -> BackendResult<PassCommit> {
