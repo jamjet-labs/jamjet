@@ -686,3 +686,16 @@ async def test_start_with_run_key_against_an_old_engine_raises() -> None:
         with pytest.raises(JamjetAPIError) as exc:
             await c.start_execution("w", {}, run_key="job:1")
     assert "this engine does not support run_key; upgrade it before relying on it" in str(exc.value)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_start_with_run_key_and_another_key_in_the_answer_raises() -> None:
+    from jamjet.client import JamjetAPIError
+
+    # The echo must be the key that was sent, not just any key.
+    respx.post(f"{BASE}/executions").respond(201, json={"execution_id": "exec_1", "run_key": "job:2"})
+    async with JamjetClient(base_url=BASE) as c:
+        with pytest.raises(JamjetAPIError) as exc:
+            await c.start_execution("w", {}, run_key="job:1")
+    assert "this engine does not support run_key; upgrade it before relying on it" in str(exc.value)
