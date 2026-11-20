@@ -147,12 +147,12 @@ jobs:
       - run: uv sync --all-extras
       - run: uv run ruff format --check .
       - run: uv run ruff check .
-      # mypy is scoped to jamjet.cloud and jamjet/transport.py (the
-      # actively-maintained surface, and the code that decides where
+      # mypy is scoped to jamjet.cloud, jamjet.auth and jamjet/transport.py
+      # (the actively-maintained surface, and the code that decides where
       # credentials go). Framework-level type issues in jamjet/llm/* and
       # similar legacy modules are tracked separately; treating them as CI
       # blockers would prevent any cloud-related PR from merging.
-      - run: uv run mypy jamjet/cloud jamjet/transport.py
+      - run: uv run mypy jamjet/cloud jamjet/auth jamjet/transport.py
 
   python-test:
     name: Python tests (${{ matrix.python-version }})

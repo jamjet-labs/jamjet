@@ -145,7 +145,8 @@ def origin_of(url: httpx.URL | str) -> Origin:
     return scheme, url.host.lower(), port
 
 
-def _show(origin: Origin) -> str:
+def show_origin(origin: Origin) -> str:
+    """An origin from ``origin_of`` written as a URL, such as ``https://engine.example:443``."""
     scheme, host, port = origin
     if ":" in host:
         host = f"[{host}]"
@@ -164,6 +165,15 @@ class EngineAuth(httpx.Auth):
     """
 
     def __init__(self, base_url: httpx.URL | str, *, token: str | None, auth: httpx.Auth | None) -> None:
+        if token and auth is not None:
+            # Imported here: that module imports this one.
+            from jamjet.auth.token_source import TokenSourceAuth
+
+            if isinstance(auth, TokenSourceAuth) and auth.header.lower() == "authorization":
+                raise ValueError(
+                    "Two credentials for the Authorization header. It carries the JamJet token, so the token "
+                    "source must use another header, such as X-Serverless-Authorization."
+                )
         self._origin = origin_of(base_url)
         self._authorization = f"Bearer {token}" if token else None
         self._auth = auth
@@ -178,8 +188,8 @@ class EngineAuth(httpx.Auth):
         origin = origin_of(request.url)
         if origin != self._origin:
             raise CredentialScopeError(
-                f"Refused to send a credential to {_show(origin)}. This client sends its credentials only to "
-                f"{_show(self._origin)}, the origin of its base URL. The request was not sent."
+                f"Refused to send a credential to {show_origin(origin)}. This client sends its credentials only to "
+                f"{show_origin(self._origin)}, the origin of its base URL. The request was not sent."
             )
 
     def _add_token(self, request: httpx.Request) -> None:
@@ -282,6 +292,26 @@ def _error_detail(response: httpx.Response, secrets: Iterable[str] = ()) -> str:
     return _clean_detail(_redact(text, secrets))
 
 
+def _status_line(response: httpx.Response, secrets: Iterable[str]) -> str:
+    request = response.request
+    return _redact(f"{response.status_code} {response.reason_phrase} for {request.method} {request.url}", secrets)
+
+
+def platform_auth_error(
+    response: httpx.Response, advice: str, *, credential_headers: Iterable[str] = ()
+) -> PlatformAuthError:
+    """A ``PlatformAuthError`` for ``response``: its status line, then
+    ``advice``, then what the answer said. Credentials are replaced as in
+    ``raise_for_status``."""
+    request = response.request
+    secrets = _credential_values(request, credential_headers)
+    detail = _error_detail(response, secrets)
+    message = f"{_status_line(response, secrets)}. {advice}"
+    if detail:
+        message = f"{message} The answer said: {detail}"
+    return PlatformAuthError(message, request=request, response=response, detail=detail)
+
+
 def raise_for_status(response: httpx.Response, *, credential_headers: Iterable[str] = ()) -> None:
     """``response.raise_for_status()``, but the raised error carries the
     server's message instead of only the status line.
@@ -294,20 +324,18 @@ def raise_for_status(response: httpx.Response, *, credential_headers: Iterable[s
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
+        if response.status_code in (401, 403) and not is_engine_error_body(response):
+            raise platform_auth_error(
+                response,
+                "The refusal came from something in front of the engine, not the engine: the answer has no "
+                "engine error body. Check that the client sends the identity the platform expects "
+                "(JamjetClient(auth=...)) and that this caller may call the service.",
+                credential_headers=credential_headers,
+            ) from exc
         request = response.request
         secrets = _credential_values(request, credential_headers)
         detail = _error_detail(response, secrets)
-        line = _redact(f"{response.status_code} {response.reason_phrase} for {request.method} {request.url}", secrets)
-        if response.status_code in (401, 403) and not is_engine_error_body(response):
-            message = (
-                f"{line}. The refusal came from something in front of the engine, not the engine: the answer "
-                "has no engine error body. Check that the client sends the identity the platform expects "
-                "(JamjetClient(auth=...)) and that this caller may call the service."
-            )
-            if detail:
-                message = f"{message} The answer said: {detail}"
-            raise PlatformAuthError(message, request=request, response=response, detail=detail) from exc
-        message = line
+        message = _status_line(response, secrets)
         if response.has_redirect_location:
             message = f"{message} (redirects are not followed)"
         if detail:

@@ -2052,6 +2052,9 @@ dev = [
     { name = "syrupy" },
     { name = "types-pyyaml" },
 ]
+google-auth = [
+    { name = "google-auth", extra = ["requests"] },
+]
 langchain = [
     { name = "langchain" },
 ]
@@ -2086,6 +2089,7 @@ requires-dist = [
     { name = "crewai", marker = "extra == 'crewai'", specifier = ">=0.70" },
     { name = "cryptography", specifier = ">=42" },
     { name = "google-adk", marker = "extra == 'adk'", specifier = ">=0.1" },
+    { name = "google-auth", extras = ["requests"], marker = "extra == 'google-auth'", specifier = ">=2.0,<3" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "jamjet-engram", marker = "python_full_version >= '3.12' and extra == 'memory'", specifier = ">=0.1,<0.3" },
@@ -2112,7 +2116,7 @@ requires-dist = [
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "uvicorn", marker = "extra == 'sidecar'", specifier = ">=0.30" },
 ]
-provides-extras = ["dev", "openai", "anthropic", "cloud-all", "model", "sidecar", "langchain", "crewai", "adk", "anthropic-agent", "openai-agents", "pii", "memory"]
+provides-extras = ["dev", "openai", "anthropic", "cloud-all", "model", "sidecar", "langchain", "crewai", "adk", "anthropic-agent", "openai-agents", "pii", "memory", "google-auth"]
 
 [[package]]
 name = "jamjet-engram"
