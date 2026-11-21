@@ -434,7 +434,7 @@ impl StateBackend for FailingGetEvents {
     async fn complete_work_item(
         &self,
         item_id: jamjet_state::backend::WorkItemId,
-    ) -> jamjet_state::backend::BackendResult<()> {
+    ) -> jamjet_state::backend::BackendResult<bool> {
         self.inner.complete_work_item(item_id).await
     }
 

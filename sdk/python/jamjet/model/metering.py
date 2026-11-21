@@ -15,7 +15,7 @@ class ModelCallRecord:
     model: str
     input_tokens: int
     output_tokens: int
-    cost_usd: float
+    cost_usd: float | None  # None when the call's cost is not known
 
 
 MeterSink = Callable[[ModelCallRecord], None]

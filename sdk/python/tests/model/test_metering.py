@@ -26,3 +26,9 @@ async def test_calls_sink_when_provided():
     mw = MeteringMiddleware(sink=seen.append)
     await mw.after(_req(), _resp())
     assert seen and seen[0].provider == "anthropic"
+
+
+async def test_records_an_unknown_cost_as_none():
+    mw = MeteringMiddleware()
+    await mw.after(_req(), ModelResponse(message=object(), input_tokens=1, output_tokens=2))
+    assert mw.records[0].cost_usd is None

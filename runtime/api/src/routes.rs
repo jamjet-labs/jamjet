@@ -376,6 +376,20 @@ async fn create_workflow(
     // node) and refuses an out-of-range timeout when the request is raised.
     jamjet_ir::validate_human_approvals(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // A run's dollar cap is held to the range one step may report. Outside
+    // it the cap would compare against nothing real: a negative one refuses
+    // every step and a huge one never trips. Refused for a NEW version only:
+    // a version stored before this check still re-registers on boot, and its
+    // runs fail with `cost_cap_invalid` at their first spending step.
+    // `on_budget_exceeded` is still accepted and is read by nothing.
+    if let Some(cap) = parsed.cost_budget_usd {
+        if jamjet_state::usage::cost_to_nanos(cap).is_none() {
+            return Err(ApiError::BadRequest(format!(
+                "invalid workflow IR: cost_budget_usd must be between 0 and {} USD",
+                jamjet_state::usage::MAX_REPORTED_COST_USD
+            )));
+        }
+    }
 
     let def = WorkflowDefinition {
         workflow_id: workflow_id.clone(),
@@ -766,18 +780,38 @@ async fn get_execution(
 }
 
 /// One run as `GET /executions/:id` and the MCP `jamjet_get_execution` tool
-/// show it: its state derived from the log ([`with_derived_state`]) and what
-/// it is waiting for ([`crate::waiting::waiting_for`]).
+/// show it: its state derived from the log ([`with_derived_state`]), what
+/// it is waiting for ([`crate::waiting::waiting_for`]) and what it has spent.
 pub(crate) async fn execution_view(
     backend: &dyn jamjet_state::StateBackend,
     execution: WorkflowExecution,
 ) -> Result<Value, ApiError> {
     let waiting = crate::waiting::waiting_for(backend, &execution, Utc::now()).await?;
+    let execution_id = execution.execution_id.clone();
     let execution = with_derived_state(backend, execution).await;
     let mut body = serde_json::to_value(execution)
         .map_err(|e| ApiError::Internal(format!("serialize execution: {e}")))?;
     body["waiting_for"] = json!(waiting);
+    body["usage"] = run_usage_view(backend, &execution_id).await?;
     Ok(body)
+}
+
+/// What the run has spent, counted from its log (and its earlier segments')
+/// by the fold the caps use. `null` when the log holds an event this build
+/// cannot read: a partial count would be taken for the whole.
+async fn run_usage_view(
+    backend: &dyn jamjet_state::StateBackend,
+    id: &ExecutionId,
+) -> Result<Value, ApiError> {
+    match jamjet_state::fold_run_usage(backend, id).await? {
+        Ok(usage) => {
+            let mut view = serde_json::to_value(&usage)
+                .map_err(|e| ApiError::Internal(format!("serialize usage: {e}")))?;
+            view["cost_usd"] = json!(usage.cost_usd());
+            Ok(view)
+        }
+        Err(_unreadable) => Ok(Value::Null),
+    }
 }
 
 /// `execution` with its `current_state` re-derived from the event log (the
@@ -1982,6 +2016,9 @@ enum Refusal {
     /// The item was withheld as not the engine's (its payload names another
     /// workflow than its execution); the node itself is not failed.
     Refused,
+    /// The run's token or dollar cap is spent: the node failed for good and
+    /// the run fails on the scheduler's next pass.
+    Budget,
 }
 
 impl Refusal {
@@ -1991,6 +2028,7 @@ impl Refusal {
             Self::ApprovalRequired => "approval_required",
             Self::NotReady => "not_ready",
             Self::Refused => "refused",
+            Self::Budget => "budget",
         }
     }
 }
@@ -3098,6 +3136,13 @@ async fn gate_claimed_item(
     // A dispatch node needs the whole graph parsed (its failure wording is the
     // worker's); every other node needs only its own definition and the
     // workflow-level policy, so the hot path still skips the full parse.
+    //
+    // A claim reads the run's caps too, and fails closed when they cannot be
+    // read. A completion does not read them (`completion_gate`).
+    let caps = match caps_from_raw(&ir_value) {
+        Ok(caps) => caps,
+        Err(reason) => return fail_closed(backend, wi, reason).await,
+    };
     let GuardInputs {
         workflow_policy,
         workflow_agent,
@@ -3145,6 +3190,7 @@ async fn gate_claimed_item(
         },
         Some(wi.id),
         Some(wi.lease_fence),
+        Some(&caps),
     )
     .await
     {
@@ -3212,6 +3258,26 @@ async fn gate_claimed_item(
             }
         }
 
+        // The run's cap is spent, and the guard recorded the trip. Settled as
+        // a block is, so the step is never retried and the run fails on the
+        // scheduler's next pass; a claim that names the run is told `budget`.
+        // `Complete` mode never checks caps, so a re-check does not get here.
+        DispatchGuardOutcome::Spent { reason } => {
+            warn!(
+                execution_id = %wi.execution_id,
+                node_id = %wi.node_id,
+                %reason,
+                "claim: the run's cap is spent; failing the node"
+            );
+            if mode == jamjet_worker::node_guard::GuardMode::Complete {
+                return ClaimGate::Withhold(Refusal::Budget);
+            }
+            match fail_node(backend, wi, reason).await {
+                ClaimGate::Withhold(Refusal::Blocked) => ClaimGate::Withhold(Refusal::Budget),
+                other => other,
+            }
+        }
+
         // NOT a denial — no policy was ever consulted, so nothing is audited and
         // nothing is settled. See the `Err` arm above for why leaving the lease
         // alone is the right infrastructure-failure behaviour.
@@ -3235,6 +3301,32 @@ struct GuardInputs {
     /// `WorkflowIr::remote_agents`.
     remote_agents: std::collections::HashMap<String, jamjet_ir::workflow::RemoteAgentConfig>,
     node_def: NodeDef,
+}
+
+/// The run caps of a workflow, read from its stored IR: `token_budget` and
+/// `cost_budget_usd`. The claim gate reads them here, and so does the
+/// completion route for a cost it cannot count, so they agree on what a cap
+/// is. A present but unreadable value is
+/// `Err` (the fail-closed reason), never "no cap".
+fn caps_from_raw(ir_value: &Value) -> Result<jamjet_state::RunCaps, String> {
+    let token_budget = match ir_value.get("token_budget") {
+        None | Some(Value::Null) => None,
+        Some(raw) => Some(
+            serde_json::from_value(raw.clone())
+                .map_err(|e| format!("failed to load workflow token_budget: {e}"))?,
+        ),
+    };
+    let cost_budget_usd = match ir_value.get("cost_budget_usd") {
+        None | Some(Value::Null) => None,
+        Some(raw) => Some(
+            serde_json::from_value(raw.clone())
+                .map_err(|e| format!("failed to load workflow cost_budget_usd: {e}"))?,
+        ),
+    };
+    Ok(jamjet_state::RunCaps {
+        token_budget,
+        cost_budget_usd,
+    })
 }
 
 /// The workflow-level policy and agent, and one node's definition, read from
@@ -3344,6 +3436,9 @@ async fn completion_gate(
         },
         Some(wi.id),
         Some(wi.lease_fence),
+        // A step that ran is recorded whatever the run has spent: `Complete`
+        // mode never checks caps, and the scheduler fails a run past one.
+        None,
     )
     .await
     {
@@ -3357,6 +3452,9 @@ async fn completion_gate(
                 .to_string(),
         )),
         DispatchGuardOutcome::Unavailable { reason } => Err(unavailable(reason)),
+        // Not reached: `Complete` mode never checks caps. Refused rather than
+        // recorded if it ever is.
+        DispatchGuardOutcome::Spent { reason } => Err(refused(reason)),
     }
 }
 
@@ -3494,9 +3592,13 @@ struct CompleteWorkItemRequest {
     #[serde(default)]
     finish_reason: Option<String>,
     /// Estimated USD cost of this node, as the worker reports it. Counted
-    /// toward an agent card's `cost_budget_usd`.
+    /// toward the run's `cost_budget_usd` and an agent card's. A number from
+    /// 0 to 10,000; anything else is refused.
     #[serde(default)]
     cost_usd: Option<f64>,
+    /// The currency of `cost_usd`. Optional; when sent, it must be `"USD"`.
+    #[serde(default)]
+    cost_currency: Option<String>,
 }
 
 /// `POST /work-items/:id/complete` — mark a work item as completed and emit NodeCompleted event.
@@ -3579,12 +3681,24 @@ async fn complete_work_item(
     // write. The budget enforcer reads them back, and the approval digest
     // leaves them out as engine-written, so a reported value would be a budget
     // reset and a change to later nodes' input that no approval covers.
-    // A reported cost is summed into agent cost budgets, so it must be a
-    // spend: a negative one would refund the budget.
-    if body.cost_usd.is_some_and(|c| !(c.is_finite() && c >= 0.0)) {
-        return Err(ApiError::BadRequest(
-            "cost_usd must be a non-negative number".to_string(),
-        ));
+    // A reported cost is summed into the run's dollar cap and agent cost
+    // budgets, so it must be a spend the engine can count: a number from 0
+    // to the per-call ceiling, in USD. A negative one would refund a budget.
+    if let Some(problem) = uncountable_cost(body.cost_usd, body.cost_currency.as_deref()) {
+        // The step ran, so it may have paid. Under a dollar cap its spend
+        // cannot be counted, and a retry would pay again with nothing
+        // recorded: the holder's step fails for good instead. The fence
+        // shows the caller holds the item; without one nothing is written.
+        if let (Some(wi), Some(fence)) = (recorded.as_ref(), body.lease_fence.filter(|f| *f > 0)) {
+            if fail_uncounted_step(backend.as_ref(), wi, fence, &problem, state.agents.as_ref())
+                .await?
+            {
+                return Err(ApiError::BadRequest(format!(
+                    "{problem}; the run has a dollar cap, so the step failed"
+                )));
+            }
+        }
+        return Err(ApiError::BadRequest(problem));
     }
 
     let state_patch = jamjet_state::approvals::action_state(&body.state_patch);
@@ -3779,7 +3893,17 @@ async fn complete_work_item(
                 "complete: unfenced legacy path — settle and terminal event are \
                  not atomic; echo lease_fence to make them one transaction"
             );
-            backend.complete_work_item(item_id).await?;
+            // Only a still-claimed item settles, so a completion sent again
+            // (its answer lost) records nothing twice.
+            if !backend.complete_work_item(item_id).await? {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "completed": false,
+                        "reason": "the work item is not claimed",
+                    })),
+                ));
+            }
             false
         }
     };
@@ -3824,6 +3948,115 @@ async fn complete_work_item(
         StatusCode::OK,
         Json(json!({ "completed": true, "work_item_id": id })),
     ))
+}
+
+/// Why a reported cost cannot be counted, or `None` when it can: `cost_usd`
+/// absent, or a number from 0 to the per-call ceiling, and `cost_currency`
+/// absent or `"USD"`.
+fn uncountable_cost(cost_usd: Option<f64>, cost_currency: Option<&str>) -> Option<String> {
+    if cost_currency.is_some_and(|c| c != "USD") {
+        return Some("cost_currency must be \"USD\"".to_string());
+    }
+    if cost_usd.is_some_and(|c| jamjet_state::usage::cost_to_nanos(c).is_none()) {
+        return Some(format!(
+            "cost_usd must be a number from 0 to {}",
+            jamjet_state::usage::MAX_REPORTED_COST_USD
+        ));
+    }
+    None
+}
+
+/// Fail for good the step of `wi`, whose reported cost cannot be counted,
+/// when its run has a dollar cap. Returns whether the step failed.
+///
+/// One fenced `commit_turn_unless_terminal` settles the item and appends
+/// `NodeFailed { retryable: false }`, as a claim refusal does, and the
+/// scheduler fails the run. Only for an item whose result the completion
+/// gate would record: the same rules decide what may be written for it. A
+/// run or workflow that cannot be read writes nothing, as the gate would.
+///
+/// `Err` (503) when the store could not be read or the write failed: the
+/// item is still claimed and nothing is recorded, so the caller sends the
+/// completion again. A 400 would not be sent again, and the step would run
+/// again with its first spend uncounted.
+async fn fail_uncounted_step(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+    fence: i64,
+    problem: &str,
+    agents: &dyn jamjet_agents::AgentRegistry,
+) -> Result<bool, ApiError> {
+    match dollar_capped(backend, wi).await {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => return Ok(false),
+        Ok(Err(e)) => {
+            warn!(work_item_id = %wi.id, error = %e, "complete: could not read the run's dollar cap");
+            return Ok(false);
+        }
+        Err(e) => {
+            warn!(work_item_id = %wi.id, error = %e, "complete: could not read the run's dollar cap");
+            return Err(ApiError::Unavailable(e));
+        }
+    }
+    if let Err((status, reason)) = completion_gate(backend, wi, agents).await {
+        warn!(work_item_id = %wi.id, %reason, "complete: an uncountable cost on a step the gate refuses");
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            return Err(ApiError::Unavailable(reason));
+        }
+        return Ok(false);
+    }
+    let terminal = jamjet_state::Event::new(
+        wi.execution_id.clone(),
+        0,
+        jamjet_state::EventKind::NodeFailed {
+            node_id: wi.node_id.clone(),
+            error: format!("the step reported a cost the run's dollar cap cannot count: {problem}"),
+            attempt: wi.attempt,
+            retryable: false,
+        },
+    );
+    match backend
+        .commit_turn_unless_terminal(wi.id, fence, terminal, false)
+        .await
+    {
+        Ok(jamjet_state::TurnCommit::Committed(_)) => Ok(true),
+        Ok(jamjet_state::TurnCommit::ExecutionTerminal(_)) => Ok(false),
+        Err(jamjet_state::StateBackendError::FenceLost(_)) => Ok(false),
+        Err(e) => {
+            warn!(work_item_id = %wi.id, error = %e, "complete: could not fail a step with an uncountable cost");
+            Err(ApiError::Unavailable(format!(
+                "could not fail the step for its uncountable cost: {e}"
+            )))
+        }
+    }
+}
+
+/// Whether the run of `wi` has a dollar cap: `cost_budget_usd` set in its
+/// stored IR, whatever its value, read as the claim gate reads it
+/// ([`caps_from_raw`]). `Ok(Err)`: the run, its workflow or its caps are
+/// not in what is stored. `Err`: the store could not be read.
+async fn dollar_capped(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+) -> Result<Result<bool, String>, String> {
+    let Some(execution) = backend
+        .get_execution(&wi.execution_id)
+        .await
+        .map_err(|e| format!("execution unreadable: {e}"))?
+    else {
+        return Ok(Err("execution not found".to_string()));
+    };
+    let Some(def) = backend
+        .get_workflow(&execution.workflow_id, &execution.workflow_version)
+        .await
+        .map_err(|e| format!("workflow unreadable: {e}"))?
+    else {
+        return Ok(Err(format!(
+            "workflow {} v{} not found",
+            execution.workflow_id, execution.workflow_version
+        )));
+    };
+    Ok(caps_from_raw(&def.ir).map(|caps| caps.cost_budget_usd.is_some()))
 }
 
 #[derive(Deserialize)]

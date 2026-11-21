@@ -154,6 +154,7 @@ impl NodeExecutor for Scripted {
                 input_tokens: Some(tokens),
                 output_tokens: Some(0),
                 finish_reason: None,
+                cost_usd: None,
             }),
             Act::Fail => Err(ExecutorError::Fatal("tool down".into())),
         }
@@ -358,11 +359,15 @@ impl Run {
 
     /// Settle the retry the engine queued for the failed item `id`: the
     /// item itself, back in the queue. On SQLite it waits out a retry delay
-    /// and cannot be claimed yet, so it is settled by its id. Left pending,
+    /// and cannot be claimed yet, so it is settled by its id, as failed: the
+    /// unfenced complete settles only a claimed item. Left pending,
     /// it is a live item of the node, and the next hand enqueue is refused.
     async fn drop_retry(&self, id: &str) {
         let id = uuid::Uuid::parse_str(id).unwrap();
-        self.backend.complete_work_item(id).await.unwrap();
+        self.backend
+            .fail_work_item(id, "dropped by the test")
+            .await
+            .unwrap();
     }
 
     async fn events(&self) -> Vec<EventKind> {

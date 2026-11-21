@@ -163,6 +163,7 @@ impl NodeExecutor for A2aTaskExecutor {
                     input_tokens: None,
                     output_tokens: None,
                     finish_reason: Some("completed".into()),
+                    cost_usd: None,
                 })
             }
             A2aTaskState::Failed => {

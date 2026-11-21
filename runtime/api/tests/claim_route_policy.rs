@@ -723,6 +723,56 @@ async fn an_item_whose_workflow_ir_is_corrupt_is_not_handed_out() {
     assert_withheld(&claim(&make_state(backend), "python_tool").await);
 }
 
+/// A workflow whose `token_budget` cannot be read: a claim fails closed on
+/// it, but the result of a step already claimed is recorded. Recording reads
+/// no cap, and the step may have paid. Before, the completion parsed the caps
+/// with the rest of the guard's inputs and answered 409, so the result was
+/// lost.
+#[tokio::test]
+async fn a_result_is_recorded_though_the_caps_cannot_be_read() {
+    let backend = memory();
+    let mut ir = ir_with_node(json!({ "id": "n1", "kind": {
+        "type": "python_fn", "module": "app.steps", "function": "ordinary", "output_schema": ""
+    } }));
+    ir["token_budget"] = json!("lots");
+    let payload = json!({ "workflow_id": WF, "workflow_version": VERSION, "node_id": "n1" });
+    let (execution_id, _) = seed(&backend, ir, "python_tool", payload.clone()).await;
+    // Claimed outside the claim gate, as a build that read no caps claimed it.
+    let item = backend
+        .claim_work_item("external-python-worker-0", &["python_tool"])
+        .await
+        .unwrap()
+        .expect("the item is ready");
+    let body =
+        json!({ "output": { "ok": true }, "state_patch": {}, "lease_fence": item.lease_fence });
+    let resp = build_router_with_opts(make_state(backend.clone()), true)
+        .oneshot(
+            Request::post(format!("/work-items/{}/complete", item.id))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let answer = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&answer)
+    );
+    assert!(
+        backend.get_events(&execution_id).await.unwrap().iter().any(
+            |e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == "n1")
+        ),
+        "the result is recorded"
+    );
+
+    seed_item(&backend, "python_tool", payload).await;
+    assert_withheld(&claim(&make_state(backend), "python_tool").await);
+}
+
 /// The node id is what selects the policy set and the dispatch marker. A node
 /// that is not in the IR has neither, so it cannot be evaluated.
 #[tokio::test]
@@ -1497,7 +1547,7 @@ impl StateBackend for FailFirstGetEvents {
     async fn complete_work_item(
         &self,
         item_id: jamjet_state::backend::WorkItemId,
-    ) -> jamjet_state::backend::BackendResult<()> {
+    ) -> jamjet_state::backend::BackendResult<bool> {
         self.inner.complete_work_item(item_id).await
     }
 

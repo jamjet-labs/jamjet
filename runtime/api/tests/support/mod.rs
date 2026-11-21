@@ -136,6 +136,7 @@ impl jamjet_worker::NodeExecutor for NoopExecutor {
             input_tokens: None,
             output_tokens: None,
             finish_reason: None,
+            cost_usd: None,
         })
     }
 }

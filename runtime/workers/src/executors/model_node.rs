@@ -287,6 +287,7 @@ impl NodeExecutor for ModelNodeExecutor {
             input_tokens: Some(response.input_tokens),
             output_tokens: Some(response.output_tokens),
             finish_reason: Some(response.finish_reason),
+            cost_usd: response.cost_usd,
         })
     }
 }
@@ -340,6 +341,7 @@ mod tests {
                 output_tokens: 1,
                 structured: None,
                 tool_calls: vec![],
+                cost_usd: None,
             })
         }
         async fn structured_output(
@@ -379,6 +381,7 @@ mod tests {
                         name: "get_weather".to_string(),
                         arguments: serde_json::json!({"location": "London"}),
                     }],
+                    cost_usd: None,
                 }),
                 FakeKind::TextResponse => Ok(ModelResponse {
                     content: "Hello, world!".to_string(),
@@ -388,6 +391,7 @@ mod tests {
                     output_tokens: 5,
                     structured: None,
                     tool_calls: vec![],
+                    cost_usd: None,
                 }),
             }
         }

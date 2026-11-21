@@ -257,11 +257,23 @@ pub enum EventKind {
         kind: String,
         limit: u64,
         current: u64,
+        /// Why the cap counts as reached when the count alone does not say
+        /// so: `"tokens_not_reported"` when a step under the cap reported no
+        /// tokens. `None` when the count reached the cap, and on old logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     CostBudgetExceeded {
         node_id: NodeId,
         limit_usd: f64,
         current_usd: f64,
+        /// Why the cap counts as reached when the sum alone does not say so:
+        /// `"cost_not_reported"` when a step under the cap reported no usable
+        /// cost, `"cost_cap_invalid"` when the cap itself is not a number
+        /// from 0 to 10,000 USD. `None` when the sum reached the cap, and on
+        /// old logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     AutonomyLimitReached {
         node_id: NodeId,

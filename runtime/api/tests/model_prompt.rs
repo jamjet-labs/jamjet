@@ -43,6 +43,7 @@ impl ModelAdapter for RecordingModel {
             output_tokens: 1,
             structured: None,
             tool_calls: vec![],
+            cost_usd: None,
         })
     }
     async fn structured_output(&self, _: StructuredRequest) -> Result<ModelResponse, ModelError> {

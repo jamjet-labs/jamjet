@@ -6,7 +6,7 @@
 use crate::executor::{ExecutionResult, ExecutorError, NodeExecutor};
 use async_trait::async_trait;
 use jamjet_scheduler::strategy_bridge::{
-    DecideRequest, DiscoverRequest, ScoreRequest, StrategyBridge,
+    DecideRequest, DecideResponse, DiscoverRequest, ScoreRequest, StrategyBridge,
 };
 use jamjet_state::backend::WorkItem;
 use serde_json::{json, Value};
@@ -14,6 +14,22 @@ use tracing::{debug, instrument, warn, Span};
 
 pub struct CoordinatorExecutor {
     bridge: StrategyBridge,
+}
+
+/// A tiebreaker's input tokens, output tokens and cost.
+type Usage = (Option<u64>, Option<u64>, Option<f64>);
+
+/// The usage a tiebreaker reported, as the run's caps count it: tokens as
+/// `{"input": n, "output": m}`, and its cost. A count it left out stays
+/// unknown.
+fn tiebreaker_usage(r: &DecideResponse) -> Usage {
+    let count = |k: &str| {
+        r.tiebreaker_tokens
+            .as_ref()
+            .and_then(|t| t.get(k))
+            .and_then(Value::as_u64)
+    };
+    (count("input"), count("output"), r.tiebreaker_cost)
 }
 
 impl CoordinatorExecutor {
@@ -135,6 +151,7 @@ impl NodeExecutor for CoordinatorExecutor {
                 input_tokens: None,
                 output_tokens: None,
                 finish_reason: None,
+                cost_usd: None,
             });
         }
 
@@ -177,6 +194,7 @@ impl NodeExecutor for CoordinatorExecutor {
                 input_tokens: None,
                 output_tokens: None,
                 finish_reason: None,
+                cost_usd: None,
             });
         }
 
@@ -231,6 +249,7 @@ impl NodeExecutor for CoordinatorExecutor {
                 input_tokens: None,
                 output_tokens: None,
                 finish_reason: None,
+                cost_usd: None,
             });
         }
 
@@ -244,6 +263,7 @@ impl NodeExecutor for CoordinatorExecutor {
 
         // Phase 3: Decision
         let used_tiebreaker_model: Option<String>;
+        let (input_tokens, output_tokens, cost_usd): Usage;
         let decide_result: Value = if score_resp.spread > threshold {
             // Fast path: structured scoring wins
             let top = &score_resp.rankings[0];
@@ -252,6 +272,7 @@ impl NodeExecutor for CoordinatorExecutor {
                 .map(|r| json!({"uri": &r.uri, "reason": "lower score"}))
                 .collect();
             used_tiebreaker_model = None;
+            (input_tokens, output_tokens, cost_usd) = (None, None, None);
             json!({
                 "type": "coordinator_decision",
                 "node_id": item.node_id,
@@ -291,6 +312,11 @@ impl NodeExecutor for CoordinatorExecutor {
                     } else {
                         None
                     };
+                    (input_tokens, output_tokens, cost_usd) = if is_llm {
+                        tiebreaker_usage(&r)
+                    } else {
+                        (None, None, None)
+                    };
                     json!({
                         "type": "coordinator_decision",
                         "node_id": item.node_id,
@@ -306,6 +332,7 @@ impl NodeExecutor for CoordinatorExecutor {
                 Err(e) => {
                     warn!("LLM tiebreaker failed, falling back to top scorer: {e}");
                     used_tiebreaker_model = None;
+                    (input_tokens, output_tokens, cost_usd) = (None, None, None);
                     if let Some(first) = top_n.first() {
                         json!({
                             "type": "coordinator_decision",
@@ -360,9 +387,114 @@ impl NodeExecutor for CoordinatorExecutor {
             duration_ms,
             gen_ai_system: None,
             gen_ai_model: used_tiebreaker_model,
-            input_tokens: None,
-            output_tokens: None,
+            input_tokens,
+            output_tokens,
             finish_reason: None,
+            cost_usd,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn item() -> WorkItem {
+        WorkItem {
+            id: uuid::Uuid::new_v4(),
+            execution_id: jamjet_core::workflow::ExecutionId::new(),
+            node_id: "route".into(),
+            queue_type: "coordinator".into(),
+            payload: json!({ "task": "pick one", "tiebreaker": { "threshold": 0.1 } }),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: chrono::Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            tenant_id: "default".into(),
+            lease_fence: 0,
+        }
+    }
+
+    /// A strategy bridge with two close candidates, so the tiebreaker runs
+    /// and answers `decide`.
+    async fn bridge(decide: Value) -> MockServer {
+        let server = MockServer::start().await;
+        let candidate = |uri: &str| {
+            json!({ "uri": uri, "agent_card": {}, "skills": [], "latency_class": null,
+                    "cost_class": null, "trust_domain": null })
+        };
+        let answer = |body: Value| ResponseTemplate::new(200).set_body_json(body);
+        Mock::given(method("POST"))
+            .and(path("/coordinator/discover"))
+            .respond_with(answer(json!({
+                "candidates": [candidate("agent://one"), candidate("agent://two")],
+                "filtered_out": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/coordinator/score"))
+            .respond_with(answer(json!({
+                "rankings": [
+                    { "uri": "agent://one", "scores": {}, "composite": 0.50 },
+                    { "uri": "agent://two", "scores": {}, "composite": 0.49 }
+                ],
+                "spread": 0.01
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/coordinator/decide"))
+            .respond_with(answer(decide))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn decision(tokens: Value, cost: Value) -> Value {
+        json!({
+            "selected_uri": "agent://one", "method": "llm_tiebreaker", "reasoning": "closer",
+            "confidence": 0.6, "rejected": [], "tiebreaker_tokens": tokens, "tiebreaker_cost": cost
+        })
+    }
+
+    /// The tiebreaker's model call is the step's spend. Its tokens and cost
+    /// go on the result, where the run's caps count them. Before, the step
+    /// named the model and reported neither, so a capped run failed on it as
+    /// unknown spend. A tiebreaker that reports no usage leaves it unknown.
+    #[tokio::test]
+    async fn a_tiebreaker_reports_its_usage_on_the_result() {
+        let server = bridge(decision(json!({ "input": 50, "output": 20 }), json!(0.003))).await;
+        let r = CoordinatorExecutor::new(server.uri())
+            .execute(&item())
+            .await
+            .expect("the coordinator decides");
+        assert_eq!(
+            (
+                r.gen_ai_model.as_deref(),
+                r.input_tokens,
+                r.output_tokens,
+                r.cost_usd
+            ),
+            (Some("claude-sonnet-4-6"), Some(50), Some(20), Some(0.003))
+        );
+
+        let server = bridge(decision(Value::Null, Value::Null)).await;
+        let r = CoordinatorExecutor::new(server.uri())
+            .execute(&item())
+            .await
+            .expect("the coordinator decides");
+        assert_eq!(
+            (
+                r.gen_ai_model.as_deref(),
+                r.input_tokens,
+                r.output_tokens,
+                r.cost_usd
+            ),
+            (Some("claude-sonnet-4-6"), None, None, None)
+        );
     }
 }

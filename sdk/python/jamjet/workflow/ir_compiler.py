@@ -22,6 +22,7 @@ manual ``nodes:`` + ``edges:`` path::
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import TYPE_CHECKING, Any
 
@@ -46,9 +47,10 @@ class WorkflowSchemaWarning(UserWarning):
 # instead of dropped without a word. Keep these in step with
 # _compile_graph_yaml and _yaml_node_to_kind.
 #
-# Governance settings. The runtime enforces policy, cost_budget_usd,
-# token_budget and continue_as_new; it reads neither data_policy nor
-# on_budget_exceeded yet, so those compile with a warning. They may sit at the top level of
+# Governance settings. The runtime enforces policy, cost_budget_usd and
+# token_budget; it reads none of data_policy, on_budget_exceeded or
+# continue_as_new (a run at its cap fails, it does not roll over), so the first
+# two compile with a warning. They may sit at the top level of
 # the document or in the `workflow:` header, but not both.
 _GOVERNANCE_KEYS = ("policy", "cost_budget_usd", "token_budget", "on_budget_exceeded", "data_policy", "continue_as_new")
 _GRAPH_TOP_LEVEL_KEYS = frozenset(
@@ -347,20 +349,30 @@ def _compile_data_policy(raw: Any, *, location: str) -> dict[str, Any] | None:
     return dict(raw)
 
 
+#: The largest ``cost_budget_usd`` the engine registers, in USD.
+_MAX_COST_BUDGET_USD = 10_000
+
+
 def _apply_governance(ir: dict[str, Any], sources: list[tuple[str, dict[str, Any]]]) -> None:
     """Copy the governance settings found in ``sources`` into ``ir``.
 
     None may be dropped without a word: a setting given in two places, or with
     a malformed value, is an error. The runtime enforces policy,
-    cost_budget_usd, token_budget and continue_as_new; data_policy and
-    on_budget_exceeded compile into the IR with a warning, because the runtime
-    does not read them yet.
+    cost_budget_usd and token_budget; data_policy and on_budget_exceeded
+    compile into the IR with a warning, because the runtime does not read them
+    yet. continue_as_new is carried into the IR and read by nothing.
     """
     ir["policy"] = _compile_policy(_governance_value(sources, "policy"), location="workflow-level policy")
     budget = _governance_value(sources, "cost_budget_usd")
     if budget is not None:
-        if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
-            raise ValueError(f"cost_budget_usd must be a positive number, got {budget!r}")
+        # The range the engine registers: one step may report up to this much.
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, (int, float))
+            or not math.isfinite(budget)
+            or not 0 <= budget <= _MAX_COST_BUDGET_USD
+        ):
+            raise ValueError(f"cost_budget_usd must be a number from 0 to 10000 (USD), got {budget!r}")
         ir["cost_budget_usd"] = float(budget)
     tokens = _governance_value(sources, "token_budget")
     if tokens is not None:

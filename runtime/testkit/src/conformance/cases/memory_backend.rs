@@ -191,7 +191,7 @@ pub async fn test_work_queue(fx: &Fixture) {
         .await
         .unwrap()
         .is_none());
-    backend.complete_work_item(item_id).await.unwrap();
+    assert!(backend.complete_work_item(item_id).await.unwrap());
 }
 
 pub async fn test_complete_work_item_fenced(fx: &Fixture) {
@@ -239,6 +239,46 @@ pub async fn test_complete_work_item_fenced(fx: &Fixture) {
         .complete_work_item_fenced(item_id, fence)
         .await
         .unwrap());
+}
+
+/// The unfenced settle takes only an item still claimed, as the fenced one
+/// does: a pending item, one already settled and an unknown id are `false`,
+/// and a pending item stays claimable. A completion sent twice without its
+/// fence used to settle the row again on SQLite, and the route recorded the
+/// step twice.
+pub async fn unfenced_complete_settles_only_a_claimed_item(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
+    let exec_id = ExecutionId::new();
+    backend
+        .create_execution(sample_execution(&exec_id))
+        .await
+        .unwrap();
+    let item_id = backend
+        .enqueue_work_item(pending_item(&exec_id))
+        .await
+        .unwrap();
+
+    assert!(
+        !backend.complete_work_item(item_id).await.unwrap(),
+        "a pending item is not settled"
+    );
+    let claimed = backend
+        .claim_work_item("w1", &["default"])
+        .await
+        .unwrap()
+        .expect("the pending item is still claimable");
+    assert_eq!(claimed.id, item_id);
+    assert!(backend.complete_work_item(item_id).await.unwrap());
+    assert!(
+        !backend.complete_work_item(item_id).await.unwrap(),
+        "a settled item is not settled again"
+    );
+    assert!(!backend.complete_work_item(Uuid::new_v4()).await.unwrap());
+    assert!(backend
+        .claim_work_item("w2", &["default"])
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// Build a never-claimed pending work item (worker_id = None, lease_fence = 0).

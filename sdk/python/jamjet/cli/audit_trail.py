@@ -315,9 +315,21 @@ def _final_answer(final_state: Any, execution: dict[str, Any]) -> str | None:
 
 
 def _budget_detail(kind: dict[str, Any]) -> str:
+    reason = kind.get("reason")
     if kind.get("type") == "cost_budget_exceeded":
-        return f"cost {kind.get('current_usd')} USD, limit {kind.get('limit_usd')} USD"
-    return f"{kind.get('kind', 'budget')} {kind.get('current')}, limit {kind.get('limit')}"
+        limit, current = kind.get("limit_usd"), kind.get("current_usd")
+        if reason == "cost_not_reported":
+            return (
+                f"a step did not report a usable cost, so the cap of {limit} USD cannot be checked "
+                f"({current} USD counted)"
+            )
+        if reason == "cost_cap_invalid":
+            return f"the cost cap of {limit} USD is not a cap a run can be held to (it must be 0 to 10,000 USD)"
+        return f"cost {current} USD, limit {limit} USD"
+    name = kind.get("kind", "budget")
+    if reason == "tokens_not_reported":
+        return f"a step did not report its tokens, so the cap on {name} (limit {kind.get('limit')}) cannot be checked"
+    return f"{name} {kind.get('current')}, limit {kind.get('limit')}"
 
 
 # ── rendering ────────────────────────────────────────────────────────────────

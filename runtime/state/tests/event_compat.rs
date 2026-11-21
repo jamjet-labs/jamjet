@@ -203,3 +203,77 @@ fn a_run_key_is_written_and_none_is_left_out() {
         r#"{"type":"workflow_started","workflow_id":"wf","workflow_version":"1.0.0","initial_input":{"a":1}}"#
     );
 }
+
+/// Both cap trip events take an optional `reason`. A trip written before it
+/// existed reads as `None`, and a trip without one writes the JSON it always
+/// did.
+#[test]
+fn trip_events_with_and_without_reason() {
+    let old_cost = r#"{"type":"cost_budget_exceeded","node_id":"__model_2__","limit_usd":1.0,"current_usd":1.0312}"#;
+    match serde_json::from_str::<EventKind>(old_cost).expect("old shape must parse") {
+        EventKind::CostBudgetExceeded {
+            node_id,
+            limit_usd,
+            current_usd,
+            reason,
+        } => {
+            assert_eq!(node_id, "__model_2__");
+            assert_eq!(limit_usd, 1.0);
+            assert_eq!(current_usd, 1.0312);
+            assert_eq!(reason, None);
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+    let old_tokens = r#"{"type":"token_budget_exceeded","node_id":"__model_2__","kind":"total_tokens","limit":2000,"current":2104}"#;
+    match serde_json::from_str::<EventKind>(old_tokens).expect("old shape must parse") {
+        EventKind::TokenBudgetExceeded {
+            node_id,
+            kind,
+            limit,
+            current,
+            reason,
+        } => {
+            assert_eq!(node_id, "__model_2__");
+            assert_eq!(kind, "total_tokens");
+            assert_eq!((limit, current), (2000, 2104));
+            assert_eq!(reason, None);
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+
+    let cost = |reason: Option<&str>| EventKind::CostBudgetExceeded {
+        node_id: "__model_2__".into(),
+        limit_usd: 1.0,
+        current_usd: 0.41,
+        reason: reason.map(String::from),
+    };
+    let tokens = |reason: Option<&str>| EventKind::TokenBudgetExceeded {
+        node_id: "step".into(),
+        kind: "total_tokens".into(),
+        limit: 2000,
+        current: 0,
+        reason: reason.map(String::from),
+    };
+    assert_eq!(
+        serde_json::to_string(&cost(Some("cost_not_reported"))).unwrap(),
+        r#"{"type":"cost_budget_exceeded","node_id":"__model_2__","limit_usd":1.0,"current_usd":0.41,"reason":"cost_not_reported"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&cost(None)).unwrap(),
+        r#"{"type":"cost_budget_exceeded","node_id":"__model_2__","limit_usd":1.0,"current_usd":0.41}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&tokens(Some("tokens_not_reported"))).unwrap(),
+        r#"{"type":"token_budget_exceeded","node_id":"step","kind":"total_tokens","limit":2000,"current":0,"reason":"tokens_not_reported"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&tokens(None)).unwrap(),
+        r#"{"type":"token_budget_exceeded","node_id":"step","kind":"total_tokens","limit":2000,"current":0}"#
+    );
+
+    let with = r#"{"type":"token_budget_exceeded","node_id":"step","kind":"total_tokens","limit":2000,"current":0,"reason":"tokens_not_reported"}"#;
+    assert!(matches!(
+        serde_json::from_str::<EventKind>(with).unwrap(),
+        EventKind::TokenBudgetExceeded { reason: Some(r), .. } if r == "tokens_not_reported"
+    ));
+}

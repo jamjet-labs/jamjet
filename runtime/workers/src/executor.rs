@@ -7,7 +7,7 @@ use serde_json::Value;
 /// Channel sender for real-time streaming events from executors.
 pub type StreamEventSender = tokio::sync::mpsc::Sender<Value>;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ExecutionResult {
     pub output: Value,
     pub state_patch: Value,
@@ -22,6 +22,10 @@ pub struct ExecutionResult {
     pub output_tokens: Option<u64>,
     /// Telemetry: finish reason (e.g. "stop", "length", "tool_calls").
     pub finish_reason: Option<String>,
+    /// What the step cost in USD, as its source reports it. Recorded on the
+    /// step's `NodeCompleted`, where a run's dollar cap counts it. `None`
+    /// for a step that reports no cost.
+    pub cost_usd: Option<f64>,
 }
 
 /// Structured error returned by node executors.

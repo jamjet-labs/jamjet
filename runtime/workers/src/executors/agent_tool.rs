@@ -112,6 +112,7 @@ impl AgentToolExecutor {
             input_tokens: None,
             output_tokens: None,
             finish_reason: None,
+            cost_usd: None,
         })
     }
 
@@ -244,6 +245,7 @@ impl AgentToolExecutor {
             input_tokens: None,
             output_tokens: None,
             finish_reason: None,
+            cost_usd: None,
         })
     }
 
@@ -392,6 +394,7 @@ impl AgentToolExecutor {
             input_tokens: None,
             output_tokens: None,
             finish_reason: None,
+            cost_usd: None,
         })
     }
 }
@@ -875,6 +878,7 @@ impl NodeExecutor for AgentToolExecutor {
             input_tokens: None,
             output_tokens: None,
             finish_reason: None,
+            cost_usd: None,
         })
     }
 }

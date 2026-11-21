@@ -515,14 +515,17 @@ class JamjetClient:
         """Mark a work item as completed and emit a NodeCompleted event.
 
         ``input_tokens``, ``output_tokens`` and ``cost_usd`` are recorded on
-        the event and count toward the token and cost budgets of the agent
-        the node acts for. ``cost_usd`` must be a non-negative number (the
-        runtime answers 400 otherwise).
+        the event and count toward the run's ``token_budget`` and
+        ``cost_budget_usd`` and the budgets of the agent the node acts for.
+        ``cost_usd`` must be a number from 0 to 10000, in USD (the runtime
+        answers 400 otherwise). Under a dollar cap, a fenced completion with a
+        cost the runtime cannot count also fails the step for good.
 
         When ``lease_fence`` is provided (and non-zero), it is echoed back so the
         runtime can prove this worker still holds the lease: a stale fence (the
         item was reclaimed/replayed) is rejected with 409 and no NodeCompleted is
-        emitted. A falsy/absent fence keeps the legacy unfenced behavior.
+        emitted. A falsy/absent fence keeps the legacy unfenced behavior, which
+        settles only an item still claimed: sent again, it is refused with 409.
         """
         body: dict[str, Any] = {
             "output": output,

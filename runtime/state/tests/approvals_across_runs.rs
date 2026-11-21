@@ -694,7 +694,7 @@ mod on_the_defaults {
         async fn get_work_item(&self, item_id: WorkItemId) -> BackendResult<Option<WorkItem>> {
             self.0.get_work_item(item_id).await
         }
-        async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
+        async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<bool> {
             self.0.complete_work_item(item_id).await
         }
         async fn complete_work_item_fenced(

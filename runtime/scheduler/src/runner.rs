@@ -1,8 +1,10 @@
 use jamjet_core::node::{NodeId, NodeKind};
 use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::WorkflowIr;
-use jamjet_state::backend::{PassCommit, SchedulerPass, StateBackend, WorkItem};
+use jamjet_state::backend::{PassCommit, SchedulerPass, StateBackend, StateBackendError, WorkItem};
+use jamjet_state::caps::{self, RunCaps};
 use jamjet_state::event::EventKind;
+use jamjet_state::usage::{RunUsage, Unreadable};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -58,6 +60,11 @@ pub struct Scheduler {
     /// replaying the whole log. The entry is dropped when the execution reaches
     /// a terminal state.
     progress: Mutex<HashMap<ExecutionId, ExecProgress>>,
+    /// What each capped run's earlier segments spent, folded once: a segment
+    /// that ended takes no more steps. A run on its first segment has
+    /// nothing here to fold. Dropped with the run's progress when the run
+    /// reaches a terminal state.
+    earlier_usage: Mutex<HashMap<ExecutionId, Result<RunUsage, Unreadable>>>,
     /// Seals the expiries and escalations the deadline sweep records into the
     /// audit chain.
     sealer: Option<Arc<dyn jamjet_state::approvals::ApprovalSealer>>,
@@ -72,6 +79,7 @@ impl Scheduler {
             config: SchedulerConfig::default(),
             ir_cache: Mutex::new(HashMap::new()),
             progress: Mutex::new(HashMap::new()),
+            earlier_usage: Mutex::new(HashMap::new()),
             sealer: None,
             stale_passes: AtomicU64::new(0),
         }
@@ -407,34 +415,7 @@ impl Scheduler {
         workflow_id: &str,
         workflow_version: &str,
     ) -> Result<PassEnd, Box<dyn std::error::Error + Send + Sync>> {
-        // Fold only the events appended since the last tick into the cached
-        // progress for this execution. Completed/failed nodes never revert and
-        // the IR is immutable, so replaying the whole event log every tick is
-        // pure overhead that grows with execution length — we apply just the
-        // delta instead, keeping a tick's cost bounded by the graph size.
-        let mut progress = self
-            .progress
-            .lock()
-            .unwrap()
-            .get(execution_id)
-            .cloned()
-            .unwrap_or_default();
-
-        let new_events = self
-            .backend
-            .get_events_since(execution_id, progress.last_sequence)
-            .await?;
-        for event in &new_events {
-            progress.apply(event);
-        }
-
-        // Write the advanced progress back before any early return below, so a
-        // tick that bails out (e.g. at the concurrency cap) doesn't have to
-        // re-read the same delta next time.
-        self.progress
-            .lock()
-            .unwrap()
-            .insert(execution_id.clone(), progress.clone());
+        let mut progress = self.fold_new_events(execution_id).await?;
 
         // FAIL CLOSED on a log this build cannot fully read. An event of an
         // unknown kind may revoke, deny or redirect anything, so the run is
@@ -442,25 +423,44 @@ impl Scheduler {
         // expired or completed. The stall is recorded once, durably, so it is
         // visible in the run's events.
         if progress.unreadable {
-            if !progress.stall_recorded {
-                let event = jamjet_state::Event::new(
-                    execution_id.clone(),
-                    0,
-                    EventKind::RunStalled {
-                        reason: jamjet_state::approvals::UNREADABLE_LOG_REASON.to_string(),
-                    },
-                );
-                let once = |log: &[jamjet_state::Event]| {
-                    !log.iter()
-                        .any(|e| matches!(e.kind, EventKind::RunStalled { .. }))
-                };
-                if let jamjet_state::ConditionalAppend::Appended(_) =
-                    self.backend.append_event_if(event, &once).await?
-                {
-                    warn!(execution_id = %execution_id, "Run stalled: its log holds event kinds this build cannot read");
-                }
-            }
+            self.record_stall(execution_id, &progress).await?;
             return Ok(PassEnd::Done);
+        }
+
+        // A run past one of its caps fails, before anything after the step
+        // that passed it is dispatched. The trip and the failure are this
+        // pass's only writes, so they land together or not at all. A run
+        // with no cap is never folded. A run whose earlier segment cannot be
+        // read cannot be checked, so it is not advanced (as above).
+        let caps = RunCaps {
+            token_budget: ir.token_budget.clone(),
+            cost_budget_usd: ir.cost_budget_usd,
+        };
+        if caps.token_budget.is_some() || caps.cost_budget_usd.is_some() {
+            let usage = match self.run_usage(execution_id, &progress).await? {
+                Ok(usage) => usage,
+                Err(_) => {
+                    self.record_stall(execution_id, &progress).await?;
+                    return Ok(PassEnd::Done);
+                }
+            };
+            if let Some(trip) = caps::past_cap(&caps, &usage) {
+                let node = usage.last_billable_node.clone().unwrap_or_default();
+                warn!(execution_id = %execution_id, node_id = %node, reason = %trip.describe(), "Run past its cap; failing it");
+                let pass = SchedulerPass {
+                    execution_id: execution_id.clone(),
+                    seen_sequence: progress.last_sequence,
+                    events: vec![trip.event(&node)],
+                    work_items: Vec::new(),
+                    finish: Some((
+                        jamjet_core::workflow::WorkflowStatus::Failed,
+                        EventKind::WorkflowFailed {
+                            error: trip.describe(),
+                        },
+                    )),
+                };
+                return self.commit_pass(execution_id, pass, progress).await;
+            }
         }
 
         // Approval deadlines. Only an execution holding a node on a request
@@ -798,6 +798,123 @@ impl Scheduler {
             // Nothing to record, and the cache already holds this fold.
             return Ok(PassEnd::Done);
         }
+        self.commit_pass(execution_id, pass, progress).await
+    }
+
+    /// Fold the events appended since the last pass into the run's cached
+    /// progress, and return it. Completed and failed nodes never revert and
+    /// the IR is immutable, so replaying the whole log on every tick is pure
+    /// overhead that grows with the run; only the delta is applied, which
+    /// keeps a tick's cost bounded by the graph size.
+    async fn fold_new_events(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<ExecProgress, StateBackendError> {
+        let mut progress = self
+            .progress
+            .lock()
+            .unwrap()
+            .get(execution_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let new_events = self
+            .backend
+            .get_events_since(execution_id, progress.last_sequence)
+            .await?;
+        for event in &new_events {
+            progress.apply(event);
+        }
+
+        // Write the advanced progress back before any early return of the
+        // pass, so a pass that bails out (at the concurrency cap, say) does
+        // not read the same delta again.
+        self.progress
+            .lock()
+            .unwrap()
+            .insert(execution_id.clone(), progress.clone());
+        Ok(progress)
+    }
+
+    /// Record once, durably, that the run is not advanced because a log it
+    /// needs holds event kinds this build cannot read.
+    async fn record_stall(
+        &self,
+        execution_id: &ExecutionId,
+        progress: &ExecProgress,
+    ) -> Result<(), StateBackendError> {
+        if progress.stall_recorded {
+            return Ok(());
+        }
+        let event = jamjet_state::Event::new(
+            execution_id.clone(),
+            0,
+            EventKind::RunStalled {
+                reason: jamjet_state::approvals::UNREADABLE_LOG_REASON.to_string(),
+            },
+        );
+        let once = |log: &[jamjet_state::Event]| {
+            !log.iter()
+                .any(|e| matches!(e.kind, EventKind::RunStalled { .. }))
+        };
+        if let jamjet_state::ConditionalAppend::Appended(_) =
+            self.backend.append_event_if(event, &once).await?
+        {
+            warn!(execution_id = %execution_id, "Run stalled: its log holds event kinds this build cannot read");
+        }
+        Ok(())
+    }
+
+    /// What the run has spent: its earlier segments, folded once, and this
+    /// segment, folded a delta at a time into `progress`. `Ok(Err(_))` when
+    /// a log it needs holds an event this build cannot read.
+    async fn run_usage(
+        &self,
+        execution_id: &ExecutionId,
+        progress: &ExecProgress,
+    ) -> Result<Result<RunUsage, Unreadable>, StateBackendError> {
+        if progress.unreadable {
+            return Ok(Err(Unreadable));
+        }
+        Ok(self
+            .earlier_usage(execution_id)
+            .await?
+            .map(|earlier| earlier.plus(&progress.usage)))
+    }
+
+    /// What the segments before this one spent, root first. Read from the
+    /// store once per run: a segment that ended takes no more steps.
+    async fn earlier_usage(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Result<RunUsage, Unreadable>, StateBackendError> {
+        if let Some(known) = self.earlier_usage.lock().unwrap().get(execution_id) {
+            return Ok(known.clone());
+        }
+        let run = self
+            .backend
+            .get_execution(execution_id)
+            .await?
+            .ok_or_else(|| StateBackendError::NotFound(execution_id.to_string()))?;
+        let earlier = match run.parent_execution_id {
+            None => Ok(RunUsage::default()),
+            Some(parent) => jamjet_state::fold_run_usage(self.backend.as_ref(), &parent).await?,
+        };
+        self.earlier_usage
+            .lock()
+            .unwrap()
+            .insert(execution_id.clone(), earlier.clone());
+        Ok(earlier)
+    }
+
+    /// Write `pass`, folded from `progress`, and keep the run's cached
+    /// progress in step with what the store holds.
+    async fn commit_pass(
+        &self,
+        execution_id: &ExecutionId,
+        pass: SchedulerPass,
+        progress: ExecProgress,
+    ) -> Result<PassEnd, Box<dyn std::error::Error + Send + Sync>> {
         let recorded = pass.events.clone();
         let dispatched = pass.work_items.len();
         let finished = pass.finish.as_ref().map(|(status, _)| status.clone());
@@ -812,7 +929,7 @@ impl Scheduler {
                         info!(execution_id = %execution_id, ?status, "Execution reached terminal state");
                         // Execution is terminal; drop its progress so the cache doesn't grow
                         // without bound as executions complete.
-                        self.progress.lock().unwrap().remove(execution_id);
+                        self.forget(execution_id);
                     }
                     None => {
                         // `last_sequence` is still the last event the pass read, so the
@@ -835,7 +952,7 @@ impl Scheduler {
                 // A run cancelled since this pass read it keeps its cancel:
                 // nothing is appended after `WorkflowCancelled`.
                 debug!(execution_id = %execution_id, ?prior, "Execution already terminal; nothing to record");
-                self.progress.lock().unwrap().remove(execution_id);
+                self.forget(execution_id);
                 Ok(PassEnd::Done)
             }
             Err(e) => {
@@ -844,6 +961,12 @@ impl Scheduler {
                 Err(e.into())
             }
         }
+    }
+
+    /// Drop what the scheduler keeps for a run that reached a terminal state.
+    fn forget(&self, execution_id: &ExecutionId) {
+        self.progress.lock().unwrap().remove(execution_id);
+        self.earlier_usage.lock().unwrap().remove(execution_id);
     }
 }
 
@@ -933,6 +1056,9 @@ struct ExecProgress {
     unreadable: bool,
     /// A `RunStalled` is already in the log, so it is not recorded again.
     stall_recorded: bool,
+    /// What this segment has spent, folded with the rest of the progress.
+    /// The caps read it with the earlier segments' usage.
+    usage: RunUsage,
     /// Nodes in `rejected` because their request EXPIRED (not a human
     /// rejection). A `human_approval` node among them with a usable
     /// `fallback_node` completes routed to the fallback instead of failing.
@@ -969,6 +1095,9 @@ struct ExecProgress {
 impl ExecProgress {
     /// Fold one event into the running state. Must be applied in sequence order.
     fn apply(&mut self, event: &jamjet_state::Event) {
+        // An unreadable event also sets `unreadable` below, which the caps
+        // read before they read the usage.
+        let _ = self.usage.apply(event);
         match &event.kind {
             EventKind::NodeCompleted {
                 node_id,
@@ -1510,6 +1639,138 @@ mod tests {
             parent_execution_id: None,
             segment_number: 0,
         }
+    }
+
+    /// A small deterministic generator (xorshift64*), so a failing case can
+    /// be rerun from its seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+        }
+    }
+
+    /// An event of segment `segment`, mostly completions with any mix of
+    /// telemetry: a model or none, each token count reported or not, a cost
+    /// that is usable, negative, NaN, above the per-step ceiling or absent,
+    /// and a key or none. Keys repeat within a segment (replays) and never
+    /// across segments, as keys derived from a segment's own id do. Now and
+    /// then an event this build cannot read.
+    fn random_event(rng: &mut Rng, segment: usize) -> EventKind {
+        let node = ["a", "b", "c"][rng.below(3) as usize].to_string();
+        match rng.below(10) {
+            0 => EventKind::NodeScheduled {
+                node_id: node,
+                queue_type: "general".into(),
+            },
+            1 => EventKind::NodeFailed {
+                node_id: node,
+                error: "boom".into(),
+                attempt: 1,
+                retryable: true,
+            },
+            2 if rng.below(40) == 0 => EventKind::Unknown,
+            _ => EventKind::NodeCompleted {
+                node_id: node,
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({}),
+                duration_ms: 1,
+                gen_ai_system: None,
+                gen_ai_model: (rng.below(3) == 0).then(|| "m".to_string()),
+                input_tokens: (rng.below(4) != 0).then(|| rng.below(1000)),
+                output_tokens: (rng.below(4) != 0).then(|| rng.below(1000)),
+                finish_reason: None,
+                cost_usd: match rng.below(6) {
+                    0 => None,
+                    1 => Some(-1.0),
+                    2 => Some(f64::NAN),
+                    3 => Some(20_000.0),
+                    _ => Some(rng.below(1000) as f64 / 1000.0),
+                },
+                provenance: None,
+                idempotency_key: (rng.below(3) != 0)
+                    .then(|| format!("s{segment}-k{}", rng.below(5))),
+            },
+        }
+    }
+
+    /// The caps read what the scheduler folds: the earlier segments once,
+    /// and this segment a delta at a time as its log grows between passes.
+    /// For 200 random runs of one to three segments, after every pass that
+    /// equals `fold_run_usage` over the whole run, which reads every log
+    /// from the start; and when one says a log cannot be read, so does the
+    /// other.
+    #[tokio::test]
+    async fn the_incremental_fold_equals_the_full_fold() {
+        let mut unreadable_cases = 0;
+        let mut segmented_cases = 0;
+        for seed in 1..=200u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+            let s = Scheduler::new(backend.clone());
+            let segments = 1 + rng.below(3) as usize;
+            let mut parent: Option<ExecutionId> = None;
+            for n in 0..segments {
+                let mut e = running_execution(chrono::Utc::now());
+                e.parent_execution_id = parent.clone();
+                e.segment_number = n as u32;
+                let id = e.execution_id.clone();
+                let last = n + 1 == segments;
+                if !last {
+                    e.status = WorkflowStatus::Completed;
+                }
+                backend.create_execution(e).await.unwrap();
+                if !last {
+                    for _ in 0..rng.below(12) {
+                        let kind = random_event(&mut rng, n);
+                        backend
+                            .append_event(Event::new(id.clone(), 0, kind))
+                            .await
+                            .unwrap();
+                    }
+                }
+                parent = Some(id);
+            }
+            let current = parent.unwrap();
+            if segments > 1 {
+                segmented_cases += 1;
+            }
+
+            let mut unreadable = false;
+            for _ in 0..1 + rng.below(6) {
+                for _ in 0..rng.below(6) {
+                    let kind = random_event(&mut rng, segments - 1);
+                    backend
+                        .append_event(Event::new(current.clone(), 0, kind))
+                        .await
+                        .unwrap();
+                }
+                let progress = s.fold_new_events(&current).await.unwrap();
+                let incremental = s.run_usage(&current, &progress).await.unwrap();
+                let full = jamjet_state::fold_run_usage(backend.as_ref(), &current)
+                    .await
+                    .unwrap();
+                match (&incremental, &full) {
+                    (Ok(a), Ok(b)) => assert_eq!(a, b, "seed {seed}"),
+                    (Err(_), Err(_)) => unreadable = true,
+                    _ => panic!("seed {seed}: incremental {incremental:?}, full {full:?}"),
+                }
+            }
+            if unreadable {
+                unreadable_cases += 1;
+            }
+        }
+        // The cases reach every branch: several segments, and logs that
+        // cannot be read, as well as runs that can.
+        assert!(segmented_cases > 50, "{segmented_cases} segmented cases");
+        assert!(
+            (5..150).contains(&unreadable_cases),
+            "{unreadable_cases} unreadable cases"
+        );
     }
 
     /// One tick advances every running run. It read one page of the 100 most

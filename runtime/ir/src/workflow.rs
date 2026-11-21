@@ -55,8 +55,10 @@ pub struct WorkflowIr {
     /// If absent, the execution fails with `WorkflowFailed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_budget_exceeded: Option<String>,
-    /// If true, when a budget ceiling is hit the execution rolls over to a new
-    /// segment (continue-as-new) instead of failing. Default: false.
+    /// Not read: a run that reaches its token or dollar cap fails, whatever
+    /// this says. It used to roll such a run over to a new segment, which
+    /// inherited the spend and paid for one more call per segment. Kept so
+    /// stored workflows that set it still load. Default: false.
     #[serde(default)]
     pub continue_as_new: bool,
     /// Data handling policy (PII redaction + retention controls).

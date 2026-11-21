@@ -228,6 +228,7 @@ macro_rules! for_each_case {
                 test_snapshots,
                 test_work_queue,
                 test_complete_work_item_fenced,
+                unfenced_complete_settles_only_a_claimed_item,
                 fenced_complete_rejects_stale_fence_after_reclaim,
                 fenced_complete_rejects_forged_fence_zero_on_pending_item,
                 fenced_complete_settles_claimed_item_with_matching_fence,
@@ -285,6 +286,7 @@ macro_rules! for_each_case {
             idempotency,
             [
                 tool_effect_round_trip,
+                a_recorded_effect_keeps_its_cost,
                 no_key_no_effect_recorded,
                 concurrent_winner_insert_or_ignore,
                 tool_effect_survives_reopen,
@@ -374,6 +376,7 @@ macro_rules! for_each_case {
                 tokens_carry_tenant_id,
                 scoped_dead_letter_stores_the_bare_execution_uuid,
                 scoped_fail_cannot_reach_another_tenants_item,
+                scoped_unfenced_complete_cannot_reach_another_tenants_item,
                 scoped_reclaim_cannot_resurrect_a_settled_item,
                 scoped_claim_side_expiry_consumes_attempts,
                 a_reservation_is_scoped_to_its_tenant,

@@ -82,6 +82,7 @@ impl NodeExecutor for ConditionNodeExecutor {
             input_tokens: None,
             output_tokens: None,
             finish_reason: None,
+            cost_usd: None,
         };
 
         let branches_raw = match item.payload.get("branches") {
@@ -164,6 +165,7 @@ impl NodeExecutor for ConditionNodeExecutor {
             input_tokens: None,
             output_tokens: None,
             finish_reason: None,
+            cost_usd: None,
         })
     }
 }

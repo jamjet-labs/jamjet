@@ -25,7 +25,9 @@ class BudgetExceededError(ModelDeniedError):
 
     Fail-closed: the call is denied *before* it reaches the provider.
     Both the limit and the consumed amount are named in the message so callers
-    can surface the exact figures to the user or an audit log.
+    can surface the exact figures to the user or an audit log.  ``cost_unknown``
+    is true when a dollar cap cannot be checked because an earlier call
+    reported no cost.
     """
 
     def __init__(
@@ -35,9 +37,12 @@ class BudgetExceededError(ModelDeniedError):
         limit_tokens: int | None,
         consumed_usd: float,
         consumed_tokens: int,
+        cost_unknown: bool = False,
     ) -> None:
         parts: list[str] = []
-        if limit_usd is not None:
+        if limit_usd is not None and cost_unknown:
+            parts.append(f"a call reported no cost (${consumed_usd:.6f} counted, limit ${limit_usd:.6f})")
+        elif limit_usd is not None:
             parts.append(f"cost ${consumed_usd:.6f} >= limit ${limit_usd:.6f}")
         if limit_tokens is not None:
             parts.append(f"tokens {consumed_tokens} >= limit {limit_tokens}")
@@ -47,6 +52,7 @@ class BudgetExceededError(ModelDeniedError):
         self.limit_tokens = limit_tokens
         self.consumed_usd = consumed_usd
         self.consumed_tokens = consumed_tokens
+        self.cost_unknown = cost_unknown
 
 
 @runtime_checkable

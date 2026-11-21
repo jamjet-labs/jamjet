@@ -31,6 +31,14 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `note`. The YAML compiler reads `options`. `jamjet approve` takes `--choice` and `--note`.
   The `ApprovalReceived` event gains an optional `choice`. An older build ignores it, so a
   condition on the choice never matches there: do not roll back while such a run is live.
+- `GET /executions/:id` carries `usage`: `input_tokens`, `output_tokens`, `cost_usd`,
+  `billable_steps` (steps that name a model or report tokens or a cost), `cost_unknown_steps`,
+  `tokens_unknown_steps`, and the same count for input and output tokens alone
+  (`input_tokens_unknown_steps`, `output_tokens_unknown_steps`).
+  It is counted from the run's event log by the fold the caps use. It covers the segment
+  asked for and the `continue_as_new` segments before it, not later ones: ask for the latest
+  segment's id for the whole run. It is null when the log holds an event this build cannot read. The MCP
+  `jamjet_get_execution` tool carries it too.
 
 ### Changed
 
@@ -60,6 +68,99 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   answered 409 `OptionsChanged` by every decision, a rejection included.
 - Migration 0017 adds an index for the approvals list. A build from before it will not open
   a store that has run it, so there is no rollback past this release.
+- A step is counted when it names a model or reports tokens or a cost. One that reports none
+  of these is not counted under any cap, so a `python_fn` that calls a model and returns no
+  usage keys is never stopped.
+- Under `cost_budget_usd`, a counted step that reports no cost stops the run. The built-in
+  provider adapters report none; the model sidecar does, for a model litellm can price. Under
+  a token cap, a counted step that reports no count for the tokens the cap reads stops the
+  run: report both counts, 0 included. The trip carries a `reason` (`cost_not_reported`,
+  `tokens_not_reported`, or `cost_cap_invalid`), and `jamjet audit` shows it.
+- Upgrading with runs in flight: a run under `cost_budget_usd` that already ran a model step
+  in process fails on its next pass with `cost_not_reported`, because the older worker
+  recorded that step with no cost. A run under a token cap with an HTTP step that reported
+  one of its two token counts fails the same way, with `tokens_not_reported`, when the cap
+  reads the other. Drain such runs before upgrading.
+- A budget trip no longer rolls a `continue_as_new` run over to a new segment; it fails the
+  run. `continue_as_new` is not read. A step refused at its cap fails for good, and a claim
+  that names the run is told `budget`. A named claim retried after that refusal reads
+  `blocked`, because the node has already failed for good.
+- A `continue_as_new` rollover cut short by a crash on the older build ends with both
+  segments `Failed`, not the parent `LimitExceeded`. Nothing needs repair by hand.
+- `cost_budget_usd` must be between 0 and 10,000 when a new version is registered (400
+  otherwise). A version already stored with a cap outside that range still re-registers
+  unchanged (200). `on_budget_exceeded` is still accepted and is read by nothing. A stored workflow whose
+  `cost_budget_usd` is negative, NaN or above 10,000 now fails its run on the first pass, with
+  reason `cost_cap_invalid`. Before, infinity meant no limit and a large finite value was
+  compared as it stood.
+- `__budget` is no longer read. The in-process worker still writes it, for display, and its
+  `total_cost_usd` now counts the step's cost (it passed none before).
+- A cap trip is recorded at claim with the refused step's name, and when the scheduler fails
+  a run it names the last step that spent, in any segment of the run.
+- A run whose earlier segment holds an event this build cannot read stalls: with a cap set
+  it is not advanced, and one `RunStalled` is recorded.
+- Recorded usage differs by transport in one case. A step that finishes after its run has
+  failed on a cap is withdrawn over HTTP (409), so its spend is not recorded. In process it
+  is recorded after the failure, and counted.
+- Public crate API: `ModelResponse` and `ExecutionResult` gain `cost_usd` (and
+  `ExecutionResult` gains `Default`); `CostBudgetExceeded` and `TokenBudgetExceeded` gain an
+  optional `reason`; `DispatchGuardOutcome` gains `Spent`; `guard_item` takes one more
+  parameter; `BudgetState::exhausted` is deprecated, and the worker's
+  `check_budget_before_execution` and `check_budget_after_execution` are gone. A malformed
+  sidecar cost, or one that is not in USD, fails the step for every model registry caller;
+  an eval judge's scorer fails instead. `tool_effects` records gain `cost_usd`, and older
+  records replay with no cost. An agent card's `cost_budget_usd` now counts the sidecar's
+  cost in process. The complete route answers 400 for a cost above 10,000 or a currency other
+  than USD. Its text for a bad cost is now "cost_usd must be a number from 0 to 10000" (it was
+  "cost_usd must be a non-negative number"). Under a dollar cap, a fenced completion whose
+  cost cannot be counted also fails the step for good in the same write, and the 400 says so
+  ("...; the run has a dollar cap, so the step failed"): the step may have paid, and a retry
+  would pay again with nothing recorded. When the store cannot be read or that write fails,
+  the answer is 503 and the item stays claimed, so the client sends the completion again.
+- The Ollama adapter fails a call whose answer has a token count that is not a whole number,
+  or leaves a count out of an answer that is not final (`done` is not `true`). It used to
+  record 0, which a token cap reads as known. A count left out of a final answer is still 0:
+  Ollama leaves a count of zero out.
+- Removed: `rollover_segment` (its caller was the budget trip), with its five tests, and the
+  worker's pre-call budget check with four more tests it carried, nine worker tests in all.
+  Their cases are covered by the caps unit tests and `run_caps`.
+
+### Fixed
+
+- **Run caps hold on every transport.** A run's tokens and cost are now counted from its own
+  event log, across continue-as-new segments, and both `token_budget` and `cost_budget_usd`
+  are enforced for in-process and HTTP workers alike. A step that would start on a spent run
+  is refused. A run past its cap fails before anything after it runs. Steps already running
+  when the cap is reached still finish. In process their spend is recorded and counted, so a
+  run can end above its cap by the steps that were in flight: with parallel branches, by
+  their width. Over HTTP a step that completes after the run has failed is withdrawn (409),
+  and its spend is not recorded.
+- A cap trip after a model call no longer throws the paid result away and pays for it again
+  on retry. A failed read of the log at the cap no longer lets the step through.
+- A failed attempt's spend is still not counted: the fail route takes no usage. Under a
+  dollar cap, a completion refused before its cost is read (a string cost, a number that does
+  not parse) or sent unfenced with a bad cost leaves the step to retry, and the first
+  attempt's spend goes uncounted. An `eval` judge and a remote agent called by `agent_tool`
+  report no spend, so they are held at the cap but not counted.
+- A `coordinator` node's LLM tiebreaker now reports its tokens and cost on the step, so the
+  run caps count them. It named its model and reported neither, so under a cap the step
+  read as unknown spend and failed the run.
+- A completion sent without its lease fence settles only an item that is still claimed. Sent
+  again, it is 409 ("the work item is not claimed") and records nothing. On SQLite each
+  repeat used to record the step again, cost included, so three sends of one $0.40 step read
+  as $1.20. An unfenced completion of an item no worker has claimed, or of an unknown item id,
+  is 409 too (it was 200, or 404 for an unknown id on SQLite).
+  `StateBackend::complete_work_item` now returns `bool`, `false` for an item that is not
+  claimed, as `complete_work_item_fenced` does.
+- Python: a model call that litellm cannot price reports no cost, not $0. `cost_usd` is
+  `None` on `ModelResponse` and `ModelCallRecord` (now `float | None`), and the model sidecar
+  sends `null`, so under `cost_budget_usd` the run stops after that step. `BudgetMiddleware`
+  adds nothing to its own cost total for such a call, and under a dollar cap it denies the
+  next call, as the engine does: the spend is unknown. `BudgetExceededError` gains
+  `cost_unknown`. A token-only budget still counts the call's tokens and goes on.
+- Python: the workflow compiler holds `cost_budget_usd` to the range registration accepts,
+  0 to 10,000. It now compiles 0, which it refused, and refuses a cap above 10,000, NaN or
+  infinity, which it compiled for the engine to refuse.
 
 ### Security
 

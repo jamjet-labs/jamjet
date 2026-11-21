@@ -552,3 +552,18 @@ async def test_local_callers_and_listed_hosts_are_answered(monkeypatch: pytest.M
     monkeypatch.setenv("JAMJET_SIDECAR_ALLOWED_HOSTS", "sidecar, other")
     resp = await _post("http://sidecar:4280", {"content-type": "application/json"})
     assert resp.status_code == 200
+
+
+async def test_complete_core_sends_null_for_an_unpriced_call() -> None:
+    """A response with no cost goes out as cost_usd null, which the engine reads as unknown."""
+
+    class UnpricedModel:
+        async def complete(self, request):  # noqa: ANN001, ANN201
+            return ModelResponse(message=FakeMessage(content="ok"), input_tokens=3, output_tokens=4)
+
+    result = await _complete(
+        {"model": "anthropic/claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]},
+        UnpricedModel(),  # type: ignore[arg-type]
+    )
+    assert "cost_usd" in result
+    assert result["cost_usd"] is None
