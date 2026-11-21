@@ -158,8 +158,9 @@ async fn settle_item(
     Ok(())
 }
 
-/// Write `snapshot` under `tenant`, replacing one the run already has at its
-/// sequence, as `write_snapshot` does.
+/// Write `snapshot` under `tenant`, the run's, replacing one the run already
+/// has at its sequence, as `write_snapshot` does. Only a row of `tenant` is
+/// replaced; the run's lock already holds it to the run's tenant.
 async fn insert_snapshot(
     conn: &mut PgConnection,
     snapshot: &Snapshot,
@@ -179,7 +180,8 @@ async fn insert_snapshot(
            created_at = EXCLUDED.created_at, status = EXCLUDED.status, \
            completed_nodes_json = EXCLUDED.completed_nodes_json, \
            active_nodes_json = EXCLUDED.active_nodes_json, \
-           last_sequence = EXCLUDED.last_sequence",
+           last_sequence = EXCLUDED.last_sequence \
+         WHERE snapshots.tenant_id = $3",
     )
     .bind(snapshot.id)
     .bind(snapshot.execution_id.0)

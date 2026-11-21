@@ -1269,6 +1269,17 @@ pub trait StateBackend: Send + Sync {
     ) -> BackendResult<Option<FailOutcome>> {
         crate::legacy::fail_in_steps(self, item_id, lease_fence, error).await
     }
+
+    /// The time decisions use: the database's on Postgres, this process's
+    /// elsewhere.
+    ///
+    /// Approval deadlines are stamped and checked with it, so engines whose
+    /// clocks disagree still agree on when a request expires. The default is
+    /// [`crate::clock::process_now`], which is right for a store that one
+    /// process owns.
+    async fn store_now(&self) -> BackendResult<chrono::DateTime<chrono::Utc>> {
+        Ok(crate::clock::process_now())
+    }
 }
 
 /// Metadata for an API token (does not contain the plaintext token).

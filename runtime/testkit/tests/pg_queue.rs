@@ -336,6 +336,45 @@ async fn eight_claimers_take_two_hundred_items_once_each() {
     );
 }
 
+/// The process clock is an hour ahead. The Postgres store's clock, which
+/// approval deadlines are stamped and checked with, is the database's, on
+/// the unscoped store and on a tenant's view; SQLite's is this process's.
+#[tokio::test]
+async fn store_now_is_the_database_clock() {
+    if !in_a_skewed_child("store_now_is_the_database_clock") {
+        return;
+    }
+    assert_the_clock_is_an_hour_ahead();
+    let db = TestDatabase::fresh()
+        .await
+        .expect("the parent saw a Postgres URL");
+    let b = store(&db, settings()).await;
+    let pool = db.pool().await;
+    let tenant = b.for_tenant(TenantId::default());
+    for (whose, view) in [("unscoped", &b), ("scoped", &tenant)] {
+        let before: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let now = view.store_now().await.unwrap();
+        let after: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            before <= now && now <= after,
+            "{whose}: store_now {now} is not between {before} and {after}"
+        );
+    }
+    let sqlite = SqliteFactory.fresh().await.expect("SQLite is always here");
+    let off = sqlite.backend.store_now().await.unwrap() - jamjet_state::clock::process_now();
+    assert!(
+        off.num_seconds().abs() <= 1,
+        "SQLite's store clock is {off} off this process's"
+    );
+    println!("{CHILD_RAN}");
+}
+
 /// The process clock is an hour ahead. A 30 s lease, by the database's
 /// clock, is not reclaimed by the sweeps or by a claim's fast reclaim. Once
 /// the database's clock passes it, the next poll reclaims it, and so does

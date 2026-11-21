@@ -584,6 +584,51 @@ async fn an_approval_gated_tool_is_held_and_requests_approval() {
     );
 }
 
+/// A store whose clock answers a fixed time.
+struct FixedClock(chrono::DateTime<chrono::Utc>);
+
+impl jamjet_testkit::Hooks for FixedClock {
+    fn store_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        Some(self.0)
+    }
+}
+
+/// A dispatch request's deadline is stamped on the store's clock: with the
+/// store's clock a day ahead of this process's, `expires_at` is the timeout
+/// after the store's time.
+#[tokio::test]
+async fn a_dispatch_request_is_stamped_by_the_store_clock() {
+    let store_now = chrono::Utc::now() + chrono::Duration::days(1);
+    let backend: Arc<dyn StateBackend> = Arc::new(jamjet_testkit::Intercept::new(
+        memory(),
+        Arc::new(FixedClock(store_now)),
+    ));
+    let mut ir = dispatch_ir(true, &[], &["send_wire"]);
+    ir["policy"]["approval_timeout_secs"] = json!(600);
+    let (execution_id, _) = seed(
+        &backend,
+        ir,
+        "python_tool",
+        dispatch_payload(calls_input(&["send_wire"])),
+    )
+    .await;
+    let state = make_state(backend.clone());
+
+    assert_withheld(&claim(&state, "python_tool").await);
+
+    let requests = approval_requests(&backend, &execution_id).await;
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let expires_at = requests[0]["expires_at"]
+        .as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .unwrap_or_else(|| panic!("no expires_at: {}", requests[0]));
+    let off = (expires_at.with_timezone(&chrono::Utc)
+        - (store_now + chrono::Duration::seconds(600)))
+    .num_seconds()
+    .abs();
+    assert!(off <= 1, "expires_at {expires_at}, store time {store_now}");
+}
+
 /// One gated call holds the WHOLE batch. Running the two permitted calls and
 /// holding the third would execute a partial turn the approver never saw.
 #[tokio::test]

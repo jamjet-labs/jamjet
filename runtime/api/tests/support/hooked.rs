@@ -794,4 +794,12 @@ impl StateBackend for HookedBackend {
             .fail_work_item_fenced_recorded(item_id, lease_fence, error)
             .await
     }
+
+    /// Delegated, so deadlines on this wrapper follow the wrapped store's
+    /// clock.
+    async fn store_now(
+        &self,
+    ) -> jamjet_state::backend::BackendResult<chrono::DateTime<chrono::Utc>> {
+        self.inner.store_now().await
+    }
 }

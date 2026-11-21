@@ -740,4 +740,13 @@ impl StateBackend for PgBackend {
     ) -> BackendResult<Option<FailOutcome>> {
         queue::fail_work_item_fenced_recorded(self, item_id, lease_fence, error).await
     }
+
+    /// The database's clock, as the leases use: every engine on this
+    /// database reads the same time, whatever its own clock says.
+    async fn store_now(&self) -> BackendResult<chrono::DateTime<chrono::Utc>> {
+        sqlx::query_scalar("SELECT statement_timestamp()")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(tx::statement_error)
+    }
 }

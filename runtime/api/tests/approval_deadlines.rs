@@ -520,6 +520,83 @@ async fn a_decision_past_the_deadline_is_refused_before_the_sweep_runs() {
     }
 }
 
+/// The store's clock, set apart from this process's.
+#[derive(Default)]
+struct StoreClock(Mutex<Option<DateTime<Utc>>>);
+
+impl jamjet_testkit::Hooks for StoreClock {
+    fn store_now(&self) -> Option<DateTime<Utc>> {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// The deadline is checked on the store's clock, which on Postgres is the
+/// database's: with the store's clock 1 s past `expires_at` and this
+/// process's clock still before it, the decision is refused as expired and
+/// nothing is recorded.
+#[tokio::test]
+async fn decision_after_the_deadline_by_the_store_clock_is_refused() {
+    for tb in support::backends().await {
+        let clock = Arc::new(StoreClock::default());
+        let store: Arc<dyn StateBackend> = Arc::new(jamjet_testkit::Intercept::new(
+            tb.dyn_backend(),
+            clock.clone(),
+        ));
+        let env = env_on(tb.name(), store).await;
+        let eid = start_and_request(
+            &env,
+            ir(Value::Null, gate(json!({ "approval_timeout_secs": 600 }))),
+        )
+        .await;
+        let ctx = request_context(&events(&env, &eid).await);
+        let digest = ctx["action_digest"].as_str().unwrap().to_string();
+        let expires_at = ts(&ctx, "expires_at").unwrap();
+        assert!(Utc::now() < expires_at, "{}", env.name);
+        *clock.0.lock().unwrap() = Some(expires_at + Duration::seconds(1));
+
+        let before = events(&env, &eid).await.len();
+        let (st, body) = approve(&env, &eid, &digest).await;
+        assert!(Utc::now() < expires_at, "{}", env.name);
+        assert_eq!(st, StatusCode::CONFLICT, "{}: {body}", env.name);
+        assert!(
+            body.to_string().contains("expired at its deadline"),
+            "{}: {body}",
+            env.name
+        );
+        assert_eq!(
+            events(&env, &eid).await.len(),
+            before,
+            "{}: nothing recorded",
+            env.name
+        );
+    }
+}
+
+/// A request's deadline is stamped on the store's clock: with the store's
+/// clock a day ahead of this process's, `expires_at` is the timeout after the
+/// store's time.
+#[tokio::test]
+async fn a_request_is_stamped_by_the_store_clock() {
+    for tb in support::backends().await {
+        let store_now = Utc::now() + Duration::days(1);
+        let clock = Arc::new(StoreClock(Mutex::new(Some(store_now))));
+        let store: Arc<dyn StateBackend> =
+            Arc::new(jamjet_testkit::Intercept::new(tb.dyn_backend(), clock));
+        let env = env_on(tb.name(), store).await;
+        let eid = start_and_request(
+            &env,
+            ir(Value::Null, gate(json!({ "approval_timeout_secs": 600 }))),
+        )
+        .await;
+        let ctx = request_context(&events(&env, &eid).await);
+        close_to(
+            ts(&ctx, "expires_at"),
+            store_now + Duration::seconds(600),
+            env.name,
+        );
+    }
+}
+
 /// An unreadable deadline is treated as passed: refuse, and expire it.
 #[tokio::test]
 async fn an_unreadable_deadline_fails_closed() {

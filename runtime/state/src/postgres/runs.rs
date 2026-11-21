@@ -169,10 +169,15 @@ impl NewEvent {
 }
 
 /// Append `events` to the run's log in order, in one statement, at the
-/// sequences after the log's last, under `tenant`. Returns the last
-/// sequence. The caller holds the run's lock ([`lock_run`]), or has just
-/// inserted the run's row in the same transaction, so no other writer can
-/// take a sequence in between. `events` is not empty.
+/// sequences after the log's last, under `tenant`, the run's own. Returns
+/// the last sequence. The caller holds the run's lock ([`lock_run`]), or has
+/// just inserted the run's row in the same transaction, so no other writer
+/// can take a sequence in between. `events` is not empty.
+///
+/// Every row of a run carries the run's tenant, which never changes, so the
+/// last sequence read under that tenant is the log's last. Were a row of
+/// another tenant ever in the log, the insert would hit the unique sequence
+/// key and fail rather than reach across tenants.
 pub(super) async fn insert_events(
     conn: &mut PgConnection,
     execution_id: Uuid,
@@ -186,7 +191,7 @@ pub(super) async fn insert_events(
     let times: Vec<DateTime<Utc>> = events.iter().map(|e| e.created_at).collect();
     let last: Option<i64> = sqlx::query_scalar(
         "WITH last AS (SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events \
-                       WHERE execution_id = $1), \
+                       WHERE execution_id = $1 AND tenant_id = $2), \
               added AS ( \
                 INSERT INTO events \
                   (id, execution_id, tenant_id, sequence, kind_type, node_id, kind_json, created_at) \
@@ -342,18 +347,21 @@ async fn lock_known_run(
 }
 
 /// Set the run's terminal `status`, keeping a completion time it already
-/// has. The caller holds the run's lock.
+/// has. The caller holds the run's lock, which read `tenant`.
 async fn set_terminal_status(
     conn: &mut PgConnection,
     execution_id: Uuid,
+    tenant: &str,
     status: &'static str,
 ) -> Result<(), TxError> {
     sqlx::query(
         "UPDATE workflow_executions SET status = $2, updated_at = statement_timestamp(), \
-         completed_at = COALESCE(completed_at, statement_timestamp()) WHERE execution_id = $1",
+         completed_at = COALESCE(completed_at, statement_timestamp()) \
+         WHERE execution_id = $1 AND tenant_id = $3",
     )
     .bind(execution_id)
     .bind(status)
+    .bind(tenant)
     .execute(conn)
     .await?;
     Ok(())
@@ -625,10 +633,10 @@ pub(super) async fn patch_append_array(
     let value = &value;
     with_tx(&b.pool, "patch_append_array", |tx| {
         Box::pin(async move {
-            let state: Option<String> = match scope {
+            let row: Option<(String, String)> = match scope {
                 None => {
-                    sqlx::query_scalar(
-                        "SELECT current_state FROM workflow_executions \
+                    sqlx::query_as(
+                        "SELECT current_state, tenant_id FROM workflow_executions \
                          WHERE execution_id = $1 FOR UPDATE",
                     )
                     .bind(id)
@@ -636,8 +644,8 @@ pub(super) async fn patch_append_array(
                     .await?
                 }
                 Some(tenant) => {
-                    sqlx::query_scalar(
-                        "SELECT current_state FROM workflow_executions \
+                    sqlx::query_as(
+                        "SELECT current_state, tenant_id FROM workflow_executions \
                          WHERE execution_id = $1 AND tenant_id = $2 FOR UPDATE",
                     )
                     .bind(id)
@@ -647,7 +655,7 @@ pub(super) async fn patch_append_array(
                 }
             };
             fault_point!("pg.patch_append_array", 1);
-            let Some(state) = state else {
+            let Some((state, tenant)) = row else {
                 return Err(StateBackendError::NotFound(format!("execution {id}")).into());
             };
             let mut state: serde_json::Value =
@@ -663,10 +671,11 @@ pub(super) async fn patch_append_array(
             let state = serde_json::to_string(&state).map_err(StateBackendError::from)?;
             sqlx::query(
                 "UPDATE workflow_executions SET current_state = $2, \
-                 updated_at = statement_timestamp() WHERE execution_id = $1",
+                 updated_at = statement_timestamp() WHERE execution_id = $1 AND tenant_id = $3",
             )
             .bind(id)
             .bind(state)
+            .bind(tenant)
             .execute(&mut **tx)
             .await?;
             fault_point!("pg.patch_append_array", 2);
@@ -1196,7 +1205,7 @@ pub(super) async fn finish_execution(
             if run.status.is_terminal() {
                 return Ok(ExecutionFinish::AlreadyTerminal(run.status));
             }
-            set_terminal_status(tx, id, status).await?;
+            set_terminal_status(tx, id, &run.tenant, status).await?;
             fault_point!("pg.finish_execution", 2);
             let sequence = insert_events(tx, id, &run.tenant, row).await?;
             fault_point!("pg.finish_execution", 3);
@@ -1206,10 +1215,11 @@ pub(super) async fn finish_execution(
     .await
 }
 
-/// L1, then the whole log, across tenants, once the run is known to be the
-/// view's: a condition that says nothing has resolved a request must see
-/// every row that could have. The condition runs here, under the lock, and
-/// the append follows in the same transaction.
+/// L1, then the whole log, once the run is known to be the view's: a
+/// condition that says nothing has resolved a request must see every row
+/// that could have. Every row of a run carries the run's tenant, so the read
+/// under that tenant is the whole log. The condition runs here, under the
+/// lock, and the append follows in the same transaction.
 pub(super) async fn append_event_if(
     b: &PgBackend,
     event: Event,
@@ -1228,9 +1238,10 @@ pub(super) async fn append_event_if(
             }
             let rows = sqlx::query(
                 "SELECT id, execution_id, sequence, kind_json, created_at FROM events \
-                 WHERE execution_id = $1 ORDER BY sequence",
+                 WHERE execution_id = $1 AND tenant_id = $2 ORDER BY sequence",
             )
             .bind(id)
+            .bind(&run.tenant)
             .fetch_all(&mut **tx)
             .await?;
             fault_point!("pg.append_event_if", 2);
@@ -1291,9 +1302,11 @@ pub(super) async fn commit_scheduler_pass(
                 return Ok(PassCommit::ExecutionTerminal(run.status));
             }
             let latest: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE execution_id = $1",
+                "SELECT COALESCE(MAX(sequence), 0) FROM events \
+                 WHERE execution_id = $1 AND tenant_id = $2",
             )
             .bind(id)
+            .bind(&run.tenant)
             .fetch_one(&mut **tx)
             .await?;
             fault_point!("pg.commit_scheduler_pass", 2);
@@ -1305,10 +1318,12 @@ pub(super) async fn commit_scheduler_pass(
             if !nodes.is_empty() {
                 let live: bool = sqlx::query_scalar(
                     "SELECT EXISTS (SELECT 1 FROM work_items WHERE execution_id = $1 \
-                     AND node_id = ANY($2) AND status IN ('pending', 'claimed'))",
+                     AND tenant_id = $3 AND node_id = ANY($2) \
+                     AND status IN ('pending', 'claimed'))",
                 )
                 .bind(id)
                 .bind(nodes)
+                .bind(&run.tenant)
                 .fetch_one(&mut **tx)
                 .await?;
                 fault_point!("pg.commit_scheduler_pass", 3);
@@ -1328,7 +1343,7 @@ pub(super) async fn commit_scheduler_pass(
                 fault_point!("pg.commit_scheduler_pass", 5);
             }
             if let Some((status, event)) = finish {
-                set_terminal_status(tx, id, status).await?;
+                set_terminal_status(tx, id, &run.tenant, status).await?;
                 fault_point!("pg.commit_scheduler_pass", 6);
                 last_sequence = insert_events(tx, id, &run.tenant, event).await?;
                 fault_point!("pg.commit_scheduler_pass", 7);

@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 sqlx = { workspace = true }
 libsqlite3-sys = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
 # The fault points are on for the kit's own tests only. As a normal
@@ -27,3 +28,4 @@ uuid = { workspace = true }
 # release builds of the server included.
 [dev-dependencies]
 jamjet-state = { path = "../state", features = ["test-hooks"] }
+tracing-subscriber = { workspace = true }

@@ -451,7 +451,11 @@ pub async fn submit_approval(
     // BEFORE the digest rules on purpose: a late approval with no digest, or
     // a stale one, is answered 409 Expired (the request can no longer be
     // decided at all) rather than 400 DigestRequired or 409 StaleDigest.
-    if request.deadline().expired(chrono::Utc::now()) {
+    let now = backend
+        .store_now()
+        .await
+        .map_err(|e| SubmitError::Backend(e.to_string()))?;
+    if request.deadline().expired(now) {
         return Err(SubmitError::Expired(node_id));
     }
     let request_digest = request.action_digest().map(str::to_owned);

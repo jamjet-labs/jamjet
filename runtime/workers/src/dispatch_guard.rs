@@ -542,9 +542,11 @@ pub(crate) async fn guard_dispatch_in(
                     crate::node_guard::basis_preview(&basis.payload, basis.step, node_def),
             });
             if let (Some(deadline), Some(obj)) = (&deadline, context.as_object_mut()) {
-                if let Err(e) =
-                    jamjet_state::approvals::stamp_deadline(obj, deadline, chrono::Utc::now())
-                {
+                let stamped = match backend.store_now().await {
+                    Ok(now) => jamjet_state::approvals::stamp_deadline(obj, deadline, now),
+                    Err(e) => Err(e.to_string()),
+                };
+                if let Err(e) = stamped {
                     return DispatchGuardOutcome::Unavailable {
                         reason: format!("approval required but its deadline could not be set: {e}"),
                     };
