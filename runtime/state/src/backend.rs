@@ -979,8 +979,9 @@ pub trait StateBackend: Send + Sync {
     ///
     /// In one transaction:
     /// 1. Attempt `UPDATE work_items SET status='completed', completed_at=?, lease_expires_at=NULL
-    ///    WHERE id=? AND lease_fence=?`. Zero rows means the fence no longer matches
-    ///    (lease was stolen or item already settled) — rollback and return `Ok(false)`.
+    ///    WHERE id=? AND lease_fence=? AND status='claimed' AND execution_id=?`. Zero rows means
+    ///    the fence no longer matches (lease was stolen or item already settled), the item is
+    ///    not claimed, or it is another run's: rollback and return `Ok(false)`.
     /// 2. Idempotently mark the execution terminal:
     ///    `UPDATE workflow_executions SET status='limit_exceeded', updated_at=?, completed_at=COALESCE(completed_at,?)
     ///    WHERE execution_id=? AND status NOT IN ('completed','failed','cancelled','limit_exceeded')`.

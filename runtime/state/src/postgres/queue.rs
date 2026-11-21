@@ -1301,7 +1301,8 @@ pub(super) async fn fail_work_item_fenced_recorded(
 
 /// L1 on the run, then the fenced settle of its item, then the run set
 /// `limit_exceeded` unless it has ended. A run that is not there, or not
-/// the view's, is `NotFound`; a fence that does not match is `false`.
+/// the view's, is `NotFound`; a fence that does not match, an item that is
+/// not claimed, or one of another run is `false`.
 pub(super) async fn finalize_rollover_fenced(
     b: &PgBackend,
     execution_id: &ExecutionId,
@@ -1322,17 +1323,21 @@ pub(super) async fn finalize_rollover_fenced(
                 None => sqlx::query(
                     "UPDATE work_items SET status = 'completed', \
                      completed_at = statement_timestamp(), lease_expires_at = NULL \
-                     WHERE id = $1 AND lease_fence = $2",
-                )
-                .bind(item)
-                .bind(lease_fence),
-                Some(tenant) => sqlx::query(
-                    "UPDATE work_items SET status = 'completed', \
-                     completed_at = statement_timestamp(), lease_expires_at = NULL \
-                     WHERE id = $1 AND lease_fence = $2 AND tenant_id = $3",
+                     WHERE id = $1 AND lease_fence = $2 AND status = 'claimed' \
+                     AND execution_id = $3",
                 )
                 .bind(item)
                 .bind(lease_fence)
+                .bind(run),
+                Some(tenant) => sqlx::query(
+                    "UPDATE work_items SET status = 'completed', \
+                     completed_at = statement_timestamp(), lease_expires_at = NULL \
+                     WHERE id = $1 AND lease_fence = $2 AND status = 'claimed' \
+                     AND execution_id = $3 AND tenant_id = $4",
+                )
+                .bind(item)
+                .bind(lease_fence)
+                .bind(run)
                 .bind(tenant),
             };
             let settled = settle.execute(&mut **tx).await?.rows_affected();

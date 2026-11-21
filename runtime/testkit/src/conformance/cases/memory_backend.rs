@@ -398,6 +398,61 @@ pub async fn fenced_complete_rejects_forged_fence_zero_on_pending_item(fx: &Fixt
     );
 }
 
+/// A rollover finalizes only a still-claimed item of its own run. A forged
+/// fence 0 matched a pending item's fence and settled it, and a run could
+/// settle another run's item and end itself on it.
+pub async fn finalize_rollover_settles_only_a_claimed_item_of_its_run(fx: &Fixture) {
+    let backend = fx.backend.as_ref();
+    let run = ExecutionId::new();
+    let other = ExecutionId::new();
+    for id in [&run, &other] {
+        backend
+            .create_execution(sample_execution(id))
+            .await
+            .unwrap();
+    }
+    let item_id = backend.enqueue_work_item(pending_item(&run)).await.unwrap();
+    let status =
+        |id: ExecutionId| async move { backend.get_execution(&id).await.unwrap().unwrap().status };
+
+    assert!(
+        !backend
+            .finalize_rollover_fenced(&run, item_id, 0)
+            .await
+            .unwrap(),
+        "a forged fence 0 must not finalize a pending item"
+    );
+    assert_eq!(status(run.clone()).await, WorkflowStatus::Running);
+    let claimed = backend
+        .claim_work_item("w1", &["default"])
+        .await
+        .unwrap()
+        .expect("the pending item is still claimable");
+    assert_eq!(claimed.id, item_id);
+
+    assert!(
+        !backend
+            .finalize_rollover_fenced(&other, item_id, claimed.lease_fence)
+            .await
+            .unwrap(),
+        "another run's item is not finalized"
+    );
+    assert_eq!(status(other.clone()).await, WorkflowStatus::Running);
+
+    assert!(backend
+        .finalize_rollover_fenced(&run, item_id, claimed.lease_fence)
+        .await
+        .unwrap());
+    assert_eq!(status(run.clone()).await, WorkflowStatus::LimitExceeded);
+    assert!(
+        !backend
+            .finalize_rollover_fenced(&run, item_id, claimed.lease_fence)
+            .await
+            .unwrap(),
+        "a settled item is not finalized again"
+    );
+}
+
 /// Happy path: a currently-claimed item settled with its matching fence returns
 /// true (the worker_id-is-some guard must not block the legitimate holder).
 pub async fn fenced_complete_settles_claimed_item_with_matching_fence(fx: &Fixture) {

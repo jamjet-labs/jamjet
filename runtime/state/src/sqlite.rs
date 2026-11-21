@@ -1951,11 +1951,12 @@ impl StateBackend for SqliteBackend {
         // 1. Fence-gated settle of the work item.
         let rows = sqlx::query(
             "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL \
-             WHERE id = ? AND lease_fence = ?",
+             WHERE id = ? AND lease_fence = ? AND status = 'claimed' AND execution_id = ?",
         )
         .bind(&now)
         .bind(&item_id_str)
         .bind(lease_fence)
+        .bind(&exec_id_str)
         .execute(&mut *tx)
         .await
         .map_err(map_db_err)?
