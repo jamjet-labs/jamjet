@@ -32,8 +32,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The `ApprovalReceived` event gains an optional `choice`. An older build ignores it, so a
   condition on the choice never matches there: do not roll back while such a run is live.
 - `GET /executions/:id` carries `usage`: `input_tokens`, `output_tokens`, `cost_usd`,
-  `billable_steps`, `cost_unknown_steps`, `tokens_unknown_steps`, and the same count for
-  input and output tokens alone (`input_tokens_unknown_steps`, `output_tokens_unknown_steps`).
+  `billable_steps` (steps that name a model or report tokens or a cost), `cost_unknown_steps`,
+  `tokens_unknown_steps`, and the same count for input and output tokens alone
+  (`input_tokens_unknown_steps`, `output_tokens_unknown_steps`).
   It is counted from the run's event log, across `continue_as_new` segments, by the fold the
   caps use. It is null when the log holds an event this build cannot read. The MCP
   `jamjet_get_execution` tool carries it too.
@@ -66,12 +67,14 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   answered 409 `OptionsChanged` by every decision, a rejection included.
 - Migration 0017 adds an index for the approvals list. A build from before it will not open
   a store that has run it, so there is no rollback past this release.
-- Under `cost_budget_usd`, a step that reports no cost stops the run. The built-in provider
-  adapters report none; the model sidecar does, for a model litellm can price. Under a token
-  cap, a step that reports no count for the tokens the cap reads stops the run: report both
-  counts, 0 included. The trip
-  carries a `reason` (`cost_not_reported`, `tokens_not_reported`, or `cost_cap_invalid`),
-  and `jamjet audit` shows it.
+- A step is counted when it names a model or reports tokens or a cost. One that reports none
+  of these is not counted under any cap, so a `python_fn` that calls a model and returns no
+  usage keys is never stopped.
+- Under `cost_budget_usd`, a counted step that reports no cost stops the run. The built-in
+  provider adapters report none; the model sidecar does, for a model litellm can price. Under
+  a token cap, a counted step that reports no count for the tokens the cap reads stops the
+  run: report both counts, 0 included. The trip carries a `reason` (`cost_not_reported`,
+  `tokens_not_reported`, or `cost_cap_invalid`), and `jamjet audit` shows it.
 - A budget trip no longer rolls a `continue_as_new` run over to a new segment; it fails the
   run. `continue_as_new` is not read. A step refused at its cap fails for good, and a claim
   that names the run is told `budget`. A named claim retried after that refusal reads

@@ -195,11 +195,16 @@ shows the count as `usage`: `input_tokens`, `output_tokens`, `cost_usd`, `billab
 the counts of steps that did not report a cost or tokens. `usage` is null when the log holds
 an event this build cannot read, since a partial count would be taken for the whole.
 
+A step is counted when its completion names a model or reports tokens or a cost;
+`billable_steps` is the number of counted steps. A step that reports none of these is not
+counted at all, under any cap. A `python_fn` that calls a model and returns no usage keys is
+never counted, so it is never stopped.
+
 | Cap | A step is let through only if | The run fails when |
 |-----|-------------------------------|--------------------|
-| `total_tokens` | every billable step reported its tokens, and input plus output is below the cap | every billable step reported its tokens, and the total is above the cap |
+| `total_tokens` | every counted step reported its tokens, and input plus output is below the cap | a counted step left the count unknown, or input plus output is above the cap |
 | `input_tokens`, `output_tokens` | the same, for that count | the same, for that count |
-| `cost_budget_usd` | every billable step reported a usable cost, and the cost is below the cap | every billable step reported a usable cost, and the cost is above the cap |
+| `cost_budget_usd` | every counted step reported a usable cost, and the cost is below the cap | a counted step left the cost unknown, or the cost is above the cap |
 
 - At the cap, the run goes on. The next step that can spend is refused at claim, and the run
   fails then. Past the cap, the scheduler fails the run in its next pass, before anything
@@ -212,8 +217,8 @@ an event this build cannot read, since a partial count would be taken for the wh
 - The cap is checked on every step that can spend. `condition`, `human_approval` and
   `limit_exceeded` nodes run at the cap, because the engine runs them and they cannot spend.
   An `eval` node is held: an LLM judge spends.
-- A step that reports no cost under a dollar cap stops the run, and a step that reports
-  no token count under a token cap does the same. The trip carries `reason`:
+- A counted step that reports no cost under a dollar cap stops the run, and a counted step
+  that reports no token count under a token cap does the same. The trip carries `reason`:
   `cost_not_reported` or `tokens_not_reported`. A count that is already over its cap trips as
   a plain overspend. A step that reports a cost but no tokens, `cost_usd: 0` included, counts
   as tokens unknown. A self-reporting worker under a token cap must send both counts, 0
