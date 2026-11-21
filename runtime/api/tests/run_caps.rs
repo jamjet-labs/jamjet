@@ -1322,14 +1322,30 @@ async fn a_replayed_result_keeps_its_cost_and_counts_once() {
         )
         .register_executor("model", executor);
 
-        let (one, two) = tokio::join!(first_worker.poll_and_execute(), async {
-            entered.notified().await;
-            let (two, ()) = tokio::join!(second_worker.poll_and_execute(), async {
-                hooks.waiting.notified().await;
-                release.notify_one();
-            });
-            two
-        });
+        // Each wait is on the other worker. If one returns early, its
+        // signal never comes: the deadline turns that hang into a failure
+        // that names the stage.
+        let stage = Mutex::new("the first worker calls the model");
+        let handshake = async {
+            tokio::join!(first_worker.poll_and_execute(), async {
+                entered.notified().await;
+                *stage.lock().unwrap() = "the second worker finds the reservation held";
+                let (two, ()) = tokio::join!(second_worker.poll_and_execute(), async {
+                    hooks.waiting.notified().await;
+                    *stage.lock().unwrap() = "both workers finish";
+                    release.notify_one();
+                });
+                two
+            })
+        };
+        let Ok((one, two)) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), handshake).await
+        else {
+            panic!(
+                "{name}: the replay handshake stalled waiting for: {}",
+                stage.lock().unwrap()
+            );
+        };
         assert!(
             matches!(one, Ok(true)) && matches!(two, Ok(true)),
             "{name}: {one:?} {two:?}"
