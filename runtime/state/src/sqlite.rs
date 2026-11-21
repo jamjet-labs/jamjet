@@ -1715,12 +1715,15 @@ impl StateBackend for SqliteBackend {
         row.map(|r| row_to_work_item(&r)).transpose()
     }
 
-    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
+    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<bool> {
         let id_str = item_id.to_string();
         let completed_at = Utc::now().to_rfc3339();
 
+        // Only a still-claimed item, as the fenced settle: a completion sent
+        // again matches zero rows.
         let rows_affected = sqlx::query(
-            "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL WHERE id = ?",
+            "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL \
+             WHERE id = ? AND status = 'claimed'",
         )
         .bind(&completed_at)
         .bind(&id_str)
@@ -1728,11 +1731,7 @@ impl StateBackend for SqliteBackend {
         .await
         .map_err(map_db_err)?
         .rows_affected();
-
-        if rows_affected == 0 {
-            return Err(StateBackendError::NotFound(id_str));
-        }
-        Ok(())
+        Ok(rows_affected > 0)
     }
 
     #[instrument(skip(self), fields(item_id = %item_id, fence = lease_fence))]
@@ -4478,7 +4477,7 @@ mod tests {
         assert_eq!(claimed.node_id, "node-1");
         assert_eq!(claimed.worker_id.as_deref(), Some("worker-1"));
 
-        db.complete_work_item(item_id).await.unwrap();
+        assert!(db.complete_work_item(item_id).await.unwrap());
 
         // No more items
         let none = db.claim_work_item("worker-1", &["default"]).await.unwrap();

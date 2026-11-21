@@ -918,7 +918,7 @@ impl StateBackend for Intercept {
         )
     }
 
-    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
+    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<bool> {
         around!(
             self,
             Op::CompleteWorkItem(item_id),

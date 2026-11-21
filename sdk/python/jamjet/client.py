@@ -522,7 +522,8 @@ class JamjetClient:
         When ``lease_fence`` is provided (and non-zero), it is echoed back so the
         runtime can prove this worker still holds the lease: a stale fence (the
         item was reclaimed/replayed) is rejected with 409 and no NodeCompleted is
-        emitted. A falsy/absent fence keeps the legacy unfenced behavior.
+        emitted. A falsy/absent fence keeps the legacy unfenced behavior, which
+        settles only an item still claimed: sent again, it is refused with 409.
         """
         body: dict[str, Any] = {
             "output": output,

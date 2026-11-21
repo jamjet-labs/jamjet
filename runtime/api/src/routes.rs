@@ -3893,7 +3893,17 @@ async fn complete_work_item(
                 "complete: unfenced legacy path — settle and terminal event are \
                  not atomic; echo lease_fence to make them one transaction"
             );
-            backend.complete_work_item(item_id).await?;
+            // Only a still-claimed item settles, so a completion sent again
+            // (its answer lost) records nothing twice.
+            if !backend.complete_work_item(item_id).await? {
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "completed": false,
+                        "reason": "the work item is not claimed",
+                    })),
+                ));
+            }
             false
         }
     };

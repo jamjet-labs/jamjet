@@ -119,6 +119,13 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not parse) or sent unfenced with a bad cost leaves the step to retry, and the first
   attempt's spend goes uncounted. An `eval` judge and a remote agent called by `agent_tool`
   report no spend, so they are held at the cap but not counted.
+- A completion sent without its lease fence settles only an item that is still claimed. Sent
+  again, it is 409 ("the work item is not claimed") and records nothing. On SQLite each
+  repeat used to record the step again, cost included, so three sends of one $0.40 step read
+  as $1.20. An unfenced completion of an item no worker has claimed, or of an unknown item id,
+  is 409 too (it was 200, or 404 for an unknown id on SQLite).
+  `StateBackend::complete_work_item` now returns `bool`, `false` for an item that is not
+  claimed, as `complete_work_item_fenced` does.
 - Python: a model call that litellm cannot price reports no cost, not $0. `cost_usd` is
   `None` on `ModelResponse` and `ModelCallRecord` (now `float | None`), and the model sidecar
   sends `null`, so under `cost_budget_usd` the run stops after that step. `BudgetMiddleware`

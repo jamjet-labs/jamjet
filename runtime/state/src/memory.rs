@@ -1355,10 +1355,13 @@ impl StateBackend for InMemoryBackend {
         Ok(self.work_items.get(&item_id).map(|r| r.value().clone()))
     }
 
-    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
+    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<bool> {
         let _pass = self.pass_lock.lock().await;
-        self.work_items.remove(&item_id);
-        Ok(())
+        // Only a still-claimed item (`worker_id` set), as the fenced settle.
+        Ok(self
+            .work_items
+            .remove_if(&item_id, |_k, entry| entry.worker_id.is_some())
+            .is_some())
     }
 
     async fn complete_work_item_fenced(

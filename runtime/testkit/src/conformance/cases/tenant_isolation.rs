@@ -516,6 +516,51 @@ pub async fn scoped_fail_cannot_reach_another_tenants_item(fx: &Fixture) {
         .is_some());
 }
 
+/// The unfenced settle of a scoped store reaches only its own tenant's
+/// items: beta, holding alpha's claimed item id, settles nothing.
+pub async fn scoped_unfenced_complete_cannot_reach_another_tenants_item(fx: &Fixture) {
+    let Some((_, scoper)) = store(fx) else {
+        return without_tenant_views(fx);
+    };
+    register_tenant(scoper, "alpha", "Alpha").await;
+    register_tenant(scoper, "beta", "Beta").await;
+    let tenant_a = scoper(&TenantId::from("alpha"));
+    let tenant_b = scoper(&TenantId::from("beta"));
+
+    let exec = sample_execution("wf-x");
+    let execution_id = exec.execution_id.clone();
+    tenant_a.create_execution(exec).await.unwrap();
+    let item_id = uuid::Uuid::new_v4();
+    tenant_a
+        .enqueue_work_item(jamjet_state::WorkItem {
+            id: item_id,
+            execution_id,
+            node_id: "node-x".to_string(),
+            queue_type: "general".to_string(),
+            payload: json!({}),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            lease_fence: 0,
+            tenant_id: "alpha".to_string(),
+        })
+        .await
+        .unwrap();
+    tenant_a
+        .claim_work_item("worker-a", &["general"])
+        .await
+        .unwrap()
+        .expect("claimable");
+
+    assert!(
+        !tenant_b.complete_work_item(item_id).await.unwrap(),
+        "a scoped backend must never settle another tenant's item"
+    );
+    assert!(tenant_a.complete_work_item(item_id).await.unwrap());
+}
+
 // ── The tenant-scoped backend must match the untenanted one ──────────────────
 
 /// The tenant-scoped `reclaim_expired_leases` must not resurrect a settled item.

@@ -1678,12 +1678,14 @@ impl StateBackend for TenantScopedSqliteBackend {
         row.map(|r| row_to_work_item(&r)).transpose()
     }
 
-    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
+    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<bool> {
         let id_str = item_id.to_string();
         let completed_at = Utc::now().to_rfc3339();
 
+        // Only a still-claimed item of this tenant, as the fenced settle.
         let rows_affected = sqlx::query(
-            "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL WHERE id = ? AND tenant_id = ?",
+            "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL \
+             WHERE id = ? AND tenant_id = ? AND status = 'claimed'",
         )
         .bind(&completed_at)
         .bind(&id_str)
@@ -1692,11 +1694,7 @@ impl StateBackend for TenantScopedSqliteBackend {
         .await
         .map_err(map_db_err)?
         .rows_affected();
-
-        if rows_affected == 0 {
-            return Err(StateBackendError::NotFound(id_str));
-        }
-        Ok(())
+        Ok(rows_affected > 0)
     }
 
     #[instrument(skip(self), fields(tenant = %self.tenant_id, item_id = %item_id, fence = lease_fence))]

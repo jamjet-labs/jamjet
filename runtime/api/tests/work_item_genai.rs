@@ -138,6 +138,12 @@ async fn complete_work_item_threads_gen_ai_fields() {
         })
         .await
         .expect("enqueue_work_item");
+    // A worker holds it: the unfenced completion settles only a claimed item.
+    backend
+        .claim_work_item("w", &["general"])
+        .await
+        .expect("claim_work_item")
+        .expect("the item is claimable");
     let body = serde_json::json!({
         "execution_id": execution_id.to_string(),
         "node_id": "genai-node",
@@ -280,6 +286,12 @@ async fn complete_work_item_without_gen_ai_fields_keeps_backward_compat() {
         })
         .await
         .expect("enqueue_work_item");
+    // A worker holds it: the unfenced completion settles only a claimed item.
+    backend
+        .claim_work_item("w", &["general"])
+        .await
+        .expect("claim_work_item")
+        .expect("the item is claimable");
     // Old-style body with no GenAI fields.
     let body = serde_json::json!({
         "execution_id": execution_id.to_string(),

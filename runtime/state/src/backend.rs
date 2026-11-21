@@ -819,8 +819,15 @@ pub trait StateBackend: Send + Sync {
     /// output under another item's key.
     async fn get_work_item(&self, item_id: WorkItemId) -> BackendResult<Option<WorkItem>>;
 
-    /// Mark a work item as completed and release the lease.
-    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()>;
+    /// Settle a work item that is still claimed, with no fence: the legacy
+    /// unfenced completion. Returns `true` iff a row was updated.
+    ///
+    /// Returns `false`, never an error, for an item that is absent, pending
+    /// (never claimed, or freed by a reclaim) or already settled, as
+    /// [`Self::complete_work_item_fenced`] does. A completion sent again
+    /// then settles nothing, so its caller records nothing twice. A scoped
+    /// store settles only its own tenant's items; another tenant's is `false`.
+    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<bool>;
 
     /// Fence-guarded completion of a work item. Settles the item ONLY if the
     /// stored `lease_fence` still matches AND the item is still claimable

@@ -1086,6 +1086,59 @@ async fn a_completion_retried_after_a_lost_answer_counts_once() {
     }
 }
 
+/// The same, sent without the lease fence. The unfenced settle used to take
+/// an item that was no longer claimed: on SQLite each repeat wrote another
+/// `NodeCompleted`, so three sends of one $0.40 step read as $1.20. The
+/// repeat must be 409 on every backend and the step count once.
+#[tokio::test]
+async fn an_unfenced_completion_sent_twice_counts_once() {
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            linear_ir(
+                "wf-unfenced-twice",
+                &["a", "b"],
+                python_fn(),
+                json!({ "cost_budget_usd": 1.0 }),
+            ),
+        )
+        .await;
+        let name = run.name;
+        let wi = run.claim_http().await;
+        let body = json!({
+            "output": {},
+            "state_patch": {},
+            "cost_usd": 0.4,
+            "input_tokens": 3,
+            "output_tokens": 1
+        });
+        let path = format!("/work-items/{}/complete", wi["id"].as_str().unwrap());
+        let (st, answer) = support::post(&run.state, &path, body.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{name}: {answer}");
+        for _ in 0..2 {
+            let (st, answer) = support::post(&run.state, &path, body.clone()).await;
+            assert_eq!(
+                (st, answer),
+                (
+                    StatusCode::CONFLICT,
+                    json!({ "completed": false, "reason": "the work item is not claimed" })
+                ),
+                "{name}"
+            );
+        }
+        assert_eq!(run.completed().await, vec!["a"], "{name}");
+        let usage = fold_run_usage(run.backend.as_ref(), &run.eid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (usage.billable_steps, usage.cost_nanos, usage.input_tokens),
+            (1, 400_000_000, 3),
+            "{name}"
+        );
+    }
+}
+
 /// A model that waits for the test before it answers, so a second worker can
 /// reach the same step meanwhile. Each call reports 4 tokens and
 /// `cost_usd: 0.0123`.
