@@ -666,10 +666,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     run under that tenant's run lock: the sequence and log reads, the terminal status
     update, the scheduler pass's checks, the state patch and the snapshot upsert. Token
     validation is the one exception: it finds the tenant from the token, as on SQLite.
-  - Settings, read by `PgSettings::from_env`, which refuses one that is set but not valid: `JAMJET_PG_POOL_SIZE` (10, at
-    least 2), `JAMJET_PG_ACQUIRE_TIMEOUT_MS` (5000), `JAMJET_PG_STATEMENT_TIMEOUT_MS`
-    (30000), `JAMJET_PG_LOCK_TIMEOUT_MS` (10000), `JAMJET_PG_IDLE_IN_TX_TIMEOUT_MS`
-    (60000).
+  - Settings, read by `PgSettings::from_env`, which refuses one that is set but not
+    valid: `JAMJET_PG_POOL_SIZE` (10, at least 2), `JAMJET_PG_ACQUIRE_TIMEOUT_MS` (5000),
+    `JAMJET_PG_STATEMENT_TIMEOUT_MS` (30000), `JAMJET_PG_LOCK_TIMEOUT_MS` (10000),
+    `JAMJET_PG_IDLE_IN_TX_TIMEOUT_MS` (60000).
   - A deadlock, a lock timeout or a connection lost before the commit is retried from the
     start of the transaction. An error from the commit itself is never retried: its
     outcome is unknown, and the call answers `Unavailable`. So is a pool with no connection
@@ -696,8 +696,7 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - The Postgres tests run when `JAMJET_TEST_POSTGRES_URL` names a server
     (`runtime/scripts/pg-test.sh up` starts one in Docker) and skip otherwise.
     `JAMJET_REQUIRE_POSTGRES_TESTS=1` makes a missing URL a failure, as in CI. The tenant
-    check, `pg_scope`, runs the conformance suite once more on a tenant's view and takes
-    about 95 to 105 s.
+    check, `pg_scope`, runs the conformance suite once more on a tenant's view.
 
 ### Fixed
 
@@ -842,9 +841,13 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `StateBackend::store_now()` is the store's clock. Its default is the process clock, which
   SQLite and memory keep; Postgres answers the database's time. Approval deadlines are
   stamped and checked with it: the scheduler's deadline sweep, the approve route's
-  deadline check, and the guards that stamp a request's deadline. So with several
-  engines on one Postgres database, a deadline does not depend on which engine's clock
-  reads it.
+  deadline check, and the guards that stamp a request's deadline. The guard's check that
+  a lease is still held before it admits a step, and an agent's time budget, read it too.
+  So with several engines on one Postgres database, a deadline or a lease does not depend
+  on which engine's clock reads it.
+- `StateBackend::finalize_rollover_fenced` settles only a claimed item of the run it
+  names, on every store. A fence of 0 used to settle a pending item, and a run could
+  settle another run's item.
 
 ---
 
