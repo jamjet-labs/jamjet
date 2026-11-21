@@ -368,6 +368,30 @@ async fn a_dollar_cap_must_be_between_0_and_10000() {
     assert!(post_workflow(&state, ir).await.is_success());
 }
 
+/// A version stored before the range check, with a cap above 10,000,
+/// re-registers unchanged as before: deployments re-register on every boot.
+/// Its runs still fail with `cost_cap_invalid` at their first spending step.
+/// A new version with such a cap is refused, and so is a changed definition.
+#[tokio::test]
+async fn a_stored_version_with_a_cap_above_10000_re_registers() {
+    let backend = Arc::new(jamjet_state::InMemoryBackend::new());
+    let state = make_state(backend.clone());
+    let mut ir = dispatch_ir(Some(true));
+    ir["version"] = json!("stored-before");
+    ir["cost_budget_usd"] = json!(20_000.0);
+    support::store_ir(backend.as_ref(), &ir).await;
+    assert_eq!(post_workflow(&state, ir.clone()).await, StatusCode::OK);
+    let mut changed = ir.clone();
+    changed["cost_budget_usd"] = json!(30_000.0);
+    assert_eq!(post_workflow(&state, changed).await, StatusCode::CONFLICT);
+    let mut new_version = ir;
+    new_version["version"] = json!("new");
+    assert_eq!(
+        post_workflow(&state, new_version).await,
+        StatusCode::BAD_REQUEST
+    );
+}
+
 /// `on_budget_exceeded` is read by nothing now. Registration still accepts
 /// it, so a stored workflow that sets it re-registers.
 #[tokio::test]

@@ -86,8 +86,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `blocked`, because the node has already failed for good.
 - A `continue_as_new` rollover cut short by a crash on the older build ends with both
   segments `Failed`, not the parent `LimitExceeded`. Nothing needs repair by hand.
-- `cost_budget_usd` must be between 0 and 10,000 at registration (400 otherwise).
-  `on_budget_exceeded` is still accepted and is read by nothing. A stored workflow whose
+- `cost_budget_usd` must be between 0 and 10,000 when a new version is registered (400
+  otherwise). A version already stored with a cap outside that range still re-registers
+  unchanged (200). `on_budget_exceeded` is still accepted and is read by nothing. A stored workflow whose
   `cost_budget_usd` is negative, NaN or above 10,000 now fails its run on the first pass, with
   reason `cost_cap_invalid`. Before, infinity meant no limit and a large finite value was
   compared as it stood.
