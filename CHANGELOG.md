@@ -35,8 +35,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `billable_steps` (steps that name a model or report tokens or a cost), `cost_unknown_steps`,
   `tokens_unknown_steps`, and the same count for input and output tokens alone
   (`input_tokens_unknown_steps`, `output_tokens_unknown_steps`).
-  It is counted from the run's event log, across `continue_as_new` segments, by the fold the
-  caps use. It is null when the log holds an event this build cannot read. The MCP
+  It is counted from the run's event log by the fold the caps use. It covers the segment
+  asked for and the `continue_as_new` segments before it, not later ones: ask for the latest
+  segment's id for the whole run. It is null when the log holds an event this build cannot read. The MCP
   `jamjet_get_execution` tool carries it too.
 
 ### Changed

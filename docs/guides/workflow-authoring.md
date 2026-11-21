@@ -192,8 +192,10 @@ cost_budget_usd: 2.50
 The engine counts a run's tokens and cost from its own event log, across `continue_as_new`
 segments, and enforces both caps for in-process and HTTP workers alike. `GET /executions/:id`
 shows the count as `usage`: `input_tokens`, `output_tokens`, `cost_usd`, `billable_steps` and
-the counts of steps that did not report a cost or tokens. `usage` is null when the log holds
-an event this build cannot read, since a partial count would be taken for the whole.
+the counts of steps that did not report a cost or tokens. It covers the segment you ask for
+and the segments before it, not later ones, so ask for the latest segment for the whole run.
+`usage` is null when the log holds an event this build cannot read, since a partial count
+would be taken for the whole.
 
 A step is counted when its completion names a model or reports tokens or a cost;
 `billable_steps` is the number of counted steps. A step that reports none of these is not
