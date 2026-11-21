@@ -3136,17 +3136,19 @@ async fn gate_claimed_item(
     // A dispatch node needs the whole graph parsed (its failure wording is the
     // worker's); every other node needs only its own definition and the
     // workflow-level policy, so the hot path still skips the full parse.
+    //
+    // A claim reads the run's caps too, and fails closed when they cannot be
+    // read. A completion does not read them (`completion_gate`).
+    let caps = match caps_from_raw(&ir_value) {
+        Ok(caps) => caps,
+        Err(reason) => return fail_closed(backend, wi, reason).await,
+    };
     let GuardInputs {
         workflow_policy,
         workflow_agent,
         remote_agents,
         node_def,
-        caps,
     } = if jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&kind) {
-        let caps = match caps_from_raw(&ir_value) {
-            Ok(caps) => caps,
-            Err(reason) => return fail_closed(backend, wi, reason).await,
-        };
         let ir = match serde_json::from_value::<jamjet_ir::WorkflowIr>(ir_value) {
             Ok(ir) => ir,
             Err(e) => {
@@ -3161,7 +3163,6 @@ async fn gate_claimed_item(
             workflow_agent: ir.agent_ref,
             remote_agents: ir.remote_agents,
             node_def,
-            caps,
         }
     } else {
         match guard_inputs_from_raw(&ir_value, &wi.node_id) {
@@ -3300,13 +3301,12 @@ struct GuardInputs {
     /// `WorkflowIr::remote_agents`.
     remote_agents: std::collections::HashMap<String, jamjet_ir::workflow::RemoteAgentConfig>,
     node_def: NodeDef,
-    /// `WorkflowIr::token_budget` and `WorkflowIr::cost_budget_usd`.
-    caps: jamjet_state::RunCaps,
 }
 
 /// The run caps of a workflow, read from its stored IR: `token_budget` and
-/// `cost_budget_usd`. The claim gate and the completion route both read them
-/// here, so they agree on what a cap is. A present but unreadable value is
+/// `cost_budget_usd`. The claim gate reads them here, and so does the
+/// completion route for a cost it cannot count, so they agree on what a cap
+/// is. A present but unreadable value is
 /// `Err` (the fail-closed reason), never "no cap".
 fn caps_from_raw(ir_value: &Value) -> Result<jamjet_state::RunCaps, String> {
     let token_budget = match ir_value.get("token_budget") {
@@ -3367,7 +3367,6 @@ fn guard_inputs_from_raw(ir_value: &Value, node_id: &str) -> Result<GuardInputs,
         workflow_agent,
         remote_agents,
         node_def,
-        caps: caps_from_raw(ir_value)?,
     })
 }
 
@@ -3404,7 +3403,6 @@ async fn completion_gate(
         workflow_agent,
         remote_agents,
         node_def,
-        caps: _,
     } = guard_inputs_from_raw(&def.ir, &wi.node_id).map_err(refused)?;
     // The engine reports the result of a kind it runs itself; an external
     // worker's report for one is never recorded (see the claim route).
