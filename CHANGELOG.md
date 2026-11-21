@@ -75,6 +75,11 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a token cap, a counted step that reports no count for the tokens the cap reads stops the
   run: report both counts, 0 included. The trip carries a `reason` (`cost_not_reported`,
   `tokens_not_reported`, or `cost_cap_invalid`), and `jamjet audit` shows it.
+- Upgrading with runs in flight: a run under `cost_budget_usd` that already ran a model step
+  in process fails on its next pass with `cost_not_reported`, because the older worker
+  recorded that step with no cost. A run under a token cap with an HTTP step that reported
+  one of its two token counts fails the same way, with `tokens_not_reported`, when the cap
+  reads the other. Drain such runs before upgrading.
 - A budget trip no longer rolls a `continue_as_new` run over to a new segment; it fails the
   run. `continue_as_new` is not read. A step refused at its cap fails for good, and a claim
   that names the run is told `budget`. A named claim retried after that refusal reads
