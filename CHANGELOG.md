@@ -113,8 +113,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   event log, across continue-as-new segments, and both `token_budget` and `cost_budget_usd`
   are enforced for in-process and HTTP workers alike. A step that would start on a spent run
   is refused. A run past its cap fails before anything after it runs. Steps already running
-  when the cap is reached still finish and count, so a run can end above its cap by the
-  steps that were in flight: with parallel branches, by their width.
+  when the cap is reached still finish. In process their spend is recorded and counted, so a
+  run can end above its cap by the steps that were in flight: with parallel branches, by
+  their width. Over HTTP a step that completes after the run has failed is withdrawn (409),
+  and its spend is not recorded.
 - A cap trip after a model call no longer throws the paid result away and pays for it again
   on retry. A failed read of the log at the cap no longer lets the step through.
 - A failed attempt's spend is still not counted: the fail route takes no usage. Under a

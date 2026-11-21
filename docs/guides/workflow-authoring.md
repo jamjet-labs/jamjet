@@ -211,9 +211,11 @@ never counted, so it is never stopped.
   after the step that passed it is dispatched. The trip is recorded as `token_budget_exceeded`
   or `cost_budget_exceeded`. It names the step that was refused, or, when the scheduler fails
   the run, the last step that spent.
-- Steps already running when the cap is reached still finish, and all of them count. A run
-  can end above its cap by the steps that were in flight, and no more. Parallel branches are
-  the case: two steps claimed under the cap can both run.
+- Steps already running when the cap is reached still finish. In process, all of them are
+  recorded and counted, so a run can end above its cap by the steps that were in flight, and
+  no more. Parallel branches are the case: two steps claimed under the cap can both run. Over
+  HTTP, a step that completes after the run has failed is withdrawn (409), and its spend is
+  not recorded.
 - The cap is checked on every step that can spend. `condition`, `human_approval` and
   `limit_exceeded` nodes run at the cap, because the engine runs them and they cannot spend.
   An `eval` node is held: an LLM judge spends.
