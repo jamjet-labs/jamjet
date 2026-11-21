@@ -100,16 +100,20 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Recorded usage differs by transport in one case. A step that finishes after its run has
   failed on a cap is withdrawn over HTTP (409), so its spend is not recorded. In process it
   is recorded after the failure, and counted.
-- Public crate API, for the 0.6.0 release: `ModelResponse` and `ExecutionResult` gain
-  `cost_usd` (and `ExecutionResult` gains `Default`); `CostBudgetExceeded` and
-  `TokenBudgetExceeded` gain an optional `reason`; `DispatchGuardOutcome` gains `Spent`;
-  `guard_item` takes one more parameter; `BudgetState::exhausted` is deprecated, and the
-  worker's `check_budget_before_execution` and `check_budget_after_execution` are gone. A malformed
+- Public crate API: `ModelResponse` and `ExecutionResult` gain `cost_usd` (and
+  `ExecutionResult` gains `Default`); `CostBudgetExceeded` and `TokenBudgetExceeded` gain an
+  optional `reason`; `DispatchGuardOutcome` gains `Spent`; `guard_item` takes one more
+  parameter; `BudgetState::exhausted` is deprecated, and the worker's
+  `check_budget_before_execution` and `check_budget_after_execution` are gone. A malformed
   sidecar cost, or one that is not in USD, fails the step for every model registry caller;
   an eval judge's scorer fails instead. `tool_effects` records gain `cost_usd`, and older
   records replay with no cost. An agent card's `cost_budget_usd` now counts the sidecar's
   cost in process. The complete route answers 400 for a cost above 10,000 or a currency other
-  than USD.
+  than USD. Its text for a bad cost is now "cost_usd must be a number from 0 to 10000" (it was
+  "cost_usd must be a non-negative number"). Under a dollar cap, a fenced completion whose
+  cost cannot be counted also fails the step for good in the same write, and the 400 says so
+  ("...; the run has a dollar cap, so the step failed"): the step may have paid, and a retry
+  would pay again with nothing recorded.
 - Removed: `rollover_segment` (its caller was the budget trip), with its five tests, and the
   worker's pre-call budget check with four more tests it carried, nine worker tests in all.
   Their cases are covered by the caps unit tests and `run_caps`.
