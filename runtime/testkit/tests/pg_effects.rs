@@ -1,7 +1,8 @@
 //! Effect reservations on the Postgres store, where the suite's cases do not
 //! reach: two engines racing for one key, a reservation's expiry on the
-//! database's clock while this process's clock is an hour wrong, and a TTL
-//! too large to add to a time.
+//! database's clock while this process's clock is an hour wrong, a TTL
+//! too large to add to a time, and a tenant's view releasing or sizing what
+//! another tenant holds.
 //!
 //! A reservation is one upsert that takes the key only while no live
 //! reservation holds it, so there is no moment between "nobody holds it" and
@@ -244,4 +245,98 @@ async fn a_huge_ttl_is_held_to_the_longest_reservation() {
         held <= longest && longest - held < Duration::from_secs(60),
         "held {held:?}, the longest is {longest:?}"
     );
+}
+
+/// How many reservations of `key` `tenant` holds, read past any view.
+async fn reservations_of(pool: &PgPool, tenant: &str, key: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM tool_reservations WHERE tenant_id = $1 AND idempotency_key = $2",
+    )
+    .bind(tenant)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// `globex`, and the unscoped store under `default`, each hold key `k` as
+/// `worker-A` under fence 1. `acme`'s view releases `k` with that same
+/// owner and fence: both reservations are still there, and another worker
+/// still finds the key held. Each holder's own release then frees it.
+#[tokio::test]
+async fn a_view_cannot_release_another_tenants_reservation() {
+    let Some(db) = TestDatabase::fresh().await else {
+        return jamjet_testkit::skip("a_view_cannot_release_another_tenants_reservation");
+    };
+    let base = store(&db).await;
+    let pool = db.pool().await;
+    let acme = make_tenant(&base, "acme").await;
+    let globex = make_tenant(&base, "globex").await;
+    let run = ExecutionId::new();
+    let ttl = Duration::from_secs(300);
+    let holders: [(&str, &PgBackend); 2] = [("globex", &globex), (DEFAULT_TENANT, &base)];
+    for (whose, holder) in holders {
+        let taken = holder
+            .reserve_tool_effect("k", &run, "n1", "worker-A", 1, ttl)
+            .await
+            .unwrap();
+        assert_eq!(taken, ReserveOutcome::Acquired, "{whose}");
+
+        acme.release_tool_reservation("k", "worker-A", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            reservations_of(&pool, whose, "k").await,
+            1,
+            "acme released {whose}'s reservation"
+        );
+        let other = holder
+            .reserve_tool_effect("k", &run, "n1", "worker-B", 2, ttl)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&other, ReserveOutcome::Held { owner, .. } if owner == "worker-A"),
+            "{whose}: the key was freed: {other:?}"
+        );
+
+        holder
+            .release_tool_reservation("k", "worker-A", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            reservations_of(&pool, whose, "k").await,
+            0,
+            "{whose}: its own release"
+        );
+    }
+}
+
+/// `globex`, and the unscoped store under `default`, store bytes `acme`
+/// never stored. `acme`'s view learns neither their presence nor their
+/// size; each owner reads its own size.
+#[tokio::test]
+async fn a_view_cannot_size_another_tenants_artifact() {
+    let Some(db) = TestDatabase::fresh().await else {
+        return jamjet_testkit::skip("a_view_cannot_size_another_tenants_artifact");
+    };
+    let base = store(&db).await;
+    let acme = make_tenant(&base, "acme").await;
+    let globex = make_tenant(&base, "globex").await;
+    let owners: [(&str, &PgBackend, &[u8]); 2] = [
+        ("globex", &globex, b"globex's report"),
+        (DEFAULT_TENANT, &base, b"the default tenant's report"),
+    ];
+    for (whose, owner, bytes) in owners {
+        let stored = owner.put_artifact(bytes, Some("text/plain")).await.unwrap();
+        assert_eq!(
+            acme.artifact_size(&stored.hash).await.unwrap(),
+            None,
+            "acme sized {whose}'s artifact"
+        );
+        assert_eq!(
+            owner.artifact_size(&stored.hash).await.unwrap(),
+            Some(bytes.len() as u64),
+            "{whose}: its own size"
+        );
+    }
 }

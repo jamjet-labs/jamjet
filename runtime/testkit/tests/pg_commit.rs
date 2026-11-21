@@ -1,7 +1,7 @@
 //! The fenced commit of a node's turn on the Postgres store, where the
 //! suite's cases do not reach: two siblings of one run committing at once on
-//! two engines, a cancel that lands before the commit, and a cancel that
-//! lands while the commit holds the run.
+//! two engines, a cancel that lands before the commit, a cancel that lands
+//! while the commit holds the run, and a commit replayed with the held fence.
 //!
 //! The commit locks the run's row, then the item's, and folds the snapshot
 //! under the run's lock. So two siblings take turns at the run, and the
@@ -395,4 +395,130 @@ async fn a_view_cannot_commit_another_tenants_item() {
         .await
         .unwrap();
     assert_eq!(seq, 1, "globex's own commit lands");
+}
+
+/// The item's whole row as JSON text, read past any view.
+async fn item_text(pool: &PgPool, id: uuid::Uuid) -> String {
+    sqlx::query_scalar("SELECT row_to_json(w)::text FROM work_items w WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Commit `held`'s turn with the fence it was claimed under, through
+/// `commit_turn_unless_terminal` or through `commit_turn`.
+async fn commit_held(
+    b: &PgBackend,
+    held: &WorkItem,
+    event: Event,
+    refuse_terminal: bool,
+) -> Result<TurnCommit, StateBackendError> {
+    if refuse_terminal {
+        b.commit_turn_unless_terminal(held.id, held.lease_fence, event, true)
+            .await
+    } else {
+        b.commit_turn(held.id, held.lease_fence, event, true)
+            .await
+            .map(TurnCommit::Committed)
+    }
+}
+
+/// A turn is committed, or withdrawn by a cancel, and then committed again
+/// with the fence it was claimed under: with the same event, as a retry
+/// after an unknown outcome would, and with a new one, as a worker whose
+/// item was withdrawn would. Unscoped and through a tenant's view, through
+/// both commit calls, the replay is `FenceLost`: the
+/// fence still matches, but the item is no longer claimed. The log keeps
+/// its one `NodeCompleted` (none after a withdraw) and the item's row is
+/// as it was.
+#[tokio::test]
+async fn a_replayed_commit_with_the_held_fence_is_fence_lost() {
+    let Some(db) = TestDatabase::fresh().await else {
+        return jamjet_testkit::skip("a_replayed_commit_with_the_held_fence_is_fence_lost");
+    };
+    let (one, two) = (store(&db).await, store(&db).await);
+    let pool = db.pool().await;
+    let acme = make_tenant(&one, "acme").await;
+    let views: [(&str, PgBackend, PgBackend); 2] = [
+        ("unscoped", one.clone(), two.clone()),
+        ("acme", acme, two.for_tenant(TenantId::from("acme"))),
+    ];
+    for (whose, engine, other) in views {
+        for first_refuses in [false, true] {
+            let id = new_run(&engine).await;
+            let held = claimed(&engine, &id, "step", "worker-1").await;
+            let event = completed(&id, "step", json!({ "step": 1 }));
+            let first = commit_held(&engine, &held, event.clone(), first_refuses).await;
+            assert_eq!(
+                first.unwrap_or_else(|e| panic!("{whose}: the first commit: {e}")),
+                TurnCommit::Committed(1),
+                "{whose}: the first commit"
+            );
+            let row = item_text(&pool, held.id).await;
+            for (replay_refuses, same) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let again = if same {
+                    event.clone()
+                } else {
+                    completed(&id, "step", json!({ "step": 2 }))
+                };
+                let replay = commit_held(&engine, &held, again, replay_refuses).await;
+                assert!(
+                    matches!(replay, Err(StateBackendError::FenceLost(_))),
+                    "{whose}: a replay after a commit (first refuses {first_refuses}, \
+                     replay refuses {replay_refuses}, same event {same}): {replay:?}"
+                );
+                assert_eq!(
+                    kinds_of(&pool, &id).await,
+                    vec!["node_completed"],
+                    "{whose}: the replay recorded something"
+                );
+                assert_eq!(
+                    item_text(&pool, held.id).await,
+                    row,
+                    "{whose}: the replay touched the item"
+                );
+            }
+        }
+
+        let id = new_run(&engine).await;
+        let held = claimed(&engine, &id, "step", "worker-1").await;
+        assert!(matches!(
+            cancel(&other, &id).await,
+            ExecutionFinish::Finished(_)
+        ));
+        let event = completed(&id, "step", json!({ "step": 1 }));
+        let withdrawn = commit_held(&engine, &held, event.clone(), true).await;
+        assert_eq!(
+            withdrawn.unwrap_or_else(|e| panic!("{whose}: the withdraw: {e}")),
+            TurnCommit::ExecutionTerminal(WorkflowStatus::Cancelled),
+            "{whose}: the withdraw"
+        );
+        let row = item_text(&pool, held.id).await;
+        for (replay_refuses, same) in [(false, false), (true, false), (false, true), (true, true)] {
+            let again = if same {
+                event.clone()
+            } else {
+                completed(&id, "step", json!({ "step": 2 }))
+            };
+            let replay = commit_held(&engine, &held, again, replay_refuses).await;
+            assert!(
+                matches!(replay, Err(StateBackendError::FenceLost(_))),
+                "{whose}: a replay after a withdraw (replay refuses {replay_refuses}, \
+                 same event {same}): {replay:?}"
+            );
+            assert_eq!(
+                kinds_of(&pool, &id).await,
+                vec!["workflow_cancelled"],
+                "{whose}: the replay recorded a completion for a withdrawn node"
+            );
+            assert_eq!(
+                item_text(&pool, held.id).await,
+                row,
+                "{whose}: the replay touched the item"
+            );
+        }
+    }
 }
