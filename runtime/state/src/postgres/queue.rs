@@ -924,26 +924,24 @@ pub(super) async fn get_work_item(
     row.map(|r| row_to_item(&r)).transpose()
 }
 
-/// Unfenced: `NotFound` when there is no such item (in this view).
-pub(super) async fn complete_work_item(b: &PgBackend, item: WorkItemId) -> BackendResult<()> {
+/// Unfenced: settles only a still-claimed item. `false` for an item that is
+/// absent, not claimed, or another tenant's.
+pub(super) async fn complete_work_item(b: &PgBackend, item: WorkItemId) -> BackendResult<bool> {
     let query = match b.scope() {
         None => sqlx::query(
             "UPDATE work_items SET status = 'completed', completed_at = statement_timestamp(), \
-             lease_expires_at = NULL WHERE id = $1",
+             lease_expires_at = NULL WHERE id = $1 AND status = 'claimed'",
         )
         .bind(item),
         Some(tenant) => sqlx::query(
             "UPDATE work_items SET status = 'completed', completed_at = statement_timestamp(), \
-             lease_expires_at = NULL WHERE id = $1 AND tenant_id = $2",
+             lease_expires_at = NULL WHERE id = $1 AND tenant_id = $2 AND status = 'claimed'",
         )
         .bind(item)
         .bind(tenant),
     };
     let done = query.execute(&b.pool).await.map_err(statement_error)?;
-    if done.rows_affected() == 0 {
-        return Err(StateBackendError::NotFound(item.to_string()));
-    }
-    Ok(())
+    Ok(done.rows_affected() > 0)
 }
 
 /// Settles only the holder of a still-claimed item under `lease_fence`.

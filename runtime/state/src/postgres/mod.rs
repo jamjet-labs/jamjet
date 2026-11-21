@@ -521,7 +521,7 @@ impl StateBackend for PgBackend {
         queue::get_work_item(self, item_id).await
     }
 
-    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<()> {
+    async fn complete_work_item(&self, item_id: WorkItemId) -> BackendResult<bool> {
         queue::complete_work_item(self, item_id).await
     }
 

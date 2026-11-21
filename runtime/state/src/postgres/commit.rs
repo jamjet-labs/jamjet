@@ -60,6 +60,7 @@ fn effect_of(kind: &EventKind) -> BackendResult<Option<Effect>> {
         input_tokens,
         output_tokens,
         finish_reason,
+        cost_usd,
         idempotency_key: Some(key),
         ..
     } = kind
@@ -76,6 +77,7 @@ fn effect_of(kind: &EventKind) -> BackendResult<Option<Effect>> {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "finish_reason": finish_reason,
+        "cost_usd": cost_usd,
     });
     Ok(Some(Effect {
         key: key.clone(),
