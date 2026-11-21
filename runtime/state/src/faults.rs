@@ -157,6 +157,7 @@ pub const POINTS: &[(&str, u32)] = &[
     ("pg.create_run", 2),
     ("pg.create_run", 3),
     ("pg.create_run", 4),
+    ("pg.create_run", 5),
     ("pg.finish_execution", 1),
     ("pg.finish_execution", 2),
     ("pg.finish_execution", 3),

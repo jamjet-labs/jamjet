@@ -15,6 +15,7 @@ mod commit;
 mod effects;
 mod projection;
 mod queue;
+mod run_keys;
 mod runs;
 mod schema;
 mod settings;
@@ -30,10 +31,10 @@ pub use settings::{
 use crate::artifact::ArtifactRef;
 use crate::backend::{
     ApiToken, ApprovalCursor, ApprovalProjectionRow, BackendResult, ClaimFilter, ClaimedWorkItem,
-    ConditionalAppend, ExecutionFinish, FailOutcome, GateMark, LeaseRenewal, LeasedItem,
-    OpenWorkItem, PassCommit, PendingApprovalRow, ReclaimResult, ReserveOutcome, RunningPage,
-    SchedulerPass, StateBackend, StateBackendError, TurnCommit, WorkItem, WorkItemId,
-    WorkflowDefinition,
+    ConditionalAppend, ExecutionFinish, FailOutcome, GateMark, KeyedStart, LeaseRenewal,
+    LeasedItem, OpenWorkItem, PassCommit, PendingApprovalRow, ReclaimResult, ReserveOutcome,
+    RunKeyClaim, RunKeyRecord, RunningPage, SchedulerPass, StateBackend, StateBackendError,
+    TurnCommit, WorkItem, WorkItemId, WorkflowDefinition,
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
@@ -343,8 +344,10 @@ impl StateBackend for PgBackend {
             started_event,
             scheduled_event,
             work_item,
+            None,
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn start_execution_atomic(
@@ -361,8 +364,10 @@ impl StateBackend for PgBackend {
             started_event,
             scheduled_event,
             work_item,
+            None,
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn get_tool_effect(&self, key: &str) -> BackendResult<Option<serde_json::Value>> {
@@ -706,6 +711,31 @@ impl StateBackend for PgBackend {
         execution_id: &ExecutionId,
     ) -> BackendResult<Vec<OpenWorkItem>> {
         queue::open_work_items(self, execution_id).await
+    }
+
+    async fn start_execution_keyed(
+        &self,
+        execution: WorkflowExecution,
+        started_event: EventKind,
+        scheduled_event: EventKind,
+        work_item: WorkItem,
+        key: RunKeyClaim,
+    ) -> BackendResult<KeyedStart> {
+        let started_event = crate::features::run_keys::with_run_key(started_event, &key.run_key)?;
+        runs::create_run(
+            self,
+            execution,
+            None,
+            started_event,
+            scheduled_event,
+            work_item,
+            Some(&key),
+        )
+        .await
+    }
+
+    async fn get_run_key(&self, run_key: &str) -> BackendResult<Option<RunKeyRecord>> {
+        run_keys::get_run_key(self, run_key).await
     }
 
     async fn create_tenant(&self, tenant: Tenant) -> BackendResult<()> {

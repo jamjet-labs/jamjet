@@ -148,6 +148,7 @@ fn random_kind(rng: &mut Rng) -> EventKind {
             workflow_version: "1".into(),
             initial_input: json!({}),
             initiated_by: None,
+            run_key: None,
         },
     }
 }

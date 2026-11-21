@@ -90,3 +90,9 @@ CREATE TABLE projector_checkpoints (projection_name text NOT NULL, execution_id 
 CREATE TABLE artifacts (tenant_id text NOT NULL DEFAULT 'default', hash text NOT NULL, bytes bytea NOT NULL,
   size bigint NOT NULL, media_type text, created_at timestamptz NOT NULL, PRIMARY KEY (tenant_id, hash));
 CREATE INDEX artifacts_hash ON artifacts (hash);
+
+-- A caller's key for a run (POST /executions with run_key), per tenant,
+-- claimed in the run's start transaction. No foreign key, as on SQLite.
+CREATE TABLE run_keys (tenant_id text NOT NULL, run_key text NOT NULL, execution_id uuid NOT NULL,
+  workflow_id text NOT NULL, workflow_version text NOT NULL, input_hash text NOT NULL,
+  created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, PRIMARY KEY (tenant_id, run_key));

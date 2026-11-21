@@ -26,8 +26,8 @@ use super::tx::{no_nul, statement_error, with_tx, TxError};
 use super::PgBackend;
 use crate::backend::{
     same_definition, version_conflict, BackendResult, ClaimedWorkItem, ConditionalAppend,
-    EventCondition, ExecutionFinish, PassCommit, RunningPage, SchedulerPass, StateBackendError,
-    WorkItem, WorkflowDefinition,
+    EventCondition, ExecutionFinish, KeyedStart, PassCommit, RunKeyClaim, RunningPage,
+    SchedulerPass, StateBackendError, WorkItem, WorkflowDefinition,
 };
 use crate::event::{Event, EventKind, EventSequence};
 use crate::snapshot::Snapshot;
@@ -1080,13 +1080,18 @@ pub(super) fn row_to_snapshot(row: &PgRow) -> BackendResult<Snapshot> {
 
 // ── Starting a run ───────────────────────────────────────────────────────────
 
-/// `start_execution_atomic` and `create_segment_atomic`: the run's row, its
-/// seed snapshot when it is a segment, `WorkflowStarted` and the start
-/// node's `NodeScheduled`, and the start node's item, in one transaction.
-/// The run's row goes in first, so a run id already taken fails there, on
-/// its primary key, before anything else is written. On a tenant's view the
-/// segment's parent and the item's run, where it is not the new run, must be
-/// the tenant's.
+/// `start_execution_atomic`, `create_segment_atomic` and
+/// `start_execution_keyed`: the run's row, its seed snapshot when it is a
+/// segment, `WorkflowStarted` and the start node's `NodeScheduled`, and the
+/// start node's item, in one transaction. The run's row goes in before its
+/// other rows, so a run id already taken fails there, on its primary key,
+/// before any of them is written. On a tenant's view the segment's parent and the item's
+/// run, where it is not the new run, must be the tenant's.
+///
+/// With a `key`, the run key is claimed before any row of the run, under the
+/// view's tenant or, unscoped, the work item's, as on SQLite. A key held for
+/// another run is [`KeyedStart::Taken`] and nothing is written. Without a
+/// key the answer is always `Started`.
 pub(super) async fn create_run(
     b: &PgBackend,
     execution: WorkflowExecution,
@@ -1094,7 +1099,11 @@ pub(super) async fn create_run(
     started_event: EventKind,
     scheduled_event: EventKind,
     work_item: WorkItem,
-) -> BackendResult<()> {
+    key: Option<&RunKeyClaim>,
+) -> BackendResult<KeyedStart> {
+    if let Some(key) = key {
+        super::run_keys::check_claim(key)?;
+    }
     if let Some(parent) = &execution.parent_execution_id {
         own_run(b, parent).await?;
     }
@@ -1120,10 +1129,20 @@ pub(super) async fn create_run(
         NewEvent::made(&scheduled_event)?,
     ];
     let item = [NewItem::of(&work_item)?];
+    let key_tenant = b.scope().unwrap_or(&work_item.tenant_id);
     let (execution, seed, events, item) = (&execution, &seed, &events, &item);
     let (initial_input, current_state) = (&initial_input, &current_state);
     with_tx(&b.pool, "create_run", |tx| {
         Box::pin(async move {
+            // The run key, before any row of the run: a key held for another
+            // run leaves this start with nothing written.
+            if let Some(key) = key {
+                let held = super::run_keys::claim(tx, key_tenant, key, id).await?;
+                fault_point!("pg.create_run", 1);
+                if let Some(held) = held {
+                    return Ok(KeyedStart::Taken(held));
+                }
+            }
             sqlx::query(
                 "INSERT INTO workflow_executions \
                    (execution_id, tenant_id, workflow_id, workflow_version, status, \
@@ -1145,7 +1164,7 @@ pub(super) async fn create_run(
             .bind(segment_number)
             .execute(&mut **tx)
             .await?;
-            fault_point!("pg.create_run", 1);
+            fault_point!("pg.create_run", 2);
             if let Some((snap, state, completed, active)) = seed {
                 sqlx::query(
                     "INSERT INTO snapshots \
@@ -1165,15 +1184,15 @@ pub(super) async fn create_run(
                 .bind(snap.last_sequence)
                 .execute(&mut **tx)
                 .await?;
-                fault_point!("pg.create_run", 2);
+                fault_point!("pg.create_run", 3);
             }
             // The run's row is not visible to anyone else until the commit,
             // so nobody can append between these and the start.
             insert_events(tx, id, tenant, events).await?;
-            fault_point!("pg.create_run", 3);
-            insert_items(tx, tenant, item).await?;
             fault_point!("pg.create_run", 4);
-            Ok(())
+            insert_items(tx, tenant, item).await?;
+            fault_point!("pg.create_run", 5);
+            Ok(KeyedStart::Started)
         })
     })
     .await
