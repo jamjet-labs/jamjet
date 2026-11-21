@@ -652,6 +652,53 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `jamjet dev --db PATH` creates the folder for the database.
 
+- **Postgres state store (preview).** `jamjet_state::PgBackend` keeps runs, events,
+  snapshots, the work queue, leases, run keys, tool effects, artifacts, tokens, tenants and
+  the approvals read model in one Postgres database. This is the store, usable from Rust;
+  the server uses it from the next change. SQLite stays the default and does not change.
+  - Several engines can share the database. A write into a run locks the run's row first,
+    claims skip rows another engine holds (`FOR UPDATE SKIP LOCKED`), and leases and
+    approval deadlines are decided on the database's clock.
+  - `jamjet_state::postgres::migrate` creates or updates the schema. `PgBackend::connect`
+    runs no migration and refuses a schema that is empty, behind, ahead, half applied or
+    changed. `PgBackend::for_tenant` gives one tenant's view, on the same pool. Each
+    statement a tenant's view sends filters by its tenant, including the ones that already
+    run under that tenant's run lock: the sequence and log reads, the terminal status
+    update, the scheduler pass's checks, the state patch and the snapshot upsert. Token
+    validation is the one exception: it finds the tenant from the token, as on SQLite.
+  - Settings, read by `PgSettings::from_env`, which refuses one that is set but not valid: `JAMJET_PG_POOL_SIZE` (10, at
+    least 2), `JAMJET_PG_ACQUIRE_TIMEOUT_MS` (5000), `JAMJET_PG_STATEMENT_TIMEOUT_MS`
+    (30000), `JAMJET_PG_LOCK_TIMEOUT_MS` (10000), `JAMJET_PG_IDLE_IN_TX_TIMEOUT_MS`
+    (60000).
+  - A deadlock, a lock timeout or a connection lost before the commit is retried from the
+    start of the transaction. An error from the commit itself is never retried: its
+    outcome is unknown, and the call answers `Unavailable`. So is a pool with no connection
+    free within the acquire timeout.
+  - Where it differs from SQLite:
+    - Events, snapshots, tool effects, approval rows and projector checkpoints that the
+      unscoped store writes into a run carry the run's tenant. SQLite's unscoped store
+      writes `default`.
+    - A lapsed lease is not renewed. Its holder gets it back only by re-attach, after a
+      reclaim and before anyone else claims it.
+    - A park keeps the caller's retry time while the engine's clock and the database's
+      agree within a second. Otherwise the delay is applied to the database's clock.
+    - Claims take items in the order they were queued, by the database's clock. SQLite
+      orders by the item's `created_at`.
+    - Enqueueing an item for a run that does not exist, or finalizing a rollover of one,
+      is `NotFound`.
+    - Text cannot hold a NUL. A node id, queue, worker id, error text, key or name with one
+      is refused with `Database("text contains a NUL character")`, and nothing is written.
+      JSON is stored as text, so a `\u0000` inside a run's input or state reads back as
+      written.
+    - A pending-approvals cursor whose time or run id does not parse is a `Database` error.
+    - Node ids sort bytewise, whatever the database's collation.
+    - A token's `created_at` is the database's time. Stored times keep microseconds.
+  - The Postgres tests run when `JAMJET_TEST_POSTGRES_URL` names a server
+    (`runtime/scripts/pg-test.sh up` starts one in Docker) and skip otherwise.
+    `JAMJET_REQUIRE_POSTGRES_TESTS=1` makes a missing URL a failure, as in CI. The tenant
+    check, `pg_scope`, runs the conformance suite once more on a tenant's view and takes
+    about 95 to 105 s.
+
 ### Fixed
 
 - **A durable agent keeps its tool results.** After a tool ran, the next model call
@@ -789,6 +836,15 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Work items and scheduler events on SQLite carry the run's tenant. Unscoped SQLite
   used to stamp `default` on events written by the scheduler's pass and by the sweep,
   and on dead-letter rows.
+- `StateBackendError` has a new variant, `Unavailable(String)`: the store cannot answer
+  now, and the call may be tried again. A downstream exhaustive `match` on the enum stops
+  compiling. The API answers it with 503 and `Retry-After: 1`.
+- `StateBackend::store_now()` is the store's clock. Its default is the process clock, which
+  SQLite and memory keep; Postgres answers the database's time. Approval deadlines are
+  stamped and checked with it: the scheduler's deadline sweep, the approve route's
+  deadline check, and the guards that stamp a request's deadline. So with several
+  engines on one Postgres database, a deadline does not depend on which engine's clock
+  reads it.
 
 ---
 

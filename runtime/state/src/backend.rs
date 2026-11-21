@@ -237,8 +237,11 @@ pub enum KeyedStart {
 
 /// Trait abstracting the durable state storage backend.
 ///
-/// Implementors: `SqliteBackend`, `PostgresBackend`.
-/// Both must guarantee transactional writes per state transition.
+/// Implementors: [`InMemoryBackend`](crate::InMemoryBackend) (tests and dev),
+/// [`SqliteBackend`](crate::SqliteBackend) with its tenant view
+/// [`TenantScopedSqliteBackend`](crate::TenantScopedSqliteBackend), and [`PgBackend`](crate::PgBackend) with its
+/// tenant views. Each must make each state transition one transactional
+/// write, and pass the conformance suite in `jamjet-testkit`.
 #[async_trait]
 pub trait StateBackend: Send + Sync {
     // ── Workflow definitions ─────────────────────────────────────────────
