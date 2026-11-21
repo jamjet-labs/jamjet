@@ -1380,6 +1380,49 @@ async fn a_spent_run_refuses_the_next_python_fn_claim() {
     }
 }
 
+/// `a -> b` under `total_tokens: 5`: `a` a plain `python_fn`, `b` an agent
+/// tool dispatch node. The claim route reads the caps for a dispatch node on
+/// its own path, apart from every other kind. With `a` completed at the cap,
+/// the claim for `b` gives nothing out on that path too: oldest-first gets
+/// `{"claimed": false}`, a claim that names the run is told `budget`, and
+/// one trip names `b`.
+#[tokio::test]
+async fn a_spent_run_refuses_an_agent_tool_dispatch_claim() {
+    let dispatch = json!({
+        "type": "python_fn",
+        "module": "jamjet.agents.tool_runtime",
+        "function": "dispatch_tool_calls",
+        "output_schema": "",
+        "agent_tool_dispatch": true
+    });
+    let caps = json!({ "token_budget": { "total_tokens": 5 } });
+    let report = json!({ "input_tokens": 5, "output_tokens": 0 });
+    for named in [false, true] {
+        for tb in support::backends().await {
+            let mut ir = linear_ir("wf-spent-dispatch", &["a", "b"], python_fn(), caps.clone());
+            ir["nodes"]["b"]["kind"] = dispatch.clone();
+            let run = start(tb, ir).await;
+            let name = run.name;
+            run.spend_a(report.clone()).await;
+            let (want, got) = if named {
+                (
+                    json!({ "claimed": false, "reason": "budget" }),
+                    claim_named(&run).await,
+                )
+            } else {
+                (json!({ "claimed": false }), claim_oldest(&run.state).await)
+            };
+            assert_eq!(got, (StatusCode::OK, want), "{name} named={named}");
+            assert_eq!(
+                run.trips().await,
+                vec![token_trip("b", 5, 5)],
+                "{name} named={named}: {:?}",
+                run.log().await
+            );
+        }
+    }
+}
+
 /// The refused step fails for good, once, on both transports: one
 /// `NodeFailed { retryable: false }` naming the cap, nothing left to claim,
 /// and the run fails on the next pass with `b` never run.
