@@ -352,7 +352,7 @@ def test_governance_set_in_two_places_is_an_error() -> None:
 @pytest.mark.parametrize(
     ("block", "match"),
     [
-        ("cost_budget_usd: -1\n", "cost_budget_usd must be a positive number"),
+        ("cost_budget_usd: -1\n", "cost_budget_usd must be a number from 0 to 10000"),
         ("token_budget: {tokens: 5}\n", "Unknown key\\(s\\) in token_budget"),
         ("on_budget_exceeded: [over]\n", "on_budget_exceeded must name a node"),
         ("data_policy: {pii: true}\n", "Unknown key\\(s\\) in data_policy"),
@@ -361,6 +361,30 @@ def test_governance_set_in_two_places_is_an_error() -> None:
 def test_malformed_governance_is_an_error(block: str, match: str) -> None:
     with pytest.raises(ValueError, match=match):
         irc.compile_yaml("workflow:\n  id: w\n" + block + ONE_NODE)
+
+
+@pytest.mark.parametrize(
+    ("value", "compiles"),
+    [
+        ("0", True),
+        ("0.25", True),
+        ("10000", True),
+        ("10000.01", False),
+        ("-0.01", False),
+        (".nan", False),
+        (".inf", False),
+        ("true", False),
+        ("'1'", False),
+    ],
+)
+def test_a_dollar_cap_is_held_to_the_range_registration_accepts(value: str, compiles: bool) -> None:
+    """The engine registers a cap from 0 to 10,000 USD. The compiler accepts the same range."""
+    source = f"workflow:\n  id: w\ncost_budget_usd: {value}\n" + ONE_NODE
+    if compiles:
+        assert _compile_quietly(source)["cost_budget_usd"] == float(value)
+    else:
+        with pytest.raises(ValueError, match="cost_budget_usd must be a number from 0 to 10000"):
+            irc.compile_yaml(source)
 
 
 def test_unenforced_governance_compiles_with_a_warning() -> None:

@@ -22,6 +22,7 @@ manual ``nodes:`` + ``edges:`` path::
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import TYPE_CHECKING, Any
 
@@ -348,6 +349,10 @@ def _compile_data_policy(raw: Any, *, location: str) -> dict[str, Any] | None:
     return dict(raw)
 
 
+#: The largest ``cost_budget_usd`` the engine registers, in USD.
+_MAX_COST_BUDGET_USD = 10_000
+
+
 def _apply_governance(ir: dict[str, Any], sources: list[tuple[str, dict[str, Any]]]) -> None:
     """Copy the governance settings found in ``sources`` into ``ir``.
 
@@ -360,8 +365,14 @@ def _apply_governance(ir: dict[str, Any], sources: list[tuple[str, dict[str, Any
     ir["policy"] = _compile_policy(_governance_value(sources, "policy"), location="workflow-level policy")
     budget = _governance_value(sources, "cost_budget_usd")
     if budget is not None:
-        if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
-            raise ValueError(f"cost_budget_usd must be a positive number, got {budget!r}")
+        # The range the engine registers: one step may report up to this much.
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, (int, float))
+            or not math.isfinite(budget)
+            or not 0 <= budget <= _MAX_COST_BUDGET_USD
+        ):
+            raise ValueError(f"cost_budget_usd must be a number from 0 to 10000 (USD), got {budget!r}")
         ir["cost_budget_usd"] = float(budget)
     tokens = _governance_value(sources, "token_budget")
     if tokens is not None:

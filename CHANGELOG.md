@@ -157,6 +157,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   adds nothing to its own cost total for such a call, and under a dollar cap it denies the
   next call, as the engine does: the spend is unknown. `BudgetExceededError` gains
   `cost_unknown`. A token-only budget still counts the call's tokens and goes on.
+- Python: the workflow compiler holds `cost_budget_usd` to the range registration accepts,
+  0 to 10,000. It now compiles 0, which it refused, and refuses a cap above 10,000, NaN or
+  infinity, which it compiled for the engine to refuse.
 
 ### Security
 
