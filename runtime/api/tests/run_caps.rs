@@ -1598,3 +1598,85 @@ async fn a_budget_trip_fails_the_run_and_never_rolls_over() {
         );
     }
 }
+
+/// `GET /executions/:id` quotes what the run has spent, counted from its log
+/// by the same fold the caps use. Three steps: one reports tokens and a cost,
+/// one tokens only (its cost is unknown), one nothing (not a billable step).
+/// The answer carries these eight keys, and `usage` is null when the log
+/// holds an event this build cannot read, so a reader never takes a partial
+/// count for the whole.
+#[tokio::test]
+async fn usage_on_the_run_matches_the_fold() {
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            linear_ir("wf-usage", &["a", "b", "c"], python_fn(), json!({})),
+        )
+        .await;
+        let name = run.name;
+        let (_, before) = support::get(&run.state, &format!("/executions/{}", run.eid)).await;
+        assert_eq!(
+            before["usage"],
+            json!({
+                "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+                "billable_steps": 0, "cost_unknown_steps": 0, "tokens_unknown_steps": 0,
+                "input_tokens_unknown_steps": 0, "output_tokens_unknown_steps": 0
+            }),
+            "{name}: a run that has spent nothing"
+        );
+        for report in [
+            json!({ "gen_ai_model": "m", "input_tokens": 120, "output_tokens": 30, "cost_usd": 0.25 }),
+            json!({ "gen_ai_model": "m", "input_tokens": 10, "output_tokens": 5 }),
+            json!({}),
+        ] {
+            let wi = run.claim_http().await;
+            let (st, body) = run.complete_http(&wi, report).await;
+            assert_eq!(st, StatusCode::OK, "{name}: {body}");
+        }
+        let (st, got) = support::get(&run.state, &format!("/executions/{}", run.eid)).await;
+        assert_eq!(st, StatusCode::OK, "{name}");
+        assert_eq!(
+            got["usage"],
+            json!({
+                "input_tokens": 130, "output_tokens": 35, "cost_usd": 0.25,
+                "billable_steps": 2, "cost_unknown_steps": 1, "tokens_unknown_steps": 0,
+                "input_tokens_unknown_steps": 0, "output_tokens_unknown_steps": 0
+            }),
+            "{name}"
+        );
+        let fold = fold_run_usage(run.backend.as_ref(), &run.eid)
+            .await
+            .unwrap()
+            .expect("readable");
+        assert_eq!(
+            got["usage"]["input_tokens"],
+            json!(fold.input_tokens),
+            "{name}"
+        );
+        assert_eq!(
+            got["usage"]["output_tokens"],
+            json!(fold.output_tokens),
+            "{name}"
+        );
+        assert_eq!(got["usage"]["cost_usd"], json!(fold.cost_usd()), "{name}");
+        assert_eq!(
+            got["usage"]["billable_steps"],
+            json!(fold.billable_steps),
+            "{name}"
+        );
+
+        run.backend
+            .append_event(jamjet_state::Event::new(
+                run.eid.clone(),
+                0,
+                EventKind::Unknown,
+            ))
+            .await
+            .unwrap();
+        let (_, unread) = support::get(&run.state, &format!("/executions/{}", run.eid)).await;
+        assert!(
+            unread.as_object().unwrap().contains_key("usage") && unread["usage"].is_null(),
+            "{name}: an unreadable log reads null, not a partial count: {unread}"
+        );
+    }
+}

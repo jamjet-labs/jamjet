@@ -778,18 +778,38 @@ async fn get_execution(
 }
 
 /// One run as `GET /executions/:id` and the MCP `jamjet_get_execution` tool
-/// show it: its state derived from the log ([`with_derived_state`]) and what
-/// it is waiting for ([`crate::waiting::waiting_for`]).
+/// show it: its state derived from the log ([`with_derived_state`]), what
+/// it is waiting for ([`crate::waiting::waiting_for`]) and what it has spent.
 pub(crate) async fn execution_view(
     backend: &dyn jamjet_state::StateBackend,
     execution: WorkflowExecution,
 ) -> Result<Value, ApiError> {
     let waiting = crate::waiting::waiting_for(backend, &execution, Utc::now()).await?;
+    let execution_id = execution.execution_id.clone();
     let execution = with_derived_state(backend, execution).await;
     let mut body = serde_json::to_value(execution)
         .map_err(|e| ApiError::Internal(format!("serialize execution: {e}")))?;
     body["waiting_for"] = json!(waiting);
+    body["usage"] = run_usage_view(backend, &execution_id).await?;
     Ok(body)
+}
+
+/// What the run has spent, counted from its log (and its earlier segments')
+/// by the fold the caps use. `null` when the log holds an event this build
+/// cannot read: a partial count would be taken for the whole.
+async fn run_usage_view(
+    backend: &dyn jamjet_state::StateBackend,
+    id: &ExecutionId,
+) -> Result<Value, ApiError> {
+    match jamjet_state::fold_run_usage(backend, id).await? {
+        Ok(usage) => {
+            let mut view = serde_json::to_value(&usage)
+                .map_err(|e| ApiError::Internal(format!("serialize usage: {e}")))?;
+            view["cost_usd"] = json!(usage.cost_usd());
+            Ok(view)
+        }
+        Err(_unreadable) => Ok(Value::Null),
+    }
 }
 
 /// `execution` with its `current_state` re-derived from the event log (the
