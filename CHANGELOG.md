@@ -141,6 +141,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not parse) or sent unfenced with a bad cost leaves the step to retry, and the first
   attempt's spend goes uncounted. An `eval` judge and a remote agent called by `agent_tool`
   report no spend, so they are held at the cap but not counted.
+- A `coordinator` node's LLM tiebreaker now reports its tokens and cost on the step, so the
+  run caps count them. It named its model and reported neither, so under a cap the step
+  read as unknown spend and failed the run.
 - A completion sent without its lease fence settles only an item that is still claimed. Sent
   again, it is 409 ("the work item is not claimed") and records nothing. On SQLite each
   repeat used to record the step again, cost included, so three sends of one $0.40 step read
