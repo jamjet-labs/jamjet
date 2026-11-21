@@ -66,6 +66,11 @@ pub enum DispatchGuardOutcome {
     /// recorded, because no policy denied — this is infrastructure, and the
     /// caller should retry rather than audit a denial that never happened.
     Unavailable { reason: String },
+    /// A run cap is spent: the step must not fire. Settled like `Blocked`
+    /// (the node fails for good), though no policy refused it: the cap's
+    /// trip event is on record, not a `PolicyViolation`. `reason` names the
+    /// cap.
+    Spent { reason: String },
 }
 
 /// True for nodes that run a whole agent turn's model-chosen tool calls.
@@ -1288,6 +1293,7 @@ mod tests {
                 Default::default(),
                 None,
                 None,
+                None,
             )
             .await
         }
@@ -1320,6 +1326,7 @@ mod tests {
             &payload,
             None,
             Default::default(),
+            None,
             None,
             None,
         )
@@ -1367,6 +1374,7 @@ mod tests {
             &payload,
             None,
             Default::default(),
+            None,
             None,
             None,
         )
@@ -1453,6 +1461,7 @@ mod tests {
             &json!({ "workflow_id": "model-wf", "node_id": "n1", "prompt": "hi" }),
             None,
             Default::default(),
+            None,
             None,
             None,
         )
@@ -1747,6 +1756,7 @@ mod tests {
             &json!({ "input": input_for(&["send_wire"]) }),
             Some(&sealer),
             Default::default(),
+            None,
             None,
             None,
         )

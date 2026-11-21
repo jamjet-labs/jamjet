@@ -30,6 +30,7 @@ use jamjet_state::approvals::{
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::EventKind;
 use jamjet_state::Event;
+use jamjet_state::{fold_run_usage, RunCaps};
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -182,6 +183,12 @@ struct CardGate {
 /// restrictions: the policy chain still has to allow the node, and a card
 /// gate holds a node the chain would allow, through the same approval path
 /// (same digest binding, the chain's deadline).
+///
+/// Before all of it, in `Fire` mode, a node that can spend (any kind not in
+/// [`ZERO_COST_KINDS`]) is held to the run's `caps`: see [`caps_allow`].
+/// First, so a spent run never asks anyone to approve a step that cannot
+/// run. `Complete` mode never checks caps: a step that ran is recorded, and
+/// the scheduler fails a run that is past its cap.
 #[allow(clippy::too_many_arguments)]
 pub async fn guard_item(
     backend: &dyn StateBackend,
@@ -196,8 +203,15 @@ pub async fn guard_item(
     agents: AgentScope<'_>,
     work_item_id: Option<uuid::Uuid>,
     lease_fence: Option<i64>,
+    caps: Option<&RunCaps>,
 ) -> GuardOutcome {
     use crate::agent_limits;
+
+    if mode == GuardMode::Fire {
+        if let Err(refused) = caps_allow(backend, execution_id, node_id, node_def, caps).await {
+            return refused;
+        }
+    }
 
     // First, so a node the agent may not use never raises an approval request
     // and is refused even when no policy applies.
@@ -323,6 +337,62 @@ pub async fn guard_item(
         }
         (outcome, _) => outcome,
     }
+}
+
+/// The node kinds that cannot spend: the engine runs them and they call no
+/// model and no tool. They fire whatever the run has spent, so a run that is
+/// exactly at its cap still reaches its end. `eval` is not one of them: an
+/// LLM judge spends.
+pub const ZERO_COST_KINDS: &[&str] = &["condition", "human_approval", "limit_exceeded"];
+
+/// May a step of `node_def` fire under the run's `caps`? Folds the run's
+/// usage from its log (every segment, root first) and asks
+/// [`jamjet_state::caps::may_fire`]. `Ok` without reading anything for a
+/// kind in [`ZERO_COST_KINDS`] or a run with no cap.
+///
+/// A log that cannot be read, or holds an event this build cannot read, is
+/// `Unavailable`: nothing fires and nothing is recorded, and the step decides
+/// again on its next attempt. A spent cap is `Spent`, after the trip event is
+/// appended (best effort: the refusal stands either way).
+async fn caps_allow(
+    backend: &dyn StateBackend,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    node_def: &NodeDef,
+    caps: Option<&RunCaps>,
+) -> Result<(), GuardOutcome> {
+    let Some(caps) = caps.filter(|c| c.token_budget.is_some() || c.cost_budget_usd.is_some())
+    else {
+        return Ok(());
+    };
+    if ZERO_COST_KINDS.contains(&jamjet_policy::engine::node_kind_tag(&node_def.kind).as_str()) {
+        return Ok(());
+    }
+    let usage = match fold_run_usage(backend, execution_id).await {
+        Ok(Ok(usage)) => usage,
+        Ok(Err(unreadable)) => {
+            return Err(GuardOutcome::Unavailable {
+                reason: format!("the run's usage cannot be counted: {unreadable}"),
+            })
+        }
+        Err(e) => {
+            return Err(GuardOutcome::Unavailable {
+                reason: format!("the run's usage cannot be read: {e}"),
+            })
+        }
+    };
+    let Err(trip) = jamjet_state::caps::may_fire(caps, &usage) else {
+        return Ok(());
+    };
+    let reason = trip.describe();
+    warn!(execution_id = %execution_id, node_id, %reason, "run cap spent; the step does not fire");
+    if let Err(e) = backend
+        .append_event(Event::new(execution_id.clone(), 0, trip.event(node_id)))
+        .await
+    {
+        warn!(execution_id = %execution_id, node_id, "could not record a cap trip: {e}");
+    }
+    Err(GuardOutcome::Spent { reason })
 }
 
 /// `Ok` while `item` is still leased under `fence` and the lease has not

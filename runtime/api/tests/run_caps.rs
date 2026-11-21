@@ -1262,3 +1262,339 @@ async fn a_replayed_result_keeps_its_cost_and_counts_once() {
         assert_eq!(caps::past_cap(&cap, &usage), None, "{name}");
     }
 }
+
+// ── A spent run at claim ─────────────────────────────────────────────────────
+
+/// A claim that names its run, on the `python_tool` queue.
+async fn claim_named(run: &Run) -> (StatusCode, Value) {
+    support::post(
+        &run.state,
+        "/work-items/claim",
+        json!({
+            "worker_id": "http-w",
+            "queue_types": ["python_tool"],
+            "execution_id": run.eid.to_string()
+        }),
+    )
+    .await
+}
+
+/// A claim of the oldest item on the `python_tool` queue.
+async fn claim_oldest(state: &jamjet_api::state::AppState) -> (StatusCode, Value) {
+    support::post(
+        state,
+        "/work-items/claim",
+        json!({ "worker_id": "http-w", "queue_types": ["python_tool"] }),
+    )
+    .await
+}
+
+impl Run {
+    /// Each `NodeFailed` as `(node, error, retryable)`.
+    async fn failures(&self) -> Vec<(String, String, bool)> {
+        self.events()
+            .await
+            .into_iter()
+            .filter_map(|k| match k {
+                EventKind::NodeFailed {
+                    node_id,
+                    error,
+                    retryable,
+                    ..
+                } => Some((node_id, error, retryable)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `a -> b` over HTTP: `a` is claimed and completed with `report`, then
+    /// the scheduler dispatches `b`.
+    async fn spend_a(&self, report: Value) {
+        let wi = self.claim_http().await;
+        let (st, body) = self.complete_http(&wi, report).await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", self.name);
+        self.scheduler.tick().await.expect("scheduler tick");
+        assert_eq!(self.scheduled().await, vec!["a", "b"], "{}", self.name);
+    }
+}
+
+/// `a -> b`, both `python_fn`, under `total_tokens: 5`, and again under
+/// `cost_budget_usd: 1.0`. A worker completes `a` with 5 tokens (or $1.00):
+/// the run is at its cap, not past it, so `b` is dispatched. The claim for
+/// `b` gives nothing out: a claim that names the run is told `budget`; the
+/// oldest-first claim gets the answer an empty queue gets, as for every
+/// other refusal. The trip names `b`, and a dollar trip is in dollars.
+#[tokio::test]
+async fn a_spent_run_refuses_the_next_python_fn_claim() {
+    let cases = [
+        (
+            json!({ "token_budget": { "total_tokens": 5 } }),
+            json!({ "input_tokens": 5, "output_tokens": 0 }),
+            token_trip("b", 5, 5),
+        ),
+        (
+            json!({ "cost_budget_usd": 1.0 }),
+            json!({ "input_tokens": 5, "output_tokens": 0, "cost_usd": 1.0 }),
+            json!({
+                "type": "cost_budget_exceeded",
+                "node_id": "b",
+                "limit_usd": 1.0,
+                "current_usd": 1.0
+            }),
+        ),
+    ];
+    for (caps, report, trip) in cases {
+        for tb in support::backends().await {
+            let run = start(
+                tb,
+                linear_ir("wf-spent-named", &["a", "b"], python_fn(), caps.clone()),
+            )
+            .await;
+            let name = run.name;
+            run.spend_a(report.clone()).await;
+            assert_eq!(
+                claim_named(&run).await,
+                (
+                    StatusCode::OK,
+                    json!({ "claimed": false, "reason": "budget" })
+                ),
+                "{name} {caps}"
+            );
+            assert_eq!(run.trips().await, vec![trip.clone()], "{name} {caps}");
+        }
+        for tb in support::backends().await {
+            let run = start(
+                tb,
+                linear_ir("wf-spent-oldest", &["a", "b"], python_fn(), caps.clone()),
+            )
+            .await;
+            let name = run.name;
+            run.spend_a(report.clone()).await;
+            assert_eq!(
+                claim_oldest(&run.state).await,
+                (StatusCode::OK, json!({ "claimed": false })),
+                "{name} {caps}"
+            );
+            assert_eq!(run.trips().await, vec![trip.clone()], "{name} {caps}");
+        }
+    }
+}
+
+/// The refused step fails for good, once, on both transports: one
+/// `NodeFailed { retryable: false }` naming the cap, nothing left to claim,
+/// and the run fails on the next pass with `b` never run.
+#[tokio::test]
+async fn a_spent_refusal_fails_the_node_for_good_and_the_run_fails() {
+    let caps = json!({ "token_budget": { "total_tokens": 5 } });
+    let refused = vec![(
+        "b".to_string(),
+        "token budget reached: total_tokens 5 of 5".to_string(),
+        false,
+    )];
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            linear_ir("wf-spent-http", &["a", "b"], python_fn(), caps.clone()),
+        )
+        .await;
+        let name = run.name;
+        run.spend_a(json!({ "input_tokens": 5, "output_tokens": 0 }))
+            .await;
+        let b = run.backend.open_work_items(&run.eid).await.unwrap();
+        assert_eq!(b.len(), 1, "{name}: {b:?}");
+        assert_eq!(
+            claim_oldest(&run.state).await,
+            (StatusCode::OK, json!({ "claimed": false })),
+            "{name}"
+        );
+        assert_eq!(run.failures().await, refused, "{name}");
+        assert!(
+            run.tb.is_settled(b[0].id).await,
+            "{name}: b is left to retry"
+        );
+        assert_eq!(
+            claim_oldest(&run.state).await,
+            (StatusCode::OK, json!({ "claimed": false })),
+            "{name}"
+        );
+        run.scheduler.tick().await.expect("scheduler tick");
+        assert_eq!(run.status().await, WorkflowStatus::Failed, "{name}");
+        assert_eq!(run.completed().await, vec!["a"], "{name}");
+        assert_eq!(run.failures().await, refused, "{name}");
+    }
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            linear_ir("wf-spent-in-process", &["a", "b"], model(), caps.clone()),
+        )
+        .await;
+        let name = run.name;
+        let held = Held::default();
+        let spender = Spender::new(5, &held);
+        let worker = model_worker(run.backend.clone(), Arc::new(spender.clone()));
+        run.drive_in_process(&worker, &held).await;
+        assert_eq!(spender.calls(), 1, "{name}: {:?}", run.log().await);
+        assert_eq!(run.status().await, WorkflowStatus::Failed, "{name}");
+        assert_eq!(run.completed().await, vec!["a"], "{name}");
+        assert_eq!(run.failures().await, refused, "{name}");
+        assert_eq!(run.trips().await, vec![token_trip("b", 5, 5)], "{name}");
+    }
+}
+
+/// Fails every `get_events` of `run` once `on` is set.
+struct FailEvents {
+    run: ExecutionId,
+    on: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Hooks for FailEvents {
+    async fn before(&self, op: &Op<'_>) -> Option<StateBackendError> {
+        match op {
+            Op::GetEvents(id) if **id == self.run && self.on.load(Ordering::SeqCst) => Some(
+                StateBackendError::Database("the log could not be read (test)".into()),
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// Under a cap, a step fires only once the run's usage is known. When the
+/// log cannot be read, or holds an event this build cannot read, nothing
+/// fires and nothing is failed or recorded: the claim gets nothing (over
+/// HTTP the item stays leased until its lease runs out; in process the
+/// attempt fails and is retried), and the step decides again later.
+#[tokio::test]
+async fn an_unreadable_usage_fold_holds_the_step() {
+    let caps = json!({ "token_budget": { "total_tokens": 5 } });
+    for unknown_event in [true, false] {
+        let case = if unknown_event {
+            "unknown event"
+        } else {
+            "read error"
+        };
+        // Over HTTP.
+        for tb in support::backends().await {
+            let run = start(
+                tb,
+                linear_ir("wf-unreadable-http", &["a"], python_fn(), caps.clone()),
+            )
+            .await;
+            let name = run.name;
+            run.scheduler.tick().await.expect("scheduler tick");
+            let hooks = Arc::new(FailEvents {
+                run: run.eid.clone(),
+                on: AtomicBool::new(!unknown_event),
+            });
+            if unknown_event {
+                run.backend
+                    .append_event(jamjet_state::Event::new(
+                        run.eid.clone(),
+                        0,
+                        EventKind::Unknown,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let state =
+                support::make_state(Arc::new(Intercept::new(run.backend.clone(), hooks.clone())));
+            assert_eq!(
+                claim_oldest(&state).await,
+                (StatusCode::OK, json!({ "claimed": false })),
+                "{name}: {case}"
+            );
+            hooks.on.store(false, Ordering::SeqCst);
+            assert_eq!(run.settled().await, Vec::<String>::new(), "{name}: {case}");
+            assert_eq!(run.trips().await, Vec::<Value>::new(), "{name}: {case}");
+            let open = run.backend.open_work_items(&run.eid).await.unwrap();
+            assert!(
+                open.len() == 1 && open[0].claimed,
+                "{name}: {case}: the item stays leased: {open:?}"
+            );
+        }
+        // In process.
+        for tb in support::backends().await {
+            let run = start(
+                tb,
+                linear_ir("wf-unreadable-in-process", &["a"], model(), caps.clone()),
+            )
+            .await;
+            let name = run.name;
+            run.scheduler.tick().await.expect("scheduler tick");
+            let hooks = Arc::new(FailEvents {
+                run: run.eid.clone(),
+                on: AtomicBool::new(!unknown_event),
+            });
+            if unknown_event {
+                run.backend
+                    .append_event(jamjet_state::Event::new(
+                        run.eid.clone(),
+                        0,
+                        EventKind::Unknown,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let held = Held::default();
+            let spender = Spender::new(1, &held);
+            let worker = model_worker(
+                Arc::new(Intercept::new(run.backend.clone(), hooks.clone())),
+                Arc::new(spender.clone()),
+            );
+            let answer = worker.poll_and_execute().await;
+            hooks.on.store(false, Ordering::SeqCst);
+            assert!(answer.is_err(), "{name}: {case}: {answer:?}");
+            assert_eq!(spender.calls(), 0, "{name}: {case}");
+            assert_eq!(run.settled().await, Vec::<String>::new(), "{name}: {case}");
+            assert_eq!(run.trips().await, Vec::<Value>::new(), "{name}: {case}");
+        }
+    }
+}
+
+/// `a -> b` under `total_tokens: 1` with `continue_as_new` set, in process.
+/// `a` reports 2 tokens. A budget trip used to roll such a run over to a
+/// new segment, which inherited the spend and paid for one more call per
+/// segment. The run must fail instead: `a`'s spend is kept, `b` never runs,
+/// and no second segment exists.
+#[tokio::test]
+async fn a_budget_trip_fails_the_run_and_never_rolls_over() {
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            linear_ir(
+                "wf-no-rollover",
+                &["a", "b"],
+                model(),
+                json!({ "token_budget": { "total_tokens": 1 }, "continue_as_new": true }),
+            ),
+        )
+        .await;
+        let name = run.name;
+        let held = Held::default();
+        let spender = Spender::new(2, &held);
+        let worker = model_worker(run.backend.clone(), Arc::new(spender.clone()));
+        run.drive_in_process(&worker, &held).await;
+
+        assert_eq!(
+            run.status().await,
+            WorkflowStatus::Failed,
+            "{name}: {:?}",
+            run.log().await
+        );
+        assert_eq!(spender.calls(), 1, "{name}");
+        assert_eq!(run.completed().await, vec!["a"], "{name}");
+        assert!(
+            !run.events()
+                .await
+                .iter()
+                .any(|k| matches!(k, EventKind::SegmentBoundary { .. })),
+            "{name}: the run rolled over: {:?}",
+            run.log().await
+        );
+        let next = jamjet_state::segment::segment_execution_id(&run.eid, 1);
+        assert!(
+            run.backend.get_execution(&next).await.unwrap().is_none(),
+            "{name}: a second segment was started"
+        );
+    }
+}

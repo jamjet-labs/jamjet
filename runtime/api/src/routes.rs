@@ -1982,6 +1982,9 @@ enum Refusal {
     /// The item was withheld as not the engine's (its payload names another
     /// workflow than its execution); the node itself is not failed.
     Refused,
+    /// The run's token or dollar cap is spent: the node failed for good and
+    /// the run fails on the scheduler's next pass.
+    Budget,
 }
 
 impl Refusal {
@@ -1991,6 +1994,7 @@ impl Refusal {
             Self::ApprovalRequired => "approval_required",
             Self::NotReady => "not_ready",
             Self::Refused => "refused",
+            Self::Budget => "budget",
         }
     }
 }
@@ -3103,7 +3107,12 @@ async fn gate_claimed_item(
         workflow_agent,
         remote_agents,
         node_def,
+        caps,
     } = if jamjet_worker::dispatch_guard::is_agent_tool_dispatch(&kind) {
+        let caps = match caps_from_raw(&ir_value) {
+            Ok(caps) => caps,
+            Err(reason) => return fail_closed(backend, wi, reason).await,
+        };
         let ir = match serde_json::from_value::<jamjet_ir::WorkflowIr>(ir_value) {
             Ok(ir) => ir,
             Err(e) => {
@@ -3118,6 +3127,7 @@ async fn gate_claimed_item(
             workflow_agent: ir.agent_ref,
             remote_agents: ir.remote_agents,
             node_def,
+            caps,
         }
     } else {
         match guard_inputs_from_raw(&ir_value, &wi.node_id) {
@@ -3145,6 +3155,7 @@ async fn gate_claimed_item(
         },
         Some(wi.id),
         Some(wi.lease_fence),
+        Some(&caps),
     )
     .await
     {
@@ -3212,6 +3223,26 @@ async fn gate_claimed_item(
             }
         }
 
+        // The run's cap is spent, and the guard recorded the trip. Settled as
+        // a block is, so the step is never retried and the run fails on the
+        // scheduler's next pass; a claim that names the run is told `budget`.
+        // `Complete` mode never checks caps, so a re-check does not get here.
+        DispatchGuardOutcome::Spent { reason } => {
+            warn!(
+                execution_id = %wi.execution_id,
+                node_id = %wi.node_id,
+                %reason,
+                "claim: the run's cap is spent; failing the node"
+            );
+            if mode == jamjet_worker::node_guard::GuardMode::Complete {
+                return ClaimGate::Withhold(Refusal::Budget);
+            }
+            match fail_node(backend, wi, reason).await {
+                ClaimGate::Withhold(Refusal::Blocked) => ClaimGate::Withhold(Refusal::Budget),
+                other => other,
+            }
+        }
+
         // NOT a denial — no policy was ever consulted, so nothing is audited and
         // nothing is settled. See the `Err` arm above for why leaving the lease
         // alone is the right infrastructure-failure behaviour.
@@ -3235,6 +3266,33 @@ struct GuardInputs {
     /// `WorkflowIr::remote_agents`.
     remote_agents: std::collections::HashMap<String, jamjet_ir::workflow::RemoteAgentConfig>,
     node_def: NodeDef,
+    /// `WorkflowIr::token_budget` and `WorkflowIr::cost_budget_usd`.
+    caps: jamjet_state::RunCaps,
+}
+
+/// The run caps of a workflow, read from its stored IR: `token_budget` and
+/// `cost_budget_usd`. The claim gate and the completion route both read them
+/// here, so they agree on what a cap is. A present but unreadable value is
+/// `Err` (the fail-closed reason), never "no cap".
+fn caps_from_raw(ir_value: &Value) -> Result<jamjet_state::RunCaps, String> {
+    let token_budget = match ir_value.get("token_budget") {
+        None | Some(Value::Null) => None,
+        Some(raw) => Some(
+            serde_json::from_value(raw.clone())
+                .map_err(|e| format!("failed to load workflow token_budget: {e}"))?,
+        ),
+    };
+    let cost_budget_usd = match ir_value.get("cost_budget_usd") {
+        None | Some(Value::Null) => None,
+        Some(raw) => Some(
+            serde_json::from_value(raw.clone())
+                .map_err(|e| format!("failed to load workflow cost_budget_usd: {e}"))?,
+        ),
+    };
+    Ok(jamjet_state::RunCaps {
+        token_budget,
+        cost_budget_usd,
+    })
 }
 
 /// The workflow-level policy and agent, and one node's definition, read from
@@ -3275,6 +3333,7 @@ fn guard_inputs_from_raw(ir_value: &Value, node_id: &str) -> Result<GuardInputs,
         workflow_agent,
         remote_agents,
         node_def,
+        caps: caps_from_raw(ir_value)?,
     })
 }
 
@@ -3311,6 +3370,7 @@ async fn completion_gate(
         workflow_agent,
         remote_agents,
         node_def,
+        caps: _,
     } = guard_inputs_from_raw(&def.ir, &wi.node_id).map_err(refused)?;
     // The engine reports the result of a kind it runs itself; an external
     // worker's report for one is never recorded (see the claim route).
@@ -3344,6 +3404,9 @@ async fn completion_gate(
         },
         Some(wi.id),
         Some(wi.lease_fence),
+        // A step that ran is recorded whatever the run has spent: `Complete`
+        // mode never checks caps, and the scheduler fails a run past one.
+        None,
     )
     .await
     {
@@ -3357,6 +3420,9 @@ async fn completion_gate(
                 .to_string(),
         )),
         DispatchGuardOutcome::Unavailable { reason } => Err(unavailable(reason)),
+        // Not reached: `Complete` mode never checks caps. Refused rather than
+        // recorded if it ever is.
+        DispatchGuardOutcome::Spent { reason } => Err(refused(reason)),
     }
 }
 
@@ -3910,7 +3976,8 @@ async fn fail_uncounted_step(
 }
 
 /// Whether the run of `wi` has a dollar cap: `cost_budget_usd` set in its
-/// stored IR, whatever its value.
+/// stored IR, whatever its value, read as the claim gate reads it
+/// ([`caps_from_raw`]).
 async fn dollar_capped(
     backend: &dyn jamjet_state::StateBackend,
     wi: &WorkItem,
@@ -3930,10 +3997,7 @@ async fn dollar_capped(
                 execution.workflow_id, execution.workflow_version
             )
         })?;
-    Ok(!matches!(
-        def.ir.get("cost_budget_usd"),
-        None | Some(Value::Null)
-    ))
+    Ok(caps_from_raw(&def.ir)?.cost_budget_usd.is_some())
 }
 
 #[derive(Deserialize)]

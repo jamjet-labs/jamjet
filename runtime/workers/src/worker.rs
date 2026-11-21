@@ -12,11 +12,11 @@ use jamjet_agents::AgentRegistry;
 use jamjet_core::workflow::ExecutionId;
 use jamjet_ir::workflow::{NodeDef, WorkflowIr};
 use jamjet_policy::engine::node_kind_tag;
+use jamjet_state::artifact_threshold;
 use jamjet_state::backend::{StateBackend, StateBackendError, WorkItem, WorkItemId};
 use jamjet_state::budget::BudgetState;
 use jamjet_state::event::EventKind;
 use jamjet_state::spill_bytes;
-use jamjet_state::{artifact_threshold, materialize, start_next_segment};
 use jamjet_telemetry::{gen_ai_attrs, metrics, record_gen_ai_usage};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -353,10 +353,8 @@ impl Worker {
                     let kind_tag = node_kind_tag(kind);
                     node_span.record(gen_ai_attrs::JAMJET_NODE_KIND, kind_tag.as_str());
 
-                    // Load budget state from latest snapshot.
-                    let budget = self.load_budget_state(&execution_id).await;
-
-                    // Policy check.
+                    // The policy, approval and cap gate. A spent run's step
+                    // is refused here, before anything is paid for.
                     if let Some(r) = self
                         .check_policy(
                             &execution_id,
@@ -369,18 +367,6 @@ impl Worker {
                             &ir,
                             &item.payload,
                         )
-                        .await
-                    {
-                        heartbeat.abort();
-                        return r;
-                    }
-
-                    // Budget check BEFORE execution — never fire on a spent budget.
-                    // The post-execution check trips only after the call is paid
-                    // for, so without this a rollover child inherits pinned
-                    // counters and buys one more call per segment (C2).
-                    if let Some(r) = self
-                        .check_budget_before_execution(&execution_id, &node_id, &ir, &budget)
                         .await
                     {
                         heartbeat.abort();
@@ -651,7 +637,6 @@ impl Worker {
                         return Ok(());
                     }
 
-                    // Budget enforcement after execution.
                     match exec_result {
                         Ok(mut result) => {
                             // Approval records are the engine's: only the
@@ -672,40 +657,18 @@ impl Worker {
                                     }
                                 }
                             }
-                            let mut budget = budget;
-                            if let Some(r) = self
-                                .check_budget_after_execution(
-                                    &execution_id,
-                                    &node_id,
-                                    &ir,
-                                    &mut budget,
-                                    result.input_tokens,
-                                    result.output_tokens,
-                                    // Not the step's cost: a trip here throws
-                                    // a paid result away, and the retry pays
-                                    // again. The cost goes on the step's
-                                    // `NodeCompleted`, where the caps read it.
-                                    None,
-                                    &mut result.state_patch,
-                                )
-                                .await
-                            {
-                                heartbeat.abort();
-                                if ir.continue_as_new {
-                                    return self
-                                        .rollover_segment(
-                                            &execution_id,
-                                            &ir,
-                                            &workflow_id,
-                                            &workflow_version,
-                                            &tenant_id,
-                                            item_id,
-                                            lease_fence,
-                                        )
-                                        .await;
-                                }
-                                return r;
-                            }
+                            // The run's counters in its state, `__budget`, for
+                            // display only: the caps read the log. A paid
+                            // result is always kept; a run past its cap fails
+                            // in the scheduler's pass, and its next spending
+                            // step is refused at claim.
+                            let mut budget = self.load_budget_state(&execution_id).await;
+                            budget.accumulate(
+                                result.input_tokens,
+                                result.output_tokens,
+                                result.cost_usd,
+                            );
+                            budget.patch_into_snapshot_state(&mut result.state_patch);
                             Ok(result)
                         }
                         Err(e) => Err(e),
@@ -981,7 +944,7 @@ impl Worker {
 
     /// Turn a guard decision into the worker's lifecycle answer: `None` to run,
     /// `Some(Err)` to fail the attempt, `Some(Ok)` once the item is settled
-    /// (held, or failed for good on a policy block).
+    /// (held, or failed for good on a policy block or a spent cap).
     async fn settle_outcome(
         &self,
         execution_id: &ExecutionId,
@@ -1005,31 +968,21 @@ impl Worker {
             // being cancelled can append `NodeFailed` after `WorkflowCancelled`.
             // Nothing runs either way; the run stays cancelled.
             DispatchGuardOutcome::Blocked { reason } => {
-                let terminal = jamjet_state::Event::new(
-                    execution_id.clone(),
-                    0,
-                    EventKind::NodeFailed {
-                        node_id: node_id.to_string(),
-                        error: format!("policy blocked: {reason}"),
-                        attempt,
-                        retryable: false,
-                    },
-                );
-                match self
-                    .backend
-                    .commit_turn(item_id, lease_fence, terminal, false)
+                self.fail_for_good(
+                    execution_id,
+                    node_id,
+                    item_id,
+                    lease_fence,
+                    attempt,
+                    format!("policy blocked: {reason}"),
+                )
+                .await
+            }
+            // A spent cap is settled as a block is: retrying cannot unspend
+            // it, and a step left to retry would only be refused again.
+            DispatchGuardOutcome::Spent { reason } => {
+                self.fail_for_good(execution_id, node_id, item_id, lease_fence, attempt, reason)
                     .await
-                {
-                    Ok(_) => {
-                        warn!(execution_id = %execution_id, node_id, %reason, "Node failed: policy blocked");
-                        Some(Ok(()))
-                    }
-                    Err(StateBackendError::FenceLost(_)) => {
-                        warn!(execution_id = %execution_id, node_id, "Fence lost on policy-block commit; abandoning");
-                        Some(Ok(()))
-                    }
-                    Err(e) => Some(Err(Box::new(e))),
-                }
             }
             // Not a denial: the decision could not be made or recorded, so the
             // node fails and is retried rather than being audited as blocked.
@@ -1040,6 +993,44 @@ impl Worker {
                 self.settle_held(execution_id, node_id, item_id, lease_fence)
                     .await
             }
+        }
+    }
+
+    /// Fail the node for good: settle the item and record a terminal
+    /// `NodeFailed { retryable: false }` with `error` in one fenced commit.
+    async fn fail_for_good(
+        &self,
+        execution_id: &ExecutionId,
+        node_id: &str,
+        item_id: WorkItemId,
+        lease_fence: i64,
+        attempt: u32,
+        error: String,
+    ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        let terminal = jamjet_state::Event::new(
+            execution_id.clone(),
+            0,
+            EventKind::NodeFailed {
+                node_id: node_id.to_string(),
+                error: error.clone(),
+                attempt,
+                retryable: false,
+            },
+        );
+        match self
+            .backend
+            .commit_turn(item_id, lease_fence, terminal, false)
+            .await
+        {
+            Ok(_) => {
+                warn!(execution_id = %execution_id, node_id, %error, "Node failed for good");
+                Some(Ok(()))
+            }
+            Err(StateBackendError::FenceLost(_)) => {
+                warn!(execution_id = %execution_id, node_id, "Fence lost on the commit that fails the node; abandoning");
+                Some(Ok(()))
+            }
+            Err(e) => Some(Err(Box::new(e))),
         }
     }
 
@@ -1191,7 +1182,7 @@ impl Worker {
 
     // ── Policy check ──────────────────────────────────────────────────────────
 
-    /// Policy and approval gate for one item, for every node kind. The
+    /// Policy, approval and cap gate for one item, for every node kind. The
     /// decision is `node_guard::guard_item`, the same function the HTTP claim
     /// route runs, so the two transports cannot enforce different rules; this
     /// method owns only the settle.
@@ -1226,6 +1217,10 @@ impl Worker {
             Some(item_id),
             // The in-process worker holds its lease for the whole step.
             None,
+            Some(&jamjet_state::RunCaps {
+                token_budget: ir.token_budget.clone(),
+                cost_budget_usd: ir.cost_budget_usd,
+            }),
         )
         .await;
         self.settle_outcome(
@@ -1239,8 +1234,10 @@ impl Worker {
         .await
     }
 
-    // ── Budget enforcement ────────────────────────────────────────────────────
+    // ── Budget display ────────────────────────────────────────────────────────
 
+    /// The `__budget` counters in the run's latest snapshot. Display only:
+    /// nothing decides from them, the caps read the run's log.
     async fn load_budget_state(&self, execution_id: &ExecutionId) -> BudgetState {
         self.backend
             .latest_snapshot(execution_id)
@@ -1249,219 +1246,6 @@ impl Worker {
             .flatten()
             .map(|s| BudgetState::from_snapshot_state(&s.state))
             .unwrap_or_default()
-    }
-
-    /// Refuse to fire when the budget is already spent.
-    ///
-    /// `check_budget_after_execution` only trips once the call has been made and
-    /// paid for. This pre-check is what makes a spent budget refuse the *next*
-    /// call instead of buying it first.
-    ///
-    /// SCOPE — this is half of C2, and the half it is not closes elsewhere.
-    /// Because the post-execution check is `>` and a tripping turn is DISCARDED
-    /// rather than committed, committed counters normally settle strictly BELOW
-    /// the ceiling. This guard's `>=` therefore catches the case where a turn
-    /// lands exactly ON the ceiling, not the ordinary rollover chain: a
-    /// `continue_as_new` child inherits under-ceiling counters, passes this
-    /// guard, and buys one more discarded call per segment. Stopping that chain
-    /// means not rolling over on a budget trip at all, which is a separate change
-    /// to the rollover branch in `execute_item`.
-    ///
-    /// Deliberately kind-agnostic: budget accounting follows the tokens an
-    /// executor reports, not the node kind, so a kind allowlist would leak — the
-    /// budget fixture in this file trips on a `tool` node.
-    ///
-    /// SEMANTIC CHANGE: under `>=`, a ceiling of literally zero (`total_tokens:
-    /// 0`, `cost_budget_usd: 0.0`) now refuses every node up front, where it
-    /// previously allowed exactly one call before tripping. "Spend nothing" now
-    /// means nothing.
-    ///
-    /// Returns `Some(Err(..))` to refuse, `None` to let the node fire.
-    // `BudgetState::exhausted` is deprecated for `jamjet_state::caps`, which
-    // reads the run's log. This check goes when the claim checks the caps.
-    #[allow(deprecated)]
-    async fn check_budget_before_execution(
-        &self,
-        execution_id: &ExecutionId,
-        node_id: &str,
-        ir: &WorkflowIr,
-        budget: &BudgetState,
-    ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-        let trip = budget.exhausted(ir.token_budget.as_ref(), ir.cost_budget_usd)?;
-        warn!(
-            execution_id = %execution_id,
-            node_id,
-            kind = %trip.kind,
-            limit = trip.limit,
-            current = trip.current,
-            "Budget already exhausted; refusing to fire"
-        );
-
-        // The audit record is best-effort; the refusal is not. A backend read
-        // failure here must never downgrade into letting the node fire, so the
-        // sequence lookup is `if let Ok` rather than `?`.
-        if let Ok(latest) = self.backend.latest_sequence(execution_id).await {
-            // A cost trip carries dollars, which do not survive the u64 cast that
-            // TokenBudgetExceeded's limit/current fields require: a $0.50 ceiling
-            // would be recorded as 0. Report it on the cost event instead, exactly
-            // as the post-execution path does. Token ceilings are u32 in the IR,
-            // so their f64 -> u64 roundtrip is lossless.
-            let kind = if trip.kind == "cost_usd" {
-                EventKind::CostBudgetExceeded {
-                    node_id: node_id.to_string(),
-                    limit_usd: trip.limit,
-                    current_usd: trip.current,
-                    reason: None,
-                }
-            } else {
-                EventKind::TokenBudgetExceeded {
-                    node_id: node_id.to_string(),
-                    kind: trip.kind.clone(),
-                    limit: trip.limit as u64,
-                    current: trip.current as u64,
-                    reason: None,
-                }
-            };
-            let _ = self
-                .backend
-                .append_event(jamjet_state::Event::new(
-                    execution_id.clone(),
-                    latest + 1,
-                    kind,
-                ))
-                .await;
-        }
-
-        Some(Err(format!(
-            "budget exhausted before execution: {} {} >= {}",
-            trip.kind, trip.current, trip.limit
-        )
-        .into()))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn check_budget_after_execution(
-        &self,
-        execution_id: &ExecutionId,
-        node_id: &str,
-        ir: &WorkflowIr,
-        budget: &mut BudgetState,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        cost_usd: Option<f64>,
-        state_patch: &mut serde_json::Value,
-    ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-        budget.accumulate(input_tokens, output_tokens, cost_usd);
-        budget.patch_into_snapshot_state(state_patch);
-
-        if let Some(tb) = &ir.token_budget {
-            if let Some(limit) = tb.total_tokens {
-                let limit = limit as u64;
-                let current = budget.total_tokens();
-                if current > limit {
-                    return self
-                        .emit_token_budget_exceeded(
-                            execution_id,
-                            node_id,
-                            "total_tokens",
-                            limit,
-                            current,
-                        )
-                        .await;
-                }
-            }
-            if let Some(limit) = tb.input_tokens {
-                let limit = limit as u64;
-                if budget.total_input_tokens > limit {
-                    return self
-                        .emit_token_budget_exceeded(
-                            execution_id,
-                            node_id,
-                            "input_tokens",
-                            limit,
-                            budget.total_input_tokens,
-                        )
-                        .await;
-                }
-            }
-            if let Some(limit) = tb.output_tokens {
-                let limit = limit as u64;
-                if budget.total_output_tokens > limit {
-                    return self
-                        .emit_token_budget_exceeded(
-                            execution_id,
-                            node_id,
-                            "output_tokens",
-                            limit,
-                            budget.total_output_tokens,
-                        )
-                        .await;
-                }
-            }
-        }
-
-        if let Some(cost_limit) = ir.cost_budget_usd {
-            if budget.total_cost_usd > cost_limit {
-                warn!(
-                    execution_id = %execution_id,
-                    node_id,
-                    cost_limit,
-                    current = budget.total_cost_usd,
-                    "Cost budget exceeded"
-                );
-                let seq = self.backend.latest_sequence(execution_id).await.ok()? + 1;
-                let _ = self
-                    .backend
-                    .append_event(jamjet_state::Event::new(
-                        execution_id.clone(),
-                        seq,
-                        EventKind::CostBudgetExceeded {
-                            node_id: node_id.to_string(),
-                            limit_usd: cost_limit,
-                            current_usd: budget.total_cost_usd,
-                            reason: None,
-                        },
-                    ))
-                    .await;
-                return Some(Err(format!(
-                    "cost budget exceeded: ${:.4} > ${:.4}",
-                    budget.total_cost_usd, cost_limit
-                )
-                .into()));
-            }
-        }
-
-        None
-    }
-
-    async fn emit_token_budget_exceeded(
-        &self,
-        execution_id: &ExecutionId,
-        node_id: &str,
-        kind: &str,
-        limit: u64,
-        current: u64,
-    ) -> Option<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-        warn!(execution_id = %execution_id, node_id, kind, limit, current, "Token budget exceeded");
-        let seq = self.backend.latest_sequence(execution_id).await.ok()? + 1;
-        let _ = self
-            .backend
-            .append_event(jamjet_state::Event::new(
-                execution_id.clone(),
-                seq,
-                EventKind::TokenBudgetExceeded {
-                    node_id: node_id.to_string(),
-                    kind: kind.to_string(),
-                    limit,
-                    current,
-                    reason: None,
-                },
-            ))
-            .await;
-        Some(Err(format!(
-            "token budget exceeded: {kind} {current} > {limit}"
-        )
-        .into()))
     }
 
     // ── IR loading ────────────────────────────────────────────────────────────
@@ -1478,165 +1262,6 @@ impl Worker {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("workflow {workflow_id} v{workflow_version} not found"))?;
         serde_json::from_value(def.ir).map_err(|e| e.to_string())
-    }
-
-    // ── Continue-as-new rollover ──────────────────────────────────────────────
-
-    /// Perform a continue-as-new rollover at the strategy ceiling.
-    ///
-    /// Crash-safety order: create new segment FIRST (durable), THEN append
-    /// SegmentBoundary to old execution, THEN mark old execution terminal.
-    /// Double-roll guard: if the old execution already has a SegmentBoundary event
-    /// OR is already terminal, skip the rollover (idempotent on re-run after crash).
-    #[allow(clippy::too_many_arguments)]
-    async fn rollover_segment(
-        &self,
-        execution_id: &ExecutionId,
-        ir: &WorkflowIr,
-        workflow_id: &str,
-        workflow_version: &str,
-        tenant_id: &str,
-        item_id: WorkItemId,
-        lease_fence: i64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Double-roll guard: check SegmentBoundary event OR terminal status.
-        let events = self.backend.get_events(execution_id).await?;
-        let already = events
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }));
-        if already {
-            warn!(
-                execution_id = %execution_id,
-                "continue-as-new: SegmentBoundary already exists; skipping duplicate rollover"
-            );
-            // Fence-guarded: ensure the old execution is terminal AND settle the
-            // work item atomically. Handles Major-2: a crash before
-            // update_execution_status leaves the execution non-terminal; the
-            // retry hits `already` and finalizes via this path.
-            // Ok(false) = stale fence (zombie); log and return without error.
-            match self
-                .backend
-                .finalize_rollover_fenced(execution_id, item_id, lease_fence)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    warn!(
-                        execution_id = %execution_id,
-                        "continue-as-new already-branch: stale fence — another worker owns this item"
-                    );
-                }
-                Err(e) => return Err(e.to_string().into()),
-            }
-            return Ok(());
-        }
-
-        let exec = self
-            .backend
-            .get_execution(execution_id)
-            .await?
-            .ok_or_else(|| format!("execution {execution_id} not found for rollover"))?;
-
-        if exec.status.is_terminal() {
-            warn!(
-                execution_id = %execution_id,
-                status = ?exec.status,
-                "continue-as-new: old execution already terminal; skipping rollover"
-            );
-            // Fence-guarded settle: idempotent — the terminal update is a no-op
-            // since the execution is already terminal; only the work item settle
-            // is meaningful (fence-guarded against zombie workers).
-            match self
-                .backend
-                .finalize_rollover_fenced(execution_id, item_id, lease_fence)
-                .await
-            {
-                Ok(_) => {}
-                Err(e) => return Err(e.to_string().into()),
-            }
-            return Ok(());
-        }
-
-        let next_seg = exec.segment_number + 1;
-        let start_node_id = ir.start_node.as_str();
-
-        // Materialize carried state.
-        let mat = materialize(self.backend.as_ref(), execution_id).await?;
-
-        // The start item as the scheduler dispatches any node: its own queue
-        // (not the queue of the item that hit the ceiling) and the payload
-        // `build_work_item_payload` builds over the carried state.
-        let start_node = ir
-            .node(start_node_id)
-            .ok_or_else(|| format!("start node {start_node_id} is not in the workflow"))?;
-        let carried = mat.current_state.as_object().cloned().unwrap_or_default();
-        let start_payload = jamjet_scheduler::payload::build_work_item_payload(
-            ir,
-            start_node_id,
-            start_node,
-            &carried,
-            workflow_id,
-            workflow_version,
-        );
-        let start_queue = start_node.kind.queue_type();
-
-        // ORDER: new segment FIRST (crash-safe chain), THEN SegmentBoundary audit,
-        // THEN terminal status on old execution.
-        let next_id = start_next_segment(
-            self.backend.as_ref(),
-            execution_id,
-            &mat,
-            workflow_id,
-            workflow_version,
-            next_seg,
-            start_node_id,
-            start_queue.as_str(),
-            start_payload,
-            jamjet_scheduler::payload::max_attempts_for(start_node.retry_policy.as_deref()),
-            tenant_id,
-        )
-        .await?;
-
-        // Append SegmentBoundary to the OLD execution's event log (pure audit).
-        let seq = self.backend.latest_sequence(execution_id).await? + 1;
-        self.backend
-            .append_event(jamjet_state::Event::new(
-                execution_id.clone(),
-                seq,
-                EventKind::SegmentBoundary {
-                    segment_number: next_seg,
-                    next_execution_id: next_id.to_string(),
-                },
-            ))
-            .await?;
-
-        // Fence-guarded finalization: marks old execution terminal (LimitExceeded)
-        // AND settles the work item in one transaction. Ok(false) = stale fence
-        // (zombie worker — another lease holder now owns this item).
-        match self
-            .backend
-            .finalize_rollover_fenced(execution_id, item_id, lease_fence)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                warn!(
-                    execution_id = %execution_id,
-                    "continue-as-new: stale fence during finalization — new lease holder owns the item"
-                );
-                return Ok(());
-            }
-            Err(e) => return Err(e.to_string().into()),
-        }
-
-        info!(
-            old_execution_id = %execution_id,
-            new_execution_id = %next_id,
-            segment_number = next_seg,
-            "continue-as-new: rolled over to new segment"
-        );
-
-        Ok(())
     }
 }
 
@@ -3524,836 +3149,496 @@ mod tests {
         );
     }
 
-    // ── Continue-as-new tests (Task 2g-3) ────────────────────────────────────
+    // ── Run caps, in process ──────────────────────────────────────────────────
 
-    /// Returns 2 input tokens -- exceeds `budget_ceiling_ir_json`'s
-    /// `total_tokens: 1` ceiling on the post-execution `>` check, while leaving a
-    /// fresh execution genuinely under the ceiling for the pre-execution `>=` check.
-    struct BudgetTriggerExecutor;
-
-    #[async_trait::async_trait]
-    impl NodeExecutor for BudgetTriggerExecutor {
-        async fn execute(
-            &self,
-            _item: &jamjet_state::backend::WorkItem,
-        ) -> Result<ExecutionResult, ExecutorError> {
-            Ok(ExecutionResult {
-                output: serde_json::json!({}),
-                state_patch: serde_json::json!({}),
-                duration_ms: 1,
-                gen_ai_system: None,
-                gen_ai_model: None,
-                input_tokens: Some(2), // exceeds the total_tokens: 1 ceiling
-                output_tokens: None,
-                finish_reason: None,
-                cost_usd: None,
-            })
-        }
-    }
-
-    fn budget_ceiling_ir_json(continue_as_new: bool) -> serde_json::Value {
-        serde_json::json!({
-            "workflow_id": "seg-wf",
-            "version": "1.0.0",
-            "state_schema": "{}",
-            "start_node": "n1",
-            "continue_as_new": continue_as_new,
-            // A ceiling of 1, not 0: the executor's 2 tokens exceed it after the
-            // fact, but a FRESH execution (0 tokens) is genuinely under it, so the
-            // pre-execution `>=` guard lets the first turn fire. A zero ceiling
-            // would read as already-exhausted before anything ran.
-            "token_budget": { "total_tokens": 1 },
-            "nodes": {
-                "n1": {
-                    "id": "n1",
-                    "kind": {
-                        "type": "tool",
-                        "tool_ref": "stub",
-                        "input_mapping": {},
-                        "output_schema": "{}"
-                    }
-                }
-            },
-            "edges": [],
-            "retry_policies": {},
-            "models": {},
-            "tools": {},
-            "mcp_servers": {},
-            "remote_agents": {}
-        })
-    }
-
-    async fn setup_budget_backend(continue_as_new: bool) -> (Arc<InMemoryBackend>, ExecutionId) {
-        let backend = Arc::new(InMemoryBackend::new());
-        let eid = ExecutionId::new();
-
-        let now = Utc::now();
-        backend
-            .create_execution(WorkflowExecution {
-                execution_id: eid.clone(),
-                workflow_id: "seg-wf".into(),
-                workflow_version: "1.0.0".into(),
-                status: WorkflowStatus::Running,
-                initial_input: serde_json::json!({ "counter": 5 }),
-                current_state: serde_json::json!({ "counter": 5 }),
-                started_at: now,
-                updated_at: now,
-                completed_at: None,
-                session_type: None,
-                parent_execution_id: None,
-                segment_number: 0,
-            })
-            .await
-            .unwrap();
-
-        backend
-            .store_workflow(jamjet_state::backend::WorkflowDefinition {
-                workflow_id: "seg-wf".into(),
-                version: "1.0.0".into(),
-                ir: budget_ceiling_ir_json(continue_as_new),
-                created_at: Utc::now(),
-                tenant_id: "default".into(),
-            })
-            .await
-            .unwrap();
-
-        backend
-            .enqueue_work_item(jamjet_state::backend::WorkItem {
-                id: Uuid::new_v4(),
-                execution_id: eid.clone(),
-                node_id: "n1".into(),
-                queue_type: "default".into(),
-                payload: serde_json::json!({
-                    "workflow_id": "seg-wf",
-                    "workflow_version": "1.0.0"
-                }),
-                attempt: 0,
-                max_attempts: 3,
-                created_at: Utc::now(),
-                lease_expires_at: None,
-                worker_id: None,
-                tenant_id: "default".into(),
-                lease_fence: 0,
-            })
-            .await
-            .unwrap();
-
-        (backend, eid)
-    }
-
-    /// With `continue_as_new: true`, hitting the token budget ceiling must roll
-    /// over to a new linked segment instead of returning Err.
-    #[tokio::test]
-    async fn continue_as_new_rolls_over_at_budget_ceiling() {
-        let (backend, old_eid) = setup_budget_backend(true).await;
-        let worker = Worker::new(
-            "test-worker".into(),
-            backend.clone() as Arc<dyn StateBackend>,
-            vec!["default".into()],
-        )
-        .register_executor("tool", Arc::new(BudgetTriggerExecutor));
-
-        let item = backend
-            .claim_work_item("test-worker", &["default"])
-            .await
-            .unwrap()
-            .expect("item must be claimable");
-
-        let result = worker.execute_item(item).await;
-        assert!(
-            result.is_ok(),
-            "execute_item must return Ok(()) after rollover; got: {result:?}"
-        );
-
-        let old_events = backend.get_events(&old_eid).await.unwrap();
-        let boundary = old_events
-            .iter()
-            .find(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }))
-            .expect("old execution must have a SegmentBoundary event");
-
-        let (next_seg, next_id_str) = match &boundary.kind {
-            EventKind::SegmentBoundary {
-                segment_number,
-                next_execution_id,
-            } => (*segment_number, next_execution_id.clone()),
-            _ => unreachable!(),
-        };
-        assert_eq!(next_seg, 1, "segment_number in SegmentBoundary must be 1");
-
-        let old_exec = backend
-            .get_execution(&old_eid)
-            .await
-            .unwrap()
-            .expect("old execution must still exist");
-        assert_eq!(
-            old_exec.status,
-            WorkflowStatus::LimitExceeded,
-            "old execution must be LimitExceeded, not Failed"
-        );
-
-        // ExecutionId Display is "exec_{uuid_simple}" (no hyphens). Strip the prefix
-        // and parse the simple UUID to reconstruct the ExecutionId.
-        let new_eid = if next_id_str.starts_with("exec_") {
-            let uuid_str = next_id_str.trim_start_matches("exec_");
-            ExecutionId(uuid::Uuid::parse_str(uuid_str).expect("valid uuid"))
-        } else {
-            ExecutionId(uuid::Uuid::parse_str(&next_id_str).expect("valid uuid"))
-        };
-
-        let new_exec = backend
-            .get_execution(&new_eid)
-            .await
-            .unwrap()
-            .expect("new execution must exist");
-
-        assert_eq!(
-            new_exec.parent_execution_id.as_ref(),
-            Some(&old_eid),
-            "new execution must link to the old execution"
-        );
-        assert_eq!(
-            new_exec.segment_number, 1,
-            "new execution must have segment_number = 1"
-        );
-
-        let old_mat = jamjet_state::materialize(backend.as_ref(), &old_eid)
-            .await
-            .expect("materialize old execution");
-        assert_eq!(
-            new_exec.current_state, old_mat.current_state,
-            "new execution current_state must equal old execution's materialized current_state"
-        );
-
-        // On the start node's own queue (a `tool` node's), not the queue of
-        // the item that hit the ceiling.
-        let new_item = backend
-            .claim_work_item("test-worker-2", &["tool"])
-            .await
-            .unwrap()
-            .expect("new execution must have a claimable work item");
-        assert_eq!(
-            new_item.execution_id, new_eid,
-            "new work item must belong to the new segment execution"
-        );
-        assert_eq!(
-            new_item.node_id, "n1",
-            "new work item must target the start node"
-        );
-    }
-
-    /// A rollover's start item is built as the scheduler builds every item.
-    /// It used to carry two workflow fields only: a `model` start node had no
-    /// model, so the next segment's first turn was refused with a policy
-    /// violation that named no policy.
-    #[tokio::test]
-    async fn a_rollover_start_item_is_built_like_any_other() {
-        let mut ir_json = budget_ceiling_ir_json(true);
-        ir_json["nodes"]["n1"]["kind"] = serde_json::json!({
-            "type": "model",
-            "model_ref": "fast",
-            "prompt_ref": "",
-            "output_schema": "{}"
-        });
-        ir_json["nodes"]["n1"]["retry_policy"] = serde_json::json!("io_default");
-        ir_json["models"] = serde_json::json!({
-            "fast": { "provider": "anthropic", "model": "claude-sonnet-4-6" }
-        });
-        let ir: WorkflowIr = serde_json::from_value(ir_json.clone()).unwrap();
-        let backend = Arc::new(InMemoryBackend::new());
-        let eid = ExecutionId::new();
-        let now = Utc::now();
-        backend
-            .create_execution(WorkflowExecution {
-                execution_id: eid.clone(),
-                workflow_id: "seg-wf".into(),
-                workflow_version: "1.0.0".into(),
-                status: WorkflowStatus::Running,
-                initial_input: serde_json::json!({ "counter": 5 }),
-                current_state: serde_json::json!({ "counter": 5 }),
-                started_at: now,
-                updated_at: now,
-                completed_at: None,
-                session_type: None,
-                parent_execution_id: None,
-                segment_number: 0,
-            })
-            .await
-            .unwrap();
-        backend
-            .store_workflow(jamjet_state::backend::WorkflowDefinition {
-                workflow_id: "seg-wf".into(),
-                version: "1.0.0".into(),
-                ir: ir_json,
-                created_at: Utc::now(),
-                tenant_id: "default".into(),
-            })
-            .await
-            .unwrap();
-        let state = serde_json::json!({ "counter": 5 });
-        backend
-            .enqueue_work_item(jamjet_state::backend::WorkItem {
-                id: Uuid::new_v4(),
-                execution_id: eid.clone(),
-                node_id: "n1".into(),
-                queue_type: "model".into(),
-                payload: jamjet_scheduler::payload::build_work_item_payload(
-                    &ir,
-                    "n1",
-                    ir.node("n1").unwrap(),
-                    state.as_object().unwrap(),
-                    "seg-wf",
-                    "1.0.0",
-                ),
-                attempt: 0,
-                max_attempts: 3,
-                created_at: Utc::now(),
-                lease_expires_at: None,
-                worker_id: None,
-                tenant_id: "default".into(),
-                lease_fence: 0,
-            })
-            .await
-            .unwrap();
-        let worker = Worker::new(
-            "test-worker".into(),
-            backend.clone() as Arc<dyn StateBackend>,
-            vec!["model".into()],
-        )
-        .register_executor("model", Arc::new(BudgetTriggerExecutor));
-
-        let item = backend
-            .claim_work_item("test-worker", &["model"])
-            .await
-            .unwrap()
-            .unwrap();
-        worker.execute_item(item).await.unwrap();
-
-        let next = backend
-            .claim_work_item("test-worker", &["model"])
-            .await
-            .unwrap()
-            .expect("the next segment's start item is on the model queue");
-        assert_ne!(next.execution_id, eid);
-        let carried = jamjet_state::materialize(backend.as_ref(), &eid)
-            .await
-            .unwrap()
-            .current_state;
-        assert_eq!(
-            next.payload,
-            jamjet_scheduler::payload::build_work_item_payload(
-                &ir,
-                "n1",
-                ir.node("n1").unwrap(),
-                carried.as_object().unwrap(),
-                "seg-wf",
-                "1.0.0",
-            )
-        );
-        assert_eq!(next.payload["model"], "anthropic/claude-sonnet-4-6");
-        // The start node's own attempt budget, not a fixed 3.
-        assert_eq!(
-            next.max_attempts,
-            jamjet_scheduler::payload::max_attempts_for(Some("io_default"))
-        );
-        assert_ne!(next.max_attempts, 3);
-
-        // Its first turn runs: no policy violation for a missing model.
-        let next_eid = next.execution_id.clone();
-        worker.execute_item(next).await.unwrap();
-        let events = backend.get_events(&next_eid).await.unwrap();
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e.kind, EventKind::PolicyViolation { .. })),
-            "{events:?}"
-        );
-    }
-
-    /// With `continue_as_new: false`, budget ceiling must return Err (old behavior).
-    #[tokio::test]
-    async fn continue_as_new_false_keeps_old_terminate_behavior() {
-        let (backend, old_eid) = setup_budget_backend(false).await;
-        let worker = Worker::new(
-            "test-worker".into(),
-            backend.clone() as Arc<dyn StateBackend>,
-            vec!["default".into()],
-        )
-        .register_executor("tool", Arc::new(BudgetTriggerExecutor));
-
-        let item = backend
-            .claim_work_item("test-worker", &["default"])
-            .await
-            .unwrap()
-            .expect("item must be claimable");
-
-        let result = worker.execute_item(item).await;
-        assert!(
-            result.is_err(),
-            "with continue_as_new=false, execute_item must return Err on budget ceiling"
-        );
-
-        let old_events = backend.get_events(&old_eid).await.unwrap();
-        let boundary_count = old_events
-            .iter()
-            .filter(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }))
-            .count();
-        assert_eq!(
-            boundary_count, 0,
-            "no SegmentBoundary event when continue_as_new=false"
-        );
-
-        let old_exec = backend
-            .get_execution(&old_eid)
-            .await
-            .unwrap()
-            .expect("old execution must still exist");
-        assert_ne!(
-            old_exec.status,
-            WorkflowStatus::LimitExceeded,
-            "old execution must NOT be LimitExceeded when continue_as_new=false"
-        );
-    }
-
-    /// Double-roll guard: a second work item for the OLD execution after a
-    /// successful rollover must not create a second new segment.
-    #[tokio::test]
-    async fn continue_as_new_double_roll_guard() {
-        let (backend, old_eid) = setup_budget_backend(true).await;
-        let worker = Worker::new(
-            "test-worker".into(),
-            backend.clone() as Arc<dyn StateBackend>,
-            vec!["default".into()],
-        )
-        .register_executor("tool", Arc::new(BudgetTriggerExecutor));
-
-        // First rollover.
-        let item1 = backend
-            .claim_work_item("test-worker", &["default"])
-            .await
-            .unwrap()
-            .expect("item1 must be claimable");
-        worker
-            .execute_item(item1)
-            .await
-            .expect("first rollover must succeed");
-
-        // Verify first rollover happened.
-        let old_events = backend.get_events(&old_eid).await.unwrap();
-        assert_eq!(
-            old_events
-                .iter()
-                .filter(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }))
-                .count(),
-            1,
-            "must have exactly one SegmentBoundary after first rollover"
-        );
-
-        // Simulate a second work item arriving for the OLD execution
-        // (e.g., crash-recovery re-enqueue scenario).
-        backend
-            .enqueue_work_item(jamjet_state::backend::WorkItem {
-                id: Uuid::new_v4(),
-                execution_id: old_eid.clone(),
-                node_id: "n1".into(),
-                queue_type: "default".into(),
-                payload: serde_json::json!({
-                    "workflow_id": "seg-wf",
-                    "workflow_version": "1.0.0"
-                }),
-                attempt: 0,
-                max_attempts: 3,
-                created_at: Utc::now(),
-                lease_expires_at: None,
-                worker_id: None,
-                tenant_id: "default".into(),
-                lease_fence: 0,
-            })
-            .await
-            .unwrap();
-
-        // Claim items until we find the OLD execution's second item.
-        let item2a = backend
-            .claim_work_item("test-worker", &["default"])
-            .await
-            .unwrap()
-            .expect("item must be claimable");
-
-        let item2_old = if item2a.execution_id != old_eid {
-            backend
-                .claim_work_item("test-worker", &["default"])
-                .await
-                .unwrap()
-                .expect("old execution's second item must be claimable")
-        } else {
-            item2a
-        };
-
-        assert_eq!(
-            item2_old.execution_id, old_eid,
-            "item2_old must belong to the OLD execution"
-        );
-
-        let result = worker.execute_item(item2_old).await;
-        assert!(
-            result.is_ok(),
-            "double-roll guard path must return Ok(()): {result:?}"
-        );
-
-        let old_events_after = backend.get_events(&old_eid).await.unwrap();
-        assert_eq!(
-            old_events_after
-                .iter()
-                .filter(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }))
-                .count(),
-            1,
-            "must still have exactly one SegmentBoundary event after double-roll attempt"
-        );
-    }
-
-    /// Regression test for Major-2: crash after SegmentBoundary but before terminal marking.
-    ///
-    /// Simulates: the worker appended SegmentBoundary to the old execution and created the
-    /// new segment, then crashed before calling update_execution_status (old execution is
-    /// still Running). On retry, the worker hits the `already` branch and must mark the
-    /// old execution LimitExceeded via finalize_rollover_fenced.
-    #[tokio::test]
-    async fn continue_as_new_already_branch_marks_old_execution_terminal() {
-        let (backend, old_eid) = setup_budget_backend(true).await;
-        let worker = Worker::new(
-            "test-worker".into(),
-            backend.clone() as Arc<dyn StateBackend>,
-            vec!["default".into()],
-        )
-        .register_executor("tool", Arc::new(BudgetTriggerExecutor));
-
-        // First rollover: succeeds normally.
-        let item1 = backend
-            .claim_work_item("test-worker", &["default"])
-            .await
-            .unwrap()
-            .expect("item1 must be claimable");
-        worker
-            .execute_item(item1)
-            .await
-            .expect("first rollover must succeed");
-
-        // Verify old execution is now terminal.
-        let exec_after_first = backend
-            .get_execution(&old_eid)
-            .await
-            .unwrap()
-            .expect("old execution must exist");
-        assert_eq!(exec_after_first.status, WorkflowStatus::LimitExceeded);
-
-        // Simulate crash-before-terminal: reset the old execution back to Running.
-        // This represents what would have happened if the worker crashed between
-        // appending SegmentBoundary and calling update_execution_status.
-        backend
-            .update_execution_status(&old_eid, WorkflowStatus::Running)
-            .await
-            .expect("reset status for crash simulation");
-
-        let exec_reset = backend
-            .get_execution(&old_eid)
-            .await
-            .unwrap()
-            .expect("old execution must exist after reset");
-        assert_eq!(
-            exec_reset.status,
-            WorkflowStatus::Running,
-            "status must be reset to Running"
-        );
-
-        // Enqueue a second work item for the old execution (as crash-recovery reclaim would do).
-        backend
-            .enqueue_work_item(jamjet_state::backend::WorkItem {
-                id: Uuid::new_v4(),
-                execution_id: old_eid.clone(),
-                node_id: "n1".into(),
-                queue_type: "default".into(),
-                payload: serde_json::json!({
-                    "workflow_id": "seg-wf",
-                    "workflow_version": "1.0.0"
-                }),
-                attempt: 0,
-                max_attempts: 3,
-                created_at: Utc::now(),
-                lease_expires_at: None,
-                worker_id: None,
-                tenant_id: "default".into(),
-                lease_fence: 0,
-            })
-            .await
-            .unwrap();
-
-        // Claim the retry item for the OLD execution.
-        // Drain any new segment item first if it comes up first.
-        let item2a = backend
-            .claim_work_item("test-worker-retry", &["default"])
-            .await
-            .unwrap()
-            .expect("must be claimable");
-
-        let item2_old = if item2a.execution_id != old_eid {
-            backend
-                .claim_work_item("test-worker-retry2", &["default"])
-                .await
-                .unwrap()
-                .expect("old execution's retry item must be claimable")
-        } else {
-            item2a
-        };
-
-        assert_eq!(
-            item2_old.execution_id, old_eid,
-            "retry item must belong to old execution"
-        );
-
-        worker
-            .execute_item(item2_old)
-            .await
-            .expect("retry rollover (already branch) must succeed");
-
-        // KEY ASSERTION (Major-2 regression): old execution must now be terminal.
-        let exec_final = backend
-            .get_execution(&old_eid)
-            .await
-            .unwrap()
-            .expect("old execution must exist");
-        assert_eq!(
-            exec_final.status,
-            WorkflowStatus::LimitExceeded,
-            "Major-2 regression: old execution must be LimitExceeded after already-branch finalization; \
-             got {:?} — means crash-before-terminal was not repaired",
-            exec_final.status
-        );
-    }
-
-    // ── Pre-execution budget guard tests (C2) ─────────────────────────────────
-
-    /// Counts every executor invocation. A refused node must leave it at 0 —
-    /// that count IS the money, so it is the assertion that matters.
-    struct CountingBudgetExecutor {
+    /// Counts every executor invocation and reports 2 input tokens. A refused
+    /// node must leave the count at 0: that count is the money.
+    struct CountingSpender {
         calls: Arc<std::sync::atomic::AtomicU32>,
     }
 
+    impl CountingSpender {
+        fn new() -> (Self, Arc<std::sync::atomic::AtomicU32>) {
+            let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            (
+                Self {
+                    calls: calls.clone(),
+                },
+                calls,
+            )
+        }
+    }
+
     #[async_trait::async_trait]
-    impl NodeExecutor for CountingBudgetExecutor {
+    impl NodeExecutor for CountingSpender {
         async fn execute(
             &self,
             _item: &jamjet_state::backend::WorkItem,
         ) -> Result<ExecutionResult, ExecutorError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(ExecutionResult {
-                output: serde_json::json!({}),
-                state_patch: serde_json::json!({}),
-                duration_ms: 1,
-                gen_ai_system: None,
-                gen_ai_model: None,
                 input_tokens: Some(2),
-                output_tokens: None,
-                finish_reason: None,
-                cost_usd: None,
+                output_tokens: Some(0),
+                gen_ai_model: Some("m".into()),
+                ..Default::default()
             })
         }
     }
 
-    /// Seed the execution's latest snapshot with an already-spent `__budget`.
-    ///
-    /// This is exactly the state a continue-as-new child inherits: the parent's
-    /// counters, carried forward by `materialize`, sitting at the ceiling with the
-    /// same ceiling still in the same IR.
-    async fn seed_spent_budget(backend: &InMemoryBackend, eid: &ExecutionId, input_tokens: u64) {
-        let budget = BudgetState {
-            total_input_tokens: input_tokens,
-            ..Default::default()
-        };
-        let mut state = serde_json::json!({ "counter": 5 });
-        budget.patch_into_snapshot_state(&mut state);
-        backend
-            .write_snapshot(jamjet_state::Snapshot::new(eid.clone(), 0, state))
-            .await
-            .expect("seed snapshot must write");
+    /// `n1`, a node of `kind`, alone in workflow `caps-wf`, with the keys of
+    /// `caps` set on the workflow.
+    fn caps_ir_json(kind: serde_json::Value, caps: serde_json::Value) -> serde_json::Value {
+        let mut ir = serde_json::json!({
+            "workflow_id": "caps-wf",
+            "version": "1.0.0",
+            "state_schema": "{}",
+            "start_node": "n1",
+            "nodes": { "n1": { "id": "n1", "kind": kind } },
+            "edges": [],
+            "retry_policies": {},
+            "models": {},
+            "tools": {},
+            "mcp_servers": {},
+            "remote_agents": {}
+        });
+        for (key, value) in caps.as_object().unwrap() {
+            ir[key] = value.clone();
+        }
+        ir
     }
 
-    /// The guard is wired into `execute_item` ahead of every executor dispatch:
-    /// an execution whose counters already sit at the ceiling makes ZERO executor
-    /// calls. That count is the whole point — it is the money.
-    ///
-    /// This does NOT prove the `continue_as_new` chain terminates. It cannot: the
-    /// chain's carried counters land strictly BELOW the ceiling (the post-check is
-    /// `>`, the tripping turn is discarded), so the seeded state here is reached
-    /// by a turn landing exactly on the ceiling, not by the chain. Terminating the
-    /// chain means not rolling over on a trip, which lives in the rollover branch.
-    ///
-    /// Driven with `continue_as_new: true` so a regression that lets the node fire
-    /// shows up as the runaway itself: without the guard this returns `Ok(())`,
-    /// having paid for one call, discarded it, and rolled over.
-    #[tokio::test]
-    async fn exhausted_budget_makes_no_executor_call() {
-        let (backend, eid) = setup_budget_backend(true).await;
-        // The fixture node is a TOOL node, not a model node. That is deliberate:
-        // budget accounting follows the tokens an executor reports, not the node
-        // kind, so a `Model | Agent` allowlist in the guard would silently let
-        // this through and this assertion would still pass while the count did not.
-        let ir: WorkflowIr =
-            serde_json::from_value(budget_ceiling_ir_json(true)).expect("fixture IR must parse");
-        assert_eq!(
-            node_kind_tag(&ir.node("n1").expect("n1 exists").kind),
-            "tool",
-            "fixture node must be a tool node for the kind-agnostic claim to bite"
-        );
+    fn tool_kind() -> serde_json::Value {
+        serde_json::json!({ "type": "tool", "tool_ref": "stub", "input_mapping": {}, "output_schema": "{}" })
+    }
 
-        // Ceiling is total_tokens: 1; 1 input token means the counters sit exactly
-        // on it, which is the state a turn landing on the ceiling commits.
-        seed_spent_budget(&backend, &eid, 1).await;
+    /// A completed step that spent `input_tokens`, as a model step records it.
+    fn spent_step(eid: &ExecutionId, node: &str, input_tokens: u64) -> jamjet_state::Event {
+        jamjet_state::Event::new(
+            eid.clone(),
+            0,
+            EventKind::NodeCompleted {
+                node_id: node.into(),
+                output: serde_json::json!({}),
+                state_patch: serde_json::json!({}),
+                duration_ms: 1,
+                gen_ai_system: Some("test".into()),
+                gen_ai_model: Some("m".into()),
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(0),
+                finish_reason: None,
+                cost_usd: None,
+                provenance: None,
+                idempotency_key: None,
+            },
+        )
+    }
 
-        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    /// A run of `caps-wf` under `ir`, segment 0, Running, with nothing in its
+    /// log yet.
+    async fn caps_run(ir: serde_json::Value) -> (Arc<InMemoryBackend>, ExecutionId) {
+        let backend = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = Utc::now();
+        backend
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "caps-wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: serde_json::json!({}),
+                current_state: serde_json::json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        backend
+            .store_workflow(jamjet_state::backend::WorkflowDefinition {
+                workflow_id: "caps-wf".into(),
+                version: "1.0.0".into(),
+                ir,
+                created_at: now,
+                tenant_id: "default".into(),
+            })
+            .await
+            .unwrap();
+        (backend, eid)
+    }
+
+    /// An item for `n1` of `eid` on the `default` queue.
+    async fn enqueue_n1(backend: &InMemoryBackend, eid: &ExecutionId) {
+        backend
+            .enqueue_work_item(jamjet_state::backend::WorkItem {
+                id: Uuid::new_v4(),
+                execution_id: eid.clone(),
+                node_id: "n1".into(),
+                queue_type: "default".into(),
+                payload: serde_json::json!({ "workflow_id": "caps-wf", "workflow_version": "1.0.0" }),
+                attempt: 0,
+                max_attempts: 3,
+                created_at: Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Claim the one item on `default` and run it on a worker whose executor
+    /// for `kind_tag` counts its calls. Returns the worker's answer.
+    async fn run_capped_n1(
+        backend: &Arc<InMemoryBackend>,
+        kind_tag: &str,
+        executor: CountingSpender,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let worker = Worker::new(
             "test-worker".into(),
             backend.clone() as Arc<dyn StateBackend>,
             vec!["default".into()],
         )
-        .register_executor(
-            "tool",
-            Arc::new(CountingBudgetExecutor {
-                calls: Arc::clone(&calls),
-            }),
-        );
-
+        .register_executor(kind_tag, Arc::new(executor));
         let item = backend
             .claim_work_item("test-worker", &["default"])
             .await
             .unwrap()
-            .expect("item must be claimable");
+            .expect("the item is claimable");
+        worker.execute_item(item).await
+    }
 
-        let result = worker.execute_item(item).await;
-        assert!(
-            result.is_err(),
-            "an exhausted budget must refuse the node, not run it: {result:?}"
-        );
+    /// Each `NodeFailed` of `eid` as `(node, error, retryable)`.
+    async fn failures(backend: &InMemoryBackend, eid: &ExecutionId) -> Vec<(String, String, bool)> {
+        backend
+            .get_events(eid)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventKind::NodeFailed {
+                    node_id,
+                    error,
+                    retryable,
+                    ..
+                } => Some((node_id, error, retryable)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each cap trip of `eid`, as JSON.
+    async fn trips(backend: &InMemoryBackend, eid: &ExecutionId) -> Vec<serde_json::Value> {
+        backend
+            .get_events(eid)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::TokenBudgetExceeded { .. } | EventKind::CostBudgetExceeded { .. }
+                )
+            })
+            .map(|e| serde_json::to_value(&e.kind).unwrap())
+            .collect()
+    }
+
+    /// The trip a spent `total_tokens` cap of 1 records against `n1`.
+    fn n1_trip(limit: u64, current: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "token_budget_exceeded",
+            "node_id": "n1",
+            "kind": "total_tokens",
+            "limit": limit,
+            "current": current
+        })
+    }
+
+    /// A run whose log already holds a step that spent its whole
+    /// `total_tokens: 1` makes ZERO executor calls for its next step: the
+    /// claim is refused by the shared guard, the item is settled, and the node
+    /// fails for good in one fenced write, so nothing retries it. The trip is
+    /// on the record, and the run does not roll over though `continue_as_new`
+    /// is set: rolling over a spent run is the runaway itself.
+    ///
+    /// A `tool` node on purpose: the guard is not a model allowlist. It
+    /// replaces `exhausted_budget_makes_no_executor_call`, which read the
+    /// `__budget` key from the run's state instead of its log.
+    #[tokio::test]
+    async fn a_spent_run_makes_no_model_call_in_process() {
+        let (backend, eid) = caps_run(caps_ir_json(
+            tool_kind(),
+            serde_json::json!({ "token_budget": { "total_tokens": 1 }, "continue_as_new": true }),
+        ))
+        .await;
+        backend
+            .append_event(spent_step(&eid, "earlier", 1))
+            .await
+            .unwrap();
+        enqueue_n1(&backend, &eid).await;
+        let (executor, calls) = CountingSpender::new();
+
+        let result = run_capped_n1(&backend, "tool", executor).await;
+
+        assert!(result.is_ok(), "the refusal settles the item: {result:?}");
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "C2: an exhausted budget must not pay for one more call"
+            "a spent run must not pay for one more call"
         );
-
-        // The refusal is on the record, and it names the ceiling that tripped.
-        let events = backend.get_events(&eid).await.unwrap();
-        let trip = events
-            .iter()
-            .find_map(|e| match &e.kind {
-                EventKind::TokenBudgetExceeded {
-                    kind,
-                    limit,
-                    current,
-                    ..
-                } => Some((kind.clone(), *limit, *current)),
-                _ => None,
-            })
-            .expect("refusal must emit TokenBudgetExceeded");
-        assert_eq!(trip, ("total_tokens".to_string(), 1, 1));
-
-        // And it must NOT roll over: rolling over on an exhausted budget is the
-        // runaway itself, since the child inherits the same spent counters.
         assert_eq!(
-            events
-                .iter()
-                .filter(|e| matches!(e.kind, EventKind::SegmentBoundary { .. }))
-                .count(),
-            0,
-            "C2: a refused node must not roll over into another segment"
+            failures(&backend, &eid).await,
+            vec![(
+                "n1".to_string(),
+                "token budget reached: total_tokens 1 of 1".to_string(),
+                false
+            )]
         );
-    }
-
-    /// A fresh budget under the ceiling fires normally — the guard must not be a
-    /// blanket stop.
-    #[tokio::test]
-    async fn budget_under_the_ceiling_fires() {
-        let backend = Arc::new(InMemoryBackend::new());
-        let worker = Worker::new(
-            "test-worker".into(),
-            backend.clone() as Arc<dyn StateBackend>,
-            vec!["default".into()],
-        );
-        let ir: WorkflowIr =
-            serde_json::from_value(budget_ceiling_ir_json(false)).expect("fixture IR must parse");
-        let refused = worker
-            .check_budget_before_execution(&ExecutionId::new(), "n1", &ir, &BudgetState::default())
-            .await;
-        assert!(refused.is_none(), "a fresh budget must not be refused");
-    }
-
-    /// No budget configured means the guard never fires, however large the counters.
-    #[tokio::test]
-    async fn no_budget_configured_never_refuses() {
-        let backend = Arc::new(InMemoryBackend::new());
-        let worker = Worker::new(
-            "test-worker".into(),
-            backend.clone() as Arc<dyn StateBackend>,
-            vec!["default".into()],
-        );
-        let mut ir_json = budget_ceiling_ir_json(false);
-        ir_json["token_budget"] = serde_json::Value::Null;
-        let ir: WorkflowIr = serde_json::from_value(ir_json).expect("IR must parse");
-        let huge = BudgetState {
-            total_input_tokens: 10_000_000,
-            ..Default::default()
-        };
-        let refused = worker
-            .check_budget_before_execution(&ExecutionId::new(), "n1", &ir, &huge)
-            .await;
-        assert!(refused.is_none());
-    }
-
-    /// A spent COST budget reports as `CostBudgetExceeded`, matching the
-    /// post-execution path. Routing it through `TokenBudgetExceeded` would cast
-    /// the dollar limit to u64 and record a $0.50 ceiling as `limit: 0`.
-    #[tokio::test]
-    async fn exhausted_cost_budget_reports_dollars_not_truncated_tokens() {
-        let backend = Arc::new(InMemoryBackend::new());
-        let eid = ExecutionId::new();
-        let worker = Worker::new(
-            "test-worker".into(),
-            backend.clone() as Arc<dyn StateBackend>,
-            vec!["default".into()],
-        );
-        let mut ir_json = budget_ceiling_ir_json(false);
-        ir_json["token_budget"] = serde_json::Value::Null;
-        ir_json["cost_budget_usd"] = serde_json::json!(0.5);
-        let ir: WorkflowIr = serde_json::from_value(ir_json).expect("IR must parse");
-        let spent = BudgetState {
-            total_cost_usd: 0.5,
-            ..Default::default()
-        };
-
-        let refused = worker
-            .check_budget_before_execution(&eid, "n1", &ir, &spent)
-            .await;
+        assert_eq!(trips(&backend, &eid).await, vec![n1_trip(1, 1)]);
         assert!(
-            refused.expect("a spent cost budget must refuse").is_err(),
-            "refusal must be an Err"
+            backend
+                .claim_work_item("test-worker", &["default"])
+                .await
+                .unwrap()
+                .is_none(),
+            "the refused item is settled, not left to retry"
         );
+        let events = backend.get_events(&eid).await.unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::SegmentBoundary { .. })),
+            "a refused step must not roll the run over: {events:?}"
+        );
+    }
+
+    /// A `condition` node cannot spend, so a run exactly at its cap still
+    /// takes it (it is often the run's way to its end). Nothing is recorded
+    /// against the cap.
+    #[tokio::test]
+    async fn a_condition_node_runs_at_the_cap() {
+        let (backend, eid) = caps_run(caps_ir_json(
+            serde_json::json!({ "type": "condition", "branches": [] }),
+            serde_json::json!({ "token_budget": { "total_tokens": 1 } }),
+        ))
+        .await;
+        backend
+            .append_event(spent_step(&eid, "earlier", 1))
+            .await
+            .unwrap();
+        enqueue_n1(&backend, &eid).await;
+        let (executor, calls) = CountingSpender::new();
+
+        run_capped_n1(&backend, "condition", executor)
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(failures(&backend, &eid).await, vec![]);
+        assert_eq!(trips(&backend, &eid).await, Vec::<serde_json::Value>::new());
+    }
+
+    /// An `eval` node can spend (an LLM judge calls a model), so it is held
+    /// to the cap like any other step: refused at the cap, run under it.
+    #[tokio::test]
+    async fn an_eval_node_is_refused_at_the_cap() {
+        let eval = serde_json::json!({
+            "type": "eval", "scorers": [], "on_fail": "halt", "input_expr": null
+        });
+        let caps = serde_json::json!({ "token_budget": { "total_tokens": 1 } });
+
+        let (backend, eid) = caps_run(caps_ir_json(eval.clone(), caps.clone())).await;
+        backend
+            .append_event(spent_step(&eid, "earlier", 1))
+            .await
+            .unwrap();
+        enqueue_n1(&backend, &eid).await;
+        let (executor, calls) = CountingSpender::new();
+        run_capped_n1(&backend, "eval", executor).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            failures(&backend, &eid).await,
+            vec![(
+                "n1".to_string(),
+                "token budget reached: total_tokens 1 of 1".to_string(),
+                false
+            )]
+        );
+        assert_eq!(trips(&backend, &eid).await, vec![n1_trip(1, 1)]);
+
+        // Under the cap it runs.
+        let (backend, eid) = caps_run(caps_ir_json(eval, caps)).await;
+        enqueue_n1(&backend, &eid).await;
+        let (executor, calls) = CountingSpender::new();
+        run_capped_n1(&backend, "eval", executor).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(failures(&backend, &eid).await, vec![]);
+    }
+
+    /// A spent run never asks anyone to approve: the cap is checked before
+    /// the approval path, so a node the tenant gates is refused with no
+    /// `ToolApprovalRequired`. An approval request for a step that can never
+    /// run would wait on a person for nothing.
+    #[tokio::test]
+    async fn caps_are_checked_before_an_approval_is_requested() {
+        let (backend, eid) = caps_run(caps_ir_json(
+            tool_kind(),
+            serde_json::json!({ "token_budget": { "total_tokens": 1 } }),
+        ))
+        .await;
+        let now = Utc::now();
+        backend
+            .create_tenant(jamjet_state::Tenant {
+                id: "default".into(),
+                name: "default".into(),
+                status: jamjet_state::TenantStatus::Active,
+                policy: Some(serde_json::json!({
+                    "blocked_tools": [],
+                    "require_approval_for": ["*"],
+                    "model_allowlist": []
+                })),
+                limits: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        backend
+            .append_event(spent_step(&eid, "earlier", 1))
+            .await
+            .unwrap();
+        enqueue_n1(&backend, &eid).await;
+        let (executor, calls) = CountingSpender::new();
+
+        run_capped_n1(&backend, "tool", executor).await.unwrap();
 
         let events = backend.get_events(&eid).await.unwrap();
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e.kind, EventKind::TokenBudgetExceeded { .. })),
-            "a cost trip must not be recorded as a token trip"
+                .any(|e| matches!(e.kind, EventKind::ToolApprovalRequired { .. })),
+            "a spent run asked for an approval: {events:?}"
         );
-        let cost = events
-            .iter()
-            .find_map(|e| match &e.kind {
-                EventKind::CostBudgetExceeded {
-                    limit_usd,
-                    current_usd,
-                    ..
-                } => Some((*limit_usd, *current_usd)),
-                _ => None,
-            })
-            .expect("cost refusal must emit CostBudgetExceeded");
-        assert_eq!(cost, (0.5, 0.5), "dollar amounts must survive intact");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            failures(&backend, &eid).await,
+            vec![(
+                "n1".to_string(),
+                "token budget reached: total_tokens 1 of 1".to_string(),
+                false
+            )]
+        );
+    }
+
+    /// A run an older engine rolled over: its root segment spent the whole
+    /// `total_tokens: 1` and wrote no `__budget` key, then a second segment
+    /// started. The second segment's first step is refused: usage is folded
+    /// over every segment, root first, so a rollover child inherits the spend.
+    #[tokio::test]
+    async fn a_rollover_child_from_an_old_log_inherits_the_spend() {
+        let (backend, root) = caps_run(caps_ir_json(
+            tool_kind(),
+            serde_json::json!({ "token_budget": { "total_tokens": 1 }, "continue_as_new": true }),
+        ))
+        .await;
+        backend
+            .append_event(spent_step(&root, "n1", 1))
+            .await
+            .unwrap();
+        let carried = jamjet_state::materialize(backend.as_ref(), &root)
+            .await
+            .unwrap();
+        let child = jamjet_state::start_next_segment(
+            backend.as_ref(),
+            &root,
+            &carried,
+            "caps-wf",
+            "1.0.0",
+            1,
+            "n1",
+            "default",
+            serde_json::json!({ "workflow_id": "caps-wf", "workflow_version": "1.0.0" }),
+            3,
+            "default",
+        )
+        .await
+        .unwrap();
+        backend
+            .append_event(jamjet_state::Event::new(
+                root.clone(),
+                0,
+                EventKind::SegmentBoundary {
+                    segment_number: 1,
+                    next_execution_id: child.to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        backend
+            .update_execution_status(&root, WorkflowStatus::LimitExceeded)
+            .await
+            .unwrap();
+        let (executor, calls) = CountingSpender::new();
+
+        run_capped_n1(&backend, "tool", executor).await.unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            failures(&backend, &child).await,
+            vec![(
+                "n1".to_string(),
+                "token budget reached: total_tokens 1 of 1".to_string(),
+                false
+            )]
+        );
+        assert_eq!(trips(&backend, &child).await, vec![n1_trip(1, 1)]);
+    }
+
+    /// Runs from before the caps read the log kept a `__budget` key in their
+    /// state, and it can disagree with the log. The log decides: a snapshot
+    /// that says nothing was spent does not let a run whose log shows 5000
+    /// tokens under a cap of 5000 take another step, and a snapshot that says
+    /// 5000 does not stop a run whose log shows nothing.
+    #[tokio::test]
+    async fn old_runs_whose_budget_key_disagrees_with_the_log_follow_the_log() {
+        let caps = serde_json::json!({ "token_budget": { "total_tokens": 5000 } });
+        for (snapshot_tokens, log_tokens, runs) in [(0u64, Some(5000u64), 0u32), (5000, None, 1)] {
+            let (backend, eid) = caps_run(caps_ir_json(tool_kind(), caps.clone())).await;
+            let mut state = serde_json::json!({});
+            jamjet_state::budget::BudgetState {
+                total_input_tokens: snapshot_tokens,
+                ..Default::default()
+            }
+            .patch_into_snapshot_state(&mut state);
+            assert_eq!(
+                state["__budget"]["total_input_tokens"], snapshot_tokens,
+                "the old key is in the snapshot"
+            );
+            backend
+                .write_snapshot(jamjet_state::Snapshot::new(eid.clone(), 0, state))
+                .await
+                .unwrap();
+            if let Some(tokens) = log_tokens {
+                backend
+                    .append_event(spent_step(&eid, "earlier", tokens))
+                    .await
+                    .unwrap();
+            }
+            enqueue_n1(&backend, &eid).await;
+            let (executor, calls) = CountingSpender::new();
+
+            run_capped_n1(&backend, "tool", executor).await.unwrap();
+
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                runs,
+                "snapshot {snapshot_tokens}, log {log_tokens:?}"
+            );
+        }
     }
 
     // ── Artifact spill tests ──────────────────────────────────────────────────
