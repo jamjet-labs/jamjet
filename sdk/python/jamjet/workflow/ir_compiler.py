@@ -46,9 +46,10 @@ class WorkflowSchemaWarning(UserWarning):
 # instead of dropped without a word. Keep these in step with
 # _compile_graph_yaml and _yaml_node_to_kind.
 #
-# Governance settings. The runtime enforces policy, cost_budget_usd,
-# token_budget and continue_as_new; it reads neither data_policy nor
-# on_budget_exceeded yet, so those compile with a warning. They may sit at the top level of
+# Governance settings. The runtime enforces policy, cost_budget_usd and
+# token_budget; it reads none of data_policy, on_budget_exceeded or
+# continue_as_new (a run at its cap fails, it does not roll over), so the first
+# two compile with a warning. They may sit at the top level of
 # the document or in the `workflow:` header, but not both.
 _GOVERNANCE_KEYS = ("policy", "cost_budget_usd", "token_budget", "on_budget_exceeded", "data_policy", "continue_as_new")
 _GRAPH_TOP_LEVEL_KEYS = frozenset(
@@ -352,9 +353,9 @@ def _apply_governance(ir: dict[str, Any], sources: list[tuple[str, dict[str, Any
 
     None may be dropped without a word: a setting given in two places, or with
     a malformed value, is an error. The runtime enforces policy,
-    cost_budget_usd, token_budget and continue_as_new; data_policy and
-    on_budget_exceeded compile into the IR with a warning, because the runtime
-    does not read them yet.
+    cost_budget_usd and token_budget; data_policy and on_budget_exceeded
+    compile into the IR with a warning, because the runtime does not read them
+    yet. continue_as_new is carried into the IR and read by nothing.
     """
     ir["policy"] = _compile_policy(_governance_value(sources, "policy"), location="workflow-level policy")
     budget = _governance_value(sources, "cost_budget_usd")

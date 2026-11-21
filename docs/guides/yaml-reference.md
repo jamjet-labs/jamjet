@@ -79,12 +79,12 @@ settings.
 Governance settings (`policy`, `cost_budget_usd`, `token_budget`,
 `on_budget_exceeded`, `data_policy`, `continue_as_new`) may sit at the top
 level or in the `workflow:` header, but not both; a malformed one is an error.
-The runtime enforces `policy`, and the in-process worker enforces
-`token_budget` and `cost_budget_usd` for the nodes it runs; with
-`continue_as_new: true` a run that reaches its budget rolls over into a new
-segment. `on_budget_exceeded` and `data_policy` (PII
-redaction and retention) are compiled into the IR, and the runtime does not
-act on them.
+The runtime enforces `policy`, `token_budget` and `cost_budget_usd` on every
+transport: a run's spend is counted from its log, and a run that reaches a cap
+fails (see [Capping a run's spend](workflow-authoring.md#capping-a-runs-spend)).
+`continue_as_new` is no longer read for a budget. `on_budget_exceeded` and
+`data_policy` (PII redaction and retention) are compiled into the IR, and the
+runtime does not act on them.
 
 `agent_ref` (workflow) and `acts_for` (node) compile to the IR's `agent_ref`. The engine then holds the node to the named card's `allowed_tools`, `blocked_tools`, `require_approval_for` and `allowed_delegations` (see the [Agent Model Guide](agent-model-guide.md#enforcing-allowed_tools)), and refuses it if no agent is registered at that `uri`. A node uses `acts_for` because `agent_ref` on an `agent` node already names the agent it calls.
 

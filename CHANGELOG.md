@@ -31,6 +31,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `note`. The YAML compiler reads `options`. `jamjet approve` takes `--choice` and `--note`.
   The `ApprovalReceived` event gains an optional `choice`. An older build ignores it, so a
   condition on the choice never matches there: do not roll back while such a run is live.
+- `GET /executions/:id` carries `usage`: `input_tokens`, `output_tokens`, `cost_usd`,
+  `billable_steps`, `cost_unknown_steps`, `tokens_unknown_steps`, and the same count for
+  input and output tokens alone (`input_tokens_unknown_steps`, `output_tokens_unknown_steps`).
+  It is counted from the run's event log, across `continue_as_new` segments, by the fold the
+  caps use. It is null when the log holds an event this build cannot read. The MCP
+  `jamjet_get_execution` tool carries it too.
 
 ### Changed
 
@@ -60,6 +66,58 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   answered 409 `OptionsChanged` by every decision, a rejection included.
 - Migration 0017 adds an index for the approvals list. A build from before it will not open
   a store that has run it, so there is no rollback past this release.
+- Under `cost_budget_usd`, a step that reports no cost stops the run. The built-in provider
+  adapters report none; the model sidecar does. Under a token cap, a step that reports no
+  count for the tokens the cap reads stops the run: report both counts, 0 included. The trip
+  carries a `reason` (`cost_not_reported`, `tokens_not_reported`, or `cost_cap_invalid`),
+  and `jamjet audit` shows it.
+- A budget trip no longer rolls a `continue_as_new` run over to a new segment; it fails the
+  run. `continue_as_new` is not read. A step refused at its cap fails for good, and a claim
+  that names the run is told `budget`. A named claim retried after that refusal reads
+  `blocked`, because the node has already failed for good.
+- `cost_budget_usd` must be between 0 and 10,000 at registration (400 otherwise).
+  `on_budget_exceeded` is still accepted and is read by nothing. A stored workflow whose
+  `cost_budget_usd` is negative, NaN or above 10,000 now fails its run on the first pass, with
+  reason `cost_cap_invalid`. Before, infinity meant no limit and a large finite value was
+  compared as it stood.
+- `__budget` is no longer read. The in-process worker still writes it, for display, and its
+  `total_cost_usd` now counts the step's cost (it passed none before).
+- A cap trip is recorded at claim with the refused step's name, and when the scheduler fails
+  a run it names the last step that spent, in any segment of the run.
+- A run whose earlier segment holds an event this build cannot read stalls: with a cap set
+  it is not advanced, and one `RunStalled` is recorded.
+- Recorded usage differs by transport in one case. A step that finishes after its run has
+  failed on a cap is withdrawn over HTTP (409), so its spend is not recorded. In process it
+  is recorded after the failure, and counted.
+- Public crate API, for the 0.6.0 release: `ModelResponse` and `ExecutionResult` gain
+  `cost_usd` (and `ExecutionResult` gains `Default`); `CostBudgetExceeded` and
+  `TokenBudgetExceeded` gain an optional `reason`; `DispatchGuardOutcome` gains `Spent`;
+  `guard_item` takes one more parameter; `BudgetState::exhausted` is deprecated, and the
+  worker's `check_budget_before_execution` and `check_budget_after_execution` are gone. A malformed
+  sidecar cost, or one that is not in USD, fails the step for every model registry caller;
+  an eval judge's scorer fails instead. `tool_effects` records gain `cost_usd`, and older
+  records replay with no cost. An agent card's `cost_budget_usd` now counts the sidecar's
+  cost in process. The complete route answers 400 for a cost above 10,000 or a currency other
+  than USD.
+- Removed: `rollover_segment` (its caller was the budget trip), with its five tests, and the
+  worker's pre-call budget check with four more tests it carried, nine worker tests in all.
+  Their cases are covered by the caps unit tests and `run_caps`.
+
+### Fixed
+
+- **Run caps hold on every transport.** A run's tokens and cost are now counted from its own
+  event log, across continue-as-new segments, and both `token_budget` and `cost_budget_usd`
+  are enforced for in-process and HTTP workers alike. A step that would start on a spent run
+  is refused. A run past its cap fails before anything after it runs. Steps already running
+  when the cap is reached still finish and count, so a run can end above its cap by the
+  steps that were in flight: with parallel branches, by their width.
+- A cap trip after a model call no longer throws the paid result away and pays for it again
+  on retry. A failed read of the log at the cap no longer lets the step through.
+- A failed attempt's spend is still not counted: the fail route takes no usage. Under a
+  dollar cap, a completion refused before its cost is read (a string cost, a number that does
+  not parse) or sent unfenced with a bad cost leaves the step to retry, and the first
+  attempt's spend goes uncounted. An `eval` judge and a remote agent called by `agent_tool`
+  report no spend, so they are held at the cap but not counted.
 
 ### Security
 
