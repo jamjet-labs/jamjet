@@ -234,3 +234,49 @@ def test_audit_uses_the_runtime_option() -> None:
     assert result.exit_code == 0, result.output
     made.assert_called_once_with("http://127.0.0.1:7711")
     assert "cancel_booking blocked" in result.output
+
+
+def _budget_row(kind: dict) -> str:
+    fixture = copy.deepcopy(_load("approved_run.json"))
+    template = copy.deepcopy(fixture["events"][-1])
+    template["kind"] = kind
+    fixture["events"].append(template)
+    row = next(r for r in _trail(fixture).rows if r.step == "budget stopped the run")
+    return row.detail
+
+
+def test_a_cap_trip_with_a_reason_says_why_the_run_stopped() -> None:
+    assert _budget_row(
+        {"type": "token_budget_exceeded", "node_id": "n", "kind": "total_tokens", "limit": 2000, "current": 2104}
+    ) == ("total_tokens 2104, limit 2000")
+    assert _budget_row(
+        {
+            "type": "token_budget_exceeded",
+            "node_id": "n",
+            "kind": "total_tokens",
+            "limit": 2000,
+            "current": 0,
+            "reason": "tokens_not_reported",
+        }
+    ) == ("a step did not report its tokens, so the cap on total_tokens (limit 2000) cannot be checked")
+    assert _budget_row({"type": "cost_budget_exceeded", "node_id": "n", "limit_usd": 1.0, "current_usd": 1.0312}) == (
+        "cost 1.0312 USD, limit 1.0 USD"
+    )
+    assert _budget_row(
+        {
+            "type": "cost_budget_exceeded",
+            "node_id": "n",
+            "limit_usd": 1.0,
+            "current_usd": 0.41,
+            "reason": "cost_not_reported",
+        }
+    ) == ("a step did not report a usable cost, so the cap of 1.0 USD cannot be checked (0.41 USD counted)")
+    assert _budget_row(
+        {
+            "type": "cost_budget_exceeded",
+            "node_id": "n",
+            "limit_usd": -1.0,
+            "current_usd": 0.0,
+            "reason": "cost_cap_invalid",
+        }
+    ) == ("the cost cap of -1.0 USD is not a cap a run can be held to (it must be 0 to 10,000 USD)")
