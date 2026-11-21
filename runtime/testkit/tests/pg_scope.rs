@@ -272,7 +272,10 @@ fn words(sql: &str) -> BTreeSet<&str> {
         .collect()
 }
 
-/// Whether `sql` holds `tenant_id = $n`, the column qualified or not.
+/// Whether `sql` holds `tenant_id = $n`, the column qualified or not, as a
+/// filter: in a WHERE or a join's ON. The same text in a SET list, an
+/// upsert's DO UPDATE SET or a select list writes or reads the tenant and
+/// filters nothing.
 fn has_tenant_filter(sql: &str) -> bool {
     sql.match_indices("tenant_id").any(|(at, m)| {
         let before = sql[..at].chars().next_back();
@@ -287,7 +290,61 @@ fn has_tenant_filter(sql: &str) -> bool {
         after
             .strip_prefix('$')
             .is_some_and(|n| n.starts_with(|c: char| c.is_ascii_digit()))
+            && matches!(clause_at(sql, at), Some("where" | "on"))
     })
+}
+
+/// The clause keywords [`clause_at`] follows.
+const CLAUSES: &str = "with select insert into update delete set from join on using where \
+                       group having order limit offset values returning conflict do for window";
+
+/// The clause `sql[at..]` sits in, in lower case: the last clause keyword
+/// before it at its own depth of parentheses. A parenthesis without a
+/// keyword of its own (a grouping, a function's arguments) is in the clause
+/// around it; a subquery's clauses end at its closing parenthesis. Text in
+/// single quotes is skipped.
+fn clause_at(sql: &str, at: usize) -> Option<&'static str> {
+    let mut stack: Vec<Option<&'static str>> = vec![None];
+    let mut chars = sql[..at].char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\'' => {
+                for (_, c) in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                }
+            }
+            '(' => {
+                let top = *stack.last().unwrap();
+                stack.push(top);
+            }
+            ')' => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' => {
+                let mut end = i + c.len_utf8();
+                while let Some(&(j, d)) = chars.peek() {
+                    if !(d.is_ascii_alphanumeric() || d == '_') {
+                        break;
+                    }
+                    end = j + d.len_utf8();
+                    chars.next();
+                }
+                let word = &sql[i..end];
+                if let Some(k) = CLAUSES
+                    .split_whitespace()
+                    .find(|k| k.eq_ignore_ascii_case(word))
+                {
+                    *stack.last_mut().unwrap() = Some(k);
+                }
+            }
+            _ => {}
+        }
+    }
+    *stack.last().unwrap()
 }
 
 /// The rule on small statements, the projection upsert without its tenant
@@ -312,6 +369,13 @@ fn the_rule_reads_statements() {
          ON CONFLICT (tenant_id, execution_id) DO UPDATE SET execution_id = EXCLUDED.execution_id \
          WHERE events.execution_id = $2",
         "UPDATE api_tokens SET last_used_at = statement_timestamp() WHERE token_hash = $1",
+        // A filter after a subquery, after a SET list, in a join's ON.
+        "UPDATE events SET status = (SELECT s FROM store_identity WHERE id = 1) \
+         WHERE execution_id IN (SELECT execution_id FROM workflow_executions) \
+         AND (tenant_id = $2 OR FALSE)",
+        "SELECT e.sequence FROM events e JOIN workflow_executions r \
+         ON r.execution_id = e.execution_id AND r.tenant_id = $1 AND e.tenant_id = $1",
+        "SELECT * FROM events WHERE kind <> 'set tenant_id' AND tenant_id = $1",
     ];
     for sql in ok {
         assert_eq!(missing_tenant(sql, &tables), None, "{sql}");
@@ -330,6 +394,16 @@ fn the_rule_reads_statements() {
         "INSERT INTO events (tenant_id, execution_id) VALUES ($1, $2) \
          ON CONFLICT (id) DO UPDATE SET execution_id = EXCLUDED.execution_id \
          WHERE events.execution_id = $2",
+        // A tenant_id = $n in a SET list writes the tenant; it filters nothing.
+        "UPDATE events SET tenant_id = $1 WHERE execution_id = $2",
+        "UPDATE events SET status = $1, tenant_id = $2",
+        "INSERT INTO proj_approvals (execution_id, node_id, tenant_id) VALUES ($1, $2, $3) \
+         ON CONFLICT (execution_id, node_id) DO UPDATE SET tenant_id = $3",
+        "INSERT INTO proj_approvals (execution_id, node_id, tenant_id) VALUES ($1, $2, $3) \
+         ON CONFLICT (execution_id, node_id) DO UPDATE SET node_id = $2, tenant_id = $3 \
+         WHERE proj_approvals.execution_id = $1",
+        // Nor in a select list.
+        "SELECT tenant_id = $1 FROM events WHERE execution_id = $2",
     ];
     for sql in bad {
         assert!(missing_tenant(sql, &tables).is_some(), "let through: {sql}");

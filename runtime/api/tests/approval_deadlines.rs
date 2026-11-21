@@ -572,6 +572,128 @@ async fn decision_after_the_deadline_by_the_store_clock_is_refused() {
     }
 }
 
+/// A store clock set apart from this process's, and a delay on the next
+/// conditional append once armed.
+#[derive(Default)]
+struct SkewedStore {
+    now: Mutex<Option<DateTime<Utc>>>,
+    delay_append: Mutex<Option<std::time::Duration>>,
+}
+
+#[async_trait::async_trait]
+impl jamjet_testkit::Hooks for SkewedStore {
+    async fn before(&self, op: &jamjet_testkit::Op<'_>) -> Option<jamjet_state::StateBackendError> {
+        if matches!(op, jamjet_testkit::Op::AppendEventIf(_)) {
+            let delay = self.delay_append.lock().unwrap().take();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        None
+    }
+
+    fn store_now(&self) -> Option<DateTime<Utc>> {
+        *self.now.lock().unwrap()
+    }
+}
+
+/// The deadline check inside the append, and the reading of a refused
+/// append, are on the store's clock too, carried forward from the time the
+/// route read it.
+///
+/// - This process's clock is past `expires_at` and the store's is 30 s
+///   before it: the decision is in time and is recorded.
+/// - This process's clock is 10 minutes before `expires_at`, the store's is
+///   200 ms before it, and the append waits 500 ms: by the store's clock the
+///   deadline passes during the wait, so the decision is refused as expired
+///   and nothing is recorded.
+#[tokio::test]
+async fn the_deadline_inside_the_append_is_on_the_store_clock() {
+    for tb in support::backends().await {
+        let hooks = Arc::new(SkewedStore::default());
+        let store: Arc<dyn StateBackend> = Arc::new(jamjet_testkit::Intercept::new(
+            tb.dyn_backend(),
+            hooks.clone(),
+        ));
+        let env = env_on(tb.name(), store).await;
+
+        // In time by the store, late by this process.
+        let eid = start_and_request(
+            &env,
+            ir(Value::Null, gate(json!({ "approval_timeout_secs": 600 }))),
+        )
+        .await;
+        let mut ctx = request_context(&events(&env, &eid).await);
+        let digest = ctx["action_digest"].as_str().unwrap().to_string();
+        let expires_at = Utc::now() - Duration::seconds(60);
+        ctx["expires_at"] = json!(expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        env.backend
+            .append_event(Event::new(
+                eid.clone(),
+                0,
+                EventKind::ToolApprovalRequired {
+                    node_id: "pay".into(),
+                    tool_name: "pay".into(),
+                    approver: "human".into(),
+                    context: ctx,
+                },
+            ))
+            .await
+            .unwrap();
+        *hooks.now.lock().unwrap() = Some(expires_at - Duration::seconds(30));
+        let (st, body) = approve(&env, &eid, &digest).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "{}: in time by the store's clock: {body}",
+            env.name
+        );
+        assert_eq!(
+            count(&events(&env, &eid).await, received),
+            1,
+            "{}",
+            env.name
+        );
+
+        // In time by this process, late by the store after the wait.
+        *hooks.now.lock().unwrap() = None;
+        let eid = start_and_request(
+            &env,
+            ir(Value::Null, gate(json!({ "approval_timeout_secs": 600 }))),
+        )
+        .await;
+        let ctx = request_context(&events(&env, &eid).await);
+        let digest = ctx["action_digest"].as_str().unwrap().to_string();
+        let expires_at = ts(&ctx, "expires_at").unwrap();
+        assert!(
+            Utc::now() + Duration::seconds(500) < expires_at,
+            "{}",
+            env.name
+        );
+        *hooks.now.lock().unwrap() = Some(expires_at - Duration::milliseconds(200));
+        *hooks.delay_append.lock().unwrap() = Some(std::time::Duration::from_millis(500));
+        let before = events(&env, &eid).await.len();
+        let (st, body) = approve(&env, &eid, &digest).await;
+        assert!(
+            hooks.delay_append.lock().unwrap().is_none(),
+            "{}: the append was not reached",
+            env.name
+        );
+        assert_eq!(st, StatusCode::CONFLICT, "{}: {body}", env.name);
+        assert!(
+            body.to_string().contains("expired at its deadline"),
+            "{}: late by the store's clock: {body}",
+            env.name
+        );
+        assert_eq!(
+            events(&env, &eid).await.len(),
+            before,
+            "{}: nothing recorded",
+            env.name
+        );
+    }
+}
+
 /// A request's deadline is stamped on the store's clock: with the store's
 /// clock a day ahead of this process's, `expires_at` is the timeout after the
 /// store's time.
