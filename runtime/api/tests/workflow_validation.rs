@@ -330,3 +330,52 @@ async fn a_timeout_with_nanos_of_a_second_or_more_is_refused() {
     ir["timeouts"] = serde_json::json!({ "node_timeout": { "secs": 5, "nanos": 999_999_999 } });
     assert!(post_workflow(&state, ir).await.is_success());
 }
+
+/// A run's dollar cap is a number from 0 to 10,000, the range one step may
+/// report. A cap outside it would compare against nothing real: a negative
+/// one refuses every step, a huge one never trips.
+#[tokio::test]
+async fn a_dollar_cap_must_be_between_0_and_10000() {
+    let state = make_state(Arc::new(jamjet_state::InMemoryBackend::new()));
+    for (n, ok) in [
+        (json!(0), true),
+        (json!(0.25), true),
+        (json!(10_000), true),
+        (json!(-0.01), false),
+        (json!(-1), false),
+        (json!(10_000.01), false),
+        (json!(1e300), false),
+        (json!("NaN"), false),
+        (json!("inf"), false),
+    ] {
+        let mut ir = dispatch_ir(Some(true));
+        ir["version"] = json!(format!("v-{n}"));
+        ir["cost_budget_usd"] = n.clone();
+        let status = post_workflow(&state, ir).await;
+        if ok {
+            assert!(status.is_success(), "{n}: {status}");
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{n}");
+        }
+    }
+    // No cap, and a null one, register as before.
+    let mut ir = dispatch_ir(Some(true));
+    ir["version"] = json!("no-cap");
+    assert!(post_workflow(&state, ir).await.is_success());
+    let mut ir = dispatch_ir(Some(true));
+    ir["version"] = json!("null-cap");
+    ir["cost_budget_usd"] = Value::Null;
+    assert!(post_workflow(&state, ir).await.is_success());
+}
+
+/// `on_budget_exceeded` is read by nothing now. Registration still accepts
+/// it, so a stored workflow that sets it re-registers.
+#[tokio::test]
+async fn on_budget_exceeded_is_still_accepted() {
+    let state = make_state(Arc::new(jamjet_state::InMemoryBackend::new()));
+    let mut ir = dispatch_ir(Some(true));
+    ir["cost_budget_usd"] = json!(1.0);
+    ir["on_budget_exceeded"] = json!("n1");
+    ir["continue_as_new"] = json!(true);
+    assert!(post_workflow(&state, ir).await.is_success());
+}

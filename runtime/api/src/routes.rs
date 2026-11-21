@@ -243,6 +243,18 @@ async fn create_workflow(
     // shape here, not `validate_workflow`'s ref rules.)
     let parsed = serde_json::from_value::<jamjet_ir::WorkflowIr>(body.ir.clone())
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // A run's dollar cap is held to the range one step may report. Outside
+    // it the cap would compare against nothing real: a negative one refuses
+    // every step and a huge one never trips. `on_budget_exceeded` is still
+    // accepted and is read by nothing.
+    if let Some(cap) = parsed.cost_budget_usd {
+        if jamjet_state::usage::cost_to_nanos(cap).is_none() {
+            return Err(ApiError::BadRequest(format!(
+                "invalid workflow IR: cost_budget_usd must be between 0 and {} USD",
+                jamjet_state::usage::MAX_REPORTED_COST_USD
+            )));
+        }
+    }
     // A node timeout bounds an executor call; past the cap it is a mistake,
     // and near u64::MAX it overflowed the reservation math and panicked the
     // worker that ran the node.
