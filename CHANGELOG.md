@@ -84,6 +84,8 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   run. `continue_as_new` is not read. A step refused at its cap fails for good, and a claim
   that names the run is told `budget`. A named claim retried after that refusal reads
   `blocked`, because the node has already failed for good.
+- A `continue_as_new` rollover cut short by a crash on the older build ends with both
+  segments `Failed`, not the parent `LimitExceeded`. Nothing needs repair by hand.
 - `cost_budget_usd` must be between 0 and 10,000 at registration (400 otherwise).
   `on_budget_exceeded` is still accepted and is read by nothing. A stored workflow whose
   `cost_budget_usd` is negative, NaN or above 10,000 now fails its run on the first pass, with
