@@ -3416,6 +3416,34 @@ mod tests {
         );
     }
 
+    /// A run with no cap has nothing to count, so its log is not folded for
+    /// one: an event this build cannot read does not hold its step, which
+    /// fires and completes. Under a cap the same log holds it
+    /// (`an_unreadable_usage_fold_holds_the_step`).
+    #[tokio::test]
+    async fn a_run_without_caps_fires_whatever_its_log_holds() {
+        let (backend, eid) = caps_run(caps_ir_json(tool_kind(), serde_json::json!({}))).await;
+        backend
+            .append_event(jamjet_state::Event::new(eid.clone(), 0, EventKind::Unknown))
+            .await
+            .unwrap();
+        enqueue_n1(&backend, &eid).await;
+        let (executor, calls) = CountingSpender::new();
+
+        run_capped_n1(&backend, "tool", executor).await.unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(failures(&backend, &eid).await, vec![]);
+        assert_eq!(trips(&backend, &eid).await, Vec::<serde_json::Value>::new());
+        let events = backend.get_events(&eid).await.unwrap();
+        assert!(
+            events.iter().any(
+                |e| matches!(&e.kind, EventKind::NodeCompleted { node_id, .. } if node_id == "n1")
+            ),
+            "the step's result is recorded: {events:?}"
+        );
+    }
+
     /// A `condition` node cannot spend, so a run exactly at its cap still
     /// takes it (it is often the run's way to its end). Nothing is recorded
     /// against the cap.
