@@ -132,6 +132,16 @@ pub fn linear(ids: &[&str]) -> Value {
 /// its `WorkflowStarted`, the start node's `NodeScheduled` and the start
 /// node's item, in one write.
 pub async fn start_run(backend: &dyn StateBackend, ir: Value) -> ExecutionId {
+    start_segment(backend, ir, None).await
+}
+
+/// [`start_run`], as segment `n` of the run whose previous segment is
+/// `parent` when `parent` is `Some((parent, n))`.
+pub async fn start_segment(
+    backend: &dyn StateBackend,
+    ir: Value,
+    parent: Option<(&ExecutionId, u32)>,
+) -> ExecutionId {
     let now = chrono::Utc::now();
     backend
         .store_workflow(WorkflowDefinition {
@@ -158,8 +168,8 @@ pub async fn start_run(backend: &dyn StateBackend, ir: Value) -> ExecutionId {
         updated_at: now,
         completed_at: None,
         session_type: None,
-        parent_execution_id: None,
-        segment_number: 0,
+        parent_execution_id: parent.map(|(p, _)| p.clone()),
+        segment_number: parent.map_or(0, |(_, n)| n),
     };
     let item = WorkItem {
         id: Uuid::new_v4(),
