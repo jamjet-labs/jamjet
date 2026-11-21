@@ -116,6 +116,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ("...; the run has a dollar cap, so the step failed"): the step may have paid, and a retry
   would pay again with nothing recorded. When the store cannot be read or that write fails,
   the answer is 503 and the item stays claimed, so the client sends the completion again.
+- The Ollama adapter fails a call whose answer has a token count that is not a whole number,
+  or leaves a count out of an answer that is not final (`done` is not `true`). It used to
+  record 0, which a token cap reads as known. A count left out of a final answer is still 0:
+  Ollama leaves a count of zero out.
 - Removed: `rollover_segment` (its caller was the budget trip), with its five tests, and the
   worker's pre-call budget check with four more tests it carried, nine worker tests in all.
   Their cases are covered by the caps unit tests and `run_caps`.

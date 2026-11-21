@@ -135,9 +135,22 @@ impl OllamaAdapter {
             .unwrap_or("")
             .to_string();
 
-        // Ollama provides token counts in prompt_eval_count / eval_count.
-        let input_tokens = resp["prompt_eval_count"].as_u64().unwrap_or(0);
-        let output_tokens = resp["eval_count"].as_u64().unwrap_or(0);
+        // Ollama provides token counts in prompt_eval_count / eval_count, and
+        // leaves a count of zero out of its answer (`omitempty`). So a
+        // missing count is zero, but only in a final answer. A count that is
+        // not a whole number is not zero either: the run's caps would read it
+        // as known.
+        let done = resp["done"].as_bool() == Some(true);
+        let count = |field: &str| -> Result<u64, ModelError> {
+            match &resp[field] {
+                Value::Null if done => Ok(0),
+                v => v.as_u64().ok_or_else(|| {
+                    ModelError::Serialization(format!("Ollama answer has no usable '{field}': {v}"))
+                }),
+            }
+        };
+        let input_tokens = count("prompt_eval_count")?;
+        let output_tokens = count("eval_count")?;
 
         // Ollama uses "done_reason" (not "finish_reason").
         let finish_reason = resp["done_reason"].as_str().unwrap_or("stop").to_string();
@@ -284,5 +297,40 @@ mod tests {
         assert_eq!(parsed.input_tokens, 42);
         assert_eq!(parsed.output_tokens, 5);
         assert_eq!(parsed.finish_reason, "stop");
+    }
+
+    /// Ollama leaves a count of zero out of its answer (`omitempty`), so a
+    /// count missing from a final answer is zero. A count that is not a whole
+    /// number, or one missing from an answer that is not final, is not a
+    /// count the run's caps can use: the call fails rather than record zero.
+    #[test]
+    fn a_count_must_be_a_number_or_left_out_of_a_final_answer() {
+        let adapter = OllamaAdapter::new("http://localhost:11434");
+        let answer = |extra: Value| {
+            let mut resp = json!({
+                "model": "qwen3:8b",
+                "message": {"role": "assistant", "content": "Hi"},
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                resp[k] = v.clone();
+            }
+            adapter.parse_response(resp)
+        };
+        let cached = answer(json!({ "done": true, "eval_count": 3 })).unwrap();
+        assert_eq!((cached.input_tokens, cached.output_tokens), (0, 3));
+        let zero = answer(json!({ "prompt_eval_count": 0, "eval_count": 0 })).unwrap();
+        assert_eq!((zero.input_tokens, zero.output_tokens), (0, 0));
+        for bad in [
+            json!({ "prompt_eval_count": 4 }),
+            json!({ "done": false, "prompt_eval_count": 4 }),
+            json!({ "done": true, "prompt_eval_count": "4", "eval_count": 1 }),
+            json!({ "done": true, "prompt_eval_count": 4, "eval_count": -1 }),
+            json!({ "done": true, "prompt_eval_count": 4, "eval_count": 1.5 }),
+        ] {
+            assert!(
+                matches!(answer(bad.clone()), Err(ModelError::Serialization(_))),
+                "{bad}"
+            );
+        }
     }
 }
