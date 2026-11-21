@@ -1628,21 +1628,13 @@ mod tests {
         }
     }
 
-    /// A store whose clock answers a fixed time.
-    pub(crate) struct StoreClock(pub(crate) chrono::DateTime<chrono::Utc>);
-
-    impl jamjet_testkit::Hooks for StoreClock {
-        fn store_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-            Some(self.0)
-        }
-    }
-
     /// The lease is decided on the store's clock, which stamped it. With the
     /// store's clock an hour past this process's, a lease this process still
     /// sees as live has lapsed there (and may be reclaimed), so the step is
     /// not admitted. On the store's own time it is held.
     #[tokio::test]
     async fn a_lease_is_held_by_the_store_clock() {
+        use crate::test_support::StoreClock;
         use jamjet_core::workflow::{WorkflowExecution, WorkflowStatus};
         use jamjet_state::{InMemoryBackend, WorkItem};
         use std::sync::Arc;
