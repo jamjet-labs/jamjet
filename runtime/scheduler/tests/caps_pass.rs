@@ -677,6 +677,46 @@ async fn a_later_segment_counts_the_spend_of_the_segments_before_it() {
     }
 }
 
+/// The only spend is in segment 0, and it is past the cap. Segment 1 has
+/// billed nothing, and the scheduler fails it on its first pass. The trip
+/// names the last billable node across both segments, `a` of segment 0, not
+/// the empty name the current segment alone would give.
+#[tokio::test]
+async fn a_trip_names_the_last_billable_node_of_an_earlier_segment() {
+    for store in stores().await {
+        let case = store.name();
+        let backend = store.backend();
+        let (_root, child) =
+            second_segment(backend.as_ref(), token_capped(5, linear(&["a", "b"])), 6).await;
+
+        let scheduler = Scheduler::new(backend.clone());
+        let worker = Worker::default();
+        for _ in 0..3 {
+            scheduler.tick().await.unwrap();
+            worker.complete_all(backend.as_ref(), |_| json!({})).await;
+        }
+        let events = backend.get_events(&child).await.unwrap();
+        assert_eq!(
+            trips(&events),
+            vec![json!({
+                "type": "token_budget_exceeded",
+                "node_id": "a",
+                "kind": "total_tokens",
+                "limit": 5,
+                "current": 6
+            })],
+            "{case}: {:?}",
+            kinds(&events)
+        );
+        assert!(worker.items_of("b").is_empty(), "{case}: b was dispatched");
+        assert_eq!(
+            status(backend.as_ref(), &child).await,
+            WorkflowStatus::Failed,
+            "{case}"
+        );
+    }
+}
+
 /// An earlier segment's log holds an event this build cannot read, so a
 /// capped run's spend cannot be known. The run is not advanced, and the
 /// stall is recorded once.
