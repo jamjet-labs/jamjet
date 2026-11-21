@@ -53,10 +53,13 @@ pub enum CapKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapTrip {
     pub kind: CapKind,
-    /// The cap, in tokens or USD.
+    /// The cap, in tokens or USD. A token count above 2^53 is rounded
+    /// here; the trip event and [`CapTrip::describe`] carry it exactly.
     pub limit: f64,
     /// What the run has counted against it, in tokens or USD.
     pub current: f64,
+    /// For a token trip, the cap and the count as compared: `(limit, current)`.
+    tokens: Option<(u64, u64)>,
     /// The cap's name in a trip event: `total_tokens`, `input_tokens`,
     /// `output_tokens` or `cost_usd`. For `TokensNotReported` it names the
     /// token cap that could not be checked.
@@ -139,6 +142,7 @@ fn first_trip(caps: &RunCaps, u: &RunUsage, bound: Bound) -> Option<CapTrip> {
                 kind,
                 limit: limit as f64,
                 current: count as f64,
+                tokens: Some((limit, count)),
                 cap,
             });
         }
@@ -161,6 +165,7 @@ fn first_trip(caps: &RunCaps, u: &RunUsage, bound: Bound) -> Option<CapTrip> {
                 },
                 limit,
                 current: u.cost_usd(),
+                tokens: None,
                 cap: "cost_usd",
             });
         }
@@ -169,6 +174,12 @@ fn first_trip(caps: &RunCaps, u: &RunUsage, bound: Bound) -> Option<CapTrip> {
 }
 
 impl CapTrip {
+    /// A token trip's cap and count, exact.
+    fn token_counts(&self) -> (u64, u64) {
+        self.tokens
+            .unwrap_or((self.limit as u64, self.current as u64))
+    }
+
     /// A dollar cap that no step could pass: not a cost a step may report.
     fn cap_is_invalid(&self) -> bool {
         self.kind == CapKind::CostUsd && cost_to_nanos(self.limit).is_none()
@@ -187,8 +198,8 @@ impl CapTrip {
             | CapKind::TokensNotReported => EventKind::TokenBudgetExceeded {
                 node_id: node_id.to_string(),
                 kind: self.cap.to_string(),
-                limit: self.limit as u64,
-                current: self.current as u64,
+                limit: self.token_counts().0,
+                current: self.token_counts().1,
                 reason: (self.kind == CapKind::TokensNotReported)
                     .then(|| "tokens_not_reported".to_string()),
             },
@@ -216,11 +227,14 @@ impl CapTrip {
         match self.kind {
             CapKind::TotalTokens | CapKind::InputTokens | CapKind::OutputTokens => format!(
                 "token budget reached: {} {} of {}",
-                self.cap, self.current, self.limit
+                self.cap,
+                self.token_counts().1,
+                self.token_counts().0
             ),
             CapKind::TokensNotReported => format!(
                 "token budget cannot be checked: a step did not report the tokens this cap counts ({} cap {})",
-                self.cap, self.limit
+                self.cap,
+                self.token_counts().0
             ),
             CapKind::CostUsd if self.cap_is_invalid() => format!(
                 "cost budget ${} is not a cap a run can be held to: it must be between $0 and ${}",
@@ -611,6 +625,24 @@ mod tests {
                 .unwrap_err()
                 .describe(),
             "cost budget $-1 is not a cap a run can be held to: it must be between $0 and $10000"
+        );
+    }
+
+    /// A token count above 2^53 does not fit an f64 exactly. The trip event
+    /// and the refusal text carry the count the cap compared, not a rounded
+    /// one.
+    #[test]
+    fn a_trip_keeps_a_large_token_count_exact() {
+        let big = 9_007_199_254_740_993_u64;
+        let u = fold(&[completion("m", Some(big), Some(0), None, None)]);
+        let trip = past_cap(&tokens(Some(1), None, None), &u).expect("past the cap");
+        assert_eq!(
+            json_of(&trip, "m"),
+            json!({"type":"token_budget_exceeded","node_id":"m","kind":"total_tokens","limit":1,"current":big})
+        );
+        assert_eq!(
+            trip.describe(),
+            "token budget reached: total_tokens 9007199254740993 of 1"
         );
     }
 }
