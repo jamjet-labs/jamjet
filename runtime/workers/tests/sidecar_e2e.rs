@@ -346,6 +346,11 @@ async fn the_in_process_dollar_cap_trips_on_sidecar_cost() {
     );
     let run = backend.get_execution(&eid).await.unwrap().unwrap();
     assert_eq!(run.status, WorkflowStatus::Failed, "{log:?}");
+    assert!(
+        log.iter().any(|e| e == "node_scheduled(m2)")
+            && !log.iter().any(|e| e == "node_scheduled(m3)"),
+        "m3 is never dispatched: {log:?}"
+    );
     assert_eq!(
         server.received_requests().await.unwrap().len(),
         2,
