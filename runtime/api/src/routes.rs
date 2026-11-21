@@ -3693,7 +3693,7 @@ async fn complete_work_item(
         // shows the caller holds the item; without one nothing is written.
         if let (Some(wi), Some(fence)) = (recorded.as_ref(), body.lease_fence.filter(|f| *f > 0)) {
             if fail_uncounted_step(backend.as_ref(), wi, fence, &problem, state.agents.as_ref())
-                .await
+                .await?
             {
                 return Err(ApiError::BadRequest(format!(
                     "{problem}; the run has a dollar cap, so the step failed"
@@ -3976,24 +3976,36 @@ fn uncountable_cost(cost_usd: Option<f64>, cost_currency: Option<&str>) -> Optio
 /// scheduler fails the run. Only for an item whose result the completion
 /// gate would record: the same rules decide what may be written for it. A
 /// run or workflow that cannot be read writes nothing, as the gate would.
+///
+/// `Err` (503) when the store could not be read or the write failed: the
+/// item is still claimed and nothing is recorded, so the caller sends the
+/// completion again. A 400 would not be sent again, and the step would run
+/// again with its first spend uncounted.
 async fn fail_uncounted_step(
     backend: &dyn jamjet_state::StateBackend,
     wi: &WorkItem,
     fence: i64,
     problem: &str,
     agents: &dyn jamjet_agents::AgentRegistry,
-) -> bool {
+) -> Result<bool, ApiError> {
     match dollar_capped(backend, wi).await {
-        Ok(true) => {}
-        Ok(false) => return false,
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => return Ok(false),
+        Ok(Err(e)) => {
+            warn!(work_item_id = %wi.id, error = %e, "complete: could not read the run's dollar cap");
+            return Ok(false);
+        }
         Err(e) => {
             warn!(work_item_id = %wi.id, error = %e, "complete: could not read the run's dollar cap");
-            return false;
+            return Err(ApiError::Unavailable(e));
         }
     }
-    if let Err((_, reason)) = completion_gate(backend, wi, agents).await {
+    if let Err((status, reason)) = completion_gate(backend, wi, agents).await {
         warn!(work_item_id = %wi.id, %reason, "complete: an uncountable cost on a step the gate refuses");
-        return false;
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            return Err(ApiError::Unavailable(reason));
+        }
+        return Ok(false);
     }
     let terminal = jamjet_state::Event::new(
         wi.execution_id.clone(),
@@ -4009,39 +4021,44 @@ async fn fail_uncounted_step(
         .commit_turn_unless_terminal(wi.id, fence, terminal, false)
         .await
     {
-        Ok(jamjet_state::TurnCommit::Committed(_)) => true,
-        Ok(jamjet_state::TurnCommit::ExecutionTerminal(_)) => false,
-        Err(jamjet_state::StateBackendError::FenceLost(_)) => false,
+        Ok(jamjet_state::TurnCommit::Committed(_)) => Ok(true),
+        Ok(jamjet_state::TurnCommit::ExecutionTerminal(_)) => Ok(false),
+        Err(jamjet_state::StateBackendError::FenceLost(_)) => Ok(false),
         Err(e) => {
             warn!(work_item_id = %wi.id, error = %e, "complete: could not fail a step with an uncountable cost");
-            false
+            Err(ApiError::Unavailable(format!(
+                "could not fail the step for its uncountable cost: {e}"
+            )))
         }
     }
 }
 
 /// Whether the run of `wi` has a dollar cap: `cost_budget_usd` set in its
 /// stored IR, whatever its value, read as the claim gate reads it
-/// ([`caps_from_raw`]).
+/// ([`caps_from_raw`]). `Ok(Err)`: the run, its workflow or its caps are
+/// not in what is stored. `Err`: the store could not be read.
 async fn dollar_capped(
     backend: &dyn jamjet_state::StateBackend,
     wi: &WorkItem,
-) -> Result<bool, String> {
-    let execution = backend
+) -> Result<Result<bool, String>, String> {
+    let Some(execution) = backend
         .get_execution(&wi.execution_id)
         .await
         .map_err(|e| format!("execution unreadable: {e}"))?
-        .ok_or_else(|| "execution not found".to_string())?;
-    let def = backend
+    else {
+        return Ok(Err("execution not found".to_string()));
+    };
+    let Some(def) = backend
         .get_workflow(&execution.workflow_id, &execution.workflow_version)
         .await
         .map_err(|e| format!("workflow unreadable: {e}"))?
-        .ok_or_else(|| {
-            format!(
-                "workflow {} v{} not found",
-                execution.workflow_id, execution.workflow_version
-            )
-        })?;
-    Ok(caps_from_raw(&def.ir)?.cost_budget_usd.is_some())
+    else {
+        return Ok(Err(format!(
+            "workflow {} v{} not found",
+            execution.workflow_id, execution.workflow_version
+        )));
+    };
+    Ok(caps_from_raw(&def.ir).map(|caps| caps.cost_budget_usd.is_some()))
 }
 
 #[derive(Deserialize)]

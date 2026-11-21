@@ -114,7 +114,8 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "cost_usd must be a non-negative number"). Under a dollar cap, a fenced completion whose
   cost cannot be counted also fails the step for good in the same write, and the 400 says so
   ("...; the run has a dollar cap, so the step failed"): the step may have paid, and a retry
-  would pay again with nothing recorded.
+  would pay again with nothing recorded. When the store cannot be read or that write fails,
+  the answer is 503 and the item stays claimed, so the client sends the completion again.
 - Removed: `rollover_segment` (its caller was the budget trip), with its five tests, and the
   worker's pre-call budget check with four more tests it carried, nine worker tests in all.
   Their cases are covered by the caps unit tests and `run_caps`.

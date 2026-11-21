@@ -965,6 +965,68 @@ async fn a_malformed_cost_under_a_dollar_cap_fails_the_node_for_good() {
     }
 }
 
+/// Fails every `commit_turn_unless_terminal` while `on` is set: a store
+/// that is briefly away when the route fails a step for good.
+struct FailFencedCommit {
+    on: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Hooks for FailFencedCommit {
+    async fn before(&self, op: &Op<'_>) -> Option<StateBackendError> {
+        match op {
+            Op::CommitTurnUnlessTerminal { .. } if self.on.load(Ordering::SeqCst) => Some(
+                StateBackendError::Database("the store is away (test)".into()),
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// Under a dollar cap, a fenced completion with a cost the engine cannot
+/// count, when the write that fails the step errors. The answer must be a
+/// 5xx, which the client sends again, not a 400, which it does not: the item
+/// is still claimed and nothing is recorded. Sent again once the store is
+/// back, the step fails for good.
+#[tokio::test]
+async fn a_failed_write_for_an_uncountable_cost_is_retryable() {
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            linear_ir(
+                "wf-bad-cost-store-away",
+                &["a"],
+                python_fn(),
+                json!({ "cost_budget_usd": 1.0 }),
+            ),
+        )
+        .await;
+        let name = run.name;
+        let wi = run.claim_http().await;
+        let hooks = Arc::new(FailFencedCommit {
+            on: AtomicBool::new(true),
+        });
+        let state =
+            support::make_state(Arc::new(Intercept::new(run.backend.clone(), hooks.clone())));
+        let body = json!({
+            "output": {},
+            "state_patch": {},
+            "lease_fence": wi["lease_fence"],
+            "cost_usd": -0.5
+        });
+        let path = format!("/work-items/{}/complete", wi["id"].as_str().unwrap());
+        let (st, answer) = support::post(&state, &path, body.clone()).await;
+        assert!(st.is_server_error(), "{name}: {st} {answer}");
+        assert_eq!(run.settled().await, Vec::<String>::new(), "{name}");
+        assert_eq!(run.item_status(&wi).await, "claimed", "{name}");
+
+        hooks.on.store(false, Ordering::SeqCst);
+        let (st, answer) = support::post(&state, &path, body).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{name}: {answer}");
+        assert_eq!(run.settled().await, vec!["node_failed(a)"], "{name}");
+    }
+}
+
 /// Under a dollar cap, a completion with a cost the engine cannot count
 /// fails the step only for the caller that holds the item, and only for a
 /// step whose result it could report. With no fence, with a fence that is
