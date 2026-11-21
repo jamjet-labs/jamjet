@@ -67,8 +67,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Migration 0017 adds an index for the approvals list. A build from before it will not open
   a store that has run it, so there is no rollback past this release.
 - Under `cost_budget_usd`, a step that reports no cost stops the run. The built-in provider
-  adapters report none; the model sidecar does. Under a token cap, a step that reports no
-  count for the tokens the cap reads stops the run: report both counts, 0 included. The trip
+  adapters report none; the model sidecar does, for a model litellm can price. Under a token
+  cap, a step that reports no count for the tokens the cap reads stops the run: report both
+  counts, 0 included. The trip
   carries a `reason` (`cost_not_reported`, `tokens_not_reported`, or `cost_cap_invalid`),
   and `jamjet audit` shows it.
 - A budget trip no longer rolls a `continue_as_new` run over to a new segment; it fails the
@@ -118,6 +119,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not parse) or sent unfenced with a bad cost leaves the step to retry, and the first
   attempt's spend goes uncounted. An `eval` judge and a remote agent called by `agent_tool`
   report no spend, so they are held at the cap but not counted.
+- Python: a model call that litellm cannot price reports no cost, not $0. `cost_usd` is
+  `None` on `ModelResponse` and `ModelCallRecord` (now `float | None`), and the model sidecar
+  sends `null`, so under `cost_budget_usd` the run stops after that step. `BudgetMiddleware`
+  adds nothing to its own cost total for such a call.
 
 ### Security
 

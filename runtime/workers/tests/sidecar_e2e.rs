@@ -509,6 +509,72 @@ async fn a_sidecar_without_cost_records_none() {
     }
 }
 
+/// A sidecar that cannot price the model sends `cost_usd: null`. Under a
+/// dollar cap that step is counted with an unknown cost, and the run stops
+/// before the next step: an unpriced call is not a $0 call.
+#[tokio::test]
+async fn an_unpriced_sidecar_call_stops_a_dollar_capped_run() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/complete"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(answer_with(r#", "cost_usd": null"#)),
+        )
+        .mount(&server)
+        .await;
+    let registry = Arc::new(
+        ModelRegistry::new()
+            .register(Arc::new(SidecarModelAdapter::new(server.uri())))
+            .with_default("sidecar"),
+    );
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let eid = start_run(backend.as_ref(), priced_ir()).await;
+    let worker = Worker::new("w".into(), backend.clone(), vec!["model".into()])
+        .register_executor("model", Arc::new(ModelNodeExecutor::new(registry)));
+    let scheduler = Scheduler::new(backend.clone());
+    for _ in 0..12 {
+        scheduler.tick().await.expect("scheduler tick");
+        let run = backend.get_execution(&eid).await.unwrap().unwrap();
+        if run.status.is_terminal() {
+            break;
+        }
+        let _ = worker.poll_and_execute().await;
+    }
+
+    let usage = jamjet_state::usage::fold_run_usage(backend.as_ref(), &eid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(usage.billable_steps, 1, "{usage:?}");
+    assert_eq!(usage.cost_unknown_steps, 1, "{usage:?}");
+    let events: Vec<EventKind> = backend
+        .get_events(&eid)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    let trips: Vec<Value> = events
+        .iter()
+        .filter(|k| matches!(k, EventKind::CostBudgetExceeded { .. }))
+        .map(|k| serde_json::to_value(k).unwrap())
+        .collect();
+    assert_eq!(trips.len(), 1, "{events:?}");
+    assert_eq!(
+        trips[0]["reason"],
+        json!("cost_not_reported"),
+        "{}",
+        trips[0]
+    );
+    let run = backend.get_execution(&eid).await.unwrap().unwrap();
+    assert_eq!(run.status, WorkflowStatus::Failed, "{events:?}");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "no model call after an unpriced one under a dollar cap"
+    );
+}
+
 /// A cost in another currency is not a cost the engine can count in USD:
 /// the step fails for good.
 #[tokio::test]

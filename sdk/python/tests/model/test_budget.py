@@ -195,6 +195,15 @@ class TestBudgetMiddlewareTokenBudget:
         assert mw.consumed_tokens == 50
 
 
+class TestBudgetMiddlewareUnpricedCall:
+    async def test_an_unpriced_call_adds_no_cost(self) -> None:
+        """A call with no cost (None) adds nothing to the local cost total."""
+        mw = BudgetMiddleware(Budget(cost_usd=0.10))
+        await mw.after(_req(), ModelResponse(message=object(), input_tokens=5, output_tokens=5))
+        assert mw.consumed_cost_usd == 0.0
+        assert mw.consumed_tokens == 10
+
+
 class TestBudgetMiddlewareBothCaps:
     async def test_cost_exceeded_triggers_denial_when_tokens_ok(self) -> None:
         """Either cap exceeded is enough to deny — cost cap hit here."""

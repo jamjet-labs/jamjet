@@ -10,7 +10,9 @@ Check BEFORE the call: if accumulated spend (tokens and/or cost_usd) is
 already >= the configured limit, raise ``BudgetExceededError`` without calling
 the backend.  After a successful provider response, accumulate the response's
 ``cost_usd`` and total tokens (``input_tokens + output_tokens``) for future
-checks.
+checks.  A response with no cost (``cost_usd`` of ``None``, a model with no
+price) adds nothing to the cost total here; the engine's run caps read it as
+an unknown cost.
 
 Precise semantics (M5):
 
@@ -103,5 +105,6 @@ class BudgetMiddleware(BaseModelMiddleware):
         """Accumulate the cost and tokens from a completed call."""
         if self._budget is not None:
             self._consumed_tokens += response.input_tokens + response.output_tokens
-            self._consumed_cost_usd += response.cost_usd
+            if response.cost_usd is not None:
+                self._consumed_cost_usd += response.cost_usd
         return response

@@ -44,10 +44,13 @@ class LiteLLMBackend:
             kwargs["tools"] = request.tools
         resp = await litellm.acompletion(**kwargs)
         usage = getattr(resp, "usage", None)
+        # A model litellm has no price for is not a free call: report no cost,
+        # so the engine reads the step as unpriced.
+        cost: float | None
         try:
             cost = float(litellm.completion_cost(completion_response=resp))
         except Exception:
-            cost = 0.0
+            cost = None
         return ModelResponse(
             message=resp.choices[0].message,
             input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,

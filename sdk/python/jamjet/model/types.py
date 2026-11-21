@@ -47,12 +47,15 @@ class ModelResponse:
 
     ``message`` is an OpenAI-shaped message (has ``.content`` and ``.tool_calls``)
     so existing strategy runners consume it unchanged.
+
+    ``cost_usd`` is ``None`` when the call's cost is not known (a model with no
+    price), which is not the same as a call that cost nothing.
     """
 
     message: Any
     input_tokens: int = 0
     output_tokens: int = 0
-    cost_usd: float = 0.0
+    cost_usd: float | None = None
     raw: Any = None
 
 

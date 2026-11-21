@@ -102,3 +102,17 @@ async def test_shared_conftest_mock_supports_streaming():
     # mock, which must return an async generator for stream=True (CodeRabbit #2).
     chunks = [c.delta async for c in LiteLLMBackend().stream(_req())]
     assert chunks == ["mock", "-stream"]
+
+
+async def test_complete_reports_no_cost_when_litellm_cannot_price_the_model(monkeypatch):
+    """A model litellm has no price for is not a $0 call: the cost is unknown."""
+    _install_fake_litellm(monkeypatch)
+
+    def completion_cost(*, completion_response):
+        raise ValueError("This model isn't mapped yet.")
+
+    monkeypatch.setattr(sys.modules["litellm"], "completion_cost", completion_cost)
+    resp = await LiteLLMBackend().complete(_req())
+    assert resp.cost_usd is None
+    assert resp.input_tokens == 12
+    assert resp.output_tokens == 5

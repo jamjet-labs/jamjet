@@ -218,8 +218,9 @@ an event this build cannot read, since a partial count would be taken for the wh
   a plain overspend. A step that reports a cost but no tokens, `cost_usd: 0` included, counts
   as tokens unknown. A self-reporting worker under a token cap must send both counts, 0
   included.
-- The built-in model provider adapters report no cost. The model sidecar does. Under
-  `cost_budget_usd`, a model step through a native adapter stops the run.
+- The built-in model provider adapters report no cost. The model sidecar does, for a model
+  litellm can price; for one it cannot, it sends `cost_usd: null`. Under `cost_budget_usd`, a
+  model step through a native adapter, or an unpriced one through the sidecar, stops the run.
 - `cost_budget_usd` must be between 0 and 10,000 at registration (400 otherwise). A stored
   value outside that range, from an older build, fails the run on its first pass with the
   trip reason `cost_cap_invalid`.
