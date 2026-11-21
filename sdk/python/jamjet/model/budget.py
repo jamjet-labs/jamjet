@@ -11,8 +11,9 @@ already >= the configured limit, raise ``BudgetExceededError`` without calling
 the backend.  After a successful provider response, accumulate the response's
 ``cost_usd`` and total tokens (``input_tokens + output_tokens``) for future
 checks.  A response with no cost (``cost_usd`` of ``None``, a model with no
-price) adds nothing to the cost total here; the engine's run caps read it as
-an unknown cost.
+price) adds nothing to the cost total, but its spend is unknown: under a
+dollar cap the next call is denied, as the engine's run caps deny it.  A
+token-only budget still counts its tokens and goes on.
 
 Precise semantics (M5):
 
@@ -65,6 +66,7 @@ class BudgetMiddleware(BaseModelMiddleware):
         self._budget = budget
         self._consumed_tokens: int = 0
         self._consumed_cost_usd: float = 0.0
+        self._unpriced_calls: int = 0
 
     # -- Read-only introspection ----------------------------------------------
 
@@ -88,15 +90,17 @@ class BudgetMiddleware(BaseModelMiddleware):
         cost_cap = self._budget.cost_usd
         token_cap = self._budget.tokens
 
+        cost_unknown = cost_cap is not None and self._unpriced_calls > 0
         cost_exceeded = cost_cap is not None and self._consumed_cost_usd >= cost_cap
         token_exceeded = token_cap is not None and self._consumed_tokens >= token_cap
 
-        if cost_exceeded or token_exceeded:
+        if cost_unknown or cost_exceeded or token_exceeded:
             raise BudgetExceededError(
                 limit_usd=cost_cap,
                 limit_tokens=token_cap,
                 consumed_usd=self._consumed_cost_usd,
                 consumed_tokens=self._consumed_tokens,
+                cost_unknown=cost_unknown,
             )
 
         return request
@@ -105,6 +109,8 @@ class BudgetMiddleware(BaseModelMiddleware):
         """Accumulate the cost and tokens from a completed call."""
         if self._budget is not None:
             self._consumed_tokens += response.input_tokens + response.output_tokens
-            if response.cost_usd is not None:
+            if response.cost_usd is None:
+                self._unpriced_calls += 1
+            else:
                 self._consumed_cost_usd += response.cost_usd
         return response

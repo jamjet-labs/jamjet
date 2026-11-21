@@ -154,7 +154,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python: a model call that litellm cannot price reports no cost, not $0. `cost_usd` is
   `None` on `ModelResponse` and `ModelCallRecord` (now `float | None`), and the model sidecar
   sends `null`, so under `cost_budget_usd` the run stops after that step. `BudgetMiddleware`
-  adds nothing to its own cost total for such a call.
+  adds nothing to its own cost total for such a call, and under a dollar cap it denies the
+  next call, as the engine does: the spend is unknown. `BudgetExceededError` gains
+  `cost_unknown`. A token-only budget still counts the call's tokens and goes on.
 
 ### Security
 

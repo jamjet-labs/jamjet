@@ -203,6 +203,35 @@ class TestBudgetMiddlewareUnpricedCall:
         assert mw.consumed_cost_usd == 0.0
         assert mw.consumed_tokens == 10
 
+    async def test_an_unpriced_call_keeps_the_known_subtotal(self) -> None:
+        mw = BudgetMiddleware(Budget(cost_usd=1.0))
+        await mw.after(_req(), ModelResponse(message=object(), input_tokens=5, output_tokens=5, cost_usd=0.03))
+        await mw.after(_req(), ModelResponse(message=object(), input_tokens=5, output_tokens=5))
+        assert mw.consumed_cost_usd == pytest.approx(0.03)
+        assert mw.consumed_tokens == 20
+
+    async def test_an_unpriced_call_stops_a_dollar_capped_budget(self) -> None:
+        """The spend of an unpriced call is unknown, so the cap cannot be checked: the next call is denied."""
+        mw = BudgetMiddleware(Budget(cost_usd=0.10))
+        await mw.after(_req(), ModelResponse(message=object(), input_tokens=5, output_tokens=5))
+        with pytest.raises(BudgetExceededError) as exc_info:
+            await mw.before(_req())
+        err = exc_info.value
+        assert err.cost_unknown is True
+        assert "no cost" in str(err)
+
+    async def test_an_unpriced_call_does_not_stop_a_token_budget(self) -> None:
+        mw = BudgetMiddleware(Budget(tokens=100))
+        await mw.after(_req(), ModelResponse(message=object(), input_tokens=5, output_tokens=5))
+        req = _req()
+        assert await mw.before(req) is req
+
+    async def test_a_zero_cost_is_known(self) -> None:
+        mw = BudgetMiddleware(Budget(cost_usd=0.10))
+        await mw.after(_req(), ModelResponse(message=object(), input_tokens=5, output_tokens=5, cost_usd=0.0))
+        req = _req()
+        assert await mw.before(req) is req
+
 
 class TestBudgetMiddlewareBothCaps:
     async def test_cost_exceeded_triggers_denial_when_tokens_ok(self) -> None:
