@@ -3399,13 +3399,12 @@ mod tests {
             )]
         );
         assert_eq!(trips(&backend, &eid).await, vec![n1_trip(1, 1)]);
+        // Settled, not still leased: a claim also finds nothing while the
+        // refusal's lease runs, and the item would retry once it ran out.
+        let open = backend.open_work_items(&eid).await.unwrap();
         assert!(
-            backend
-                .claim_work_item("test-worker", &["default"])
-                .await
-                .unwrap()
-                .is_none(),
-            "the refused item is settled, not left to retry"
+            open.is_empty(),
+            "the refused item is settled, not left to retry: {open:?}"
         );
         let events = backend.get_events(&eid).await.unwrap();
         assert!(
