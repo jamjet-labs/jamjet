@@ -4,7 +4,7 @@
 #![cfg(unix)]
 
 use jamjet_state::SqliteBackend;
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -145,17 +145,35 @@ fn the_allow_flag_lets_the_server_start_with_a_warning() {
     )
     .spawn()
     .unwrap();
-    // Still serving after a few seconds: it did not refuse.
-    std::thread::sleep(Duration::from_secs(3));
+    // Read both pipes as the server writes them, and wait for the warning.
+    let (tx, lines) = std::sync::mpsc::channel::<String>();
+    for pipe in [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+    }
+    let deadline = Instant::now() + WAIT;
+    let mut seen = String::new();
+    while !seen.contains("JAMJET_ALLOW_EPHEMERAL_STORE") && Instant::now() < deadline {
+        if let Ok(line) = lines.recv_timeout(Duration::from_millis(100)) {
+            seen.push_str(&line);
+            seen.push('\n');
+        }
+    }
+    // Still serving once the warning is out: it did not refuse.
     let ended = child.try_wait().unwrap();
     let _ = child.kill();
     let _ = child.wait();
-    let stderr = read_all(child.stderr.take());
-    let stdout = read_all(child.stdout.take());
-    assert!(ended.is_none(), "it exited: {stdout}\n{stderr}");
+    assert!(ended.is_none(), "it exited: {seen}");
     assert!(
-        format!("{stdout}{stderr}").contains("JAMJET_ALLOW_EPHEMERAL_STORE"),
-        "no warning: {stdout}{stderr}"
+        seen.contains("JAMJET_ALLOW_EPHEMERAL_STORE"),
+        "no warning within {WAIT:?}: {seen}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
