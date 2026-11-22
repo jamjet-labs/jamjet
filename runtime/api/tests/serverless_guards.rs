@@ -199,3 +199,49 @@ async fn token_create_is_not_guarded() {
     assert!(stdout.trim().starts_with("jj_"), "{stdout:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A bad shutdown setting stops startup before a store is opened or a
+/// directory is made.
+#[test]
+fn a_bad_stop_setting_stops_startup_before_anything_is_created() {
+    for (name, value) in [
+        ("JAMJET_SHUTDOWN_GRACE_SECS", "soon"),
+        ("JAMJET_STOP_TIMEOUT_SECS", "0"),
+    ] {
+        let dir = temp_dir();
+        let (status, stdout, stderr) = run(&dir, &[], &[(name, value)]);
+        let status = status.expect("the server must refuse and exit, not serve");
+        assert!(!status.success(), "{name}: {stdout}\n{stderr}");
+        assert!(
+            format!("{stdout}{stderr}").contains(name),
+            "{name}: {stdout}{stderr}"
+        );
+        assert!(
+            !dir.join(".jamjet").exists(),
+            "{name}: a .jamjet directory was made"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A value that is not UTF-8 is not read as unset.
+#[test]
+fn a_grace_that_is_not_utf8_stops_startup() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = temp_dir();
+    let mut cmd = server(&dir, &[], &[]);
+    cmd.env(
+        "JAMJET_SHUTDOWN_GRACE_SECS",
+        std::ffi::OsStr::from_bytes(b"4\xff"),
+    );
+    let mut child = cmd.spawn().unwrap();
+    let status = wait_exit(&mut child).expect("the server must refuse and exit, not serve");
+    assert!(!status.success());
+    let text = format!(
+        "{}{}",
+        read_all(child.stdout.take()),
+        read_all(child.stderr.take())
+    );
+    assert!(text.contains("JAMJET_SHUTDOWN_GRACE_SECS"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

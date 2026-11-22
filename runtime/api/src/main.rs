@@ -113,6 +113,8 @@ async fn main() -> anyhow::Result<()> {
     // Before any store is opened and before `.jamjet` is created: a serverless
     // platform loses a SQLite file when an instance stops.
     startup::check_store_env(&config)?;
+    // A bad stop setting stops startup here too, before migrations run.
+    let shutdown_plan = startup::shutdown_plan_from_env()?;
     // Parse the failover generation up front so a misconfiguration fails startup
     // before we open any backend (rather than silently disabling failover-safety).
     let configured_store_term = store_term_from_env()?;
@@ -255,7 +257,6 @@ async fn main() -> anyhow::Result<()> {
     //
     // On SIGTERM or Ctrl-C the scheduler stops between ticks and the embedded
     // workers finish the items they hold, for up to the grace period.
-    let shutdown_plan = startup::shutdown_plan_from_env()?;
     let shutdown_grace = shutdown_plan.grace;
     let (shutdown_trigger, shutdown) = jamjet_worker::shutdown();
     let scheduler =

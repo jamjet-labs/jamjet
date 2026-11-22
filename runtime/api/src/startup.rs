@@ -497,10 +497,13 @@ pub fn shutdown_plan(
     })
 }
 
-/// [`shutdown_plan`] on the process environment.
+/// [`shutdown_plan`] on the process environment. A value that is not UTF-8
+/// is read with replacement characters, so it fails the parse and stops
+/// startup rather than counting as unset.
 pub fn shutdown_plan_from_env() -> anyhow::Result<ShutdownPlan> {
-    let platform = on_serverless_platform(|k| std::env::var(k).ok());
-    shutdown_plan(|k| std::env::var(k).ok(), platform).map_err(|e| anyhow::anyhow!("{e}"))
+    let get = |k: &str| std::env::var_os(k).map(|v| v.to_string_lossy().into_owned());
+    let platform = on_serverless_platform(get);
+    shutdown_plan(get, platform).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 #[cfg(test)]
