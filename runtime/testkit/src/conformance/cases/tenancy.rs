@@ -434,8 +434,8 @@ pub async fn scoped_enqueue_into_another_tenants_run_is_not_found(fx: &Fixture) 
 }
 
 /// `globex`'s run has a pending approval row and a projector checkpoint.
-/// `acme`'s projection of that run, single, batched or the checkpoint alone,
-/// is `NotFound`: the row stays pending for `globex`'s reviewers and the
+/// `acme`'s projection of that run, single, batched (with rows or none) or
+/// the checkpoint alone, is `NotFound`: the row stays pending for `globex`'s reviewers and the
 /// projector does not skip ahead.
 pub async fn scoped_projection_of_another_tenants_run_is_not_found(fx: &Fixture) {
     let Some((acme, globex)) = two_tenants(fx).await else {
@@ -468,6 +468,11 @@ pub async fn scoped_projection_of_another_tenants_run_is_not_found(fx: &Fixture)
             )
             .await;
         let what = format!("apply_approval_projection_batch to {whose}");
+        refused(fx, &before, &what, out).await;
+        let out = acme
+            .apply_approval_projection_batch(vec![], "approvals", &run, 9)
+            .await;
+        let what = format!("an empty apply_approval_projection_batch to {whose}");
         refused(fx, &before, &what, out).await;
         let out = acme.set_projector_checkpoint("approvals", &run, 9).await;
         refused(

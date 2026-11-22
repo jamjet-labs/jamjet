@@ -166,6 +166,31 @@ impl InMemoryBackend {
 }
 
 impl InMemoryBackend {
+    /// Write a projection row unless the stored one is newer: a stale batch
+    /// from a second projector never moves a row back.
+    fn upsert_projection_row(&self, row: crate::backend::ApprovalProjectionRow, now: String) {
+        use dashmap::mapref::entry::Entry;
+        let key = (row.execution_id.0.to_string(), row.node_id.clone());
+        match self.proj_approvals.entry(key) {
+            Entry::Occupied(mut stored) => {
+                if stored.get().0.last_sequence <= row.last_sequence {
+                    stored.insert((row, now));
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert((row, now));
+            }
+        }
+    }
+
+    /// Move a checkpoint forward; never back.
+    fn advance_checkpoint(&self, key: (String, String), checkpoint: i64) {
+        let mut stored = self.projector_checkpoints.entry(key).or_insert(checkpoint);
+        if *stored < checkpoint {
+            *stored = checkpoint;
+        }
+    }
+
     /// Append `event` to its execution's log, assigning its sequence WHILE
     /// holding the log's lock. Taking the sequence first let a plain append
     /// reserve N, a conditional append land N+1 ahead of it, and N be pushed
@@ -1557,11 +1582,9 @@ impl StateBackend for InMemoryBackend {
     ) -> BackendResult<()> {
         // In-memory: no ACID atomicity, but both writes happen in the same
         // synchronous step so there is no observable gap in tests.
-        let key = (row.execution_id.0.to_string(), row.node_id.clone());
-        self.proj_approvals
-            .insert(key, (row.clone(), Utc::now().to_rfc3339()));
         let cp_key = (projection_name.to_string(), row.execution_id.0.to_string());
-        self.projector_checkpoints.insert(cp_key, new_checkpoint);
+        self.upsert_projection_row(row, Utc::now().to_rfc3339());
+        self.advance_checkpoint(cp_key, new_checkpoint);
         Ok(())
     }
 
@@ -1578,11 +1601,10 @@ impl StateBackend for InMemoryBackend {
         // One time for the batch, as SQLite stamps it.
         let now = Utc::now().to_rfc3339();
         for row in rows {
-            let key = (row.execution_id.0.to_string(), row.node_id.clone());
-            self.proj_approvals.insert(key, (row, now.clone()));
+            self.upsert_projection_row(row, now.clone());
         }
         let cp_key = (projection_name.to_string(), execution_id.0.to_string());
-        self.projector_checkpoints.insert(cp_key, new_checkpoint);
+        self.advance_checkpoint(cp_key, new_checkpoint);
         Ok(())
     }
 
@@ -1621,7 +1643,7 @@ impl StateBackend for InMemoryBackend {
         new_checkpoint: i64,
     ) -> BackendResult<()> {
         let key = (projection_name.to_string(), execution_id.0.to_string());
-        self.projector_checkpoints.insert(key, new_checkpoint);
+        self.advance_checkpoint(key, new_checkpoint);
         Ok(())
     }
 

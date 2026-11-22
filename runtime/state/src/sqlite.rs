@@ -2317,7 +2317,8 @@ impl StateBackend for SqliteBackend {
                  tool_name     = excluded.tool_name,
                  approver      = excluded.approver,
                  context_json  = excluded.context_json,
-                 updated_at    = excluded.updated_at"#,
+                 updated_at    = excluded.updated_at
+                 WHERE proj_approvals.last_sequence <= excluded.last_sequence"#,
         )
         .bind(&exec_id_str)
         .bind(&row.node_id)
@@ -2340,7 +2341,8 @@ impl StateBackend for SqliteBackend {
                VALUES (?, ?, ?, 'default', ?)
                ON CONFLICT(projection_name, execution_id) DO UPDATE SET
                  last_sequence = excluded.last_sequence,
-                 updated_at    = excluded.updated_at"#,
+                 updated_at    = excluded.updated_at
+                 WHERE projector_checkpoints.last_sequence <= excluded.last_sequence"#,
         )
         .bind(projection_name)
         .bind(&exec_id_str)
@@ -2391,7 +2393,8 @@ impl StateBackend for SqliteBackend {
                      tool_name     = excluded.tool_name,
                      approver      = excluded.approver,
                      context_json  = excluded.context_json,
-                     updated_at    = excluded.updated_at"#,
+                     updated_at    = excluded.updated_at
+                     WHERE proj_approvals.last_sequence <= excluded.last_sequence"#,
             )
             .bind(&exec_id_str)
             .bind(&row.node_id)
@@ -2416,7 +2419,8 @@ impl StateBackend for SqliteBackend {
                VALUES (?, ?, ?, 'default', ?)
                ON CONFLICT(projection_name, execution_id) DO UPDATE SET
                  last_sequence = excluded.last_sequence,
-                 updated_at    = excluded.updated_at"#,
+                 updated_at    = excluded.updated_at
+                 WHERE projector_checkpoints.last_sequence <= excluded.last_sequence"#,
         )
         .bind(projection_name)
         .bind(&exec_id_str)
@@ -2513,7 +2517,8 @@ impl StateBackend for SqliteBackend {
                VALUES (?, ?, ?, 'default', ?)
                ON CONFLICT(projection_name, execution_id) DO UPDATE SET
                  last_sequence = excluded.last_sequence,
-                 updated_at    = excluded.updated_at"#,
+                 updated_at    = excluded.updated_at
+                 WHERE projector_checkpoints.last_sequence <= excluded.last_sequence"#,
         )
         .bind(projection_name)
         .bind(&id_str)
