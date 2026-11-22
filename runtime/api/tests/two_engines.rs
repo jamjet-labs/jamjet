@@ -258,9 +258,15 @@ async fn two_engines_on_one_sqlite_file_complete_every_node_once() {
 }
 
 /// A cancel through A lands while a pass would finish the run: each run
-/// ends once, cancelled or completed, with nothing after its end. The
-/// cancels go out from 0 to 950 ms after each run's last step completes,
-/// so some land while the finish is due; the test asserts at least one did.
+/// ends once, cancelled or completed, with nothing after its end.
+///
+/// Thirty runs in two groups. Twenty complete their last step at once, so
+/// one pass finishes them all, and their cancels go out 0 to 950 ms later:
+/// some land while that pass works through the runs, after it listed them
+/// as running. Ten complete 50 ms apart, so they meet the scheduler's
+/// 500 ms tick at ten points, and each cancel goes out 20 ms after its
+/// run's completion: whatever the tick's phase, most of those land while
+/// the finish is due. The test asserts at least one cancel did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_engines_cancel_and_finish_race_once() {
     for backend in [Backend::Sqlite, Backend::Postgres] {
@@ -276,8 +282,13 @@ async fn two_engines_cancel_and_finish_race_once() {
             let http = client();
             let workflow = format!("race-{}", uuid::Uuid::new_v4().simple());
             register(&http, &a.base(), &store.developer, &work_only(&workflow)).await;
+            // (wait before the completion, wait from it to the cancel), in ms.
+            let plan: Vec<(u64, u64)> = (0..20)
+                .map(|j| (0, 50 * j))
+                .chain((0..10).map(|k| (50 * k, 20)))
+                .collect();
             let mut runs = Vec::new();
-            for _ in 0..20 {
+            for _ in 0..plan.len() {
                 runs.push(start_run(&http, &a.base(), &store.developer, &workflow).await);
             }
             let mut held = Vec::new();
@@ -289,14 +300,15 @@ async fn two_engines_cancel_and_finish_race_once() {
                     held.push(item);
                 }
             }
-            let races = held.into_iter().enumerate().map(|(i, item)| {
+            let races = held.into_iter().zip(plan).map(|(item, (before, after))| {
                 let http = http.clone();
                 let (a, b) = (a.base(), b.base());
                 let token = store.developer.clone();
                 async move {
+                    tokio::time::sleep(Duration::from_millis(before)).await;
                     let (st, body) = complete(&http, &b, &token, &item).await.unwrap();
                     assert_eq!(st, 200, "{body}");
-                    tokio::time::sleep(Duration::from_millis(50 * i as u64)).await;
+                    tokio::time::sleep(Duration::from_millis(after)).await;
                     let (st, body) = must(
                         &http,
                         &a,
@@ -314,23 +326,40 @@ async fn two_engines_cancel_and_finish_race_once() {
             let ids: Vec<String> = outcomes.iter().map(|(id, _)| id.clone()).collect();
             let snapshot = finished(&store, &ids, Duration::from_secs(10)).await;
             let mut cancelled_while_due = 0;
-            for (id, st) in &outcomes {
+            let mut staggered_while_due = 0;
+            for (n, (id, st)) in outcomes.iter().enumerate() {
                 let kinds: Vec<&str> = snapshot.events_of(id).map(|e| e.kind_type()).collect();
                 let ends: Vec<&&str> = kinds
                     .iter()
                     .filter(|k| k.starts_with("workflow_") && **k != "workflow_started")
                     .collect();
-                assert_eq!(ends.len(), 1, "run {id} ended {} times: {kinds:?}", ends.len());
-                let expected = if *st == 200 { "workflow_cancelled" } else { "workflow_completed" };
-                assert_eq!(*ends[0], expected, "run {id}, cancel answered {st}: {kinds:?}");
+                assert_eq!(
+                    ends.len(),
+                    1,
+                    "run {id} ended {} times: {kinds:?}",
+                    ends.len()
+                );
+                let expected = if *st == 200 {
+                    "workflow_cancelled"
+                } else {
+                    "workflow_completed"
+                };
+                assert_eq!(
+                    *ends[0], expected,
+                    "run {id}, cancel answered {st}: {kinds:?}"
+                );
                 if *st == 200 && kinds.contains(&"node_completed") {
                     cancelled_while_due += 1;
+                    if n >= 20 {
+                        staggered_while_due += 1;
+                    }
                 }
             }
             no_violations(&jamjet_testkit::invariants::check_snapshot(&snapshot));
             let lost = outcomes.iter().filter(|(_, st)| *st == 400).count();
             eprintln!(
-                "{case}: {cancelled_while_due} cancels landed while the finish was due, {lost} came after it"
+                "{case}: {cancelled_while_due} cancels landed while the finish was due \
+                 ({staggered_while_due} of the 10 staggered runs), {lost} came after it"
             );
             assert!(
                 cancelled_while_due >= 1,
