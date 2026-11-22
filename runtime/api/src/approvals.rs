@@ -930,9 +930,12 @@ pub async fn decision_answer(
         "sequence": submitted.event.sequence,
     });
     let waiting = match backend.get_execution(execution_id).await {
-        Ok(Some(execution)) => crate::waiting::waiting_for(backend, &execution, chrono::Utc::now())
-            .await
-            .map_err(|e| e.to_string()),
+        Ok(Some(execution)) => match backend.store_now().await {
+            Ok(now) => crate::waiting::waiting_for(backend, &execution, now)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        },
         Ok(None) => Err("the execution was not found".to_string()),
         Err(e) => Err(e.to_string()),
     };

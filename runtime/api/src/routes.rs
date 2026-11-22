@@ -749,7 +749,8 @@ async fn list_waiting_for(
     let page = backend
         .list_running_executions_after(params.after.as_deref(), limit)
         .await?;
-    let now = Utc::now();
+    // The store's clock, as the approve routes judge a deadline.
+    let now = backend.store_now().await?;
     let mut executions = Vec::new();
     for execution in page.executions {
         if crate::waiting::waiting_for(backend, &execution, now).await? != Some(wanted) {
@@ -786,7 +787,8 @@ pub(crate) async fn execution_view(
     backend: &dyn jamjet_state::StateBackend,
     execution: WorkflowExecution,
 ) -> Result<Value, ApiError> {
-    let waiting = crate::waiting::waiting_for(backend, &execution, Utc::now()).await?;
+    let now = backend.store_now().await?;
+    let waiting = crate::waiting::waiting_for(backend, &execution, now).await?;
     let execution_id = execution.execution_id.clone();
     let execution = with_derived_state(backend, execution).await;
     let mut body = serde_json::to_value(execution)

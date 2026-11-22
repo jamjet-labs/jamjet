@@ -3,11 +3,17 @@
 
 use crate::backend::{BackendResult, StateBackendError};
 use sqlx::migrate::Migrator;
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::postgres::PgConnectOptions;
+use sqlx::{ConnectOptions, Connection, PgConnection, PgPool, Row};
+use std::str::FromStr;
 
 /// The Postgres state migrations, `state/migrations_pg`.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations_pg");
+
+/// The session lock [`migrate`] holds from before it reads the schema until
+/// its connection closes, so two runs take turns and each counts only what
+/// it applied. "JJMIGR" in ASCII.
+pub const MIGRATE_LOCK: i64 = 0x4a4a_4d49_4752;
 
 /// Where a database's schema stands against [`MIGRATOR`], from its
 /// `_sqlx_migrations` table.
@@ -54,6 +60,15 @@ impl SchemaState {
             )),
         }
     }
+
+    /// Whether [`migrate`] may move the schema on from here: it is empty,
+    /// behind or current, not newer than this build, half done or changed.
+    pub fn can_migrate(&self) -> bool {
+        matches!(
+            self,
+            Self::Current { .. } | Self::Empty | Self::Behind { .. }
+        )
+    }
 }
 
 /// One row of `_sqlx_migrations`.
@@ -67,19 +82,33 @@ struct Applied {
 /// Where the database behind `pool` stands against [`MIGRATOR`]. Reads
 /// only.
 pub async fn schema_state(pool: &PgPool) -> BackendResult<SchemaState> {
-    let applied = applied(pool).await?;
-    let known: Vec<(i64, &[u8])> = MIGRATOR
+    let mut conn = pool.acquire().await.map_err(read_failed)?;
+    let applied = applied(&mut conn).await?;
+    Ok(judge(&applied, &known(&MIGRATOR)))
+}
+
+/// [`schema_state`] of the database at `url`, on a connection of its own
+/// that is closed afterwards. Reads only, takes no lock.
+pub async fn schema_state_at(url: &str) -> Result<SchemaState, String> {
+    let mut conn = connect_one(url).await?;
+    let outcome = applied(&mut conn).await.map_err(|e| e.to_string());
+    let _ = conn.close().await;
+    Ok(judge(&outcome?, &known(&MIGRATOR)))
+}
+
+/// The `(version, checksum)` of each up migration in `migrator`.
+fn known(migrator: &Migrator) -> Vec<(i64, &[u8])> {
+    migrator
         .iter()
         .filter(|m| !m.migration_type.is_down_migration())
         .map(|m| (m.version, m.checksum.as_ref()))
-        .collect();
-    Ok(judge(&applied, &known))
+        .collect()
 }
 
 /// The rows of `_sqlx_migrations`, none when the table does not exist.
-async fn applied(pool: &PgPool) -> BackendResult<Vec<Applied>> {
+async fn applied(conn: &mut PgConnection) -> BackendResult<Vec<Applied>> {
     let exists: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(read_failed)?;
     if !exists {
@@ -87,7 +116,7 @@ async fn applied(pool: &PgPool) -> BackendResult<Vec<Applied>> {
     }
     let rows =
         sqlx::query("SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version")
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await
             .map_err(read_failed)?;
     rows.iter()
@@ -140,6 +169,17 @@ fn read_failed(e: sqlx::Error) -> StateBackendError {
     StateBackendError::Database(format!("cannot read the Postgres schema version: {e}"))
 }
 
+/// One connection to `url`, outside any pool. No message repeats the URL,
+/// which holds the password.
+async fn connect_one(url: &str) -> Result<PgConnection, String> {
+    PgConnectOptions::from_str(url)
+        .map_err(|e| format!("not a Postgres URL: {e}"))?
+        .application_name("jamjet-migrate")
+        .connect()
+        .await
+        .map_err(|e| format!("cannot connect to Postgres: {e}"))
+}
+
 /// What [`migrate`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrateReport {
@@ -149,35 +189,78 @@ pub struct MigrateReport {
     pub applied: usize,
 }
 
-/// Apply every pending migration in [`MIGRATOR`] to the database at `url`,
-/// on a connection of its own that is closed afterwards. sqlx's migrator
-/// takes a session lock and does not release it when a migration fails;
-/// closing the connection does.
+/// Why [`migrate`] did not finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrateError {
+    /// The schema is one migrate leaves alone: newer than this build, half
+    /// done or changed ([`SchemaState::can_migrate`]). Nothing was applied.
+    Refused(SchemaState),
+    /// The database could not be reached or read, or a migration failed.
+    /// A migration runs in a transaction, so a failed one leaves no trace.
+    Failed(String),
+}
+
+impl std::fmt::Display for MigrateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(state) => match state.refusal() {
+                Some(why) => f.write_str(&why),
+                None => write!(f, "{state:?}"),
+            },
+            Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for MigrateError {}
+
+/// Apply every pending migration in [`MIGRATOR`] to the database at `url`.
+pub async fn migrate(url: &str) -> Result<MigrateReport, MigrateError> {
+    migrate_with(url, &MIGRATOR).await
+}
+
+/// Apply every pending migration in `migrator` to the database at `url`,
+/// on one connection of its own, not a pooled one.
 ///
-/// The connection is a pool of one, closed when done: the migrator's future
-/// on a bare `&mut PgConnection` is not `Send` for every lifetime, so a
-/// caller in a `Send` future could not await it.
-pub async fn migrate(url: &str) -> Result<MigrateReport, String> {
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(url)
-        .await
-        .map_err(|e| format!("cannot connect to Postgres: {e}"))?;
-    let outcome = migrate_on(&pool).await;
-    pool.close().await;
+/// It takes [`MIGRATE_LOCK`] first, so of two runs at once the second waits
+/// and then finds nothing to do, and reads the schema under it. sqlx's
+/// migrator takes a session lock of its own and does not release it when a
+/// migration fails. Closing the connection ends the session, which releases
+/// both, so the connection is closed on every path.
+pub async fn migrate_with(url: &str, migrator: &Migrator) -> Result<MigrateReport, MigrateError> {
+    let mut conn = connect_one(url).await.map_err(MigrateError::Failed)?;
+    let outcome = migrate_on(&mut conn, migrator).await;
+    // A close that fails still drops the socket, which ends the session.
+    let _ = conn.close().await;
     outcome
 }
 
-async fn migrate_on(pool: &PgPool) -> Result<MigrateReport, String> {
-    let before = applied(pool).await.map_err(|e| e.to_string())?.len();
-    MIGRATOR
-        .run(pool)
+async fn migrate_on(
+    conn: &mut PgConnection,
+    migrator: &Migrator,
+) -> Result<MigrateReport, MigrateError> {
+    let failed = |e: StateBackendError| MigrateError::Failed(e.to_string());
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATE_LOCK)
+        .execute(&mut *conn)
         .await
-        .map_err(|e| format!("migration failed: {e}"))?;
-    let after = applied(pool).await.map_err(|e| e.to_string())?;
+        .map_err(|e| MigrateError::Failed(format!("cannot take the migrate lock: {e}")))?;
+    let before = applied(conn).await.map_err(failed)?;
+    let state = judge(&before, &known(migrator));
+    if !state.can_migrate() {
+        return Err(MigrateError::Refused(state));
+    }
+    // `run_direct` is sqlx's own way around the `Send` limit of `run` on a
+    // bare connection ("implementation of `Acquire` is not general
+    // enough"); `run` is this call after an acquire.
+    migrator
+        .run_direct(None, &mut *conn, false)
+        .await
+        .map_err(|e| MigrateError::Failed(format!("migration failed: {e}")))?;
+    let after = applied(conn).await.map_err(failed)?;
     Ok(MigrateReport {
         version: after.iter().map(|a| a.version).max().unwrap_or(0),
-        applied: after.len().saturating_sub(before),
+        applied: after.len().saturating_sub(before.len()),
     })
 }
 

@@ -1,6 +1,6 @@
 use jamjet_agents::{InMemoryAgentRegistry, SqliteAgentRegistry};
 use jamjet_api::cli::Command;
-use jamjet_api::startup::{self, DevBind};
+use jamjet_api::startup::{self, DevBind, StoreKind};
 use jamjet_api::{config::ApiConfig, routes::build_router_with_opts, state::AppState};
 use jamjet_audit::{AuditEnricher, NoopAuditBackend, SqliteAuditBackend};
 use jamjet_state::{InMemoryBackend, SqliteBackend};
@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
     // Load .env if present
     dotenvy::dotenv().ok();
 
-    // `token create` and `help` run and exit; no arguments serves.
+    // `token create`, `migrate` and `help` run and exit; no arguments serves.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = jamjet_api::cli::parse_args(&args);
     // Before anything reads one: a switch set to something that is not a
@@ -62,6 +62,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Ok(Command::TokenCreate(req)) => return jamjet_api::cli::run_token_create(&req).await,
         Ok(Command::TokenRevoke(id)) => return jamjet_api::cli::run_token_revoke(&id).await,
+        Ok(Command::Migrate { check }) => {
+            std::process::exit(jamjet_api::cli::run_migrate(check).await)
+        }
         Err(e) => {
             eprintln!("jamjet-server: {e}\n\n{}", jamjet_api::cli::USAGE);
             std::process::exit(2);
@@ -114,18 +117,32 @@ async fn main() -> anyhow::Result<()> {
     // Parse the failover generation up front so a misconfiguration fails startup
     // before we open any backend (rather than silently disabling failover-safety).
     let configured_store_term = store_term_from_env()?;
-    let storage_label = if storage_backend == "memory" {
-        "memory"
-    } else {
-        "sqlite"
-    };
+    // `STORAGE_BACKEND=memory` wins; then a `postgres://` or `postgresql://`
+    // URL is Postgres; anything else is SQLite.
+    let store_kind = startup::store_kind(
+        Some(storage_backend.as_str()),
+        &startup::existing_database_url(&config),
+    );
 
     info!(
         port = config.port,
         dev_mode = config.dev_mode,
-        storage = %storage_label,
+        storage = %store_kind.label(),
         "Starting JamJet runtime"
     );
+    // Cron on Postgres would start each schedule once per engine: refuse
+    // the opt-in, skip dev mode's cron, before opening the database.
+    if store_kind == StoreKind::Postgres {
+        if embed_cron {
+            anyhow::bail!("{}", jamjet_api::store::CRON_REFUSAL);
+        }
+        if config.dev_mode {
+            warn!(
+                "{}; the cron scheduler is not started",
+                jamjet_api::store::CRON_REFUSAL
+            );
+        }
+    }
     if remote_dev_mode_allowed {
         warn!(
             bind = %bind_addr,
@@ -143,7 +160,9 @@ async fn main() -> anyhow::Result<()> {
         warn!("JAMJET_ALLOW_SELF_APPROVAL is set: the principal that starts a run may approve it");
     }
 
-    let state = if storage_backend == "memory" {
+    // The Postgres store, for the outbox drain, which runs on its pool.
+    let mut postgres: Option<jamjet_state::PgBackend> = None;
+    let state = if store_kind == StoreKind::Memory {
         info!("Using in-memory storage (ephemeral, no persistence)");
 
         let backend = Arc::new(InMemoryBackend::new());
@@ -170,6 +189,26 @@ async fn main() -> anyhow::Result<()> {
             cron_store: None,
             approval_policy,
         }
+    } else if store_kind == StoreKind::Postgres {
+        let database_url = startup::existing_database_url(&config);
+        // The URL stays out of the logs; the shown form has no password.
+        info!("Connecting to state backend");
+        tracing::debug!(url = %startup::shown_url(&database_url), "State backend URL");
+        warn!("{}", jamjet_api::store::PREVIEW_WARNING);
+        let pg = jamjet_api::store::open_postgres(&database_url).await?;
+        if let Some(term) = configured_store_term {
+            let applied = pg
+                .set_store_term_at_least(term)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to set store term: {e}"))?;
+            info!(
+                store_term = applied,
+                "Applied failover generation from JAMJET_STORE_TERM"
+            );
+        }
+        let state = jamjet_api::store::postgres_state(&pg, approval_policy).await?;
+        postgres = Some(pg);
+        state
     } else {
         // Determine database URL: env > config > SQLite dev default
         let database_url = startup::database_url(&config);
@@ -269,6 +308,13 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move { projector.run().await });
     info!("Projector started");
 
+    // On Postgres, the outbox drain seals the sealed events whose inline
+    // seal was lost: now, and every 2 s.
+    if let Some(pg) = postgres {
+        jamjet_api::store::spawn_outbox_drain(pg, state.enricher.clone());
+        info!("Audit outbox drain started");
+    }
+
     // In dev mode (or when JAMJET_EMBED_WORKERS is set), run an in-process worker
     // pool so submitted workflows actually execute. In production, run dedicated
     // worker processes against the same state backend instead. The base backend
@@ -305,7 +351,7 @@ async fn main() -> anyhow::Result<()> {
     // supported way to run cron, in production too: there is no separate cron
     // process, because one would need its own token and would become the
     // initiator of every run it starts.
-    if (config.dev_mode || embed_cron) && storage_backend != "memory" {
+    if (config.dev_mode || embed_cron) && store_kind == StoreKind::Sqlite {
         let database_url = startup::database_url(&config);
         match jamjet_state::SqliteBackend::open(&database_url).await {
             Ok(b) => {

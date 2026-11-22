@@ -24,7 +24,10 @@ mod tokens;
 mod tx;
 
 pub use outbox::OutboxRow;
-pub use schema::{migrate, schema_state, MigrateReport, SchemaState, MIGRATOR};
+pub use schema::{
+    migrate, migrate_with, schema_state, schema_state_at, MigrateError, MigrateReport, SchemaState,
+    MIGRATE_LOCK, MIGRATOR,
+};
 pub use settings::{
     PgSettings, ACQUIRE_TIMEOUT_ENV, IDLE_IN_TX_TIMEOUT_ENV, LOCK_TIMEOUT_ENV, MIN_POOL_SIZE,
     POOL_SIZE_ENV, STATEMENT_TIMEOUT_ENV,

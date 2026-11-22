@@ -1,9 +1,8 @@
 # Deployment Guide
 
-The runtime is one binary, `jamjet-server`. It keeps state in a SQLite file, or
-in memory for throwaway runs. There is no Postgres backend: the server opens
-any `DATABASE_URL` as SQLite, so a `postgresql://` URL fails at startup with
-`failed to open state backend`.
+The runtime is one binary, `jamjet-server`. It keeps state in a SQLite file, in
+Postgres (a preview, see [Postgres](#postgres-preview)), or in memory for
+throwaway runs.
 
 The runtime is single-tenant. Tokens of any tenant but `default` are refused;
 see [Security](security.md#rbac).
@@ -221,6 +220,84 @@ is missing.
 
 ---
 
+## Postgres (preview)
+
+Several engine instances can share one Postgres database. A `DATABASE_URL`
+that starts `postgres://` or `postgresql://` selects it; `STORAGE_BACKEND=memory`
+still wins over any URL. The server logs `Postgres store (preview)` at start.
+The URL never reaches the logs at info level, and the commands below never
+print its password.
+
+```bash
+export DATABASE_URL=postgres://jamjet:<password>@db.internal:5432/jamjet
+
+# Before each deploy, once:
+jamjet-server migrate
+# schema at version 2 (2 applied)
+
+jamjet-server            # every engine instance
+```
+
+### Migrate before each deploy
+
+`jamjet-server migrate` applies the pending migrations and exits 0. Run it once
+per deploy, before the new instances start. Two runs at once take turns: the
+second waits and then applies nothing. It exits 3 when the database is newer
+than this build and 4 when a migration is half done or differs from this
+build's, and changes nothing in either case.
+
+`jamjet-server migrate --check` changes nothing. It exits 0 when the schema is
+current, 2 when it is behind (or empty), 3 when it is newer, 4 when it is half
+done or changed.
+
+The server checks the schema at start and refuses one it does not match:
+
+- empty or older: run `jamjet-server migrate`;
+- newer: this build is older than the database schema; do not roll back below
+  a schema migration;
+- half done or changed: the message names the migration.
+
+Migrations stay additive for one release (new tables, new columns with
+defaults, new indexes), so instances of the previous build keep running while a
+deploy migrates. A restarted instance of the old build then refuses the newer
+schema, as it should.
+
+On SQLite, `jamjet-server migrate` migrates the file the way the server does
+when it opens it, and `--check` is refused.
+
+### Pool and connections
+
+Each engine opens one pool, shared by the state store, the audit log, the agent
+registry and the audit outbox drain. Each setting is checked at start; a value
+that is set but not valid stops the server, naming the variable.
+
+| Variable | What it does | Default |
+|----------|--------------|---------|
+| `JAMJET_PG_POOL_SIZE` | Connections in the pool, at least 2 | `10` |
+| `JAMJET_PG_ACQUIRE_TIMEOUT_MS` | How long a call waits for a free connection before it answers 503 | `5000` |
+| `JAMJET_PG_STATEMENT_TIMEOUT_MS` | `statement_timeout` on each connection | `30000` |
+| `JAMJET_PG_LOCK_TIMEOUT_MS` | `lock_timeout` on each connection | `10000` |
+| `JAMJET_PG_IDLE_IN_TX_TIMEOUT_MS` | `idle_in_transaction_session_timeout` on each connection | `60000` |
+
+The connection budget is the number of engines times `JAMJET_PG_POOL_SIZE`,
+plus 2 for each `token` command running and 1 for each `migrate`. Keep it under
+the database's `max_connections`, with room for your own tools.
+
+### What differs on Postgres
+
+- Cron is not supported yet: each engine would fire every schedule.
+  `JAMJET_EMBED_CRON=1` stops the server at start. In dev mode the cron
+  scheduler is skipped with a warning, and `/cron` answers 400, as with
+  `STORAGE_BACKEND=memory`.
+- Every engine on one database writes one audit chain, so every engine and
+  every `token` command must use the same audit signing settings
+  ([Signing the audit log](security.md#signing-the-audit-log)).
+- The token commands work as on SQLite, against a migrated database:
+  `jamjet-server token create --role operator` with the same `DATABASE_URL`.
+  A token issued once is accepted by every engine on the database.
+
+---
+
 ## Docker
 
 The repo's `Dockerfile` builds the UI, the server and the Python SDK into one
@@ -346,10 +423,10 @@ any other value.
 | `JAMJET_DEV_MODE` | No authentication, in-process workers and cron. Refused on a non-loopback bind | off |
 | `JAMJET_DEV_MODE_ALLOW_REMOTE` | Let dev mode listen on a non-loopback address (logged as a warning). Requests must still name an allowed host | off |
 | `JAMJET_DEV_ALLOWED_HOSTS` | Host names dev mode answers besides `localhost` and loopback addresses, comma-separated, without scheme or port (`host.docker.internal`) | none |
-| `DATABASE_URL` | SQLite database, as `sqlite://<path>` | `sqlite://.jamjet/runtime.db` in the working directory (`sqlite:///data/runtime.db` in the Docker image) |
-| `STORAGE_BACKEND` | `memory` keeps state in memory and keeps no audit log; any other value uses SQLite | SQLite |
+| `DATABASE_URL` | SQLite database, as `sqlite://<path>`, or Postgres, as `postgres://` or `postgresql://` ([Postgres](#postgres-preview)) | `sqlite://.jamjet/runtime.db` in the working directory (`sqlite:///data/runtime.db` in the Docker image) |
+| `STORAGE_BACKEND` | `memory` keeps state in memory and keeps no audit log; any other value uses the store `DATABASE_URL` names | the store `DATABASE_URL` names |
 | `JAMJET_EMBED_WORKERS` | Runs the in-process worker pool outside dev mode | off (`1` in the Docker image) |
-| `JAMJET_EMBED_CRON` | Runs the cron scheduler outside dev mode (not with `STORAGE_BACKEND=memory`) | off (`1` in the Docker image) |
+| `JAMJET_EMBED_CRON` | Runs the cron scheduler outside dev mode (not with `STORAGE_BACKEND=memory`; refused on Postgres) | off (`1` in the Docker image) |
 | `JAMJET_STORE_TERM` | Failover generation for the lease fence, a non-negative integer. An invalid value fails startup | unset |
 | `JAMJET_PUBLIC_URL` | Base URL used for the `did:web` id in `/.well-known/did.json` | `http://$JAMJET_BIND:$JAMJET_PORT` |
 | `JAMJET_MODEL_SEAM_URL` | Send every model call through the model sidecar at this URL. With the in-process workers on, startup fails if it does not answer `/health` | unset |
