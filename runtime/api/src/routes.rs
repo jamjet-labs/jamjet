@@ -2422,10 +2422,13 @@ async fn claim_for_execution(
         }
         // A read first: only when something matches is the claim (a write
         // transaction) tried.
-        let outcome = if backend.has_claimable(queue_refs, filter).await? {
-            if is_draining() {
-                return Ok(claim_refused("draining"));
-            }
+        let found = backend.has_claimable(queue_refs, filter).await?;
+        // One check after the read covers both answers: a drain that began
+        // during it is not met with a lease or with `not_ready`.
+        if is_draining() {
+            return Ok(claim_refused("draining"));
+        }
+        let outcome = if found {
             backend
                 .claim_for_execution(&body.worker_id, queue_refs, lease_secs, filter)
                 .await?
