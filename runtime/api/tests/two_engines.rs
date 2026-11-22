@@ -266,7 +266,8 @@ async fn two_engines_on_one_sqlite_file_complete_every_node_once() {
 /// as running. Ten complete 50 ms apart, so they meet the scheduler's
 /// 500 ms tick at ten points, and each cancel goes out 20 ms after its
 /// run's completion: whatever the tick's phase, most of those land while
-/// the finish is due. The test asserts at least one cancel did.
+/// the finish is due. The test asserts at least one cancel did, and at least
+/// one of the ten staggered ones, so the bunched group alone cannot pass it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_engines_cancel_and_finish_race_once() {
     for backend in [Backend::Sqlite, Backend::Postgres] {
@@ -364,6 +365,11 @@ async fn two_engines_cancel_and_finish_race_once() {
             assert!(
                 cancelled_while_due >= 1,
                 "no cancel landed while a finish was due, so the race never opened"
+            );
+            assert!(
+                staggered_while_due >= 1,
+                "no staggered cancel landed while its finish was due, so the race \
+                 opened only at one phase of the tick"
             );
         })
         .await;
