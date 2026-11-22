@@ -187,8 +187,18 @@ async fn inject_dev_tenant(
 
 // ── Health ───────────────────────────────────────────────────────────────────
 
+/// `status` never changes: the dev stack's probe reads it. `commit` is what
+/// this binary was built from (a local build from a changed tree reports HEAD),
+/// `features` what it can do that an older engine could not.
 async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+    let commit = env!("JAMJET_COMMIT");
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": if commit.is_empty() { Value::Null } else { json!(commit) },
+        "commit_source": env!("JAMJET_COMMIT_SOURCE"),
+        "features": crate::features::FEATURES,
+    }))
 }
 
 // ── Workflow definitions ─────────────────────────────────────────────────────
