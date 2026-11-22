@@ -36,7 +36,9 @@ pub struct OutboxRow {
 impl PgBackend {
     /// Up to `limit` rows written at least `older_than` ago by the
     /// database's clock, oldest first, each with its event. A tenant's view
-    /// sees only its own tenant's rows.
+    /// sees only its own tenant's rows. A row whose event this build cannot
+    /// read is logged and left out, so it does not hold up the rest; it
+    /// stays in the outbox.
     pub async fn outbox_due(
         &self,
         older_than: Duration,
@@ -57,16 +59,27 @@ impl PgBackend {
         .fetch_all(&self.pool)
         .await
         .map_err(statement_error)?;
-        rows.iter()
-            .map(|row| {
-                Ok(OutboxRow {
-                    event: row_to_event(row)?,
-                    tenant_id: row.try_get("tenant_id").map_err(statement_error)?,
-                    attempts: row.try_get("attempts").map_err(statement_error)?,
-                    gap_recorded: row.try_get("gap_recorded").map_err(statement_error)?,
-                })
-            })
-            .collect()
+        let mut due = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let event = match row_to_event(row) {
+                Ok(event) => event,
+                Err(e) => {
+                    let event_id: Option<Uuid> = row.try_get("id").ok();
+                    tracing::error!(
+                        ?event_id,
+                        "an outbox row's event cannot be read, so it is not sealed: {e}"
+                    );
+                    continue;
+                }
+            };
+            due.push(OutboxRow {
+                event,
+                tenant_id: row.try_get("tenant_id").map_err(statement_error)?,
+                attempts: row.try_get("attempts").map_err(statement_error)?,
+                gap_recorded: row.try_get("gap_recorded").map_err(statement_error)?,
+            });
+        }
+        Ok(due)
     }
 
     /// Count a failed seal of the event's row and keep its error. Answers

@@ -20,13 +20,13 @@ use jamjet_audit::{
     verify_chain, ActorType, AuditBackend, AuditEnricher, AuditError, AuditLogEntry, AuditQuery,
     AuditSigner, PgAuditBackend,
 };
-use jamjet_core::workflow::ExecutionId;
+use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_scheduler::Scheduler;
 use jamjet_state::approvals::SEALED_EVENT_KINDS;
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::{Event, EventKind};
 use jamjet_state::faults::{Fault, Scope};
-use jamjet_state::{PgBackend, PgSettings};
+use jamjet_state::{PgBackend, PgSettings, Tenant, TenantId, TenantStatus};
 use jamjet_testkit::pg::{TestDatabase, POOL_SIZE};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -615,6 +615,122 @@ async fn two_drains_seal_once() {
     assert_eq!(outbox_rows(&env).await, 0);
 }
 
+/// A request in a run of a second tenant: its outbox row and its drained
+/// entry carry that tenant, though the drain runs on the unscoped store. A
+/// view of another tenant neither sees the row nor counts a failure on it;
+/// the run's own tenant's view sees it.
+#[tokio::test]
+async fn a_drained_event_keeps_its_runs_tenant() {
+    let Some(env) = env("a_drained_event_keeps_its_runs_tenant").await else {
+        return;
+    };
+    let now = Utc::now();
+    let acme = TenantId::from("acme");
+    // A tenant is created through its own view, as the tenant routes do.
+    env.pg
+        .for_tenant(acme.clone())
+        .create_tenant(Tenant {
+            id: acme.clone(),
+            name: "Acme".into(),
+            status: TenantStatus::Active,
+            policy: None,
+            limits: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    let eid = ExecutionId::new();
+    env.pg
+        .for_tenant(acme.clone())
+        .create_execution(WorkflowExecution {
+            execution_id: eid.clone(),
+            workflow_id: "wf-outbox".into(),
+            workflow_version: "0.1.0".into(),
+            status: WorkflowStatus::Running,
+            initial_input: json!({}),
+            current_state: json!({}),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+            session_type: None,
+            parent_execution_id: None,
+            segment_number: 0,
+        })
+        .await
+        .unwrap();
+    let request = append_unsealed_request(&env.pg, &eid, "pay").await;
+    let tenant_of_row: String =
+        sqlx::query_scalar("SELECT tenant_id FROM audit_outbox WHERE event_id = $1")
+            .bind(request)
+            .fetch_one(&env.pg.pool())
+            .await
+            .unwrap();
+    assert_eq!(tenant_of_row, "acme", "the row carries the run's tenant");
+
+    let other = env.pg.for_tenant(TenantId::from("default"));
+    assert!(other
+        .outbox_due(Duration::ZERO, 100)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(other.outbox_note_failure(request, "no").await.unwrap(), 0);
+    other.outbox_mark_gap(request).await.unwrap();
+    let own = env.pg.for_tenant(acme.clone());
+    let due = own.outbox_due(Duration::ZERO, 100).await.unwrap();
+    assert_eq!(
+        due.iter()
+            .map(|r| (r.event.id, r.tenant_id.as_str(), r.attempts, r.gap_recorded))
+            .collect::<Vec<_>>(),
+        [(request, "acme", 0, false)],
+        "the other tenant's view changed nothing"
+    );
+
+    let report = drain(&env.pg, &env.enricher, Duration::ZERO, 100).await;
+    assert_eq!((report.due, report.sealed), (1, 1), "{report:?}");
+    let all = entries(&env).await;
+    assert_eq!(all.len(), 1);
+    assert_eq!(
+        (all[0].event_id, all[0].tenant_id.as_str()),
+        (request, "acme")
+    );
+    assert_eq!(outbox_rows(&env).await, 0);
+}
+
+/// An outbox row whose event this build cannot read is left where it is and
+/// does not hold up the rows after it.
+#[tokio::test]
+async fn an_unreadable_row_does_not_hold_up_the_rest() {
+    let Some(env) = env("an_unreadable_row_does_not_hold_up_the_rest").await else {
+        return;
+    };
+    let eid = start(&env).await;
+    let unreadable = append_unsealed_request(&env.pg, &eid, "a").await;
+    let readable = append_unsealed_request(&env.pg, &eid, "b").await;
+    sqlx::query("UPDATE events SET kind_json = 'not json' WHERE id = $1")
+        .bind(unreadable)
+        .execute(&env.pg.pool())
+        .await
+        .unwrap();
+
+    let report = drain(&env.pg, &env.enricher, Duration::ZERO, 100).await;
+    assert_eq!(
+        (report.due, report.sealed, report.error.as_deref()),
+        (1, 1, None),
+        "{report:?}"
+    );
+    let all = entries(&env).await;
+    assert_eq!(
+        all.iter().map(|e| e.event_id).collect::<Vec<_>>(),
+        [readable]
+    );
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT event_id FROM audit_outbox")
+        .fetch_all(&env.pg.pool())
+        .await
+        .unwrap();
+    assert_eq!(left, [unreadable], "the unreadable row stays");
+}
+
 // ── The list of sealed kinds ─────────────────────────────────────────────────
 
 /// A kind a sealer seals, and the files that make its event.
@@ -622,7 +738,8 @@ type Sealed = (&'static str, &'static [&'static str]);
 
 /// Each place the engine seals an event: the file, the function the call
 /// sits in, and the kinds it seals there (`None`: the drain, which seals
-/// what the outbox holds). Each kind is made as `EventKind::<Variant> {` in
+/// what the outbox holds, and `seal_appended`, which seals for its
+/// callers listed here). Each kind is made as `EventKind::<Variant> {` in
 /// the files named with it.
 const SEALERS: &[(&str, &str, Option<&[Sealed]>)] = &[
     (
@@ -652,11 +769,25 @@ const SEALERS: &[(&str, &str, Option<&[Sealed]>)] = &[
         Some(&[("approval_received", &["api/src/approvals.rs"])]),
     ),
     ("audit/src/outbox.rs", "drain", None),
+    // Hands an event from the sealers above that call it to the enricher.
+    ("state/src/approvals.rs", "seal_appended", None),
 ];
 
-/// What the scan looks for. The enricher's own calls of itself
-/// (`audit/src/enricher.rs`) are the seal, not a sealer.
-const SEAL_CALLS: &[&str] = &["seal_appended(", "try_enrich_and_append("];
+/// What the scan looks for: each way into the enricher's seal.
+/// `enrich_and_append(` also matches `try_enrich_and_append(`.
+const SEAL_CALLS: &[&str] = &[
+    "seal_appended(",
+    "enrich_and_append(",
+    "seal_approval_record(",
+];
+
+/// Calls the scan passes over, by file and function: the enricher's entry
+/// points calling its own seal, which are the seal, not a sealer. Each must
+/// still be in the code, so a stale entry cannot hide a new call.
+const INTERNAL: &[(&str, &str)] = &[
+    ("audit/src/enricher.rs", "enrich_and_append"),
+    ("audit/src/enricher.rs", "seal_approval_record"),
+];
 
 /// The source scan finds every call that seals an event, outside the
 /// enricher itself, and each is in [`SEALERS`] with the kinds it seals;
@@ -675,9 +806,6 @@ fn sealed_kinds_list_matches_the_sealers() {
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        if rel == "audit/src/enricher.rs" {
-            continue;
-        }
         let text = std::fs::read_to_string(&file).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         for (n, line) in lines.iter().enumerate() {
@@ -695,6 +823,13 @@ fn sealed_kinds_list_matches_the_sealers() {
                 .unwrap_or_else(|| panic!("{rel}:{}: a seal outside any function", n + 1));
             found.entry((rel.clone(), within)).or_default().push(n + 1);
         }
+    }
+    for (file, within) in INTERNAL {
+        let key = (file.to_string(), within.to_string());
+        assert!(
+            found.remove(&key).is_some(),
+            "{file} {within} no longer calls the seal: drop it from INTERNAL"
+        );
     }
 
     let listed: BTreeSet<(String, String)> = SEALERS
