@@ -3218,6 +3218,36 @@ async fn a_waiting_claim_leases_nothing_once_the_drain_has_started() {
     assert_eq!(body, json!({ "claimed": false, "reason": "draining" }));
 }
 
+/// The drain starts while the claim waits on its read of what is claimable,
+/// and the read says yes: the item is not leased after the drain began.
+#[tokio::test]
+async fn a_claim_whose_read_finds_an_item_leases_nothing_if_the_drain_began_during_it() {
+    let inner: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let hooked = support::hooked::HookedBackend::new(inner.clone(), Arc::new(NoHook));
+    let in_read = hooked.in_has_claimable.clone();
+    let state = make_state(Arc::new(hooked));
+    let workflow = ir("wf-drain-read", Some("by_execution"), None);
+    register(&state, None, workflow.clone()).await;
+    let e = start(&state, None, "wf-drain-read").await;
+    enqueue_second(&inner, workflow, &e).await;
+    let draining = jamjet_api::routes::Draining::default();
+    let flag = draining.clone();
+    *in_read.lock().unwrap() = Some(Arc::new(move || {
+        flag.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let ask = json!({
+        "worker_id": "w", "queue_types": [QUEUE], "execution_id": e,
+        "node_id": "second", "wait_ms": 3000
+    });
+    let body = claim_behind_drain_flag(&state, &draining, ask.clone()).await;
+    assert_eq!(body, json!({ "claimed": false, "reason": "draining" }));
+    // Nothing was leased: a claim with the drain over takes the item.
+    *in_read.lock().unwrap() = None;
+    draining.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    let after = claim_behind_drain_flag(&state, &draining, ask).await;
+    assert_eq!(after["claimed"], true, "{after}");
+}
+
 struct NoHook;
 
 #[async_trait::async_trait]

@@ -2414,13 +2414,18 @@ async fn claim_for_execution(
         // The server is stopping: no item is leased from here on, and a claim
         // answered now ends before the platform's stop timeout. The caller
         // claims again, usually on another instance. A drain is noticed
-        // within one nap, at most half a second.
+        // within one nap, at most half a second. The check is made again after
+        // the read below; a small window remains before the backend write,
+        // because the flag and the write are not atomic.
         if is_draining() {
             return Ok(claim_refused("draining"));
         }
         // A read first: only when something matches is the claim (a write
         // transaction) tried.
         let outcome = if backend.has_claimable(queue_refs, filter).await? {
+            if is_draining() {
+                return Ok(claim_refused("draining"));
+            }
             backend
                 .claim_for_execution(&body.worker_id, queue_refs, lease_secs, filter)
                 .await?
