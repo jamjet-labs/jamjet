@@ -1,0 +1,7 @@
+model: scripted (no API key)
+Booked Casa do Rio for 11 December. Paid the 2400 the reply asked for.
+called search_venues(city='Lisbon', date='2026-12-11')
+called read_reply(venue='Casa do Rio')
+called pay_deposit(venue='Casa do Rio', amount=2400)
+payments.log: 1 line(s)
+paid 2400 for Casa do Rio

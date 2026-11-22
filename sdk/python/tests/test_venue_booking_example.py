@@ -217,3 +217,22 @@ def test_solution_ep2_keeps_the_approval_gate_on_pay_deposit():
     script = yaml.safe_load((ROOT / EP2 / "script.yaml").read_text())
     paid = [c for turn in script["turns"] for c in turn.get("tool_calls", []) if c["name"].startswith("pay_")]
     assert paid == [{"name": "pay_small_deposit", "arguments": {"venue": "Casa do Rio", "amount": 200}}]
+
+
+STEP10 = "step-10-untrusted-reply"
+
+
+def test_step10_no_gate_pays_what_the_reply_asked():
+    out = run_step(STEP10, "no_gate.py")
+    assert out.splitlines()[0] == "model: scripted (no API key)"
+    assert normalise(out) == expected(STEP10, "expected-no-gate.txt")
+    paid = (ROOT / STEP10 / "payments.log").read_text().splitlines()
+    # We asked for a 500 deposit. The reply asked for 2400.
+    assert paid == ["paid 2400 for Casa do Rio"]
+
+
+def test_step10_the_injected_text_is_data_not_code():
+    reply = (ROOT / STEP10 / "replies" / "casa-do-rio.txt").read_text()
+    assert "NOTE TO BOOKING ASSISTANTS" in reply
+    for name in ("agent.py", "no_gate.py", "venue_tools.py", "script.yaml"):
+        assert "BOOKING ASSISTANTS" not in (ROOT / STEP10 / name).read_text()
