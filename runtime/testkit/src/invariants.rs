@@ -45,6 +45,11 @@ pub enum Store {
 pub struct Violation {
     /// The rule's number, 1 to 5, as in the module docs.
     pub rule: u8,
+    /// Which part of the rule, one name per check: `dense` (1),
+    /// `completed_twice` and `live_items` (2), `stranded` (3), `ends`,
+    /// `end_kind`, `after_end` and `unfinished_end` (4), `entries`,
+    /// `genesis`, `chain` and `outbox` (5).
+    pub clause: &'static str,
     /// The run it is about, as the store writes the id; `None` for the
     /// audit chain and the outbox.
     pub run: Option<String>,
@@ -55,8 +60,12 @@ pub struct Violation {
 impl fmt::Display for Violation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.run {
-            Some(run) => write!(f, "rule {} in run {run}: {}", self.rule, self.what),
-            None => write!(f, "rule {}: {}", self.rule, self.what),
+            Some(run) => write!(
+                f,
+                "rule {} ({}) in run {run}: {}",
+                self.rule, self.clause, self.what
+            ),
+            None => write!(f, "rule {} ({}): {}", self.rule, self.clause, self.what),
         }
     }
 }
@@ -187,6 +196,7 @@ pub fn check_snapshot(snapshot: &Snapshot) -> Vec<Violation> {
         if *count > 1 {
             found.push(violation(
                 2,
+                "live_items",
                 Some(run),
                 format!("{count} live items for node {node}"),
             ));
@@ -198,9 +208,10 @@ pub fn check_snapshot(snapshot: &Snapshot) -> Vec<Violation> {
     found
 }
 
-fn violation(rule: u8, run: Option<&str>, what: String) -> Violation {
+fn violation(rule: u8, clause: &'static str, run: Option<&str>, what: String) -> Violation {
     Violation {
         rule,
+        clause,
         run: run.map(str::to_string),
         what,
     }
@@ -213,6 +224,7 @@ fn dense(run: &Run, events: &[&StoredEvent], found: &mut Vec<Violation>) {
         if event.sequence != expected {
             found.push(violation(
                 1,
+                "dense",
                 Some(&run.id),
                 format!(
                     "sequence {} where {expected} was due: the sequences are not 1..{}",
@@ -240,6 +252,7 @@ fn once_per_dispatch(run: &Run, events: &[&StoredEvent], found: &mut Vec<Violati
                 if *n == 2 {
                     found.push(violation(
                         2,
+                        "completed_twice",
                         Some(&run.id),
                         format!(
                             "node {node} completed twice for one dispatch (sequence {})",
@@ -292,6 +305,7 @@ fn nothing_stranded(
         if state == Held::Scheduled && !live.contains_key(&(run.id.as_str(), node)) {
             found.push(violation(
                 3,
+                "stranded",
                 Some(&run.id),
                 format!("node {node} is scheduled and has no live item"),
             ));
@@ -310,6 +324,7 @@ fn one_end(run: &Run, events: &[&StoredEvent], found: &mut Vec<Violation>) {
         if run.status != "limit_exceeded" && !ends.is_empty() {
             found.push(violation(
                 4,
+                "unfinished_end",
                 Some(&run.id),
                 format!(
                     "a {} run has a terminal event ({})",
@@ -323,6 +338,7 @@ fn one_end(run: &Run, events: &[&StoredEvent], found: &mut Vec<Violation>) {
     let [end] = ends.as_slice() else {
         found.push(violation(
             4,
+            "ends",
             Some(&run.id),
             format!(
                 "a {} run has {} terminal events, not one",
@@ -339,6 +355,7 @@ fn one_end(run: &Run, events: &[&StoredEvent], found: &mut Vec<Violation>) {
     if ends_as != Some(run.status.as_str()) {
         found.push(violation(
             4,
+            "end_kind",
             Some(&run.id),
             format!("a {} run ends with {}", run.status, end.kind_type()),
         ));
@@ -347,6 +364,7 @@ fn one_end(run: &Run, events: &[&StoredEvent], found: &mut Vec<Violation>) {
         if later.kind_type() != "audit_seal_failed" {
             found.push(violation(
                 4,
+                "after_end",
                 Some(&run.id),
                 format!(
                     "{} at sequence {} after the terminal event",
@@ -374,6 +392,7 @@ fn sealed_once(snapshot: &Snapshot, audit: &AuditState, found: &mut Vec<Violatio
         if n != 1 {
             found.push(violation(
                 5,
+                "entries",
                 Some(&event.run),
                 format!(
                     "{} at sequence {} has {n} audit entries, not one",
@@ -392,6 +411,7 @@ fn sealed_once(snapshot: &Snapshot, audit: &AuditState, found: &mut Vec<Violatio
         if genesis != 1 {
             found.push(violation(
                 5,
+                "genesis",
                 None,
                 format!("the chain has {genesis} entries with no predecessor, not one"),
             ));
@@ -399,6 +419,7 @@ fn sealed_once(snapshot: &Snapshot, audit: &AuditState, found: &mut Vec<Violatio
         if let Err(e) = verify_chain(&audit.entries, &AuditSigner::new(AUDIT_KEY)) {
             found.push(violation(
                 5,
+                "chain",
                 None,
                 format!("the chain does not verify: {e}"),
             ));
@@ -408,6 +429,7 @@ fn sealed_once(snapshot: &Snapshot, audit: &AuditState, found: &mut Vec<Violatio
     if !waiting.is_empty() {
         found.push(violation(
             5,
+            "outbox",
             None,
             format!(
                 "the outbox still holds {} events: {waiting:?}",

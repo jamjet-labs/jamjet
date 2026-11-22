@@ -453,46 +453,76 @@ async fn skewed_engine_does_not_expire_an_approval_early() {
     .await;
 }
 
-/// The invariant check names each rule a store breaks: an engine finishes
-/// six runs cleanly, the check finds nothing, then one rule is broken in
-/// each run (two for rule 2) and the check names exactly those.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_invariants_name_each_broken_rule() {
-    for backend in [Backend::Sqlite, Backend::Postgres] {
-        let case = format!("the_invariants_name_each_broken_rule ({backend:?})");
-        let Some(store) = TestStore::on(backend, &case).await else {
-            continue;
+/// The invariant check names each part of each rule a store breaks: an
+/// engine finishes twelve runs cleanly, the check finds nothing, then each
+/// run gets one break (one gets an allowed `AuditSealFailed` after its end)
+/// and the check must name exactly those, by rule, part and run.
+async fn names_each_broken_rule(backend: Backend, case: &str) {
+    let Some(store) = TestStore::on(backend, case).await else {
+        return;
+    };
+    within(case, Duration::from_secs(30), async {
+        let ids = finish_runs(&store, 12).await;
+        assert!(store.check().await.is_empty(), "{:?}", store.check().await);
+        let mut expected = BTreeSet::new();
+        let mut expect = |rule: u8, clause: &'static str, run: Option<&String>| {
+            expected.insert((rule, clause, run.cloned()));
         };
-        within(&case, Duration::from_secs(30), async {
-            let ids = finish_runs(&store, 6).await;
-            assert!(store.check().await.is_empty(), "{:?}", store.check().await);
-            let mut expected = BTreeSet::new();
-            breaks::delete_the_first_event(&store, &ids[0]).await;
-            expected.insert((1, Some(ids[0].clone())));
-            breaks::revive_two_items(&store, &ids[1]).await;
-            expected.insert((2, Some(ids[1].clone())));
-            breaks::complete_twice(&store, &ids[5]).await;
-            expected.insert((2, Some(ids[5].clone())));
-            breaks::reopen_with_a_node_scheduled(&store, &ids[2]).await;
-            expected.insert((3, Some(ids[2].clone())));
-            breaks::end_twice(&store, &ids[3]).await;
-            expected.insert((4, Some(ids[3].clone())));
-            if backend == Backend::Postgres {
-                breaks::drop_an_audit_entry(&store, &ids[4]).await;
-                // The missing entry, and the chain it no longer links.
-                expected.insert((5, Some(ids[4].clone())));
-                expected.insert((5, None));
-            }
-            let found: BTreeSet<(u8, Option<String>)> = store
-                .check()
-                .await
-                .into_iter()
-                .map(|v| (v.rule, v.run))
-                .collect();
-            assert_eq!(found, expected, "{:#?}", store.check().await);
-        })
-        .await;
-    }
+        breaks::delete_the_first_event(&store, &ids[0]).await;
+        expect(1, "dense", Some(&ids[0]));
+        breaks::revive_two_items(&store, &ids[1]).await;
+        expect(2, "live_items", Some(&ids[1]));
+        breaks::complete_twice(&store, &ids[2]).await;
+        expect(2, "completed_twice", Some(&ids[2]));
+        breaks::reopen_with_a_node_scheduled(&store, &ids[3]).await;
+        expect(3, "stranded", Some(&ids[3]));
+        breaks::end_twice(&store, &ids[4]).await;
+        expect(4, "ends", Some(&ids[4]));
+        breaks::append_after_the_end(&store, &ids[5]).await;
+        expect(4, "after_end", Some(&ids[5]));
+        // Allowed: a seal gap recorded after the run ended.
+        breaks::seal_gap_after_the_end(&store, &ids[6]).await;
+        breaks::set_status(&store, &ids[7], "failed").await;
+        expect(4, "end_kind", Some(&ids[7]));
+        breaks::set_status(&store, &ids[8], "running").await;
+        expect(4, "unfinished_end", Some(&ids[8]));
+        if backend == Backend::Postgres {
+            breaks::drop_an_audit_entry(&store, &ids[9]).await;
+            expect(5, "entries", Some(&ids[9]));
+            // The entry after it no longer links.
+            expect(5, "chain", None);
+            breaks::refill_the_outbox(&store, &ids[10]).await;
+            expect(5, "outbox", None);
+            breaks::drop_the_genesis(&store).await;
+            expect(5, "genesis", None);
+        }
+        let found: BTreeSet<(u8, &'static str, Option<String>)> = store
+            .check()
+            .await
+            .into_iter()
+            .map(|v| (v.rule, v.clause, v.run))
+            .collect();
+        assert_eq!(found, expected, "{:#?}", store.check().await);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_invariants_name_each_broken_rule_on_sqlite() {
+    names_each_broken_rule(
+        Backend::Sqlite,
+        "the_invariants_name_each_broken_rule_on_sqlite",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_invariants_name_each_broken_rule_on_postgres() {
+    names_each_broken_rule(
+        Backend::Postgres,
+        "the_invariants_name_each_broken_rule_on_postgres",
+    )
+    .await;
 }
 
 /// `n` runs of `approve` then `work`, finished by one engine; their ids as
@@ -517,14 +547,16 @@ async fn finish_runs(store: &TestStore, n: usize) -> Vec<String> {
         Answers::default(),
         stop.clone(),
     );
-    let mut ids = Vec::new();
+    let mut runs = Vec::new();
     for _ in 0..n {
-        let run = start_run(&http, &a.base(), &store.developer, &workflow).await;
+        runs.push(start_run(&http, &a.base(), &store.developer, &workflow).await);
+    }
+    for run in &runs {
         let row = engine::wait_for_request(
             &http,
             &a.base(),
             &store.reviewer,
-            &run,
+            run,
             Duration::from_secs(10),
         )
         .await;
@@ -532,8 +564,8 @@ async fn finish_runs(store: &TestStore, n: usize) -> Vec<String> {
             .await
             .unwrap();
         assert_eq!(st, 200, "{body}");
-        ids.push(db_id(&run));
     }
+    let ids: Vec<String> = runs.iter().map(|r| db_id(r)).collect();
     finished(store, &ids, Duration::from_secs(20)).await;
     stop.store(true, Ordering::SeqCst);
     w.await.unwrap();
@@ -646,6 +678,107 @@ mod breaks {
                  SELECT {id}, execution_id, sequence + 1, {kind_type}kind_json, created_at \
                  FROM events WHERE execution_id = '{run}' AND sequence = \
                  (SELECT MAX(sequence) FROM events WHERE execution_id = '{run}')"
+            ),
+        )
+        .await;
+    }
+
+    /// Rule 4: an event after the run's end, a copy of its last
+    /// `NodeScheduled` at the next sequence.
+    pub async fn append_after_the_end(store: &TestStore, run: &str) {
+        copy_to_the_end(store, run, "node_scheduled").await;
+    }
+
+    /// Allowed by rule 4: an `AuditSealFailed` after the run's end, made
+    /// from a copy of its last event with its kind rewritten.
+    pub async fn seal_gap_after_the_end(store: &TestStore, run: &str) {
+        let gap = serde_json::json!({
+            "type": "audit_seal_failed",
+            "event_id": uuid::Uuid::new_v4(),
+            "sequence": 3,
+            "event_type": "tool_approval_required",
+            "error": "the audit log was unreachable",
+        })
+        .to_string();
+        let (id, kind_type, kind_value) = if store.file().is_some() {
+            (format!("'{}'", uuid::Uuid::new_v4()), "", "")
+        } else {
+            (
+                "gen_random_uuid()".to_string(),
+                "kind_type, node_id, ",
+                "'audit_seal_failed', NULL, ",
+            )
+        };
+        sql(
+            store,
+            format!(
+                "INSERT INTO events (id, execution_id, sequence, {kind_type}kind_json, created_at) \
+                 SELECT {id}, execution_id, sequence + 1, {kind_value}'{gap}', created_at \
+                 FROM events WHERE execution_id = '{run}' AND sequence = \
+                 (SELECT MAX(sequence) FROM events WHERE execution_id = '{run}')"
+            ),
+        )
+        .await;
+    }
+
+    /// Rule 4: the run's status, set without its events.
+    pub async fn set_status(store: &TestStore, run: &str, status: &str) {
+        sql(
+            store,
+            format!(
+                "UPDATE workflow_executions SET status = '{status}' WHERE execution_id = '{run}'"
+            ),
+        )
+        .await;
+    }
+
+    /// Rule 5: an outbox row again for the run's sealed decision.
+    pub async fn refill_the_outbox(store: &TestStore, run: &str) {
+        sql(
+            store,
+            format!(
+                "INSERT INTO audit_outbox (event_id, execution_id, sequence, tenant_id, kind_type) \
+                 SELECT id, execution_id, sequence, tenant_id, kind_type FROM events \
+                 WHERE execution_id = '{run}' AND kind_type = 'approval_received'"
+            ),
+        )
+        .await;
+    }
+
+    /// Rule 5: the chain's first entry gone, so no entry is its genesis.
+    pub async fn drop_the_genesis(store: &TestStore) {
+        sql(
+            store,
+            "DELETE FROM audit_log WHERE prev_hash IS NULL".to_string(),
+        )
+        .await;
+    }
+
+    /// A copy of the run's last event of `kind`, at the run's next
+    /// sequence.
+    async fn copy_to_the_end(store: &TestStore, run: &str, kind: &str) {
+        let (id, kind_type, of_kind) = if store.file().is_some() {
+            (
+                format!("'{}'", uuid::Uuid::new_v4()),
+                "",
+                format!("kind_json LIKE '%\"type\":\"{kind}\"%'"),
+            )
+        } else {
+            (
+                "gen_random_uuid()".to_string(),
+                "kind_type, node_id, ",
+                format!("kind_type = '{kind}'"),
+            )
+        };
+        sql(
+            store,
+            format!(
+                "INSERT INTO events (id, execution_id, sequence, {kind_type}kind_json, created_at) \
+                 SELECT {id}, execution_id, \
+                   (SELECT MAX(sequence) + 1 FROM events WHERE execution_id = '{run}'), \
+                   {kind_type}kind_json, created_at \
+                 FROM events WHERE execution_id = '{run}' AND sequence = \
+                 (SELECT MAX(sequence) FROM events WHERE execution_id = '{run}' AND {of_kind})"
             ),
         )
         .await;
