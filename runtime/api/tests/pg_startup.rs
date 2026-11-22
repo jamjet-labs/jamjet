@@ -12,7 +12,7 @@
 //! environment, against a database of its own. Without
 //! `JAMJET_TEST_POSTGRES_URL` the cases skip.
 
-use jamjet_state::postgres::{migrate_with, MIGRATE_LOCK, MIGRATOR};
+use jamjet_state::postgres::{migrate_with, MigrateError, SchemaState, MIGRATE_LOCK, MIGRATOR};
 use jamjet_testkit::pg::TestDatabase;
 use sqlx::PgPool;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -606,6 +606,30 @@ async fn a_failed_migration_leaves_the_previous_version_and_frees_the_lock() {
         assert!(again.is_err(), "the same migration fails again");
         assert_eq!(recorded(&pool).await, vec![(1, 1)]);
         let _ = std::fs::remove_dir_all(&source);
+    })
+    .await;
+}
+
+/// A migrate refused on a newer schema closes its connection too, so the
+/// lock it took before reading the schema is free when it returns.
+#[tokio::test]
+async fn a_refused_migration_frees_the_lock() {
+    within_budget(async {
+        let Some(db) = empty("a_refused_migration_frees_the_lock").await else {
+            return;
+        };
+        make_older(&db).await;
+        let pool = db.pool().await;
+        make_ahead(&pool).await;
+        let refused = migrate_with(db.url(), &MIGRATOR).await;
+        assert!(
+            matches!(
+                refused,
+                Err(MigrateError::Refused(SchemaState::Ahead { .. }))
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(advisory_locks_held(&pool).await, 0, "no lock is left held");
     })
     .await;
 }
