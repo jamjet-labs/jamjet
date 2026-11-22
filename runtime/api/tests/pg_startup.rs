@@ -191,12 +191,24 @@ fn request(
     token: Option<&str>,
     body: Option<&serde_json::Value>,
 ) -> (u16, String) {
+    let body = body.map(|b| b.to_string()).unwrap_or_default();
+    request_raw(addr, method, path, token, &body)
+}
+
+/// `method path` on `addr` with `token` and `body` sent as it is, for a body
+/// no `serde_json::Value` can hold.
+fn request_raw(
+    addr: &str,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: &str,
+) -> (u16, String) {
     let mut conn = std::net::TcpStream::connect(addr).unwrap();
     conn.set_read_timeout(Some(WAIT)).unwrap();
     let auth = token
         .map(|t| format!("Authorization: Bearer {t}\r\n"))
         .unwrap_or_default();
-    let body = body.map(|b| b.to_string()).unwrap_or_default();
     write!(
         conn,
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\n\
@@ -834,6 +846,77 @@ async fn token_created_on_postgres_works_on_two_engines() {
             .await
             .unwrap();
     assert_eq!(sealed, ["token_issued", "token_revoked"], "{sealed:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Request bodies ───────────────────────────────────────────────────────────
+
+/// A JSON body with a lone surrogate escape (`\ud800`) is refused with 400
+/// before it reaches the store, so no run is created: the text a Postgres
+/// column would refuse never gets that far. The same body with a valid
+/// escape starts a run, so the count can see one.
+#[tokio::test]
+async fn a_body_with_a_lone_surrogate_is_400() {
+    let dir = temp_dir();
+    let Some(db) = migrated("a_body_with_a_lone_surrogate_is_400", &dir).await else {
+        return;
+    };
+    let created = run(
+        &dir,
+        db.url(),
+        &["token", "create", "--role", "developer"],
+        &[],
+    );
+    assert_eq!(created.code, Some(0), "{}", created.all());
+    let token = created.stdout.trim().to_string();
+    let engine = serve(&dir, db.url(), &[]);
+
+    let node = serde_json::json!({
+        "id": "a",
+        "kind": { "type": "python_fn", "module": "myapp.steps", "function": "a", "output_schema": "" },
+        "retry_policy": null, "node_timeout_secs": null, "description": null,
+        "labels": {}, "policy": null
+    });
+    let ir = serde_json::json!({
+        "workflow_id": "wf-surrogate", "version": "0.1.0", "name": null, "description": null,
+        "state_schema": "", "start_node": "a", "nodes": { "a": node },
+        "edges": [{ "from": "a", "to": "end", "condition": null }],
+        "retry_policies": {}, "timeouts": {}, "models": {}, "tools": {},
+        "mcp_servers": {}, "remote_agents": {}, "labels": {}
+    });
+    let (st, body) = request(
+        &engine.addr,
+        "POST",
+        "/workflows",
+        Some(&token),
+        Some(&serde_json::json!({ "ir": ir })),
+    );
+    assert!((200..300).contains(&st), "{st} {body}");
+
+    let pool = db.pool().await;
+    let runs = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM workflow_executions")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let start = |escape: &str| {
+        format!(
+            r#"{{"workflow_id":"wf-surrogate","workflow_version":"0.1.0","input":{{"x":"\{escape}"}}}}"#
+        )
+    };
+
+    let lone = start("ud800");
+    assert!(lone.contains(r#""x":"\ud800""#), "{lone}");
+    let (st, body) = request_raw(&engine.addr, "POST", "/executions", Some(&token), &lone);
+    assert_eq!(st, 400, "{body}");
+    assert_eq!(runs().await, 0, "a refused body created a run");
+
+    let valid = start("u00e9");
+    let (st, body) = request_raw(&engine.addr, "POST", "/executions", Some(&token), &valid);
+    assert!((200..300).contains(&st), "{st} {body}");
+    assert_eq!(runs().await, 1, "a valid body starts one run");
+    drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
