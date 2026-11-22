@@ -85,6 +85,12 @@ fn worker_model(tools: &[&str]) -> Value {
     kind
 }
 
+/// `kind` with no prompt: the model reads the conversation in state.
+fn without_prompt(mut kind: Value) -> Value {
+    kind["prompt_ref"] = json!("");
+    kind
+}
+
 fn python_fn(function: &str) -> Value {
     json!({ "type": "python_fn", "module": "app.steps", "function": function, "output_schema": "" })
 }
@@ -359,6 +365,17 @@ impl Run {
             .filter(|k| matches!(k, EventKind::NodeFailed { node_id, .. } if node_id == node))
             .map(|k| serde_json::to_value(k).unwrap())
             .collect()
+    }
+
+    /// How many approval requests were raised for `node`.
+    async fn approval_requests(&self, node: &str) -> usize {
+        self.events()
+            .await
+            .into_iter()
+            .filter(
+                |k| matches!(k, EventKind::ToolApprovalRequired { node_id, .. } if node_id == node),
+            )
+            .count()
     }
 
     /// The error `node` failed with for good, if it did.
@@ -1364,10 +1381,6 @@ async fn autonomy_limits_count_a_worker_model_step() {
 /// only the node's own system prompt.
 #[tokio::test]
 async fn a_step_whose_prompt_cannot_be_built_fails_at_claim_as_in_the_engine() {
-    let without_prompt = |mut kind: Value| {
-        kind["prompt_ref"] = json!("");
-        kind
-    };
     let cases = [
         (
             "a template naming state the run lacks",
@@ -1702,6 +1715,223 @@ async fn a_budget_that_cannot_be_counted_is_never_handed_out() {
             "{name}: {again}"
         );
     }
+}
+
+/// For the guard-order test: spend the run's 100-token cap with its `pay`
+/// step, or gate every node behind an approval.
+async fn spend_or_gate(run: &Run, gated: bool) {
+    if gated {
+        set_tenant_policy(
+            run,
+            json!({ "blocked_tools": [], "require_approval_for": ["*"], "model_allowlist": [] }),
+        )
+        .await;
+    } else {
+        run.http_step(json!({ "input_tokens": 100, "output_tokens": 0 }))
+            .await;
+        run.tick().await;
+    }
+}
+
+/// A worker model step with no prompt to send meets the same guard first,
+/// as in process: on a spent run the claim answers `budget` and records the
+/// trip, and under an approval gate it answers `approval_required` and asks
+/// for the approval. Neither fails the step for its prompt.
+#[tokio::test]
+async fn the_guard_decides_before_a_missing_prompt_as_in_process() {
+    for gated in [false, true] {
+        let engine_backends = support::backends().await;
+        let worker_backends = support::backends().await;
+        for (engine_tb, worker_tb) in engine_backends.into_iter().zip(worker_backends) {
+            let case = if gated { "gated" } else { "spent" };
+            let workflow = |kind: Value| {
+                if gated {
+                    ir("wf-guard-first", &[("think", kind)], json!({}))
+                } else {
+                    ir(
+                        "wf-guard-first",
+                        &[("pay", python_fn("pay")), ("think", kind)],
+                        json!({ "token_budget": { "total_tokens": 100 } }),
+                    )
+                }
+            };
+            let engine_run = start(engine_tb, workflow(without_prompt(engine_model(&[])))).await;
+            let name = engine_run.name;
+            spend_or_gate(&engine_run, gated).await;
+            let (registry, calls) = scripted_registry();
+            let worker = jamjet_worker::Worker::new(
+                "engine".into(),
+                engine_run.backend.clone(),
+                vec!["model".into()],
+            )
+            .register_executor(
+                "model",
+                Arc::new(jamjet_worker::ModelNodeExecutor::new(registry)),
+            );
+            assert!(worker.poll_and_execute().await.unwrap(), "{name}: {case}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{name}: {case}");
+
+            let worker_run = start(worker_tb, workflow(without_prompt(worker_model(&[])))).await;
+            spend_or_gate(&worker_run, gated).await;
+            let body = worker_run.claim_as("router").await;
+            let reason = if gated { "approval_required" } else { "budget" };
+            assert_eq!(
+                body,
+                json!({ "claimed": false, "reason": reason }),
+                "{name}: {case}: {:?}",
+                worker_run.log().await
+            );
+
+            for (what, run) in [("in process", &engine_run), ("at claim", &worker_run)] {
+                let failures = run.failures("think").await;
+                assert!(
+                    failures.iter().all(|f| !f["error"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("ModelNodeExecutor")),
+                    "{name}: {case}: {what}: failed for its prompt first: {failures:?}"
+                );
+                assert_eq!(
+                    run.approval_requests("think").await,
+                    usize::from(gated),
+                    "{name}: {case}: {what}: {:?}",
+                    run.log().await
+                );
+            }
+            assert_eq!(
+                worker_run.trips().await,
+                engine_run.trips().await,
+                "{name}: {case}"
+            );
+            assert_eq!(
+                worker_run.failures("think").await,
+                engine_run.failures("think").await,
+                "{name}: {case}"
+            );
+            if !gated {
+                assert_eq!(worker_run.trips().await.len(), 1, "{name}: {case}");
+            }
+        }
+    }
+}
+
+/// Appends a parallel step's completion, `tokens` input tokens, to `run`'s
+/// log right after the `after`-th read of that log (`get_events`) returns.
+struct CompletesAfterRead {
+    inner: Arc<dyn StateBackend>,
+    run: ExecutionId,
+    after: usize,
+    tokens: u64,
+    reads: AtomicUsize,
+}
+
+/// A parallel step's completion of `tokens` input tokens, for `run`.
+fn parallel_step(run: &ExecutionId, tokens: u64) -> jamjet_state::Event {
+    jamjet_state::Event::new(
+        run.clone(),
+        0,
+        EventKind::NodeCompleted {
+            node_id: "side".into(),
+            output: json!({}),
+            state_patch: json!({}),
+            duration_ms: 1,
+            gen_ai_system: None,
+            gen_ai_model: Some(MODEL.into()),
+            input_tokens: Some(tokens),
+            output_tokens: Some(0),
+            finish_reason: Some("stop".into()),
+            cost_usd: None,
+            provenance: None,
+            idempotency_key: Some("side-step".into()),
+        },
+    )
+}
+
+#[async_trait::async_trait]
+impl Hooks for CompletesAfterRead {
+    async fn after(&self, op: &Op<'_>) {
+        if let Op::GetEvents(id) = op {
+            if **id == self.run && self.reads.fetch_add(1, Ordering::SeqCst) + 1 == self.after {
+                self.inner
+                    .append_event(parallel_step(&self.run, self.tokens))
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+}
+
+/// `budget_left` is never more than the claim's own cap check left. A
+/// parallel step completes while the claim decides, right after the claim's
+/// `k`-th read of the run's log (`k` 0: before the claim). Whether the check
+/// counted it shows in a twin claim where that completion alone spends the
+/// 2000-token cap: refused with `budget`. When the check counted a 1999-token
+/// completion, the step is handed out with at most the 1 token left.
+#[tokio::test]
+async fn budget_left_never_exceeds_what_the_claims_cap_check_left() {
+    const CAP: u64 = 2000;
+    let capped = json!({ "token_budget": { "total_tokens": CAP } });
+    // What a claim answers when the parallel step's `tokens` land after its
+    // `k`-th read of the log.
+    let claim = |k: usize, tokens: u64, tb: TestBackend| {
+        let capped = capped.clone();
+        async move {
+            let run = start(tb, one_step("wf-race", &[], capped)).await;
+            let name = run.name;
+            if k == 0 {
+                run.backend
+                    .append_event(parallel_step(&run.eid, tokens))
+                    .await
+                    .unwrap();
+            }
+            let hooks = Arc::new(CompletesAfterRead {
+                inner: run.backend.clone(),
+                run: run.eid.clone(),
+                after: k,
+                tokens,
+                reads: AtomicUsize::new(0),
+            });
+            let racing = support::make_state(Arc::new(Intercept::new(run.backend.clone(), hooks)));
+            let (st, body) = send(
+                &racing,
+                "POST",
+                "/work-items/claim",
+                None,
+                claim_request("router", &run.id),
+            )
+            .await;
+            assert_eq!(st, 200, "{name}: {body}");
+            (name, body)
+        }
+    };
+    let mut counted_once = false;
+    for k in 0..=3 {
+        for (spent_tb, partial_tb) in support::backends()
+            .await
+            .into_iter()
+            .zip(support::backends().await)
+        {
+            let (name, spent) = claim(k, CAP, spent_tb).await;
+            let (_, partial) = claim(k, CAP - 1, partial_tb).await;
+            assert_eq!(partial["claimed"], json!(true), "{name}: k {k}: {partial}");
+            let left = partial["work_item"]["budget_left"]["total_tokens"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{name}: k {k}: {partial}"));
+            let counted = spent == json!({ "claimed": false, "reason": "budget" });
+            if counted {
+                counted_once = true;
+                assert!(
+                    left <= 1,
+                    "{name}: k {k}: the check counted {} tokens of {CAP} and the worker was told {left} are left",
+                    CAP - 1
+                );
+            } else {
+                assert_eq!(spent["claimed"], json!(true), "{name}: k {k}: {spent}");
+                assert!(left <= CAP, "{name}: k {k}: {partial}");
+            }
+        }
+    }
+    assert!(counted_once, "no injection point was counted by the check");
 }
 
 /// A model step its run's worker runs is enqueued by the engine only, so

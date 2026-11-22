@@ -3169,27 +3169,6 @@ async fn gate_claimed_item(
         Ok(caps) => caps,
         Err(reason) => return fail_closed(backend, wi, reason).await,
     };
-    // A model step its run's worker runs is handed out with what the run's
-    // caps leave. Counted before the guard, so a log that cannot be read
-    // withholds the step before the guard records anything for it (an
-    // agent's step, an approval used). Never "no cap" for want of a read.
-    let worker_model = crate::worker_model::is_worker_model(&kind);
-    let budget_left = if worker_model {
-        match crate::worker_model::budget_left_of_run(backend, &wi.execution_id, &caps).await {
-            Ok(left) => Some(left),
-            Err(reason) => {
-                warn!(
-                    execution_id = %wi.execution_id,
-                    node_id = %wi.node_id,
-                    %reason,
-                    "claim: could not count what the run's caps leave; withholding the payload"
-                );
-                return ClaimGate::Withhold(Refusal::NotReady);
-            }
-        }
-    } else {
-        None
-    };
     let GuardInputs {
         workflow_policy,
         workflow_agent,
@@ -3242,27 +3221,49 @@ async fn gate_claimed_item(
     .await
     {
         DispatchGuardOutcome::Allow => {
+            if !crate::worker_model::is_worker_model(&kind) {
+                return ClaimGate::Release { budget_left: None };
+            }
             // A model step whose request holds no prompt to send fails here,
             // after the same guard and with the same words as in the
             // in-process model executor, not retryable. Handed out, its
             // worker would have to make the prompt up.
-            if worker_model {
-                if let Some(reason) = crate::worker_model::missing_prompt(&wi.payload) {
-                    // A re-check writes nothing: the claim decides the item
-                    // again in `Fire` mode.
-                    if mode == jamjet_worker::node_guard::GuardMode::Complete {
-                        return ClaimGate::Withhold(Refusal::Blocked);
-                    }
+            if let Some(reason) = crate::worker_model::missing_prompt(&wi.payload) {
+                // A re-check writes nothing: the claim decides the item again
+                // in `Fire` mode.
+                if mode == jamjet_worker::node_guard::GuardMode::Complete {
+                    return ClaimGate::Withhold(Refusal::Blocked);
+                }
+                warn!(
+                    execution_id = %wi.execution_id,
+                    node_id = %wi.node_id,
+                    %reason,
+                    "claim: the model step has no prompt to send; failing the node"
+                );
+                return fail_node(backend, wi, reason).await;
+            }
+            // Handed out with what the run's caps leave, counted from a read
+            // of the log made after the guard admitted the step. The log only
+            // grows, so this counts at least what the cap check counted, and
+            // the worker is never told it has more than the check left. A
+            // count that fails hands nothing out and records nothing more:
+            // never "no cap" for want of a read. In `Fire` mode the guard
+            // counts first of all, so a log that cannot be read at all stops
+            // the step there, before anything is recorded.
+            match crate::worker_model::budget_left_of_run(backend, &wi.execution_id, &caps).await {
+                Ok(left) => ClaimGate::Release {
+                    budget_left: Some(left),
+                },
+                Err(reason) => {
                     warn!(
                         execution_id = %wi.execution_id,
                         node_id = %wi.node_id,
                         %reason,
-                        "claim: the model step has no prompt to send; failing the node"
+                        "claim: could not count what the run's caps leave; withholding the payload"
                     );
-                    return fail_node(backend, wi, reason).await;
+                    ClaimGate::Withhold(Refusal::NotReady)
                 }
             }
-            ClaimGate::Release { budget_left }
         }
 
         // The guard already recorded the `PolicyViolation`. A block is a

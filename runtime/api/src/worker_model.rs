@@ -227,7 +227,9 @@ mod tests {
     }
 
     /// Integer nano-dollars: $0.10 and $0.20 leave nothing of $0.30, and
-    /// exactly $0.20 of $0.50.
+    /// exactly $0.20 of $0.50. $0.10 leaves exactly $0.20 of $0.30 and $0.58
+    /// exactly $0.42 of $1.00, where subtracting in `f64` gives
+    /// 0.19999999999999998 and 0.42000000000000004.
     #[test]
     fn cents_are_counted_exactly() {
         let u = usage(&[(Some(1), Some(1), Some(0.1)), (Some(1), Some(1), Some(0.2))]);
@@ -238,6 +240,16 @@ mod tests {
         assert_eq!(
             budget_left(&caps(None, None, None, Some(0.5)), &u).cost_usd,
             Some(0.2)
+        );
+        let dime = usage(&[(Some(1), Some(1), Some(0.1))]);
+        assert_eq!(
+            budget_left(&caps(None, None, None, Some(0.3)), &dime).cost_usd,
+            Some(0.2)
+        );
+        let spent = usage(&[(Some(1), Some(1), Some(0.58))]);
+        assert_eq!(
+            budget_left(&caps(None, None, None, Some(1.0)), &spent).cost_usd,
+            Some(0.42)
         );
     }
 
