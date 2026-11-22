@@ -32,7 +32,6 @@ import enum
 import hashlib
 import importlib.metadata
 import json
-import math
 import re
 import sys
 import time
@@ -57,6 +56,8 @@ from jamjet.cli.demo import demo_app
 from jamjet.client import JamjetClient
 from jamjet.deploy import LOCAL_RUNTIME_URL
 from jamjet.transport import OutcomeUnknown
+from jamjet.worker_step import failure_report as _failure_report  # noqa: F401  (still imported from here)
+from jamjet.worker_step import run_claimed_item
 
 # ── Logo — block letter J  (0=bg  1=yellow#f5c518  2=orange#ea580c) ──────────
 # 6×7 grid: clean J — top bar + vertical stem + orange hook at base.
@@ -200,26 +201,6 @@ def _print_error(label: str, message: object) -> None:
     if label:
         console.print(label, style="red", end=" ")
     console.print(_safe(message), markup=False, highlight=False, soft_wrap=True)
-
-
-def _failure_report(exc: BaseException) -> str:
-    """The error text a worker sends with ``fail_work_item``.
-
-    When the runtime refused the result, its error body can quote the output
-    back; sending that to ``/fail`` would store server-echoed values in the
-    event log, so only the status goes. Any other HTTP error came from the
-    handler's own call: report its status, host and path (not the query
-    string, which can carry tokens) without blaming the runtime.
-    """
-    from jamjet.client import JamjetAPIError
-
-    if isinstance(exc, httpx.HTTPStatusError):
-        request = exc.request
-        status = exc.response.status_code
-        if isinstance(exc, JamjetAPIError):
-            return f"runtime refused the result: HTTP {status} for {request.method} {request.url.path}"
-        return f"HTTP {status} from {request.method} {request.url.scheme}://{request.url.host}{request.url.path}"
-    return str(exc)
 
 
 def _event_kind(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -2024,24 +2005,6 @@ def workers(
     asyncio.run(_workers())
 
 
-def _reported_usage(output: dict[str, Any]) -> dict[str, Any]:
-    """Token usage and cost a node reports in its output, for the engine to
-    charge to the agent the node acts for. Only values that are a spend are
-    forwarded: non-negative integers below 2**64 for tokens (the engine reads
-    a u64 and refuses the whole result otherwise), a non-negative finite number
-    for cost (a negative cost would refund an agent's budget, and the engine
-    refuses one). Booleans are not numbers here."""
-    usage: dict[str, Any] = {}
-    for key in ("input_tokens", "output_tokens"):
-        v = output.get(key)
-        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2**64:
-            usage[key] = v
-    cost = output.get("cost_usd")
-    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
-        usage["cost_usd"] = float(cost)
-    return usage
-
-
 async def _worker_loop(
     client: Any,
     worker_id: str,
@@ -2053,42 +2016,25 @@ async def _worker_loop(
 ) -> None:
     """Core python_tool worker polling loop, separated for testability.
 
-    Claim work items from *queues*, resolve the handler named by
-    ``payload["module"]`` / ``payload["function"]``, invoke it with
-    ``payload["input"]``, and post complete / fail back to the runtime.
-    ``lease_secs`` is the lease the worker asks the engine for on every claim
-    (the engine default, 30 s, when ``None``); a worker running long steps
-    asks for what it can heartbeat comfortably. Heartbeats are sent every
-    ``heartbeat_interval_s`` seconds, by default a third of the lease the
-    engine granted (the claim answer's ``lease_secs``), from a task on the
-    event loop. A heartbeat answer that carries a new
-    ``lease_fence`` means the engine re-attached a lease that had expired
-    while it was unreachable; the worker completes with that fence. A synchronous handler
-    therefore runs in a worker thread (``asyncio.to_thread``), never on the
-    loop: on 2026-09-06 a blocking 50 s handler starved the heartbeat, the
-    30 s lease lapsed, and the step was re-run until it was dead-lettered.
+    Claim work items from *queues* and hand each one to
+    :func:`~jamjet.worker_step.run_claimed_item`, which resolves the handler
+    named by ``payload["module"]`` / ``payload["function"]``, invokes it with
+    ``payload["input"]``, heartbeats the lease and posts complete / fail back
+    to the runtime under the lease fence. ``lease_secs`` is the lease the
+    worker asks the engine for on every claim (the engine default, 30 s, when
+    ``None``); a worker running long steps asks for what it can heartbeat
+    comfortably. Heartbeats are sent every ``heartbeat_interval_s`` seconds,
+    by default a third of the lease the engine granted (the claim answer's
+    ``lease_secs``). A synchronous handler runs in a worker thread
+    (``asyncio.to_thread``), never on the loop: on 2026-09-06 a blocking 50 s
+    handler starved the heartbeat, the 30 s lease lapsed, and the step was
+    re-run until it was dead-lettered.
 
     The engine answers a heartbeat with ``cancel_requested`` once the
     execution is cancelled. The worker then sets ``cancel_requested`` on the
     handler's :class:`~jamjet.worker_context.WorkContext`, stops waiting for
     the result, and reports nothing for the item.
     """
-    import importlib as _importlib
-
-    from jamjet.worker_context import WorkContext, reset_current_work, set_current_work
-
-    def _heartbeat_interval(work_item: dict[str, Any]) -> float:
-        # Pace from the lease the engine GRANTED, which it echoes in the claim
-        # answer and which may differ from the one asked for (it holds requests
-        # to [5, 3600] s). Pacing from the request let a worker that asked for
-        # 20000 s heartbeat every 6667 s against a 3600 s lease.
-        if heartbeat_interval_s is not None:
-            return heartbeat_interval_s
-        granted = work_item.get("lease_secs")
-        if not isinstance(granted, (int, float)) or isinstance(granted, bool) or granted <= 0:
-            granted = lease_secs or 30
-        return max(1.0, granted / 3)
-
     while True:
         try:
             if lease_secs is not None:
@@ -2101,175 +2047,13 @@ async def _worker_loop(
                 await asyncio.sleep(2)
                 continue
 
-            item_id: str = work_item["id"]
-            exec_id: str = work_item["execution_id"]
-            node_id: str = work_item["node_id"]
-            payload: dict[str, Any] = work_item.get("payload", {})
-            # The fence can change once: a heartbeat that re-attaches an
-            # expired lease returns a newer one, and every later call must
-            # carry it. A one-slot holder keeps the closures below in step.
-            lease = {"fence": int(work_item.get("lease_fence", 0))}
-            # Echoed on complete so the engine records the result against it.
-            idempotency_key: str | None = work_item.get("idempotency_key")
-
-            console.print(f"[cyan]Claimed[/cyan] id={item_id} node=[bold]{node_id}[/bold] exec={exec_id}")
-            interval = _heartbeat_interval(work_item)
-
-            ctx = WorkContext(item_id=item_id, execution_id=exec_id, node_id=node_id)
-            ctx_token = set_current_work(ctx)
-            handler_task: asyncio.Task[Any] | None = None
-
-            # Keep the lease alive while the handler runs, and stop the handler
-            # when the engine says the execution was cancelled.
-            async def _heartbeat_loop() -> None:
-                while True:
-                    await asyncio.sleep(interval)
-                    try:
-                        answer = await client.heartbeat_work_item(item_id, worker_id, lease["fence"])
-                    except Exception as hb_err:
-                        console.print(f"[yellow]Heartbeat error:[/yellow] {hb_err}")
-                        continue
-                    if not isinstance(answer, dict):
-                        continue
-                    new_fence = answer.get("lease_fence")
-                    if isinstance(new_fence, int) and new_fence != lease["fence"]:
-                        console.print(
-                            f"[yellow]Lease re-attached[/yellow] id={item_id} fence {lease['fence']} -> {new_fence}"
-                        )
-                        lease["fence"] = new_fence
-                    if answer.get("cancel_requested"):
-                        ctx.cancel_requested.set()
-                        if handler_task is not None:
-                            handler_task.cancel()
-                        return
-
-            hb_task = asyncio.create_task(_heartbeat_loop())
-
-            t_start = time.monotonic()
-            try:
-                mod_path = payload.get("module")
-                fn_path = payload.get("function")
-                if not mod_path or not fn_path:
-                    raise ValueError(f"work item payload missing 'module' or 'function': {sorted(payload)}")
-
-                mod = _importlib.import_module(mod_path)
-                fn: Any = mod
-                for part in fn_path.split("."):
-                    fn = getattr(fn, part)
-
-                tool_input = payload.get("input", {})
-
-                # Inject deterministic seeds so handlers can opt into replay fidelity.
-                from jamjet.runtime.local.seed import _inject_seeds
-
-                _inject_seeds(exec_id)
-
-                async def _run_handler() -> Any:
-                    # A coroutine function runs on the loop; anything else runs in
-                    # a thread so the heartbeat task keeps the lease alive. The
-                    # thread inherits this context, so `current_work()` works there.
-                    if asyncio.iscoroutinefunction(fn):
-                        return await fn(tool_input)
-                    outcome = await asyncio.to_thread(fn, tool_input)
-                    if asyncio.iscoroutine(outcome) or asyncio.isfuture(outcome):
-                        outcome = await outcome
-                    return outcome
-
-                handler_task = asyncio.create_task(_run_handler())
-                try:
-                    result = await handler_task
-                except asyncio.CancelledError:
-                    if not ctx.cancel_requested.is_set():
-                        raise
-                    console.print(
-                        f"[yellow]Abandoned[/yellow] id={item_id} node=[bold]{node_id}[/bold]: execution cancelled"
-                    )
-                    if once:
-                        return
-                    continue
-
-                duration_ms = int((time.monotonic() - t_start) * 1000)
-                output: Any = result if isinstance(result, dict) else {"result": result}
-
-                # The node mutates workflow state with its return value: a
-                # PythonFn node's return dict IS its `state_patch` (merge-patched
-                # into state, top-level keys replaced). This is what carries the
-                # agent loop's `dispatch_tool_calls` return — {"messages": [...]}
-                # — into state["messages"] for the next turn's model node.
-                # A non-dict return is coerced to {"result": <value>} above, so a
-                # plain tool additively records {"result": ...}; nodes that mean
-                # to leave state untouched simply return {}.
-                #
-                # This is a deliberate semantic (return-as-state_patch), NOT a bug.
-                # Caveat (F-2j-statepatch-namespace): because top-level keys are
-                # replaced, a plain @tool that returns a dict must avoid the loop's
-                # reserved keys (e.g. "messages", "last_model_output") or it will
-                # clobber loop state. There is no key namespacing yet; that is a
-                # tracked follow-up, not handled here.
-                state_patch: dict[str, Any] = output
-
-                # Forward optional GenAI telemetry if the tool surfaced it.
-                gen_ai_model_field: str | None = None
-                finish_reason_field: str | None = None
-                usage: dict[str, Any] = {}
-                if isinstance(output, dict):
-                    gen_ai_model_field = output.get("gen_ai_model") or None
-                    finish_reason_field = output.get("finish_reason") or None
-                    usage = _reported_usage(output)
-
-                try:
-                    await client.complete_work_item(
-                        item_id,
-                        exec_id,
-                        node_id,
-                        output,
-                        state_patch,
-                        duration_ms,
-                        gen_ai_model=gen_ai_model_field,
-                        finish_reason=finish_reason_field,
-                        # Echo the lease fence from the claim (or the re-attached one)
-                        # so the runtime can fence the completion. Omitted when
-                        # 0/absent, keeping the unfenced fallback backward-compatible.
-                        lease_fence=lease["fence"],
-                        idempotency_key=idempotency_key,
-                        **usage,
-                    )
-                except Exception as complete_exc:
-                    # A 409 means our echoed fence no longer matches: the lease was
-                    # reclaimed and a NEW worker owns this item now. This (stale)
-                    # worker must NOT fail_work_item — that would clobber the
-                    # reclaimed work the new claimant is running and defeat the fence.
-                    # Treat the lost lease as a no-op and move on. httpx surfaces the
-                    # rejection as HTTPStatusError carrying .response.status_code.
-                    status = getattr(getattr(complete_exc, "response", None), "status_code", None)
-                    if status == 409:
-                        console.print(f"[yellow]Completion rejected; lease lost[/yellow] id={item_id}")
-                        if once:
-                            return
-                        continue
-                    # Any other completion error keeps the existing fail behavior.
-                    raise
-                console.print(f"[green]Completed[/green] id={item_id} node=[bold]{node_id}[/bold] {duration_ms}ms")
-            except Exception as exc:
-                _print_error("Failed", f"node={node_id}: {exc}")
-                try:
-                    # Echo the fence here for the same reason completion does: it
-                    # proves the lease is still ours. It also buys the retry and
-                    # dead-letter semantics — without it the runtime settles the
-                    # item, emits no NodeFailed, and the execution never finishes.
-                    await client.fail_work_item(item_id, _failure_report(exc), lease_fence=lease["fence"])
-                except Exception as fail_exc:
-                    # 409: the lease was reclaimed while this node was failing, so
-                    # a new claimant owns the item. Reporting our failure would
-                    # kill work that is currently running under a newer fence.
-                    status = getattr(getattr(fail_exc, "response", None), "status_code", None)
-                    if status == 409:
-                        console.print(f"[yellow]Failure report rejected; lease lost[/yellow] id={item_id}")
-                    else:
-                        raise
-            finally:
-                hb_task.cancel()
-                reset_current_work(ctx_token)
+            await run_claimed_item(
+                client,
+                worker_id,
+                work_item,
+                heartbeat_interval_s=heartbeat_interval_s,
+                lease_secs=lease_secs,
+            )
 
             if once:
                 return
