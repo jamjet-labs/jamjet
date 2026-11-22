@@ -408,6 +408,101 @@ pub fn check_store_env(config: &ApiConfig) -> anyhow::Result<()> {
     }
 }
 
+/// The seconds the platform gives between SIGTERM and SIGKILL, when it is not
+/// the default. Read at startup. An integer of at least 1.
+pub const STOP_TIMEOUT_ENV: &str = "JAMJET_STOP_TIMEOUT_SECS";
+
+/// How long a serverless platform waits after SIGTERM before it kills the
+/// process, when [`STOP_TIMEOUT_ENV`] does not say.
+pub const PLATFORM_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Room left in the stop timeout for the process to exit after the drains.
+pub const STOP_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a shutdown may take, as startup works it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownPlan {
+    /// How long in-flight work gets (`JAMJET_SHUTDOWN_GRACE_SECS`).
+    pub grace: std::time::Duration,
+    /// The time the platform gives after SIGTERM, when there is one.
+    pub stop_timeout: Option<std::time::Duration>,
+}
+
+fn secs_var(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    least: u64,
+) -> Result<Option<std::time::Duration>, String> {
+    let Some(raw) = get(name) else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n >= least => Ok(Some(std::time::Duration::from_secs(n))),
+        _ => Err(format!(
+            "invalid {name} `{raw}`: expected a whole number of seconds, at least {least}"
+        )),
+    }
+}
+
+/// The grace and the stop timeout. With a stop timeout (set, or implied by a
+/// platform) the grace defaults to what is left of it after the scheduler
+/// and HTTP drains and a margin, and a grace that does not fit stops startup:
+/// the platform would kill the process mid-drain. Without one the grace
+/// defaults to [`jamjet_worker::shutdown::DEFAULT_SHUTDOWN_GRACE`].
+pub fn shutdown_plan(
+    get: impl Fn(&str) -> Option<String>,
+    platform: bool,
+) -> Result<ShutdownPlan, String> {
+    use jamjet_worker::shutdown::{DEFAULT_SHUTDOWN_GRACE, HTTP_DRAIN, SCHEDULER_STOP};
+    const GRACE_ENV: &str = "JAMJET_SHUTDOWN_GRACE_SECS";
+    let stop_timeout = match secs_var(&get, STOP_TIMEOUT_ENV, 1)? {
+        Some(t) => Some(t),
+        None => platform.then_some(PLATFORM_STOP_TIMEOUT),
+    };
+    let set_grace = secs_var(&get, GRACE_ENV, 0)?;
+    let Some(stop) = stop_timeout else {
+        return Ok(ShutdownPlan {
+            grace: set_grace.unwrap_or(DEFAULT_SHUTDOWN_GRACE),
+            stop_timeout,
+        });
+    };
+    let fixed = SCHEDULER_STOP + HTTP_DRAIN + STOP_MARGIN;
+    if stop < fixed {
+        return Err(format!(
+            "{STOP_TIMEOUT_ENV}={} is too short: the scheduler and HTTP drains need {} s \
+             plus {} s margin",
+            stop.as_secs(),
+            (SCHEDULER_STOP + HTTP_DRAIN).as_secs(),
+            STOP_MARGIN.as_secs()
+        ));
+    }
+    let grace = set_grace.unwrap_or(stop - fixed);
+    if grace + fixed > stop {
+        return Err(format!(
+            "{GRACE_ENV}={} does not fit {STOP_TIMEOUT_ENV}={}: grace {} + scheduler {} + \
+             HTTP drain {} + margin {} = {} s, more than the stop timeout. Lower \
+             {GRACE_ENV} or raise {STOP_TIMEOUT_ENV}.",
+            grace.as_secs(),
+            stop.as_secs(),
+            grace.as_secs(),
+            SCHEDULER_STOP.as_secs(),
+            HTTP_DRAIN.as_secs(),
+            STOP_MARGIN.as_secs(),
+            (grace + fixed).as_secs()
+        ));
+    }
+    Ok(ShutdownPlan {
+        grace,
+        stop_timeout,
+    })
+}
+
+/// [`shutdown_plan`] on the process environment.
+pub fn shutdown_plan_from_env() -> anyhow::Result<ShutdownPlan> {
+    let platform = on_serverless_platform(|k| std::env::var(k).ok());
+    shutdown_plan(|k| std::env::var(k).ok(), platform).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,5 +875,61 @@ mod tests {
         assert!(on_serverless_platform(
             |k| (k == "K_SERVICE").then(|| "svc".to_string())
         ));
+    }
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn the_platform_default_grace_is_four_seconds() {
+        use std::time::Duration;
+        let plan = shutdown_plan(env(&[("K_SERVICE", "svc")]), true).unwrap();
+        assert_eq!(plan.grace, Duration::from_secs(4));
+        assert_eq!(plan.stop_timeout, Some(Duration::from_secs(10)));
+        let plan = shutdown_plan(env(&[]), false).unwrap();
+        assert_eq!(plan.grace, Duration::from_secs(20));
+        assert_eq!(plan.stop_timeout, None);
+        // An explicit stop timeout off a platform sets the grace too.
+        let plan = shutdown_plan(env(&[("JAMJET_STOP_TIMEOUT_SECS", "30")]), false).unwrap();
+        assert_eq!(plan.grace, Duration::from_secs(24));
+        assert_eq!(plan.stop_timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn a_grace_that_does_not_fit_is_refused() {
+        use std::time::Duration;
+        let err = shutdown_plan(env(&[("JAMJET_SHUTDOWN_GRACE_SECS", "20")]), true).unwrap_err();
+        assert!(err.contains("26"), "{err}");
+        assert!(err.contains("10"), "{err}");
+        assert!(err.contains("JAMJET_SHUTDOWN_GRACE_SECS"), "{err}");
+        assert!(err.contains("JAMJET_STOP_TIMEOUT_SECS"), "{err}");
+        // The largest grace that fits 10 s is 4 s.
+        assert!(shutdown_plan(env(&[("JAMJET_SHUTDOWN_GRACE_SECS", "5")]), true).is_err());
+        let plan = shutdown_plan(env(&[("JAMJET_SHUTDOWN_GRACE_SECS", "4")]), true).unwrap();
+        assert_eq!(plan.grace, Duration::from_secs(4));
+        let err = shutdown_plan(env(&[("JAMJET_STOP_TIMEOUT_SECS", "5")]), true).unwrap_err();
+        assert!(err.contains("5 s plus 1 s margin"), "{err}");
+        let plan = shutdown_plan(env(&[("JAMJET_STOP_TIMEOUT_SECS", "6")]), true).unwrap();
+        assert_eq!(plan.grace, Duration::ZERO);
+        assert_eq!(plan.stop_timeout, Some(Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn bad_values_are_refused() {
+        for name in ["JAMJET_STOP_TIMEOUT_SECS", "JAMJET_SHUTDOWN_GRACE_SECS"] {
+            for bad in ["abc", "-1", ""] {
+                let pairs = [(name, bad)];
+                assert!(shutdown_plan(env(&pairs), true).is_err(), "{name}={bad:?}");
+                assert!(shutdown_plan(env(&pairs), false).is_err(), "{name}={bad:?}");
+            }
+        }
+        // A stop timeout of 0 is not a timeout.
+        assert!(shutdown_plan(env(&[("JAMJET_STOP_TIMEOUT_SECS", "0")]), false).is_err());
     }
 }

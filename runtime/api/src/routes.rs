@@ -959,12 +959,15 @@ pub async fn refuse_claims_while_draining(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let mut req = req;
     if draining.0.load(std::sync::atomic::Ordering::SeqCst)
         && req.method() == axum::http::Method::POST
         && req.uri().path() == "/work-items/claim"
     {
         return nothing_to_claim().into_response();
     }
+    // A claim already waiting for its item reads this to stop waiting.
+    req.extensions_mut().insert(draining);
     next.run(req).await
 }
 
@@ -2039,6 +2042,7 @@ async fn claim_work_item(
     Extension(tenant_id): Extension<TenantId>,
     token: Option<Extension<jamjet_state::ApiToken>>,
     dev: Option<Extension<crate::auth::DevMode>>,
+    draining: Option<Extension<Draining>>,
     Json(body): Json<ClaimWorkItemRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
@@ -2085,6 +2089,7 @@ async fn claim_work_item(
             &filter,
             token.as_ref().map(|Extension(t)| t),
             dev.is_some(),
+            draining.as_ref().map(|Extension(d)| d),
         )
         .await;
     }
@@ -2358,7 +2363,9 @@ async fn claim_for_execution(
     filter: &jamjet_state::ClaimFilter,
     token: Option<&jamjet_state::ApiToken>,
     dev_mode: bool,
+    draining: Option<&Draining>,
 ) -> Result<Json<Value>, ApiError> {
+    let is_draining = || draining.is_some_and(|d| d.0.load(std::sync::atomic::Ordering::SeqCst));
     let Some(execution_id) = filter.execution_id.clone() else {
         return Ok(claim_refused("not_found"));
     };
@@ -2436,8 +2443,24 @@ async fn claim_for_execution(
                 if left.is_zero() {
                     return Ok(claim_refused("not_ready"));
                 }
-                tokio::time::sleep(left.min(pause)).await;
+                // The server is stopping: a claim answered now ends before
+                // the platform's stop timeout, and the caller claims again
+                // on the next instance.
+                if is_draining() {
+                    return Ok(claim_refused("draining"));
+                }
+                // A drain is noticed within a tenth of a second, whatever the
+                // poll interval has grown to.
+                let nap = if draining.is_some() {
+                    pause.min(std::time::Duration::from_millis(100))
+                } else {
+                    pause
+                };
+                tokio::time::sleep(left.min(nap)).await;
                 pause = (pause * 2).min(std::time::Duration::from_millis(500));
+                if is_draining() {
+                    return Ok(claim_refused("draining"));
+                }
                 // The run may have ended while this waited.
                 if !run_is_live(backend.as_ref(), &execution_id).await? {
                     settle_items_of_ended_run(
