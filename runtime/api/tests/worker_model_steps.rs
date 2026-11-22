@@ -2985,6 +2985,60 @@ async fn tokens_missing_is_400() {
     }
 }
 
+/// Under a cap, a step that reports no token counts may have paid, and its
+/// spend cannot be counted: the answer is refused and the step fails for
+/// good, so a retry never pays again with the first spend lost. The run
+/// fails on the next pass. Without a cap it is a plain 400
+/// (`tokens_missing_is_400`).
+#[tokio::test]
+async fn tokens_missing_under_a_cap_fails_the_step_for_good() {
+    for (cap, caps) in [
+        ("a dollar cap", json!({ "cost_budget_usd": 1.0 })),
+        (
+            "a token cap",
+            json!({ "token_budget": { "total_tokens": 1000 } }),
+        ),
+    ] {
+        for (what, keys) in [
+            ("no input tokens", &["input_tokens"][..]),
+            ("no tokens", &["input_tokens", "output_tokens"][..]),
+        ] {
+            for tb in support::backends().await {
+                let run = start(tb, one_step("wf-tokens-capped", &["search"], caps.clone())).await;
+                let name = run.name;
+                let wi = run.step().await;
+                let (st, body) = run
+                    .complete(&wi, result_of(&wi, answer_without(keys)))
+                    .await;
+                assert_eq!(st, 400, "{name}, {cap}, {what}: {body}");
+                assert_eq!(body["completed"], json!(false), "{name}, {cap}, {what}");
+                assert!(
+                    run.completions("think").await.is_empty(),
+                    "{name}, {cap}, {what}"
+                );
+                assert!(
+                    run.failed_for_good("think").await.is_some(),
+                    "{name}, {cap}, {what}: {:?}",
+                    run.log().await
+                );
+                let id = uuid::Uuid::parse_str(wi["id"].as_str().unwrap()).unwrap();
+                assert!(
+                    run.tb.is_settled(id).await,
+                    "{name}, {cap}, {what}: the item is still the worker's"
+                );
+                let (st, body) = run.complete(&wi, result_of(&wi, answer())).await;
+                assert_eq!(st, 409, "{name}, {cap}, {what}: sent again: {body}");
+                run.tick().await;
+                assert_eq!(
+                    run.status().await,
+                    WorkflowStatus::Failed,
+                    "{name}, {cap}, {what}"
+                );
+            }
+        }
+    }
+}
+
 /// A cost must be a number from 0 to 10,000, as for any step. Without a
 /// dollar cap a bad one is refused and nothing is recorded. Under one, the
 /// step may have paid and its spend cannot be counted, so it fails for good.

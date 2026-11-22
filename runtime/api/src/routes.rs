@@ -3891,6 +3891,7 @@ async fn complete_work_item(
                 wi,
                 node,
                 fence,
+                Uncounted::Cost,
                 &problem,
                 state.agents.as_ref(),
             )
@@ -4260,19 +4261,38 @@ async fn complete_worker_model_step(
         }
     };
 
-    let tokens = match answer.tokens() {
-        Ok(tokens) => tokens,
-        Err(reason) => return refused(StatusCode::BAD_REQUEST, reason),
+    // The step ran and may have paid. Under a cap that cannot count it, a
+    // retry would pay again with the first spend lost, so the step fails
+    // for good instead; without one, nothing is recorded.
+    let counted = match answer.tokens() {
+        Err(problem) => Err((Uncounted::Tokens, problem)),
+        Ok(tokens) => match uncountable_cost(answer.cost_usd, answer.cost_currency.as_deref()) {
+            Some(problem) => Err((Uncounted::Cost, problem)),
+            None => Ok(tokens),
+        },
     };
-    if let Some(problem) = uncountable_cost(answer.cost_usd, answer.cost_currency.as_deref()) {
-        if fail_uncounted_step(backend, wi, node, fence, &problem, state.agents.as_ref()).await? {
-            return refused(
-                StatusCode::BAD_REQUEST,
-                format!("{problem}; the run has a dollar cap, so the step failed"),
-            );
+    let tokens = match counted {
+        Ok(tokens) => tokens,
+        Err((what, problem)) => {
+            if fail_uncounted_step(
+                backend,
+                wi,
+                node,
+                fence,
+                what,
+                &problem,
+                state.agents.as_ref(),
+            )
+            .await?
+            {
+                return refused(
+                    StatusCode::BAD_REQUEST,
+                    format!("{problem}; the run has {}, so the step failed", what.cap()),
+                );
+            }
+            return refused(StatusCode::BAD_REQUEST, problem);
         }
-        return refused(StatusCode::BAD_REQUEST, problem);
-    }
+    };
 
     if let Some(problem) = answer.malformed(&node.inputs.node_def.kind) {
         return refused(StatusCode::UNPROCESSABLE_ENTITY, problem);
@@ -4423,10 +4443,40 @@ fn uncountable_cost(cost_usd: Option<f64>, cost_currency: Option<&str>) -> Optio
     None
 }
 
-/// Fail for good the step of `wi`, whose node is `node` and whose reported
-/// cost cannot be counted, when its run has a dollar cap. Returns whether
-/// the step failed. For every kind, a model step its run's worker ran
-/// included.
+/// What a step reported that its run's caps cannot count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Uncounted {
+    /// A cost that is not a number from 0 to the ceiling in USD: a dollar
+    /// cap cannot count it.
+    Cost,
+    /// No token counts, which a model step its run's worker ran must
+    /// report: its answer is not recorded, so no cap counts what it spent.
+    Tokens,
+}
+
+impl Uncounted {
+    /// Whether the step's run has a cap that cannot count it: a dollar cap
+    /// for a cost, any cap for missing tokens.
+    fn defeats(self, caps: &jamjet_state::RunCaps) -> bool {
+        match self {
+            Self::Cost => caps.cost_budget_usd.is_some(),
+            Self::Tokens => caps.cost_budget_usd.is_some() || caps.token_budget.is_some(),
+        }
+    }
+
+    /// The cap it defeats, as the answer names it.
+    fn cap(self) -> &'static str {
+        match self {
+            Self::Cost => "a dollar cap",
+            Self::Tokens => "a cap",
+        }
+    }
+}
+
+/// Fail for good the step of `wi`, whose node is `node` and which reported
+/// `what` its run's caps cannot count, when the run has such a cap
+/// ([`Uncounted::defeats`]). Returns whether the step failed. For every
+/// kind, a model step its run's worker ran included.
 ///
 /// One fenced `commit_turn_unless_terminal` settles the item and appends
 /// `NodeFailed { retryable: false }`, as a claim refusal does, and the
@@ -4443,21 +4493,22 @@ async fn fail_uncounted_step(
     wi: &WorkItem,
     node: &RecordedNode,
     fence: i64,
+    what: Uncounted,
     problem: &str,
     agents: &dyn jamjet_agents::AgentRegistry,
 ) -> Result<bool, ApiError> {
-    // `cost_budget_usd` set in the run's stored IR, whatever its value, read
-    // as the claim gate reads it.
+    // The caps set in the run's stored IR, whatever their values, read as
+    // the claim gate reads them.
     match caps_from_raw(&node.ir) {
-        Ok(caps) if caps.cost_budget_usd.is_some() => {}
+        Ok(caps) if what.defeats(&caps) => {}
         Ok(_) => return Ok(false),
         Err(e) => {
-            warn!(work_item_id = %wi.id, error = %e, "complete: could not read the run's dollar cap");
+            warn!(work_item_id = %wi.id, error = %e, "complete: could not read the run's caps");
             return Ok(false);
         }
     }
     if let Err((status, reason)) = completion_gate(backend, wi, node, agents).await {
-        warn!(work_item_id = %wi.id, %reason, "complete: an uncountable cost on a step the gate refuses");
+        warn!(work_item_id = %wi.id, %reason, "complete: an uncountable step the gate refuses");
         if status == StatusCode::SERVICE_UNAVAILABLE {
             return Err(ApiError::Unavailable(reason));
         }
@@ -4468,7 +4519,12 @@ async fn fail_uncounted_step(
         0,
         jamjet_state::EventKind::NodeFailed {
             node_id: wi.node_id.clone(),
-            error: format!("the step reported a cost the run's dollar cap cannot count: {problem}"),
+            error: match what {
+                Uncounted::Cost => {
+                    format!("the step reported a cost the run's dollar cap cannot count: {problem}")
+                }
+                Uncounted::Tokens => format!("the run's caps cannot count the step: {problem}"),
+            },
             attempt: wi.attempt,
             retryable: false,
         },
@@ -4481,9 +4537,9 @@ async fn fail_uncounted_step(
         Ok(jamjet_state::TurnCommit::ExecutionTerminal(_)) => Ok(false),
         Err(jamjet_state::StateBackendError::FenceLost(_)) => Ok(false),
         Err(e) => {
-            warn!(work_item_id = %wi.id, error = %e, "complete: could not fail a step with an uncountable cost");
+            warn!(work_item_id = %wi.id, error = %e, "complete: could not fail an uncountable step");
             Err(ApiError::Unavailable(format!(
-                "could not fail the step for its uncountable cost: {e}"
+                "could not fail the step its caps cannot count: {e}"
             )))
         }
     }
