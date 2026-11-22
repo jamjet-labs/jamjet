@@ -727,7 +727,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - The Postgres tests run when `JAMJET_TEST_POSTGRES_URL` names a server
     (`runtime/scripts/pg-test.sh up` starts one in Docker) and skip otherwise.
     `JAMJET_REQUIRE_POSTGRES_TESTS=1` makes a missing URL a failure, as in CI. The tenant
-    check, `pg_scope`, runs the conformance suite once more on a tenant's view.
+    check, `pg_scope`, runs the conformance suite once more on a tenant's view. On Postgres
+    the log order case runs eight writers of 250 appends each, not 2,000: each conditional
+    append reads the whole log, so its cost grows with the square of the count.
 
 ### Fixed
 

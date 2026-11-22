@@ -180,6 +180,14 @@ pub async fn log_order_matches_sequence_order_under_concurrency(fx: &Fixture) {
     ) {
         return;
     }
+    // Each conditional append reads the whole log under the run's lock, so
+    // the cost grows with the square of the count. On Postgres 8 x 2,000
+    // took about 430 s of the suite's 465 s; 8 x 250 keeps eight writers
+    // racing on one log in a few seconds.
+    let per_writer = match fx.kind {
+        StoreKind::Postgres | StoreKind::PostgresScoped => 250,
+        _ => 2000,
+    };
     let b = fx.backend.clone();
     let id = ExecutionId::new();
     b.create_execution(exec(&id)).await.unwrap();
@@ -188,7 +196,7 @@ pub async fn log_order_matches_sequence_order_under_concurrency(fx: &Fixture) {
         let b = b.clone();
         let id = id.clone();
         tasks.push(tokio::spawn(async move {
-            for _ in 0..2000 {
+            for _ in 0..per_writer {
                 if t % 2 == 0 {
                     b.append_event(Event::new(id.clone(), 0, request()))
                         .await
@@ -206,7 +214,7 @@ pub async fn log_order_matches_sequence_order_under_concurrency(fx: &Fixture) {
         t.await.unwrap();
     }
     let log = b.get_events(&id).await.unwrap();
-    assert_eq!(log.len(), 16_000);
+    assert_eq!(log.len(), 8 * per_writer);
     let out_of_order = log
         .windows(2)
         .filter(|w| w[0].sequence >= w[1].sequence)
