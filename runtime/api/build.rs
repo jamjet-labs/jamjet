@@ -32,26 +32,35 @@ fn main() {
     let vcs = std::fs::read_to_string(manifest.join(".cargo_vcs_info.json")).ok();
 
     // Rebuild when HEAD moves. `--git-path` works in a worktree, where `.git`
-    // is a file.
-    if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
-        println!(
-            "cargo:rerun-if-changed={}",
-            resolve(&manifest, &head).display()
-        );
-    }
-    if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        if let Some(p) = git(&["rev-parse", "--git-path", &r]) {
-            println!(
-                "cargo:rerun-if-changed={}",
-                resolve(&manifest, &p).display()
-            );
+    // is a file. Cargo treats a watched file that does not exist as always
+    // changed, so only paths that exist are watched. After `git gc` the
+    // branch's own file is gone, and the next commit creates it again: then
+    // its directory is watched instead, which changes when the file appears.
+    // A new repository has no `packed-refs`; the loose refs cover it.
+    let path_of = |args: &[&str]| git(args).map(|p| resolve(&manifest, &p));
+    let watch = |path: &std::path::Path| println!("cargo:rerun-if-changed={}", path.display());
+    if let Some(head) = path_of(&["rev-parse", "--git-path", "HEAD"]) {
+        if head.exists() {
+            watch(&head);
         }
     }
-    if let Some(p) = git(&["rev-parse", "--git-path", "packed-refs"]) {
-        println!(
-            "cargo:rerun-if-changed={}",
-            resolve(&manifest, &p).display()
-        );
+    if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(mut p) = path_of(&["rev-parse", "--git-path", &r]) {
+            while !p.exists() {
+                if !p.pop() {
+                    break;
+                }
+            }
+            // The git directory itself holds the objects: never watch that.
+            if p.exists() && !p.join("HEAD").exists() {
+                watch(&p);
+            }
+        }
+    }
+    if let Some(p) = path_of(&["rev-parse", "--git-path", "packed-refs"]) {
+        if p.exists() {
+            watch(&p);
+        }
     }
 
     match build_commit::resolve_commit(env.as_deref(), vcs.as_deref(), || {
