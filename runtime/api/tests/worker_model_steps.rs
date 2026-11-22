@@ -3510,3 +3510,100 @@ async fn the_runs_worker_can_fail_its_model_step_and_it_is_retried() {
         assert_eq!(st, 200, "{name}: {body}");
     }
 }
+
+// ── Usage a cap cannot count, from the wrong sender or lease ─────────────────
+
+/// Usage that does not parse fails the step for good only for the run's
+/// worker under the claim's lease: another principal is told 404, and an
+/// answer with no fence or a stale one is a 409, under a dollar cap too.
+/// Those record nothing and leave the step claimed; the worker's own answer
+/// then fails it.
+#[tokio::test]
+async fn usage_that_does_not_parse_fails_the_step_only_after_the_owner_and_the_fence() {
+    let path = std::env::temp_dir().join(format!("jjwm-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+    let sqlite = Arc::new(SqliteBackend::open(&url).await.unwrap());
+    let (alice, _) = sqlite.create_token("alice", "developer").await.unwrap();
+    let (bob, _) = sqlite.create_token("bob", "developer").await.unwrap();
+    let backend: Arc<dyn StateBackend> = sqlite.clone();
+    let state = support::make_state(backend.clone());
+    let workflow = one_step(
+        "wf-usage-order",
+        &["search"],
+        json!({ "cost_budget_usd": 1.0 }),
+    );
+    let (st, body) = send(
+        &state,
+        "POST",
+        "/workflows",
+        Some(&alice),
+        json!({ "ir": workflow }),
+    )
+    .await;
+    assert!((200..300).contains(&st), "{st} {body}");
+    let (_, body) = send(
+        &state,
+        "POST",
+        "/executions",
+        Some(&alice),
+        json!({ "workflow_id": "wf-usage-order", "workflow_version": "0.1.0", "input": input() }),
+    )
+    .await;
+    let id = body["execution_id"].as_str().unwrap().to_string();
+    let run = Run {
+        name: "sqlite",
+        eid: parse_id(&id),
+        id: id.clone(),
+        scheduler: Scheduler::new(backend.clone()),
+        tb: TestBackend::Sqlite {
+            backend: sqlite.clone(),
+            url,
+        },
+        backend: backend.clone(),
+        state: state.clone(),
+    };
+    let (_, claimed) = send(
+        &state,
+        "POST",
+        "/work-items/claim",
+        Some(&alice),
+        claim_request("alice-router", &id),
+    )
+    .await;
+    assert_eq!(claimed["claimed"], json!(true), "{claimed}");
+    let wi = claimed["work_item"].clone();
+    let complete = format!("/work-items/{}/complete", wi["id"].as_str().unwrap());
+    let bad = answer_with("input_tokens", json!(-5));
+    let before = run.events().await.len();
+
+    let (st, body) = send(
+        &state,
+        "POST",
+        &complete,
+        Some(&bob),
+        result_of(&wi, bad.clone()),
+    )
+    .await;
+    assert_eq!(st, 404, "another principal: {body}");
+    run.unchanged(&wi, before, "another principal").await;
+
+    let mut unfenced = result_of(&wi, bad.clone());
+    unfenced.as_object_mut().unwrap().remove("lease_fence");
+    let mut stale = result_of(&wi, bad.clone());
+    stale["lease_fence"] = json!(wi["lease_fence"].as_i64().unwrap() + 1);
+    for (what, sent) in [("no fence", unfenced), ("a stale fence", stale)] {
+        let (st, body) = send(&state, "POST", &complete, Some(&alice), sent).await;
+        assert_eq!(st, 409, "{what}: {body}");
+        run.unchanged(&wi, before, what).await;
+    }
+    assert!(run.failed_for_good("think").await.is_none());
+
+    let (st, body) = send(&state, "POST", &complete, Some(&alice), result_of(&wi, bad)).await;
+    assert_eq!(st, 422, "the run's worker: {body}");
+    assert!(
+        run.failed_for_good("think").await.is_some(),
+        "{:?}",
+        run.log().await
+    );
+    let _ = std::fs::remove_file(path);
+}
