@@ -93,6 +93,7 @@ macro_rules! audit_conformance_suite {
                 an_entry_reads_back_as_it_was_sealed,
                 an_entry_appended_twice_is_kept_once,
                 filter_values_are_bound_not_spliced,
+                a_filter_with_a_nul_matches_nothing,
             ]
         );
     };
@@ -445,5 +446,28 @@ pub mod cases {
         q.tenant_id = Some("acme".into());
         assert!(b.query(&q).await.unwrap().is_empty());
         assert_eq!(b.count(&q).await.unwrap(), 0);
+    }
+
+    /// A filter value with a NUL matches and counts nothing, on every
+    /// store: no stored text holds one (Postgres text cannot), and a reader
+    /// gets an empty page, not an error.
+    pub async fn a_filter_with_a_nul_matches_nothing(fx: &AuditFixture) {
+        let b = &fx.backend;
+        let e = sealed("tool_called", None, now());
+        assert!(b.append_linked(e).await.unwrap());
+        for field in 0..4 {
+            let mut q = AuditQuery::new();
+            let v = Some("tool\0called".to_string());
+            match field {
+                0 => q.actor_id = v,
+                1 => q.event_type = v,
+                2 => q.execution_id = v,
+                _ => q.tenant_id = v,
+            }
+            let rows = b.query(&q).await.expect("a NUL in a filter is data");
+            assert!(rows.is_empty(), "field {field} matched {} rows", rows.len());
+            assert_eq!(b.count(&q).await.unwrap(), 0, "field {field} counted rows");
+        }
+        assert_eq!(b.count(&AuditQuery::new()).await.unwrap(), 1);
     }
 }

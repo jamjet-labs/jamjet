@@ -220,6 +220,9 @@ impl AuditBackend for PgAuditBackend {
     }
 
     async fn query(&self, q: &AuditQuery) -> Result<Vec<AuditLogEntry>, AuditError> {
+        if matches_nothing(q) {
+            return Ok(Vec::new());
+        }
         let (where_clause, values) = where_clause(q);
         let n = values.len();
         let sql = format!(
@@ -245,6 +248,9 @@ impl AuditBackend for PgAuditBackend {
     }
 
     async fn count(&self, q: &AuditQuery) -> Result<u64, AuditError> {
+        if matches_nothing(q) {
+            return Ok(0);
+        }
         let (where_clause, values) = where_clause(q);
         let sql = format!("SELECT COUNT(*) FROM audit_log WHERE {where_clause}");
         let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql));
@@ -329,6 +335,16 @@ fn bind_entry<'q, O>(
 enum Value<'a> {
     Time(DateTime<Utc>),
     Text(&'a str),
+}
+
+/// Whether a text filter of `q` holds a NUL. Postgres text cannot hold one,
+/// so no entry has it and the filter matches nothing, as on SQLite; sent to
+/// the server, the value would be an encoding error.
+fn matches_nothing(q: &AuditQuery) -> bool {
+    [&q.actor_id, &q.event_type, &q.execution_id, &q.tenant_id]
+        .into_iter()
+        .flatten()
+        .any(|value| value.contains('\0'))
 }
 
 /// The WHERE clause for `q`, with a numbered placeholder for each filter
