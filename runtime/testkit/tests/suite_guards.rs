@@ -1,8 +1,9 @@
 //! The suite fails a store that would pass parts of it without running
-//! them. The store here is memory labelled as Postgres: no fault point
-//! belongs to it, and its hooks answer as memory's do, with no rows. That is
-//! what a Postgres backend whose points and row hooks were left out would
-//! look like to the cases.
+//! them. The store here is memory labelled as Postgres: the `pg.*` fault
+//! points belong to that label but none of them is in its code, and its
+//! hooks answer as memory's do, with no rows. That is what a Postgres
+//! backend whose points and row hooks were left out would look like to the
+//! cases.
 
 use jamjet_testkit::conformance::{cases, Fixture, MemoryFactory, StoreFactory, StoreKind};
 use std::future::Future;
@@ -38,14 +39,14 @@ where
 }
 
 #[test]
-fn the_faults_case_fails_a_store_that_owns_no_fault_point() {
+fn the_faults_case_fails_a_store_whose_points_and_rows_are_missing() {
     for kind in POSTGRES {
         let message = panic_of(kind, |fx| async move {
             cases::faults::an_error_at_any_step_leaves_no_partial_write(&fx).await
         })
         .unwrap_or_else(|| panic!("{kind:?}: the error case passed with no point to fail"));
         assert!(
-            message.contains("no point in faults::POINTS belongs to this store"),
+            message.contains("a store whose code has fault points keeps rows"),
             "{kind:?}: {message}"
         );
     }
@@ -59,7 +60,7 @@ fn the_hang_case_fails_a_postgres_store() {
         })
         .unwrap_or_else(|| panic!("{kind:?}: the hang case passed without a hang"));
         assert!(
-            message.contains("the Postgres half of this case is not written"),
+            message.contains("the slow pass never reached pg.commit_scheduler_pass#2"),
             "{kind:?}: {message}"
         );
     }

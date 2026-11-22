@@ -670,3 +670,13 @@ impl StateBackend for FailingGetEvents {
             .await
     }
 }
+
+/// Hooks for `jamjet_testkit::Intercept` whose store clock answers a fixed
+/// time, to set the store's clock apart from this process's.
+pub(crate) struct StoreClock(pub(crate) chrono::DateTime<chrono::Utc>);
+
+impl jamjet_testkit::Hooks for StoreClock {
+    fn store_now(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        Some(self.0)
+    }
+}

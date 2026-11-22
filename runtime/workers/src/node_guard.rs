@@ -397,12 +397,21 @@ async fn caps_allow(
 
 /// `Ok` while `item` is still leased under `fence` and the lease has not
 /// expired; else the `Unavailable` to decide again on the next attempt.
+/// Expiry is read on the store's clock, which stamped the lease: an engine
+/// whose clock is behind the database's would see a lapsed lease as held.
 async fn lease_still_held(
     backend: &dyn StateBackend,
     item: uuid::Uuid,
     fence: i64,
 ) -> Result<(), GuardOutcome> {
-    let now = chrono::Utc::now();
+    let now = match backend.store_now().await {
+        Ok(now) => now,
+        Err(e) => {
+            return Err(GuardOutcome::Unavailable {
+                reason: format!("the store's clock could not be read; not admitted: {e}"),
+            })
+        }
+    };
     match backend.get_work_item(item).await {
         Ok(Some(wi))
             if wi.lease_fence == fence
@@ -1127,7 +1136,11 @@ pub async fn require_approval(
             basis_preview(&basis.payload, basis.step, node_def),
         );
         if let Some(deadline) = &deadline {
-            if let Err(e) = stamp_deadline(obj, deadline, chrono::Utc::now()) {
+            let stamped = match backend.store_now().await {
+                Ok(now) => stamp_deadline(obj, deadline, now),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = stamped {
                 // Never raise a request without the deadline its policy set.
                 return GuardOutcome::Unavailable {
                     reason: format!("approval required but its deadline could not be set: {e}"),
@@ -1613,5 +1626,77 @@ mod tests {
                 "unreadable batch {payload} must not count as a number of calls"
             );
         }
+    }
+
+    /// The lease is decided on the store's clock, which stamped it. With the
+    /// store's clock an hour past this process's, a lease this process still
+    /// sees as live has lapsed there (and may be reclaimed), so the step is
+    /// not admitted. On the store's own time it is held.
+    #[tokio::test]
+    async fn a_lease_is_held_by_the_store_clock() {
+        use crate::test_support::StoreClock;
+        use jamjet_core::workflow::{WorkflowExecution, WorkflowStatus};
+        use jamjet_state::{InMemoryBackend, WorkItem};
+        use std::sync::Arc;
+
+        let inner: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = chrono::Utc::now();
+        inner
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: json!({}),
+                current_state: json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        inner
+            .enqueue_work_item(WorkItem {
+                id: uuid::Uuid::new_v4(),
+                execution_id: eid,
+                node_id: "n1".into(),
+                queue_type: "q".into(),
+                payload: json!({}),
+                attempt: 0,
+                max_attempts: 3,
+                created_at: now,
+                lease_expires_at: None,
+                worker_id: None,
+                tenant_id: "default".into(),
+                lease_fence: 0,
+            })
+            .await
+            .unwrap();
+        let item = inner
+            .claim_work_item_with_lease("w1", &["q"], Some(60))
+            .await
+            .unwrap()
+            .expect("the item is claimed");
+        let expires = item.lease_expires_at.expect("a claimed item has a lease");
+
+        let on = |at| jamjet_testkit::Intercept::new(inner.clone(), Arc::new(StoreClock(at)));
+        let live = on(expires - chrono::Duration::seconds(1));
+        assert!(
+            lease_still_held(&live, item.id, item.lease_fence)
+                .await
+                .is_ok(),
+            "a lease live on the store's clock is held"
+        );
+        let lapsed = on(chrono::Utc::now() + chrono::Duration::hours(1));
+        assert!(
+            lease_still_held(&lapsed, item.id, item.lease_fence)
+                .await
+                .is_err(),
+            "a lease lapsed on the store's clock is not held"
+        );
     }
 }

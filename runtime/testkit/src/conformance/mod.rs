@@ -19,7 +19,9 @@ pub mod cases;
 mod factories;
 mod hooks;
 
-pub use factories::{MemoryFactory, SqliteFactory, SqliteScopedFactory};
+pub use factories::{
+    MemoryFactory, PostgresFactory, PostgresScopedFactory, SqliteFactory, SqliteScopedFactory,
+};
 pub use hooks::{ItemRow, StoreHooks, StoreRows, StoredJson};
 
 use async_trait::async_trait;
@@ -231,6 +233,7 @@ macro_rules! for_each_case {
                 unfenced_complete_settles_only_a_claimed_item,
                 fenced_complete_rejects_stale_fence_after_reclaim,
                 fenced_complete_rejects_forged_fence_zero_on_pending_item,
+                finalize_rollover_settles_only_a_claimed_item_of_its_run,
                 fenced_complete_settles_claimed_item_with_matching_fence,
                 fenced_complete_is_atomic_under_concurrency,
                 test_patch_append_array,

@@ -19,9 +19,8 @@
 //! The hang case holds one run's scheduler pass inside its transaction and
 //! makes another run's pass meanwhile. SQLite has one writer per file, so
 //! the other pass waits for the hang to end and lands within the busy
-//! timeout. The Postgres half, where the other pass commits during the
-//! hang, comes with the Postgres backend; until then the case fails on
-//! Postgres rather than pass there unrun. Both cases skip memory only.
+//! timeout. Postgres locks the run's row, not the store, so the other pass
+//! commits while the first still hangs. Both cases skip memory only.
 
 use crate::conformance::cases::support::skipped;
 use crate::conformance::{Fixture, StoreKind, StoreRows};
@@ -57,7 +56,22 @@ fn stores_of(label: &str) -> Option<&'static [StoreKind]> {
     const UNSCOPED: &[StoreKind] = &[Sqlite];
     const SCOPED: &[StoreKind] = &[SqliteScoped];
     const BOTH: &[StoreKind] = &[Sqlite, SqliteScoped];
+    // One Postgres body serves the unscoped store and a tenant's view.
+    const POSTGRES: &[StoreKind] = &[StoreKind::Postgres, StoreKind::PostgresScoped];
     Some(match label {
+        "pg.append_event"
+        | "pg.create_run"
+        | "pg.finish_execution"
+        | "pg.append_event_if"
+        | "pg.commit_scheduler_pass"
+        | "pg.patch_append_array"
+        | "pg.expire_stale_leases"
+        | "pg.fail_work_item_fenced"
+        | "pg.fail_work_item_fenced_recorded"
+        | "pg.finalize_rollover_fenced"
+        | "pg.reclaim_expired_leases_recorded"
+        | "pg.commit_turn"
+        | "pg.apply_approval_projection" => POSTGRES,
         "sqlite.commit_turn"
         | "sqlite.append_event"
         | "sqlite.claim_work_item"
@@ -208,19 +222,16 @@ struct At {
 }
 
 pub async fn a_hang_inside_a_transaction_blocks_only_its_run(fx: &Fixture) {
-    const LABEL: &str = "sqlite.commit_scheduler_pass";
     const STEP: u32 = 2;
     // Shorter than the SQLite busy timeout, so the waiting pass lands.
     const HANG: Duration = Duration::from_secs(2);
-    match fx.kind {
-        Sqlite | SqliteScoped => {}
+    // Step 2 follows the read of the log's last sequence: the slow pass
+    // holds the SQLite write lock there, or on Postgres its run's row.
+    let label = match fx.kind {
+        Sqlite | SqliteScoped => "sqlite.commit_scheduler_pass",
+        StoreKind::Postgres | StoreKind::PostgresScoped => "pg.commit_scheduler_pass",
         StoreKind::Memory => return skipped(fx, "memory has no transactions to hold"),
-        StoreKind::Postgres | StoreKind::PostgresScoped => panic!(
-            "{:?}: the Postgres half of this case is not written, so it would pass here \
-             without holding a transaction; it comes with the Postgres backend",
-            fx.kind
-        ),
-    }
+    };
     assert!(
         faults::enabled(),
         "jamjet-state is built without its test-hooks feature, so no point can fire"
@@ -233,9 +244,9 @@ pub async fn a_hang_inside_a_transaction_blocks_only_its_run(fx: &Fixture) {
     let (other_run, other_pass) = dispatch_pass(&b).await;
 
     // The slow pass hangs after its second statement, inside its
-    // transaction: on SQLite it holds the file's write lock meanwhile.
+    // transaction, holding what that transaction holds.
     let scope = Scope::new();
-    scope.arm(LABEL, STEP, Fault::Hang(HANG));
+    scope.arm(label, STEP, Fault::Hang(HANG));
     let slow = tokio::spawn({
         let (scope, b) = (scope.clone(), b.clone());
         async move {
@@ -245,10 +256,10 @@ pub async fn a_hang_inside_a_transaction_blocks_only_its_run(fx: &Fixture) {
         }
     });
     let deadline = Instant::now() + Duration::from_secs(5);
-    while scope.fired(LABEL, STEP) == 0 {
+    while scope.fired(label, STEP) == 0 {
         assert!(
-            Instant::now() < deadline,
-            "the slow pass never reached {LABEL}#{STEP}"
+            Instant::now() < deadline && !slow.is_finished(),
+            "the slow pass never reached {label}#{STEP}"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -258,6 +269,7 @@ pub async fn a_hang_inside_a_transaction_blocks_only_its_run(fx: &Fixture) {
     let other_start = Instant::now();
     let other = second.commit_scheduler_pass(other_pass).await;
     let other_took = other_start.elapsed();
+    let slow_still_hung = !slow.is_finished();
     let (slow, slow_took) = slow.await.expect("the slow pass's task");
 
     assert!(
@@ -266,20 +278,30 @@ pub async fn a_hang_inside_a_transaction_blocks_only_its_run(fx: &Fixture) {
     );
     assert!(slow_took >= HANG, "the slow pass hung: {slow_took:?}");
     assert_eq!(
-        scope.fired(LABEL, STEP),
+        scope.fired(label, STEP),
         1,
         "the slow pass reached the point once"
     );
     assert!(
         matches!(other, Ok(PassCommit::Committed { .. })),
-        "the other pass lands within the busy timeout: {other:?} after {other_took:?}"
+        "the other pass lands: {other:?} after {other_took:?}"
     );
-    // It started while the slow pass held the write lock, so it waited
-    // for the hang to end: the two passes did meet.
-    assert!(
-        other_took >= HANG / 2,
-        "the other pass waited for the slow one: {other_took:?}"
-    );
+    if matches!(fx.kind, Sqlite | SqliteScoped) {
+        // It started while the slow pass held the write lock, so it waited
+        // for the hang to end: the two passes did meet.
+        assert!(
+            other_took >= HANG / 2,
+            "the other pass waited for the slow one: {other_took:?}"
+        );
+    } else {
+        // It started while the slow pass held its run's row, and landed
+        // before the hang ended: the two passes met and did not wait.
+        assert!(
+            slow_still_hung && other_took < HANG / 2,
+            "the other pass committed during the hang: {other_took:?}, \
+             slow pass still hanging: {slow_still_hung}"
+        );
+    }
     for run in [&slow_run, &other_run] {
         assert_eq!(
             b.latest_sequence(run).await.unwrap(),

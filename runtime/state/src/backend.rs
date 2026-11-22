@@ -124,6 +124,13 @@ pub enum StateBackendError {
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// The store could not answer now: a deadlock or a lock timeout that
+    /// outlasted its retries, a lost connection, a timeout, or no free
+    /// connection. A commit whose outcome is unknown answers this too, so the
+    /// call may have landed. Worth a retry later; the API answers 503.
+    #[error("store unavailable: {0}")]
+    Unavailable(String),
 }
 
 pub type BackendResult<T> = Result<T, StateBackendError>;
@@ -230,8 +237,11 @@ pub enum KeyedStart {
 
 /// Trait abstracting the durable state storage backend.
 ///
-/// Implementors: `SqliteBackend`, `PostgresBackend`.
-/// Both must guarantee transactional writes per state transition.
+/// Implementors: [`InMemoryBackend`](crate::InMemoryBackend) (tests and dev),
+/// [`SqliteBackend`](crate::SqliteBackend) with its tenant view
+/// [`TenantScopedSqliteBackend`](crate::TenantScopedSqliteBackend), and [`PgBackend`](crate::PgBackend) with its
+/// tenant views. Each must make each state transition one transactional
+/// write, and pass the conformance suite in `jamjet-testkit`.
 #[async_trait]
 pub trait StateBackend: Send + Sync {
     // ── Workflow definitions ─────────────────────────────────────────────
@@ -969,8 +979,9 @@ pub trait StateBackend: Send + Sync {
     ///
     /// In one transaction:
     /// 1. Attempt `UPDATE work_items SET status='completed', completed_at=?, lease_expires_at=NULL
-    ///    WHERE id=? AND lease_fence=?`. Zero rows means the fence no longer matches
-    ///    (lease was stolen or item already settled) — rollback and return `Ok(false)`.
+    ///    WHERE id=? AND lease_fence=? AND status='claimed' AND execution_id=?`. Zero rows means
+    ///    the fence no longer matches (lease was stolen or item already settled), the item is
+    ///    not claimed, or it is another run's: rollback and return `Ok(false)`.
     /// 2. Idempotently mark the execution terminal:
     ///    `UPDATE workflow_executions SET status='limit_exceeded', updated_at=?, completed_at=COALESCE(completed_at,?)
     ///    WHERE execution_id=? AND status NOT IN ('completed','failed','cancelled','limit_exceeded')`.
@@ -1261,6 +1272,17 @@ pub trait StateBackend: Send + Sync {
         error: &str,
     ) -> BackendResult<Option<FailOutcome>> {
         crate::legacy::fail_in_steps(self, item_id, lease_fence, error).await
+    }
+
+    /// The time decisions use: the database's on Postgres, this process's
+    /// elsewhere.
+    ///
+    /// Approval deadlines are stamped and checked with it, so engines whose
+    /// clocks disagree still agree on when a request expires. The default is
+    /// [`crate::clock::process_now`], which is right for a store that one
+    /// process owns.
+    async fn store_now(&self) -> BackendResult<chrono::DateTime<chrono::Utc>> {
+        Ok(crate::clock::process_now())
     }
 }
 

@@ -1487,13 +1487,19 @@ impl StateBackend for InMemoryBackend {
         lease_fence: i64,
     ) -> BackendResult<bool> {
         let _pass = self.pass_lock.lock().await;
-        // Fence check: only the current holder may finalize.
-        match self.work_items.get(&work_item_id) {
-            Some(entry) if entry.lease_fence == lease_fence => {}
-            _ => return Ok(false),
+        // Fence check: only the current holder of a still-claimed item of
+        // this run may finalize, checked and removed in one step.
+        if self
+            .work_items
+            .remove_if(&work_item_id, |_k, entry| {
+                entry.worker_id.is_some()
+                    && entry.lease_fence == lease_fence
+                    && entry.execution_id == *execution_id
+            })
+            .is_none()
+        {
+            return Ok(false);
         }
-        // Fence matched — settle the work item.
-        self.work_items.remove(&work_item_id);
         // Idempotent terminal update on the execution.
         if let Some(mut entry) = self.executions.get_mut(execution_id) {
             if !entry.status.is_terminal() {

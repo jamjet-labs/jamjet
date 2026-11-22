@@ -6,8 +6,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use jamjet_core::workflow::ExecutionId;
 use jamjet_state::{
-    InMemoryBackend, SqliteBackend, StateBackend, TenantId, WorkItem, WorkItemId, DEFAULT_TENANT,
+    InMemoryBackend, PgBackend, SqliteBackend, StateBackend, TenantId, WorkItem, WorkItemId,
+    DEFAULT_TENANT,
 };
+use sqlx::postgres::{PgArguments, Postgres};
 use sqlx::sqlite::{Sqlite, SqliteArguments, SqliteRow};
 use sqlx::Row;
 use std::collections::BTreeMap;
@@ -536,6 +538,275 @@ impl StoreHooks for SqliteHooks {
                 .await
                 .unwrap_or_else(|e| panic!("read {table}: {e}"));
             let mut texts: Vec<String> = found.iter().map(row_text).collect();
+            texts.sort();
+            rows.insert(table.to_string(), texts);
+        }
+        Some(rows)
+    }
+}
+
+/// The tables of the Postgres state schema, every one of which
+/// [`StoreHooks::every_row`] reads. The migration log is left out.
+const POSTGRES_TABLES: &[&str] = &[
+    "api_tokens",
+    "artifacts",
+    "dead_letter_items",
+    "events",
+    "proj_approvals",
+    "projector_checkpoints",
+    "run_keys",
+    "snapshots",
+    "store_identity",
+    "tenants",
+    "tool_effects",
+    "tool_reservations",
+    "work_items",
+    "workflow_definitions",
+    "workflow_executions",
+];
+
+/// Hooks on a Postgres test database, through the fixture's first pool.
+pub(crate) struct PgHooks {
+    pub base: Arc<PgBackend>,
+    pub url: String,
+    /// The tenant the fixture's backend is scoped to, if it is.
+    pub scope: Option<TenantId>,
+}
+
+impl PgHooks {
+    /// Run a statement that must change exactly one row.
+    async fn update_one(&self, what: &str, query: sqlx::query::Query<'_, Postgres, PgArguments>) {
+        let done = query
+            .execute(&self.base.pool())
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(done.rows_affected(), 1, "{what}: no such row");
+    }
+}
+
+#[async_trait]
+impl StoreHooks for PgHooks {
+    async fn force_lease_expired(&self, item: WorkItemId) {
+        self.set_lease_expiry(item, past()).await;
+    }
+
+    async fn set_lease_expiry(&self, item: WorkItemId, at: DateTime<Utc>) {
+        let query = sqlx::query("UPDATE work_items SET lease_expires_at = $1 WHERE id = $2")
+            .bind(at)
+            .bind(item);
+        self.update_one(&format!("set the lease of {item}"), query)
+            .await;
+    }
+
+    async fn set_store_term_at_least(&self, term: i64) -> i64 {
+        self.base
+            .set_store_term_at_least(term)
+            .await
+            .unwrap_or_else(|e| panic!("raise the store term: {e}"))
+    }
+
+    async fn item_row(&self, item: WorkItemId) -> Option<ItemRow> {
+        let row = sqlx::query(
+            "SELECT status, attempt, lease_epoch, lease_fence, worker_id, retry_after \
+             FROM work_items WHERE id = $1",
+        )
+        .bind(item)
+        .fetch_optional(&self.base.pool())
+        .await
+        .unwrap_or_else(|e| panic!("read work item {item}: {e}"))?;
+        Some(ItemRow {
+            status: row.get("status"),
+            attempt: u32::try_from(row.get::<i32, _>("attempt")).expect("attempt fits a u32"),
+            lease_epoch: row.get("lease_epoch"),
+            lease_fence: row.get("lease_fence"),
+            worker_id: row.get("worker_id"),
+            retry_after: row.get("retry_after"),
+        })
+    }
+
+    async fn dead_letter_execution(&self, item: WorkItemId) -> Option<ExecutionId> {
+        let execution: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT execution_id FROM dead_letter_items WHERE id = $1")
+                .bind(item)
+                .fetch_optional(&self.base.pool())
+                .await
+                .unwrap_or_else(|e| panic!("read the dead letter of {item}: {e}"));
+        execution.map(ExecutionId)
+    }
+
+    async fn artifact_rows(&self, hash: &str, tenant: Option<&str>) -> u64 {
+        let pool = self.base.pool();
+        let count: i64 = match tenant {
+            None => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE hash = $1")
+                    .bind(hash)
+                    .fetch_one(&pool)
+                    .await
+            }
+            Some(tenant) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM artifacts WHERE hash = $1 AND tenant_id = $2",
+                )
+                .bind(hash)
+                .bind(tenant)
+                .fetch_one(&pool)
+                .await
+            }
+        }
+        .unwrap_or_else(|e| panic!("count artifact {hash}: {e}"));
+        u64::try_from(count).expect("a count is not negative")
+    }
+
+    async fn set_token_tenant(&self, token_name: &str, tenant: &str) {
+        let done = sqlx::query("UPDATE api_tokens SET tenant_id = $1 WHERE name = $2")
+            .bind(tenant)
+            .bind(token_name)
+            .execute(&self.base.pool())
+            .await
+            .unwrap_or_else(|e| panic!("move token {token_name} to {tenant}: {e}"));
+        assert!(done.rows_affected() > 0, "no token named {token_name}");
+    }
+
+    async fn reopen(&self) -> Option<Arc<dyn StateBackend>> {
+        let again = super::factories::connect_pg(&self.url).await;
+        Some(match &self.scope {
+            Some(tenant) => Arc::new(again.for_tenant(tenant.clone())),
+            None => Arc::new(again),
+        })
+    }
+
+    fn unscoped(&self) -> Arc<dyn StateBackend> {
+        self.base.clone()
+    }
+
+    async fn dead_letter_tenant(&self, item: WorkItemId) -> Option<String> {
+        sqlx::query_scalar("SELECT tenant_id FROM dead_letter_items WHERE id = $1")
+            .bind(item)
+            .fetch_optional(&self.base.pool())
+            .await
+            .unwrap_or_else(|e| panic!("read the dead letter of {item}: {e}"))
+    }
+
+    async fn stored_token_hash(&self, token_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT token_hash FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .fetch_optional(&self.base.pool())
+            .await
+            .unwrap_or_else(|e| panic!("read token {token_id}: {e}"))
+    }
+
+    async fn insert_token_row(&self, id: &str, token_hash: &str, name: &str, role: &str) -> bool {
+        // The columns an earlier build wrote; the tenant takes its default.
+        let query = sqlx::query(
+            "INSERT INTO api_tokens (id, token_hash, name, role, created_at) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(token_hash)
+        .bind(name)
+        .bind(role)
+        .bind(Utc::now());
+        self.update_one(&format!("insert token {id}"), query).await;
+        true
+    }
+
+    async fn insert_event_json(
+        &self,
+        execution: &ExecutionId,
+        sequence: i64,
+        kind_json: &str,
+    ) -> bool {
+        // The two columns the store fills from the kind at insert, as a
+        // later release would fill them for a kind of its own.
+        let kind: serde_json::Value = serde_json::from_str(kind_json)
+            .unwrap_or_else(|e| panic!("the event kind is JSON: {e}: {kind_json}"));
+        let kind_type = kind["type"].as_str().unwrap_or_default().to_string();
+        let node_id = kind["node_id"].as_str().map(str::to_string);
+        let query = sqlx::query(
+            "INSERT INTO events (id, execution_id, sequence, kind_type, node_id, kind_json, \
+             created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(execution.0)
+        .bind(sequence)
+        .bind(kind_type)
+        .bind(node_id)
+        .bind(kind_json)
+        .bind(Utc::now());
+        self.update_one(&format!("insert event {sequence} of {execution}"), query)
+            .await;
+        true
+    }
+
+    async fn make_execution_unreadable(&self, execution: &ExecutionId) -> bool {
+        // A timestamptz column cannot hold a bad time, as SQLite's text can;
+        // a run's input that is not JSON does not read back either.
+        let query = sqlx::query(
+            "UPDATE workflow_executions SET initial_input = 'not json' WHERE execution_id = $1",
+        )
+        .bind(execution.0);
+        self.update_one(&format!("damage run {execution}"), query)
+            .await;
+        true
+    }
+
+    async fn stored_json(&self, what: StoredJson) -> Option<String> {
+        let pool = self.base.pool();
+        let text: Option<String> = match &what {
+            StoredJson::Event {
+                execution,
+                sequence,
+            } => {
+                sqlx::query_scalar(
+                    "SELECT kind_json FROM events WHERE execution_id = $1 AND sequence = $2",
+                )
+                .bind(execution.0)
+                .bind(sequence)
+                .fetch_optional(&pool)
+                .await
+            }
+            StoredJson::ItemPayload(item) => {
+                sqlx::query_scalar("SELECT payload_json FROM work_items WHERE id = $1")
+                    .bind(item)
+                    .fetch_optional(&pool)
+                    .await
+            }
+            StoredJson::RunInput(execution) => {
+                sqlx::query_scalar(
+                    "SELECT initial_input FROM workflow_executions WHERE execution_id = $1",
+                )
+                .bind(execution.0)
+                .fetch_optional(&pool)
+                .await
+            }
+        }
+        .unwrap_or_else(|e| panic!("read {what:?}: {e}"));
+        Some(text.unwrap_or_else(|| panic!("no row for {what:?}")))
+    }
+
+    async fn every_row(&self) -> Option<StoreRows> {
+        let pool = self.base.pool();
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT tablename::text FROM pg_tables WHERE schemaname = current_schema() \
+             AND tablename <> '_sqlx_migrations' ORDER BY tablename",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("list the tables: {e}"));
+        assert_eq!(
+            tables, POSTGRES_TABLES,
+            "the schema's tables are not the ones every_row reads: add the new one to POSTGRES_TABLES"
+        );
+        let mut rows = StoreRows::new();
+        for table in POSTGRES_TABLES {
+            // `table` is one of the literal names above. Each row reads as
+            // one JSON object, its columns in order.
+            let mut texts: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT row_to_json(t)::text FROM {table} t"
+            )))
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("read {table}: {e}"));
             texts.sort();
             rows.insert(table.to_string(), texts);
         }

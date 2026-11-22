@@ -1,9 +1,9 @@
 //! API token text, and the hash `api_tokens.token_hash` stores for it.
 //!
-//! Both SQLite backends issue and check tokens through these functions, so
-//! the two cannot drift apart. The hash is persisted: a token issued by one
-//! build must still validate on the next, which `tests/api_token_hash.rs`
-//! pins with a known answer.
+//! The SQLite and Postgres backends issue and check tokens through these
+//! functions, so they cannot drift apart. The hash is persisted: a token
+//! issued by one build must still validate on the next, which
+//! `tests/api_token_hash.rs` pins with a known answer.
 
 use rand::RngExt as _;
 

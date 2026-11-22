@@ -330,7 +330,12 @@ pub(crate) async fn plan(
         .apply_segment(&events)
         .map_err(|_| unavailable("the run's log holds an unreadable event".to_string()))?;
 
-    let now = Utc::now();
+    // The store's clock: the first step's `created_at` may have been stamped
+    // by another engine, against the same database.
+    let now = backend
+        .store_now()
+        .await
+        .map_err(|e| unavailable(format!("the store's clock could not be read: {e}")))?;
     let step = Step { tool_calls };
     let escalation = match first_stop(&ledger, &agents, step, now) {
         None => None,
@@ -574,5 +579,74 @@ pub(crate) async fn completion_admitted(
                  the claim gate, so its result cannot be recorded"
             ),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::StoreClock;
+    use jamjet_core::workflow::{WorkflowExecution, WorkflowStatus};
+    use jamjet_state::InMemoryBackend;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// An agent's time budget runs on the store's clock, the clock other
+    /// engines' events are stamped by. With the store's clock two hours past
+    /// this process's, an agent whose first step was just recorded is past a
+    /// one hour budget.
+    #[tokio::test]
+    async fn the_time_budget_runs_on_the_store_clock() {
+        let inner: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+        let eid = ExecutionId::new();
+        let now = Utc::now();
+        inner
+            .create_execution(WorkflowExecution {
+                execution_id: eid.clone(),
+                workflow_id: "wf".into(),
+                workflow_version: "1.0.0".into(),
+                status: WorkflowStatus::Running,
+                initial_input: json!({}),
+                current_state: json!({}),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+                session_type: None,
+                parent_execution_id: None,
+                segment_number: 0,
+            })
+            .await
+            .unwrap();
+        inner
+            .append_event(Event::new(
+                eid.clone(),
+                0,
+                EventKind::AgentStepAdmitted {
+                    node_id: "n1".into(),
+                    work_item_id: None,
+                    agents: vec!["agent".into()],
+                    tool_calls: 0,
+                    approval_sequence: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let agents: Agents = vec![(
+            "agent".into(),
+            Some(AutonomyConstraints {
+                time_budget_secs: Some(3600),
+                on_limit_exceeded: Some(OnLimitExceeded::Fail),
+                ..Default::default()
+            }),
+        )];
+        let store = jamjet_testkit::Intercept::new(
+            inner.clone(),
+            Arc::new(StoreClock(Utc::now() + chrono::Duration::hours(2))),
+        );
+        let planned = plan(&store, &eid, "n1", agents, 0).await;
+        assert!(
+            matches!(planned, Err(GuardOutcome::Blocked { .. })),
+            "the time budget was not spent on the store's clock"
+        );
     }
 }

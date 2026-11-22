@@ -9,6 +9,7 @@
 //! caller there, for instance until a second engine reaches the same point.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::artifact::ArtifactRef;
 use jamjet_state::backend::{
@@ -292,6 +293,7 @@ pub enum Op<'a> {
         lease_fence: i64,
         error: &'a str,
     },
+    StoreNow,
 }
 
 /// What a test does around each call [`Intercept`] delegates.
@@ -306,6 +308,20 @@ pub trait Hooks: Send + Sync {
     /// After the inner call returned `Ok`, before the caller sees the
     /// result. Not called when the inner call failed.
     async fn after(&self, _op: &Op<'_>) {}
+
+    /// The span the inner call runs in, so a tracing subscriber can tell
+    /// what the wrapped backend did from what the rest of the test did.
+    /// None by default.
+    fn span(&self, _op: &Op<'_>) -> tracing::Span {
+        tracing::Span::none()
+    }
+
+    /// The time [`StateBackend::store_now`] answers in place of the inner
+    /// backend's, or `None` to ask the inner backend. A test sets the store's
+    /// clock apart from the process's with it.
+    fn store_now(&self) -> Option<DateTime<Utc>> {
+        None
+    }
 }
 
 /// Hooks that do nothing: [`Intercept`] then behaves as its inner backend.
@@ -326,15 +342,16 @@ impl Intercept {
     }
 }
 
-/// `before`, the inner call, `after`, in that order. A value the inner call
-/// takes by value is cloned into it, so the op can still point at it.
+/// `before`, the inner call in the hooks' span, `after`, in that order. A
+/// value the inner call takes by value is cloned into it, so the op can
+/// still point at it.
 macro_rules! around {
     ($self:ident, $op:expr, $call:expr) => {{
         let op = $op;
         if let Some(e) = $self.hooks.before(&op).await {
             return Err(e);
         }
-        let out = $call.await?;
+        let out = tracing::Instrument::instrument($call, $self.hooks.span(&op)).await?;
         $self.hooks.after(&op).await;
         Ok(out)
     }};
@@ -1325,6 +1342,16 @@ impl StateBackend for Intercept {
             self.inner
                 .fail_work_item_fenced_recorded(item_id, lease_fence, error)
         )
+    }
+
+    async fn store_now(&self) -> BackendResult<DateTime<Utc>> {
+        let fixed = self.hooks.store_now();
+        around!(self, Op::StoreNow, async {
+            match fixed {
+                Some(now) => Ok(now),
+                None => self.inner.store_now().await,
+            }
+        })
     }
 }
 

@@ -1913,11 +1913,13 @@ impl StateBackend for TenantScopedSqliteBackend {
         // 1. Fence-gated settle — tenant-scoped.
         let rows = sqlx::query(
             "UPDATE work_items SET status = 'completed', completed_at = ?, lease_expires_at = NULL \
-             WHERE id = ? AND lease_fence = ? AND tenant_id = ?",
+             WHERE id = ? AND lease_fence = ? AND status = 'claimed' AND execution_id = ? \
+             AND tenant_id = ?",
         )
         .bind(&now)
         .bind(&item_id_str)
         .bind(lease_fence)
+        .bind(&exec_id_str)
         .bind(&self.tenant_id.0)
         .execute(&mut *tx)
         .await

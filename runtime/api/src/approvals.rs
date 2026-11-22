@@ -451,7 +451,16 @@ pub async fn submit_approval(
     // BEFORE the digest rules on purpose: a late approval with no digest, or
     // a stale one, is answered 409 Expired (the request can no longer be
     // decided at all) rather than 400 DigestRequired or 409 StaleDigest.
-    if request.deadline().expired(chrono::Utc::now()) {
+    let now = backend
+        .store_now()
+        .await
+        .map_err(|e| SubmitError::Backend(e.to_string()))?;
+    // The store's clock from here on: this process's clock moved by how far
+    // the store's was from it just now. The append's condition runs
+    // synchronously and cannot ask the store, so it reads this.
+    let offset = now - jamjet_state::clock::process_now();
+    let store_clock = move || jamjet_state::clock::process_now() + offset;
+    if request.deadline().expired(now) {
         return Err(SubmitError::Expired(node_id));
     }
     let request_digest = request.action_digest().map(str::to_owned);
@@ -506,11 +515,10 @@ pub async fn submit_approval(
     let answered = request.sequence;
     let condition_node = node_id.clone();
     // The deadline is checked again HERE, inside the append under the
-    // backend's write lock, against the clock at that moment: a decision that
-    // passed the check above but whose append was delayed past the deadline
-    // is refused, never recorded late.
-    let condition =
-        move |log: &[Event]| still_open(log, &condition_node, answered, chrono::Utc::now());
+    // backend's write lock, against the store's clock at that moment: a
+    // decision that passed the check above but whose append was delayed past
+    // the deadline is refused, never recorded late.
+    let condition = move |log: &[Event]| still_open(log, &condition_node, answered, store_clock());
     let event = match backend
         .append_event_if(event.clone(), &condition)
         .await
@@ -526,7 +534,7 @@ pub async fn submit_approval(
                 .await
                 .map_err(|e| SubmitError::Backend(e.to_string()))?;
             if expired_by_deadline(&latest, &node_id)
-                || pending_but_expired(&latest, &node_id, chrono::Utc::now())
+                || pending_but_expired(&latest, &node_id, store_clock())
             {
                 return Err(SubmitError::Expired(node_id));
             }

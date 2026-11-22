@@ -1871,6 +1871,8 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1910,6 +1912,7 @@ dependencies = [
  "jamjet-scheduler",
  "jamjet-state",
  "jamjet-telemetry",
+ "jamjet-testkit",
  "reqwest 0.13.5",
  "serde",
  "serde_json",

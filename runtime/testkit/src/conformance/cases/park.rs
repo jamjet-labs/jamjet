@@ -8,6 +8,7 @@
 //! Memory does not keep `retry_after` and does not hold a parked item back
 //! from a claim; the cases say where that changes what they check.
 
+use crate::conformance::cases::support::{to_micros, with_nanos};
 use crate::conformance::{Fixture, ItemRow, StoreKind};
 use chrono::{DateTime, Utc};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
@@ -50,9 +51,10 @@ fn sample_item(execution_id: &ExecutionId) -> WorkItem {
     }
 }
 
-/// Returns a retry_after timestamp 60 seconds in the future (RFC3339).
+/// Returns a retry_after timestamp 60 seconds in the future (RFC3339), with
+/// digits below the microsecond on every platform.
 fn future_retry_after() -> String {
-    (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()
+    with_nanos(Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()
 }
 
 /// Returns a retry_after timestamp 5 seconds in the past (RFC3339).
@@ -125,8 +127,8 @@ pub async fn park_correct_fence_returns_true_and_resets_row(fx: &Fixture) {
     );
     if fx.kind != StoreKind::Memory {
         assert_eq!(
-            after.retry_after,
-            Some(parsed(&retry_after)),
+            after.retry_after.map(to_micros),
+            Some(to_micros(parsed(&retry_after))),
             "retry_after must match what was passed"
         );
     }
@@ -202,8 +204,8 @@ pub async fn park_stale_fence_returns_false_row_unchanged(fx: &Fixture) {
     );
     if fx.kind != StoreKind::Memory {
         assert_eq!(
-            after.retry_after,
-            Some(parsed(&retry_after)),
+            after.retry_after.map(to_micros),
+            Some(to_micros(parsed(&retry_after))),
             "retry_after must be the one set by the first (valid) park"
         );
     }

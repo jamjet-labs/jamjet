@@ -64,7 +64,39 @@ impl From<jamjet_state::backend::StateBackendError> for ApiError {
             e @ jamjet_state::backend::StateBackendError::VersionConflict(_) => {
                 Self::Conflict(e.to_string())
             }
+            jamjet_state::backend::StateBackendError::Unavailable(msg) => Self::Unavailable(msg),
             other => Self::Internal(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jamjet_state::backend::StateBackendError;
+
+    #[test]
+    fn an_unavailable_store_answers_503_with_retry_after() {
+        let resp = ApiError::from(StateBackendError::Unavailable(
+            "commit outcome unknown".into(),
+        ))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap()),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn a_database_error_still_answers_500() {
+        let resp = ApiError::from(StateBackendError::Database("boom".into())).into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
     }
 }

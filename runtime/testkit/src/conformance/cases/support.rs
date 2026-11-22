@@ -1,7 +1,9 @@
 //! What several case modules share: tenant views, skipping a case on a
-//! store it does not apply to, and racing two calls.
+//! store it does not apply to, racing two calls, and stored times compared
+//! at the precision a store keeps.
 
 use crate::conformance::{Fixture, StoreKind};
+use chrono::{DateTime, SubsecRound, Timelike, Utc};
 use jamjet_state::{StateBackend, Tenant, TenantId, TenantStatus};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -74,6 +76,21 @@ pub async fn in_tenant(fx: &Fixture, tenant: &str) -> Arc<dyn StateBackend> {
         Some(view) => view,
         None => fx.backend.clone(),
     }
+}
+
+/// `t` with digits below the microsecond, as Linux's clock gives them.
+/// macOS's clock steps in whole microseconds, so a case that stores a time
+/// it built from `Utc::now()` meets those digits on every platform this way.
+pub fn with_nanos(t: DateTime<Utc>) -> DateTime<Utc> {
+    t.with_nanosecond(t.nanosecond() / 1_000 * 1_000 + 789)
+        .expect("a time from the clock is not in a leap second")
+}
+
+/// `t` cut to whole microseconds, the precision a Postgres `timestamptz`
+/// keeps. A case that reads back a time it stored compares at this
+/// precision.
+pub fn to_micros(t: DateTime<Utc>) -> DateTime<Utc> {
+    t.trunc_subsecs(6)
 }
 
 /// When a call started and when it returned.

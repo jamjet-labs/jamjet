@@ -1,6 +1,7 @@
 //! The fixture's own contract: every handle and hook reaches the same
 //! store, and the hooks read and write what the backend does.
 
+use crate::conformance::cases::support::{to_micros, with_nanos};
 use crate::conformance::{Fixture, StoreKind, StoredJson};
 use chrono::{Duration, Utc};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
@@ -102,7 +103,7 @@ pub async fn item_row_follows_a_claim_and_a_park(fx: &Fixture) {
     assert_eq!(row.worker_id.as_deref(), Some("worker-a"));
     assert_eq!((row.lease_epoch, row.lease_fence), (1, fence));
 
-    let retry_after = Utc::now() + Duration::hours(1);
+    let retry_after = with_nanos(Utc::now() + Duration::hours(1));
     let parked = fx
         .backend
         .park_work_item(item, fence, &retry_after.to_rfc3339(), 2)
@@ -115,9 +116,9 @@ pub async fn item_row_follows_a_claim_and_a_park(fx: &Fixture) {
     assert_eq!(row.worker_id, None);
     let kept = match fx.kind {
         StoreKind::Memory => None,
-        _ => Some(retry_after),
+        _ => Some(to_micros(retry_after)),
     };
-    assert_eq!(row.retry_after, kept);
+    assert_eq!(row.retry_after.map(to_micros), kept);
 }
 
 pub async fn a_forced_expiry_is_reclaimed_and_a_future_one_is_not(fx: &Fixture) {

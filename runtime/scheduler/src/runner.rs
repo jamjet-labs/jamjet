@@ -199,8 +199,9 @@ impl Scheduler {
     /// of one request cannot both land, and a replayed or concurrent sweep
     /// records nothing twice.
     ///
-    /// `now` is the sweep's clock: the loop passes `Utc::now()`; a test passes
-    /// the moment it wants to examine.
+    /// `now` is the sweep's clock: the loop passes the store's
+    /// ([`StateBackend::store_now`], the database's on Postgres); a test
+    /// passes the moment it wants to examine.
     pub async fn sweep_approval_deadlines(
         &self,
         execution_id: &ExecutionId,
@@ -482,7 +483,7 @@ impl Scheduler {
             .any(|n| progress.deadline_requests.contains(n))
         {
             match self
-                .sweep_approval_deadlines(execution_id, chrono::Utc::now())
+                .sweep_approval_deadlines(execution_id, self.backend.store_now().await?)
                 .await
             {
                 Ok(sweep) if !sweep.expired.is_empty() || !sweep.escalated.is_empty() => {
