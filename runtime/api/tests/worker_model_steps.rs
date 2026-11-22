@@ -3394,3 +3394,49 @@ async fn usage_that_does_not_parse_under_a_cap_fails_the_step_for_good() {
         }
     }
 }
+
+// ── A lease that ran out ─────────────────────────────────────────────────────
+
+/// An answer sent after the step's lease ran out is a 409 and records
+/// nothing, even while nothing has taken the step back yet: the lease is
+/// read against the store's clock. An answer off the allow list records no
+/// violation then either. The step is then claimed again and completed.
+#[tokio::test]
+async fn an_answer_after_the_lease_ran_out_is_409_before_anything_takes_it_back() {
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            one_step(
+                "wf-lapsed",
+                &["search"],
+                json!({ "policy": policy(&["vertex_ai/*"]) }),
+            ),
+        )
+        .await;
+        let name = run.name;
+        let first = run.step_as("router-1").await;
+        let id = uuid::Uuid::parse_str(first["id"].as_str().unwrap()).unwrap();
+        run.tb.expire_lease(id).await;
+        let before = run.events().await.len();
+        for (what, body) in [
+            ("an answer", answer()),
+            (
+                "an answer off the allow list",
+                answer_with("model", json!("openai/gpt-4o")),
+            ),
+        ] {
+            let (st, reply) = run.complete(&first, result_of(&first, body)).await;
+            assert_eq!(st, 409, "{name}: {what}: {reply}");
+        }
+        assert_eq!(
+            run.events().await.len(),
+            before,
+            "{name}: {:?}",
+            run.log().await
+        );
+        let again = run.step_as("router-2").await;
+        let (st, body) = run.complete(&again, result_of(&again, answer())).await;
+        assert_eq!(st, 200, "{name}: {body}");
+        assert_eq!(run.completions("think").await.len(), 1, "{name}");
+    }
+}

@@ -4201,12 +4201,28 @@ async fn refresh_current_state(
     }
 }
 
-/// Whether `wi`, as read, is still claimed under `fence`: the lease its
-/// claim minted, neither settled (no lease left) nor taken back (no holder,
-/// or a newer fence). The fenced commit decides again; this lets a late or
-/// repeated answer be refused before anything is recorded for it.
-fn holds_lease(wi: &WorkItem, fence: i64) -> bool {
-    wi.lease_fence == fence && wi.worker_id.is_some() && wi.lease_expires_at.is_some()
+/// Whether `wi`, as read, is still claimed under `fence` at `now`: the
+/// lease its claim minted, neither settled (no lease left), taken back (no
+/// holder, or a newer fence) nor run out. `now` is the store's clock, which
+/// stamped the lease, as `node_guard`'s lease check reads it. The fenced
+/// commit decides again; this lets a late or repeated answer be refused
+/// before anything is recorded for it, also while nothing has taken the
+/// step back yet.
+fn holds_lease(wi: &WorkItem, fence: i64, now: chrono::DateTime<chrono::Utc>) -> bool {
+    wi.lease_fence == fence
+        && wi.worker_id.is_some()
+        && wi.lease_expires_at.is_some_and(|expires| expires > now)
+}
+
+/// The store's clock, for [`holds_lease`]; a clock that cannot be read is a
+/// 503 and records nothing.
+async fn lease_clock(
+    backend: &dyn jamjet_state::StateBackend,
+) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    backend
+        .store_now()
+        .await
+        .map_err(|e| format!("the store's clock could not be read: {e}"))
 }
 
 /// `POST /work-items/:id/complete` for a model step its run's own worker
@@ -4257,9 +4273,14 @@ async fn complete_worker_model_step(
                     .to_string(),
             )
         }
-        Some(fence) if fence > 0 && holds_lease(wi, fence) => fence,
+        Some(fence) if fence > 0 => fence,
         Some(_) => return refused(StatusCode::CONFLICT, stale()),
     };
+    match lease_clock(backend).await {
+        Ok(now) if holds_lease(wi, fence, now) => {}
+        Ok(_) => return refused(StatusCode::CONFLICT, stale()),
+        Err(reason) => return refused(StatusCode::SERVICE_UNAVAILABLE, reason),
+    }
 
     if body.output.is_some() || body.state_patch.is_some() {
         return refused(
@@ -4376,8 +4397,12 @@ async fn complete_worker_model_step(
     // The check of the model used records a violation, so the lease is read
     // again first: an answer whose lease moved while it was decided records
     // nothing.
+    let now = match lease_clock(backend).await {
+        Ok(now) => now,
+        Err(reason) => return refused(StatusCode::SERVICE_UNAVAILABLE, reason),
+    };
     match backend.get_work_item(wi.id).await {
-        Ok(Some(now)) if holds_lease(&now, fence) => {}
+        Ok(Some(item)) if holds_lease(&item, fence, now) => {}
         Ok(_) => return refused(StatusCode::CONFLICT, stale()),
         Err(e) => {
             return refused(
