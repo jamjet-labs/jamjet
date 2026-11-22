@@ -101,7 +101,8 @@ over OTLP/gRPC (for example `http://localhost:4317`).
 Python and Java steps run in their own worker processes, and the server emits
 no spans for them. Nor does it for a `model` step with `executor: worker`,
 which the run's own worker runs: its usage is on the run's log and in
-`GET /executions/:id`'s `usage`, not in the span or the metric. Prompts and completions are not attached to spans.
+`GET /executions/:id`'s `usage`, not in the span or the metric. Prompts and
+completions are not attached to spans.
 
 ---
 

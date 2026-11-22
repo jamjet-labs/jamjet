@@ -4230,13 +4230,16 @@ async fn lease_clock(
 /// reports; the engine decides what is recorded, in this order:
 ///
 /// 1. The lease. No `lease_fence`, or one the item no longer holds (the
-///    lease was taken back, or the answer was recorded already), is 409.
+///    lease ran out on the store's clock, was taken back, or the answer was
+///    recorded already), is 409.
 /// 2. The answer is the model's. An `output`, a `state_patch` or usage
 ///    beside `model_result`, or no `model_result`, is 400; an answer that
-///    does not parse is 422.
-/// 3. The usage the caps count. A token count missing is 400. A cost that
-///    cannot be counted is 400, and under a dollar cap the step fails for
-///    good, since it may have paid ([`fail_uncounted_step`]).
+///    does not parse is 422. When its usage is what does not parse, a cap
+///    that reads that usage fails the step for good, as in step 3.
+/// 3. The usage the caps count. A token count missing is 400, and under any
+///    cap the step fails for good. A cost that cannot be counted is 400, and
+///    under a dollar cap the step fails for good, since it may have paid
+///    ([`fail_uncounted_step`]).
 /// 4. The answer against the registered node
 ///    ([`crate::worker_model::ModelResult::malformed`]): 422.
 /// 5. The completion gate every result passes ([`completion_gate`]).
@@ -4248,7 +4251,7 @@ async fn lease_clock(
 /// executor would build from the same answer (`model_outcome`), in one
 /// fenced commit: 200. The scheduler's next pass fails a run past its cap.
 /// Every refusal records nothing and leaves the item the worker's, but for
-/// a cost under a dollar cap and a model off an allow list, which fail the
+/// usage a cap cannot count and a model off an allow list, which fail the
 /// step for good.
 async fn complete_worker_model_step(
     state: &AppState,

@@ -167,9 +167,8 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hashes differently, since the field is now part of the definition. Such a stored version
   switches to worker execution on upgrade: an approval bound to it before the upgrade is
   asked again, its new steps go to `model_worker`, and its runs wait there until the run's
-  worker claims them. A stored model
-  node with an `executor` value this build does not know no longer parses, and its runs fail
-  closed.
+  worker claims them. A stored model node with an `executor` value this build does not know
+  no longer parses, and its runs fail closed.
 - `POST /work-items` refuses a worker model node (400): its payload is the request the claim
   hands out, and only the engine builds it.
 - The completion of every other kind is unchanged: `output` and `state_patch` are still
