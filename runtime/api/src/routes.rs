@@ -3228,7 +3228,8 @@ async fn gate_claimed_item(
             // after the same guard and with the same words as in the
             // in-process model executor, not retryable. Handed out, its
             // worker would have to make the prompt up.
-            if let Some(reason) = crate::worker_model::missing_prompt(&wi.payload) {
+            if let Some(reason) = jamjet_worker::executors::model_node::missing_prompt(&wi.payload)
+            {
                 // A re-check writes nothing: the claim decides the item again
                 // in `Fire` mode.
                 if mode == jamjet_worker::node_guard::GuardMode::Complete {
@@ -3440,17 +3441,23 @@ fn guard_inputs_from_raw(ir_value: &Value, node_id: &str) -> Result<GuardInputs,
     })
 }
 
-/// Whether a worker's result for `wi` may be recorded: the claim gate's
-/// decision in `GuardMode::Complete`. `Err` carries the status and reason.
-///
-/// Every input comes from engine-written records (the execution's workflow
-/// coordinates, the stored IR, the item as enqueued), never from the body.
-/// Unreadable state refuses with 503 rather than recording on a guess.
-async fn completion_gate(
+/// A claimed item's node as its run's registered workflow defines it, with
+/// the workflow's policy and caps: what a completion is decided from, never
+/// the item's payload or the request.
+struct RecordedNode {
+    /// The run's stored IR, for its caps.
+    ir: Value,
+    inputs: GuardInputs,
+}
+
+/// [`RecordedNode`] for `wi`, read from the execution's workflow
+/// coordinates and the stored IR. `Err` carries the status and reason:
+/// unreadable state is 503, so nothing is recorded on a guess, and a run,
+/// workflow or node that is not there is 409.
+async fn recorded_node(
     backend: &dyn jamjet_state::StateBackend,
     wi: &WorkItem,
-    agents: &dyn jamjet_agents::AgentRegistry,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<RecordedNode, (StatusCode, String)> {
     let unavailable = |e: String| (StatusCode::SERVICE_UNAVAILABLE, e);
     let refused = |e: String| (StatusCode::CONFLICT, e);
     let execution = backend
@@ -3468,12 +3475,32 @@ async fn completion_gate(
                 execution.workflow_id, execution.workflow_version
             ))
         })?;
+    let inputs = guard_inputs_from_raw(&def.ir, &wi.node_id).map_err(refused)?;
+    Ok(RecordedNode { ir: def.ir, inputs })
+}
+
+/// Whether a worker's result for `wi`, whose node is `node`, may be
+/// recorded: the claim gate's decision in `GuardMode::Complete`. `Err`
+/// carries the status and reason. Every result passes it, a model step's
+/// answer included.
+///
+/// Every input comes from engine-written records (the execution's workflow
+/// coordinates, the stored IR, the item as enqueued), never from the body.
+/// Unreadable state refuses with 503 rather than recording on a guess.
+async fn completion_gate(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+    node: &RecordedNode,
+    agents: &dyn jamjet_agents::AgentRegistry,
+) -> Result<(), (StatusCode, String)> {
+    let unavailable = |e: String| (StatusCode::SERVICE_UNAVAILABLE, e);
+    let refused = |e: String| (StatusCode::CONFLICT, e);
     let GuardInputs {
         workflow_policy,
         workflow_agent,
         remote_agents,
         node_def,
-    } = guard_inputs_from_raw(&def.ir, &wi.node_id).map_err(refused)?;
+    } = &node.inputs;
     // The engine reports the result of a kind it runs itself; an external
     // worker's report for one is never recorded (see the claim route).
     if jamjet_worker::executable::runner_for_kind(&node_def.kind)
@@ -3488,26 +3515,6 @@ async fn completion_gate(
             ),
         ));
     }
-    // A model step run by its run's worker is recorded from the model's
-    // answer, and the engine builds the step's output and state from it, so
-    // a worker never writes a state key. An output and a state patch of the
-    // worker's own are never taken for it, and nothing is recorded.
-    if matches!(
-        node_def.kind,
-        jamjet_core::NodeKind::Model {
-            executor: jamjet_core::node::ModelExecutor::Worker,
-            ..
-        }
-    ) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "node {} is a model step run by its run's worker; its result is the model's \
-                 answer, from which the engine builds the output and the state patch",
-                wi.node_id
-            ),
-        ));
-    }
     match jamjet_worker::node_guard::guard_item(
         backend,
         jamjet_worker::node_guard::GuardMode::Complete,
@@ -3515,13 +3522,13 @@ async fn completion_gate(
         &wi.node_id,
         &wi.tenant_id,
         workflow_policy.as_ref(),
-        &node_def,
+        node_def,
         &wi.payload,
         // Complete mode never raises a request.
         None,
         jamjet_worker::node_guard::AgentScope {
             workflow_agent: workflow_agent.as_deref(),
-            remote_agents: Some(&remote_agents),
+            remote_agents: Some(remote_agents),
             registry: Some(agents),
         },
         Some(wi.id),
@@ -3641,13 +3648,32 @@ impl ClaimGate {
     }
 }
 
+/// A field that is absent (`None`) or present, `null` included
+/// (`Some(Value::Null)`): a route that refuses a field must see a `null`
+/// one, and one that requires a field must take `null` as sent.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
 #[derive(Deserialize)]
 struct CompleteWorkItemRequest {
     // Workers may still send `execution_id` and `node_id`. They are ignored
     // (serde drops unknown fields): the run and node are the ones the engine
     // recorded for the item, never the caller's word.
-    output: Value,
-    state_patch: Value,
+    /// The step's output and state patch, as the worker reports them. Both
+    /// are required for every kind but a model step its run's worker runs,
+    /// whose result is `model_result` and which may send neither. Optional
+    /// here so the route decides which, from the node the engine recorded.
+    #[serde(default, deserialize_with = "present")]
+    output: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    state_patch: Option<Value>,
+    /// The answer of a model step its run's worker ran
+    /// ([`crate::worker_model::ModelResult`]). Read only after the caller
+    /// is shown to hold the item, so a stranger is told 404 whatever it
+    /// sends.
+    #[serde(default, deserialize_with = "present")]
+    model_result: Option<Value>,
     #[serde(default)]
     duration_ms: u64,
     /// Lease fence echoed from the claim response. When present, the completion is
@@ -3689,6 +3715,33 @@ struct CompleteWorkItemRequest {
     /// The currency of `cost_usd`. Optional; when sent, it must be `"USD"`.
     #[serde(default)]
     cost_currency: Option<String>,
+}
+
+impl CompleteWorkItemRequest {
+    /// The first usage field sent beside the answer: a model step's usage is
+    /// its answer's (`model_result`), and the engine records only that.
+    fn usage_beside_the_answer(&self) -> Option<&'static str> {
+        [
+            ("gen_ai_system", self.gen_ai_system.is_some()),
+            ("gen_ai_model", self.gen_ai_model.is_some()),
+            ("input_tokens", self.input_tokens.is_some()),
+            ("output_tokens", self.output_tokens.is_some()),
+            ("finish_reason", self.finish_reason.is_some()),
+            ("cost_usd", self.cost_usd.is_some()),
+            ("cost_currency", self.cost_currency.is_some()),
+        ]
+        .into_iter()
+        .find_map(|(field, sent)| sent.then_some(field))
+    }
+}
+
+/// A completion that records nothing: `status` and
+/// `{"completed": false, "reason": ...}`.
+fn not_completed(status: StatusCode, reason: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (
+        status,
+        Json(json!({ "completed": false, "reason": reason.into() })),
+    )
 }
 
 /// `POST /work-items/:id/complete` — mark a work item as completed and emit NodeCompleted event.
@@ -3746,6 +3799,55 @@ async fn complete_work_item(
             ));
         }
     }
+
+    // Which result this is comes from the node the engine recorded for the
+    // item, never from the body. A model step its run's worker ran is
+    // recorded from the model's answer, which the engine turns into the
+    // step's output and state; every other kind from the worker's output and
+    // state patch. A node that cannot be read records nothing.
+    let node = match recorded.as_ref() {
+        Some(wi) => match recorded_node(backend.as_ref(), wi).await {
+            Ok(node) => Some(node),
+            Err((status, reason)) => {
+                warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, %reason, "complete: refused");
+                return Ok(not_completed(status, reason));
+            }
+        },
+        None => None,
+    };
+    if let (Some(wi), Some(node)) = (recorded.as_ref(), node.as_ref()) {
+        if crate::worker_model::is_worker_model(&node.inputs.node_def.kind) {
+            return complete_worker_model_step(&state, backend.as_ref(), wi, node, &id, body).await;
+        }
+        if body.model_result.is_some() {
+            return Ok(not_completed(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "model_result is the answer of a model step its run's worker runs; node {} \
+                     is not one, and reports its output and state_patch",
+                    wi.node_id
+                ),
+            ));
+        }
+        // Both required, as they were before `model_result` existed (the
+        // request extractor's 422 then).
+        for (field, sent) in [
+            ("output", body.output.is_some()),
+            ("state_patch", body.state_patch.is_some()),
+        ] {
+            if !sent {
+                return Ok(not_completed(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("missing field `{field}`"),
+                ));
+            }
+        }
+    }
+    // Null only for an item that is not there, for which nothing is
+    // recorded whatever the body holds.
+    let output = body.output.clone().unwrap_or(Value::Null);
+    let reported_patch = body.state_patch.clone().unwrap_or(Value::Null);
+
     let derived_key: Option<String> = match &recorded {
         Some(wi) => {
             jamjet_state::derive_idempotency_key(backend.as_ref(), &wi.execution_id, &wi.node_id)
@@ -3779,9 +3881,20 @@ async fn complete_work_item(
         // cannot be counted, and a retry would pay again with nothing
         // recorded: the holder's step fails for good instead. The fence
         // shows the caller holds the item; without one nothing is written.
-        if let (Some(wi), Some(fence)) = (recorded.as_ref(), body.lease_fence.filter(|f| *f > 0)) {
-            if fail_uncounted_step(backend.as_ref(), wi, fence, &problem, state.agents.as_ref())
-                .await?
+        if let (Some(wi), Some(node), Some(fence)) = (
+            recorded.as_ref(),
+            node.as_ref(),
+            body.lease_fence.filter(|f| *f > 0),
+        ) {
+            if fail_uncounted_step(
+                backend.as_ref(),
+                wi,
+                node,
+                fence,
+                &problem,
+                state.agents.as_ref(),
+            )
+            .await?
             {
                 return Err(ApiError::BadRequest(format!(
                     "{problem}; the run has a dollar cap, so the step failed"
@@ -3791,8 +3904,8 @@ async fn complete_work_item(
         return Err(ApiError::BadRequest(problem));
     }
 
-    let state_patch = jamjet_state::approvals::action_state(&body.state_patch);
-    if state_patch != body.state_patch {
+    let state_patch = jamjet_state::approvals::action_state(&reported_patch);
+    if state_patch != reported_patch {
         warn!(work_item_id = %id, "complete: dropped engine bookkeeping keys from the reported state_patch");
     }
 
@@ -3804,7 +3917,7 @@ async fn complete_work_item(
             0,
             jamjet_state::EventKind::NodeCompleted {
                 node_id: node_id.to_string(),
-                output: body.output.clone(),
+                output: output.clone(),
                 state_patch: state_patch.clone(),
                 duration_ms: body.duration_ms,
                 gen_ai_system: body.gen_ai_system.clone(),
@@ -3874,9 +3987,9 @@ async fn complete_work_item(
     // gate (`node_guard::guard_item`), read-only: a gated node completes only
     // under an approval for its current occurrence. No event is written on a
     // refusal and the item is left alone.
-    if let Some(wi) = recorded.as_ref() {
+    if let (Some(wi), Some(node)) = (recorded.as_ref(), node.as_ref()) {
         if let Err((status, reason)) =
-            completion_gate(backend.as_ref(), wi, state.agents.as_ref()).await
+            completion_gate(backend.as_ref(), wi, node, state.agents.as_ref()).await
         {
             warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, %reason, "complete: refused");
             return Ok((
@@ -4015,25 +4128,279 @@ async fn complete_work_item(
     // rebuilds from, so the two would simply disagree with no way to tell which
     // is right.
     if let Some(wi) = recorded.as_ref() {
-        let execution_id = wi.execution_id.clone();
-        // Denormalised read-model refresh, best effort by design: the
-        // authoritative state is the event log plus the snapshot `commit_turn`
-        // wrote inside the transaction, and the materializer recomputes from
-        // those. Losing this write costs a stale convenience column, not state.
-        if let Ok(Some(mut exec)) = backend.get_execution(&execution_id).await {
-            if let Some(state_obj) = exec.current_state.as_object_mut() {
-                if let Some(patch_obj) = state_patch.as_object() {
-                    for (k, v) in patch_obj {
-                        state_obj.insert(k.clone(), v.clone());
-                    }
+        refresh_current_state(backend.as_ref(), &wi.execution_id, &state_patch).await;
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "completed": true, "work_item_id": id })),
+    ))
+}
+
+/// Merge a recorded step's `state_patch` into the run's `current_state`
+/// column. A denormalised read model, refreshed best effort by design: the
+/// authoritative state is the event log plus the snapshot `commit_turn`
+/// wrote inside the transaction, and the materializer recomputes from
+/// those. Losing this write costs a stale convenience column, not state.
+async fn refresh_current_state(
+    backend: &dyn jamjet_state::StateBackend,
+    execution_id: &ExecutionId,
+    state_patch: &Value,
+) {
+    if let Ok(Some(mut exec)) = backend.get_execution(execution_id).await {
+        if let Some(state_obj) = exec.current_state.as_object_mut() {
+            if let Some(patch_obj) = state_patch.as_object() {
+                for (k, v) in patch_obj {
+                    state_obj.insert(k.clone(), v.clone());
                 }
             }
-            let _ = backend
-                .update_execution_current_state(&execution_id, &exec.current_state)
-                .await;
+        }
+        let _ = backend
+            .update_execution_current_state(execution_id, &exec.current_state)
+            .await;
+    }
+}
+
+/// Whether `wi`, as read, is still claimed under `fence`: the lease its
+/// claim minted, neither settled (no lease left) nor taken back (no holder,
+/// or a newer fence). The fenced commit decides again; this lets a late or
+/// repeated answer be refused before anything is recorded for it.
+fn holds_lease(wi: &WorkItem, fence: i64) -> bool {
+    wi.lease_fence == fence && wi.worker_id.is_some() && wi.lease_expires_at.is_some()
+}
+
+/// `POST /work-items/:id/complete` for a model step its run's own worker
+/// ran. The worker is trusted for the model's answer and the usage it
+/// reports; the engine decides what is recorded, in this order:
+///
+/// 1. The lease. No `lease_fence`, or one the item no longer holds (the
+///    lease was taken back, or the answer was recorded already), is 409.
+/// 2. The answer is the model's. An `output`, a `state_patch` or usage
+///    beside `model_result`, or no `model_result`, is 400; an answer that
+///    does not parse is 422.
+/// 3. The usage the caps count. A token count missing is 400. A cost that
+///    cannot be counted is 400, and under a dollar cap the step fails for
+///    good, since it may have paid ([`fail_uncounted_step`]).
+/// 4. The answer against the registered node
+///    ([`crate::worker_model::ModelResult::malformed`]): 422.
+/// 5. The completion gate every result passes ([`completion_gate`]).
+/// 6. The model the worker reports, against the allow lists
+///    (`node_guard::reported_model_allowed`). Off one, the violation is
+///    recorded and the step fails for good: 409.
+///
+/// Then `NodeCompleted`, with the output and state patch the in-process
+/// executor would build from the same answer (`model_outcome`), in one
+/// fenced commit: 200. The scheduler's next pass fails a run past its cap.
+/// Every refusal records nothing and leaves the item the worker's, but for
+/// a cost under a dollar cap and a model off an allow list, which fail the
+/// step for good.
+async fn complete_worker_model_step(
+    state: &AppState,
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+    node: &RecordedNode,
+    id: &str,
+    body: CompleteWorkItemRequest,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let refused = |status: StatusCode, reason: String| {
+        warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, %reason, "complete: refused a model step's answer");
+        Ok(not_completed(status, reason))
+    };
+    let stale = || "stale or invalid lease fence".to_string();
+
+    let fence = match body.lease_fence {
+        None => {
+            return refused(
+                StatusCode::CONFLICT,
+                "a model step its run's worker runs completes only under the lease_fence from \
+                 its claim"
+                    .to_string(),
+            )
+        }
+        Some(fence) if fence > 0 && holds_lease(wi, fence) => fence,
+        Some(_) => return refused(StatusCode::CONFLICT, stale()),
+    };
+
+    if body.output.is_some() || body.state_patch.is_some() {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "node {} is a model step its run's worker runs; its result is model_result, the \
+                 model's answer, from which the engine builds the output and the state patch",
+                wi.node_id
+            ),
+        );
+    }
+    if let Some(field) = body.usage_beside_the_answer() {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            format!("{field} belongs in model_result: a model step's usage is its answer's"),
+        );
+    }
+    let Some(raw) = body.model_result else {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "node {} is a model step its run's worker runs; it completes with \
+                 model_result, the model's answer",
+                wi.node_id
+            ),
+        );
+    };
+    let answer: crate::worker_model::ModelResult = match serde_json::from_value(raw) {
+        Ok(answer) => answer,
+        // The parser's words can quote what the worker sent: told to the
+        // worker, as the request extractor would, but not logged.
+        Err(e) => {
+            warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, "complete: refused a model step's answer: model_result does not parse");
+            return Ok(not_completed(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("model_result: {e}"),
+            ));
+        }
+    };
+
+    let tokens = match answer.tokens() {
+        Ok(tokens) => tokens,
+        Err(reason) => return refused(StatusCode::BAD_REQUEST, reason),
+    };
+    if let Some(problem) = uncountable_cost(answer.cost_usd, answer.cost_currency.as_deref()) {
+        if fail_uncounted_step(backend, wi, node, fence, &problem, state.agents.as_ref()).await? {
+            return refused(
+                StatusCode::BAD_REQUEST,
+                format!("{problem}; the run has a dollar cap, so the step failed"),
+            );
+        }
+        return refused(StatusCode::BAD_REQUEST, problem);
+    }
+
+    if let Some(problem) = answer.malformed(&node.inputs.node_def.kind) {
+        return refused(StatusCode::UNPROCESSABLE_ENTITY, problem);
+    }
+
+    if let Err((status, reason)) = completion_gate(backend, wi, node, state.agents.as_ref()).await {
+        return refused(status, reason);
+    }
+
+    // The check of the model used records a violation, so the lease is read
+    // again first: an answer whose lease moved while it was decided records
+    // nothing.
+    match backend.get_work_item(wi.id).await {
+        Ok(Some(now)) if holds_lease(&now, fence) => {}
+        Ok(_) => return refused(StatusCode::CONFLICT, stale()),
+        Err(e) => {
+            return refused(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("the work item could not be read: {e}"),
+            )
+        }
+    }
+    match jamjet_worker::node_guard::reported_model_allowed(
+        backend,
+        &wi.execution_id,
+        &wi.node_id,
+        &wi.tenant_id,
+        node.inputs.workflow_policy.as_ref(),
+        &node.inputs.node_def,
+        &answer.model,
+    )
+    .await
+    {
+        DispatchGuardOutcome::Allow => {}
+        // The violation is on record. The worker may have paid for a model
+        // the run may not use, and a retry would only call one again: the
+        // step fails for good, in one fenced commit, as a claim refusal does.
+        DispatchGuardOutcome::Blocked { reason } => {
+            let terminal = jamjet_state::Event::new(
+                wi.execution_id.clone(),
+                0,
+                jamjet_state::EventKind::NodeFailed {
+                    node_id: wi.node_id.clone(),
+                    error: format!("policy blocked: {reason}"),
+                    attempt: wi.attempt,
+                    retryable: false,
+                },
+            );
+            return match backend
+                .commit_turn_unless_terminal(wi.id, fence, terminal, false)
+                .await
+            {
+                Ok(jamjet_state::TurnCommit::Committed(_)) => refused(
+                    StatusCode::CONFLICT,
+                    format!("policy blocked: {reason}; the step failed"),
+                ),
+                Ok(jamjet_state::TurnCommit::ExecutionTerminal(status)) => {
+                    refused(StatusCode::CONFLICT, format!("execution is {status:?}"))
+                }
+                Err(jamjet_state::StateBackendError::FenceLost(_)) => {
+                    refused(StatusCode::CONFLICT, stale())
+                }
+                Err(e) => Err(e.into()),
+            };
+        }
+        DispatchGuardOutcome::Unavailable { reason } => {
+            return refused(StatusCode::SERVICE_UNAVAILABLE, reason)
+        }
+        // Not reached: no gate and no cap is read for the model used.
+        // Refused rather than recorded if one ever is.
+        DispatchGuardOutcome::Held { .. } | DispatchGuardOutcome::Spent { .. } => {
+            return refused(
+                StatusCode::CONFLICT,
+                "the model used could not be cleared".to_string(),
+            )
         }
     }
 
+    // The key the engine derives, as for every completion: never the body's.
+    let derived_key = jamjet_state::derive_idempotency_key(backend, &wi.execution_id, &wi.node_id)
+        .await
+        .ok();
+    if let (Some(sent), Some(derived)) = (body.idempotency_key.as_deref(), derived_key.as_deref()) {
+        if sent != derived {
+            warn!(
+                work_item_id = %id,
+                "complete: the echoed idempotency_key differs from the engine-derived one; \
+                 recording under the derived key"
+            );
+        }
+    }
+    let response = answer.response(tokens);
+    let (output, state_patch) = jamjet_worker::executors::model_node::model_outcome(&response);
+    let completed = jamjet_state::Event::new(
+        wi.execution_id.clone(),
+        // Assigned inside `commit_turn`'s transaction.
+        0,
+        jamjet_state::EventKind::NodeCompleted {
+            node_id: wi.node_id.clone(),
+            output,
+            state_patch: state_patch.clone(),
+            duration_ms: body.duration_ms,
+            gen_ai_system: Some(
+                jamjet_worker::executors::model_node::gen_ai_system(&response.model).to_string(),
+            ),
+            gen_ai_model: Some(response.model.clone()),
+            input_tokens: Some(response.input_tokens),
+            output_tokens: Some(response.output_tokens),
+            finish_reason: Some(response.finish_reason.clone()),
+            cost_usd: response.cost_usd,
+            provenance: None,
+            idempotency_key: derived_key,
+        },
+    );
+    match backend
+        .commit_turn_unless_terminal(wi.id, fence, completed, true)
+        .await
+    {
+        Ok(jamjet_state::TurnCommit::Committed(_)) => {}
+        Ok(jamjet_state::TurnCommit::ExecutionTerminal(status)) => {
+            return refused(StatusCode::CONFLICT, format!("execution is {status:?}"))
+        }
+        Err(jamjet_state::StateBackendError::FenceLost(_)) => {
+            return refused(StatusCode::CONFLICT, stale())
+        }
+        Err(e) => return Err(e.into()),
+    }
+    refresh_current_state(backend, &wi.execution_id, &state_patch).await;
     Ok((
         StatusCode::OK,
         Json(json!({ "completed": true, "work_item_id": id })),
@@ -4056,14 +4423,16 @@ fn uncountable_cost(cost_usd: Option<f64>, cost_currency: Option<&str>) -> Optio
     None
 }
 
-/// Fail for good the step of `wi`, whose reported cost cannot be counted,
-/// when its run has a dollar cap. Returns whether the step failed.
+/// Fail for good the step of `wi`, whose node is `node` and whose reported
+/// cost cannot be counted, when its run has a dollar cap. Returns whether
+/// the step failed. For every kind, a model step its run's worker ran
+/// included.
 ///
 /// One fenced `commit_turn_unless_terminal` settles the item and appends
 /// `NodeFailed { retryable: false }`, as a claim refusal does, and the
 /// scheduler fails the run. Only for an item whose result the completion
-/// gate would record: the same rules decide what may be written for it. A
-/// run or workflow that cannot be read writes nothing, as the gate would.
+/// gate would record: the same rules decide what may be written for it.
+/// Caps that cannot be read write nothing.
 ///
 /// `Err` (503) when the store could not be read or the write failed: the
 /// item is still claimed and nothing is recorded, so the caller sends the
@@ -4072,23 +4441,22 @@ fn uncountable_cost(cost_usd: Option<f64>, cost_currency: Option<&str>) -> Optio
 async fn fail_uncounted_step(
     backend: &dyn jamjet_state::StateBackend,
     wi: &WorkItem,
+    node: &RecordedNode,
     fence: i64,
     problem: &str,
     agents: &dyn jamjet_agents::AgentRegistry,
 ) -> Result<bool, ApiError> {
-    match dollar_capped(backend, wi).await {
-        Ok(Ok(true)) => {}
-        Ok(Ok(false)) => return Ok(false),
-        Ok(Err(e)) => {
+    // `cost_budget_usd` set in the run's stored IR, whatever its value, read
+    // as the claim gate reads it.
+    match caps_from_raw(&node.ir) {
+        Ok(caps) if caps.cost_budget_usd.is_some() => {}
+        Ok(_) => return Ok(false),
+        Err(e) => {
             warn!(work_item_id = %wi.id, error = %e, "complete: could not read the run's dollar cap");
             return Ok(false);
         }
-        Err(e) => {
-            warn!(work_item_id = %wi.id, error = %e, "complete: could not read the run's dollar cap");
-            return Err(ApiError::Unavailable(e));
-        }
     }
-    if let Err((status, reason)) = completion_gate(backend, wi, agents).await {
+    if let Err((status, reason)) = completion_gate(backend, wi, node, agents).await {
         warn!(work_item_id = %wi.id, %reason, "complete: an uncountable cost on a step the gate refuses");
         if status == StatusCode::SERVICE_UNAVAILABLE {
             return Err(ApiError::Unavailable(reason));
@@ -4119,34 +4487,6 @@ async fn fail_uncounted_step(
             )))
         }
     }
-}
-
-/// Whether the run of `wi` has a dollar cap: `cost_budget_usd` set in its
-/// stored IR, whatever its value, read as the claim gate reads it
-/// ([`caps_from_raw`]). `Ok(Err)`: the run, its workflow or its caps are
-/// not in what is stored. `Err`: the store could not be read.
-async fn dollar_capped(
-    backend: &dyn jamjet_state::StateBackend,
-    wi: &WorkItem,
-) -> Result<Result<bool, String>, String> {
-    let Some(execution) = backend
-        .get_execution(&wi.execution_id)
-        .await
-        .map_err(|e| format!("execution unreadable: {e}"))?
-    else {
-        return Ok(Err("execution not found".to_string()));
-    };
-    let Some(def) = backend
-        .get_workflow(&execution.workflow_id, &execution.workflow_version)
-        .await
-        .map_err(|e| format!("workflow unreadable: {e}"))?
-    else {
-        return Ok(Err(format!(
-            "workflow {} v{} not found",
-            execution.workflow_id, execution.workflow_version
-        )));
-    };
-    Ok(caps_from_raw(&def.ir).map(|caps| caps.cost_budget_usd.is_some()))
 }
 
 #[derive(Deserialize)]

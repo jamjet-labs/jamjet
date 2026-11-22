@@ -5,16 +5,24 @@
 //! built and what the run's caps leave ([`BudgetLeft`]), after the same gate
 //! as every item (`routes::gate_claimed_item`). A step whose request holds no
 //! prompt to send is failed there instead, as the in-process model executor
-//! fails it ([`missing_prompt`]), so the worker never sends a prompt of its
-//! own making.
+//! fails it (`jamjet_worker::executors::model_node::missing_prompt`), so the
+//! worker never sends a prompt of its own making.
+//!
+//! The completion takes the model's answer ([`ModelResult`]), never an
+//! output or a state patch of the worker's own. The engine checks it against
+//! the registered node ([`ModelResult::malformed`]) and builds the step's
+//! output and state from it with the in-process executor's function
+//! (`model_outcome`), so the two executors record the same step.
 
 use jamjet_core::node::ModelExecutor;
 use jamjet_core::workflow::ExecutionId;
 use jamjet_core::NodeKind;
+use jamjet_models::adapter::ToolCall;
+use jamjet_models::ModelResponse;
 use jamjet_state::backend::StateBackend;
 use jamjet_state::usage::cost_to_nanos;
 use jamjet_state::{fold_run_usage, RunCaps, RunUsage};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Whether `kind` is a model step its run's own worker runs.
@@ -104,35 +112,166 @@ pub async fn budget_left_of_run(
     }
 }
 
-/// Why the model step of `payload` cannot be sent to a model: the request
-/// the engine built holds no prompt. `None` when it holds one.
+/// The most tool calls one answer may carry: as many as a tool dispatch
+/// node reads (`jamjet_policy::dispatch::MAX_PENDING_CALLS`).
+pub const MAX_TOOL_CALLS: usize = 256;
+
+/// The longest model id an answer may report, in characters.
+pub const MAX_MODEL_CHARS: usize = 256;
+
+/// A model step's answer, as its run's worker reports it (`model_result` on
+/// `POST /work-items/:id/complete`): what the model said, which model said
+/// it, and what the call used.
 ///
-/// The in-process model executor fails the step with these words before it
-/// calls the model (`jamjet_worker::ModelNodeExecutor`), not retryable: the
-/// scheduler could not render the node's prompt (`prompt_error`), or the node
-/// has no prompt and the conversation it would read is empty once a system
-/// message repeating the node's system prompt is dropped. The claim fails a
-/// worker model step the same way.
-pub fn missing_prompt(payload: &Value) -> Option<String> {
-    if let Some(reason) = payload.get("prompt_error").and_then(Value::as_str) {
-        return Some(format!("ModelNodeExecutor: {reason}"));
+/// The worker is trusted for the answer and its usage. The engine checks
+/// the answer against the registered node ([`Self::malformed`]), holds the
+/// model to the allow lists, and builds the step's output and state from it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelResult {
+    pub content: String,
+    pub finish_reason: String,
+    /// The model that answered, as the worker reports it.
+    pub model: String,
+    #[serde(default)]
+    pub tool_calls: Vec<ReportedCall>,
+    /// Required, with `output_tokens`: the caps count them ([`Self::tokens`]).
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    /// USD; held to the rule every reported cost is held to.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    /// Optional; when sent, it must be `"USD"`.
+    #[serde(default)]
+    pub cost_currency: Option<String>,
+}
+
+/// One tool call the model asked for.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReportedCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+impl ModelResult {
+    /// Both token counts, or why the answer cannot be recorded without
+    /// them: they are what the run's caps count.
+    pub fn tokens(&self) -> Result<(u64, u64), String> {
+        match (self.input_tokens, self.output_tokens) {
+            (Some(input), Some(output)) => Ok((input, output)),
+            _ => Err(
+                "model_result must report input_tokens and output_tokens, which the \
+                      run's caps count"
+                    .to_string(),
+            ),
+        }
     }
-    let prompt = payload.get("prompt").and_then(Value::as_str).unwrap_or("");
-    if !prompt.is_empty() {
-        return None;
+
+    /// Why this is not an answer the step of `kind` could record, or `None`.
+    /// `kind` is the registered node's, never the item's payload: the tools
+    /// a call may name are the ones the node offers its model.
+    ///
+    /// The model id is recorded and checked against allow lists, so it is
+    /// not empty, at most [`MAX_MODEL_CHARS`] characters and holds no
+    /// control or invisible format character. At most [`MAX_TOOL_CALLS`]
+    /// calls. A call has a non-empty id no other call has (its result is
+    /// matched back by it) and names a tool the node offers. Calls finish
+    /// with `tool_calls`, and `tool_calls` has calls.
+    ///
+    /// The reasons name a call by its place in the list, never by what the
+    /// worker sent.
+    pub fn malformed(&self, kind: &NodeKind) -> Option<String> {
+        if self.model.is_empty() {
+            return Some("model must not be empty".to_string());
+        }
+        if self.model.chars().count() > MAX_MODEL_CHARS {
+            return Some(format!("model is longer than {MAX_MODEL_CHARS} characters"));
+        }
+        if self
+            .model
+            .chars()
+            .any(jamjet_ir::is_forbidden_identifier_char)
+        {
+            return Some("model holds a control or invisible format character".to_string());
+        }
+        if self.tool_calls.len() > MAX_TOOL_CALLS {
+            return Some(format!("more than {MAX_TOOL_CALLS} tool calls"));
+        }
+        match (
+            self.finish_reason == "tool_calls",
+            self.tool_calls.is_empty(),
+        ) {
+            (true, true) => {
+                return Some("finish_reason is tool_calls and there are no tool calls".to_string())
+            }
+            (false, false) => {
+                return Some("an answer with tool calls must finish with tool_calls".to_string())
+            }
+            _ => {}
+        }
+        let offered = offered_tools(kind);
+        let mut seen: std::collections::HashMap<&str, usize> = Default::default();
+        for (i, call) in self.tool_calls.iter().enumerate() {
+            if call.id.is_empty() {
+                return Some(format!("tool call {i} has an empty id"));
+            }
+            if let Some(first) = seen.insert(call.id.as_str(), i) {
+                return Some(format!("tool calls {first} and {i} have the same id"));
+            }
+            if !offered.contains(&call.name.as_str()) {
+                return Some(format!(
+                    "tool call {i} names a tool the node does not offer"
+                ));
+            }
+        }
+        None
     }
-    let system_prompt = payload.get("system_prompt").and_then(Value::as_str);
-    let conversation = payload
-        .get("messages")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let sent = conversation.iter().any(|message| {
-        let role = message.get("role").and_then(Value::as_str);
-        let content = message.get("content").and_then(Value::as_str).unwrap_or("");
-        !(role == Some("system") && Some(content) == system_prompt)
-    });
-    (!sent).then(|| "ModelNodeExecutor: no prompt or messages provided".to_string())
+
+    /// The answer as the engine's model adapter returns one, with its
+    /// [`Self::tokens`]: what `model_outcome` and the step's event read.
+    pub fn response(&self, (input_tokens, output_tokens): (u64, u64)) -> ModelResponse {
+        ModelResponse {
+            content: self.content.clone(),
+            model: self.model.clone(),
+            finish_reason: self.finish_reason.clone(),
+            input_tokens,
+            output_tokens,
+            structured: None,
+            tool_calls: self
+                .tool_calls
+                .iter()
+                .map(|c| ToolCall {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    arguments: c.arguments.clone(),
+                })
+                .collect(),
+            cost_usd: self.cost_usd,
+        }
+    }
+}
+
+/// The names of the tools a model node offers its model: each schema's
+/// `function.name` (the OpenAI shape the SDK compiles), or a flat schema's
+/// `name`. A schema with neither, or an empty one, offers nothing. Empty for
+/// any other kind.
+pub fn offered_tools(kind: &NodeKind) -> Vec<&str> {
+    let NodeKind::Model { tools, .. } = kind else {
+        return Vec::new();
+    };
+    tools
+        .iter()
+        .filter_map(|schema| {
+            schema
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .or_else(|| schema.get("name"))
+                .and_then(Value::as_str)
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -298,66 +437,6 @@ mod tests {
         }
     }
 
-    const SYSTEM: &str = "You plan events.";
-
-    #[test]
-    fn a_rendered_prompt_is_a_request_to_send() {
-        for payload in [
-            json!({ "prompt": "Find a venue in Lisbon" }),
-            json!({ "prompt": "Find a venue", "system_prompt": SYSTEM }),
-            json!({ "messages": [ { "role": "user", "content": "hi" } ] }),
-            json!({ "messages": [ { "content": "no role reads as the user" } ] }),
-            json!({ "system_prompt": SYSTEM, "messages": [
-                { "role": "system", "content": "another system message" }
-            ] }),
-            json!({ "prompt": "", "messages": [ { "role": "assistant", "content": "" } ] }),
-        ] {
-            assert_eq!(missing_prompt(&payload), None, "{payload}");
-        }
-    }
-
-    #[test]
-    fn a_prompt_the_scheduler_could_not_render_is_missing() {
-        let payload = json!({
-            "prompt_error": "prompt template: `{{ state.city }}`: the run's state has no `city`",
-            "messages": [ { "role": "user", "content": "a conversation to fall back on" } ]
-        });
-        assert_eq!(
-            missing_prompt(&payload).as_deref(),
-            Some(
-                "ModelNodeExecutor: prompt template: `{{ state.city }}`: the run's state has no \
-                 `city`"
-            )
-        );
-    }
-
-    #[test]
-    fn no_prompt_and_no_conversation_is_missing() {
-        let none = Some("ModelNodeExecutor: no prompt or messages provided");
-        for payload in [
-            json!({}),
-            json!({ "prompt": "" }),
-            json!({ "prompt": 7 }),
-            json!({ "messages": [] }),
-            json!({ "messages": "not a list" }),
-            json!({ "system_prompt": SYSTEM, "messages": [
-                { "role": "system", "content": SYSTEM }
-            ] }),
-        ] {
-            assert_eq!(missing_prompt(&payload).as_deref(), none, "{payload}");
-        }
-    }
-
-    /// The executor reads `prompt_error` only as text; another shape is
-    /// passed over, and the prompt decides.
-    #[test]
-    fn a_prompt_error_that_is_not_text_is_passed_over() {
-        assert_eq!(
-            missing_prompt(&json!({ "prompt_error": 1, "prompt": "Find a venue" })),
-            None
-        );
-    }
-
     #[test]
     fn only_a_model_node_its_worker_runs_is_a_worker_model_step() {
         let model = |executor: Option<&str>| {
@@ -376,5 +455,267 @@ mod tests {
         )
         .unwrap();
         assert!(!is_worker_model(&python));
+    }
+
+    /// A model node offering `tools`, by name, in the OpenAI shape the SDK
+    /// compiles.
+    fn offering(tools: &[&str]) -> NodeKind {
+        serde_json::from_value(json!({
+            "type": "model", "model_ref": "m", "prompt_ref": "p", "output_schema": "",
+            "executor": "worker",
+            "tools": tools.iter().map(|t| json!({
+                "type": "function", "function": { "name": t, "parameters": {} }
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap()
+    }
+
+    fn answer(model_result: Value) -> ModelResult {
+        serde_json::from_value(model_result).unwrap()
+    }
+
+    fn good() -> Value {
+        json!({
+            "content": "", "finish_reason": "tool_calls", "model": "vertex_ai/gemini-2.5-pro",
+            "tool_calls": [ { "id": "c1", "name": "search", "arguments": { "q": "venues" } } ],
+            "input_tokens": 812, "output_tokens": 95, "cost_usd": 0.0031
+        })
+    }
+
+    fn with(key: &str, value: Value) -> Value {
+        let mut a = good();
+        a[key] = value;
+        a
+    }
+
+    fn call(id: &str, name: &str) -> Value {
+        json!({ "id": id, "name": name, "arguments": {} })
+    }
+
+    #[test]
+    fn a_well_formed_answer_is_taken() {
+        assert_eq!(answer(good()).malformed(&offering(&["search"])), None);
+        let text = json!({
+            "content": "Book the hall.", "finish_reason": "stop", "model": "m",
+            "input_tokens": 1, "output_tokens": 1
+        });
+        assert_eq!(answer(text).malformed(&offering(&[])), None);
+    }
+
+    #[test]
+    fn both_token_counts_are_reported() {
+        assert_eq!(answer(good()).tokens(), Ok((812, 95)));
+        for (what, keys) in [
+            ("input", &["input_tokens"][..]),
+            ("output", &["output_tokens"][..]),
+            ("both", &["input_tokens", "output_tokens"][..]),
+        ] {
+            let mut a = good();
+            for k in keys {
+                a.as_object_mut().unwrap().remove(*k);
+            }
+            assert_eq!(
+                answer(a).tokens(),
+                Err(
+                    "model_result must report input_tokens and output_tokens, which the \
+                     run's caps count"
+                        .to_string()
+                ),
+                "{what}"
+            );
+        }
+    }
+
+    /// The tools a call may name are the node's: each schema's
+    /// `function.name`, or a flat schema's `name`. A schema with neither, or
+    /// an empty one, offers nothing.
+    #[test]
+    fn a_call_names_a_tool_the_node_offers() {
+        let kind: NodeKind = serde_json::from_value(json!({
+            "type": "model", "model_ref": "m", "prompt_ref": "p", "output_schema": "",
+            "tools": [
+                { "type": "function", "function": { "name": "search" } },
+                { "name": "book", "input_schema": {} },
+                { "type": "function", "function": { "description": "no name" } },
+                { "type": "function", "function": { "name": "" } },
+                { "name": 7 }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(offered_tools(&kind), vec!["search", "book"]);
+        let calls = |names: &[&str]| {
+            with(
+                "tool_calls",
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| call(&format!("c{i}"), n))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        };
+        assert_eq!(answer(calls(&["search", "book"])).malformed(&kind), None);
+        for names in [
+            &["delete_records"][..],
+            &["search", "delete_records"],
+            &[""],
+        ] {
+            assert_eq!(
+                answer(calls(names)).malformed(&kind),
+                Some(format!(
+                    "tool call {} names a tool the node does not offer",
+                    names.len() - 1
+                )),
+                "{names:?}"
+            );
+        }
+        assert_eq!(
+            answer(good()).malformed(&offering(&[])),
+            Some("tool call 0 names a tool the node does not offer".to_string())
+        );
+        let python: NodeKind = serde_json::from_value(
+            json!({ "type": "python_fn", "module": "m", "function": "f", "output_schema": "" }),
+        )
+        .unwrap();
+        assert!(offered_tools(&python).is_empty());
+    }
+
+    #[test]
+    fn every_call_has_an_id_of_its_own() {
+        let kind = offering(&["search"]);
+        assert_eq!(
+            answer(with(
+                "tool_calls",
+                json!([call("c1", "search"), call("c1", "search")])
+            ))
+            .malformed(&kind),
+            Some("tool calls 0 and 1 have the same id".to_string())
+        );
+        assert_eq!(
+            answer(with(
+                "tool_calls",
+                json!([
+                    call("a", "search"),
+                    call("b", "search"),
+                    call("a", "search")
+                ])
+            ))
+            .malformed(&kind),
+            Some("tool calls 0 and 2 have the same id".to_string())
+        );
+        assert_eq!(
+            answer(with(
+                "tool_calls",
+                json!([call("c1", "search"), call("", "search")])
+            ))
+            .malformed(&kind),
+            Some("tool call 1 has an empty id".to_string())
+        );
+    }
+
+    #[test]
+    fn the_finish_reason_and_the_calls_agree() {
+        let kind = offering(&["search"]);
+        assert_eq!(
+            answer(with("tool_calls", json!([]))).malformed(&kind),
+            Some("finish_reason is tool_calls and there are no tool calls".to_string())
+        );
+        let mut none = good();
+        none.as_object_mut().unwrap().remove("tool_calls");
+        assert_eq!(
+            answer(none).malformed(&kind),
+            Some("finish_reason is tool_calls and there are no tool calls".to_string())
+        );
+        for reason in ["stop", "length", "tool_use", ""] {
+            assert_eq!(
+                answer(with("finish_reason", json!(reason))).malformed(&kind),
+                Some("an answer with tool calls must finish with tool_calls".to_string()),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn at_most_256_calls() {
+        let kind = offering(&["search"]);
+        let calls = |n: usize| -> Value {
+            (0..n)
+                .map(|i| call(&format!("c{i}"), "search"))
+                .collect::<Vec<_>>()
+                .into()
+        };
+        assert_eq!(
+            answer(with("tool_calls", calls(256))).malformed(&kind),
+            None
+        );
+        assert_eq!(
+            answer(with("tool_calls", calls(257))).malformed(&kind),
+            Some("more than 256 tool calls".to_string())
+        );
+    }
+
+    /// The model id is recorded and checked against allow lists: not empty,
+    /// at most 256 characters (not bytes), no control or invisible format
+    /// character.
+    #[test]
+    fn the_model_id_is_bounded_and_visible() {
+        let kind = offering(&["search"]);
+        for model in [
+            "m".repeat(256),
+            "é".repeat(256),
+            "openai/gpt-4o".to_string(),
+        ] {
+            assert_eq!(
+                answer(with("model", json!(model))).malformed(&kind),
+                None,
+                "{model}"
+            );
+        }
+        for (model, why) in [
+            (String::new(), "model must not be empty"),
+            ("m".repeat(257), "model is longer than 256 characters"),
+            ("é".repeat(257), "model is longer than 256 characters"),
+            (
+                "vertex_ai/gemini\nopenai/gpt-4o".to_string(),
+                "model holds a control or invisible format character",
+            ),
+            (
+                "vertex_ai/gemini\u{202E}".to_string(),
+                "model holds a control or invisible format character",
+            ),
+            (
+                "vertex_ai/\u{200B}gemini".to_string(),
+                "model holds a control or invisible format character",
+            ),
+        ] {
+            assert_eq!(
+                answer(with("model", json!(model))).malformed(&kind),
+                Some(why.to_string()),
+                "{model:?}"
+            );
+        }
+    }
+
+    /// The answer as the engine's model adapter returns one: what
+    /// `model_outcome` and the step's event read.
+    #[test]
+    fn the_response_carries_the_answer() {
+        let a = answer(good());
+        let response = a.response(a.tokens().unwrap());
+        assert_eq!(response.content, "");
+        assert_eq!(response.model, "vertex_ai/gemini-2.5-pro");
+        assert_eq!(response.finish_reason, "tool_calls");
+        assert_eq!((response.input_tokens, response.output_tokens), (812, 95));
+        assert_eq!(response.cost_usd, Some(0.0031));
+        assert_eq!(response.structured, None);
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(
+            (
+                response.tool_calls[0].id.as_str(),
+                response.tool_calls[0].name.as_str(),
+                &response.tool_calls[0].arguments
+            ),
+            ("c1", "search", &json!({ "q": "venues" }))
+        );
     }
 }

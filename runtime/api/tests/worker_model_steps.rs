@@ -788,6 +788,18 @@ async fn the_engine_model_queue_is_still_never_served() {
 /// `marked`: with the by-execution marker, which the payload builder writes
 /// for a node claimed by its execution; else without it.
 async fn hand_enqueue(run: &Run, ir: &Value, node_id: &str, queue: &str, marked: bool) {
+    hand_enqueue_with(run, ir, node_id, queue, marked, |_| {}).await;
+}
+
+/// [`hand_enqueue`], with the payload changed by `edit` before it is stored.
+async fn hand_enqueue_with(
+    run: &Run,
+    ir: &Value,
+    node_id: &str,
+    queue: &str,
+    marked: bool,
+    edit: impl FnOnce(&mut Value),
+) {
     let parsed: jamjet_ir::WorkflowIr = serde_json::from_value(ir.clone()).unwrap();
     let mut payload = jamjet_scheduler::build_work_item_payload(
         &parsed,
@@ -806,6 +818,7 @@ async fn hand_enqueue(run: &Run, ir: &Value, node_id: &str, queue: &str, marked:
     } else {
         obj.remove(jamjet_core::node::CLAIM_PAYLOAD_KEY);
     }
+    edit(&mut payload);
     let seq = run.backend.latest_sequence(&run.eid).await.unwrap() + 1;
     run.backend
         .append_event(jamjet_state::Event::new(
@@ -1992,7 +2005,8 @@ fn answer_fields(completed: &Value) -> Value {
         "output_tokens": completed["output_tokens"],
         "cost_usd": completed["cost_usd"],
         "finish_reason": completed["finish_reason"],
-        "gen_ai_model": completed["gen_ai_model"]
+        "gen_ai_model": completed["gen_ai_model"],
+        "gen_ai_system": completed["gen_ai_system"]
     })
 }
 
@@ -2156,6 +2170,256 @@ async fn a_model_result_for_another_kind_is_400() {
     }
 }
 
+/// GUARD: another kind's result still needs its output and state patch, as
+/// before `model_result` existed (the request extractor's 422). A null
+/// output is an output.
+#[tokio::test]
+async fn another_kinds_result_still_needs_its_output_and_state_patch() {
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            ir("wf-py-shape", &[("pay", python_fn("pay"))], json!({})),
+        )
+        .await;
+        let name = run.name;
+        let (_, claimed) = run
+            .post(
+                "/work-items/claim",
+                json!({ "worker_id": "py", "queue_types": ["python_tool"] }),
+            )
+            .await;
+        assert_eq!(claimed["claimed"], json!(true), "{name}: {claimed}");
+        let wi = &claimed["work_item"];
+        let before = run.events().await.len();
+        let fenced = |body: Value| {
+            let mut body = body;
+            body["lease_fence"] = wi["lease_fence"].clone();
+            body["idempotency_key"] = wi["idempotency_key"].clone();
+            body
+        };
+        for (what, body) in [
+            ("no output", fenced(json!({ "state_patch": {} }))),
+            ("no state patch", fenced(json!({ "output": {} }))),
+            ("neither", fenced(json!({}))),
+        ] {
+            let (st, answer) = run.complete(wi, body).await;
+            assert_eq!(st, 422, "{name}: {what}: {answer}");
+            run.unchanged(wi, before, what).await;
+        }
+        let (st, body) = run
+            .complete(wi, fenced(json!({ "output": null, "state_patch": {} })))
+            .await;
+        assert_eq!(st, 200, "{name}: {body}");
+        assert_eq!(
+            run.completions("pay").await[0]["output"],
+            Value::Null,
+            "{name}"
+        );
+    }
+}
+
+/// A worker model step's usage is the answer's. Telemetry beside it, as
+/// another kind's result carries it, is a 400 and records nothing, and so
+/// is a completion that carries no answer.
+#[tokio::test]
+async fn usage_beside_the_answer_or_no_answer_is_400() {
+    for tb in support::backends().await {
+        let run = start(tb, one_step("wf-beside", &["search"], json!({}))).await;
+        let name = run.name;
+        let wi = run.step().await;
+        let before = run.events().await.len();
+        let mut bodies = Vec::new();
+        for (key, value) in [
+            ("input_tokens", json!(1)),
+            ("output_tokens", json!(1)),
+            ("cost_usd", json!(0.0)),
+            ("cost_currency", json!("USD")),
+            ("gen_ai_model", json!(MODEL)),
+            ("gen_ai_system", json!("openai")),
+            ("finish_reason", json!("stop")),
+        ] {
+            let mut body = result_of(&wi, answer());
+            body[key] = value;
+            bodies.push((format!("{key} beside the answer"), body));
+        }
+        let mut none = result_of(&wi, answer());
+        none.as_object_mut().unwrap().remove("model_result");
+        bodies.push(("no answer".to_string(), none));
+        for (what, body) in bodies {
+            let (st, answer) = run.complete(&wi, body).await;
+            assert_eq!(st, 400, "{name}: {what}: {answer}");
+            assert_eq!(answer["completed"], json!(false), "{name}: {what}");
+            run.unchanged(&wi, before, &what).await;
+        }
+        let (st, body) = run.complete(&wi, result_of(&wi, answer())).await;
+        assert_eq!(st, 200, "{name}: {body}");
+    }
+}
+
+/// An answer of the wrong shape is a 422 and records nothing: a cost or a
+/// count that is not a number, text that is not a string, a missing model,
+/// calls that are not a list, a call with no name, no answer object at all.
+#[tokio::test]
+async fn an_answer_of_the_wrong_shape_is_422() {
+    let mut no_model = answer();
+    no_model.as_object_mut().unwrap().remove("model");
+    let mut no_reason = answer();
+    no_reason.as_object_mut().unwrap().remove("finish_reason");
+    for tb in support::backends().await {
+        let (run, wi) = refused_each(
+            tb,
+            "wf-shape",
+            &["search"],
+            422,
+            vec![
+                (
+                    "a cost as a string",
+                    answer_with("cost_usd", json!("0.0031")),
+                ),
+                ("negative tokens", answer_with("input_tokens", json!(-1))),
+                (
+                    "tokens as a fraction",
+                    answer_with("output_tokens", json!(9.5)),
+                ),
+                ("content that is not text", answer_with("content", json!(7))),
+                ("no model", no_model.clone()),
+                ("no finish reason", no_reason.clone()),
+                (
+                    "calls that are not a list",
+                    answer_with("tool_calls", json!("search")),
+                ),
+                (
+                    "a call with no name",
+                    answer_with("tool_calls", json!([{ "id": "c1", "arguments": {} }])),
+                ),
+                ("an answer that is null", Value::Null),
+                ("an answer that is a list", json!([answer()])),
+            ],
+        )
+        .await;
+        let (st, body) = run.complete(&wi, result_of(&wi, answer())).await;
+        assert_eq!(st, 200, "{}: {body}", run.name);
+    }
+}
+
+/// The tools a call may name are the ones the registered node offers, not
+/// the ones the item's payload lists: a payload written by hand that offers
+/// one more tool does not let the model call it.
+#[tokio::test]
+async fn the_tools_a_call_may_name_are_the_registered_nodes() {
+    for tb in support::backends().await {
+        let workflow = ir(
+            "wf-offered-by-node",
+            &[
+                ("prep", python_fn("prep")),
+                ("think", worker_model(&["search"])),
+            ],
+            json!({}),
+        );
+        let run = start(tb, workflow.clone()).await;
+        let name = run.name;
+        hand_enqueue_with(&run, &workflow, "think", QUEUE, true, |payload| {
+            payload["tools"] = json!([tool_schema("search"), tool_schema("delete_records")]);
+        })
+        .await;
+        let wi = run.step().await;
+        assert_eq!(
+            wi["payload"]["tools"][1]["function"]["name"], "delete_records",
+            "{name}: the hand-written payload was not the one handed out"
+        );
+        let before = run.events().await.len();
+        let (st, body) = run
+            .complete(
+                &wi,
+                result_of(
+                    &wi,
+                    answer_with("tool_calls", json!([call("c1", "delete_records")])),
+                ),
+            )
+            .await;
+        assert_eq!(st, 422, "{name}: {body}");
+        run.unchanged(&wi, before, "a call to a tool only the payload offers")
+            .await;
+        let (st, body) = run.complete(&wi, result_of(&wi, answer())).await;
+        assert_eq!(st, 200, "{name}: {body}");
+    }
+}
+
+/// The answer passes the same completion gate as every result: a tenant
+/// approval gate or block put on after the claim refuses it with 409, and
+/// nothing is recorded.
+#[tokio::test]
+async fn the_completion_gate_still_decides_the_answer() {
+    for tb in support::backends().await {
+        let run = start(tb, one_step("wf-gated-after", &["search"], json!({}))).await;
+        let name = run.name;
+        let wi = run.step().await;
+        let before = run.events().await.len();
+        for (what, tenant) in [
+            (
+                "a gate put on after the claim",
+                json!({ "blocked_tools": [], "require_approval_for": ["*"], "model_allowlist": [] }),
+            ),
+            (
+                "a block put on after the claim",
+                json!({ "blocked_tools": ["*"], "require_approval_for": [], "model_allowlist": [] }),
+            ),
+        ] {
+            set_tenant_policy(&run, tenant).await;
+            let (st, body) = run.complete(&wi, result_of(&wi, answer())).await;
+            assert_eq!(st, 409, "{name}: {what}: {body}");
+            run.unchanged(&wi, before, what).await;
+        }
+        set_tenant_policy(&run, json!({})).await;
+        let (st, body) = run.complete(&wi, result_of(&wi, answer())).await;
+        assert_eq!(st, 200, "{name}: {body}");
+    }
+}
+
+/// An answer naming a model off the allow list that comes late (after the
+/// lease was taken back) or again (after the step was recorded) is a 409
+/// and records nothing: no violation, and the node is not failed.
+#[tokio::test]
+async fn a_late_or_repeated_answer_off_the_allow_list_records_nothing() {
+    let off_list = || answer_with("model", json!("openai/gpt-4o"));
+    let listed = |id: &str| {
+        one_step(
+            id,
+            &["search"],
+            json!({ "policy": policy(&["vertex_ai/*"]) }),
+        )
+    };
+    for tb in support::backends().await {
+        let run = start(tb, listed("wf-late-off-list")).await;
+        let name = run.name;
+        let first = run.step_as("router-1").await;
+        let id = uuid::Uuid::parse_str(first["id"].as_str().unwrap()).unwrap();
+        run.tb.expire_lease(id).await;
+        let again = run.step_as("router-2").await;
+        let (st, body) = run.complete(&first, result_of(&first, off_list())).await;
+        assert_eq!(st, 409, "{name}: late: {body}");
+        assert!(run.violations("think").await.is_empty(), "{name}: late");
+        assert!(run.failed_for_good("think").await.is_none(), "{name}: late");
+        let (st, body) = run.complete(&again, result_of(&again, answer())).await;
+        assert_eq!(st, 200, "{name}: {body}");
+    }
+    for tb in support::backends().await {
+        let run = start(tb, listed("wf-again-off-list")).await;
+        let name = run.name;
+        let wi = run.step().await;
+        let (st, body) = run.complete(&wi, result_of(&wi, answer())).await;
+        assert_eq!(st, 200, "{name}: {body}");
+        let (st, body) = run.complete(&wi, result_of(&wi, off_list())).await;
+        assert_eq!(st, 409, "{name}: again: {body}");
+        assert!(run.violations("think").await.is_empty(), "{name}: again");
+        assert!(
+            run.failed_for_good("think").await.is_none(),
+            "{name}: again"
+        );
+        assert_eq!(run.completions("think").await.len(), 1, "{name}: again");
+    }
+}
+
 /// An answer that arrives after the step's lease ran out and the step was
 /// taken back is a 409 and records nothing. The holder of the new lease
 /// completes it.
@@ -2171,6 +2435,20 @@ async fn a_result_after_the_lease_expired_is_409_and_records_nothing() {
         let (st, body) = run.complete(&first, result_of(&first, answer())).await;
         assert_eq!(st, 409, "{name}: {body}");
         assert!(run.completions("think").await.is_empty(), "{name}");
+        // The lease is decided before the body: a late answer that also
+        // carries a state patch, or does not parse, is told about its lease.
+        let mut late_patch = result_of(&first, answer());
+        late_patch["state_patch"] = json!({ "approved": true });
+        for (what, body) in [
+            ("with a state patch", late_patch),
+            (
+                "that does not parse",
+                result_of(&first, json!({ "content": 7 })),
+            ),
+        ] {
+            let (st, answer) = run.complete(&first, body).await;
+            assert_eq!(st, 409, "{name}: a late answer {what}: {answer}");
+        }
         let (st, body) = run.complete(&again, result_of(&again, answer())).await;
         assert_eq!(st, 200, "{name}: {body}");
         assert_eq!(run.completions("think").await.len(), 1, "{name}");
@@ -2206,7 +2484,19 @@ async fn a_result_without_a_fence_is_409() {
         unfenced.as_object_mut().unwrap().remove("lease_fence");
         let mut zero = result_of(&wi, answer());
         zero["lease_fence"] = json!(0);
-        for (what, body) in [("no fence", unfenced), ("a zero fence", zero)] {
+        // The lease is decided before the body: an unfenced answer that also
+        // carries a state patch is told about its lease.
+        let mut unfenced_patch = result_of(&wi, answer());
+        unfenced_patch
+            .as_object_mut()
+            .unwrap()
+            .remove("lease_fence");
+        unfenced_patch["state_patch"] = json!({ "approved": true });
+        for (what, body) in [
+            ("no fence", unfenced),
+            ("a zero fence", zero),
+            ("no fence and a state patch", unfenced_patch),
+        ] {
             let (st, answer) = run.complete(&wi, body).await;
             assert_eq!(st, 409, "{name}: {what}: {answer}");
             run.unchanged(&wi, before, what).await;
@@ -2259,11 +2549,52 @@ async fn another_token_cannot_complete_it() {
     let item = wi["id"].as_str().unwrap();
     let before = backend.get_events(&parse_id(&id)).await.unwrap().len();
 
+    // Bodies the run's initiator would be told 409, 400 and 422 for. Another
+    // principal is told 404 first, whatever the body, so the answer says
+    // nothing about the item.
+    let mut unfenced = result_of(&wi, answer());
+    unfenced.as_object_mut().unwrap().remove("lease_fence");
+    let mut with_patch = result_of(&wi, answer());
+    with_patch["state_patch"] = json!({ "approved": true });
+    let repeated = result_of(
+        &wi,
+        answer_with(
+            "tool_calls",
+            json!([call("c1", "search"), call("c1", "search")]),
+        ),
+    );
+    let malformed = result_of(&wi, json!({ "content": 7 }));
+    let empty_model = result_of(&wi, answer_with("model", json!("")));
     for (what, path, body) in [
         (
             "complete",
             format!("/work-items/{item}/complete"),
             result_of(&wi, answer()),
+        ),
+        (
+            "complete with no fence",
+            format!("/work-items/{item}/complete"),
+            unfenced,
+        ),
+        (
+            "complete with a state patch",
+            format!("/work-items/{item}/complete"),
+            with_patch,
+        ),
+        (
+            "complete with a repeated call id",
+            format!("/work-items/{item}/complete"),
+            repeated,
+        ),
+        (
+            "complete with an answer that does not parse",
+            format!("/work-items/{item}/complete"),
+            malformed,
+        ),
+        (
+            "complete with an empty model",
+            format!("/work-items/{item}/complete"),
+            empty_model,
         ),
         (
             "fail",
@@ -2371,6 +2702,82 @@ async fn a_tenant_allow_list_applies_to_the_reported_model() {
             vec!["model used is not allowed: openai/gpt-4o".to_string()],
             "{name}"
         );
+    }
+}
+
+/// Puts the item back in the queue right after the first read of it once
+/// armed: the lease is taken back while a completion is decided.
+struct TakesTheLeaseBack {
+    inner: Arc<dyn StateBackend>,
+    item: uuid::Uuid,
+    armed: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Hooks for TakesTheLeaseBack {
+    async fn after(&self, op: &Op<'_>) {
+        if let Op::GetWorkItem(id) = op {
+            if *id == self.item && self.armed.swap(false, Ordering::SeqCst) {
+                let wi = self.inner.get_work_item(self.item).await.unwrap().unwrap();
+                assert!(self
+                    .inner
+                    .park_for_execution(wi.id, wi.lease_fence, wi.attempt)
+                    .await
+                    .unwrap());
+            }
+        }
+    }
+}
+
+/// An answer naming a model off the allow list, whose lease is taken back
+/// while it is decided, is a 409 and records nothing: the lease is read
+/// again before the model used is checked, a check that records a
+/// violation. The step goes to the run's worker again under a new lease.
+#[tokio::test]
+async fn an_answer_whose_lease_moves_while_it_is_decided_records_nothing() {
+    for tb in support::backends().await {
+        let run = start(
+            tb,
+            one_step(
+                "wf-moved",
+                &["search"],
+                json!({ "policy": policy(&["vertex_ai/*"]) }),
+            ),
+        )
+        .await;
+        let name = run.name;
+        let wi = run.step().await;
+        let item = uuid::Uuid::parse_str(wi["id"].as_str().unwrap()).unwrap();
+        let hooks = Arc::new(TakesTheLeaseBack {
+            inner: run.backend.clone(),
+            item,
+            armed: AtomicBool::new(true),
+        });
+        let moving =
+            support::make_state(Arc::new(Intercept::new(run.backend.clone(), hooks.clone())));
+        let (st, body) = send(
+            &moving,
+            "POST",
+            &format!("/work-items/{item}/complete"),
+            None,
+            result_of(&wi, answer_with("model", json!("openai/gpt-4o"))),
+        )
+        .await;
+        assert_eq!(st, 409, "{name}: {body}");
+        assert!(
+            !hooks.armed.load(Ordering::SeqCst),
+            "{name}: the lease was not taken back"
+        );
+        assert!(
+            run.violations("think").await.is_empty(),
+            "{name}: {:?}",
+            run.log().await
+        );
+        assert!(run.failed_for_good("think").await.is_none(), "{name}");
+        let again = run.step().await;
+        assert_ne!(again["lease_fence"], wi["lease_fence"], "{name}");
+        let (st, body) = run.complete(&again, result_of(&again, answer())).await;
+        assert_eq!(st, 200, "{name}: {body}");
     }
 }
 
