@@ -1198,11 +1198,12 @@ async fn approve_execution(
     ))
 }
 
-/// The seam between a decision's durable append and its inline seal. An
-/// error a test arms here skips the seal, as an engine that stopped there
-/// would: the decision is recorded and has no audit entry, which on
-/// Postgres the outbox drain then seals.
-async fn before_decision_seal() -> jamjet_state::BackendResult<()> {
+/// The seam between a decision's durable append and its inline seal, on
+/// this route and on the MCP approve tool. An error a test arms here skips
+/// the seal, as an engine that stopped there would: the decision is
+/// recorded and has no audit entry, which on Postgres the outbox drain then
+/// seals.
+pub(crate) async fn before_decision_seal() -> jamjet_state::BackendResult<()> {
     jamjet_state::fault_point!("decision.after_append_before_seal", 1);
     Ok(())
 }
@@ -1232,6 +1233,7 @@ fn submit_refusal(e: crate::approvals::SubmitError) -> ApiError {
         | SubmitError::ChoiceNotAllowed(_)
         | SubmitError::BadNote(_) => ApiError::BadRequest(e.to_string()),
         SubmitError::Backend(msg) => ApiError::Internal(msg),
+        SubmitError::Unavailable(_) => ApiError::Unavailable(e.to_string()),
     }
 }
 

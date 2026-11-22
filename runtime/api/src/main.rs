@@ -41,6 +41,9 @@ fn store_term_from_env() -> anyhow::Result<Option<i64>> {
 async fn main() -> anyhow::Result<()> {
     // Load .env if present
     dotenvy::dotenv().ok();
+    // A test build arms the fault point `JAMJET_TEST_CRASH_AT` names. A
+    // release build has no fault points, and this does nothing.
+    jamjet_state::faults::arm_from_env();
 
     // `token create`, `migrate` and `help` run and exit; no arguments serves.
     let args: Vec<String> = std::env::args().skip(1).collect();

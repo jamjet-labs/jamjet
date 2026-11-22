@@ -13,6 +13,15 @@ pub enum AuditError {
     Serialization(String),
 }
 
+/// A store error as a database error. The Postgres audit log's commit path
+/// carries a fault point (`jamjet_state::faults`), and a fault a test arms
+/// there is a store error.
+impl From<jamjet_state::StateBackendError> for AuditError {
+    fn from(e: jamjet_state::StateBackendError) -> Self {
+        AuditError::Database(e.to_string())
+    }
+}
+
 /// Query parameters for `AuditBackend::query`.
 #[derive(Debug, Default)]
 pub struct AuditQuery {

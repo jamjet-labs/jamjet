@@ -21,6 +21,7 @@ use crate::entry::AuditLogEntry;
 use crate::sqlite::parse_actor_type;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use jamjet_state::fault_point;
 use sqlx::postgres::PgArguments;
 use sqlx::{PgPool, Postgres};
 use uuid::Uuid;
@@ -152,7 +153,11 @@ async fn write(
     Ok(position.is_some())
 }
 
+/// Every append commits here, a seal onto the head included, so one fault
+/// point stops any of them with the head locked, the entry written and the
+/// outbox row deleted, none of it committed.
 async fn commit(tx: sqlx::PgTransaction<'_>) -> Result<(), AuditError> {
+    fault_point!("audit.seal.before_commit", 1);
     tx.commit()
         .await
         .map_err(|e| AuditError::Database(format!("commit outcome unknown: {e}")))

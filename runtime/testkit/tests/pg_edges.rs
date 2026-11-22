@@ -1,14 +1,11 @@
 //! Edges of the Postgres store the suite does not reach: a pool with no
-//! connection free, a slow sweep beside the claims, a NUL in an identifier
-//! or in a run's JSON, and a server restart under the pool.
+//! connection free, a slow sweep beside the claims, and a NUL in an
+//! identifier or in a run's JSON. A server restart under the pool is in
+//! `api/tests/pg_restart.rs`, which runs alone.
 //!
-//! What these share: a call that cannot get a connection, or loses its
-//! server, answers `Unavailable` and never hangs past the acquire timeout,
-//! and a value Postgres text cannot hold is refused before it is sent.
-//!
-//! The restart case runs only when `JAMJET_TEST_POSTGRES_CONTAINER` names
-//! the test server's Docker container, since it restarts that server under
-//! every other test that uses it.
+//! What these share: a call that cannot get a connection answers
+//! `Unavailable` and never hangs past the acquire timeout, and a value
+//! Postgres text cannot hold is refused before it is sent.
 
 use chrono::Utc;
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
@@ -25,8 +22,6 @@ use uuid::Uuid;
 
 /// The text every NUL refusal answers with.
 const NUL_IN_TEXT: &str = "text contains a NUL character";
-/// The variable naming the test server's container, for the restart case.
-const CONTAINER_ENV: &str = "JAMJET_TEST_POSTGRES_CONTAINER";
 
 fn settings(pool_size: u32, acquire_timeout: Duration) -> PgSettings {
     PgSettings {
@@ -325,60 +320,4 @@ async fn a_run_input_with_nul_starts_and_reads_back() {
         b.get_execution(&run).await.unwrap().unwrap().current_state,
         state
     );
-}
-
-/// The server restarts under a pool of the store: while it is down, calls
-/// answer `Unavailable` and nothing else, and once it is back they succeed
-/// on the same store, with no reconnect by the caller.
-#[tokio::test]
-async fn postgres_server_restart_is_survived_by_the_pool() {
-    let Some(container) = std::env::var(CONTAINER_ENV).ok().filter(|c| !c.is_empty()) else {
-        eprintln!(
-            "skipped postgres_server_restart_is_survived_by_the_pool: {CONTAINER_ENV} not set"
-        );
-        return;
-    };
-    let Some(db) = TestDatabase::fresh().await else {
-        return jamjet_testkit::skip("postgres_server_restart_is_survived_by_the_pool");
-    };
-    let b = store(&db, settings(3, Duration::from_secs(1))).await;
-    let run = start(&b, json!({}), "begin", "work", 3).await.unwrap();
-    assert!(b.get_execution(&run).await.unwrap().is_some());
-
-    let restart = std::thread::spawn(move || {
-        std::process::Command::new("docker")
-            .args(["restart", "-t", "1", &container])
-            .output()
-            .expect("run docker restart")
-    });
-    let mut unavailable = 0;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut back = false;
-    while Instant::now() < deadline {
-        match b.get_execution(&run).await {
-            Ok(found) => {
-                assert!(found.is_some(), "the run is gone after the restart");
-                if restart.is_finished() && unavailable > 0 {
-                    back = true;
-                    break;
-                }
-            }
-            Err(StateBackendError::Unavailable(_)) => unavailable += 1,
-            Err(other) => panic!("a call during the restart answered {other:?}"),
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let out = restart.join().unwrap();
-    assert!(
-        out.status.success(),
-        "docker restart failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(unavailable > 0, "no call saw the server down");
-    assert!(
-        back,
-        "the store did not work again within 60 s of the restart"
-    );
-    let item = b.claim_work_item("w1", &["work"]).await.unwrap();
-    assert!(item.is_some(), "a claim after the restart");
 }
