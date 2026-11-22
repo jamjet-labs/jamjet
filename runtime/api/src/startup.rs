@@ -21,6 +21,13 @@ pub const EMBED_WORKERS_ENV: &str = "JAMJET_EMBED_WORKERS";
 /// Starts the in-process cron scheduler outside dev mode.
 pub const EMBED_CRON_ENV: &str = "JAMJET_EMBED_CRON";
 
+/// Set by Knative-style serverless container platforms to the service name.
+pub const PLATFORM_SERVICE_ENV: &str = "K_SERVICE";
+
+/// Lets the server keep a SQLite file on a serverless platform, where the disk
+/// is lost when an instance stops. Read only when such a platform is detected.
+pub const ALLOW_EPHEMERAL_STORE_ENV: &str = "JAMJET_ALLOW_EPHEMERAL_STORE";
+
 /// Every boolean switch `jamjet-server` reads. [`check_flags`] refuses to
 /// start on a value of any of them that is not a boolean.
 pub const BOOL_FLAGS: &[&str] = &[
@@ -28,6 +35,7 @@ pub const BOOL_FLAGS: &[&str] = &[
     DEV_MODE_ALLOW_REMOTE_ENV,
     EMBED_WORKERS_ENV,
     EMBED_CRON_ENV,
+    ALLOW_EPHEMERAL_STORE_ENV,
     crate::approvals::ALLOW_SELF_APPROVAL_ENV,
     crate::auth::TENANT_TOKENS_AS_DEFAULT_ENV,
     jamjet_audit::signer::ALLOW_INSECURE_KEY_ENV,
@@ -315,6 +323,89 @@ pub fn existing_database_url(config: &ApiConfig) -> String {
                 std::path::Path::new(".jamjet").join("runtime.db").display()
             )
         })
+}
+
+/// Which store the server will open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreKind {
+    Memory,
+    Sqlite,
+    Postgres,
+}
+
+/// `STORAGE_BACKEND=memory` wins; `postgres://` or `postgresql://` is
+/// Postgres; anything else is SQLite.
+pub fn store_kind(storage_backend: &str, database_url: &str) -> StoreKind {
+    if storage_backend == "memory" {
+        return StoreKind::Memory;
+    }
+    let url = database_url.trim_start().to_ascii_lowercase();
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        StoreKind::Postgres
+    } else {
+        StoreKind::Sqlite
+    }
+}
+
+/// `K_SERVICE` present and not blank.
+pub fn on_serverless_platform(get: impl Fn(&str) -> Option<String>) -> bool {
+    get(PLATFORM_SERVICE_ENV).is_some_and(|v| !v.trim().is_empty())
+}
+
+/// What to do about the store the server is about to open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreCheck {
+    Ok,
+    Warn(String),
+    Refuse(String),
+}
+
+/// On a serverless platform a SQLite file is refused unless
+/// [`ALLOW_EPHEMERAL_STORE_ENV`] is on (then a warning), and the memory store
+/// warns. Postgres is fine. Off a platform nothing changes.
+pub fn check_store_for_platform(
+    platform: bool,
+    kind: StoreKind,
+    allow_ephemeral: bool,
+) -> StoreCheck {
+    if !platform {
+        return StoreCheck::Ok;
+    }
+    match kind {
+        StoreKind::Postgres => StoreCheck::Ok,
+        StoreKind::Memory => StoreCheck::Warn(
+            "STORAGE_BACKEND=memory on a serverless platform: runs and approvals are lost \
+             when an instance stops. Point DATABASE_URL at a managed Postgres."
+                .to_string(),
+        ),
+        StoreKind::Sqlite if allow_ephemeral => StoreCheck::Warn(format!(
+            "{ALLOW_EPHEMERAL_STORE_ENV} is set: the SQLite file on this serverless platform \
+             is lost when an instance stops."
+        )),
+        StoreKind::Sqlite => StoreCheck::Refuse(format!(
+            "refusing to keep a SQLite file on a serverless platform. Such platforms keep \
+             files in memory and lose them when an instance stops, and a network volume is \
+             no safe home for SQLite either. Set DATABASE_URL to a managed Postgres. To run \
+             with a throwaway store anyway, set {ALLOW_EPHEMERAL_STORE_ENV}=1."
+        )),
+    }
+}
+
+/// [`check_store_for_platform`] on the process environment. Call it before
+/// any store is opened and before [`database_url`] creates `.jamjet`.
+pub fn check_store_env(config: &ApiConfig) -> anyhow::Result<()> {
+    let platform = on_serverless_platform(|k| std::env::var(k).ok());
+    let storage_backend = std::env::var("STORAGE_BACKEND").unwrap_or_default();
+    let kind = store_kind(&storage_backend, &existing_database_url(config));
+    let allow = env_flag(ALLOW_EPHEMERAL_STORE_ENV)?;
+    match check_store_for_platform(platform, kind, allow) {
+        StoreCheck::Ok => Ok(()),
+        StoreCheck::Warn(msg) => {
+            tracing::warn!("{msg}");
+            Ok(())
+        }
+        StoreCheck::Refuse(msg) => anyhow::bail!("{msg}"),
+    }
 }
 
 #[cfg(test)]
@@ -620,6 +711,7 @@ mod tests {
             "JAMJET_ALLOW_SELF_APPROVAL",
             "JAMJET_TENANT_TOKENS_AS_DEFAULT",
             "JAMJET_AUDIT_ALLOW_INSECURE_KEY",
+            "JAMJET_ALLOW_EPHEMERAL_STORE",
         ] {
             assert!(
                 BOOL_FLAGS.contains(&name),
@@ -634,5 +726,59 @@ mod tests {
             check_dev_mode_bind(false, &[addr("0.0.0.0:7700")], false),
             Ok(DevBind::Ok)
         );
+    }
+
+    #[test]
+    fn sqlite_on_a_platform_is_refused() {
+        for url in ["sqlite://data/runtime.db", "", "sqlite::memory:"] {
+            let kind = store_kind("", url);
+            assert_eq!(kind, StoreKind::Sqlite, "{url:?}");
+            match check_store_for_platform(true, kind, false) {
+                StoreCheck::Refuse(msg) => {
+                    assert!(msg.contains("DATABASE_URL"), "{msg}");
+                    assert!(msg.contains("JAMJET_ALLOW_EPHEMERAL_STORE"), "{msg}");
+                }
+                other => panic!("{url:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_allow_flag_and_the_memory_store_warn() {
+        assert!(matches!(
+            check_store_for_platform(true, StoreKind::Sqlite, true),
+            StoreCheck::Warn(_)
+        ));
+        let kind = store_kind("memory", "postgres://h/db");
+        assert_eq!(kind, StoreKind::Memory);
+        assert!(matches!(
+            check_store_for_platform(true, kind, false),
+            StoreCheck::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn postgres_on_a_platform_and_anything_off_it_is_ok() {
+        for url in ["postgres://u@h/db", "postgresql://u@h/db"] {
+            let kind = store_kind("", url);
+            assert_eq!(kind, StoreKind::Postgres, "{url}");
+            assert_eq!(check_store_for_platform(true, kind, false), StoreCheck::Ok);
+        }
+        for kind in [StoreKind::Memory, StoreKind::Sqlite, StoreKind::Postgres] {
+            for allow in [false, true] {
+                assert_eq!(check_store_for_platform(false, kind, allow), StoreCheck::Ok);
+            }
+        }
+    }
+
+    #[test]
+    fn a_blank_k_service_is_no_platform() {
+        for v in ["", "  "] {
+            assert!(!on_serverless_platform(|_| Some(v.to_string())), "{v:?}");
+        }
+        assert!(!on_serverless_platform(|_| None));
+        assert!(on_serverless_platform(
+            |k| (k == "K_SERVICE").then(|| "svc".to_string())
+        ));
     }
 }

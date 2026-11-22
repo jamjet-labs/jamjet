@@ -111,6 +111,9 @@ async fn main() -> anyhow::Result<()> {
     // adapters and the MCP and A2A clients all build one.
     jamjet_models::http::client().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage_backend = std::env::var("STORAGE_BACKEND").unwrap_or_default();
+    // Before any store is opened and before `.jamjet` is created: a serverless
+    // platform loses a SQLite file when an instance stops.
+    startup::check_store_env(&config)?;
     // Parse the failover generation up front so a misconfiguration fails startup
     // before we open any backend (rather than silently disabling failover-safety).
     let configured_store_term = store_term_from_env()?;
