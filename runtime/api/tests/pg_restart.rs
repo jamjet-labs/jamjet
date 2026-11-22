@@ -37,20 +37,31 @@ const CONTAINER_ENV: &str = "JAMJET_TEST_POSTGRES_CONTAINER";
 /// Set to `1` to make a missing [`CONTAINER_ENV`] a failure.
 const REQUIRE_ENV: &str = "JAMJET_REQUIRE_RESTART_TESTS";
 
-/// The container to restart, `None` (skipped) when none is named. Panics
-/// when one is required and none is named, and when the container does not
-/// publish the port of the server the tests connect to.
+/// Whether [`REQUIRE_ENV`] asks for the restart cases to run.
+fn required() -> bool {
+    std::env::var(REQUIRE_ENV).is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// The container to restart, `None` (skipped) when none is named or there
+/// is no test server URL. Panics when the cases are required and either is
+/// missing, and when the container does not publish the port of the server
+/// the tests connect to.
 fn container(case: &str) -> Option<String> {
     let named = std::env::var(CONTAINER_ENV).ok().filter(|c| !c.is_empty());
     let Some(name) = named else {
         assert!(
-            !std::env::var(REQUIRE_ENV).is_ok_and(|v| !v.is_empty() && v != "0"),
+            !required(),
             "{REQUIRE_ENV} is set but {CONTAINER_ENV} is not"
         );
         eprintln!("skipped {case}: {CONTAINER_ENV} not set");
         return None;
     };
-    let url = jamjet_testkit::pg::admin_url()?;
+    let url_env = jamjet_testkit::pg::URL_ENV;
+    let Some(url) = jamjet_testkit::pg::admin_url() else {
+        assert!(!required(), "{REQUIRE_ENV} is set but {url_env} is not");
+        eprintln!("skipped {case}: {url_env} not set");
+        return None;
+    };
     let port = url
         .split_once("://")
         .and_then(|(_, rest)| rest.rsplit_once('@').map_or(Some(rest), |(_, h)| Some(h)))
