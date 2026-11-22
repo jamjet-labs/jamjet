@@ -13,6 +13,6 @@ pub use workflow::{EdgeDef, NodeDef, WorkflowIr};
 
 pub use validate::{
     human_approval_fallback, is_forbidden_identifier_char, reachable_from,
-    validate_approval_options, validate_edges, validate_entry_points, validate_human_approvals,
-    validate_identifier_chars,
+    refuse_misplaced_executor, validate_approval_options, validate_edges, validate_entry_points,
+    validate_human_approvals, validate_identifier_chars,
 };

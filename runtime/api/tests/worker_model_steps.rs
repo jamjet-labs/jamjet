@@ -965,6 +965,59 @@ async fn an_external_fn_named_model_worker_is_refused() {
     assert!(body.to_string().contains("built-in queue"), "{body}");
 }
 
+/// A version stored before `model_worker` was a built-in name, with an
+/// `external_fn` node on that queue, still registers again (deployments
+/// re-register on every boot). A new version naming it is refused.
+#[tokio::test]
+async fn a_stored_version_naming_model_worker_still_registers_again() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let state = support::make_state(backend.clone());
+    let kind = json!({
+        "type": "external_fn", "queue": QUEUE, "handler": "h", "output_schema": ""
+    });
+    let stored = ir("wf-older", &[("n", kind)], json!({}));
+    support::store_ir(backend.as_ref(), &stored).await;
+    let (st, body) = register_status(&state, stored.clone()).await;
+    assert_eq!(st, 200, "{body}");
+    let mut newer = stored;
+    newer["version"] = json!("0.2.0");
+    let (st, body) = register_status(&state, newer).await;
+    assert_eq!(st, 400, "{body}");
+    assert!(body.to_string().contains("built-in queue"), "{body}");
+}
+
+/// The generic completion never records a worker model step: an output and
+/// a state patch of the worker's own are a 400, and the log and the item
+/// are left as they were.
+#[tokio::test]
+async fn a_worker_model_step_is_never_completed_with_the_workers_own_output() {
+    for tb in support::backends().await {
+        let run = start(tb, one_step("wf-own-output", &["search"], json!({}))).await;
+        let name = run.name;
+        let wi = run.step().await;
+        let before = run.events().await.len();
+        for (what, patch) in [
+            ("a state patch", json!({ "approved": true })),
+            ("engine keys", json!({ "__budget": { "spent": 0 } })),
+            ("an empty state patch", json!({})),
+        ] {
+            let body = json!({
+                "output": { "content": "forged" }, "state_patch": patch,
+                "lease_fence": wi["lease_fence"], "idempotency_key": wi["idempotency_key"],
+                "input_tokens": 1, "output_tokens": 1
+            });
+            let (st, answer) = run.complete(&wi, body).await;
+            assert_eq!(st, 400, "{name}: {what}: {answer}");
+            assert_eq!(
+                answer["completed"],
+                json!(false),
+                "{name}: {what}: {answer}"
+            );
+            run.unchanged(&wi, before, what).await;
+        }
+    }
+}
+
 // ── The claim ────────────────────────────────────────────────────────────────
 
 /// Only the run's initiator may claim its model step; another principal is

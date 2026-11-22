@@ -283,7 +283,9 @@ async fn create_workflow(
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
     // `claim` means something on `external_fn` and `python_fn` only. On
     // another kind serde drops it, and the author would believe items are
-    // claimable only by execution when any claimer gets them.
+    // claimable only by execution when any claimer gets them. A `model` node
+    // run by its run's worker is always claimed by its execution, so `claim`
+    // is refused there too.
     if let Some(nodes) = body.ir.get("nodes").and_then(Value::as_object) {
         for (id, node) in nodes {
             let kind = node.get("kind");
@@ -302,11 +304,6 @@ async fn create_workflow(
     // Likewise a model prompt the runtime cannot render would fail every run
     // that reaches the node.
     jamjet_ir::validate_prompt_templates(&parsed)
-        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
-    // An `external_fn` queue named after a built-in queue (or empty, or with
-    // characters a worker cannot send) would route its items to a worker that
-    // cannot run them, or to none at all.
-    jamjet_ir::validate_external_queues(&parsed)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
     // Node ids are printed into commands a reviewer pastes into a shell.
     jamjet_ir::validate_node_ids(&parsed)
@@ -369,6 +366,20 @@ async fn create_workflow(
     // idempotent re-register above: a version stored with it before this
     // release keeps re-registering on boot.
     jamjet_ir::refuse_retired_timeouts(&body.ir)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // An `external_fn` queue named after a built-in queue (or empty, or with
+    // characters a worker cannot send) would route its items to a worker that
+    // cannot run them, or to none at all. Refused for a NEW version: a
+    // version stored before `model_worker` became a built-in name still
+    // re-registers on boot, and its items still reach the workers draining
+    // that queue.
+    jamjet_ir::validate_external_queues(&parsed)
+        .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
+    // `executor` says who makes a `model` node's call. On any other kind
+    // serde drops it, and the author would believe something about who runs
+    // the node that is not so. Refused for a NEW version, like the checks
+    // above: a stored one runs as it always did.
+    jamjet_ir::refuse_misplaced_executor(&body.ir)
         .map_err(|e| ApiError::BadRequest(format!("invalid workflow IR: {e}")))?;
     // A `human_approval` timeout or fallback the engine cannot honour is
     // refused for a NEW version. A stored one still re-registers: the
@@ -3414,6 +3425,26 @@ async fn completion_gate(
             format!(
                 "node {} is a kind the engine runs itself; an external worker cannot \
                  report its result",
+                wi.node_id
+            ),
+        ));
+    }
+    // A model step run by its run's worker is recorded from the model's
+    // answer, and the engine builds the step's output and state from it, so
+    // a worker never writes a state key. An output and a state patch of the
+    // worker's own are never taken for it, and nothing is recorded.
+    if matches!(
+        node_def.kind,
+        jamjet_core::NodeKind::Model {
+            executor: jamjet_core::node::ModelExecutor::Worker,
+            ..
+        }
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "node {} is a model step run by its run's worker; its result is the model's \
+                 answer, from which the engine builds the output and the state patch",
                 wi.node_id
             ),
         ));
