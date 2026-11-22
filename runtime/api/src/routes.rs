@@ -2411,6 +2411,13 @@ async fn claim_for_execution(
     let mut pause = std::time::Duration::from_millis(50);
     let mut first_look = true;
     loop {
+        // The server is stopping: no item is leased from here on, and a claim
+        // answered now ends before the platform's stop timeout. The caller
+        // claims again, usually on another instance. A drain is noticed
+        // within one nap, at most half a second.
+        if is_draining() {
+            return Ok(claim_refused("draining"));
+        }
         // A read first: only when something matches is the claim (a write
         // transaction) tried.
         let outcome = if backend.has_claimable(queue_refs, filter).await? {
@@ -2453,24 +2460,8 @@ async fn claim_for_execution(
                 if left.is_zero() {
                     return Ok(claim_refused("not_ready"));
                 }
-                // The server is stopping: a claim answered now ends before
-                // the platform's stop timeout, and the caller claims again
-                // on the next instance.
-                if is_draining() {
-                    return Ok(claim_refused("draining"));
-                }
-                // A drain is noticed within a tenth of a second, whatever the
-                // poll interval has grown to.
-                let nap = if draining.is_some() {
-                    pause.min(std::time::Duration::from_millis(100))
-                } else {
-                    pause
-                };
-                tokio::time::sleep(left.min(nap)).await;
+                tokio::time::sleep(left.min(pause)).await;
                 pause = (pause * 2).min(std::time::Duration::from_millis(500));
-                if is_draining() {
-                    return Ok(claim_refused("draining"));
-                }
                 // The run may have ended while this waited.
                 if !run_is_live(backend.as_ref(), &execution_id).await? {
                     settle_items_of_ended_run(

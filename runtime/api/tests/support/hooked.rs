@@ -67,6 +67,8 @@ pub struct HookedBackend {
     pub panic_workflow_reads: Arc<std::sync::atomic::AtomicBool>,
     /// While set, `release_lease` fails as a busy database does.
     pub fail_release: Arc<std::sync::atomic::AtomicBool>,
+    /// How many times `has_claimable` was asked.
+    pub has_claimable_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl HookedBackend {
@@ -77,6 +79,7 @@ impl HookedBackend {
             fail_item_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             panic_workflow_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_release: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            has_claimable_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -472,6 +475,8 @@ impl StateBackend for HookedBackend {
         queue_types: &[&str],
         filter: &jamjet_state::ClaimFilter,
     ) -> jamjet_state::backend::BackendResult<bool> {
+        self.has_claimable_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.has_claimable(queue_types, filter).await
     }
 
