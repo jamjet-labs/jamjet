@@ -250,9 +250,15 @@ async fn migrate_on(
     if !state.can_migrate() {
         return Err(MigrateError::Refused(state));
     }
-    // `run_direct` is sqlx's own way around the `Send` limit of `run` on a
-    // bare connection ("implementation of `Acquire` is not general
-    // enough"); `run` is this call after an acquire.
+    // `run_direct` is `#[doc(hidden)]` in sqlx: its own way around the
+    // `Send` limit of `run` on a bare connection ("implementation of
+    // `Acquire` is not general enough"). Checked at sqlx-core 0.9.1, where
+    // `run` is `acquire()` plus `run_direct(None, conn, false)`: no target
+    // version, and `false` for `skip`, so each pending migration is run,
+    // not only marked applied. It takes sqlx's own `pg_advisory_lock`, on
+    // an id made from the database's name, after ours. runtime/Cargo.toml
+    // asks for sqlx 0.9.1 as a caret requirement, so only Cargo.lock pins
+    // it: a bump must check these three things again.
     migrator
         .run_direct(None, &mut *conn, false)
         .await
