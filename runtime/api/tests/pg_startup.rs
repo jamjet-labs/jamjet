@@ -669,17 +669,27 @@ async fn migrate_check_exit_codes() {
         let out = check(db.url());
         assert_eq!(out.code, Some(0), "{}", out.all());
 
+        // The three refusals start from version 1 with version 2 pending,
+        // so a migrate that applied anything there would record it.
+
         // Ahead: 3, and migrate refuses with 3 too.
-        let ahead = TestDatabase::fresh().await.unwrap();
+        let ahead = TestDatabase::empty().await.unwrap();
+        make_older(&ahead).await;
         make_ahead(&ahead.pool().await).await;
         let out = check(ahead.url());
         assert_eq!(out.code, Some(3), "{}", out.all());
         let out = run(&dir, ahead.url(), &["migrate"], &[]);
         assert_eq!(out.code, Some(3), "{}", out.all());
         assert!(out.all().contains("do not roll back"), "{}", out.all());
+        assert_eq!(
+            recorded(&ahead.pool().await).await,
+            vec![(1, 1), (9999, 1)],
+            "nothing applied"
+        );
 
         // Dirty: 4, both.
-        let dirty = TestDatabase::fresh().await.unwrap();
+        let dirty = TestDatabase::empty().await.unwrap();
+        make_older(&dirty).await;
         make_dirty(&dirty.pool().await).await;
         let out = check(dirty.url());
         assert_eq!(out.code, Some(4), "{}", out.all());
@@ -690,9 +700,15 @@ async fn migrate_check_exit_codes() {
             "{}",
             out.all()
         );
+        assert_eq!(
+            recorded(&dirty.pool().await).await,
+            vec![(1, 1), (DIRTY_VERSION, 1)],
+            "nothing applied"
+        );
 
         // Changed: 4, both, naming the version.
-        let changed = TestDatabase::fresh().await.unwrap();
+        let changed = TestDatabase::empty().await.unwrap();
+        make_older(&changed).await;
         sqlx::query("UPDATE _sqlx_migrations SET checksum = '\\x00' WHERE version = 1")
             .execute(&changed.pool().await)
             .await
@@ -702,6 +718,11 @@ async fn migrate_check_exit_codes() {
         let out = run(&dir, changed.url(), &["migrate"], &[]);
         assert_eq!(out.code, Some(4), "{}", out.all());
         assert!(out.all().contains("migration 1"), "{}", out.all());
+        assert_eq!(
+            recorded(&changed.pool().await).await,
+            vec![(1, 1)],
+            "nothing applied"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
