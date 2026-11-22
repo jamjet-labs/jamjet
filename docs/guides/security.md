@@ -154,7 +154,9 @@ while the gap is over five minutes.
 token's tenant, but the engine under it runs every workflow in tenant `default`.
 So a token of any other tenant is refused with 403, on REST and MCP.
 `JAMJET_TENANT_TOKENS_AS_DEFAULT=1` (read once at startup) lets such tokens act in
-`default` instead; that gives no isolation. To run tenants side by side, these would
+`default` instead; that gives no isolation. A Postgres store does not change this:
+engines that share one database run one tenant, and the database gives no tenant
+isolation. To run tenants side by side, these would
 have to carry the tenant first, and none does yet:
 
 - the scheduler's work items (every item after the start node is enqueued in `default`);

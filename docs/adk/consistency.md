@@ -31,7 +31,10 @@ transaction.
   of the transaction rather than upgrading mid-way, so a concurrent writer gets an
   immediate, handled busy signal instead of a silent lost update
   (`runtime/state/src/sqlite.rs:515-522`). SQLite is single-writer; the engine
-  leans on that rather than fighting it.
+  leans on that rather than fighting it. On Postgres each write into a run
+  locks the run's row first (`lock_run`, `runtime/state/src/postgres/runs.rs`),
+  so engines that share the database still append one run's events one at a
+  time.
 
 - **Replay is deterministic.** The state for a run is a fold over its event log.
   `apply_events_seeded` is the core replay primitive: it iterates events in
@@ -94,16 +97,22 @@ content hashes to the same ref, and a ref never changes underneath you.
 
 ## Storage backends
 
-The engine has exactly two storage backends, selected by the `STORAGE_BACKEND`
-environment variable: an in-memory backend and a SQLite backend
-(`runtime/api/src/main.rs:48-155`). There is no Postgres backend and no other
-durable store in the engine. The in-memory backend is ephemeral and per-process;
-SQLite is the durable, single-writer store used for self-host and hosted
-deployments.
+The engine has three storage backends: an in-memory backend, a SQLite backend
+and a Postgres backend, which is a preview. `STORAGE_BACKEND=memory` selects
+memory; otherwise a `DATABASE_URL` that starts `postgres://` or `postgresql://`
+selects Postgres, and any other URL is a SQLite file
+(`runtime/api/src/startup.rs:350-358`). The in-memory backend is ephemeral and
+per-process. SQLite is the durable, single-writer store used for self-host and
+hosted deployments. Postgres lets several engine instances share one database: a
+write into a run locks the run's row first, claims skip rows another instance
+holds, and leases and approval deadlines follow the database's clock. See
+[Postgres (preview)](../guides/deployment.md#postgres-preview).
 
 Cron scheduling requires the SQLite backend. The cron handlers return
 "cron scheduling requires the sqlite backend" when no cron store is configured,
-which is the case for the in-memory backend (`runtime/api/src/cron.rs:25-30`).
+which is the case for the in-memory and Postgres backends
+(`runtime/api/src/cron.rs:25-30`). On Postgres, `JAMJET_EMBED_CRON=1` stops the
+server at start, because each instance would fire every schedule.
 
 ## What is not guaranteed
 
@@ -117,12 +126,13 @@ State this plainly so nobody designs against a guarantee that does not exist.
   the engine source. The deploy surface that honors this model is
   `sdk/python/jamjet/deploy/__init__.py`.
 
-- **No cross-region or replicated consistency.** The engine is a single
-  SQLite-or-memory store per process. There is no multi-region replication, no
-  sharding, and no cross-region coordination in the engine (a repository-wide
-  search for region / shard / replica / replication implementation finds none).
-  Run-level guarantees hold within one engine instance, not across a fleet of
-  instances.
+- **No cross-region or replicated consistency.** Each engine instance uses one
+  store: memory, a SQLite file, or a Postgres database that several instances
+  can share. There is no multi-region replication, no sharding, and no
+  cross-region coordination in the engine (a repository-wide search for region /
+  shard / replica / replication implementation finds none). Run-level guarantees
+  hold within one engine instance, or across the instances that share one
+  Postgres database, not across stores.
 
 - **Cross-run views are not instantaneous.** As above, the projector is
   asynchronous. Do not assume an aggregate or cross-execution query reflects a
@@ -138,7 +148,7 @@ State this plainly so nobody designs against a guarantee that does not exist.
 | Async cross-run projector | `runtime/scheduler/src/projector.rs:250-256`; spawned `runtime/api/src/main.rs:166-167` |
 | Content-addressed artifacts | `runtime/state/src/sqlite.rs:868-884`; `runtime/state/src/hashing.rs:65-72` |
 | Immutable artifacts (`INSERT OR IGNORE`) | `runtime/state/src/sqlite.rs:872-889` |
-| SQLite-or-memory only, no Postgres | `runtime/api/src/main.rs:48-155` |
+| Memory, SQLite or Postgres (preview) | `runtime/api/src/startup.rs:350-358` (`store_kind`) |
 | Cron requires SQLite | `runtime/api/src/cron.rs:25-30` |
 
 ## See also
