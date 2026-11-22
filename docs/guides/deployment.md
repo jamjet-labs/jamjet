@@ -277,6 +277,59 @@ Images on Docker Hub (`jamjetdev/jamjet`) are built from crate release tags.
 
 ---
 
+## On a serverless container platform
+
+A platform that sets `K_SERVICE` (Cloud Run and others like it) keeps an
+instance's files in memory and drops them when the instance stops. A SQLite
+file there is lost with the instance, and a network volume is no safe home for
+SQLite either. So on such a platform `jamjet-server` refuses to start with
+SQLite, and the message names `DATABASE_URL` and the switch below. A
+`postgres://` URL passes the check, but this server build cannot open a
+Postgres store yet (see the top of this guide), so today the choices there are
+the switch below or nothing. `STORAGE_BACKEND=memory` starts with a warning,
+and keeps nothing.
+
+To keep the file anyway, for a trial you will throw away, set
+`JAMJET_ALLOW_EPHEMERAL_STORE=1`. The server then starts with a warning. The
+flag is strict like the other switches: `0` means off, and a value like `maybe`
+stops the server. Only `serve` checks this. `token create` and `token revoke`
+do not.
+
+The platform stops an instance with SIGTERM and kills it after a stop timeout,
+10 s by default on these platforms. On a platform the server assumes 10 s and
+sets its grace to 4 s: 4 s for the in-process workers, 2 s for the scheduler, 3 s
+for open connections and 1 s of margin. Set `JAMJET_STOP_TIMEOUT_SECS` (a whole
+number of at least 6) if your platform's timeout differs. The grace follows it,
+unless you set `JAMJET_SHUTDOWN_GRACE_SECS`. A grace that does not fit inside the stop
+timeout stops startup and names both variables. A step that is still running at
+the kill is reclaimed when its lease expires.
+
+A by-execution claim that is waiting when the stop signal arrives is answered
+at once with `{"claimed": false, "reason": "draining"}`. A claim that arrives
+after draining has started gets `{"claimed": false}` with no reason. Treat both
+as "ask again in about a second". The instance is going away, and the next claim
+lands on a new one.
+
+`/health` carries the commit the engine was built from, to check a deploy:
+
+```bash
+curl https://engine.example/health
+# {"status":"ok","version":"0.5.0","commit":"<40 hex characters>","commit_source":"build-env","features":[...]}
+```
+
+`commit` is null when the build had no record of it. `commit_source` says
+where it came from: `build-env` (set at build time, as in the image), `git`, or
+`none`. Compare `commit` with the commit you meant to deploy. Build your own
+image with `docker build --build-arg JAMJET_BUILD_COMMIT=$(git rev-parse HEAD) .`,
+because the image has no `.git`. `features` lists what the engine can do, so a
+client can check before it relies on a newer route.
+
+Images on Docker Hub are pushed for release tags only (`crates-v*`), and
+`latest` is the newest release. A manual run of the image workflow on a branch
+fails before it builds. Pin a version tag in a deployment, not `latest`.
+
+---
+
 ## Behind a platform identity check
 
 Some serverless container platforms check the caller's identity before a
@@ -374,8 +427,11 @@ any other value.
 
 ```bash
 curl http://localhost:7700/health
-# {"status":"ok","version":"0.5.0"}
+# {"status":"ok","version":"0.5.0","commit":null,"commit_source":"none","features":[...]}
 ```
+
+`commit` and `features` are described under
+[On a serverless container platform](#on-a-serverless-container-platform).
 
 `/health` is the only status route. A path the API does not serve answers
 `200` with the web UI's HTML for `GET`, so check the status code and the
