@@ -12,7 +12,7 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - `/health` reports the commit the engine was built from (`commit`, null when the build had no
-  record of it, and `commit_source`: `build-env`, `git` or `none`) and a `features` list a
+  record of it, and `commit_source`: `build-env`, `git`, `crate-package` or `none`) and a `features` list a
   client can check before it relies on a newer route. A build with `JAMJET_BUILD_COMMIT` set
   to anything but 40 hex characters fails. The Docker image takes it as a build argument, and
   the release builds pass it, including the cross-compiled one (`runtime/Cross.toml` passes
@@ -55,9 +55,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Only `serve` checks. Nothing changes off such a platform.
 - The shutdown fits the stop timeout: on a platform the default grace is 4 s, not 20 s, and a
   grace that does not fit stops startup. A by-execution claim that is waiting when the stop
-  signal arrives answers `{"claimed": false, "reason": "draining"}` at once. A claim that
+  signal arrives answers `{"claimed": false, "reason": "draining"}` within half a second. A claim that
   arrives after draining has started gets `{"claimed": false}` with no reason; a client
-  should ask again after about a second, and the next claim lands on a new instance.
+  should ask again after about a second, and the next claim usually lands on another instance.
 - Docker images are pushed for `crates-v*` tags only, and `latest` is the newest release. A
   manual run of the image workflow on a branch fails before it builds.
 - Sending the same decision twice answers 200 with the first decision's sequence and records

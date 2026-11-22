@@ -114,8 +114,9 @@ integration's recorded calls) claims that execution's work instead:
   (another worker holds it), `not_found` (no live run with that id that you
   may claim), `refused` (the item was withheld as not the engine's: its
   payload names another workflow than its run; the node is not failed) or
-  `not_ready` (not queued yet, or the engine could not decide now; try
-  again). `blocked`, `approval_required` and `refused` come from the run's
+  `draining` (the server is stopping; claim again, usually on another
+  instance) or `not_ready` (not queued yet, or the engine could not decide
+  now; try again). `blocked`, `approval_required` and `refused` come from the run's
   log, so a retry, or another worker, gets the same answer. Without
   `node_id` they are about the nodes the run has open now, not a node it has
   moved past. A run that has ended answers `not_found` with its `status`
@@ -279,15 +280,15 @@ Images on Docker Hub (`jamjetdev/jamjet`) are built from crate release tags.
 
 ## On a serverless container platform
 
-A platform that sets `K_SERVICE` (Cloud Run and others like it) keeps an
+A platform that sets `K_SERVICE` (Knative and platforms built on it) keeps an
 instance's files in memory and drops them when the instance stops. A SQLite
 file there is lost with the instance, and a network volume is no safe home for
 SQLite either. So on such a platform `jamjet-server` refuses to start with
 SQLite, and the message names `DATABASE_URL` and the switch below. A
 `postgres://` URL passes the check, but this server build cannot open a
 Postgres store yet (see the top of this guide), so today the choices there are
-the switch below or nothing. `STORAGE_BACKEND=memory` starts with a warning,
-and keeps nothing.
+the switch below, or `STORAGE_BACKEND=memory`, which starts with a warning and
+keeps nothing.
 
 To keep the file anyway, for a trial you will throw away, set
 `JAMJET_ALLOW_EPHEMERAL_STORE=1`. The server then starts with a warning. The
@@ -305,10 +306,10 @@ timeout stops startup and names both variables. A step that is still running at
 the kill is reclaimed when its lease expires.
 
 A by-execution claim that is waiting when the stop signal arrives is answered
-at once with `{"claimed": false, "reason": "draining"}`. A claim that arrives
+within half a second with `{"claimed": false, "reason": "draining"}`. A claim that arrives
 after draining has started gets `{"claimed": false}` with no reason. Treat both
 as "ask again in about a second". The instance is going away, and the next claim
-lands on a new one.
+usually lands on another one.
 
 `/health` carries the commit the engine was built from, to check a deploy:
 
@@ -318,8 +319,10 @@ curl https://engine.example/health
 ```
 
 `commit` is null when the build had no record of it. `commit_source` says
-where it came from: `build-env` (set at build time, as in the image), `git`, or
-`none`. Compare `commit` with the commit you meant to deploy. Build your own
+where it came from: `build-env` (set at build time, as in the image), `git`
+(read from the checkout), `crate-package` (a crate built from crates.io) or
+`none`. A build from a tree with uncommitted changes reports HEAD, so build a
+release from a clean checkout. Compare `commit` with the commit you meant to deploy. Build your own
 image with `docker build --build-arg JAMJET_BUILD_COMMIT=$(git rev-parse HEAD) .`,
 because the image has no `.git`. `features` lists what the engine can do, so a
 client can check before it relies on a newer route.
