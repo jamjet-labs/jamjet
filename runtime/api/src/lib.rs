@@ -11,6 +11,7 @@ pub mod startup;
 pub mod state;
 pub mod static_files;
 pub mod waiting;
+pub mod worker_model;
 
 pub use auth::{require_auth, require_write_role, AuthState, Role};
 pub use config::ApiConfig;

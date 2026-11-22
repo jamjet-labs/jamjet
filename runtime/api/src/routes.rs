@@ -2007,8 +2007,11 @@ fn nothing_to_claim() -> Json<Value> {
 
 /// Whether a claimed item may be handed to the caller.
 enum ClaimGate {
-    /// Hand back the payload.
-    Release,
+    /// Hand back the payload, and for a model step its run's worker runs,
+    /// what the run's caps leave, beside it.
+    Release {
+        budget_left: Option<crate::worker_model::BudgetLeft>,
+    },
     /// Refuse. The item has already been settled as its outcome requires.
     /// The reason is told only to a claim that names its execution; the
     /// oldest-first claim answers as an empty queue does.
@@ -2148,20 +2151,19 @@ async fn claim_work_item(
     // item can sit on any of them). So a node can reach a worker down this
     // route without passing through `Worker::execute_item`. See
     // `gate_claimed_item`.
-    if matches!(
-        gate_claimed_item(
-            backend.as_ref(),
-            &wi,
-            state.enricher.as_ref(),
-            state.agents.as_ref(),
-            jamjet_worker::node_guard::GuardMode::Fire,
-            false,
-        )
-        .await,
-        ClaimGate::Withhold(_)
-    ) {
-        return Ok(nothing_to_claim());
-    }
+    let budget_left = match gate_claimed_item(
+        backend.as_ref(),
+        &wi,
+        state.enricher.as_ref(),
+        state.agents.as_ref(),
+        jamjet_worker::node_guard::GuardMode::Fire,
+        false,
+    )
+    .await
+    {
+        ClaimGate::Release { budget_left } => budget_left,
+        ClaimGate::Withhold(_) => return Ok(nothing_to_claim()),
+    };
     // On record, so the same worker claiming this lease again by execution
     // gets it back rather than a second decision. A compare-and-swap from
     // undecided, refused for an expired lease: a named retry from the same
@@ -2200,37 +2202,47 @@ async fn claim_work_item(
     // still handed out. That is the behaviour this route had all along, and
     // withholding real work because a replay OPTIMISATION could not be prepared
     // would trade a live queue for a hygiene property.
-    claimed_response(backend.as_ref(), &wi, granted_lease_secs).await
+    claimed_response(
+        backend.as_ref(),
+        &wi,
+        granted_lease_secs,
+        budget_left.as_ref(),
+    )
+    .await
 }
 
-/// The answer for a claim that hands out `wi`.
+/// The answer for a claim that hands out `wi`. `budget_left`, the gate's for
+/// a model step its run's worker runs, goes beside the payload, which is
+/// handed out as it is stored, so the digests that bind it are unchanged.
 async fn claimed_response(
     backend: &dyn jamjet_state::StateBackend,
     wi: &WorkItem,
     granted_lease_secs: u64,
+    budget_left: Option<&crate::worker_model::BudgetLeft>,
 ) -> Result<Json<Value>, ApiError> {
     let idem_key = compute_idempotency_key(backend, wi).await;
 
-    Ok(Json(json!({
-        "claimed": true,
-        "work_item": {
-            "id": wi.id.to_string(),
-            "execution_id": wi.execution_id.to_string(),
-            "node_id": wi.node_id,
-            "queue_type": wi.queue_type,
-            "payload": wi.payload,
-            "attempt": wi.attempt,
-            // The lease fence the external worker echoes on complete so the
-            // engine can prove the lease is still held (exactly-once-COMMIT).
-            "lease_fence": wi.lease_fence,
-            // The lease length granted, which may differ from the one asked
-            // for, so the worker can pace its heartbeats.
-            "lease_secs": granted_lease_secs,
-            // Echoed on complete so the result is recorded against it and a
-            // re-run replays instead of re-firing the tool.
-            "idempotency_key": idem_key,
-        }
-    })))
+    let mut work_item = json!({
+        "id": wi.id.to_string(),
+        "execution_id": wi.execution_id.to_string(),
+        "node_id": wi.node_id,
+        "queue_type": wi.queue_type,
+        "payload": wi.payload,
+        "attempt": wi.attempt,
+        // The lease fence the external worker echoes on complete so the
+        // engine can prove the lease is still held (exactly-once-COMMIT).
+        "lease_fence": wi.lease_fence,
+        // The lease length granted, which may differ from the one asked
+        // for, so the worker can pace its heartbeats.
+        "lease_secs": granted_lease_secs,
+        // Echoed on complete so the result is recorded against it and a
+        // re-run replays instead of re-firing the tool.
+        "idempotency_key": idem_key,
+    });
+    if let Some(left) = budget_left {
+        work_item["budget_left"] = json!(left);
+    }
+    Ok(Json(json!({ "claimed": true, "work_item": work_item })))
 }
 
 /// A refusal of a claim that names an execution, with its reason.
@@ -2753,7 +2765,7 @@ async fn release_claimed(
             }
             Ok(claim_refused(reason.as_str()))
         }
-        ClaimGate::Release => {
+        ClaimGate::Release { budget_left } => {
             // On record before it is handed out: a lease handed out again is
             // re-checked as a completion only if this release is recorded.
             // Refused for a lease that expired while the gate decided, and
@@ -2765,7 +2777,7 @@ async fn release_claimed(
             {
                 return Ok(claim_refused("not_ready"));
             }
-            claimed_response(backend, &wi, lease_secs).await
+            claimed_response(backend, &wi, lease_secs, budget_left.as_ref()).await
         }
     }
 }
@@ -2818,9 +2830,12 @@ async fn rehand_lease(
         )
         .await
         {
-            ClaimGate::Release => {
+            ClaimGate::Release { budget_left } => {
                 return match backend.renew_lease(wi.id, worker_id, wi.lease_fence).await {
-                    Ok(()) => claimed_response(backend, &wi, leased.lease_secs).await,
+                    Ok(()) => {
+                        claimed_response(backend, &wi, leased.lease_secs, budget_left.as_ref())
+                            .await
+                    }
                     Err(jamjet_state::StateBackendError::FenceLost(_)) => {
                         Ok(claim_refused("not_ready"))
                     }
@@ -3154,6 +3169,27 @@ async fn gate_claimed_item(
         Ok(caps) => caps,
         Err(reason) => return fail_closed(backend, wi, reason).await,
     };
+    // A model step its run's worker runs is handed out with what the run's
+    // caps leave. Counted before the guard, so a log that cannot be read
+    // withholds the step before the guard records anything for it (an
+    // agent's step, an approval used). Never "no cap" for want of a read.
+    let worker_model = crate::worker_model::is_worker_model(&kind);
+    let budget_left = if worker_model {
+        match crate::worker_model::budget_left_of_run(backend, &wi.execution_id, &caps).await {
+            Ok(left) => Some(left),
+            Err(reason) => {
+                warn!(
+                    execution_id = %wi.execution_id,
+                    node_id = %wi.node_id,
+                    %reason,
+                    "claim: could not count what the run's caps leave; withholding the payload"
+                );
+                return ClaimGate::Withhold(Refusal::NotReady);
+            }
+        }
+    } else {
+        None
+    };
     let GuardInputs {
         workflow_policy,
         workflow_agent,
@@ -3205,7 +3241,29 @@ async fn gate_claimed_item(
     )
     .await
     {
-        DispatchGuardOutcome::Allow => ClaimGate::Release,
+        DispatchGuardOutcome::Allow => {
+            // A model step whose request holds no prompt to send fails here,
+            // after the same guard and with the same words as in the
+            // in-process model executor, not retryable. Handed out, its
+            // worker would have to make the prompt up.
+            if worker_model {
+                if let Some(reason) = crate::worker_model::missing_prompt(&wi.payload) {
+                    // A re-check writes nothing: the claim decides the item
+                    // again in `Fire` mode.
+                    if mode == jamjet_worker::node_guard::GuardMode::Complete {
+                        return ClaimGate::Withhold(Refusal::Blocked);
+                    }
+                    warn!(
+                        execution_id = %wi.execution_id,
+                        node_id = %wi.node_id,
+                        %reason,
+                        "claim: the model step has no prompt to send; failing the node"
+                    );
+                    return fail_node(backend, wi, reason).await;
+                }
+            }
+            ClaimGate::Release { budget_left }
+        }
 
         // The guard already recorded the `PolicyViolation`. A block is a
         // decision a retry cannot change, so the node fails for good: the item
@@ -3576,7 +3634,7 @@ impl ClaimGate {
     /// The same withholding, with `reason`.
     fn with(self, reason: Refusal) -> Self {
         match self {
-            Self::Release => Self::Release,
+            Self::Release { budget_left } => Self::Release { budget_left },
             Self::Withhold(_) => Self::Withhold(reason),
         }
     }
@@ -4136,6 +4194,16 @@ async fn enqueue_work_item(
     {
         return Err(ApiError::BadRequest(format!(
             "node {} is a kind the engine runs itself; it cannot be enqueued by hand",
+            body.node_id
+        )));
+    }
+    // Nor is a model step its run's worker runs: this route stores the
+    // payload as sent, and that step's payload is the request the claim
+    // hands the worker. It is the engine's to build, from the run's state.
+    if crate::worker_model::is_worker_model(&kind) {
+        return Err(ApiError::BadRequest(format!(
+            "node {} is a model step its run's worker runs; the engine builds its request \
+             and enqueues it, so it cannot be enqueued by hand",
             body.node_id
         )));
     }
