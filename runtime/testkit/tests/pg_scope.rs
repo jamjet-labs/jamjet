@@ -33,8 +33,8 @@ const SPAN: &str = "scoped_store";
 /// Cases left out, with why. The others all run.
 const LEFT_OUT: &[(&str, &str)] = &[(
     "log_order_matches_sequence_order_under_concurrency",
-    "takes about 8 minutes on Postgres; its statements are the ones \
-     the other append_event_if cases send",
+    "its statements are the ones the other append_event_if cases send, \
+     so its eight writers would add only time",
 )];
 
 /// Statements a tenant's view sends unfiltered on purpose, with why. Each
@@ -159,8 +159,33 @@ macro_rules! run_cases {
     };
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_scoped_statement_filters_by_tenant() {
+/// The whole suite is one future. A failure late in it overflows a test
+/// thread's 2 MB stack, and the abort loses the failure's message. So it
+/// runs on a thread of its own with a 64 MB stack, as do the runtime's
+/// workers.
+const STACK: usize = 64 << 20;
+
+#[test]
+fn every_scoped_statement_filters_by_tenant() {
+    let suite = std::thread::Builder::new()
+        .name("pg_scope".into())
+        .stack_size(STACK)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(STACK)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(scoped_statements_filter_by_tenant())
+        })
+        .unwrap();
+    if let Err(panic) = suite.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn scoped_statements_filter_by_tenant() {
     let Some(db) = TestDatabase::fresh().await else {
         return jamjet_testkit::skip("every_scoped_statement_filters_by_tenant");
     };
