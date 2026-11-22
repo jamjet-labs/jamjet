@@ -9,11 +9,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// SQLite tables Postgres has none of: nothing reads timers or cron jobs on
-/// Postgres, and the agent registry comes with the Postgres agents change.
-const SQLITE_ONLY: &[&str] = &["agents", "cron_jobs", "timers"];
+/// Postgres.
+const SQLITE_ONLY: &[&str] = &["cron_jobs", "timers"];
 
-/// Postgres tables SQLite has none of.
-const POSTGRES_ONLY: &[&str] = &[];
+/// Postgres tables SQLite's state store has none of: the audit log, which
+/// SQLite keeps in a table the audit backend creates
+/// ([`audit_log_matches_sqlite`]), its head and its outbox.
+const POSTGRES_ONLY: &[&str] = &["audit_head", "audit_log", "audit_outbox"];
 
 /// Columns only Postgres has: the engine fills them at insert from what
 /// SQLite reads out of the JSON, and the claim order on the database clock.
@@ -134,6 +136,7 @@ async fn foreign_keys_match_sqlite() {
     .await
     .unwrap()
     .into_iter()
+    .filter(|(table, ..): &ForeignKey| !POSTGRES_ONLY.contains(&table.as_str()))
     .collect();
 
     let missing: Vec<&ForeignKey> = sqlite.difference(&postgres).collect();
@@ -143,6 +146,43 @@ async fn foreign_keys_match_sqlite() {
         "foreign keys (table, column, references, column) only on SQLite: {missing:#?}\n\
          only on Postgres: {extra:#?}"
     );
+}
+
+/// The Postgres audit log has the columns of SQLite's, and `position`,
+/// which orders two entries of one instant as SQLite's `rowid` does.
+#[tokio::test]
+async fn audit_log_matches_sqlite() {
+    let Some(db) = TestDatabase::fresh().await else {
+        return jamjet_testkit::skip("audit_log_matches_sqlite");
+    };
+    // One connection: each connection to `sqlite::memory:` is a database
+    // of its own.
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    jamjet_audit::SqliteAuditBackend::new(pool.clone())
+        .migrate()
+        .await
+        .unwrap();
+    let mut expected: BTreeSet<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('audit_log')")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+    assert!(!expected.is_empty(), "SQLite has no audit_log");
+    assert!(
+        expected.insert("position".into()),
+        "SQLite has position now"
+    );
+    let postgres = postgres_columns(&db)
+        .await
+        .remove("audit_log")
+        .unwrap_or_default();
+    assert_eq!(postgres, expected);
 }
 
 #[test]

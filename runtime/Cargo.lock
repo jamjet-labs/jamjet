@@ -1660,6 +1660,7 @@ dependencies = [
  "jamjet-ir",
  "jamjet-policy",
  "jamjet-state",
+ "jamjet-testkit",
  "libsqlite3-sys",
  "serde",
  "serde_json",
@@ -1865,6 +1866,7 @@ version = "0.5.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "jamjet-audit",
  "jamjet-core",
  "jamjet-state",
  "libsqlite3-sys",

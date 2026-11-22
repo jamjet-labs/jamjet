@@ -39,6 +39,14 @@ impl AuditQuery {
     }
 }
 
+/// Seals an entry onto a head for [`AuditBackend::append_sealed`]: given
+/// the head's `entry_hash` and `created_at` (`None` for an empty log) and
+/// the store's time now, the sealed entry to append.
+pub type SealOntoHead<'a> = dyn Fn(Option<String>, Option<DateTime<Utc>>, DateTime<Utc>) -> AuditLogEntry
+    + Send
+    + Sync
+    + 'a;
+
 /// Append-only audit log storage.
 ///
 /// Implementations MUST NEVER issue UPDATE or DELETE SQL against the
@@ -67,6 +75,28 @@ pub trait AuditBackend: Send + Sync {
     /// check, which is right only for a log one process writes.
     async fn append_linked(&self, entry: AuditLogEntry) -> Result<bool, AuditError> {
         self.append(entry).await.map(|()| true)
+    }
+
+    /// Seal an entry onto the head with `seal` and append it. Answers the
+    /// head after the append, or `None` when another writer moved the head
+    /// first and the caller must seal again.
+    ///
+    /// The default reads the head and the time, seals, and appends with
+    /// [`append_linked`](Self::append_linked), which another writer can
+    /// beat: with two writers sealing back to back, the one that re-reads
+    /// the head after a refusal can lose every time. A store that can hold
+    /// the head while `seal` runs overrides this and is never beaten.
+    async fn append_sealed(
+        &self,
+        seal: &SealOntoHead<'_>,
+    ) -> Result<Option<(Option<String>, DateTime<Utc>)>, AuditError> {
+        let (head, head_at) = match self.head_at().await? {
+            Some((hash, at)) => (hash, Some(at)),
+            None => (None, None),
+        };
+        let entry = seal(head, head_at, self.now().await?);
+        let next = (entry.entry_hash.clone(), entry.created_at);
+        Ok(self.append_linked(entry).await?.then_some(next))
     }
 
     /// The newest entry's `entry_hash` and `created_at`, in the order
@@ -108,4 +138,12 @@ pub trait AuditBackend: Send + Sync {
 
     /// Count audit log entries matching the query (for pagination).
     async fn count(&self, q: &AuditQuery) -> Result<u64, AuditError>;
+
+    /// The time a writer dates its next entry by. This process's clock by
+    /// default. A store several engines share answers with its own clock,
+    /// so entries from engines whose clocks disagree are still dated in the
+    /// order they were appended.
+    async fn now(&self) -> Result<DateTime<Utc>, AuditError> {
+        Ok(jamjet_state::clock::process_now())
+    }
 }

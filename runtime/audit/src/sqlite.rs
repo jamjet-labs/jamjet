@@ -362,7 +362,7 @@ fn actor_type_str(a: &ActorType) -> &'static str {
     }
 }
 
-fn parse_actor_type(s: &str) -> Option<ActorType> {
+pub(crate) fn parse_actor_type(s: &str) -> Option<ActorType> {
     match s {
         "human" => Some(ActorType::Human),
         "agent" => Some(ActorType::Agent),

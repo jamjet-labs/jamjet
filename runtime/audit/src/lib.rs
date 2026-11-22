@@ -13,6 +13,7 @@ pub mod chain;
 pub mod enricher;
 pub mod entry;
 pub mod noop;
+pub mod postgres;
 pub mod signer;
 pub mod sqlite;
 
@@ -21,5 +22,6 @@ pub use chain::{verify_chain, verify_entry, ChainError};
 pub use enricher::{AuditEnricher, AuditRecord, RequestContext};
 pub use entry::{ActorType, AuditLogEntry};
 pub use noop::NoopAuditBackend;
+pub use postgres::PgAuditBackend;
 pub use signer::AuditSigner;
 pub use sqlite::SqliteAuditBackend;

@@ -195,10 +195,10 @@ pub(crate) async fn open(url: &str) -> SqliteBackend {
 
 /// A directory under the system temp directory, removed on drop. The file
 /// and its WAL live here, so nothing is left behind.
-struct TempDir(PathBuf);
+pub(crate) struct TempDir(pub(crate) PathBuf);
 
 impl TempDir {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
             "jamjet_conformance_{}",
             uuid::Uuid::new_v4().simple()

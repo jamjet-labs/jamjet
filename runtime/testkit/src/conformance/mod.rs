@@ -15,6 +15,7 @@
 //! [`StoreHooks`] for what the trait cannot do (backdate a lease, read a raw
 //! row, reopen the store). So the same case runs unchanged on every backend.
 
+pub mod audit;
 pub mod cases;
 mod factories;
 mod hooks;
