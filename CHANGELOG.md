@@ -669,8 +669,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - The server checks the schema at start and refuses one that is empty, behind, newer,
     half done or changed, naming what to do.
   - With `JAMJET_EMBED_CRON=1` the server stops at start on Postgres, since each engine
-    would fire every schedule. In dev mode the cron scheduler is skipped with a warning and
-    `/cron` answers 400, as with `STORAGE_BACKEND=memory`.
+    would fire every schedule, and the message says to set `JAMJET_EMBED_CRON=0` or unset
+    it. The Docker image sets `JAMJET_EMBED_CRON=1`, so pass `-e JAMJET_EMBED_CRON=0` with
+    a Postgres URL. In dev mode the cron scheduler is skipped with a warning and `/cron`
+    answers 400, as with `STORAGE_BACKEND=memory`.
   - `jamjet-server token create` and `token revoke` work against a migrated Postgres
     database with the same `DATABASE_URL`. A token is accepted by every engine on it.
   - One audit chain for every engine on the database. An append locks the chain's head

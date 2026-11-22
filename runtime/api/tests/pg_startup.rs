@@ -746,6 +746,14 @@ async fn postgres_refuses_embedded_cron() {
         "{}",
         refused.all()
     );
+    // The Docker image sets the variable, so the refusal says what to do.
+    assert!(
+        refused
+            .all()
+            .contains("set JAMJET_EMBED_CRON=0 or unset it"),
+        "{}",
+        refused.all()
+    );
 
     let engine = serve(&dir, db.url(), &[("JAMJET_DEV_MODE", "1")]);
     assert!(

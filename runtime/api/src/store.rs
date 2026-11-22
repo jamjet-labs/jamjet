@@ -28,6 +28,10 @@ pub const PREVIEW_WARNING: &str = "Postgres store (preview)";
 pub const CRON_REFUSAL: &str =
     "cron is not supported on Postgres yet: each engine would fire every schedule";
 
+/// What to do when `JAMJET_EMBED_CRON` stops a server on Postgres. The
+/// Docker image sets it, so the user may not know it is on.
+pub const CRON_REFUSAL_FIX: &str = "set JAMJET_EMBED_CRON=0 or unset it";
+
 /// How often the outbox drain runs. It also runs once at startup.
 pub const DRAIN_EVERY: Duration = Duration::from_secs(2);
 

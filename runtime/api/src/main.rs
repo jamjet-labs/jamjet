@@ -137,7 +137,11 @@ async fn main() -> anyhow::Result<()> {
     // the opt-in, skip dev mode's cron, before opening the database.
     if store_kind == StoreKind::Postgres {
         if embed_cron {
-            anyhow::bail!("{}", jamjet_api::store::CRON_REFUSAL);
+            anyhow::bail!(
+                "{}; {}",
+                jamjet_api::store::CRON_REFUSAL,
+                jamjet_api::store::CRON_REFUSAL_FIX
+            );
         }
         if config.dev_mode {
             warn!(

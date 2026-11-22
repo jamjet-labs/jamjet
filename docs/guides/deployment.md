@@ -288,7 +288,8 @@ the database's `max_connections`, with room for your own tools.
 - Cron is not supported yet: each engine would fire every schedule.
   `JAMJET_EMBED_CRON=1` stops the server at start. In dev mode the cron
   scheduler is skipped with a warning, and `/cron` answers 400, as with
-  `STORAGE_BACKEND=memory`.
+  `STORAGE_BACKEND=memory`. The Docker image sets `JAMJET_EMBED_CRON=1`, so
+  pass `-e JAMJET_EMBED_CRON=0` with a Postgres URL.
 - Every engine on one database writes one audit chain, so every engine and
   every `token` command must use the same audit signing settings
   ([Signing the audit log](security.md#signing-the-audit-log)).
@@ -322,7 +323,9 @@ docker exec jamjet jamjet-server token revoke <token id>
 ```
 
 Mount a volume on `/data`, or every container starts with an empty database
-and the tokens you issued are gone. The audit log is hash-chained but not
+and the tokens you issued are gone. To run the image on Postgres, pass
+`-e DATABASE_URL=postgres://...` with `-e JAMJET_EMBED_CRON=0`, since cron is
+not supported on Postgres yet. The audit log is hash-chained but not
 signed until you give it a key: mount an Ed25519 seed and set
 `JAMJET_AUDIT_SIGNING_MODE=ed25519` and `JAMJET_AUDIT_ED25519_KEY_FILE` (see
 [Signing the audit log](security.md#signing-the-audit-log)).
