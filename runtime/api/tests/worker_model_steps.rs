@@ -3468,3 +3468,45 @@ async fn an_answer_after_the_lease_ran_out_is_409_before_anything_takes_it_back(
         assert_eq!(run.completions("think").await.len(), 1, "{name}");
     }
 }
+
+// ── The worker's own failure ─────────────────────────────────────────────────
+
+/// The run's own worker can report its model step failed, with the fence
+/// from its claim, as a router does after a 422: the attempt is charged,
+/// the step is put back for a retry, and the next claim gets it again.
+#[tokio::test]
+async fn the_runs_worker_can_fail_its_model_step_and_it_is_retried() {
+    for tb in support::backends().await {
+        let run = start(tb, one_step("wf-own-fail", &["search"], json!({}))).await;
+        let name = run.name;
+        let wi = run.step().await;
+        let (st, body) = run
+            .post(
+                &format!("/work-items/{}/fail", wi["id"].as_str().unwrap()),
+                json!({ "error": "the provider refused the call", "lease_fence": wi["lease_fence"] }),
+            )
+            .await;
+        assert_eq!(st, 200, "{name}: {body}");
+        assert_eq!(body["retryable"], json!(true), "{name}: {body}");
+        assert!(run.failed_for_good("think").await.is_none(), "{name}");
+        let log = run.log().await;
+        assert!(
+            log.contains(&"retry_scheduled(think)".to_string()),
+            "{name}: {log:?}"
+        );
+        let id = uuid::Uuid::parse_str(wi["id"].as_str().unwrap()).unwrap();
+        assert_eq!(run.tb.item_status(id).await, "pending", "{name}");
+        // The retry waits out its backoff (2 s on SQLite) before it is
+        // handed out again.
+        let mut retry = claim_request("router", &run.id);
+        retry["wait_ms"] = json!(10_000);
+        let (st, body) = run.post("/work-items/claim", retry).await;
+        assert_eq!(st, 200, "{name}: {body}");
+        assert_eq!(body["claimed"], json!(true), "{name}: {body}");
+        let again = body["work_item"].clone();
+        assert_eq!(again["id"], wi["id"], "{name}");
+        assert_eq!(again["attempt"], json!(1), "{name}: {again}");
+        let (st, body) = run.complete(&again, result_of(&again, answer())).await;
+        assert_eq!(st, 200, "{name}: {body}");
+    }
+}
