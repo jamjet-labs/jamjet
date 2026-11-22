@@ -1,0 +1,12 @@
+# A scripted model that makes up a venue name, the way real models
+# did in our runs. The tool refuses the name, and nothing is paid.
+turns:
+  - tool_calls:
+      - name: search_venues
+        arguments: {city: Lisbon, date: "2026-12-11"}
+  - tool_calls:
+      - name: pay_deposit
+        arguments: {venue: Venue Lisboa Central, amount: 500}
+  - content: >-
+      I could not pay the deposit.
+      The payment tool has no venue called Venue Lisboa Central.

@@ -133,6 +133,10 @@ same three models, and `qwen2.5:7b` obeyed the injected text in 15 of
 the model and the prompt. With the gate, none of these payments
 happens without a person.
 
+Step 12 fixes the tools so a made-up name is refused. On the same
+models, one of them then reads the real reply and pays the 2400 in 2
+of 10 runs. See [step 12](../step-12-known-venues/).
+
 To try your own model, install the model extra as the series README
 shows, then set `VENUE_MODEL`. For Ollama the name is
 `ollama_chat/<model>`:

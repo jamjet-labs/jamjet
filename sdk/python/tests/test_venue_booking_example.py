@@ -279,3 +279,64 @@ def test_step11_checks_pass_and_fail_when_the_gate_is_removed(tmp_path):
     assert bad.returncode == 1, bad.stdout + bad.stderr
     assert "2 failed" in bad.stdout
     assert "paid without approval: ['paid 500 for Casa do Rio']" in bad.stdout
+
+
+STEP12 = "step-12-known-venues"
+
+# Calls pay_deposit and read_reply directly with each venue name on the
+# command line, then prints how many payments were written.
+PAY_NAMED = """
+import asyncio, sys
+from venue_tools import PAYMENTS, pay_deposit, read_reply
+for venue in sys.argv[1:]:
+    print(asyncio.run(pay_deposit(venue=venue, amount=500)))
+    print(asyncio.run(read_reply(venue=venue)).splitlines()[0])
+print(len(PAYMENTS.read_text().splitlines()) if PAYMENTS.exists() else 0)
+"""
+
+# Calls pay_deposit for a venue we know, once per amount given as Python.
+PAY_AMOUNT = """
+import asyncio, sys
+from venue_tools import PAYMENTS, pay_deposit
+for amount in sys.argv[1:]:
+    print(asyncio.run(pay_deposit(venue="Casa do Rio", amount=eval(amount))))
+print(len(PAYMENTS.read_text().splitlines()) if PAYMENTS.exists() else 0)
+"""
+
+
+def test_step12_refuses_a_venue_the_model_made_up():
+    out = run_step(STEP12)
+    assert normalise(out) == expected(STEP12)
+    assert "payments.log: 0 line(s)" in out
+    assert not (ROOT / STEP12 / "payments.log").exists()
+
+
+def test_step12_tools_refuse_unknown_names_and_take_known_ones():
+    names = ("Venue Lisboa Central", "<result[0].name>", "casa do rio ")
+    out = run_step(STEP12, "-c", args=(PAY_NAMED, *names)).splitlines()
+    assert out[0] == "Refused: there is no venue called 'Venue Lisboa Central'. Use a name that search_venues returned."
+    assert out[1].startswith("Refused: there is no venue called 'Venue Lisboa Central'")
+    assert out[2].startswith("Refused: ") and out[3].startswith("Refused: ")
+    # A known venue is paid under the name we hold, whatever the case.
+    assert out[4] == "Deposit of 500 paid for Casa do Rio."
+    assert out[5].startswith("Hello, and thank you")
+    assert out[6] == "1"
+    assert (ROOT / STEP12 / "payments.log").read_text() == "paid 500 for Casa do Rio\n"
+
+
+def test_step12_refuses_amounts_that_are_not_positive_numbers():
+    out = run_step(STEP12, "-c", args=(PAY_AMOUNT, "'500'", "0", "-5", "True")).splitlines()
+    assert [line.split(":")[0] for line in out[:4]] == ["Refused"] * 4
+    assert out[4] == "0"
+
+
+def test_step12_changes_only_the_tools():
+    """Same reply, agent and prompt as step 10 with no gate."""
+    reply = "replies/casa-do-rio.txt"
+    assert (ROOT / STEP12 / reply).read_bytes() == (ROOT / STEP10 / reply).read_bytes()
+
+    def agent_and_prompt(path: Path) -> str:
+        text = path.read_text()
+        return text[text.index("agent = Agent(") : text.index('if __name__ == "__main__":')]
+
+    assert agent_and_prompt(ROOT / STEP12 / "agent.py") == agent_and_prompt(ROOT / STEP10 / "no_gate.py")
