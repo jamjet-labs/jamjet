@@ -4482,6 +4482,23 @@ async fn complete_worker_model_step(
     }
     let response = answer.response(tokens);
     let (output, state_patch) = jamjet_worker::executors::model_node::model_outcome(&response);
+    // A large output goes to the artifact store, as the in-process worker
+    // stores it (`worker.rs`), so both executors record the same reference.
+    // The artifact is written before the event that names it; a write that
+    // fails records nothing and the worker sends the answer again. The state
+    // patch stays inline on both.
+    let output = match jamjet_state::spill_bytes(&output, jamjet_state::artifact_threshold()) {
+        None => output,
+        Some(bytes) => match backend.put_artifact(&bytes, Some("application/json")).await {
+            Ok(artifact) => artifact.to_sentinel(),
+            Err(e) => {
+                return refused(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("the step's output could not be stored: {e}"),
+                )
+            }
+        },
+    };
     let completed = jamjet_state::Event::new(
         wi.execution_id.clone(),
         // Assigned inside `commit_turn`'s transaction.

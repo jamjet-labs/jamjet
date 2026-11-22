@@ -519,10 +519,15 @@ fn scripted_answer() -> ModelResponse {
 /// A registry whose only adapter answers [`scripted_answer`], and its call
 /// count.
 fn scripted_registry() -> (Arc<ModelRegistry>, Arc<AtomicUsize>) {
+    scripted_registry_with(scripted_answer())
+}
+
+/// [`scripted_registry`], answering `answer`.
+fn scripted_registry_with(answer: ModelResponse) -> (Arc<ModelRegistry>, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let registry = ModelRegistry::new()
         .register(Arc::new(Scripted {
-            answer: scripted_answer(),
+            answer,
             calls: calls.clone(),
         }))
         .with_default("scripted");
@@ -2011,49 +2016,72 @@ fn answer_fields(completed: &Value) -> Value {
 }
 
 /// The same answer, from the engine's model adapter in process and from the
-/// run's worker over HTTP, is recorded as the same step.
+/// run's worker over HTTP, is recorded as the same step. A long answer's
+/// output (9000 bytes of text, past the 8 KiB threshold) is moved to the
+/// artifact store on both, and both record the same reference.
 #[tokio::test]
 async fn the_same_answer_writes_the_same_event_on_both_executors() {
-    let engine_backends = support::backends().await;
-    let worker_backends = support::backends().await;
-    for (engine_tb, worker_tb) in engine_backends.into_iter().zip(worker_backends) {
-        let engine_run = start(
-            engine_tb,
-            ir(
-                "wf-both",
-                &[("think", engine_model(&["search"]))],
-                json!({}),
-            ),
-        )
-        .await;
-        let name = engine_run.name;
-        let (registry, calls) = scripted_registry();
-        let worker = jamjet_worker::Worker::new(
-            "engine".into(),
-            engine_run.backend.clone(),
-            vec!["model".into()],
-        )
-        .register_executor(
-            "model",
-            Arc::new(jamjet_worker::ModelNodeExecutor::new(registry)),
-        );
-        assert!(worker.poll_and_execute().await.unwrap(), "{name}");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "{name}");
-        let in_process = engine_run.completions("think").await;
-        assert_eq!(in_process.len(), 1, "{name}: {:?}", engine_run.log().await);
+    let long_text = "x".repeat(9000);
+    let long = ModelResponse {
+        content: long_text.clone(),
+        finish_reason: "stop".into(),
+        tool_calls: vec![],
+        ..scripted_answer()
+    };
+    let mut long_answer = answer_with("content", json!(long_text));
+    long_answer["finish_reason"] = json!("stop");
+    long_answer["tool_calls"] = json!([]);
+    for (what, scripted, sent) in [
+        ("a call", scripted_answer(), answer()),
+        ("a long answer", long, long_answer),
+    ] {
+        let engine_backends = support::backends().await;
+        let worker_backends = support::backends().await;
+        for (engine_tb, worker_tb) in engine_backends.into_iter().zip(worker_backends) {
+            let engine_run = start(
+                engine_tb,
+                ir(
+                    "wf-both",
+                    &[("think", engine_model(&["search"]))],
+                    json!({}),
+                ),
+            )
+            .await;
+            let name = engine_run.name;
+            let (registry, calls) = scripted_registry_with(scripted.clone());
+            let worker = jamjet_worker::Worker::new(
+                "engine".into(),
+                engine_run.backend.clone(),
+                vec!["model".into()],
+            )
+            .register_executor(
+                "model",
+                Arc::new(jamjet_worker::ModelNodeExecutor::new(registry)),
+            );
+            assert!(worker.poll_and_execute().await.unwrap(), "{name}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{name}");
+            let in_process = engine_run.completions("think").await;
+            assert_eq!(in_process.len(), 1, "{name}: {:?}", engine_run.log().await);
 
-        let worker_run = start(worker_tb, one_step("wf-both", &["search"], json!({}))).await;
-        let wi = worker_run.step().await;
-        let (st, body) = worker_run.complete(&wi, result_of(&wi, answer())).await;
-        assert_eq!(st, 200, "{name}: {body}");
-        let over_http = worker_run.completions("think").await;
-        assert_eq!(over_http.len(), 1, "{name}: {:?}", worker_run.log().await);
+            let worker_run = start(worker_tb, one_step("wf-both", &["search"], json!({}))).await;
+            let wi = worker_run.step().await;
+            let (st, body) = worker_run.complete(&wi, result_of(&wi, sent.clone())).await;
+            assert_eq!(st, 200, "{name}, {what}: {body}");
+            let over_http = worker_run.completions("think").await;
+            assert_eq!(over_http.len(), 1, "{name}: {:?}", worker_run.log().await);
 
-        assert_eq!(
-            answer_fields(&over_http[0]),
-            answer_fields(&in_process[0]),
-            "{name}"
-        );
+            assert_eq!(
+                answer_fields(&over_http[0]),
+                answer_fields(&in_process[0]),
+                "{name}, {what}"
+            );
+            assert_eq!(
+                over_http[0]["output"].get("$artifact").is_some(),
+                what == "a long answer",
+                "{name}, {what}: {}",
+                over_http[0]["output"]
+            );
+        }
     }
 }
 
