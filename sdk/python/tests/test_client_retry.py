@@ -31,8 +31,9 @@ from tests.test_client_auth import BASE, CALLS, TOKEN, Call, _answer
 NOW = 1795168800.0
 
 # Whether each client call may be sent again after it may have taken effect.
-# complete_work_item and fail_work_item are safe here because the table's
-# calls carry a lease fence; without one they are unsafe (see UNFENCED).
+# complete_work_item, complete_model_step and fail_work_item are safe here
+# because the table's calls carry a lease fence; without one they are unsafe
+# (see UNFENCED).
 SAFE = {
     "health": True,
     "create_workflow": True,
@@ -57,6 +58,7 @@ SAFE = {
     "discover_agent": False,
     "claim_work_item": False,
     "complete_work_item": True,
+    "complete_model_step": True,
     "fail_work_item": True,
     "heartbeat_work_item": True,
     "tick": True,
@@ -74,6 +76,12 @@ UNFENCED = [
     Call(
         "complete_work_item",
         lambda c: c.complete_work_item("wi-1", "exec_1", "n1", {"r": 1}, {}),
+        "POST",
+        "/work-items/wi-1/complete",
+    ),
+    Call(
+        "complete_model_step",
+        lambda c: c.complete_model_step("wi-1", {"content": "", "finish_reason": "stop", "model": "m"}, lease_fence=0),
         "POST",
         "/work-items/wi-1/complete",
     ),

@@ -19,6 +19,10 @@ The rules it keeps:
 - A heartbeat answer with ``cancel_requested`` sets the handler's
   :class:`~jamjet.worker_context.WorkContext` flag, stops waiting for the
   handler and reports nothing.
+- A worker model step (an item of the ``model_worker`` queue) is answered by
+  the caller's model through :func:`jamjet.drive_model.run_model_step`,
+  under the same heartbeats, fence and cancel rules, and completed with the
+  model's answer. Any failure goes to the fenced fail route with its reason.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ import httpx
 from rich.console import Console
 
 from jamjet.cli.audit_trail import _clean as _safe
+from jamjet.drive_model import MODEL_QUEUE, run_model_step, step_context
 from jamjet.worker_context import WorkContext, reset_current_work, set_current_work
 
 if TYPE_CHECKING:
@@ -118,6 +123,24 @@ def heartbeat_interval(work_item: dict[str, Any], lease_secs: int | None = None)
     return max(1.0, granted / 3)
 
 
+DEFAULT_MODEL_TIMEOUT_S = 600.0
+"""How long a worker model step may wait for the caller's model when neither
+the work item nor the caller sets a limit."""
+
+
+def model_step_timeout(payload: dict[str, Any], model_timeout_s: float | None = None) -> float:
+    """The limit on a worker model step's call: the smaller of the model's own
+    ``timeout_secs`` in the payload (from the workflow's model settings) and
+    ``model_timeout_s``, the caller's, else :data:`DEFAULT_MODEL_TIMEOUT_S`."""
+    limits: list[float] = []
+    own = payload.get("timeout_secs")
+    if isinstance(own, (int, float)) and not isinstance(own, bool) and own > 0:
+        limits.append(float(own))
+    if model_timeout_s is not None and model_timeout_s > 0:
+        limits.append(float(model_timeout_s))
+    return min(limits) if limits else DEFAULT_MODEL_TIMEOUT_S
+
+
 def _status_code(exc: BaseException) -> int | None:
     # httpx surfaces a refusal as HTTPStatusError carrying .response.status_code.
     return getattr(getattr(exc, "response", None), "status_code", None)
@@ -132,6 +155,7 @@ async def run_claimed_item(
     run_key: str | None = None,
     heartbeat_interval_s: float | None = None,
     lease_secs: int | None = None,
+    model_timeout_s: float | None = None,
 ) -> StepResult:
     """Run one claimed work item and report its result.
 
@@ -143,6 +167,8 @@ async def run_claimed_item(
     does not use it. ``heartbeat_interval_s`` overrides the pace set by
     :func:`heartbeat_interval`; ``lease_secs`` is the lease the claim asked
     for, used for the pace only when the answer does not carry the granted one.
+    ``model_timeout_s`` limits a worker model step's call (see
+    :func:`model_step_timeout`).
 
     A 409 on complete or fail returns :attr:`StepResult.LEASE_LOST` and sends
     nothing more. A failure the engine would not take for another reason
@@ -197,34 +223,46 @@ async def run_claimed_item(
     hb_task = asyncio.create_task(_heartbeat_loop())
 
     t_start = time.monotonic()
+    is_model_step = work_item.get("queue_type") == MODEL_QUEUE
     try:
-        mod_path = payload.get("module")
-        fn_path = payload.get("function")
-        if not mod_path or not fn_path:
-            raise ValueError(f"work item payload missing 'module' or 'function': {sorted(payload)}")
+        if is_model_step:
+            # The caller's model answers the request the engine built.
+            step_ctx = step_context(work_item, run_key=run_key)
+            timeout_s = model_step_timeout(payload, model_timeout_s)
 
-        mod = importlib.import_module(mod_path)
-        fn: Any = mod
-        for part in fn_path.split("."):
-            fn = getattr(fn, part)
+            async def _run_handler() -> Any:
+                # A model that is not the seam raises TypeError here, which
+                # fails the item like any other reason.
+                return await run_model_step(model, payload, step_ctx, timeout_s=timeout_s)  # type: ignore[arg-type]
 
-        tool_input = payload.get("input", {})
+        else:
+            mod_path = payload.get("module")
+            fn_path = payload.get("function")
+            if not mod_path or not fn_path:
+                raise ValueError(f"work item payload missing 'module' or 'function': {sorted(payload)}")
 
-        # Inject deterministic seeds so handlers can opt into replay fidelity.
-        from jamjet.runtime.local.seed import _inject_seeds
+            mod = importlib.import_module(mod_path)
+            fn: Any = mod
+            for part in fn_path.split("."):
+                fn = getattr(fn, part)
 
-        _inject_seeds(exec_id)
+            tool_input = payload.get("input", {})
 
-        async def _run_handler() -> Any:
-            # A coroutine function runs on the loop; anything else runs in
-            # a thread so the heartbeat task keeps the lease alive. The
-            # thread inherits this context, so `current_work()` works there.
-            if asyncio.iscoroutinefunction(fn):
-                return await fn(tool_input)
-            outcome = await asyncio.to_thread(fn, tool_input)
-            if asyncio.iscoroutine(outcome) or asyncio.isfuture(outcome):
-                outcome = await outcome
-            return outcome
+            # Inject deterministic seeds so handlers can opt into replay fidelity.
+            from jamjet.runtime.local.seed import _inject_seeds
+
+            _inject_seeds(exec_id)
+
+            async def _run_handler() -> Any:
+                # A coroutine function runs on the loop; anything else runs in
+                # a thread so the heartbeat task keeps the lease alive. The
+                # thread inherits this context, so `current_work()` works there.
+                if asyncio.iscoroutinefunction(fn):
+                    return await fn(tool_input)
+                outcome = await asyncio.to_thread(fn, tool_input)
+                if asyncio.iscoroutine(outcome) or asyncio.isfuture(outcome):
+                    outcome = await outcome
+                return outcome
 
         handler_task = asyncio.create_task(_run_handler())
         try:
@@ -236,6 +274,25 @@ async def run_claimed_item(
             return StepResult.CANCELLED
 
         duration_ms = int((time.monotonic() - t_start) * 1000)
+        if is_model_step:
+            # The model's answer, never an output or a state patch: the
+            # engine builds those. A 409 is a lost lease, as below.
+            try:
+                await client.complete_model_step(
+                    item_id,
+                    result,
+                    lease_fence=lease["fence"],
+                    idempotency_key=idempotency_key,
+                    duration_ms=duration_ms,
+                )
+            except Exception as complete_exc:
+                if _status_code(complete_exc) == 409:
+                    console.print(f"[yellow]Completion rejected; lease lost[/yellow] id={item_id}")
+                    return StepResult.LEASE_LOST
+                raise
+            console.print(f"[green]Completed[/green] id={item_id} node=[bold]{node_id}[/bold] {duration_ms}ms")
+            return StepResult.COMPLETED
+
         output: Any = result if isinstance(result, dict) else {"result": result}
 
         # The node mutates workflow state with its return value: a

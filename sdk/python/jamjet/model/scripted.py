@@ -209,6 +209,10 @@ def _build(request: ModelRequest) -> ModelResponse:
         output_tokens=int(output_tokens),
         cost_usd=0.0,
         raw=turn,
+        # The script is the model: its counts (or the estimate) are the usage,
+        # and a scripted call costs nothing.
+        usage_reported=True,
+        model=request.ref.litellm_model,
     )
 
 

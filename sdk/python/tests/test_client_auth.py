@@ -757,6 +757,30 @@ CALLS = [
         },
     ),
     Call(
+        "complete_model_step",
+        lambda c: c.complete_model_step(
+            "wi-1",
+            {"content": "hi", "finish_reason": "stop", "model": "m", "input_tokens": 1, "output_tokens": 2},
+            lease_fence=3,
+            idempotency_key="k1",
+            duration_ms=7,
+        ),
+        "POST",
+        "/work-items/wi-1/complete",
+        {
+            "lease_fence": 3,
+            "duration_ms": 7,
+            "model_result": {
+                "content": "hi",
+                "finish_reason": "stop",
+                "model": "m",
+                "input_tokens": 1,
+                "output_tokens": 2,
+            },
+            "idempotency_key": "k1",
+        },
+    ),
+    Call(
         "fail_work_item",
         lambda c: c.fail_work_item("wi-1", "boom", lease_fence=3),
         "POST",

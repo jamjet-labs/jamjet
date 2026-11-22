@@ -662,6 +662,35 @@ class JamjetClient:
             operation="complete_work_item",
         )
 
+    async def complete_model_step(
+        self,
+        item_id: str,
+        model_result: dict[str, Any],
+        *,
+        lease_fence: int,
+        idempotency_key: str | None = None,
+        duration_ms: int = 0,
+    ) -> None:
+        """Complete a worker model step with the model's answer.
+
+        A ``model`` node marked ``executor: worker`` takes ``model_result``
+        (the content, the finish reason, the model that answered, the tool
+        calls and the usage), never an output or a state patch: the engine
+        builds those from the answer. The engine requires the fence. A late
+        or repeated answer is a 409 and records nothing.
+        """
+        body: dict[str, Any] = {"lease_fence": lease_fence, "duration_ms": duration_ms, "model_result": model_result}
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        # Fenced, a second send is refused with 409 once the first lands.
+        await self._request(
+            "POST",
+            f"/work-items/{item_id}/complete",
+            json=body,
+            safe=bool(lease_fence),
+            operation="complete_model_step",
+        )
+
     async def fail_work_item(self, item_id: str, error: str, lease_fence: int = 0) -> None:
         """Report that this work item's node failed.
 
