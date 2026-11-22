@@ -199,6 +199,9 @@ a router of its own. Set `executor` in the node's kind:
   version may not name `model_worker` as its queue.
 - `POST /work-items` refuses such a node (400). Its payload is the request the
   claim hands out, and only the engine builds it, from the run's state.
+- A step of such a node written straight into the store on the engine's
+  `model` queue is run by the engine. The run's worker cannot complete or fail
+  it (403), and any other token is told `404`, as for every step of the node.
 - A runtime from before this change drops `executor` and makes the call
   itself. Check the runtime version before you rely on it.
 
@@ -283,17 +286,19 @@ The checks, in order. Each refusal answers `{"completed": false, "reason":
 | What was sent | Answer |
 |---|---|
 | By a caller who may not claim the item | `404`, whatever the body says |
-| No `lease_fence`, or one the item no longer holds: a late answer, or the same answer sent twice | `409` |
+| No `lease_fence`, or one the item no longer holds: an answer after the lease ran out (read on the store's clock, whether or not anything has taken the step back yet), or the same answer sent twice | `409` |
 | `output` or `state_patch`; no `model_result`; usage beside `model_result` instead of in it (`input_tokens`, `output_tokens`, `cost_usd`, `cost_currency`, `finish_reason`, `gen_ai_model`, `gen_ai_system`) | `400` |
-| A `model_result` that does not parse: a cost sent as a string, a token count that is negative or not whole, `content` that is not a string, a call with no name | `422` |
+| A `model_result` that does not parse: a cost sent as a string, a token count that is negative or not whole, `content` that is not a string, a call with no name | `422`. When the usage is what does not parse, a cap that reads it fails the step for good, as for usage left out: a token count under any cap, a cost under a dollar cap |
 | A token count left out, or a cost that is not a number from 0 to 10,000 in USD | `400`. Under a cap that cannot count it the step fails for good in the same write, and the answer says so: missing tokens under any cap, a bad cost under a dollar cap |
 | A `model` that is empty, longer than 256 characters or holds a control or invisible format character; more than 256 calls; `finish_reason` `tool_calls` with no calls, or calls with any other `finish_reason`; a call id that is empty or used twice; a call to a tool the registered node does not offer | `422` |
 | A block or a gate put on after the claim | `409` |
 | A `model` off an allow list (tenant, workflow or node) | `409`. A `PolicyViolation` "model used is not allowed: <model>" is recorded and the step fails for good |
 | Anything else | `200`. `NodeCompleted` is recorded under the engine's idempotency key, in one fenced write. The scheduler's next pass fails a run past its cap |
 
-A `503` means the engine could not read what it needed to decide; send the
-same answer again.
+A `503` means the engine could not read what it needed to decide, or could
+not tell whether its write landed (a Postgres `COMMIT` that failed). Send the
+same answer again. If that answer is a `409`, read the run to see whether the
+first one was recorded.
 
 A worker that hands the call to a router should pass it the run id, the node
 id, the attempt and the idempotency key, so the router can tell a retry from a
@@ -307,14 +312,18 @@ dollar cap, no cost is fine.
 
 Where the two executors still differ:
 
-- An output above 8 KiB is moved to the artifact store in process. From the
-  worker it is recorded inline, as for any HTTP completion. The state patch is
-  inline on both.
 - The worker's step does not write the `__budget` display counters the
   in-process worker writes. The caps read the log, not those counters.
+- The `jamjet.node` span, its GenAI attributes and the
+  `gen_ai.client.token.usage` metric are recorded for steps the engine runs
+  only. A worker's model step is on the log and in `usage`, not in them.
 - The spend of a step that fails for good is not on the log, as for any failed
   attempt. That covers a model off an allow list, and tokens or a cost a cap
   cannot count. The run's `usage` does not include that call.
+
+A long output (above `JAMJET_ARTIFACT_THRESHOLD_BYTES`, 8 KiB by default) is
+moved to the artifact store on both executors, and the event records the same
+reference. The state patch stays inline.
 
 The completion of every other kind is unchanged: it still needs `output` and
 `state_patch` (422 without them), and `model_result` on one is a 400.

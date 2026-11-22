@@ -64,7 +64,13 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   executor's function, so both executors record the same step.
 - Under any cap, an answer without both token counts fails the step for good, and under a
   dollar cap so does a cost that cannot be counted: the step may have paid, and a retry would
-  pay again with nothing recorded. Without a cap it is a plain 400.
+  pay again with nothing recorded. Without a cap it is a plain 400. Usage that does not parse
+  (a negative, fractional or string token count, a cost that is not a number) is treated the
+  same way under a cap that reads it, and is a 422 without one.
+- An answer sent after the step's lease ran out is a 409 and records nothing, also before
+  the scheduler or another claim takes the step back: the lease is read on the store's clock.
+- A long output is moved to the artifact store, as the in-process worker moves it, so both
+  executors record the same event.
 
 ### Changed
 
@@ -158,19 +164,26 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   call itself, so check the engine's version before you rely on it. The Python SDK and the
   YAML compiler do not write it yet.
 - A model node that an older engine stored with `executor: "worker"`, which it ignored, now
-  hashes differently, since the field is now part of the definition. An approval bound to it
-  before the upgrade is asked again, and its new steps go to `model_worker`. A stored model
+  hashes differently, since the field is now part of the definition. Such a stored version
+  switches to worker execution on upgrade: an approval bound to it before the upgrade is
+  asked again, its new steps go to `model_worker`, and its runs wait there until the run's
+  worker claims them. A stored model
   node with an `executor` value this build does not know no longer parses, and its runs fail
   closed.
 - `POST /work-items` refuses a worker model node (400): its payload is the request the claim
   hands out, and only the engine builds it.
 - The completion of every other kind is unchanged: `output` and `state_patch` are still
-  required (422), and `model_result` on one is 400. One thing moved: a run, workflow or node
+  required (422), and `model_result` on one is 400. Complete, fail and heartbeat now read
+  whether an item is claimable only by its run from the registered node as well as the
+  item's marker, so an item enqueued without the marker is still its run's alone. A step of
+  a worker model node that the engine holds (put on the engine's `model` queue by hand) is
+  not the worker's to complete or fail (403). One thing moved: a run, workflow or node
   that cannot be read is now answered (503 or 409) before a bad cost (400) or a zero fence
   (409). The statuses are the same.
 - What a worker model step does not do yet:
-  - An output above 8 KiB is recorded inline. In process it goes to the artifact store. The
-    state patch is inline on both.
+  - It writes no `__budget` display counters, and it has no `jamjet.node` span, GenAI
+    attributes or `gen_ai.client.token.usage` metric: those count steps the engine runs.
+    Its usage is on the log and in `usage`.
   - The spend of a step that fails for good is not counted, as for any failed attempt. That
     includes a step whose reported model is off an allow list: only its `NodeFailed` is on
     the log, so the run's usage leaves that call out.
