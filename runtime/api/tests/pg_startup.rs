@@ -22,10 +22,12 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_jamjet-server");
-/// How long a process may take to exit or to listen.
+/// How long a process may take to exit or to listen, and an engine to
+/// answer a request. Every wait on a process here is bounded by it, and a
+/// process still running then is killed and fails the case: that is what
+/// keeps a hang from eating the run. A timeout around a whole case could
+/// not do it, since these waits block the test's thread.
 const WAIT: Duration = Duration::from_secs(60);
-/// The whole case, so a hang fails instead of eating the run.
-const CASE: Duration = Duration::from_secs(240);
 
 // ── Processes ────────────────────────────────────────────────────────────────
 
@@ -190,6 +192,7 @@ fn request(
     body: Option<&serde_json::Value>,
 ) -> (u16, String) {
     let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    conn.set_read_timeout(Some(WAIT)).unwrap();
     let auth = token
         .map(|t| format!("Authorization: Bearer {t}\r\n"))
         .unwrap_or_default();
@@ -335,139 +338,121 @@ async fn advisory_locks_held(pool: &PgPool) -> i64 {
     .unwrap()
 }
 
-async fn within_budget(case: impl std::future::Future<Output = ()>) {
-    tokio::time::timeout(CASE, case)
-        .await
-        .expect("the case ran past its time budget");
-}
-
 // ── The schema check at start ────────────────────────────────────────────────
 
 /// An empty database is refused with what to run; after `migrate` the same
 /// server starts, says the store is a preview, and logs no password.
 #[tokio::test]
 async fn server_refuses_an_empty_database_until_migrated() {
-    within_budget(async {
-        let Some(db) = empty("server_refuses_an_empty_database_until_migrated").await else {
-            return;
-        };
-        let dir = temp_dir();
-        let refused = finish(
-            server(&dir, db.url(), &[], &[]).spawn().unwrap(),
-            "a server on an empty database",
-        );
-        assert_ne!(refused.code, Some(0), "{}", refused.all());
-        assert!(
-            refused.all().contains("run `jamjet-server migrate`"),
-            "{}",
-            refused.all()
-        );
-        no_password(db.url(), &refused.all());
+    let Some(db) = empty("server_refuses_an_empty_database_until_migrated").await else {
+        return;
+    };
+    let dir = temp_dir();
+    let refused = finish(
+        server(&dir, db.url(), &[], &[]).spawn().unwrap(),
+        "a server on an empty database",
+    );
+    assert_ne!(refused.code, Some(0), "{}", refused.all());
+    assert!(
+        refused.all().contains("run `jamjet-server migrate`"),
+        "{}",
+        refused.all()
+    );
+    no_password(db.url(), &refused.all());
 
-        let out = run(&dir, db.url(), &["migrate"], &[]);
-        assert_eq!(out.code, Some(0), "{}", out.all());
+    let out = run(&dir, db.url(), &["migrate"], &[]);
+    assert_eq!(out.code, Some(0), "{}", out.all());
 
-        let engine = serve(&dir, db.url(), &[]);
-        assert!(
-            engine.log.contains("Postgres store (preview)"),
-            "{}",
-            engine.log
-        );
-        assert!(
-            engine.log.contains(r#""storage":"postgres""#),
-            "{}",
-            engine.log
-        );
-        assert!(
-            engine.log.contains("Audit outbox drain started"),
-            "{}",
-            engine.log
-        );
-        no_password(db.url(), &engine.log);
-        assert_eq!(get(&engine.addr, "/health", None), 200);
-        drop(engine);
-        let _ = std::fs::remove_dir_all(&dir);
-    })
-    .await;
+    let engine = serve(&dir, db.url(), &[]);
+    assert!(
+        engine.log.contains("Postgres store (preview)"),
+        "{}",
+        engine.log
+    );
+    assert!(
+        engine.log.contains(r#""storage":"postgres""#),
+        "{}",
+        engine.log
+    );
+    assert!(
+        engine.log.contains("Audit outbox drain started"),
+        "{}",
+        engine.log
+    );
+    no_password(db.url(), &engine.log);
+    assert_eq!(get(&engine.addr, "/health", None), 200);
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A database an older build migrated (version 1 only) is refused until
 /// `migrate` brings it up.
 #[tokio::test]
 async fn server_refuses_an_older_schema() {
-    within_budget(async {
-        let Some(db) = empty("server_refuses_an_older_schema").await else {
-            return;
-        };
-        make_older(&db).await;
-        let dir = temp_dir();
-        let refused = finish(
-            server(&dir, db.url(), &[], &[]).spawn().unwrap(),
-            "a server on an older schema",
-        );
-        assert_ne!(refused.code, Some(0), "{}", refused.all());
-        assert!(
-            refused.all().contains("at version 1")
-                && refused.all().contains("run `jamjet-server migrate`"),
-            "{}",
-            refused.all()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    })
-    .await;
+    let Some(db) = empty("server_refuses_an_older_schema").await else {
+        return;
+    };
+    make_older(&db).await;
+    let dir = temp_dir();
+    let refused = finish(
+        server(&dir, db.url(), &[], &[]).spawn().unwrap(),
+        "a server on an older schema",
+    );
+    assert_ne!(refused.code, Some(0), "{}", refused.all());
+    assert!(
+        refused.all().contains("at version 1")
+            && refused.all().contains("run `jamjet-server migrate`"),
+        "{}",
+        refused.all()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A database a newer build migrated is refused: this build rolled back
 /// below a schema migration.
 #[tokio::test]
 async fn server_refuses_a_newer_schema() {
-    within_budget(async {
-        let dir = temp_dir();
-        let Some(db) = migrated("server_refuses_a_newer_schema", &dir).await else {
-            return;
-        };
-        make_ahead(&db.pool().await).await;
-        let refused = finish(
-            server(&dir, db.url(), &[], &[]).spawn().unwrap(),
-            "a server on a newer schema",
-        );
-        assert_ne!(refused.code, Some(0), "{}", refused.all());
-        assert!(
-            refused.all().contains(
-                "this build is older than the database schema; do not roll back below a schema migration"
-            ),
-            "{}",
-            refused.all()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    })
-    .await;
+    let dir = temp_dir();
+    let Some(db) = migrated("server_refuses_a_newer_schema", &dir).await else {
+        return;
+    };
+    make_ahead(&db.pool().await).await;
+    let refused = finish(
+        server(&dir, db.url(), &[], &[]).spawn().unwrap(),
+        "a server on a newer schema",
+    );
+    assert_ne!(refused.code, Some(0), "{}", refused.all());
+    assert!(
+        refused.all().contains(
+            "this build is older than the database schema; do not roll back below a schema migration"
+        ),
+        "{}",
+        refused.all()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A migration that started and did not finish is refused, naming it.
 #[tokio::test]
 async fn server_refuses_a_dirty_schema() {
-    within_budget(async {
-        let dir = temp_dir();
-        let Some(db) = migrated("server_refuses_a_dirty_schema", &dir).await else {
-            return;
-        };
-        make_dirty(&db.pool().await).await;
-        let refused = finish(
-            server(&dir, db.url(), &[], &[]).spawn().unwrap(),
-            "a server on a dirty schema",
-        );
-        assert_ne!(refused.code, Some(0), "{}", refused.all());
-        assert!(
-            refused.all().contains(&format!(
-                "migration {DIRTY_VERSION} started and did not finish"
-            )),
-            "{}",
-            refused.all()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    })
-    .await;
+    let dir = temp_dir();
+    let Some(db) = migrated("server_refuses_a_dirty_schema", &dir).await else {
+        return;
+    };
+    make_dirty(&db.pool().await).await;
+    let refused = finish(
+        server(&dir, db.url(), &[], &[]).spawn().unwrap(),
+        "a server on a dirty schema",
+    );
+    assert_ne!(refused.code, Some(0), "{}", refused.all());
+    assert!(
+        refused.all().contains(&format!(
+            "migration {DIRTY_VERSION} started and did not finish"
+        )),
+        "{}",
+        refused.all()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── migrate ──────────────────────────────────────────────────────────────────
@@ -476,33 +461,30 @@ async fn server_refuses_a_dirty_schema() {
 /// still succeeds.
 #[tokio::test]
 async fn migrate_twice_is_a_no_op() {
-    within_budget(async {
-        let Some(db) = empty("migrate_twice_is_a_no_op").await else {
-            return;
-        };
-        let dir = temp_dir();
-        let first = run(&dir, db.url(), &["migrate"], &[]);
-        assert_eq!(first.code, Some(0), "{}", first.all());
-        assert!(
-            first
-                .stdout
-                .contains(&migrated_line(known_versions().len())),
-            "{}",
-            first.all()
-        );
-        let second = run(&dir, db.url(), &["migrate"], &[]);
-        assert_eq!(second.code, Some(0), "{}", second.all());
-        assert!(
-            second.stdout.contains(&migrated_line(0)),
-            "{}",
-            second.all()
-        );
-        let pool = db.pool().await;
-        let once: Vec<(i64, i64)> = known_versions().into_iter().map(|v| (v, 1)).collect();
-        assert_eq!(recorded(&pool).await, once);
-        let _ = std::fs::remove_dir_all(&dir);
-    })
-    .await;
+    let Some(db) = empty("migrate_twice_is_a_no_op").await else {
+        return;
+    };
+    let dir = temp_dir();
+    let first = run(&dir, db.url(), &["migrate"], &[]);
+    assert_eq!(first.code, Some(0), "{}", first.all());
+    assert!(
+        first
+            .stdout
+            .contains(&migrated_line(known_versions().len())),
+        "{}",
+        first.all()
+    );
+    let second = run(&dir, db.url(), &["migrate"], &[]);
+    assert_eq!(second.code, Some(0), "{}", second.all());
+    assert!(
+        second.stdout.contains(&migrated_line(0)),
+        "{}",
+        second.all()
+    );
+    let pool = db.pool().await;
+    let once: Vec<(i64, i64)> = known_versions().into_iter().map(|v| (v, 1)).collect();
+    assert_eq!(recorded(&pool).await, once);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Two `migrate` processes on one empty database: both wait on migrate's
@@ -510,52 +492,49 @@ async fn migrate_twice_is_a_no_op() {
 /// migration and the other none, and each version is recorded once.
 #[tokio::test]
 async fn two_migrators_at_once_apply_each_migration_once() {
-    within_budget(async {
-        let Some(db) = empty("two_migrators_at_once_apply_each_migration_once").await else {
-            return;
-        };
-        let dir = temp_dir();
-        let pool = db.pool().await;
-        let mut holder = pool.acquire().await.unwrap();
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(MIGRATE_LOCK)
-            .execute(&mut *holder)
-            .await
-            .unwrap();
-        let a = server(&dir, db.url(), &["migrate"], &[]).spawn().unwrap();
-        let b = server(&dir, db.url(), &["migrate"], &[]).spawn().unwrap();
+    let Some(db) = empty("two_migrators_at_once_apply_each_migration_once").await else {
+        return;
+    };
+    let dir = temp_dir();
+    let pool = db.pool().await;
+    let mut holder = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATE_LOCK)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let a = server(&dir, db.url(), &["migrate"], &[]).spawn().unwrap();
+    let b = server(&dir, db.url(), &["migrate"], &[]).spawn().unwrap();
 
-        // The race opened: both are inside migrate, waiting on its lock.
-        let deadline = Instant::now() + WAIT;
-        while waiting_for_the_migrate_lock(&pool).await < 2 {
-            assert!(
-                Instant::now() < deadline,
-                "the two migrators never both waited on migrate's lock"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(MIGRATE_LOCK)
-            .execute(&mut *holder)
-            .await
-            .unwrap();
-        drop(holder);
-
-        let (a, b) = (finish(a, "migrator a"), finish(b, "migrator b"));
-        assert_eq!(a.code, Some(0), "{}", a.all());
-        assert_eq!(b.code, Some(0), "{}", b.all());
-        let all = migrated_line(known_versions().len());
-        let none = migrated_line(0);
-        let said = [a.stdout.trim(), b.stdout.trim()];
+    // The race opened: both are inside migrate, waiting on its lock.
+    let deadline = Instant::now() + WAIT;
+    while waiting_for_the_migrate_lock(&pool).await < 2 {
         assert!(
-            said == [all.as_str(), none.as_str()] || said == [none.as_str(), all.as_str()],
-            "one applies everything, the other nothing: {said:?}"
+            Instant::now() < deadline,
+            "the two migrators never both waited on migrate's lock"
         );
-        let once: Vec<(i64, i64)> = known_versions().into_iter().map(|v| (v, 1)).collect();
-        assert_eq!(recorded(&pool).await, once);
-        let _ = std::fs::remove_dir_all(&dir);
-    })
-    .await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(MIGRATE_LOCK)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    drop(holder);
+
+    let (a, b) = (finish(a, "migrator a"), finish(b, "migrator b"));
+    assert_eq!(a.code, Some(0), "{}", a.all());
+    assert_eq!(b.code, Some(0), "{}", b.all());
+    let all = migrated_line(known_versions().len());
+    let none = migrated_line(0);
+    let said = [a.stdout.trim(), b.stdout.trim()];
+    assert!(
+        said == [all.as_str(), none.as_str()] || said == [none.as_str(), all.as_str()],
+        "one applies everything, the other nothing: {said:?}"
+    );
+    let once: Vec<(i64, i64)> = known_versions().into_iter().map(|v| (v, 1)).collect();
+    assert_eq!(recorded(&pool).await, once);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A migration that fails leaves the schema at the version before it, with
@@ -563,75 +542,67 @@ async fn two_migrators_at_once_apply_each_migration_once() {
 /// afterwards and the next migrator runs at once.
 #[tokio::test]
 async fn a_failed_migration_leaves_the_previous_version_and_frees_the_lock() {
-    within_budget(async {
-        let Some(db) =
-            empty("a_failed_migration_leaves_the_previous_version_and_frees_the_lock").await
-        else {
-            return;
-        };
-        let source = temp_dir();
-        std::fs::write(
-            source.join("0001_fine.sql"),
-            "CREATE TABLE fine_table (id int);",
-        )
+    let Some(db) = empty("a_failed_migration_leaves_the_previous_version_and_frees_the_lock").await
+    else {
+        return;
+    };
+    let source = temp_dir();
+    std::fs::write(
+        source.join("0001_fine.sql"),
+        "CREATE TABLE fine_table (id int);",
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("0002_fails.sql"),
+        "CREATE TABLE never_table (id int);\nSELECT 1 / 0;",
+    )
+    .unwrap();
+    let migrator = sqlx::migrate::Migrator::new(source.as_path())
+        .await
         .unwrap();
-        std::fs::write(
-            source.join("0002_fails.sql"),
-            "CREATE TABLE never_table (id int);\nSELECT 1 / 0;",
-        )
+
+    let failed = migrate_with(db.url(), &migrator)
+        .await
+        .expect_err("the second migration fails");
+    assert!(failed.to_string().contains("division by zero"), "{failed}");
+
+    let pool = db.pool().await;
+    assert_eq!(recorded(&pool).await, vec![(1, 1)]);
+    let never: bool = sqlx::query_scalar("SELECT to_regclass('never_table') IS NOT NULL")
+        .fetch_one(&pool)
+        .await
         .unwrap();
-        let migrator = sqlx::migrate::Migrator::new(source.as_path())
-            .await
-            .unwrap();
+    assert!(!never, "the failed migration left nothing behind");
+    assert_eq!(advisory_locks_held(&pool).await, 0, "no lock is left held");
 
-        let failed = migrate_with(db.url(), &migrator)
-            .await
-            .expect_err("the second migration fails");
-        assert!(failed.to_string().contains("division by zero"), "{failed}");
-
-        let pool = db.pool().await;
-        assert_eq!(recorded(&pool).await, vec![(1, 1)]);
-        let never: bool = sqlx::query_scalar("SELECT to_regclass('never_table') IS NOT NULL")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(!never, "the failed migration left nothing behind");
-        assert_eq!(advisory_locks_held(&pool).await, 0, "no lock is left held");
-
-        // The next one does not wait for a lock the first kept.
-        let again =
-            tokio::time::timeout(Duration::from_secs(10), migrate_with(db.url(), &migrator))
-                .await
-                .expect("the second migrator ran at once");
-        assert!(again.is_err(), "the same migration fails again");
-        assert_eq!(recorded(&pool).await, vec![(1, 1)]);
-        let _ = std::fs::remove_dir_all(&source);
-    })
-    .await;
+    // The next one does not wait for a lock the first kept.
+    let again = tokio::time::timeout(Duration::from_secs(10), migrate_with(db.url(), &migrator))
+        .await
+        .expect("the second migrator ran at once");
+    assert!(again.is_err(), "the same migration fails again");
+    assert_eq!(recorded(&pool).await, vec![(1, 1)]);
+    let _ = std::fs::remove_dir_all(&source);
 }
 
 /// A migrate refused on a newer schema closes its connection too, so the
 /// lock it took before reading the schema is free when it returns.
 #[tokio::test]
 async fn a_refused_migration_frees_the_lock() {
-    within_budget(async {
-        let Some(db) = empty("a_refused_migration_frees_the_lock").await else {
-            return;
-        };
-        make_older(&db).await;
-        let pool = db.pool().await;
-        make_ahead(&pool).await;
-        let refused = migrate_with(db.url(), &MIGRATOR).await;
-        assert!(
-            matches!(
-                refused,
-                Err(MigrateError::Refused(SchemaState::Ahead { .. }))
-            ),
-            "{refused:?}"
-        );
-        assert_eq!(advisory_locks_held(&pool).await, 0, "no lock is left held");
-    })
-    .await;
+    let Some(db) = empty("a_refused_migration_frees_the_lock").await else {
+        return;
+    };
+    make_older(&db).await;
+    let pool = db.pool().await;
+    make_ahead(&pool).await;
+    let refused = migrate_with(db.url(), &MIGRATOR).await;
+    assert!(
+        matches!(
+            refused,
+            Err(MigrateError::Refused(SchemaState::Ahead { .. }))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(advisory_locks_held(&pool).await, 0, "no lock is left held");
 }
 
 /// `migrate --check` changes nothing and exits 0 current, 2 behind, 3 ahead,
@@ -639,121 +610,115 @@ async fn a_refused_migration_frees_the_lock() {
 /// dirty or changed one, and applies nothing there.
 #[tokio::test]
 async fn migrate_check_exit_codes() {
-    within_budget(async {
-        let Some(db) = empty("migrate_check_exit_codes").await else {
-            return;
-        };
-        let dir = temp_dir();
-        let check = |url: &str| run(&dir, url, &["migrate", "--check"], &[]);
+    let Some(db) = empty("migrate_check_exit_codes").await else {
+        return;
+    };
+    let dir = temp_dir();
+    let check = |url: &str| run(&dir, url, &["migrate", "--check"], &[]);
 
-        // Empty: behind, and the check created nothing.
-        let out = check(db.url());
-        assert_eq!(out.code, Some(2), "{}", out.all());
-        let pool = db.pool().await;
-        let table: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(!table, "--check changed nothing");
+    // Empty: behind, and the check created nothing.
+    let out = check(db.url());
+    assert_eq!(out.code, Some(2), "{}", out.all());
+    let pool = db.pool().await;
+    let table: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!table, "--check changed nothing");
 
-        // Older: behind.
-        let older = TestDatabase::empty().await.unwrap();
-        make_older(&older).await;
-        let out = check(older.url());
-        assert_eq!(out.code, Some(2), "{}", out.all());
-        assert_eq!(recorded(&older.pool().await).await, vec![(1, 1)]);
+    // Older: behind.
+    let older = TestDatabase::empty().await.unwrap();
+    make_older(&older).await;
+    let out = check(older.url());
+    assert_eq!(out.code, Some(2), "{}", out.all());
+    assert_eq!(recorded(&older.pool().await).await, vec![(1, 1)]);
 
-        // Current.
-        let out = run(&dir, db.url(), &["migrate"], &[]);
-        assert_eq!(out.code, Some(0), "{}", out.all());
-        let out = check(db.url());
-        assert_eq!(out.code, Some(0), "{}", out.all());
+    // Current.
+    let out = run(&dir, db.url(), &["migrate"], &[]);
+    assert_eq!(out.code, Some(0), "{}", out.all());
+    let out = check(db.url());
+    assert_eq!(out.code, Some(0), "{}", out.all());
 
-        // The three refusals start from version 1 with version 2 pending,
-        // so a migrate that applied anything there would record it.
+    // The three refusals start from version 1 with version 2 pending,
+    // so a migrate that applied anything there would record it.
 
-        // Ahead: 3, and migrate refuses with 3 too.
-        let ahead = TestDatabase::empty().await.unwrap();
-        make_older(&ahead).await;
-        make_ahead(&ahead.pool().await).await;
-        let out = check(ahead.url());
-        assert_eq!(out.code, Some(3), "{}", out.all());
-        let out = run(&dir, ahead.url(), &["migrate"], &[]);
-        assert_eq!(out.code, Some(3), "{}", out.all());
-        assert!(out.all().contains("do not roll back"), "{}", out.all());
-        assert_eq!(
-            recorded(&ahead.pool().await).await,
-            vec![(1, 1), (9999, 1)],
-            "nothing applied"
-        );
+    // Ahead: 3, and migrate refuses with 3 too.
+    let ahead = TestDatabase::empty().await.unwrap();
+    make_older(&ahead).await;
+    make_ahead(&ahead.pool().await).await;
+    let out = check(ahead.url());
+    assert_eq!(out.code, Some(3), "{}", out.all());
+    let out = run(&dir, ahead.url(), &["migrate"], &[]);
+    assert_eq!(out.code, Some(3), "{}", out.all());
+    assert!(out.all().contains("do not roll back"), "{}", out.all());
+    assert_eq!(
+        recorded(&ahead.pool().await).await,
+        vec![(1, 1), (9999, 1)],
+        "nothing applied"
+    );
 
-        // Dirty: 4, both.
-        let dirty = TestDatabase::empty().await.unwrap();
-        make_older(&dirty).await;
-        make_dirty(&dirty.pool().await).await;
-        let out = check(dirty.url());
-        assert_eq!(out.code, Some(4), "{}", out.all());
-        let out = run(&dir, dirty.url(), &["migrate"], &[]);
-        assert_eq!(out.code, Some(4), "{}", out.all());
-        assert!(
-            out.all().contains(&DIRTY_VERSION.to_string()),
-            "{}",
-            out.all()
-        );
-        assert_eq!(
-            recorded(&dirty.pool().await).await,
-            vec![(1, 1), (DIRTY_VERSION, 1)],
-            "nothing applied"
-        );
+    // Dirty: 4, both.
+    let dirty = TestDatabase::empty().await.unwrap();
+    make_older(&dirty).await;
+    make_dirty(&dirty.pool().await).await;
+    let out = check(dirty.url());
+    assert_eq!(out.code, Some(4), "{}", out.all());
+    let out = run(&dir, dirty.url(), &["migrate"], &[]);
+    assert_eq!(out.code, Some(4), "{}", out.all());
+    assert!(
+        out.all().contains(&DIRTY_VERSION.to_string()),
+        "{}",
+        out.all()
+    );
+    assert_eq!(
+        recorded(&dirty.pool().await).await,
+        vec![(1, 1), (DIRTY_VERSION, 1)],
+        "nothing applied"
+    );
 
-        // Changed: 4, both, naming the version.
-        let changed = TestDatabase::empty().await.unwrap();
-        make_older(&changed).await;
-        sqlx::query("UPDATE _sqlx_migrations SET checksum = '\\x00' WHERE version = 1")
-            .execute(&changed.pool().await)
-            .await
-            .unwrap();
-        let out = check(changed.url());
-        assert_eq!(out.code, Some(4), "{}", out.all());
-        let out = run(&dir, changed.url(), &["migrate"], &[]);
-        assert_eq!(out.code, Some(4), "{}", out.all());
-        assert!(out.all().contains("migration 1"), "{}", out.all());
-        assert_eq!(
-            recorded(&changed.pool().await).await,
-            vec![(1, 1)],
-            "nothing applied"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    })
-    .await;
+    // Changed: 4, both, naming the version.
+    let changed = TestDatabase::empty().await.unwrap();
+    make_older(&changed).await;
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = '\\x00' WHERE version = 1")
+        .execute(&changed.pool().await)
+        .await
+        .unwrap();
+    let out = check(changed.url());
+    assert_eq!(out.code, Some(4), "{}", out.all());
+    let out = run(&dir, changed.url(), &["migrate"], &[]);
+    assert_eq!(out.code, Some(4), "{}", out.all());
+    assert!(out.all().contains("migration 1"), "{}", out.all());
+    assert_eq!(
+        recorded(&changed.pool().await).await,
+        vec![(1, 1)],
+        "nothing applied"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Neither `migrate` nor `migrate --check` prints the URL's password, when
 /// it works and when the password is wrong.
 #[tokio::test]
 async fn migrate_never_prints_the_password() {
-    within_budget(async {
-        let Some(db) = empty("migrate_never_prints_the_password").await else {
-            return;
-        };
-        let dir = temp_dir();
-        for args in [&["migrate"][..], &["migrate", "--check"]] {
-            let out = run(&dir, db.url(), args, &[("RUST_LOG", "debug")]);
-            assert_eq!(out.code, Some(0), "{args:?}: {}", out.all());
-            no_password(db.url(), &out.all());
-        }
-        let password = password_of(db.url());
-        let wrong = db
-            .url()
-            .replacen(&format!(":{password}@"), ":not-the-password-7f3a@", 1);
-        for args in [&["migrate"][..], &["migrate", "--check"]] {
-            let out = run(&dir, &wrong, args, &[("RUST_LOG", "debug")]);
-            assert_ne!(out.code, Some(0), "{args:?}: {}", out.all());
-            no_password(&wrong, &out.all());
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    })
-    .await;
+    let Some(db) = empty("migrate_never_prints_the_password").await else {
+        return;
+    };
+    let dir = temp_dir();
+    for args in [&["migrate"][..], &["migrate", "--check"]] {
+        let out = run(&dir, db.url(), args, &[("RUST_LOG", "debug")]);
+        assert_eq!(out.code, Some(0), "{args:?}: {}", out.all());
+        no_password(db.url(), &out.all());
+    }
+    let password = password_of(db.url());
+    let wrong = db
+        .url()
+        .replacen(&format!(":{password}@"), ":not-the-password-7f3a@", 1);
+    for args in [&["migrate"][..], &["migrate", "--check"]] {
+        let out = run(&dir, &wrong, args, &[("RUST_LOG", "debug")]);
+        assert_ne!(out.code, Some(0), "{args:?}: {}", out.all());
+        no_password(&wrong, &out.all());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── Cron and tokens ──────────────────────────────────────────────────────────
@@ -763,41 +728,38 @@ async fn migrate_never_prints_the_password() {
 /// `/cron` answers 400, as on the memory store.
 #[tokio::test]
 async fn postgres_refuses_embedded_cron() {
-    within_budget(async {
-        let dir = temp_dir();
-        let Some(db) = migrated("postgres_refuses_embedded_cron", &dir).await else {
-            return;
-        };
-        let refused = finish(
-            server(&dir, db.url(), &[], &[("JAMJET_EMBED_CRON", "1")])
-                .spawn()
-                .unwrap(),
-            "a server with embedded cron on Postgres",
-        );
-        assert_ne!(refused.code, Some(0), "{}", refused.all());
-        assert!(
-            refused.all().contains(
-                "cron is not supported on Postgres yet: each engine would fire every schedule"
-            ),
-            "{}",
-            refused.all()
-        );
+    let dir = temp_dir();
+    let Some(db) = migrated("postgres_refuses_embedded_cron", &dir).await else {
+        return;
+    };
+    let refused = finish(
+        server(&dir, db.url(), &[], &[("JAMJET_EMBED_CRON", "1")])
+            .spawn()
+            .unwrap(),
+        "a server with embedded cron on Postgres",
+    );
+    assert_ne!(refused.code, Some(0), "{}", refused.all());
+    assert!(
+        refused.all().contains(
+            "cron is not supported on Postgres yet: each engine would fire every schedule"
+        ),
+        "{}",
+        refused.all()
+    );
 
-        let engine = serve(&dir, db.url(), &[("JAMJET_DEV_MODE", "1")]);
-        assert!(
-            engine.log.contains("cron is not supported on Postgres yet"),
-            "{}",
-            engine.log
-        );
-        assert!(
-            !engine.log.contains("Cron scheduler started"),
-            "{}",
-            engine.log
-        );
-        assert_eq!(get(&engine.addr, "/cron", None), 400);
-        let _ = std::fs::remove_dir_all(&dir);
-    })
-    .await;
+    let engine = serve(&dir, db.url(), &[("JAMJET_DEV_MODE", "1")]);
+    assert!(
+        engine.log.contains("cron is not supported on Postgres yet"),
+        "{}",
+        engine.log
+    );
+    assert!(
+        !engine.log.contains("Cron scheduler started"),
+        "{}",
+        engine.log
+    );
+    assert_eq!(get(&engine.addr, "/cron", None), 400);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A token issued by `jamjet-server token create` on Postgres is accepted by
@@ -805,67 +767,66 @@ async fn postgres_refuses_embedded_cron() {
 /// revoke from the command line is refused by both from then on.
 #[tokio::test]
 async fn token_created_on_postgres_works_on_two_engines() {
-    within_budget(async {
-        let dir = temp_dir();
-        let Some(db) = migrated("token_created_on_postgres_works_on_two_engines", &dir).await
-        else {
-            return;
-        };
-        let key = [("JAMJET_AUDIT_SIGNING_KEY", "pg-startup-test-key")];
-        let created = run(
-            &dir,
-            db.url(),
-            &["token", "create", "--role", "developer", "--name", "ci"],
-            &key,
-        );
-        assert_eq!(created.code, Some(0), "{}", created.all());
-        no_password(db.url(), &created.all());
-        let token = created.stdout.trim().to_string();
-        assert!(token.starts_with("jj_"), "{token:?}");
+    let dir = temp_dir();
+    let Some(db) = migrated("token_created_on_postgres_works_on_two_engines", &dir).await else {
+        return;
+    };
+    let key = [("JAMJET_AUDIT_SIGNING_KEY", "pg-startup-test-key")];
+    let created = run(
+        &dir,
+        db.url(),
+        &["token", "create", "--role", "developer", "--name", "ci"],
+        &key,
+    );
+    assert_eq!(created.code, Some(0), "{}", created.all());
+    no_password(db.url(), &created.all());
+    let token = created.stdout.trim().to_string();
+    assert!(token.starts_with("jj_"), "{token:?}");
 
-        let one = serve(&dir, db.url(), &key);
-        let two = serve(&dir, db.url(), &key);
-        for engine in [&one, &two] {
-            assert_eq!(get(&engine.addr, "/executions", Some(&token)), 200);
-            assert_eq!(get(&engine.addr, "/executions", None), 401);
-        }
+    let one = serve(&dir, db.url(), &key);
+    let two = serve(&dir, db.url(), &key);
+    for engine in [&one, &two] {
+        assert_eq!(get(&engine.addr, "/executions", Some(&token)), 200);
+        assert_eq!(get(&engine.addr, "/executions", None), 401);
+    }
 
-        // Both engines keep agents in the database: one registers, the
-        // other lists it.
-        let uri = "https://agents.example/researcher";
-        let card = serde_json::json!({
-            "id": uri, "uri": uri, "name": "researcher", "description": "research agent",
-            "version": "1.0.0",
-            "capabilities": { "skills": [], "protocols": [], "tools_provided": [], "tools_consumed": [] },
-            "autonomy": "bounded_autonomous", "constraints": null, "auth": { "type": "none" }
-        });
-        let (st, body) = request(&one.addr, "POST", "/agents", Some(&token), Some(&card));
-        assert_eq!(st, 201, "{body}");
-        let (st, body) = request(&two.addr, "GET", "/agents", Some(&token), None);
-        assert_eq!(st, 200, "{body}");
-        assert!(body.contains(uri), "the other engine lists the agent: {body}");
+    // Both engines keep agents in the database: one registers, the
+    // other lists it.
+    let uri = "https://agents.example/researcher";
+    let card = serde_json::json!({
+        "id": uri, "uri": uri, "name": "researcher", "description": "research agent",
+        "version": "1.0.0",
+        "capabilities": { "skills": [], "protocols": [], "tools_provided": [], "tools_consumed": [] },
+        "autonomy": "bounded_autonomous", "constraints": null, "auth": { "type": "none" }
+    });
+    let (st, body) = request(&one.addr, "POST", "/agents", Some(&token), Some(&card));
+    assert_eq!(st, 201, "{body}");
+    let (st, body) = request(&two.addr, "GET", "/agents", Some(&token), None);
+    assert_eq!(st, 200, "{body}");
+    assert!(
+        body.contains(uri),
+        "the other engine lists the agent: {body}"
+    );
 
-        let pool = db.pool().await;
-        let id: String = sqlx::query_scalar("SELECT id FROM api_tokens")
-            .fetch_one(&pool)
+    let pool = db.pool().await;
+    let id: String = sqlx::query_scalar("SELECT id FROM api_tokens")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let revoked = run(&dir, db.url(), &["token", "revoke", &id], &key);
+    assert_eq!(revoked.code, Some(0), "{}", revoked.all());
+    no_password(db.url(), &revoked.all());
+    for engine in [&one, &two] {
+        assert_eq!(get(&engine.addr, "/executions", Some(&token)), 401);
+    }
+
+    let sealed: Vec<String> =
+        sqlx::query_scalar("SELECT event_type FROM audit_log ORDER BY position")
+            .fetch_all(&pool)
             .await
             .unwrap();
-        let revoked = run(&dir, db.url(), &["token", "revoke", &id], &key);
-        assert_eq!(revoked.code, Some(0), "{}", revoked.all());
-        no_password(db.url(), &revoked.all());
-        for engine in [&one, &two] {
-            assert_eq!(get(&engine.addr, "/executions", Some(&token)), 401);
-        }
-
-        let sealed: Vec<String> =
-            sqlx::query_scalar("SELECT event_type FROM audit_log ORDER BY position")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(sealed, ["token_issued", "token_revoked"], "{sealed:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    })
-    .await;
+    assert_eq!(sealed, ["token_issued", "token_revoked"], "{sealed:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── The outbox drain ─────────────────────────────────────────────────────────
@@ -879,76 +840,73 @@ async fn a_server_seals_what_the_outbox_holds() {
     use jamjet_state::event::{Event, EventKind};
     use jamjet_state::{PgBackend, PgSettings, StateBackend};
 
-    within_budget(async {
-        let dir = temp_dir();
-        let Some(db) = migrated("a_server_seals_what_the_outbox_holds", &dir).await else {
-            return;
-        };
-        let settings = PgSettings {
-            pool_size: 2,
-            ..PgSettings::default()
-        };
-        let pg = PgBackend::connect(db.url(), settings).await.unwrap();
-        let now = chrono::Utc::now();
-        let eid = ExecutionId::new();
-        pg.create_execution(WorkflowExecution {
-            execution_id: eid.clone(),
-            workflow_id: "wf-unsealed".into(),
-            workflow_version: "0.1.0".into(),
-            status: WorkflowStatus::Running,
-            initial_input: serde_json::json!({}),
-            current_state: serde_json::json!({}),
-            started_at: now,
-            updated_at: now,
-            completed_at: None,
-            session_type: None,
-            parent_execution_id: None,
-            segment_number: 0,
-        })
+    let dir = temp_dir();
+    let Some(db) = migrated("a_server_seals_what_the_outbox_holds", &dir).await else {
+        return;
+    };
+    let settings = PgSettings {
+        pool_size: 2,
+        ..PgSettings::default()
+    };
+    let pg = PgBackend::connect(db.url(), settings).await.unwrap();
+    let now = chrono::Utc::now();
+    let eid = ExecutionId::new();
+    pg.create_execution(WorkflowExecution {
+        execution_id: eid.clone(),
+        workflow_id: "wf-unsealed".into(),
+        workflow_version: "0.1.0".into(),
+        status: WorkflowStatus::Running,
+        initial_input: serde_json::json!({}),
+        current_state: serde_json::json!({}),
+        started_at: now,
+        updated_at: now,
+        completed_at: None,
+        session_type: None,
+        parent_execution_id: None,
+        segment_number: 0,
+    })
+    .await
+    .unwrap();
+    let event = Event::new(
+        eid,
+        0,
+        EventKind::ToolApprovalRequired {
+            node_id: "pay".into(),
+            tool_name: "pay".into(),
+            approver: "human".into(),
+            context: serde_json::json!({}),
+        },
+    );
+    let event_id = event.id;
+    pg.append_event(event).await.unwrap();
+    let pool = pg.pool();
+    sqlx::query("UPDATE audit_outbox SET created_at = created_at - interval '1 minute'")
+        .execute(&pool)
         .await
         .unwrap();
-        let event = Event::new(
-            eid,
-            0,
-            EventKind::ToolApprovalRequired {
-                node_id: "pay".into(),
-                tool_name: "pay".into(),
-                approver: "human".into(),
-                context: serde_json::json!({}),
-            },
-        );
-        let event_id = event.id;
-        pg.append_event(event).await.unwrap();
-        let pool = pg.pool();
-        sqlx::query("UPDATE audit_outbox SET created_at = created_at - interval '1 minute'")
-            .execute(&pool)
+    let entries = || async {
+        sqlx::query_scalar::<_, String>("SELECT actor_id FROM audit_log WHERE event_id = $1")
+            .bind(event_id)
+            .fetch_all(&pool)
             .await
-            .unwrap();
-        let entries = || async {
-            sqlx::query_scalar::<_, String>("SELECT actor_id FROM audit_log WHERE event_id = $1")
-                .bind(event_id)
-                .fetch_all(&pool)
-                .await
-                .unwrap()
-        };
-        assert!(entries().await.is_empty(), "nothing sealed it yet");
+            .unwrap()
+    };
+    assert!(entries().await.is_empty(), "nothing sealed it yet");
 
-        let _engine = serve(&dir, db.url(), &[]);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while entries().await.is_empty() {
-            assert!(
-                Instant::now() < deadline,
-                "the server never sealed the outbox row"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(entries().await, ["system"], "sealed once, by the drain");
-        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_outbox")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(left, 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    })
-    .await;
+    let _engine = serve(&dir, db.url(), &[]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while entries().await.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the server never sealed the outbox row"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(entries().await, ["system"], "sealed once, by the drain");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+    let _ = std::fs::remove_dir_all(&dir);
 }
