@@ -3329,3 +3329,68 @@ async fn an_engine_held_step_of_a_worker_model_node_is_not_the_workers() {
     );
     let _ = std::fs::remove_file(path);
 }
+
+// ── Usage a cap cannot count ─────────────────────────────────────────────────
+
+/// Under a cap, an answer whose token counts do not parse is the same as
+/// one that leaves them out: the step may have paid and its spend cannot be
+/// counted, so the step fails for good (422, and the answer says so). A
+/// cost that does not parse does the same under a dollar cap; a token cap
+/// does not read the cost, so there it is a plain 422. Without a cap
+/// (`an_answer_of_the_wrong_shape_is_422`) nothing is recorded.
+#[tokio::test]
+async fn usage_that_does_not_parse_under_a_cap_fails_the_step_for_good() {
+    let dollar = json!({ "cost_budget_usd": 1.0 });
+    let tokens = json!({ "token_budget": { "total_tokens": 1000 } });
+    let cases = [
+        ("negative input tokens", "input_tokens", json!(-5)),
+        ("input tokens as a string", "input_tokens", json!("812")),
+        ("fractional input tokens", "input_tokens", json!(812.5)),
+        ("input tokens past u64", "input_tokens", json!(1e20)),
+        ("output tokens as a string", "output_tokens", json!("95")),
+        ("a cost as a string", "cost_usd", json!("0.0031")),
+        ("a currency that is not text", "cost_currency", json!(7)),
+    ];
+    for (cap, caps) in [("a dollar cap", &dollar), ("a token cap", &tokens)] {
+        for (what, key, value) in &cases {
+            let fails = cap == "a dollar cap" || key.ends_with("_tokens");
+            for tb in support::backends().await {
+                let run = start(tb, one_step("wf-usage-unparsed", &["search"], caps.clone())).await;
+                let name = run.name;
+                let wi = run.step().await;
+                let before = run.events().await.len();
+                let (st, body) = run
+                    .complete(&wi, result_of(&wi, answer_with(key, value.clone())))
+                    .await;
+                assert_eq!(st, 422, "{name}, {cap}, {what}: {body}");
+                assert!(
+                    run.completions("think").await.is_empty(),
+                    "{name}, {cap}, {what}"
+                );
+                if !fails {
+                    run.unchanged(&wi, before, &format!("{cap}, {what}")).await;
+                    continue;
+                }
+                assert!(
+                    body["reason"]
+                        .as_str()
+                        .is_some_and(|r| r.ends_with("so the step failed")),
+                    "{name}, {cap}, {what}: {body}"
+                );
+                assert!(
+                    run.failed_for_good("think").await.is_some(),
+                    "{name}, {cap}, {what}: {:?}",
+                    run.log().await
+                );
+                let (st, body) = run.complete(&wi, result_of(&wi, answer())).await;
+                assert_eq!(st, 409, "{name}, {cap}, {what}: sent again: {body}");
+                run.tick().await;
+                assert_eq!(
+                    run.status().await,
+                    WorkflowStatus::Failed,
+                    "{name}, {cap}, {what}"
+                );
+            }
+        }
+    }
+}

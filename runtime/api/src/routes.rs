@@ -4287,12 +4287,44 @@ async fn complete_worker_model_step(
             ),
         );
     };
-    let answer: crate::worker_model::ModelResult = match serde_json::from_value(raw) {
+    let answer: crate::worker_model::ModelResult = match serde_json::from_value(raw.clone()) {
         Ok(answer) => answer,
         // The parser's words can quote what the worker sent: told to the
         // worker, as the request extractor would, but not logged.
         Err(e) => {
             warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, "complete: refused a model step's answer: model_result does not parse");
+            // Usage no cap can count is usage left out: under a cap that
+            // reads it the step may have paid, so it fails for good, as one
+            // that reports no tokens does. The log names the field only.
+            if let Some(unreadable) = crate::worker_model::unreadable_usage(&raw) {
+                let what = match unreadable {
+                    crate::worker_model::UnreadableUsage::Tokens(_) => Uncounted::Tokens,
+                    crate::worker_model::UnreadableUsage::Cost(_) => Uncounted::Cost,
+                };
+                let problem = format!(
+                    "model_result.{} is not a value the run's caps can count",
+                    unreadable.field()
+                );
+                if fail_uncounted_step(
+                    backend,
+                    wi,
+                    node,
+                    fence,
+                    what,
+                    &problem,
+                    state.agents.as_ref(),
+                )
+                .await?
+                {
+                    return Ok(not_completed(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!(
+                            "model_result: {e}; the run has {}, so the step failed",
+                            what.cap()
+                        ),
+                    ));
+                }
+            }
             return Ok(not_completed(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!("model_result: {e}"),

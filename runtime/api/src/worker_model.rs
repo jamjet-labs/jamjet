@@ -253,6 +253,49 @@ impl ModelResult {
     }
 }
 
+/// Usage in an answer that does not parse which no cap can count: a token
+/// count, or a cost, of the wrong type. Under a cap that reads it the step
+/// may have paid with nothing to count, so it fails as one that left the
+/// usage out does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreadableUsage {
+    /// `input_tokens` or `output_tokens` that is not a whole number from 0
+    /// to `u64::MAX` (negative, fractional, a string, past the range).
+    Tokens(&'static str),
+    /// `cost_usd` that is not a number, or `cost_currency` that is not text.
+    Cost(&'static str),
+}
+
+impl UnreadableUsage {
+    /// The field, as the answer and the log name it. Never the value sent.
+    pub fn field(self) -> &'static str {
+        match self {
+            Self::Tokens(field) | Self::Cost(field) => field,
+        }
+    }
+}
+
+/// The first usage field of `raw`, a `model_result` that did not parse,
+/// that no cap can count, or `None`. A field left out or null is not read
+/// here: [`ModelResult::tokens`] and the cost rule decide those once the
+/// answer parses.
+pub fn unreadable_usage(raw: &Value) -> Option<UnreadableUsage> {
+    let answer = raw.as_object()?;
+    let sent = |field: &str| answer.get(field).filter(|v| !v.is_null());
+    for field in ["input_tokens", "output_tokens"] {
+        if sent(field).is_some_and(|v| v.as_u64().is_none()) {
+            return Some(UnreadableUsage::Tokens(field));
+        }
+    }
+    if sent("cost_usd").is_some_and(|v| !v.is_number()) {
+        return Some(UnreadableUsage::Cost("cost_usd"));
+    }
+    if sent("cost_currency").is_some_and(|v| !v.is_string()) {
+        return Some(UnreadableUsage::Cost("cost_currency"));
+    }
+    None
+}
+
 /// The names of the tools a model node offers its model: each schema's
 /// `function.name` (the OpenAI shape the SDK compiles), or a flat schema's
 /// `name`. A schema with neither, or an empty one, offers nothing. Empty for
@@ -277,6 +320,56 @@ pub fn offered_tools(kind: &NodeKind) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A token count or a cost of the wrong type is named by its field; a
+    /// field left out, null or of the right type is not.
+    #[test]
+    fn usage_no_cap_can_count_is_named_by_its_field() {
+        let with = |field: &str, value: Value| {
+            let mut answer = json!({ "content": "", "finish_reason": "stop", "model": "m" });
+            answer[field] = value;
+            unreadable_usage(&answer)
+        };
+        for value in [
+            json!(-5),
+            json!("812"),
+            json!(812.5),
+            json!(1e20),
+            json!([1]),
+        ] {
+            assert_eq!(
+                with("input_tokens", value.clone()),
+                Some(UnreadableUsage::Tokens("input_tokens")),
+                "{value}"
+            );
+            assert_eq!(
+                with("output_tokens", value.clone()),
+                Some(UnreadableUsage::Tokens("output_tokens")),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            with("cost_usd", json!("0.0031")),
+            Some(UnreadableUsage::Cost("cost_usd"))
+        );
+        assert_eq!(
+            with("cost_currency", json!(7)),
+            Some(UnreadableUsage::Cost("cost_currency"))
+        );
+        for (field, value) in [
+            ("input_tokens", json!(0)),
+            ("input_tokens", Value::Null),
+            ("output_tokens", json!(u64::MAX)),
+            ("cost_usd", json!(-1.0)),
+            ("cost_usd", Value::Null),
+            ("cost_currency", json!("EUR")),
+            ("content", json!(7)),
+        ] {
+            assert_eq!(with(field, value.clone()), None, "{field}: {value}");
+        }
+        assert_eq!(unreadable_usage(&json!([{ "input_tokens": -5 }])), None);
+        assert_eq!(unreadable_usage(&Value::Null), None);
+    }
     use jamjet_ir::workflow::TokenBudgetIr;
     use jamjet_state::Event;
     use jamjet_state::EventKind;
