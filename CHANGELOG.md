@@ -39,6 +39,32 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   asked for and the `continue_as_new` segments before it, not later ones: ask for the latest
   segment's id for the whole run. It is null when the log holds an event this build cannot read. The MCP
   `jamjet_get_execution` tool carries it too.
+- **A run's own worker can make its model calls.** A `model` node with `executor: worker` is
+  handed, by execution, to the worker that started the run, with its budget left. The engine
+  still checks the model against the allow list, the caps and every tool call, and writes the
+  step's state itself from the worker's answer. The step goes to a new built-in queue,
+  `model_worker`, which only a claim naming the run is given. See "Model steps run by the
+  run's own worker" in the deployment guide, which also says what the engine trusts the
+  worker for and what it checks.
+- The claim of such a step carries `budget_left` beside the payload: what each cap leaves,
+  null for a cap the run does not have, 0 for a cap the engine cannot check. The payload is
+  the request the engine built from the run's state: the node's prompt, or for a node with no
+  prompt, the conversation in `state.messages`. A step whose request has no prompt to send
+  fails at claim with the in-process executor's words (`blocked`).
+- `POST /work-items/:id/complete` takes `model_result` for such a step: `content`,
+  `finish_reason`, `model`, `tool_calls` as a flat `{id, name, arguments}` list, both token
+  counts, and an optional `cost_usd`. It refuses, in order: a caller who may not claim the
+  item (404); no fence or a stale one (409); an `output`, a `state_patch`, usage beside the
+  answer, or no answer (400); an answer that does not parse (422); a token count left out or
+  a cost that cannot be counted (400); a model id that is empty, long or holds an invisible
+  character, more than 256 calls, a `finish_reason` that disagrees with the calls, an empty or
+  repeated call id, or a call to a tool the node does not offer (422); a gate or block put on
+  after the claim (409); a reported model off an allow list (409, a `PolicyViolation`, and the
+  step fails for good). The engine builds the output and the state patch with the in-process
+  executor's function, so both executors record the same step.
+- Under any cap, an answer without both token counts fails the step for good, and under a
+  dollar cap so does a cost that cannot be counted: the step may have paid, and a retry would
+  pay again with nothing recorded. Without a cap it is a plain 400.
 
 ### Changed
 
@@ -124,6 +150,34 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Removed: `rollover_segment` (its caller was the budget trip), with its five tests, and the
   worker's pre-call budget check with four more tests it carried, nine worker tests in all.
   Their cases are covered by the caps unit tests and `run_caps`.
+- `model_worker` is a built-in queue name: a new `external_fn` version may no longer name it
+  (400). A version already stored with it still re-registers.
+- `executor` on any node kind but `model` is refused when a new version is registered, and
+  `claim` on a `model` node is refused too. Write `executor` only for `worker`:
+  `"executor": null` is refused on every kind. An older engine drops `executor` and makes the
+  call itself, so check the engine's version before you rely on it. The Python SDK and the
+  YAML compiler do not write it yet.
+- A model node that an older engine stored with `executor: "worker"`, which it ignored, now
+  hashes differently, since the field is now part of the definition. An approval bound to it
+  before the upgrade is asked again, and its new steps go to `model_worker`. A stored model
+  node with an `executor` value this build does not know no longer parses, and its runs fail
+  closed.
+- `POST /work-items` refuses a worker model node (400): its payload is the request the claim
+  hands out, and only the engine builds it.
+- The completion of every other kind is unchanged: `output` and `state_patch` are still
+  required (422), and `model_result` on one is 400. One thing moved: a run, workflow or node
+  that cannot be read is now answered (503 or 409) before a bad cost (400) or a zero fence
+  (409). The statuses are the same.
+- What a worker model step does not do yet:
+  - An output above 8 KiB is recorded inline. In process it goes to the artifact store. The
+    state patch is inline on both.
+  - The spend of a step that fails for good is not counted, as for any failed attempt. That
+    includes a step whose reported model is off an allow list: only its `NodeFailed` is on
+    the log, so the run's usage leaves that call out.
+  - A model off an allow list, reported after the run was cancelled, records its
+    `PolicyViolation` in the cancelled run's log before the answer is 409.
+  - If another claim takes the lease back between the engine's last read of it and the write
+    of that violation, the violation is recorded for a step the new holder then runs.
 
 ### Fixed
 

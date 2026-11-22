@@ -243,6 +243,11 @@ never counted, so it is never stopped.
   that does not parse) or sent without its lease fence and with a bad cost leaves the step to
   be retried, and the first attempt's spend is not counted. A malformed cost that reaches the
   handler under a dollar cap fails the step for good instead.
+- A `model` node with `executor: worker` is claimed with what the caps leave
+  (`budget_left`), and its worker must report both token counts. Under any cap, an answer
+  without them fails the step for good, and under a dollar cap so does a cost it cannot
+  count (see [Model
+  steps run by the run's own worker](deployment.md#model-steps-run-by-the-runs-own-worker)).
 - `on_budget_exceeded` is accepted and read by nothing. `continue_as_new` is no longer read
   for a budget: a run that reaches its cap fails, it does not roll over to a new segment.
 
