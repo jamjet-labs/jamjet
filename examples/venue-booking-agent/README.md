@@ -61,7 +61,10 @@ In-process steps run with `python agent.py`. Durable steps need
 
 ## Two more steps
 
-They build on step 05 and are not part of the three episodes.
+They build on step 05 and are not part of the three episodes. Both
+were checked on the scripted model. Step 10 was also run on three
+small local models, and its README says what they did. Neither was
+run on `anthropic/claude-sonnet-5-5`.
 
 | Step | What it adds | Runs |
 |---|---|---|

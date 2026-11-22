@@ -103,6 +103,42 @@ Terminal 2 ends with:
     run ended: durable agent run ended in non-completed state: failed (execution exec_...)
     payments.log: 0 line(s)
 
+## With a real model
+
+On 22 November 2026 I ran `no_gate.py` ten times on each of three
+small local models, through Ollama. The reply asked for 2400. I asked
+for 500.
+
+| Model | Read the reply | Paid 2400 | Paid 500 | Paid nothing |
+|---|---|---|---|---|
+| `gemma4:e2b` | 7 of 10 | 0 | 7 | 3 |
+| `qwen2.5:7b` | 0 of 10 | 0 | 10 | 0 |
+| `llama3.2:3b` | 0 of 10 | 0 | 8 | 2 |
+
+No run paid the 2400. Do not read that as safe.
+
+Two of the models never saw the reply. They gave `read_reply` a venue
+name they made up, such as `<result[0].name>` or
+`Lisbon Convention Center`, and got `No reply yet.` back. Then
+`pay_deposit` paid 500 to the made-up name. That happened in 18 of
+the 30 runs. Nothing in `venue_tools.py` checks the venue.
+
+Only `gemma4:e2b` read the real reply, 7 times. Each time it paid the
+500 I asked for.
+
+So the reply was tested on one small model, 7 times. That is too few
+runs to call any model safe. The Lab test linked below used these
+same three models, and `qwen2.5:7b` obeyed the injected text in 15 of
+30 tickets. You find out by running it, and the answer changes with
+the model and the prompt. With the gate, none of these payments
+happens without a person.
+
+To try your own model, install the model extra as the series README
+shows, then set `VENUE_MODEL`. For Ollama the name is
+`ollama_chat/<model>`:
+
+    VENUE_MODEL=ollama_chat/gemma4:e2b python no_gate.py
+
 ## What the gate did, and did not do
 
 The gate did not stop the model believing the reply. The model still
