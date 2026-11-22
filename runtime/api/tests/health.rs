@@ -69,8 +69,9 @@ async fn every_feature_has_a_guard() {
     let (_, body) = get(&state(), "/health").await;
     for name in body["features"].as_array().unwrap() {
         match name.as_str().unwrap() {
-            // A claim that names an execution answers with a reason, where an
-            // engine without the feature answers 400.
+            // A claim that names an execution answers with a reason. An
+            // engine without the feature ignores `execution_id` and answers
+            // with no reason.
             "claim_by_execution" => {
                 let (st, body) = post(
                     &state(),
@@ -85,6 +86,62 @@ async fn every_feature_has_a_guard() {
                 assert_eq!(st, 200, "{body}");
                 assert_eq!(body["claimed"], false, "{body}");
                 assert!(body["reason"].is_string(), "{body}");
+            }
+            // Two starts with one key give one run, and the key is echoed.
+            // An engine without the feature starts a second run.
+            "run_key" => {
+                let st = state();
+                let ir = support::python_fn_start_ir("wf-health-key");
+                let (code, body) = post(&st, "/workflows", json!({ "ir": ir })).await;
+                assert!(code.is_success(), "{code} {body}");
+                let start = json!({
+                    "workflow_id": "wf-health-key",
+                    "workflow_version": "0.1.0",
+                    "input": {},
+                    "run_key": "health:1",
+                });
+                let (_, first) = post(&st, "/executions", start.clone()).await;
+                let (_, second) = post(&st, "/executions", start).await;
+                assert!(first["execution_id"].is_string(), "{first}");
+                assert_eq!(first["execution_id"], second["execution_id"], "{second}");
+                assert_eq!(first["run_key"], "health:1", "{first}");
+                assert_eq!(second["run_key"], "health:1", "{second}");
+            }
+            // A `python_fn` node may opt in to being claimed by its own run:
+            // the oldest-first claim leaves its item alone, and the claim
+            // that names the run takes it.
+            "python_fn_by_execution" => {
+                let st = state();
+                let mut ir = support::python_fn_start_ir("wf-health-claim");
+                ir["nodes"]["py_start"]["kind"]["claim"] = json!("by_execution");
+                let (code, body) = post(&st, "/workflows", json!({ "ir": ir })).await;
+                assert!(code.is_success(), "{code} {body}");
+                let (code, started) = post(
+                    &st,
+                    "/executions",
+                    json!({ "workflow_id": "wf-health-claim", "workflow_version": "0.1.0", "input": {} }),
+                )
+                .await;
+                assert!(code.is_success(), "{code} {started}");
+                let execution_id = started["execution_id"].as_str().unwrap();
+                let (_, any) = post(
+                    &st,
+                    "/work-items/claim",
+                    json!({ "worker_id": "w", "queue_types": ["python_tool"] }),
+                )
+                .await;
+                assert_eq!(any["claimed"], false, "{any}");
+                let (_, own) = post(
+                    &st,
+                    "/work-items/claim",
+                    json!({
+                        "worker_id": "w",
+                        "queue_types": ["python_tool"],
+                        "execution_id": execution_id,
+                    }),
+                )
+                .await;
+                assert_eq!(own["claimed"], true, "{own}");
             }
             other => panic!("feature {other} has no guard arm in tests/health.rs"),
         }
