@@ -2301,18 +2301,53 @@ fn by_execution_item(wi: &WorkItem) -> bool {
         == Some(jamjet_core::node::CLAIM_BY_EXECUTION)
 }
 
+/// Whether `wi`'s node, as its run's registered workflow defines it, is
+/// claimable only by its execution, whatever the item's payload says: an
+/// item written without the marker (an operator's, on another queue) is
+/// still its run's alone. A run, workflow or node that is not there says
+/// nothing here, and the routes' own checks refuse it; a store that cannot
+/// be read is an error, never a guess.
+async fn registered_by_execution(
+    backend: &dyn jamjet_state::StateBackend,
+    wi: &WorkItem,
+) -> Result<bool, ApiError> {
+    match registered_node(backend, &wi.execution_id, &wi.node_id).await {
+        Ok(Some(kind)) => {
+            Ok(jamjet_core::node::claim_mode(&kind) == jamjet_core::node::ClaimMode::ByExecution)
+        }
+        Ok(None) | Err(ApiError::NotFound(_) | ApiError::Conflict(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Whether the caller may NOT touch `wi`: an item claimable only by its
-/// execution, and a caller [`may_act_for_execution`] refuses. The complete,
-/// fail and heartbeat routes answer such a caller as for an item that does
-/// not exist.
+/// execution, by its payload's marker or by its registered node, and a
+/// caller [`may_act_for_execution`] refuses. The complete, fail and
+/// heartbeat routes answer such a caller as for an item that does not
+/// exist.
 async fn foreign_by_execution_item(
     backend: &dyn jamjet_state::StateBackend,
     wi: &WorkItem,
     token: Option<&jamjet_state::ApiToken>,
     dev_mode: bool,
 ) -> Result<bool, ApiError> {
-    Ok(by_execution_item(wi)
-        && !may_act_for_execution(backend, &wi.execution_id, token, dev_mode).await?)
+    let by_execution = by_execution_item(wi) || registered_by_execution(backend, wi).await?;
+    Ok(by_execution && !may_act_for_execution(backend, &wi.execution_id, token, dev_mode).await?)
+}
+
+/// Why the run's worker may not report the result of `wi`, a step of a
+/// model node its run's worker runs, if it may not: the item is not on
+/// `model_worker`. On an engine queue the engine's own pool makes the call
+/// and records it (an operator's hand enqueue), so a worker's answer for it
+/// is never recorded, as for any kind the engine runs.
+fn worker_model_item_held_by_engine(wi: &WorkItem) -> Option<String> {
+    (wi.queue_type != jamjet_core::node::QueueType::ModelWorker.as_str()).then(|| {
+        format!(
+            "node {} is queued on '{}', where the engine makes the call; an external worker \
+             cannot report its result",
+            wi.node_id, wi.queue_type
+        )
+    })
 }
 
 /// How many claims one principal may hold waiting (`wait_ms`) at once. A
@@ -3817,6 +3852,10 @@ async fn complete_work_item(
     };
     if let (Some(wi), Some(node)) = (recorded.as_ref(), node.as_ref()) {
         if crate::worker_model::is_worker_model(&node.inputs.node_def.kind) {
+            if let Some(reason) = worker_model_item_held_by_engine(wi) {
+                warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, %reason, "complete: refused");
+                return Ok(not_completed(StatusCode::FORBIDDEN, reason));
+            }
             return complete_worker_model_step(&state, backend.as_ref(), wi, node, &id, body).await;
         }
         if body.model_result.is_some() {
@@ -4756,6 +4795,9 @@ async fn registered_node(
 /// does not have is not the engine's; the route's other checks apply.
 async fn engine_owned(backend: &dyn jamjet_state::StateBackend, wi: &WorkItem) -> Option<String> {
     match registered_node(backend, &wi.execution_id, &wi.node_id).await {
+        Ok(Some(kind)) if crate::worker_model::is_worker_model(&kind) => {
+            worker_model_item_held_by_engine(wi)
+        }
         Ok(Some(kind))
             if jamjet_worker::executable::runner_for_kind(&kind)
                 == jamjet_worker::executable::Runner::InProcess =>

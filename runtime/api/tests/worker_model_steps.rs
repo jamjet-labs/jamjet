@@ -3219,3 +3219,113 @@ async fn a_worker_model_step_past_the_cap_fails_the_run_next_pass() {
         );
     }
 }
+
+// ── An engine-held step of a worker model node ───────────────────────────────
+
+/// A worker model node's step can be held by the engine: an operator put it
+/// on the engine's `model` queue without the marker, and the in-process
+/// pool took it. Another principal is answered 404 on complete, fail and
+/// heartbeat, as for any item only its run may touch: the node's claim mode
+/// is read from the registered node, not only from the payload's marker.
+/// The run's initiator cannot report its result either (403), since the
+/// engine is making the call. Nothing is recorded, and the engine's lease
+/// is left as it was.
+#[tokio::test]
+async fn an_engine_held_step_of_a_worker_model_node_is_not_the_workers() {
+    let path = std::env::temp_dir().join(format!("jjwm-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+    let sqlite = Arc::new(SqliteBackend::open(&url).await.unwrap());
+    let (alice, _) = sqlite.create_token("alice", "developer").await.unwrap();
+    let (bob, _) = sqlite.create_token("bob", "developer").await.unwrap();
+    let backend: Arc<dyn StateBackend> = sqlite.clone();
+    let state = support::make_state(backend.clone());
+    let workflow = ir(
+        "wf-engine-held",
+        &[
+            ("prep", python_fn("prep")),
+            ("think", worker_model(&["search"])),
+        ],
+        json!({}),
+    );
+    let (st, body) = send(
+        &state,
+        "POST",
+        "/workflows",
+        Some(&alice),
+        json!({ "ir": workflow }),
+    )
+    .await;
+    assert!((200..300).contains(&st), "{st} {body}");
+    let (_, body) = send(
+        &state,
+        "POST",
+        "/executions",
+        Some(&alice),
+        json!({ "workflow_id": "wf-engine-held", "workflow_version": "0.1.0", "input": input() }),
+    )
+    .await;
+    let id = body["execution_id"].as_str().unwrap().to_string();
+    let run = Run {
+        name: "sqlite",
+        eid: parse_id(&id),
+        id,
+        scheduler: Scheduler::new(backend.clone()),
+        tb: TestBackend::Sqlite {
+            backend: sqlite.clone(),
+            url,
+        },
+        backend: backend.clone(),
+        state: state.clone(),
+    };
+    hand_enqueue(&run, &workflow, "think", "model", false).await;
+    let held = backend
+        .claim_work_item("engine", &["model"])
+        .await
+        .unwrap()
+        .expect("the engine holds the step");
+    assert_eq!(held.node_id, "think");
+    let item = held.id.to_string();
+    let wi = json!({ "id": item, "lease_fence": held.lease_fence, "idempotency_key": null });
+    let before = run.events().await.len();
+
+    let requests = |fence: i64| {
+        [
+            (
+                "complete",
+                format!("/work-items/{item}/complete"),
+                result_of(&wi, answer()),
+            ),
+            (
+                "fail",
+                format!("/work-items/{item}/fail"),
+                json!({ "error": "no", "lease_fence": fence }),
+            ),
+            (
+                "heartbeat",
+                format!("/work-items/{item}/heartbeat"),
+                json!({ "worker_id": "engine", "lease_fence": fence }),
+            ),
+        ]
+    };
+    for (what, path, body) in requests(held.lease_fence) {
+        let (st, answer) = send(&state, "POST", &path, Some(&bob), body).await;
+        assert_eq!(st, 404, "another principal's {what}: {answer}");
+    }
+    for (what, path, body) in requests(held.lease_fence).into_iter().take(2) {
+        let (st, answer) = send(&state, "POST", &path, Some(&alice), body).await;
+        assert_eq!(st, 403, "the initiator's {what}: {answer}");
+    }
+    assert_eq!(
+        run.events().await.len(),
+        before,
+        "something was recorded: {:?}",
+        run.log().await
+    );
+    let now = backend.get_work_item(held.id).await.unwrap().unwrap();
+    assert_eq!(
+        (now.worker_id.as_deref(), now.lease_fence),
+        (Some("engine"), held.lease_fence),
+        "the engine's lease moved"
+    );
+    let _ = std::fs::remove_file(path);
+}
