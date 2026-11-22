@@ -217,6 +217,8 @@ pub const POINTS: &[(&str, u32)] = &[
     // before its `BEGIN`, and the start of each retry.
     ("pg_tx.attempt", 1),
     ("pg_tx.retry", 1),
+    // api/src/routes.rs: a seam, between a decision's append and its seal.
+    ("decision.after_append_before_seal", 1),
 ];
 
 /// A fault point: the boundary after statement `$step` of the transaction

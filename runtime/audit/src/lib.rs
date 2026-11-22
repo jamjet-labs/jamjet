@@ -13,6 +13,7 @@ pub mod chain;
 pub mod enricher;
 pub mod entry;
 pub mod noop;
+pub mod outbox;
 pub mod postgres;
 pub mod signer;
 pub mod sqlite;

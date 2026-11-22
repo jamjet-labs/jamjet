@@ -1173,7 +1173,7 @@ async fn approve_execution(
     // The per-node worker events emitted through the fenced `commit_turn` path
     // are not yet routed through the enricher; tracked as F-t3-audit-emit.
     // A repeat appended nothing, and its decision was sealed the first time.
-    if !submitted.repeat {
+    if !submitted.repeat && before_decision_seal().await.is_ok() {
         let ctx = jamjet_audit::RequestContext {
             actor_id,
             actor_type: jamjet_audit::ActorType::Human,
@@ -1194,6 +1194,15 @@ async fn approve_execution(
     Ok(Json(
         crate::approvals::decision_answer(backend.as_ref(), &execution_id, &submitted).await,
     ))
+}
+
+/// The seam between a decision's durable append and its inline seal. An
+/// error a test arms here skips the seal, as an engine that stopped there
+/// would: the decision is recorded and has no audit entry, which on
+/// Postgres the outbox drain then seals.
+async fn before_decision_seal() -> jamjet_state::BackendResult<()> {
+    jamjet_state::fault_point!("decision.after_append_before_seal", 1);
+    Ok(())
 }
 
 /// The answer of `POST /executions/:id/approve` to a refused decision.

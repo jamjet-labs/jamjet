@@ -13,6 +13,7 @@
 
 mod commit;
 mod effects;
+mod outbox;
 mod projection;
 mod queue;
 mod run_keys;
@@ -22,6 +23,7 @@ mod settings;
 mod tokens;
 mod tx;
 
+pub use outbox::OutboxRow;
 pub use schema::{migrate, schema_state, MigrateReport, SchemaState, MIGRATOR};
 pub use settings::{
     PgSettings, ACQUIRE_TIMEOUT_ENV, IDLE_IN_TX_TIMEOUT_ENV, LOCK_TIMEOUT_ENV, MIN_POOL_SIZE,

@@ -474,6 +474,20 @@ pub fn pending_approvals(events: &[Event]) -> Vec<PendingApproval> {
     by_node.into_values().flatten().collect()
 }
 
+/// The event kinds the engine seals into the audit chain, as each kind's
+/// `type` tag: a request, a decision, an expiry and an escalation. On
+/// Postgres the store writes an `audit_outbox` row with each event of these
+/// kinds, in the transaction that appends it, so an event whose seal is lost
+/// (a crash after the append, a failed audit write) is sealed later by the
+/// outbox drain. A new sealer of another kind goes on this list too: a test
+/// in `api/tests/pg_outbox.rs` reads the sources and fails until it does.
+pub const SEALED_EVENT_KINDS: &[&str] = &[
+    "tool_approval_required",
+    "approval_received",
+    "approval_expired",
+    "approval_escalated",
+];
+
 /// Seals an approval record (a request, an expiry, an escalation) that has
 /// been durably appended into the signed, hash-chained audit log, beside the
 /// decisions the approve routes seal. Implemented by `jamjet_audit`'s
@@ -521,6 +535,18 @@ pub async fn record_seal_gap(
     event: &Event,
     error: String,
 ) {
+    if let Err(e) = try_record_seal_gap(backend, event, error).await {
+        tracing::error!(execution_id = %event.execution_id, "could not record the audit gap either: {e}");
+    }
+}
+
+/// [`record_seal_gap`], answering whether the record landed, for a caller
+/// that must know (the outbox drain marks its row only once it has).
+pub async fn try_record_seal_gap(
+    backend: &dyn crate::backend::StateBackend,
+    event: &Event,
+    error: String,
+) -> crate::backend::BackendResult<()> {
     let event_type = serde_json::to_value(&event.kind)
         .ok()
         .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
@@ -542,9 +568,7 @@ pub async fn record_seal_gap(
             error,
         },
     );
-    if let Err(e) = backend.append_event(gap).await {
-        tracing::error!(execution_id = %event.execution_id, "could not record the audit gap either: {e}");
-    }
+    backend.append_event(gap).await.map(|_| ())
 }
 
 /// Context key under which a request records when it expires: UTC, RFC 3339.
