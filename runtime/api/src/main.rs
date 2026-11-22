@@ -5,7 +5,6 @@ use jamjet_api::{config::ApiConfig, routes::build_router_with_opts, state::AppSt
 use jamjet_audit::{AuditEnricher, NoopAuditBackend, SqliteAuditBackend};
 use jamjet_state::{InMemoryBackend, SqliteBackend};
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{info, warn};
 
 /// Parse a `JAMJET_STORE_TERM` value: a non-negative integer (the promotion
@@ -117,6 +116,11 @@ async fn main() -> anyhow::Result<()> {
     // adapters and the MCP and A2A clients all build one.
     jamjet_models::http::client().map_err(|e| anyhow::anyhow!("{e}"))?;
     let storage_backend = std::env::var("STORAGE_BACKEND").unwrap_or_default();
+    // Before any store is opened and before `.jamjet` is created: a serverless
+    // platform loses a SQLite file when an instance stops.
+    startup::check_store_env(&config)?;
+    // A bad stop setting stops startup here too, before migrations run.
+    let shutdown_plan = startup::shutdown_plan_from_env()?;
     // Parse the failover generation up front so a misconfiguration fails startup
     // before we open any backend (rather than silently disabling failover-safety).
     let configured_store_term = store_term_from_env()?;
@@ -299,7 +303,7 @@ async fn main() -> anyhow::Result<()> {
     //
     // On SIGTERM or Ctrl-C the scheduler stops between ticks and the embedded
     // workers finish the items they hold, for up to the grace period.
-    let shutdown_grace = shutdown_grace_from_env()?;
+    let shutdown_grace = shutdown_plan.grace;
     let (shutdown_trigger, shutdown) = jamjet_worker::shutdown();
     let scheduler =
         jamjet_scheduler::Scheduler::new(state.backend.clone()).with_sealer(state.enricher.clone());
@@ -432,6 +436,7 @@ async fn main() -> anyhow::Result<()> {
     // stream never ends) must not hold the drain back.
     info!(
         grace_secs = shutdown_grace.as_secs(),
+        stop_timeout_secs = shutdown_plan.stop_timeout.map(|t| t.as_secs()),
         "Shutting down: finishing in-flight work"
     );
     let still_running = shutdown_trigger.stop_and_drain(shutdown_grace).await;
@@ -457,22 +462,6 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("Shutting down");
     Ok(())
-}
-
-/// How long shutdown waits for in-flight work: `JAMJET_SHUTDOWN_GRACE_SECS`,
-/// default [`jamjet_worker::shutdown::DEFAULT_SHUTDOWN_GRACE`] (20 s; with
-/// the scheduler and HTTP drains a shutdown takes at most 25 s). An invalid
-/// value fails startup.
-fn shutdown_grace_from_env() -> anyhow::Result<Duration> {
-    match std::env::var("JAMJET_SHUTDOWN_GRACE_SECS") {
-        Err(std::env::VarError::NotPresent) => Ok(jamjet_worker::shutdown::DEFAULT_SHUTDOWN_GRACE),
-        Err(e) => anyhow::bail!("failed to read JAMJET_SHUTDOWN_GRACE_SECS: {e}"),
-        Ok(raw) => raw
-            .trim()
-            .parse::<u64>()
-            .map(Duration::from_secs)
-            .map_err(|e| anyhow::anyhow!("invalid JAMJET_SHUTDOWN_GRACE_SECS `{raw}`: {e}")),
-    }
 }
 
 /// Resolves on Ctrl-C or SIGTERM. The server used to wait for Ctrl-C only, so

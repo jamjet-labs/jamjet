@@ -47,6 +47,10 @@ mime_guess = { workspace = true }
 # The in-process cron launcher implements `jamjet_timers::CronLauncher`.
 async-trait = { workspace = true }
 
+[build-dependencies]
+# Reads `.cargo_vcs_info.json` for the build commit.
+serde_json = { workspace = true }
+
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 # Paused time for tests of the claim route's bounded wait.

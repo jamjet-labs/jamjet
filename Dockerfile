@@ -15,8 +15,11 @@ COPY runtime/ runtime/
 COPY rust-toolchain.toml .
 COPY --from=web-builder /build/web/dist web/dist
 
+# The image has no .git, so the commit comes in as a build argument. An empty
+# value is read as unset.
+ARG JAMJET_BUILD_COMMIT=
 WORKDIR /build/runtime
-RUN cargo build --release --locked --bin jamjet-server
+RUN JAMJET_BUILD_COMMIT="${JAMJET_BUILD_COMMIT}" cargo build --release --locked --bin jamjet-server
 
 # ── Stage 3: Final image ────────────────────────────────────────────
 FROM python:3.12-slim-bookworm

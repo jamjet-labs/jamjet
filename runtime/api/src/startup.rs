@@ -21,6 +21,13 @@ pub const EMBED_WORKERS_ENV: &str = "JAMJET_EMBED_WORKERS";
 /// Starts the in-process cron scheduler outside dev mode.
 pub const EMBED_CRON_ENV: &str = "JAMJET_EMBED_CRON";
 
+/// Set by Knative-style serverless container platforms to the service name.
+pub const PLATFORM_SERVICE_ENV: &str = "K_SERVICE";
+
+/// Lets the server keep a SQLite file on a serverless platform, where the disk
+/// is lost when an instance stops. Read only when such a platform is detected.
+pub const ALLOW_EPHEMERAL_STORE_ENV: &str = "JAMJET_ALLOW_EPHEMERAL_STORE";
+
 /// Every boolean switch `jamjet-server` reads. [`check_flags`] refuses to
 /// start on a value of any of them that is not a boolean.
 pub const BOOL_FLAGS: &[&str] = &[
@@ -28,6 +35,7 @@ pub const BOOL_FLAGS: &[&str] = &[
     DEV_MODE_ALLOW_REMOTE_ENV,
     EMBED_WORKERS_ENV,
     EMBED_CRON_ENV,
+    ALLOW_EPHEMERAL_STORE_ENV,
     crate::approvals::ALLOW_SELF_APPROVAL_ENV,
     crate::auth::TENANT_TOKENS_AS_DEFAULT_ENV,
     jamjet_audit::signer::ALLOW_INSECURE_KEY_ENV,
@@ -355,6 +363,165 @@ pub fn store_kind(storage_backend: Option<&str>, database_url: &str) -> StoreKin
     } else {
         StoreKind::Sqlite
     }
+}
+
+/// `K_SERVICE` present and not blank.
+pub fn on_serverless_platform(get: impl Fn(&str) -> Option<String>) -> bool {
+    get(PLATFORM_SERVICE_ENV).is_some_and(|v| !v.trim().is_empty())
+}
+
+/// What to do about the store the server is about to open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreCheck {
+    Ok,
+    Warn(String),
+    Refuse(String),
+}
+
+/// On a serverless platform a SQLite file is refused unless
+/// [`ALLOW_EPHEMERAL_STORE_ENV`] is on (then a warning), and the memory store
+/// warns. Postgres is fine. Off a platform nothing changes.
+pub fn check_store_for_platform(
+    platform: bool,
+    kind: StoreKind,
+    allow_ephemeral: bool,
+) -> StoreCheck {
+    if !platform {
+        return StoreCheck::Ok;
+    }
+    match kind {
+        StoreKind::Postgres => StoreCheck::Ok,
+        StoreKind::Memory => StoreCheck::Warn(
+            "STORAGE_BACKEND=memory on a serverless platform: runs and approvals are lost \
+             when an instance stops. Point DATABASE_URL at a managed Postgres."
+                .to_string(),
+        ),
+        StoreKind::Sqlite if allow_ephemeral => StoreCheck::Warn(format!(
+            "{ALLOW_EPHEMERAL_STORE_ENV} is set: the SQLite file on this serverless platform \
+             is lost when an instance stops."
+        )),
+        StoreKind::Sqlite => StoreCheck::Refuse(format!(
+            "refusing to keep a SQLite file on a serverless platform. Such platforms keep \
+             files in memory and lose them when an instance stops, and a network volume is \
+             no safe home for SQLite either. Set DATABASE_URL to a managed Postgres. To run \
+             with a throwaway store anyway, set {ALLOW_EPHEMERAL_STORE_ENV}=1."
+        )),
+    }
+}
+
+/// [`check_store_for_platform`] on the process environment. Call it before
+/// any store is opened and before [`database_url`] creates `.jamjet`.
+pub fn check_store_env(config: &ApiConfig) -> anyhow::Result<()> {
+    let platform = on_serverless_platform(|k| std::env::var(k).ok());
+    let storage_backend = std::env::var("STORAGE_BACKEND").ok();
+    let kind = store_kind(storage_backend.as_deref(), &existing_database_url(config));
+    let allow = env_flag(ALLOW_EPHEMERAL_STORE_ENV)?;
+    match check_store_for_platform(platform, kind, allow) {
+        StoreCheck::Ok => Ok(()),
+        StoreCheck::Warn(msg) => {
+            tracing::warn!("{msg}");
+            Ok(())
+        }
+        StoreCheck::Refuse(msg) => anyhow::bail!("{msg}"),
+    }
+}
+
+/// The seconds the platform gives between SIGTERM and SIGKILL, when it is not
+/// the default. Read at startup. An integer of at least 1.
+pub const STOP_TIMEOUT_ENV: &str = "JAMJET_STOP_TIMEOUT_SECS";
+
+/// How long a serverless platform waits after SIGTERM before it kills the
+/// process, when [`STOP_TIMEOUT_ENV`] does not say.
+pub const PLATFORM_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Room left in the stop timeout for the process to exit after the drains.
+pub const STOP_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a shutdown may take, as startup works it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownPlan {
+    /// How long in-flight work gets (`JAMJET_SHUTDOWN_GRACE_SECS`).
+    pub grace: std::time::Duration,
+    /// The time the platform gives after SIGTERM, when there is one.
+    pub stop_timeout: Option<std::time::Duration>,
+}
+
+fn secs_var(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    least: u64,
+) -> Result<Option<std::time::Duration>, String> {
+    let Some(raw) = get(name) else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n >= least => Ok(Some(std::time::Duration::from_secs(n))),
+        _ => Err(format!(
+            "invalid {name} `{raw}`: expected a whole number of seconds, at least {least}"
+        )),
+    }
+}
+
+/// The grace and the stop timeout. With a stop timeout (set, or implied by a
+/// platform) the grace defaults to what is left of it after the scheduler
+/// and HTTP drains and a margin, and a grace that does not fit stops startup:
+/// the platform would kill the process mid-drain. Without one the grace
+/// defaults to [`jamjet_worker::shutdown::DEFAULT_SHUTDOWN_GRACE`].
+pub fn shutdown_plan(
+    get: impl Fn(&str) -> Option<String>,
+    platform: bool,
+) -> Result<ShutdownPlan, String> {
+    use jamjet_worker::shutdown::{DEFAULT_SHUTDOWN_GRACE, HTTP_DRAIN, SCHEDULER_STOP};
+    const GRACE_ENV: &str = "JAMJET_SHUTDOWN_GRACE_SECS";
+    let stop_timeout = match secs_var(&get, STOP_TIMEOUT_ENV, 1)? {
+        Some(t) => Some(t),
+        None => platform.then_some(PLATFORM_STOP_TIMEOUT),
+    };
+    let set_grace = secs_var(&get, GRACE_ENV, 0)?;
+    let Some(stop) = stop_timeout else {
+        return Ok(ShutdownPlan {
+            grace: set_grace.unwrap_or(DEFAULT_SHUTDOWN_GRACE),
+            stop_timeout,
+        });
+    };
+    let fixed = SCHEDULER_STOP + HTTP_DRAIN + STOP_MARGIN;
+    if stop < fixed {
+        return Err(format!(
+            "{STOP_TIMEOUT_ENV}={} is too short: the scheduler and HTTP drains need {} s \
+             plus {} s margin",
+            stop.as_secs(),
+            (SCHEDULER_STOP + HTTP_DRAIN).as_secs(),
+            STOP_MARGIN.as_secs()
+        ));
+    }
+    let grace = set_grace.unwrap_or(stop - fixed);
+    if grace + fixed > stop {
+        return Err(format!(
+            "{GRACE_ENV}={} does not fit {STOP_TIMEOUT_ENV}={}: grace {} + scheduler {} + \
+             HTTP drain {} + margin {} = {} s, more than the stop timeout. Lower \
+             {GRACE_ENV} or raise {STOP_TIMEOUT_ENV}.",
+            grace.as_secs(),
+            stop.as_secs(),
+            grace.as_secs(),
+            SCHEDULER_STOP.as_secs(),
+            HTTP_DRAIN.as_secs(),
+            STOP_MARGIN.as_secs(),
+            (grace + fixed).as_secs()
+        ));
+    }
+    Ok(ShutdownPlan {
+        grace,
+        stop_timeout,
+    })
+}
+
+/// [`shutdown_plan`] on the process environment. A value that is not UTF-8
+/// is read with replacement characters, so it fails the parse and stops
+/// startup rather than counting as unset.
+pub fn shutdown_plan_from_env() -> anyhow::Result<ShutdownPlan> {
+    let get = |k: &str| std::env::var_os(k).map(|v| v.to_string_lossy().into_owned());
+    let platform = on_serverless_platform(get);
+    shutdown_plan(get, platform).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// `url` as a message may show it. A Postgres URL loses its user, password
@@ -720,6 +887,7 @@ mod tests {
             "JAMJET_ALLOW_SELF_APPROVAL",
             "JAMJET_TENANT_TOKENS_AS_DEFAULT",
             "JAMJET_AUDIT_ALLOW_INSECURE_KEY",
+            "JAMJET_ALLOW_EPHEMERAL_STORE",
         ] {
             assert!(
                 BOOL_FLAGS.contains(&name),
@@ -734,5 +902,115 @@ mod tests {
             check_dev_mode_bind(false, &[addr("0.0.0.0:7700")], false),
             Ok(DevBind::Ok)
         );
+    }
+
+    #[test]
+    fn sqlite_on_a_platform_is_refused() {
+        for url in ["sqlite://data/runtime.db", "", "sqlite::memory:"] {
+            let kind = store_kind(None, url);
+            assert_eq!(kind, StoreKind::Sqlite, "{url:?}");
+            match check_store_for_platform(true, kind, false) {
+                StoreCheck::Refuse(msg) => {
+                    assert!(msg.contains("DATABASE_URL"), "{msg}");
+                    assert!(msg.contains("JAMJET_ALLOW_EPHEMERAL_STORE"), "{msg}");
+                }
+                other => panic!("{url:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_allow_flag_and_the_memory_store_warn() {
+        assert!(matches!(
+            check_store_for_platform(true, StoreKind::Sqlite, true),
+            StoreCheck::Warn(_)
+        ));
+        let kind = store_kind(Some("memory"), "postgres://h/db");
+        assert_eq!(kind, StoreKind::Memory);
+        assert!(matches!(
+            check_store_for_platform(true, kind, false),
+            StoreCheck::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn postgres_on_a_platform_and_anything_off_it_is_ok() {
+        for url in ["postgres://u@h/db", "postgresql://u@h/db"] {
+            let kind = store_kind(None, url);
+            assert_eq!(kind, StoreKind::Postgres, "{url}");
+            assert_eq!(check_store_for_platform(true, kind, false), StoreCheck::Ok);
+        }
+        for kind in [StoreKind::Memory, StoreKind::Sqlite, StoreKind::Postgres] {
+            for allow in [false, true] {
+                assert_eq!(check_store_for_platform(false, kind, allow), StoreCheck::Ok);
+            }
+        }
+    }
+
+    #[test]
+    fn a_blank_k_service_is_no_platform() {
+        for v in ["", "  "] {
+            assert!(!on_serverless_platform(|_| Some(v.to_string())), "{v:?}");
+        }
+        assert!(!on_serverless_platform(|_| None));
+        assert!(on_serverless_platform(
+            |k| (k == "K_SERVICE").then(|| "svc".to_string())
+        ));
+    }
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn the_platform_default_grace_is_four_seconds() {
+        use std::time::Duration;
+        let plan = shutdown_plan(env(&[("K_SERVICE", "svc")]), true).unwrap();
+        assert_eq!(plan.grace, Duration::from_secs(4));
+        assert_eq!(plan.stop_timeout, Some(Duration::from_secs(10)));
+        let plan = shutdown_plan(env(&[]), false).unwrap();
+        assert_eq!(plan.grace, Duration::from_secs(20));
+        assert_eq!(plan.stop_timeout, None);
+        // An explicit stop timeout off a platform sets the grace too.
+        let plan = shutdown_plan(env(&[("JAMJET_STOP_TIMEOUT_SECS", "30")]), false).unwrap();
+        assert_eq!(plan.grace, Duration::from_secs(24));
+        assert_eq!(plan.stop_timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn a_grace_that_does_not_fit_is_refused() {
+        use std::time::Duration;
+        let err = shutdown_plan(env(&[("JAMJET_SHUTDOWN_GRACE_SECS", "20")]), true).unwrap_err();
+        assert!(err.contains("26"), "{err}");
+        assert!(err.contains("10"), "{err}");
+        assert!(err.contains("JAMJET_SHUTDOWN_GRACE_SECS"), "{err}");
+        assert!(err.contains("JAMJET_STOP_TIMEOUT_SECS"), "{err}");
+        // The largest grace that fits 10 s is 4 s.
+        assert!(shutdown_plan(env(&[("JAMJET_SHUTDOWN_GRACE_SECS", "5")]), true).is_err());
+        let plan = shutdown_plan(env(&[("JAMJET_SHUTDOWN_GRACE_SECS", "4")]), true).unwrap();
+        assert_eq!(plan.grace, Duration::from_secs(4));
+        let err = shutdown_plan(env(&[("JAMJET_STOP_TIMEOUT_SECS", "5")]), true).unwrap_err();
+        assert!(err.contains("5 s plus 1 s margin"), "{err}");
+        let plan = shutdown_plan(env(&[("JAMJET_STOP_TIMEOUT_SECS", "6")]), true).unwrap();
+        assert_eq!(plan.grace, Duration::ZERO);
+        assert_eq!(plan.stop_timeout, Some(Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn bad_values_are_refused() {
+        for name in ["JAMJET_STOP_TIMEOUT_SECS", "JAMJET_SHUTDOWN_GRACE_SECS"] {
+            for bad in ["abc", "-1", ""] {
+                let pairs = [(name, bad)];
+                assert!(shutdown_plan(env(&pairs), true).is_err(), "{name}={bad:?}");
+                assert!(shutdown_plan(env(&pairs), false).is_err(), "{name}={bad:?}");
+            }
+        }
+        // A stop timeout of 0 is not a timeout.
+        assert!(shutdown_plan(env(&[("JAMJET_STOP_TIMEOUT_SECS", "0")]), false).is_err());
     }
 }
