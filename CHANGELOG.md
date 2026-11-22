@@ -684,9 +684,8 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the run's log records the gap (`AuditSealFailed`) while the drain keeps trying. A gap
     can be recorded twice for one event, never not at all: read gaps per event id.
   - Agents are kept in the same database (`jamjet_agents::PgAgentRegistry`).
-  - Several engines can share the database. A write into a run locks the run's row first,
-    claims skip rows another engine holds (`FOR UPDATE SKIP LOCKED`), and leases and
-    approval deadlines are decided on the database's clock.
+  - A write into a run locks the run's row first, claims use `FOR UPDATE SKIP LOCKED`,
+    and leases and approval deadlines are decided on the database's clock.
   - `jamjet_state::postgres::migrate` creates or updates the schema. `PgBackend::connect`
     runs no migration and refuses a schema that is empty, behind, ahead, half applied or
     changed. `PgBackend::for_tenant` gives one tenant's view, on the same pool. Each
