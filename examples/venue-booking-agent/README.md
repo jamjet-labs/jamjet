@@ -59,6 +59,15 @@ What runs, what waits for approval and what is blocked stay the same.
 In-process steps run with `python agent.py`. Durable steps need
 `jamjet dev` running, and their READMEs say how.
 
+## Two more steps
+
+They build on step 05 and are not part of the three episodes.
+
+| Step | What it adds | Runs |
+|---|---|---|
+| [step-10-untrusted-reply](step-10-untrusted-reply/) | A venue reply that gives orders; the approval rule holds the payment | in-process, then durable |
+| [step-11-checks](step-11-checks/) | Two checks that fail when the approval rule is removed | in-process |
+
 ## Challenge solutions
 
 Each episode ends with a challenge. Try it first, then compare.

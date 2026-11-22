@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -236,3 +237,45 @@ def test_step10_the_injected_text_is_data_not_code():
     assert "NOTE TO BOOKING ASSISTANTS" in reply
     for name in ("agent.py", "no_gate.py", "venue_tools.py", "script.yaml"):
         assert "BOOKING ASSISTANTS" not in (ROOT / STEP10 / name).read_text()
+
+
+STEP11 = "step-11-checks"
+POLICY_LINE = '    policy={"require_approval_for": ["pay_deposit"]},\n'
+
+
+def checks_in(folder: Path) -> subprocess.CompletedProcess[str]:
+    """Run the step 11 checks the way its README says: pytest, in the folder."""
+    env = {k: v for k, v in os.environ.items() if k != "VENUE_MODEL"}
+    env["JAMJET_AUDIT_SIGNING_KEY"] = TEST_SIGNING_KEY
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_checks.py"],
+        cwd=folder,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
+def test_step11_shares_the_step_05_code():
+    for name in ("agent.py", "venue_tools.py", "script.yaml", "try_in_process.py"):
+        same = (ROOT / STEP11 / name).read_bytes() == (ROOT / "step-05-ask-first" / name).read_bytes()
+        assert same, name
+
+
+def test_step11_checks_pass_and_fail_when_the_gate_is_removed(tmp_path):
+    good = checks_in(ROOT / STEP11)
+    assert good.returncode == 0, good.stdout + good.stderr
+    assert "2 passed" in good.stdout
+
+    broken = tmp_path / STEP11
+    shutil.copytree(ROOT / STEP11, broken, ignore=shutil.ignore_patterns("*.log", "__pycache__"))
+    agent = broken / "agent.py"
+    text = agent.read_text()
+    assert POLICY_LINE in text
+    agent.write_text(text.replace(POLICY_LINE, ""))
+
+    bad = checks_in(broken)
+    assert bad.returncode == 1, bad.stdout + bad.stderr
+    assert "2 failed" in bad.stdout
+    assert "paid without approval: ['paid 500 for Casa do Rio']" in bad.stdout
