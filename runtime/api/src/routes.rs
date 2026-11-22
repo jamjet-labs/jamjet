@@ -187,8 +187,18 @@ async fn inject_dev_tenant(
 
 // ── Health ───────────────────────────────────────────────────────────────────
 
+/// `status` never changes: the dev stack's probe reads it. `commit` is what
+/// this binary was built from (a local build from a changed tree reports HEAD),
+/// `features` what it can do that an older engine could not.
 async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+    let commit = env!("JAMJET_COMMIT");
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": if commit.is_empty() { Value::Null } else { json!(commit) },
+        "commit_source": env!("JAMJET_COMMIT_SOURCE"),
+        "features": crate::features::FEATURES,
+    }))
 }
 
 // ── Workflow definitions ─────────────────────────────────────────────────────
@@ -959,12 +969,15 @@ pub async fn refuse_claims_while_draining(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let mut req = req;
     if draining.0.load(std::sync::atomic::Ordering::SeqCst)
         && req.method() == axum::http::Method::POST
         && req.uri().path() == "/work-items/claim"
     {
         return nothing_to_claim().into_response();
     }
+    // A claim already waiting for its item reads this to stop waiting.
+    req.extensions_mut().insert(draining);
     next.run(req).await
 }
 
@@ -2039,6 +2052,7 @@ async fn claim_work_item(
     Extension(tenant_id): Extension<TenantId>,
     token: Option<Extension<jamjet_state::ApiToken>>,
     dev: Option<Extension<crate::auth::DevMode>>,
+    draining: Option<Extension<Draining>>,
     Json(body): Json<ClaimWorkItemRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
@@ -2085,6 +2099,7 @@ async fn claim_work_item(
             &filter,
             token.as_ref().map(|Extension(t)| t),
             dev.is_some(),
+            draining.as_ref().map(|Extension(d)| d),
         )
         .await;
     }
@@ -2358,7 +2373,9 @@ async fn claim_for_execution(
     filter: &jamjet_state::ClaimFilter,
     token: Option<&jamjet_state::ApiToken>,
     dev_mode: bool,
+    draining: Option<&Draining>,
 ) -> Result<Json<Value>, ApiError> {
+    let is_draining = || draining.is_some_and(|d| d.0.load(std::sync::atomic::Ordering::SeqCst));
     let Some(execution_id) = filter.execution_id.clone() else {
         return Ok(claim_refused("not_found"));
     };
@@ -2394,9 +2411,21 @@ async fn claim_for_execution(
     let mut pause = std::time::Duration::from_millis(50);
     let mut first_look = true;
     loop {
+        // The server is stopping: no item is leased from here on, and a claim
+        // answered now ends before the platform's stop timeout. The caller
+        // claims again, usually on another instance. A drain is noticed
+        // within one nap, at most half a second. The check is made again after
+        // the read below; a small window remains before the backend write,
+        // because the flag and the write are not atomic.
+        if is_draining() {
+            return Ok(claim_refused("draining"));
+        }
         // A read first: only when something matches is the claim (a write
         // transaction) tried.
         let outcome = if backend.has_claimable(queue_refs, filter).await? {
+            if is_draining() {
+                return Ok(claim_refused("draining"));
+            }
             backend
                 .claim_for_execution(&body.worker_id, queue_refs, lease_secs, filter)
                 .await?

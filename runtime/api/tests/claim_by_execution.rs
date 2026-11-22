@@ -3130,3 +3130,127 @@ async fn dev_mode_lets_any_claimer_take_it() {
     }
     let _ = std::fs::remove_file(path);
 }
+
+// ── Waiting while the server runs (the stop signal's flag is present) ───────
+
+/// A claim through the router with the drain middleware in front, as the
+/// server runs it, so the claim sees a `Draining` flag that is not set.
+async fn claim_behind_drain_flag(
+    state: &AppState,
+    draining: &jamjet_api::routes::Draining,
+    body: Value,
+) -> Value {
+    let resp = build_router_with_opts(state.clone(), true)
+        .layer(axum::middleware::from_fn_with_state(
+            draining.clone(),
+            jamjet_api::routes::refuse_claims_while_draining,
+        ))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/work-items/claim")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// While the server is not stopping, a waiting claim backs off from 50 ms to
+/// 500 ms between looks. A fast poll is for a drain only.
+#[tokio::test]
+async fn a_waiting_claim_keeps_its_backoff_while_nothing_drains() {
+    let inner: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let hooked = support::hooked::HookedBackend::new(inner, Arc::new(NoHook));
+    let looks = hooked.has_claimable_calls.clone();
+    let state = make_state(Arc::new(hooked));
+    register(&state, None, ir("wf-backoff", Some("by_execution"), None)).await;
+    let e = start(&state, None, "wf-backoff").await;
+    let draining = jamjet_api::routes::Draining::default();
+    let before = looks.load(std::sync::atomic::Ordering::SeqCst);
+    let body = claim_behind_drain_flag(
+        &state,
+        &draining,
+        json!({
+            "worker_id": "w", "queue_types": [QUEUE], "execution_id": e,
+            "node_id": "second", "wait_ms": 2000
+        }),
+    )
+    .await;
+    assert_eq!(body["reason"], "not_ready", "{body}");
+    // Looks at 0, 50, 150, 350, 750, 1250 and 1750 ms: seven. A poll every
+    // 100 ms would make twenty-one.
+    let looks = looks.load(std::sync::atomic::Ordering::SeqCst) - before;
+    assert!(
+        (6..=10).contains(&looks),
+        "{looks} looks in a 2 s wait; the backoff is 50 ms doubling to 500 ms"
+    );
+}
+
+/// A claim that is waiting when the drain starts is not handed an item that
+/// shows up after it.
+#[tokio::test]
+async fn a_waiting_claim_leases_nothing_once_the_drain_has_started() {
+    let backend: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let state = make_state(backend.clone());
+    let workflow = ir("wf-drain-lease", Some("by_execution"), None);
+    register(&state, None, workflow.clone()).await;
+    let e = start(&state, None, "wf-drain-lease").await;
+    let draining = jamjet_api::routes::Draining::default();
+    let (flag, b2, e2) = (draining.clone(), backend.clone(), e.clone());
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        flag.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        enqueue_second(&b2, workflow, &e2).await;
+    });
+    let body = claim_behind_drain_flag(
+        &state,
+        &draining,
+        json!({
+            "worker_id": "w", "queue_types": [QUEUE], "execution_id": e,
+            "node_id": "second", "wait_ms": 3000
+        }),
+    )
+    .await;
+    assert_eq!(body, json!({ "claimed": false, "reason": "draining" }));
+}
+
+/// The drain starts while the claim waits on its read of what is claimable,
+/// and the read says yes: the item is not leased after the drain began.
+#[tokio::test]
+async fn a_claim_whose_read_finds_an_item_leases_nothing_if_the_drain_began_during_it() {
+    let inner: Arc<dyn StateBackend> = Arc::new(InMemoryBackend::new());
+    let hooked = support::hooked::HookedBackend::new(inner.clone(), Arc::new(NoHook));
+    let in_read = hooked.in_has_claimable.clone();
+    let state = make_state(Arc::new(hooked));
+    let workflow = ir("wf-drain-read", Some("by_execution"), None);
+    register(&state, None, workflow.clone()).await;
+    let e = start(&state, None, "wf-drain-read").await;
+    enqueue_second(&inner, workflow, &e).await;
+    let draining = jamjet_api::routes::Draining::default();
+    let flag = draining.clone();
+    *in_read.lock().unwrap() = Some(Arc::new(move || {
+        flag.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let ask = json!({
+        "worker_id": "w", "queue_types": [QUEUE], "execution_id": e,
+        "node_id": "second", "wait_ms": 3000
+    });
+    let body = claim_behind_drain_flag(&state, &draining, ask.clone()).await;
+    assert_eq!(body, json!({ "claimed": false, "reason": "draining" }));
+    // Nothing was leased: a claim with the drain over takes the item.
+    *in_read.lock().unwrap() = None;
+    draining.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    let after = claim_behind_drain_flag(&state, &draining, ask).await;
+    assert_eq!(after["claimed"], true, "{after}");
+}
+
+struct NoHook;
+
+#[async_trait::async_trait]
+impl support::hooked::AfterWrite for NoHook {
+    async fn after(&self, _write: support::hooked::Write) {}
+}
