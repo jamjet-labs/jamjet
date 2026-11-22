@@ -731,6 +731,127 @@ async fn an_unreadable_row_does_not_hold_up_the_rest() {
     assert_eq!(left, [unreadable], "the unreadable row stays");
 }
 
+/// A full page of unreadable rows at the head of the outbox: one drain at
+/// that limit still reaches the readable row behind them.
+#[tokio::test]
+async fn a_page_of_unreadable_rows_does_not_starve_the_drain() {
+    let Some(env) = env("a_page_of_unreadable_rows_does_not_starve_the_drain").await else {
+        return;
+    };
+    let eid = start(&env).await;
+    for n in 0..100 {
+        let id = append_unsealed_request(&env.pg, &eid, &format!("bad{n}")).await;
+        sqlx::query("UPDATE events SET kind_json = 'not json' WHERE id = $1")
+            .bind(id)
+            .execute(&env.pg.pool())
+            .await
+            .unwrap();
+    }
+    let readable = append_unsealed_request(&env.pg, &eid, "good").await;
+
+    let report = drain(&env.pg, &env.enricher, Duration::ZERO, 100).await;
+    assert_eq!(
+        (report.due, report.sealed, report.error.as_deref()),
+        (1, 1, None),
+        "{report:?}"
+    );
+    assert_eq!(
+        entries(&env)
+            .await
+            .iter()
+            .map(|e| e.event_id)
+            .collect::<Vec<_>>(),
+        [readable]
+    );
+    assert_eq!(outbox_rows(&env).await, 100, "the unreadable rows stay");
+}
+
+/// The audit log as stored, refusing the entries of the events named.
+struct Refusing {
+    inner: PgAuditBackend,
+    refused: BTreeSet<Uuid>,
+}
+
+impl Refusing {
+    fn check(&self, event_id: Uuid) -> Result<(), AuditError> {
+        if self.refused.contains(&event_id) {
+            return Err(AuditError::Database("this entry is refused".into()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AuditBackend for Refusing {
+    async fn append(&self, entry: AuditLogEntry) -> Result<(), AuditError> {
+        self.check(entry.event_id)?;
+        self.inner.append(entry).await
+    }
+    async fn append_linked(&self, entry: AuditLogEntry) -> Result<bool, AuditError> {
+        self.check(entry.event_id)?;
+        self.inner.append_linked(entry).await
+    }
+    async fn append_sealed(
+        &self,
+        seal: &SealOntoHead<'_>,
+    ) -> Result<Option<(Option<String>, DateTime<Utc>)>, AuditError> {
+        // Sealing has no effect but the entry it answers: peek at its event.
+        self.check(seal(None, None, Utc::now()).event_id)?;
+        self.inner.append_sealed(seal).await
+    }
+    async fn head_at(&self) -> Result<Option<(Option<String>, DateTime<Utc>)>, AuditError> {
+        self.inner.head_at().await
+    }
+    async fn head(&self) -> Result<Option<String>, AuditError> {
+        self.inner.head().await
+    }
+    async fn query(&self, q: &AuditQuery) -> Result<Vec<AuditLogEntry>, AuditError> {
+        self.inner.query(q).await
+    }
+    async fn count(&self, q: &AuditQuery) -> Result<u64, AuditError> {
+        self.inner.count(q).await
+    }
+    async fn now(&self) -> Result<DateTime<Utc>, AuditError> {
+        self.inner.now().await
+    }
+}
+
+/// A full page of rows whose seal keeps failing, at the head of the outbox:
+/// after one drain has tried them, the next reaches the row behind them.
+#[tokio::test]
+async fn a_page_of_failing_rows_does_not_starve_the_drain() {
+    let Some(env) = env("a_page_of_failing_rows_does_not_starve_the_drain").await else {
+        return;
+    };
+    let eid = start(&env).await;
+    let mut failing = BTreeSet::new();
+    for n in 0..100 {
+        failing.insert(append_unsealed_request(&env.pg, &eid, &format!("bad{n}")).await);
+    }
+    let readable = append_unsealed_request(&env.pg, &eid, "good").await;
+    let enricher = AuditEnricher::with_signer(
+        Arc::new(Refusing {
+            inner: PgAuditBackend::new(env.pg.pool()),
+            refused: failing,
+        }),
+        env.signer.clone(),
+    );
+
+    let first = drain(&env.pg, &enricher, Duration::ZERO, 100).await;
+    assert_eq!((first.due, first.failed), (100, 100), "{first:?}");
+    let second = drain(&env.pg, &enricher, Duration::ZERO, 100).await;
+    assert_eq!(second.sealed, 1, "{second:?}");
+    assert_eq!(
+        entries(&env)
+            .await
+            .iter()
+            .map(|e| e.event_id)
+            .collect::<Vec<_>>(),
+        [readable]
+    );
+    assert_eq!(outbox_rows(&env).await, 100, "the failing rows stay");
+}
+
 // ── The list of sealed kinds ─────────────────────────────────────────────────
 
 /// A kind a sealer seals, and the files that make its event.

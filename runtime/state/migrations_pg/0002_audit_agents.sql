@@ -8,7 +8,9 @@
 -- breaks a tie between two entries of one instant.
 --
 -- audit_outbox holds a row for each sealed event that has no audit entry
--- yet. The entry's append deletes it in the same transaction.
+-- yet. The entry's append deletes it in the same transaction. A row is due
+-- from its last failed try (last_tried_at), or from its creation before any,
+-- so rows that keep failing queue behind newer ones.
 
 CREATE TABLE audit_log (
   position bigint GENERATED ALWAYS AS IDENTITY, id uuid PRIMARY KEY, event_id uuid NOT NULL,
@@ -29,8 +31,9 @@ INSERT INTO audit_head (id) VALUES (1);
 CREATE TABLE audit_outbox (event_id uuid PRIMARY KEY REFERENCES events(id), execution_id uuid NOT NULL,
   sequence bigint NOT NULL, tenant_id text NOT NULL, kind_type text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
-  attempts int NOT NULL DEFAULT 0, last_error text, gap_recorded boolean NOT NULL DEFAULT false);
-CREATE INDEX audit_outbox_created ON audit_outbox (created_at);
+  attempts int NOT NULL DEFAULT 0, last_error text, last_tried_at timestamptz,
+  gap_recorded boolean NOT NULL DEFAULT false);
+CREATE INDEX audit_outbox_due ON audit_outbox ((COALESCE(last_tried_at, created_at)), event_id);
 CREATE TABLE agents (id uuid PRIMARY KEY, uri text NOT NULL UNIQUE, card_json text NOT NULL,
   status text NOT NULL DEFAULT 'registered', registered_at timestamptz NOT NULL, updated_at timestamptz NOT NULL,
   last_heartbeat timestamptz, tenant_id text NOT NULL DEFAULT 'default' REFERENCES tenants(id));
