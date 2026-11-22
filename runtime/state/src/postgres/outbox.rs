@@ -12,11 +12,12 @@
 //! so a row that keeps failing queues behind rows written after its last
 //! try, and a drain is never held up by the same rows each time.
 //!
-//! Each method runs its statements one by one and takes no row lock. Two drains may read one row at once; the
+//! Each method but [`PgBackend::outbox_record_gap`] runs its statements one
+//! by one and takes no row lock. Two drains may read one row at once; the
 //! audit log keeps one entry per event, so the second seal adds nothing.
 
-use super::runs::row_to_event;
-use super::tx::statement_error;
+use super::runs::{insert_events, lock_known_run, row_to_event, NewEvent};
+use super::tx::{statement_error, with_tx};
 use super::PgBackend;
 use crate::backend::BackendResult;
 use crate::event::Event;
@@ -153,6 +154,40 @@ impl PgBackend {
         .await
         .map_err(statement_error)?;
         Ok(attempts.unwrap_or(0))
+    }
+
+    /// Record `event`'s gap in its run's log (`AuditSealFailed`), unless it
+    /// is recorded already. The row's mark is claimed and the record
+    /// appended in one transaction, under the run's lock, so of two drains
+    /// at once one records the gap and the other finds it claimed. Answers
+    /// whether this call recorded it; `false` also when the row is gone.
+    pub async fn outbox_record_gap(&self, event: &Event, error: String) -> BackendResult<bool> {
+        let gap = NewEvent::of(&crate::approvals::seal_gap_event(event, error))?;
+        let run = event.execution_id.0;
+        let event_id = event.id;
+        let scope = self.scope();
+        with_tx(&self.pool, "outbox_record_gap", |tx| {
+            let gap = &gap;
+            Box::pin(async move {
+                let locked = lock_known_run(tx, run, scope).await?;
+                let claimed: Option<i32> = sqlx::query_scalar(
+                    "UPDATE audit_outbox SET gap_recorded = true \
+                     WHERE event_id = $1 AND NOT gap_recorded \
+                       AND ($2::text IS NULL OR tenant_id = $2) \
+                     RETURNING 1",
+                )
+                .bind(event_id)
+                .bind(scope)
+                .fetch_optional(&mut **tx)
+                .await?;
+                if claimed.is_none() {
+                    return Ok(false);
+                }
+                insert_events(tx, run, &locked.tenant, std::slice::from_ref(gap)).await?;
+                Ok(true)
+            })
+        })
+        .await
     }
 
     /// Note that the run's log now records the event's gap, so it is

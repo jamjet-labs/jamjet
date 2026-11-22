@@ -852,6 +852,125 @@ async fn a_page_of_failing_rows_does_not_starve_the_drain() {
     assert_eq!(outbox_rows(&env).await, 100, "the failing rows stay");
 }
 
+/// The audit log refusing every write, after both of two drains have come
+/// to their seal: each drain has read the row before either counts it.
+struct Gate {
+    barrier: tokio::sync::Barrier,
+    met: AtomicBool,
+}
+
+impl Gate {
+    async fn refuse(&self) -> Result<(), AuditError> {
+        if tokio::time::timeout(Duration::from_secs(5), self.barrier.wait())
+            .await
+            .is_ok()
+        {
+            self.met.store(true, Ordering::SeqCst);
+        }
+        Err(AuditError::Database("audit log unavailable".into()))
+    }
+}
+
+#[async_trait]
+impl AuditBackend for Gate {
+    async fn append(&self, _: AuditLogEntry) -> Result<(), AuditError> {
+        self.refuse().await
+    }
+    async fn append_linked(&self, _: AuditLogEntry) -> Result<bool, AuditError> {
+        self.refuse().await.map(|_| false)
+    }
+    async fn append_sealed(
+        &self,
+        _: &SealOntoHead<'_>,
+    ) -> Result<Option<(Option<String>, DateTime<Utc>)>, AuditError> {
+        self.refuse().await.map(|_| None)
+    }
+    async fn query(&self, _: &AuditQuery) -> Result<Vec<AuditLogEntry>, AuditError> {
+        Ok(Vec::new())
+    }
+    async fn count(&self, _: &AuditQuery) -> Result<u64, AuditError> {
+        Ok(0)
+    }
+}
+
+/// Two engines drain a row whose seal has failed twice, at once, and both
+/// fail it a third time: the run's log records its gap once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_drains_at_the_third_failure_record_one_gap() {
+    let Some(env) = env("two_drains_at_the_third_failure_record_one_gap").await else {
+        return;
+    };
+    let eid = start(&env).await;
+    let request = append_unsealed_request(&env.pg, &eid, "pay").await;
+    sqlx::query("UPDATE audit_outbox SET attempts = 2 WHERE event_id = $1")
+        .bind(request)
+        .execute(&env.pg.pool())
+        .await
+        .unwrap();
+    let gate = Arc::new(Gate {
+        barrier: tokio::sync::Barrier::new(2),
+        met: AtomicBool::new(false),
+    });
+    let a = AuditEnricher::with_signer(gate.clone(), env.signer.clone());
+    let b = AuditEnricher::with_signer(gate.clone(), env.signer.clone());
+    let other = connect(&env.db).await;
+    let (ra, rb) = tokio::join!(
+        drain(&env.pg, &a, Duration::ZERO, 100),
+        drain(&other, &b, Duration::ZERO, 100),
+    );
+    assert!(
+        gate.met.load(Ordering::SeqCst),
+        "both drains read the row before either failed it"
+    );
+    assert_eq!((ra.failed, rb.failed), (1, 1), "{ra:?} {rb:?}");
+    assert_eq!(gaps(&env, &eid).await, [request], "one gap: {ra:?} {rb:?}");
+    assert_eq!(ra.gaps_recorded + rb.gaps_recorded, 1, "{ra:?} {rb:?}");
+}
+
+/// The engine's own seal fails right after the append and records the
+/// gap; the drain then fails the event three times more and records no
+/// second one.
+#[tokio::test]
+async fn an_inline_gap_is_not_recorded_again_by_the_drain() {
+    let Some(env) = env("an_inline_gap_is_not_recorded_again_by_the_drain").await else {
+        return;
+    };
+    let down = AuditEnricher::with_signer(
+        Arc::new(Flaky {
+            inner: PgAuditBackend::new(env.pg.pool()),
+            failing: AtomicBool::new(true),
+        }),
+        env.signer.clone(),
+    );
+    let eid = start(&env).await;
+    let event = Event::new(
+        eid.clone(),
+        0,
+        EventKind::ToolApprovalRequired {
+            node_id: "pay".into(),
+            tool_name: "pay".into(),
+            approver: "human".into(),
+            context: json!({}),
+        },
+    );
+    let sequence = env.pg.append_event(event.clone()).await.unwrap();
+    jamjet_state::approvals::seal_appended(
+        &env.pg,
+        Some(&down),
+        event.clone(),
+        sequence,
+        "default",
+    )
+    .await;
+    assert_eq!(gaps(&env, &eid).await, [event.id], "the inline seal's gap");
+
+    for _ in 0..3 {
+        let report = drain(&env.pg, &down, Duration::ZERO, 100).await;
+        assert_eq!(report.failed, 1, "{report:?}");
+    }
+    assert_eq!(gaps(&env, &eid).await, [event.id], "still one gap");
+}
+
 // ── The list of sealed kinds ─────────────────────────────────────────────────
 
 /// A kind a sealer seals, and the files that make its event.

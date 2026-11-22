@@ -121,6 +121,8 @@ pub(super) struct NewEvent {
     node_id: Option<String>,
     kind_json: String,
     created_at: DateTime<Utc>,
+    /// For an `AuditSealFailed` record, the event whose gap it records.
+    gap_of: Option<Uuid>,
 }
 
 /// The `type` tag `serde` writes first in every event kind's JSON.
@@ -148,12 +150,17 @@ impl NewEvent {
         if let Some(node) = &node_id {
             no_nul("node id", node)?;
         }
+        let gap_of = match kind {
+            EventKind::AuditSealFailed { event_id, .. } => Some(*event_id),
+            _ => None,
+        };
         Ok(Self {
             id,
             kind_type,
             node_id,
             kind_json,
             created_at,
+            gap_of,
         })
     }
 
@@ -181,7 +188,9 @@ impl NewEvent {
 ///
 /// An event of a sealed kind ([`SEALED_EVENT_KINDS`]) gets its
 /// `audit_outbox` row in the same statement, so it is never committed
-/// without one. Its audit entry deletes the row.
+/// without one. Its audit entry deletes the row. An `AuditSealFailed`
+/// record marks the row of the event it names (`gap_recorded`), so the
+/// outbox drain does not record that gap a second time.
 ///
 /// [`SEALED_EVENT_KINDS`]: crate::approvals::SEALED_EVENT_KINDS
 pub(super) async fn insert_events(
@@ -195,6 +204,7 @@ pub(super) async fn insert_events(
     let nodes: Vec<Option<&str>> = events.iter().map(|e| e.node_id.as_deref()).collect();
     let kinds: Vec<&str> = events.iter().map(|e| e.kind_json.as_str()).collect();
     let times: Vec<DateTime<Utc>> = events.iter().map(|e| e.created_at).collect();
+    let gaps: Vec<Uuid> = events.iter().filter_map(|e| e.gap_of).collect();
     let last: Option<i64> = sqlx::query_scalar(
         "WITH last AS (SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events \
                        WHERE execution_id = $1 AND tenant_id = $2), \
@@ -210,7 +220,10 @@ pub(super) async fn insert_events(
               outbox AS ( \
                 INSERT INTO audit_outbox (event_id, execution_id, sequence, tenant_id, kind_type) \
                 SELECT id, $1, sequence, $2, kind_type FROM added \
-                WHERE kind_type = ANY($8::text[])) \
+                WHERE kind_type = ANY($8::text[])), \
+              gaps AS ( \
+                UPDATE audit_outbox SET gap_recorded = true \
+                WHERE event_id = ANY($9::uuid[]) AND execution_id = $1) \
          SELECT MAX(sequence) FROM added",
     )
     .bind(execution_id)
@@ -221,6 +234,7 @@ pub(super) async fn insert_events(
     .bind(kinds)
     .bind(times)
     .bind(crate::approvals::SEALED_EVENT_KINDS)
+    .bind(gaps)
     .fetch_one(conn)
     .await?;
     last.ok_or_else(|| StateBackendError::Database("no event to append".into()).into())
@@ -347,7 +361,7 @@ pub(super) async fn lock_run(
 }
 
 /// [`lock_run`], with a run that is not there answered `NotFound`.
-async fn lock_known_run(
+pub(super) async fn lock_known_run(
     conn: &mut PgConnection,
     execution_id: Uuid,
     scope: Option<&str>,

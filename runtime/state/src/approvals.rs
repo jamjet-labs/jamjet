@@ -547,6 +547,17 @@ pub async fn try_record_seal_gap(
     event: &Event,
     error: String,
 ) -> crate::backend::BackendResult<()> {
+    backend
+        .append_event(seal_gap_event(event, error))
+        .await
+        .map(|_| ())
+}
+
+/// The `AuditSealFailed` record of `event`'s gap, for its run's log, with
+/// the error log line that goes with it. On Postgres, appending it marks
+/// the event's outbox row, so the outbox drain does not record the gap
+/// again.
+pub fn seal_gap_event(event: &Event, error: String) -> Event {
     let event_type = serde_json::to_value(&event.kind)
         .ok()
         .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
@@ -558,7 +569,7 @@ pub async fn try_record_seal_gap(
         %error,
         "event not sealed into the audit chain; recording the gap"
     );
-    let gap = Event::new(
+    Event::new(
         event.execution_id.clone(),
         0,
         EventKind::AuditSealFailed {
@@ -567,8 +578,7 @@ pub async fn try_record_seal_gap(
             event_type,
             error,
         },
-    );
-    backend.append_event(gap).await.map(|_| ())
+    )
 }
 
 /// Context key under which a request records when it expires: UTC, RFC 3339.

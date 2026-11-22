@@ -14,10 +14,12 @@
 //! closed.
 //!
 //! Two engines can drain at once. Both may seal one event; the audit log
-//! keeps one entry per event, so the second seal adds nothing.
+//! keeps one entry per event, so the second seal adds nothing. A gap is
+//! claimed on its row in the transaction that records it, so only one
+//! drain records it, and a gap the engine's own seal recorded marks the row
+//! too.
 
 use crate::enricher::{AuditEnricher, RequestContext};
-use jamjet_state::approvals::try_record_seal_gap;
 use jamjet_state::PgBackend;
 use std::time::Duration;
 use tracing::{error, warn};
@@ -86,15 +88,10 @@ pub async fn drain(
             continue;
         }
         let why = format!("the outbox could not seal it in {attempts} attempts: {seal_error}");
-        match try_record_seal_gap(pg, &row.event, why).await {
-            Ok(()) => {
-                report.gaps_recorded += 1;
-                if let Err(e) = pg.outbox_mark_gap(event_id).await {
-                    // The next drain records the gap again: a second record
-                    // of one gap, never none.
-                    warn!(%event_id, "a recorded gap could not be marked in the outbox: {e}");
-                }
-            }
+        match pg.outbox_record_gap(&row.event, why).await {
+            Ok(true) => report.gaps_recorded += 1,
+            // Another drain, or the engine's own seal, recorded it first.
+            Ok(false) => {}
             Err(e) => error!(%event_id, "an audit gap could not be recorded: {e}"),
         }
     }
