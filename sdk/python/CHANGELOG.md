@@ -29,9 +29,24 @@
   engine without options ignores both. `jamjet approve --choice <id> --note <text>`, and
   `jamjet approvals` lists the options and shows a decided request's choice and note.
 - **`options` on a `human_approval` node** in a YAML workflow goes through to the IR.
-- **Start a run by key.** `start_execution(..., run_key=None, reuse=None)` sends a
-  `run_key` so a retried start returns the same run. It raises `JamjetAPIError` if the
-  engine does not echo the key: an older engine drops it and would start a second run.
+- **Start a run by key.** `start_execution(..., *, run_key=None, reuse=None)` sends a
+  `run_key` so a retried start returns the same run, and `agent.run_durable(run_key=...)`
+  passes one through. An older engine drops the key and would start a second run, so
+  before the first keyed start the client reads `/health` and raises
+  `EngineFeatureMissing("run_key")` when the engine does not list it. Nothing is
+  registered or started. The key is checked before it is sent: 1 to 200 characters of
+  `A-Z a-z 0-9 . _ : / @ + = -`. An answer that does not echo the key raises
+  `JamjetAPIError` naming the run that started. The same key with another input raises
+  `RunKeyConflict`, which carries the run the key names.
+- **A start with a `run_key` is sent again after a lost answer**, since the engine
+  answers a repeat with the same run. A start with `reuse="failed_only"` is not: it
+  raises `OutcomeUnknown`. A start without a key still raises `OutcomeUnknown`, and the
+  message now says to pass a `run_key`.
+- **`client.find_execution(run_key)`** returns the run a key names, or None. It raises
+  `EngineFeatureMissing("run_key")` when the answer does not echo the key: an older
+  engine ignores the query and lists every run.
+- **`client.require_features(*names)`** raises `EngineFeatureMissing` for the first
+  feature the engine does not list in `/health`.
 - `compile_agent_to_ir(..., claim_by_execution=True)` marks each tool-dispatch node
   `claim: by_execution`. The default output is unchanged. `jamjet worker` and
   `claim_work_item` do not claim by execution yet, so they never get these steps and

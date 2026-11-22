@@ -772,6 +772,14 @@ CALLS = [
     ),
     Call("tick", lambda c: c.tick(budget_ms=5000), "POST", "/ops/tick", {"budget_ms": 5000}),
     Call("engine_features", lambda c: c.engine_features(), "GET", "/health"),
+    Call("require_features", lambda c: c.require_features(), "GET", "/health"),
+    Call(
+        "find_execution",
+        lambda c: c.find_execution("job:1"),
+        "GET",
+        "/executions",
+        params={"run_key": "job:1"},
+    ),
     Call("post", lambda c: c.post("/custom/route", json={"k": "v"}), "POST", "/custom/route", {"k": "v"}),
     Call(
         "get",
@@ -795,6 +803,8 @@ def _answer(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"events": []})
     if path == "/approvals":
         return httpx.Response(200, json={"approvals": [], "next_after": None})
+    if path == "/executions" and "run_key" in request.url.params:
+        return httpx.Response(200, json={"run_key": request.url.params["run_key"], "executions": []})
     return httpx.Response(200, json={"ok": True})
 
 

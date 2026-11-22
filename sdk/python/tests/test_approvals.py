@@ -791,6 +791,8 @@ async def test_approve_returns_the_repeat_fields_unchanged() -> None:
 @respx.mock
 @pytest.mark.asyncio
 async def test_start_with_run_key_sends_key_and_reuse() -> None:
+    # An engine that lists run_key in /health; the client checks before a keyed start.
+    respx.get(f"{BASE}/health").respond(200, json={"status": "ok", "features": ["run_key"]})
     route = respx.post(f"{BASE}/executions").respond(
         201, json={"execution_id": "exec_1", "run_key": "job:1", "created": True}
     )
@@ -815,7 +817,8 @@ async def test_start_without_a_key_sends_no_key_fields() -> None:
 @respx.mock
 @pytest.mark.asyncio
 async def test_start_with_run_key_against_an_old_engine_raises() -> None:
-    # An older engine drops run_key and starts a second run: no echo in the answer.
+    # An engine that lists run_key but drops it would start a second run: no echo in the answer.
+    respx.get(f"{BASE}/health").respond(200, json={"status": "ok", "features": ["run_key"]})
     respx.post(f"{BASE}/executions").respond(201, json={"execution_id": "exec_1"})
     async with JamjetClient(base_url=BASE) as c:
         with pytest.raises(JamjetAPIError) as exc:
@@ -827,6 +830,7 @@ async def test_start_with_run_key_against_an_old_engine_raises() -> None:
 @pytest.mark.asyncio
 async def test_start_with_run_key_and_another_key_in_the_answer_raises() -> None:
     # The echo must be the key that was sent, not just any key.
+    respx.get(f"{BASE}/health").respond(200, json={"status": "ok", "features": ["run_key"]})
     respx.post(f"{BASE}/executions").respond(201, json={"execution_id": "exec_1", "run_key": "job:2"})
     async with JamjetClient(base_url=BASE) as c:
         with pytest.raises(JamjetAPIError) as exc:

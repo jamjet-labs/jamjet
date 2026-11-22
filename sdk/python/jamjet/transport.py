@@ -109,6 +109,27 @@ class PlatformAuthError(JamjetAPIError):
     """
 
 
+class RunKeyConflict(JamjetAPIError):  # noqa: N818 - the name the SDK's callers match on
+    """A 409 for a start whose ``run_key`` already names a run of another
+    workflow, version or input. The key stays with that run for good.
+
+    ``existing_execution_id`` is the run the key names, when the client could
+    look it up.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request: httpx.Request,
+        response: httpx.Response,
+        detail: str,
+        existing_execution_id: str | None = None,
+    ) -> None:
+        super().__init__(message, request=request, response=response, detail=detail)
+        self.existing_execution_id = existing_execution_id
+
+
 class CredentialScopeError(RuntimeError):
     """A request would have carried a credential to another origin. Nothing was sent."""
 
@@ -471,12 +492,12 @@ def _backoff(policy: RetryPolicy, sends: int) -> float:
     return ceiling * _random()
 
 
-def _outcome_unknown(operation: str, what: str) -> OutcomeUnknown:
-    return OutcomeUnknown(
+def _outcome_unknown(operation: str, what: str, advice: str | None) -> OutcomeUnknown:
+    message = (
         f"{operation} may have taken effect, but {what}. It was not sent again, because a second send could do "
-        "it twice. Check whether it took effect before you repeat it.",
-        operation=operation,
+        "it twice. Check whether it took effect before you repeat it."
     )
+    return OutcomeUnknown(message if advice is None else f"{message} {advice}", operation=operation)
 
 
 async def send_with_retries(
@@ -488,6 +509,7 @@ async def send_with_retries(
     operation: str,
     policy: RetryPolicy,
     credential_headers: Callable[[], Iterable[str]] = tuple,
+    advice: str | None = None,
 ) -> httpx.Response:
     """Send a call, and send it again while ``policy`` and the failure allow.
 
@@ -499,6 +521,8 @@ async def send_with_retries(
     sent again here: an auth hook that refreshes a token sends its own one
     resend. A transport error has the value of ``Authorization`` and of each
     of ``credential_headers()`` replaced in its message and its chain.
+    ``advice`` ends the message of an ``OutcomeUnknown``: how to check, or
+    how to make the call safe to repeat.
     """
     # Such a body is not sent again even when the request never left: an auth
     # hook may have read it before the connection was tried.
@@ -517,7 +541,7 @@ async def send_with_retries(
             if isinstance(exc, httpx.UnsupportedProtocol | httpx.LocalProtocolError):
                 raise
             if not safe and not isinstance(exc, _NOT_SENT):
-                raise _outcome_unknown(operation, f"its answer was lost ({type(exc).__name__})") from exc
+                raise _outcome_unknown(operation, f"its answer was lost ({type(exc).__name__})", advice) from exc
             if sends >= attempts:
                 raise
             reason = type(exc).__name__
@@ -534,6 +558,7 @@ async def send_with_retries(
                     raise _outcome_unknown(
                         operation,
                         f"the answer was {status} {response.reason_phrase}, which does not say whether it did",
+                        advice,
                     ) from exc
                 asked = _retry_after(response)
                 if asked is not None and asked > policy.max_retry_after_s:

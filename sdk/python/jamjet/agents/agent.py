@@ -656,12 +656,19 @@ class Agent:
         runtime_url: str = "http://127.0.0.1:7700",
         session: Session | str | None = None,
         auth: httpx.Auth | None = None,
+        run_key: str | None = None,
     ) -> AgentResult:
         """Run the agent durably on the JamJet engine, mirroring :meth:`run`.
 
         *auth* is an ``httpx.Auth`` for whatever stands in front of the engine
         (see :class:`~jamjet.client.JamjetClient`); it is passed to the client
         as it is.
+
+        *run_key* names the run, so a retried caller with the same prompt and
+        key follows the run the first call started instead of starting another
+        (see :meth:`~jamjet.client.JamjetClient.start_execution`). The engine
+        must list ``run_key`` in ``/health``; when it does not, this raises
+        ``EngineFeatureMissing`` before anything is registered or started.
 
         Compiles the agent to an agent-loop IR (``model -> tools -> model``,
         statically unrolled and bounded by *max_turns*), registers it, then
@@ -727,10 +734,19 @@ class Agent:
 
         t0 = time.monotonic()
         async with JamjetClient(runtime_url, auth=auth) as client:
+            if run_key is not None:
+                # Before any write: an engine without the feature would drop
+                # the key and start a new run on every retry.
+                await client.require_features("run_key")
             # Register the compiled IR, then start an execution seeded with the
             # running messages + tool-resolver map (build_initial_state).
             await client.create_workflow(ir)
-            started = await client.start_execution(workflow_id, initial_input, workflow_version=workflow_version)
+            if run_key is None:
+                started = await client.start_execution(workflow_id, initial_input, workflow_version=workflow_version)
+            else:
+                started = await client.start_execution(
+                    workflow_id, initial_input, workflow_version=workflow_version, run_key=run_key
+                )
             exec_id = started.get("execution_id")
             if not exec_id:
                 raise RuntimeError(f"start_execution returned no execution_id: {started!r}")

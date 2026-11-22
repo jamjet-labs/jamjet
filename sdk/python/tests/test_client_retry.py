@@ -61,6 +61,8 @@ SAFE = {
     "heartbeat_work_item": True,
     "tick": True,
     "engine_features": True,
+    "require_features": True,
+    "find_execution": True,
     "post": False,
     "get": True,
 }
@@ -150,10 +152,11 @@ async def test_a_read_timeout_on_a_plain_start_is_outcome_unknown() -> None:
     assert isinstance(error.__cause__, httpx.ReadTimeout)
     # A caller's `except httpx.RequestError: retry` must not catch it and send it again.
     assert not isinstance(error, httpx.HTTPError)
-    # start_execution takes no run_key yet, so the message must not point at one.
+    # A start without a key is the one start that is unsafe, so the message points at the key.
     assert str(error) == (
         "start_execution may have taken effect, but its answer was lost (ReadTimeout). It was not sent again, "
-        "because a second send could do it twice. Check whether it took effect before you repeat it."
+        "because a second send could do it twice. Check whether it took effect before you repeat it. "
+        "Start it with a run_key to make a start safe to send again."
     )
 
 
