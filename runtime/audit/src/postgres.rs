@@ -267,8 +267,15 @@ impl AuditBackend for PgAuditBackend {
     }
 }
 
+/// A statement's error, as the state store answers it: `Unavailable` when
+/// no connection was free or the connection was lost, so `GET /audit` can
+/// answer 503; otherwise the database's own text.
 fn db(e: sqlx::Error) -> AuditError {
-    AuditError::Database(e.to_string())
+    let text = e.to_string();
+    match jamjet_state::postgres::statement_error(e) {
+        jamjet_state::StateBackendError::Unavailable(why) => AuditError::Unavailable(why),
+        _ => AuditError::Database(text),
+    }
 }
 
 /// Postgres keeps a time to the microsecond, and the entry's hash covers its

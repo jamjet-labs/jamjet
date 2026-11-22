@@ -32,6 +32,7 @@ pub use settings::{
     PgSettings, ACQUIRE_TIMEOUT_ENV, IDLE_IN_TX_TIMEOUT_ENV, LOCK_TIMEOUT_ENV, MIN_POOL_SIZE,
     POOL_SIZE_ENV, STATEMENT_TIMEOUT_ENV,
 };
+pub use tx::statement_error;
 
 use crate::artifact::ArtifactRef;
 use crate::backend::{

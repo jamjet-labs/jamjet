@@ -321,3 +321,48 @@ async fn a_run_input_with_nul_starts_and_reads_back() {
         state
     );
 }
+
+/// The audit log on a pool whose one connection is held elsewhere: a read
+/// answers `Unavailable` within the acquire timeout, not a database error,
+/// so `GET /audit` can answer 503 as the store's routes do.
+#[tokio::test]
+async fn an_audit_read_with_no_connection_free_answers_unavailable() {
+    use jamjet_audit::{AuditBackend, AuditError, AuditQuery, PgAuditBackend};
+    let Some(db) = TestDatabase::fresh().await else {
+        return jamjet_testkit::skip("an_audit_read_with_no_connection_free_answers_unavailable");
+    };
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(300))
+        .connect_with(db.connect_options())
+        .await
+        .unwrap();
+    let audit = PgAuditBackend::new(pool.clone());
+    let query = AuditQuery {
+        limit: 10,
+        ..AuditQuery::default()
+    };
+    assert!(
+        audit.query(&query).await.unwrap().is_empty(),
+        "the log reads"
+    );
+    let held = pool.acquire().await.unwrap();
+    let began = Instant::now();
+    let read = audit.query(&query).await;
+    assert!(
+        matches!(read, Err(AuditError::Unavailable(_))),
+        "a read with no connection free: {read:?}"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        began.elapsed()
+    );
+    let counted = audit.count(&query).await;
+    assert!(
+        matches!(counted, Err(AuditError::Unavailable(_))),
+        "a count with no connection free: {counted:?}"
+    );
+    drop(held);
+    assert!(audit.query(&query).await.is_ok(), "the log reads again");
+}

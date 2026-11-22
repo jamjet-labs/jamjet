@@ -22,6 +22,7 @@ use engine::{
     approve, approve_then_work, bases, call, client, db_id, register, start_run, worker, Answers,
     Engine, TestStore,
 };
+use jamjet_audit::{AuditBackend, AuditError, AuditLogEntry, AuditQuery};
 use jamjet_core::workflow::{ExecutionId, WorkflowExecution, WorkflowStatus};
 use jamjet_state::{EventKind, PgBackend, PgSettings, StateBackend, StateBackendError, WorkItem};
 use jamjet_testkit::pg::TestDatabase;
@@ -314,6 +315,8 @@ async fn postgres_restart_mid_run_keeps_invariants() {
                         )
                         .await;
                         answers.note_answer("read a run", &read);
+                        let audit = call(&http, base, "GET", "/audit?limit=1", &token, None).await;
+                        answers.note_answer("read the audit log", &audit);
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -389,7 +392,8 @@ async fn postgres_restart_mid_run_keeps_invariants() {
 
 /// A store that cannot be reached, as while its database restarts: the
 /// token check fails, then (with tokens readable again) a decision's first
-/// read of the log fails. Both answer 503 with `Retry-After`, not 500.
+/// read of the log fails, then the audit log cannot be read. Each answers
+/// 503 with `Retry-After`, not 500.
 #[tokio::test]
 async fn an_unreachable_store_answers_503() {
     use axum::body::Body;
@@ -413,11 +417,33 @@ async fn an_unreachable_store_answers_503() {
         }
     }
 
+    /// An audit log whose store cannot be reached.
+    struct DownAudit;
+
+    fn audit_down() -> AuditError {
+        AuditError::Unavailable("the database is restarting".into())
+    }
+
+    #[async_trait::async_trait]
+    impl AuditBackend for DownAudit {
+        async fn append(&self, _: AuditLogEntry) -> Result<(), AuditError> {
+            Err(audit_down())
+        }
+        async fn query(&self, _: &AuditQuery) -> Result<Vec<AuditLogEntry>, AuditError> {
+            Err(audit_down())
+        }
+        async fn count(&self, _: &AuditQuery) -> Result<u64, AuditError> {
+            Err(audit_down())
+        }
+    }
+
     let down = Arc::new(Down(AtomicU8::new(0)));
     let inner = Arc::new(jamjet_state::InMemoryBackend::new());
     let (token, _) = inner.create_token("reviewer", "reviewer").await.unwrap();
     let backend: Arc<dyn StateBackend> = Arc::new(Intercept::new(inner, down.clone()));
-    let router = jamjet_api::routes::build_router_with_opts(support::make_state(backend), false);
+    let mut state = support::make_state(backend);
+    state.audit = Arc::new(DownAudit);
+    let router = jamjet_api::routes::build_router_with_opts(state, false);
     let send = |method: &str, path: &str, body: serde_json::Value| {
         Request::builder()
             .method(method)
@@ -440,6 +466,7 @@ async fn an_unreachable_store_answers_503() {
 
     down.0.store(2, Ordering::SeqCst);
     let resp = router
+        .clone()
         .oneshot(send(
             "POST",
             &format!("/executions/{run}/approve"),
@@ -448,5 +475,13 @@ async fn an_unreachable_store_answers_503() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 503, "a decision");
+    assert_eq!(resp.headers()["retry-after"], "1");
+
+    down.0.store(0, Ordering::SeqCst);
+    let resp = router
+        .oneshot(send("GET", "/audit", serde_json::Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503, "an audit read");
     assert_eq!(resp.headers()["retry-after"], "1");
 }

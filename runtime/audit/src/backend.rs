@@ -11,6 +11,10 @@ pub enum AuditError {
     Database(String),
     #[error("serialization error: {0}")]
     Serialization(String),
+    /// The log's store could not be reached (no connection free, or the
+    /// connection lost), as while its database restarts. Worth trying again.
+    #[error("audit log unavailable: {0}")]
+    Unavailable(String),
 }
 
 /// A store error as a database error. The Postgres audit log's commit path

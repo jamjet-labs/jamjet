@@ -1793,17 +1793,8 @@ async fn list_audit_log(
         to: None,
     };
 
-    let total = state
-        .audit
-        .count(&q)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let entries = state
-        .audit
-        .query(&q)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let total = state.audit.count(&q).await?;
+    let entries = state.audit.query(&q).await?;
 
     Ok(Json(json!({
         "items": entries,
