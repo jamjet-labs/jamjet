@@ -683,8 +683,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the same write. The engine still seals it right after. A row whose seal was lost (the
     engine stopped between the two, or the audit write failed) is sealed by a drain that
     each engine runs at start and every 2 seconds. After three failed seals of one event,
-    the run's log records the gap (`AuditSealFailed`) while the drain keeps trying. A gap
-    can be recorded twice for one event, never not at all: read gaps per event id.
+    the run's log records the gap (`AuditSealFailed`) while the drain keeps trying. Each
+    event's gap is recorded once, whether the engine's own seal or a drain records it, and
+    never not at all. A row that cannot be read, or whose seal keeps failing, does not hold
+    up the rows behind it.
   - Agents are kept in the same database (`jamjet_agents::PgAgentRegistry`).
   - A write into a run locks the run's row first, claims use `FOR UPDATE SKIP LOCKED`,
     and leases and approval deadlines are decided on the database's clock.
@@ -718,7 +720,7 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     - Text cannot hold a NUL. A node id, queue, worker id, error text, key or name with one
       is refused with `Database("text contains a NUL character")`, and nothing is written.
       JSON is stored as text, so a `\u0000` inside a run's input or state reads back as
-      written.
+      written. A `GET /audit` filter with a NUL matches nothing, as on SQLite.
     - A pending-approvals cursor whose time or run id does not parse is a `Database` error.
     - Node ids sort bytewise, whatever the database's collation.
     - A token's `created_at` is the database's time. Stored times keep microseconds.
