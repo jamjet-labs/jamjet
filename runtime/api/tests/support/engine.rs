@@ -232,6 +232,13 @@ pub struct Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        // A case that is failing says what the engine's own threads panicked
+        // on, if they did: a call that got no answer may be one of them.
+        if std::thread::panicking() {
+            for panic in self.panics() {
+                eprintln!("the engine on {} panicked: {panic}", self.addr);
+            }
+        }
         self.kill();
     }
 }
@@ -326,6 +333,29 @@ impl Engine {
     /// How many times `needle` appears in what the engine printed.
     pub fn count(&self, needle: &str) -> usize {
         self.log.lock().unwrap().matches(needle).count()
+    }
+
+    /// What the process printed for each panic of one of its threads: the
+    /// line that says where, and the message under it. Its stdout and stderr
+    /// are read apart, so the log lines in between (JSON) are skipped.
+    pub fn panics(&self) -> Vec<String> {
+        let log = self.log.lock().unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        let mut panics = Vec::new();
+        for (at, line) in lines.iter().enumerate() {
+            if !line.contains("panicked at") {
+                continue;
+            }
+            let mut said = Vec::new();
+            for next in lines[at..].iter().filter(|l| !l.starts_with('{')).take(6) {
+                said.push(*next);
+                if next.starts_with("note:") {
+                    break;
+                }
+            }
+            panics.push(said.join("\n"));
+        }
+        panics
     }
 
     /// SIGKILL, and wait for the process to go.
