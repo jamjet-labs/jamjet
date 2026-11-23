@@ -250,8 +250,11 @@ POST /work-items/claim
   after the claim, so it is a limit to pass to the model, not a promise: the
   engine still enforces the caps.
 - A step claimed again after its lease ran out, by any worker of the run,
-  carries the same `idempotency_key`. A router that keeps answers by that key
-  can answer a retry without paying again.
+  carries the same `idempotency_key`, as long as the run's state is the same
+  at both claims. The key covers the state, as it does for every external
+  step, so another branch of the run that writes state in between gives the
+  retry a new key. A router that keeps answers by that key can answer a retry
+  without paying again.
 
 The worker completes the step with the model's answer, never with an output or
 a state patch:
