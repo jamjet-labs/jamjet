@@ -90,6 +90,32 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `/health` lists `worker_model_steps` in `features` once the engine runs model steps for a
   run's own worker. A client checks it before it registers a worker model node, and the
   Python SDK does in drive mode. An engine that does not list it ignores `executor`.
+- **The engine can run with its loops off.** With `JAMJET_BACKGROUND=off` it starts no
+  scheduler, projector, in-process workers, audit outbox drain or cron. A scheduler calls
+  `POST /ops/tick` (operator role) about once a minute, and each write advances its run
+  before it answers. This is for a serverless container platform that gives an instance no
+  CPU between requests. See "Request-driven mode" in docs/guides/deployment.md.
+  - `POST /ops/tick` does once what the loops do: it reclaims lapsed leases, seals the audit
+    outbox on Postgres, advances each running run from where the last tick stopped, runs the
+    engine steps still on the queues (model and eval calls among them, waited for past the
+    budget), and projects approvals. It answers with a report, or with `{"ran": false,
+    "reason": "busy"}` while another tick holds the lease. Two ticks never run at once, on
+    one engine or on several sharing a store. The body can only lower the budget
+    (`{"budget_ms": n}`, at least 100), and an unknown field is a 400. It is a 503 while the
+    server stops, and a 409 on an engine with the loops on and no embedded workers.
+  - After `POST /executions`, approve, cancel, an external event, a work item's complete or
+    fail, and the MCP tools that start, approve and cancel a run, the engine dispatches the
+    run's next steps and runs its own quick steps (`condition`, `human_approval`,
+    `limit_exceeded`) within `JAMJET_INLINE_ADVANCE_MS`, as the engine and not as the
+    caller. It never changes the answer. With the loops on it does nothing.
+  - Settings: `JAMJET_TICK_INTERVAL_SECS` (60), `JAMJET_TICK_BUDGET_MS` (45000),
+    `JAMJET_INLINE_ADVANCE_MS` (2000) and `JAMJET_TICK_ENGINE_CONCURRENCY` (4).
+  - `/health` carries `background` (`on` or `off`) and `tick_overdue`: true when the loops
+    are off and no tick has finished for three intervals, null with the loops on or when the
+    store could not be read. `status` is unchanged. While a tick is overdue, a request logs
+    one error line, at most once every 5 minutes. `GET /ops/status`, for any role, returns
+    the stored tick state and the last tick's report.
+  - `features` in `/health` lists `ops_tick`. `jamjet ops tick` checks for it.
 
 ### Changed
 
@@ -219,6 +245,31 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `PolicyViolation` in the cancelled run's log before the answer is 409.
   - If another claim takes the lease back between the engine's last read of it and the write
     of that violation, the violation is recorded for a step the new holder then runs.
+- `JAMJET_BACKGROUND` defaults to `on`, so nothing changes until it is set. It takes `on` or
+  `off`. Any other value, `0`, `false` and empty included, stops the server. With it `off`,
+  `JAMJET_EMBED_CRON=1` stops the server (the Docker image sets it, so pass
+  `JAMJET_EMBED_CRON=0`), `JAMJET_EMBED_WORKERS` is ignored, and on Postgres
+  `JAMJET_TICK_ENGINE_CONCURRENCY` must be below `JAMJET_PG_POOL_SIZE - 1`. With the loops
+  on, on a platform that sets `K_SERVICE`, the server logs one warning that they need CPU
+  between requests.
+- A value of `JAMJET_TICK_INTERVAL_SECS`, `JAMJET_TICK_BUDGET_MS`, `JAMJET_INLINE_ADVANCE_MS`
+  or `JAMJET_TICK_ENGINE_CONCURRENCY` that is set but not valid stops the server, with the
+  loops on too.
+- With the loops off, only a tick runs the projector, so `GET /approvals`, and
+  `GET /executions/:id/approvals` once a tick has projected the run, can lag the log by one
+  tick interval. A model or eval step the engine runs waits for a tick.
+- `StateBackend` gains `begin_tick`, `finish_tick` and `tick_status`. Their defaults refuse
+  ("this backend cannot coordinate ticks"), so a backend outside this repository still
+  compiles, and `POST /ops/tick` on it is a 500.
+- SQLite gains an `engine_ticks` table, created when the store opens and not through a
+  migration, so a file still opens on the build before this one.
+- Postgres gains migration `0003_engine_ticks.sql`. A build from before it refuses a database
+  that has run it, so do not roll back below this release once it has run.
+- New public API: `TickBegin`, `TickOutcome`, `TickStatus` and `MAX_TICK_LEASE` in
+  `jamjet_state`; the `jamjet_api::driver` module, and `Background`, `DriverConfig` and
+  `background_plan` in `jamjet_api::startup`; `Scheduler::advance_one` and `reclaim_once`,
+  with `PassReport`, `Dispatched` and `Reclaimed`; `Worker::run_item_for`;
+  `Shutdown::track` and `stopping`.
 
 ### Fixed
 
