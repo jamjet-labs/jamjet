@@ -22,7 +22,10 @@ use jamjet_api::driver::Driver;
 use jamjet_api::routes::{build_router_with_opts, refuse_claims_while_draining, Draining};
 use jamjet_api::startup::{Background, DriverConfig};
 use jamjet_api::state::AppState;
-use jamjet_audit::{AuditBackend, AuditEnricher, AuditSigner, NoopAuditBackend, PgAuditBackend};
+use jamjet_audit::{
+    ActorType, AuditBackend, AuditEnricher, AuditError, AuditLogEntry, AuditQuery, AuditSigner,
+    NoopAuditBackend, PgAuditBackend,
+};
 use jamjet_core::workflow::{ExecutionId, WorkflowStatus};
 use jamjet_models::ModelRegistry;
 use jamjet_state::backend::{StateBackend, StateBackendError};
@@ -30,7 +33,7 @@ use jamjet_state::event::EventKind;
 use jamjet_state::faults::{Fault, Scope};
 use jamjet_state::{
     ClaimFilter, Event, InMemoryBackend, PgBackend, PgSettings, SqliteBackend, Tenant, TenantId,
-    TenantStatus,
+    TenantStatus, DEFAULT_TENANT,
 };
 use jamjet_testkit::invariants::{self, Store};
 use jamjet_testkit::pg::TestDatabase;
@@ -203,6 +206,29 @@ impl Hooks for Probe {
     }
 }
 
+// ── The audit log, kept ──────────────────────────────────────────────────────
+
+/// Keeps every appended entry, for a case on memory or SQLite that reads
+/// what was sealed. On Postgres the audit log is the database's.
+#[derive(Default)]
+struct CapturingAudit {
+    entries: tokio::sync::Mutex<Vec<AuditLogEntry>>,
+}
+
+#[async_trait]
+impl AuditBackend for CapturingAudit {
+    async fn append(&self, entry: AuditLogEntry) -> Result<(), AuditError> {
+        self.entries.lock().await.push(entry);
+        Ok(())
+    }
+    async fn query(&self, _q: &AuditQuery) -> Result<Vec<AuditLogEntry>, AuditError> {
+        Ok(self.entries.lock().await.iter().rev().cloned().collect())
+    }
+    async fn count(&self, _q: &AuditQuery) -> Result<u64, AuditError> {
+        Ok(self.entries.lock().await.len() as u64)
+    }
+}
+
 // ── A store, an engine on it, and a router ───────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +260,9 @@ struct Options {
     /// test of this crate builds a router without it.
     driver_extension: bool,
     config: DriverConfig,
+    /// Keep the audit entries on memory and SQLite too, for a case that
+    /// reads them.
+    capture_audit: bool,
 }
 
 impl Default for Options {
@@ -249,6 +278,7 @@ impl Default for Options {
                 engine_concurrency: 2,
                 tick_interval: Duration::from_secs(60),
             },
+            capture_audit: false,
         }
     }
 }
@@ -271,6 +301,8 @@ struct Env {
     ops: String,
     alice: String,
     bob: String,
+    /// Who the audit log names for a request made with alice's token.
+    alice_principal: String,
 }
 
 impl Drop for Env {
@@ -333,7 +365,11 @@ impl Env {
                 (audit, enricher)
             }
             None => {
-                let audit: Arc<dyn AuditBackend> = Arc::new(NoopAuditBackend);
+                let audit: Arc<dyn AuditBackend> = if options.capture_audit {
+                    Arc::new(CapturingAudit::default())
+                } else {
+                    Arc::new(NoopAuditBackend)
+                };
                 let enricher = Arc::new(AuditEnricher::new(audit.clone()));
                 (audit, enricher)
             }
@@ -379,7 +415,8 @@ impl Env {
             async move { inner.create_token(name, role).await.unwrap().0 }
         };
         let ops = mint("ops", "operator").await;
-        let alice = mint("alice", "developer").await;
+        let (alice, alice_token) = inner.create_token("alice", "developer").await.unwrap();
+        let alice_principal = jamjet_api::auth::principal_of(&alice_token);
         let bob = mint("bob", "reviewer").await;
         Some(Env {
             kind,
@@ -396,6 +433,7 @@ impl Env {
             ops,
             alice,
             bob,
+            alice_principal,
         })
     }
 
@@ -669,6 +707,24 @@ impl Env {
             .collect();
         nodes.sort();
         nodes
+    }
+
+    /// The audit entries of `run` of one event type: the database's on
+    /// Postgres, the kept ones elsewhere (with `capture_audit`).
+    async fn sealed(&self, run: &ExecutionId, event_type: &str) -> Vec<AuditLogEntry> {
+        let query = AuditQuery {
+            event_type: Some(event_type.to_string()),
+            limit: 100,
+            ..AuditQuery::default()
+        };
+        self.state
+            .audit
+            .query(&query)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == event_type && e.execution_id == run.to_string())
+            .collect()
     }
 
     /// Every invariant of the store (on a file or a database, not memory).
@@ -1290,6 +1346,66 @@ async fn a_request_raised_or_decided_by_an_advance_is_listed_at_once() {
             env.stored(&run).await,
             decided("review1", "pending"),
             "{name}: no tick ran, so the stored copy is behind"
+        );
+    }
+}
+
+// ── Who the advance runs as ──────────────────────────────────────────────────
+
+/// A developer's worker completes `s` of `s` then `review` through the
+/// route, on a router that carries the driver as `main`'s does, so the
+/// completion's advance runs the approval step inside the developer's
+/// request. The request it raises is sealed as the engine's, a system actor
+/// of the run's tenant, not as `token:<the developer's id>`, and the step
+/// runs under a worker id of the engine's own, not the developer's worker's.
+#[tokio::test]
+async fn engine_steps_are_never_attributed_to_the_caller() {
+    for kind in kinds() {
+        let options = Options {
+            capture_audit: true,
+            ..Options::default()
+        };
+        let Some(env) = Env::with(kind, "engine_steps_are_never_attributed", options).await else {
+            continue;
+        };
+        let name = env.name();
+        env.register(&workflow(
+            "wf-attr",
+            vec![py("s"), review("review")],
+            &[("s", "review")],
+        ))
+        .await;
+        let run = env.start("wf-attr").await;
+        env.work("python_tool", "s").await;
+        assert_eq!(
+            env.requests(&run).await,
+            1,
+            "{name}: the completion's advance raised the request"
+        );
+
+        let sealed = env.sealed(&run, "tool_approval_required").await;
+        assert_eq!(sealed.len(), 1, "{name}: {sealed:?}");
+        assert_eq!(sealed[0].actor_id, "system", "{name}");
+        assert_ne!(sealed[0].actor_id, env.alice_principal, "{name}");
+        assert_eq!(sealed[0].actor_type, ActorType::System, "{name}");
+        assert_eq!(sealed[0].tenant_id, DEFAULT_TENANT, "{name}");
+        let started: Vec<String> = env
+            .events(&run)
+            .await
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::NodeStarted {
+                    node_id, worker_id, ..
+                } if node_id.as_str() == "review" => Some(worker_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 1, "{name}: {started:?}");
+        assert!(started[0].starts_with("engine-"), "{name}: {started:?}");
+        assert_ne!(started[0], "w1", "{name}: the developer's worker");
+        assert!(
+            !started[0].contains(&env.alice_principal),
+            "{name}: {started:?}"
         );
     }
 }
