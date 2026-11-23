@@ -19,6 +19,7 @@ use jamjet_state::{
 };
 use serde_json::json;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Rounds per race, unless a case says otherwise.
 const ROUNDS: usize = 200;
@@ -497,15 +498,51 @@ pub async fn decision_and_expiry_of_one_request_land_once(fx: &Fixture) {
 /// each to one run: the log holds the 400 events at 400 consecutive
 /// sequences with no repeat, and each writer's events in the order it
 /// appended them. Some appends of the two handles were in flight at once.
-/// The run is made with `create_execution`, so the log holds only these; on
-/// memory, whose one counter numbers every run's events, it is the only run
-/// in the store.
+/// Each round makes a run with `create_execution` and the rounds follow one
+/// another, so the log holds only that round's events (on memory, whose one
+/// counter numbers every run's events, the run is the only one appended to).
+///
+/// Whether two appends meet is down to how the threads are scheduled: on a
+/// machine with few cores, 50 in-memory appends can each finish before the
+/// next thread starts. So a round in which no append of one handle was in
+/// flight with one of the other's is followed by another, until one has
+/// been or [`OVERLAP_WINDOW`] has passed, and every round checks the log.
 pub async fn concurrent_appends_keep_sequences_dense(fx: &Fixture) {
-    const WRITERS: usize = 8;
-    const APPENDS: u32 = 50;
     let Some((name, first, second)) = handles(fx) else {
         return;
     };
+    let window = Instant::now() + OVERLAP_WINDOW;
+    let mut rounds = 0;
+    loop {
+        rounds += 1;
+        if dense_appends_round(&name, &first, &second).await > 0 {
+            if rounds > 1 {
+                eprintln!("{name}: appends of the two handles met in round {rounds}");
+            }
+            return;
+        }
+        assert!(
+            Instant::now() < window,
+            "{name}: no append of one handle was in flight with one of the other's \
+             in {rounds} rounds"
+        );
+    }
+}
+
+/// How long [`concurrent_appends_keep_sequences_dense`] runs rounds, one
+/// after the other, to see two appends meet.
+const OVERLAP_WINDOW: Duration = Duration::from_secs(30);
+
+/// One round of [`concurrent_appends_keep_sequences_dense`], which checks
+/// the log it made. How many appends of one handle were in flight with one
+/// of the other's.
+async fn dense_appends_round(
+    name: &str,
+    first: &Arc<dyn StateBackend>,
+    second: &Arc<dyn StateBackend>,
+) -> usize {
+    const WRITERS: usize = 8;
+    const APPENDS: u32 = 50;
     let id = ExecutionId::new();
     first.create_execution(run(&id)).await.unwrap();
     let writers = (0..WRITERS).map(|w| {
@@ -566,10 +603,7 @@ pub async fn concurrent_appends_keep_sequences_dense(fx: &Fixture) {
         );
         next[w] += 1;
     }
-    assert!(
-        overlapped > 0,
-        "{name}: no append of one handle was in flight with one of the other's"
-    );
+    overlapped
 }
 
 /// Two handles append 100 values each to one array in a run's state, a pair
