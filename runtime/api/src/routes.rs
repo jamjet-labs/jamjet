@@ -452,6 +452,8 @@ async fn start_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     token: Option<Extension<jamjet_state::ApiToken>>,
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
     Json(body): Json<StartExecutionRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let key = crate::run_key::StartKey::from_request(body.run_key, body.reuse)?;
@@ -460,7 +462,7 @@ async fn start_execution(
     let initiated_by = token
         .as_ref()
         .map(|Extension(t)| crate::auth::principal_of(t));
-    start_run(
+    let started = start_run(
         &state,
         &tenant_id,
         body.workflow_id,
@@ -469,7 +471,18 @@ async fn start_execution(
         initiated_by,
         key,
     )
-    .await
+    .await?;
+    // Only a start that wrote a run: a retried key that names a run already
+    // started (200) wrote nothing.
+    if started.0 == StatusCode::CREATED {
+        if let Some(run) = started.1["execution_id"]
+            .as_str()
+            .and_then(|id| parse_execution_id(id).ok())
+        {
+            crate::driver::after_write(driver.as_ref(), draining.as_ref(), &run).await;
+        }
+    }
+    Ok(started)
 }
 
 /// Start one run of `workflow_id`: the execution record, `WorkflowStarted`
@@ -865,6 +878,8 @@ pub(crate) async fn with_derived_state(
 async fn cancel_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
@@ -906,6 +921,7 @@ async fn cancel_execution(
         }
     }
 
+    crate::driver::after_write(driver.as_ref(), draining.as_ref(), &execution_id).await;
     Ok(Json(json!({ "execution_id": id, "status": "cancelled" })))
 }
 
@@ -1138,11 +1154,14 @@ struct ApproveRequest {
 /// sends its own decision again gets the first one's answer with
 /// `repeat: true`, and nothing is recorded; the rules are in
 /// [`crate::approvals`].
+#[allow(clippy::too_many_arguments)] // each is an extractor
 async fn approve_execution(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     token: Option<Extension<jamjet_state::ApiToken>>,
     dev_mode: Option<Extension<crate::auth::DevMode>>,
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
     Path(id): Path<String>,
     Json(body): Json<ApproveRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -1220,9 +1239,16 @@ async fn approve_execution(
         }
     }
 
-    Ok(Json(
-        crate::approvals::decision_answer(backend.as_ref(), &execution_id, &submitted).await,
-    ))
+    // The answer is read from the run as the decision left it, then the run
+    // is advanced: what an advance does is the next step's news, not this
+    // decision's.
+    let answer =
+        crate::approvals::decision_answer(backend.as_ref(), &execution_id, &submitted).await;
+    // A repeat appended nothing, so there is nothing to follow.
+    if !submitted.repeat {
+        crate::driver::after_write(driver.as_ref(), draining.as_ref(), &execution_id).await;
+    }
+    Ok(Json(answer))
 }
 
 /// The seam between a decision's durable append and its inline seal, on
@@ -1461,6 +1487,8 @@ struct ExternalEventRequest {
 async fn send_external_event(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
     Path(id): Path<String>,
     Json(body): Json<ExternalEventRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -1478,6 +1506,7 @@ async fn send_external_event(
     );
     backend.append_event(event).await?;
 
+    crate::driver::after_write(driver.as_ref(), draining.as_ref(), &execution_id).await;
     Ok(Json(json!({ "execution_id": id, "accepted": true })))
 }
 
@@ -3828,12 +3857,15 @@ fn not_completed(status: StatusCode, reason: impl Into<String>) -> (StatusCode, 
 }
 
 /// `POST /work-items/:id/complete` — mark a work item as completed and emit NodeCompleted event.
+#[allow(clippy::too_many_arguments)] // each is an extractor
 async fn complete_work_item(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
     dev: Option<Extension<crate::auth::DevMode>>,
     token: Option<Extension<jamjet_state::ApiToken>>,
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
     Json(body): Json<CompleteWorkItemRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let item_id = Uuid::parse_str(&id)
@@ -3904,7 +3936,15 @@ async fn complete_work_item(
                 warn!(work_item_id = %id, execution_id = %wi.execution_id, node_id = %wi.node_id, %reason, "complete: refused");
                 return Ok(not_completed(StatusCode::FORBIDDEN, reason));
             }
-            return complete_worker_model_step(&state, backend.as_ref(), wi, node, &id, body).await;
+            let answer =
+                complete_worker_model_step(&state, backend.as_ref(), wi, node, &id, body).await;
+            // Only a recorded answer (200) wrote a step; every refusal wrote
+            // nothing the run can move on from.
+            if matches!(&answer, Ok((StatusCode::OK, _))) {
+                crate::driver::after_write(driver.as_ref(), draining.as_ref(), &wi.execution_id)
+                    .await;
+            }
+            return answer;
         }
         if body.model_result.is_some() {
             return Ok(not_completed(
@@ -4217,6 +4257,10 @@ async fn complete_work_item(
     // is right.
     if let Some(wi) = recorded.as_ref() {
         refresh_current_state(backend.as_ref(), &wi.execution_id, &state_patch).await;
+        // The step is recorded: take its run on to the next step before
+        // answering. An item that could not be read recorded no event, so
+        // there is no run to take on.
+        crate::driver::after_write(driver.as_ref(), draining.as_ref(), &wi.execution_id).await;
     }
 
     Ok((
@@ -4964,12 +5008,15 @@ async fn engine_owned(backend: &dyn jamjet_state::StateBackend, wi: &WorkItem) -
 /// event, so the scheduler fold kept the node in `scheduled` while the row sat in
 /// a `'failed'` status that no sweep ever selects. Every legitimate tool failure
 /// stranded its execution as `Running`, permanently.
+#[allow(clippy::too_many_arguments)] // each is an extractor
 async fn fail_work_item(
     State(state): State<AppState>,
     Extension(tenant_id): Extension<TenantId>,
     Path(id): Path<String>,
     token: Option<Extension<jamjet_state::ApiToken>>,
     dev: Option<Extension<crate::auth::DevMode>>,
+    driver: Option<Extension<std::sync::Arc<crate::driver::Driver>>>,
+    draining: Option<Extension<Draining>>,
     Json(body): Json<FailWorkItemRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let item_id = Uuid::parse_str(&id)
@@ -5074,6 +5121,10 @@ async fn fail_work_item(
         retryable,
         "fail: worker reported a node failure"
     );
+
+    // The failure is recorded (and a retry queued): the run may fail, or
+    // wait out its backoff, which the next pass sees.
+    crate::driver::after_write(driver.as_ref(), draining.as_ref(), &item.execution_id).await;
 
     Ok((
         StatusCode::OK,
@@ -5670,6 +5721,8 @@ mod tests {
             Extension(tenant.clone()),
             None,
             None,
+            None,
+            None,
             Path(eid.to_string()),
             Json(body()),
         )
@@ -5691,6 +5744,8 @@ mod tests {
             Extension(tenant),
             None,
             Some(Extension(crate::auth::DevMode)),
+            None,
+            None,
             Path(eid.to_string()),
             Json(body()),
         )

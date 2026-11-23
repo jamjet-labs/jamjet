@@ -233,6 +233,12 @@ pub const POINTS: &[(&str, u32)] = &[
     // after each run its walk advanced.
     ("tick.after_begin", 1),
     ("tick.mid_walk", 1),
+    // api/src/driver.rs: a seam in the inline advance, after a write has
+    // committed and before the advance that follows it. workers/src/worker.rs:
+    // a seam in an engine step an advance runs, after its item is claimed and
+    // before the step runs.
+    ("inline.after_write", 1),
+    ("inline.mid_engine_step", 1),
     // audit/src/postgres.rs: the line before every commit of an append to
     // the Postgres audit log, a seal onto the head included.
     ("audit.seal.before_commit", 1),

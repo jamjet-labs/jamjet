@@ -24,8 +24,10 @@
 //! logged and counted in the [`AdvanceReport`]: the write that led to it has
 //! already committed, and the tick will go on from the log.
 
+use crate::routes::Draining;
 use crate::startup::Background;
 use crate::state::AppState;
+use axum::Extension;
 use jamjet_audit::AuditEnricher;
 use jamjet_core::workflow::ExecutionId;
 use jamjet_models::ModelRegistry;
@@ -39,7 +41,7 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub use crate::startup::DriverConfig;
 
@@ -757,6 +759,63 @@ impl Driver {
             errors: u64::from(errors.load(Ordering::SeqCst)),
             drained: drained.load(Ordering::SeqCst),
         }
+    }
+}
+
+// ── Request-driven mode: inline advance ─────────────────────────────────────
+
+/// The seam between a write that has committed and the advance that follows
+/// it. An error a test arms here skips the advance, as an engine that stopped
+/// there would: the write is on record, the run is not advanced, and the next
+/// tick goes on from the log.
+async fn after_write_seam() -> jamjet_state::BackendResult<()> {
+    jamjet_state::fault_point!("inline.after_write", 1);
+    Ok(())
+}
+
+/// After the handler's write has committed and before it answers: one advance
+/// of that run within the inline budget. Never changes the answer. Nothing
+/// happens with loops on, without the extension (every existing test builds
+/// `AppState` without it), or while draining (the tick catches up).
+///
+/// Why before the answer: on a request-billed platform the process may get no
+/// CPU after it answers, so work spawned for later may never run.
+///
+/// The advance runs in a task of its own that this call awaits. A panic in it
+/// is a log line and not a failed request, and a client that hangs up halfway
+/// does not cut it off between two writes: the write that led here has
+/// committed, and what the advance leaves undone the tick does.
+pub async fn after_write(
+    driver: Option<&Extension<Arc<Driver>>>,
+    draining: Option<&Extension<Draining>>,
+    execution: &ExecutionId,
+) {
+    let Some(Extension(driver)) = driver else {
+        return;
+    };
+    if driver.background == Background::On {
+        return;
+    }
+    if draining.is_some_and(|Extension(d)| d.0.load(Ordering::SeqCst)) {
+        return;
+    }
+    if let Err(e) = after_write_seam().await {
+        warn!(execution_id = %execution, "inline advance skipped: {e}");
+        return;
+    }
+    let advancing = Arc::clone(driver);
+    let run = execution.clone();
+    let budget = driver.config.inline_budget;
+    match tokio::spawn(async move { advancing.advance(&run, budget).await }).await {
+        Ok(report) => debug!(
+            execution_id = %execution,
+            dispatched = report.dispatched,
+            engine_steps = report.engine_steps,
+            errors = report.errors,
+            out_of_budget = report.out_of_budget,
+            "inline advance"
+        ),
+        Err(e) => warn!(execution_id = %execution, "inline advance did not finish: {e}"),
     }
 }
 

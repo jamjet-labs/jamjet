@@ -100,6 +100,15 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                 .await
                 .map_err(|e| e.to_string())?;
 
+                // With the loops off, take the new run on before answering,
+                // as `POST /executions` does.
+                if let Some(run) = started["execution_id"]
+                    .as_str()
+                    .and_then(|id| parse_execution_id(id).ok())
+                {
+                    advance_after_write(&ctx, &run).await;
+                }
+
                 Ok(vec![McpContent::Text {
                     text: json!({"execution_id": started["execution_id"]}).to_string(),
                 }])
@@ -293,6 +302,8 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                         "execution {id_str} is already terminal: {status:?}"
                     ));
                 }
+
+                advance_after_write(&ctx, &eid).await;
 
                 Ok(vec![McpContent::Text {
                     text: json!({"execution_id": id_str, "status": "cancelled"}).to_string(),
@@ -537,8 +548,14 @@ pub fn build_mcp_bridge(state: AppState, dev_mode: bool) -> Router {
                     }
                 }
 
+                // The answer is read from the run as the decision left it, then
+                // the run is advanced, as the approve route does. A repeat
+                // appended nothing, so there is nothing to follow.
                 let answer =
                     crate::approvals::decision_answer(backend.as_ref(), &eid, &submitted).await;
+                if !submitted.repeat {
+                    advance_after_write(&ctx, &eid).await;
+                }
                 Ok(vec![McpContent::Text {
                     text: answer.to_string(),
                 }])
@@ -700,6 +717,23 @@ fn resolve_caller(
         tenant: TenantId::from(token.tenant_id.clone()),
         token: Some(token),
     })
+}
+
+/// [`crate::driver::after_write`] for a tool call: the driver and the drain
+/// flag are the request extensions the router layers carry, as they are for a
+/// route's handler.
+async fn advance_after_write(ctx: &ToolCallContext, execution: &ExecutionId) {
+    let driver = ctx
+        .extensions
+        .get::<Arc<crate::driver::Driver>>()
+        .cloned()
+        .map(axum::Extension);
+    let draining = ctx
+        .extensions
+        .get::<crate::routes::Draining>()
+        .cloned()
+        .map(axum::Extension);
+    crate::driver::after_write(driver.as_ref(), draining.as_ref(), execution).await;
 }
 
 fn parse_execution_id(s: &str) -> Result<ExecutionId, String> {

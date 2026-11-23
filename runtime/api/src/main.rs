@@ -428,6 +428,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // The driver travels as a request extension: `POST /ops/tick` and the
+    // inline advance after a write read it there. The advance reads the
+    // driver's `Background` and does nothing with the loops on, so in dev mode
+    // or with the embedded workers the layer only serves the tick.
     let router = build_router_with_opts(state, config.dev_mode);
     let router = match driver {
         Some(driver) => router.layer(axum::Extension(driver)),

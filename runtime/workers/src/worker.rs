@@ -1294,12 +1294,21 @@ impl Worker {
             attempt = item.attempt,
             "Claimed work item for one run"
         );
+        mid_engine_step().await?;
         let done = self.execute_item(item).await;
         self.finished
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         done?;
         Ok(Some(()))
     }
+}
+
+/// The seam between an inline engine step's claim and its run. An error a
+/// test arms here leaves the step as an engine that stopped there would: the
+/// item leased and nothing recorded, for the lease sweep to take back.
+async fn mid_engine_step() -> Result<(), jamjet_state::StateBackendError> {
+    jamjet_state::fault_point!("inline.mid_engine_step", 1);
+    Ok(())
 }
 
 /// How long a node's executor may run: the node's `node_timeout_secs`, else
