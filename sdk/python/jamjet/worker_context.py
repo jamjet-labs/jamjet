@@ -10,6 +10,12 @@ reports a cancelled execution on the heartbeat, the worker sets the event and
 stops waiting, and a long-running step (a model inference loop, say) polls the
 event between chunks and returns early. Nothing the handler returns after that
 is reported.
+
+``idempotency_key`` is the key the engine gave the item on claim, or ``None``
+from an older engine. It is the same on every attempt of the step, so a
+handler that writes outside JamJet can pass it on and have a repeat ignored.
+``run_key`` is the caller's key for the run when the process working the item
+started it with one; ``None`` otherwise.
 """
 
 from __future__ import annotations
@@ -25,6 +31,8 @@ class WorkContext:
     execution_id: str
     node_id: str
     cancel_requested: threading.Event = field(default_factory=threading.Event)
+    idempotency_key: str | None = None
+    run_key: str | None = None
 
 
 _CURRENT: contextvars.ContextVar[WorkContext | None] = contextvars.ContextVar("jamjet_work_context", default=None)
