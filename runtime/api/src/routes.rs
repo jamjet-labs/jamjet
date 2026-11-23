@@ -187,8 +187,18 @@ async fn inject_dev_tenant(
 
 // ── Health ───────────────────────────────────────────────────────────────────
 
+/// `status` never changes: the dev stack's probe reads it. `commit` is what
+/// this binary was built from (a local build from a changed tree reports HEAD),
+/// `features` what it can do that an older engine could not.
 async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+    let commit = env!("JAMJET_COMMIT");
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": if commit.is_empty() { Value::Null } else { json!(commit) },
+        "commit_source": env!("JAMJET_COMMIT_SOURCE"),
+        "features": crate::features::FEATURES,
+    }))
 }
 
 // ── Workflow definitions ─────────────────────────────────────────────────────
@@ -760,7 +770,8 @@ async fn list_waiting_for(
     let page = backend
         .list_running_executions_after(params.after.as_deref(), limit)
         .await?;
-    let now = Utc::now();
+    // The store's clock, as the approve routes judge a deadline.
+    let now = backend.store_now().await?;
     let mut executions = Vec::new();
     for execution in page.executions {
         if crate::waiting::waiting_for(backend, &execution, now).await? != Some(wanted) {
@@ -797,7 +808,8 @@ pub(crate) async fn execution_view(
     backend: &dyn jamjet_state::StateBackend,
     execution: WorkflowExecution,
 ) -> Result<Value, ApiError> {
-    let waiting = crate::waiting::waiting_for(backend, &execution, Utc::now()).await?;
+    let now = backend.store_now().await?;
+    let waiting = crate::waiting::waiting_for(backend, &execution, now).await?;
     let execution_id = execution.execution_id.clone();
     let execution = with_derived_state(backend, execution).await;
     let mut body = serde_json::to_value(execution)
@@ -970,12 +982,15 @@ pub async fn refuse_claims_while_draining(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let mut req = req;
     if draining.0.load(std::sync::atomic::Ordering::SeqCst)
         && req.method() == axum::http::Method::POST
         && req.uri().path() == "/work-items/claim"
     {
         return nothing_to_claim().into_response();
     }
+    // A claim already waiting for its item reads this to stop waiting.
+    req.extensions_mut().insert(draining);
     next.run(req).await
 }
 
@@ -1184,7 +1199,7 @@ async fn approve_execution(
     // The per-node worker events emitted through the fenced `commit_turn` path
     // are not yet routed through the enricher; tracked as F-t3-audit-emit.
     // A repeat appended nothing, and its decision was sealed the first time.
-    if !submitted.repeat {
+    if !submitted.repeat && before_decision_seal().await.is_ok() {
         let ctx = jamjet_audit::RequestContext {
             actor_id,
             actor_type: jamjet_audit::ActorType::Human,
@@ -1205,6 +1220,16 @@ async fn approve_execution(
     Ok(Json(
         crate::approvals::decision_answer(backend.as_ref(), &execution_id, &submitted).await,
     ))
+}
+
+/// The seam between a decision's durable append and its inline seal, on
+/// this route and on the MCP approve tool. An error a test arms here skips
+/// the seal, as an engine that stopped there would: the decision is
+/// recorded and has no audit entry, which on Postgres the outbox drain then
+/// seals.
+pub(crate) async fn before_decision_seal() -> jamjet_state::BackendResult<()> {
+    jamjet_state::fault_point!("decision.after_append_before_seal", 1);
+    Ok(())
 }
 
 /// The answer of `POST /executions/:id/approve` to a refused decision.
@@ -1232,6 +1257,7 @@ fn submit_refusal(e: crate::approvals::SubmitError) -> ApiError {
         | SubmitError::ChoiceNotAllowed(_)
         | SubmitError::BadNote(_) => ApiError::BadRequest(e.to_string()),
         SubmitError::Backend(msg) => ApiError::Internal(msg),
+        SubmitError::Unavailable(_) => ApiError::Unavailable(e.to_string()),
     }
 }
 
@@ -1791,17 +1817,8 @@ async fn list_audit_log(
         to: None,
     };
 
-    let total = state
-        .audit
-        .count(&q)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let entries = state
-        .audit
-        .query(&q)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let total = state.audit.count(&q).await?;
+    let entries = state.audit.query(&q).await?;
 
     Ok(Json(json!({
         "items": entries,
@@ -2053,6 +2070,7 @@ async fn claim_work_item(
     Extension(tenant_id): Extension<TenantId>,
     token: Option<Extension<jamjet_state::ApiToken>>,
     dev: Option<Extension<crate::auth::DevMode>>,
+    draining: Option<Extension<Draining>>,
     Json(body): Json<ClaimWorkItemRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let backend = state.backend_for(&tenant_id);
@@ -2099,6 +2117,7 @@ async fn claim_work_item(
             &filter,
             token.as_ref().map(|Extension(t)| t),
             dev.is_some(),
+            draining.as_ref().map(|Extension(d)| d),
         )
         .await;
     }
@@ -2416,7 +2435,9 @@ async fn claim_for_execution(
     filter: &jamjet_state::ClaimFilter,
     token: Option<&jamjet_state::ApiToken>,
     dev_mode: bool,
+    draining: Option<&Draining>,
 ) -> Result<Json<Value>, ApiError> {
+    let is_draining = || draining.is_some_and(|d| d.0.load(std::sync::atomic::Ordering::SeqCst));
     let Some(execution_id) = filter.execution_id.clone() else {
         return Ok(claim_refused("not_found"));
     };
@@ -2452,9 +2473,24 @@ async fn claim_for_execution(
     let mut pause = std::time::Duration::from_millis(50);
     let mut first_look = true;
     loop {
+        // The server is stopping: no item is leased from here on, and a claim
+        // answered now ends before the platform's stop timeout. The caller
+        // claims again, usually on another instance. A drain is noticed
+        // within one nap, at most half a second. The check is made again after
+        // the read below; a small window remains before the backend write,
+        // because the flag and the write are not atomic.
+        if is_draining() {
+            return Ok(claim_refused("draining"));
+        }
         // A read first: only when something matches is the claim (a write
         // transaction) tried.
-        let outcome = if backend.has_claimable(queue_refs, filter).await? {
+        let found = backend.has_claimable(queue_refs, filter).await?;
+        // One check after the read covers both answers: a drain that began
+        // during it is not met with a lease or with `not_ready`.
+        if is_draining() {
+            return Ok(claim_refused("draining"));
+        }
+        let outcome = if found {
             backend
                 .claim_for_execution(&body.worker_id, queue_refs, lease_secs, filter)
                 .await?

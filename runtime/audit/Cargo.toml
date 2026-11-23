@@ -35,5 +35,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# The kit, and jamjet-state's test hooks (the clock skew), for this crate's
+# own tests only (see runtime/testkit/Cargo.toml). Path-only, so cargo drops
+# them when it packages this crate.
+jamjet-state = { path = "../state", features = ["test-hooks"] }
+jamjet-testkit = { path = "../testkit" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }

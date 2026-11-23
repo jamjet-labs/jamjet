@@ -176,6 +176,20 @@ pub enum SubmitError {
     /// `comment` were both sent and differ. Holds the reason.
     BadNote(String),
     Backend(String),
+    /// The store could not be reached (`StateBackendError::Unavailable`),
+    /// as while its database restarts. Worth sending again.
+    Unavailable(String),
+}
+
+impl SubmitError {
+    /// A store error, as [`Self::Unavailable`] when the store could not be
+    /// reached and as [`Self::Backend`] otherwise.
+    fn store(e: jamjet_state::StateBackendError) -> Self {
+        match e {
+            jamjet_state::StateBackendError::Unavailable(msg) => Self::Unavailable(msg),
+            other => Self::Backend(other.to_string()),
+        }
+    }
 }
 
 /// The longest note a decision may carry, in bytes of UTF-8.
@@ -289,6 +303,7 @@ impl std::fmt::Display for SubmitError {
             ),
             Self::BadNote(reason) => write!(f, "{reason}"),
             Self::Backend(e) => write!(f, "backend error: {e}"),
+            Self::Unavailable(e) => write!(f, "store unavailable: {e}"),
         }
     }
 }
@@ -341,7 +356,7 @@ pub async fn submit_approval(
     let events = backend
         .get_events(execution_id)
         .await
-        .map_err(|e| SubmitError::Backend(e.to_string()))?;
+        .map_err(SubmitError::store)?;
     // Fail closed on a log this build cannot fully read: an unreadable event
     // may have revoked or decided what the listing still shows as pending.
     if jamjet_state::approvals::has_unreadable_events(&events) {
@@ -364,7 +379,7 @@ pub async fn submit_approval(
     let execution = backend
         .get_execution(execution_id)
         .await
-        .map_err(|e| SubmitError::Backend(e.to_string()))?;
+        .map_err(SubmitError::store)?;
     let was_paused = match &execution {
         Some(exec) => {
             if matches!(
@@ -451,10 +466,7 @@ pub async fn submit_approval(
     // BEFORE the digest rules on purpose: a late approval with no digest, or
     // a stale one, is answered 409 Expired (the request can no longer be
     // decided at all) rather than 400 DigestRequired or 409 StaleDigest.
-    let now = backend
-        .store_now()
-        .await
-        .map_err(|e| SubmitError::Backend(e.to_string()))?;
+    let now = backend.store_now().await.map_err(SubmitError::store)?;
     // The store's clock from here on: this process's clock moved by how far
     // the store's was from it just now. The append's condition runs
     // synchronously and cannot ask the store, so it reads this.
@@ -522,7 +534,7 @@ pub async fn submit_approval(
     let event = match backend
         .append_event_if(event.clone(), &condition)
         .await
-        .map_err(|e| SubmitError::Backend(e.to_string()))?
+        .map_err(SubmitError::store)?
     {
         jamjet_state::ConditionalAppend::Appended(seq) => Event {
             sequence: seq,
@@ -532,7 +544,7 @@ pub async fn submit_approval(
             let latest = backend
                 .get_events(execution_id)
                 .await
-                .map_err(|e| SubmitError::Backend(e.to_string()))?;
+                .map_err(SubmitError::store)?;
             if expired_by_deadline(&latest, &node_id)
                 || pending_but_expired(&latest, &node_id, store_clock())
             {
@@ -559,7 +571,7 @@ pub async fn submit_approval(
         backend
             .update_execution_status(execution_id, WorkflowStatus::Running)
             .await
-            .map_err(|e| SubmitError::Backend(e.to_string()))?;
+            .map_err(SubmitError::store)?;
     }
 
     Ok(Submitted {
@@ -681,7 +693,7 @@ async fn declared_options(
     let definition = backend
         .get_workflow(&execution.workflow_id, &execution.workflow_version)
         .await
-        .map_err(|e| SubmitError::Backend(e.to_string()))?;
+        .map_err(SubmitError::store)?;
     let Some(raw) = definition
         .as_ref()
         .and_then(|d| d.ir.get("nodes"))
@@ -930,9 +942,12 @@ pub async fn decision_answer(
         "sequence": submitted.event.sequence,
     });
     let waiting = match backend.get_execution(execution_id).await {
-        Ok(Some(execution)) => crate::waiting::waiting_for(backend, &execution, chrono::Utc::now())
-            .await
-            .map_err(|e| e.to_string()),
+        Ok(Some(execution)) => match backend.store_now().await {
+            Ok(now) => crate::waiting::waiting_for(backend, &execution, now)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        },
         Ok(None) => Err("the execution was not found".to_string()),
         Err(e) => Err(e.to_string()),
     };

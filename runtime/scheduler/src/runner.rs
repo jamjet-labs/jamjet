@@ -921,6 +921,13 @@ impl Scheduler {
         let finished = pass.finish.as_ref().map(|(status, _)| status.clone());
         match self.backend.commit_scheduler_pass(pass).await {
             Ok(PassCommit::Committed { .. }) => {
+                if dispatched > 0 {
+                    if let Err(e) = after_dispatch_commit().await {
+                        // The next tick folds the whole log again.
+                        self.progress.lock().unwrap().remove(execution_id);
+                        return Err(e.into());
+                    }
+                }
                 log_recorded(execution_id, &recorded);
                 if dispatched > 0 {
                     debug!(execution_id = %execution_id, dispatched, "Dispatch complete");
@@ -978,6 +985,15 @@ enum PassEnd {
     Done,
     /// The store refused the pass as stale and wrote none of it.
     Stale,
+}
+
+/// The seam after a pass that dispatched work has committed, before the
+/// scheduler updates what it keeps for the run. An error a test arms here
+/// leaves the pass as an engine that stopped there would: written, with the
+/// run refolded from its log on the next tick.
+async fn after_dispatch_commit() -> jamjet_state::BackendResult<()> {
+    jamjet_state::fault_point!("dispatch.after_commit", 1);
+    Ok(())
 }
 
 /// The log lines for what a committed pass recorded: the scheduler's pass

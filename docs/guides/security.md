@@ -154,16 +154,18 @@ while the gap is over five minutes.
 token's tenant, but the engine under it runs every workflow in tenant `default`.
 So a token of any other tenant is refused with 403, on REST and MCP.
 `JAMJET_TENANT_TOKENS_AS_DEFAULT=1` (read once at startup) lets such tokens act in
-`default` instead; that gives no isolation. To run tenants side by side, these would
+`default` instead; that gives no isolation. A Postgres store does not change this:
+engines that share one database run one tenant, and the database gives no tenant
+isolation. To run tenants side by side, these would
 have to carry the tenant first, and none does yet:
 
-- the scheduler's work items (every item after the start node is enqueued in `default`);
 - workflow lookup and its caches in the scheduler and the in-process worker (keyed by
   workflow id and version only, so two tenants' versions collide);
 - execution and work-item creation on the base backend, and segment rollover;
-- tenant policy for work items after the start node (they are in `default`, so default's
-  tenant policy applies to them);
 - the agent registry (global today).
+
+Work items already carry their run's tenant, and the worker applies that tenant's
+policy to each item.
 
 Tenant policy (`PUT /tenants/:id`, operator only) is a ceiling over the
 policies in a workflow's IR. No workflow or node rule can lift a tenant rule;

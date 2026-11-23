@@ -1,9 +1,8 @@
 # Deployment Guide
 
-The runtime is one binary, `jamjet-server`. It keeps state in a SQLite file, or
-in memory for throwaway runs. There is no Postgres backend: the server opens
-any `DATABASE_URL` as SQLite, so a `postgresql://` URL fails at startup with
-`failed to open state backend`.
+The runtime is one binary, `jamjet-server`. It keeps state in a SQLite file, in
+Postgres (a preview, see [Postgres](#postgres-preview)), or in memory for
+throwaway runs.
 
 The runtime is single-tenant. Tokens of any tenant but `default` are refused;
 see [Security](security.md#rbac).
@@ -114,8 +113,9 @@ integration's recorded calls) claims that execution's work instead:
   (another worker holds it), `not_found` (no live run with that id that you
   may claim), `refused` (the item was withheld as not the engine's: its
   payload names another workflow than its run; the node is not failed) or
-  `not_ready` (not queued yet, or the engine could not decide now; try
-  again). `blocked`, `approval_required` and `refused` come from the run's
+  `draining` (the server is stopping; claim again, usually on another
+  instance) or `not_ready` (not queued yet, or the engine could not decide
+  now; try again). `blocked`, `approval_required` and `refused` come from the run's
   log, so a retry, or another worker, gets the same answer. Without
   `node_id` they are about the nodes the run has open now, not a node it has
   moved past. A run that has ended answers `not_found` with its `status`
@@ -417,6 +417,85 @@ is missing.
 
 ---
 
+## Postgres (preview)
+
+Several engine instances can share one Postgres database. A `DATABASE_URL`
+that starts `postgres://` or `postgresql://` selects it; `STORAGE_BACKEND=memory`
+still wins over any URL. The server logs `Postgres store (preview)` at start.
+The URL never reaches the logs at info level, and the commands below never
+print its password.
+
+```bash
+export DATABASE_URL=postgres://jamjet:<password>@db.internal:5432/jamjet
+
+# Before each deploy, once:
+jamjet-server migrate
+# schema at version 2 (2 applied)
+
+jamjet-server            # every engine instance
+```
+
+### Migrate before each deploy
+
+`jamjet-server migrate` applies the pending migrations and exits 0. Run it once
+per deploy, before the new instances start. Two runs at once take turns: the
+second waits and then applies nothing. It exits 3 when the database is newer
+than this build and 4 when a migration is half done or differs from this
+build's, and changes nothing in either case.
+
+`jamjet-server migrate --check` changes nothing. It exits 0 when the schema is
+current, 2 when it is behind (or empty), 3 when it is newer, 4 when it is half
+done or changed.
+
+The server checks the schema at start and refuses one it does not match:
+
+- empty or older: run `jamjet-server migrate`;
+- newer: this build is older than the database schema; do not roll back below
+  a schema migration;
+- half done or changed: the message names the migration.
+
+Migrations stay additive for one release (new tables, new columns with
+defaults, new indexes), so instances of the previous build keep running while a
+deploy migrates. A restarted instance of the old build then refuses the newer
+schema, as it should.
+
+On SQLite, `jamjet-server migrate` migrates the file the way the server does
+when it opens it, and `--check` is refused.
+
+### Pool and connections
+
+Each engine opens one pool, shared by the state store, the audit log, the agent
+registry and the audit outbox drain. Each setting is checked at start; a value
+that is set but not valid stops the server, naming the variable.
+
+| Variable | What it does | Default |
+|----------|--------------|---------|
+| `JAMJET_PG_POOL_SIZE` | Connections in the pool, at least 2 | `10` |
+| `JAMJET_PG_ACQUIRE_TIMEOUT_MS` | How long a call waits for a free connection before it answers 503 | `5000` |
+| `JAMJET_PG_STATEMENT_TIMEOUT_MS` | `statement_timeout` on each connection | `30000` |
+| `JAMJET_PG_LOCK_TIMEOUT_MS` | `lock_timeout` on each connection | `10000` |
+| `JAMJET_PG_IDLE_IN_TX_TIMEOUT_MS` | `idle_in_transaction_session_timeout` on each connection | `60000` |
+
+The connection budget is the number of engines times `JAMJET_PG_POOL_SIZE`,
+plus 2 for each `token` command running and 1 for each `migrate`. Keep it under
+the database's `max_connections`, with room for your own tools.
+
+### What differs on Postgres
+
+- Cron is not supported yet: each engine would fire every schedule.
+  `JAMJET_EMBED_CRON=1` stops the server at start. In dev mode the cron
+  scheduler is skipped with a warning, and `/cron` answers 400, as with
+  `STORAGE_BACKEND=memory`. The Docker image sets `JAMJET_EMBED_CRON=1`, so
+  pass `-e JAMJET_EMBED_CRON=0` with a Postgres URL.
+- Every engine on one database writes one audit chain, so every engine and
+  every `token` command must use the same audit signing settings
+  ([Signing the audit log](security.md#signing-the-audit-log)).
+- The token commands work as on SQLite, against a migrated database:
+  `jamjet-server token create --role operator` with the same `DATABASE_URL`.
+  A token issued once is accepted by every engine on the database.
+
+---
+
 ## Docker
 
 The repo's `Dockerfile` builds the UI, the server and the Python SDK into one
@@ -441,7 +520,9 @@ docker exec jamjet jamjet-server token revoke <token id>
 ```
 
 Mount a volume on `/data`, or every container starts with an empty database
-and the tokens you issued are gone. The audit log is hash-chained but not
+and the tokens you issued are gone. To run the image on Postgres, pass
+`-e DATABASE_URL=postgres://...` with `-e JAMJET_EMBED_CRON=0`, since cron is
+not supported on Postgres yet. The audit log is hash-chained but not
 signed until you give it a key: mount an Ed25519 seed and set
 `JAMJET_AUDIT_SIGNING_MODE=ed25519` and `JAMJET_AUDIT_ED25519_KEY_FILE` (see
 [Signing the audit log](security.md#signing-the-audit-log)).
@@ -470,6 +551,61 @@ Images built before this change default to `STORAGE_BACKEND=memory`, and their
 second server). Build the image from this repo to get the setup above.
 
 Images on Docker Hub (`jamjetdev/jamjet`) are built from crate release tags.
+
+---
+
+## On a serverless container platform
+
+A platform that sets `K_SERVICE` (Knative and platforms built on it) keeps an
+instance's files in memory and drops them when the instance stops. A SQLite
+file there is lost with the instance, and a network volume is no safe home for
+SQLite either. So on such a platform `jamjet-server` refuses to start with
+SQLite, and the message names `DATABASE_URL` and the switch below. A
+`postgres://` URL passes the check, but this server build cannot open a
+Postgres store yet (see the top of this guide), so today the choices there are
+the switch below, or `STORAGE_BACKEND=memory`, which starts with a warning and
+keeps nothing.
+
+To keep the file anyway, for a trial you will throw away, set
+`JAMJET_ALLOW_EPHEMERAL_STORE=1`. The server then starts with a warning. The
+flag is strict like the other switches: `0` means off, and a value like `maybe`
+stops the server. Only `serve` checks this. `token create` and `token revoke`
+do not.
+
+The platform stops an instance with SIGTERM and kills it after a stop timeout,
+10 s by default on these platforms. On a platform the server assumes 10 s and
+sets its grace to 4 s: 4 s for the in-process workers, 2 s for the scheduler, 3 s
+for open connections and 1 s of margin. Set `JAMJET_STOP_TIMEOUT_SECS` (a whole
+number of at least 6) if your platform's timeout differs. The grace follows it,
+unless you set `JAMJET_SHUTDOWN_GRACE_SECS`. A grace that does not fit inside the stop
+timeout stops startup and names both variables. A step that is still running at
+the kill is reclaimed when its lease expires.
+
+A by-execution claim that is waiting when the stop signal arrives is answered
+within half a second with `{"claimed": false, "reason": "draining"}`. A claim that arrives
+after draining has started gets `{"claimed": false}` with no reason. Treat both
+as "ask again in about a second". The instance is going away, and the next claim
+usually lands on another one.
+
+`/health` carries the commit the engine was built from, to check a deploy:
+
+```bash
+curl https://engine.example/health
+# {"status":"ok","version":"0.5.0","commit":"<40 hex characters>","commit_source":"build-env","features":[...]}
+```
+
+`commit` is null when the build had no record of it. `commit_source` says
+where it came from: `build-env` (set at build time, as in the image), `git`
+(read from the checkout), `crate-package` (a crate built from crates.io) or
+`none`. A build from a tree with uncommitted changes reports HEAD, so build a
+release from a clean checkout. Compare `commit` with the commit you meant to deploy. Build your own
+image with `docker build --build-arg JAMJET_BUILD_COMMIT=$(git rev-parse HEAD) .`,
+because the image has no `.git`. `features` lists what the engine can do, so a
+client can check before it relies on a newer route.
+
+Images on Docker Hub are pushed for release tags only (`crates-v*`), and
+`latest` is the newest release. A manual run of the image workflow on a branch
+fails before it builds. Pin a version tag in a deployment, not `latest`.
 
 ---
 
@@ -542,10 +678,10 @@ any other value.
 | `JAMJET_DEV_MODE` | No authentication, in-process workers and cron. Refused on a non-loopback bind | off |
 | `JAMJET_DEV_MODE_ALLOW_REMOTE` | Let dev mode listen on a non-loopback address (logged as a warning). Requests must still name an allowed host | off |
 | `JAMJET_DEV_ALLOWED_HOSTS` | Host names dev mode answers besides `localhost` and loopback addresses, comma-separated, without scheme or port (`host.docker.internal`) | none |
-| `DATABASE_URL` | SQLite database, as `sqlite://<path>` | `sqlite://.jamjet/runtime.db` in the working directory (`sqlite:///data/runtime.db` in the Docker image) |
-| `STORAGE_BACKEND` | `memory` keeps state in memory and keeps no audit log; any other value uses SQLite | SQLite |
+| `DATABASE_URL` | SQLite database, as `sqlite://<path>`, or Postgres, as `postgres://` or `postgresql://` ([Postgres](#postgres-preview)) | `sqlite://.jamjet/runtime.db` in the working directory (`sqlite:///data/runtime.db` in the Docker image) |
+| `STORAGE_BACKEND` | `memory` keeps state in memory and keeps no audit log; any other value uses the store `DATABASE_URL` names | the store `DATABASE_URL` names |
 | `JAMJET_EMBED_WORKERS` | Runs the in-process worker pool outside dev mode | off (`1` in the Docker image) |
-| `JAMJET_EMBED_CRON` | Runs the cron scheduler outside dev mode (not with `STORAGE_BACKEND=memory`) | off (`1` in the Docker image) |
+| `JAMJET_EMBED_CRON` | Runs the cron scheduler outside dev mode (not with `STORAGE_BACKEND=memory`; refused on Postgres) | off (`1` in the Docker image) |
 | `JAMJET_STORE_TERM` | Failover generation for the lease fence, a non-negative integer. An invalid value fails startup | unset |
 | `JAMJET_PUBLIC_URL` | Base URL used for the `did:web` id in `/.well-known/did.json` | `http://$JAMJET_BIND:$JAMJET_PORT` |
 | `JAMJET_MODEL_SEAM_URL` | Send every model call through the model sidecar at this URL. With the in-process workers on, startup fails if it does not answer `/health` | unset |
@@ -570,8 +706,11 @@ any other value.
 
 ```bash
 curl http://localhost:7700/health
-# {"status":"ok","version":"0.5.0"}
+# {"status":"ok","version":"0.5.0","commit":null,"commit_source":"none","features":[...]}
 ```
+
+`commit` and `features` are described under
+[On a serverless container platform](#on-a-serverless-container-platform).
 
 `/health` is the only status route. A path the API does not serve answers
 `200` with the web UI's HTML for `GET`, so check the status code and the

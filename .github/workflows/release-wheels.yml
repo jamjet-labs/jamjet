@@ -118,11 +118,15 @@ jobs:
         if: ${{ !matrix.cross }}
         run: cargo build --release --locked --target ${{ matrix.target }} -p jamjet-api
         working-directory: runtime
+        env:
+          JAMJET_BUILD_COMMIT: ${{ github.sha }}
 
       - name: Build binary (cross)
         if: ${{ matrix.cross }}
         run: cross build --release --locked --target ${{ matrix.target }} -p jamjet-api
         working-directory: runtime
+        env:
+          JAMJET_BUILD_COMMIT: ${{ github.sha }}
 
       - name: Stage binary (Unix)
         if: runner.os != 'Windows'

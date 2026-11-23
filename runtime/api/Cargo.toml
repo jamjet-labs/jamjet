@@ -47,6 +47,10 @@ mime_guess = { workspace = true }
 # The in-process cron launcher implements `jamjet_timers::CronLauncher`.
 async-trait = { workspace = true }
 
+[build-dependencies]
+# Reads `.cargo_vcs_info.json` for the build commit.
+serde_json = { workspace = true }
+
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 # Paused time for tests of the claim route's bounded wait.
@@ -61,3 +65,7 @@ libsqlite3-sys = { workspace = true }
 base64 = "0.22"
 # Path only, no version: cargo drops it when it packages this crate.
 jamjet-testkit = { path = "../testkit" }
+# jamjet-state's fault points, for this crate's tests only (see
+# runtime/testkit/Cargo.toml). Path-only, so cargo drops it when it packages
+# this crate.
+jamjet-state = { path = "../state", features = ["test-hooks"] }

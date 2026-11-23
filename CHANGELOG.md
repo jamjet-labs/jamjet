@@ -11,6 +11,14 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `/health` reports the commit the engine was built from (`commit`, null when the build had no
+  record of it, and `commit_source`: `build-env`, `git`, `crate-package` or `none`) and a `features` list a
+  client can check before it relies on a newer route. A build with `JAMJET_BUILD_COMMIT` set
+  to anything but 40 hex characters fails. The Docker image takes it as a build argument, and
+  the release builds pass it, including the cross-compiled one (`runtime/Cross.toml` passes
+  the variable through).
+- `JAMJET_STOP_TIMEOUT_SECS` says how long the platform waits between SIGTERM and SIGKILL.
+  On a platform that sets `K_SERVICE` it is 10 s.
 - `GET /approvals` lists pending approvals across runs, oldest first, with the digest to echo
   and the deadline. It reads the approvals read model, which can lag the log by one projector
   tick; the approve route still decides.
@@ -74,6 +82,16 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- With `K_SERVICE` set, the server refuses a SQLite file, because such platforms lose their
+  disk when an instance stops. `JAMJET_ALLOW_EPHEMERAL_STORE=1` allows it with a warning.
+  Only `serve` checks. Nothing changes off such a platform.
+- The shutdown fits the stop timeout: on a platform the default grace is 4 s, not 20 s, and a
+  grace that does not fit stops startup. A by-execution claim that is waiting when the stop
+  signal arrives answers `{"claimed": false, "reason": "draining"}` within half a second. A claim that
+  arrives after draining has started gets `{"claimed": false}` with no reason; a client
+  should ask again after about a second, and the next claim usually lands on another instance.
+- Docker images are pushed for `crates-v*` tags only, and `latest` is the newest release. A
+  manual run of the image workflow on a branch fails before it builds.
 - Sending the same decision twice answers 200 with the first decision's sequence and records
   nothing. A different decision on a decided request is still 409. A decision on a decided
   request by another principal now says it was already decided, not that nothing is pending.
@@ -718,13 +736,44 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `jamjet dev --db PATH` creates the folder for the database.
 
-- **Postgres state store (preview).** `jamjet_state::PgBackend` keeps runs, events,
-  snapshots, the work queue, leases, run keys, tool effects, artifacts, tokens, tenants and
-  the approvals read model in one Postgres database. This is the store, usable from Rust;
-  the server uses it from the next change. SQLite stays the default and does not change.
-  - Several engines can share the database. A write into a run locks the run's row first,
-    claims skip rows another engine holds (`FOR UPDATE SKIP LOCKED`), and leases and
-    approval deadlines are decided on the database's clock.
+- **Postgres store (preview).** Set `DATABASE_URL=postgres://...` and the engine keeps runs,
+  events, the work queue, leases, tokens, agents and the audit log in one Postgres database,
+  through one connection pool. Several engines can share the database: claims skip rows
+  another engine holds, and leases and approval deadlines follow the database's clock. Run
+  `jamjet-server migrate` before you start a new version. The server refuses a schema older
+  or newer than it was built for. Cron is not supported on Postgres yet. SQLite stays the
+  default and does not change. The server logs `Postgres store (preview)` once at start. See
+  docs/guides/deployment.md, "Postgres (preview)".
+  - `jamjet-server migrate` applies the pending migrations and exits 0. Two runs at once
+    take turns: the second waits and then applies nothing. `jamjet-server migrate --check`
+    changes nothing. Both exit 3 when the database is newer than this build and 4 when a
+    migration is half done or differs from this build's; `--check` exits 2 when the schema
+    is behind or empty. Any other failure exits 1. On SQLite, `migrate` migrates the file
+    as the server does when it opens it, and `--check` is refused.
+  - The server checks the schema at start and refuses one that is empty, behind, newer,
+    half done or changed, naming what to do.
+  - With `JAMJET_EMBED_CRON=1` the server stops at start on Postgres, since each engine
+    would fire every schedule, and the message says to set `JAMJET_EMBED_CRON=0` or unset
+    it. The Docker image sets `JAMJET_EMBED_CRON=1`, so pass `-e JAMJET_EMBED_CRON=0` with
+    a Postgres URL. In dev mode the cron scheduler is skipped with a warning and `/cron`
+    answers 400, as with `STORAGE_BACKEND=memory`.
+  - `jamjet-server token create` and `token revoke` work against a migrated Postgres
+    database with the same `DATABASE_URL`. A token is accepted by every engine on it.
+  - One audit chain for every engine on the database. An append locks the chain's head
+    row, so two engines never link two entries to one head. Entries are dated by the
+    database's clock. Every engine and every `token` command must use the same audit
+    signing settings.
+  - An approval request, decision, expiry or escalation is appended with an outbox row in
+    the same write. The engine still seals it right after. A row whose seal was lost (the
+    engine stopped between the two, or the audit write failed) is sealed by a drain that
+    each engine runs at start and every 2 seconds. After three failed seals of one event,
+    the run's log records the gap (`AuditSealFailed`) while the drain keeps trying. Each
+    event's gap is recorded once, whether the engine's own seal or a drain records it, and
+    never not at all. A row that cannot be read, or whose seal keeps failing, does not hold
+    up the rows behind it.
+  - Agents are kept in the same database (`jamjet_agents::PgAgentRegistry`).
+  - A write into a run locks the run's row first, claims use `FOR UPDATE SKIP LOCKED`,
+    and leases and approval deadlines are decided on the database's clock.
   - `jamjet_state::postgres::migrate` creates or updates the schema. `PgBackend::connect`
     runs no migration and refuses a schema that is empty, behind, ahead, half applied or
     changed. `PgBackend::for_tenant` gives one tenant's view, on the same pool. Each
@@ -755,14 +804,16 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     - Text cannot hold a NUL. A node id, queue, worker id, error text, key or name with one
       is refused with `Database("text contains a NUL character")`, and nothing is written.
       JSON is stored as text, so a `\u0000` inside a run's input or state reads back as
-      written.
+      written. A `GET /audit` filter with a NUL matches nothing, as on SQLite.
     - A pending-approvals cursor whose time or run id does not parse is a `Database` error.
     - Node ids sort bytewise, whatever the database's collation.
     - A token's `created_at` is the database's time. Stored times keep microseconds.
   - The Postgres tests run when `JAMJET_TEST_POSTGRES_URL` names a server
     (`runtime/scripts/pg-test.sh up` starts one in Docker) and skip otherwise.
     `JAMJET_REQUIRE_POSTGRES_TESTS=1` makes a missing URL a failure, as in CI. The tenant
-    check, `pg_scope`, runs the conformance suite once more on a tenant's view.
+    check, `pg_scope`, runs the conformance suite once more on a tenant's view. On Postgres
+    the log order case runs eight writers of 250 appends each, not 2,000: each conditional
+    append reads the whole log, so its cost grows with the square of the count.
 
 ### Fixed
 
@@ -880,6 +931,11 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`patch_append_array` on SQLite keeps every value.** It read the run's state and
   wrote it back in two statements, so two appends at once could each write back only
   their own value, and one was lost. The read and the write are one transaction now.
+- **Approval read-model rows only move forward.** A late projector batch could put a
+  decided approval back to pending, and move the projector's checkpoint back. A row or a
+  checkpoint is now kept when the stored one is newer, on every store.
+- **The projector reads every running run.** It paged through running runs by offset, so
+  each run that finished behind the walk made it skip one. It walks them by id now.
 - **A tenant-scoped SQLite store no longer writes into another tenant's run.** A scoped
   `append_event` could append to a run of another tenant. It now answers `NotFound`, as
   for a run that does not exist. Commits, snapshots, queued items, approval projections
@@ -914,6 +970,37 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `StateBackend::finalize_rollover_fenced` settles only a claimed item of the run it
   names, on every store. A fence of 0 used to settle a pending item, and a run could
   settle another run's item.
+- `StateBackend::apply_approval_projection`, `apply_approval_projection_batch` and
+  `set_projector_checkpoint` are forward only: a caller can no longer move a checkpoint
+  back. Writing the same sequence again still writes.
+- When the store cannot be reached, the token check on every authenticated route, the
+  approve route and `GET /audit` answer 503 with `Retry-After: 1`. They answered 500.
+- `waiting_for` in `GET /executions/:id`, `GET /executions?waiting_for=` and the approve
+  answer is read on the store's clock, as approval deadlines are.
+- The audit enricher reads the chain's head inside the append now, so a head it cannot
+  read is reported as "audit log write failed: ..." (it was "audit log head unreadable:
+  ..."). A store clock it cannot read is "audit clock unreadable: ...".
+- New public API, for the audit log on Postgres: `AuditBackend::append_sealed` and
+  `AuditBackend::now`, both with defaults that keep the old behaviour; `SealOntoHead`;
+  `jamjet_audit::PgAuditBackend`; the `jamjet_audit::outbox` module (`drain`); and
+  `jamjet_state::approvals::SEALED_EVENT_KINDS` and `try_record_seal_gap`.
+- `AuditError` has a new variant, `Unavailable(String)`. A downstream exhaustive `match`
+  on it stops compiling. The Postgres audit log answers it on every path (append, head,
+  `now`, query, count) when no connection is free or the connection is lost before the
+  commit; an error from the commit itself is a `Database` error, "commit outcome unknown".
+  `AuditError` also converts from `StateBackendError`, as a `Database` error.
+- `jamjet_api::approvals::SubmitError` has a new variant, `Unavailable(String)`, answered
+  with 503. A downstream exhaustive `match` on it stops compiling.
+- `jamjet_state::postgres::migrate` returns `MigrateError` (`Refused` with the schema's
+  state, or `Failed`) instead of a `String`. New: `migrate_with`, `schema_state_at`,
+  `MIGRATE_LOCK`, `SchemaState::can_migrate`, `OutboxRow`, and `statement_error`, now
+  public. `migrate` runs sqlx's migrator through `run_direct`, a hidden sqlx API checked at
+  sqlx 0.9.1; a sqlx upgrade must check it again.
+- Test builds only: `jamjet-server` arms `JAMJET_TEST_CRASH_AT` at start, and there are new
+  fault points `dispatch.after_commit`, `audit.seal.before_commit` and
+  `decision.after_append_before_seal` (on the REST approve route and the MCP approve tool
+  alike). A release build has no test hooks, and CI fails the build if
+  `jamjet-server` names `JAMJET_TEST_CRASH_AT`.
 
 ---
 

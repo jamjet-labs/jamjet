@@ -33,7 +33,7 @@ impl SqliteAgentRegistry {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn status_to_str(s: &AgentStatus) -> &'static str {
+pub(crate) fn status_to_str(s: &AgentStatus) -> &'static str {
     match s {
         AgentStatus::Registered => "registered",
         AgentStatus::Active => "active",
@@ -43,7 +43,7 @@ fn status_to_str(s: &AgentStatus) -> &'static str {
     }
 }
 
-fn str_to_status(s: &str) -> Result<AgentStatus, String> {
+pub(crate) fn str_to_status(s: &str) -> Result<AgentStatus, String> {
     match s {
         "registered" => Ok(AgentStatus::Registered),
         "active" => Ok(AgentStatus::Active),

@@ -217,6 +217,15 @@ pub const POINTS: &[(&str, u32)] = &[
     // before its `BEGIN`, and the start of each retry.
     ("pg_tx.attempt", 1),
     ("pg_tx.retry", 1),
+    // api/src/routes.rs: a seam, between a decision's append and its seal,
+    // on the REST route and the MCP tool alike.
+    ("decision.after_append_before_seal", 1),
+    // scheduler/src/runner.rs: a seam, after a pass that dispatched work has
+    // committed and before the scheduler updates what it keeps for the run.
+    ("dispatch.after_commit", 1),
+    // audit/src/postgres.rs: the line before every commit of an append to
+    // the Postgres audit log, a seal onto the head included.
+    ("audit.seal.before_commit", 1),
 ];
 
 /// A fault point: the boundary after statement `$step` of the transaction

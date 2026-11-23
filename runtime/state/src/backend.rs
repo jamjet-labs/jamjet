@@ -1026,6 +1026,10 @@ pub trait StateBackend: Send + Sync {
     /// transaction.  Crash-safe: if the process dies between the UPSERT and the
     /// checkpoint write they are the same commit, so neither can be partially
     /// applied.
+    ///
+    /// Forward only: a stored row with a higher `last_sequence` is kept, and
+    /// so is a higher stored checkpoint, so a second projector's stale write
+    /// never moves the read model back. Equal values are written again.
     async fn apply_approval_projection(
         &self,
         row: ApprovalProjectionRow,
@@ -1045,6 +1049,9 @@ pub trait StateBackend: Send + Sync {
     /// If `rows` is empty the checkpoint is still advanced (callers that want
     /// to skip the checkpoint update when there is nothing to write should
     /// check before calling).
+    ///
+    /// Forward only, row by row and for the checkpoint, as
+    /// [`apply_approval_projection`](Self::apply_approval_projection).
     async fn apply_approval_projection_batch(
         &self,
         rows: Vec<ApprovalProjectionRow>,
@@ -1074,6 +1081,8 @@ pub trait StateBackend: Send + Sync {
     /// Used when a batch of events contained NO approval events (only
     /// non-approval events) — the checkpoint must still advance to `batch_max`
     /// so those events are not re-scanned on the next tick.
+    ///
+    /// Forward only: a higher stored checkpoint is kept.
     async fn set_projector_checkpoint(
         &self,
         projection_name: &str,

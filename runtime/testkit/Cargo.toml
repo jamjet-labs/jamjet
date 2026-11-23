@@ -12,6 +12,7 @@ publish = false
 # when it packages them, so nothing published depends on it.
 
 [dependencies]
+jamjet-audit = { path = "../audit" }
 jamjet-core = { path = "../core" }
 jamjet-state = { path = "../state" }
 async-trait = { workspace = true }

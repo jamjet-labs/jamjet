@@ -22,7 +22,7 @@ use jamjet_state::event::EventKind;
 use jamjet_state::Event;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 mod support;
@@ -121,6 +121,15 @@ async fn envs() -> Vec<Env> {
     let mut out = Vec::new();
     for tb in support::backends().await {
         let backend = tb.dyn_backend();
+        out.push(env_on(tb, backend).await);
+    }
+    out
+}
+
+/// [`envs`]'s environment for one backend, serving `backend` (the backend
+/// itself or a wrapper of it).
+async fn env_on(tb: support::TestBackend, backend: Arc<dyn StateBackend>) -> Env {
+    {
         let app = build_router_with_opts(support::make_state(backend.clone()), false);
         let (alice, _) = backend.create_token("alice", "developer").await.unwrap();
         let (bob, _) = backend.create_token("bob", "reviewer").await.unwrap();
@@ -149,9 +158,8 @@ async fn envs() -> Vec<Env> {
             .await;
             assert!(st.is_success(), "{}: {st} {body}", env.name);
         }
-        out.push(env);
+        env
     }
-    out
 }
 
 async fn call(
@@ -671,6 +679,105 @@ async fn the_mcp_tool_text_names_waiting_for_and_not_paused() {
         assert!(
             approve.contains("GET /approvals"),
             "{}: {approve}",
+            env.name
+        );
+    }
+}
+
+/// The store's clock, set apart from this process's once it is `Some`.
+#[derive(Default)]
+struct StoreClock(Mutex<Option<chrono::DateTime<Utc>>>);
+
+impl jamjet_testkit::Hooks for StoreClock {
+    fn store_now(&self) -> Option<chrono::DateTime<Utc>> {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// A request's deadline is judged on the store's clock, as the approve
+/// routes judge it: with the store's clock a day ahead of this process's, a
+/// request with ten minutes left by this process's clock has passed, so the
+/// run waits on the engine, in the single read and in the filtered list.
+#[tokio::test]
+async fn a_deadline_is_judged_on_the_store_clock() {
+    for tb in support::backends().await {
+        let clock = Arc::new(StoreClock::default());
+        let store: Arc<dyn StateBackend> = Arc::new(jamjet_testkit::Intercept::new(
+            tb.dyn_backend(),
+            clock.clone(),
+        ));
+        let env = env_on(tb, store).await;
+        let eid = start(&env, "wf-deadline").await;
+        raise_request(&env).await;
+        assert_eq!(waiting_for(&env, &eid).await, "approval", "{}", env.name);
+
+        *clock.0.lock().unwrap() = Some(Utc::now() + Duration::days(1));
+        assert_eq!(waiting_for(&env, &eid).await, "engine", "{}", env.name);
+        for (state, listed) in [("approval", false), ("engine", true)] {
+            let (st, body) = call(
+                &env.app,
+                "GET",
+                &format!("/executions?status=running&waiting_for={state}"),
+                &env.alice,
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+            let ids: Vec<ExecutionId> = body["executions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| id_of(&e["execution_id"]))
+                .collect();
+            assert_eq!(ids.contains(&eid), listed, "{} {state}: {body}", env.name);
+        }
+    }
+}
+
+/// The answer to a decision reads `waiting_for` on the store's clock too.
+/// Beside the gated `pay`, `side` is held under a lease that is live by this
+/// process's clock: with the store's clock a day ahead it has lapsed, so the
+/// run waits on a worker, not on the held step.
+#[tokio::test]
+async fn a_decision_answer_reads_waiting_for_on_the_store_clock() {
+    for tb in support::backends().await {
+        let clock = Arc::new(StoreClock::default());
+        let store: Arc<dyn StateBackend> = Arc::new(jamjet_testkit::Intercept::new(
+            tb.dyn_backend(),
+            clock.clone(),
+        ));
+        let env = env_on(tb, store).await;
+        let eid = start(&env, "wf-fan").await;
+        let first = take_step(&env).await;
+        complete(&env, &first).await;
+        scheduler_pass(&env).await;
+        raise_request(&env).await;
+        let (st, side) = call(
+            &env.app,
+            "POST",
+            "/work-items/claim",
+            &env.alice,
+            Some(json!({ "worker_id": "w", "queue_types": ["side-jobs"] })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {side}", env.name);
+        assert_eq!(side["work_item"]["node_id"], "side", "{}: {side}", env.name);
+
+        *clock.0.lock().unwrap() = Some(Utc::now() + Duration::days(1));
+        let digest = request_context(&events(&env, &eid).await)["action_digest"].clone();
+        let (st, body) = call(
+            &env.app,
+            "POST",
+            &format!("/executions/{}/approve", exec_path(&eid)),
+            &env.bob,
+            Some(json!({ "decision": "approved", "node_id": "pay", "action_digest": digest })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}: {body}", env.name);
+        assert_eq!(
+            body.get("waiting_for"),
+            Some(&json!("worker")),
+            "{}: {body}",
             env.name
         );
     }

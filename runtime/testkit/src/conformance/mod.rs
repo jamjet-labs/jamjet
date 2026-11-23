@@ -15,6 +15,7 @@
 //! [`StoreHooks`] for what the trait cannot do (backdate a lease, read a raw
 //! row, reopen the store). So the same case runs unchanged on every backend.
 
+pub mod audit;
 pub mod cases;
 mod factories;
 mod hooks;
@@ -398,8 +399,8 @@ macro_rules! for_each_case {
                 decision_and_expiry_of_one_request_land_once,
                 concurrent_appends_keep_sequences_dense,
                 concurrent_array_appends_keep_every_value,
-                #[ignore = "known gap: a stale projection batch can move a row back; fixed with the Postgres audit change"]
                 a_stale_projection_batch_never_regresses,
+                a_stale_row_or_checkpoint_write_never_regresses,
             ]
         );
         $m!(

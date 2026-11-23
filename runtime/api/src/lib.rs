@@ -4,12 +4,14 @@ pub mod cli;
 pub mod config;
 pub mod cron;
 pub mod error;
+pub mod features;
 pub mod mcp_bridge;
 pub mod routes;
 pub mod run_key;
 pub mod startup;
 pub mod state;
 pub mod static_files;
+pub mod store;
 pub mod waiting;
 pub mod worker_model;
 

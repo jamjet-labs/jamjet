@@ -720,3 +720,70 @@ pub async fn a_stale_projection_batch_never_regresses(fx: &Fixture) {
         "{name}: the two batches never overlapped in {ROUNDS} rounds, so no round raced"
     );
 }
+
+/// The single-row write and the checkpoint-only write move forward only,
+/// as the batch does: each from the second handle after a newer one from
+/// the first changes nothing and is no error. A write at the stored
+/// sequence lands. In one batch, an older row of a node after a newer one
+/// is stale too.
+pub async fn a_stale_row_or_checkpoint_write_never_regresses(fx: &Fixture) {
+    let Some((name, first, second)) = handles(fx) else {
+        return;
+    };
+    let id = ExecutionId::new();
+    first.create_execution(run(&id)).await.unwrap();
+
+    first
+        .apply_approval_projection(projected(&id, "approved", 9), "approvals", 9)
+        .await
+        .unwrap();
+    second
+        .apply_approval_projection(projected(&id, "pending", 5), "approvals", 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        projection(&*first, &id).await,
+        (vec![("approved".to_string(), 9)], 9),
+        "{name}: a stale row after a newer one"
+    );
+
+    first
+        .set_projector_checkpoint("approvals", &id, 12)
+        .await
+        .unwrap();
+    second
+        .set_projector_checkpoint("approvals", &id, 7)
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .get_projector_checkpoint("approvals", &id)
+            .await
+            .unwrap(),
+        12,
+        "{name}: a stale checkpoint after a newer one"
+    );
+
+    second
+        .apply_approval_projection(projected(&id, "rejected", 9), "approvals", 12)
+        .await
+        .unwrap();
+    assert_eq!(
+        projection(&*first, &id).await,
+        (vec![("rejected".to_string(), 9)], 12),
+        "{name}: a write at the stored sequence"
+    );
+
+    let id = ExecutionId::new();
+    first.create_execution(run(&id)).await.unwrap();
+    let rows = vec![projected(&id, "approved", 9), projected(&id, "pending", 5)];
+    first
+        .apply_approval_projection_batch(rows, "approvals", &id, 9)
+        .await
+        .unwrap();
+    assert_eq!(
+        projection(&*first, &id).await,
+        (vec![("approved".to_string(), 9)], 9),
+        "{name}: an older row of a node later in one batch"
+    );
+}

@@ -1,16 +1,17 @@
 //! `jamjet-server`'s command line: no arguments serves; `token create` issues
-//! an API token and `token revoke` revokes one.
+//! an API token, `token revoke` revokes one, and `migrate` brings a Postgres
+//! schema up to this build.
 //!
 //! Before this there was no way to issue a token: `create_token` had no
 //! caller outside tests, so a server with authentication on refused every
 //! request until someone wrote a row into `api_tokens` by hand.
 
 use crate::config::ApiConfig;
-use jamjet_audit::{
-    ActorType, AuditBackend, AuditEnricher, AuditQuery, AuditRecord, AuditSigner,
-    SqliteAuditBackend,
-};
-use jamjet_state::{ApiToken, SqliteBackend, StateBackend, TenantId, DEFAULT_TENANT};
+use crate::startup::{shown_url, store_kind, StoreKind};
+use crate::store::TokenStore;
+use jamjet_audit::{ActorType, AuditBackend, AuditEnricher, AuditQuery, AuditRecord, AuditSigner};
+use jamjet_state::postgres::{MigrateError, SchemaState};
+use jamjet_state::{ApiToken, DEFAULT_TENANT};
 
 pub const USAGE: &str = "\
 Usage:
@@ -19,17 +20,33 @@ Usage:
                                      issue an API token and print it once
   jamjet-server token revoke <token id>
                                      revoke a token (its id is printed when it is issued)
+  jamjet-server migrate [--check]    bring a Postgres schema up to this build, or with
+                                     --check only report where it stands
   jamjet-server help                 show this message
 
 Roles: operator, developer, reviewer, viewer.
 
 The token commands open the database the server uses: DATABASE_URL, or
-.jamjet/runtime.db in the working directory. It must exist, so start the
-server against it once first. Only the token's SHA-256 hash is stored; the
+.jamjet/runtime.db in the working directory. It must hold the server's
+schema: start the server against it once first, or on Postgres run
+`jamjet-server migrate`. Only the token's SHA-256 hash is stored; the
 token itself is printed once, on stdout. Each issue and revocation is sealed
 into the audit log (token_issued, token_revoked), so run them with the audit
 signing settings the server uses: they refuse when the log's newest entry is
-signed and this environment cannot sign the same way.";
+signed and this environment cannot sign the same way.
+
+`migrate` reads DATABASE_URL as the token commands do. On Postgres it applies
+the pending migrations and exits 0; it exits 3 when the database is newer than
+this build and 4 when a migration is half done or changed. `--check` changes
+nothing and exits 0 current, 2 behind, 3 newer, 4 half done or changed. On
+SQLite it migrates the file as the server does when it opens it.";
+
+/// `migrate --check`: the schema is behind this build (or empty).
+pub const MIGRATE_BEHIND: i32 = 2;
+/// `migrate`: the schema is newer than this build.
+pub const MIGRATE_AHEAD: i32 = 3;
+/// `migrate`: a migration is half done, or differs from this build's.
+pub const MIGRATE_DIRTY: i32 = 4;
 
 /// The roles a token may have, as `api_tokens.role` stores them.
 pub const ROLES: &[&str] = &["operator", "developer", "reviewer", "viewer"];
@@ -41,6 +58,10 @@ pub enum Command {
     Help,
     TokenCreate(TokenRequest),
     TokenRevoke(String),
+    /// `migrate`, or with `check` only report where the schema stands.
+    Migrate {
+        check: bool,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,6 +90,11 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             },
             Some(other) => Err(format!("unknown token command {other:?}")),
             None => Err("missing token command (`token create` or `token revoke`)".into()),
+        },
+        Some("migrate") => match (it.next(), it.next()) {
+            (None, _) => Ok(Command::Migrate { check: false }),
+            (Some("--check"), None) => Ok(Command::Migrate { check: true }),
+            _ => Err("`migrate` takes no argument but `--check`".into()),
         },
         Some(other) => Err(format!("unknown argument {other:?}")),
     }
@@ -127,48 +153,21 @@ pub async fn create_token(
     database_url: &str,
     req: &TokenRequest,
 ) -> anyhow::Result<(String, ApiToken)> {
-    let backend = SqliteBackend::connect_existing(database_url)
+    TokenStore::open(database_url)
+        .await?
+        .create_token(req)
         .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-    if req.tenant == DEFAULT_TENANT {
-        return backend
-            .create_token(&req.name, &req.role)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to create the token: {e}"));
-    }
-    let tenant = TenantId::from(req.tenant.clone());
-    if backend
-        .get_tenant(&tenant)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to read tenant {:?}: {e}", req.tenant))?
-        .is_none()
-    {
-        anyhow::bail!(
-            "no tenant {:?}; create it first (POST /tenants, operator role)",
-            req.tenant
-        );
-    }
-    backend
-        .for_tenant(tenant)
-        .create_token(&req.name, &req.role)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to create the token: {e}"))
 }
 
-/// The audit log of the database at `database_url`, signed as the server's
-/// environment says (`AuditSigner::from_env`). Refused when the log's newest
-/// entry is signed and this environment cannot sign the same way
-/// ([`refuse_another_key`]).
-async fn audit_log(database_url: &str) -> anyhow::Result<AuditEnricher> {
+/// The audit log of `store`, signed as the server's environment says
+/// (`AuditSigner::from_env`). Refused when the log's newest entry is signed
+/// and this environment cannot sign the same way ([`refuse_another_key`]).
+async fn audit_log(store: &TokenStore) -> anyhow::Result<AuditEnricher> {
     // The one switch these commands read, read strictly: a typo is an error,
     // not "off". Here, not before the command runs, so a revoke revokes
     // first whatever the switch says.
     crate::startup::env_flag(jamjet_audit::signer::ALLOW_INSECURE_KEY_ENV)?;
-    let backend = std::sync::Arc::new(
-        SqliteAuditBackend::open(database_url)
-            .await
-            .map_err(|e| anyhow::anyhow!("cannot open the audit log in {database_url}: {e}"))?,
-    );
+    let backend = store.audit().await?;
     let audit = AuditEnricher::new(backend.clone());
     refuse_another_key(backend.as_ref(), audit.signer()).await?;
     if !audit.signer().can_sign() {
@@ -321,11 +320,9 @@ pub async fn issue_token(
     req: &TokenRequest,
 ) -> anyhow::Result<(String, ApiToken)> {
     // The database first: its refusal says how to make one.
-    SqliteBackend::connect_existing(database_url)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let audit = audit_log(database_url).await?;
-    let (token, info) = create_token(database_url, req).await?;
+    let store = TokenStore::open(database_url).await?;
+    let audit = audit_log(&store).await?;
+    let (token, info) = store.create_token(req).await?;
     let record = token_record(
         "token_issued",
         &info.id,
@@ -334,11 +331,7 @@ pub async fn issue_token(
         &info.name,
     );
     if let Err(e) = audit.seal_record(record).await {
-        let undone = SqliteBackend::connect_existing(database_url)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?
-            .revoke_token(&info.id)
-            .await;
+        let undone = store.revoke_token(&info.id).await;
         anyhow::bail!(
             "the audit log could not record the token, so it was not issued ({e}){}",
             match undone {
@@ -362,9 +355,13 @@ pub async fn run_token_create(req: &TokenRequest) -> anyhow::Result<()> {
     // The id first: if stdout is closed, the operator still learns which
     // token to revoke.
     eprintln!(
-        "Created token {} in {database_url} (role {}, tenant {}, name {:?}). It is \
+        "Created token {} in {} (role {}, tenant {}, name {:?}). It is \
          shown once; only its SHA-256 hash is stored.",
-        info.id, info.role, info.tenant_id, info.name
+        info.id,
+        shown_url(&database_url),
+        info.role,
+        info.tenant_id,
+        info.name
     );
     {
         use std::io::Write;
@@ -396,7 +393,8 @@ fn token_database() -> anyhow::Result<String> {
     if std::env::var("STORAGE_BACKEND").as_deref() == Ok("memory") {
         anyhow::bail!(
             "STORAGE_BACKEND=memory keeps tokens inside the server process, so no \
-             other process can add one. Use SQLite (unset STORAGE_BACKEND) to use tokens."
+             other process can add one. Use SQLite or Postgres (unset STORAGE_BACKEND) \
+             to use tokens."
         );
     }
     // Not `database_url`: that creates `.jamjet`, and a command run in the
@@ -408,19 +406,13 @@ fn token_database() -> anyhow::Result<String> {
 /// revoked whether or not the log records it (revoking is the safe side);
 /// a record that fails is reported as an error.
 pub async fn revoke_token(database_url: &str, id: &str) -> anyhow::Result<()> {
-    let backend = SqliteBackend::connect_existing(database_url)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let store = TokenStore::open(database_url).await?;
     // Revoke first: a log that cannot be opened, or is signed with another
     // key, must not keep a token alive.
-    let Some(revoked) = backend
-        .revoke_token(id)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to revoke the token: {e}"))?
-    else {
-        anyhow::bail!("no active token {id:?} in {database_url}");
+    let Some(revoked) = store.revoke_token(id).await? else {
+        anyhow::bail!("no active token {id:?} in {}", shown_url(database_url));
     };
-    let audit = audit_log(database_url).await.map_err(|e| {
+    let audit = audit_log(&store).await.map_err(|e| {
         anyhow::anyhow!("token {id} is revoked, but the audit log could not record it: {e}")
     })?;
     let record = token_record(
@@ -443,9 +435,128 @@ pub async fn run_token_revoke(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `jamjet-server migrate [--check]`: the exit code, after saying on stdout
+/// where the schema stands, or on stderr why it cannot go on. Never prints
+/// the URL's password.
+pub async fn run_migrate(check: bool) -> i32 {
+    match migrate_command(check).await {
+        Ok((code, said)) => {
+            if code == 0 {
+                println!("{said}");
+            } else {
+                eprintln!("jamjet-server migrate: {said}");
+            }
+            code
+        }
+        Err(e) => {
+            eprintln!("jamjet-server migrate: {e}");
+            1
+        }
+    }
+}
+
+async fn migrate_command(check: bool) -> anyhow::Result<(i32, String)> {
+    let config = ApiConfig::default();
+    let storage = std::env::var("STORAGE_BACKEND").ok();
+    let url = crate::startup::existing_database_url(&config);
+    match store_kind(storage.as_deref(), &url) {
+        StoreKind::Memory => {
+            anyhow::bail!("STORAGE_BACKEND=memory keeps no schema; there is nothing to migrate")
+        }
+        StoreKind::Postgres if check => {
+            let state = jamjet_state::postgres::schema_state_at(&url)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            Ok(check_answer(&state))
+        }
+        StoreKind::Postgres => match jamjet_state::postgres::migrate(&url).await {
+            Ok(report) => Ok((
+                0,
+                format!(
+                    "schema at version {} ({} applied)",
+                    report.version, report.applied
+                ),
+            )),
+            Err(MigrateError::Refused(state)) => {
+                let (code, why) = check_answer(&state);
+                Ok((code, why))
+            }
+            Err(MigrateError::Failed(why)) => anyhow::bail!(why),
+        },
+        StoreKind::Sqlite if check => anyhow::bail!(
+            "`migrate --check` reads a Postgres schema; SQLite migrates itself when the \
+             server opens it"
+        ),
+        StoreKind::Sqlite => {
+            // As the server does at startup: the state schema, then the
+            // audit log's, in the file the server would open.
+            let url = crate::startup::database_url(&config);
+            let backend = jamjet_state::SqliteBackend::open(&url)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to open {url}: {e}"))?;
+            jamjet_audit::SqliteAuditBackend::new(backend.pool())
+                .migrate()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to migrate the audit log in {url}: {e}"))?;
+            Ok((0, format!("SQLite schema in {url} is current")))
+        }
+    }
+}
+
+/// The exit code and message for a Postgres schema in `state`, as
+/// `migrate --check` answers it.
+fn check_answer(state: &SchemaState) -> (i32, String) {
+    let code = match state {
+        SchemaState::Current { .. } => 0,
+        SchemaState::Empty | SchemaState::Behind { .. } => MIGRATE_BEHIND,
+        SchemaState::Ahead { .. } => MIGRATE_AHEAD,
+        SchemaState::Dirty { .. } | SchemaState::Changed { .. } => MIGRATE_DIRTY,
+    };
+    let said = match (state, state.refusal()) {
+        (SchemaState::Current { version }, _) => format!("schema at version {version} (current)"),
+        (_, Some(why)) => why,
+        (_, None) => format!("{state:?}"),
+    };
+    (code, said)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrate_takes_only_check() {
+        assert_eq!(
+            parse_args(&args("migrate")),
+            Ok(Command::Migrate { check: false })
+        );
+        assert_eq!(
+            parse_args(&args("migrate --check")),
+            Ok(Command::Migrate { check: true })
+        );
+        for bad in ["migrate --force", "migrate --check --check", "migrate up"] {
+            assert!(parse_args(&args(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn check_codes_follow_the_schema_state() {
+        let code = |s: SchemaState| check_answer(&s).0;
+        assert_eq!(code(SchemaState::Current { version: 2 }), 0);
+        assert_eq!(code(SchemaState::Empty), MIGRATE_BEHIND);
+        assert_eq!(
+            code(SchemaState::Behind { at: 1, needs: 2 }),
+            MIGRATE_BEHIND
+        );
+        assert_eq!(code(SchemaState::Ahead { at: 9, knows: 2 }), MIGRATE_AHEAD);
+        assert_eq!(code(SchemaState::Dirty { version: 2 }), MIGRATE_DIRTY);
+        assert_eq!(code(SchemaState::Changed { version: 1 }), MIGRATE_DIRTY);
+        assert_eq!(
+            (MIGRATE_BEHIND, MIGRATE_AHEAD, MIGRATE_DIRTY),
+            (2, 3, 4),
+            "the codes the guide documents"
+        );
+    }
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()

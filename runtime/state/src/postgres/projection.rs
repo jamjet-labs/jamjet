@@ -67,8 +67,10 @@ impl NewRow {
 }
 
 /// Upsert `rows` into the run's projection in one statement, every row at
-/// one time. Returns how many rows it wrote: none when a view does not own
-/// the run. `rows` hold one row per node.
+/// one time. A stored row with a later `last_sequence` is kept: a stale
+/// batch from a second projector never moves a row back. Returns how many
+/// rows it wrote: none when a view does not own the run, or when every
+/// stored row is newer. `rows` hold one row per node.
 async fn upsert_rows(
     conn: &mut PgConnection,
     run: Uuid,
@@ -100,7 +102,8 @@ async fn upsert_rows(
                user_id = EXCLUDED.user_id, comment = EXCLUDED.comment, \
                last_sequence = EXCLUDED.last_sequence, tool_name = EXCLUDED.tool_name, \
                approver = EXCLUDED.approver, context_json = EXCLUDED.context_json, \
-               updated_at = EXCLUDED.updated_at",
+               updated_at = EXCLUDED.updated_at \
+             WHERE proj_approvals.last_sequence <= EXCLUDED.last_sequence",
         ),
         Some(_) => sqlx::query(
             "INSERT INTO proj_approvals (execution_id, node_id, status, user_id, comment, \
@@ -118,7 +121,8 @@ async fn upsert_rows(
                user_id = EXCLUDED.user_id, comment = EXCLUDED.comment, \
                last_sequence = EXCLUDED.last_sequence, tool_name = EXCLUDED.tool_name, \
                approver = EXCLUDED.approver, context_json = EXCLUDED.context_json, \
-               updated_at = EXCLUDED.updated_at",
+               updated_at = EXCLUDED.updated_at \
+             WHERE proj_approvals.last_sequence <= EXCLUDED.last_sequence",
         ),
     };
     let mut query = query
@@ -138,8 +142,10 @@ async fn upsert_rows(
 }
 
 /// The statement that moves a projection's checkpoint for a run, the run's
-/// tenant read as [`upsert_rows`] reads it. Binds `$1` the projection, `$2`
-/// the run, `$3` the checkpoint and, scoped, `$4` the tenant.
+/// tenant read as [`upsert_rows`] reads it. It only moves forward: a stored
+/// checkpoint past `$3` stays, and the statement writes no row. Binds `$1`
+/// the projection, `$2` the run, `$3` the checkpoint and, scoped, `$4` the
+/// tenant.
 fn checkpoint_sql(scoped: bool) -> &'static str {
     if scoped {
         "INSERT INTO projector_checkpoints \
@@ -147,7 +153,8 @@ fn checkpoint_sql(scoped: bool) -> &'static str {
          SELECT $1, e.execution_id, $3, e.tenant_id, statement_timestamp() \
          FROM workflow_executions e WHERE e.execution_id = $2 AND e.tenant_id = $4 \
          ON CONFLICT (projection_name, execution_id) DO UPDATE SET \
-           last_sequence = EXCLUDED.last_sequence, updated_at = EXCLUDED.updated_at"
+           last_sequence = EXCLUDED.last_sequence, updated_at = EXCLUDED.updated_at \
+         WHERE projector_checkpoints.last_sequence <= EXCLUDED.last_sequence"
     } else {
         "INSERT INTO projector_checkpoints \
            (projection_name, execution_id, last_sequence, tenant_id, updated_at) \
@@ -156,7 +163,8 @@ fn checkpoint_sql(scoped: bool) -> &'static str {
              'default'), \
            statement_timestamp()) \
          ON CONFLICT (projection_name, execution_id) DO UPDATE SET \
-           last_sequence = EXCLUDED.last_sequence, updated_at = EXCLUDED.updated_at"
+           last_sequence = EXCLUDED.last_sequence, updated_at = EXCLUDED.updated_at \
+         WHERE projector_checkpoints.last_sequence <= EXCLUDED.last_sequence"
     }
 }
 
@@ -198,8 +206,9 @@ pub(super) async fn apply_approval_projection(
 
 /// Every row under `execution_id`, whatever run a row names, and the
 /// checkpoint, in one transaction; the checkpoint moves even when `rows` is
-/// empty. Where the batch holds two rows of one node, the later one is
-/// written, as one upsert after another would leave it.
+/// empty. Where the batch holds two rows of one node, the one with the
+/// higher `last_sequence` is written, the later one on a tie, as one
+/// forward-only upsert after another would leave it.
 pub(super) async fn apply_approval_projection_batch(
     b: &PgBackend,
     rows: Vec<ApprovalProjectionRow>,
@@ -210,7 +219,10 @@ pub(super) async fn apply_approval_projection_batch(
     no_nul("projection name", projection_name)?;
     let mut last: HashMap<&str, usize> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
-        last.insert(row.node_id.as_str(), i);
+        let kept = last.entry(row.node_id.as_str()).or_insert(i);
+        if rows[*kept].last_sequence <= row.last_sequence {
+            *kept = i;
+        }
     }
     let kept = rows
         .iter()
@@ -229,8 +241,25 @@ pub(super) async fn apply_approval_projection_batch(
     .await
 }
 
+/// Whether a run of the tenant `$2` has the id `$1`.
+const OWNS_RUN: &str = "SELECT EXISTS (SELECT 1 FROM workflow_executions \
+                        WHERE execution_id = $1 AND tenant_id = $2)";
+
+/// Whether `run` is a run of `tenant`: what a view may write into.
+async fn owns_run(conn: &mut PgConnection, run: Uuid, tenant: &str) -> Result<bool, TxError> {
+    let owned: bool = sqlx::query_scalar(OWNS_RUN)
+        .bind(run)
+        .bind(tenant)
+        .fetch_one(conn)
+        .await?;
+    Ok(owned)
+}
+
 /// The one body of both projection writes, as `pg.apply_approval_projection`
 /// in the fault points: the rows in one statement, then the checkpoint.
+/// A statement that wrote nothing found either newer rows (fine: the
+/// write only moves forward) or, on a view, a run that is not the view's
+/// (`NotFound`); only then is the run's owner read.
 async fn apply(
     b: &PgBackend,
     op: &'static str,
@@ -244,10 +273,17 @@ async fn apply(
     let not_found = || StateBackendError::NotFound(run.to_string());
     with_tx(&b.pool, op, |tx| {
         Box::pin(async move {
+            // The unscoped store writes into any run. A view's ownership is
+            // read, never taken from a row count: rows written into a run
+            // the checkpoint then finds is not the view's are rolled back.
+            let mut owned = scope.is_none();
             if !rows.is_empty() {
                 let written = upsert_rows(tx, run, scope, rows).await?;
-                if written == 0 {
-                    return Err(not_found().into());
+                if let (0, Some(tenant)) = (written, scope) {
+                    if !owns_run(tx, run, tenant).await? {
+                        return Err(not_found().into());
+                    }
+                    owned = true;
                 }
                 fault_point!("pg.apply_approval_projection", 1);
             }
@@ -255,8 +291,10 @@ async fn apply(
                 .execute(&mut **tx)
                 .await?
                 .rows_affected();
-            if moved == 0 {
-                return Err(not_found().into());
+            if let (0, false, Some(tenant)) = (moved, owned, scope) {
+                if !owns_run(tx, run, tenant).await? {
+                    return Err(not_found().into());
+                }
             }
             fault_point!("pg.apply_approval_projection", 2);
             Ok(())
@@ -335,7 +373,8 @@ pub(super) async fn get_projector_checkpoint(
     Ok(checkpoint.unwrap_or(0))
 }
 
-/// One statement; on a view, `NotFound` for a run that is not the view's.
+/// One statement, forward only; on a view, `NotFound` for a run that is not
+/// the view's, read only when the statement wrote nothing.
 pub(super) async fn set_projector_checkpoint(
     b: &PgBackend,
     projection_name: &str,
@@ -344,12 +383,22 @@ pub(super) async fn set_projector_checkpoint(
 ) -> BackendResult<()> {
     no_nul("projection name", projection_name)?;
     let run = execution_id.0;
-    let moved = checkpoint_query(projection_name, run, new_checkpoint, b.scope())
+    let scope = b.scope();
+    let moved = checkpoint_query(projection_name, run, new_checkpoint, scope)
         .execute(&b.pool)
         .await
         .map_err(statement_error)?
         .rows_affected();
-    if moved == 0 {
+    let Some(tenant) = scope.filter(|_| moved == 0) else {
+        return Ok(());
+    };
+    let owned: bool = sqlx::query_scalar(OWNS_RUN)
+        .bind(run)
+        .bind(tenant)
+        .fetch_one(&b.pool)
+        .await
+        .map_err(statement_error)?;
+    if !owned {
         return Err(StateBackendError::NotFound(run.to_string()));
     }
     Ok(())
