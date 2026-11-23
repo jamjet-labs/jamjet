@@ -42,7 +42,9 @@ def search_venues(city: str, date: str) -> str:
 def read_reply(venue: str) -> str:
     """Read the venue's emailed reply to our booking enquiry."""
     name = venue.strip().lower().replace(" ", "-")
-    reply = REPLIES / f"{name}.txt"
+    reply = (REPLIES / f"{name}.txt").resolve()
+    if reply.parent != REPLIES.resolve():
+        return "No reply yet."  # read only files in replies/
     return reply.read_text() if reply.exists() else "No reply yet."
 
 

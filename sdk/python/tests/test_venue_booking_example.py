@@ -325,9 +325,25 @@ def test_step12_tools_refuse_unknown_names_and_take_known_ones():
 
 
 def test_step12_refuses_amounts_that_are_not_positive_numbers():
-    out = run_step(STEP12, "-c", args=(PAY_AMOUNT, "'500'", "0", "-5", "True")).splitlines()
-    assert [line.split(":")[0] for line in out[:4]] == ["Refused"] * 4
-    assert out[4] == "0"
+    amounts = ("'500'", "0", "-5", "True", "float('nan')", "float('inf')")
+    out = run_step(STEP12, "-c", args=(PAY_AMOUNT, *amounts)).splitlines()
+    assert [line.split(":")[0] for line in out[:6]] == ["Refused"] * 6
+    assert out[6] == "0"
+
+
+READ = """
+import asyncio, sys
+from venue_tools import read_reply
+for venue in sys.argv[1:]:
+    print(asyncio.run(read_reply(venue=venue)).splitlines()[0])
+"""
+
+
+def test_step10_reads_replies_only_from_its_replies_folder():
+    # expected-no-gate.txt sits one folder up, beside venue_tools.py
+    out = run_step(STEP10, "-c", args=(READ, "../expected-no-gate", "Casa do Rio")).splitlines()
+    assert out[0] == "No reply yet."
+    assert out[1].startswith("Hello, and thank you")
 
 
 def test_step12_changes_only_the_tools():

@@ -9,6 +9,7 @@ the model as text, and nothing is written to payments.log.
 """
 
 import json
+import math
 from pathlib import Path
 
 from jamjet import tool
@@ -70,7 +71,7 @@ def pay_deposit(venue: str, amount: float) -> str:
     if name is None:
         return no_such_venue(venue)
     number = type(amount) in (int, float)
-    if not number or amount <= 0:
+    if not number or not math.isfinite(amount) or amount <= 0:
         return f"Refused: {amount!r} is not an amount I can pay."
     with PAYMENTS.open("a") as f:
         f.write(f"paid {amount} for {name}\n")
