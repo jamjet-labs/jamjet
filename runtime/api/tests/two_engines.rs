@@ -127,8 +127,15 @@ async fn every_node_once(backend: Backend, case: &str, runs: usize, budget: Dura
         return;
     };
     within(case, budget, async {
-        let a = Engine::start(&store, &[]).await;
-        let b = Engine::start(&store, &[]).await;
+        // Two hundred runs at once keep every connection of a pool of the
+        // harness's usual 5 busy, and a call that waits more than the acquire
+        // timeout for one is answered 503. The server's own default is 10.
+        let env: &[(&str, &str)] = match backend {
+            Backend::Postgres => &[("JAMJET_PG_POOL_SIZE", "10")],
+            Backend::Sqlite => &[],
+        };
+        let a = Engine::start(&store, env).await;
+        let b = Engine::start(&store, env).await;
         let engines = [a.base(), b.base()];
         let http = client();
         let workflow = format!("two-engines-{}", uuid::Uuid::new_v4().simple());
