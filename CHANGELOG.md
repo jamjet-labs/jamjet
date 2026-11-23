@@ -108,7 +108,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     fail, and the MCP tools that start, approve and cancel a run, the engine dispatches the
     run's next steps and runs its own quick steps (`condition`, `human_approval`,
     `limit_exceeded`) within `JAMJET_INLINE_ADVANCE_MS`, as the engine and not as the
-    caller. It never changes the answer. With the loops on it does nothing.
+    caller. It never changes the answer, and the answer waits for it for at most
+    `JAMJET_INLINE_ADVANCE_MS` and 1 s more, and not past a stop signal; past either the
+    advance goes on as work the shutdown waits for. With the loops on it does nothing.
   - Settings: `JAMJET_TICK_INTERVAL_SECS` (60), `JAMJET_TICK_BUDGET_MS` (45000),
     `JAMJET_INLINE_ADVANCE_MS` (2000) and `JAMJET_TICK_ENGINE_CONCURRENCY` (4).
   - `/health` carries `background` (`on` or `off`) and `tick_overdue`: true when the loops

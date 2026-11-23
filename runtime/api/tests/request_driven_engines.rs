@@ -613,10 +613,11 @@ async fn sigterm_mid_tick_ends_within_ten_seconds() {
 }
 
 /// SIGTERM while the engine step an inline advance runs is inside its store
-/// transaction, and stays there: the drain waits out the 4 s grace, the
-/// process exits inside 10 s with the transaction open, and the store rolls
-/// it back. Nothing of the step is written, the decision before it stands,
-/// and after a restart the store holds every rule.
+/// transaction, and stays there: the decision that led to it is answered,
+/// as it is on record, the drain waits out the 4 s grace, the process exits
+/// inside 10 s with the transaction open, and the store rolls it back.
+/// Nothing of the step is written, the decision before it stands, and after
+/// a restart the store holds every rule.
 ///
 /// The dead step leaves its item leased and its effect's idempotency key
 /// reserved, as any step that died mid-run would, so that no retry runs it
@@ -679,10 +680,11 @@ async fn sigterm_mid_transaction_leaves_no_partial_write() {
                 a.log()
             );
             let decided = deciding.await.unwrap();
-            assert!(
-                decided.is_err(),
-                "the decision whose advance was cut off got no answer: {decided:?}"
-            );
+            let (st, answer) = decided.unwrap_or_else(|e| {
+                panic!("the decision on record got no answer: {e}\n{}", a.log())
+            });
+            assert_eq!(st, 200, "the decision on record is answered: {answer}");
+            assert_eq!(answer["accepted"], true, "{answer}");
 
             let stopped = store.snapshot().await;
             assert_eq!(counted(&stopped, &run, "approval_received", None), 1);

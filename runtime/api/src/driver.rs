@@ -850,6 +850,11 @@ impl Driver {
 
 // ── Request-driven mode: inline advance ─────────────────────────────────────
 
+/// How long a write's answer waits for its advance past the inline budget:
+/// the advance finishes the engine step in hand when its budget runs out,
+/// and a quick step takes far less than this.
+pub const INLINE_ANSWER_MARGIN: Duration = Duration::from_secs(1);
+
 /// The seam between a write that has committed and the advance that follows
 /// it. An error a test arms here skips the advance, as an engine that stopped
 /// there would: the write is on record, the run is not advanced, and the next
@@ -867,10 +872,15 @@ async fn after_write_seam() -> jamjet_state::BackendResult<()> {
 /// Why before the answer: on a request-billed platform the process may get no
 /// CPU after it answers, so work spawned for later may never run.
 ///
-/// The advance runs in a task of its own that this call awaits. A panic in it
-/// is a log line and not a failed request, and a client that hangs up halfway
-/// does not cut it off between two writes: the write that led here has
-/// committed, and what the advance leaves undone the tick does.
+/// The advance runs in a task of its own that this call awaits, for at most
+/// the inline budget and [`INLINE_ANSWER_MARGIN`], and not past a stop
+/// signal. Past either the write answers as it would have, and the advance
+/// goes on in its task, counted as running work, so the drain still waits
+/// for it. The answer never waits on a slow store or a step that hangs. A
+/// panic in the advance is a log line and not a failed request, and a client
+/// that hangs up halfway does not cut it off between two writes: the write
+/// that led here has committed, and what the advance leaves undone the tick
+/// does.
 pub async fn after_write(
     driver: Option<&Extension<Arc<Driver>>>,
     draining: Option<&Extension<Draining>>,
@@ -892,16 +902,41 @@ pub async fn after_write(
     let advancing = Arc::clone(driver);
     let run = execution.clone();
     let budget = driver.config.inline_budget;
-    match tokio::spawn(async move { advancing.advance(&run, budget).await }).await {
-        Ok(report) => debug!(
+    // Counted from before the task starts, so a drain that begins now waits
+    // for it whether or not this request still does.
+    let running = driver.shutdown.track();
+    let mut advance = tokio::spawn(async move {
+        let _running = running;
+        advancing.advance(&run, budget).await
+    });
+    let waited = budget.saturating_add(INLINE_ANSWER_MARGIN);
+    let mut stop = driver.shutdown.receiver();
+    let stopping = async move {
+        // A process whose trigger is gone never stops: wait for the rest.
+        if stop.wait_for(|stopping| *stopping).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        done = &mut advance => match done {
+            Ok(report) => debug!(
+                execution_id = %execution,
+                dispatched = report.dispatched,
+                engine_steps = report.engine_steps,
+                errors = report.errors,
+                out_of_budget = report.out_of_budget,
+                "inline advance"
+            ),
+            Err(e) => warn!(execution_id = %execution, "inline advance did not finish: {e}"),
+        },
+        _ = tokio::time::sleep(waited) => warn!(
             execution_id = %execution,
-            dispatched = report.dispatched,
-            engine_steps = report.engine_steps,
-            errors = report.errors,
-            out_of_budget = report.out_of_budget,
-            "inline advance"
+            "inline advance still running after {waited:?}: the write answers, the advance goes on"
         ),
-        Err(e) => warn!(execution_id = %execution, "inline advance did not finish: {e}"),
+        _ = stopping => info!(
+            execution_id = %execution,
+            "the server is stopping: the write answers, its advance goes on until the drain ends"
+        ),
     }
 }
 

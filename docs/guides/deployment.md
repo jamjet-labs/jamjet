@@ -746,8 +746,11 @@ counted, and the next tick goes on from the log. It runs as the engine, never as
 the caller, and only after a request that wrote something: a repeated decision,
 or a start whose `run_key` names a run already started, advances nothing. While
 the server stops, writes skip the advance and the next tick catches up. A write
-answers after its advance, so it can take up to about `JAMJET_INLINE_ADVANCE_MS`
-longer.
+answers after its advance, so it can take up to `JAMJET_INLINE_ADVANCE_MS` and
+1 s longer. Past that, or once a stop signal arrives, the write answers as it
+would have and the advance goes on, as work the shutdown waits for. On a
+platform that gives an instance no CPU once it has answered, such an advance may
+not finish; a step it left half done is retried once its lease runs out.
 
 ### The tick
 

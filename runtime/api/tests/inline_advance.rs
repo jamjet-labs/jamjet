@@ -1609,6 +1609,129 @@ async fn a_client_that_hangs_up_does_not_cut_the_advance_off() {
     }
 }
 
+/// A completion whose advance hangs in its pass answers once the inline
+/// budget and the margin have passed, as it would have, and the advance goes
+/// on in its task: the drain still waits for it, and once it is let go it
+/// dispatches the next step. Here the budget is 200 ms and the margin 1 s.
+#[tokio::test]
+async fn a_write_answers_within_its_advance_budget_and_the_advance_goes_on() {
+    for kind in kinds() {
+        let mut options = Options::default();
+        options.config.inline_budget = Duration::from_millis(200);
+        let Some(env) = Env::with(kind, "a_write_answers_within_its_advance_budget", options).await
+        else {
+            continue;
+        };
+        let env = Arc::new(env);
+        let name = env.name();
+        env.register(&two_steps("wf-bounded")).await;
+        let run = env.start("wf-bounded").await;
+        let item = env.claimed("python_tool", "s").await;
+        let work_item_id = item["id"].clone();
+
+        env.probe.hold_read.store(true, Ordering::SeqCst);
+        let call = {
+            let env = env.clone();
+            tokio::spawn(async move { env.complete_item(&item).await })
+        };
+        tokio::time::timeout(Duration::from_secs(20), env.probe.entered.notified())
+            .await
+            .expect("the advance began");
+        let held = Instant::now();
+        let reply = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the answer waited for the advance past its budget"))
+            .unwrap();
+        let waited = held.elapsed();
+        assert_eq!(reply.status, StatusCode::OK, "{name}: {}", reply.body);
+        assert_eq!(
+            reply.body,
+            json!({ "completed": true, "work_item_id": work_item_id }),
+            "{name}: the answer it would have given"
+        );
+        assert!(
+            waited < Duration::from_secs(3),
+            "{name}: answered {waited:?} after the advance began"
+        );
+        assert_eq!(env.scheduled(&run).await, ["s"], "{name}: still held");
+
+        // The advance is still counted: a drain waits for it.
+        let trigger = env.trigger.lock().unwrap().take().unwrap();
+        let drain = tokio::spawn(trigger.stop_and_drain(Duration::from_secs(20)));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !drain.is_finished(),
+            "{name}: the drain did not wait for the advance the answer left"
+        );
+        env.probe.release.add_permits(1);
+        let still = tokio::time::timeout(Duration::from_secs(20), drain)
+            .await
+            .expect("the drain ends once the advance does")
+            .unwrap();
+        assert_eq!(still, 0, "{name}: drained");
+        assert_eq!(
+            env.scheduled(&run).await,
+            ["s", "p"],
+            "{name}: the advance went on and dispatched the next step"
+        );
+        env.assert_invariants().await;
+    }
+}
+
+/// A stop signal while a write's advance hangs lets the answer go at once,
+/// with the budget far from spent, and the advance finishes inside the
+/// drain.
+#[tokio::test]
+async fn a_stop_signal_lets_a_write_answer_while_its_advance_finishes() {
+    for kind in kinds() {
+        let Some(env) = Env::new(kind, "a_stop_signal_lets_a_write_answer").await else {
+            continue;
+        };
+        let env = Arc::new(env);
+        let name = env.name();
+        env.register(&two_steps("wf-stop-answer")).await;
+        let run = env.start("wf-stop-answer").await;
+        let item = env.claimed("python_tool", "s").await;
+
+        env.probe.hold_read.store(true, Ordering::SeqCst);
+        let call = {
+            let env = env.clone();
+            tokio::spawn(async move { env.complete_item(&item).await })
+        };
+        tokio::time::timeout(Duration::from_secs(20), env.probe.entered.notified())
+            .await
+            .expect("the advance began");
+        // The inline budget is 30 s: only the stop signal can let it go.
+        let trigger = env.trigger.lock().unwrap().take().unwrap();
+        let drain = tokio::spawn(trigger.stop_and_drain(Duration::from_secs(20)));
+        let reply = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{name}: the answer waited for the advance past the stop signal")
+            })
+            .unwrap();
+        assert_eq!(reply.status, StatusCode::OK, "{name}: {}", reply.body);
+        assert_eq!(reply.body["completed"], true, "{name}: {}", reply.body);
+        assert!(
+            !drain.is_finished(),
+            "{name}: the drain waits for the advance"
+        );
+
+        env.probe.release.add_permits(1);
+        let still = tokio::time::timeout(Duration::from_secs(20), drain)
+            .await
+            .expect("the drain ends once the advance does")
+            .unwrap();
+        assert_eq!(still, 0, "{name}: drained");
+        assert_eq!(
+            env.scheduled(&run).await,
+            ["s", "p"],
+            "{name}: the pass in hand finished"
+        );
+        env.assert_invariants().await;
+    }
+}
+
 // ── The advance and the tick ─────────────────────────────────────────────────
 
 /// An inline advance and a tick on one run fold the same log and decide to
