@@ -167,7 +167,9 @@ this change refuses `claim` on a `python_fn` node at registration. In Python,
 agent's tool-dispatch nodes. `jamjet worker` and `JamjetClient.claim_work_item`
 do not claim by execution yet. They claim oldest-first, so they never get these
 items: the step stays pending and the run waits, with no error. The run's own
-worker has to call `POST /work-items/claim` with the run's `execution_id`.
+worker has to call `POST /work-items/claim` with the run's `execution_id`. In
+Python, `agent.run_durable(drive=True)` is that worker (see "Driving a run from
+your own process" in the Python SDK guide).
 
 This decides who runs the node and reports its result, not who can read the
 run: `GET /executions/:id` shows its state to any token of the tenant.
@@ -189,9 +191,9 @@ a router of its own. Set `executor` in the node's kind:
   it on any kind but `model` (400), and refuses `claim` on a `model` node: a
   worker model step is always claimed by execution. It goes inside `kind`. Put
   at the node's top level it is ignored, and the engine makes the call.
-- The YAML compiler and the Python SDK do not write it yet. A client that does
-  should write it only for `worker`: `"executor": null` is refused on every
-  kind.
+- The YAML compiler does not write it yet. The Python SDK writes it for
+  `agent.run_durable(drive=True)`. A client that writes it should write it only
+  for `worker`: `"executor": null` is refused on every kind.
 - The step goes to the built-in queue `model_worker`. Only a claim that names
   the run gets it: the oldest-first claim never hands it out, the engine's own
   workers never run it, and `jamjet worker` does not claim it. While nobody

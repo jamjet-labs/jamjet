@@ -252,13 +252,224 @@ generator, a file that cannot seek) is sent once.
 Safe to repeat: `health`, `tick`, `create_workflow`, `list_cron_jobs`,
 `get_execution`, `list_executions`, `get_events`, `list_approvals`,
 `list_pending_approvals`, `put_artifact`, `get_artifact`, `list_agents`,
-`get_agent`, a heartbeat, and a
-completion or failure that carries its lease fence (the engine refuses a
-second one with 409). Not safe: `start_execution`, `cancel_execution`,
-`approve`, `claim_work_item`, `create_cron_job`, `register_agent`,
-`activate_agent`, `deactivate_agent`, `discover_agent`, `send_external_event`,
-and a completion or failure with no fence. Anything not on the first list is
-treated as not safe.
+`get_agent`, `find_execution`, `require_features`, `claim_for_execution` (the
+engine gives the same worker the lease it already holds), a heartbeat,
+`start_execution` with a `run_key` (the engine answers a second send with the
+first run), and a completion or failure that carries its lease fence (the
+engine refuses a second one with 409). Not safe: `start_execution` with no
+`run_key` or with `reuse="failed_only"`, `cancel_execution`, `approve`,
+`claim_work_item`, `create_cron_job`, `register_agent`, `activate_agent`,
+`deactivate_agent`, `discover_agent`, `send_external_event`, and a completion
+or failure with no fence. Anything not on the first list is treated as not
+safe.
+
+---
+
+## Driving a run from your own process
+
+`run_durable` starts a run and then waits. Something else works its steps: a
+`jamjet worker` runs the tool steps, and the engine runs the model steps.
+Drive mode puts all of that in the process that started the run. Its tool
+steps run through the agent's `@tool` functions, and its model steps run
+through a model you pass in, which can send the call on to your own router.
+Use it where you cannot run a separate worker, such as a job on a serverless
+container platform with an engine behind it.
+
+```python
+from jamjet import Agent, tool
+from jamjet.model import Model, ModelRequest, ModelResponse
+
+@tool
+def find_venues(city: str) -> str:
+    ...
+
+class MyRouterBackend:
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        step = request.metadata["jamjet"]
+        answer = await my_router.complete(request.messages, key=step["idempotency_key"])
+        return ModelResponse(
+            message={"content": answer.text, "tool_calls": answer.tool_calls},
+            input_tokens=answer.input_tokens,
+            output_tokens=answer.output_tokens,
+            cost_usd=answer.cost_usd,  # None when you do not know it
+            usage_reported=True,
+            model=answer.model,
+        )
+
+    def stream(self, request: ModelRequest):
+        raise NotImplementedError("drive mode does not stream")
+
+agent = Agent("planner", model="openai/gpt-4o", tools=[find_venues], instructions="Find a venue.")
+
+result = await agent.run_durable(
+    "Find a venue for 40 people on Friday",
+    runtime_url="https://engine.example",
+    run_key="booking:2026-11-27",
+    drive=True,
+    model=Model(backend=MyRouterBackend()),
+)
+```
+
+The engine has to list `python_fn_by_execution` and `worker_model_steps` in
+`/health` (and `run_key`, when you pass one). If it does not, `run_durable`
+raises `EngineFeatureMissing` before it registers or starts anything. Update
+the engine first.
+
+The call returns what `run_durable` always returns, and the run is an ordinary
+run: `jamjet executions`, `jamjet audit` and the approval commands work on it.
+The graph it registers differs from the one `run_durable` registers without
+`drive=True`: every model step is handed to the run's own worker, and every
+tool step can be claimed only by the token that started the run. It has its
+own version, so the same agent can have both on one engine. `jamjet worker`
+never gets these steps.
+
+### `run_key`: the same run after a retry
+
+A `run_key` names the run. Start again with the same key, the same agent, the
+same prompt and the same `max_turns`, and you get the run the first start
+made, not a second one.
+That is how a job that was killed finds its run again. The key is 1 to 200
+characters of `A-Z a-z 0-9 . _ : / @ + = -`.
+
+- The same key with another prompt or another agent raises `RunKeyConflict`
+  (import it from `jamjet.transport`). Its `existing_execution_id` names the
+  run the key holds. Keep the prompt the same across retries. A prompt that
+  carries a time or a random value will not find its run.
+- A key keeps its run for good. Once the run has ended, the same key returns
+  the ended run. To run the work again, use a new key, for example one that
+  ends in an attempt number.
+- Without a key, a start that lost its answer raises `OutcomeUnknown` and is
+  not sent again, because a second send could start a second run. The message
+  says to pass a key. For the same reason, a start with `reuse="failed_only"`
+  is not sent again after a lost answer. Look the run up with
+  `client.find_execution(run_key)`.
+- A start through `run_durable` has no `reuse` argument. The key and its default
+  rule are what it uses.
+
+### `model=`: the caller's model
+
+`model` is a `jamjet.model.Model`, the seam with its middleware, so your
+allow list, PII redaction and budget still apply. Without it, drive mode uses
+the agent's own model with the agent's governance. A `model` that is not a
+`Model` is a `TypeError` before anything is sent, and so is `model=` without
+`drive=True`.
+
+The request is the one the engine built from the run: the node's system
+prompt, then its prompt, or the run's conversation when the node has no
+prompt. Your backend sees the run on `request.metadata["jamjet"]`:
+`execution_id`, `node_id`, `item_id`, `attempt`, `idempotency_key`, `run_key`
+and `budget`, which is what the run's caps leave when the step was claimed
+(`None` when the run has none). When the node has an output schema it is on
+`request.metadata["output_schema"]`.
+
+What the backend's `ModelResponse` must carry:
+
+- `model`: the name of the model that answered. The engine holds it to the
+  run's allow list. The LiteLLM backend reports the model it was asked for,
+  because the provider's own name is often a dated snapshot that an allow list
+  does not hold. A response with no name fails the step.
+- `usage_reported=True`, with `input_tokens` and `output_tokens` read from the
+  call. It defaults to false, so a backend that leaves the counts at 0 has
+  reported nothing and is not read as free.
+- `cost_usd`: the cost if you know it, else `None`. Never 0 for an unknown cost.
+  A cost that is not a number from 0 fails the step. With a dollar cap on the
+  run, a step with no cost fails the run, since the engine cannot count it.
+- `message` with the content and the tool calls, as an OpenAI message or a dict
+  with `content` and `tool_calls`. The finish reason is set for you: `tool_calls`
+  when there are calls, else the message's own, else `stop`.
+
+A backend that reports no usage cannot complete a step. The engine refuses an
+answer with no token counts, so the step fails and is tried again like any
+failed step, and goes to the dead-letter queue when its attempts run out.
+A response that fails any of these checks is reported to the engine as the
+step's failure, with the reason.
+
+The engine counts usage when it records an answer. A call that was paid for and
+then failed, or whose answer arrived after the lease ran out, is not in the
+run's caps. Keep your own record of spend, keyed by the idempotency key.
+A budget that lives in the caller's middleware counts in this process only, and
+starts again from zero in a process that is started again. The caps in the run
+count across restarts.
+
+### What a run does when it ends
+
+| The run | `run_durable` | A job should |
+|---------|---------------|--------------|
+| completed | returns the `AgentResult` | exit 0 |
+| failed, or stopped by a limit | raises `RuntimeError` ("ended in non-completed state"), with `execution_id` set | exit 1 |
+| cancelled | raises `RunCancelled` | exit 1 |
+| waiting for an approval | raises `RunWaiting`, `waiting_for == "approval"` | exit 0, and start again with the same `run_key` after the decision |
+| its step is held by another worker, and nothing moves for 180 s | raises `RunWaiting`, `waiting_for == "worker"` | exit 0, and start again later |
+| no progress for 180 s | raises `RunStalled` | exit 1 |
+| the engine will not hand out the next step (`blocked`, `refused`), or this token did not start the run (`not_found`) | raises `RunBlocked`, with `reason` | exit 1 |
+| the engine answers 401 or 403 | raises `JamjetAPIError` (`PlatformAuthError` when the answer is not the engine's), nothing more is sent | exit 1 |
+
+Import `RunWaiting`, `RunStalled`, `RunBlocked`, `RunCancelled` and
+`RunInterrupted` from `jamjet.drive`. Each carries `execution_id`.
+
+`RunWaiting` is not a failure. A job that drives a run exits 0 on it and is
+started again later, with the same `run_key`, and goes on where the run
+stopped. A stall names an overdue tick when the engine reports one: with its
+loops off, nothing runs the engine's own steps until something calls
+`POST /ops/tick`.
+
+The call has no time limit of its own. It ends by the table above. Each model
+call is cut after the node's own `timeout_secs`, or after 600 s when it has
+none. To stop a drive from outside, call `jamjet.drive.drive_run` yourself
+with a `stop` event: nothing more is claimed, the step in hand gets 5 s, and
+`RunInterrupted` is raised. `run_durable` installs no SIGTERM handler. A job
+that is killed leaves its step's lease to lapse, and the run goes on when the
+job is started again with the same key.
+
+### At least once: what a step can do twice
+
+A step can run more than once. A step whose lease runs out, because the
+process stalled or lost the engine for longer than the lease, is handed out
+again. A process that is killed and started again
+gets a new worker id, so it waits up to one lease before the step is handed
+out again. A step that fails is tried again by the engine's retry policy. A
+step that has lost its lease keeps running until it ends, and its result is
+refused.
+
+Every attempt of a step carries the same idempotency key. A tool gets it from
+the work context:
+
+```python
+from jamjet.worker_context import current_work
+
+@tool
+def book_room(venue: str) -> str:
+    key = current_work().idempotency_key   # the same on every attempt
+    return reserve(venue, idempotency_key=key)
+```
+
+A tool that writes outside JamJet has to pass the key on, or check it, so a
+repeat does nothing. `current_work().run_key` is the run's key. A model step
+carries the key on `request.metadata["jamjet"]["idempotency_key"]`. A router
+that keeps its answers by that key can answer a repeat without a second charge.
+The LiteLLM backend does not use the key: it calls the provider again, and the
+provider charges again. The engine records one answer for a step, and a second
+one is refused with 409.
+
+Within one process, a run is driven once at a time. A second call for a run the
+process is already driving raises `RunWaiting` at once and claims nothing. A
+second process on the same run waits for the first one's step like any other
+worker.
+
+### Limits
+
+- One token may hold 16 waiting claims on an engine process. Drive no more
+  than 16 runs at once with one token. A claim past that, with nothing to hand
+  out, is answered 429. The client waits as `Retry-After` says, sends it
+  again, and then raises.
+- The tool functions must import in the driving process under the name the
+  run was started with (`module:function`). A tool defined in the script that
+  starts the run works while that script is the one that drives it.
+- If the engine cannot be reached, the call raises the transport's error. Start
+  it again with the same `run_key`.
+- An older engine raises `EngineFeatureMissing` before anything is written.
+  An older SDK on this engine works as before: `jamjet worker` and a plain
+  `run_durable` do not change.
 
 ---
 

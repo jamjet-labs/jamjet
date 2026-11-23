@@ -51,10 +51,52 @@
   `claim: by_execution`. The default output is unchanged. `jamjet worker` and
   `claim_work_item` do not claim by execution yet, so they never get these steps and
   the run waits with no error. The run's own worker has to call
-  `POST /work-items/claim` with `execution_id`.
+  `POST /work-items/claim` with `execution_id`. `run_durable(drive=True)` is that worker.
+- **Drive mode: work a run's steps in the process that started it.**
+  `agent.run_durable(prompt, run_key=..., drive=True, model=..., lease_secs=...)` starts the
+  run, then claims its steps itself instead of waiting for a `jamjet worker` and the engine.
+  Tool steps run through the agent's `@tool` functions. Model steps run through `model`, a
+  `jamjet.model.Model` (by default the agent's own, with its governance), which can send the
+  call on to your own router. The run ends the way the new `jamjet.drive` exceptions say:
+  `RunWaiting` for an approval, or for a step another worker holds (a job exits 0 on it and
+  is started again with the same `run_key`), and `RunBlocked`, `RunStalled`, `RunCancelled`
+  and `RunInterrupted`. Each carries `execution_id`. A run that failed or hit a limit raises
+  `RuntimeError`, as `run_durable` does without drive. `model=` and `lease_secs=` without
+  `drive=True` are a `TypeError`, and nothing is sent. It needs an engine that lists
+  `python_fn_by_execution` and `worker_model_steps` in `/health` (and `run_key`, with a
+  key), else `EngineFeatureMissing` is raised before anything is registered. See "Driving a
+  run from your own process" in the Python SDK guide.
+- **A step can run more than once, and every attempt carries the same idempotency key.** A
+  tool reads it from `jamjet.worker_context.current_work().idempotency_key`, with
+  `run_key`. A model step gets it on `request.metadata["jamjet"]["idempotency_key"]`. The
+  default model backend does not use the key, so a repeated model step is paid for again.
+  A process drives a run once at a time: a second drive of the same run in the process
+  raises `RunWaiting` and claims nothing, since the engine would hand it the first drive's
+  step. A process that is started again has a new worker id and waits for the old lease to
+  lapse.
+- **`ModelResponse.usage_reported` and `ModelResponse.model`.** `usage_reported` defaults to
+  false, so a backend that leaves the token counts at 0 has reported nothing. `model` is the
+  model that answered. A model backend for drive mode must set `usage_reported=True`, with
+  the counts, and name its model. A backend that reports no usage cannot complete a step:
+  the engine refuses an answer with no token counts, and the step fails and is tried again
+  until it is dead-lettered. `cost_usd=None` means the cost is not known and is sent as
+  none, never as 0. The LiteLLM and scripted backends set both fields.
+- **`compile_agent_to_ir(..., drive=True)`** marks each model node `executor: worker` and
+  each tool-dispatch node as claimed by execution. The default output is unchanged. A drive
+  graph has its own content version, so the engine keeps it beside the same agent's other
+  version.
+- **`client.claim_for_execution(...)` and `client.complete_model_step(...)`.** The first
+  returns the whole claim answer, with the reason when nothing came back, and is safe to
+  send again. The second completes a worker model step with the model's answer under its
+  lease fence.
+- **`WorkContext.idempotency_key` and `WorkContext.run_key`.** Set for every step a
+  `jamjet worker` or a drive runs.
 
 ### Changed
 
+- **`jamjet worker` and drive mode run a claimed step with one executor**,
+  `jamjet.worker_step.run_claimed_item`. `jamjet worker` behaves as before, and now sets
+  the claim's idempotency key on the step's work context.
 - **Credentials go only to the engine's own address.** The JamJet token and anything an
   auth hook adds are sent to the scheme, host and port of `base_url` and nowhere else. A
   request to another address raises `CredentialScopeError` before anything is sent.
@@ -65,6 +107,20 @@
   or an httpx error. It is a `RuntimeError`, not an httpx error, so
   `except httpx.HTTPError` does not catch it. The original error is on `__cause__`.
   Import it from `jamjet.transport`.
+
+### Known limits
+
+- **Metering counts unreported usage as 0.** `MeteringMiddleware` and `BudgetMiddleware`
+  read `input_tokens` and `output_tokens` as they are, so a response with
+  `usage_reported=False` adds nothing to a token total. A cost of `None` is counted as
+  unknown: under a dollar cap the next call is refused. The engine's own caps count only
+  the steps it records, so a model call that was paid for and then failed is in your own
+  record of spend and not in the run's.
+- **`run_durable` installs no SIGTERM handler.** A job that is killed leaves its lease to
+  lapse, and the run goes on when the job is started again with the same `run_key`. Call
+  `jamjet.drive.drive_run(..., stop=event)` to stop a drive cleanly.
+- **A token may hold 16 waiting claims** on an engine process, so one token drives at most
+  16 runs at once.
 
 ### Fixed
 

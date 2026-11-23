@@ -87,6 +87,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the scheduler or another claim takes the step back: the lease is read on the store's clock.
 - A long output is moved to the artifact store, as the in-process worker moves it, so both
   executors record the same event.
+- `/health` lists `worker_model_steps` in `features` once the engine runs model steps for a
+  run's own worker. A client checks it before it registers a worker model node, and the
+  Python SDK does in drive mode. An engine that does not list it ignores `executor`.
 
 ### Changed
 
@@ -187,8 +190,8 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `executor` on any node kind but `model` is refused when a new version is registered, and
   `claim` on a `model` node is refused too. Write `executor` only for `worker`:
   `"executor": null` is refused on every kind. An older engine drops `executor` and makes the
-  call itself, so check the engine's version before you rely on it. The Python SDK and the
-  YAML compiler do not write it yet.
+  call itself, so check the engine's version before you rely on it. The YAML compiler does not
+  write it yet. The Python SDK writes it for `agent.run_durable(drive=True)`.
 - A model node that an older engine stored with `executor: "worker"`, which it ignored, now
   hashes differently, since the field is now part of the definition. Such a stored version
   switches to worker execution on upgrade: an approval bound to it before the upgrade is
