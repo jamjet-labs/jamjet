@@ -173,12 +173,6 @@ struct Ticks {
     failed: Vec<String>,
 }
 
-impl Ticks {
-    fn busy(&self) -> usize {
-        self.busy_elsewhere + self.busy_here
-    }
-}
-
 /// A tick through `base`, its answer noted in `ticks`.
 async fn one_tick(http: reqwest::Client, base: String, token: String, ticks: Arc<Mutex<Ticks>>) {
     let answer = tick(&http, &base, &token).await;
@@ -245,9 +239,10 @@ fn ticker(
 }
 
 /// How long the round of runs may be repeated to see the races open: a
-/// refused tick and a stale pass. Whether one round opens them is down to
-/// timing; a round that saw neither is followed by another, until both were
-/// seen or this has passed since the engines were up.
+/// tick refused by the other engine's lease and a stale pass. Whether one
+/// round opens them is down to timing; a round that saw neither is
+/// followed by another, until both were seen or this has passed since the
+/// engines were up.
 const RACE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Every run of `ids` completed, with its approval decided once and each of
@@ -269,8 +264,10 @@ fn each_run_once(snapshot: &Snapshot, ids: &[String]) {
 /// a tick to raise its request, the approver decides through the engine
 /// that did not start the run, and the workers claim through both engines
 /// and complete through the one they did not claim from. The ticker ticks
-/// both all along. More rounds of `runs` follow while no tick was refused or
-/// no pass was refused as stale (see [`RACE_WINDOW`]).
+/// both all along. More rounds of `runs` follow while no tick was refused by
+/// the other engine's lease in the store, or no pass was refused as stale
+/// (see [`RACE_WINDOW`]). A tick refused by its own engine's lock shows
+/// nothing about the store, so it does not count.
 async fn every_node_once(backend: Backend, case: &str, runs: usize, budget: Duration) {
     warm_up();
     let Some(store) = TestStore::on(backend, case).await else {
@@ -376,13 +373,13 @@ async fn every_node_once(backend: Backend, case: &str, runs: usize, budget: Dura
             let snapshot = finished(&store, &ids, budget).await;
             each_run_once(&snapshot, &ids);
             let stale = a.count(STALE) + b.count(STALE);
-            let busy = ticks.lock().unwrap().busy();
+            let busy = ticks.lock().unwrap().busy_elsewhere;
             if (stale >= 1 && busy >= 1) || Instant::now() >= race_over {
                 break snapshot;
             }
             eprintln!(
-                "{case}: after round {rounds} ({} runs) {stale} stale passes, {busy} busy ticks; \
-                 another round",
+                "{case}: after round {rounds} ({} runs) {stale} stale passes, {busy} ticks \
+                 refused by the other engine's lease; another round",
                 ids.len()
             );
         };
@@ -430,8 +427,9 @@ async fn every_node_once(backend: Backend, case: &str, runs: usize, budget: Dura
         );
         assert!(ticks.ran >= 1, "no tick ran");
         assert!(
-            ticks.busy() >= 1,
-            "no tick was refused, so two ticks never met"
+            ticks.busy_elsewhere >= 1,
+            "no tick was refused by the other engine's lease, so the store's lease never \
+             kept two engines' ticks apart"
         );
         assert!(
             stale >= 1,
