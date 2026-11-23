@@ -242,7 +242,8 @@ POST /work-items/claim
   the in-process model executor uses, and the claim answers `blocked`. That is
   a prompt template that names a state key the run lacks, or no prompt and no
   conversation. The worker never sends a prompt of its own making.
-- `budget_left` is what the run's caps leave, counted at claim. It sits beside
+- `budget_left` is what the run's caps leave, counted at claim from the same
+  read of the run's log that decided the step may fire. It sits beside
   the payload, so the payload and the digests that bind it are unchanged. A
   field is null when the run has no such cap, and 0 when the engine cannot
   check that cap (a step left out a count it reads, or the stored dollar cap

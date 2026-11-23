@@ -55,7 +55,8 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   run's own worker" in the deployment guide, which also says what the engine trusts the
   worker for and what it checks.
 - The claim of such a step carries `budget_left` beside the payload: what each cap leaves,
-  null for a cap the run does not have, 0 for a cap the engine cannot check. The payload is
+  counted from the read of the run's log that decided the step may fire, null for a cap the
+  run does not have, 0 for a cap the engine cannot check. The payload is
   the request the engine built from the run's state: the node's prompt, or for a node with no
   prompt, the conversation in `state.messages`. A step whose request has no prompt to send
   fails at claim with the in-process executor's words (`blocked`).

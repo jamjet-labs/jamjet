@@ -3268,7 +3268,7 @@ async fn gate_claimed_item(
         }
     };
 
-    match jamjet_worker::node_guard::guard_item(
+    let (outcome, counted) = jamjet_worker::node_guard::guard_item_counted(
         backend,
         mode,
         &wi.execution_id,
@@ -3289,8 +3289,8 @@ async fn gate_claimed_item(
         Some(wi.lease_fence),
         Some(&caps),
     )
-    .await
-    {
+    .await;
+    match outcome {
         DispatchGuardOutcome::Allow => {
             if !crate::worker_model::is_worker_model(&kind) {
                 return ClaimGate::Release { budget_left: None };
@@ -3314,15 +3314,24 @@ async fn gate_claimed_item(
                 );
                 return fail_node(backend, wi, reason).await;
             }
-            // Handed out with what the run's caps leave, counted from a read
-            // of the log made after the guard admitted the step. The log only
-            // grows, so this counts at least what the cap check counted, and
-            // the worker is never told it has more than the check left. A
-            // count that fails hands nothing out and records nothing more:
-            // never "no cap" for want of a read. In `Fire` mode the guard
-            // counts first of all, so a log that cannot be read at all stops
-            // the step there, before anything is recorded.
-            match crate::worker_model::budget_left_of_run(backend, &wi.execution_id, &caps).await {
+            // Handed out with what the run's caps leave. In `Fire` mode that
+            // is counted from the usage the guard's cap check read, so the
+            // decision to fire and the figure the worker is told come from
+            // one count: a sibling's spend that the check did not see is not
+            // reported as spent for a step the check let fire. The count is
+            // taken before the guard records anything, so a log that cannot
+            // be read stops the step there, with no agent step admitted for a
+            // claim that is then withheld. Otherwise (a re-check, which
+            // writes nothing; a run with no cap) the log is read now. A count
+            // that fails hands nothing out and records nothing more: never
+            // "no cap" for want of a read.
+            let left = match counted {
+                Some(usage) => Ok(crate::worker_model::budget_left(&caps, &usage)),
+                None => {
+                    crate::worker_model::budget_left_of_run(backend, &wi.execution_id, &caps).await
+                }
+            };
+            match left {
                 Ok(left) => ClaimGate::Release {
                     budget_left: Some(left),
                 },

@@ -30,7 +30,7 @@ use jamjet_state::approvals::{
 use jamjet_state::backend::StateBackend;
 use jamjet_state::event::EventKind;
 use jamjet_state::Event;
-use jamjet_state::{fold_run_usage, RunCaps};
+use jamjet_state::{fold_run_usage, RunCaps, RunUsage};
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -205,11 +205,97 @@ pub async fn guard_item(
     lease_fence: Option<i64>,
     caps: Option<&RunCaps>,
 ) -> GuardOutcome {
+    guard_item_counted(
+        backend,
+        mode,
+        execution_id,
+        node_id,
+        tenant_id,
+        workflow_policy,
+        node_def,
+        payload,
+        sealer,
+        agents,
+        work_item_id,
+        lease_fence,
+        caps,
+    )
+    .await
+    .0
+}
+
+/// [`guard_item`], with the run's usage as the firing check counted it, for a
+/// caller that tells the step what its caps leave. `Some` only in `Fire`
+/// mode, for a step the caps were read for (a node that can spend, a run with
+/// a cap) and that they let fire.
+///
+/// That count is the one the decision was made on, and it is read before the
+/// guard records anything (an agent's admitted step, an approval request). A
+/// caller that counted again after `Allow` could find the log unreadable with
+/// a step already admitted, or find a sibling's spend that the decision did
+/// not see.
+#[allow(clippy::too_many_arguments)]
+pub async fn guard_item_counted(
+    backend: &dyn StateBackend,
+    mode: GuardMode,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    tenant_id: &str,
+    workflow_policy: Option<&PolicySetIr>,
+    node_def: &NodeDef,
+    payload: &Value,
+    sealer: Option<&dyn ApprovalSealer>,
+    agents: AgentScope<'_>,
+    work_item_id: Option<uuid::Uuid>,
+    lease_fence: Option<i64>,
+    caps: Option<&RunCaps>,
+) -> (GuardOutcome, Option<RunUsage>) {
+    let mut counted = None;
+    let outcome = decide(
+        backend,
+        mode,
+        execution_id,
+        node_id,
+        tenant_id,
+        workflow_policy,
+        node_def,
+        payload,
+        sealer,
+        agents,
+        work_item_id,
+        lease_fence,
+        caps,
+        &mut counted,
+    )
+    .await;
+    (outcome, counted)
+}
+
+/// The body of [`guard_item`]. `counted` is set to the usage the firing
+/// check read, once it let the step fire.
+#[allow(clippy::too_many_arguments)]
+async fn decide(
+    backend: &dyn StateBackend,
+    mode: GuardMode,
+    execution_id: &ExecutionId,
+    node_id: &str,
+    tenant_id: &str,
+    workflow_policy: Option<&PolicySetIr>,
+    node_def: &NodeDef,
+    payload: &Value,
+    sealer: Option<&dyn ApprovalSealer>,
+    agents: AgentScope<'_>,
+    work_item_id: Option<uuid::Uuid>,
+    lease_fence: Option<i64>,
+    caps: Option<&RunCaps>,
+    counted: &mut Option<RunUsage>,
+) -> GuardOutcome {
     use crate::agent_limits;
 
     if mode == GuardMode::Fire {
-        if let Err(refused) = caps_allow(backend, execution_id, node_id, node_def, caps).await {
-            return refused;
+        match caps_allow(backend, execution_id, node_id, node_def, caps).await {
+            Ok(usage) => *counted = usage,
+            Err(refused) => return refused,
         }
     }
 
@@ -435,8 +521,9 @@ pub const ZERO_COST_KINDS: &[&str] = &["condition", "human_approval", "limit_exc
 
 /// May a step of `node_def` fire under the run's `caps`? Folds the run's
 /// usage from its log (every segment, root first) and asks
-/// [`jamjet_state::caps::may_fire`]. `Ok` without reading anything for a
-/// kind in [`ZERO_COST_KINDS`] or a run with no cap.
+/// [`jamjet_state::caps::may_fire`]. `Ok(Some(usage))` is that usage, when
+/// the step may fire. `Ok(None)` without reading anything for a kind in
+/// [`ZERO_COST_KINDS`] or a run with no cap.
 ///
 /// A log that cannot be read, or holds an event this build cannot read, is
 /// `Unavailable`: nothing fires and nothing is recorded, and the step decides
@@ -448,13 +535,13 @@ async fn caps_allow(
     node_id: &str,
     node_def: &NodeDef,
     caps: Option<&RunCaps>,
-) -> Result<(), GuardOutcome> {
+) -> Result<Option<RunUsage>, GuardOutcome> {
     let Some(caps) = caps.filter(|c| c.token_budget.is_some() || c.cost_budget_usd.is_some())
     else {
-        return Ok(());
+        return Ok(None);
     };
     if ZERO_COST_KINDS.contains(&jamjet_policy::engine::node_kind_tag(&node_def.kind).as_str()) {
-        return Ok(());
+        return Ok(None);
     }
     let usage = match fold_run_usage(backend, execution_id).await {
         Ok(Ok(usage)) => usage,
@@ -470,7 +557,7 @@ async fn caps_allow(
         }
     };
     let Err(trip) = jamjet_state::caps::may_fire(caps, &usage) else {
-        return Ok(());
+        return Ok(Some(usage));
     };
     let reason = trip.describe();
     warn!(execution_id = %execution_id, node_id, %reason, "run cap spent; the step does not fire");
@@ -1941,6 +2028,76 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(violations_in(backend.as_ref(), &eid).await, vec![]);
+    }
+
+    /// The firing check hands back the usage it counted with the decision,
+    /// for a step it let fire under a cap, and for nothing else: not a
+    /// re-check, not a run with no cap, not a step it refused.
+    #[tokio::test]
+    async fn the_firing_check_hands_back_the_usage_it_counted() {
+        let caps = |total: u32| RunCaps {
+            token_budget: Some(jamjet_ir::workflow::TokenBudgetIr {
+                total_tokens: Some(total),
+                input_tokens: None,
+                output_tokens: None,
+            }),
+            cost_budget_usd: None,
+        };
+        let (backend, eid) = store_with_tenant(None).await;
+        backend
+            .append_event(Event::new(
+                eid.clone(),
+                0,
+                EventKind::NodeCompleted {
+                    node_id: "earlier".into(),
+                    output: json!({}),
+                    state_patch: json!({}),
+                    duration_ms: 1,
+                    gen_ai_system: None,
+                    gen_ai_model: Some("m".into()),
+                    input_tokens: Some(30),
+                    output_tokens: Some(20),
+                    finish_reason: None,
+                    cost_usd: None,
+                    provenance: None,
+                    idempotency_key: Some("earlier".into()),
+                },
+            ))
+            .await
+            .unwrap();
+        let decide = |mode: GuardMode, caps: Option<RunCaps>| {
+            let (backend, eid) = (backend.clone(), eid.clone());
+            async move {
+                guard_item_counted(
+                    backend.as_ref(),
+                    mode,
+                    &eid,
+                    "think",
+                    "default",
+                    None,
+                    &worker_model_node(None),
+                    &json!({ "model": "vertex_ai/gemini-2.5-pro" }),
+                    None,
+                    AgentScope::default(),
+                    None,
+                    None,
+                    caps.as_ref(),
+                )
+                .await
+            }
+        };
+        let (outcome, counted) = decide(GuardMode::Fire, Some(caps(100))).await;
+        assert!(matches!(outcome, GuardOutcome::Allow), "{outcome:?}");
+        assert_eq!(counted.map(|u| u.total_tokens()), Some(50));
+        let (outcome, counted) = decide(GuardMode::Fire, None).await;
+        assert!(matches!(outcome, GuardOutcome::Allow), "{outcome:?}");
+        assert!(counted.is_none());
+        let (outcome, counted) = decide(GuardMode::Complete, Some(caps(100))).await;
+        assert!(matches!(outcome, GuardOutcome::Allow), "{outcome:?}");
+        assert!(counted.is_none());
+        let (outcome, counted) = decide(GuardMode::Fire, Some(caps(50))).await;
+        assert!(matches!(outcome, GuardOutcome::Spent { .. }), "{outcome:?}");
+        assert!(counted.is_none());
     }
 
     /// The lease is decided on the store's clock, which stamped it. With the

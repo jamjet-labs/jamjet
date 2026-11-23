@@ -1952,6 +1952,170 @@ async fn budget_left_never_exceeds_what_the_claims_cap_check_left() {
     assert!(counted_once, "no injection point was counted by the check");
 }
 
+/// A claim decides and reports from one count of the run's log: the one its
+/// cap check made. A parallel step spends the whole 2000-token cap right
+/// after the claim's `k`-th read of the log (`k` 0: before the claim). The
+/// claim either counted it and refuses with `budget`, or did not, and then
+/// the worker is told what the check left, all 2000. It is never handed a
+/// step with nothing left that the check let fire.
+#[tokio::test]
+async fn a_claim_decides_and_reports_the_budget_from_one_count() {
+    const CAP: u64 = 2000;
+    let capped = json!({ "token_budget": { "total_tokens": CAP } });
+    let (mut handed_out, mut refused) = (0, 0);
+    for k in 0..=8 {
+        for tb in support::backends().await {
+            let run = start(tb, one_step("wf-one-count", &[], capped.clone())).await;
+            let name = run.name;
+            if k == 0 {
+                run.backend
+                    .append_event(parallel_step(&run.eid, CAP))
+                    .await
+                    .unwrap();
+            }
+            let hooks = Arc::new(CompletesAfterRead {
+                inner: run.backend.clone(),
+                run: run.eid.clone(),
+                after: k,
+                tokens: CAP,
+                reads: AtomicUsize::new(0),
+            });
+            let racing = support::make_state(Arc::new(Intercept::new(run.backend.clone(), hooks)));
+            let (st, body) = send(
+                &racing,
+                "POST",
+                "/work-items/claim",
+                None,
+                claim_request("router", &run.id),
+            )
+            .await;
+            assert_eq!(st, 200, "{name}: k {k}: {body}");
+            if body["claimed"] == json!(true) {
+                handed_out += 1;
+                assert_eq!(
+                    body["work_item"]["budget_left"]["total_tokens"],
+                    json!(CAP),
+                    "{name}: k {k}: handed out with a count other than the check's: {body}"
+                );
+            } else {
+                refused += 1;
+                assert_eq!(
+                    body,
+                    json!({ "claimed": false, "reason": "budget" }),
+                    "{name}: k {k}"
+                );
+            }
+        }
+    }
+    assert!(handed_out > 0, "no claim was handed out");
+    assert!(refused > 0, "no claim was refused");
+}
+
+/// Fails every `get_events` of `run` from the moment an agent step of it is
+/// admitted.
+struct FailsReadsAfterAdmission {
+    run: ExecutionId,
+    failing: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Hooks for FailsReadsAfterAdmission {
+    async fn before(&self, op: &Op<'_>) -> Option<StateBackendError> {
+        match op {
+            Op::GetEvents(id) if **id == self.run && self.failing.load(Ordering::SeqCst) => Some(
+                StateBackendError::Database("the log could not be read (test)".into()),
+            ),
+            _ => None,
+        }
+    }
+
+    async fn after(&self, op: &Op<'_>) {
+        if let Op::AppendEventIf(event) = op {
+            if event.execution_id == self.run
+                && matches!(event.kind, EventKind::AgentStepAdmitted { .. })
+            {
+                self.failing.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// A claim withheld for a log it cannot read after the agent's step was
+/// admitted must not leave that step counted: with one iteration allowed, the
+/// retry would find the limit spent and fail the node without any work
+/// handed out. The log goes unreadable right after the admission is
+/// recorded; once it reads again, the same worker is handed the step, and the
+/// agent has spent one step.
+#[tokio::test]
+async fn a_claim_that_cannot_count_the_budget_leaves_no_step_admitted() {
+    for tb in support::backends().await {
+        let state = support::make_state(tb.dyn_backend());
+        let (st, body) = send(
+            &state,
+            "POST",
+            "/agents",
+            None,
+            json!({
+                "id": AGENT, "uri": AGENT, "name": "planner", "description": "plans events",
+                "version": "1.0.0",
+                "capabilities": { "skills": [], "protocols": [], "tools_provided": [], "tools_consumed": [] },
+                "autonomy": "fully_autonomous",
+                "constraints": { "max_iterations": 1 },
+                "auth": { "type": "none" }
+            }),
+        )
+        .await;
+        assert!((200..300).contains(&st), "{st} {body}");
+        let run = start_on(
+            tb,
+            state,
+            one_step(
+                "wf-admission",
+                &[],
+                json!({ "agent_ref": AGENT, "token_budget": { "total_tokens": 2000 } }),
+            ),
+        )
+        .await;
+        let name = run.name;
+        let hooks = Arc::new(FailsReadsAfterAdmission {
+            run: run.eid.clone(),
+            failing: AtomicBool::new(false),
+        });
+        let mut racing =
+            support::make_state(Arc::new(Intercept::new(run.backend.clone(), hooks.clone())));
+        racing.agents = run.state.agents.clone();
+        let (st, first) = send(
+            &racing,
+            "POST",
+            "/work-items/claim",
+            None,
+            claim_request("router", &run.id),
+        )
+        .await;
+        assert_eq!(st, 200, "{name}: {first}");
+        hooks.failing.store(false, Ordering::SeqCst);
+        let admitted = || async {
+            run.events()
+                .await
+                .into_iter()
+                .filter(|k| matches!(k, EventKind::AgentStepAdmitted { node_id, .. } if node_id == "think"))
+                .count()
+        };
+        if first["claimed"] != json!(true) {
+            assert_eq!(
+                admitted().await,
+                0,
+                "{name}: the claim was withheld and left a step admitted: {:?}",
+                run.log().await
+            );
+        }
+        let wi = run.step().await;
+        assert_eq!(wi["budget_left"]["total_tokens"], json!(2000), "{name}");
+        assert_eq!(admitted().await, 1, "{name}: {:?}", run.log().await);
+        assert!(run.failed_for_good("think").await.is_none(), "{name}");
+    }
+}
+
 /// A model step its run's worker runs is enqueued by the engine only, so
 /// the request a claim hands out is always the one the engine built:
 /// `POST /work-items`, which stores the caller's payload as sent, refuses
