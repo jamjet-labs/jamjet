@@ -168,9 +168,9 @@ def model_item(item_id: str = "wi-model") -> dict:
 
 
 class ScriptedEngine:
-    """Plays the engine's routes. ``claims`` and ``executions`` are answered in
-    order, the last one again and again; an entry is a JSON body or a
-    ``httpx.Response``."""
+    """Plays the engine's routes. ``claims``, ``executions`` and ``approvals``
+    are answered in order, the last one again and again; an entry is a JSON
+    body or a ``httpx.Response``."""
 
     def __init__(
         self,
@@ -178,12 +178,14 @@ class ScriptedEngine:
         claims: list[Any],
         executions: list[Any] | None = None,
         health: list[Any] | None = None,
+        approvals: list[Any] | None = None,
         complete_status: dict[str, int] | None = None,
         heartbeat: dict[str, Any] | None = None,
     ) -> None:
         self.claims = list(claims)
         self.executions = list(executions or [COMPLETED])
         self.health = list(health or [{"status": "ok", "features": ALL_FEATURES}])
+        self.approvals = list(approvals or [{"pending": [], "decided": []}])
         self.complete_status = complete_status or {}
         self.heartbeat = heartbeat or {"renewed": True, "cancel_requested": False}
         self.requests: list[tuple[str, str, Any]] = []
@@ -220,6 +222,8 @@ class ScriptedEngine:
             return httpx.Response(200, json={"failed": True})
         if path == "/executions/exec_1/events":
             return httpx.Response(200, json={"events": []})
+        if path == "/executions/exec_1/approvals":
+            return self._next(self.approvals)
         if path == "/executions/exec_1":
             return self._next(self.executions)
         return httpx.Response(404, json={"error": f"unexpected {request.method} {path}"})
@@ -453,6 +457,48 @@ async def test_progress_in_the_run_resets_the_stall_bound(clock: Clock) -> None:
     execution = await drive_with(engine, stall_after_s=2.0)
     assert execution == COMPLETED
     assert len(engine.sent("/work-items/claim")) == 7
+
+
+@pytest.mark.parametrize(
+    ("approvals", "node_id"),
+    [
+        ({"pending": [{"node_id": "review", "sequence": 7}], "decided": []}, "review"),
+        # Two requests open at once: no one node to name.
+        ({"pending": [{"node_id": "legal"}, {"node_id": "finance"}], "decided": []}, None),
+        # An approvals read that fails does not hide the wait.
+        (httpx.Response(500, json={"error": "boom"}), None),
+    ],
+)
+async def test_a_run_at_an_approval_node_waits_at_once(approvals: Any, node_id: str | None, clock: Clock) -> None:
+    # A human_approval node has no item on the driver's queues, so the claim
+    # says not_ready, not approval_required. The run says what it waits for.
+    at_approval = {**RUNNING, "waiting_for": "approval"}
+    engine = ScriptedEngine(
+        claims=[{"claimed": False, "reason": "not_ready"}], executions=[at_approval], approvals=[approvals]
+    )
+    with pytest.raises(RunWaiting) as waiting:
+        await drive_with(engine, stall_after_s=3.0)
+    assert waiting.value.execution_id == "exec_1"
+    assert waiting.value.waiting_for == "approval"
+    assert waiting.value.node_id == node_id
+    # On the first answer, not after the stall bound.
+    assert len(engine.sent("/work-items/claim")) == 1
+    assert clock.slept == []
+    assert engine.sent("/executions/exec_1/approvals")
+
+
+@pytest.mark.parametrize("waiting_for", ["engine", "worker"])
+async def test_a_run_waiting_on_anything_else_still_stalls(waiting_for: str, clock: Clock) -> None:
+    engine = ScriptedEngine(
+        claims=[{"claimed": False, "reason": "not_ready"}],
+        executions=[{**RUNNING, "waiting_for": waiting_for}],
+    )
+    with pytest.raises(RunStalled) as stalled:
+        await drive_with(engine, stall_after_s=3.0)
+    assert "no progress in 3 s" in str(stalled.value)
+    assert len(engine.sent("/work-items/claim")) == 4
+    assert clock.slept == [1.0, 1.0, 1.0]
+    assert engine.sent("/approvals") == []
 
 
 async def test_an_ended_run_or_a_run_not_ours_ends_the_drive(clock: Clock) -> None:

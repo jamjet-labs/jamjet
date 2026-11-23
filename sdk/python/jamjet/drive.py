@@ -9,13 +9,17 @@ the run ends or one of the exit rules below applies.
 What each claim answer leads to:
 
 - An item: it is run. A lost lease is not an error; the loop claims again.
-- ``approval_required``: :class:`RunWaiting` with ``waiting_for="approval"``.
+- ``approval_required`` (a step on these queues waits for a decision):
+  :class:`RunWaiting` with ``waiting_for="approval"``.
 - ``blocked`` or ``refused``: :class:`RunBlocked` with the reason.
 - ``claimed_by_other``: claim again each second. Another driver holds the
   step, or a dead one whose lease will lapse. After ``stall_after_s``,
   :class:`RunWaiting` with ``waiting_for="worker"``.
 - ``not_ready``, or a reason this build does not know: read the run. An
-  ended run returns or raises by its status; else claim again. After
+  ended run returns or raises by its status. A run whose ``waiting_for`` is
+  ``approval`` (a ``human_approval`` node, which puts nothing on these
+  queues) raises :class:`RunWaiting` with ``waiting_for="approval"`` at once,
+  naming the node when one request is pending. Else claim again. After
   ``stall_after_s`` with no progress, :class:`RunStalled`.
 - ``not_found``: the run ended (it returns or raises by its status), or this
   caller may not drive it (:class:`RunBlocked`).
@@ -285,6 +289,10 @@ async def _drive(
             execution = await client.get_execution(execution_id)
             if execution.get("status") in _TERMINAL:
                 return _ended(execution_id, execution)
+            if execution.get("waiting_for") == "approval":
+                # A human_approval node puts nothing on these queues, so the
+                # claim says not_ready, not approval_required. The run says it.
+                raise RunWaiting(execution_id, "approval", await _pending_approval_node(client, execution_id))
             mark = _progress_mark(execution)
             if seen is not None and mark != seen:
                 last_progress = now
@@ -299,6 +307,23 @@ def _ended(execution_id: str, execution: dict[str, Any]) -> dict[str, Any]:
     if execution.get("status") == "cancelled":
         raise RunCancelled(execution_id, f"run {execution_id} was cancelled")
     return execution
+
+
+async def _pending_approval_node(client: JamjetClient, execution_id: str) -> str | None:
+    """The node the run's one pending approval is for, or None when no one
+    node is pending or the approvals cannot be read."""
+    try:
+        listing = await client.list_approvals(execution_id)
+    except Exception:  # noqa: BLE001 - the run waits either way
+        return None
+    pending = listing.get("pending") if isinstance(listing, dict) else None
+    if not isinstance(pending, list):
+        return None
+    nodes = {row.get("node_id") for row in pending if isinstance(row, dict)}
+    if len(nodes) != 1:
+        return None
+    (node,) = nodes
+    return node if isinstance(node, str) else None
 
 
 def _progress_mark(execution: dict[str, Any]) -> str:
