@@ -74,6 +74,7 @@ fn stores_of(label: &str) -> Option<&'static [StoreKind]> {
         | "pg.commit_turn"
         | "pg.apply_approval_projection"
         | "pg.begin_tick"
+        | "pg.renew_tick"
         | "pg.finish_tick" => POSTGRES,
         "sqlite.commit_turn"
         | "sqlite.append_event"
@@ -99,6 +100,7 @@ fn stores_of(label: &str) -> Option<&'static [StoreKind]> {
         | "sqlite.fail_work_item_fenced_recorded"
         | "sqlite.patch_append_array"
         | "sqlite.begin_tick"
+        | "sqlite.renew_tick"
         | "sqlite.finish_tick" => BOTH,
         _ => return None,
     })
@@ -727,6 +729,22 @@ async fn prepare(fx: &Fixture, operation: &str, at: At) -> Call {
                     async move {
                         let begun = b.begin_tick("faults-tick", TICK_LEASE).await?;
                         assert!(matches!(begun, TickBegin::Began { .. }), "{begun:?}");
+                        Ok(())
+                    }
+                }),
+                lands: &[("engine_ticks", 1, 1)],
+            }
+        }
+        "renew_tick" => {
+            free_tick(&b).await;
+            let begun = b.begin_tick("faults-tick", TICK_LEASE).await.unwrap();
+            assert!(matches!(begun, TickBegin::Began { .. }), "{begun:?}");
+            Call {
+                run: call(move || {
+                    let b = b.clone();
+                    async move {
+                        let renewed = b.renew_tick("faults-tick", TICK_LEASE * 2).await?;
+                        assert!(renewed, "the holder could not renew");
                         Ok(())
                     }
                 }),

@@ -464,6 +464,7 @@ async fn a_backend_without_tick_state_refuses_to_coordinate_ticks() {
         b.begin_tick("engine-b:1", lease).await.map(drop),
         b.finish_tick("engine-a:1", &outcome).await.map(drop),
         b.tick_status().await.map(drop),
+        b.renew_tick("engine-a:1", lease).await.map(drop),
     ];
     for refused in refusals {
         assert!(

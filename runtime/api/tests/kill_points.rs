@@ -783,6 +783,9 @@ fn audit_seal_before_commit_on_postgres() {
 /// One request-driven case is given this long.
 const DRIVEN_CASE: Duration = Duration::from_secs(60);
 
+/// The tick's lease in the store, which a tick renews while it runs.
+const TICK_LEASE: Duration = Duration::from_secs(30);
+
 /// Engine A with the loops off and the fault point armed, and engine B with
 /// the loops off and nothing armed, on one store of their own. B makes the
 /// writes and ticks that bring a run to the point; then a call to A kills it.
@@ -853,6 +856,40 @@ impl Driven {
 
     async fn died(&mut self) {
         self.a.died_at(self.point, TO_DIE).await;
+    }
+
+    /// Tick through A until a tick runs: once the lease of the tick that
+    /// died, which nothing renews, has run out. A tick renews its lease
+    /// while it runs, so the lease is short, and this is within one lease of
+    /// `sent`, the moment the call that killed it was sent.
+    async fn tick_once_the_dead_lease_lapses(&self, sent: Instant) -> Value {
+        let within = TICK_LEASE + Duration::from_secs(5);
+        loop {
+            let (st, body) = tick(&self.http, &self.a.base(), &self.store.operator)
+                .await
+                .unwrap();
+            assert_eq!(st, 200, "{body}");
+            if body["ran"] == true {
+                let waited = sent.elapsed();
+                eprintln!(
+                    "{}: a tick ran {:.1} s after the call that killed the last one",
+                    self.point,
+                    waited.as_secs_f64()
+                );
+                assert!(
+                    waited <= within,
+                    "the dead tick's lease held for {waited:?}"
+                );
+                return body;
+            }
+            assert_eq!(body["reason"], "busy", "{body}");
+            assert!(
+                sent.elapsed() < within,
+                "still busy {:?} after the kill: {body}",
+                sent.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     /// Drive `runs` to their end through A, which must be running again: a
@@ -970,8 +1007,9 @@ fn work_condition_work() -> Value {
 
 /// A tick dies right after it took the store's tick lease: nothing else of
 /// it ran. The lease is still its holder's, so a tick after the restart is
-/// told the store is busy, naming the dead tick. Once the lease has run out,
-/// one tick runs the step the dead one did not reach, and the run completes.
+/// told the store is busy, naming the dead tick. Nothing renews the lease,
+/// so it runs out within one lease, 30 s, whatever the budget; then one
+/// tick runs the step the dead one did not reach, and the run completes.
 async fn tick_after_begin(backend: Backend, name: &str) {
     let point = "tick.after_begin#1";
     let Some(mut d) = Driven::begin(backend, name, point, condition_then_work()).await else {
@@ -979,6 +1017,7 @@ async fn tick_after_begin(backend: Backend, name: &str) {
     };
     // `s` starts the run, so its item waits on the queue for a tick.
     let run = d.start().await;
+    let sent = Instant::now();
     let lost = tick(&d.http, &d.a.base(), &d.store.operator).await;
     assert!(
         lost.is_err(),
@@ -988,11 +1027,11 @@ async fn tick_after_begin(backend: Backend, name: &str) {
     let row = d.store.tick_row().await.expect("the tick took the lease");
     let holder = row.holder.clone().expect("the lease is held");
     let left = row.lease_left.expect("the lease has an end");
-    // The default 45 s budget and the two minutes a slow step may run past it,
-    // from the tick's start, a moment ago.
+    // One lease from the tick's start, a moment ago, and not the default
+    // 45 s budget or more.
     assert!(
-        left > chrono::Duration::seconds(120) && left <= chrono::Duration::seconds(165),
-        "the lease is the budget and 120 s: {row:?}"
+        left > chrono::Duration::zero() && left <= chrono::Duration::from_std(TICK_LEASE).unwrap(),
+        "the lease is 30 s: {row:?}"
     );
     let before = d.store.snapshot().await;
     assert_eq!(
@@ -1007,8 +1046,7 @@ async fn tick_after_begin(backend: Backend, name: &str) {
     assert_eq!(st, 200, "{busy}");
     assert_eq!(busy["ran"], false, "the dead tick's lease is held: {busy}");
     assert_eq!(busy["held_by"], holder.as_str(), "{busy}");
-    assert_eq!(d.store.lapse_tick_lease().await, 1);
-    let report = tick_ran(&d.http, &d.a.base(), &d.store.operator).await;
+    let report = d.tick_once_the_dead_lease_lapses(sent).await;
     assert_eq!(
         report["engine_steps"]["slow"], 1,
         "the tick ran `s`: {report}"
@@ -1039,8 +1077,9 @@ fn tick_after_begin_on_postgres() {
 /// A tick dies after its walk advanced the first of two runs whose
 /// approvals ran out undecided: that run's expiry, fallback and end are
 /// written, and the other run was not reached. After the restart, once the
-/// dead tick's lease has run out, one tick expires the other run's request
-/// and runs its fallback, and writes nothing again for the first.
+/// dead tick's lease has run out, within one lease, one tick expires the
+/// other run's request and runs its fallback, and writes nothing again for
+/// the first.
 async fn tick_mid_walk(backend: Backend, name: &str) {
     let point = "tick.mid_walk#1";
     // `review` waits a second for a decision, then falls back to `hold`.
@@ -1064,6 +1103,7 @@ async fn tick_mid_walk(backend: Backend, name: &str) {
     // Past both deadlines: each was a second from its request, which came
     // before the tick answered.
     tokio::time::sleep(Duration::from_secs(2)).await;
+    let sent = Instant::now();
     let lost = tick(&d.http, &d.a.base(), &d.store.operator).await;
     assert!(
         lost.is_err(),
@@ -1097,8 +1137,7 @@ async fn tick_mid_walk(backend: Backend, name: &str) {
     assert!(d.store.tick_row().await.unwrap().holder.is_some());
 
     d.a.restart().await;
-    assert_eq!(d.store.lapse_tick_lease().await, 1);
-    let report = tick_ran(&d.http, &d.a.base(), &d.store.operator).await;
+    let report = d.tick_once_the_dead_lease_lapses(sent).await;
     assert_eq!(report["deadlines"]["expired"], 1, "{report}");
     let after = d.store.snapshot().await;
     assert_eq!(

@@ -2,9 +2,10 @@
 //! engine on a store, and what the last tick left behind (where its walk
 //! stopped, whether it got through, its report).
 //!
-//! The lease is taken and given back with conditional writes on the store's
-//! clock. A second holder is told who holds it, a lapsed lease is taken
-//! over, and a holder that lost the lease cannot write its outcome. A store
+//! The lease is taken, renewed and given back with conditional writes on the
+//! store's clock. A second holder is told who holds it, a lapsed lease is
+//! taken over, a renewed lease is not, and a holder that lost the lease can
+//! neither renew it nor write its outcome. A store
 //! has one tick row: a tenant's view takes and reads the same lease as the
 //! unscoped store. `pg_ticks` checks that the lease follows the database's
 //! clock on Postgres.
@@ -264,4 +265,109 @@ pub async fn two_handles_begin_at_once_one_wins(fx: &Fixture) {
         overlapped > 0,
         "the two begins never overlapped in {ROUNDS} rounds, so no round raced"
     );
+}
+
+/// A renewal moves the end of the holder's lease, and only the holder's. A
+/// short lease renewed before it lapses is still held after its first end:
+/// another holder is told it is busy, through either handle. A renewal by a
+/// holder the row does not name, with no row, after the lease was given
+/// back, or after it lapsed and was taken over, is `false` and changes
+/// nothing. A lease too long to add to the clock is refused. The row is the
+/// store's, not a tenant's: the other handle renews the same lease.
+pub async fn a_renewal_keeps_the_lease_for_its_holder_only(fx: &Fixture) {
+    let b = &*fx.backend;
+    let other = second(fx);
+    assert!(
+        !b.renew_tick("engine-a:1", LIVE).await.unwrap(),
+        "a renewal with no row"
+    );
+    assert_eq!(
+        b.tick_status().await.unwrap(),
+        None,
+        "a renewal with no lease made a row"
+    );
+
+    assert!(matches!(
+        b.begin_tick("engine-a:1", SHORT).await.unwrap(),
+        TickBegin::Began { .. }
+    ));
+    let begun = status(b).await;
+    assert!(other.renew_tick("engine-a:1", LIVE).await.unwrap());
+    let renewed = status(b).await;
+    let left =
+        renewed.lease_until.expect("a renewed lease has an end") - b.store_now().await.unwrap();
+    assert!(
+        (55..=60).contains(&left.num_seconds()),
+        "a lease renewed for 60 s has {left} left by the store's clock"
+    );
+    assert_eq!(
+        TickStatus {
+            lease_until: begun.lease_until,
+            ..renewed.clone()
+        },
+        begun,
+        "a renewal moves the end of the lease and nothing else"
+    );
+    tokio::time::sleep(SHORT * 3).await;
+    for (whose, handle) in [
+        ("this handle", fx.backend.clone()),
+        ("second handle", other.clone()),
+    ] {
+        assert_eq!(
+            handle.begin_tick("engine-b:1", LIVE).await.unwrap(),
+            TickBegin::Busy {
+                holder: "engine-a:1".into(),
+                lease_until: renewed.lease_until.unwrap()
+            },
+            "{whose}: the renewed lease was taken over at its first end"
+        );
+    }
+
+    for holder in ["engine-b:1", "engine-a:2", ""] {
+        assert!(
+            !b.renew_tick(holder, LIVE).await.unwrap(),
+            "{holder:?} renewed a lease it does not hold"
+        );
+    }
+    let refused = b.renew_tick("engine-a:1", Duration::MAX).await;
+    assert!(
+        matches!(refused, Err(StateBackendError::Database(_))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        status(b).await,
+        renewed,
+        "a refused renewal changed the row"
+    );
+
+    // Given back: nothing to renew.
+    assert!(b
+        .finish_tick("engine-a:1", &outcome(Some("run-3"), true, json!({})))
+        .await
+        .unwrap());
+    let finished = status(b).await;
+    assert!(!b.renew_tick("engine-a:1", LIVE).await.unwrap());
+    assert_eq!(status(b).await, finished, "a renewal after the finish");
+
+    // Lapsed and taken over: the old holder cannot take it back.
+    assert!(matches!(
+        b.begin_tick("engine-c:1", SHORT).await.unwrap(),
+        TickBegin::Began { .. }
+    ));
+    tokio::time::sleep(SHORT * 3).await;
+    assert!(matches!(
+        other.begin_tick("engine-d:1", LIVE).await.unwrap(),
+        TickBegin::Began { .. }
+    ));
+    let taken = status(b).await;
+    assert!(
+        !b.renew_tick("engine-c:1", LIVE).await.unwrap(),
+        "a holder whose lease was taken over renewed it"
+    );
+    assert_eq!(
+        status(b).await,
+        taken,
+        "the lost holder's renewal changed the row"
+    );
+    assert_eq!(taken.holder.as_deref(), Some("engine-d:1"));
 }

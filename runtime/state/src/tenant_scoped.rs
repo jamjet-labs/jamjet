@@ -2690,6 +2690,10 @@ impl StateBackend for TenantScopedSqliteBackend {
     async fn tick_status(&self) -> BackendResult<Option<crate::backend::TickStatus>> {
         crate::sqlite::tick_status_in(&self.pool).await
     }
+
+    async fn renew_tick(&self, holder: &str, lease: std::time::Duration) -> BackendResult<bool> {
+        crate::sqlite::renew_tick_in(&self.pool, holder, lease).await
+    }
 }
 
 /// Parse a datetime that might be either RFC 3339 or SQLite's `datetime('now')` format.

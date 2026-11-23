@@ -58,6 +58,9 @@ struct Probe {
     /// Seconds the store's clock is set apart from the process's; 0 asks the
     /// store.
     clock_skew_secs: AtomicI64,
+    /// Sleep this long in every sweep of lapsed leases: a tick that runs
+    /// long, holding its lease.
+    reclaim_delay_ms: AtomicU64,
 }
 
 impl Probe {
@@ -71,6 +74,7 @@ impl Probe {
             read_delay_ms: AtomicU64::new(0),
             read_in_flight: AtomicBool::new(false),
             clock_skew_secs: AtomicI64::new(0),
+            reclaim_delay_ms: AtomicU64::new(0),
         }
     }
 
@@ -113,6 +117,12 @@ impl Hooks for Probe {
             }
             Op::FinishTick { .. } if self.finish_fault.load(Ordering::SeqCst) => {
                 return Some(StateBackendError::Unavailable("injected".into()));
+            }
+            Op::ReclaimExpiredLeasesRecorded => {
+                let ms = self.reclaim_delay_ms.load(Ordering::SeqCst);
+                if ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
             }
             _ => {}
         }
@@ -462,6 +472,62 @@ async fn health_reports_overdue_after_three_intervals() {
         );
         // Every answer came from the one read the first request made.
         assert_eq!(env.probe.reads(), 1, "{name}");
+    }
+}
+
+/// A tick that runs for longer than three intervals holds a live lease in
+/// the store all along, so the engine is not overdue while it runs, though
+/// no tick has finished and the process has been up for three intervals.
+/// Before it began, the engine was overdue.
+#[tokio::test]
+async fn a_tick_that_is_running_is_not_overdue() {
+    for kind in kinds() {
+        let Some(env) = Env::new(kind, "a_tick_that_is_running_is_not_overdue").await else {
+            continue;
+        };
+        let name = env.name();
+        let timing = WatchTiming {
+            read_every: Duration::from_millis(200),
+            ..WatchTiming::default()
+        };
+        let engine = env.engine_with(Background::Off, Duration::from_secs(1), timing);
+        let up = Instant::now();
+        sleep_until(up + Duration::from_millis(3_500)).await;
+        assert_eq!(env.overdue(&engine).await, true, "{name}: no tick yet");
+
+        env.probe.reclaim_delay_ms.store(4_000, Ordering::SeqCst);
+        let tick = {
+            let (app, ops) = (engine.app.clone(), env.ops.clone());
+            tokio::spawn(async move { send(&app, "POST", "/ops/tick", Some(&ops)).await })
+        };
+        let began = Instant::now();
+        while env
+            .inner
+            .tick_status()
+            .await
+            .unwrap()
+            .and_then(|r| r.holder)
+            .is_none()
+        {
+            assert!(
+                began.elapsed() < Duration::from_secs(10),
+                "{name}: the tick never took its lease"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Each look reads the row again: the window is 200 ms.
+        for look in 0..3 {
+            tokio::time::sleep(Duration::from_millis(1_000)).await;
+            assert_eq!(
+                env.overdue(&engine).await,
+                false,
+                "{name}: look {look}, while the tick runs"
+            );
+        }
+        let (st, report) = tick.await.unwrap();
+        assert_eq!(st, StatusCode::OK, "{name}: {report}");
+        assert_eq!(report["ran"], true, "{name}: {report}");
+        assert_eq!(env.overdue(&engine).await, false, "{name}: after it");
     }
 }
 

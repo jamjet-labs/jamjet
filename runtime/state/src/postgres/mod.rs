@@ -806,4 +806,8 @@ impl StateBackend for PgBackend {
     async fn tick_status(&self) -> BackendResult<Option<TickStatus>> {
         ticks::tick_status(self).await
     }
+
+    async fn renew_tick(&self, holder: &str, lease: std::time::Duration) -> BackendResult<bool> {
+        ticks::renew_tick(self, holder, lease).await
+    }
 }

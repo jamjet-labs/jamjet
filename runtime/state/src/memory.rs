@@ -1986,6 +1986,19 @@ impl StateBackend for InMemoryBackend {
     async fn tick_status(&self) -> BackendResult<Option<crate::backend::TickStatus>> {
         Ok(self.tick.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
+
+    async fn renew_tick(&self, holder: &str, lease: std::time::Duration) -> BackendResult<bool> {
+        let lease = crate::backend::tick_lease(lease)?;
+        let mut tick = self.tick.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = tick.as_mut() else {
+            return Ok(false);
+        };
+        if row.holder.as_deref() != Some(holder) {
+            return Ok(false);
+        }
+        row.lease_until = Some(crate::clock::process_now() + lease);
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

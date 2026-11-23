@@ -100,7 +100,8 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     engine steps still on the queues (model and eval calls among them, waited for past the
     budget), and projects approvals. It answers with a report, or with `{"ran": false,
     "reason": "busy"}` while another tick holds the lease. Two ticks never run at once, on
-    one engine or on several sharing a store. The body can only lower the budget
+    one engine or on several sharing a store. The lease is 30 s, and a running tick renews it
+    every 10 s, so a tick that died frees it within 30 s. The body can only lower the budget
     (`{"budget_ms": n}`, at least 100), and an unknown field is a 400. It is a 503 while the
     server stops, and a 409 on an engine with the loops on and no embedded workers.
   - After `POST /executions`, approve, cancel, an external event, a work item's complete or
@@ -111,10 +112,10 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Settings: `JAMJET_TICK_INTERVAL_SECS` (60), `JAMJET_TICK_BUDGET_MS` (45000),
     `JAMJET_INLINE_ADVANCE_MS` (2000) and `JAMJET_TICK_ENGINE_CONCURRENCY` (4).
   - `/health` carries `background` (`on` or `off`) and `tick_overdue`: true when the loops
-    are off and no tick has finished for three intervals, null with the loops on or when the
-    store could not be read. `status` is unchanged. While a tick is overdue, a request logs
-    one error line, at most once every 5 minutes. `GET /ops/status`, for any role, returns
-    the stored tick state and the last tick's report.
+    are off, no tick has finished for three intervals and none holds a live lease, null with
+    the loops on or when the store could not be read. `status` is unchanged. While a tick is
+    overdue, a request logs one error line, at most once every 5 minutes. `GET /ops/status`,
+    for any role, returns the stored tick state and the last tick's report.
   - `features` in `/health` lists `ops_tick`. `jamjet ops tick` checks for it.
 
 ### Changed
@@ -261,9 +262,9 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with the run's log, and reads the log otherwise, with the loops on or off. A run that ended
   after the projector's last pass, or a request raised or decided since, no longer lists a
   decided request as pending or leaves a new one out.
-- `StateBackend` gains `begin_tick`, `finish_tick` and `tick_status`. Their defaults refuse
-  ("this backend cannot coordinate ticks"), so a backend outside this repository still
-  compiles, and `POST /ops/tick` on it is a 500.
+- `StateBackend` gains `begin_tick`, `renew_tick`, `finish_tick` and `tick_status`. Their
+  defaults refuse ("this backend cannot coordinate ticks"), so a backend outside this
+  repository still compiles, and `POST /ops/tick` on it is a 500.
 - SQLite gains an `engine_ticks` table, created when the store opens and not through a
   migration, so a file still opens on the build before this one.
 - Postgres gains migration `0003_engine_ticks.sql`. A build from before it refuses a database

@@ -2623,6 +2623,10 @@ impl StateBackend for SqliteBackend {
     async fn tick_status(&self) -> BackendResult<Option<crate::backend::TickStatus>> {
         tick_status_in(&self.pool).await
     }
+
+    async fn renew_tick(&self, holder: &str, lease: std::time::Duration) -> BackendResult<bool> {
+        renew_tick_in(&self.pool, holder, lease).await
+    }
 }
 
 pub(crate) use crate::backend::DEFAULT_LEASE_SECS;
@@ -4393,6 +4397,32 @@ pub(crate) async fn finish_tick_in(
     .map_err(map_db_err)?
     .rows_affected();
     fault_point!("sqlite.finish_tick", 1);
+    tx.commit().await.map_err(map_db_err)?;
+    Ok(done == 1)
+}
+
+/// [`StateBackend::renew_tick`] for both SQLite backends: one update that
+/// names its holder, in a `BEGIN IMMEDIATE` transaction, on this process's
+/// clock as the begin is.
+pub(crate) async fn renew_tick_in(
+    pool: &SqlitePool,
+    holder: &str,
+    lease: std::time::Duration,
+) -> BackendResult<bool> {
+    let lease = crate::backend::tick_lease(lease)?;
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(map_db_err)?;
+    let done =
+        sqlx::query("UPDATE engine_ticks SET lease_until = ? WHERE name = 'tick' AND holder = ?")
+            .bind((crate::clock::process_now() + lease).to_rfc3339())
+            .bind(holder)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?
+            .rows_affected();
+    fault_point!("sqlite.renew_tick", 1);
     tx.commit().await.map_err(map_db_err)?;
     Ok(done == 1)
 }

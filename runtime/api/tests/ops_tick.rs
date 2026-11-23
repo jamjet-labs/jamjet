@@ -18,7 +18,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use jamjet_agents::InMemoryAgentRegistry;
-use jamjet_api::driver::{Driver, TickResult};
+use jamjet_api::driver::{Driver, TickLease, TickResult};
 use jamjet_api::routes::{build_router_with_opts, refuse_claims_while_draining, Draining};
 use jamjet_api::startup::{Background, DriverConfig};
 use jamjet_api::state::AppState;
@@ -215,6 +215,7 @@ const CONFIGURED_TICK_MS: u64 = 60_000;
 struct Options {
     config: DriverConfig,
     models: Arc<ModelRegistry>,
+    lease: TickLease,
 }
 
 impl Default for Options {
@@ -230,6 +231,7 @@ impl Default for Options {
                 tick_interval: Duration::from_secs(60),
             },
             models: Arc::new(ModelRegistry::new()),
+            lease: TickLease::default(),
         }
     }
 }
@@ -312,6 +314,7 @@ impl Env {
             pg.as_ref(),
             &options.config,
             options.models.clone(),
+            options.lease,
         );
         // The default tenant's row, which the token routes may look up. A
         // store that has it already says so, and that is fine.
@@ -576,6 +579,11 @@ impl Env {
         self.inner.tick_status().await.unwrap()
     }
 
+    /// The store's clock, which the tick lease is taken on.
+    async fn store_now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.inner.store_now().await.unwrap()
+    }
+
     /// Every invariant of the store (on a file or a database, not memory).
     async fn assert_invariants(&self) {
         let Some(store) = &self.store else { return };
@@ -602,6 +610,7 @@ impl Env {
             self.pg.as_ref(),
             &Options::default().config,
             Arc::new(ModelRegistry::new()),
+            TickLease::default(),
         );
         (driver, probe, trigger)
     }
@@ -613,6 +622,7 @@ fn engine_on(
     pg: Option<&PgBackend>,
     config: &DriverConfig,
     models: Arc<ModelRegistry>,
+    lease: TickLease,
 ) -> (AppState, Arc<Driver>, jamjet_worker::ShutdownTrigger) {
     // On Postgres the audit log is the database's, so the invariants check
     // the chain the engine wrote.
@@ -643,8 +653,9 @@ fn engine_on(
         approval_policy: Default::default(),
     };
     let (trigger, shutdown) = jamjet_worker::shutdown();
-    let mut driver =
-        Driver::new(&state, models, shutdown, *config).with_background(Background::Off);
+    let mut driver = Driver::new(&state, models, shutdown, *config)
+        .with_background(Background::Off)
+        .with_tick_lease(lease);
     if let Some(pg) = pg {
         driver = driver.with_outbox(pg.clone());
     }
@@ -1217,11 +1228,11 @@ async fn two_ticks_at_once_on_two_engines_one_runs_one_is_busy() {
         };
         assert_eq!(held_by, holder, "{name}: the store names the holder");
         assert_ne!(held_by, "this instance", "{name}");
-        // The lease is the first tick's budget (the configured 60 s) and the
-        // two minutes allowed for a slow step.
+        // The lease is 30 s, whatever the budget (the configured 60 s): the
+        // tick renews it while it runs.
         let until = lease_until.expect("the store says when the lease ends");
         let left = (until - chrono::Utc::now()).num_seconds();
-        assert!((170..=180).contains(&left), "{name}: {left} s left");
+        assert!((20..=30).contains(&left), "{name}: {left} s left");
         assert_eq!(other_probe.begins.load(Ordering::SeqCst), 1, "{name}");
 
         env.probe.release.add_permits(1);
@@ -1641,6 +1652,108 @@ async fn a_tick_runs_engine_model_steps_and_waits_for_them() {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "{name}");
         assert_eq!(env.status(&run).await, WorkflowStatus::Completed, "{name}");
+        env.assert_invariants().await;
+    }
+}
+
+/// A tick waits for a model step that takes three times its lease. It
+/// renews the lease while it waits, so another engine's tick is told it is
+/// busy at every look, past the lease's first end, and the lease it is shown
+/// is never longer than one lease from now. The tick's finish lands: the row
+/// keeps its report, and the lease is free again.
+#[tokio::test]
+async fn a_tick_renews_its_lease_while_it_waits_for_a_long_step() {
+    for kind in kinds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let models = Arc::new(
+            ModelRegistry::new()
+                .register(Arc::new(SlowModel {
+                    calls: calls.clone(),
+                    delay: Duration::from_secs(3),
+                }))
+                .with_default("slow"),
+        );
+        let lease = TickLease {
+            lease: Duration::from_secs(1),
+            renew_every: Duration::from_millis(200),
+        };
+        let options = Options {
+            models,
+            lease,
+            ..Options::default()
+        };
+        let Some(env) = Env::with(kind, "a_tick_renews_its_lease", options).await else {
+            continue;
+        };
+        let name = env.name();
+        let env = Arc::new(env);
+        let (other, _other_probe, _other_trigger) = env.second_engine();
+        let ir: Value = serde_json::from_str(include_str!("fixtures/hello_agent_ir.json")).unwrap();
+        env.register(&ir).await;
+        let (st, body) = support::post(
+            &env.state,
+            "/executions",
+            json!({ "workflow_id": "demo", "workflow_version": "0.1.0",
+                    "input": { "query": "Capital of France?" } }),
+        )
+        .await;
+        assert!(st.is_success(), "{name}: {st} {body}");
+
+        let first = {
+            let env = env.clone();
+            tokio::spawn(async move { env.tick_ran(r#"{"budget_ms":100}"#).await })
+        };
+        let began = Instant::now();
+        while calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                began.elapsed() < Duration::from_secs(20),
+                "{name}: the tick never called the model"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let holder = env
+            .row()
+            .await
+            .unwrap()
+            .holder
+            .expect("the tick holds the lease");
+
+        // Five looks over 2.5 s, the first after the lease's first end.
+        for look in 0..5 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let TickResult::Busy {
+                held_by,
+                lease_until,
+            } = other.tick(Duration::from_secs(5)).await.unwrap()
+            else {
+                panic!("{name}: look {look}: the lease lapsed under a tick that was running");
+            };
+            assert_eq!(held_by, holder, "{name}: look {look}");
+            let left =
+                lease_until.expect("the store says when the lease ends") - env.store_now().await;
+            assert!(
+                left <= chrono::Duration::from_std(lease.lease).unwrap(),
+                "{name}: look {look}: {left} left, longer than one lease"
+            );
+        }
+
+        let report = first.await.unwrap();
+        assert_eq!(
+            report["engine_steps"]["slow"], 1,
+            "{name}: the tick ran the model step: {report}"
+        );
+        let row = env.row().await.unwrap();
+        assert_eq!(
+            (row.holder.as_deref(), row.lease_until),
+            (None, None),
+            "{name}: the tick gave its lease back"
+        );
+        assert_eq!(
+            row.last_report.as_ref().unwrap()["engine_steps"]["slow"],
+            1,
+            "{name}: the finish of the tick that ran the step landed: {row:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{name}");
         env.assert_invariants().await;
     }
 }

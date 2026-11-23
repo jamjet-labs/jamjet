@@ -1,14 +1,15 @@
-//! The tick lease on Postgres (`StateBackend::begin_tick`, `finish_tick`,
-//! `tick_status`): one row, `name = 'tick'`, shared by every engine on the
-//! database and by every tenant's view, on the database's clock.
+//! The tick lease on Postgres (`StateBackend::begin_tick`, `renew_tick`,
+//! `finish_tick`, `tick_status`): one row, `name = 'tick'`, shared by every
+//! engine on the database and by every tenant's view, on the database's
+//! clock.
 //!
 //! A begin is one upsert whose update runs only while the lease is free or
 //! lapsed. A begin that meets a row another begin has locked waits for it
 //! and checks the row as that one left it, so two begins never both take
 //! the lease. When the update does not run, the row stays locked by this
 //! transaction, so the read that follows names the holder that kept it. A
-//! finish is one update that names its holder: a holder whose lease was
-//! taken over changes nothing.
+//! renewal and a finish are each one update that names its holder: a holder
+//! whose lease was taken over changes nothing.
 
 use super::runs::decode;
 use super::tx::{no_nul, statement_error, with_tx};
@@ -100,6 +101,36 @@ pub(super) async fn finish_tick(
             .await?
             .rows_affected();
             fault_point!("pg.finish_tick", 1);
+            Ok(done == 1)
+        })
+    })
+    .await
+}
+
+pub(super) async fn renew_tick(
+    b: &PgBackend,
+    holder: &str,
+    lease: Duration,
+) -> BackendResult<bool> {
+    // A holder with a NUL cannot hold the lease.
+    if holder.contains('\0') {
+        return Ok(false);
+    }
+    crate::backend::tick_lease(lease)?;
+    let secs = lease.as_secs_f64();
+    with_tx(&b.pool, "renew_tick", |tx| {
+        Box::pin(async move {
+            let done = sqlx::query(
+                "UPDATE engine_ticks \
+                 SET lease_until = statement_timestamp() + make_interval(secs => $2) \
+                 WHERE name = 'tick' AND holder = $1",
+            )
+            .bind(holder)
+            .bind(secs)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+            fault_point!("pg.renew_tick", 1);
             Ok(done == 1)
         })
     })

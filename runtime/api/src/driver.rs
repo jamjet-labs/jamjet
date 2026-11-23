@@ -111,6 +111,8 @@ pub struct Driver {
     background: Background,
     /// Told when a tick of this driver has finished and saved its state.
     watch: Option<Arc<TickWatch>>,
+    /// The tick's lease in the store, and its renewal.
+    lease: TickLease,
 }
 
 impl Driver {
@@ -151,6 +153,7 @@ impl Driver {
             tick_lock: Arc::new(tokio::sync::Mutex::new(())),
             background: Background::Off,
             watch: None,
+            lease: TickLease::default(),
         }
     }
 
@@ -177,6 +180,13 @@ impl Driver {
     /// state, so `/health` stops calling the tick overdue at once.
     pub fn with_watch(mut self, watch: Arc<TickWatch>) -> Self {
         self.watch = Some(watch);
+        self
+    }
+
+    /// Another tick lease than the default, for a test that cannot wait
+    /// for half a minute.
+    pub fn with_tick_lease(mut self, lease: TickLease) -> Self {
+        self.lease = lease;
         self
     }
 
@@ -316,9 +326,31 @@ impl Driver {
 /// The shortest budget a tick takes. A smaller one cannot visit a run.
 pub const MIN_TICK_BUDGET: Duration = Duration::from_millis(100);
 
-/// How long past its budget a tick may still be running an engine step (a
-/// model call) when its lease is taken: the lease is the budget plus this.
-pub const SLOW_STEP_ALLOWANCE: Duration = Duration::from_secs(120);
+/// The tick's lease in the store, and how often a running tick renews it.
+///
+/// The lease is short and renewed, not sized to the longest step: a tick
+/// waits for every engine step it started, and a model call alone may take
+/// minutes. So a lease lapses only once its holder has stopped renewing it,
+/// and a tick that dies frees the store's tick within one lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TickLease {
+    /// 30 s: half the default tick interval, so a tick that died never makes
+    /// the next scheduled one answer busy.
+    pub lease: Duration,
+    /// 10 s, a third of the lease, as a worker heartbeats its item: a
+    /// renewal that fails, or waits for a connection, leaves time for the
+    /// next before the lease lapses.
+    pub renew_every: Duration,
+}
+
+impl Default for TickLease {
+    fn default() -> Self {
+        Self {
+            lease: Duration::from_secs(30),
+            renew_every: Duration::from_secs(10),
+        }
+    }
+}
 
 /// Outbox rows one tick seals.
 const OUTBOX_LIMIT: u32 = 500;
@@ -431,6 +463,38 @@ async fn mid_walk_seam() -> jamjet_state::BackendResult<()> {
     Ok(())
 }
 
+/// Renews a tick's lease every [`TickLease::renew_every`] until it is
+/// dropped. A renewal the store refuses because another holder has the
+/// lease ends it; one that fails is tried again at the next turn.
+struct Renewal {
+    /// Dropped with the guard, which stops the renewals. A renewal in
+    /// flight then finishes, and the loop ends at its next turn.
+    _stop: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Renewal {
+    fn start(backend: Arc<dyn StateBackend>, holder: String, lease: TickLease) -> Self {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => return,
+                    _ = tokio::time::sleep(lease.renew_every) => {}
+                }
+                match backend.renew_tick(&holder, lease.lease).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!("tick lease lost: another tick took over while this one ran");
+                        return;
+                    }
+                    Err(e) => warn!("tick: the lease could not be renewed: {e}"),
+                }
+            }
+        });
+        Self { _stop: stop }
+    }
+}
+
 /// What the walk over the running runs did.
 #[derive(Default)]
 struct Walk {
@@ -498,11 +562,7 @@ impl Driver {
             });
         };
         let holder = format!("{}:{}", self.instance, uuid::Uuid::new_v4().simple());
-        let cursor = match self
-            .backend
-            .begin_tick(&holder, budget + SLOW_STEP_ALLOWANCE)
-            .await?
-        {
+        let cursor = match self.backend.begin_tick(&holder, self.lease.lease).await? {
             TickBegin::Began { cursor, .. } => cursor,
             TickBegin::Busy {
                 holder,
@@ -514,6 +574,9 @@ impl Driver {
                 })
             }
         };
+        // Renewed while this tick runs, however long the steps it waits for
+        // take, and no longer once it ends, by any path.
+        let renewal = Renewal::start(self.backend.clone(), holder.clone(), self.lease);
         after_begin_seam().await?;
         let mut complete = true;
 
@@ -632,6 +695,9 @@ impl Driver {
             complete,
             report: serde_json::to_value(&report).unwrap_or(serde_json::Value::Null),
         };
+        // A renewal still in flight names this holder, so once the finish
+        // has given the lease back it changes nothing.
+        drop(renewal);
         match self.backend.finish_tick(&holder, &outcome).await {
             // Only a finish the store saved: a tick it did not record is one
             // no other engine sees either.
@@ -885,7 +951,9 @@ impl Default for WatchTiming {
 /// the last one finished more than three tick intervals ago, or when none has
 /// finished and this process has been up for longer than that. `/health` says
 /// so in `tick_overdue`, and while it is overdue any request writes one error
-/// line, at most once per [`WatchTiming::log_every`].
+/// line, at most once per [`WatchTiming::log_every`]. A tick that holds a
+/// live lease in the store is running, so nothing is overdue while it runs,
+/// however long the steps it waits for take.
 ///
 /// The tick row is read at most once per [`WatchTiming::read_every`], with
 /// the store's clock, so the age is taken on the clock that stamped it. A
@@ -919,6 +987,30 @@ struct Found {
     last_finished_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The store's clock less this process's, at the read.
     clock_offset: chrono::Duration,
+    /// At the read, a tick held a lease that had not lapsed.
+    running: bool,
+}
+
+impl Found {
+    /// What a read of `row` says, the store's clock `clock_offset` from this
+    /// process's.
+    fn read(row: Option<&jamjet_state::TickStatus>, clock_offset: chrono::Duration) -> Self {
+        let store_now = jamjet_state::clock::process_now() + clock_offset;
+        Self {
+            last_finished_at: row.and_then(|r| r.last_finished_at),
+            clock_offset,
+            running: row.is_some_and(|r| {
+                r.holder.is_some() && r.lease_until.is_some_and(|until| until > store_now)
+            }),
+        }
+    }
+}
+
+/// How long since the last tick finished, and whether one is running.
+#[derive(Clone, Copy)]
+struct Since {
+    age: Duration,
+    running: bool,
 }
 
 /// The turn to read the row: one request at a time holds it, and dropping it
@@ -992,7 +1084,7 @@ impl TickWatch {
             tracing::error!(
                 "no tick for {} s while the background loops are off: approvals do not \
                  expire, lapsed leases are not reclaimed, engine steps do not run",
-                since.as_secs()
+                since.age.as_secs()
             );
         }
         Some(overdue)
@@ -1003,10 +1095,7 @@ impl TickWatch {
     pub async fn status(&self) -> jamjet_state::BackendResult<Option<jamjet_state::TickStatus>> {
         match self.read().await {
             Ok((row, clock_offset)) => {
-                self.remember(Some(Found {
-                    last_finished_at: row.as_ref().and_then(|r| r.last_finished_at),
-                    clock_offset,
-                }));
+                self.remember(Some(Found::read(row.as_ref(), clock_offset)));
                 Ok(row)
             }
             Err(e) => {
@@ -1028,26 +1117,32 @@ impl TickWatch {
             found: Some(Found {
                 last_finished_at: Some(jamjet_state::clock::process_now() + clock_offset),
                 clock_offset,
+                running: false,
             }),
         });
     }
 
-    fn is_overdue(&self, since: Duration) -> bool {
-        since > self.interval.saturating_mul(3)
+    fn is_overdue(&self, since: Since) -> bool {
+        !since.running && since.age > self.interval.saturating_mul(3)
     }
 
     /// How long since the last tick finished, on the store's clock, or since
-    /// this process started when none has.
-    async fn since_last_tick(&self) -> Option<Duration> {
+    /// this process started when none has; and whether one was running at
+    /// the last read.
+    async fn since_last_tick(&self) -> Option<Since> {
         if self.background == Background::On {
             return None;
         }
         let found = self.found().await?;
-        Some(match found.last_finished_at {
+        let age = match found.last_finished_at {
             Some(at) => (jamjet_state::clock::process_now() + found.clock_offset - at)
                 .to_std()
                 .unwrap_or(Duration::ZERO),
             None => self.up_since.elapsed(),
+        };
+        Some(Since {
+            age,
+            running: found.running,
         })
     }
 
@@ -1065,10 +1160,11 @@ impl TickWatch {
         if let Some(seen) = self.fresh() {
             return seen.found;
         }
-        let found = self.read().await.ok().map(|(row, clock_offset)| Found {
-            last_finished_at: row.and_then(|r| r.last_finished_at),
-            clock_offset,
-        });
+        let found = self
+            .read()
+            .await
+            .ok()
+            .map(|(row, clock_offset)| Found::read(row.as_ref(), clock_offset));
         self.remember(found)
     }
 

@@ -1330,6 +1330,19 @@ pub trait StateBackend: Send + Sync {
     async fn tick_status(&self) -> BackendResult<Option<TickStatus>> {
         Err(cannot_coordinate_ticks())
     }
+
+    /// Move the end of `holder`'s tick lease to `lease` from now by the
+    /// store's clock, if the tick row still names `holder`. A running tick
+    /// renews its lease while it runs, so the lease can be short: it lapses
+    /// only once its holder stops renewing it. `false`, with nothing
+    /// written, when the row does not name `holder`: the lease lapsed and
+    /// another holder took it, `holder` never held it, or it was given
+    /// back. A lease longer than [`MAX_TICK_LEASE`] is refused. The default
+    /// refuses.
+    async fn renew_tick(&self, holder: &str, lease: std::time::Duration) -> BackendResult<bool> {
+        let _ = (holder, lease);
+        Err(cannot_coordinate_ticks())
+    }
 }
 
 /// Metadata for an API token (does not contain the plaintext token).

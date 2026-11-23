@@ -786,10 +786,11 @@ budget is held to `JAMJET_TICK_BUDGET_MS`. Any other field is a 400.
 Two ticks never run at once. A lock in each process and a lease in the store
 collapse them to one, so with several engines on one database you can tick any
 of them. A repeated or late tick records nothing twice. That rests on the
-store's conditional writes, not on the lease. The lease lasts the tick's budget
-plus 120 s. If an instance dies mid-tick, every tick answers busy until that
-lease lapses. A tick goes on when its caller hangs up, so a scheduler that gives
-up early does not cut it off between two steps.
+store's conditional writes, not on the lease. The lease lasts 30 s, and a
+running tick renews it every 10 s for as long as it runs, however long the steps
+it waits for take. If an instance dies mid-tick, ticks answer busy until its
+lease lapses, within 30 s. A tick goes on when its caller hangs up, so a
+scheduler that gives up early does not cut it off between two steps.
 
 ### Who may call the tick
 
@@ -864,9 +865,9 @@ model's own `timeout_secs` in the IR says so. With the defaults, allow at least
 45 s plus 300 s. Lower the model timeout or the tick budget if your platform's
 limit is shorter.
 
-A tick that waits more than 120 s past its budget for a slow step outlives its
-lease, and another tick can then start beside it. Nothing is recorded twice,
-but it is wasted work.
+A tick that waits for a slow step keeps renewing its lease, so no other tick
+starts beside it, and ticks on any engine of the store answer busy until it
+ends.
 
 On a stop signal, a tick or an advance in progress counts as work the shutdown
 waits for, within the grace (4 s on a platform). A tick that is stopping
@@ -885,7 +886,8 @@ curl https://engine.example/health
 
 - `tick_overdue` is true when the last tick finished more than three intervals
   ago (`JAMJET_TICK_INTERVAL_SECS`), or when none has finished and the process
-  has been up for longer than that. It is null with the loops on, and when the
+  has been up for longer than that. A tick that holds a live lease is running,
+  so a long tick is not overdue. It is null with the loops on, and when the
   store could not be read, or not within 2 s. `status` stays `"ok"`, since the
   process still serves.
 - Each instance reads the tick state at most every 30 s, so a tick another
