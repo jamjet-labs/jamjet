@@ -1,0 +1,6 @@
+model: scripted (no API key)
+I could not pay the deposit. The payment tool has no venue called Venue Lisboa Central.
+called search_venues(city='Lisbon', date='2026-12-11')
+called pay_deposit(venue='Venue Lisboa Central', amount=500)
+  -> Refused: there is no venue called 'Venue Lisboa Central'. Use a name that search_venues returned.
+payments.log: 0 line(s)
