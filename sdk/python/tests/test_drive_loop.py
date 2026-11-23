@@ -610,6 +610,70 @@ def test_the_worker_id_is_unique_per_process() -> None:
         assert forked != mine
 
 
+async def test_one_process_drives_a_run_once_at_a_time(tools: types.SimpleNamespace, clock: Clock) -> None:
+    # The engine hands the lease a worker id holds to that id again. Two drives of
+    # one run in this process share an id, so without a guard each would run the step.
+    held = tool_item(function="slow")
+    engine = ScriptedEngine(claims=[held, held, ENDED_COMPLETED])
+    started = asyncio.Event()
+
+    def on_start() -> None:
+        started.set()
+        if len(tools.calls) > 1:
+            tools.release.set()  # a second run of the step must not hang the test
+
+    tools.on_start = on_start
+    with respx.mock(assert_all_called=False) as mock:
+        mock.route(host="engine.test").mock(side_effect=engine)
+        async with JamjetClient(BASE) as one, JamjetClient(BASE) as two:
+            first = asyncio.ensure_future(drive_run(one, "exec_1", queues=QUEUES, model=caller_model(), run_key=None))
+            try:
+                await asyncio.wait_for(started.wait(), timeout=10)
+                with pytest.raises(RunWaiting) as waiting:
+                    await drive_run(two, "exec_1", queues=QUEUES, model=caller_model(), run_key=None)
+                assert waiting.value.waiting_for == "worker"
+                assert waiting.value.execution_id == "exec_1"
+                assert "already driving run exec_1" in str(waiting.value)
+                # The second drive claimed nothing, and the step ran once.
+                assert len(engine.sent("/work-items/claim")) == 1
+                assert tools.calls == [{"q": "venues"}]
+
+                # The step ends; then the engine says the run is over.
+                engine.claims[:] = [ENDED_COMPLETED]
+                tools.release.set()
+                assert await first == COMPLETED
+                assert tools.calls == [{"q": "venues"}]
+                assert len(engine.sent("/work-items/wi-tools/complete")) == 1
+
+                # Once the first drive has ended, the run can be driven here again.
+                assert await drive_run(two, "exec_1", queues=QUEUES, model=caller_model(), run_key=None) == COMPLETED
+            finally:
+                # A failed assert must not leave the first drive running.
+                tools.release.set()
+                first.cancel()
+                await asyncio.gather(first, return_exceptions=True)
+
+
+def _child_drives(queue: Any) -> None:
+    queue.put(sorted(drive._driving))
+
+
+def test_a_forked_child_does_not_inherit_its_parents_drives() -> None:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("this platform does not fork")
+    ctx = multiprocessing.get_context("fork")
+    drive._driving.add("exec_in_the_parent")
+    try:
+        queue = ctx.Queue()
+        child = ctx.Process(target=_child_drives, args=(queue,))
+        child.start()
+        in_child = queue.get(timeout=30)
+        child.join(timeout=30)
+    finally:
+        drive._driving.discard("exec_in_the_parent")
+    assert in_child == []
+
+
 # ── auth and features ────────────────────────────────────────────────────────
 
 

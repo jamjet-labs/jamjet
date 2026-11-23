@@ -28,7 +28,10 @@ An ended run: ``cancelled`` raises :class:`RunCancelled`; ``completed``,
 
 The worker id is ``drive-<12 hex>``, made once per process. A driver started
 again after a crash has a new id, so it waits for the old lease to lapse
-before it gets the step: two processes never share a lease.
+before it gets the step: two processes never share a lease. Within a process
+a run is driven once at a time: the engine hands a worker id the lease it
+already holds, so a second drive here would run the first one's step too. It
+raises :class:`RunWaiting` instead.
 
 On the ``stop`` event nothing more is claimed. The step in hand gets
 :data:`STOP_GRACE_S` to finish; then :class:`RunInterrupted` is raised, and a
@@ -45,6 +48,7 @@ import hashlib
 import json
 import os
 import secrets
+import threading
 import time
 from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -86,16 +90,26 @@ def _new_worker_id() -> str:
 
 _worker_id = _new_worker_id()
 
+# The runs this process is driving now. The engine hands the lease a worker id
+# holds to that same id again, and every drive here has one id, so a second
+# drive of a run already driven here would be handed the first one's step and
+# run it beside the first.
+_driving: set[str] = set()
+_driving_lock = threading.Lock()
 
-def _renew_worker_id() -> None:
-    global _worker_id
+
+def _after_fork_in_child() -> None:
+    global _worker_id, _driving_lock
+    # A forked child is another process: it must not claim under its parent's
+    # id, or the engine would hand it the lease the parent holds. Nor does it
+    # inherit the parent's drives, or a lock the parent held at the fork.
     _worker_id = _new_worker_id()
+    _driving.clear()
+    _driving_lock = threading.Lock()
 
 
-# A forked child is another process: it must not claim under its parent's id,
-# or the engine would hand it the lease the parent holds.
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_renew_worker_id)
+    os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def driver_worker_id() -> str:
@@ -163,7 +177,46 @@ async def drive_run(
     ``model`` answers the run's worker model steps. ``run_key`` is shown to
     tool handlers on their work context. ``lease_secs`` is the lease each
     claim asks for. See the module docstring for the exit rules.
+
+    A process drives a run once at a time. A second call for a run this
+    process is already driving raises :class:`RunWaiting` at once and claims
+    nothing.
     """
+    with _driving_lock:
+        if execution_id in _driving:
+            raise RunWaiting(
+                execution_id,
+                "worker",
+                message=f"this process is already driving run {execution_id}; it was not driven a second time",
+            )
+        _driving.add(execution_id)
+    try:
+        return await _drive(
+            client,
+            execution_id,
+            queues=queues,
+            model=model,
+            run_key=run_key,
+            lease_secs=lease_secs,
+            stall_after_s=stall_after_s,
+            stop=stop,
+        )
+    finally:
+        with _driving_lock:
+            _driving.discard(execution_id)
+
+
+async def _drive(
+    client: JamjetClient,
+    execution_id: str,
+    *,
+    queues: list[str],
+    model: Model | None,
+    run_key: str | None,
+    lease_secs: int | None,
+    stall_after_s: float,
+    stop: asyncio.Event | None,
+) -> dict[str, Any]:
     worker_id = driver_worker_id()
     last_progress = _monotonic()
     seen: str | None = None
