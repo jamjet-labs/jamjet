@@ -1313,13 +1313,17 @@ async fn list_approvals_for_execution(
     let backend = state.backend_for(&tenant_id);
     let execution_id = parse_execution_id(&id)?;
 
-    // Fast path: serve from the durable projection (eventually-consistent; lags
-    // the write path by up to one projector tick, ~500 ms).
+    // Fast path: serve from the durable projection, but only once it has
+    // caught up with the run: its checkpoint has reached the run's latest
+    // event. The projector lags the log (500 ms with the loops on, a tick
+    // interval with them off), and it never visits a run again once the run
+    // has ended, so a copy that is behind can be behind for good.
     //
-    // Fallback to event-log replay when the projection is empty.  This covers:
-    // - Running executions not yet visited by the projector (no tick yet).
-    // - Terminal executions that completed before a projector tick (projector
-    //   only scans Running; their events were never folded into proj_approvals).
+    // Else the event log is read. This covers:
+    // - A run the projector has not caught up with: a request raised or a
+    //   decision recorded since its last pass, by a write or its advance.
+    // - Terminal executions whose last events came after the projector's last
+    //   pass (the projector only scans Running).
     // - Non-default-tenant executions (the projector runs on the base backend
     //   and writes proj_approvals with tenant_id='default'; reading via
     //   backend_for(&tenant_id) returns nothing for the real tenant).
@@ -1328,7 +1332,19 @@ async fn list_approvals_for_execution(
     // Follow-up: F-2h-tenant (thread tenant into projector writes) + F-2h-terminal
     // (project terminal executions) will close the coverage gap so the fallback
     // shrinks to a thin cold-start edge case.
-    let rows = backend.get_approval_projection(&execution_id).await?;
+    //
+    // The latest sequence is read before the checkpoint, and the rows after
+    // it: the rows are at least as new as the checkpoint they were written
+    // with, so a copy found caught up holds every event the read saw.
+    let latest = backend.latest_sequence(&execution_id).await?;
+    let checkpoint = backend
+        .get_projector_checkpoint("approvals", &execution_id)
+        .await?;
+    let rows = if checkpoint >= latest {
+        backend.get_approval_projection(&execution_id).await?
+    } else {
+        Vec::new()
+    };
 
     if !rows.is_empty() {
         // Projection fast path: build the response from the durable read model.
@@ -1400,9 +1416,9 @@ async fn list_approvals_for_execution(
             serde_json::json!({ "pending": pending, "decided": decided }),
         ))
     } else {
-        // Event-log fallback: guarantees the endpoint is never worse than before
-        // the projection switch (2h-3).  Covers unprojected, terminal, and
-        // non-default-tenant executions until F-2h-tenant + F-2h-terminal land.
+        // Event-log fallback: the run's own log, always current. Covers a
+        // copy that is behind or missing, terminal runs, and non-default
+        // tenants.
         let events = backend.get_events(&execution_id).await?;
         Ok(Json(crate::approvals::approvals_view(&events)))
     }

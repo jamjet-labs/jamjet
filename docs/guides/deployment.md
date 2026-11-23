@@ -734,11 +734,12 @@ warning at start that the loops need CPU between requests.
   waits for it to finish. The step after it is dispatched by the next write to
   the run or the next tick. A run of such steps moves about one step per tick.
 - Approval deadlines expire, and lapsed leases are reclaimed, only on a tick.
-- `GET /approvals` reads the approvals read model, and so does
-  `GET /executions/:id/approvals` once a tick has projected that run. Only a
-  tick brings the model up to date, so both can lag the log by one tick
-  interval. Before a tick has projected a run, `GET /executions/:id/approvals`
-  reads the run's log. The approve route always decides from the log.
+- `GET /approvals` reads the approvals read model. Only a tick brings the
+  model up to date, so it can lag the log by one tick interval.
+  `GET /executions/:id/approvals` reads the model only when it has caught up
+  with the run's log, and reads the log otherwise, so a request that a write
+  raised or decided shows at once. The approve route always decides from the
+  log.
 
 The advance never changes a write's answer. A failure in it is logged and
 counted, and the next tick goes on from the log. It runs as the engine, never as

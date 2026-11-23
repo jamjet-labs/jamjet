@@ -1112,6 +1112,178 @@ async fn a_request_that_wrote_nothing_does_not_advance() {
     }
 }
 
+// ── The approvals a run lists ────────────────────────────────────────────────
+
+impl Env {
+    /// The reviewer decides `run`'s pending `node`: `approved` or `rejected`.
+    async fn decide(&self, run: &ExecutionId, node: &str, decision: &str) -> Reply {
+        let digest = self.digest(run).await;
+        self.call(
+            "POST",
+            &format!("/executions/{run}/approve"),
+            &self.bob,
+            Some(json!({ "decision": decision, "node_id": node, "action_digest": digest })),
+        )
+        .await
+    }
+
+    /// `GET /executions/:id/approvals` as the reviewer: the nodes pending,
+    /// and each decided node with its status.
+    async fn listed(&self, run: &ExecutionId) -> (Vec<String>, Vec<(String, String)>) {
+        let reply = self
+            .call("GET", &format!("/executions/{run}/approvals"), &self.bob, None)
+            .await;
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "{}: {}",
+            self.name(),
+            reply.body
+        );
+        let node = |row: &Value| row["node_id"].as_str().unwrap_or_default().to_string();
+        let pending = reply.body["pending"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}: {}", self.name(), reply.body))
+            .iter()
+            .map(node)
+            .collect();
+        let decided = reply.body["decided"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}: {}", self.name(), reply.body))
+            .iter()
+            .map(|row| (node(row), row["status"].as_str().unwrap_or_default().to_string()))
+            .collect();
+        (pending, decided)
+    }
+
+    /// The stored copy of `run`'s approvals, as the projector left it: each
+    /// node with its status.
+    async fn stored(&self, run: &ExecutionId) -> Vec<(String, String)> {
+        self.inner
+            .get_approval_projection(run)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.node_id, row.status))
+            .collect()
+    }
+}
+
+fn decided(node: &str, status: &str) -> Vec<(String, String)> {
+    vec![(node.to_string(), status.to_string())]
+}
+
+/// A tick has stored `review` as pending. The reviewer rejects it, and the
+/// decision's advance fails the node and the run before the answer. No
+/// projector visits a finished run again, so the stored copy says pending
+/// for good. Read right after the decision, and again after another tick,
+/// the run lists the rejection and nothing pending.
+#[tokio::test]
+async fn a_run_that_ends_inside_its_advance_lists_its_decision() {
+    for kind in kinds() {
+        let Some(env) = Env::new(kind, "a_run_that_ends_inside_its_advance").await else {
+            continue;
+        };
+        let name = env.name();
+        env.register(&workflow(
+            "wf-ends",
+            vec![py("s"), review("review")],
+            &[("s", "review")],
+        ))
+        .await;
+        let run = env.start("wf-ends").await;
+        env.work("python_tool", "s").await;
+        env.tick().await;
+        let pending = vec!["review".to_string()];
+        assert_eq!(
+            env.stored(&run).await,
+            decided("review", "pending"),
+            "{name}: the tick stored the request"
+        );
+        assert_eq!(env.listed(&run).await, (pending, vec![]), "{name}");
+
+        let reply = env.decide(&run, "review", "rejected").await;
+        assert_eq!(reply.status, StatusCode::OK, "{name}: {}", reply.body);
+        assert_eq!(
+            env.status(&run).await,
+            WorkflowStatus::Failed,
+            "{name}: the run ended inside the advance"
+        );
+
+        // No tick in between.
+        assert_eq!(
+            env.listed(&run).await,
+            (vec![], decided("review", "rejected")),
+            "{name}: right after the decision"
+        );
+        env.tick().await;
+        assert_eq!(
+            env.stored(&run).await,
+            decided("review", "pending"),
+            "{name}: no projector visits a finished run"
+        );
+        assert_eq!(
+            env.listed(&run).await,
+            (vec![], decided("review", "rejected")),
+            "{name}: after the next tick"
+        );
+    }
+}
+
+/// A tick has stored `review1` as pending. The reviewer approves it, and the
+/// decision's advance dispatches `p`. Read right after, `review1` is decided
+/// and nothing is pending. The worker completes `p`, and the completion's
+/// advance raises `review2`. Read right after, `review2` is pending. No tick
+/// runs in between, so the stored copy still says `review1` is pending.
+#[tokio::test]
+async fn a_request_raised_or_decided_by_an_advance_is_listed_at_once() {
+    for kind in kinds() {
+        let Some(env) = Env::new(kind, "a_request_raised_or_decided").await else {
+            continue;
+        };
+        let name = env.name();
+        env.register(&workflow(
+            "wf-two-reviews",
+            vec![py("s"), review("review1"), py("p"), review("review2")],
+            &[("s", "review1"), ("review1", "p"), ("p", "review2")],
+        ))
+        .await;
+        let run = env.start("wf-two-reviews").await;
+        env.work("python_tool", "s").await;
+        env.tick().await;
+        assert_eq!(
+            env.stored(&run).await,
+            decided("review1", "pending"),
+            "{name}: the tick stored the request"
+        );
+
+        let reply = env.decide(&run, "review1", "approved").await;
+        assert_eq!(reply.status, StatusCode::OK, "{name}: {}", reply.body);
+        assert_eq!(
+            env.listed(&run).await,
+            (vec![], decided("review1", "approved")),
+            "{name}: right after the decision"
+        );
+
+        env.work("python_tool", "p").await;
+        assert_eq!(
+            env.requests(&run).await,
+            2,
+            "{name}: the completion's advance raised review2"
+        );
+        assert_eq!(
+            env.listed(&run).await,
+            (vec!["review2".to_string()], decided("review1", "approved")),
+            "{name}: right after the completion"
+        );
+        assert_eq!(
+            env.stored(&run).await,
+            decided("review1", "pending"),
+            "{name}: no tick ran, so the stored copy is behind"
+        );
+    }
+}
+
 // ── What the advance must never do ───────────────────────────────────────────
 
 /// A pass that fails inside the advance changes nothing the caller is told:

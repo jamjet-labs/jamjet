@@ -255,9 +255,12 @@ JamJet uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A value of `JAMJET_TICK_INTERVAL_SECS`, `JAMJET_TICK_BUDGET_MS`, `JAMJET_INLINE_ADVANCE_MS`
   or `JAMJET_TICK_ENGINE_CONCURRENCY` that is set but not valid stops the server, with the
   loops on too.
-- With the loops off, only a tick runs the projector, so `GET /approvals`, and
-  `GET /executions/:id/approvals` once a tick has projected the run, can lag the log by one
-  tick interval. A model or eval step the engine runs waits for a tick.
+- With the loops off, only a tick runs the projector, so `GET /approvals` can lag the log by
+  one tick interval. A model or eval step the engine runs waits for a tick.
+- `GET /executions/:id/approvals` reads the approvals read model only when it has caught up
+  with the run's log, and reads the log otherwise, with the loops on or off. A run that ended
+  after the projector's last pass, or a request raised or decided since, no longer lists a
+  decided request as pending or leaves a new one out.
 - `StateBackend` gains `begin_tick`, `finish_tick` and `tick_status`. Their defaults refuse
   ("this backend cannot coordinate ticks"), so a backend outside this repository still
   compiles, and `POST /ops/tick` on it is a 500.
