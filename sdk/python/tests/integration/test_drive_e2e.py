@@ -566,6 +566,115 @@ def test_two_drivers_on_one_run_complete_each_node_once(engine: Engine, tmp_path
     say("two drivers", f"run {run_id}\nclaims per driver {dict(by_worker)}\nrefusals {dict(reasons)}")
 
 
+# The python_fn step of the approval workflow below, run by the driver in this process.
+PREPARED: list[Any] = []
+
+
+def prepare_notes(state: dict[str, Any]) -> dict[str, Any]:
+    PREPARED.append(state.get("release"))
+    return {"notes": f"release {state.get('release')} notes written"}
+
+
+def approval_workflow() -> dict[str, Any]:
+    """A python_fn step the driver claims, then a human_approval node, then the end."""
+
+    def node(node_id: str, kind: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": node_id,
+            "kind": kind,
+            "retry_policy": None,
+            "node_timeout_secs": None,
+            "description": None,
+            "labels": {},
+        }
+
+    return {
+        "workflow_id": "drive-e2e-approval",
+        "version": "0.1.0",
+        "name": None,
+        "description": None,
+        "state_schema": "",
+        "start_node": "prepare",
+        "nodes": {
+            "prepare": node(
+                "prepare",
+                {
+                    "type": "python_fn",
+                    "module": __name__,
+                    "function": "prepare_notes",
+                    "output_schema": "",
+                    "claim": "by_execution",
+                },
+            ),
+            "review": node(
+                "review",
+                {
+                    "type": "human_approval",
+                    "description": "Publish the notes?",
+                    "timeout_secs": None,
+                    "fallback_node": None,
+                },
+            ),
+        },
+        "edges": [
+            {"from": "prepare", "to": "review", "condition": None},
+            {"from": "review", "to": "end", "condition": None},
+        ],
+        "retry_policies": {},
+        "timeouts": {},
+        "models": {},
+        "tools": {},
+        "mcp_servers": {},
+        "remote_agents": {},
+        "labels": {},
+    }
+
+
+def test_a_drive_stops_at_an_approval_node_at_once_and_a_second_drive_finishes(engine: Engine) -> None:
+    from jamjet.client import JamjetClient
+    from jamjet.drive import DRIVE_QUEUES, RunWaiting, drive_run
+
+    stall_after_s = 60.0
+    PREPARED.clear()
+
+    async def scenario() -> tuple[str, RunWaiting, float, dict[str, Any], dict[str, Any]]:
+        async with JamjetClient(engine.url) as client:
+            ir = approval_workflow()
+            await client.create_workflow(ir)
+            started = await client.start_execution(ir["workflow_id"], {"release": "1.4"}, ir["version"])
+            run_id = started["execution_id"]
+            began = time.monotonic()
+            with pytest.raises(RunWaiting) as waiting:
+                await drive_run(
+                    client, run_id, queues=list(DRIVE_QUEUES), model=None, run_key=None, stall_after_s=stall_after_s
+                )
+            waited_s = time.monotonic() - began
+            (pending,) = (await client.list_approvals(run_id))["pending"]
+            decision = await client.approve(
+                run_id,
+                "approved",
+                node_id=pending["node_id"],
+                action_digest=(pending.get("context") or {}).get("action_digest"),
+                user_id="reviewer",
+            )
+            done = await drive_run(client, run_id, queues=list(DRIVE_QUEUES), model=None, run_key=None)
+            return run_id, waiting.value, waited_s, decision, done
+
+    run_id, waiting, waited_s, decision, done = run_within(150, scenario())
+
+    # The step ran here, then the drive left at the approval, well before the stall bound.
+    assert PREPARED == ["1.4"]
+    assert (waiting.execution_id, waiting.waiting_for, waiting.node_id) == (run_id, "approval", "review")
+    assert waited_s < stall_after_s / 2, f"the drive took {waited_s:.1f} s to say the run waits"
+    assert decision["accepted"] is True, decision
+    # The second drive saw the run through to its end and ran nothing again.
+    assert done["status"] == "completed", done
+    assert done["current_state"]["notes"] == "release 1.4 notes written"
+    assert PREPARED == ["1.4"]
+    assert engine.node_completions(run_id)["prepare"] == 1
+    say("approval node", f"run {run_id}: waiting for approval at {waiting.node_id} after {waited_s:.1f} s")
+
+
 @pytest.mark.skipif(
     not os.environ.get("JAMJET_OLD_SERVER_PATH"),
     reason="set JAMJET_OLD_SERVER_PATH=<jamjet-server built from python-sdk-v0.13.0>",
