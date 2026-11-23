@@ -677,8 +677,9 @@ class Agent:
         *drive* works the run's steps in this process instead of waiting for
         workers: its tool steps through this agent's ``@tool`` functions, its
         worker model steps through *model* (a :class:`~jamjet.model.Model`;
-        by default the agent's own, with its governance middleware). The run's
-        tool dispatch steps are claimable only by the token that started it.
+        by default the agent's own, with its governance middleware). Every
+        model step of the run is a worker model step, and its model and tool
+        dispatch steps are claimable only by the token that started it.
         *lease_secs* is the lease each claim asks for. The engine must list
         ``python_fn_by_execution`` and ``worker_model_steps`` in ``/health``,
         else ``EngineFeatureMissing`` is raised before anything is registered.
@@ -756,7 +757,7 @@ class Agent:
             initial_input = build_initial_state(self, prompt)
 
         if drive:
-            ir = compile_agent_to_ir(self, prompt, max_turns, claim_by_execution=True)
+            ir = compile_agent_to_ir(self, prompt, max_turns, drive=True)
         else:
             ir = compile_agent_to_ir(self, prompt, max_turns)
         workflow_id: str = ir["workflow_id"]

@@ -301,6 +301,15 @@ async def test_drive_runs_tool_and_model_steps_until_completed(tools: types.Simp
     assert result.execution_id == "exec_1"
     # The features, then the register and the start, then claims for this run only.
     assert engine.paths()[:3] == ["GET /health", "POST /workflows", "POST /executions"]
+    # The registered graph hands every model step and every tool step to this run's worker.
+    (registered,) = engine.sent("/workflows")
+    kinds = {node_id: node["kind"] for node_id, node in registered["ir"]["nodes"].items()}
+    assert {i: k["executor"] for i, k in kinds.items() if k["type"] == "model"} == {
+        f"__model_{t}__": "worker" for t in range(9)
+    }
+    assert {i: k["claim"] for i, k in kinds.items() if k["type"] == "python_fn"} == {
+        f"__tools_{t}__": "by_execution" for t in range(8)
+    }
     assert engine.sent("/work-items/claim") == [claim_body(90)] * 3
     # The model step went to the caller's model and its answer to the engine.
     assert [r.messages for r in backend.requests] == [[{"role": "user", "content": "Find a venue"}]]

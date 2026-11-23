@@ -467,11 +467,15 @@ def test_compile_marks_dispatch_by_execution_only_when_asked():
             assert "claim" not in node["kind"]
 
 
-def test_default_compile_is_byte_identical():
+def test_the_default_ir_is_unchanged():
     import hashlib
     import json
 
     ir = compile_agent_to_ir(_agent(), "hi", max_turns=2)
+    # drive=False is the default, not a new shape.
+    assert compile_agent_to_ir(_agent(), "hi", max_turns=2, drive=False) == ir
+    for node in ir["nodes"].values():
+        assert "executor" not in node["kind"]
     assert "claim" not in ir["nodes"]["__tools_0__"]["kind"]
     assert ir["nodes"]["__tools_0__"]["kind"] == {
         "type": "python_fn",
@@ -501,3 +505,54 @@ def test_default_compile_is_byte_identical():
     assert (
         hashlib.sha256(text.encode()).hexdigest() == "cabac21833cb7acc4759b543b106e9cfa19dd3910be42d87ca21decd5995e02c"
     )
+
+
+# ── drive mode ────────────────────────────────────────────────────────────────
+
+
+def test_drive_ir_marks_model_and_dispatch_nodes():
+    ir = compile_agent_to_ir(_agent(), "hi", max_turns=2, drive=True)
+    nodes = ir["nodes"]
+    assert set(nodes) == {
+        "__model_0__",
+        "__tool_gate_0__",
+        "__tools_0__",
+        "__model_1__",
+        "__tool_gate_1__",
+        "__tools_1__",
+        "__model_2__",
+    }
+    # Every model node, the final one too, is run by the run's own worker.
+    for node_id in ("__model_0__", "__model_1__", "__model_2__"):
+        assert nodes[node_id]["kind"]["executor"] == "worker"
+        assert "claim" not in nodes[node_id]["kind"]
+    assert nodes["__model_2__"]["kind"] == {
+        "type": "model",
+        "model_ref": "anthropic/claude-sonnet-4-6",
+        "prompt_ref": "",
+        "output_schema": "",
+        "system_prompt": "You are a research assistant.",
+        "tools": [],
+        "executor": "worker",
+    }
+    # Every dispatch node is claimed by its execution, and has no executor.
+    for node_id in ("__tools_0__", "__tools_1__"):
+        assert nodes[node_id]["kind"]["claim"] == "by_execution"
+        assert "executor" not in nodes[node_id]["kind"]
+    # The gates run on the engine as before.
+    for node_id in ("__tool_gate_0__", "__tool_gate_1__"):
+        assert "executor" not in nodes[node_id]["kind"]
+        assert "claim" not in nodes[node_id]["kind"]
+
+    # Nothing else differs from the default graph, but the cache key does.
+    default = compile_agent_to_ir(_agent(), "hi", max_turns=2)
+    assert ir["version"] != default["version"]
+    for node in ir["nodes"].values():
+        node["kind"].pop("executor", None)
+        node["kind"].pop("claim", None)
+    ir["version"] = default["version"]
+    assert ir == default
+
+    # drive is keyword only.
+    with pytest.raises(TypeError):
+        compile_agent_to_ir(_agent(), "hi", 2, False, True)  # type: ignore[misc]
