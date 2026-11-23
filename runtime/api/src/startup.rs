@@ -543,6 +543,229 @@ pub fn shown_url(url: &str) -> String {
     format!("{scheme}://{host}{path}")
 }
 
+// ── Request-driven mode ──
+
+/// Turns the engine's own loops (scheduler, projector, embedded workers,
+/// outbox drain, cron) on or off: `on`, the default, or `off`. With `off` a
+/// caller drives the engine through `POST /ops/tick`.
+pub const BACKGROUND_ENV: &str = "JAMJET_BACKGROUND";
+
+/// Whether the engine runs its own loops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Background {
+    On,
+    Off,
+}
+
+impl Background {
+    /// The value as `JAMJET_BACKGROUND` spells it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// [`BACKGROUND_ENV`]: unset is on; `on` or `off`, in any case; anything
+/// else is an error naming the variable. It is not a boolean switch, so
+/// `0` or `false` is refused rather than read one way or the other.
+pub fn background_from(get: impl Fn(&str) -> Option<String>) -> Result<Background, String> {
+    let Some(raw) = get(BACKGROUND_ENV) else {
+        return Ok(Background::On);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" => Ok(Background::On),
+        "off" => Ok(Background::Off),
+        _ => Err(format!(
+            "invalid {BACKGROUND_ENV} `{raw}`: expected `on` or `off`"
+        )),
+    }
+}
+
+/// Logged once at startup when the loops are off.
+pub const LOOPS_OFF_NOTICE: &str = "background loops are off; call POST /ops/tick every minute";
+
+/// Milliseconds an advance after a write may spend running engine steps.
+pub const INLINE_ADVANCE_ENV: &str = "JAMJET_INLINE_ADVANCE_MS";
+/// Milliseconds one tick may spend.
+pub const TICK_BUDGET_ENV: &str = "JAMJET_TICK_BUDGET_MS";
+/// Engine steps one tick runs at once.
+pub const TICK_ENGINE_CONCURRENCY_ENV: &str = "JAMJET_TICK_ENGINE_CONCURRENCY";
+/// Seconds between ticks the caller is expected to keep.
+pub const TICK_INTERVAL_ENV: &str = "JAMJET_TICK_INTERVAL_SECS";
+
+/// How the engine works with the loops off: inside a tick and after a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverConfig {
+    /// [`INLINE_ADVANCE_ENV`], 2000 ms by default.
+    pub inline_budget: std::time::Duration,
+    /// [`TICK_BUDGET_ENV`], 45000 ms by default, at least 100 ms.
+    pub tick_budget: std::time::Duration,
+    /// [`TICK_ENGINE_CONCURRENCY_ENV`], 4 by default, at least 1.
+    pub engine_concurrency: usize,
+    /// [`TICK_INTERVAL_ENV`], 60 s by default.
+    pub tick_interval: std::time::Duration,
+}
+
+impl Default for DriverConfig {
+    fn default() -> Self {
+        Self {
+            inline_budget: std::time::Duration::from_millis(2_000),
+            tick_budget: std::time::Duration::from_millis(45_000),
+            engine_concurrency: 4,
+            tick_interval: std::time::Duration::from_secs(60),
+        }
+    }
+}
+
+/// `name` as a whole number of at least `least`, or its default when unset.
+fn whole_at_least(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    least: u64,
+    default: u64,
+) -> Result<u64, String> {
+    let Some(raw) = get(name) else {
+        return Ok(default);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n >= least => Ok(n),
+        _ => Err(format!(
+            "invalid {name} `{raw}`: expected a whole number, at least {least}"
+        )),
+    }
+}
+
+/// The driver settings, each defaulted when unset. A value that is set but
+/// not valid is an error naming the variable.
+pub fn driver_config_from(get: impl Fn(&str) -> Option<String>) -> Result<DriverConfig, String> {
+    use std::time::Duration;
+    let defaults = DriverConfig::default();
+    let ms = |d: Duration| d.as_millis() as u64;
+    let engine_concurrency = whole_at_least(
+        &get,
+        TICK_ENGINE_CONCURRENCY_ENV,
+        1,
+        defaults.engine_concurrency as u64,
+    )?;
+    Ok(DriverConfig {
+        inline_budget: Duration::from_millis(whole_at_least(
+            &get,
+            INLINE_ADVANCE_ENV,
+            1,
+            ms(defaults.inline_budget),
+        )?),
+        tick_budget: Duration::from_millis(whole_at_least(
+            &get,
+            TICK_BUDGET_ENV,
+            100,
+            ms(defaults.tick_budget),
+        )?),
+        engine_concurrency: usize::try_from(engine_concurrency).map_err(|_| {
+            format!("{TICK_ENGINE_CONCURRENCY_ENV} is too large: {engine_concurrency}")
+        })?,
+        tick_interval: Duration::from_secs(whole_at_least(
+            &get,
+            TICK_INTERVAL_ENV,
+            1,
+            defaults.tick_interval.as_secs(),
+        )?),
+    })
+}
+
+/// A tick may run [`DriverConfig::engine_concurrency`] engine steps at once,
+/// each holding a connection, plus one for the tick itself. On Postgres the
+/// steps must stay below `pool_size - 1`, so a tick never takes every
+/// connection from the requests.
+pub fn check_tick_pool(engine_concurrency: usize, pool_size: u32) -> Result<(), String> {
+    let pool = u64::from(pool_size);
+    if (engine_concurrency as u64).saturating_add(1) < pool {
+        return Ok(());
+    }
+    let pool_env = jamjet_state::postgres::POOL_SIZE_ENV;
+    Err(format!(
+        "{TICK_ENGINE_CONCURRENCY_ENV}={engine_concurrency} must be below {pool_env} - 1 \
+         (here {pool_size} - 1 = {}), or a tick could take every connection from the \
+         requests. Lower {TICK_ENGINE_CONCURRENCY_ENV} or raise {pool_env}.",
+        pool.saturating_sub(1)
+    ))
+}
+
+/// A line startup logs once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    Info(String),
+    Warn(String),
+}
+
+/// What [`BACKGROUND_ENV`] means for this start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundPlan {
+    pub background: Background,
+    /// Parsed whatever the switch, so a typo never waits for the day the
+    /// loops are turned off.
+    pub driver: DriverConfig,
+    /// What to log, in order.
+    pub notices: Vec<Notice>,
+}
+
+/// The loops switch and its rules, before any store is opened. With the
+/// loops off, `JAMJET_EMBED_CRON` on stops startup (cron is a loop), the
+/// embedded workers are not started, and on Postgres a tick must leave pool
+/// connections for the requests ([`check_tick_pool`]). With the loops on, a
+/// serverless platform gets a warning: the loops need CPU between requests.
+pub fn background_plan(
+    get: impl Fn(&str) -> Option<String>,
+    store: StoreKind,
+) -> Result<BackgroundPlan, String> {
+    let background = background_from(&get)?;
+    let driver = driver_config_from(&get)?;
+    let mut notices = Vec::new();
+    match background {
+        Background::On => {
+            if on_serverless_platform(&get) {
+                notices.push(Notice::Warn(format!(
+                    "the background loops are on, and they need CPU between requests. On a \
+                     serverless platform that throttles CPU outside requests they stall: set \
+                     {BACKGROUND_ENV}=off there and call POST /ops/tick every minute"
+                )));
+            }
+        }
+        Background::Off => {
+            if parse_flag(EMBED_CRON_ENV, get(EMBED_CRON_ENV).as_deref())? {
+                return Err(format!(
+                    "{EMBED_CRON_ENV} runs the cron scheduler as a background loop, and \
+                     {BACKGROUND_ENV}=off turns the loops off: set {EMBED_CRON_ENV}=0 or unset it"
+                ));
+            }
+            if store == StoreKind::Postgres {
+                let pool = jamjet_state::PgSettings::from_lookup(|name| Ok(get(name)))?.pool_size;
+                check_tick_pool(driver.engine_concurrency, pool)?;
+            }
+            notices.push(Notice::Info(LOOPS_OFF_NOTICE.to_string()));
+            if parse_flag(EMBED_WORKERS_ENV, get(EMBED_WORKERS_ENV).as_deref())? {
+                notices.push(Notice::Info(format!(
+                    "{EMBED_WORKERS_ENV} is ignored with {BACKGROUND_ENV}=off: engine steps \
+                     run inside requests instead"
+                )));
+            }
+        }
+    }
+    Ok(BackgroundPlan {
+        background,
+        driver,
+        notices,
+    })
+}
+
+/// [`background_plan`] on the process environment. A value that is not
+/// UTF-8 is read with replacement characters, so it fails the parse.
+pub fn background_plan_from_env(store: StoreKind) -> anyhow::Result<BackgroundPlan> {
+    let get = |k: &str| std::env::var_os(k).map(|v| v.to_string_lossy().into_owned());
+    background_plan(get, store).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,5 +1235,179 @@ mod tests {
         }
         // A stop timeout of 0 is not a timeout.
         assert!(shutdown_plan(env(&[("JAMJET_STOP_TIMEOUT_SECS", "0")]), false).is_err());
+    }
+
+    // ── Request-driven mode ──
+
+    const OFF: (&str, &str) = ("JAMJET_BACKGROUND", "off");
+
+    #[test]
+    fn background_defaults_to_on() {
+        assert_eq!(background_from(env(&[])), Ok(Background::On));
+        for (raw, want) in [
+            ("on", Background::On),
+            ("On", Background::On),
+            ("off", Background::Off),
+            ("OFF", Background::Off),
+            (" off ", Background::Off),
+        ] {
+            let pairs = [("JAMJET_BACKGROUND", raw)];
+            assert_eq!(background_from(env(&pairs)), Ok(want), "{raw:?}");
+        }
+    }
+
+    /// Not a boolean switch: `0` and `false` are refused, not read as off.
+    #[test]
+    fn background_refuses_a_typo() {
+        for raw in ["of", "0", "1", "false", "true", "no", "", "offf"] {
+            let pairs = [("JAMJET_BACKGROUND", raw)];
+            let err = background_from(env(&pairs)).unwrap_err();
+            assert!(err.contains("JAMJET_BACKGROUND"), "{raw:?}: {err}");
+            assert!(
+                background_plan(env(&pairs), StoreKind::Sqlite).is_err(),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn loops_off_with_embedded_cron_is_refused_naming_both() {
+        for kind in [StoreKind::Memory, StoreKind::Sqlite, StoreKind::Postgres] {
+            for on in ["1", "true"] {
+                let err =
+                    background_plan(env(&[OFF, ("JAMJET_EMBED_CRON", on)]), kind).unwrap_err();
+                assert!(err.contains("JAMJET_BACKGROUND"), "{kind:?}: {err}");
+                assert!(err.contains("JAMJET_EMBED_CRON"), "{kind:?}: {err}");
+            }
+        }
+        assert!(
+            background_plan(env(&[OFF, ("JAMJET_EMBED_CRON", "0")]), StoreKind::Sqlite).is_ok()
+        );
+        // With the loops on nothing changes.
+        assert!(background_plan(env(&[("JAMJET_EMBED_CRON", "1")]), StoreKind::Sqlite).is_ok());
+    }
+
+    #[test]
+    fn loops_off_says_so_once_and_ignores_embedded_workers() {
+        let plan = background_plan(env(&[OFF]), StoreKind::Sqlite).unwrap();
+        assert_eq!(plan.background, Background::Off);
+        assert_eq!(
+            plan.notices,
+            vec![Notice::Info(
+                "background loops are off; call POST /ops/tick every minute".to_string()
+            )]
+        );
+        let plan = background_plan(
+            env(&[OFF, ("JAMJET_EMBED_WORKERS", "1")]),
+            StoreKind::Sqlite,
+        )
+        .unwrap();
+        assert_eq!(plan.notices.len(), 2, "{:?}", plan.notices);
+        match &plan.notices[1] {
+            Notice::Info(line) => {
+                assert!(line.contains("JAMJET_EMBED_WORKERS is ignored"), "{line}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn loops_on_warn_on_a_platform_only() {
+        let platform = ("K_SERVICE", "svc");
+        let plan = background_plan(env(&[platform]), StoreKind::Postgres).unwrap();
+        assert_eq!(plan.background, Background::On);
+        match plan.notices.as_slice() {
+            [Notice::Warn(line)] => {
+                assert!(line.contains("need CPU between requests"), "{line}");
+                assert!(line.contains("JAMJET_BACKGROUND=off"), "{line}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let plan = background_plan(env(&[]), StoreKind::Postgres).unwrap();
+        assert_eq!(plan.notices, Vec::<Notice>::new());
+        let plan = background_plan(env(&[platform, OFF]), StoreKind::Postgres).unwrap();
+        assert!(
+            !plan.notices.iter().any(|n| matches!(n, Notice::Warn(_))),
+            "{:?}",
+            plan.notices
+        );
+    }
+
+    #[test]
+    fn driver_settings_default_and_parse_strictly() {
+        use std::time::Duration;
+        let d = driver_config_from(env(&[])).unwrap();
+        assert_eq!(d.inline_budget, Duration::from_millis(2000));
+        assert_eq!(d.tick_budget, Duration::from_millis(45000));
+        assert_eq!(d.engine_concurrency, 4);
+        assert_eq!(d.tick_interval, Duration::from_secs(60));
+        let d = driver_config_from(env(&[
+            ("JAMJET_INLINE_ADVANCE_MS", "1"),
+            ("JAMJET_TICK_BUDGET_MS", " 100 "),
+            ("JAMJET_TICK_ENGINE_CONCURRENCY", "1"),
+            ("JAMJET_TICK_INTERVAL_SECS", "1"),
+        ]))
+        .unwrap();
+        assert_eq!(d.inline_budget, Duration::from_millis(1));
+        assert_eq!(d.tick_budget, Duration::from_millis(100));
+        assert_eq!(d.engine_concurrency, 1);
+        assert_eq!(d.tick_interval, Duration::from_secs(1));
+        for (name, bad) in [
+            ("JAMJET_INLINE_ADVANCE_MS", "0"),
+            ("JAMJET_INLINE_ADVANCE_MS", "2s"),
+            ("JAMJET_TICK_BUDGET_MS", "99"),
+            ("JAMJET_TICK_BUDGET_MS", "-1"),
+            ("JAMJET_TICK_ENGINE_CONCURRENCY", "0"),
+            ("JAMJET_TICK_ENGINE_CONCURRENCY", "four"),
+            ("JAMJET_TICK_INTERVAL_SECS", "0"),
+            ("JAMJET_TICK_INTERVAL_SECS", ""),
+        ] {
+            let pairs = [(name, bad)];
+            let err = driver_config_from(env(&pairs)).unwrap_err();
+            assert!(err.contains(name), "{name}={bad:?}: {err}");
+            // Refused with the loops on too: a typo does not wait for the
+            // day they are turned off.
+            assert!(
+                background_plan(env(&pairs), StoreKind::Sqlite).is_err(),
+                "{name}={bad:?}"
+            );
+            let pairs = [(name, bad), OFF];
+            assert!(
+                background_plan(env(&pairs), StoreKind::Sqlite).is_err(),
+                "{name}={bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tick_must_leave_pool_connections_for_the_requests() {
+        for (concurrency, pool) in [(4, 10), (3, 5), (1, 3)] {
+            assert_eq!(
+                check_tick_pool(concurrency, pool),
+                Ok(()),
+                "{concurrency}/{pool}"
+            );
+        }
+        for (concurrency, pool) in [(4, 5), (9, 10), (1, 2), (20, 10), (usize::MAX, u32::MAX)] {
+            let err = check_tick_pool(concurrency, pool).unwrap_err();
+            assert!(err.contains("JAMJET_TICK_ENGINE_CONCURRENCY"), "{err}");
+            assert!(err.contains("JAMJET_PG_POOL_SIZE"), "{err}");
+        }
+        // The defaults (4 steps, a pool of 10) fit.
+        assert!(background_plan(env(&[OFF]), StoreKind::Postgres).is_ok());
+        let small = ("JAMJET_PG_POOL_SIZE", "5");
+        let err = background_plan(env(&[OFF, small]), StoreKind::Postgres).unwrap_err();
+        assert!(err.contains("JAMJET_PG_POOL_SIZE"), "{err}");
+        let three = ("JAMJET_TICK_ENGINE_CONCURRENCY", "3");
+        assert!(background_plan(env(&[OFF, small, three]), StoreKind::Postgres).is_ok());
+        // Only Postgres has the pool, and only a tick needs the room.
+        assert!(background_plan(env(&[OFF, small]), StoreKind::Sqlite).is_ok());
+        assert!(background_plan(env(&[small]), StoreKind::Postgres).is_ok());
+        let err = background_plan(
+            env(&[OFF, ("JAMJET_PG_POOL_SIZE", "lots")]),
+            StoreKind::Postgres,
+        )
+        .unwrap_err();
+        assert!(err.contains("JAMJET_PG_POOL_SIZE"), "{err}");
     }
 }
